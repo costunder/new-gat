@@ -1,0 +1,30 @@
+seed: 17
+# Select CUDA when the server's PyTorch build exposes it; otherwise use CPU.
+device: auto
+output_dir: results
+
+data:
+  num_nodes: 28
+  extra_edges: 22
+  num_excitations: 192
+  channels: 3
+  edge_feature_channels: 3
+  potential_scale: 1.0
+  requested_step: 0.03
+  stability_margin: 0.80
+
+model:
+  hidden_channels: 48
+  minimum_conductance: 0.0001
+  stability_margin: 0.95
+  adaptive_stability: true
+
+training:
+  train_fraction: 0.75
+  epochs: 500
+  learning_rate: 0.008
+  weight_decay: 0.00001
+  node_weight: 1.0
+  flux_weight: 1.0
+  conductance_weight: 0.0
+  log_every: 10

@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+bootstrap_python="${PYTHON:-python3}"
+venv_dir="${VENV_DIR:-${project_root}/.venv-gpu}"
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+    echo "scripts/setup_gpu.sh targets the Linux host reached through MobaXterm." >&2
+    exit 2
+fi
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+    echo "nvidia-smi was not found; request a GPU node before running setup_gpu.sh." >&2
+    exit 2
+fi
+nvidia-smi -L
+
+cuda_version="$(nvidia-smi | sed -n 's/.*CUDA Version: \([0-9][0-9.]*\).*/\1/p' | head -n 1)"
+if [[ -z "${cuda_version}" ]]; then
+    echo "Could not read the driver CUDA compatibility from nvidia-smi." >&2
+    exit 2
+fi
+cuda_major="${cuda_version%%.*}"
+cuda_minor="${cuda_version#*.}"
+cuda_minor="${cuda_minor%%.*}"
+driver_cuda_code=$((10#${cuda_major} * 100 + 10#${cuda_minor}))
+
+wheel_tag="${CUDA_WHEEL_TAG:-}"
+if [[ -z "${wheel_tag}" ]]; then
+    if (( driver_cuda_code >= 1302 )); then
+        wheel_tag="cu132"
+    elif (( driver_cuda_code >= 1300 )); then
+        wheel_tag="cu130"
+    elif (( driver_cuda_code >= 1206 )); then
+        wheel_tag="cu126"
+    else
+        echo "The locked torch 2.13 stack requires a driver supporting CUDA 12.6+." >&2
+        echo "Driver compatibility reported by nvidia-smi: CUDA ${cuda_version}." >&2
+        echo "This script will not silently install an older cu118 PyTorch release." >&2
+        exit 2
+    fi
+fi
+
+case "${wheel_tag}" in
+    cu126) required_cuda_code=1206; expected_cuda_runtime="12.6" ;;
+    cu130) required_cuda_code=1300; expected_cuda_runtime="13.0" ;;
+    cu132) required_cuda_code=1302; expected_cuda_runtime="13.2" ;;
+    *)
+        echo "Unsupported CUDA_WHEEL_TAG=${wheel_tag}; choose cu126, cu130, or cu132." >&2
+        exit 2
+        ;;
+esac
+if (( driver_cuda_code < required_cuda_code )); then
+    echo "CUDA_WHEEL_TAG=${wheel_tag} needs CUDA ${expected_cuda_runtime}+ driver compatibility." >&2
+    echo "nvidia-smi reports CUDA ${cuda_version}." >&2
+    exit 2
+fi
+
+constraints_file="${project_root}/constraints-${wheel_tag}.txt"
+lock_file="${project_root}/requirements-lock.txt"
+torch_index_url="https://download.pytorch.org/whl/${wheel_tag}"
+if [[ ! -f "${constraints_file}" || ! -f "${lock_file}" ]]; then
+    echo "GPU lock files are missing: ${constraints_file} or ${lock_file}" >&2
+    exit 2
+fi
+
+if [[ "${USE_ACTIVE_ENV:-0}" == "1" ]]; then
+    environment_python="${PYTHON:-python}"
+else
+    if [[ ! -x "${venv_dir}/bin/python" ]]; then
+        "${bootstrap_python}" -m venv "${venv_dir}"
+    fi
+    environment_python="${venv_dir}/bin/python"
+fi
+
+if ! "${environment_python}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+    echo "Python 3.11 or newer is required: ${environment_python}" >&2
+    exit 2
+fi
+
+if [[ "${SKIP_DEPS:-0}" != "1" ]]; then
+    "${environment_python}" -m pip install --upgrade pip
+    "${environment_python}" -m pip install "setuptools>=75" wheel
+    torch_version="$(sed -n 's/^torch==//p' "${constraints_file}")"
+    if [[ -z "${torch_version}" || "${torch_version}" == *$'\n'* ]]; then
+        echo "${constraints_file} must contain exactly one torch==version pin." >&2
+        exit 2
+    fi
+    echo "Installing torch==${torch_version} from ${torch_index_url}"
+    "${environment_python}" -m pip install --upgrade \
+        --constraint "${constraints_file}" \
+        "torch==${torch_version}" \
+        --index-url "${torch_index_url}"
+    "${environment_python}" -m pip install \
+        --constraint "${constraints_file}" \
+        --requirement "${lock_file}"
+    "${environment_python}" -m pip install \
+        --no-deps --no-build-isolation -e "${project_root}"
+else
+    "${environment_python}" -m pip install --no-deps --no-build-isolation -e "${project_root}"
+fi
+
+cd "${project_root}"
+"${environment_python}" -m pip check
+snapshot_dir="${ENVIRONMENT_SNAPSHOT_DIR:-${project_root}}"
+mkdir -p "${snapshot_dir}"
+lock_report="${snapshot_dir}/.gpu-environment.json"
+freeze_report="${snapshot_dir}/.gpu-environment.freeze.txt"
+"${environment_python}" scripts/verify_gpu_lock.py \
+    --lock "${lock_file}" \
+    --constraints "${constraints_file}" \
+    --cuda-tag "${wheel_tag}" \
+    --json-out "${lock_report}"
+freeze_temporary="$(mktemp "${freeze_report}.tmp.XXXXXX")"
+"${environment_python}" -m pip freeze --all > "${freeze_temporary}"
+mv -f "${freeze_temporary}" "${freeze_report}"
+"${environment_python}" scripts/gpu_preflight.py \
+    --device "${DEVICE:-cuda}" \
+    --require-paper-deps \
+    --min-free-gb "${MIN_FREE_GB:-2}"
+
+if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
+    "${environment_python}" -m pytest -q
+fi
+
+echo "Exact environment report: ${lock_report}"
+echo "Resolved transitive snapshot: ${freeze_report}"
+echo "GPU environment ready. Run: bash scripts/paper.sh --help"

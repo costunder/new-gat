@@ -1,0 +1,45 @@
+seed: 17
+
+graph:
+  num_nodes: 12
+  extra_edges: 7
+  seed: 29
+
+augmentation:
+  include_bfs: true
+  include_dfs: true
+  random_count: 14
+  random_seed_start: 100
+  unseen_seed_start: 10000
+  # null means k = beta. Any integer k < beta is deliberately rejected.
+  k: null
+  lossy_extension_enabled: false
+
+probe:
+  hidden_dim: 48
+  epochs: 800
+  learning_rate: 0.01
+  weight_decay: 0.00001
+
+output: results/summary.json
+
+# Independent downstream paper protocol. The legacy projector smoke above
+# remains unchanged and is never reported as the paper headline.
+paper:
+  learning_rate: 0.002
+  weight_decay: 0.00001
+  amp: true
+  pin_memory: true
+  non_blocking: true
+  full:
+    hidden_dim: 64
+    optimizer_updates: 800
+    batch_size: 16
+    train_charts_per_graph: 8
+    eval_charts_per_graph: 8
+  tiny:
+    hidden_dim: 16
+    optimizer_updates: 24
+    batch_size: 4
+    train_charts_per_graph: 3
+    eval_charts_per_graph: 2

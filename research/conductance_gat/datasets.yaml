@@ -1,0 +1,141 @@
+registry_version: 2
+track: conductance_gat
+paper_suite_complete: true
+claim: Positive incidence conductance learns heterogeneous edge transport independently of cycle PE.
+objective_protocol:
+  headline: Train the full conductance model from observed node messages only.
+  supervised_ceiling: Report full_flux_supervised separately because it reads per-edge flux labels.
+  ablation: Report full_joint separately and never merge it into the headline result.
+  capacity_limit: Core ablations share hidden width and optimization but not parameter budgets; core per-baseline parameter counts are not currently emitted.
+
+datasets:
+  - id: single_graph_excitation_smoke
+    name: Current single-graph excitation sanity check
+    tier: smoke
+    status: implemented
+    data_policy: generated
+    source_url: generated://research.conductance_gat.synthetic
+    task: Recover flux and node update on one fixed graph with known potentials.
+    split: 144/48 excitation split on the same 28-node graph; not graph OOD.
+    metrics: [node_update_rmse, flux_rmse, conductance_rmse, conductance_correlation]
+    claim: Algebra, optimization, and artifact-pipeline certification only.
+    adapter: research.conductance_gat.synthetic.make_conductance_dataset
+    leakage_guard: Do not report as unseen-graph or conductance-law generalization.
+
+  - id: static_multigraph_identification
+    name: Static heterogeneous multi-graph synthetic
+    tier: paper_core
+    status: implemented
+    data_policy: generated
+    cache_glob: conductance_gat/core-*/manifest.json
+    source_url: generated://research.conductance_gat.paper_data/s1-v5
+    task: Learn a shared positive conductance law across independently generated graphs and excitations.
+    split: Graph-ID 70/15/15 with separate seen-graph and unseen-graph excitation tests.
+    metrics: [graph_macro_flux_relative_l2, graph_macro_node_message_relative_l2, graph_macro_log_conductance_rmse, graph_macro_conductance_spearman, node_message_nnls_gap]
+    claim: Evaluate the shared law on independently seeded held graph IDs; canonical topology/feature/conductance uniqueness is not certified.
+    adapter: research.conductance_gat.paper_data.generate_s1
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: The validator checks seed-derived graph-ID separation, cardinality, tensor validity, and cache checksums, but not canonical topology or feature/conductance-content hashes; label same-evaluation node-message NNLS and per-edge flux supervision as ceilings.
+
+  - id: topology_size_ood
+    name: Conductance topology and size OOD synthetic
+    tier: paper_core
+    status: implemented
+    data_policy: generated
+    cache_glob: conductance_gat/core-*/manifest.json
+    source_url: generated://research.conductance_gat.paper_data/s2-v5
+    task: Apply the same conductance law to unseen graph families and larger graphs.
+    split: Train n=16..32 ER-like/RGG-like generators; test n=48..96 grid/barbell/family-OOD.
+    metrics: [graph_macro_flux_relative_l2, graph_macro_log_conductance_rmse]
+    claim: Generalization is not edge or topology memorization.
+    adapter: research.conductance_gat.paper_data.generate_s2
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Freeze generator seeds and graph IDs in the split manifest; exact cross-split isomorphism deduplication is not implemented.
+
+  - id: nonlinear_rollout
+    name: Positive state-dependent nonlinear diffusion rollout
+    tier: paper_core
+    status: implemented
+    data_policy: generated
+    cache_glob: conductance_gat/core-*/manifest.json
+    source_url: generated://research.conductance_gat.paper_data/s3-v5
+    task: Learn c_e=f(x_e,abs(BH)) and predict trajectories on held-out graphs.
+    split: One trajectory is generated per graph; the graph-ID split therefore makes trajectories disjoint, but it does not create an independent unseen-initial-condition axis; evaluate horizons 1/5/10/50.
+    metrics: [horizon_relative_l2, flux_error, dissipation_violations, norm_growth, cap_activation]
+    claim: Tests held-graph state-dependent rollout for one initial condition per graph, without separating unseen-graph and unseen-initial-condition effects.
+    adapter: research.conductance_gat.paper_data.generate_s3
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Never split time steps from the same trajectory across train and test; do not describe trajectory identity as an independently randomized split axis.
+
+  - id: identifiability_robustness
+    name: Conductance contrast, excitation coverage, and noise factorial
+    tier: paper_core
+    status: implemented
+    data_policy: generated
+    cache_glob: conductance_gat/core-*/manifest.json
+    source_url: generated://research.conductance_gat.paper_data/s4-v5
+    task: Sweep known contrast 1/10/100, sparse excitation, and noise infinity/40/20 dB; contrast is supplied as an edge feature.
+    split: Every split contains all 18 factor cells with independent graph and excitation seeds, so evaluation is factor-grid ID and held-graph-ID rather than unseen-contrast OOD.
+    metrics: [error_vs_snr, error_vs_coverage, flux_ls_gap, node_message_nnls_gap]
+    claim: Measures conditional empirical recovery and NNLS rank diagnostics on held graph IDs; it is not blind contrast identification or a formal identifiability result.
+    adapter: research.conductance_gat.paper_data.generate_s4
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Label per-edge flux LS and node-message NNLS as transductive same-evaluation ceilings; only node_only full is headline; report that graph-global min/max normalization defines the true contrast law while the learned estimator is edge-local, so recovery error includes function-class mismatch.
+
+  - id: pascalvoc_sp
+    name: LRGB PascalVOC-SP
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: conductance_gat/public/official-ready.json
+    source_url: https://github.com/vijaydwivedi75/lrgb
+    task: Superpixel node classification using graph edge weights.
+    split: Official LRGB train/validation/test split.
+    metrics: [macro_f1]
+    baselines: [no_message_mlp, gcn, gat, gine, conductance_model]
+    claim: Predictive utility on a standard edge-weighted node task.
+    adapter: research.conductance_gat.public_data.prepare_public_data
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Use the official split and shared active node encoder/head/depth/optimizer; no-message and GCN intentionally freeze/skip the edge encoder; report active parameter counts and disclose that the custom one-layer backbone budgets are not matched or reference-tuned.
+
+  - id: ogbg_molhiv
+    name: OGB ogbg-molhiv
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: conductance_gat/public/official-ready.json
+    source_url: https://ogb.stanford.edu/docs/graphprop/
+    task: Molecular graph classification with categorical atom and bond features.
+    split: Official scaffold split.
+    metrics: [roc_auc]
+    baselines: [no_message_mlp, gcn, gat, gine, conductance_model]
+    claim: Graph-level utility on unseen molecular scaffolds.
+    adapter: research.conductance_gat.public_data.prepare_public_data
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Use the official split and AtomEncoder/BondEncoder where active, deduplicate bidirectional physical edges, report active parameter counts, and disclose that the custom one-layer backbone budgets are not matched or reference-tuned.
+
+  - id: pglib_dc
+    name: PGLib/MATPOWER DC transport proxy
+    tier: conditional
+    status: blocked
+    data_policy: manual
+    source_url: https://github.com/power-grid-lib/pglib-opf
+    task: Recover branch transport on held-out grid topologies and operating points.
+    split: Split by case/topology; scenario-only random split cannot support topology generalization.
+    metrics: [line_flow_rmse, node_injection_rmse, balance_residual]
+    claim: Conditional physical proxy for B^T C B transport, not real sensor validation.
+    adapter: Requires MATPOWER case parser, DC solver, sparse incidence, and phase-shift handling.
+    leakage_guard: Preserve case version/license and compare with the analytic DC oracle.
+
+  - id: roman_empire_boundary
+    name: Roman-empire positive-diffusion boundary test
+    tier: optional
+    status: planned
+    data_policy: download
+    source_url: https://github.com/yandex-research/heterophilous-graphs
+    task: Heterophilous node classification.
+    split: All ten official splits.
+    metrics: [accuracy_mean, accuracy_std]
+    claim: Negative-control boundary for strictly positive diffusion.
+    adapter: planned sparse node-classification adapter
+    leakage_guard: Treat a failure as a model limitation, not a dataset to tune away.

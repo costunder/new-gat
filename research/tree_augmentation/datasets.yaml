@@ -1,0 +1,87 @@
+registry_version: 2
+track: tree_augmentation
+paper_suite_complete: true
+claim: Spanning-tree chart augmentation improves robustness without changing downstream labels or graph splits.
+
+datasets:
+  - id: single_graph_chart_smoke
+    name: Current single-graph chart transition sanity check
+    tier: smoke
+    status: implemented
+    data_policy: generated
+    source_url: generated://research.tree_augmentation.run
+    task: Certify lossless chart transitions and compare fixed versus multiple charts on one graph.
+    split: One 12-node graph, 16 training trees, one unseen tree.
+    metrics: [transition_error, cocycle_error, unseen_chart_mse]
+    claim: Algebra and augmentation-pipeline certification only.
+    adapter: research.tree_augmentation.augmentation
+    leakage_guard: Target is projector-derived and cannot support a downstream novelty claim.
+
+  - id: cyclecount_ood_multichart
+    name: CycleCount-OOD multi-chart protocol
+    tier: paper_core
+    status: implemented
+    data_policy: generated
+    cache_glob: cyclecount_ood_v2/*.manifest.json
+    source_url: generated://research.tree_augmentation.paper/core-v2
+    task: Predict independent cycle-count labels while varying charts per graph.
+    split: Graph split first, then fresh BFS seen-family and held-out Wilson sampler-family charts within every ID/OOD quadrant.
+    metrics: [task_metric_mean, worst_chart, chart_std, prediction_flip_rate]
+    claim: Separates chart robustness from topology OOD.
+    adapter: python -m research.tree_augmentation.paper --suite core
+    validator: research.tree_augmentation.cache_validation.validate_dataset_cache
+    leakage_guard: Different charts of one graph must never cross graph train/test splits.
+
+  - id: csl_chart_sanity
+    name: CSL fixed-beta chart sanity benchmark
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: csl_pyg_v2/*.manifest.json
+    source_url: https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.GNNBenchmarkDataset.html
+    task: Ten-class circular-skip-link graph classification under fresh BFS and held-out Wilson sampler-family charts.
+    split: Deterministic label-stratified five-fold 3/1/1 protocol cached by graph index.
+    metrics: [accuracy, worst_chart_accuracy, chart_std]
+    claim: Controlled fixed-beta chart robustness, not broad real-world generalization.
+    adapter: python -m research.tree_augmentation.paper --suite csl (optional PyG)
+    validator: research.tree_augmentation.cache_validation.validate_dataset_cache
+    leakage_guard: Fold membership and source graph indices are frozen before chart sampling.
+
+  - id: zinc12k_multichart
+    name: ZINC-12K multi-chart downstream evaluation
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: zinc_pyg_v2/*.manifest.json
+    source_url: https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.ZINC.html
+    task: Molecular regression combining chart/topology coordinates with preserved categorical atom and bond features under fixed-BFS versus mixed-chart training.
+    split: Official graph split plus config-controlled fresh BFS and held-out Wilson chart samples per test graph.
+    metrics: [mae, worst_chart_mae, prediction_spread, preprocessing_time, peak_memory]
+    claim: Real downstream utility of chart augmentation on variable-beta molecular graphs with atom and bond chemistry retained; this is not a topology-only ZINC model.
+    adapter: python -m research.tree_augmentation.paper --suite zinc (optional PyG)
+    validator: research.tree_augmentation.cache_validation.validate_dataset_cache
+    leakage_guard: Match optimizer updates across K; preserve official ZINC splits and targets; atom/bond tensors stay fixed across charts; projector targets are excluded from headline labels.
+
+  - id: brec_chart_stress
+    name: BREC relabeling and chart stress test
+    tier: optional
+    status: planned
+    data_policy: manual
+    source_url: https://github.com/GraphPKU/BREC
+    task: Measure whether chart selection changes pair distinguishability and reliability.
+    split: Official RPC groups with charts nested inside each graph instance.
+    metrics: [successful_pairs, chart_failure_rate, reliability_failures]
+    claim: Optional interaction between expressivity and chart robustness.
+    adapter: planned BREC chart wrapper
+    leakage_guard: Fix cycle-sensitive subset before observing model results.
+
+chart_protocol:
+  training_conditions: [single_root0_bfs, mixed_random_root_bfs_dfs]
+  evaluation_conditions: [fresh_chart_seen_bfs_family, fresh_chart_unseen_wilson_family, id_graphs, topology_ood_graphs]
+  unseen_family_excluded_from_training: true
+  exact_tree_overlap_between_families_allowed: true
+  wilson_draws_conditioned_on_bfs_outputs: false
+  current_random_sampler_name: random_priority_kruskal
+  uniform_sampler: Wilson loop-erased random walk implemented in paper_data.py
+  variable_beta_encoder: sign-even orientation-gauge-safe masked coordinate-set and edge-set pooling implemented in paper_model.py
+  permutation_scope: Exact for orientation/order/relabeling of the same physical tree; label-dependent selection of another BFS/DFS tree remains chart shift.

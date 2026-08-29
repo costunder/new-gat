@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chartgat"
+version = "0.1.0"
+description = "Independent incidence-conductance, cycle-PE, and tree-augmentation experiments"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26",
+  "networkx>=3.2",
+  "torch>=2.2",
+  "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "ruff>=0.6",
+]
+paper = [
+  "ogb>=1.3.6",
+  "pandas>=2.1",
+  "scikit-learn>=1.4",
+  "scipy>=1.11",
+  "torch-geometric>=2.5",
+  "tqdm>=4.66",
+]
+combined = [
+  "pandas>=2.1",
+  "matplotlib>=3.8",
+]
+
+[tool.setuptools.packages.find]
+where = ["src", "."]
+include = ["chartgat*", "research*"]
+exclude = ["research.combined_later*", "research.*.tests*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+"research.conductance_gat" = ["config.yaml", "datasets.yaml"]
+"research.cycle_pe" = ["config.yaml", "datasets.yaml"]
+"research.tree_augmentation" = ["config.yaml", "datasets.yaml"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers"
+testpaths = [
+  "tests",
+  "research/conductance_gat/tests",
+  "research/cycle_pe/tests",
+  "research/tree_augmentation/tests",
+]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

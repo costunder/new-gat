@@ -1,0 +1,5 @@
+# This file constrains every direct paper dependency to requirements-lock.txt.
+# For a Linux GPU host, use scripts/setup_gpu.sh instead: it additionally picks
+# and verifies the matching official CUDA wheel channel.
+-c requirements-lock.txt
+-e .[dev,paper]

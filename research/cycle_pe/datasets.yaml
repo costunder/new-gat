@@ -1,0 +1,90 @@
+registry_version: 2
+track: cycle_pe
+paper_suite_complete: true
+claim: Static cycle-space PE is evaluated on independent cycle-count targets, official BREC RPC, and ZINC-12K.
+
+datasets:
+  - id: cycle_membership_smoke
+    name: Bridge versus any-cycle smoke probe
+    tier: smoke
+    status: implemented
+    data_policy: generated
+    source_url: generated://research.cycle_pe.synthetic
+    task: Classify whether an edge belongs to any cycle across small graph families.
+    split: 16 training and 16 test graphs from disjoint generator families.
+    metrics: [balanced_accuracy, f1, auroc, graph_macro_accuracy]
+    claim: Feature, batching, and invariance pipeline certification only.
+    adapter: research.cycle_pe.synthetic.make_graph_family_split
+    leakage_guard: Projector leverage directly reveals this target, so it is excluded from headline evidence.
+
+  - id: cyclecount_ood
+    name: CycleCount-OOD
+    tier: paper_core
+    status: implemented
+    data_policy: generated
+    cache_glob: cycle_count_ood/*.json.gz
+    source_url: generated://research.cycle_pe.paper_data/cycle-count-ood-v4
+    task: Independently predict edge, node, or graph C3-C6 counts plus edge shortest-cycle length and congestion.
+    split: 10000 train, 2000 validation, 2000 ID, 3000 size-OOD, and 3000 family-OOD graphs.
+    metrics: [mae, rmse, normalized_mae, graph_macro_mae, rounded_exact_accuracy]
+    claim: Nontrivial cycle composition with size and graph-family extrapolation.
+    adapter: research.cycle_pe.paper_data.load_or_generate_cycle_count_ood
+    validator: research.cycle_pe.cache_validation.validate_dataset_cache
+    leakage_guard: Edge, node, and graph targets use separate models; raw width is fit on train only and never test-fit or truncated.
+    protocol_coverage: Size-OOD and family-OOD are implemented; degree-sequence-matched counterfactuals are not implemented.
+
+  - id: brec_v3
+    name: BREC v3
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: BREC/Data/raw/brec_v3.npy
+    source_url: https://github.com/GraphPKU/BREC
+    task: Distinguish 400 non-isomorphic graph pairs under the official RPC protocol.
+    split: Official Basic, Regular, Extension, CFI, 4-Vertex-Condition, and Distance-Regular categories with ten official search seeds.
+    metrics: [per_seed_correct, per_seed_fail, per_seed_real_correct, global_valid, hotelling_t2]
+    claim: Expressivity beyond ordinary message passing with reliability-gated results.
+    adapter: python -m research.cycle_pe.paper --suite brec
+    validator: research.cycle_pe.cache_validation.validate_dataset_cache
+    leakage_guard: Official mode reports ten independent complete-seed runs and is globally valid only with zero reliability failures; any-seed union is custom-only.
+
+  - id: zinc12k
+    name: ZINC-12K
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: ZINC12K/subset/processed/*.pt
+    source_url: https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.ZINC.html
+    task: Molecular constrained-solubility graph regression with official PyG subset partitions.
+    split: Official 10000/1000/1000 train, validation, and test split.
+    metrics: [mae, rmse, normalized_mae, graph_macro_mae]
+    claim: Real molecular graph utility under a common static-cycle PE backbone.
+    adapter: python -m research.cycle_pe.paper --suite zinc
+    validator: research.cycle_pe.cache_validation.validate_dataset_cache
+    leakage_guard: Chemistry features and topology PE are fixed before training; raw PE width is fit on train only.
+
+  - id: aqsol
+    name: AQSOL scaffold OOD
+    tier: conditional
+    status: blocked
+    data_policy: download
+    source_url: https://www.jmlr.org/papers/v24/22-0567.html
+    task: Measured aqueous-solubility graph regression.
+    split: Official scaffold 7831/996/996 split.
+    metrics: [mae, scaffold_ood_gap]
+    claim: Required only for a separate scaffold-OOD headline claim.
+    adapter: No AQSOL adapter is implemented in this track.
+    leakage_guard: Do not replace the official scaffold split with a random split.
+
+  - id: peptides
+    name: LRGB Peptides-func and Peptides-struct
+    tier: optional
+    status: planned
+    data_policy: download
+    source_url: https://github.com/vijaydwivedi75/lrgb
+    task: Long-range molecular graph classification and regression.
+    split: Official 70/15/15 splits.
+    metrics: [average_precision, mae]
+    claim: Optional larger-graph scaling and long-range utility.
+    adapter: A future LRGB/PyG molecular adapter is planned.
+    leakage_guard: Use the official evaluator and report PE preprocessing memory and time.
