@@ -10,6 +10,71 @@
 
 ## 0. 리뷰어가 먼저 알아야 할 판정
 
+### 2026-08-30 최종 실행 범위: 트랙별 데이터에서 우리 모델만 실행
+
+기본 실행은 `--suite benchmark`로 변경했다. Conductance GAT는 GAT/GATv2 논문에
+나오는 Cora/CiteSeer/PubMed/PPI/ogbn-arxiv에서 우리 conductance 모델만 학습한다.
+Cycle PE는 SignNet/PEARL 공통 ZINC-12K 및 PEARL의 Peptides-struct에서 우리 cycle-set
+PE 모델만 학습한다. 외부 비교 모델의 구현·실행은 제거했다. 트리 증강의 CSL/ZINC
+fixed-BFS vs multi-chart는 같은 우리 모델의 증강 ablation이므로 독립적으로 유지한다.
+
+기본 실행에서 S1–S4/CycleCount 생성과 BREC는 제외했다. 기존 코드는 명시적인 `core`/`all`
+보조 suite에 남아 있다. 아래의 이전 감사 내용에서 '현재 paper core'는 이 교정 전 경로를
+가리키며, 새 benchmark의 실행 목록으로 읽으면 안 된다. 이 보조 suite에서도 외부
+MLP/GCN/GAT/GINE 모델은 실행하지 않는다. 자체 연산의 ablation/해석적 진단은 별개다.
+
+외부 비교 점수는 **논문 표에서 출처를 밝혀 인용**한다. 저장소가 직접 재현한 값이라고
+표기하지 않으며 우리 seed별 결과와 paired 통계로 합치지 않는다. 데이터 이름뿐 아니라
+버전/split/지표/입력/파라미터 예산/학습 조건도 확인하고 다른 조건을 표 주석에 명시한다.
+전체 공개 데이터 다운로드/GPU 학습은 이 Windows 작업 공간에서 수행하지 않았다.
+Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 추가하지 않았다.
+
+#### 새 기본 실행의 구현 경계
+
+| 트랙 | 새 실행 모듈 | 비교·데이터 계약 |
+|---|---|---|
+| Conductance GAT | `research/conductance_gat/benchmark.py` | Cora/CiteSeer/PubMed public masks, PPI 20/2/2, ogbn-arxiv official split; 우리 conductance |
+| Cycle PE | `research/cycle_pe/benchmark.py` | ZINC 10k/1k/1k, Peptides-struct 10873/2331/2331; 우리 cycle-set PE |
+| Tree augmentation | 기존 `research/tree_augmentation/paper.py`의 `csl`·`zinc` | fixed-BFS vs multi-chart; CSL은 한 개의 stratified 90/30/30 split, ZINC는 official split |
+
+- GAT의 `benchmark_data.py`는 원본/분할 checksum과 전처리 규칙을 저장한다.
+  우리 모델은 기존 positive scalar estimator와 sparse `H - eta B^T C B H`를 사용한다.
+  표준 GAT/GATv2/GCN/SAGE 생성 분기와 `--baselines` 선택 옵션은 없다.
+  ogbn-arxiv 학습은 full-batch로, GATv2 논문의 GraphSAINT 설정과 다르다.
+- PE의 `benchmark_data.py`는 공식 atom/bond feature와 target을 그대로 보존한다.
+  `benchmark_models.py`는 기존 Cycle PE의 edge-aware message layer와 task head를 사용한다.
+  BFS fundamental basis, 여섯 set statistic, GELU encoder 및 edge-PE 주입을 재사용한다.
+  별도 GINE 경쟁 모델이나 LapPE/RWSE/SignNet/PEARL 구현·전처리는 없다.
+  PE를 downstream 예측으로 읽는 neural layer는 우리 모델의 구성요소이며 외부 비교 모델이 아니다.
+- Cycle-set은 cycle-column sign/order에는 불변이지만 chart 교체에는 불변이 아니다.
+  원 논문과 같은 데이터셋을 쓰는 것과 논문 모델의 수치를 재현하는 것은 구분한다.
+- 학습은 CUDA 전용이다. 기본 float32, PPI batch 2, 분자/tree batch 32, model seeds 0–4다.
+  GAT/PE는 validation으로 checkpoint를 선택한 뒤 test를 한 번 평가한다. GAT는 accuracy,
+  PPI는 전체 node-label micro-F1, PE는 MAE를 사용한다. 시간/메모리/파라미터도 따로 저장한다.
+- Root `scripts/run_paper.py` 기본값과 다섯 Bash wrapper를 새 `benchmark`로 연결했다.
+  준비는 GAT/PE/CSL/ZINC 네 child만 한 번씩 수행한다. 기본 재현은 preflight 이후
+  GAT 5개 + PE 5개 + tree 10개 child이며 세 트랙 결과 폴더를 분리한다.
+- Benchmark schema v2는 `datasets.<dataset>.models.conductance` 또는 `.models.cycle_set`를
+  사용한다. `scripts/aggregate_paper.py`는 이 경로의 test만 성능으로 집계하고
+  validation/history/외부 모델 점수/인용 수치를 제외한다. Paired 비교는 우리 모델의
+  내부 ablation에만 적용하며 benchmark의 단일 모델로 외부 모델과의 통계를 만들지 않는다.
+- 보조 Cycle PE 기본 variant는 raw/set/projector이고 No-PE는 명시적 옵션의 내부 ablation이다.
+
+#### 검증 범위
+
+- 외부 모델 제거 후 root runner/집계/registry 및 세 트랙 관련 검사: **174 passed, 1 skipped**.
+  생략된 한 검사는 로컬 PyG 미설치로 실행하지 못한 데이터 batching 검사다.
+- 수정 Python의 Ruff 검사 통과. 기본 재현의 20개 학습 child와 준비의 4개 child 명령은
+  실제 각 트랙의 CLI parser로 검증했다. 외부 모델 선택 옵션은 거부되고, 논문 인용 점수는
+  우리 결과 집계와 paired 통계에 포함되지 않는 것을 테스트했다.
+- Windows 검사 중 `Windows fatal exception: access violation` 진단 출력이 있었으나
+  검사 프로세스는 계속 실행되어 위 pytest 결과와 종료 코드 0을 반환했다. 이 호스트 진단을
+  Linux/CUDA 검증 통과로 해석하지 않는다.
+- 이 작업에서는 실제 데이터 다운로드, PyG/OGB 실제 cache 로딩, Linux Bash 실행 또는
+  GPU benchmark 학습을 수행하지 않았다. CPU 학습 결과를 연구 결과로 생성하지 않았다.
+
+### 기존 연구 및 감사 기록
+
 1. 활성 연구는 세 개이며 서로 독립이다.
    - `research/conductance_gat`: positive scalar edge conductance를 학습하는 sparse incidence
      operator.
@@ -41,9 +106,9 @@
 ### 코드 스냅샷
 
 - 파일: `code_summary.md`
-- 포함 파일: 89개
-- 크기: 794,172 bytes, 21,185 lines (`str.splitlines()` 기준)
-- SHA-256: `61E87F7D7809EFB1C7DB639A4168C1A5982B15894B2289F42BA70B956B9AFAAB`
+- 포함 파일: 96개
+- 크기: 888,612 bytes, 23,459 lines (`str.splitlines()` 기준)
+- SHA-256: `6992248634329AC31A129FCDB1D78E6A969F7A5182F9556FAC9B361095D8F332`
 - 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`, `.gitattributes`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
 
@@ -366,13 +431,10 @@ function-class misspecification도 섞인다.
 - PascalVOC-SP: PyG LRGB official train/val/test, node classification, macro-F1.
 - ogbg-molhiv: OGB official scaffold split, graph classification, OGB ROC-AUC evaluator.
 
-비교군은 no-message MLP, sparse GCN, custom single-head edge-aware GAT, custom GINE,
-conductance model이다. 같은 adapter/split/hidden width/one-layer depth/head/optimizer 아래 실행하고
-exact parameter count를 기록한다. MolHIV는 OGB AtomEncoder/BondEncoder를 사용한다.
-
-다만 이들은 benchmark 논문의 reference hyperparameter configuration이 아니라 프로젝트 내부의
-custom one-layer comparison이다. Parameter count를 기록하지만 budget을 강제로 같게 맞추지는
-않는다.
+이 보조 public 경로도 우리 conductance model만 실행한다. 이전 no-message MLP, sparse GCN,
+custom single-head edge-aware GAT, GINE 경쟁 모델 구현은 제거했다. Parameter count를 기록하고
+MolHIV의 OGB AtomEncoder/BondEncoder는 원자·결합 입력을 읽는 구성요소로 유지한다.
+외부 점수는 논문 표를 인용하며 모델·학습 조건 차이를 표시한다.
 
 ### 4.5 산출물과 테스트
 
@@ -548,7 +610,7 @@ python -m research.cycle_pe.paper \
   --suite core --data-root ./data \
   --output-dir ./results/cycle-core-seed0 \
   --device cuda --data-seed 0 --split-seed 0 --chart-seed 0 --model-seed 0 \
-  --variants no_pe,raw,set,projector \
+  --variants raw,set,projector \
   --core-targets edge,node,graph --batch-size 64 --workers 8 --amp
 ```
 
@@ -591,9 +653,9 @@ aggregation, variant-lazy projector, ZINC fixture와 CLI collision/partial prese
 11. Official BREC는 최대 4×10×400 pair training 결과를 메모리에 모은 뒤 마지막에 기록한다.
     Pair/seed 단위 incremental checkpoint와 resume가 없어 중단 시 현재 child 진행분을 같은
     run-id로 재개할 수 없다. Pair decode/PE 전처리도 variant/seed마다 반복된다.
-12. No-PE 외 baseline이 부족하다. 최소한 LapPE/sign-invariant LapPE, RWSE, GIN/GINE,
-    GPS/Graphormer와 CycleNet 또는 기존 cycle-space PE를 같은 split/budget으로 비교하고 통계적
-    significance를 보고해야 한다.
+12. 외부 모델은 사용자가 정한 실행 범위에서 제외한다. 관련 논문의 표를 인용하고
+    split/입력/예산/평가 조건이 일치하는지 기록한다. 인용 점수에 대해 우리 seed와의
+    paired significance를 주장하지 않는다.
 
 ## 6. 연구 트랙 C — Full-β Spanning-tree Chart Augmentation
 
@@ -794,12 +856,12 @@ CUDA/public full 결과가 없다는 경계는 그대로다.
 
 ### P1 — 강한 scientific claim 전에
 
-1. Conductance: standard diffusion/GAT/GINE reference implementation과 tuned matched-depth/budget
-   비교, real physical/sensor conductance data 또는 명확한 synthetic-only claim.
-2. Cycle PE: degree/`(n,m,β)` matched counterfactual, prior cycle PE/Graph Transformer baseline,
+1. Conductance: 관련 논문 표를 인용한 비교의 조건 확인, real physical/sensor conductance data
+   또는 명확한 synthetic-only claim. 외부 모델을 저장소에 추가하는 작업은 현재 범위 밖이다.
+2. Cycle PE: degree/`(n,m,β)` matched counterfactual, 기존 cycle PE 논문과의 수학적 차이 설명,
    dense projector scaling 측정.
-3. Tree augmentation: no-PE/standard GNN baseline, BFS-only/DFS-only/Wilson-only ablation, validation
-   기반 selection, large-β scaling.
+3. Tree augmentation: 우리 모델의 BFS-only/DFS-only/Wilson-only ablation, validation 기반 selection,
+   large-β scaling.
 4. Leakage negative tests와 graph/canonical hash guard 강화.
 5. 독립 reviewer가 BREC threshold/statistic/reliability와 category aggregation을 official source와
    다시 대조.

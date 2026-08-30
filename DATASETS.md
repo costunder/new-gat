@@ -1,5 +1,41 @@
 # 데이터셋 및 평가 계약
 
+## 기본 실행: 각 연구의 경쟁 논문과 같은 데이터셋
+
+`prepare_data.sh`, `reproduce.sh`, 트랙별 `reproduce.sh`의 기본 suite는 `benchmark`다.
+기본 실행에서는 아래 공개 데이터만 사용하며 S1–S4/CycleCount를 생성하지 않는다.
+
+| 트랙 | 기본 데이터 | 경쟁 논문과의 연결 | 이 저장소에서 실행하는 모델 | 지표 |
+|---|---|---|---|---|
+| Conductance GAT | Cora, CiteSeer, PubMed | GAT 원 논문의 인용 그래프, Planetoid public mask | 우리 conductance만 | accuracy |
+| Conductance GAT | PPI | GAT 원 논문의 공식 20/2/2 그래프 split | 위와 동일 | micro-F1 |
+| Conductance GAT | ogbn-arxiv | GATv2의 OGB node prediction, 공식 시간 split | 위와 동일 | accuracy |
+| Cycle PE | ZINC-12K | SignNet와 PEARL 공통, 공식 10,000/1,000/1,000 | 우리 cycle-set PE만 | MAE |
+| Cycle PE | Peptides-struct | PEARL 부록 K.2, LRGB 공식 split·11개 target | 위와 동일 | MAE |
+| Tree augmentation | CSL, ZINC-12K | 공개 구조·분자 데이터에서 고정 tree와 다중 tree 비교 | 같은 모델의 fixed-BFS vs multi-chart | accuracy / MAE |
+
+**우리 모델만 실행**한다. 외부 비교 방법은 논문 표의 수치를 출처와 함께 인용한다.
+우리 GAT/PE는 validation으로 checkpoint를 선택한 뒤 test를 평가하고 모델 크기와 비용을
+별도로 기록한다. 논문 인용 수치는 우리 seed별 실행값이나 paired 통계에 넣지 않는다.
+표를 비교할 때 데이터 버전·split·지표·추가 입력·파라미터 예산·학습 조건을 확인하고,
+다른 부분은 표 주석에 남긴다. 특히 현재 ogbn-arxiv full-batch 설정은 GATv2 논문의
+GraphSAINT 설정과 다르므로 동일 학습 조건의 재실험으로 표현하지 않는다.
+트랙 간 모델을 결합하거나 GAT 트랙에 새 cycle PE를 주입하지 않는다.
+
+논문 원문: [GAT](https://arxiv.org/pdf/1710.10903),
+[GATv2](https://arxiv.org/pdf/2105.14491),
+[SignNet](https://arxiv.org/html/2202.13013v4),
+[PEARL](https://arxiv.org/pdf/2502.01122).
+
+Alchemy는 SignNet의 공개 index 파일에서 중복 및 train/test 겹침이 발견되어 기본 실행에
+추가하지 않았다. 임의로 다시 나눈 split을 원 논문과 동일하다고 표시하지 않는다.
+검토한 원본은 [고정된 upstream revision의 Alchemy split](https://github.com/cptq/SignNet-BasisNet/tree/07f31187823ff8d42ed2f61eabe54344aea7cf24/Alchemy)이다.
+
+아래 S1–S4, CycleCount, BREC 및 PascalVOC-SP/molhiv는 기존 `core`/`all` suite의
+**보조 연구 계약**이다. 기본 benchmark와 구분해서 읽어야 한다.
+
+## 보조 실험의 상태 및 계약
+
 이 문서는 세 독립 연구 트랙에서 **현재 코드로 실행되는** 데이터, split, 비교군,
 metric, leakage guard를 정리한다. 계획과 구현을 혼동하지 않도록 다음 상태를 구분한다.
 
@@ -29,7 +65,8 @@ python scripts/check_datasets.py \
 
 1. Physical graph split을 먼저 고정하고 excitation, trajectory, chart를 그 안에서 만든다.
 2. 같은 graph의 다른 excitation/chart를 graph OOD처럼 train/test에 나누지 않는다.
-3. Public benchmark는 official split을 그대로 쓴다.
+3. Official split이 있는 public benchmark는 해당 split을 그대로 쓴다. CSL은 예외로
+   현재 한 개의 고정 stratified 90/30/30 분할을 사용하며, 5-fold 논문 점수 재현이 아니다.
 4. `--allow-download` 없이는 network 접근을 하지 않는다.
 5. Generated cache는 seed/config/schema hash로 구분하고 기존 cache를 검증한다.
 6. Dataset preparation과 training output을 분리하고 기존 non-empty run을 덮어쓰지 않는다.
@@ -82,16 +119,15 @@ Per-edge flux supervision이 conductance recovery를 쉽게 만들어 headline�
 `full`이 flux target의 제거·변조에 독립적이라는 회귀 테스트가 있다. LS와 NNLS는
 inductive learned baseline으로 보고하지 않는다.
 
-### Required public benchmarks
+### Supplementary public benchmarks (`all`, not default `benchmark`)
 
-| 데이터 | split/task | metric | matched comparisons |
+| 데이터 | split/task | metric | 실행 모델 |
 |---|---|---|---|
-| PascalVOC-SP | LRGB official split, superpixel node classification | macro-F1 | no-message MLP, GCN, edge-aware GAT, GINE, conductance |
-| ogbg-molhiv | OGB official scaffold split, graph classification | ROC-AUC | 같은 5개 비교 |
+| PascalVOC-SP | LRGB official split, superpixel node classification | macro-F1 | 우리 conductance |
+| ogbg-molhiv | OGB official scaffold split, graph classification | ROC-AUC | 우리 conductance |
 
-각 비교는 같은 adapter, active node encoding, hidden width, one-layer depth, head, optimizer와
-split을 사용한다. 사용하지 않는 edge encoder는 freeze/skip하고 trainable active parameter count를
-기록하지만 exact parameter/FLOP budget은 맞추지 않는다. MolHIV는
+이 보조 경로도 외부 비교 모델 없이 우리 conductance의 node encoding, 한 layer의 연산,
+task head를 학습하고 trainable parameter count를 기록한다. MolHIV는
 OGB AtomEncoder/BondEncoder를 사용한다. Reciprocal directed arcs는 한 physical bond로
 canonicalize하며 categorical attribute 불일치는 거부하고 continuous attribute는 평균한다.
 
@@ -143,7 +179,8 @@ cycle 구조를 명시적으로 제공하는 inductive bias다.
 edge/node/graph는 별도 task, model, head, checkpoint로 학습한다. MAE, RMSE,
 train-normalized MAE, graph-macro MAE, rounded exact accuracy를 보고한다.
 
-비교 PE는 `no_pe`, `raw`, `set`, `projector`다. Projector는 closest-prior baseline이며
+기본 내부 variant는 `raw`, `set`, `projector`다. `no_pe`는 명시적으로 선택할 때만 실행하는
+우리 모델의 PE 제거 ablation이다. Projector는 closest-prior formulation이며
 novelty로 주장하지 않는다. Raw 폭은 train max-beta만으로 정한다. OOD beta가 더 크면
 그 raw split만 `not_applicable_train_fitted_width_overflow`로 기록하고 절단/test-fit하지
 않으며 다른 PE 비교는 계속 평가한다.
@@ -157,8 +194,8 @@ novelty로 주장하지 않는다. Raw 폭은 train max-beta만으로 정한다.
 주장을 해서는 안 된다.
 
 1-WL-indistinguishable이면서 cycle target이 다른 known-contrast, raw/set의 isomorphic relabeling
-및 spanning-tree shift robustness, LapPE/sign-invariant LapPE, RWSE, GIN/GINE, GPS/Graphormer,
-CycleNet/기존 cycle-space PE baseline도 없다. Suite preparation time은 variant별로 분리되지 않고
+및 spanning-tree shift robustness는 미구현이다. 외부 PE 모델은 실행 범위 밖이며 논문 표로
+인용 비교한다. Suite preparation time은 variant별로 분리되지 않고
 CPU RSS도 기록하지 않으므로 projector preprocessing 효율 비교는 아직 불완전하다.
 
 Cycle PE CLI는 data/split/chart/model seed를 독립 축으로 기록한다. CycleCount 생성과 cache

@@ -114,3 +114,37 @@ def validate_dataset_cache(
 
 
 __all__ = ["validate_dataset_cache"]
+
+
+def validate_benchmark_cache(
+    dataset_id: str,
+    data_root: Path,
+    *,
+    data_seeds: tuple[int, ...],
+    split_seeds: tuple[int, ...],
+) -> dict[str, Any]:
+    """Read-only official molecular-split validation; never invoke a downloader."""
+    del data_seeds, split_seeds
+    from .benchmark_data import EXPECTED_SIZES, _ready
+
+    root = data_root.expanduser().resolve()
+    if dataset_id == "zinc12k":
+        if not _ready(root / "ZINC12K", "zinc12k"):
+            raise FileNotFoundError("ZINC raw artifacts are required for offline PyG loading")
+        return _validate_zinc(root)
+    if dataset_id != "peptides_struct":
+        raise ValueError(f"unsupported matched PE dataset: {dataset_id}")
+    if not _ready(root / "LRGB", "peptides_struct"):
+        raise FileNotFoundError("Peptides-struct official raw train/val/test artifacts are missing")
+    processed = root / "LRGB" / "peptides-struct" / "processed"
+    paths = {split: processed / f"{split}.pt" for split in ("train", "val", "test")}
+    if not all(path.is_file() for path in paths.values()):
+        raise CacheIncompleteError("Peptides-struct processed official splits are incomplete")
+    counts = {name: _pyg_processed_count(path) for name, path in paths.items()}
+    if tuple(counts.values()) != EXPECTED_SIZES["peptides_struct"]:
+        raise CacheCorruptError(f"Peptides-struct split cardinalities disagree: {counts}")
+    return {
+        "paths": [str(path) for path in paths.values()],
+        "split_sizes": counts,
+        "sha256": {name: sha256_file(path) for name, path in paths.items()},
+    }

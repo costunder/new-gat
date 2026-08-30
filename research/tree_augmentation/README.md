@@ -14,6 +14,16 @@ It deliberately does **not** contain or import:
 The only shared code used here is graph/incidence algebra and spanning-tree
 sampling from `src/chartgat`.
 
+## Default public-data execution
+
+`reproduce.sh` now runs **CSL and ZINC-12K only** through the master's `benchmark`
+suite. Both compare fixed-BFS versus multi-chart with unchanged graph labels and
+the same prediction model. Neither conductance models nor the separate PE
+baseline comparison are imported. The generated CycleCount protocol below is
+available only through the explicit supplementary `core`/`all` suites.
+CSL currently uses one fixed stratified 90/30/30 partition, not a full five-fold
+published-score reproduction. ZINC preserves its official 10k/1k/1k split.
+
 ## Scope
 
 For a connected graph with incidence matrix `B` and cycle rank
@@ -94,7 +104,7 @@ run this script from the repository root:
 bash research/tree_augmentation/reproduce.sh
 ```
 
-The script runs the full CycleCount, CSL, and ZINC suites on CUDA, with model
+The script runs CSL and ZINC independently on CUDA, with model
 seeds `0,1,2,3,4` and data/split/chart seeds fixed to `0`. It runs only this
 track's fixed-chart and multi-chart comparisons. Dataset and result locations,
 run identifiers, and shared overrides follow the root README. Missing or damaged

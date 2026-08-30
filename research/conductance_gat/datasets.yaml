@@ -2,16 +2,104 @@ registry_version: 2
 track: conductance_gat
 paper_suite_complete: true
 claim: Positive incidence conductance learns heterogeneous edge transport independently of cycle PE.
+default_suite: benchmark
+benchmark_protocol:
+  datasets: [cora, citeseer, pubmed, ppi, ogbn-arxiv]
+  models: [conductance]
+  claim: Train only our conductance model on official datasets used by prior GAT/GATv2 papers.
+  external_comparison: Published tables are external references only; no competitor implementation or training is included.
+  recorded: Input features, adjacency preprocessing, official splits, encoder/head, hidden width, depth, optimizer, seeds and early stopping.
+  limitations: Our architecture and full-batch ogbn-arxiv protocol differ from the original papers; published scores require protocol-aware external comparison. No Cycle PE or tree augmentation.
 objective_protocol:
-  headline: Train the full conductance model from observed node messages only.
+  headline: The benchmark suite trains our conductance model on original-paper datasets; published competitors are compared externally. The following inverse-problem objectives apply only to explicit supplementary core/all suites.
   supervised_ceiling: Report full_flux_supervised separately because it reads per-edge flux labels.
   ablation: Report full_joint separately and never merge it into the headline result.
   capacity_limit: Core ablations share hidden width and optimization but not parameter budgets; core per-baseline parameter counts are not currently emitted.
 
 datasets:
+  - id: cora
+    name: Cora citation network
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: conductance_gat/matched_benchmark_v1/cora/manifest.json
+    source_url: https://github.com/kimiyoung/planetoid/tree/master/data
+    task: Classify paper subject from bag-of-words features and citation edges.
+    split: Official Planetoid public masks, 140 train / 500 validation / 1000 test nodes.
+    metrics: [accuracy]
+    models: [conductance]
+    claim: Our-method-only node classification on the Cora dataset used by GAT.
+    adapter: research.conductance_gat.benchmark_data.load_dataset
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Preserve official masks, use training labels only for loss and validation only for checkpoint selection; common feature normalization and graph preprocessing.
+
+  - id: citeseer
+    name: CiteSeer citation network
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: conductance_gat/matched_benchmark_v1/citeseer/manifest.json
+    source_url: https://github.com/kimiyoung/planetoid/tree/master/data
+    task: Classify paper subject from bag-of-words features and citation edges.
+    split: Official Planetoid public masks, 120 train / 500 validation / 1000 test nodes.
+    metrics: [accuracy]
+    models: [conductance]
+    claim: Our-method-only node classification on the CiteSeer dataset used by GAT.
+    adapter: research.conductance_gat.benchmark_data.load_dataset
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Preserve official masks including isolated nodes; no split regeneration or test-label training.
+
+  - id: pubmed
+    name: PubMed citation network
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: conductance_gat/matched_benchmark_v1/pubmed/manifest.json
+    source_url: https://github.com/kimiyoung/planetoid/tree/master/data
+    task: Classify biomedical paper subject from node features and citation edges.
+    split: Official Planetoid public masks, 60 train / 500 validation / 1000 test nodes.
+    metrics: [accuracy]
+    models: [conductance]
+    claim: Our-method-only node classification on the PubMed dataset used by GAT.
+    adapter: research.conductance_gat.benchmark_data.load_dataset
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Fixed public masks; full graph visibility is transductive and never permits validation/test labels in training loss.
+
+  - id: ppi
+    name: PPI protein-protein interaction networks
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: conductance_gat/matched_benchmark_v1/ppi/manifest.json
+    source_url: https://graphsage.stanford.edu/
+    task: Predict 121 independent protein-function labels per node from 50 features and interaction edges.
+    split: Official inductive graph split of 20 train / 2 validation / 2 test graphs.
+    metrics: [micro_f1]
+    models: [conductance]
+    claim: Our-method-only inductive node classification on PPI, used by GAT/GATv2/GraphSAGE.
+    adapter: research.conductance_gat.benchmark_data.load_dataset
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Separate graphs by official split; BCEWithLogitsLoss and global node-label micro-F1 at logit threshold zero; seed training-loader order per run.
+
+  - id: ogbn-arxiv
+    name: OGB ogbn-arxiv citation network
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: conductance_gat/matched_benchmark_v1/ogbn-arxiv/manifest.json
+    source_url: https://ogb.stanford.edu/docs/nodeprop/#ogbn-arxiv
+    task: Predict one of 40 arXiv subject categories per paper.
+    split: Official temporal node split, 90941 train / 29799 validation / 48603 test.
+    metrics: [accuracy]
+    models: [conductance]
+    claim: Our-method-only evaluation on ogbn-arxiv; no GATv2 reproduction or competitor execution.
+    adapter: research.conductance_gat.benchmark_data.load_dataset
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Preserve OGB time split and raw features; disclose undirected graph and full-batch training; select checkpoints only with validation.
+
   - id: static_multigraph_identification
     name: Static heterogeneous multi-graph synthetic
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: generated
     cache_glob: conductance_gat/core-*/manifest.json
@@ -26,7 +114,7 @@ datasets:
 
   - id: topology_size_ood
     name: Conductance topology and size OOD synthetic
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: generated
     cache_glob: conductance_gat/core-*/manifest.json
@@ -41,7 +129,7 @@ datasets:
 
   - id: nonlinear_rollout
     name: Positive state-dependent nonlinear diffusion rollout
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: generated
     cache_glob: conductance_gat/core-*/manifest.json
@@ -56,7 +144,7 @@ datasets:
 
   - id: identifiability_robustness
     name: Conductance contrast, excitation coverage, and noise factorial
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: generated
     cache_glob: conductance_gat/core-*/manifest.json
@@ -71,7 +159,7 @@ datasets:
 
   - id: pascalvoc_sp
     name: LRGB PascalVOC-SP
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: download
     cache_glob: conductance_gat/public/official-ready.json
@@ -79,15 +167,15 @@ datasets:
     task: Superpixel node classification using graph edge weights.
     split: Official LRGB train/validation/test split.
     metrics: [macro_f1]
-    baselines: [no_message_mlp, gcn, gat, gine, conductance_model]
+    models: [conductance_model]
     claim: Predictive utility on a standard edge-weighted node task.
     adapter: research.conductance_gat.public_data.prepare_public_data
     validator: research.conductance_gat.cache_validation.validate_dataset_cache
-    leakage_guard: Use the official split and shared active node encoder/head/depth/optimizer; no-message and GCN intentionally freeze/skip the edge encoder; report active parameter counts and disclose that the custom one-layer backbone budgets are not matched or reference-tuned.
+    leakage_guard: Use the official split and conductance-only model; report active parameter counts; no competitor reproduction or locally generated comparison values.
 
   - id: ogbg_molhiv
     name: OGB ogbg-molhiv
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: download
     cache_glob: conductance_gat/public/official-ready.json
@@ -95,11 +183,11 @@ datasets:
     task: Molecular graph classification with categorical atom and bond features.
     split: Official scaffold split.
     metrics: [roc_auc]
-    baselines: [no_message_mlp, gcn, gat, gine, conductance_model]
+    models: [conductance_model]
     claim: Graph-level utility on unseen molecular scaffolds.
     adapter: research.conductance_gat.public_data.prepare_public_data
     validator: research.conductance_gat.cache_validation.validate_dataset_cache
-    leakage_guard: Use the official split and AtomEncoder/BondEncoder where active, deduplicate bidirectional physical edges, report active parameter counts, and disclose that the custom one-layer backbone budgets are not matched or reference-tuned.
+    leakage_guard: Use official split and AtomEncoder/BondEncoder, deduplicate reciprocal physical edges, report active parameter counts; only conductance is trained.
 
   - id: pglib_dc
     name: PGLib/MATPOWER DC transport proxy

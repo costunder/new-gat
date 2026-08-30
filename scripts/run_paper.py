@@ -31,8 +31,13 @@ TRACK_MODULES = {
     "cycle_pe": "research.cycle_pe.paper",
     "tree_augmentation": "research.tree_augmentation.paper",
 }
+BENCHMARK_MODULES = {
+    "conductance_gat": "research.conductance_gat.benchmark",
+    "cycle_pe": "research.cycle_pe.benchmark",
+}
 CYCLE_BREC_OFFICIAL_SEEDS = (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
 CYCLE_VARIANTS = ("no_pe", "raw", "set", "projector")
+DEFAULT_CYCLE_VARIANTS = ("raw", "set", "projector")
 CYCLE_CORE_TARGETS = ("edge", "node", "graph")
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -121,7 +126,7 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
             "--json-out",
             str(preflight_output),
         ]
-        if args.suite == "all":
+        if args.suite in {"all", "benchmark"}:
             preflight.append("--require-paper-deps")
         commands.append(("gpu_preflight", preflight, preflight_output))
     brec_protocol = "official"
@@ -153,13 +158,18 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
         workers: int | None = None,
         amp: bool | None = None,
     ) -> None:
-        effective_batch_size = args.batch_size if batch_size is None else batch_size
+        default_batch_size = 2 if track == "conductance_gat" and suite == "benchmark" else 32
+        requested_batch_size = (
+            args.batch_size if args.batch_size is not None else default_batch_size
+        )
+        effective_batch_size = requested_batch_size if batch_size is None else batch_size
         effective_workers = args.workers if workers is None else workers
-        effective_amp = args.amp if amp is None else amp
+        requested_amp = args.amp if args.amp is not None else args.suite != "benchmark"
+        effective_amp = requested_amp if amp is None else amp
         command = [
             sys.executable,
             "-m",
-            TRACK_MODULES[track],
+            BENCHMARK_MODULES[track] if suite == "benchmark" else TRACK_MODULES[track],
             "--suite",
             suite,
             "--data-root",
@@ -195,6 +205,24 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
 
     executed_model_seeds = args.model_seeds[:1] if args.prepare_only else args.model_seeds
     for track in selected_tracks:
+        if args.suite == "benchmark":
+            # Original-paper public datasets with our models only.  Tree
+            # augmentation keeps its own fixed-vs-multi-chart comparison on
+            # public CSL/ZINC; it remains an ablation of our own model.
+            suites = ("csl", "zinc") if track == "tree_augmentation" else ("benchmark",)
+            for model_seed in executed_model_seeds:
+                for suite in suites:
+                    add_child(
+                        track=track,
+                        suite=suite,
+                        model_seed=model_seed,
+                        name=f"{track}:{suite}:model-seed-{model_seed}",
+                        output_dir=(
+                            _output_dir(track, run_id, model_seed, args.results_root) / suite
+                        ),
+                    )
+            continue
+
         # BREC already performs its official ten model-search seeds internally.
         # Under suite=all, run CycleCount and ZINC for every outer experiment
         # seed, but dispatch BREC exactly once rather than multiplying it by the
@@ -387,7 +415,15 @@ def _parser() -> argparse.ArgumentParser:
         choices=("all", *TRACK_MODULES),
         default=["all"],
     )
-    parser.add_argument("--suite", choices=("core", "all"), default="core")
+    parser.add_argument(
+        "--suite",
+        choices=("benchmark", "core", "all"),
+        default="benchmark",
+        help=(
+            "benchmark: our models on track-specific public datasets (default); "
+            "core/all: supplementary own-method studies"
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--run-id", type=_run_id)
     parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "data" / "paper")
@@ -410,8 +446,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cycle-variants",
         type=_cycle_variants,
-        default=CYCLE_VARIANTS,
-        help="comma-separated Cycle PE candidates forwarded only to the cycle track",
+        default=DEFAULT_CYCLE_VARIANTS,
+        help="supplementary Cycle PE variants; no_pe is an explicit optional ablation",
     )
     parser.add_argument(
         "--cycle-core-targets",
@@ -421,7 +457,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cycle-epochs", type=int)
     parser.add_argument("--cycle-learning-rate", type=float)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        help="override track batch size (default: PPI 2, molecular/tree graphs 32)",
+    )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--min-free-gb", type=float, default=2.0)
     parser.add_argument("--prepare-only", action="store_true")
@@ -443,13 +483,18 @@ def _parser() -> argparse.ArgumentParser:
         help="deprecated compatibility alias for the default independent-run behavior",
     )
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override precision (benchmark defaults to float32; supplementary suites use AMP)",
+    )
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
-    if args.batch_size < 1 or args.workers < 0:
+    if (args.batch_size is not None and args.batch_size < 1) or args.workers < 0:
         print("batch size must be positive and workers must be non-negative", file=sys.stderr)
         return 2
     if min(args.data_seed, args.split_seed, args.chart_seed) < 0:
@@ -522,8 +567,13 @@ def main() -> int:
                     "learning_rate_override": args.cycle_learning_rate,
                     "official_brec_optimization_overrides_ignored": True,
                 }
-                if "cycle_pe" in tracks
+                if "cycle_pe" in tracks and args.suite != "benchmark"
                 else None
+            ),
+            "comparison_protocol": (
+                "our_models_only_on_track_specific_public_datasets"
+                if args.suite == "benchmark"
+                else "supplementary_research_suites"
             ),
             "gpu_preflight": None
             if args.prepare_only

@@ -103,7 +103,7 @@ def test_core_prepare_only_stops_before_training(tmp_path) -> None:
     )
     manifest = json.loads((output_root / "core" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["prepare_only"] is True
-    assert manifest["variants"] == ["no_pe", "raw", "set", "projector"]
+    assert manifest["variants"] == ["raw", "set", "projector"]
     assert manifest["experiments"] == {}
     assert manifest["runtime_environment"]["workers"] == 1
     assert not list((output_root / "core").glob("*/model.pt"))

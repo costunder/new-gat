@@ -5,9 +5,15 @@
 
 | 트랙 | 연구 내용 | 데이터 |
 |---|---|---|
-| [Conductance GAT](research/conductance_gat/README.md) | 학습 가능한 edge conductance 연산자 | S1–S4, PascalVOC-SP, ogbg-molhiv |
-| [Cycle PE](research/cycle_pe/README.md) | 정적 cycle-space positional encoding | CycleCount-OOD, BREC v3, ZINC12K |
-| [Tree Augmentation](research/tree_augmentation/README.md) | spanning-tree chart 증강 | CycleCount, CSL, ZINC12K |
+| [Conductance GAT](research/conductance_gat/README.md) | 우리 incidence-conductance 모델 학습·평가 | Cora, CiteSeer, PubMed, PPI, ogbn-arxiv |
+| [Cycle PE](research/cycle_pe/README.md) | 우리 cycle-set PE 모델 학습·평가 | ZINC-12K, Peptides-struct |
+| [Tree Augmentation](research/tree_augmentation/README.md) | 우리 모델의 고정 tree·다중 tree 내부 실험 | CSL, ZINC-12K |
+
+GAT 트랙은 GAT/GATv2 논문의 데이터셋을, PE 트랙은 SignNet/PEARL 논문의 데이터셋을
+사용한다. **저장소에서는 우리 모델만 학습·평가하며 외부 비교 모델을 재구현하거나 실행하지 않는다.**
+다른 방법의 점수는 해당 논문 표를 출처와 함께 인용한다. 인용값은 직접 실행한 결과와 구분하고,
+데이터 버전·split·지표·학습 조건이 다른 경우 차이를 명시한다. 데이터셋 이름이 같다는 것만으로
+조건이 모두 일치하는 비교라고 주장하지 않는다.
 
 ## 환경
 
@@ -39,8 +45,8 @@ bash scripts/setup_gpu.sh
 
 ## 데이터 준비
 
-세 트랙에 필요한 데이터를 준비한다. 공개 데이터는 내려받고, 연구용 합성 벤치마크는
-고정된 생성 규칙과 seed로 생성한다. **공개 데이터가 없을 때 가짜 데이터로 대체하지 않는다.**
+위 표의 트랙별 공개 데이터셋을 내려받아 준비한다. **기본 실행은 자체 생성 데이터나
+공개 데이터 대체용 가짜 데이터를 만들지 않는다.**
 
 ```bash
 bash scripts/prepare_data.sh
@@ -73,12 +79,12 @@ bash research/cycle_pe/reproduce.sh
 bash research/tree_augmentation/reproduce.sh
 ```
 
-공통 기본값은 CUDA, model seeds `0,1,2,3,4`, data/split/chart seed `0`,
-batch size `32`, workers `4`다. 각 트랙의 비교군과 평가 규칙은 해당 트랙 문서에 있다.
+공통 기본값은 CUDA, model seeds `0,1,2,3,4`, data/split/chart seed `0`, workers `4`다.
+PPI batch size는 `2`, 분자·트리 데이터는 `32`이며 인용 그래프는 full-batch다.
+각 트랙의 우리 모델 구성과 평가 규칙은 해당 트랙 문서에 있다.
 
-BREC는 별도의 공식 10-seed 프로토콜을 한 번 실행한다.
-외부 model seed 5개로 반복하지 않으며 batch size `16`, workers `0`, float32를 사용한다.
-나머지 학습에는 기본적으로 AMP를 사용한다.
+기본 학습은 float32로 실행한다. GAT는 accuracy/PPI micro-F1, PE는 MAE,
+트리 증강은 CSL accuracy/ZINC MAE를 사용하며 각 트랙 안에서 비교한다.
 
 세 트랙을 순서대로 실행하려면 위 세 명령 **대신** 다음 명령을 사용한다.
 
@@ -86,7 +92,7 @@ BREC는 별도의 공식 10-seed 프로토콜을 한 번 실행한다.
 bash scripts/reproduce.sh
 ```
 
-실행 파일에는 전체 데이터·비교군 실행 설정이 들어 있다. 학습 파일은 다운로드를 수행하지 않는다.
+실행 파일에는 전체 데이터에서 우리 모델을 실행하는 설정이 들어 있다. 학습 파일은 다운로드를 수행하지 않는다.
 누락되거나 손상된 데이터는 오류로 보고한다. 실행마다 고유한 run ID를 자동 생성하고
 기존 run을 덮어쓰거나 자동 재개하지 않는다. 한 트랙이 실패해도 다른 독립 run은 계속하며,
 첫 실패에서 중단하려면 `--fail-fast`를 추가한다.
@@ -97,7 +103,7 @@ bash scripts/reproduce.sh
 |---|---|
 | `runs/paper/<run-id>/manifest.json` | 실행 상태, 명령, seed, 소스 revision |
 | `runs/paper/<run-id>/logs/` | 트랙별 실행 로그 |
-| `runs/paper/<run-id>/aggregate/` | 지표, paired 비교, 효율, 실패 목록 |
+| `runs/paper/<run-id>/aggregate/` | 우리 모델 지표·효율·실패 목록, 내부 ablation의 paired 비교 |
 | `research/<track>/results/paper/<run-id>/` | 트랙별 평가·학습 산출물 |
 
 전체 성공 시 터미널에 `all requested independent paper tracks passed`와 manifest 위치가 출력된다.
@@ -109,6 +115,10 @@ bash scripts/reproduce.sh
 `--results-root /path/to/results`를 사용한다.
 데이터 경로는 준비와 학습에서 같아야 한다.
 결과 경로를 지정해도 실행 기록과 집계는 `runs/paper/<run-id>/`에 저장된다.
+
+S1–S4, CycleCount, BREC 및 이전 PascalVOC-SP/molhiv 실험은 기본 benchmark에 포함되지
+않는다. 기존 `--suite core`/`--suite all`은 해당 보조 실험용으로만 유지한다.
+기본 실행과 보조 실험의 상세 구분은 [DATASETS.md](DATASETS.md)를 참고한다.
 
 ## 재현 범위
 

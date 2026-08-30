@@ -1,8 +1,10 @@
 # Static Cycle PE 연구 트랙
 
-이 폴더는 그래프 topology에서 한 번 계산하는 정적 cycle positional encoding(PE)을
-독립적으로 검증한다. Linux/CUDA 논문 경로는 `research.cycle_pe.paper`이며,
-CycleCount-OOD, BREC v3, ZINC-12K를 같은 batch-safe backbone에서 실행한다.
+이 폴더는 그래프 topology에서 계산하는 **우리 Cycle PE 모델만** 학습·평가한다.
+기본 실행 경로는 `research.cycle_pe.benchmark`다. SignNet·PEARL이 사용한 ZINC-12K와
+PEARL이 사용한 Peptides-struct의 공식 데이터·split을 쓰되, **해당 논문 모델을
+재구현하거나 같이 실행하지 않는다.** 다른 논문의 성능은 출처를 명시한 외부 비교표에서 다룬다.
+다른 트랙의 conductance 연산이나 tree 증강도 결합하지 않는다.
 
 ## 이 트랙 재현
 
@@ -13,18 +15,72 @@ CycleCount-OOD, BREC v3, ZINC-12K를 같은 batch-safe backbone에서 실행한�
 bash research/cycle_pe/reproduce.sh
 ```
 
-CycleCount-OOD와 ZINC-12K를 CUDA에서 model seeds `0,1,2,3,4`로 각각 실행한다.
-data/split/chart seed는 `0`으로 고정하며, 네 PE 비교군과 세 CycleCount target을 모두
-포함한다. BREC는 별도의 공식 10-seed 프로토콜을 한 번 실행한다. 다른 연구 트랙의 모델을
-호출하거나 결합하지 않는다. 데이터·결과 경로, run ID와 공통 옵션은 루트 README를 따른다.
-학습 중 누락되거나 손상된 공개 데이터는 다운로드나 대체 없이 오류로 처리한다.
+ZINC-12K와 Peptides-struct에서 우리 `cycle_set` 모델을 CUDA model seeds
+`0,1,2,3,4`로 실행한다. 학습/검증/시험은 공식 split 그대로이며 seed로 다시 나누지 않는다.
+학습에 필요한 공개 데이터가 없거나 손상되면 자동 다운로드나 대체 없이 오류로 종료한다.
+데이터·결과 경로, run ID와 공통 옵션은 루트 README를 따른다.
 
-## 구현 경계와 PE 비교군
+## 기본 데이터와 우리 모델
+
+| 데이터 | 동일 데이터를 사용하는 논문 | 공식 train / validation / test | 입력과 정답 |
+|---|---|---|---|
+| ZINC-12K | SignNet, PEARL | 10,000 / 1,000 / 1,000 | 원자·결합 범주 → penalized logP, MAE |
+| Peptides-struct | PEARL Appendix K.2 | 10,873 / 2,331 / 2,331 | OGB 9원자/3결합 범주 → 공식 11개 구조 특성, MAE |
+
+Peptides의 3D 좌표·거리·정답은 PE 입력으로 사용하지 않는다. 공식 배포 y와 그 정규화는
+그대로 보존한다. 같은 데이터셋을 쓴다는 사실이 원 논문의 모든 학습 조건을 재현했다는
+뜻은 아니므로, 외부 논문 수치와 비교할 때 입력·모델 크기·학습 조건 차이를 함께 기록한다.
+
+기본 모델 `cycle_set`은 다음 구성이다.
+
+- **PE:** 기존 BFS fundamental basis와 `cycle_set_statistics`의 여섯 통계,
+  GELU MLP를 재사용한다. 기저 column 부호/순열에는 불변이지만 BFS chart 자체의 변경에는
+  불변이 아니다. 전체 raw basis를 손실 없이 전달하는 codec이라고 주장하지 않는다.
+- **메시지 전달:** 이 트랙에 이미 있던 `paper_model._MessageLayer`를 그대로 재사용한다.
+  cycle PE를 원래 결합 특징의 embedding에 붙여 엣지에 넣고, 대칭 엣지 업데이트·양방향
+  메시지·degree-normalized 집계·LayerNorm을 적용한다. 별도의 GINE 경쟁 모델을
+  이름만 바꾼 실행이 아니다.
+- **예측:** 노드 mean/max와 엣지 mean/max를 모은 뒤 graph MLP로 목표값을 예측한다.
+  PE만으로 회귀값이 나오는 것이 아니므로 이 downstream predictor는 우리 실험의 일부다.
+- **기본 규모:** hidden 64, PE 32차원, 메시지 전달 3 layers. 전체 trainable parameter
+  500,000 상한을 검사하고 실제 수를 기록한다.
+
+Adam(lr=0.001), MAE loss, 최대 300 epochs, validation plateau LR 감소,
+50-epoch early stopping을 사용한다. test는 best-validation checkpoint를 선택한 뒤
+한 번만 평가한다. AMP 기본값은 off다. `--amp`를 켜도 메시지 집계는 FP32로 유지한다.
+기본 CLI에 경쟁 모델 선택 옵션이나 경쟁 모델 학습 loop는 없다.
+
+데이터 준비는 공식 원본과 **우리 cycle PE만** 계산하여 저장한다. 불필요한 Laplacian
+고유벡터·random-walk PE·random probe 계산은 하지 않는다. dense `m×m` projector도
+기본 경로에 없다. 원래 incidence/basis 계산 비용은 남는다.
+새 전처리 cache는 `data/paper/cycle_pe_benchmark` 아래 별도 version으로 저장하여,
+이전 비교용 cache와 혼용하지 않는다.
+
+결과는 `manifest.json`, `metrics.json`,
+`<dataset>/cycle_set/history.json`, `<dataset>/cycle_set/best.pt`에 저장된다.
+metric schema는 v2이며 `datasets.<dataset>.models.cycle_set`에 우리 결과만 들어간다.
+공식 split 내용 SHA256, 구현 SHA256, 실제 parameter 수, GPU peak memory와 runtime을
+기록한다. 준비만 한 경우 status는 `prepared`이며 학습 성공으로 처리하지 않는다.
+
+데이터 연결 근거: [SignNet 원 논문](https://arxiv.org/abs/2202.13013),
+[PEARL 원 논문](https://arxiv.org/abs/2502.01122),
+[LRGB](https://github.com/vijaydwivedi75/lrgb).
+
+Alchemy는 기본에 넣지 않았다. 조사한 공식 SignNet Alchemy index 파일에 중복 및 split 간
+겹침이 있어, 임의로 split을 재생성하고 동일 프로토콜이라고 부를 수 없다. 공식 출처와
+정규화/중복 처리 정책을 별도 확정하기 전에는 blocked optional로 남긴다.
+
+## 선택적 보조 실험: 기존 raw/set/projector 및 구조 진단
+
+아래 `research.cycle_pe.paper`의 `core`, `brec`, `zinc` suite는 명시적으로 요청할 때만
+사용한다. 우리 모델의 내부 표현 및 구조 진단용이며 기본 공개 데이터 실험을 대체하지 않는다.
+
+### 기존 구현 경계와 PE 비교군
 
 모든 PE는 edge-by-node incidence matrix와 BFS spanning tree로 만든 fundamental cycle
-basis에서 학습 전에 계산된다. 논문 CLI는 다음 네 비교군을 기본으로 모두 실행한다.
+basis에서 학습 전에 계산된다. 보조 CLI 기본값은 `raw,set,projector`다.
 
-- `no_pe`: topology PE를 주지 않는 backbone
+- `no_pe`: 명시적으로 요청할 때만 실행하는 topology PE 제거 ablation
 - `raw`: fundamental basis 좌표를 직접 투영하는 진단용 baseline
 - `set`: cycle-column 부호와 순열에 불변인 edge별 cycle-set 통계
 - `projector`: cycle-space projector를 사용하는 basis-change 불변 baseline
@@ -117,8 +173,8 @@ PyG import가 없거나 CUDA/PyTorch 조합이
   topology를 결정한다. 이 PE는 sample circulation 복구가 아니라 topology inductive bias다.
 - Degree/`(n,m,beta)`-matched 또는 1-WL-indistinguishable known-contrast가 없고, raw/set의
   isomorphic relabeling·spanning-tree shift robustness도 core/ZINC에서 평가하지 않았다.
-- No-PE 외 LapPE/sign-invariant LapPE, RWSE, GIN/GINE, GPS/Graphormer, CycleNet/기존 cycle-space
-  PE baseline이 없다.
+- 다른 논문의 결과는 원 출처와 데이터 split·입력·모델 규모·학습 조건 차이를 표시한
+  외부 비교표에서 다룬다. 이 코드에서 경쟁 모델을 별도로 학습하지 않는다.
 - Suite-level preparation time은 variant별 비용을 분리하지 않고 CPU RSS도 기록하지 않는다.
   Projector는 모든 split graph의 dense `m×m` tensor를 보관하므로 large-graph scaling이 미검증이다.
 - Official BREC는 pair/seed 단위 incremental checkpoint/resume가 없고 완료 뒤 결과를 기록한다.

@@ -13,3 +13,15 @@ has its own folder, runner, configuration, tests, and outputs.
 No result from `combined_later` may be reported as evidence for either active
 main contribution.
 
+## Default own-model benchmarks
+
+- Conductance GAT: Cora/CiteSeer/PubMed/PPI from GAT, ogbn-arxiv from GATv2;
+  only the proposed incidence-conductance model is trained on the official splits.
+- Cycle PE: ZINC-12K from SignNet/PEARL and Peptides-struct from PEARL;
+  only our cycle-set PE model is trained, without learned conductance or external PE implementations.
+- Tree augmentation: public CSL and ZINC-12K; fixed-vs-multi-tree is an ablation of our own model.
+
+The default `benchmark` suite excludes generated datasets. Existing `core`/`all`
+suites remain supplementary experiments, not substitutes for the competitors' datasets.
+Competitor scores are cited from published tables, not generated here. Label them as published
+references and disclose split/metric/training differences; they are not paired reruns with our seeds.

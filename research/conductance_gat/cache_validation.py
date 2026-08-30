@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .benchmark_data import DATASETS as BENCHMARK_DATASETS
+from .benchmark_data import load_dataset
 from .paper_data import validate_core_cache
 from .public_data import validate_public_cache
 
@@ -28,6 +30,23 @@ def validate_dataset_cache(
 
     del split_seeds
     paths: list[str] = []
+    if dataset_id in BENCHMARK_DATASETS:
+        _, manifest = load_dataset(dataset_id, data_root, allow_download=False)
+        paths.append(
+            str(
+                data_root
+                / "conductance_gat"
+                / "matched_benchmark_v1"
+                / dataset_id
+                / "manifest.json"
+            )
+        )
+        return {
+            "paths": paths,
+            "data_sha256": manifest["data_sha256"],
+            "split_sha256": manifest["split_sha256"],
+            "seed_policy": "official fixed data/splits",
+        }
     if dataset_id in CORE_DATASETS:
         for seed in data_seeds:
             _, manifest_path, _ = validate_core_cache(data_root, seed=seed)

@@ -33,10 +33,8 @@ CONDITIONS = {
     "flux_ls",
     "node_message_nnls",
     "oracle",
-    "no_message_mlp",
-    "gcn",
-    "gat",
-    "gine",
+    "conductance",
+    "cycle_set",
     "conductance_model",
     "fixed_bfs",
     "multi_chart",
@@ -99,8 +97,24 @@ _TREE_EVALUATION_METRICS = (
 # does not make it a paper metric until a reviewer deliberately extends this
 # schema.  Runtime, memory, parameter counts, configuration, sample counts, seed
 # axes, and optimization histories therefore cannot leak into hypothesis tests.
-PAPER_METRIC_SCHEMA_VERSION = 2
+# Published competitor scores belong in the cited manuscript table, not in this
+# run registry or in paired statistics with our own experiment seeds.
+PAPER_METRIC_SCHEMA_VERSION = 4
 PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
+    _metric_rule(
+        "conductance.our_model.test",
+        "conductance_gat",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.conductance\.test",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.our_model.test",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_set\.test",
+        pairable=False,
+    ),
     _metric_rule(
         "conductance.core.prediction",
         "conductance_gat",
@@ -134,8 +148,8 @@ PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "conductance_gat",
         r"summary\.json",
         r"results\.public\.[^.]+\.baselines\."
-        r"(?:no_message_mlp|gcn|gat|gine|conductance_model)\.test\.(?:macro_f1|roc_auc)",
-        pairable=True,
+        r"conductance_model\.test\.(?:macro_f1|roc_auc)",
+        pairable=False,
     ),
     _metric_rule(
         "cycle.supervised.test",
@@ -184,8 +198,24 @@ PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
 # deliberately limited to elapsed time, peak accelerator memory, and active
 # trainable parameter counts; epochs, batch size, workers, and seeds are not
 # efficiency outcomes.
-EFFICIENCY_METRIC_SCHEMA_VERSION = 1
+EFFICIENCY_METRIC_SCHEMA_VERSION = 3
 EFFICIENCY_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
+    _metric_rule(
+        "conductance.our_model.efficiency",
+        "conductance_gat",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.conductance\."
+        r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.our_model.efficiency",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_set\."
+        r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
+        pairable=False,
+    ),
     _metric_rule(
         "conductance.runtime",
         "conductance_gat",
@@ -198,7 +228,7 @@ EFFICIENCY_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "conductance_gat",
         r"summary\.json",
         r"results\.public\.[^.]+\.baselines\."
-        r"(?:no_message_mlp|gcn|gat|gine|conductance_model)\.parameter_count",
+        r"conductance_model\.parameter_count",
         pairable=False,
     ),
     _metric_rule(

@@ -1,12 +1,12 @@
 registry_version: 2
 track: cycle_pe
 paper_suite_complete: true
-claim: Static cycle-space PE is evaluated on independent cycle-count targets, official BREC RPC, and ZINC-12K.
+claim: Train only our cycle-set PE on official ZINC-12K and Peptides-struct splits used by PE literature; reference results are compared externally.
 
 datasets:
   - id: cyclecount_ood
     name: CycleCount-OOD
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: generated
     cache_glob: cycle_count_ood/*.json.gz
@@ -22,7 +22,7 @@ datasets:
 
   - id: brec_v3
     name: BREC v3
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: download
     cache_glob: BREC/Data/raw/brec_v3.npy
@@ -42,13 +42,13 @@ datasets:
     data_policy: download
     cache_glob: ZINC12K/subset/processed/*.pt
     source_url: https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.ZINC.html
-    task: Molecular constrained-solubility graph regression with official PyG subset partitions.
+    task: Penalized logP graph regression on the same official ZINC subset used by SignNet and PEARL.
     split: Official 10000/1000/1000 train, validation, and test split.
-    metrics: [mae, rmse, normalized_mae, graph_macro_mae]
-    claim: Real molecular graph utility under a common static-cycle PE backbone.
-    adapter: python -m research.cycle_pe.paper --suite zinc
-    validator: research.cycle_pe.cache_validation.validate_dataset_cache
-    leakage_guard: Chemistry features and topology PE are fixed before training; raw PE width is fit on train only.
+    metrics: [mae]
+    claim: Only our original cycle-set PE with this track's existing edge-aware GNN is trained; no competing models are reimplemented or run.
+    adapter: python -m research.cycle_pe.benchmark --suite benchmark --datasets zinc12k
+    validator: research.cycle_pe.cache_validation.validate_benchmark_cache
+    leakage_guard: Official split preserved; unchanged targets; best validation checkpoint only; split content hashes recorded.
 
   - id: aqsol
     name: AQSOL scaffold OOD
@@ -63,15 +63,30 @@ datasets:
     adapter: No AQSOL adapter is implemented in this track.
     leakage_guard: Do not replace the official scaffold split with a random split.
 
-  - id: peptides
-    name: LRGB Peptides-func and Peptides-struct
-    tier: optional
-    status: planned
+  - id: peptides_struct
+    name: LRGB Peptides-struct
+    tier: paper_core
+    status: implemented
     data_policy: download
+    cache_glob: LRGB/peptides-struct/processed/*.pt
     source_url: https://github.com/vijaydwivedi75/lrgb
-    task: Long-range molecular graph classification and regression.
-    split: Official 70/15/15 splits.
-    metrics: [average_precision, mae]
-    claim: Optional larger-graph scaling and long-range utility.
-    adapter: A future LRGB/PyG molecular adapter is planned.
-    leakage_guard: Use the official evaluator and report PE preprocessing memory and time.
+    task: Predict 11 supplied 3D-derived graph targets from 2D atom-bond graphs; used by PEARL Appendix K.2.
+    split: Official 10873/2331/2331 train/validation/test split.
+    metrics: [mae]
+    claim: Only our cycle-set PE model is trained, as on ZINC; no 3D target information is used as model input.
+    adapter: python -m research.cycle_pe.benchmark --suite benchmark --datasets peptides_struct
+    validator: research.cycle_pe.cache_validation.validate_benchmark_cache
+    leakage_guard: Preserve the official already standardized y and split; no re-splitting or target-derived features.
+
+  - id: alchemy12k
+    name: SignNet Alchemy-12K archival split
+    tier: optional
+    status: blocked
+    data_policy: download
+    source_url: https://github.com/cptq/SignNet-BasisNet/tree/main/Alchemy
+    task: Twelve quantum chemistry graph regression targets.
+    split: Upstream train_al_10.index / val_al_10.index / test_al_10.index require provenance and overlap resolution.
+    metrics: [normalized_mae]
+    claim: Not executed or advertised as a clean default benchmark.
+    adapter: No adapter enabled because audited upstream indices contain duplicates and cross-split overlap.
+    leakage_guard: Do not silently redraw splits or present train-only target normalization as the published protocol.

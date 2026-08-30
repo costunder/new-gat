@@ -6,7 +6,7 @@ claim: Spanning-tree chart augmentation improves robustness without changing dow
 datasets:
   - id: cyclecount_ood_multichart
     name: CycleCount-OOD multi-chart protocol
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: generated
     cache_glob: cyclecount_ood_v2/*.manifest.json
@@ -27,7 +27,7 @@ datasets:
     cache_glob: csl_pyg_v2/*.manifest.json
     source_url: https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.GNNBenchmarkDataset.html
     task: Ten-class circular-skip-link graph classification under fresh BFS and held-out Wilson sampler-family charts.
-    split: Deterministic label-stratified five-fold 3/1/1 protocol cached by graph index.
+    split: One deterministic label-stratified 90/30/30 partition cached by graph index; not the complete five-fold benchmark sweep.
     metrics: [accuracy, worst_chart_accuracy, chart_std]
     claim: Controlled fixed-beta chart robustness, not broad real-world generalization.
     adapter: python -m research.tree_augmentation.paper --suite csl (optional PyG)

@@ -2522,6 +2522,765 @@ __all__ = [
 ]
 ````
 
+# research/conductance_gat/benchmark.py
+
+````python
+"""Train only our conductance model on official datasets used by GAT/GATv2.
+
+Published competitor results are external references, not locally rerun models.
+Dataset overlap does not imply identical architectures, tuning or table protocols.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib.metadata
+import random
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from chartgat.cache import atomic_publish, atomic_write_json
+
+from .benchmark_data import DATASETS, load_dataset, sha256_file
+from .sparse import SparsePositiveConductance
+
+PROTOCOL_NOTE = (
+    "Only our conductance model is trained, on official datasets/splits used by prior "
+    "papers. Competitor table values must be compared externally with their complete "
+    "protocols, not presented as local reproductions. Our ogbn-arxiv training is "
+    "full-batch, unlike GATv2's GraphSAINT setup. No Cycle PE or tree augmentation."
+)
+
+
+class ConductanceConv(nn.Module):
+    """Positive orientation-invariant C with stable sparse H - eta B.T C B H."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.estimator = SparsePositiveConductance(channels, 0, channels, mode="full")
+
+    def forward(self, x: Tensor, incidence: Tensor, node_graph: Tensor) -> Tensor:
+        # Computing the positive edge law and degree cap in fp32 avoids fp16 squares/overflow.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            state = x.float()
+            tail, head = incidence
+            gradient = state[head] - state[tail]
+            c = self.estimator(gradient, state.new_empty((gradient.shape[0], 0)))
+            flux = c[:, None] * gradient
+            divergence = torch.zeros_like(state)
+            divergence.index_add_(0, head, flux)
+            divergence.index_add_(0, tail, -flux)
+            degree = state.new_zeros(state.shape[0])
+            degree.index_add_(0, head, c)
+            degree.index_add_(0, tail, c)
+            max_degree = state.new_zeros(int(node_graph.max()) + 1)
+            max_degree.scatter_reduce_(0, node_graph, degree, reduce="amax", include_self=True)
+            step = 0.95 / max_degree.clamp_min(1e-12)
+            result = state - step[node_graph, None] * divergence
+        return result.to(x.dtype)
+
+
+class ConductanceNodeClassifier(nn.Module):
+    """Our encoder/conductance-stack/prediction-head node classifier."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        classes: int,
+        *,
+        hidden_channels: int,
+        layers: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        if hidden_channels < 1 or layers < 1 or not 0 <= dropout < 1:
+            raise ValueError("hidden width/layers must be positive and dropout in [0, 1)")
+        self.dropout = dropout
+        self.encoder = nn.Linear(in_channels, hidden_channels)
+        self.decoder = nn.Linear(hidden_channels, classes)
+        self.operators = nn.ModuleList(ConductanceConv(hidden_channels) for _ in range(layers))
+        self.norms = nn.ModuleList(nn.LayerNorm(hidden_channels) for _ in range(layers))
+
+    def forward(self, graph: Any) -> Tensor:
+        h = F.dropout(F.elu(self.encoder(graph.x)), self.dropout, self.training)
+        node_graph = getattr(graph, "batch", None)
+        if node_graph is None:
+            node_graph = torch.zeros(h.shape[0], dtype=torch.long, device=h.device)
+        for operator, norm in zip(self.operators, self.norms, strict=True):
+            h = operator(h, graph.incidence_edge_index, node_graph)
+            h = F.dropout(F.elu(norm(h)), self.dropout, self.training)
+        return self.decoder(h)
+
+
+def micro_f1(logits: Tensor, labels: Tensor) -> float:
+    """Global node-label micro-F1, not per-graph averaging or multiclass argmax."""
+    predicted, truth = logits > 0, labels > 0
+    true_positive = (predicted & truth).sum().item()
+    denominator = predicted.sum().item() + truth.sum().item()
+    return float(2 * true_positive / denominator) if denominator else 0.0
+
+
+def _seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+
+
+def _device(name: str, *, prepare_only: bool) -> torch.device:
+    device = torch.device(name)
+    if not prepare_only and (device.type != "cuda" or not torch.cuda.is_available()):
+        raise RuntimeError(
+            "Matched benchmark training requires a CUDA GPU; "
+            "no CPU training/fallback is implemented."
+        )
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.get_device_properties(device)
+    return device
+
+
+def _versions() -> dict[str, str]:
+    output = {"torch": str(torch.__version__), "cuda_runtime": str(torch.version.cuda)}
+    for package in ("torch-geometric", "ogb", "numpy"):
+        try:
+            output[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            output[package] = "not_installed"
+    return output
+
+
+def _selection(values: list[str], allowed: tuple[str, ...]) -> list[str]:
+    selected = [
+        item.strip().lower() for value in values for item in value.split(",") if item.strip()
+    ]
+    if (
+        not selected
+        or len(set(selected)) != len(selected)
+        or any(item not in allowed for item in selected)
+    ):
+        raise ValueError(f"Choose each supported value at most once from {allowed}")
+    return selected
+
+
+def _make_loaders(payload: dict[str, Any], args: argparse.Namespace, device: torch.device):
+    from torch_geometric.data import Data
+    from torch_geometric.loader import DataLoader
+
+    graphs = [Data(**graph) for graph in payload["graphs"]]
+    if payload["dataset"] != "ppi":
+        # Full graph/features are visible transductively; ONLY training-mask labels enter loss.
+        return graphs[0].to(device), {
+            name: mask.to(device) for name, mask in payload["splits"].items()
+        }
+    loaders = {}
+    for split, indices in payload["splits"].items():
+        generator = torch.Generator().manual_seed(args.model_seed)
+        loaders[split] = DataLoader(
+            [graphs[index] for index in indices],
+            batch_size=args.batch_size,
+            shuffle=split == "train",
+            num_workers=args.workers,
+            generator=generator,
+            pin_memory=args.pin_memory,
+            persistent_workers=args.workers > 0,
+        )
+    return loaders, None
+
+
+def train_model(
+    payload: dict[str, Any],
+    args: argparse.Namespace,
+    device: torch.device,
+    output: Path,
+) -> dict[str, Any]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("Benchmark training requires CUDA (including direct train_model calls).")
+    _seed(args.model_seed)
+    data, masks = _make_loaders(payload, args, device)
+    model = ConductanceNodeClassifier(
+        payload["graphs"][0]["x"].shape[1],
+        payload["classes"],
+        hidden_channels=args.hidden_channels,
+        layers=args.layers,
+        dropout=args.dropout,
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.amp.GradScaler("cuda", enabled=args.amp and amp_dtype == torch.float16)
+    checkpoint = output / "best.pt"
+    history: list[dict[str, Any]] = []
+    best_validation, best_epoch = -float("inf"), 0
+    torch.cuda.reset_peak_memory_stats(device)
+    start_time = time.perf_counter()
+
+    @torch.no_grad()
+    def evaluate(split: str) -> float:
+        model.eval()
+        if masks is not None:
+            with torch.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
+                logits = model(data)
+            if not torch.isfinite(logits).all():
+                raise RuntimeError(f"Non-finite {split} logits: {payload['dataset']}/conductance")
+            mask = masks[split]
+            return float((logits[mask].argmax(dim=-1) == data.y[mask]).float().mean())
+        true_positive = predicted_count = truth_count = 0
+        for graph in data[split]:
+            graph = graph.to(device, non_blocking=args.pin_memory)
+            with torch.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
+                logits = model(graph)
+            if not torch.isfinite(logits).all():
+                raise RuntimeError(f"Non-finite {split} logits: {payload['dataset']}/conductance")
+            predicted = logits > 0
+            truth = graph.y > 0
+            true_positive += int((predicted & truth).sum())
+            predicted_count += int(predicted.sum())
+            truth_count += int(truth.sum())
+        denominator = predicted_count + truth_count
+        return float(2 * true_positive / denominator) if denominator else 0.0
+
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        loss_sum, label_count = 0.0, 0
+        batches = [data] if masks is not None else data["train"]
+        for graph in batches:
+            if masks is None:
+                graph = graph.to(device, non_blocking=args.pin_memory)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
+                logits = model(graph)
+                if masks is not None:
+                    loss = F.cross_entropy(logits[masks["train"]], graph.y[masks["train"]])
+                    count = int(masks["train"].sum())
+                else:
+                    loss = F.binary_cross_entropy_with_logits(logits, graph.y)
+                    count = graph.y.numel()
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    f"Non-finite training loss: {payload['dataset']}/conductance, epoch {epoch}"
+                )
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            loss_sum += float(loss.detach()) * count
+            label_count += count
+        validation = evaluate("validation")
+        history.append(
+            {"epoch": epoch, "train_loss": loss_sum / label_count, "validation": validation}
+        )
+        atomic_write_json(output / "history.json", history)
+        if validation > best_validation:
+            best_validation, best_epoch = validation, epoch
+            state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+            checkpoint_data = {
+                "state_dict": state,
+                "best_epoch": epoch,
+                "validation": validation,
+                "dataset": payload["dataset"],
+                "model": "conductance",
+                "architecture": {
+                    "hidden_channels": args.hidden_channels,
+                    "layers": args.layers,
+                    "dropout": args.dropout,
+                },
+            }
+            atomic_publish(checkpoint, lambda path, saved=checkpoint_data: torch.save(saved, path))
+        if epoch == 1 or epoch % 10 == 0:
+            print(
+                f"{payload['dataset']}/conductance epoch={epoch} val={validation:.6f}", flush=True
+            )
+        if epoch - best_epoch >= args.patience:
+            break
+    saved = torch.load(checkpoint, map_location=device, weights_only=True)
+    model.load_state_dict(saved["state_dict"])
+    # Test is evaluated exactly once per method after validation-only model selection.
+    test_metric = evaluate("test")
+    result = {
+        "validation": best_validation,
+        "test": test_metric,
+        "best_epoch": best_epoch,
+        "epochs_run": len(history),
+        "trainable_parameters": sum(p.numel() for p in model.parameters()),
+        "checkpoint": str(checkpoint.resolve()),
+        "history": str((output / "history.json").resolve()),
+        "elapsed_seconds": time.perf_counter() - start_time,
+        "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
+        "amp_dtype": str(amp_dtype) if args.amp else "float32",
+        "training": "full_batch" if masks is not None else "official_inductive_graph_minibatch",
+        "model_seed": args.model_seed,
+        "test_selection": "best_validation_checkpoint_only",
+    }
+    atomic_write_json(output / "metrics.json", result)
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--suite", choices=("benchmark",), default="benchmark")
+    parser.add_argument("--data-root", type=Path, default=Path("data/paper"))
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("results/conductance_gat/benchmark")
+    )
+    parser.add_argument("--datasets", nargs="+", default=list(DATASETS))
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--data-seed", type=int, default=0)
+    parser.add_argument("--split-seed", type=int, default=0)
+    parser.add_argument("--chart-seed", type=int, default=0)
+    parser.add_argument("--model-seed", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--workers", "--num-workers", type=int, default=0)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--hidden-channels", type=int, default=64)
+    parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument("--lr", type=float, default=0.005)
+    parser.add_argument("--weight-decay", type=float, default=0.0005)
+    parser.add_argument("--prepare-only", action="store_true")
+    parser.add_argument("--allow-download", action="store_true")
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    args.datasets = _selection(args.datasets, DATASETS)
+    if min(args.batch_size, args.epochs, args.patience, args.layers) < 1 or args.workers < 0:
+        raise ValueError(
+            "batch size, epochs, patience, layers must be positive; workers nonnegative"
+        )
+    if args.hidden_channels < 1 or not 0 <= args.dropout < 1:
+        raise ValueError("invalid hidden width/dropout")
+    if args.lr <= 0 or args.weight_decay < 0:
+        raise ValueError("learning rate must be positive and weight decay nonnegative")
+    if min(args.data_seed, args.split_seed, args.chart_seed, args.model_seed) < 0:
+        raise ValueError("seed values must be nonnegative")
+    device = _device(args.device, prepare_only=args.prepare_only)
+    output = args.output_dir.expanduser().resolve()
+    if output.exists() and any(output.iterdir()):
+        raise FileExistsError(f"Output directory is not empty: {output}; use a new run directory")
+    output.mkdir(parents=True, exist_ok=True)
+    config = {
+        key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
+    }
+    manifest: dict[str, Any] = {
+        "schema_version": 2,
+        "track": "conductance_gat",
+        "suite": "benchmark",
+        "status": "running",
+        "protocol_note": PROTOCOL_NOTE,
+        "config": config,
+        "versions": _versions(),
+        "seed_axes": {
+            "model_seed": args.model_seed,
+            "data_seed": "not_applicable: fixed official source data",
+            "split_seed": "not_applicable: official fixed masks/splits",
+            "chart_seed": "not_applicable: no chart/PE/augmentation",
+        },
+        "gpu": torch.cuda.get_device_name(device)
+        if device.type == "cuda" and torch.cuda.is_available()
+        else None,
+        "completed": [],
+        "expected": [f"{dataset}/conductance" for dataset in args.datasets],
+        "sources": ["https://arxiv.org/abs/1710.10903", "https://arxiv.org/abs/2105.14491"],
+        "implementation_sha256": {
+            name: sha256_file(Path(__file__).with_name(name))
+            for name in ("benchmark.py", "benchmark_data.py", "sparse.py")
+        },
+        "reproducibility": (
+            "Seeded runs; GPU scatter kernels can remain nondeterministic. No bitwise guarantee."
+        ),
+    }
+    metrics: dict[str, Any] = {
+        "schema_version": 2,
+        "track": "conductance_gat",
+        "suite": "benchmark",
+        "status": "running",
+        "model_seed": args.model_seed,
+        "datasets": {},
+    }
+    atomic_write_json(output / "manifest.json", manifest)
+    try:
+        for dataset in args.datasets:
+            print(f"Loading official matched dataset: {dataset}", flush=True)
+            payload, protocol = load_dataset(
+                dataset, args.data_root, allow_download=args.allow_download
+            )
+            record: dict[str, Any] = {
+                "metric": protocol["metric"],
+                "protocol": protocol,
+                "models": {},
+            }
+            metrics["datasets"][dataset] = record
+            if args.prepare_only:
+                continue
+            record["models"]["conductance"] = train_model(
+                payload, args, device, output / dataset / "conductance"
+            )
+            manifest["completed"].append(f"{dataset}/conductance")
+            atomic_write_json(output / "metrics.json", metrics)
+            atomic_write_json(output / "manifest.json", manifest)
+            torch.cuda.empty_cache()
+        if not args.prepare_only and manifest["completed"] != manifest["expected"]:
+            raise RuntimeError("Incomplete matched benchmark; cannot mark passed")
+        manifest["status"] = metrics["status"] = "prepared" if args.prepare_only else "passed"
+    except Exception as exc:
+        manifest["status"] = metrics["status"] = "failed"
+        manifest["error"] = f"{type(exc).__name__}: {exc}"
+        atomic_write_json(output / "manifest.json", manifest)
+        atomic_write_json(output / "metrics.json", metrics)
+        raise
+    atomic_write_json(output / "manifest.json", manifest)
+    atomic_write_json(output / "metrics.json", metrics)
+    print(f"{manifest['status']}: {output}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# research/conductance_gat/benchmark_data.py
+
+````python
+"""Official GAT/GATv2 datasets for our conductance model; no generated fallback."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+import torch
+from torch import Tensor
+
+from chartgat.cache import (
+    CacheCorruptError,
+    CacheIncompleteError,
+    CacheWrongRequestError,
+    atomic_publish,
+    atomic_write_json,
+)
+
+DATASETS = ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv")
+CACHE_VERSION = 1
+SOURCES = {
+    "cora": "https://github.com/kimiyoung/planetoid/tree/master/data",
+    "citeseer": "https://github.com/kimiyoung/planetoid/tree/master/data",
+    "pubmed": "https://github.com/kimiyoung/planetoid/tree/master/data",
+    "ppi": "https://graphsage.stanford.edu/",
+    "ogbn-arxiv": "https://ogb.stanford.edu/docs/nodeprop/#ogbn-arxiv",
+}
+EXPECTED = {
+    "cora": {"nodes": 2708, "features": 1433, "classes": 7, "splits": [140, 500, 1000]},
+    "citeseer": {"nodes": 3327, "features": 3703, "classes": 6, "splits": [120, 500, 1000]},
+    "pubmed": {"nodes": 19717, "features": 500, "classes": 3, "splits": [60, 500, 1000]},
+    "ogbn-arxiv": {
+        "nodes": 169343,
+        "features": 128,
+        "classes": 40,
+        "splits": [90941, 29799, 48603],
+    },
+    "ppi": {"features": 50, "classes": 121, "graphs": [20, 2, 2]},
+}
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def tensor_hash(value: Tensor) -> str:
+    value = value.detach().cpu().contiguous()
+    digest = hashlib.sha256(str((str(value.dtype), tuple(value.shape))).encode())
+    digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def canonical_edges(edge_index: Tensor, num_nodes: int) -> tuple[Tensor, Tensor]:
+    """One orientation per edge for B, plus a canonical adjacency representation."""
+    edges = edge_index.detach().cpu().long()
+    if edges.ndim != 2 or edges.shape[0] != 2:
+        raise ValueError("edge_index must be a 2 x E matrix")
+    if edges.numel() and (int(edges.min()) < 0 or int(edges.max()) >= num_nodes):
+        raise ValueError("edge endpoint is outside the graph")
+    low, high = torch.minimum(edges[0], edges[1]), torch.maximum(edges[0], edges[1])
+    keys = torch.unique(low[low != high] * num_nodes + high[low != high], sorted=True)
+    incidence = torch.stack((keys.div(num_nodes, rounding_mode="floor"), keys % num_nodes))
+    arcs = torch.cat((incidence, incidence.flip(0)), dim=1)
+    # Preserve a sorted adjacency representation without materializing B.
+    order = torch.argsort(arcs[0] * num_nodes + arcs[1])
+    return arcs[:, order].contiguous(), incidence.contiguous()
+
+
+def _graph(data: Any, *, normalize_features: bool) -> dict[str, Tensor]:
+    x = data.x.detach().cpu().float().contiguous()
+    if normalize_features:
+        # Exactly the PyG NormalizeFeatures rule used for Planetoid datasets.
+        x = x - x.min()
+        x = x / x.sum(dim=-1, keepdim=True).clamp(min=1.0)
+    arcs, incidence = canonical_edges(data.edge_index, x.shape[0])
+    return {
+        "x": x,
+        "y": data.y.detach().cpu().contiguous(),
+        "edge_index": arcs,
+        "incidence_edge_index": incidence,
+    }
+
+
+def _split_mask(indices: Tensor, num_nodes: int) -> Tensor:
+    mask = torch.zeros(num_nodes, dtype=torch.bool)
+    mask[indices.reshape(-1).long()] = True
+    return mask
+
+
+def validate_payload(name: str, payload: dict[str, Any]) -> None:
+    """Validate real cache tensors, including mandatory official dimensions/split sizes."""
+    if name not in DATASETS or payload.get("dataset") != name:
+        raise ValueError("unknown or mismatched dataset")
+    splits = payload["splits"]
+    if set(splits) != {"train", "validation", "test"}:
+        raise ValueError("all official splits are required")
+    graphs = payload["graphs"]
+    if not graphs:
+        raise ValueError("empty benchmark cache")
+    spec = EXPECTED[name]
+    for graph in graphs:
+        x, y = graph["x"], graph["y"]
+        if x.ndim != 2 or not torch.isfinite(x).all() or y.shape[0] != x.shape[0]:
+            raise ValueError("invalid node features or targets")
+        if x.shape[1] != spec["features"]:
+            raise ValueError("feature count differs from official dataset")
+        arcs, incidence = canonical_edges(graph["edge_index"], x.shape[0])
+        if not torch.equal(arcs, graph["edge_index"]):
+            raise ValueError("common undirected adjacency is not canonical")
+        if not torch.equal(incidence, graph["incidence_edge_index"]):
+            raise ValueError("incidence and adjacency represent different graphs")
+    if name == "ppi":
+        flattened = [int(index) for values in splits.values() for index in values]
+        if sorted(flattened) != list(range(len(graphs))):
+            raise ValueError("PPI graphs must be disjoint and exhaustive across splits")
+        if [len(splits[key]) for key in ("train", "validation", "test")] != spec["graphs"]:
+            raise ValueError("PPI requires its official 20/2/2 graph split")
+        if any(
+            graph["y"].ndim != 2
+            or graph["y"].shape[1] != payload["classes"]
+            or not torch.all((graph["y"] == 0) | (graph["y"] == 1))
+            for graph in graphs
+        ):
+            raise ValueError("PPI requires binary multi-label node targets")
+    else:
+        if len(graphs) != 1:
+            raise ValueError("citation benchmark must contain exactly one graph")
+        n = graphs[0]["x"].shape[0]
+        masks = [splits[key] for key in ("train", "validation", "test")]
+        if any(mask.dtype != torch.bool or mask.shape != (n,) or not mask.any() for mask in masks):
+            raise ValueError("each node split must be a nonempty boolean mask")
+        if torch.any(sum(mask.long() for mask in masks) > 1):
+            raise ValueError("train, validation and test masks overlap")
+        y = graphs[0]["y"]
+        if (
+            y.ndim != 1
+            or y.dtype != torch.long
+            or int(y.min()) < 0
+            or int(y.max()) >= payload["classes"]
+        ):
+            raise ValueError("invalid node class labels")
+        if n != spec["nodes"] or [int(m.sum()) for m in masks] != spec["splits"]:
+            raise ValueError("node count/split sizes differ from the official protocol")
+    if payload["classes"] != spec["classes"]:
+        raise ValueError("class count differs from official dataset")
+
+
+@contextmanager
+def _pyg_safe_globals():
+    """Allow only PyG data containers in old OGB processed caches on PyTorch >=2.6."""
+    from torch_geometric.data import Data
+    from torch_geometric.data.data import DataEdgeAttr, DataTensorAttr
+    from torch_geometric.data.storage import BaseStorage, EdgeStorage, GlobalStorage, NodeStorage
+
+    with torch.serialization.safe_globals(
+        [Data, DataEdgeAttr, DataTensorAttr, BaseStorage, EdgeStorage, GlobalStorage, NodeStorage]
+    ):
+        yield
+
+
+def _download_official(name: str, root: Path) -> tuple[dict[str, Any], list[Path]]:
+    """Called only after the user explicitly permits dataset downloads."""
+    try:
+        from torch_geometric.datasets import PPI, Planetoid
+    except ImportError as exc:
+        raise RuntimeError(
+            "Install the project's Conda GPU environment (torch-geometric required)."
+        ) from exc
+    raw_dirs: list[Path] = []
+    payload: dict[str, Any] = {"dataset": name, "classes": EXPECTED[name]["classes"]}
+    with _pyg_safe_globals():
+        if name in {"cora", "citeseer", "pubmed"}:
+            pyg_name = {"cora": "Cora", "citeseer": "CiteSeer", "pubmed": "PubMed"}[name]
+            dataset = Planetoid(str(root / "sources"), pyg_name, split="public")
+            data = dataset[0]
+            graph = _graph(data, normalize_features=True)
+            graph["y"] = graph["y"].reshape(-1).long()
+            payload.update(
+                graphs=[graph],
+                splits={
+                    "train": data.train_mask.cpu(),
+                    "validation": data.val_mask.cpu(),
+                    "test": data.test_mask.cpu(),
+                },
+            )
+            raw_dirs.append(Path(dataset.raw_dir))
+        elif name == "ppi":
+            graphs: list[dict[str, Tensor]] = []
+            splits: dict[str, list[int]] = {}
+            for split, official in (("train", "train"), ("validation", "val"), ("test", "test")):
+                dataset = PPI(str(root / "sources" / "PPI"), split=official)
+                start = len(graphs)
+                graphs.extend(_graph(data, normalize_features=False) for data in dataset)
+                for graph in graphs[start:]:
+                    graph["y"] = graph["y"].float()
+                splits[split] = list(range(start, len(graphs)))
+                raw_dirs.append(Path(dataset.raw_dir))
+            payload.update(graphs=graphs, splits=splits)
+        else:
+            try:
+                from ogb.nodeproppred import PygNodePropPredDataset
+            except ImportError as exc:
+                raise RuntimeError(
+                    "ogbn-arxiv requires the project's optional 'ogb' dependency."
+                ) from exc
+            dataset = PygNodePropPredDataset(name="ogbn-arxiv", root=str(root / "sources"))
+            graph = _graph(dataset[0], normalize_features=False)
+            graph["y"] = graph["y"].reshape(-1).long()
+            indices = dataset.get_idx_split()
+            payload.update(
+                graphs=[graph],
+                splits={
+                    key: _split_mask(indices[official], graph["x"].shape[0])
+                    for key, official in (
+                        ("train", "train"),
+                        ("validation", "valid"),
+                        ("test", "test"),
+                    )
+                },
+            )
+            raw_dirs.extend([Path(dataset.raw_dir), Path(dataset.root) / "split"])
+    files = sorted(
+        {path for directory in raw_dirs for path in directory.rglob("*") if path.is_file()}
+    )
+    if not files:
+        raise RuntimeError("Official download has no raw source files to fingerprint")
+    return payload, files
+
+
+def load_dataset(
+    name: str, data_root: Path, *, allow_download: bool
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Verify cache or prepare official data; never instantiate a downloader offline."""
+    if name not in DATASETS:
+        raise ValueError(f"Unsupported matched dataset: {name}")
+    root = data_root.expanduser().resolve() / "conductance_gat" / "matched_benchmark_v1"
+    folder = root / name
+    tensor_path, manifest_path = folder / "data.pt", folder / "manifest.json"
+    if tensor_path.exists() or manifest_path.exists():
+        if not tensor_path.is_file() or not manifest_path.is_file():
+            raise CacheIncompleteError(
+                f"Incomplete dataset cache: {folder}; "
+                "restore the missing file or use a new data root"
+            )
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as exc:
+            raise CacheCorruptError(f"Unreadable dataset manifest: {manifest_path}") from exc
+        if manifest.get("schema_version") != CACHE_VERSION or manifest.get("dataset") != name:
+            raise CacheWrongRequestError(f"Dataset cache protocol mismatch: {folder}")
+        if sha256_file(tensor_path) != manifest.get("data_sha256"):
+            raise CacheCorruptError(f"Dataset cache checksum mismatch: {tensor_path}")
+        try:
+            payload = torch.load(tensor_path, map_location="cpu", weights_only=True)
+            validate_payload(name, payload)
+            actual_splits = {
+                key: tensor_hash(value if isinstance(value, Tensor) else torch.tensor(value))
+                for key, value in payload["splits"].items()
+            }
+            if actual_splits != manifest.get("split_sha256"):
+                raise ValueError("official split fingerprint mismatch")
+            if manifest.get("source_url") != SOURCES[name] or not manifest.get(
+                "source_files_sha256"
+            ):
+                raise ValueError("official dataset provenance missing or incorrect")
+        except Exception as exc:
+            raise CacheCorruptError(f"Invalid dataset tensors/metadata: {folder}: {exc}") from exc
+        manifest["preprocessing"]["self_loops"] = (
+            "conductance residual identity; no incidence loops"
+        )
+        return payload, manifest
+    if not allow_download:
+        raise FileNotFoundError(
+            f"{name} is not prepared. Run bash scripts/prepare_data.sh first. "
+            "No synthetic substitute is allowed."
+        )
+    payload, files = _download_official(name, root)
+    validate_payload(name, payload)
+    atomic_publish(tensor_path, lambda path: torch.save(payload, path))
+    split_hashes = {
+        key: tensor_hash(value if isinstance(value, Tensor) else torch.tensor(value))
+        for key, value in payload["splits"].items()
+    }
+    manifest = {
+        "schema_version": CACHE_VERSION,
+        "dataset": name,
+        "source_url": SOURCES[name],
+        "data_sha256": sha256_file(tensor_path),
+        "split_sha256": split_hashes,
+        "source_files_sha256": {str(path.relative_to(root)): sha256_file(path) for path in files},
+        "split": "official_public_masks"
+        if name in DATASETS[:3]
+        else "official_inductive_graph_split"
+        if name == "ppi"
+        else "official_time_split",
+        "task": "multi_label_node_classification" if name == "ppi" else "node_classification",
+        "metric": "micro_f1" if name == "ppi" else "accuracy",
+        "preprocessing": {
+            "graph": "undirected, deduplicated arcs, self-loops removed before operators",
+            "features": "PyG NormalizeFeatures equivalent"
+            if name in DATASETS[:3]
+            else "official unmodified features",
+            "incidence": "same undirected graph, one low-to-high orientation per edge",
+            "self_loops": "conductance residual identity; no incidence loops",
+        },
+        "graphs": [
+            {
+                "nodes": int(g["x"].shape[0]),
+                "arcs": int(g["edge_index"].shape[1]),
+                "undirected_edges": int(g["incidence_edge_index"].shape[1]),
+            }
+            for g in payload["graphs"]
+        ],
+        "split_counts": {
+            key: len(value) if isinstance(value, list) else int(value.sum())
+            for key, value in payload["splits"].items()
+        },
+    }
+    atomic_write_json(manifest_path, manifest)
+    return payload, manifest
+````
+
 # research/conductance_gat/cache_validation.py
 
 ````python
@@ -2532,6 +3291,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .benchmark_data import DATASETS as BENCHMARK_DATASETS
+from .benchmark_data import load_dataset
 from .paper_data import validate_core_cache
 from .public_data import validate_public_cache
 
@@ -2555,6 +3316,23 @@ def validate_dataset_cache(
 
     del split_seeds
     paths: list[str] = []
+    if dataset_id in BENCHMARK_DATASETS:
+        _, manifest = load_dataset(dataset_id, data_root, allow_download=False)
+        paths.append(
+            str(
+                data_root
+                / "conductance_gat"
+                / "matched_benchmark_v1"
+                / dataset_id
+                / "manifest.json"
+            )
+        )
+        return {
+            "paths": paths,
+            "data_sha256": manifest["data_sha256"],
+            "split_sha256": manifest["split_sha256"],
+            "seed_policy": "official fixed data/splits",
+        }
     if dataset_id in CORE_DATASETS:
         for seed in data_seeds:
             _, manifest_path, _ = validate_core_cache(data_root, seed=seed)
@@ -2577,16 +3355,104 @@ registry_version: 2
 track: conductance_gat
 paper_suite_complete: true
 claim: Positive incidence conductance learns heterogeneous edge transport independently of cycle PE.
+default_suite: benchmark
+benchmark_protocol:
+  datasets: [cora, citeseer, pubmed, ppi, ogbn-arxiv]
+  models: [conductance]
+  claim: Train only our conductance model on official datasets used by prior GAT/GATv2 papers.
+  external_comparison: Published tables are external references only; no competitor implementation or training is included.
+  recorded: Input features, adjacency preprocessing, official splits, encoder/head, hidden width, depth, optimizer, seeds and early stopping.
+  limitations: Our architecture and full-batch ogbn-arxiv protocol differ from the original papers; published scores require protocol-aware external comparison. No Cycle PE or tree augmentation.
 objective_protocol:
-  headline: Train the full conductance model from observed node messages only.
+  headline: The benchmark suite trains our conductance model on original-paper datasets; published competitors are compared externally. The following inverse-problem objectives apply only to explicit supplementary core/all suites.
   supervised_ceiling: Report full_flux_supervised separately because it reads per-edge flux labels.
   ablation: Report full_joint separately and never merge it into the headline result.
   capacity_limit: Core ablations share hidden width and optimization but not parameter budgets; core per-baseline parameter counts are not currently emitted.
 
 datasets:
+  - id: cora
+    name: Cora citation network
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: conductance_gat/matched_benchmark_v1/cora/manifest.json
+    source_url: https://github.com/kimiyoung/planetoid/tree/master/data
+    task: Classify paper subject from bag-of-words features and citation edges.
+    split: Official Planetoid public masks, 140 train / 500 validation / 1000 test nodes.
+    metrics: [accuracy]
+    models: [conductance]
+    claim: Our-method-only node classification on the Cora dataset used by GAT.
+    adapter: research.conductance_gat.benchmark_data.load_dataset
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Preserve official masks, use training labels only for loss and validation only for checkpoint selection; common feature normalization and graph preprocessing.
+
+  - id: citeseer
+    name: CiteSeer citation network
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: conductance_gat/matched_benchmark_v1/citeseer/manifest.json
+    source_url: https://github.com/kimiyoung/planetoid/tree/master/data
+    task: Classify paper subject from bag-of-words features and citation edges.
+    split: Official Planetoid public masks, 120 train / 500 validation / 1000 test nodes.
+    metrics: [accuracy]
+    models: [conductance]
+    claim: Our-method-only node classification on the CiteSeer dataset used by GAT.
+    adapter: research.conductance_gat.benchmark_data.load_dataset
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Preserve official masks including isolated nodes; no split regeneration or test-label training.
+
+  - id: pubmed
+    name: PubMed citation network
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: conductance_gat/matched_benchmark_v1/pubmed/manifest.json
+    source_url: https://github.com/kimiyoung/planetoid/tree/master/data
+    task: Classify biomedical paper subject from node features and citation edges.
+    split: Official Planetoid public masks, 60 train / 500 validation / 1000 test nodes.
+    metrics: [accuracy]
+    models: [conductance]
+    claim: Our-method-only node classification on the PubMed dataset used by GAT.
+    adapter: research.conductance_gat.benchmark_data.load_dataset
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Fixed public masks; full graph visibility is transductive and never permits validation/test labels in training loss.
+
+  - id: ppi
+    name: PPI protein-protein interaction networks
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: conductance_gat/matched_benchmark_v1/ppi/manifest.json
+    source_url: https://graphsage.stanford.edu/
+    task: Predict 121 independent protein-function labels per node from 50 features and interaction edges.
+    split: Official inductive graph split of 20 train / 2 validation / 2 test graphs.
+    metrics: [micro_f1]
+    models: [conductance]
+    claim: Our-method-only inductive node classification on PPI, used by GAT/GATv2/GraphSAGE.
+    adapter: research.conductance_gat.benchmark_data.load_dataset
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Separate graphs by official split; BCEWithLogitsLoss and global node-label micro-F1 at logit threshold zero; seed training-loader order per run.
+
+  - id: ogbn-arxiv
+    name: OGB ogbn-arxiv citation network
+    tier: paper_core
+    status: implemented
+    data_policy: download
+    cache_glob: conductance_gat/matched_benchmark_v1/ogbn-arxiv/manifest.json
+    source_url: https://ogb.stanford.edu/docs/nodeprop/#ogbn-arxiv
+    task: Predict one of 40 arXiv subject categories per paper.
+    split: Official temporal node split, 90941 train / 29799 validation / 48603 test.
+    metrics: [accuracy]
+    models: [conductance]
+    claim: Our-method-only evaluation on ogbn-arxiv; no GATv2 reproduction or competitor execution.
+    adapter: research.conductance_gat.benchmark_data.load_dataset
+    validator: research.conductance_gat.cache_validation.validate_dataset_cache
+    leakage_guard: Preserve OGB time split and raw features; disclose undirected graph and full-batch training; select checkpoints only with validation.
+
   - id: static_multigraph_identification
     name: Static heterogeneous multi-graph synthetic
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: generated
     cache_glob: conductance_gat/core-*/manifest.json
@@ -2601,7 +3467,7 @@ datasets:
 
   - id: topology_size_ood
     name: Conductance topology and size OOD synthetic
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: generated
     cache_glob: conductance_gat/core-*/manifest.json
@@ -2616,7 +3482,7 @@ datasets:
 
   - id: nonlinear_rollout
     name: Positive state-dependent nonlinear diffusion rollout
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: generated
     cache_glob: conductance_gat/core-*/manifest.json
@@ -2631,7 +3497,7 @@ datasets:
 
   - id: identifiability_robustness
     name: Conductance contrast, excitation coverage, and noise factorial
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: generated
     cache_glob: conductance_gat/core-*/manifest.json
@@ -2646,7 +3512,7 @@ datasets:
 
   - id: pascalvoc_sp
     name: LRGB PascalVOC-SP
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: download
     cache_glob: conductance_gat/public/official-ready.json
@@ -2654,15 +3520,15 @@ datasets:
     task: Superpixel node classification using graph edge weights.
     split: Official LRGB train/validation/test split.
     metrics: [macro_f1]
-    baselines: [no_message_mlp, gcn, gat, gine, conductance_model]
+    models: [conductance_model]
     claim: Predictive utility on a standard edge-weighted node task.
     adapter: research.conductance_gat.public_data.prepare_public_data
     validator: research.conductance_gat.cache_validation.validate_dataset_cache
-    leakage_guard: Use the official split and shared active node encoder/head/depth/optimizer; no-message and GCN intentionally freeze/skip the edge encoder; report active parameter counts and disclose that the custom one-layer backbone budgets are not matched or reference-tuned.
+    leakage_guard: Use the official split and conductance-only model; report active parameter counts; no competitor reproduction or locally generated comparison values.
 
   - id: ogbg_molhiv
     name: OGB ogbg-molhiv
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: download
     cache_glob: conductance_gat/public/official-ready.json
@@ -2670,11 +3536,11 @@ datasets:
     task: Molecular graph classification with categorical atom and bond features.
     split: Official scaffold split.
     metrics: [roc_auc]
-    baselines: [no_message_mlp, gcn, gat, gine, conductance_model]
+    models: [conductance_model]
     claim: Graph-level utility on unseen molecular scaffolds.
     adapter: research.conductance_gat.public_data.prepare_public_data
     validator: research.conductance_gat.cache_validation.validate_dataset_cache
-    leakage_guard: Use the official split and AtomEncoder/BondEncoder where active, deduplicate bidirectional physical edges, report active parameter counts, and disclose that the custom one-layer backbone budgets are not matched or reference-tuned.
+    leakage_guard: Use official split and AtomEncoder/BondEncoder, deduplicate reciprocal physical edges, report active parameter counts; only conductance is trained.
 
   - id: pglib_dc
     name: PGLib/MATPOWER DC transport proxy
@@ -4026,98 +4892,6 @@ class SumCategoricalEncoder(nn.Module):
         return result
 
 
-def _bidirectional_edges(
-    edge_index: Tensor, edge_features: Tensor
-) -> tuple[Tensor, Tensor, Tensor]:
-    tail, head = edge_index
-    source = torch.cat((tail, head))
-    target = torch.cat((head, tail))
-    return source, target, torch.cat((edge_features, edge_features), dim=0)
-
-
-class NoMessageMLPLayer(nn.Module):
-    def __init__(self, hidden: int) -> None:
-        super().__init__()
-        self.network = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU())
-
-    def forward(self, node_state: Tensor, edge_index: Tensor, edge_features: Tensor) -> Tensor:
-        del edge_index, edge_features
-        return self.network(node_state)
-
-
-class SparseGCNLayer(nn.Module):
-    def __init__(self, hidden: int) -> None:
-        super().__init__()
-        self.linear = nn.Linear(hidden, hidden)
-
-    def forward(self, node_state: Tensor, edge_index: Tensor, edge_features: Tensor) -> Tensor:
-        del edge_features
-        source, target, _ = _bidirectional_edges(
-            edge_index, node_state.new_empty((edge_index.shape[1], 0))
-        )
-        nodes = torch.arange(node_state.shape[0], device=node_state.device)
-        source = torch.cat((source, nodes))
-        target = torch.cat((target, nodes))
-        degree = torch.bincount(target, minlength=node_state.shape[0]).to(node_state)
-        weight = degree.index_select(0, source).rsqrt() * degree.index_select(0, target).rsqrt()
-        aggregate = torch.zeros_like(node_state)
-        aggregate.index_add_(0, target, weight[:, None] * node_state.index_select(0, source))
-        return self.linear(aggregate)
-
-
-class SparseGATLayer(nn.Module):
-    """Single-head edge-aware GAT with a torch-only segment softmax."""
-
-    def __init__(self, hidden: int) -> None:
-        super().__init__()
-        self.node_projection = nn.Linear(hidden, hidden, bias=False)
-        self.edge_projection = nn.Linear(hidden, hidden, bias=False)
-        self.attention = nn.Linear(3 * hidden, 1, bias=False)
-        self.self_projection = nn.Linear(hidden, hidden)
-
-    def forward(self, node_state: Tensor, edge_index: Tensor, edge_features: Tensor) -> Tensor:
-        source, target, directed_features = _bidirectional_edges(edge_index, edge_features)
-        projected = self.node_projection(node_state)
-        source_state = projected.index_select(0, source)
-        target_state = projected.index_select(0, target)
-        edge_state = self.edge_projection(directed_features)
-        logits = nnf.leaky_relu(
-            self.attention(torch.cat((source_state, target_state, edge_state), dim=1)).squeeze(-1),
-            negative_slope=0.2,
-        )
-        maximum = logits.new_full((node_state.shape[0],), -torch.inf)
-        maximum.scatter_reduce_(0, target, logits, reduce="amax", include_self=True)
-        unnormalized = torch.exp(logits - maximum.index_select(0, target))
-        denominator = logits.new_zeros(node_state.shape[0])
-        denominator.index_add_(0, target, unnormalized)
-        attention = unnormalized / denominator.index_select(0, target).clamp_min(1.0e-12)
-        message = attention[:, None] * (source_state + edge_state)
-        aggregate = torch.zeros_like(projected)
-        aggregate.index_add_(0, target, message)
-        return self.self_projection(node_state) + aggregate
-
-
-class SparseGINELayer(nn.Module):
-    def __init__(self, hidden: int) -> None:
-        super().__init__()
-        self.edge_projection = nn.Linear(hidden, hidden)
-        self.epsilon = nn.Parameter(torch.zeros(()))
-        self.network = nn.Sequential(
-            nn.Linear(hidden, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, hidden),
-        )
-
-    def forward(self, node_state: Tensor, edge_index: Tensor, edge_features: Tensor) -> Tensor:
-        source, target, directed_features = _bidirectional_edges(edge_index, edge_features)
-        message = nnf.relu(
-            node_state.index_select(0, source) + self.edge_projection(directed_features)
-        )
-        aggregate = torch.zeros_like(node_state)
-        aggregate.index_add_(0, target, message)
-        return self.network((1.0 + self.epsilon) * node_state + aggregate)
-
-
 class PublicConductanceModel(nn.Module):
     def __init__(
         self,
@@ -4126,15 +4900,11 @@ class PublicConductanceModel(nn.Module):
         hidden: int,
         num_classes: int,
         official_molecule: bool,
-        backbone: str = "conductance_model",
     ) -> None:
         super().__init__()
-        if backbone not in {"no_message_mlp", "gcn", "gat", "gine", "conductance_model"}:
-            raise ValueError(f"unknown public backbone {backbone!r}")
         node_width = int(sample["x"].shape[1])
         edge_width = int(sample["edge_features"].shape[1])
         self.task = str(sample["task"])
-        self.backbone_name = backbone
         if bool(sample["categorical"]) and official_molecule:
             try:
                 from ogb.graphproppred.mol_encoder import AtomEncoder, BondEncoder
@@ -4150,51 +4920,31 @@ class PublicConductanceModel(nn.Module):
         else:
             self.node_encoder = nn.Linear(node_width, hidden)
             self.edge_encoder = nn.Linear(edge_width, hidden)
-        self.uses_edge_features = backbone not in {"no_message_mlp", "gcn"}
-        if not self.uses_edge_features:
-            self.edge_encoder.requires_grad_(False)
-        # Construct shared components before the backbone so resetting the same
-        # seed gives every comparison identical encoder/head initialization.
+        self.uses_edge_features = True
         self.normalization = nn.LayerNorm(hidden)
         self.head = nn.Linear(hidden, num_classes if self.task == "node" else 1)
-        if backbone == "conductance_model":
-            self.layer: nn.Module = SparseIncidenceConductanceLayer(
-                channels=hidden,
-                edge_feature_channels=hidden,
-                hidden_channels=hidden,
-                requested_step=0.02,
-                mode="full",
-            )
-        elif backbone == "no_message_mlp":
-            self.layer = NoMessageMLPLayer(hidden)
-        elif backbone == "gcn":
-            self.layer = SparseGCNLayer(hidden)
-        elif backbone == "gat":
-            self.layer = SparseGATLayer(hidden)
-        else:
-            self.layer = SparseGINELayer(hidden)
+        self.layer = SparseIncidenceConductanceLayer(
+            channels=hidden,
+            edge_feature_channels=hidden,
+            hidden_channels=hidden,
+            requested_step=0.02,
+            mode="full",
+        )
 
     def forward(self, batch: PublicPacked) -> Tensor:
         node_state = self.node_encoder(batch.x)
-        edge_features = (
-            self.edge_encoder(batch.edge_features)
-            if self.uses_edge_features
-            else node_state.new_empty((batch.edge_index.shape[1], 0))
+        edge_features = self.edge_encoder(batch.edge_features)
+        edge_graph = batch.node_graph.index_select(0, batch.edge_index[0])
+        sparse_batch = PackedGraphBatch(
+            node_state=node_state,
+            edge_index=batch.edge_index,
+            edge_features=edge_features,
+            node_graph=batch.node_graph,
+            edge_graph=edge_graph,
+            graph_ids=batch.graph_ids,
+            requested_step=node_state.new_full((batch.num_graphs,), 0.02),
         )
-        if self.backbone_name == "conductance_model":
-            edge_graph = batch.node_graph.index_select(0, batch.edge_index[0])
-            sparse_batch = PackedGraphBatch(
-                node_state=node_state,
-                edge_index=batch.edge_index,
-                edge_features=edge_features,
-                node_graph=batch.node_graph,
-                edge_graph=edge_graph,
-                graph_ids=batch.graph_ids,
-                requested_step=node_state.new_full((batch.num_graphs,), 0.02),
-            )
-            node_state = self.layer(sparse_batch)
-        else:
-            node_state = self.layer(node_state, batch.edge_index, edge_features)
+        node_state = self.layer(sparse_batch)
         node_state = nnf.silu(self.normalization(node_state))
         if self.task == "node":
             return self.head(node_state)
@@ -4321,7 +5071,6 @@ def run_public(
     results: dict[str, Any] = {}
     histories: list[dict[str, Any]] = []
     states: dict[str, dict[str, Tensor]] = {}
-    backbone_names = ("no_message_mlp", "gcn", "gat", "gine", "conductance_model")
     for dataset_number, dataset_name in enumerate(("pascalvoc_sp", "ogbg_molhiv")):
         splits = datasets[dataset_name]
         sample = splits["train"][0]
@@ -4330,26 +5079,23 @@ def run_public(
         results[dataset_name] = {
             "fixture": False,
             "official_result": True,
-            "comparison_protocol": {
+            "model_protocol": {
                 "hidden_channels": hidden,
                 "backbone_depth": 1,
-                "shared_encoder_initialization": True,
-                "shared_head_initialization": True,
-                "shared_optimizer_and_split": True,
+                "model": "conductance_model",
+                "split": "official",
+                "competitor_execution": "not implemented; published results compared externally",
             },
             "baselines": {},
         }
         model_seed = seed + dataset_number * 101
-        for backbone in backbone_names:
-            # Shared modules are constructed before the variable backbone, so
-            # this reset makes their initial tensors identical across models.
+        for model_name in ("conductance_model",):
             seed_everything(model_seed)
             model = PublicConductanceModel(
                 sample,
                 hidden=hidden,
                 num_classes=num_classes,
                 official_molecule=(dataset_name == "ogbg_molhiv"),
-                backbone=backbone,
             ).to(device)
             parameter_count = sum(
                 parameter.numel() for parameter in model.parameters() if parameter.requires_grad
@@ -4404,7 +5150,7 @@ def run_public(
                 histories.append(
                     {
                         "suite": dataset_name,
-                        "baseline": backbone,
+                        "baseline": model_name,
                         "epoch": epoch,
                         "train_loss": total / max(count, 1),
                         "validation_loss": validation_loss,
@@ -4418,11 +5164,11 @@ def run_public(
                     }
             if best_state is not None:
                 model.load_state_dict(best_state)
-            state_key = f"{dataset_name}_{backbone}"
+            state_key = f"{dataset_name}_{model_name}"
             states[state_key] = {
                 name: value.detach().cpu() for name, value in model.state_dict().items()
             }
-            results[dataset_name]["baselines"][backbone] = {
+            results[dataset_name]["baselines"][model_name] = {
                 "parameter_count": parameter_count,
                 "parameter_count_policy": "trainable_active_parameters_only",
                 "uses_edge_features": model.uses_edge_features,
@@ -5825,7 +6571,7 @@ __all__ = [
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-exec bash "${project_root}/scripts/paper.sh" --suite all --tracks conductance_gat "$@"
+exec bash "${project_root}/scripts/paper.sh" --suite benchmark --tracks conductance_gat "$@"
 ````
 
 # research/conductance_gat/sparse.py
@@ -6604,6 +7350,256 @@ def test_learned_model_has_gradient_and_isotropic_baseline_is_scalar() -> None:
     assert metrics["conductance_correlation_defined"] is False
 ````
 
+# research/conductance_gat/tests/test_matched_benchmark.py
+
+````python
+"""Unit fixtures only: no public downloads and no CPU/GPU benchmark training."""
+
+from __future__ import annotations
+
+import copy
+import json
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from chartgat.cache import CacheCorruptError, CacheIncompleteError
+from research.conductance_gat import benchmark, benchmark_data
+
+
+@pytest.fixture
+def payload(monkeypatch):
+    # Reduced dimensions exist only in this test fixture, never a production dataset path.
+    monkeypatch.setitem(
+        benchmark_data.EXPECTED,
+        "cora",
+        {
+            "nodes": 8,
+            "features": 3,
+            "classes": 2,
+            "splits": [3, 2, 2],
+        },
+    )
+    arcs, incidence = benchmark_data.canonical_edges(
+        torch.tensor([[0, 1, 2, 3, 4, 5, 6], [1, 2, 3, 4, 5, 6, 7]]), 8
+    )
+    masks = {}
+    for name, indices in (("train", [0, 1, 2]), ("validation", [3, 4]), ("test", [5, 6])):
+        mask = torch.zeros(8, dtype=torch.bool)
+        mask[indices] = True
+        masks[name] = mask
+    return {
+        "dataset": "cora",
+        "classes": 2,
+        "graphs": [
+            {
+                "x": torch.arange(24).float().reshape(8, 3),
+                "y": torch.arange(8) % 2,
+                "edge_index": arcs,
+                "incidence_edge_index": incidence,
+            }
+        ],
+        "splits": masks,
+    }
+
+
+def _mock_download(monkeypatch, tmp_path, payload):
+    def download(name, root):
+        source = root / "sources" / "fixture.txt"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("test fixture; not a production dataset", encoding="utf-8")
+        return copy.deepcopy(payload), [source]
+
+    monkeypatch.setattr(benchmark_data, "_download_official", download)
+
+
+def test_default_dataset_and_own_model_only_contract():
+    args = benchmark.build_parser().parse_args([])
+    assert args.datasets == ["cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"]
+    assert not hasattr(args, "baselines")
+    assert not hasattr(args, "heads")
+    assert args.device == "cuda" and not args.amp
+    with pytest.raises(SystemExit):
+        benchmark.build_parser().parse_args(["--tiny"])
+    with pytest.raises(SystemExit):
+        benchmark.build_parser().parse_args(["--baselines", "gat"])
+
+
+def test_canonical_incidence_and_adjacency_have_same_edges():
+    arcs, incidence = benchmark_data.canonical_edges(
+        torch.tensor([[2, 1, 0, 1, 1, 0], [1, 2, 1, 0, 1, 1]]), 3
+    )
+    assert torch.equal(incidence, torch.tensor([[0, 1], [1, 2]]))
+    assert torch.equal(arcs, torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]]))
+
+
+def test_split_validator_accepts_official_mask_semantics(payload):
+    benchmark_data.validate_payload("cora", payload)
+    assert sum(int(mask.sum()) for mask in payload["splits"].values()) == 7
+    # Transductive public protocols deliberately leave some nodes unlabeled.
+
+
+def test_split_validator_rejects_overlap(payload):
+    payload["splits"]["validation"][0] = True
+    payload["splits"]["validation"][3] = False
+    with pytest.raises(ValueError, match="overlap"):
+        benchmark_data.validate_payload("cora", payload)
+
+
+def test_split_validator_rejects_wrong_official_size(payload):
+    payload["splits"]["train"][0] = False
+    with pytest.raises(ValueError, match="official protocol"):
+        benchmark_data.validate_payload("cora", payload)
+
+
+def test_same_graph_required_for_incidence_and_adjacency(payload):
+    payload["graphs"][0]["incidence_edge_index"] = payload["graphs"][0]["incidence_edge_index"][
+        :, :-1
+    ]
+    with pytest.raises(ValueError, match="different graphs"):
+        benchmark_data.validate_payload("cora", payload)
+
+
+def test_offline_missing_cache_never_calls_downloader(monkeypatch, tmp_path):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("offline preparation must never call a downloader")
+
+    monkeypatch.setattr(benchmark_data, "_download_official", forbidden)
+    with pytest.raises(FileNotFoundError, match="No synthetic substitute"):
+        benchmark_data.load_dataset("cora", tmp_path, allow_download=False)
+    assert not list(tmp_path.iterdir())
+
+
+def test_real_cache_contract_roundtrip_and_checksum(monkeypatch, tmp_path, payload):
+    _mock_download(monkeypatch, tmp_path, payload)
+    _, manifest = benchmark_data.load_dataset("cora", tmp_path, allow_download=True)
+    assert len(manifest["data_sha256"]) == 64
+    assert set(manifest["split_sha256"]) == {"train", "validation", "test"}
+    loaded, reloaded_manifest = benchmark_data.load_dataset("cora", tmp_path, allow_download=False)
+    assert torch.equal(loaded["graphs"][0]["x"], payload["graphs"][0]["x"])
+    assert reloaded_manifest == manifest
+    tensor_path = tmp_path / "conductance_gat/matched_benchmark_v1/cora/data.pt"
+    with tensor_path.open("ab") as stream:
+        stream.write(b"corruption")
+    with pytest.raises(CacheCorruptError, match="checksum"):
+        benchmark_data.load_dataset("cora", tmp_path, allow_download=False)
+
+
+def test_partial_cache_fails_even_when_download_allowed(tmp_path):
+    folder = tmp_path / "conductance_gat/matched_benchmark_v1/cora"
+    folder.mkdir(parents=True)
+    (folder / "manifest.json").write_text("{}", encoding="utf-8")
+    with pytest.raises(CacheIncompleteError):
+        benchmark_data.load_dataset("cora", tmp_path, allow_download=True)
+
+
+def test_manifest_split_hash_corruption_fails(monkeypatch, tmp_path, payload):
+    _mock_download(monkeypatch, tmp_path, payload)
+    benchmark_data.load_dataset("cora", tmp_path, allow_download=True)
+    path = tmp_path / "conductance_gat/matched_benchmark_v1/cora/manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["split_sha256"]["train"] = "bad"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(CacheCorruptError, match="split fingerprint"):
+        benchmark_data.load_dataset("cora", tmp_path, allow_download=False)
+
+
+def test_ppi_micro_f1_counts_node_labels_globally():
+    logits = torch.tensor([[1.0, -1.0, 1.0], [-1.0, 1.0, -1.0]])
+    truth = torch.tensor([[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]])
+    assert benchmark.micro_f1(logits, truth) == pytest.approx(2 / 3)
+    assert benchmark.micro_f1(torch.zeros(1, 2), torch.zeros(1, 2)) == 0
+
+
+def test_incidence_operator_orientation_invariance_and_autograd():
+    torch.manual_seed(4)
+    model = benchmark.ConductanceConv(4)
+    state = torch.randn(4, 4, requires_grad=True)
+    edges = torch.tensor([[0, 1, 2, 0], [1, 2, 3, 3]])
+    groups = torch.zeros(4, dtype=torch.long)
+    output = model(state, edges, groups)
+    assert torch.allclose(output, model(state, edges.flip(0), groups), atol=1e-6)
+    assert torch.allclose(output.mean(0), state.mean(0), atol=1e-6)
+    output.square().sum().backward()
+    assert state.grad is not None and torch.isfinite(state.grad).all()
+    assert all(parameter.grad is not None for parameter in model.parameters())
+
+
+def test_conductance_classifier_forward_only(payload):
+    graph = SimpleNamespace(**payload["graphs"][0])
+    model = benchmark.ConductanceNodeClassifier(3, 2, hidden_channels=8, layers=2, dropout=0.0)
+    assert model(graph).shape == (8, 2)
+
+
+def test_cpu_training_is_rejected_before_any_dataset_action(tmp_path):
+    with pytest.raises(RuntimeError, match="CUDA GPU"):
+        benchmark.main(["--device", "cpu", "--output-dir", str(tmp_path / "run")])
+    assert not (tmp_path / "run").exists()
+
+
+def test_preparation_saves_protocol_without_training(monkeypatch, tmp_path, payload):
+    _mock_download(monkeypatch, tmp_path, payload)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("prepare-only must never train")
+
+    monkeypatch.setattr(benchmark, "train_model", forbidden)
+    output = tmp_path / "output"
+    assert (
+        benchmark.main(
+            [
+                "--prepare-only",
+                "--allow-download",
+                "--device",
+                "cpu",
+                "--datasets",
+                "cora",
+                "--data-root",
+                str(tmp_path / "data"),
+                "--output-dir",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    result = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
+    assert result["status"] == "prepared"
+    assert result["schema_version"] == 2
+    assert result["datasets"]["cora"]["models"] == {}
+    assert "baselines" not in result["datasets"]["cora"]
+    assert not list(output.rglob("best.pt"))
+
+
+def test_selection_rejects_duplicates_unknown_and_empty():
+    assert benchmark._selection(["cora,citeseer", "pubmed"], benchmark_data.DATASETS) == [
+        "cora",
+        "citeseer",
+        "pubmed",
+    ]
+    for values in (["cora", "cora"], ["toy"], []):
+        with pytest.raises(ValueError):
+            benchmark._selection(values, benchmark_data.DATASETS)
+
+
+def test_optional_pyg_batch_offsets_and_conductance_forward(payload):
+    pytest.importorskip("torch_geometric")
+    from torch_geometric.data import Batch, Data
+
+    graph = payload["graphs"][0]
+    batch = Batch.from_data_list([Data(**graph), Data(**graph)])
+    edge_count = graph["incidence_edge_index"].shape[1]
+    assert torch.equal(
+        batch.incidence_edge_index[:, edge_count:], graph["incidence_edge_index"] + 8
+    )
+    model = benchmark.ConductanceNodeClassifier(3, 2, hidden_channels=8, layers=2, dropout=0.0)
+    model.eval()
+    with torch.no_grad():
+        result = model(batch)
+    assert result.shape == (16, 2)
+    assert torch.isfinite(result).all()
+````
+
 # research/conductance_gat/tests/test_paper_pipeline.py
 
 ````python
@@ -6889,30 +7885,34 @@ def test_public_reciprocal_edge_adapter_without_network() -> None:
         deduplicate_undirected_edges(reciprocal, categorical, 2)
 
 
-def test_public_loss_weight_and_inactive_edge_encoders_match_active_computation() -> None:
+def test_public_loss_weight_and_conductance_edge_encoder() -> None:
     node_sample = _unit_public_model_input("node")
     assert paper_module._public_loss_weight(node_sample["y"], "node") == node_sample["y"].numel()
     graph_sample = _unit_public_model_input("graph")
     assert paper_module._public_loss_weight(graph_sample["y"], "graph") == 1
 
-    gcn = paper_module.PublicConductanceModel(
+    model = paper_module.PublicConductanceModel(
         node_sample,
         hidden=8,
         num_classes=3,
         official_molecule=False,
-        backbone="gcn",
     )
-    gat = paper_module.PublicConductanceModel(
-        node_sample,
-        hidden=8,
-        num_classes=3,
-        official_molecule=False,
-        backbone="gat",
-    )
-    assert not gcn.uses_edge_features
-    assert not any(parameter.requires_grad for parameter in gcn.edge_encoder.parameters())
-    assert gat.uses_edge_features
-    assert all(parameter.requires_grad for parameter in gat.edge_encoder.parameters())
+    assert model.uses_edge_features
+    assert all(parameter.requires_grad for parameter in model.edge_encoder.parameters())
+    assert isinstance(model.layer, SparseIncidenceConductanceLayer)
+
+
+def test_public_competitor_implementations_and_selector_are_removed() -> None:
+    for name in ("NoMessageMLPLayer", "SparseGCNLayer", "SparseGATLayer", "SparseGINELayer"):
+        assert not hasattr(paper_module, name)
+    with pytest.raises(TypeError, match="backbone"):
+        paper_module.PublicConductanceModel(
+            _unit_public_model_input("node"),
+            hidden=8,
+            num_classes=3,
+            official_molecule=False,
+            backbone="gcn",
+        )
 
 
 def test_cli_refuses_nonempty_output_without_touching_existing_artifacts(
@@ -7126,6 +8126,746 @@ __all__ = [
 ]
 ````
 
+# research/cycle_pe/benchmark.py
+
+````python
+"""Train only our cycle-set PE on official molecular benchmark splits.
+
+Other papers' model results belong in an external comparison table, not this run.
+Actual training requires CUDA. Preparation never trains or generates substitutes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.metadata
+import json
+import math
+import random
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from chartgat.cache import atomic_publish, atomic_write_json
+from research.cycle_pe.benchmark_data import DATASETS, Graph, collate, load_benchmark
+from research.cycle_pe.benchmark_models import MODEL_NAME, CyclePEModel, architecture_protocol
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--suite", choices=("benchmark",), default="benchmark")
+    result.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    result.add_argument("--data-root", type=Path, default=Path("data/paper"))
+    result.add_argument("--output-dir", type=Path, default=Path("results/cycle_pe/benchmark"))
+    result.add_argument("--device", default="cuda")
+    for seed in ("data", "split", "chart", "model"):
+        result.add_argument(f"--{seed}-seed", type=int, default=0)
+    result.add_argument("--batch-size", type=int, default=32)
+    result.add_argument("--workers", type=int, default=0)
+    result.add_argument("--prepare-only", action="store_true")
+    result.add_argument("--allow-download", action="store_true")
+    result.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
+    result.add_argument("--epochs", type=int, default=300)
+    result.add_argument("--patience", type=int, default=50)
+    result.add_argument("--lr", type=float, default=1e-3)
+    result.add_argument("--weight-decay", type=float, default=0.0)
+    result.add_argument("--hidden-dim", type=int, default=64)
+    result.add_argument("--pe-dim", type=int, default=32)
+    result.add_argument("--layers", type=int, default=3)
+    result.add_argument("--max-parameters", type=int, default=500_000)
+    return result
+
+
+def _validate(args: argparse.Namespace) -> None:
+    if any(getattr(args, f"{seed}_seed") < 0 for seed in ("data", "split", "chart", "model")):
+        raise ValueError("seeds must be nonnegative")
+    for key in (
+        "batch_size",
+        "epochs",
+        "patience",
+        "hidden_dim",
+        "pe_dim",
+        "layers",
+        "max_parameters",
+    ):
+        if getattr(args, key) < 1:
+            raise ValueError(f"--{key.replace('_', '-')} must be positive")
+    if args.workers < 0 or args.lr <= 0 or args.weight_decay < 0:
+        raise ValueError("invalid worker count or optimizer settings")
+    if len(set(args.datasets)) != len(args.datasets):
+        raise ValueError("datasets must not contain duplicates")
+    if not args.prepare_only and (
+        torch.device(args.device).type != "cuda" or not torch.cuda.is_available()
+    ):
+        raise RuntimeError("Cycle PE benchmark training requires CUDA; no CPU fallback")
+
+
+def _seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+
+
+def _worker_seed(_: int) -> None:
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def _loader(graphs: list[Graph], args: argparse.Namespace, *, train: bool) -> DataLoader:
+    # Keep data ordering independent of model RNG consumption.
+    generator = torch.Generator().manual_seed(args.model_seed)
+    return DataLoader(
+        graphs,
+        batch_size=args.batch_size,
+        shuffle=train,
+        num_workers=args.workers,
+        pin_memory=True,
+        collate_fn=collate,
+        generator=generator,
+        worker_init_fn=_worker_seed,
+        persistent_workers=args.workers > 0,
+    )
+
+
+@torch.no_grad()
+def evaluate(model: CyclePEModel, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    total = 0.0
+    count = 0
+    for batch in loader:
+        batch = batch.to(device)
+        predicted = model(batch).float()
+        if not torch.isfinite(predicted).all():
+            raise FloatingPointError("nonfinite validation/test prediction")
+        total += float((predicted - batch.y).abs().sum())
+        count += batch.y.numel()
+    if count == 0:
+        raise ValueError("cannot evaluate an empty official split")
+    return total / count
+
+
+def _train_model(
+    dataset: str,
+    splits: dict[str, list[Graph]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if torch.device(args.device).type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("Cycle PE benchmark training requires CUDA; no CPU fallback")
+    _seed(args.model_seed)
+    device = torch.device(args.device)
+    model = CyclePEModel(
+        dataset=dataset,
+        hidden=args.hidden_dim,
+        pe_dim=args.pe_dim,
+        layers=args.layers,
+    ).to(device)
+    parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if parameters > args.max_parameters:
+        raise ValueError(
+            f"{dataset}/{MODEL_NAME}: {parameters} parameters exceeds budget {args.max_parameters}"
+        )
+    train_loader = _loader(splits["train"], args, train=True)
+    validation_loader = _loader(splits["validation"], args, train=False)
+    test_loader = _loader(splits["test"], args, train=False)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, factor=0.5, patience=25, min_lr=1e-6
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
+    run = args.output_dir / dataset / MODEL_NAME
+    run.mkdir(parents=True, exist_ok=False)
+    checkpoint = run / "best.pt"
+    history_path = run / "history.json"
+    history = []
+    best = math.inf
+    best_epoch = 0
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        train_sum = 0.0
+        train_count = 0
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
+                predicted = model(batch)
+                loss = (predicted.float() - batch.y).abs().mean()
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"{dataset}/{MODEL_NAME}: nonfinite training loss")
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0, error_if_nonfinite=True)
+            scaler.step(optimizer)
+            scaler.update()
+            train_sum += float(loss.detach()) * batch.y.numel()
+            train_count += batch.y.numel()
+        validation = evaluate(model, validation_loader, device)
+        scheduler.step(validation)
+        history.append(
+            {
+                "epoch": epoch,
+                "train_mae": train_sum / train_count,
+                "validation_mae": validation,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+            }
+        )
+        atomic_write_json(history_path, history)
+        if validation < best:
+            best, best_epoch = validation, epoch
+            payload = {
+                "state_dict": model.state_dict(),
+                "epoch": epoch,
+                "validation_mae": validation,
+                "dataset": dataset,
+                "model": MODEL_NAME,
+                "model_seed": args.model_seed,
+                "arguments": {
+                    key: str(value) if isinstance(value, Path) else value
+                    for key, value in vars(args).items()
+                },
+            }
+            atomic_publish(checkpoint, lambda path, state=payload: torch.save(state, path))
+        print(
+            f"{dataset}/{MODEL_NAME} epoch={epoch} train_mae={train_sum / train_count:.6f} "
+            f"validation_mae={validation:.6f} best={best:.6f}",
+            flush=True,
+        )
+        if epoch - best_epoch >= args.patience:
+            break
+    selected = torch.load(checkpoint, map_location=device, weights_only=True)
+    model.load_state_dict(selected["state_dict"])
+    # Test is touched only once, after validation selects the checkpoint.
+    test = evaluate(model, test_loader, device)
+    torch.cuda.synchronize(device)
+    elapsed = time.perf_counter() - started
+    return {
+        "validation": best,
+        "test": test,
+        "best_epoch": best_epoch,
+        "trainable_parameters": parameters,
+        "checkpoint": str(checkpoint),
+        "history": str(history_path),
+        "elapsed_seconds": elapsed,
+        "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
+        "epochs_completed": len(history),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    _validate(args)
+    args.data_root = args.data_root.expanduser().resolve()
+    args.output_dir = args.output_dir.expanduser().resolve()
+    if args.output_dir.exists() and any(args.output_dir.iterdir()):
+        raise FileExistsError(f"Output directory is not empty: {args.output_dir}; choose a new run")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = args.output_dir / "manifest.json"
+    if manifest_path.exists():
+        raise FileExistsError(
+            f"Run already exists: {args.output_dir}; choose a new output directory"
+        )
+    arguments = {
+        key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
+    }
+    versions = {"torch": torch.__version__, "cuda": torch.version.cuda}
+    for library in ("torch-geometric", "numpy", "networkx"):
+        try:
+            versions[library] = importlib.metadata.version(library)
+        except importlib.metadata.PackageNotFoundError:
+            versions[library] = "not_installed"
+    manifest = {
+        "schema_version": 2,
+        "track": "cycle_pe",
+        "suite": "benchmark",
+        "status": "running",
+        "protocol": "ours_only_on_official_benchmark_splits",
+        "arguments": arguments,
+        "software": versions,
+        "architecture": architecture_protocol(),
+        "implementation_sha256": {
+            name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+            for name in (
+                "benchmark.py",
+                "benchmark_data.py",
+                "benchmark_models.py",
+                "features.py",
+                "paper_model.py",
+            )
+        },
+        "seeds": {
+            "model_seed": args.model_seed,
+            "data_seed": "unused: fixed official graphs",
+            "split_seed": "unused: official splits",
+            "chart_seed": "unused: one deterministic BFS chart, no augmentation",
+        },
+        "controls": {
+            "model": MODEL_NAME,
+            "external_models_trained": False,
+            "test_checkpoint_selection": False,
+            "parameter_budget": args.max_parameters,
+            "target_policy": "official labels unchanged",
+        },
+    }
+    metrics: dict[str, Any] = {
+        "schema_version": 2,
+        "track": "cycle_pe",
+        "suite": "benchmark",
+        "status": "running",
+        "model_seed": args.model_seed,
+        "datasets": {},
+    }
+    atomic_write_json(manifest_path, manifest)
+    try:
+        for dataset in args.datasets:
+            started = time.perf_counter()
+            splits, protocol = load_benchmark(
+                args.data_root,
+                dataset,
+                allow_download=args.allow_download,
+            )
+            dataset_metrics: dict[str, Any] = {
+                "metric": "mae",
+                "protocol": protocol,
+                "models": {},
+                "data_preparation_seconds": time.perf_counter() - started,
+            }
+            metrics["datasets"][dataset] = dataset_metrics
+            if not args.prepare_only:
+                dataset_metrics["models"][MODEL_NAME] = _train_model(dataset, splits, args)
+                atomic_write_json(args.output_dir / "metrics.json", metrics)
+            del splits
+        metrics["status"] = manifest["status"] = "prepared" if args.prepare_only else "passed"
+        atomic_write_json(args.output_dir / "metrics.json", metrics)
+        manifest["dataset_protocols"] = {
+            name: data["protocol"] for name, data in metrics["datasets"].items()
+        }
+        atomic_write_json(manifest_path, manifest)
+    except Exception as exc:
+        manifest["status"] = metrics["status"] = "failed"
+        manifest["error"] = f"{type(exc).__name__}: {exc}"
+        atomic_write_json(manifest_path, manifest)
+        atomic_write_json(args.output_dir / "metrics.json", metrics)
+        raise
+    print(json.dumps({"status": metrics["status"], "output_dir": str(args.output_dir)}), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# research/cycle_pe/benchmark_data.py
+
+````python
+"""Official datasets for our cycle PE; no fallback or random re-splitting.
+
+Only adapters import PyG. Tensor preparation and invariance tests are independent
+of optional download libraries. Only our cycle-set PE is precomputed.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass, fields
+from pathlib import Path
+from typing import Any
+
+import networkx as nx
+import numpy as np
+import torch
+from torch import Tensor
+
+from chartgat.algebra import incidence_matrix
+from chartgat.cache import atomic_publish, atomic_write_json
+from chartgat.graphs import spanning_tree_indices
+from research.cycle_pe.features import (
+    SET_STAT_NAMES,
+    cycle_set_statistics,
+    static_fundamental_basis,
+)
+
+DATASETS = ("zinc12k", "peptides_struct")
+CACHE_VERSION = "own-cycle-set-v2"
+SPLITS = ("train", "validation", "test")
+EXPECTED_SIZES = {
+    "zinc12k": (10000, 1000, 1000),
+    "peptides_struct": (10873, 2331, 2331),
+}
+SOURCES = {
+    "zinc12k": "https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.ZINC.html",
+    "peptides_struct": "https://github.com/vijaydwivedi75/lrgb",
+}
+
+
+@dataclass
+class Graph:
+    x: Tensor
+    edge_index: Tensor
+    edge_attr: Tensor
+    y: Tensor
+    cycle_set: Tensor
+
+
+@dataclass
+class Batch(Graph):
+    batch: Tensor
+    ptr: Tensor
+
+    def to(self, device: torch.device) -> Batch:
+        return Batch(
+            **{f.name: getattr(self, f.name).to(device, non_blocking=True) for f in fields(self)}
+        )
+
+    def pin_memory(self) -> Batch:
+        return Batch(**{f.name: getattr(self, f.name).pin_memory() for f in fields(self)})
+
+
+def collate(graphs: list[Graph]) -> Batch:
+    counts = [len(g.x) for g in graphs]
+    ptr = torch.tensor([0, *np.cumsum(counts).tolist()], dtype=torch.long)
+    return Batch(
+        x=torch.cat([g.x for g in graphs]),
+        edge_index=torch.cat([g.edge_index + ptr[i] for i, g in enumerate(graphs)], dim=1),
+        edge_attr=torch.cat([g.edge_attr for g in graphs]),
+        y=torch.stack([g.y for g in graphs]),
+        cycle_set=torch.cat([g.cycle_set for g in graphs]),
+        batch=torch.repeat_interleave(torch.arange(len(graphs)), torch.tensor(counts)),
+        ptr=ptr,
+    )
+
+
+def graph_fingerprint(data: Any, digest: Any) -> None:
+    """Hash actual ordered topology, chemistry and labels, not just split sizes."""
+    for key in ("x", "edge_index", "edge_attr", "y"):
+        tensor = getattr(data, key).detach().cpu().contiguous()
+        array = tensor.numpy()
+        digest.update(key.encode())
+        digest.update(str((array.shape, array.dtype.str)).encode())
+        digest.update(array.tobytes())
+
+
+def cycle_statistics(num_nodes: int, edge_index: Tensor) -> Tensor:
+    """Six sign/column-order invariant summaries of one fixed BFS cycle basis.
+
+    Reuses the existing basis and set-statistics implementation, including
+    disconnected graphs componentwise. No m-by-m projector is constructed.
+    The chart is not invariant to recomputing BFS after arbitrary relabeling.
+    """
+    directed = edge_index.T.tolist()
+    edges = sorted({tuple(sorted((u, v))) for u, v in directed})
+    graph = nx.Graph()
+    graph.add_nodes_from(range(num_nodes))
+    graph.add_edges_from(edges)
+    edge_lookup = {edge: index for index, edge in enumerate(edges)}
+    blocks = []
+    components = sorted(nx.connected_components(graph), key=min)
+    for component in components:
+        nodes = sorted(component)
+        local = {node: i for i, node in enumerate(nodes)}
+        component_edges = [edge for edge in edges if edge[0] in component]
+        local_edges = [(local[u], local[v]) for u, v in component_edges]
+        incidence = incidence_matrix(len(nodes), local_edges)
+        tree = spanning_tree_indices(len(nodes), local_edges, mode="bfs")
+        block = static_fundamental_basis(incidence, tree)
+        blocks.append((component_edges, block))
+    rank = sum(block.shape[1] for _, block in blocks)
+    basis = np.zeros((len(edges), rank), dtype=np.float64)
+    offset = 0
+    for component_edges, block in blocks:
+        rows = [edge_lookup[edge] for edge in component_edges]
+        basis[rows, offset : offset + block.shape[1]] = block
+        offset += block.shape[1]
+    values = cycle_set_statistics(basis)
+    indices = [edge_lookup[tuple(sorted(edge))] for edge in directed]
+    return torch.from_numpy(values[indices].reshape(len(directed), len(SET_STAT_NAMES))).float()
+
+
+def prepare_graph(data: Any) -> Graph:
+    """Preserve chemistry/targets and compute only the original cycle-set PE."""
+    x = data.x.detach().cpu().long().reshape(int(data.num_nodes), -1)
+    edge_index = data.edge_index.detach().cpu().long().contiguous()
+    edge_attr = data.edge_attr.detach().cpu().long()
+    if edge_attr.ndim == 1:
+        edge_attr = edge_attr.unsqueeze(1)
+    if edge_attr.ndim != 2 or len(edge_attr) != edge_index.shape[1]:
+        raise ValueError("invalid official bond-feature shape")
+    y = data.y.detach().cpu().float().reshape(-1)
+    n = len(x)
+    if n < 1 or edge_index.ndim != 2 or edge_index.shape[0] != 2:
+        raise ValueError("invalid official graph shape")
+    if not torch.isfinite(y).all() or not torch.isfinite(data.x).all():
+        raise ValueError("nonfinite official input/target")
+    pairs = list(map(tuple, edge_index.T.tolist()))
+    if len(set(pairs)) != len(pairs) or any(u == v for u, v in pairs):
+        raise ValueError("molecular benchmark requires simple loop-free edges")
+    attributes = {edge: edge_attr[i] for i, edge in enumerate(pairs)}
+    for u, v in pairs:
+        if (v, u) not in attributes or not torch.equal(attributes[u, v], attributes[v, u]):
+            raise ValueError("molecular bonds must have agreeing directed copies")
+    # The original cycle-PE message layer itself sends messages in both
+    # directions, so retain exactly one copy per official undirected bond.
+    keep = edge_index[0] < edge_index[1]
+    edge_index = edge_index[:, keep]
+    edge_attr = edge_attr[keep]
+    return Graph(
+        x,
+        edge_index,
+        edge_attr,
+        y,
+        cycle_statistics(n, edge_index),
+    )
+
+
+def _ready(root: Path, dataset: str) -> bool:
+    if dataset == "zinc12k":
+        raw = root / "raw"
+        raw_names = [
+            f"{split}.{suffix}"
+            for split in ("train", "val", "test")
+            for suffix in ("pickle", "index")
+        ]
+    else:
+        raw = root / "peptides-struct" / "raw"
+        raw_names = [f"{split}.pt" for split in ("train", "val", "test")]
+    # PyG checks raw artifacts BEFORE processed files in Dataset.__init__.
+    # Processed-only caches must not trigger an implicit network download.
+    return all((raw / name).is_file() for name in raw_names)
+
+
+def load_official_splits(data_root: Path, dataset: str, *, allow_download: bool) -> dict[str, Any]:
+    if dataset not in DATASETS:
+        raise ValueError(f"unknown cycle PE dataset: {dataset}")
+    root = data_root / ("ZINC12K" if dataset == "zinc12k" else "LRGB")
+    if not allow_download and not _ready(root, dataset):
+        raise FileNotFoundError(f"{dataset}: official data absent at {root}; run prepare_data.sh")
+    try:
+        from torch_geometric.datasets import ZINC, LRGBDataset
+    except ImportError as exc:
+        raise RuntimeError(
+            "Cycle PE benchmarks require the project's PyG paper dependencies"
+        ) from exc
+    datasets = {}
+    for split, official in zip(SPLITS, ("train", "val", "test"), strict=True):
+        datasets[split] = (
+            ZINC(str(root), subset=True, split=official)
+            if dataset == "zinc12k"
+            else LRGBDataset(str(root), name="Peptides-struct", split=official)
+        )
+    sizes = tuple(len(datasets[split]) for split in SPLITS)
+    if sizes != EXPECTED_SIZES[dataset]:
+        raise RuntimeError(
+            f"{dataset} official split mismatch: {sizes} != {EXPECTED_SIZES[dataset]}"
+        )
+    return datasets
+
+
+def load_benchmark(
+    data_root: Path,
+    dataset: str,
+    *,
+    allow_download: bool,
+) -> tuple[dict[str, list[Graph]], dict[str, Any]]:
+    official = load_official_splits(data_root, dataset, allow_download=allow_download)
+    target_width = 1 if dataset == "zinc12k" else 11
+    signature = {
+        "version": CACHE_VERSION,
+        "dataset": dataset,
+        "representation": "existing_bfs_cycle_set",
+    }
+    key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:16]
+    cache_dir = data_root / "cycle_pe_benchmark" / dataset / key
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    result: dict[str, list[Graph]] = {}
+    split_hashes = {}
+    for split in SPLITS:
+        digest = hashlib.sha256()
+        for data in official[split]:
+            graph_fingerprint(data, digest)
+        split_hashes[split] = digest.hexdigest()
+        cache = cache_dir / f"{split}.pt"
+        meta = cache_dir / f"{split}.json"
+        if cache.exists() and meta.exists():
+            metadata = json.loads(meta.read_text(encoding="utf-8"))
+            if (
+                metadata.get("source_sha256") != split_hashes[split]
+                or metadata.get("signature") != signature
+                or metadata.get("cache_sha256") != hashlib.sha256(cache.read_bytes()).hexdigest()
+            ):
+                raise RuntimeError(f"Mismatched/corrupt PE cache: {cache}; no silent rebuild")
+            rows = torch.load(cache, map_location="cpu", weights_only=True)
+            graphs = [Graph(**row) for row in rows]
+        elif cache.exists() or meta.exists():
+            raise RuntimeError(
+                f"Incomplete PE cache at {cache_dir}; remove only this cache and prepare again"
+            )
+        else:
+            graphs = []
+            for index, data in enumerate(official[split]):
+                graph = prepare_graph(data)
+                if graph.y.numel() != target_width:
+                    raise ValueError(f"{dataset}: unexpected target width")
+                graphs.append(graph)
+                if (index + 1) % 1000 == 0:
+                    print(
+                        f"{dataset}/{split}: topology PE {index + 1}/{len(official[split])}",
+                        flush=True,
+                    )
+            rows = [
+                {field.name: getattr(graph, field.name) for field in fields(graph)}
+                for graph in graphs
+            ]
+            atomic_publish(cache, lambda path, payload=rows: torch.save(payload, path))
+            atomic_write_json(
+                meta,
+                {
+                    "signature": signature,
+                    "source_sha256": split_hashes[split],
+                    "cache_sha256": hashlib.sha256(cache.read_bytes()).hexdigest(),
+                },
+            )
+        if len(graphs) != len(official[split]):
+            raise RuntimeError(f"{dataset}: cached graph count mismatch")
+        result[split] = graphs
+    protocol = {
+        "comparison": "ours_only_on_official_benchmark_splits",
+        "source_url": SOURCES[dataset],
+        "official_splits": True,
+        "split_sizes": {s: len(result[s]) for s in SPLITS},
+        "split_content_sha256": split_hashes,
+        "target_width": target_width,
+        "target_scaling": "official supplied labels, unchanged; no fitted target scaling",
+        "input_features": "ZINC categorical atoms/bonds"
+        if dataset == "zinc12k"
+        else "OGB 9 atom / 3 bond categorical fields",
+        "preparation": signature,
+        "cache_directory": str(cache_dir),
+    }
+    return result, protocol
+````
+
+# research/cycle_pe/benchmark_models.py
+
+````python
+"""Our static cycle-set PE attached to this track's existing edge-aware GNN.
+
+The downstream message layers are reused from paper_model, not a separately run
+GINE/GAT/SignNet/PEARL baseline. Official categorical atom/bond features remain
+inputs; the cycle encoding is the existing fixed-BFS set representation.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor, nn
+
+from research.cycle_pe.benchmark_data import DATASETS, Batch
+from research.cycle_pe.features import SET_STAT_NAMES
+from research.cycle_pe.paper_model import _MessageLayer
+
+MODEL_NAME = "cycle_set"
+ATOM_DIMS = (119, 4, 12, 12, 10, 6, 6, 2, 2)
+BOND_DIMS = (5, 6, 2)
+
+
+class CategoricalEncoder(nn.Module):
+    def __init__(self, cardinalities: tuple[int, ...], output: int):
+        super().__init__()
+        self.embeddings = nn.ModuleList([nn.Embedding(width, output) for width in cardinalities])
+
+    def forward(self, x: Tensor) -> Tensor:
+        if x.shape[1] != len(self.embeddings):
+            raise ValueError("categorical input field count disagrees with official schema")
+        return torch.stack([layer(x[:, i]) for i, layer in enumerate(self.embeddings)]).sum(0)
+
+
+def _pool(values: Tensor, assignment: Tensor, count: int) -> tuple[Tensor, Tensor]:
+    total = values.new_zeros((count, values.shape[1])).index_add(0, assignment, values)
+    sizes = torch.bincount(assignment, minlength=count).clamp_min(1).unsqueeze(1)
+    maximum = values.new_full((count, values.shape[1]), -torch.inf)
+    maximum.scatter_reduce_(
+        0, assignment[:, None].expand_as(values), values, reduce="amax", include_self=True
+    )
+    maximum = torch.where(torch.isfinite(maximum), maximum, torch.zeros_like(maximum))
+    return total / sizes, maximum
+
+
+class CyclePEModel(nn.Module):
+    """Only our cycle-set model; no architecture selector or competing run."""
+
+    def __init__(self, *, dataset: str, hidden: int = 64, pe_dim: int = 32, layers: int = 3):
+        super().__init__()
+        if dataset not in DATASETS:
+            raise ValueError(f"unknown dataset: {dataset}")
+        self.node_encoder = CategoricalEncoder((28,) if dataset == "zinc12k" else ATOM_DIMS, hidden)
+        self.bond_encoder = CategoricalEncoder((4,) if dataset == "zinc12k" else BOND_DIMS, hidden)
+        self.pe_encoder = nn.Sequential(
+            nn.Linear(len(SET_STAT_NAMES), pe_dim), nn.GELU(), nn.Linear(pe_dim, pe_dim)
+        )
+        self.edge_encoder = nn.Sequential(nn.Linear(hidden + pe_dim, hidden), nn.GELU())
+        # This is the existing track backbone, including symmetric edge updates,
+        # bidirectional messages, degree-normalized aggregation and LayerNorm.
+        self.layers = nn.ModuleList(_MessageLayer(hidden) for _ in range(layers))
+        self.graph_trunk = nn.Sequential(
+            nn.Linear(4 * hidden, hidden), nn.GELU(), nn.Linear(hidden, hidden)
+        )
+        self.graph_head = nn.Linear(hidden, 1 if dataset == "zinc12k" else 11)
+
+    def forward(self, batch: Batch) -> Tensor:
+        node = self.node_encoder(batch.x)
+        edge = self.edge_encoder(
+            torch.cat((self.bond_encoder(batch.edge_attr), self.pe_encoder(batch.cycle_set)), dim=1)
+        )
+        # _MessageLayer consumes exactly one representative per undirected bond.
+        # Stable FP32 scatter arithmetic is retained under optional AMP; heads
+        # and feature encoders may use autocast.
+        with torch.autocast(device_type=node.device.type, enabled=False):
+            node, edge = node.float(), edge.float()
+            for layer in self.layers:
+                node, edge = layer(node, edge, batch.edge_index.T)
+            graph_count = len(batch.ptr) - 1
+            node_mean, node_max = _pool(node, batch.batch, graph_count)
+            edge_graph = batch.batch[batch.edge_index[0]]
+            edge_mean, edge_max = _pool(edge, edge_graph, graph_count)
+            pooled = torch.cat((node_mean, node_max, edge_mean, edge_max), dim=1)
+        return self.graph_head(self.graph_trunk(pooled))
+
+
+def architecture_protocol() -> dict[str, str]:
+    return {
+        "model": MODEL_NAME,
+        "positional_encoding": (
+            "existing BFS fundamental-cycle basis and cycle_set_statistics; "
+            "six sign/column-order-invariant summaries, GELU MLP"
+        ),
+        "backbone": (
+            "existing cycle_pe.paper_model._MessageLayer edge-aware GNN; "
+            "not a separate external-model baseline"
+        ),
+        "pe_injection": "concatenate learned cycle-set PE with categorical bond embedding",
+        "pooling": "node mean/max and edge mean/max, then graph MLP",
+        "cycle_symmetry": (
+            "invariant to cycle-column signs/order; conditional on fixed BFS chart, "
+            "not arbitrary chart replacement"
+        ),
+        "reference_comparison": (
+            "external published tables only; this executable trains only our cycle-set model"
+        ),
+        "numeric_policy": "message layers and scatter pooling stay FP32 under optional AMP",
+    }
+````
+
 # research/cycle_pe/cache_validation.py
 
 ````python
@@ -7245,6 +8985,40 @@ def validate_dataset_cache(
 
 
 __all__ = ["validate_dataset_cache"]
+
+
+def validate_benchmark_cache(
+    dataset_id: str,
+    data_root: Path,
+    *,
+    data_seeds: tuple[int, ...],
+    split_seeds: tuple[int, ...],
+) -> dict[str, Any]:
+    """Read-only official molecular-split validation; never invoke a downloader."""
+    del data_seeds, split_seeds
+    from .benchmark_data import EXPECTED_SIZES, _ready
+
+    root = data_root.expanduser().resolve()
+    if dataset_id == "zinc12k":
+        if not _ready(root / "ZINC12K", "zinc12k"):
+            raise FileNotFoundError("ZINC raw artifacts are required for offline PyG loading")
+        return _validate_zinc(root)
+    if dataset_id != "peptides_struct":
+        raise ValueError(f"unsupported matched PE dataset: {dataset_id}")
+    if not _ready(root / "LRGB", "peptides_struct"):
+        raise FileNotFoundError("Peptides-struct official raw train/val/test artifacts are missing")
+    processed = root / "LRGB" / "peptides-struct" / "processed"
+    paths = {split: processed / f"{split}.pt" for split in ("train", "val", "test")}
+    if not all(path.is_file() for path in paths.values()):
+        raise CacheIncompleteError("Peptides-struct processed official splits are incomplete")
+    counts = {name: _pyg_processed_count(path) for name, path in paths.items()}
+    if tuple(counts.values()) != EXPECTED_SIZES["peptides_struct"]:
+        raise CacheCorruptError(f"Peptides-struct split cardinalities disagree: {counts}")
+    return {
+        "paths": [str(path) for path in paths.values()],
+        "split_sizes": counts,
+        "sha256": {name: sha256_file(path) for name, path in paths.items()},
+    }
 ````
 
 # research/cycle_pe/datasets.yaml
@@ -7253,12 +9027,12 @@ __all__ = ["validate_dataset_cache"]
 registry_version: 2
 track: cycle_pe
 paper_suite_complete: true
-claim: Static cycle-space PE is evaluated on independent cycle-count targets, official BREC RPC, and ZINC-12K.
+claim: Train only our cycle-set PE on official ZINC-12K and Peptides-struct splits used by PE literature; reference results are compared externally.
 
 datasets:
   - id: cyclecount_ood
     name: CycleCount-OOD
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: generated
     cache_glob: cycle_count_ood/*.json.gz
@@ -7274,7 +9048,7 @@ datasets:
 
   - id: brec_v3
     name: BREC v3
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: download
     cache_glob: BREC/Data/raw/brec_v3.npy
@@ -7294,13 +9068,13 @@ datasets:
     data_policy: download
     cache_glob: ZINC12K/subset/processed/*.pt
     source_url: https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.ZINC.html
-    task: Molecular constrained-solubility graph regression with official PyG subset partitions.
+    task: Penalized logP graph regression on the same official ZINC subset used by SignNet and PEARL.
     split: Official 10000/1000/1000 train, validation, and test split.
-    metrics: [mae, rmse, normalized_mae, graph_macro_mae]
-    claim: Real molecular graph utility under a common static-cycle PE backbone.
-    adapter: python -m research.cycle_pe.paper --suite zinc
-    validator: research.cycle_pe.cache_validation.validate_dataset_cache
-    leakage_guard: Chemistry features and topology PE are fixed before training; raw PE width is fit on train only.
+    metrics: [mae]
+    claim: Only our original cycle-set PE with this track's existing edge-aware GNN is trained; no competing models are reimplemented or run.
+    adapter: python -m research.cycle_pe.benchmark --suite benchmark --datasets zinc12k
+    validator: research.cycle_pe.cache_validation.validate_benchmark_cache
+    leakage_guard: Official split preserved; unchanged targets; best validation checkpoint only; split content hashes recorded.
 
   - id: aqsol
     name: AQSOL scaffold OOD
@@ -7315,18 +9089,33 @@ datasets:
     adapter: No AQSOL adapter is implemented in this track.
     leakage_guard: Do not replace the official scaffold split with a random split.
 
-  - id: peptides
-    name: LRGB Peptides-func and Peptides-struct
-    tier: optional
-    status: planned
+  - id: peptides_struct
+    name: LRGB Peptides-struct
+    tier: paper_core
+    status: implemented
     data_policy: download
+    cache_glob: LRGB/peptides-struct/processed/*.pt
     source_url: https://github.com/vijaydwivedi75/lrgb
-    task: Long-range molecular graph classification and regression.
-    split: Official 70/15/15 splits.
-    metrics: [average_precision, mae]
-    claim: Optional larger-graph scaling and long-range utility.
-    adapter: A future LRGB/PyG molecular adapter is planned.
-    leakage_guard: Use the official evaluator and report PE preprocessing memory and time.
+    task: Predict 11 supplied 3D-derived graph targets from 2D atom-bond graphs; used by PEARL Appendix K.2.
+    split: Official 10873/2331/2331 train/validation/test split.
+    metrics: [mae]
+    claim: Only our cycle-set PE model is trained, as on ZINC; no 3D target information is used as model input.
+    adapter: python -m research.cycle_pe.benchmark --suite benchmark --datasets peptides_struct
+    validator: research.cycle_pe.cache_validation.validate_benchmark_cache
+    leakage_guard: Preserve the official already standardized y and split; no re-splitting or target-derived features.
+
+  - id: alchemy12k
+    name: SignNet Alchemy-12K archival split
+    tier: optional
+    status: blocked
+    data_policy: download
+    source_url: https://github.com/cptq/SignNet-BasisNet/tree/main/Alchemy
+    task: Twelve quantum chemistry graph regression targets.
+    split: Upstream train_al_10.index / val_al_10.index / test_al_10.index require provenance and overlap resolution.
+    metrics: [normalized_mae]
+    claim: Not executed or advertised as a clean default benchmark.
+    adapter: No adapter enabled because audited upstream indices contain duplicates and cross-split overlap.
+    leakage_guard: Do not silently redraw splits or present train-only target normalization as the published protocol.
 ````
 
 # research/cycle_pe/features.py
@@ -8939,8 +10728,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument(
         "--variants",
-        default=",".join(PE_VARIANTS),
-        help="comma-separated subset of no_pe,raw,set,projector",
+        default="raw,set,projector",
+        help="own PE ablations: raw,set,projector; no_pe only when explicitly requested",
     )
     parser.add_argument(
         "--core-targets",
@@ -11173,7 +12962,7 @@ __all__ = [
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-exec bash "${project_root}/scripts/paper.sh" --suite all --tracks cycle_pe "$@"
+exec bash "${project_root}/scripts/paper.sh" --suite benchmark --tracks cycle_pe "$@"
 ````
 
 # research/cycle_pe/tests/fixtures.py
@@ -11235,6 +13024,253 @@ def write_brec_fixture(path: Path, *, num_relabel: int = 2) -> Path:
                 )
     np.save(path, np.asarray(train_records + reliability_records, dtype=object), allow_pickle=True)
     return path
+````
+
+# research/cycle_pe/tests/test_benchmark.py
+
+````python
+"""Unit fixtures only; the experiment CLI never creates substitute datasets."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import fields, replace
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from chartgat.algebra import incidence_matrix
+from chartgat.graphs import spanning_tree_indices
+from research.cycle_pe import benchmark
+from research.cycle_pe.benchmark_data import (
+    CACHE_VERSION,
+    DATASETS,
+    EXPECTED_SIZES,
+    Graph,
+    _ready,
+    collate,
+    cycle_statistics,
+    graph_fingerprint,
+    prepare_graph,
+)
+from research.cycle_pe.benchmark_models import MODEL_NAME, CyclePEModel
+from research.cycle_pe.features import cycle_set_statistics, static_fundamental_basis
+from research.cycle_pe.paper_model import _MessageLayer
+
+
+def _data(n: int = 4) -> SimpleNamespace:
+    undirected = [(i, (i + 1) % n) for i in range(n)]
+    edge_index = torch.tensor(undirected + [(v, u) for u, v in undirected]).T.contiguous()
+    return SimpleNamespace(
+        num_nodes=n,
+        x=torch.arange(n).reshape(-1, 1),
+        edge_index=edge_index,
+        edge_attr=torch.ones((2 * n, 1), dtype=torch.long),
+        y=torch.tensor([0.7]),
+    )
+
+
+def _graph(n: int = 4) -> Graph:
+    return prepare_graph(_data(n))
+
+
+def test_defaults_keep_paper_datasets_and_only_our_model() -> None:
+    args = benchmark.parser().parse_args([])
+    assert tuple(args.datasets) == DATASETS == ("zinc12k", "peptides_struct")
+    assert EXPECTED_SIZES["zinc12k"] == (10000, 1000, 1000)
+    assert sum(EXPECTED_SIZES["peptides_struct"]) == 15535
+    assert MODEL_NAME == "cycle_set"
+    assert not hasattr(args, "baselines")
+    assert not hasattr(args, "tiny")
+    with pytest.raises(SystemExit):
+        benchmark.parser().parse_args(["--baselines", "signnet"])
+
+
+def test_cpu_actual_benchmark_is_rejected() -> None:
+    args = benchmark.parser().parse_args(["--device", "cpu"])
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        benchmark._validate(args)
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        benchmark._train_model("zinc12k", {}, args)
+
+
+def test_processed_only_cache_does_not_authorize_implicit_pyg_download(tmp_path) -> None:
+    processed = tmp_path / "subset" / "processed"
+    processed.mkdir(parents=True)
+    for name in ("train", "val", "test"):
+        (processed / f"{name}.pt").touch()
+    assert not _ready(tmp_path, "zinc12k")
+
+
+def test_fingerprint_hashes_targets_features_and_order() -> None:
+    def fingerprint(data):
+        digest = hashlib.sha256()
+        graph_fingerprint(data, digest)
+        return digest.hexdigest()
+
+    original = _data()
+    expected = fingerprint(original)
+    original.y += 1
+    assert fingerprint(original) != expected
+    changed = _data()
+    changed.x[0, 0] += 1
+    assert fingerprint(changed) != expected
+
+
+def test_preparation_has_only_cycle_pe_and_preserves_targets() -> None:
+    data = _data(4)
+    graph = prepare_graph(data)
+    assert {field.name for field in fields(graph)} == {
+        "x",
+        "edge_index",
+        "edge_attr",
+        "y",
+        "cycle_set",
+    }
+    assert CACHE_VERSION == "own-cycle-set-v2"
+    assert graph.edge_index.shape == (2, 4)
+    assert (graph.edge_index[0] < graph.edge_index[1]).all()
+    assert graph.cycle_set.shape == (4, 6)
+    torch.testing.assert_close(graph.y, data.y)
+    torch.testing.assert_close(graph.x, data.x)
+
+
+def test_cycle_set_preserves_existing_basis_summary_semantics() -> None:
+    edges = [(0, 1), (0, 2), (0, 3), (1, 2), (2, 3)]
+    incidence = incidence_matrix(4, edges)
+    tree = spanning_tree_indices(4, edges, mode="bfs")
+    expected = cycle_set_statistics(static_fundamental_basis(incidence, tree))
+    directed = torch.tensor(edges + [(v, u) for u, v in edges]).T
+    actual = cycle_statistics(4, directed)
+    np.testing.assert_allclose(actual[: len(edges)].numpy(), expected, rtol=1e-6)
+    torch.testing.assert_close(actual[: len(edges)], actual[len(edges) :])
+
+
+def test_our_model_reuses_existing_layers_and_all_parameters_receive_gradients() -> None:
+    torch.manual_seed(5)
+    model = CyclePEModel(dataset="zinc12k", hidden=12, pe_dim=6, layers=2)
+    assert all(isinstance(layer, _MessageLayer) for layer in model.layers)
+    graphs = [_graph(4), _graph(5)]
+    batch = collate(graphs)
+    output = model(batch)
+    assert output.shape == (2, 1)
+    (output - batch.y).abs().mean().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    model.eval()
+    with torch.no_grad():
+        combined = model(batch)
+        separate = torch.cat([model(collate([graph])) for graph in graphs])
+    torch.testing.assert_close(combined, separate, atol=3e-6, rtol=3e-6)
+
+
+def test_graph_readout_is_permutation_invariant_given_transported_cycle_chart() -> None:
+    torch.manual_seed(4)
+    graph = _graph(5)
+    model = CyclePEModel(dataset="zinc12k", hidden=12, pe_dim=6, layers=2).eval()
+    permutation = torch.tensor([3, 0, 4, 1, 2])
+    inverse = torch.argsort(permutation)
+    transformed = replace(graph, x=graph.x[permutation], edge_index=inverse[graph.edge_index])
+    torch.testing.assert_close(model(collate([graph])), model(collate([transformed])))
+    reverse = replace(graph, edge_index=graph.edge_index.flip(0))
+    torch.testing.assert_close(model(collate([graph])), model(collate([reverse])))
+
+
+def test_cycle_set_amp_aggregation_matches_tensor_dtype() -> None:
+    model = CyclePEModel(dataset="zinc12k", hidden=12, pe_dim=6, layers=2)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        result = model(collate([_graph()]))
+    assert torch.isfinite(result).all()
+
+
+def test_peptides_uses_eleven_official_targets_and_stays_within_budget() -> None:
+    data = _data()
+    data.x = torch.zeros((4, 9), dtype=torch.long)
+    data.edge_attr = torch.zeros((8, 3), dtype=torch.long)
+    data.y = torch.arange(11).float()
+    graph = prepare_graph(data)
+    model = CyclePEModel(dataset="peptides_struct")
+    assert model(collate([graph])).shape == (1, 11)
+    assert sum(p.numel() for p in model.parameters()) <= 500_000
+
+
+@pytest.mark.parametrize(
+    "dataset,atom_width,bond_width,target_width",
+    [
+        ("zinc12k", 1, 1, 1),
+        ("peptides_struct", 9, 3, 11),
+    ],
+)
+def test_edgeless_graph_preparation_and_readout(dataset, atom_width, bond_width, target_width):
+    data = SimpleNamespace(
+        num_nodes=1,
+        x=torch.zeros((1, atom_width), dtype=torch.long),
+        edge_index=torch.empty((2, 0), dtype=torch.long),
+        edge_attr=torch.empty((0, bond_width), dtype=torch.long),
+        y=torch.zeros(target_width),
+    )
+    graph = prepare_graph(data)
+    model = CyclePEModel(dataset=dataset, hidden=12, pe_dim=6, layers=2)
+    output = model(collate([graph]))
+    assert output.shape == (1, target_width)
+    assert torch.isfinite(output).all()
+
+
+def test_prepare_only_reports_prepared_never_passed_training(tmp_path, monkeypatch) -> None:
+    graph = _graph()
+    monkeypatch.setattr(
+        benchmark,
+        "load_benchmark",
+        lambda *a, **kw: (
+            {s: [graph] for s in ("train", "validation", "test")},
+            {"official_splits": True, "fixture_only": True},
+        ),
+    )
+    output = tmp_path / "result"
+    assert (
+        benchmark.main(
+            [
+                "--datasets",
+                "zinc12k",
+                "--prepare-only",
+                "--device",
+                "cpu",
+                "--output-dir",
+                str(output),
+                "--data-root",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    metrics = json.loads((output / "metrics.json").read_text())
+    assert metrics["schema_version"] == 2
+    assert metrics["status"] == "prepared"
+    assert metrics["datasets"]["zinc12k"]["models"] == {}
+    with pytest.raises(FileExistsError):
+        benchmark.main(["--datasets", "zinc12k", "--prepare-only", "--output-dir", str(output)])
+
+
+def test_main_invokes_only_our_model_once_per_dataset(tmp_path, monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(benchmark, "_validate", lambda args: None)
+    monkeypatch.setattr(benchmark, "load_benchmark", lambda *a, **kw: ({}, {}))
+
+    def fake_train(dataset, splits, args):
+        calls.append(dataset)
+        return {"test": 0.5, "validation": 0.4}
+
+    monkeypatch.setattr(benchmark, "_train_model", fake_train)
+    output = tmp_path / "ours"
+    benchmark.main(["--output-dir", str(output), "--data-root", str(tmp_path)])
+    assert calls == list(DATASETS)
+    metrics = json.loads((output / "metrics.json").read_text())
+    assert metrics["schema_version"] == 2
+    for dataset in DATASETS:
+        assert set(metrics["datasets"][dataset]["models"]) == {"cycle_set"}
+        assert "baselines" not in metrics["datasets"][dataset]
 ````
 
 # research/cycle_pe/tests/test_brec_protocol.py
@@ -11859,7 +13895,7 @@ def test_core_prepare_only_stops_before_training(tmp_path) -> None:
     )
     manifest = json.loads((output_root / "core" / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["prepare_only"] is True
-    assert manifest["variants"] == ["no_pe", "raw", "set", "projector"]
+    assert manifest["variants"] == ["raw", "set", "projector"]
     assert manifest["experiments"] == {}
     assert manifest["runtime_environment"]["workers"] == 1
     assert not list((output_root / "core").glob("*/model.pt"))
@@ -12757,7 +14793,7 @@ claim: Spanning-tree chart augmentation improves robustness without changing dow
 datasets:
   - id: cyclecount_ood_multichart
     name: CycleCount-OOD multi-chart protocol
-    tier: paper_core
+    tier: optional
     status: implemented
     data_policy: generated
     cache_glob: cyclecount_ood_v2/*.manifest.json
@@ -12778,7 +14814,7 @@ datasets:
     cache_glob: csl_pyg_v2/*.manifest.json
     source_url: https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.GNNBenchmarkDataset.html
     task: Ten-class circular-skip-link graph classification under fresh BFS and held-out Wilson sampler-family charts.
-    split: Deterministic label-stratified five-fold 3/1/1 protocol cached by graph index.
+    split: One deterministic label-stratified 90/30/30 partition cached by graph index; not the complete five-fold benchmark sweep.
     metrics: [accuracy, worst_chart_accuracy, chart_std]
     claim: Controlled fixed-beta chart robustness, not broad real-world generalization.
     adapter: python -m research.tree_augmentation.paper --suite csl (optional PyG)
@@ -15364,7 +17400,7 @@ __all__ = [
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-exec bash "${project_root}/scripts/paper.sh" --suite all --tracks tree_augmentation "$@"
+exec bash "${project_root}/scripts/paper.sh" --suite benchmark --tracks tree_augmentation "$@"
 ````
 
 # research/tree_augmentation/tests/test_paper.py
@@ -16169,10 +18205,8 @@ CONDITIONS = {
     "flux_ls",
     "node_message_nnls",
     "oracle",
-    "no_message_mlp",
-    "gcn",
-    "gat",
-    "gine",
+    "conductance",
+    "cycle_set",
     "conductance_model",
     "fixed_bfs",
     "multi_chart",
@@ -16235,8 +18269,24 @@ _TREE_EVALUATION_METRICS = (
 # does not make it a paper metric until a reviewer deliberately extends this
 # schema.  Runtime, memory, parameter counts, configuration, sample counts, seed
 # axes, and optimization histories therefore cannot leak into hypothesis tests.
-PAPER_METRIC_SCHEMA_VERSION = 2
+# Published competitor scores belong in the cited manuscript table, not in this
+# run registry or in paired statistics with our own experiment seeds.
+PAPER_METRIC_SCHEMA_VERSION = 4
 PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
+    _metric_rule(
+        "conductance.our_model.test",
+        "conductance_gat",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.conductance\.test",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.our_model.test",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_set\.test",
+        pairable=False,
+    ),
     _metric_rule(
         "conductance.core.prediction",
         "conductance_gat",
@@ -16270,8 +18320,8 @@ PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "conductance_gat",
         r"summary\.json",
         r"results\.public\.[^.]+\.baselines\."
-        r"(?:no_message_mlp|gcn|gat|gine|conductance_model)\.test\.(?:macro_f1|roc_auc)",
-        pairable=True,
+        r"conductance_model\.test\.(?:macro_f1|roc_auc)",
+        pairable=False,
     ),
     _metric_rule(
         "cycle.supervised.test",
@@ -16320,8 +18370,24 @@ PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
 # deliberately limited to elapsed time, peak accelerator memory, and active
 # trainable parameter counts; epochs, batch size, workers, and seeds are not
 # efficiency outcomes.
-EFFICIENCY_METRIC_SCHEMA_VERSION = 1
+EFFICIENCY_METRIC_SCHEMA_VERSION = 3
 EFFICIENCY_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
+    _metric_rule(
+        "conductance.our_model.efficiency",
+        "conductance_gat",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.conductance\."
+        r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.our_model.efficiency",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_set\."
+        r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
+        pairable=False,
+    ),
     _metric_rule(
         "conductance.runtime",
         "conductance_gat",
@@ -16334,7 +18400,7 @@ EFFICIENCY_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "conductance_gat",
         r"summary\.json",
         r"results\.public\.[^.]+\.baselines\."
-        r"(?:no_message_mlp|gcn|gat|gine|conductance_model)\.parameter_count",
+        r"conductance_model\.parameter_count",
         pairable=False,
     ),
     _metric_rule(
@@ -17625,7 +19691,7 @@ cd "${project_root}"
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec bash "${project_root}/scripts/paper.sh" --suite all --prepare-only --allow-download "$@"
+exec bash "${project_root}/scripts/paper.sh" --suite benchmark --prepare-only --allow-download "$@"
 ````
 
 # scripts/reproduce.sh
@@ -17635,7 +19701,7 @@ exec bash "${project_root}/scripts/paper.sh" --suite all --prepare-only --allow-
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-exec bash "${project_root}/scripts/paper.sh" --suite all "$@"
+exec bash "${project_root}/scripts/paper.sh" --suite benchmark "$@"
 ````
 
 # scripts/run_paper.py
@@ -17674,8 +19740,13 @@ TRACK_MODULES = {
     "cycle_pe": "research.cycle_pe.paper",
     "tree_augmentation": "research.tree_augmentation.paper",
 }
+BENCHMARK_MODULES = {
+    "conductance_gat": "research.conductance_gat.benchmark",
+    "cycle_pe": "research.cycle_pe.benchmark",
+}
 CYCLE_BREC_OFFICIAL_SEEDS = (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
 CYCLE_VARIANTS = ("no_pe", "raw", "set", "projector")
+DEFAULT_CYCLE_VARIANTS = ("raw", "set", "projector")
 CYCLE_CORE_TARGETS = ("edge", "node", "graph")
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -17764,7 +19835,7 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
             "--json-out",
             str(preflight_output),
         ]
-        if args.suite == "all":
+        if args.suite in {"all", "benchmark"}:
             preflight.append("--require-paper-deps")
         commands.append(("gpu_preflight", preflight, preflight_output))
     brec_protocol = "official"
@@ -17796,13 +19867,18 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
         workers: int | None = None,
         amp: bool | None = None,
     ) -> None:
-        effective_batch_size = args.batch_size if batch_size is None else batch_size
+        default_batch_size = 2 if track == "conductance_gat" and suite == "benchmark" else 32
+        requested_batch_size = (
+            args.batch_size if args.batch_size is not None else default_batch_size
+        )
+        effective_batch_size = requested_batch_size if batch_size is None else batch_size
         effective_workers = args.workers if workers is None else workers
-        effective_amp = args.amp if amp is None else amp
+        requested_amp = args.amp if args.amp is not None else args.suite != "benchmark"
+        effective_amp = requested_amp if amp is None else amp
         command = [
             sys.executable,
             "-m",
-            TRACK_MODULES[track],
+            BENCHMARK_MODULES[track] if suite == "benchmark" else TRACK_MODULES[track],
             "--suite",
             suite,
             "--data-root",
@@ -17838,6 +19914,24 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
 
     executed_model_seeds = args.model_seeds[:1] if args.prepare_only else args.model_seeds
     for track in selected_tracks:
+        if args.suite == "benchmark":
+            # Original-paper public datasets with our models only.  Tree
+            # augmentation keeps its own fixed-vs-multi-chart comparison on
+            # public CSL/ZINC; it remains an ablation of our own model.
+            suites = ("csl", "zinc") if track == "tree_augmentation" else ("benchmark",)
+            for model_seed in executed_model_seeds:
+                for suite in suites:
+                    add_child(
+                        track=track,
+                        suite=suite,
+                        model_seed=model_seed,
+                        name=f"{track}:{suite}:model-seed-{model_seed}",
+                        output_dir=(
+                            _output_dir(track, run_id, model_seed, args.results_root) / suite
+                        ),
+                    )
+            continue
+
         # BREC already performs its official ten model-search seeds internally.
         # Under suite=all, run CycleCount and ZINC for every outer experiment
         # seed, but dispatch BREC exactly once rather than multiplying it by the
@@ -18030,7 +20124,15 @@ def _parser() -> argparse.ArgumentParser:
         choices=("all", *TRACK_MODULES),
         default=["all"],
     )
-    parser.add_argument("--suite", choices=("core", "all"), default="core")
+    parser.add_argument(
+        "--suite",
+        choices=("benchmark", "core", "all"),
+        default="benchmark",
+        help=(
+            "benchmark: our models on track-specific public datasets (default); "
+            "core/all: supplementary own-method studies"
+        ),
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--run-id", type=_run_id)
     parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "data" / "paper")
@@ -18053,8 +20155,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cycle-variants",
         type=_cycle_variants,
-        default=CYCLE_VARIANTS,
-        help="comma-separated Cycle PE candidates forwarded only to the cycle track",
+        default=DEFAULT_CYCLE_VARIANTS,
+        help="supplementary Cycle PE variants; no_pe is an explicit optional ablation",
     )
     parser.add_argument(
         "--cycle-core-targets",
@@ -18064,7 +20166,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cycle-epochs", type=int)
     parser.add_argument("--cycle-learning-rate", type=float)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        help="override track batch size (default: PPI 2, molecular/tree graphs 32)",
+    )
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--min-free-gb", type=float, default=2.0)
     parser.add_argument("--prepare-only", action="store_true")
@@ -18086,13 +20192,18 @@ def _parser() -> argparse.ArgumentParser:
         help="deprecated compatibility alias for the default independent-run behavior",
     )
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--amp",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override precision (benchmark defaults to float32; supplementary suites use AMP)",
+    )
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
-    if args.batch_size < 1 or args.workers < 0:
+    if (args.batch_size is not None and args.batch_size < 1) or args.workers < 0:
         print("batch size must be positive and workers must be non-negative", file=sys.stderr)
         return 2
     if min(args.data_seed, args.split_seed, args.chart_seed) < 0:
@@ -18165,8 +20276,13 @@ def main() -> int:
                     "learning_rate_override": args.cycle_learning_rate,
                     "official_brec_optimization_overrides_ignored": True,
                 }
-                if "cycle_pe" in tracks
+                if "cycle_pe" in tracks and args.suite != "benchmark"
                 else None
+            ),
+            "comparison_protocol": (
+                "our_models_only_on_track_specific_public_datasets"
+                if args.suite == "benchmark"
+                else "supplementary_research_suites"
             ),
             "gpu_preflight": None
             if args.prepare_only
@@ -19356,6 +21472,79 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+@pytest.mark.parametrize(
+    ("track", "dataset", "model"),
+    [
+        ("conductance_gat", "cora", "conductance"),
+        ("cycle_pe", "zinc12k", "cycle_set"),
+    ],
+)
+def test_benchmarks_aggregate_only_our_model_and_ignore_published_scores(
+    tmp_path: Path,
+    track: str,
+    dataset: str,
+    model: str,
+) -> None:
+    commands = []
+    for seed in (0, 1):
+        output = tmp_path / f"seed-{seed}"
+        _write_json(
+            output / "metrics.json",
+            {
+                "track": track,
+                "suite": "benchmark",
+                "datasets": {
+                    dataset: {
+                        "models": {
+                            model: {
+                                "test": 0.1 + seed * 0.01,
+                                "validation": 0.05,
+                                "best_epoch": 15,
+                                "trainable_parameters": 1000,
+                                "elapsed_seconds": 3.0,
+                                "peak_gpu_memory_bytes": 2048,
+                            },
+                            "external_model": {"test": 0.5, "elapsed_seconds": 8.0},
+                        },
+                        "published_reference": {"test": 0.4, "std": 0.02},
+                        "baselines": {"gat": {"test": 0.3}, "signnet": {"test": 0.2}},
+                    },
+                },
+            },
+        )
+        commands.append(
+            {
+                "name": f"{track}:benchmark:model-seed-{seed}",
+                "command": [
+                    "python",
+                    "--suite",
+                    "benchmark",
+                    "--model-seed",
+                    str(seed),
+                    "--data-seed",
+                    "0",
+                    "--split-seed",
+                    "0",
+                    "--chart-seed",
+                    "0",
+                ],
+                "returncode": 0,
+                "artifact_errors": [],
+                "output": str(output),
+            }
+        )
+    manifest = tmp_path / "manifest.json"
+    _write_json(manifest, {"run_id": "matched", "status": "passed", "commands": commands})
+    result = aggregate_manifest(manifest, bootstrap_samples=0)
+    assert result["metric_groups"] == 1
+    assert result["sample_rows"] == 2
+    assert result["efficiency_rows"] == 6
+    assert result["ignored_numeric_fields"] > 0
+    with (tmp_path / "aggregate" / "paired.csv").open(encoding="utf-8", newline="") as stream:
+        pairs = list(csv.DictReader(stream))
+    assert pairs == []
+
+
 def test_aggregate_keeps_data_axes_fixed_and_pairs_model_seeds(tmp_path: Path) -> None:
     commands = []
     for model_seed, full, edge in ((1, 0.2, 0.5), (2, 0.4, 0.7)):
@@ -20281,6 +22470,18 @@ def test_paper_dataset_profile_matches_complete_core_code(tmp_path: Path) -> Non
     assert all(row["tier"] == "paper_core" for row in payload["rows"])
     assert all(row["status"] == "implemented" for row in payload["rows"])
     assert all(row["cache_status"] == "not_checked" for row in payload["rows"])
+    assert {(row["track"], row["id"]) for row in payload["rows"]} == {
+        ("conductance_gat", "cora"),
+        ("conductance_gat", "citeseer"),
+        ("conductance_gat", "pubmed"),
+        ("conductance_gat", "ppi"),
+        ("conductance_gat", "ogbn-arxiv"),
+        ("cycle_pe", "zinc12k"),
+        ("cycle_pe", "peptides_struct"),
+        ("tree_augmentation", "csl_chart_sanity"),
+        ("tree_augmentation", "zinc12k_multichart"),
+    }
+    assert all(row["data_policy"] == "download" for row in payload["rows"])
 
 
 def test_complete_flag_is_derived_only_from_required_core_status() -> None:
@@ -20364,13 +22565,19 @@ def test_checker_routes_requested_axes_to_full_dataset_validators(
 ) -> None:
     original_resolver = check_datasets._load_python_reference
     calls: list[tuple[str, Path, dict[str, object]]] = []
+    validator_references = {
+        entry["validator"]
+        for track in check_datasets.TRACKS
+        for entry in check_datasets.load_registry(track)["datasets"]
+        if entry["tier"] == "paper_core"
+    }
 
     def validator(dataset_id: str, data_root: Path, **kwargs: object) -> dict[str, object]:
         calls.append((dataset_id, data_root, kwargs))
         return {"validated": dataset_id}
 
     def resolve(reference: str) -> object:
-        if reference.endswith(".validate_dataset_cache"):
+        if reference in validator_references:
             return validator
         return original_resolver(reference)
 
@@ -20389,7 +22596,7 @@ def test_checker_routes_requested_axes_to_full_dataset_validators(
     assert payload["cached_data_ready"] is True
     assert payload["requested_seed_axes"] == {"data": [11, 17], "split": [13]}
     assert "tiny" not in payload
-    assert calls
+    assert len(calls) == len(payload["rows"])
     for _, root, kwargs in calls:
         assert root == tmp_path.resolve()
         assert kwargs == {"data_seeds": (11, 17), "split_seeds": (13,)}
@@ -20963,11 +23170,11 @@ def test_paper_runner_routes_independent_seed_axes(capsys: pytest.CaptureFixture
         capsys,
     )
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.count("--data-seed 11") == 2
-    assert completed.stdout.count("--split-seed 13") == 2
-    assert completed.stdout.count("--chart-seed 17") == 2
-    assert completed.stdout.count("--model-seed 5") == 1
-    assert completed.stdout.count("--model-seed 7") == 1
+    assert completed.stdout.count("--data-seed 11") == 4
+    assert completed.stdout.count("--split-seed 13") == 4
+    assert completed.stdout.count("--chart-seed 17") == 4
+    assert completed.stdout.count("--model-seed 5") == 2
+    assert completed.stdout.count("--model-seed 7") == 2
 
 
 def test_paper_runner_exposes_cycle_candidate_reduction_without_overriding_official_brec(
@@ -21036,6 +23243,18 @@ def test_cycle_runner_forwards_selected_non_projector_variants(
         capsys,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_supplementary_default_runs_own_pe_variants_without_no_pe(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    completed = _dry_run(
+        ["--dry-run", "--tracks", "cycle_pe", "--suite", "core", "--model-seeds", "0"],
+        capsys,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "--variants raw,set,projector" in completed.stdout
+    assert "--variants no_pe" not in completed.stdout
 
 
 def test_brec_keeps_official_protocol_when_other_batch_sizes_are_overridden(
@@ -21111,7 +23330,7 @@ def test_readme_commands_use_full_independent_protocols() -> None:
         assert "set -euo pipefail" in source
         parsed.append(_parser().parse_args(words[3:-1]))
     assert sum(args.prepare_only for args in parsed) == 1
-    assert all(args.suite == "all" for args in parsed)
+    assert all(args.suite == "benchmark" for args in parsed)
     assert {tuple(args.tracks) for args in parsed if not args.prepare_only} == {
         ("conductance_gat",),
         ("cycle_pe",),
@@ -21135,6 +23354,61 @@ def test_default_workspace_directories_exist_in_a_clone() -> None:
         "research/tree_augmentation/results/.gitkeep",
     ]
     assert all((ROOT / path).is_file() for path in paths)
+
+
+def test_default_benchmarks_match_each_track_without_generated_data(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    completed = _dry_run(["--dry-run", "--model-seeds", "0"], capsys)
+    assert completed.returncode == 0, completed.stderr
+    assert "research.conductance_gat.benchmark" in completed.stdout
+    assert "research.cycle_pe.benchmark" in completed.stdout
+    assert "research.tree_augmentation.paper --suite csl" in completed.stdout
+    assert "research.tree_augmentation.paper --suite zinc" in completed.stdout
+    assert "--require-paper-deps" in completed.stdout
+    assert "--suite core" not in completed.stdout
+    assert "--suite brec" not in completed.stdout
+    assert "--variants" not in completed.stdout
+    assert "--baselines" not in completed.stdout
+    assert "research.conductance_gat.paper" not in completed.stdout
+
+
+def test_benchmark_prepares_each_public_suite_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    completed = _dry_run(
+        ["--dry-run", "--prepare-only", "--allow-download", "--model-seeds", "2,3"],
+        capsys,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.count("--model-seed 2") == 4
+    assert "--model-seed 3" not in completed.stdout
+    assert "gpu_preflight.py" not in completed.stdout
+    assert "--suite core" not in completed.stdout
+
+
+@pytest.mark.parametrize("prepare_only", [False, True])
+def test_own_model_child_arguments_parse_with_actual_track_clis(prepare_only: bool) -> None:
+    from research.conductance_gat.benchmark import build_parser as conductance_parser
+    from research.cycle_pe.benchmark import parser as cycle_parser
+    from research.tree_augmentation.paper import _parser as tree_parser
+    from scripts.run_paper import _commands, _parser
+
+    parsers = {
+        "research.conductance_gat.benchmark": conductance_parser(),
+        "research.cycle_pe.benchmark": cycle_parser(),
+        "research.tree_augmentation.paper": tree_parser(),
+    }
+    args = _parser().parse_args(["--prepare-only", "--allow-download"] if prepare_only else [])
+    commands = _commands(args, "argument-contract")
+    children = [command for name, command, _ in commands if name != "gpu_preflight"]
+    assert len(children) == (4 if prepare_only else 20)
+    for command in children:
+        parsed = parsers[command[2]].parse_args(command[3:])
+        assert parsed.prepare_only is prepare_only
+        assert parsed.device == ("cpu" if prepare_only else "cuda")
+        assert not hasattr(parsed, "baselines")
+        assert not parsed.amp
 
 
 def test_legacy_demo_entrypoints_are_removed() -> None:

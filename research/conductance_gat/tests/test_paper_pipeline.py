@@ -280,30 +280,34 @@ def test_public_reciprocal_edge_adapter_without_network() -> None:
         deduplicate_undirected_edges(reciprocal, categorical, 2)
 
 
-def test_public_loss_weight_and_inactive_edge_encoders_match_active_computation() -> None:
+def test_public_loss_weight_and_conductance_edge_encoder() -> None:
     node_sample = _unit_public_model_input("node")
     assert paper_module._public_loss_weight(node_sample["y"], "node") == node_sample["y"].numel()
     graph_sample = _unit_public_model_input("graph")
     assert paper_module._public_loss_weight(graph_sample["y"], "graph") == 1
 
-    gcn = paper_module.PublicConductanceModel(
+    model = paper_module.PublicConductanceModel(
         node_sample,
         hidden=8,
         num_classes=3,
         official_molecule=False,
-        backbone="gcn",
     )
-    gat = paper_module.PublicConductanceModel(
-        node_sample,
-        hidden=8,
-        num_classes=3,
-        official_molecule=False,
-        backbone="gat",
-    )
-    assert not gcn.uses_edge_features
-    assert not any(parameter.requires_grad for parameter in gcn.edge_encoder.parameters())
-    assert gat.uses_edge_features
-    assert all(parameter.requires_grad for parameter in gat.edge_encoder.parameters())
+    assert model.uses_edge_features
+    assert all(parameter.requires_grad for parameter in model.edge_encoder.parameters())
+    assert isinstance(model.layer, SparseIncidenceConductanceLayer)
+
+
+def test_public_competitor_implementations_and_selector_are_removed() -> None:
+    for name in ("NoMessageMLPLayer", "SparseGCNLayer", "SparseGATLayer", "SparseGINELayer"):
+        assert not hasattr(paper_module, name)
+    with pytest.raises(TypeError, match="backbone"):
+        paper_module.PublicConductanceModel(
+            _unit_public_model_input("node"),
+            hidden=8,
+            num_classes=3,
+            official_molecule=False,
+            backbone="gcn",
+        )
 
 
 def test_cli_refuses_nonempty_output_without_touching_existing_artifacts(

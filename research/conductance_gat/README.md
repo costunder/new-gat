@@ -13,7 +13,8 @@ The paper path never materializes a dense incidence matrix. For each oriented
 edge `tail -> head`, `sparse.py` gathers `H[head] - H[tail]`; two PyTorch
 `index_add_` operations scatter signed flux back to the incident nodes. Graphs
 of different sizes are concatenated into one `PackedGraphBatch`, so memory is
-linear in nodes and edges and the same code runs on CPU or CUDA.
+linear in nodes and edges. Numerical operator unit tests can run on CPU;
+benchmark training requires CUDA and never silently falls back to CPU.
 
 ## Reproduce this track
 
@@ -25,13 +26,64 @@ run this script from the repository root:
 bash research/conductance_gat/reproduce.sh
 ```
 
-The script runs the full conductance suite: S1--S4, PascalVOC-SP, and ogbg-molhiv.
+The script trains **only our conductance model on datasets used by GAT/GATv2**:
+**Cora, CiteSeer, PubMed, PPI, and ogbn-arxiv**.
 It uses CUDA and model seeds `0,1,2,3,4`, with data/split/chart seeds fixed to `0`.
-It executes only this track, through its own `paper.py` entry point. Dataset and
+It executes only this track, through its own `benchmark.py` entry point. Dataset and
 result locations, run identifiers, and shared overrides follow the root README.
 Missing or damaged public data is an error; training does not download a substitute.
 
-## Seed axes and runtime controls
+## Our model on original-paper datasets
+
+| Dataset from competing papers | Official split | Target and metric |
+|---|---|---|
+| Cora / CiteSeer / PubMed ([GAT](https://arxiv.org/abs/1710.10903)) | Planetoid `public` masks, unchanged | Paper subject; node accuracy |
+| PPI ([GAT](https://arxiv.org/abs/1710.10903), [GATv2](https://arxiv.org/abs/2105.14491)) | Separate 20/2/2 train/validation/test graphs | 121 protein functions; global node-label micro-F1 |
+| ogbn-arxiv ([GATv2](https://arxiv.org/abs/2105.14491)) | OGB temporal split, unchanged | 40 paper subject classes; node accuracy |
+
+Every dataset is run only with our positive incidence **conductance** model.
+The repository does **not** implement or train standalone competing models.
+GAT/GATv2 and other published table results are external comparison references.
+There is **no Cycle PE and no spanning-tree augmentation** in this track.
+
+Our model uses a linear input encoder, two conductance layers of width 64,
+layer normalization/ELU/dropout, and a linear prediction head. Dropout is 0.5.
+Adam uses learning rate 0.005 and weight decay 0.0005, for at most 200 epochs
+with validation patience 50. These controls and trainable parameter counts
+are recorded in every run. There is no competitor selector or attention-head option.
+
+Sharing original-paper datasets does **not** make these runs reproductions of
+the papers' architectures, tuning budgets or reported scores. Compare published
+tables externally only after checking split, preprocessing, training and metric
+compatibility. Our ogbn-arxiv training is full-batch; GATv2 used GraphSAINT.
+PPI uses graph minibatches, BCEWithLogitsLoss, and a fixed zero-logit threshold.
+Only validation chooses the saved checkpoint; test is evaluated once afterward.
+No claim of novelty or outperformance follows from simply running this suite.
+
+Preparation downloads only the named official public sources. Verified caches
+live under `data/paper/conductance_gat/matched_benchmark_v1/<dataset>/`.
+Each cache records raw-source file checksums, prepared tensor SHA256 and official
+split fingerprints; training verifies the cached tensors before using them.
+Missing, partial or corrupt caches fail rather than generating replacement data.
+
+Each per-seed run writes `manifest.json` and `metrics.json`; individual
+`<dataset>/conductance/` directories contain `best.pt`, `history.json`, and
+`metrics.json`. Output schema version 2 stores `datasets.<dataset>.models.conductance`.
+Manifests record all expected/completed dataset runs, model/data
+protocol, optimizer settings, software/GPU versions and implementation checksums.
+Changing `data_seed`, `split_seed` or `chart_seed` does not alter official fixed
+data/splits; these axes are explicitly recorded as not applicable. CUDA scatter
+operations can remain nondeterministic, so seeded runs are not a bitwise guarantee.
+
+## Supplementary suites (not the default matched benchmark)
+
+The existing `paper.py` `core`/`all` suites remain explicitly selectable for
+mechanistic S1--S4 diagnostics and additional PascalVOC-SP/ogbg-molhiv tasks.
+They are **not substitutes for the GAT/GATv2 datasets above** and are not run by
+the default benchmark preparation/reproduction scripts. Their original protocol
+details follow; they must not be pooled into the matched-benchmark headline.
+
+## Supplementary seed axes and runtime controls
 
 Randomness is separated into `--data-seed`, `--split-seed`, `--chart-seed`, and
 `--model-seed`. Generated S1--S4 graphs, excitations, trajectories, labels, and
@@ -52,7 +104,7 @@ DataLoader memory, and non-blocking host-to-device transfer; all are explicit:
 CUDA device/runtime and peak allocated/reserved memory. An OOM error reports the
 batch-size recovery command instead of silently falling back to CPU.
 
-## Implemented core datasets
+## Supplementary synthetic datasets
 
 | ID | Implemented protocol | Claim tested |
 |---|---|---|
@@ -107,9 +159,9 @@ coverage, state variation of predicted conductance, stability-cap activation,
 and S3 rollout norm/dissipation diagnostics. S4 additionally writes metrics for
 every factorial cell.
 
-## Required paper public benchmarks (optional loader dependencies)
+## Supplementary public benchmarks (optional loader dependencies)
 
-Both public benchmarks are included in the reproduction script. Preparation is
+These public benchmarks belong only to the explicit legacy `all` suite. Preparation is
 network-opt-in: no official dataset class is instantiated for a download unless
 `--allow-download` is supplied during the root README's data-preparation step.
 
@@ -118,14 +170,11 @@ network-opt-in: no official dataset class is instantiated for a download unless
 - [OGB ogbg-molhiv](https://ogb.stanford.edu/docs/graphprop/): official scaffold
   split, OGB AtomEncoder/BondEncoder, and graph ROC-AUC.
 
-Both public tasks train five custom one-layer comparisons through the same data
-adapter, split, hidden width, node encoder, readout/head, and optimizer:
-no-message MLP, sparse GCN, edge-aware GAT, GINE, and the incidence-conductance
-model. Shared active node-encoder/head tensors receive identical initialization.
-GAT, GINE, and conductance use the same edge encoder; no-message and GCN freeze
-and skip it because those backbones do not consume edge features. JSON records
-active trainable `parameter_count`, but backbone budgets are not matched and
-these implementations are not tuned reference benchmark configurations.
+Both public tasks train only the incidence-conductance model with its node and
+edge encoders and prediction head. Standalone competitor models have been removed
+from both the default and supplementary execution paths. JSON records active
+trainable `parameter_count`; supplementary public results retain the legacy key
+`baselines.conductance_model` solely for output compatibility.
 PascalVOC train/validation CE is weighted by node label count rather than graph
 count.
 
@@ -138,7 +187,7 @@ required processed files. Later runs without `--allow-download` verify those
 files before constructing a PyG dataset, so a damaged cache cannot silently
 trigger a network request. Missing public data is never replaced by generated stand-ins.
 
-## Deterministic cache and outputs
+## Supplementary deterministic cache and outputs
 
 Core cache directories are keyed by a canonical hash of schema version,
 generator version, `data_seed`, and profile. Each `manifest.json` has:
@@ -150,7 +199,7 @@ generator version, `data_seed`, and profile. Each `manifest.json` has:
 There is no timestamp in a cache manifest. A changed generator version receives
 a new cache key rather than reusing stale data.
 
-Training writes only to `--output-dir`. The path must be new or empty; the
+Supplementary `paper.py` training writes only to `--output-dir`. The path must be new or empty; the
 runner refuses a non-empty directory before data preparation and leaves its
 existing artifacts untouched:
 
@@ -176,10 +225,12 @@ unit-test adapter fixtures and CLI artifact handling.
 
 ## Files
 
+- `benchmark_data.py`: Cora/CiteSeer/PubMed/PPI/ogbn-arxiv adapters and verified real caches;
+- `benchmark.py`: our conductance-only CUDA benchmark on original-paper datasets;
 - `sparse.py`: dense-`B`-free gather/scatter layer and variable-graph packing;
 - `paper_data.py`: deterministic S1--S4 generation, splits, and cache manifests;
 - `public_data.py`: official PyG/OGB adapters;
-- `paper.py`: prepare/train/evaluate CLI, baselines, metrics, AMP, JSON/CSV;
+- `paper.py`: supplementary conductance models/own ablations, metrics, AMP, JSON/CSV;
 - `tests/`: algebra, datasets, adapter, cache, and CLI regression tests.
 
 This directory tests only the incidence-conductance-attention hypothesis. It

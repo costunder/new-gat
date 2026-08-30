@@ -75,6 +75,18 @@ def test_paper_dataset_profile_matches_complete_core_code(tmp_path: Path) -> Non
     assert all(row["tier"] == "paper_core" for row in payload["rows"])
     assert all(row["status"] == "implemented" for row in payload["rows"])
     assert all(row["cache_status"] == "not_checked" for row in payload["rows"])
+    assert {(row["track"], row["id"]) for row in payload["rows"]} == {
+        ("conductance_gat", "cora"),
+        ("conductance_gat", "citeseer"),
+        ("conductance_gat", "pubmed"),
+        ("conductance_gat", "ppi"),
+        ("conductance_gat", "ogbn-arxiv"),
+        ("cycle_pe", "zinc12k"),
+        ("cycle_pe", "peptides_struct"),
+        ("tree_augmentation", "csl_chart_sanity"),
+        ("tree_augmentation", "zinc12k_multichart"),
+    }
+    assert all(row["data_policy"] == "download" for row in payload["rows"])
 
 
 def test_complete_flag_is_derived_only_from_required_core_status() -> None:
@@ -158,13 +170,19 @@ def test_checker_routes_requested_axes_to_full_dataset_validators(
 ) -> None:
     original_resolver = check_datasets._load_python_reference
     calls: list[tuple[str, Path, dict[str, object]]] = []
+    validator_references = {
+        entry["validator"]
+        for track in check_datasets.TRACKS
+        for entry in check_datasets.load_registry(track)["datasets"]
+        if entry["tier"] == "paper_core"
+    }
 
     def validator(dataset_id: str, data_root: Path, **kwargs: object) -> dict[str, object]:
         calls.append((dataset_id, data_root, kwargs))
         return {"validated": dataset_id}
 
     def resolve(reference: str) -> object:
-        if reference.endswith(".validate_dataset_cache"):
+        if reference in validator_references:
             return validator
         return original_resolver(reference)
 
@@ -183,7 +201,7 @@ def test_checker_routes_requested_axes_to_full_dataset_validators(
     assert payload["cached_data_ready"] is True
     assert payload["requested_seed_axes"] == {"data": [11, 17], "split": [13]}
     assert "tiny" not in payload
-    assert calls
+    assert len(calls) == len(payload["rows"])
     for _, root, kwargs in calls:
         assert root == tmp_path.resolve()
         assert kwargs == {"data_seeds": (11, 17), "split_seeds": (13,)}

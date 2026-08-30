@@ -1399,8 +1399,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument(
         "--variants",
-        default=",".join(PE_VARIANTS),
-        help="comma-separated subset of no_pe,raw,set,projector",
+        default="raw,set,projector",
+        help="own PE ablations: raw,set,projector; no_pe only when explicitly requested",
     )
     parser.add_argument(
         "--core-targets",

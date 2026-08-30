@@ -192,11 +192,11 @@ def test_paper_runner_routes_independent_seed_axes(capsys: pytest.CaptureFixture
         capsys,
     )
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.count("--data-seed 11") == 2
-    assert completed.stdout.count("--split-seed 13") == 2
-    assert completed.stdout.count("--chart-seed 17") == 2
-    assert completed.stdout.count("--model-seed 5") == 1
-    assert completed.stdout.count("--model-seed 7") == 1
+    assert completed.stdout.count("--data-seed 11") == 4
+    assert completed.stdout.count("--split-seed 13") == 4
+    assert completed.stdout.count("--chart-seed 17") == 4
+    assert completed.stdout.count("--model-seed 5") == 2
+    assert completed.stdout.count("--model-seed 7") == 2
 
 
 def test_paper_runner_exposes_cycle_candidate_reduction_without_overriding_official_brec(
@@ -265,6 +265,18 @@ def test_cycle_runner_forwards_selected_non_projector_variants(
         capsys,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_supplementary_default_runs_own_pe_variants_without_no_pe(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    completed = _dry_run(
+        ["--dry-run", "--tracks", "cycle_pe", "--suite", "core", "--model-seeds", "0"],
+        capsys,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "--variants raw,set,projector" in completed.stdout
+    assert "--variants no_pe" not in completed.stdout
 
 
 def test_brec_keeps_official_protocol_when_other_batch_sizes_are_overridden(
@@ -340,7 +352,7 @@ def test_readme_commands_use_full_independent_protocols() -> None:
         assert "set -euo pipefail" in source
         parsed.append(_parser().parse_args(words[3:-1]))
     assert sum(args.prepare_only for args in parsed) == 1
-    assert all(args.suite == "all" for args in parsed)
+    assert all(args.suite == "benchmark" for args in parsed)
     assert {tuple(args.tracks) for args in parsed if not args.prepare_only} == {
         ("conductance_gat",),
         ("cycle_pe",),
@@ -364,6 +376,61 @@ def test_default_workspace_directories_exist_in_a_clone() -> None:
         "research/tree_augmentation/results/.gitkeep",
     ]
     assert all((ROOT / path).is_file() for path in paths)
+
+
+def test_default_benchmarks_match_each_track_without_generated_data(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    completed = _dry_run(["--dry-run", "--model-seeds", "0"], capsys)
+    assert completed.returncode == 0, completed.stderr
+    assert "research.conductance_gat.benchmark" in completed.stdout
+    assert "research.cycle_pe.benchmark" in completed.stdout
+    assert "research.tree_augmentation.paper --suite csl" in completed.stdout
+    assert "research.tree_augmentation.paper --suite zinc" in completed.stdout
+    assert "--require-paper-deps" in completed.stdout
+    assert "--suite core" not in completed.stdout
+    assert "--suite brec" not in completed.stdout
+    assert "--variants" not in completed.stdout
+    assert "--baselines" not in completed.stdout
+    assert "research.conductance_gat.paper" not in completed.stdout
+
+
+def test_benchmark_prepares_each_public_suite_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    completed = _dry_run(
+        ["--dry-run", "--prepare-only", "--allow-download", "--model-seeds", "2,3"],
+        capsys,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.count("--model-seed 2") == 4
+    assert "--model-seed 3" not in completed.stdout
+    assert "gpu_preflight.py" not in completed.stdout
+    assert "--suite core" not in completed.stdout
+
+
+@pytest.mark.parametrize("prepare_only", [False, True])
+def test_own_model_child_arguments_parse_with_actual_track_clis(prepare_only: bool) -> None:
+    from research.conductance_gat.benchmark import build_parser as conductance_parser
+    from research.cycle_pe.benchmark import parser as cycle_parser
+    from research.tree_augmentation.paper import _parser as tree_parser
+    from scripts.run_paper import _commands, _parser
+
+    parsers = {
+        "research.conductance_gat.benchmark": conductance_parser(),
+        "research.cycle_pe.benchmark": cycle_parser(),
+        "research.tree_augmentation.paper": tree_parser(),
+    }
+    args = _parser().parse_args(["--prepare-only", "--allow-download"] if prepare_only else [])
+    commands = _commands(args, "argument-contract")
+    children = [command for name, command, _ in commands if name != "gpu_preflight"]
+    assert len(children) == (4 if prepare_only else 20)
+    for command in children:
+        parsed = parsers[command[2]].parse_args(command[3:])
+        assert parsed.prepare_only is prepare_only
+        assert parsed.device == ("cpu" if prepare_only else "cuda")
+        assert not hasattr(parsed, "baselines")
+        assert not parsed.amp
 
 
 def test_legacy_demo_entrypoints_are_removed() -> None:

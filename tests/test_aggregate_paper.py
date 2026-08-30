@@ -14,6 +14,79 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+@pytest.mark.parametrize(
+    ("track", "dataset", "model"),
+    [
+        ("conductance_gat", "cora", "conductance"),
+        ("cycle_pe", "zinc12k", "cycle_set"),
+    ],
+)
+def test_benchmarks_aggregate_only_our_model_and_ignore_published_scores(
+    tmp_path: Path,
+    track: str,
+    dataset: str,
+    model: str,
+) -> None:
+    commands = []
+    for seed in (0, 1):
+        output = tmp_path / f"seed-{seed}"
+        _write_json(
+            output / "metrics.json",
+            {
+                "track": track,
+                "suite": "benchmark",
+                "datasets": {
+                    dataset: {
+                        "models": {
+                            model: {
+                                "test": 0.1 + seed * 0.01,
+                                "validation": 0.05,
+                                "best_epoch": 15,
+                                "trainable_parameters": 1000,
+                                "elapsed_seconds": 3.0,
+                                "peak_gpu_memory_bytes": 2048,
+                            },
+                            "external_model": {"test": 0.5, "elapsed_seconds": 8.0},
+                        },
+                        "published_reference": {"test": 0.4, "std": 0.02},
+                        "baselines": {"gat": {"test": 0.3}, "signnet": {"test": 0.2}},
+                    },
+                },
+            },
+        )
+        commands.append(
+            {
+                "name": f"{track}:benchmark:model-seed-{seed}",
+                "command": [
+                    "python",
+                    "--suite",
+                    "benchmark",
+                    "--model-seed",
+                    str(seed),
+                    "--data-seed",
+                    "0",
+                    "--split-seed",
+                    "0",
+                    "--chart-seed",
+                    "0",
+                ],
+                "returncode": 0,
+                "artifact_errors": [],
+                "output": str(output),
+            }
+        )
+    manifest = tmp_path / "manifest.json"
+    _write_json(manifest, {"run_id": "matched", "status": "passed", "commands": commands})
+    result = aggregate_manifest(manifest, bootstrap_samples=0)
+    assert result["metric_groups"] == 1
+    assert result["sample_rows"] == 2
+    assert result["efficiency_rows"] == 6
+    assert result["ignored_numeric_fields"] > 0
+    with (tmp_path / "aggregate" / "paired.csv").open(encoding="utf-8", newline="") as stream:
+        pairs = list(csv.DictReader(stream))
+    assert pairs == []
+
+
 def test_aggregate_keeps_data_axes_fixed_and_pairs_model_seeds(tmp_path: Path) -> None:
     commands = []
     for model_seed, full, edge in ((1, 0.2, 0.5), (2, 0.4, 0.7)):

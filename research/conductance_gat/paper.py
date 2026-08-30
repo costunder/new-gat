@@ -1024,98 +1024,6 @@ class SumCategoricalEncoder(nn.Module):
         return result
 
 
-def _bidirectional_edges(
-    edge_index: Tensor, edge_features: Tensor
-) -> tuple[Tensor, Tensor, Tensor]:
-    tail, head = edge_index
-    source = torch.cat((tail, head))
-    target = torch.cat((head, tail))
-    return source, target, torch.cat((edge_features, edge_features), dim=0)
-
-
-class NoMessageMLPLayer(nn.Module):
-    def __init__(self, hidden: int) -> None:
-        super().__init__()
-        self.network = nn.Sequential(nn.Linear(hidden, hidden), nn.SiLU())
-
-    def forward(self, node_state: Tensor, edge_index: Tensor, edge_features: Tensor) -> Tensor:
-        del edge_index, edge_features
-        return self.network(node_state)
-
-
-class SparseGCNLayer(nn.Module):
-    def __init__(self, hidden: int) -> None:
-        super().__init__()
-        self.linear = nn.Linear(hidden, hidden)
-
-    def forward(self, node_state: Tensor, edge_index: Tensor, edge_features: Tensor) -> Tensor:
-        del edge_features
-        source, target, _ = _bidirectional_edges(
-            edge_index, node_state.new_empty((edge_index.shape[1], 0))
-        )
-        nodes = torch.arange(node_state.shape[0], device=node_state.device)
-        source = torch.cat((source, nodes))
-        target = torch.cat((target, nodes))
-        degree = torch.bincount(target, minlength=node_state.shape[0]).to(node_state)
-        weight = degree.index_select(0, source).rsqrt() * degree.index_select(0, target).rsqrt()
-        aggregate = torch.zeros_like(node_state)
-        aggregate.index_add_(0, target, weight[:, None] * node_state.index_select(0, source))
-        return self.linear(aggregate)
-
-
-class SparseGATLayer(nn.Module):
-    """Single-head edge-aware GAT with a torch-only segment softmax."""
-
-    def __init__(self, hidden: int) -> None:
-        super().__init__()
-        self.node_projection = nn.Linear(hidden, hidden, bias=False)
-        self.edge_projection = nn.Linear(hidden, hidden, bias=False)
-        self.attention = nn.Linear(3 * hidden, 1, bias=False)
-        self.self_projection = nn.Linear(hidden, hidden)
-
-    def forward(self, node_state: Tensor, edge_index: Tensor, edge_features: Tensor) -> Tensor:
-        source, target, directed_features = _bidirectional_edges(edge_index, edge_features)
-        projected = self.node_projection(node_state)
-        source_state = projected.index_select(0, source)
-        target_state = projected.index_select(0, target)
-        edge_state = self.edge_projection(directed_features)
-        logits = nnf.leaky_relu(
-            self.attention(torch.cat((source_state, target_state, edge_state), dim=1)).squeeze(-1),
-            negative_slope=0.2,
-        )
-        maximum = logits.new_full((node_state.shape[0],), -torch.inf)
-        maximum.scatter_reduce_(0, target, logits, reduce="amax", include_self=True)
-        unnormalized = torch.exp(logits - maximum.index_select(0, target))
-        denominator = logits.new_zeros(node_state.shape[0])
-        denominator.index_add_(0, target, unnormalized)
-        attention = unnormalized / denominator.index_select(0, target).clamp_min(1.0e-12)
-        message = attention[:, None] * (source_state + edge_state)
-        aggregate = torch.zeros_like(projected)
-        aggregate.index_add_(0, target, message)
-        return self.self_projection(node_state) + aggregate
-
-
-class SparseGINELayer(nn.Module):
-    def __init__(self, hidden: int) -> None:
-        super().__init__()
-        self.edge_projection = nn.Linear(hidden, hidden)
-        self.epsilon = nn.Parameter(torch.zeros(()))
-        self.network = nn.Sequential(
-            nn.Linear(hidden, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, hidden),
-        )
-
-    def forward(self, node_state: Tensor, edge_index: Tensor, edge_features: Tensor) -> Tensor:
-        source, target, directed_features = _bidirectional_edges(edge_index, edge_features)
-        message = nnf.relu(
-            node_state.index_select(0, source) + self.edge_projection(directed_features)
-        )
-        aggregate = torch.zeros_like(node_state)
-        aggregate.index_add_(0, target, message)
-        return self.network((1.0 + self.epsilon) * node_state + aggregate)
-
-
 class PublicConductanceModel(nn.Module):
     def __init__(
         self,
@@ -1124,15 +1032,11 @@ class PublicConductanceModel(nn.Module):
         hidden: int,
         num_classes: int,
         official_molecule: bool,
-        backbone: str = "conductance_model",
     ) -> None:
         super().__init__()
-        if backbone not in {"no_message_mlp", "gcn", "gat", "gine", "conductance_model"}:
-            raise ValueError(f"unknown public backbone {backbone!r}")
         node_width = int(sample["x"].shape[1])
         edge_width = int(sample["edge_features"].shape[1])
         self.task = str(sample["task"])
-        self.backbone_name = backbone
         if bool(sample["categorical"]) and official_molecule:
             try:
                 from ogb.graphproppred.mol_encoder import AtomEncoder, BondEncoder
@@ -1148,51 +1052,31 @@ class PublicConductanceModel(nn.Module):
         else:
             self.node_encoder = nn.Linear(node_width, hidden)
             self.edge_encoder = nn.Linear(edge_width, hidden)
-        self.uses_edge_features = backbone not in {"no_message_mlp", "gcn"}
-        if not self.uses_edge_features:
-            self.edge_encoder.requires_grad_(False)
-        # Construct shared components before the backbone so resetting the same
-        # seed gives every comparison identical encoder/head initialization.
+        self.uses_edge_features = True
         self.normalization = nn.LayerNorm(hidden)
         self.head = nn.Linear(hidden, num_classes if self.task == "node" else 1)
-        if backbone == "conductance_model":
-            self.layer: nn.Module = SparseIncidenceConductanceLayer(
-                channels=hidden,
-                edge_feature_channels=hidden,
-                hidden_channels=hidden,
-                requested_step=0.02,
-                mode="full",
-            )
-        elif backbone == "no_message_mlp":
-            self.layer = NoMessageMLPLayer(hidden)
-        elif backbone == "gcn":
-            self.layer = SparseGCNLayer(hidden)
-        elif backbone == "gat":
-            self.layer = SparseGATLayer(hidden)
-        else:
-            self.layer = SparseGINELayer(hidden)
+        self.layer = SparseIncidenceConductanceLayer(
+            channels=hidden,
+            edge_feature_channels=hidden,
+            hidden_channels=hidden,
+            requested_step=0.02,
+            mode="full",
+        )
 
     def forward(self, batch: PublicPacked) -> Tensor:
         node_state = self.node_encoder(batch.x)
-        edge_features = (
-            self.edge_encoder(batch.edge_features)
-            if self.uses_edge_features
-            else node_state.new_empty((batch.edge_index.shape[1], 0))
+        edge_features = self.edge_encoder(batch.edge_features)
+        edge_graph = batch.node_graph.index_select(0, batch.edge_index[0])
+        sparse_batch = PackedGraphBatch(
+            node_state=node_state,
+            edge_index=batch.edge_index,
+            edge_features=edge_features,
+            node_graph=batch.node_graph,
+            edge_graph=edge_graph,
+            graph_ids=batch.graph_ids,
+            requested_step=node_state.new_full((batch.num_graphs,), 0.02),
         )
-        if self.backbone_name == "conductance_model":
-            edge_graph = batch.node_graph.index_select(0, batch.edge_index[0])
-            sparse_batch = PackedGraphBatch(
-                node_state=node_state,
-                edge_index=batch.edge_index,
-                edge_features=edge_features,
-                node_graph=batch.node_graph,
-                edge_graph=edge_graph,
-                graph_ids=batch.graph_ids,
-                requested_step=node_state.new_full((batch.num_graphs,), 0.02),
-            )
-            node_state = self.layer(sparse_batch)
-        else:
-            node_state = self.layer(node_state, batch.edge_index, edge_features)
+        node_state = self.layer(sparse_batch)
         node_state = nnf.silu(self.normalization(node_state))
         if self.task == "node":
             return self.head(node_state)
@@ -1319,7 +1203,6 @@ def run_public(
     results: dict[str, Any] = {}
     histories: list[dict[str, Any]] = []
     states: dict[str, dict[str, Tensor]] = {}
-    backbone_names = ("no_message_mlp", "gcn", "gat", "gine", "conductance_model")
     for dataset_number, dataset_name in enumerate(("pascalvoc_sp", "ogbg_molhiv")):
         splits = datasets[dataset_name]
         sample = splits["train"][0]
@@ -1328,26 +1211,23 @@ def run_public(
         results[dataset_name] = {
             "fixture": False,
             "official_result": True,
-            "comparison_protocol": {
+            "model_protocol": {
                 "hidden_channels": hidden,
                 "backbone_depth": 1,
-                "shared_encoder_initialization": True,
-                "shared_head_initialization": True,
-                "shared_optimizer_and_split": True,
+                "model": "conductance_model",
+                "split": "official",
+                "competitor_execution": "not implemented; published results compared externally",
             },
             "baselines": {},
         }
         model_seed = seed + dataset_number * 101
-        for backbone in backbone_names:
-            # Shared modules are constructed before the variable backbone, so
-            # this reset makes their initial tensors identical across models.
+        for model_name in ("conductance_model",):
             seed_everything(model_seed)
             model = PublicConductanceModel(
                 sample,
                 hidden=hidden,
                 num_classes=num_classes,
                 official_molecule=(dataset_name == "ogbg_molhiv"),
-                backbone=backbone,
             ).to(device)
             parameter_count = sum(
                 parameter.numel() for parameter in model.parameters() if parameter.requires_grad
@@ -1402,7 +1282,7 @@ def run_public(
                 histories.append(
                     {
                         "suite": dataset_name,
-                        "baseline": backbone,
+                        "baseline": model_name,
                         "epoch": epoch,
                         "train_loss": total / max(count, 1),
                         "validation_loss": validation_loss,
@@ -1416,11 +1296,11 @@ def run_public(
                     }
             if best_state is not None:
                 model.load_state_dict(best_state)
-            state_key = f"{dataset_name}_{backbone}"
+            state_key = f"{dataset_name}_{model_name}"
             states[state_key] = {
                 name: value.detach().cpu() for name, value in model.state_dict().items()
             }
-            results[dataset_name]["baselines"][backbone] = {
+            results[dataset_name]["baselines"][model_name] = {
                 "parameter_count": parameter_count,
                 "parameter_count_policy": "trainable_active_parameters_only",
                 "uses_edge_features": model.uses_edge_features,
