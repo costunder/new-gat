@@ -131,17 +131,26 @@ CLI는 `--data-seed`, `--split-seed`, `--chart-seed`, `--model-seed`를 독립�
 
 ## Linux/CUDA 설치
 
-서버 CUDA driver와 맞는 PyTorch wheel을 먼저 설치한 뒤 저장소 root에서 실행한다.
+MobaXterm으로 접속한 Linux GPU 서버에서 Conda가 먼저 사용 가능해야 한다.
+`conda --version`이 실패하면 서버의 Conda module/경로를 관리자에게 확인한다.
+저장소 root에서 프로젝트 전용 환경을 만들고 활성화한 뒤 설치한다.
 
 ```bash
-python -m pip install --upgrade pip
-# CUDA 버전에 맞는 torch wheel 설치 후:
-python -m pip install --no-build-isolation -e ".[dev,paper]"
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda create -n new-gat python=3.11 pip -y
+conda activate new-gat
+bash scripts/setup_gpu.sh
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-MobaXterm은 SSH terminal일 뿐이므로 같은 Linux 명령을 사용한다. 결과 재현성 때문에 실제
-GPU 서버의 Python, CUDA, torch, GPU 이름은 각 manifest에 자동 기록된다.
+[루트 README](../../README.md)에서 이미 이 프로젝트용 환경을 만들었다면 생성만 건너뛰고
+같은 환경을 활성화한다. `base`, 공유 환경 또는 다른 프로젝트의 환경에는 설치하지 않는다.
+Setup은 저장소의 exact CUDA/package pin과 public adapter 의존성을 설치하고 GPU·테스트를 검증한다.
+
+아래 모든 `python` 명령은 **이 Conda 환경이 활성화된 저장소 root**에서 실행한다.
+새 SSH/tmux 창에서는 위 `source`와 `conda activate new-gat`을 다시 실행한다.
+데이터 경로와 GPU 할당, wheel 선택은 루트 README를 따른다. 결과 재현성 때문에 실제 GPU
+서버의 Python, CUDA, torch, GPU 이름은 각 manifest에 자동 기록된다.
 
 ## 정확한 실행 명령
 

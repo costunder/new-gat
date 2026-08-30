@@ -106,10 +106,29 @@ one categorical bond type per canonical undirected edge in its verified cache.
 The model combines those chart-invariant chemistry embeddings with its topology
 and cycle-chart representation; it is not a topology-only ZINC baseline.
 
-The core path uses the repository's base dependencies (`pip install -e .`).
-The public adapters additionally require a PyTorch/CUDA-compatible PyG install;
-`pip install -e '.[paper]'` installs the declared Python extras after the
-server's CUDA-enabled PyTorch environment has been selected.
+### Linux/CUDA setup
+
+Use the Linux GPU host reached through MobaXterm. Conda must be available through
+the server's supported installation/module; ask the administrator if
+`conda --version` fails. From the repository root, create a dedicated environment:
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda create -n new-gat python=3.11 pip -y
+conda activate new-gat
+bash scripts/setup_gpu.sh
+```
+
+If you already created this project's environment using the
+[root README](../../README.md), skip creation and activate that same environment.
+Do not install into `base`, a shared environment, or another project's environment.
+Setup installs the repository's exact CUDA/package pins, including the public PyG
+adapters, then verifies CUDA and tests.
+
+Every `python` command below assumes this Conda environment is active. Run paper
+and test commands from the repository root. In each new SSH/tmux shell, run the
+`source` and `conda activate new-gat` commands again; no environment recreation
+is needed. See the root README for data paths, GPU allocation, and wheel selection.
 
 ### Exact CLI
 
@@ -167,9 +186,9 @@ python -m research.tree_augmentation.paper \
   --amp --batch-size 16 --workers 4 --pin-memory --non-blocking
 ```
 
-Optional adapters use `--suite csl`, `--suite zinc`, or `--suite all`. Install
-PyG with wheels matching the server's PyTorch/CUDA build before requesting
-them. A missing verified processed cache is network-safe by default: pass
+Optional adapters use `--suite csl`, `--suite zinc`, or `--suite all`. The GPU
+setup above installs their pinned PyG dependencies. A missing verified processed
+cache is network-safe by default: pass
 `--allow-download` explicitly to permit the PyG adapters to access their public
 dataset endpoints. `--tiny` limits converted records and optimizer updates, but
 still uses the real adapter and split. `--workers` is passed directly to every

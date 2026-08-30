@@ -29,8 +29,7 @@ node에서 설치·학습을 시작하지 않는다. `srun`, `qsub` 등의 정�
 hostname
 nvidia-smi
 git --version
-python3 --version
-python3 -m venv --help
+conda --version
 tmux -V
 ```
 
@@ -38,13 +37,15 @@ tmux -V
 
 - `nvidia-smi`에 사용할 NVIDIA GPU가 보인다.
 - `nvidia-smi` 상단의 `CUDA Version`이 **12.6 이상**이다. 이 값은 driver의 CUDA 호환 범위다.
-- Python은 **3.11 이상**이고 `venv`를 사용할 수 있다.
+- Conda 명령을 사용할 수 있다. 실험용 Python 3.11 환경은 3번에서 새로 만든다.
 - Git과 tmux가 설치되어 있다.
 - GitHub, PyPI, PyTorch wheel 저장소와 데이터셋 다운로드 주소에 접속할 수 있다.
-- 코드·가상환경·데이터·결과를 쓸 수 있는 디스크 공간과 quota가 있다.
+- 코드·Conda 환경·데이터·결과를 쓸 수 있는 디스크 공간과 quota가 있다.
 
-준비물이 없다면 서버의 Python/CUDA module 또는 관리자 제공 환경을 먼저 사용한다.
-이 저장소의 설치 스크립트는 NVIDIA driver나 시스템 Python을 설치하지 않는다.
+`conda: command not found`라면 먼저 서버 안내에 따라 Conda module을 불러오거나 관리자에게
+Conda 사용 경로를 확인한다. Module 이름은 서버마다 다르므로 임의 이름으로 실행하지 않는다.
+이 저장소의 설치 스크립트는 Conda나 NVIDIA driver를 설치하지 않는다. Conda 자체가 준비됐다고
+해서 `new-gat` 환경까지 이미 있다는 뜻은 아니므로 아래 환경 생성 단계를 생략하지 않는다.
 
 ## 2. 공개 저장소 받기
 
@@ -92,12 +93,32 @@ mkdir -p "$NEW_GAT_DATA_ROOT" "$NEW_GAT_RESULTS_ROOT"
 
 ## 3. GPU 실행 환경 설치
 
+프로젝트 전용 **Conda 환경을 처음 한 번 생성**한다. 아래 명령도 저장소 폴더의 tmux 안에서
+실행한다. `source`는 현재 Bash에서 `conda activate`를 사용할 수 있게 한다.
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda create -n new-gat python=3.11 pip -y
+conda activate new-gat
+python --version
+```
+
+이미 이 프로젝트용 `new-gat` 환경을 만들어 두었다면 `conda create`만 건너뛰고 활성화한다.
+이름이 같더라도 다른 프로젝트가 사용 중인 환경이라면 덮어쓰지 말고 별도 이름으로 만든다.
+`base`나 여러 사람이 함께 쓰는 환경에는 설치하지 않는다.
+
+활성화한 전용 환경에 GPU 의존성을 설치한다.
+
 ```bash
 bash scripts/setup_gpu.sh
 ```
 
-이 명령 하나가 `.venv-gpu` 가상환경 생성, 고정 버전 의존성 설치, CUDA 연산 확인,
-단위 테스트를 실행한다. 처음에는 패키지 다운로드 때문에 시간이 걸린다.
+이 명령은 **현재 활성화된 Conda 환경**에 고정 버전 의존성을 설치하고, CUDA 연산 확인과
+단위 테스트를 실행한다. 환경을 별도로 만들거나 시스템 Python으로 전환하지 않는다.
+Conda는 전용 환경과 Python 3.11을 관리하고, GPU PyTorch는 setup이 고른 공식 CUDA wheel과
+exact constraints로 설치한다. NVIDIA driver는 서버에 미리 준비되어 있어야 한다.
+별도의 CUDA/cuDNN 패키지를 임의로 섞어 설치하지 않는다.
+처음에는 패키지 다운로드 때문에 시간이 걸린다.
 마지막에 다음 문장이 출력되어야 다음 단계로 간다.
 
 ```text
@@ -107,17 +128,34 @@ GPU environment ready. Run: bash scripts/paper.sh --help
 실제 Python과 GPU를 한 번 더 확인한다.
 
 ```bash
-.venv-gpu/bin/python -c 'import sys, torch; print(sys.executable); print(torch.__version__); print(torch.version.cuda); print(torch.cuda.get_device_name(0))'
+python -c 'import sys, torch; print(sys.executable); print(torch.__version__); print(torch.version.cuda); print(torch.cuda.get_device_name(0))'
 bash scripts/paper.sh --help
 ```
 
-이후 `bash scripts/paper.sh`는 자동으로 `.venv-gpu/bin/python`을 사용한다.
-다른 Python 스크립트를 직접 호출할 때도 아래 예제처럼 `.venv-gpu/bin/python`을 쓴다.
-환경 활성화 명령은 필수가 아니다.
+이후 `bash scripts/paper.sh`는 활성 Conda 환경의 `$CONDA_PREFIX/bin/python`을 사용한다.
+직접 호출하는 `python`도 같은 환경이어야 한다. **새 SSH 창이나 새 tmux 창을 열면 실행 전에
+다시 활성화**한다. 단순히 기존 tmux 창에 재접속했다면 그 안의 환경은 유지된다.
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate new-gat
+```
+
+새 shell에서는 저장소 폴더로 이동하고 2번의 데이터·결과 경로 `export`도 다시 실행한다.
 
 설치 기록은 `.gpu-environment.json`, `.gpu-environment.freeze.txt`에 남는다.
 현재 lock은 `torch==2.13.0`이며 driver에 따라 `cu126`, `cu130`, `cu132` 중 하나를 선택한다.
 CUDA 12.6 미만 driver에서는 설치를 중단하며 CPU로 자동 전환하지 않는다.
+
+Wheel channel을 고정해야 할 때만 다음처럼 지정한다. 활성 Conda 환경은 그대로 사용한다.
+
+```bash
+CUDA_WHEEL_TAG=cu126 bash scripts/setup_gpu.sh
+```
+
+이미 설치된 의존성을 변경하지 않고 검증하려면 `SKIP_DEPS=1 bash scripts/setup_gpu.sh`를
+사용할 수 있다. 단, 프로젝트의 editable 설치는 갱신하며 버전·ABI·CUDA가 lock과 다르면
+실패한다. 처음 만든 빈 환경에서는 이 옵션을 사용하지 않는다.
 
 ## 4. 먼저 아주 작은 GPU 테스트 실행
 
@@ -138,7 +176,7 @@ bash scripts/paper.sh \
 종료 후 성공 여부를 확인한다. 출력이 `passed`여야 한다.
 
 ```bash
-.venv-gpu/bin/python -c 'import json; print(json.load(open("runs/paper/first-gpu-smoke/manifest.json"))["status"])'
+python -c 'import json; print(json.load(open("runs/paper/first-gpu-smoke/manifest.json"))["status"])'
 ```
 
 `--tiny`는 실행 경로 점검용이다. 여기서 얻은 숫자를 정식 실험 결과로 쓰지 않는다.
@@ -168,7 +206,7 @@ bash scripts/paper.sh \
 준비가 끝나면 파일 존재뿐 아니라 split·shape·checksum까지 검사한다.
 
 ```bash
-.venv-gpu/bin/python scripts/check_datasets.py \
+python scripts/check_datasets.py \
   --profile paper \
   --data-root "$NEW_GAT_DATA_ROOT" \
   --data-seeds 0 --split-seeds 0 \
@@ -200,7 +238,7 @@ bash scripts/paper.sh \
 ```
 
 ```bash
-.venv-gpu/bin/python -c 'import json; print(json.load(open("runs/paper/core-one-seed-v1/manifest.json"))["status"])'
+python -c 'import json; print(json.load(open("runs/paper/core-one-seed-v1/manifest.json"))["status"])'
 ```
 
 `passed`와 결과 파일을 확인한 뒤 다음 단계로 간다. 이 실행은 공개 benchmark와 BREC를
@@ -281,7 +319,7 @@ tail -n 50 runs/paper/paper-all-v1/logs/*.log
 실행 종료 후 전체 성공 여부를 확인한다.
 
 ```bash
-.venv-gpu/bin/python -c 'import json; print(json.load(open("runs/paper/paper-all-v1/manifest.json"))["status"])'
+python -c 'import json; print(json.load(open("runs/paper/paper-all-v1/manifest.json"))["status"])'
 ls runs/paper/paper-all-v1/aggregate/
 ```
 
@@ -311,10 +349,13 @@ Cycle `suite=all` 결과는 model seed별 `core/`, `zinc/`와 별도의
 | 증상 | 할 일 |
 |---|---|
 | `nvidia-smi: command not found` 또는 GPU가 안 보임 | GPU node/allocation인지 확인한다. CPU로 학습을 대신 실행하지 않는다. |
-| Python 버전 또는 `venv` 오류 | Python 3.11+ module/환경을 준비한다. 다른 executable은 `PYTHON=python3.11 bash scripts/setup_gpu.sh`처럼 지정한다. |
+| `conda: command not found` | 서버 안내에 따라 Conda module/경로를 준비한다. 모르면 관리자에게 확인한다. |
+| `conda activate`가 shell 초기화를 요구함 | 3번의 `source "$(conda info --base)/etc/profile.d/conda.sh"`를 실행하고 다시 활성화한다. |
+| Conda 환경 비활성화 또는 `base` 환경 오류 | 3번에서 만든 전용 환경을 `conda activate new-gat`으로 활성화한다. |
+| Python 버전 오류 | 전용 환경에서 `python --version`이 3.11 이상인지 확인한다. 최초 생성 명령은 Python 3.11을 지정한다. |
 | CUDA 12.6 미만 / driver 호환 오류 | 관리자에게 driver 환경을 확인한다. 현재 lock은 구형 torch로 자동 하향하지 않는다. |
-| `GPU Python was not found` | 저장소 root에서 `bash scripts/setup_gpu.sh`를 먼저 끝낸다. |
-| `ModuleNotFoundError` | 직접 호출 시 `.venv-gpu/bin/python`을 쓰는지 확인한다. 설치를 끝낸 환경과 실행 환경이 같아야 한다. |
+| Conda 환경의 Python을 찾지 못함 | `conda activate new-gat` 후 `python --version`을 확인하고 저장소 root에서 setup을 끝낸다. |
+| `ModuleNotFoundError` | 설치에 사용한 Conda 환경이 활성화됐는지 `conda info --envs`와 `which python`으로 확인한다. |
 | 데이터 cache가 없다고 나옴 | 5번 준비·검사를 실행하고 data root와 data/split seed가 학습 명령과 같은지 확인한다. |
 | `run id already exists` | 기존 결과를 지우지 말고 새 `--run-id`를 사용한다. 자동 resume 옵션은 없다. |
 | CUDA OOM | 해당 작업을 멈추고 batch를 `32 → 16 → 8`로 낮춰 새 run ID로 실행한다. Official BREC batch는 16 고정이다. |
@@ -330,29 +371,7 @@ graph 크기를 자동 추정하지 않는다. 더 큰 graph를 검사하려면
 `--preflight-nodes-per-graph`, `--preflight-edges-per-graph`, `--preflight-cycle-rank`를
 실제 사용할 크기에 맞춰 늘린다. 사전검사 통과가 전체 데이터의 OOM 부재를 보장하지는 않는다.
 
-## 10. 기존 Conda 환경을 사용해야 하는 서버
-
-기본 `.venv-gpu` 경로를 사용했다면 이 절은 건너뛴다. 서버가 지정한 Conda 환경을
-써야 한다면 설치뿐 아니라 **이후 실행에서도** `USE_ACTIVE_ENV=1`을 지정한다.
-
-```bash
-conda activate YOUR_ENV
-USE_ACTIVE_ENV=1 bash scripts/setup_gpu.sh
-USE_ACTIVE_ENV=1 bash scripts/paper.sh --help
-```
-
-이 경우 setup은 활성 환경의 패키지를 저장소 exact pin으로 설치·정렬하므로 공유 환경에
-무작정 실행하지 않는다. 의존성을 변경하지 않으려면 `USE_ACTIVE_ENV=1 SKIP_DEPS=1`로
-검증하되 이미 설치된 버전·ABI·CUDA가 lock과 다르면 실패한다.
-직접 Python 스크립트를 실행할 때는 활성 환경의 `python`을 사용한다.
-
-Wheel channel을 고정해야 할 때만 다음처럼 지정한다.
-
-```bash
-CUDA_WHEEL_TAG=cu126 bash scripts/setup_gpu.sh
-```
-
-## 11. 업데이트와 Private 복귀
+## 10. 업데이트와 Private 복귀
 
 실행 중에는 source를 바꾸지 않는다. 다음 새 실험 전에 최신 코드를 받으려면 저장소에서
 `git pull --ff-only`를 실행하고, 의존성이 바뀌었다면 setup을 다시 실행한다.
@@ -377,10 +396,10 @@ Private 전환 후 새 clone/pull에는 권한 있는 계정의 SSH key 또는 H
 코드를 수정한 뒤 검증할 때는 다음을 사용한다.
 
 ```bash
-.venv-gpu/bin/python -m pytest -q
-.venv-gpu/bin/ruff check .
-.venv-gpu/bin/ruff format --check .
-.venv-gpu/bin/python scripts/generate_code_summary.py --check
+python -m pytest -q
+python -m ruff check .
+python -m ruff format --check .
+python scripts/generate_code_summary.py --check
 ```
 
 `research/combined_later/`는 격리된 과거 prototype이다. 위 paper 명령은 이를 실행하지 않는다.

@@ -2,22 +2,7 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-python_command="${PYTHON:-python3}"
-venv_dir="${VENV_DIR:-${project_root}/.venv}"
-
-if [[ "${USE_ACTIVE_ENV:-0}" == "1" ]]; then
-    environment_python="${PYTHON:-python}"
-else
-    if [[ ! -x "${venv_dir}/bin/python" ]]; then
-        "${python_command}" -m venv "${venv_dir}"
-    fi
-    environment_python="${venv_dir}/bin/python"
-fi
-
-if ! "${environment_python}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
-    echo "Python 3.11 or newer is required: ${environment_python}" >&2
-    exit 2
-fi
+source "${project_root}/scripts/conda_env.sh"
 
 if [[ "${SKIP_DEPS:-0}" == "1" ]]; then
     # Use an already-provisioned cluster environment without changing its packages.

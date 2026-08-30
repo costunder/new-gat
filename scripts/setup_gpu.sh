@@ -2,13 +2,13 @@
 set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-bootstrap_python="${PYTHON:-python3}"
-venv_dir="${VENV_DIR:-${project_root}/.venv-gpu}"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
     echo "scripts/setup_gpu.sh targets the Linux host reached through MobaXterm." >&2
     exit 2
 fi
+source "${project_root}/scripts/conda_env.sh"
+
 if ! command -v nvidia-smi >/dev/null 2>&1; then
     echo "nvidia-smi was not found; request a GPU node before running setup_gpu.sh." >&2
     exit 2
@@ -61,20 +61,6 @@ lock_file="${project_root}/requirements-lock.txt"
 torch_index_url="https://download.pytorch.org/whl/${wheel_tag}"
 if [[ ! -f "${constraints_file}" || ! -f "${lock_file}" ]]; then
     echo "GPU lock files are missing: ${constraints_file} or ${lock_file}" >&2
-    exit 2
-fi
-
-if [[ "${USE_ACTIVE_ENV:-0}" == "1" ]]; then
-    environment_python="${PYTHON:-python}"
-else
-    if [[ ! -x "${venv_dir}/bin/python" ]]; then
-        "${bootstrap_python}" -m venv "${venv_dir}"
-    fi
-    environment_python="${venv_dir}/bin/python"
-fi
-
-if ! "${environment_python}" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
-    echo "Python 3.11 or newer is required: ${environment_python}" >&2
     exit 2
 fi
 

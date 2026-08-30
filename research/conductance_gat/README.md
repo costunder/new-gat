@@ -20,26 +20,27 @@ compatible smoke test. Paper claims and paper results must use `paper.py`.
 
 ## Linux/CUDA setup
 
-From the repository root on the Linux host reached through MobaXterm:
+Use the Linux GPU host reached through MobaXterm. Conda must first be available
+through the server's supported installation/module; ask the administrator if
+`conda --version` fails. From the repository root, create a dedicated environment:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-# Install the PyTorch wheel matching the host CUDA driver first.
-python -m pip install --no-build-isolation -e '.[dev]'
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda create -n new-gat python=3.11 pip -y
+conda activate new-gat
+bash scripts/setup_gpu.sh
 ```
 
-The generated S1--S4 core uses only the project dependencies. PascalVOC-SP and
-ogbg-molhiv are required public benchmarks in the paper protocol, while their
-download/loader adapters use optional PyG/OGB dependencies installed with:
+If you already created this project's environment using the
+[root README](../../README.md), skip creation and activate that same environment.
+Do not install into `base`, a shared environment, or another project's environment.
+The setup script installs the repository's exact CUDA/package pins, including
+PyG/OGB dependencies for PascalVOC-SP and ogbg-molhiv, then verifies CUDA and tests.
 
-```bash
-python -m pip install --no-build-isolation -e '.[dev,paper]'
-```
-
-Use the official PyTorch/PyG CUDA installation matrix when selecting wheels:
-<https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html>.
+Every `python` command below assumes this Conda environment is active and the
+working directory is the repository root. In each new SSH/tmux shell, run the
+`source` and `conda activate new-gat` commands again; no environment recreation
+is needed. See the root README for data paths, GPU allocation, and wheel selection.
 The runner checks CUDA availability before doing any work and gives an explicit
 error when a requested optional dependency or prepared public dataset is absent.
 

@@ -31,13 +31,16 @@
    constraints, suite-aware preflight, closed paper-metric registry도 구현했다. 반면 “통합 모델을
    active로 승격”하라는 항목은 결함 수정으로 받아들이지 않았다. 사용자가 요구한 현재 범위는
    세 독립 연구이고 결합은 이후 단계이기 때문이다.
+8. 2026-08-30 서버 실행 환경을 전용 Conda 생성·활성화 방식으로 변경했다. 네 Bash
+   entrypoint는 활성 non-base Conda Python을 검증한 뒤 설치·실행하며 venv를 생성하지 않는다.
+   연구 모델·데이터·평가 protocol은 변경하지 않았다.
 
 ### 코드 스냅샷
 
 - 파일: `code_summary.md`
-- 포함 파일: 90개
-- 크기: 878,608 bytes, 23,460 lines (`str.splitlines()` 기준)
-- SHA-256: `3756DA9F3C4F672082624C976058C6A1033718E2C3BAB123C3B98351B6BFCB55`
+- 포함 파일: 93개
+- 크기: 894,287 bytes, 23,857 lines (`str.splitlines()` 기준)
+- SHA-256: `EB9DB0DFC0C7E26B59DFDC2B73D06AD1BC3D77A6D5834DFC5A701A5A7E0FA78F`
 - 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
 
@@ -134,10 +137,12 @@ representation으로 제공하는 inductive bias다.
 - `requirements-lock.txt`, `constraints-cu*.txt`: Python 3.11 호환 exact top-level 연구 stack과
   CUDA 12.6/13.0/13.2별 official torch channel 계약.
 - `requirements-paper.txt`: portable paper dependency가 같은 lock을 사용하게 하는 진입점.
-- `scripts/setup_gpu.sh`, `scripts/verify_gpu_lock.py`: Linux GPU 환경 생성, exact package/ABI/CUDA
-  runtime 검증과 transitive freeze snapshot.
+- `scripts/setup_gpu.sh`, `scripts/verify_gpu_lock.py`: 활성 프로젝트 전용 Conda 환경에 exact
+  package 설치, ABI/CUDA runtime 검증과 transitive freeze snapshot.
+- `scripts/conda_env.sh`, `scripts/verify_conda_env.py`: Linux Bash 진입점이 공유하는
+  Conda/Python 검사. 비활성 환경, base 환경과 중첩된 별도 Python 환경을 거부한다.
 - `scripts/gpu_preflight.py`: conductance/projector/tree-chart/BREC/public-PyG synthetic shape-stress.
-- `scripts/paper.sh`: GPU environment Python으로 master runner 실행.
+- `scripts/paper.sh`: 활성 Conda 환경의 Python으로 master runner 실행.
 - `scripts/run_paper.py`: 세 독립 트랙을 model-seed별 subprocess로 dispatch하고 중앙 manifest 작성.
 - `scripts/aggregate_paper.py`: 폐쇄형 paper metric/efficiency registry와 seed-aligned 통계.
 - `scripts/generate_code_summary.py`: 외부 교차검증용 exact source snapshot 생성/검사.
@@ -185,16 +190,37 @@ node에 GPU가 없다면 먼저 cluster scheduler로 GPU allocation을 받아야
 
 ### 3.1 설치
 
+Conda 자체가 서버에서 사용 가능해야 한다. 없다면 서버의 Conda module/설치 경로를 관리자
+안내에 따라 준비한다. **실험 환경은 이미 존재한다고 가정하지 않고 아래에서 새로 생성한다.**
+Setup은 Conda나 NVIDIA driver를 설치하지 않는다. 명령은 저장소 root에서 실행한다.
+긴 설치와 학습을 유지할 tmux를 먼저 시작한 뒤 같은 창에서 나머지를 진행한다.
+
 ```bash
-cd /path/to/NEW-GAT
+cd /path/to/new-gat
 nvidia-smi
+conda --version
+tmux new -s new-gat
+```
+
+tmux 안에서:
+
+```bash
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda create -n new-gat python=3.11 pip -y
+conda activate new-gat
 bash scripts/setup_gpu.sh
 ```
+
+이 프로젝트용 환경이 이미 있으면 생성만 건너뛰고 활성화한다. 다른 프로젝트의 동명 환경,
+공유 환경이나 `base`를 재사용하지 않는다. 새 SSH/tmux 창에서는 위 `source`와
+`conda activate new-gat`을 다시 실행하고 데이터·결과 경로도 같은 값으로 설정한다.
+모든 직접 `python` 호출과 paper runner는 이 환경을 사용한다.
 
 `setup_gpu.sh`가 수행하는 작업:
 
 1. Linux와 `nvidia-smi` 확인.
-2. `.venv-gpu` 생성 또는 `USE_ACTIVE_ENV=1`일 때 활성 Conda/venv 사용.
+2. 활성 non-base Conda 환경을 확인하고 `$CONDA_PREFIX/bin/python` 사용. 환경 자동 생성이나
+   시스템 Python fallback은 없다.
 3. driver compatibility에 따라 `cu126`, `cu130`, `cu132` 중 official channel 선택. CUDA 12.6
    미만에서 과거 torch로 자동 후퇴하지 않는다. `CUDA_WHEEL_TAG`로 지원 tag만 고정할 수 있다.
 4. 선택한 `constraints-cu*.txt`와 `requirements-lock.txt`의 14개 top-level exact pin 설치.
@@ -207,6 +233,11 @@ bash scripts/setup_gpu.sh
 현재 lock은 `torch==2.13.0`이고 Python 3.11 계약을 유지한다. Setup의 기본 preflight는 환경과
 conductance smoke이며, master training invocation이 선택 suite에 맞는 고메모리 profile을 추가로
 실행한다.
+
+`CUDA_WHEEL_TAG=cu126 bash scripts/setup_gpu.sh`처럼 wheel channel을 고정할 수 있다.
+이미 exact lock을 설치한 환경에서 의존성 설치를 생략하려면
+`SKIP_DEPS=1 bash scripts/setup_gpu.sh`를 쓴다. 이때도 프로젝트 editable 설치는 갱신하며,
+version/ABI/CUDA 검증을 생략하지 않는다. 새 빈 환경에는 이 옵션을 사용하지 않는다.
 
 Full paper runner는 CPU fallback을 하지 않는다. CPU는 `--tiny --allow-cpu`를 함께 준 코드
 fixture 검사에서만 허용된다.
@@ -226,7 +257,7 @@ bash scripts/paper.sh \
   --data-seed 0 --split-seed 0 --chart-seed 0 \
   --run-id prepare-all-v1
 
-.venv-gpu/bin/python scripts/check_datasets.py \
+python scripts/check_datasets.py \
   --profile paper \
   --data-root "$paper_data_root" \
   --seeds 0 \
@@ -250,9 +281,9 @@ validation, `os.replace`, manifest-last 순서로 publish한다.
 먼저 `--suite core --model-seeds 0` 한 seed kill test를 완료한 뒤 아래 명령을 실행한다.
 Official BREC만 4 variants × 10 seeds × 400 pairs라서 `suite=all`을 첫 실행으로 쓰면 안 된다.
 
-```bash
-tmux new -s new-gat
+3.1에서 시작한 tmux 창과 활성 `new-gat` 환경에서 실행한다.
 
+```bash
 bash scripts/paper.sh \
   --suite all \
   --device cuda \
@@ -777,22 +808,32 @@ roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사�
 
 ## 8. 자동 검증 상태
 
-마지막 로컬 회귀검사:
+2026-08-30 Conda 전환 후 로컬 회귀검사:
 
 ```text
-pytest -q                     140 passed
+pytest -q                     167 passed, 13 skipped
 ruff check .                 All checks passed
-ruff format --check .        79 files already formatted
+ruff format --check .        81 files already formatted
+README CLI dry-run           6 examples passed (Python runner, not Bash execution)
+```
+
+기존 데이터/작은 파이프라인 검증 기록(이번 환경 수정에서 재학습하지 않음):
+
+```text
 dataset checker paper        code_ready=true, paper_benchmark_suite_complete=true
 master core tiny CPU         passed (3 independent children + schema-v2 aggregate)
 ```
 
-140 tests의 구성:
+통과한 167 tests의 구성:
 
 - Conductance track: 20.
 - Cycle PE track: 43.
 - Tree augmentation track: 21.
-- Root algebra/runner/preflight/registry/boundary/cache/statistics/environment: 56.
+- Root algebra/runner/preflight/registry/boundary/cache/statistics/environment: 83.
+
+추가 Linux/Bash 전용 13개는 로컬 Windows에 Bash가 없어 명시적으로 skip했다. Conda 검사
+로직의 unit test와 Bash source 계약 검사는 통과했지만 실제 Conda/Bash 실행을 인증한 것은
+아니다. GPU 서버의 `setup_gpu.sh` 마지막 pytest에서 이 13개도 실행된다.
 
 이 테스트는 실제 CUDA kernel과 official dataset 전체 학습 성능을 대체하지 않는다. 로컬
 master tiny wiring `reaudit-v4-core-tiny`는 `data=43, split=47, chart=53, model=41`로
@@ -801,8 +842,8 @@ group 1,833개, 별도 efficiency 30행, failure/OOM 0을 생성했다. 금지�
 history/임의 parameter count가 paper 표에 들어간 사례는 0이다. 이 숫자와 tiny 성능은 과학
 결과로 사용하면 안 된다.
 
-마지막 Windows CPU `pytest`는 exit code 0과 140 passed를 반환했지만 PyTorch serialization
-구간에서 간헐적인 Windows faulthandler `access violation` 진단을 출력했다. 이 로컬 진단을
+마지막 Windows CPU `pytest`는 exit code 0과 167 passed, 13 skipped를 반환했지만 실행 중
+간헐적인 Windows faulthandler `access violation` 진단을 출력했다. 이 로컬 진단을
 Linux CUDA 성공 또는 실패의 증거로 해석하지 말고, target 서버의 clean environment에서
 동일 검사를 다시 실행해야 한다.
 
