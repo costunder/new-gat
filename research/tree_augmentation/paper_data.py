@@ -1,7 +1,6 @@
 """Datasets and spanning-tree charts for the independent paper protocol.
 
-The existing :mod:`research.tree_augmentation.run` smoke experiment is kept
-separate.  This module adds graph-level downstream labels, a true uniform
+This module supplies graph-level downstream labels, a true uniform
 spanning-tree sampler, deterministic caches, and optional PyG dataset adapters.
 """
 
@@ -485,14 +484,10 @@ def _register_unique_graph(
     return True
 
 
-def build_cyclecount_records(*, seed: int, tiny: bool) -> tuple[GraphRecord, ...]:
+def build_cyclecount_records(*, seed: int) -> tuple[GraphRecord, ...]:
     """Create graph-first ID/OOD splits with chart-independent cycle-count labels."""
 
-    counts = (
-        {"train": 8, "validation": 3, "id_test": 4, "ood_test": 4}
-        if tiny
-        else {"train": 128, "validation": 24, "id_test": 40, "ood_test": 40}
-    )
+    counts = {"train": 128, "validation": 24, "id_test": 40, "ood_test": 40}
     records: list[GraphRecord] = []
     graph_buckets: dict[tuple[int, int], list[nx.Graph]] = {}
     for split in ("train", "validation", "id_test"):
@@ -620,7 +615,6 @@ def _cache_records(
     task_type: str,
     source: str,
     seed: int,
-    tiny: bool,
 ) -> PreparedDataset:
     payload = {
         "dataset_version": DATASET_VERSION,
@@ -644,7 +638,7 @@ def _cache_records(
         "suite": suite,
         "source": source,
         "seed": seed,
-        "tiny": tiny,
+        "profile": "full",
         "task_type": task_type,
         "target_names": list(target_names),
         "data_path": str(data_path),
@@ -666,23 +660,26 @@ def _cache_records(
     return _load_cached_dataset(suite=suite, data_path=data_path, manifest_path=manifest_path)
 
 
-def prepare_cyclecount_dataset(data_root: Path, *, seed: int, tiny: bool) -> PreparedDataset:
+def prepare_cyclecount_dataset(data_root: Path, *, seed: int) -> PreparedDataset:
     """Create or verify the offline CycleCount-style deterministic cache."""
 
-    variant = "tiny" if tiny else "full"
     cache_dir = data_root.expanduser().resolve() / "cyclecount_ood_v2"
-    stem = f"seed-{seed}-{variant}"
-    records = build_cyclecount_records(seed=seed, tiny=tiny)
+    stem = f"seed-{seed}-full"
+    data_path = cache_dir / f"{stem}.json"
+    manifest_path = cache_dir / f"{stem}.manifest.json"
+    if data_path.exists() or manifest_path.exists():
+        return validate_prepared_cache("core", data_root, seed=seed)
+    records = build_cyclecount_records(seed=seed)
+    _validate_protocol_records("core", records)
     return _cache_records(
         suite="core",
         records=records,
-        data_path=cache_dir / f"{stem}.json",
-        manifest_path=cache_dir / f"{stem}.manifest.json",
+        data_path=data_path,
+        manifest_path=manifest_path,
         target_names=tuple(f"cycles_len_{length}" for length in TARGET_CYCLE_LENGTHS),
         task_type="regression",
         source="generated://tree_augmentation/cyclecount_ood_v2",
         seed=seed,
-        tiny=tiny,
     )
 
 
@@ -794,7 +791,7 @@ def zinc_record_from_pyg(
     )
 
 
-def _prepare_csl_records(data_root: Path, *, seed: int, tiny: bool) -> tuple[GraphRecord, ...]:
+def _prepare_csl_records(data_root: Path, *, seed: int) -> tuple[GraphRecord, ...]:
     GNNBenchmarkDataset, _ = _require_pyg("csl")
     raw_root = data_root / "pyg" / "CSL"
     try:
@@ -812,18 +809,7 @@ def _prepare_csl_records(data_root: Path, *, seed: int, tiny: bool) -> tuple[Gra
         for position, index in enumerate(rng.permutation(members)):
             folds[int(index)] = position % 5
     records: list[GraphRecord] = []
-    if tiny:
-        selected = []
-        for label in sorted(set(labels)):
-            members = [index for index, value in enumerate(labels) if value == label]
-            for fold in range(5):
-                candidates = [index for index in members if folds[index] == fold]
-                if candidates:
-                    selected.append(candidates[0])
-        selected.sort()
-    else:
-        selected = list(range(len(dataset)))
-    for index in selected:
+    for index in range(len(dataset)):
         data = dataset[index]
         num_nodes, edges = _pyg_edges(data)
         fold = folds[index]
@@ -842,7 +828,7 @@ def _prepare_csl_records(data_root: Path, *, seed: int, tiny: bool) -> tuple[Gra
     return tuple(records)
 
 
-def _prepare_zinc_records(data_root: Path, *, tiny: bool) -> tuple[GraphRecord, ...]:
+def _prepare_zinc_records(data_root: Path) -> tuple[GraphRecord, ...]:
     _, ZINC = _require_pyg("zinc")
     raw_root = data_root / "pyg" / "ZINC"
     records: list[GraphRecord] = []
@@ -854,9 +840,8 @@ def _prepare_zinc_records(data_root: Path, *, tiny: bool) -> tuple[GraphRecord, 
                 f"failed to prepare ZINC-12K split {split!r} under {raw_root}. Check network "
                 f"access, write permission, and the PyG dataset download; original error: {error}"
             ) from error
-        limit = min(len(dataset), 32 if split == "train" else 12) if tiny else len(dataset)
         normalized_split = "validation" if split == "val" else split
-        for index in range(limit):
+        for index in range(len(dataset)):
             data = dataset[index]
             records.append(
                 zinc_record_from_pyg(
@@ -873,7 +858,6 @@ def prepare_optional_pyg_dataset(
     data_root: Path,
     *,
     seed: int,
-    tiny: bool,
     allow_download: bool = False,
 ) -> PreparedDataset:
     """Prepare CSL or ZINC through optional PyG adapters with verified caches."""
@@ -882,14 +866,11 @@ def prepare_optional_pyg_dataset(
     if normalized not in {"csl", "zinc"}:
         raise ValueError("optional PyG suite must be csl or zinc")
     cache_dir = data_root.expanduser().resolve() / f"{normalized}_pyg_v2"
-    variant = "tiny" if tiny else "full"
-    stem = f"seed-{seed}-{variant}"
+    stem = f"seed-{seed}-full"
     data_path = cache_dir / f"{stem}.json"
     manifest_path = cache_dir / f"{stem}.manifest.json"
     if data_path.exists() or manifest_path.exists():
-        return _load_cached_dataset(
-            suite=normalized, data_path=data_path, manifest_path=manifest_path
-        )
+        return validate_prepared_cache(normalized, data_root, seed=seed)
     if not allow_download:
         raise OptionalDatasetError(
             f"suite {normalized!r} has no verified processed cache under {cache_dir}. "
@@ -897,15 +878,16 @@ def prepare_optional_pyg_dataset(
             "public dataset endpoint, or copy a complete cache plus manifest here."
         )
     if normalized == "csl":
-        records = _prepare_csl_records(data_root.expanduser().resolve(), seed=seed, tiny=tiny)
+        records = _prepare_csl_records(data_root.expanduser().resolve(), seed=seed)
         target_names = tuple(f"class_{index}" for index in range(10))
         task_type = "classification"
         source = "PyG:GNNBenchmarkDataset/CSL"
     else:
-        records = _prepare_zinc_records(data_root.expanduser().resolve(), tiny=tiny)
+        records = _prepare_zinc_records(data_root.expanduser().resolve())
         target_names = ("constrained_logP",)
         task_type = "regression"
         source = "PyG:ZINC(subset=True)"
+    _validate_protocol_records(normalized, records)
     return _cache_records(
         suite=normalized,
         records=records,
@@ -915,7 +897,6 @@ def prepare_optional_pyg_dataset(
         task_type=task_type,
         source=source,
         seed=seed,
-        tiny=tiny,
     )
 
 
@@ -924,17 +905,15 @@ def validate_prepared_cache(
     data_root: Path,
     *,
     seed: int,
-    tiny: bool,
 ) -> PreparedDataset:
     """Validate one requested processed cache without generating or downloading data."""
 
     normalized = suite.lower()
     if normalized not in {"core", "csl", "zinc"}:
         raise ValueError("suite must be core, csl, or zinc")
-    variant = "tiny" if tiny else "full"
     cache_name = "cyclecount_ood_v2" if normalized == "core" else f"{normalized}_pyg_v2"
     cache_dir = data_root.expanduser().resolve() / cache_name
-    stem = f"seed-{seed}-{variant}"
+    stem = f"seed-{seed}-full"
     data_path = cache_dir / f"{stem}.json"
     manifest_path = cache_dir / f"{stem}.manifest.json"
     present = (data_path.is_file(), manifest_path.is_file())
@@ -951,7 +930,13 @@ def validate_prepared_cache(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
         raise CacheCorruptError(f"invalid tree {normalized} processed cache") from error
-    if manifest.get("seed") != int(seed) or manifest.get("tiny") is not bool(tiny):
+    # Existing full v2 caches used tiny=false. Accept those without rewriting
+    # their records or fingerprints, but never accept a reduced legacy cache.
+    if (
+        manifest.get("seed") != int(seed)
+        or manifest.get("tiny", False) is not False
+        or manifest.get("profile", "full") != "full"
+    ):
         raise CacheWrongRequestError(f"tree {normalized} cache seed/profile mismatch")
     expected_source = {
         "core": "generated://tree_augmentation/cyclecount_ood_v2",
@@ -960,31 +945,28 @@ def validate_prepared_cache(
     }[normalized]
     if manifest.get("source") != expected_source:
         raise CacheWrongRequestError(f"tree {normalized} cache source mismatch")
+    _validate_protocol_records(normalized, prepared.records)
+    return prepared
+
+
+def _validate_protocol_records(suite: str, records: Sequence[GraphRecord]) -> None:
+    """Reject incomplete public splits and reduced caches before paper training."""
+
     expected_counts = {
-        "core": (
-            {"train": 8, "validation": 3, "id_test": 4, "ood_test": 4}
-            if tiny
-            else {"train": 128, "validation": 24, "id_test": 40, "ood_test": 40}
-        ),
-        "csl": (
-            {"train": 30, "validation": 10, "test": 10}
-            if tiny
-            else {"train": 90, "validation": 30, "test": 30}
-        ),
-        "zinc": (
-            {"train": 32, "validation": 12, "test": 12}
-            if tiny
-            else {"train": 10_000, "validation": 1_000, "test": 1_000}
-        ),
-    }[normalized]
-    actual_counts = {name: len(ids) for name, ids in manifest["split_graph_ids"].items()}
+        "core": {"train": 128, "validation": 24, "id_test": 40, "ood_test": 40},
+        "csl": {"train": 90, "validation": 30, "test": 30},
+        "zinc": {"train": 10_000, "validation": 1_000, "test": 1_000},
+    }[suite]
+    actual_counts: dict[str, int] = {}
+    for record in records:
+        actual_counts[record.split] = actual_counts.get(record.split, 0) + 1
     if actual_counts != expected_counts:
-        raise CacheCorruptError(f"tree {normalized} split cardinalities are invalid")
-    expected_target_width = 4 if normalized == "core" else 1
-    for record in prepared.records:
+        raise CacheCorruptError(f"tree {suite} split cardinalities are invalid")
+    expected_target_width = 4 if suite == "core" else 1
+    for record in records:
         if len(record.target) != expected_target_width or not np.all(np.isfinite(record.target)):
-            raise CacheCorruptError(f"tree {normalized} target shape or value is invalid")
-        if normalized == "zinc":
+            raise CacheCorruptError(f"tree {suite} target shape or value is invalid")
+        if suite == "zinc":
             if record.x is None or len(record.x) != record.num_nodes:
                 raise CacheCorruptError("tree ZINC atom features are missing or misaligned")
             if record.edge_attr is None or len(record.edge_attr) != len(record.edges):
@@ -993,7 +975,6 @@ def validate_prepared_cache(
                 raise CacheCorruptError("tree ZINC atom category is outside the supported range")
             if any(not 0 <= int(value) < ZINC_NUM_BOND_TYPES for value in record.edge_attr):
                 raise CacheCorruptError("tree ZINC bond category is outside the supported range")
-    return prepared
 
 
 __all__ = [

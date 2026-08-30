@@ -29,7 +29,7 @@ from chartgat.cache import (
 from .sparse import edge_divergence, edge_gradient, weighted_degree
 
 SCHEMA_VERSION = 2
-GENERATOR_VERSION = "conductance-s1-s4-edge-index-v5"
+GENERATOR_VERSION = "conductance-s1-s4-edge-index-v6-full-only"
 
 
 def _generator(seed: int) -> torch.Generator:
@@ -251,9 +251,9 @@ def _vary_nodes(low: int, high: int, seed: int) -> int:
     return int(torch.randint(low, high + 1, (1,), generator=_generator(seed)))
 
 
-def generate_s1(seed: int, tiny: bool) -> dict[str, Any]:
-    counts = (4, 1, 1) if tiny else (42, 9, 9)
-    excitation_counts = (3, 2, 2) if tiny else (6, 3, 3)
+def generate_s1(seed: int) -> dict[str, Any]:
+    counts = (42, 9, 9)
+    excitation_counts = (6, 3, 3)
     result: dict[str, Any] = {name: [] for name in ("train", "validation", "test", "seen_test")}
     offset = 0
     for split, graph_count, excitation_count in zip(
@@ -262,7 +262,7 @@ def generate_s1(seed: int, tiny: bool) -> dict[str, Any]:
         for graph_number in range(graph_count):
             graph_seed = seed * 100_000 + offset * 101 + 11
             graph_id = f"s1-{split}-{graph_number:03d}"
-            nodes = _vary_nodes(8 if tiny else 16, 14 if tiny else 32, graph_seed)
+            nodes = _vary_nodes(16, 32, graph_seed)
             family = "er" if graph_number % 2 == 0 else "rgg"
             for excitation in range(excitation_count):
                 result[split].append(
@@ -275,7 +275,7 @@ def generate_s1(seed: int, tiny: bool) -> dict[str, Any]:
                     )
                 )
             if split == "train":
-                seen_count = 1 if tiny else 2
+                seen_count = 2
                 for excitation in range(seen_count):
                     result["seen_test"].append(
                         make_example(
@@ -291,16 +291,14 @@ def generate_s1(seed: int, tiny: bool) -> dict[str, Any]:
     return result
 
 
-def _s2_protocol_counts(tiny: bool) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+def _s2_protocol_counts() -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     """Return graph and per-graph excitation counts for train/validation/test."""
 
-    if tiny:
-        return (4, 2, 4), (2, 2, 2)
     return (28, 8, 16), (4, 3, 3)
 
 
-def generate_s2(seed: int, tiny: bool) -> dict[str, Any]:
-    counts, excitation_counts = _s2_protocol_counts(tiny)
+def generate_s2(seed: int) -> dict[str, Any]:
+    counts, excitation_counts = _s2_protocol_counts()
     result: dict[str, Any] = {name: [] for name in ("train", "validation", "test")}
     for split_number, (split, count, excitations) in enumerate(
         zip(("train", "validation", "test"), counts, excitation_counts, strict=True)
@@ -308,10 +306,10 @@ def generate_s2(seed: int, tiny: bool) -> dict[str, Any]:
         for graph_number in range(count):
             graph_seed = seed * 200_000 + split_number * 20_000 + graph_number * 131 + 29
             if split == "test":
-                low, high = (12, 20) if tiny else (48, 96)
+                low, high = (48, 96)
                 family = "grid" if graph_number % 2 == 0 else "barbell"
             else:
-                low, high = (6, 10) if tiny else (16, 32)
+                low, high = (16, 32)
                 family = "er" if graph_number % 2 == 0 else "rgg"
             nodes = _vary_nodes(low, high, graph_seed)
             graph_id = f"s2-{split}-{family}-{graph_number:03d}"
@@ -397,22 +395,22 @@ def _trajectory_examples(trajectory: dict[str, Any]) -> list[dict[str, Any]]:
     return examples
 
 
-def generate_s3(seed: int, tiny: bool) -> dict[str, Any]:
-    counts = (3, 1, 2) if tiny else (12, 3, 5)
-    horizon = 10 if tiny else 50
+def generate_s3(seed: int) -> dict[str, Any]:
+    counts = (12, 3, 5)
+    horizon = 50
     result: dict[str, Any] = {
         "train": [],
         "validation": [],
         "test": [],
         "rollout_test": [],
-        "horizons": [1, 5, 10] if tiny else [1, 5, 10, 50],
+        "horizons": [1, 5, 10, 50],
     }
     for split_number, (split, count) in enumerate(
         zip(("train", "validation", "test"), counts, strict=True)
     ):
         for number in range(count):
             graph_seed = seed * 300_000 + split_number * 30_000 + number * 151 + 37
-            nodes = _vary_nodes(8 if tiny else 18, 14 if tiny else 36, graph_seed)
+            nodes = _vary_nodes(18, 36, graph_seed)
             family = "er" if number % 2 == 0 else "rgg"
             trajectory = _make_trajectory(
                 graph_id=f"s3-{split}-{number:03d}",
@@ -429,13 +427,13 @@ def generate_s3(seed: int, tiny: bool) -> dict[str, Any]:
     return result
 
 
-def generate_s4(seed: int, tiny: bool) -> dict[str, Any]:
+def generate_s4(seed: int) -> dict[str, Any]:
     result: dict[str, Any] = {"train": [], "validation": [], "test": []}
     contrasts = (1.0, 10.0, 100.0)
     active_fractions = (1.0, 0.25)
     snrs: tuple[float | None, ...] = (None, 40.0, 20.0)
-    graph_counts = (1, 1, 1) if tiny else (3, 1, 2)
-    excitation_counts = (2, 1, 2) if tiny else (6, 2, 4)
+    graph_counts = (3, 1, 2)
+    excitation_counts = (6, 2, 4)
     cell = 0
     for contrast in contrasts:
         for active_fraction in active_fractions:
@@ -456,7 +454,7 @@ def generate_s4(seed: int, tiny: bool) -> dict[str, Any]:
                             + graph_number * 173
                             + 41
                         )
-                        nodes = _vary_nodes(8 if tiny else 18, 14 if tiny else 32, graph_seed)
+                        nodes = _vary_nodes(18, 32, graph_seed)
                         graph_id = (
                             f"s4-{split}-c{contrast:g}-a{active_fraction:g}-"
                             f"s{snr}-{graph_number:02d}"
@@ -480,16 +478,15 @@ def generate_s4(seed: int, tiny: bool) -> dict[str, Any]:
     return result
 
 
-def generate_core(seed: int, tiny: bool = False) -> dict[str, Any]:
+def generate_core(seed: int) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "generator_version": GENERATOR_VERSION,
         "seed": int(seed),
-        "tiny": bool(tiny),
-        "s1": generate_s1(seed + 101, tiny),
-        "s2": generate_s2(seed + 202, tiny),
-        "s3": generate_s3(seed + 303, tiny),
-        "s4": generate_s4(seed + 404, tiny),
+        "s1": generate_s1(seed + 101),
+        "s2": generate_s2(seed + 202),
+        "s3": generate_s3(seed + 303),
+        "s4": generate_s4(seed + 404),
     }
 
 
@@ -550,8 +547,8 @@ def _split_counts(core: dict[str, Any]) -> dict[str, dict[str, int]]:
     }
 
 
-def _expected_split_counts(tiny: bool) -> dict[str, dict[str, int]]:
-    s2_graph_counts, s2_excitation_counts = _s2_protocol_counts(tiny)
+def _expected_split_counts() -> dict[str, dict[str, int]]:
+    s2_graph_counts, s2_excitation_counts = _s2_protocol_counts()
     s2_counts = {
         split: graph_count * excitation_count
         for split, graph_count, excitation_count in zip(
@@ -561,29 +558,19 @@ def _expected_split_counts(tiny: bool) -> dict[str, dict[str, int]]:
             strict=True,
         )
     }
-    return (
-        {
-            "s1": {"train": 12, "validation": 2, "test": 2, "seen_test": 4},
-            "s2": s2_counts,
-            "s3": {"train": 30, "validation": 10, "test": 20},
-            "s4": {"train": 36, "validation": 18, "test": 36},
-        }
-        if tiny
-        else {
-            "s1": {"train": 252, "validation": 27, "test": 27, "seen_test": 84},
-            "s2": s2_counts,
-            "s3": {"train": 600, "validation": 150, "test": 250},
-            "s4": {"train": 324, "validation": 36, "test": 144},
-        }
-    )
+    return {
+        "s1": {"train": 252, "validation": 27, "test": 27, "seen_test": 84},
+        "s2": s2_counts,
+        "s3": {"train": 600, "validation": 150, "test": 250},
+        "s4": {"train": 324, "validation": 36, "test": 144},
+    }
 
 
-def _core_request(seed: int, tiny: bool) -> dict[str, Any]:
+def _core_request(seed: int) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "generator_version": GENERATOR_VERSION,
         "seed": int(seed),
-        "tiny": bool(tiny),
     }
 
 
@@ -669,7 +656,7 @@ def _validate_core_content(core: Any, request: dict[str, Any], manifest: dict[st
     split_counts = _split_counts(core)
     if manifest.get("split_counts") != split_counts:
         raise CacheCorruptError("conductance split-count manifest does not match the artifact")
-    if split_counts != _expected_split_counts(bool(request["tiny"])):
+    if split_counts != _expected_split_counts():
         raise CacheCorruptError("conductance split cardinalities do not match the paper protocol")
     for suite_splits in graph_ids.values():
         named_sets = [set(values) for name, values in suite_splits.items() if name != "seen_test"]
@@ -679,11 +666,11 @@ def _validate_core_content(core: Any, request: dict[str, Any], manifest: dict[st
 
 
 def validate_core_cache(
-    data_root: Path | str, *, seed: int, tiny: bool = False
+    data_root: Path | str, *, seed: int
 ) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     """Read and fully validate one requested generated core cache without writing."""
 
-    request = _core_request(seed, tiny)
+    request = _core_request(seed)
     artifact_path, manifest_path = _core_cache_paths(data_root, request)
     present = (artifact_path.is_file(), manifest_path.is_file())
     if not any(present):
@@ -718,15 +705,15 @@ def validate_core_cache(
 
 
 def prepare_core_cache(
-    data_root: Path | str, *, seed: int, tiny: bool = False, force: bool = False
+    data_root: Path | str, *, seed: int, force: bool = False
 ) -> tuple[dict[str, Any], Path, dict[str, Any]]:
-    request = _core_request(seed, tiny)
+    request = _core_request(seed)
     artifact_path, manifest_path = _core_cache_paths(data_root, request)
     cache_key = artifact_path.parent.name.removeprefix("core-")
     if (artifact_path.exists() or manifest_path.exists()) and not force:
-        return validate_core_cache(data_root, seed=seed, tiny=tiny)
+        return validate_core_cache(data_root, seed=seed)
 
-    core = generate_core(seed, tiny)
+    core = generate_core(seed)
     expected_content_sha256 = _content_fingerprint(core)
 
     def validate_artifact(temporary: Path) -> None:
@@ -758,7 +745,7 @@ def prepare_core_cache(
         manifest,
         validator=lambda temporary: json.loads(temporary.read_text(encoding="utf-8")),
     )
-    return validate_core_cache(data_root, seed=seed, tiny=tiny)
+    return validate_core_cache(data_root, seed=seed)
 
 
 __all__ = [

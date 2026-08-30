@@ -17,16 +17,14 @@ from research.cycle_pe.paper_adapters import (
     find_brec_v3,
     load_brec_v3,
     validate_brec_v3,
-    write_tiny_brec_fixture,
 )
+from research.cycle_pe.tests.fixtures import write_brec_fixture
 
 
-def test_tiny_brec_fixture_matches_lazy_rpc_layout(tmp_path) -> None:
-    path = write_tiny_brec_fixture(
-        tmp_path / "BREC" / "Data" / "raw" / "brec_v3.npy", num_relabel=2
-    )
+def test_brec_fixture_matches_lazy_rpc_layout(tmp_path) -> None:
+    path = write_brec_fixture(tmp_path / "BREC" / "Data" / "raw" / "brec_v3.npy", num_relabel=2)
     assert find_brec_v3(tmp_path) == path
-    adapter = BRECAdapter(path, num_relabel=2)
+    adapter = BRECAdapter(path, num_relabel=2, protocol="custom")
     assert adapter.pair_count == 2
     pair = adapter.load_pair(0)
     assert len(pair.train_test) == 4
@@ -74,19 +72,21 @@ def test_brec_full_load_is_fail_closed_without_opt_in(monkeypatch, tmp_path) -> 
         load_brec_v3(tmp_path, allow_download=False)
 
 
-def test_brec_tiny_fixture_is_always_offline(monkeypatch, tmp_path) -> None:
+def test_brec_load_uses_explicit_supplied_artifact_without_network(monkeypatch, tmp_path) -> None:
+    write_brec_fixture(tmp_path / "BREC" / "Data" / "raw" / "brec_v3.npy")
+
     def unexpected_network(*args, **kwargs):
-        raise AssertionError("tiny BREC fixture must never use the network")
+        raise AssertionError("an existing artifact must not trigger a download")
 
     monkeypatch.setattr(paper_adapters.urllib.request, "urlopen", unexpected_network)
     adapter = load_brec_v3(
         tmp_path,
         num_relabel=2,
         allow_download=True,
-        tiny=True,
+        protocol="custom",
     )
     assert adapter.pair_count == 2
-    assert adapter.metadata["offline_fixture"] is True
+    assert adapter.metadata["protocol"] == "custom"
 
 
 class _FakeHTTPResponse(io.BytesIO):
@@ -113,7 +113,7 @@ def _zip_payload(members: dict[str, bytes]) -> bytes:
 
 
 def test_explicit_brec_download_extracts_only_valid_npy(monkeypatch, tmp_path) -> None:
-    fixture = write_tiny_brec_fixture(tmp_path / "source.npy", num_relabel=2)
+    fixture = write_brec_fixture(tmp_path / "source.npy", num_relabel=2)
     payload = _zip_payload({"BREC/Data/raw/brec_v3.npy": fixture.read_bytes()})
     monkeypatch.setattr(
         paper_adapters.urllib.request,
@@ -173,7 +173,7 @@ def test_zinc_download_requires_explicit_opt_in(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(paper_adapters, "_require_pyg_zinc", lambda: UnexpectedZincConstruction)
     with pytest.raises(FileNotFoundError, match="--allow-download"):
-        paper_adapters.load_zinc12k(tmp_path, tiny=True, allow_download=False)
+        paper_adapters.load_zinc12k(tmp_path, allow_download=False)
 
 
 def test_zinc_adapter_uses_official_split_names_without_network(monkeypatch, tmp_path) -> None:
@@ -203,7 +203,10 @@ def test_zinc_adapter_uses_official_split_names_without_network(monkeypatch, tmp
             return FakeData()
 
     monkeypatch.setattr(paper_adapters, "_require_pyg_zinc", lambda: FakeZinc)
-    bundle = paper_adapters.load_zinc12k(tmp_path, tiny=True, allow_download=False)
+    monkeypatch.setattr(
+        paper_adapters, "ZINC_SPLIT_SIZES", {"train": 1, "validation": 1, "test": 1}
+    )
+    bundle = paper_adapters.load_zinc12k(tmp_path, allow_download=False)
     assert calls == [(True, "train"), (True, "val"), (True, "test")]
     assert {name: len(graphs) for name, graphs in bundle.splits.items()} == {
         "train": 1,
@@ -220,3 +223,20 @@ def test_zinc_adapter_uses_official_split_names_without_network(monkeypatch, tmp
         "subset/processed/val.pt",
         "subset/processed/test.pt",
     }
+
+
+def test_zinc_rejects_nonofficial_split_cardinality(monkeypatch, tmp_path) -> None:
+    class IncompleteZinc:
+        def __init__(self, **kwargs):
+            pass
+
+        def __len__(self):
+            return 1
+
+    monkeypatch.setattr(paper_adapters, "_require_pyg_zinc", lambda: IncompleteZinc)
+    with pytest.raises(RuntimeError, match="must contain 10000 graphs"):
+        paper_adapters.load_zinc12k(tmp_path, allow_download=True)
+
+
+def test_public_adapter_has_no_fixture_generator() -> None:
+    assert not hasattr(paper_adapters, "write_tiny_brec_fixture")

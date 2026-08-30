@@ -37,27 +37,6 @@ cocycle law
 M_(T'' <- T') M_(T' <- T) = M_(T'' <- T).
 ```
 
-The legacy smoke experiment compares:
-
-1. a raw static Cycle-PE probe trained on one fixed tree;
-2. the same probe trained with multiple BFS/DFS/random-priority Kruskal charts;
-3. both probes evaluated on a held-out unseen tree;
-4. the chart-invariant cycle-projector diagonal as an analytic oracle.
-
-Its diagnostic target is the static, chart-independent edge cycle leverage
-`diag(P_cycle)`, where
-
-```text
-P_cycle = F_T (F_T^T F_T)^(-1) F_T^T.
-```
-
-The learned probe intentionally receives raw chart coordinates.  It is a small
-diagnostic for augmentation, not a claim that augmentation is an exact
-substitute for an invariant architecture.
-
-This projector-derived target is never used as the paper headline.  It remains
-available only to preserve the original algebra/pipeline smoke test.
-
 ## Independent downstream paper protocol
 
 `paper.py` adds a separate graph-level protocol with no conductance, potential,
@@ -98,8 +77,7 @@ same physical tree. BFS/DFS root and neighbor ordering can select a different
 tree after an arbitrary relabeling; that remains an intentional chart shift,
 not an exact end-to-end graph-permutation-invariance claim.
 
-Full non-tiny core, CSL, and ZINC runs are paper-table eligible; every `--tiny`
-run remains pipeline validation only. CSL and ZINC use public PyG adapters and
+Core uses the full scientific cycle-count protocol. CSL and ZINC use public PyG adapters and
 emit actionable dependency, network, and cache-path errors when PyG or a
 download is unavailable. The ZINC adapter preserves the integer atom types and
 one categorical bond type per canonical undirected edge in its verified cache.
@@ -108,9 +86,10 @@ and cycle-chart representation; it is not a topology-only ZINC baseline.
 
 ### Linux/CUDA setup
 
-Use the Linux GPU host reached through MobaXterm. Conda must be available through
-the server's supported installation/module; ask the administrator if
-`conda --version` fails. From the repository root, create a dedicated environment:
+Use a Linux workstation or server with an NVIDIA GPU, directly from a local
+terminal or through any SSH client. Neither MobaXterm nor tmux is required.
+Follow the [root README](../../README.md) for the supported hardware/software
+requirements and Conda installation. From the repository root, create a dedicated environment:
 
 ```bash
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -123,10 +102,12 @@ If you already created this project's environment using the
 [root README](../../README.md), skip creation and activate that same environment.
 Do not install into `base`, a shared environment, or another project's environment.
 Setup installs the repository's exact CUDA/package pins, including the public PyG
-adapters, then verifies CUDA and tests.
+adapters, then verifies the lock, package compatibility, and CUDA. The default
+wheel channel is `cu126`; do not change it between reproductions of the same run.
+Tests are optional: `RUN_TESTS=1 bash scripts/setup_gpu.sh`.
 
 Every `python` command below assumes this Conda environment is active. Run paper
-and test commands from the repository root. In each new SSH/tmux shell, run the
+and test commands from the repository root. In each new terminal, run the
 `source` and `conda activate new-gat` commands again; no environment recreation
 is needed. See the root README for data paths, GPU allocation, and wheel selection.
 
@@ -153,7 +134,7 @@ For independent paper axes, pass all four explicitly:
 
 ```bash
 python -m research.tree_augmentation.paper \
-  --suite core --data-root /data/tree-augmentation \
+  --suite core --data-root ./data/tree-augmentation \
   --output-dir results/tree-core-axes --device cuda:0 \
   --data-seed 11 --split-seed 13 --chart-seed 17 --model-seed 19 \
   --amp --batch-size 16 --workers 4 --pin-memory --non-blocking
@@ -163,17 +144,8 @@ Prepare the deterministic offline cache without training:
 
 ```bash
 python -m research.tree_augmentation.paper \
-  --suite core --data-root /data/tree-augmentation \
+  --suite core --data-root ./data/tree-augmentation \
   --output-dir results/tree-core-prepared --seed 17 --prepare-only --workers 0
-```
-
-Run the tiny CPU fixture used by tests:
-
-```bash
-python -m research.tree_augmentation.paper \
-  --suite core --data-root /data/tree-augmentation \
-  --output-dir results/tree-core-tiny --device cpu --seed 17 \
-  --tiny --no-amp --batch-size 4 --workers 0
 ```
 
 Run the full CUDA path with autocast/GradScaler, pinned host transfers, and
@@ -181,7 +153,7 @@ non-blocking copies enabled by the configuration:
 
 ```bash
 python -m research.tree_augmentation.paper \
-  --suite core --data-root /data/tree-augmentation \
+  --suite core --data-root ./data/tree-augmentation \
   --output-dir results/tree-core-cuda --device cuda:0 --seed 17 \
   --amp --batch-size 16 --workers 4 --pin-memory --non-blocking
 ```
@@ -190,8 +162,8 @@ Optional adapters use `--suite csl`, `--suite zinc`, or `--suite all`. The GPU
 setup above installs their pinned PyG dependencies. A missing verified processed
 cache is network-safe by default: pass
 `--allow-download` explicitly to permit the PyG adapters to access their public
-dataset endpoints. `--tiny` limits converted records and optimizer updates, but
-still uses the real adapter and split. `--workers` is passed directly to every
+dataset endpoints. No generated stand-in replaces a missing public dataset.
+`--workers` is passed directly to every
 training and evaluation `DataLoader`. With `--suite all`, each suite gets its
 own subdirectory and the output root gets an aggregate manifest; all three are
 attempted even if an optional adapter fails.
@@ -208,19 +180,10 @@ All enabled experiments use every cycle coordinate (`k = beta`).  Passing
 idea is recorded as a disabled future extension and is never reported as
 lossless tree augmentation.
 
-## Legacy projector smoke run
+## Verification
 
-Run the default experiment from any working directory after installation:
-
-```bash
-python -m research.tree_augmentation.run
-```
-
-Run its tests from the repository root:
+Run unit tests from the repository root:
 
 ```bash
 python -m pytest research/tree_augmentation/tests -q
 ```
-
-Use a different configuration with `--config`.  The default run writes only to
-`research/tree_augmentation/results/summary.json`.

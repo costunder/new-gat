@@ -1,10 +1,9 @@
-"""Optional PyG/OGB public adapters plus deterministic offline fixtures.
+"""Official PyG/OGB public adapters with verified caches and opt-in downloads.
 
 The synthetic paper core has no optional dependencies.  Official
 PascalVOC-SP and ogbg-molhiv data are touched only through this module and only
-when the caller explicitly allows the dataset classes to download.  ``tiny``
-fixtures exercise the exact adapter/training path without network access and
-are always labelled as fixtures in result files.
+when a verified real cache exists or the caller explicitly allows downloading.
+Missing public data never falls back to generated graphs.
 """
 
 from __future__ import annotations
@@ -143,67 +142,11 @@ def adapt_pyg_graph(data: Any, graph_id: str, *, task: str) -> dict[str, Any]:
     }
 
 
-def _fixture_graph(seed: int, graph_id: str, *, task: str, categorical: bool) -> dict[str, Any]:
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
-    num_nodes = 6 + seed % 4
-    pairs = [(node, node + 1) for node in range(num_nodes - 1)]
-    pairs.extend((node, node + 2) for node in range(num_nodes - 2) if node % 2 == 0)
-    # Feed reciprocal arcs through the public deduplicator, as official PyG
-    # datasets do, so fixture tests cover this otherwise easy-to-miss step.
-    directed = pairs + [(b, a) for a, b in pairs]
-    directed_edges = torch.tensor(directed, dtype=torch.long).t().contiguous()
-    if categorical:
-        x = torch.randint(0, 4, (num_nodes, 3), generator=generator)
-        base_edge_attr = torch.randint(0, 3, (len(pairs), 2), generator=generator)
-    else:
-        x = torch.randn((num_nodes, 5), generator=generator)
-        base_edge_attr = torch.randn((len(pairs), 2), generator=generator)
-    edge_attr = torch.cat((base_edge_attr, base_edge_attr), dim=0)
-    edge_index, edge_features = deduplicate_undirected_edges(directed_edges, edge_attr, num_nodes)
-    if task == "node":
-        y = ((x[:, 0] > 0).long() + (x[:, 1] > 0).long()).clamp_max(2)
-    else:
-        # Alternate labels deterministically so every fixture split exercises
-        # the ROC-AUC evaluator; this is pipeline validation, not a benchmark.
-        y = torch.tensor([float(seed % 2)])
-    return {
-        "graph_id": graph_id,
-        "x": x,
-        "edge_index": edge_index,
-        "edge_features": edge_features,
-        "y": y,
-        "task": task,
-        "categorical": categorical,
-    }
-
-
-def make_public_fixtures(seed: int) -> dict[str, Any]:
-    result: dict[str, Any] = {"fixture": True}
-    for dataset_name, task, categorical in (
-        ("pascalvoc_sp", "node", False),
-        ("ogbg_molhiv", "graph", True),
-    ):
-        result[dataset_name] = {}
-        offset = 0 if dataset_name == "pascalvoc_sp" else 10_000
-        for split, count in (("train", 8), ("validation", 3), ("test", 4)):
-            result[dataset_name][split] = [
-                _fixture_graph(
-                    seed + offset + number * 19,
-                    f"fixture-{dataset_name}-{split}-{number:03d}",
-                    task=task,
-                    categorical=categorical,
-                )
-                for number in range(count)
-            ]
-    return result
-
-
 def _dependency_error() -> OptionalDatasetDependencyError:
     return OptionalDatasetDependencyError(
         "Official public suites require optional packages 'torch-geometric' and 'ogb'. "
-        "Install a PyTorch build matching the server CUDA runtime first, then run "
-        "`python -m pip install torch-geometric ogb`. See "
+        "Activate the dedicated Conda environment and run `bash scripts/setup_gpu.sh` "
+        "from the repository root to install the exact GPU dependency pins. See "
         "https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html "
         "and https://ogb.stanford.edu/docs/home/. The core S1-S4 suite does not need them."
     )
@@ -240,19 +183,6 @@ def _load_official(data_root: Path) -> dict[str, Any]:
         for split, official in (("train", "train"), ("validation", "valid"), ("test", "test"))
     }
     return {"fixture": False, "pascalvoc_sp": pascal, "ogbg_molhiv": mol}
-
-
-def _fixture_hash(data: dict[str, Any]) -> str:
-    digest = hashlib.sha256()
-    for dataset_name in ("pascalvoc_sp", "ogbg_molhiv"):
-        for split in ("train", "validation", "test"):
-            for graph in data[dataset_name][split]:
-                digest.update(graph["graph_id"].encode())
-                for key in ("x", "edge_index", "edge_features", "y"):
-                    tensor = graph[key].contiguous()
-                    digest.update(str(tensor.dtype).encode())
-                    digest.update(tensor.view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
 
 
 def _processed_paths(datasets: dict[str, Any], root: Path) -> list[str]:
@@ -297,13 +227,11 @@ def _processed_hashes(root: Path, paths: Sequence[str]) -> dict[str, str]:
     return hashes
 
 
-def validate_public_cache(
-    data_root: Path | str, *, seed: int, tiny: bool
-) -> tuple[Path, dict[str, Any]]:
+def validate_public_cache(data_root: Path | str) -> tuple[Path, dict[str, Any]]:
     """Validate the public marker and all recorded processed files without downloading."""
 
     public_root = Path(data_root).expanduser().resolve() / "conductance_gat" / "public"
-    marker = public_root / (f"fixture-seed{seed}.json" if tiny else "official-ready.json")
+    marker = public_root / "official-ready.json"
     if not marker.is_file():
         raise FileNotFoundError(f"conductance public cache marker is missing: {marker}")
     try:
@@ -312,30 +240,18 @@ def validate_public_cache(
         raise CacheCorruptError(f"invalid conductance public marker: {marker}") from error
     if manifest.get("schema_version") != PUBLIC_SCHEMA_VERSION:
         raise CacheWrongRequestError(f"unsupported conductance public marker schema: {marker}")
-    if bool(manifest.get("fixture")) != bool(tiny):
-        raise CacheWrongRequestError(f"conductance public marker profile mismatch: {marker}")
-    if tiny and manifest.get("seed") != int(seed):
-        raise CacheWrongRequestError(f"conductance public fixture seed mismatch: {marker}")
+    if manifest.get("fixture") is not False:
+        raise CacheWrongRequestError(f"only official public data caches are supported: {marker}")
     datasets = manifest.get("datasets")
     if not isinstance(datasets, dict) or set(datasets) != set(SOURCE_URLS):
         raise CacheCorruptError("conductance public marker has an invalid dataset set")
-    expected_sizes = (
-        {name: {"train": 8, "validation": 3, "test": 4} for name in SOURCE_URLS}
-        if tiny
-        else OFFICIAL_SPLIT_SIZES
-    )
-    for name, split_sizes in expected_sizes.items():
+    for name, split_sizes in OFFICIAL_SPLIT_SIZES.items():
         if datasets[name].get("source_url") != SOURCE_URLS[name]:
             raise CacheWrongRequestError(f"conductance public source mismatch for {name}")
         if datasets[name].get("splits") != split_sizes:
             raise CacheCorruptError(
                 f"conductance public split cardinalities are invalid for {name}"
             )
-    if tiny:
-        expected_hash = _fixture_hash(make_public_fixtures(seed))
-        if manifest.get("content_sha256") != expected_hash:
-            raise CacheCorruptError("conductance public fixture checksum mismatch")
-        return marker, manifest
     required_paths = manifest.get("required_processed_paths")
     stored_hashes = manifest.get("processed_sha256")
     if not isinstance(required_paths, list) or not required_paths:
@@ -359,68 +275,49 @@ def validate_public_cache(
 def prepare_public_data(
     data_root: Path | str,
     *,
-    seed: int,
-    tiny: bool,
     allow_download: bool = False,
 ) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     public_root = Path(data_root).expanduser().resolve() / "conductance_gat" / "public"
+    marker = public_root / "official-ready.json"
+    if not allow_download and not marker.exists():
+        raise RuntimeError(
+            "Official public data is not marked prepared. Run once with "
+            "`--suite public --prepare-only --allow-download` to let the official "
+            "PyG/OGB dataset classes download into --data-root. No download is "
+            "attempted without that explicit flag. Generated substitutes are not supported."
+        )
+    if not allow_download:
+        validate_public_cache(data_root)
     public_root.mkdir(parents=True, exist_ok=True)
-    marker = public_root / (f"fixture-seed{seed}.json" if tiny else "official-ready.json")
-    if tiny:
-        datasets = make_public_fixtures(seed)
-        manifest = {
-            "schema_version": PUBLIC_SCHEMA_VERSION,
-            "fixture": True,
-            "seed": int(seed),
-            "content_sha256": _fixture_hash(datasets),
-            "datasets": {
-                name: {
-                    "source_url": SOURCE_URLS[name],
-                    "splits": {split: len(datasets[name][split]) for split in datasets[name]},
-                }
-                for name in SOURCE_URLS
-            },
-        }
-    else:
-        if not allow_download and not marker.exists():
-            raise RuntimeError(
-                "Official public data is not marked prepared. Run once with "
-                "`--suite public --prepare-only --allow-download` to let the official "
-                "PyG/OGB dataset classes download into --data-root. No download is "
-                "attempted without that explicit flag. Use --tiny for offline fixtures."
-            )
-        if not allow_download:
-            validate_public_cache(data_root, seed=seed, tiny=False)
-        datasets = _load_official(public_root)
-        split_sizes = {
-            name: {split: len(datasets[name][split]) for split in datasets[name]}
+    datasets = _load_official(public_root)
+    split_sizes = {
+        name: {split: len(datasets[name][split]) for split in datasets[name]}
+        for name in SOURCE_URLS
+    }
+    if split_sizes != OFFICIAL_SPLIT_SIZES:
+        raise RuntimeError(
+            f"Official public split cardinalities do not match the pinned protocol: {split_sizes}"
+        )
+    required_paths = _processed_paths(datasets, public_root)
+    manifest = {
+        "schema_version": PUBLIC_SCHEMA_VERSION,
+        "fixture": False,
+        "datasets": {
+            name: {
+                "source_url": SOURCE_URLS[name],
+                "splits": split_sizes[name],
+            }
             for name in SOURCE_URLS
-        }
-        if split_sizes != OFFICIAL_SPLIT_SIZES:
-            raise RuntimeError(
-                "Official public split cardinalities do not match the pinned protocol: "
-                f"{split_sizes}"
-            )
-        required_paths = _processed_paths(datasets, public_root)
-        manifest = {
-            "schema_version": PUBLIC_SCHEMA_VERSION,
-            "fixture": False,
-            "datasets": {
-                name: {
-                    "source_url": SOURCE_URLS[name],
-                    "splits": split_sizes[name],
-                }
-                for name in SOURCE_URLS
-            },
-            "required_processed_paths": required_paths,
-            "processed_sha256": _processed_hashes(public_root, required_paths),
-        }
+        },
+        "required_processed_paths": required_paths,
+        "processed_sha256": _processed_hashes(public_root, required_paths),
+    }
     atomic_write_json(
         marker,
         manifest,
         validator=lambda temporary: json.loads(temporary.read_text(encoding="utf-8")),
     )
-    validate_public_cache(data_root, seed=seed, tiny=tiny)
+    validate_public_cache(data_root)
     return datasets, marker, manifest
 
 
@@ -430,7 +327,6 @@ __all__ = [
     "SOURCE_URLS",
     "adapt_pyg_graph",
     "deduplicate_undirected_edges",
-    "make_public_fixtures",
     "prepare_public_data",
     "validate_public_cache",
 ]

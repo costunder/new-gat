@@ -4,13 +4,13 @@ set -euo pipefail
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
-    echo "scripts/setup_gpu.sh targets the Linux host reached through MobaXterm." >&2
+    echo "scripts/setup_gpu.sh requires Linux with an NVIDIA GPU (workstation or server)." >&2
     exit 2
 fi
 source "${project_root}/scripts/conda_env.sh"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
-    echo "nvidia-smi was not found; request a GPU node before running setup_gpu.sh." >&2
+    echo "nvidia-smi was not found; verify the NVIDIA driver, or request a GPU allocation on a managed cluster." >&2
     exit 2
 fi
 nvidia-smi -L
@@ -25,21 +25,8 @@ cuda_minor="${cuda_version#*.}"
 cuda_minor="${cuda_minor%%.*}"
 driver_cuda_code=$((10#${cuda_major} * 100 + 10#${cuda_minor}))
 
-wheel_tag="${CUDA_WHEEL_TAG:-}"
-if [[ -z "${wheel_tag}" ]]; then
-    if (( driver_cuda_code >= 1302 )); then
-        wheel_tag="cu132"
-    elif (( driver_cuda_code >= 1300 )); then
-        wheel_tag="cu130"
-    elif (( driver_cuda_code >= 1206 )); then
-        wheel_tag="cu126"
-    else
-        echo "The locked torch 2.13 stack requires a driver supporting CUDA 12.6+." >&2
-        echo "Driver compatibility reported by nvidia-smi: CUDA ${cuda_version}." >&2
-        echo "This script will not silently install an older cu118 PyTorch release." >&2
-        exit 2
-    fi
-fi
+# Use the same reference runtime on every compatible host. Alternatives are explicit.
+wheel_tag="${CUDA_WHEEL_TAG:-cu126}"
 
 case "${wheel_tag}" in
     cu126) required_cuda_code=1206; expected_cuda_runtime="12.6" ;;
@@ -51,6 +38,7 @@ case "${wheel_tag}" in
         ;;
 esac
 if (( driver_cuda_code < required_cuda_code )); then
+    echo "The reference stack requires a driver supporting CUDA 12.6+." >&2
     echo "CUDA_WHEEL_TAG=${wheel_tag} needs CUDA ${expected_cuda_runtime}+ driver compatibility." >&2
     echo "nvidia-smi reports CUDA ${cuda_version}." >&2
     exit 2
@@ -105,10 +93,10 @@ mv -f "${freeze_temporary}" "${freeze_report}"
     --require-paper-deps \
     --min-free-gb "${MIN_FREE_GB:-2}"
 
-if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
+if [[ "${RUN_TESTS:-0}" == "1" ]]; then
     "${environment_python}" -m pytest -q
 fi
 
 echo "Exact environment report: ${lock_report}"
 echo "Resolved transitive snapshot: ${freeze_report}"
-echo "GPU environment ready. Run: bash scripts/paper.sh --help"
+echo "GPU environment ready. Follow README.md for dataset preparation and experiments."

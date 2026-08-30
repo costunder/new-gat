@@ -4,7 +4,6 @@ Examples
 --------
 python -m research.conductance_gat.paper --suite core --data-root ./data \
     --output-dir ./results/conductance --device cuda --seed 17
-python -m research.conductance_gat.paper --suite all --tiny --device cpu
 """
 
 from __future__ import annotations
@@ -748,7 +747,7 @@ def run_core(
         train_examples = suite["train"]
         validation_examples = suite["validation"]
         test_examples = suite["test"]
-        hidden_channels = 16 if core["tiny"] else 64
+        hidden_channels = 64
         suite_result: dict[str, Any] = {
             "claim": CORE_CLAIMS[suite_name],
             "description": suite["description"],
@@ -1253,25 +1252,6 @@ def _macro_f1(predictions: Tensor, labels: Tensor) -> float:
     return sum(scores) / max(len(scores), 1)
 
 
-def _binary_auc(scores: Tensor, labels: Tensor) -> float | None:
-    valid = torch.isfinite(labels)
-    scores = scores[valid].float().cpu()
-    labels = labels[valid].long().cpu()
-    positive = labels == 1
-    negative = labels == 0
-    if not positive.any() or not negative.any():
-        return None
-    order = torch.argsort(scores, stable=True)
-    ranks = torch.empty_like(order, dtype=torch.float32)
-    ranks[order] = torch.arange(1, order.numel() + 1, dtype=torch.float32)
-    positive_count = int(positive.sum())
-    negative_count = int(negative.sum())
-    return float(
-        (ranks[positive].sum() - positive_count * (positive_count + 1) / 2)
-        / (positive_count * negative_count)
-    )
-
-
 @torch.no_grad()
 def evaluate_public(
     model: PublicConductanceModel,
@@ -1282,7 +1262,6 @@ def evaluate_public(
     amp: bool,
     pin_memory: bool,
     num_workers: int,
-    official_molecule: bool = False,
 ) -> dict[str, Any]:
     model.eval()
     outputs: list[Tensor] = []
@@ -1306,24 +1285,18 @@ def evaluate_public(
             "macro_f1": _macro_f1(output.argmax(dim=1), label.long()),
             "num_labels": label.numel(),
         }
-    if official_molecule:
-        try:
-            from ogb.graphproppred import Evaluator
-        except (ImportError, OSError) as error:  # pragma: no cover - optional path
-            raise RuntimeError("official MolHIV evaluation requires the OGB evaluator") from error
-        evaluator = Evaluator(name="ogbg-molhiv")
-        score = evaluator.eval({"y_true": label.reshape(-1, 1), "y_pred": output.reshape(-1, 1)})[
-            "rocauc"
-        ]
-        return {
-            "roc_auc": float(score),
-            "num_graphs": label.numel(),
-            "evaluator": "ogb.graphproppred.Evaluator",
-        }
+    try:
+        from ogb.graphproppred import Evaluator
+    except (ImportError, OSError) as error:  # pragma: no cover - optional path
+        raise RuntimeError("official MolHIV evaluation requires the OGB evaluator") from error
+    evaluator = Evaluator(name="ogbg-molhiv")
+    score = evaluator.eval({"y_true": label.reshape(-1, 1), "y_pred": output.reshape(-1, 1)})[
+        "rocauc"
+    ]
     return {
-        "roc_auc": _binary_auc(output.reshape(-1), label.reshape(-1)),
+        "roc_auc": float(score),
         "num_graphs": label.numel(),
-        "evaluator": "offline_fixture_rank_auc",
+        "evaluator": "ogb.graphproppred.Evaluator",
     }
 
 
@@ -1339,6 +1312,10 @@ def run_public(
     num_workers: int,
     seed: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, dict[str, Tensor]]]:
+    if datasets.get("fixture") is not False:
+        raise ValueError(
+            "Public experiments require official data; generated substitutes are unsupported"
+        )
     results: dict[str, Any] = {}
     histories: list[dict[str, Any]] = []
     states: dict[str, dict[str, Tensor]] = {}
@@ -1346,11 +1323,11 @@ def run_public(
     for dataset_number, dataset_name in enumerate(("pascalvoc_sp", "ogbg_molhiv")):
         splits = datasets[dataset_name]
         sample = splits["train"][0]
-        num_classes = 21 if dataset_name == "pascalvoc_sp" and not datasets["fixture"] else 3
-        hidden = 24 if datasets["fixture"] else 96
+        num_classes = 21 if dataset_name == "pascalvoc_sp" else 3
+        hidden = 96
         results[dataset_name] = {
-            "fixture": bool(datasets["fixture"]),
-            "official_result": not bool(datasets["fixture"]),
+            "fixture": False,
+            "official_result": True,
             "comparison_protocol": {
                 "hidden_channels": hidden,
                 "backbone_depth": 1,
@@ -1369,7 +1346,7 @@ def run_public(
                 sample,
                 hidden=hidden,
                 num_classes=num_classes,
-                official_molecule=(dataset_name == "ogbg_molhiv" and not datasets["fixture"]),
+                official_molecule=(dataset_name == "ogbg_molhiv"),
                 backbone=backbone,
             ).to(device)
             parameter_count = sum(
@@ -1456,7 +1433,6 @@ def run_public(
                     amp=amp,
                     pin_memory=pin_memory,
                     num_workers=num_workers,
-                    official_molecule=(dataset_name == "ogbg_molhiv" and not datasets["fixture"]),
                 ),
             }
     return results, histories, states
@@ -1502,8 +1478,6 @@ def _prepare_output_dir(path: Path) -> Path:
 
 def _seed_axis_applicability(
     suite: str,
-    *,
-    public_fixture: bool | None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """Describe which resolved seed axes actually affect each requested protocol."""
 
@@ -1528,23 +1502,14 @@ def _seed_axis_applicability(
             },
         }
     if suite in {"public", "all"}:
-        fixture = bool(public_fixture)
         applicability["public"] = {
             "data": {
-                "applicable": fixture,
-                "use": (
-                    "offline fixture graph generation"
-                    if fixture
-                    else "not_applicable: official dataset content is fixed by its source"
-                ),
+                "applicable": False,
+                "use": "not_applicable: official dataset content is fixed by its source",
             },
             "split": {
                 "applicable": False,
-                "use": (
-                    "not_applicable: fixture split membership is preassigned by data_seed"
-                    if fixture
-                    else "not_applicable: official PascalVOC-SP/MolHIV splits are fixed"
-                ),
+                "use": "not_applicable: official PascalVOC-SP/MolHIV splits are fixed",
             },
             "chart": {
                 "applicable": False,
@@ -1576,7 +1541,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chart-seed", type=int, default=None)
     parser.add_argument("--model-seed", type=int, default=None)
     parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument("--tiny", action="store_true", help="offline CPU CI/fixture profile")
     parser.add_argument(
         "--allow-download", action="store_true", help="allow official PyG/OGB downloads"
     )
@@ -1604,14 +1568,12 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     amp = device.type == "cuda" if arguments.amp is None else bool(arguments.amp)
     if device.type != "cuda" and amp:
         raise ValueError("--amp is a CUDA float16 path; use --no-amp on CPU")
-    if arguments.tiny and device.type == "cpu":
-        amp = False
     pin_memory = (
         device.type == "cuda" if arguments.pin_memory is None else bool(arguments.pin_memory)
     )
     if device.type != "cuda":
         pin_memory = False
-    epochs = arguments.epochs if arguments.epochs is not None else (8 if arguments.tiny else 100)
+    epochs = arguments.epochs if arguments.epochs is not None else 100
     if epochs < 1:
         raise ValueError("--epochs must be positive")
     # Dataset preparation receives only the data axis.  Reset the global RNG to
@@ -1625,9 +1587,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     core = None
     public = None
     if arguments.suite in {"core", "all"}:
-        core, manifest_path, manifest = prepare_core_cache(
-            arguments.data_root, seed=seed_axes.data, tiny=arguments.tiny
-        )
+        core, manifest_path, manifest = prepare_core_cache(arguments.data_root, seed=seed_axes.data)
         prepared["core"] = {
             "manifest": str(manifest_path),
             "cache_key": manifest["cache_key"],
@@ -1636,26 +1596,22 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     if arguments.suite in {"public", "all"}:
         public, marker_path, manifest = prepare_public_data(
             arguments.data_root,
-            seed=seed_axes.data,
-            tiny=arguments.tiny,
             allow_download=arguments.allow_download,
         )
         prepared["public"] = {
             "manifest": str(marker_path),
             "fixture": manifest["fixture"],
-            "data_seed": seed_axes.data if manifest["fixture"] else "not_applicable",
+            "data_seed": "not_applicable",
             "split_seed": "not_applicable",
             "chart_seed": "not_applicable",
         }
-    public_fixture = None if public is None else bool(public["fixture"])
-    seed_applicability = _seed_axis_applicability(arguments.suite, public_fixture=public_fixture)
+    seed_applicability = _seed_axis_applicability(arguments.suite)
     if arguments.prepare_only:
         summary = {
             "status": "prepared",
             "suite": arguments.suite,
             "seed_axes": seed_axes.to_manifest(),
             "seed_axis_applicability": seed_applicability,
-            "tiny": arguments.tiny,
             "prepared": prepared,
         }
         (output_dir / "prepare_summary.json").write_text(
@@ -1711,7 +1667,6 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         "suite": arguments.suite,
         "seed_axes": seed_axes.to_manifest(),
         "seed_axis_applicability": seed_applicability,
-        "tiny": arguments.tiny,
         "prepared": prepared,
         "configuration": {
             "epochs": epochs,

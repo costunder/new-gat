@@ -9,6 +9,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from chartgat.cache import CacheCorruptError, CacheIncompleteError, CacheWrongRequestError
 from scripts import check_datasets
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,7 +27,6 @@ def _check(
     require_cache: bool = False,
     seeds: tuple[int, ...] = (0,),
     split_seeds: tuple[int, ...] | None = None,
-    tiny: bool = False,
 ) -> SimpleNamespace:
     command = [str(CHECKER), "--profile", profile]
     if as_json:
@@ -36,8 +38,6 @@ def _check(
     command.extend(("--seeds", ",".join(str(seed) for seed in seeds)))
     if split_seeds is not None:
         command.extend(("--split-seeds", ",".join(str(seed) for seed in split_seeds)))
-    if tiny:
-        command.append("--tiny")
     stdout = StringIO()
     stderr = StringIO()
     with (
@@ -59,11 +59,10 @@ def _check(
     )
 
 
-def test_smoke_dataset_profile_is_implemented(tmp_path: Path) -> None:
+def test_removed_smoke_dataset_profile_is_rejected(tmp_path: Path) -> None:
     result = _check("smoke", tmp_path)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "READY" in result.stdout
-    assert "code=implemented" in result.stdout
+    assert result.returncode == 2
+    assert "invalid choice" in result.stderr
 
 
 def test_paper_dataset_profile_matches_complete_core_code(tmp_path: Path) -> None:
@@ -154,168 +153,71 @@ def test_require_cache_controls_ready_and_exit_status(tmp_path: Path) -> None:
     )
 
 
-def _prepare_valid_tiny_paper_caches(data_root: Path, seed: int) -> None:
-    import torch
+def test_checker_routes_requested_axes_to_full_dataset_validators(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_resolver = check_datasets._load_python_reference
+    calls: list[tuple[str, Path, dict[str, object]]] = []
 
-    from research.conductance_gat.paper_data import prepare_core_cache
-    from research.conductance_gat.public_data import prepare_public_data
-    from research.cycle_pe.paper_adapters import write_tiny_brec_fixture
-    from research.cycle_pe.paper_data import load_or_generate_cycle_count_ood
-    from research.tree_augmentation.paper_data import (
-        GraphRecord,
-        _cache_records,
-        prepare_cyclecount_dataset,
-    )
+    def validator(dataset_id: str, data_root: Path, **kwargs: object) -> dict[str, object]:
+        calls.append((dataset_id, data_root, kwargs))
+        return {"validated": dataset_id}
 
-    prepare_core_cache(data_root, seed=seed, tiny=True)
-    prepare_public_data(data_root, seed=seed, tiny=True)
-    load_or_generate_cycle_count_ood(data_root, seed=seed, tiny=True)
-    write_tiny_brec_fixture(data_root / "cycle_pe_fixtures" / "brec_v3_q32.npy", num_relabel=32)
-    processed = data_root / "ZINC12K" / "subset" / "processed"
-    processed.mkdir(parents=True, exist_ok=True)
-    for split, count in {"train": 32, "val": 8, "test": 8}.items():
-        torch.save(({}, {"x": torch.arange(count + 1)}), processed / f"{split}.pt")
+    def resolve(reference: str) -> object:
+        if reference.endswith(".validate_dataset_cache"):
+            return validator
+        return original_resolver(reference)
 
-    prepare_cyclecount_dataset(data_root, seed=seed, tiny=True)
-
-    def records(counts: dict[str, int], *, zinc: bool) -> tuple[GraphRecord, ...]:
-        result = []
-        for split, count in counts.items():
-            for index in range(count):
-                result.append(
-                    GraphRecord(
-                        graph_id=f"fixture-{'zinc' if zinc else 'csl'}-{split}-{index}",
-                        family="fixture",
-                        split=split,
-                        num_nodes=3,
-                        edges=((0, 1), (0, 2), (1, 2)),
-                        target=(float(index % 10) if not zinc else float(index) / 10.0,),
-                        task_type="regression" if zinc else "classification",
-                        x=(0, 1, 2) if zinc else None,
-                        edge_attr=(0, 0, 0) if zinc else None,
-                    )
-                )
-        return tuple(result)
-
-    tree_specs = {
-        "csl": (
-            {"train": 30, "validation": 10, "test": 10},
-            tuple(f"class_{index}" for index in range(10)),
-            "classification",
-            "PyG:GNNBenchmarkDataset/CSL",
-        ),
-        "zinc": (
-            {"train": 32, "validation": 12, "test": 12},
-            ("constrained_logP",),
-            "regression",
-            "PyG:ZINC(subset=True)",
-        ),
-    }
-    for suite, (counts, target_names, task_type, source) in tree_specs.items():
-        cache_dir = data_root / f"{suite}_pyg_v2"
-        _cache_records(
-            suite=suite,
-            records=records(counts, zinc=suite == "zinc"),
-            data_path=cache_dir / f"seed-{seed}-tiny.json",
-            manifest_path=cache_dir / f"seed-{seed}-tiny.manifest.json",
-            target_names=target_names,
-            task_type=task_type,
-            source=source,
-            seed=seed,
-            tiny=True,
-        )
-
-
-def test_require_cache_runs_content_validators_for_requested_tiny_seed(tmp_path: Path) -> None:
-    data_root = tmp_path / "valid-data"
-    seed = 7
-    _prepare_valid_tiny_paper_caches(data_root, seed)
+    monkeypatch.setattr(check_datasets, "_load_python_reference", resolve)
     result = _check(
         "paper",
         tmp_path,
         as_json=True,
-        data_root=data_root,
+        data_root=tmp_path,
         require_cache=True,
-        seeds=(seed,),
-        tiny=True,
+        seeds=(11, 17),
+        split_seeds=(13,),
     )
     payload = json.loads(result.stdout)
     assert result.returncode == 0, result.stdout + result.stderr
     assert payload["cached_data_ready"] is True
-    assert payload["requested_seeds"] == [seed]
-    assert payload["requested_seed_axes"] == {"data": [seed], "split": [seed]}
-    assert payload["tiny"] is True
-    assert all(row["cache_status"] == "valid" for row in payload["rows"])
+    assert payload["requested_seed_axes"] == {"data": [11, 17], "split": [13]}
+    assert "tiny" not in payload
+    assert calls
+    for _, root, kwargs in calls:
+        assert root == tmp_path.resolve()
+        assert kwargs == {"data_seeds": (11, 17), "split_seeds": (13,)}
 
 
-def test_require_cache_rejects_corrupt_requested_cache(tmp_path: Path) -> None:
-    data_root = tmp_path / "corrupt-data"
-    seed = 11
-    _prepare_valid_tiny_paper_caches(data_root, seed)
-    cycle_cache = next((data_root / "cycle_count_ood").glob("*.json.gz"))
-    cycle_cache.write_bytes(b"truncated")
-    result = _check(
-        "paper",
-        tmp_path,
-        as_json=True,
-        data_root=data_root,
-        require_cache=True,
-        seeds=(seed,),
-        tiny=True,
-    )
-    payload = json.loads(result.stdout)
-    cycle_row = next(row for row in payload["rows"] if row["id"] == "cyclecount_ood")
-    assert result.returncode == 2
-    assert cycle_row["cache_status"] == "corrupt"
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        (FileNotFoundError("missing"), "missing"),
+        (CacheIncompleteError("incomplete"), "incomplete"),
+        (CacheWrongRequestError("wrong seed"), "wrong_request"),
+        (CacheCorruptError("bad checksum"), "corrupt"),
+        (RuntimeError("unexpected parser failure"), "corrupt"),
+    ],
+)
+def test_read_only_validator_failures_are_not_reported_as_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception, status: str
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(check_datasets, "_load_python_reference", lambda _reference: fail)
+    entry = {"id": "requested", "cache_glob": "requested.json", "validator": "unit.validator"}
+    result = check_datasets._validate_cache(entry, tmp_path, data_seeds=(3,))
+    assert result["cache_status"] == status
+    assert str(error) in result["cache_detail"]
+    assert not list(tmp_path.iterdir())
 
 
-def test_validator_distinguishes_wrong_request_and_incomplete_cache(tmp_path: Path) -> None:
-    from research.conductance_gat.paper_data import prepare_core_cache
-
-    entry = next(
-        item
-        for item in check_datasets.load_registry("conductance_gat")["datasets"]
-        if item["id"] == "static_multigraph_identification"
-    )
-
-    wrong_root = tmp_path / "wrong"
-    _, manifest_path, manifest = prepare_core_cache(wrong_root, seed=3, tiny=True)
-    manifest["request"]["seed"] = 999
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    wrong = check_datasets._validate_cache(entry, wrong_root, seeds=(3,), tiny=True)
-    assert wrong["cache_status"] == "wrong_request"
-
-    incomplete_root = tmp_path / "incomplete"
-    _, incomplete_manifest, _ = prepare_core_cache(incomplete_root, seed=3, tiny=True)
-    incomplete_manifest.with_name("core.pt").unlink()
-    incomplete = check_datasets._validate_cache(entry, incomplete_root, seeds=(3,), tiny=True)
-    assert incomplete["cache_status"] == "incomplete"
-
-
-def test_checker_routes_tree_csl_cache_to_split_seed_axis(tmp_path: Path) -> None:
-    data_root = tmp_path / "independent-seed-axes"
-    _prepare_valid_tiny_paper_caches(data_root, 11)
-    _prepare_valid_tiny_paper_caches(data_root, 13)
-
-    result = _check(
-        "paper",
-        tmp_path,
-        as_json=True,
-        data_root=data_root,
-        require_cache=True,
-        seeds=(11,),
-        split_seeds=(13,),
-        tiny=True,
-    )
-    payload = json.loads(result.stdout)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert payload["requested_seed_axes"] == {"data": [11], "split": [13]}
-    csl = next(row for row in payload["rows"] if row["id"] == "csl_chart_sanity")
-    tree_core = next(row for row in payload["rows"] if row["id"] == "cyclecount_ood_multichart")
-    assert csl["cache_detail"]["requested_axis"] == "split"
-    assert csl["cache_detail"]["requested_seeds"] == [13]
-    assert tree_core["cache_detail"]["requested_axis"] == "data"
-    assert tree_core["cache_detail"]["requested_seeds"] == [11]
+def test_checker_has_no_dummy_cache_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", [str(CHECKER), "--tiny"])
+    with pytest.raises(SystemExit) as caught:
+        check_datasets.main()
+    assert caught.value.code == 2
 
 
 def test_implemented_adapters_and_generated_sources_resolve() -> None:

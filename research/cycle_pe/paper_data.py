@@ -297,15 +297,7 @@ def _generate_graph(split: str, index: int, seed: int) -> PaperGraph:
     )
 
 
-def cycle_count_split_sizes(tiny: bool) -> dict[str, int]:
-    if tiny:
-        return {
-            "train": 10,
-            "validation": 4,
-            "id_test": 4,
-            "size_ood": 4,
-            "family_ood": 4,
-        }
+def cycle_count_split_sizes() -> dict[str, int]:
     return {
         "train": 10_000,
         "validation": 2_000,
@@ -356,9 +348,9 @@ def sha256_file(path: Path) -> str:
 
 
 def _cycle_count_specification(
-    *, seed: int, tiny: bool, split_sizes: dict[str, int] | None
+    *, seed: int, split_sizes: dict[str, int] | None
 ) -> tuple[dict[str, int], dict[str, Any], Path]:
-    sizes = dict(cycle_count_split_sizes(tiny) if split_sizes is None else split_sizes)
+    sizes = dict(cycle_count_split_sizes() if split_sizes is None else split_sizes)
     if set(sizes) != set(CORE_SPLITS) or any(int(value) < 1 for value in sizes.values()):
         raise ValueError(f"split_sizes must provide positive counts for {CORE_SPLITS}")
     specification = {
@@ -443,14 +435,11 @@ def validate_cycle_count_ood_cache(
     data_root: Path,
     *,
     seed: int,
-    tiny: bool = False,
     split_sizes: dict[str, int] | None = None,
 ) -> DatasetBundle:
     """Read and fully validate a requested CycleCount-OOD cache without writing."""
 
-    _, specification, filename = _cycle_count_specification(
-        seed=seed, tiny=tiny, split_sizes=split_sizes
-    )
+    _, specification, filename = _cycle_count_specification(seed=seed, split_sizes=split_sizes)
     cache_path = data_root.expanduser().resolve() / "cycle_count_ood" / filename
     if not cache_path.is_file():
         raise FileNotFoundError(f"CycleCount cache is missing for seed={seed}: {cache_path}")
@@ -476,22 +465,17 @@ def load_or_generate_cycle_count_ood(
     data_root: Path,
     *,
     seed: int,
-    tiny: bool = False,
     split_sizes: dict[str, int] | None = None,
 ) -> DatasetBundle:
     """Load a content-addressed cache or deterministically build CycleCount-OOD."""
 
-    sizes, specification, filename = _cycle_count_specification(
-        seed=seed, tiny=tiny, split_sizes=split_sizes
-    )
+    sizes, specification, filename = _cycle_count_specification(seed=seed, split_sizes=split_sizes)
     cache_dir = data_root.expanduser().resolve() / "cycle_count_ood"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / filename
 
     if cache_path.exists():
-        return validate_cycle_count_ood_cache(
-            data_root, seed=seed, tiny=tiny, split_sizes=split_sizes
-        )
+        return validate_cycle_count_ood_cache(data_root, seed=seed, split_sizes=split_sizes)
     records = []
     for split in CORE_SPLITS:
         for index in range(int(sizes[split])):
@@ -520,7 +504,7 @@ def load_or_generate_cycle_count_ood(
             _validate_cycle_count_payload(json.load(stream), specification)
 
     atomic_publish(cache_path, write, validator=validate_temporary)
-    return validate_cycle_count_ood_cache(data_root, seed=seed, tiny=tiny, split_sizes=split_sizes)
+    return validate_cycle_count_ood_cache(data_root, seed=seed, split_sizes=split_sizes)
 
 
 def structural_input_features(graph: PaperGraph) -> tuple[FloatArray, FloatArray]:

@@ -14,17 +14,21 @@ import pytest
 import torch
 
 from chartgat.algebra import fundamental_cycle_basis, incidence_matrix, validate_spanning_tree
+from chartgat.cache import CacheCorruptError, CacheWrongRequestError
 from chartgat.seeds import SeedAxes
 from research.tree_augmentation import paper as tree_paper
 from research.tree_augmentation.paper import main, run_suite
 from research.tree_augmentation.paper_data import (
     GraphRecord,
     OptionalDatasetError,
+    _cache_records,
+    _load_cached_dataset,
     build_paper_chart,
     prepare_cyclecount_dataset,
     prepare_optional_pyg_dataset,
     simple_cycle_counts,
     traversal_tree_indices,
+    validate_prepared_cache,
     wilson_ust_indices,
     zinc_record_from_pyg,
 )
@@ -234,8 +238,8 @@ def test_encoder_ignores_same_tree_node_relabeling_with_mapped_chemistry() -> No
 
 
 def test_core_cache_is_deterministic_and_graph_splits_are_disjoint(tmp_path: Path) -> None:
-    first = prepare_cyclecount_dataset(tmp_path, seed=31, tiny=True)
-    second = prepare_cyclecount_dataset(tmp_path, seed=31, tiny=True)
+    first = prepare_cyclecount_dataset(tmp_path, seed=31)
+    second = prepare_cyclecount_dataset(tmp_path, seed=31)
     assert first.data_sha256 == second.data_sha256
     manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
     split_sets = [set(ids) for ids in manifest["split_graph_ids"].values()]
@@ -243,20 +247,41 @@ def test_core_cache_is_deterministic_and_graph_splits_are_disjoint(tmp_path: Pat
         for right in split_sets[index + 1 :]:
             assert left.isdisjoint(right)
     assert manifest["graph_split_before_chart_sampling"] is True
+    assert {name: len(ids) for name, ids in manifest["split_graph_ids"].items()} == {
+        "train": 128,
+        "validation": 24,
+        "id_test": 40,
+        "ood_test": 40,
+    }
+    assert manifest["profile"] == "full"
+    assert "tiny" not in manifest
+
+    # Old full-cache manifests remain valid without rewriting the cached data.
+    manifest.pop("profile")
+    manifest["tiny"] = False
+    first.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert validate_prepared_cache("core", tmp_path, seed=31).data_sha256 == first.data_sha256
+    manifest["tiny"] = True
+    first.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(CacheWrongRequestError, match="seed/profile mismatch"):
+        prepare_cyclecount_dataset(tmp_path, seed=31)
 
 
 def test_optional_pyg_adapter_has_actionable_dependency_error(tmp_path: Path) -> None:
     if importlib.util.find_spec("torch_geometric") is not None:
         pytest.skip("PyG is installed; download behavior is environment-specific")
     with pytest.raises(OptionalDatasetError, match="torch-geometric"):
-        prepare_optional_pyg_dataset("csl", tmp_path, seed=1, tiny=True, allow_download=True)
+        prepare_optional_pyg_dataset("csl", tmp_path, seed=1, allow_download=True)
 
 
+@pytest.mark.parametrize("suite", ["csl", "zinc"])
 def test_optional_pyg_adapter_requires_explicit_download_permission(
     tmp_path: Path,
+    suite: str,
 ) -> None:
     with pytest.raises(OptionalDatasetError, match="--allow-download"):
-        prepare_optional_pyg_dataset("zinc", tmp_path, seed=1, tiny=True)
+        prepare_optional_pyg_dataset(suite, tmp_path, seed=1)
+    assert not list(tmp_path.rglob("*.json"))
 
 
 def test_dataset_seed_axes_route_to_their_declared_protocols(
@@ -265,7 +290,7 @@ def test_dataset_seed_axes_route_to_their_declared_protocols(
     calls: list[tuple[str, int]] = []
     sentinel = object()
 
-    def prepare_core(data_root: Path, *, seed: int, tiny: bool) -> object:
+    def prepare_core(data_root: Path, *, seed: int) -> object:
         calls.append(("core", seed))
         return sentinel
 
@@ -274,7 +299,6 @@ def test_dataset_seed_axes_route_to_their_declared_protocols(
         data_root: Path,
         *,
         seed: int,
-        tiny: bool,
         allow_download: bool,
     ) -> object:
         calls.append((suite, seed))
@@ -289,7 +313,6 @@ def test_dataset_seed_axes_route_to_their_declared_protocols(
                 suite,
                 tmp_path,
                 seed_axes=axes,
-                tiny=True,
                 allow_download=False,
             )
             is sentinel
@@ -323,7 +346,7 @@ def _pyg_like_zinc_fixture() -> SimpleNamespace:
 
 
 def test_zinc_pyg_fixture_chemistry_is_lossless_and_cache_roundtrips(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     record = zinc_record_from_pyg(
         _pyg_like_zinc_fixture(), graph_id="zinc-test-00000", split="test"
@@ -332,14 +355,20 @@ def test_zinc_pyg_fixture_chemistry_is_lossless_and_cache_roundtrips(
     assert record.edges == ((0, 1), (0, 2), (1, 2), (1, 3), (2, 3))
     assert record.edge_attr == (0, 1, 1, 2, 3)
 
-    monkeypatch.setattr(
-        "research.tree_augmentation.paper_data._prepare_zinc_records",
-        lambda data_root, *, tiny: (record,),
+    # Exercise serialization directly; the public loader must reject a one-record dataset.
+    prepared = _cache_records(
+        suite="zinc",
+        records=(record,),
+        data_path=tmp_path / "unit-record.json",
+        manifest_path=tmp_path / "unit-record.manifest.json",
+        target_names=("constrained_logP",),
+        task_type="regression",
+        source="unit-test-only",
+        seed=9,
     )
-    prepared = prepare_optional_pyg_dataset(
-        "zinc", tmp_path, seed=9, tiny=True, allow_download=True
+    loaded = _load_cached_dataset(
+        suite="zinc", data_path=prepared.data_path, manifest_path=prepared.manifest_path
     )
-    loaded = prepare_optional_pyg_dataset("zinc", tmp_path, seed=9, tiny=True, allow_download=False)
     assert loaded.records == prepared.records == (record,)
     payload = json.loads(prepared.data_path.read_text(encoding="utf-8"))
     manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
@@ -347,6 +376,69 @@ def test_zinc_pyg_fixture_chemistry_is_lossless_and_cache_roundtrips(
     assert payload["records"][0]["x"] == [3, 7, 2, 11]
     assert payload["records"][0]["edge_attr"] == [0, 1, 1, 2, 3]
     assert "canonical undirected edge" in manifest["categorical_feature_schema"]["edge_attr"]
+
+
+def test_public_loader_rejects_reduced_records_without_creating_paper_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = zinc_record_from_pyg(_pyg_like_zinc_fixture(), graph_id="unit-zinc", split="train")
+    monkeypatch.setattr(
+        "research.tree_augmentation.paper_data._prepare_zinc_records", lambda _root: (record,)
+    )
+    with pytest.raises(CacheCorruptError, match="split cardinalities"):
+        prepare_optional_pyg_dataset("zinc", tmp_path, seed=9, allow_download=True)
+    assert not list(tmp_path.rglob("*.json"))
+
+
+@pytest.mark.parametrize("suite", ["csl", "zinc"])
+def test_public_loader_rejects_reduced_cache_even_with_valid_checksum(
+    tmp_path: Path, suite: str
+) -> None:
+    record = zinc_record_from_pyg(_pyg_like_zinc_fixture(), graph_id="unit-record", split="train")
+    source = "PyG:ZINC(subset=True)"
+    if suite == "csl":
+        record = replace(record, family="CSL", task_type="classification", target=(0.0,))
+        source = "PyG:GNNBenchmarkDataset/CSL"
+    cache = tmp_path / f"{suite}_pyg_v2"
+    _cache_records(
+        suite=suite,
+        records=(record,),
+        data_path=cache / "seed-9-full.json",
+        manifest_path=cache / "seed-9-full.manifest.json",
+        target_names=("unit-target",),
+        task_type=record.task_type,
+        source=source,
+        seed=9,
+    )
+    with pytest.raises(CacheCorruptError, match="split cardinalities"):
+        prepare_optional_pyg_dataset(suite, tmp_path, seed=9)
+
+
+@pytest.mark.parametrize("suite", ["csl", "zinc"])
+def test_public_download_failure_does_not_generate_substitute_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suite: str
+) -> None:
+    def unavailable(*_args: object, **_kwargs: object) -> None:
+        raise OptionalDatasetError("public download unavailable")
+
+    monkeypatch.setattr(
+        f"research.tree_augmentation.paper_data._prepare_{suite}_records", unavailable
+    )
+    with pytest.raises(OptionalDatasetError, match="public download unavailable"):
+        prepare_optional_pyg_dataset(suite, tmp_path, seed=9, allow_download=True)
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_cli_rejects_tiny_and_keeps_full_reference_settings() -> None:
+    with pytest.raises(SystemExit) as caught:
+        tree_paper._parser().parse_args(["--tiny"])
+    assert caught.value.code == 2
+    settings, _ = tree_paper._load_settings()
+    assert settings["hidden_dim"] == 64
+    assert settings["optimizer_updates"] == 800
+    assert settings["batch_size"] == 16
+    assert settings["train_charts_per_graph"] == settings["eval_charts_per_graph"] == 8
+    assert "tiny" not in settings
 
 
 def test_chemistry_is_chart_invariant_and_changes_model_input_and_prediction() -> None:
@@ -400,14 +492,43 @@ def test_chemistry_is_chart_invariant_and_changes_model_input_and_prediction() -
     assert not torch.allclose(prediction[0], prediction[1])
 
 
-def test_tiny_cpu_core_cli_path_writes_2x2_results(tmp_path: Path) -> None:
+def test_core_orchestration_with_unit_test_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records = tuple(
+        GraphRecord(
+            f"unit-{split}-{index}",
+            "unit-test-only",
+            split,
+            4,
+            ((0, 1), (0, 3), (1, 2), (2, 3)),
+            (0.0, 1.0, 0.0, 0.0),
+        )
+        for split in ("train", "validation", "id_test", "ood_test")
+        for index in range(2)
+    )
+    dataset = _cache_records(
+        suite="core",
+        records=records,
+        data_path=tmp_path / "unit-records.json",
+        manifest_path=tmp_path / "unit-records.manifest.json",
+        target_names=("cycles_len_3", "cycles_len_4", "cycles_len_5", "cycles_len_6"),
+        task_type="regression",
+        source="unit-test-only",
+        seed=43,
+    )
+    settings, config_path = tree_paper._load_settings()
+    settings.update(
+        hidden_dim=8, optimizer_updates=2, train_charts_per_graph=3, eval_charts_per_graph=2
+    )
+    monkeypatch.setattr(tree_paper, "_load_settings", lambda: (settings, config_path))
+    monkeypatch.setattr(tree_paper, "_prepare_dataset", lambda *_args, **_kwargs: dataset)
     summary = run_suite(
         "core",
         data_root=tmp_path / "data",
         output_dir=tmp_path / "results",
         requested_device="cpu",
         seed=43,
-        tiny=True,
         prepare_only=False,
         amp_override=False,
         batch_size_override=4,
@@ -420,7 +541,7 @@ def test_tiny_cpu_core_cli_path_writes_2x2_results(tmp_path: Path) -> None:
     assert summary["seed_axes"] == {"data": 43, "split": 43, "chart": 43, "model": 43}
     assert "seed" not in summary
     assert summary["protocol"] == "cyclecount_graph_x_fresh_chart_family_2x2_v2"
-    assert summary["comparison"]["paper_headline_eligible"] is False
+    assert "tiny" not in summary
     assert summary["comparison"]["projector_target_used"] is False
     expected = {
         "id_graph_fresh_chart_seen_family",
@@ -476,7 +597,6 @@ def test_tiny_cpu_core_cli_path_writes_2x2_results(tmp_path: Path) -> None:
         split_seed=43,
         chart_seed=43,
         model_seed=43,
-        tiny=True,
         prepare_only=False,
         amp_override=False,
         batch_size_override=4,
@@ -513,7 +633,6 @@ def test_prepare_only_all_attempts_every_suite_without_download(
             "11",
             "--model-seed",
             "13",
-            "--tiny",
             "--prepare-only",
             "--workers",
             "0",

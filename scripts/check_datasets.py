@@ -38,7 +38,7 @@ REQUIRED_ENTRY_FIELDS = {
     "adapter",
     "leakage_guard",
 }
-ALLOWED_TIERS = {"smoke", "paper_core", "conditional", "optional"}
+ALLOWED_TIERS = {"paper_core", "conditional", "optional"}
 # ``status`` is code readiness. Dataset optionality belongs in ``tier``.
 ALLOWED_STATUSES = {"implemented", "planned", "blocked"}
 ALLOWED_DATA_POLICIES = {"generated", "download", "manual", "none"}
@@ -206,9 +206,6 @@ def validate_registry(track: str, registry: dict[str, Any]) -> list[str]:
                     if not callable(resolved):
                         errors.append(f"{label}: cache validator must be callable")
 
-    smoke = [entry for entry in datasets if entry.get("tier") == "smoke"]
-    if not smoke or any(entry.get("status") != "implemented" for entry in smoke):
-        errors.append(f"{track}: every smoke entry must be implemented")
     paper_core = [entry for entry in datasets if entry.get("tier") == "paper_core"]
     if not paper_core:
         errors.append(f"{track}: at least one paper_core dataset is required")
@@ -229,7 +226,6 @@ def _validate_cache(
     seeds: tuple[int, ...] | None = None,
     data_seeds: tuple[int, ...] | None = None,
     split_seeds: tuple[int, ...] | None = None,
-    tiny: bool,
 ) -> dict[str, Any]:
     resolved_data_seeds = data_seeds if data_seeds is not None else seeds or (0,)
     resolved_split_seeds = split_seeds if split_seeds is not None else resolved_data_seeds
@@ -250,7 +246,6 @@ def _validate_cache(
             data_root,
             data_seeds=resolved_data_seeds,
             split_seeds=resolved_split_seeds,
-            tiny=tiny,
         )
     except FileNotFoundError as error:
         return {"cache_status": "missing", "cache_detail": str(error)}
@@ -282,9 +277,10 @@ def readiness(
     data_root: Path | None = None,
     data_seeds: tuple[int, ...] = (0,),
     split_seeds: tuple[int, ...] | None = None,
-    tiny: bool = False,
 ) -> list[dict[str, Any]]:
-    tier = "smoke" if profile == "smoke" else "paper_core"
+    if profile != "paper":
+        raise ValueError("only the full paper dataset profile is supported")
+    tier = "paper_core"
     rows: list[dict[str, Any]] = []
     validation_cache: dict[tuple[str, str], dict[str, Any]] = {}
     for track, registry in registries.items():
@@ -301,7 +297,6 @@ def readiness(
                         data_root,
                         data_seeds=data_seeds,
                         split_seeds=split_seeds,
-                        tiny=tiny,
                     )
                     validation_cache[validation_key] = cache_result
                 rows.append(
@@ -330,7 +325,7 @@ def _parse_seeds(parser: argparse.ArgumentParser, value: str, option: str) -> tu
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=("smoke", "paper"), default="smoke")
+    parser.add_argument("--profile", choices=("paper",), default="paper")
     parser.add_argument("--data-root", type=Path)
     parser.add_argument(
         "--data-seeds",
@@ -342,11 +337,6 @@ def main() -> int:
     parser.add_argument(
         "--split-seeds",
         help="comma-separated split/cache seeds; defaults to --data-seeds",
-    )
-    parser.add_argument(
-        "--tiny",
-        action="store_true",
-        help="validate tiny/fixture caches instead of full paper caches",
     )
     parser.add_argument(
         "--require-cache",
@@ -377,7 +367,6 @@ def main() -> int:
         data_root=data_root,
         data_seeds=data_seeds,
         split_seeds=split_seeds,
-        tiny=bool(args.tiny),
     )
     code_ready = not errors and all(row["code_ready"] for row in rows)
     cache_ready: bool | None = None
@@ -397,7 +386,6 @@ def main() -> int:
             "data": list(data_seeds),
             "split": list(split_seeds),
         },
-        "tiny": bool(args.tiny),
         "paper_benchmark_suite_complete": not errors
         and all(registry["paper_suite_complete"] for registry in registries.values()),
         "rows": rows,

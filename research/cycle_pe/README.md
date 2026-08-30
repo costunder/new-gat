@@ -2,8 +2,7 @@
 
 이 폴더는 그래프 topology에서 한 번 계산하는 정적 cycle positional encoding(PE)을
 독립적으로 검증한다. Linux/CUDA 논문 경로는 `research.cycle_pe.paper`이며,
-CycleCount-OOD, BREC v3, ZINC-12K를 같은 batch-safe backbone에서 실행한다. 기존
-`research.cycle_pe.run`은 작은 structural smoke probe로 남아 있고 논문 결과 경로가 아니다.
+CycleCount-OOD, BREC v3, ZINC-12K를 같은 batch-safe backbone에서 실행한다.
 
 ## 구현 경계와 PE 비교군
 
@@ -34,7 +33,7 @@ flow completion은 이 트랙에 포함하지 않는다. spanning-tree augmentat
 
 ### `core`: CycleCount-OOD
 
-외부 다운로드가 없는 deterministic generator다. non-tiny protocol은 총 20,000개다.
+외부 다운로드가 없는 deterministic scientific generator이며 총 20,000개 graph를 사용한다.
 
 | split | 그래프 수 | 역할 |
 |---|---:|---|
@@ -79,22 +78,22 @@ gate**이지 upstream BREC metric이 아니다. 공식 search가 정의하지 �
 golden-output/differential numerical parity는 아직 검증하지 않았다.
 
 `--brec-protocol custom`은 flexible q/batch, AMP, clipping, pair shuffle과 derived per-pair
-seed를 허용하며, 기존 집계는 `custom_pairwise_union`으로만 기록한다. `--tiny`가 protocol을
-생략하면 offline fixture에 맞춰 custom으로 해석된다.
+seed를 허용하며, 집계는 `custom_pairwise_union`으로만 기록한다. Custom은 명시적으로
+요청해야 하며 실제로 제공한 BREC artifact를 사용한다. 기본은 항상 official이다.
 
 기본 데이터 위치는 `<data-root>/BREC/Data/raw/brec_v3.npy`다. 파일이 없으면 fail-closed이며,
 `--allow-download`를 명시했을 때만 GraphPKU Release ZIP을 HTTPS로 받아 경로, symlink,
 압축/추출 크기를 검사하고 `brec_v3.npy` 하나만 추출한다. Official mode는 q=32,
 400 pairs, 51,200 records를 강제한다. ZIP과 NPY SHA-256은 provenance로 기록하지만,
-GraphPKU가 canonical SHA-256 pin을 배포했다고 주장하지 않는다. `--tiny`는 네트워크를
-사용하지 않고 로컬 RPC fixture를 생성하므로 pipeline smoke test에만 사용한다.
+GraphPKU가 canonical SHA-256 pin을 배포했다고 주장하지 않는다. 누락된 BREC artifact를
+가짜 graph로 대체하거나 자동 생성하는 경로는 없다.
 
 ### `zinc`: ZINC-12K
 
 PyTorch Geometric의 `ZINC(subset=True)` official train/val/test 10,000/1,000/1,000 split과
 atom/bond feature를 사용한다. local cache가 없으면 fail-closed이고 `--allow-download`를
-명시해야 PyG download를 허용한다. `--tiny`도 official split의 앞부분만 읽으므로 PyG와
-cache(또는 명시적 download)는 여전히 필요하다. PyG import가 없거나 CUDA/PyTorch 조합이
+명시해야 PyG download를 허용한다. Official split별 graph 수를 검증하고 전체를 읽는다.
+PyG import가 없거나 CUDA/PyTorch 조합이
 맞지 않으면 설치 문서를 포함한 actionable error로 종료한다.
 
 ### 현재 과학적·scaling 한계
@@ -131,26 +130,28 @@ CLI는 `--data-seed`, `--split-seed`, `--chart-seed`, `--model-seed`를 독립�
 
 ## Linux/CUDA 설치
 
-MobaXterm으로 접속한 Linux GPU 서버에서 Conda가 먼저 사용 가능해야 한다.
-`conda --version`이 실패하면 서버의 Conda module/경로를 관리자에게 확인한다.
-저장소 root에서 프로젝트 전용 환경을 만들고 활성화한 뒤 설치한다.
+NVIDIA GPU가 있는 Linux 워크스테이션 또는 서버에서 실행한다. 로컬 터미널과 임의의 SSH
+client 모두 사용할 수 있으며 MobaXterm과 tmux는 필수가 아니다. 지원 환경과 Conda 설치는
+[루트 README](../../README.md)를 따른다. 저장소 root에서 프로젝트 전용 환경을 만들고
+활성화한 뒤 설치한다.
 
 ```bash
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda create -n new-gat python=3.11 pip -y
 conda activate new-gat
 bash scripts/setup_gpu.sh
-python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
 [루트 README](../../README.md)에서 이미 이 프로젝트용 환경을 만들었다면 생성만 건너뛰고
 같은 환경을 활성화한다. `base`, 공유 환경 또는 다른 프로젝트의 환경에는 설치하지 않는다.
-Setup은 저장소의 exact CUDA/package pin과 public adapter 의존성을 설치하고 GPU·테스트를 검증한다.
+Setup은 저장소의 exact CUDA/package pin과 public adapter 의존성을 설치하고 lock·package
+호환성·CUDA를 검증한다. 기본 wheel channel은 `cu126`이며 같은 실험을 재현할 때는 이를
+동일하게 유지한다. 테스트 실행은 `RUN_TESTS=1 bash scripts/setup_gpu.sh`로 선택한다.
 
 아래 모든 `python` 명령은 **이 Conda 환경이 활성화된 저장소 root**에서 실행한다.
-새 SSH/tmux 창에서는 위 `source`와 `conda activate new-gat`을 다시 실행한다.
+새 터미널에서는 위 `source`와 `conda activate new-gat`을 다시 실행한다.
 데이터 경로와 GPU 할당, wheel 선택은 루트 README를 따른다. 결과 재현성 때문에 실제 GPU
-서버의 Python, CUDA, torch, GPU 이름은 각 manifest에 자동 기록된다.
+실행 환경의 Python, CUDA, torch, GPU 이름은 각 manifest에 자동 기록된다.
 
 ## 정확한 실행 명령
 
@@ -227,18 +228,6 @@ python -m research.cycle_pe.paper \
   --allow-download
 ```
 
-다운로드 없는 CPU core smoke와 BREC offline fixture 확인:
-
-```bash
-python -m research.cycle_pe.paper \
-  --suite core --data-root ./data --output-dir ./paper_runs/core-tiny \
-  --device cpu --seed 7 --workers 0 --tiny --prepare-only --no-amp
-
-python -m research.cycle_pe.paper \
-  --suite brec --data-root ./data --output-dir ./paper_runs/brec-tiny \
-  --device cpu --seed 7 --workers 0 --tiny --prepare-only --no-amp
-```
-
 `--epochs`, `--learning-rate`, `--weight-decay`, `--hidden-dim`, `--pe-dim`, `--layers`로
 학습 설정을 override할 수 있다. CPU에서는 AMP, pinned memory, non-blocking transfer가
 자동으로 비활성화된다.
@@ -267,12 +256,4 @@ python -m pytest research/cycle_pe/tests -q
 python scripts/check_datasets.py --profile paper --json
 ```
 
-기존 structural smoke probe는 별도로 실행한다.
-
-```bash
-python -m research.cycle_pe.run
-```
-
-smoke용 `config.yaml`의 `max_cycles`는 legacy linear-probe padding 설정이다. 논문
-`research.cycle_pe.paper` 경로는 이 값을 읽지 않으며 variable-beta graph를 고정 cap 없이
-처리한다.
+`research.cycle_pe.paper`는 variable-beta graph를 고정 cap 없이 처리한다.

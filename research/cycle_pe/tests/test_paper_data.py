@@ -10,10 +10,11 @@ from research.cycle_pe.paper_data import (
     exact_cycle_targets,
     load_or_generate_cycle_count_ood,
 )
+from research.cycle_pe.tests.fixtures import CORE_TEST_SPLIT_SIZES
 
 
 def test_full_cycle_count_protocol_contains_exactly_twenty_thousand_graphs() -> None:
-    sizes = cycle_count_split_sizes(tiny=False)
+    sizes = cycle_count_split_sizes()
     assert sizes == {
         "train": 10_000,
         "validation": 2_000,
@@ -49,10 +50,10 @@ def test_exact_short_cycle_targets_cover_edge_node_and_graph_levels() -> None:
 
 
 def test_cycle_count_ood_cache_and_splits_are_deterministic(tmp_path) -> None:
-    first = load_or_generate_cycle_count_ood(tmp_path, seed=19, tiny=True)
-    second = load_or_generate_cycle_count_ood(tmp_path, seed=19, tiny=True)
+    first = load_or_generate_cycle_count_ood(tmp_path, seed=19, split_sizes=CORE_TEST_SPLIT_SIZES)
+    second = load_or_generate_cycle_count_ood(tmp_path, seed=19, split_sizes=CORE_TEST_SPLIT_SIZES)
     independent = load_or_generate_cycle_count_ood(
-        tmp_path / "independent-root", seed=19, tiny=True
+        tmp_path / "independent-root", seed=19, split_sizes=CORE_TEST_SPLIT_SIZES
     )
 
     assert first.cache_path == second.cache_path

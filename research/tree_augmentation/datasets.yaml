@@ -4,19 +4,6 @@ paper_suite_complete: true
 claim: Spanning-tree chart augmentation improves robustness without changing downstream labels or graph splits.
 
 datasets:
-  - id: single_graph_chart_smoke
-    name: Current single-graph chart transition sanity check
-    tier: smoke
-    status: implemented
-    data_policy: generated
-    source_url: generated://research.tree_augmentation.run
-    task: Certify lossless chart transitions and compare fixed versus multiple charts on one graph.
-    split: One 12-node graph, 16 training trees, one unseen tree.
-    metrics: [transition_error, cocycle_error, unseen_chart_mse]
-    claim: Algebra and augmentation-pipeline certification only.
-    adapter: research.tree_augmentation.augmentation
-    leakage_guard: Target is projector-derived and cannot support a downstream novelty claim.
-
   - id: cyclecount_ood_multichart
     name: CycleCount-OOD multi-chart protocol
     tier: paper_core

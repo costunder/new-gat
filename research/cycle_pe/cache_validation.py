@@ -41,7 +41,7 @@ def _pyg_processed_count(path: Path) -> int:
     return counts.pop()
 
 
-def _validate_zinc(data_root: Path, *, tiny: bool) -> dict[str, Any]:
+def _validate_zinc(data_root: Path) -> dict[str, Any]:
     processed = data_root.expanduser().resolve() / "ZINC12K" / "subset" / "processed"
     paths = {split: processed / f"{split}.pt" for split in ("train", "val", "test")}
     present = {name: path.is_file() for name, path in paths.items()}
@@ -52,11 +52,8 @@ def _validate_zinc(data_root: Path, *, tiny: bool) -> dict[str, Any]:
         raise CacheIncompleteError(f"Cycle PE ZINC processed splits are missing: {missing}")
     counts = {name: _pyg_processed_count(path) for name, path in paths.items()}
     expected = {"train": 10_000, "val": 1_000, "test": 1_000}
-    if not tiny and counts != expected:
+    if counts != expected:
         raise CacheCorruptError(f"Cycle PE ZINC official split cardinalities are invalid: {counts}")
-    minimum = {"train": 32, "val": 8, "test": 8}
-    if tiny and any(counts[name] < minimum[name] for name in counts):
-        raise CacheCorruptError(f"Cycle PE ZINC cache is too small for tiny validation: {counts}")
     return {
         "paths": [str(path) for path in paths.values()],
         "split_sizes": counts,
@@ -64,21 +61,14 @@ def _validate_zinc(data_root: Path, *, tiny: bool) -> dict[str, Any]:
     }
 
 
-def _validate_brec(data_root: Path, *, tiny: bool) -> dict[str, Any]:
-    if tiny:
-        path = data_root.expanduser().resolve() / "cycle_pe_fixtures" / "brec_v3_q32.npy"
-        if not path.is_file():
-            raise FileNotFoundError(f"tiny BREC fixture is missing: {path}")
-        expected_pairs = 2
-    else:
-        path = find_brec_v3(data_root)
-        expected_pairs = 400
+def _validate_brec(data_root: Path) -> dict[str, Any]:
+    path = find_brec_v3(data_root)
+    expected_pairs = 400
     try:
         adapter = BRECAdapter(
             path,
             num_relabel=32,
-            fixture=tiny,
-            protocol="custom" if tiny else "official",
+            protocol="official",
         )
     except RuntimeError as error:
         raise CacheCorruptError(f"invalid BREC cache: {path}") from error
@@ -105,7 +95,6 @@ def validate_dataset_cache(
     *,
     data_seeds: tuple[int, ...],
     split_seeds: tuple[int, ...],
-    tiny: bool,
 ) -> dict[str, Any]:
     """Validate every requested cycle cache without generating or downloading data."""
 
@@ -113,14 +102,14 @@ def validate_dataset_cache(
     if dataset_id == "cyclecount_ood":
         paths = []
         for seed in data_seeds:
-            bundle = validate_cycle_count_ood_cache(data_root, seed=seed, tiny=tiny)
+            bundle = validate_cycle_count_ood_cache(data_root, seed=seed)
             if bundle.cache_path is not None:
                 paths.append(str(bundle.cache_path))
         return {"paths": paths, "requested_data_seeds": list(data_seeds)}
     if dataset_id == "brec_v3":
-        return _validate_brec(data_root, tiny=tiny)
+        return _validate_brec(data_root)
     if dataset_id == "zinc12k":
-        return _validate_zinc(data_root, tiny=tiny)
+        return _validate_zinc(data_root)
     raise ValueError(f"unsupported cycle cache dataset {dataset_id!r}")
 
 

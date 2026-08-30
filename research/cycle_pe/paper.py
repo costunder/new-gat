@@ -4,8 +4,6 @@ Examples
 --------
 python -m research.cycle_pe.paper --suite core --data-root data --output-dir runs/cycle \
     --device cuda --seed 2025
-python -m research.cycle_pe.paper --suite core --data-root data --output-dir /tmp/cycle \
-    --device cpu --seed 7 --tiny
 """
 
 from __future__ import annotations
@@ -73,7 +71,7 @@ COMMAND_CONTRACT = (
     "python -m research.cycle_pe.paper --suite core|brec|zinc|all "
     "--data-root PATH --output-dir PATH --device cuda --seed N "
     "[--data-seed N --split-seed N --chart-seed N --model-seed N] [--workers N] "
-    "[--prepare-only] [--tiny] [--allow-download] [--brec-protocol official|custom] "
+    "[--prepare-only] [--allow-download] [--brec-protocol official|custom] "
     "[--brec-seeds 100,...,1000]"
 )
 
@@ -275,7 +273,7 @@ def _settings(args: argparse.Namespace, device: torch.device, suite: str) -> Tra
     default_epochs = {"core": 60, "zinc": 100, "brec": 20}
     default_lr = {"core": 1e-3, "zinc": 1e-3, "brec": 1e-4}
     default_weight_decay = {"core": 1e-5, "zinc": 1e-5, "brec": 1e-4}
-    epochs = args.epochs if args.epochs is not None else (2 if args.tiny else default_epochs[suite])
+    epochs = args.epochs if args.epochs is not None else default_epochs[suite]
     return TrainSettings(
         device=device,
         seed=_resolve_seed_axes(args).model,
@@ -295,7 +293,7 @@ def _settings(args: argparse.Namespace, device: torch.device, suite: str) -> Tra
 def _effective_brec_protocol(args: argparse.Namespace) -> str:
     requested = getattr(args, "brec_protocol", None)
     if requested is None:
-        return "custom" if args.tiny else "official"
+        return "official"
     return str(requested)
 
 
@@ -336,9 +334,9 @@ def _brec_settings(args: argparse.Namespace, device: torch.device, protocol: str
 
 
 def _model_dimensions(args: argparse.Namespace) -> tuple[int, int, int]:
-    hidden = args.hidden_dim if args.hidden_dim is not None else (24 if args.tiny else 64)
-    pe = args.pe_dim if args.pe_dim is not None else (12 if args.tiny else 32)
-    layers = args.layers if args.layers is not None else (2 if args.tiny else 3)
+    hidden = args.hidden_dim if args.hidden_dim is not None else 64
+    pe = args.pe_dim if args.pe_dim is not None else 32
+    layers = args.layers if args.layers is not None else 3
     return hidden, pe, layers
 
 
@@ -408,7 +406,6 @@ def _run_supervised_bundle(
         "created_utc": datetime.now(UTC).isoformat(),
         "seed_axes": seed_axes.to_manifest(),
         "seed_axis_policy": _seed_axis_policy(suite, seed_axes),
-        "tiny": args.tiny,
         "prepare_only": args.prepare_only,
         "command_contract": COMMAND_CONTRACT,
         "cli_arguments": _argument_manifest(args),
@@ -602,7 +599,7 @@ def _run_supervised_bundle(
 
 def run_core(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
     seed_axes = _resolve_seed_axes(args)
-    bundle = load_or_generate_cycle_count_ood(args.data_root, seed=seed_axes.data, tiny=args.tiny)
+    bundle = load_or_generate_cycle_count_ood(args.data_root, seed=seed_axes.data)
     if bundle.metadata is None:
         bundle.metadata = {}
     bundle.metadata.update(
@@ -642,7 +639,7 @@ def run_core(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
 
 def run_zinc(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
     seed_axes = _resolve_seed_axes(args)
-    bundle = load_zinc12k(args.data_root, tiny=args.tiny, allow_download=args.allow_download)
+    bundle = load_zinc12k(args.data_root, allow_download=args.allow_download)
     if bundle.metadata is None:
         bundle.metadata = {}
     bundle.metadata["seed_axis_policy"] = _seed_axis_policy("zinc", seed_axes)
@@ -1004,8 +1001,6 @@ def _brec_model_seed(search_seed: int, pair_index: int) -> int:
 
 
 def _validate_official_brec_arguments(args: argparse.Namespace) -> None:
-    if args.tiny:
-        raise ValueError("official BREC mode requires the full 400-pair artifact, not --tiny")
     if args.brec_num_relabel != BREC_OFFICIAL_NUM_RELABEL:
         raise ValueError("official BREC mode requires --brec-num-relabel 32")
     if args.brec_threshold is not None and not math.isclose(
@@ -1137,7 +1132,6 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
         args.data_root,
         num_relabel=args.brec_num_relabel,
         allow_download=args.allow_download,
-        tiny=args.tiny,
         protocol=protocol,
     )
     if protocol == "official":
@@ -1154,7 +1148,7 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
     suite_root = args.output_dir / "brec"
     settings = _brec_settings(args, device, protocol)
     hidden_dim, pe_dim, layers = _model_dimensions(args)
-    pair_indices = list(range(min(adapter.pair_count, 2 if args.tiny else adapter.pair_count)))
+    pair_indices = list(range(adapter.pair_count))
     manifest: dict[str, Any] = {
         "schema_version": PAPER_SCHEMA_VERSION,
         "suite": "brec",
@@ -1167,7 +1161,6 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
             brec_protocol=protocol,
             brec_seeds=args.brec_seeds,
         ),
-        "tiny": args.tiny,
         "prepare_only": args.prepare_only,
         "command_contract": COMMAND_CONTRACT,
         "cli_arguments": _argument_manifest(args),
@@ -1175,7 +1168,7 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
         "dataset_metadata": adapter.metadata,
         "brec_protocol": {
             "effective": protocol,
-            "default_policy": "official for full runs; custom for --tiny fixtures",
+            "default_policy": "official unless --brec-protocol custom is explicitly requested",
             "official_reference_compatibility": _brec_reference_compatibility(protocol),
             "custom_metric": "custom_pairwise_union" if protocol == "custom" else None,
             "outer_model_seed_used": False,
@@ -1250,7 +1243,7 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
     # Parse representative complete RPC pairs even in prepare-only mode. This
     # catches malformed graph6, disconnected graphs, and PE extraction failures.
     if args.prepare_only:
-        check_indices = pair_indices if args.tiny else [pair_indices[0], pair_indices[-1]]
+        check_indices = list(dict.fromkeys((pair_indices[0], pair_indices[-1])))
         checks: list[dict[str, Any]] = []
         for pair_index in check_indices:
             category, prepared, raw_width, _, _ = _prepare_brec_pair(
@@ -1270,9 +1263,7 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
                 }
             )
         manifest["preparation_checks"] = checks
-        manifest["preparation_check_policy"] = (
-            "all selected pairs in tiny mode; first and last pair in full mode"
-        )
+        manifest["preparation_check_policy"] = "first and last pair of the supplied artifact"
         manifest["variants"] = list(args.variants)
         manifest["artifacts"] = _artifact_checksums(suite_root)
         _write_json(suite_root / "manifest.json", manifest)
@@ -1406,7 +1397,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="supervised initialization/minibatch axis; defaults to --seed",
     )
     parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument("--tiny", action="store_true")
     parser.add_argument(
         "--variants",
         default=",".join(PE_VARIANTS),
@@ -1437,7 +1427,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--brec-protocol",
         choices=BREC_PROTOCOLS,
         default=None,
-        help="official for full paper runs; omitted --tiny runs resolve to custom",
+        help="official by default; custom must be requested explicitly on a supplied artifact",
     )
     parser.add_argument("--brec-num-relabel", type=int, default=32)
     parser.add_argument("--brec-threshold", type=float)

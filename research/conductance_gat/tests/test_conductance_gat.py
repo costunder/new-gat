@@ -8,8 +8,11 @@ from research.conductance_gat.model import (
     PositiveInvariantScalarConductance,
     frozen_operator_spectral_radius,
 )
-from research.conductance_gat.run import _training_loss, resolve_device, runtime_metadata
-from research.conductance_gat.synthetic import evaluate_model, make_conductance_dataset
+from research.conductance_gat.paper import resolve_device, runtime_metadata
+from research.conductance_gat.tests.dense_model_inputs import (
+    evaluate_model,
+    make_conductance_dataset,
+)
 
 
 def _small_dataset(dtype: torch.dtype = torch.float64):
@@ -35,7 +38,7 @@ def test_device_resolution_is_host_aware(monkeypatch) -> None:
 
 
 def test_runtime_metadata_records_resolved_cpu_host() -> None:
-    metadata = runtime_metadata(torch.device("cpu"))
+    metadata = runtime_metadata(torch.device("cpu"), amp=False, pin_memory=False, batch_size=2)
     assert metadata["device"] == "cpu"
     assert metadata["device_name"] == "cpu"
     assert metadata["python"]
@@ -149,13 +152,14 @@ def test_learned_model_has_gradient_and_isotropic_baseline_is_scalar() -> None:
         hidden_channels=10,
         step_size=dataset.step_size,
     )
-    loss, _ = _training_loss(
-        model,
-        dataset,
-        node_weight=1.0,
-        flux_weight=1.0,
-        conductance_weight=0.0,
+    prediction, diagnostics = model(
+        dataset.incidence,
+        dataset.potentials,
+        dataset.edge_features,
+        return_diagnostics=True,
     )
+    loss = (prediction - dataset.true_next_state).square().mean()
+    loss = loss + (diagnostics["edge_flux"] - dataset.true_flux).square().mean()
     loss.backward()
     gradient_norm = sum(
         parameter.grad.abs().sum() for parameter in model.parameters() if parameter.grad is not None

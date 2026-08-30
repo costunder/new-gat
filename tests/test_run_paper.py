@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ast
+import re
+import shlex
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -72,17 +74,9 @@ def test_paper_runner_defaults_to_cuda_and_every_independent_track(
     )
     assert completed.returncode == 0, completed.stderr
     assert "gpu_preflight.py" in completed.stdout
+    assert "--profile" not in completed.stdout
+    assert "--nodes-per-graph" not in completed.stdout
     assert "--device cuda" in completed.stdout
-    preflight_line = next(
-        line for line in completed.stdout.splitlines() if line.startswith("[gpu_preflight]")
-    )
-    for profile in ("conductance", "cycle-projector", "tree-chart", "brec", "public-pyg"):
-        assert f"--profile {profile}" in preflight_line
-    assert "--batch-size 32" in preflight_line
-    assert "--brec-batch-size 16" in preflight_line
-    assert "--cycle-variants no_pe,raw,set,projector" in preflight_line
-    assert "--brec-protocol official" in preflight_line
-    assert "--no-brec-amp" in preflight_line
     for module in (
         "research.conductance_gat.paper",
         "research.cycle_pe.paper",
@@ -119,7 +113,7 @@ def test_paper_runner_refuses_full_cpu_execution(capsys: pytest.CaptureFixture[s
     assert "requires CUDA" in completed.stderr
 
 
-def test_paper_runner_allows_only_explicit_tiny_cpu_validation(
+def test_paper_runner_routes_custom_output_and_seed_without_dummy_data(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     result_root = tmp_path / "scratch results"
@@ -127,11 +121,10 @@ def test_paper_runner_allows_only_explicit_tiny_cpu_validation(
         [
             "--dry-run",
             "--run-id",
-            "tiny-cpu",
+            "custom-output",
             "--device",
-            "cpu",
-            "--tiny",
-            "--allow-cpu",
+            "cuda",
+            "--no-amp",
             "--seeds",
             "7",
             "--results-root",
@@ -140,7 +133,7 @@ def test_paper_runner_allows_only_explicit_tiny_cpu_validation(
         capsys,
     )
     assert completed.returncode == 0, completed.stderr
-    assert "--tiny" in completed.stdout
+    assert "--tiny" not in completed.stdout
     assert "--no-amp" in completed.stdout
     assert "model-seed-7" in completed.stdout
     assert "--model-seed 7" in completed.stdout
@@ -175,13 +168,8 @@ def test_paper_runner_allows_cpu_data_preparation_without_training(
     assert completed.stdout.count("--model-seed 11") == 5
     assert "--model-seed 12" not in completed.stdout
     assert "--seed" not in completed.stdout
-    preflight_line = next(
-        line for line in completed.stdout.splitlines() if line.startswith("[gpu_preflight]")
-    )
-    assert "--device cpu" in preflight_line
-    assert "--profile conductance" in preflight_line
-    for expensive_profile in ("cycle-projector", "tree-chart", "brec", "public-pyg"):
-        assert f"--profile {expensive_profile}" not in preflight_line
+    assert "gpu_preflight.py" not in completed.stdout
+    assert "--allow-cpu" not in completed.stdout
 
 
 def test_paper_runner_routes_independent_seed_axes(capsys: pytest.CaptureFixture[str]) -> None:
@@ -255,21 +243,9 @@ def test_paper_runner_exposes_cycle_candidate_reduction_without_overriding_offic
     assert "--learning-rate 0.002" in zinc_line
     assert "--epochs" not in brec_line
     assert "--learning-rate" not in brec_line
-    preflight_line = next(
-        line for line in completed.stdout.splitlines() if line.startswith("[gpu_preflight]")
-    )
-    assert "--profile cycle-projector" in preflight_line
-    assert "--profile brec" in preflight_line
-    assert "--profile public-pyg" not in preflight_line
-    assert "--profile conductance" not in preflight_line
-    assert "--profile tree-chart" not in preflight_line
-    assert "--cycle-variants no_pe,projector" in preflight_line
-    assert "--brec-protocol official" in preflight_line
-    assert "--brec-batch-size 16" in preflight_line
-    assert "--no-brec-amp" in preflight_line
 
 
-def test_cycle_preflight_runs_selected_non_projector_variants(
+def test_cycle_runner_forwards_selected_non_projector_variants(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     completed = _dry_run(
@@ -289,27 +265,20 @@ def test_cycle_preflight_runs_selected_non_projector_variants(
         capsys,
     )
     assert completed.returncode == 0, completed.stderr
-    preflight_line = next(
-        line for line in completed.stdout.splitlines() if line.startswith("[gpu_preflight]")
-    )
-    assert "--profile cycle-projector" in preflight_line
-    assert "--profile conductance" not in preflight_line
-    assert "--cycle-variants no_pe,raw,set" in preflight_line
 
 
-def test_tiny_custom_brec_preflight_matches_batch_amp_and_variants(
+def test_brec_keeps_official_protocol_when_other_batch_sizes_are_overridden(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     completed = _dry_run(
         [
             "--dry-run",
             "--run-id",
-            "cycle-tiny-custom",
+            "cycle-official",
             "--tracks",
             "cycle_pe",
             "--suite",
             "all",
-            "--tiny",
             "--batch-size",
             "7",
             "--model-seeds",
@@ -320,20 +289,68 @@ def test_tiny_custom_brec_preflight_matches_batch_amp_and_variants(
         capsys,
     )
     assert completed.returncode == 0, completed.stderr
-    preflight_line = next(
-        line for line in completed.stdout.splitlines() if line.startswith("[gpu_preflight]")
-    )
-    assert "--profile cycle-projector" in preflight_line
-    assert "--profile brec" in preflight_line
-    assert "--profile public-pyg" not in preflight_line
-    assert "--cycle-variants no_pe,raw" in preflight_line
-    assert "--brec-protocol custom" in preflight_line
-    assert "--brec-batch-size 7" in preflight_line
-    assert "--brec-amp" in preflight_line
     brec_line = next(
-        line for line in completed.stdout.splitlines() if "[cycle_pe:brec:custom-tiny]" in line
+        line for line in completed.stdout.splitlines() if "[cycle_pe:brec:official-10-seed]" in line
     )
-    assert "--batch-size 7" in brec_line
-    assert "--amp" in brec_line
-    assert "--brec-protocol custom" in brec_line
+    assert "--batch-size 16" in brec_line
+    assert "--no-amp" in brec_line
+    assert "--brec-protocol official" in brec_line
     assert "--variants no_pe,raw" in brec_line
+
+
+@pytest.mark.parametrize("argument", ["--tiny", "--allow-cpu"])
+def test_paper_runner_rejects_removed_dummy_options(argument: str) -> None:
+    from scripts.run_paper import _parser
+
+    with pytest.raises(SystemExit) as caught:
+        _parser().parse_args([argument])
+    assert caught.value.code == 2
+
+
+def test_paper_runner_rejects_unsafe_run_id() -> None:
+    from scripts.run_paper import _parser
+
+    with pytest.raises(SystemExit) as caught:
+        _parser().parse_args(["--run-id", "../escape"])
+    assert caught.value.code == 2
+
+
+def test_readme_commands_use_full_independent_protocols() -> None:
+    from scripts.run_paper import _parser
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    blocks = re.findall(r"```bash\n(.*?)```", readme, flags=re.DOTALL)
+    commands = [
+        line
+        for block in blocks
+        for line in block.splitlines()
+        if line.startswith("bash scripts/paper.sh ")
+    ]
+    assert len(commands) == 5
+    parsed = [_parser().parse_args(shlex.split(line)[2:]) for line in commands]
+    assert sum(args.prepare_only for args in parsed) == 1
+    assert all(args.suite == "all" for args in parsed)
+    assert {tuple(args.tracks) for args in parsed if not args.prepare_only} == {
+        ("conductance_gat",),
+        ("cycle_pe",),
+        ("tree_augmentation",),
+        ("all",),
+    }
+    assert all(args.device == "cuda" and args.model_seeds == (0, 1, 2, 3, 4) for args in parsed)
+    assert "--tiny" not in readme
+    assert "python -c" not in readme
+    assert "\\\n" not in readme
+
+
+def test_legacy_demo_entrypoints_are_removed() -> None:
+    paths = [
+        "scripts/run_all.py",
+        "scripts/smoke.sh",
+        "scripts/smoke.ps1",
+        "scripts/setup.sh",
+        "scripts/setup.ps1",
+        "research/conductance_gat/run.py",
+        "research/cycle_pe/run.py",
+        "research/tree_augmentation/run.py",
+    ]
+    assert all(not (ROOT / path).exists() for path in paths)

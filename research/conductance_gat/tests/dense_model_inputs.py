@@ -1,4 +1,7 @@
-"""Known-potential, multiple-excitation conductance benchmark."""
+"""Test-only tensor inputs and diagnostics for dense conductance algebra.
+
+This module is not a benchmark adapter, experiment entrypoint, or paper dataset.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ from chartgat.algebra import incidence_matrix
 from chartgat.graphs import make_connected_graph
 
 if TYPE_CHECKING:
-    from .model import IncidenceConductanceAttention
+    from research.conductance_gat.model import IncidenceConductanceAttention
 
 
 @dataclass(frozen=True)

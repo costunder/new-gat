@@ -1,4 +1,4 @@
-# Runtime and experiment dependencies. Install with:
-#   bash scripts/setup.sh        # Linux/MobaXterm
-#   .\scripts\setup.ps1         # Windows PowerShell
--e .[dev]
+# Reference research packages; see README.md for Conda and CUDA installation.
+# setup_gpu.sh applies the matching CUDA constraints before this stack is used.
+-r requirements-lock.txt
+-e .

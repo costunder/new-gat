@@ -9,19 +9,6 @@ objective_protocol:
   capacity_limit: Core ablations share hidden width and optimization but not parameter budgets; core per-baseline parameter counts are not currently emitted.
 
 datasets:
-  - id: single_graph_excitation_smoke
-    name: Current single-graph excitation sanity check
-    tier: smoke
-    status: implemented
-    data_policy: generated
-    source_url: generated://research.conductance_gat.synthetic
-    task: Recover flux and node update on one fixed graph with known potentials.
-    split: 144/48 excitation split on the same 28-node graph; not graph OOD.
-    metrics: [node_update_rmse, flux_rmse, conductance_rmse, conductance_correlation]
-    claim: Algebra, optimization, and artifact-pipeline certification only.
-    adapter: research.conductance_gat.synthetic.make_conductance_dataset
-    leakage_guard: Do not report as unseen-graph or conductance-law generalization.
-
   - id: static_multigraph_identification
     name: Static heterogeneous multi-graph synthetic
     tier: paper_core

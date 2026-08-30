@@ -6,11 +6,17 @@ import pytest
 import torch
 
 from research.cycle_pe import paper
+from research.cycle_pe.tests.fixtures import small_cyclecount_loader, write_brec_fixture
 
 main = paper.main
 
 
-def test_core_tiny_cli_trains_without_download_and_writes_manifest(tmp_path) -> None:
+@pytest.fixture(autouse=True)
+def unit_test_core_loader(monkeypatch) -> None:
+    monkeypatch.setattr(paper, "load_or_generate_cycle_count_ood", small_cyclecount_loader)
+
+
+def test_core_cli_trains_injected_data_and_writes_manifest(tmp_path) -> None:
     data_root = tmp_path / "data"
     output_root = tmp_path / "runs"
     exit_code = main(
@@ -29,7 +35,6 @@ def test_core_tiny_cli_trains_without_download_and_writes_manifest(tmp_path) -> 
             "19",
             "--model-seed",
             "37",
-            "--tiny",
             "--epochs",
             "1",
             "--batch-size",
@@ -76,7 +81,7 @@ def test_core_tiny_cli_trains_without_download_and_writes_manifest(tmp_path) -> 
     assert checkpoint["model_seed"] == 37
 
 
-def test_core_tiny_prepare_only_stops_before_training(tmp_path) -> None:
+def test_core_prepare_only_stops_before_training(tmp_path) -> None:
     output_root = tmp_path / "runs"
     assert (
         main(
@@ -89,7 +94,6 @@ def test_core_tiny_prepare_only_stops_before_training(tmp_path) -> None:
                 str(output_root),
                 "--device",
                 "cpu",
-                "--tiny",
                 "--prepare-only",
                 "--workers",
                 "1",
@@ -105,7 +109,8 @@ def test_core_tiny_prepare_only_stops_before_training(tmp_path) -> None:
     assert not list((output_root / "core").glob("*/model.pt"))
 
 
-def test_brec_tiny_prepare_only_uses_offline_rpc_fixture(tmp_path) -> None:
+def test_brec_prepare_only_uses_explicit_custom_artifact(tmp_path) -> None:
+    write_brec_fixture(tmp_path / "data" / "BREC" / "Data" / "raw" / "brec_v3.npy")
     output_root = tmp_path / "runs"
     assert (
         main(
@@ -118,7 +123,8 @@ def test_brec_tiny_prepare_only_uses_offline_rpc_fixture(tmp_path) -> None:
                 str(output_root),
                 "--device",
                 "cpu",
-                "--tiny",
+                "--brec-protocol",
+                "custom",
                 "--prepare-only",
                 "--brec-num-relabel",
                 "2",
@@ -131,7 +137,7 @@ def test_brec_tiny_prepare_only_uses_offline_rpc_fixture(tmp_path) -> None:
         == 0
     )
     manifest = json.loads((output_root / "brec" / "manifest.json").read_text("utf-8"))
-    assert manifest["dataset_metadata"]["offline_fixture"] is True
+    assert manifest["dataset_metadata"]["pair_count"] == 2
     assert manifest["brec_protocol"]["effective"] == "custom"
     assert "official_training_reference_matched" not in manifest["brec_protocol"]
     compatibility = manifest["brec_protocol"]["official_reference_compatibility"]
@@ -143,7 +149,8 @@ def test_brec_tiny_prepare_only_uses_offline_rpc_fixture(tmp_path) -> None:
     assert len(manifest["preparation_checks"]) == 2
 
 
-def test_brec_tiny_custom_training_is_labeled_separately(tmp_path) -> None:
+def test_brec_custom_training_is_labeled_separately(tmp_path) -> None:
+    write_brec_fixture(tmp_path / "data" / "BREC" / "Data" / "raw" / "brec_v3.npy")
     output_root = tmp_path / "runs"
     assert (
         main(
@@ -156,7 +163,6 @@ def test_brec_tiny_custom_training_is_labeled_separately(tmp_path) -> None:
                 str(output_root),
                 "--device",
                 "cpu",
-                "--tiny",
                 "--brec-protocol",
                 "custom",
                 "--brec-num-relabel",
@@ -239,7 +245,6 @@ def test_existing_output_collision_is_rejected_without_modification(tmp_path) ->
                 str(output_root),
                 "--device",
                 "cpu",
-                "--tiny",
                 "--prepare-only",
             ]
         )
@@ -290,3 +295,9 @@ def test_all_suite_failure_preserves_completed_and_removes_failed_suite_artifact
     assert manifest["status"] == "failed"
     assert manifest["failed_suite"] == "brec"
     assert manifest["completed_suites"] == ["core"]
+
+
+@pytest.mark.parametrize("suite", ["core", "brec", "zinc"])
+def test_production_cli_rejects_removed_tiny_option(suite) -> None:
+    with pytest.raises(SystemExit):
+        paper.build_parser().parse_args(["--suite", suite, "--tiny"])

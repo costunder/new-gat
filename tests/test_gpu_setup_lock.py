@@ -90,3 +90,21 @@ def test_gpu_setup_uses_lock_and_has_no_cu118_install_branch() -> None:
     assert "TORCH_SPEC" not in source
     assert "TORCH_INDEX_URL" not in source
     assert "requires a driver supporting CUDA 12.6+" in source
+
+
+def test_gpu_setup_uses_fixed_reference_runtime_and_opt_in_unit_tests() -> None:
+    source = (ROOT / "scripts" / "setup_gpu.sh").read_text(encoding="utf-8")
+    assert 'wheel_tag="${CUDA_WHEEL_TAG:-cu126}"' in source
+    assert 'if [[ "${RUN_TESTS:-0}" == "1" ]]' in source
+    assert "SKIP_TESTS" not in source
+    assert 'wheel_tag="cu132"' not in source
+
+
+def test_conda_bootstrap_uses_named_environment_and_python_311() -> None:
+    import yaml
+
+    environment = yaml.safe_load((ROOT / "environment.yml").read_text(encoding="utf-8"))
+    assert environment["name"] == "new-gat"
+    assert environment["channels"] == ["conda-forge", "nodefaults"]
+    assert "python=3.11" in environment["dependencies"]
+    assert "pip" in environment["dependencies"]

@@ -89,6 +89,21 @@ torch-geometric==2.8.0.post1
 tqdm==4.70.0
 ````
 
+# environment.yml
+
+````yaml
+name: new-gat
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+# Install the pinned CUDA research packages with: bash scripts/setup_gpu.sh
+# CUDA packages are kept out of the bootstrap environment so the official
+# PyTorch wheel index and constraints file are always applied together.
+````
+
 # pyproject.toml
 
 ````toml
@@ -135,8 +150,8 @@ exclude = ["research.combined_later*", "research.*.tests*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-"research.conductance_gat" = ["config.yaml", "datasets.yaml"]
-"research.cycle_pe" = ["config.yaml", "datasets.yaml"]
+"research.conductance_gat" = ["datasets.yaml"]
+"research.cycle_pe" = ["datasets.yaml"]
 "research.tree_augmentation" = ["config.yaml", "datasets.yaml"]
 
 [tool.pytest.ini_options]
@@ -193,10 +208,10 @@ tqdm==4.70.0
 # requirements.txt
 
 ````text
-# Runtime and experiment dependencies. Install with:
-#   bash scripts/setup.sh        # Linux/MobaXterm
-#   .\scripts\setup.ps1         # Windows PowerShell
--e .[dev]
+# Reference research packages; see README.md for Conda and CUDA installation.
+# setup_gpu.sh applies the matching CUDA constraints before this stack is used.
+-r requirements-lock.txt
+-e .
 ````
 
 # research/__init__.py
@@ -2486,10 +2501,8 @@ from .sparse import (
     edge_gradient,
     pack_graph_examples,
 )
-from .synthetic import ConductanceDataset, make_conductance_dataset
 
 __all__ = [
-    "ConductanceDataset",
     "IncidenceConductanceAttention",
     "IsotropicConductanceAttention",
     "PositiveInvariantScalarConductance",
@@ -2498,7 +2511,6 @@ __all__ = [
     "SparsePositiveConductance",
     "edge_divergence",
     "edge_gradient",
-    "make_conductance_dataset",
     "pack_graph_examples",
 ]
 ````
@@ -2531,7 +2543,6 @@ def validate_dataset_cache(
     *,
     data_seeds: tuple[int, ...],
     split_seeds: tuple[int, ...],
-    tiny: bool,
 ) -> dict[str, Any]:
     """Validate every requested cache for one conductance registry entry."""
 
@@ -2539,54 +2550,17 @@ def validate_dataset_cache(
     paths: list[str] = []
     if dataset_id in CORE_DATASETS:
         for seed in data_seeds:
-            _, manifest_path, _ = validate_core_cache(data_root, seed=seed, tiny=tiny)
+            _, manifest_path, _ = validate_core_cache(data_root, seed=seed)
             paths.append(str(manifest_path))
     elif dataset_id in PUBLIC_DATASETS:
-        validation_seeds = data_seeds if tiny else data_seeds[:1]
-        for seed in validation_seeds:
-            marker, _ = validate_public_cache(data_root, seed=seed, tiny=tiny)
-            paths.append(str(marker))
+        marker, _ = validate_public_cache(data_root)
+        paths.append(str(marker))
     else:
         raise ValueError(f"unsupported conductance cache dataset {dataset_id!r}")
     return {"paths": sorted(set(paths)), "requested_data_seeds": list(data_seeds)}
 
 
 __all__ = ["validate_dataset_cache"]
-````
-
-# research/conductance_gat/config.yaml
-
-````yaml
-seed: 17
-# Select CUDA when the server's PyTorch build exposes it; otherwise use CPU.
-device: auto
-output_dir: results
-
-data:
-  num_nodes: 28
-  extra_edges: 22
-  num_excitations: 192
-  channels: 3
-  edge_feature_channels: 3
-  potential_scale: 1.0
-  requested_step: 0.03
-  stability_margin: 0.80
-
-model:
-  hidden_channels: 48
-  minimum_conductance: 0.0001
-  stability_margin: 0.95
-  adaptive_stability: true
-
-training:
-  train_fraction: 0.75
-  epochs: 500
-  learning_rate: 0.008
-  weight_decay: 0.00001
-  node_weight: 1.0
-  flux_weight: 1.0
-  conductance_weight: 0.0
-  log_every: 10
 ````
 
 # research/conductance_gat/datasets.yaml
@@ -2603,19 +2577,6 @@ objective_protocol:
   capacity_limit: Core ablations share hidden width and optimization but not parameter budgets; core per-baseline parameter counts are not currently emitted.
 
 datasets:
-  - id: single_graph_excitation_smoke
-    name: Current single-graph excitation sanity check
-    tier: smoke
-    status: implemented
-    data_policy: generated
-    source_url: generated://research.conductance_gat.synthetic
-    task: Recover flux and node update on one fixed graph with known potentials.
-    split: 144/48 excitation split on the same 28-node graph; not graph OOD.
-    metrics: [node_update_rmse, flux_rmse, conductance_rmse, conductance_correlation]
-    claim: Algebra, optimization, and artifact-pipeline certification only.
-    adapter: research.conductance_gat.synthetic.make_conductance_dataset
-    leakage_guard: Do not report as unseen-graph or conductance-law generalization.
-
   - id: static_multigraph_identification
     name: Static heterogeneous multi-graph synthetic
     tier: paper_core
@@ -3038,7 +2999,6 @@ Examples
 --------
 python -m research.conductance_gat.paper --suite core --data-root ./data \
     --output-dir ./results/conductance --device cuda --seed 17
-python -m research.conductance_gat.paper --suite all --tiny --device cpu
 """
 
 from __future__ import annotations
@@ -3782,7 +3742,7 @@ def run_core(
         train_examples = suite["train"]
         validation_examples = suite["validation"]
         test_examples = suite["test"]
-        hidden_channels = 16 if core["tiny"] else 64
+        hidden_channels = 64
         suite_result: dict[str, Any] = {
             "claim": CORE_CLAIMS[suite_name],
             "description": suite["description"],
@@ -4287,25 +4247,6 @@ def _macro_f1(predictions: Tensor, labels: Tensor) -> float:
     return sum(scores) / max(len(scores), 1)
 
 
-def _binary_auc(scores: Tensor, labels: Tensor) -> float | None:
-    valid = torch.isfinite(labels)
-    scores = scores[valid].float().cpu()
-    labels = labels[valid].long().cpu()
-    positive = labels == 1
-    negative = labels == 0
-    if not positive.any() or not negative.any():
-        return None
-    order = torch.argsort(scores, stable=True)
-    ranks = torch.empty_like(order, dtype=torch.float32)
-    ranks[order] = torch.arange(1, order.numel() + 1, dtype=torch.float32)
-    positive_count = int(positive.sum())
-    negative_count = int(negative.sum())
-    return float(
-        (ranks[positive].sum() - positive_count * (positive_count + 1) / 2)
-        / (positive_count * negative_count)
-    )
-
-
 @torch.no_grad()
 def evaluate_public(
     model: PublicConductanceModel,
@@ -4316,7 +4257,6 @@ def evaluate_public(
     amp: bool,
     pin_memory: bool,
     num_workers: int,
-    official_molecule: bool = False,
 ) -> dict[str, Any]:
     model.eval()
     outputs: list[Tensor] = []
@@ -4340,24 +4280,18 @@ def evaluate_public(
             "macro_f1": _macro_f1(output.argmax(dim=1), label.long()),
             "num_labels": label.numel(),
         }
-    if official_molecule:
-        try:
-            from ogb.graphproppred import Evaluator
-        except (ImportError, OSError) as error:  # pragma: no cover - optional path
-            raise RuntimeError("official MolHIV evaluation requires the OGB evaluator") from error
-        evaluator = Evaluator(name="ogbg-molhiv")
-        score = evaluator.eval({"y_true": label.reshape(-1, 1), "y_pred": output.reshape(-1, 1)})[
-            "rocauc"
-        ]
-        return {
-            "roc_auc": float(score),
-            "num_graphs": label.numel(),
-            "evaluator": "ogb.graphproppred.Evaluator",
-        }
+    try:
+        from ogb.graphproppred import Evaluator
+    except (ImportError, OSError) as error:  # pragma: no cover - optional path
+        raise RuntimeError("official MolHIV evaluation requires the OGB evaluator") from error
+    evaluator = Evaluator(name="ogbg-molhiv")
+    score = evaluator.eval({"y_true": label.reshape(-1, 1), "y_pred": output.reshape(-1, 1)})[
+        "rocauc"
+    ]
     return {
-        "roc_auc": _binary_auc(output.reshape(-1), label.reshape(-1)),
+        "roc_auc": float(score),
         "num_graphs": label.numel(),
-        "evaluator": "offline_fixture_rank_auc",
+        "evaluator": "ogb.graphproppred.Evaluator",
     }
 
 
@@ -4373,6 +4307,10 @@ def run_public(
     num_workers: int,
     seed: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, dict[str, Tensor]]]:
+    if datasets.get("fixture") is not False:
+        raise ValueError(
+            "Public experiments require official data; generated substitutes are unsupported"
+        )
     results: dict[str, Any] = {}
     histories: list[dict[str, Any]] = []
     states: dict[str, dict[str, Tensor]] = {}
@@ -4380,11 +4318,11 @@ def run_public(
     for dataset_number, dataset_name in enumerate(("pascalvoc_sp", "ogbg_molhiv")):
         splits = datasets[dataset_name]
         sample = splits["train"][0]
-        num_classes = 21 if dataset_name == "pascalvoc_sp" and not datasets["fixture"] else 3
-        hidden = 24 if datasets["fixture"] else 96
+        num_classes = 21 if dataset_name == "pascalvoc_sp" else 3
+        hidden = 96
         results[dataset_name] = {
-            "fixture": bool(datasets["fixture"]),
-            "official_result": not bool(datasets["fixture"]),
+            "fixture": False,
+            "official_result": True,
             "comparison_protocol": {
                 "hidden_channels": hidden,
                 "backbone_depth": 1,
@@ -4403,7 +4341,7 @@ def run_public(
                 sample,
                 hidden=hidden,
                 num_classes=num_classes,
-                official_molecule=(dataset_name == "ogbg_molhiv" and not datasets["fixture"]),
+                official_molecule=(dataset_name == "ogbg_molhiv"),
                 backbone=backbone,
             ).to(device)
             parameter_count = sum(
@@ -4490,7 +4428,6 @@ def run_public(
                     amp=amp,
                     pin_memory=pin_memory,
                     num_workers=num_workers,
-                    official_molecule=(dataset_name == "ogbg_molhiv" and not datasets["fixture"]),
                 ),
             }
     return results, histories, states
@@ -4536,8 +4473,6 @@ def _prepare_output_dir(path: Path) -> Path:
 
 def _seed_axis_applicability(
     suite: str,
-    *,
-    public_fixture: bool | None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """Describe which resolved seed axes actually affect each requested protocol."""
 
@@ -4562,23 +4497,14 @@ def _seed_axis_applicability(
             },
         }
     if suite in {"public", "all"}:
-        fixture = bool(public_fixture)
         applicability["public"] = {
             "data": {
-                "applicable": fixture,
-                "use": (
-                    "offline fixture graph generation"
-                    if fixture
-                    else "not_applicable: official dataset content is fixed by its source"
-                ),
+                "applicable": False,
+                "use": "not_applicable: official dataset content is fixed by its source",
             },
             "split": {
                 "applicable": False,
-                "use": (
-                    "not_applicable: fixture split membership is preassigned by data_seed"
-                    if fixture
-                    else "not_applicable: official PascalVOC-SP/MolHIV splits are fixed"
-                ),
+                "use": "not_applicable: official PascalVOC-SP/MolHIV splits are fixed",
             },
             "chart": {
                 "applicable": False,
@@ -4610,7 +4536,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chart-seed", type=int, default=None)
     parser.add_argument("--model-seed", type=int, default=None)
     parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument("--tiny", action="store_true", help="offline CPU CI/fixture profile")
     parser.add_argument(
         "--allow-download", action="store_true", help="allow official PyG/OGB downloads"
     )
@@ -4638,14 +4563,12 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     amp = device.type == "cuda" if arguments.amp is None else bool(arguments.amp)
     if device.type != "cuda" and amp:
         raise ValueError("--amp is a CUDA float16 path; use --no-amp on CPU")
-    if arguments.tiny and device.type == "cpu":
-        amp = False
     pin_memory = (
         device.type == "cuda" if arguments.pin_memory is None else bool(arguments.pin_memory)
     )
     if device.type != "cuda":
         pin_memory = False
-    epochs = arguments.epochs if arguments.epochs is not None else (8 if arguments.tiny else 100)
+    epochs = arguments.epochs if arguments.epochs is not None else 100
     if epochs < 1:
         raise ValueError("--epochs must be positive")
     # Dataset preparation receives only the data axis.  Reset the global RNG to
@@ -4659,9 +4582,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     core = None
     public = None
     if arguments.suite in {"core", "all"}:
-        core, manifest_path, manifest = prepare_core_cache(
-            arguments.data_root, seed=seed_axes.data, tiny=arguments.tiny
-        )
+        core, manifest_path, manifest = prepare_core_cache(arguments.data_root, seed=seed_axes.data)
         prepared["core"] = {
             "manifest": str(manifest_path),
             "cache_key": manifest["cache_key"],
@@ -4670,26 +4591,22 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     if arguments.suite in {"public", "all"}:
         public, marker_path, manifest = prepare_public_data(
             arguments.data_root,
-            seed=seed_axes.data,
-            tiny=arguments.tiny,
             allow_download=arguments.allow_download,
         )
         prepared["public"] = {
             "manifest": str(marker_path),
             "fixture": manifest["fixture"],
-            "data_seed": seed_axes.data if manifest["fixture"] else "not_applicable",
+            "data_seed": "not_applicable",
             "split_seed": "not_applicable",
             "chart_seed": "not_applicable",
         }
-    public_fixture = None if public is None else bool(public["fixture"])
-    seed_applicability = _seed_axis_applicability(arguments.suite, public_fixture=public_fixture)
+    seed_applicability = _seed_axis_applicability(arguments.suite)
     if arguments.prepare_only:
         summary = {
             "status": "prepared",
             "suite": arguments.suite,
             "seed_axes": seed_axes.to_manifest(),
             "seed_axis_applicability": seed_applicability,
-            "tiny": arguments.tiny,
             "prepared": prepared,
         }
         (output_dir / "prepare_summary.json").write_text(
@@ -4745,7 +4662,6 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         "suite": arguments.suite,
         "seed_axes": seed_axes.to_manifest(),
         "seed_axis_applicability": seed_applicability,
-        "tiny": arguments.tiny,
         "prepared": prepared,
         "configuration": {
             "epochs": epochs,
@@ -4822,7 +4738,7 @@ from chartgat.cache import (
 from .sparse import edge_divergence, edge_gradient, weighted_degree
 
 SCHEMA_VERSION = 2
-GENERATOR_VERSION = "conductance-s1-s4-edge-index-v5"
+GENERATOR_VERSION = "conductance-s1-s4-edge-index-v6-full-only"
 
 
 def _generator(seed: int) -> torch.Generator:
@@ -5044,9 +4960,9 @@ def _vary_nodes(low: int, high: int, seed: int) -> int:
     return int(torch.randint(low, high + 1, (1,), generator=_generator(seed)))
 
 
-def generate_s1(seed: int, tiny: bool) -> dict[str, Any]:
-    counts = (4, 1, 1) if tiny else (42, 9, 9)
-    excitation_counts = (3, 2, 2) if tiny else (6, 3, 3)
+def generate_s1(seed: int) -> dict[str, Any]:
+    counts = (42, 9, 9)
+    excitation_counts = (6, 3, 3)
     result: dict[str, Any] = {name: [] for name in ("train", "validation", "test", "seen_test")}
     offset = 0
     for split, graph_count, excitation_count in zip(
@@ -5055,7 +4971,7 @@ def generate_s1(seed: int, tiny: bool) -> dict[str, Any]:
         for graph_number in range(graph_count):
             graph_seed = seed * 100_000 + offset * 101 + 11
             graph_id = f"s1-{split}-{graph_number:03d}"
-            nodes = _vary_nodes(8 if tiny else 16, 14 if tiny else 32, graph_seed)
+            nodes = _vary_nodes(16, 32, graph_seed)
             family = "er" if graph_number % 2 == 0 else "rgg"
             for excitation in range(excitation_count):
                 result[split].append(
@@ -5068,7 +4984,7 @@ def generate_s1(seed: int, tiny: bool) -> dict[str, Any]:
                     )
                 )
             if split == "train":
-                seen_count = 1 if tiny else 2
+                seen_count = 2
                 for excitation in range(seen_count):
                     result["seen_test"].append(
                         make_example(
@@ -5084,16 +5000,14 @@ def generate_s1(seed: int, tiny: bool) -> dict[str, Any]:
     return result
 
 
-def _s2_protocol_counts(tiny: bool) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+def _s2_protocol_counts() -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     """Return graph and per-graph excitation counts for train/validation/test."""
 
-    if tiny:
-        return (4, 2, 4), (2, 2, 2)
     return (28, 8, 16), (4, 3, 3)
 
 
-def generate_s2(seed: int, tiny: bool) -> dict[str, Any]:
-    counts, excitation_counts = _s2_protocol_counts(tiny)
+def generate_s2(seed: int) -> dict[str, Any]:
+    counts, excitation_counts = _s2_protocol_counts()
     result: dict[str, Any] = {name: [] for name in ("train", "validation", "test")}
     for split_number, (split, count, excitations) in enumerate(
         zip(("train", "validation", "test"), counts, excitation_counts, strict=True)
@@ -5101,10 +5015,10 @@ def generate_s2(seed: int, tiny: bool) -> dict[str, Any]:
         for graph_number in range(count):
             graph_seed = seed * 200_000 + split_number * 20_000 + graph_number * 131 + 29
             if split == "test":
-                low, high = (12, 20) if tiny else (48, 96)
+                low, high = (48, 96)
                 family = "grid" if graph_number % 2 == 0 else "barbell"
             else:
-                low, high = (6, 10) if tiny else (16, 32)
+                low, high = (16, 32)
                 family = "er" if graph_number % 2 == 0 else "rgg"
             nodes = _vary_nodes(low, high, graph_seed)
             graph_id = f"s2-{split}-{family}-{graph_number:03d}"
@@ -5190,22 +5104,22 @@ def _trajectory_examples(trajectory: dict[str, Any]) -> list[dict[str, Any]]:
     return examples
 
 
-def generate_s3(seed: int, tiny: bool) -> dict[str, Any]:
-    counts = (3, 1, 2) if tiny else (12, 3, 5)
-    horizon = 10 if tiny else 50
+def generate_s3(seed: int) -> dict[str, Any]:
+    counts = (12, 3, 5)
+    horizon = 50
     result: dict[str, Any] = {
         "train": [],
         "validation": [],
         "test": [],
         "rollout_test": [],
-        "horizons": [1, 5, 10] if tiny else [1, 5, 10, 50],
+        "horizons": [1, 5, 10, 50],
     }
     for split_number, (split, count) in enumerate(
         zip(("train", "validation", "test"), counts, strict=True)
     ):
         for number in range(count):
             graph_seed = seed * 300_000 + split_number * 30_000 + number * 151 + 37
-            nodes = _vary_nodes(8 if tiny else 18, 14 if tiny else 36, graph_seed)
+            nodes = _vary_nodes(18, 36, graph_seed)
             family = "er" if number % 2 == 0 else "rgg"
             trajectory = _make_trajectory(
                 graph_id=f"s3-{split}-{number:03d}",
@@ -5222,13 +5136,13 @@ def generate_s3(seed: int, tiny: bool) -> dict[str, Any]:
     return result
 
 
-def generate_s4(seed: int, tiny: bool) -> dict[str, Any]:
+def generate_s4(seed: int) -> dict[str, Any]:
     result: dict[str, Any] = {"train": [], "validation": [], "test": []}
     contrasts = (1.0, 10.0, 100.0)
     active_fractions = (1.0, 0.25)
     snrs: tuple[float | None, ...] = (None, 40.0, 20.0)
-    graph_counts = (1, 1, 1) if tiny else (3, 1, 2)
-    excitation_counts = (2, 1, 2) if tiny else (6, 2, 4)
+    graph_counts = (3, 1, 2)
+    excitation_counts = (6, 2, 4)
     cell = 0
     for contrast in contrasts:
         for active_fraction in active_fractions:
@@ -5249,7 +5163,7 @@ def generate_s4(seed: int, tiny: bool) -> dict[str, Any]:
                             + graph_number * 173
                             + 41
                         )
-                        nodes = _vary_nodes(8 if tiny else 18, 14 if tiny else 32, graph_seed)
+                        nodes = _vary_nodes(18, 32, graph_seed)
                         graph_id = (
                             f"s4-{split}-c{contrast:g}-a{active_fraction:g}-"
                             f"s{snr}-{graph_number:02d}"
@@ -5273,16 +5187,15 @@ def generate_s4(seed: int, tiny: bool) -> dict[str, Any]:
     return result
 
 
-def generate_core(seed: int, tiny: bool = False) -> dict[str, Any]:
+def generate_core(seed: int) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "generator_version": GENERATOR_VERSION,
         "seed": int(seed),
-        "tiny": bool(tiny),
-        "s1": generate_s1(seed + 101, tiny),
-        "s2": generate_s2(seed + 202, tiny),
-        "s3": generate_s3(seed + 303, tiny),
-        "s4": generate_s4(seed + 404, tiny),
+        "s1": generate_s1(seed + 101),
+        "s2": generate_s2(seed + 202),
+        "s3": generate_s3(seed + 303),
+        "s4": generate_s4(seed + 404),
     }
 
 
@@ -5343,8 +5256,8 @@ def _split_counts(core: dict[str, Any]) -> dict[str, dict[str, int]]:
     }
 
 
-def _expected_split_counts(tiny: bool) -> dict[str, dict[str, int]]:
-    s2_graph_counts, s2_excitation_counts = _s2_protocol_counts(tiny)
+def _expected_split_counts() -> dict[str, dict[str, int]]:
+    s2_graph_counts, s2_excitation_counts = _s2_protocol_counts()
     s2_counts = {
         split: graph_count * excitation_count
         for split, graph_count, excitation_count in zip(
@@ -5354,29 +5267,19 @@ def _expected_split_counts(tiny: bool) -> dict[str, dict[str, int]]:
             strict=True,
         )
     }
-    return (
-        {
-            "s1": {"train": 12, "validation": 2, "test": 2, "seen_test": 4},
-            "s2": s2_counts,
-            "s3": {"train": 30, "validation": 10, "test": 20},
-            "s4": {"train": 36, "validation": 18, "test": 36},
-        }
-        if tiny
-        else {
-            "s1": {"train": 252, "validation": 27, "test": 27, "seen_test": 84},
-            "s2": s2_counts,
-            "s3": {"train": 600, "validation": 150, "test": 250},
-            "s4": {"train": 324, "validation": 36, "test": 144},
-        }
-    )
+    return {
+        "s1": {"train": 252, "validation": 27, "test": 27, "seen_test": 84},
+        "s2": s2_counts,
+        "s3": {"train": 600, "validation": 150, "test": 250},
+        "s4": {"train": 324, "validation": 36, "test": 144},
+    }
 
 
-def _core_request(seed: int, tiny: bool) -> dict[str, Any]:
+def _core_request(seed: int) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
         "generator_version": GENERATOR_VERSION,
         "seed": int(seed),
-        "tiny": bool(tiny),
     }
 
 
@@ -5462,7 +5365,7 @@ def _validate_core_content(core: Any, request: dict[str, Any], manifest: dict[st
     split_counts = _split_counts(core)
     if manifest.get("split_counts") != split_counts:
         raise CacheCorruptError("conductance split-count manifest does not match the artifact")
-    if split_counts != _expected_split_counts(bool(request["tiny"])):
+    if split_counts != _expected_split_counts():
         raise CacheCorruptError("conductance split cardinalities do not match the paper protocol")
     for suite_splits in graph_ids.values():
         named_sets = [set(values) for name, values in suite_splits.items() if name != "seen_test"]
@@ -5472,11 +5375,11 @@ def _validate_core_content(core: Any, request: dict[str, Any], manifest: dict[st
 
 
 def validate_core_cache(
-    data_root: Path | str, *, seed: int, tiny: bool = False
+    data_root: Path | str, *, seed: int
 ) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     """Read and fully validate one requested generated core cache without writing."""
 
-    request = _core_request(seed, tiny)
+    request = _core_request(seed)
     artifact_path, manifest_path = _core_cache_paths(data_root, request)
     present = (artifact_path.is_file(), manifest_path.is_file())
     if not any(present):
@@ -5511,15 +5414,15 @@ def validate_core_cache(
 
 
 def prepare_core_cache(
-    data_root: Path | str, *, seed: int, tiny: bool = False, force: bool = False
+    data_root: Path | str, *, seed: int, force: bool = False
 ) -> tuple[dict[str, Any], Path, dict[str, Any]]:
-    request = _core_request(seed, tiny)
+    request = _core_request(seed)
     artifact_path, manifest_path = _core_cache_paths(data_root, request)
     cache_key = artifact_path.parent.name.removeprefix("core-")
     if (artifact_path.exists() or manifest_path.exists()) and not force:
-        return validate_core_cache(data_root, seed=seed, tiny=tiny)
+        return validate_core_cache(data_root, seed=seed)
 
-    core = generate_core(seed, tiny)
+    core = generate_core(seed)
     expected_content_sha256 = _content_fingerprint(core)
 
     def validate_artifact(temporary: Path) -> None:
@@ -5551,7 +5454,7 @@ def prepare_core_cache(
         manifest,
         validator=lambda temporary: json.loads(temporary.read_text(encoding="utf-8")),
     )
-    return validate_core_cache(data_root, seed=seed, tiny=tiny)
+    return validate_core_cache(data_root, seed=seed)
 
 
 __all__ = [
@@ -5574,13 +5477,12 @@ __all__ = [
 # research/conductance_gat/public_data.py
 
 ````python
-"""Optional PyG/OGB public adapters plus deterministic offline fixtures.
+"""Official PyG/OGB public adapters with verified caches and opt-in downloads.
 
 The synthetic paper core has no optional dependencies.  Official
 PascalVOC-SP and ogbg-molhiv data are touched only through this module and only
-when the caller explicitly allows the dataset classes to download.  ``tiny``
-fixtures exercise the exact adapter/training path without network access and
-are always labelled as fixtures in result files.
+when a verified real cache exists or the caller explicitly allows downloading.
+Missing public data never falls back to generated graphs.
 """
 
 from __future__ import annotations
@@ -5719,67 +5621,11 @@ def adapt_pyg_graph(data: Any, graph_id: str, *, task: str) -> dict[str, Any]:
     }
 
 
-def _fixture_graph(seed: int, graph_id: str, *, task: str, categorical: bool) -> dict[str, Any]:
-    generator = torch.Generator(device="cpu")
-    generator.manual_seed(seed)
-    num_nodes = 6 + seed % 4
-    pairs = [(node, node + 1) for node in range(num_nodes - 1)]
-    pairs.extend((node, node + 2) for node in range(num_nodes - 2) if node % 2 == 0)
-    # Feed reciprocal arcs through the public deduplicator, as official PyG
-    # datasets do, so fixture tests cover this otherwise easy-to-miss step.
-    directed = pairs + [(b, a) for a, b in pairs]
-    directed_edges = torch.tensor(directed, dtype=torch.long).t().contiguous()
-    if categorical:
-        x = torch.randint(0, 4, (num_nodes, 3), generator=generator)
-        base_edge_attr = torch.randint(0, 3, (len(pairs), 2), generator=generator)
-    else:
-        x = torch.randn((num_nodes, 5), generator=generator)
-        base_edge_attr = torch.randn((len(pairs), 2), generator=generator)
-    edge_attr = torch.cat((base_edge_attr, base_edge_attr), dim=0)
-    edge_index, edge_features = deduplicate_undirected_edges(directed_edges, edge_attr, num_nodes)
-    if task == "node":
-        y = ((x[:, 0] > 0).long() + (x[:, 1] > 0).long()).clamp_max(2)
-    else:
-        # Alternate labels deterministically so every fixture split exercises
-        # the ROC-AUC evaluator; this is pipeline validation, not a benchmark.
-        y = torch.tensor([float(seed % 2)])
-    return {
-        "graph_id": graph_id,
-        "x": x,
-        "edge_index": edge_index,
-        "edge_features": edge_features,
-        "y": y,
-        "task": task,
-        "categorical": categorical,
-    }
-
-
-def make_public_fixtures(seed: int) -> dict[str, Any]:
-    result: dict[str, Any] = {"fixture": True}
-    for dataset_name, task, categorical in (
-        ("pascalvoc_sp", "node", False),
-        ("ogbg_molhiv", "graph", True),
-    ):
-        result[dataset_name] = {}
-        offset = 0 if dataset_name == "pascalvoc_sp" else 10_000
-        for split, count in (("train", 8), ("validation", 3), ("test", 4)):
-            result[dataset_name][split] = [
-                _fixture_graph(
-                    seed + offset + number * 19,
-                    f"fixture-{dataset_name}-{split}-{number:03d}",
-                    task=task,
-                    categorical=categorical,
-                )
-                for number in range(count)
-            ]
-    return result
-
-
 def _dependency_error() -> OptionalDatasetDependencyError:
     return OptionalDatasetDependencyError(
         "Official public suites require optional packages 'torch-geometric' and 'ogb'. "
-        "Install a PyTorch build matching the server CUDA runtime first, then run "
-        "`python -m pip install torch-geometric ogb`. See "
+        "Activate the dedicated Conda environment and run `bash scripts/setup_gpu.sh` "
+        "from the repository root to install the exact GPU dependency pins. See "
         "https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html "
         "and https://ogb.stanford.edu/docs/home/. The core S1-S4 suite does not need them."
     )
@@ -5816,19 +5662,6 @@ def _load_official(data_root: Path) -> dict[str, Any]:
         for split, official in (("train", "train"), ("validation", "valid"), ("test", "test"))
     }
     return {"fixture": False, "pascalvoc_sp": pascal, "ogbg_molhiv": mol}
-
-
-def _fixture_hash(data: dict[str, Any]) -> str:
-    digest = hashlib.sha256()
-    for dataset_name in ("pascalvoc_sp", "ogbg_molhiv"):
-        for split in ("train", "validation", "test"):
-            for graph in data[dataset_name][split]:
-                digest.update(graph["graph_id"].encode())
-                for key in ("x", "edge_index", "edge_features", "y"):
-                    tensor = graph[key].contiguous()
-                    digest.update(str(tensor.dtype).encode())
-                    digest.update(tensor.view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
 
 
 def _processed_paths(datasets: dict[str, Any], root: Path) -> list[str]:
@@ -5873,13 +5706,11 @@ def _processed_hashes(root: Path, paths: Sequence[str]) -> dict[str, str]:
     return hashes
 
 
-def validate_public_cache(
-    data_root: Path | str, *, seed: int, tiny: bool
-) -> tuple[Path, dict[str, Any]]:
+def validate_public_cache(data_root: Path | str) -> tuple[Path, dict[str, Any]]:
     """Validate the public marker and all recorded processed files without downloading."""
 
     public_root = Path(data_root).expanduser().resolve() / "conductance_gat" / "public"
-    marker = public_root / (f"fixture-seed{seed}.json" if tiny else "official-ready.json")
+    marker = public_root / "official-ready.json"
     if not marker.is_file():
         raise FileNotFoundError(f"conductance public cache marker is missing: {marker}")
     try:
@@ -5888,30 +5719,18 @@ def validate_public_cache(
         raise CacheCorruptError(f"invalid conductance public marker: {marker}") from error
     if manifest.get("schema_version") != PUBLIC_SCHEMA_VERSION:
         raise CacheWrongRequestError(f"unsupported conductance public marker schema: {marker}")
-    if bool(manifest.get("fixture")) != bool(tiny):
-        raise CacheWrongRequestError(f"conductance public marker profile mismatch: {marker}")
-    if tiny and manifest.get("seed") != int(seed):
-        raise CacheWrongRequestError(f"conductance public fixture seed mismatch: {marker}")
+    if manifest.get("fixture") is not False:
+        raise CacheWrongRequestError(f"only official public data caches are supported: {marker}")
     datasets = manifest.get("datasets")
     if not isinstance(datasets, dict) or set(datasets) != set(SOURCE_URLS):
         raise CacheCorruptError("conductance public marker has an invalid dataset set")
-    expected_sizes = (
-        {name: {"train": 8, "validation": 3, "test": 4} for name in SOURCE_URLS}
-        if tiny
-        else OFFICIAL_SPLIT_SIZES
-    )
-    for name, split_sizes in expected_sizes.items():
+    for name, split_sizes in OFFICIAL_SPLIT_SIZES.items():
         if datasets[name].get("source_url") != SOURCE_URLS[name]:
             raise CacheWrongRequestError(f"conductance public source mismatch for {name}")
         if datasets[name].get("splits") != split_sizes:
             raise CacheCorruptError(
                 f"conductance public split cardinalities are invalid for {name}"
             )
-    if tiny:
-        expected_hash = _fixture_hash(make_public_fixtures(seed))
-        if manifest.get("content_sha256") != expected_hash:
-            raise CacheCorruptError("conductance public fixture checksum mismatch")
-        return marker, manifest
     required_paths = manifest.get("required_processed_paths")
     stored_hashes = manifest.get("processed_sha256")
     if not isinstance(required_paths, list) or not required_paths:
@@ -5935,68 +5754,49 @@ def validate_public_cache(
 def prepare_public_data(
     data_root: Path | str,
     *,
-    seed: int,
-    tiny: bool,
     allow_download: bool = False,
 ) -> tuple[dict[str, Any], Path, dict[str, Any]]:
     public_root = Path(data_root).expanduser().resolve() / "conductance_gat" / "public"
+    marker = public_root / "official-ready.json"
+    if not allow_download and not marker.exists():
+        raise RuntimeError(
+            "Official public data is not marked prepared. Run once with "
+            "`--suite public --prepare-only --allow-download` to let the official "
+            "PyG/OGB dataset classes download into --data-root. No download is "
+            "attempted without that explicit flag. Generated substitutes are not supported."
+        )
+    if not allow_download:
+        validate_public_cache(data_root)
     public_root.mkdir(parents=True, exist_ok=True)
-    marker = public_root / (f"fixture-seed{seed}.json" if tiny else "official-ready.json")
-    if tiny:
-        datasets = make_public_fixtures(seed)
-        manifest = {
-            "schema_version": PUBLIC_SCHEMA_VERSION,
-            "fixture": True,
-            "seed": int(seed),
-            "content_sha256": _fixture_hash(datasets),
-            "datasets": {
-                name: {
-                    "source_url": SOURCE_URLS[name],
-                    "splits": {split: len(datasets[name][split]) for split in datasets[name]},
-                }
-                for name in SOURCE_URLS
-            },
-        }
-    else:
-        if not allow_download and not marker.exists():
-            raise RuntimeError(
-                "Official public data is not marked prepared. Run once with "
-                "`--suite public --prepare-only --allow-download` to let the official "
-                "PyG/OGB dataset classes download into --data-root. No download is "
-                "attempted without that explicit flag. Use --tiny for offline fixtures."
-            )
-        if not allow_download:
-            validate_public_cache(data_root, seed=seed, tiny=False)
-        datasets = _load_official(public_root)
-        split_sizes = {
-            name: {split: len(datasets[name][split]) for split in datasets[name]}
+    datasets = _load_official(public_root)
+    split_sizes = {
+        name: {split: len(datasets[name][split]) for split in datasets[name]}
+        for name in SOURCE_URLS
+    }
+    if split_sizes != OFFICIAL_SPLIT_SIZES:
+        raise RuntimeError(
+            f"Official public split cardinalities do not match the pinned protocol: {split_sizes}"
+        )
+    required_paths = _processed_paths(datasets, public_root)
+    manifest = {
+        "schema_version": PUBLIC_SCHEMA_VERSION,
+        "fixture": False,
+        "datasets": {
+            name: {
+                "source_url": SOURCE_URLS[name],
+                "splits": split_sizes[name],
+            }
             for name in SOURCE_URLS
-        }
-        if split_sizes != OFFICIAL_SPLIT_SIZES:
-            raise RuntimeError(
-                "Official public split cardinalities do not match the pinned protocol: "
-                f"{split_sizes}"
-            )
-        required_paths = _processed_paths(datasets, public_root)
-        manifest = {
-            "schema_version": PUBLIC_SCHEMA_VERSION,
-            "fixture": False,
-            "datasets": {
-                name: {
-                    "source_url": SOURCE_URLS[name],
-                    "splits": split_sizes[name],
-                }
-                for name in SOURCE_URLS
-            },
-            "required_processed_paths": required_paths,
-            "processed_sha256": _processed_hashes(public_root, required_paths),
-        }
+        },
+        "required_processed_paths": required_paths,
+        "processed_sha256": _processed_hashes(public_root, required_paths),
+    }
     atomic_write_json(
         marker,
         manifest,
         validator=lambda temporary: json.loads(temporary.read_text(encoding="utf-8")),
     )
-    validate_public_cache(data_root, seed=seed, tiny=tiny)
+    validate_public_cache(data_root)
     return datasets, marker, manifest
 
 
@@ -6006,238 +5806,9 @@ __all__ = [
     "SOURCE_URLS",
     "adapt_pyg_graph",
     "deduplicate_undirected_edges",
-    "make_public_fixtures",
     "prepare_public_data",
     "validate_public_cache",
 ]
-````
-
-# research/conductance_gat/run.py
-
-````python
-"""Train and compare learned edge conductance against an isotropic baseline."""
-
-from __future__ import annotations
-
-import argparse
-import csv
-import json
-import platform
-from pathlib import Path
-from typing import Any
-
-import torch
-import yaml
-from torch import nn
-
-from .model import IncidenceConductanceAttention, IsotropicConductanceAttention
-from .synthetic import (
-    ConductanceDataset,
-    evaluate_model,
-    make_conductance_dataset,
-    split_excitations,
-)
-
-
-def _training_loss(
-    model: nn.Module,
-    dataset: ConductanceDataset,
-    *,
-    node_weight: float,
-    flux_weight: float,
-    conductance_weight: float,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    predicted_next, diagnostics = model(
-        dataset.incidence,
-        dataset.potentials,
-        dataset.edge_features,
-        return_diagnostics=True,
-    )
-    node_loss = torch.mean((predicted_next - dataset.true_next_state).square())
-    flux_loss = torch.mean((diagnostics["edge_flux"] - dataset.true_flux).square())
-    predicted_c = diagnostics["conductance"].mean(dim=0).squeeze(-1)
-    conductance_loss = torch.mean((predicted_c - dataset.true_conductance).square())
-    loss = node_weight * node_loss + flux_weight * flux_loss + conductance_weight * conductance_loss
-    terms = {
-        "loss": float(loss.detach().cpu()),
-        "node_mse": float(node_loss.detach().cpu()),
-        "flux_mse": float(flux_loss.detach().cpu()),
-        "conductance_mse": float(conductance_loss.detach().cpu()),
-    }
-    return loss, terms
-
-
-def train_model(
-    model: nn.Module,
-    dataset: ConductanceDataset,
-    *,
-    epochs: int,
-    learning_rate: float,
-    weight_decay: float,
-    node_weight: float,
-    flux_weight: float,
-    conductance_weight: float,
-    log_every: int = 10,
-) -> list[dict[str, float]]:
-    if epochs < 1 or log_every < 1:
-        raise ValueError("epochs and log_every must be positive")
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    history: list[dict[str, float]] = []
-    model.train()
-    for epoch in range(1, epochs + 1):
-        optimizer.zero_grad(set_to_none=True)
-        loss, terms = _training_loss(
-            model,
-            dataset,
-            node_weight=node_weight,
-            flux_weight=flux_weight,
-            conductance_weight=conductance_weight,
-        )
-        loss.backward()
-        optimizer.step()
-        if epoch == 1 or epoch % log_every == 0 or epoch == epochs:
-            history.append({"epoch": float(epoch), **terms})
-    return history
-
-
-def resolve_device(requested: str | None) -> torch.device:
-    """Resolve a portable device request without assuming the launch host."""
-    normalized = (requested or "auto").strip().lower()
-    if normalized == "auto":
-        normalized = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(normalized)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(
-            f"CUDA device {normalized!r} was requested, but this PyTorch build cannot use CUDA"
-        )
-    return device
-
-
-def runtime_metadata(device: torch.device) -> dict[str, Any]:
-    """Record enough host information to distinguish CPU/CUDA experiment runs."""
-    return {
-        "python": platform.python_version(),
-        "platform": platform.platform(),
-        "torch": str(torch.__version__),
-        "cuda_available": torch.cuda.is_available(),
-        "torch_cuda_runtime": torch.version.cuda,
-        "device": str(device),
-        "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu",
-    }
-
-
-def run_experiment(config: dict[str, Any]) -> dict[str, Any]:
-    seed = int(config["seed"])
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    device = resolve_device(config.get("device"))
-    data_config = dict(config["data"])
-    dataset = make_conductance_dataset(seed=seed, **data_config)
-    train_data, test_data = split_excitations(
-        dataset,
-        train_fraction=float(config["training"]["train_fraction"]),
-        seed=seed + 1,
-    )
-    train_data = train_data.to(device)
-    test_data = test_data.to(device)
-
-    model_config = dict(config["model"])
-    common = {
-        "channels": int(data_config["channels"]),
-        "edge_feature_channels": int(data_config["edge_feature_channels"]),
-        "step_size": dataset.step_size,
-        "stability_margin": float(model_config.pop("stability_margin", 0.95)),
-        "adaptive_stability": bool(model_config.pop("adaptive_stability", True)),
-    }
-    learned = IncidenceConductanceAttention(**common, **model_config).to(device)
-    isotropic = IsotropicConductanceAttention(**common).to(device)
-
-    training = config["training"]
-    train_kwargs = {
-        "epochs": int(training["epochs"]),
-        "learning_rate": float(training["learning_rate"]),
-        "weight_decay": float(training["weight_decay"]),
-        "node_weight": float(training["node_weight"]),
-        "flux_weight": float(training["flux_weight"]),
-        "conductance_weight": float(training["conductance_weight"]),
-        "log_every": int(training["log_every"]),
-    }
-    learned_history = train_model(learned, train_data, **train_kwargs)
-    isotropic_history = train_model(isotropic, train_data, **train_kwargs)
-
-    summary: dict[str, Any] = {
-        "scope": "incidence_conductance_attention_only",
-        "seed": seed,
-        "device": str(device),
-        "runtime": runtime_metadata(device),
-        "num_nodes": int(dataset.incidence.shape[1]),
-        "num_edges": int(dataset.incidence.shape[0]),
-        "train_excitations": train_data.num_excitations,
-        "test_excitations": test_data.num_excitations,
-        "step_size": dataset.step_size,
-        "learned": evaluate_model(learned, test_data),
-        "isotropic": evaluate_model(isotropic, test_data),
-    }
-
-    output_dir = Path(config["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "summary.json").open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2, ensure_ascii=False)
-    _write_history(output_dir / "learned_history.csv", learned_history)
-    _write_history(output_dir / "isotropic_history.csv", isotropic_history)
-    portable_state = {
-        name: parameter.detach().cpu() for name, parameter in learned.state_dict().items()
-    }
-    torch.save(portable_state, output_dir / "learned_model.pt")
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
-    return summary
-
-
-def _write_history(path: Path, rows: list[dict[str, float]]) -> None:
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=Path(__file__).with_name("config.yaml"),
-        help="YAML experiment configuration",
-    )
-    parser.add_argument(
-        "--device",
-        default=None,
-        help="Runtime device override: auto, cpu, cuda, cuda:0, ...",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Output directory override (defaults to the config-relative path)",
-    )
-    arguments = parser.parse_args()
-    config_path = arguments.config.expanduser().resolve()
-    with config_path.open(encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
-    if arguments.output_dir is not None:
-        output_dir = arguments.output_dir.expanduser()
-    else:
-        output_dir = Path(config.get("output_dir", "results")).expanduser()
-        if not output_dir.is_absolute():
-            output_dir = config_path.parent / output_dir
-    config["output_dir"] = str(output_dir)
-    if arguments.device is not None:
-        config["device"] = arguments.device
-    run_experiment(config)
-
-
-if __name__ == "__main__":
-    main()
 ````
 
 # research/conductance_gat/sparse.py
@@ -6610,10 +6181,13 @@ __all__ = [
 ]
 ````
 
-# research/conductance_gat/synthetic.py
+# research/conductance_gat/tests/dense_model_inputs.py
 
 ````python
-"""Known-potential, multiple-excitation conductance benchmark."""
+"""Test-only tensor inputs and diagnostics for dense conductance algebra.
+
+This module is not a benchmark adapter, experiment entrypoint, or paper dataset.
+"""
 
 from __future__ import annotations
 
@@ -6629,7 +6203,7 @@ from chartgat.algebra import incidence_matrix
 from chartgat.graphs import make_connected_graph
 
 if TYPE_CHECKING:
-    from .model import IncidenceConductanceAttention
+    from research.conductance_gat.model import IncidenceConductanceAttention
 
 
 @dataclass(frozen=True)
@@ -6837,8 +6411,11 @@ from research.conductance_gat.model import (
     PositiveInvariantScalarConductance,
     frozen_operator_spectral_radius,
 )
-from research.conductance_gat.run import _training_loss, resolve_device, runtime_metadata
-from research.conductance_gat.synthetic import evaluate_model, make_conductance_dataset
+from research.conductance_gat.paper import resolve_device, runtime_metadata
+from research.conductance_gat.tests.dense_model_inputs import (
+    evaluate_model,
+    make_conductance_dataset,
+)
 
 
 def _small_dataset(dtype: torch.dtype = torch.float64):
@@ -6864,7 +6441,7 @@ def test_device_resolution_is_host_aware(monkeypatch) -> None:
 
 
 def test_runtime_metadata_records_resolved_cpu_host() -> None:
-    metadata = runtime_metadata(torch.device("cpu"))
+    metadata = runtime_metadata(torch.device("cpu"), amp=False, pin_memory=False, batch_size=2)
     assert metadata["device"] == "cpu"
     assert metadata["device_name"] == "cpu"
     assert metadata["python"]
@@ -6978,13 +6555,14 @@ def test_learned_model_has_gradient_and_isotropic_baseline_is_scalar() -> None:
         hidden_channels=10,
         step_size=dataset.step_size,
     )
-    loss, _ = _training_loss(
-        model,
-        dataset,
-        node_weight=1.0,
-        flux_weight=1.0,
-        conductance_weight=0.0,
+    prediction, diagnostics = model(
+        dataset.incidence,
+        dataset.potentials,
+        dataset.edge_features,
+        return_diagnostics=True,
     )
+    loss = (prediction - dataset.true_next_state).square().mean()
+    loss = loss + (diagnostics["edge_flux"] - dataset.true_flux).square().mean()
     loss.backward()
     gradient_norm = sum(
         parameter.grad.abs().sum() for parameter in model.parameters() if parameter.grad is not None
@@ -7021,6 +6599,9 @@ import pytest
 import torch
 
 import research.conductance_gat.paper as paper_module
+import research.conductance_gat.paper_data as core_data_module
+import research.conductance_gat.public_data as public_data_module
+from chartgat.cache import CacheWrongRequestError
 from research.conductance_gat.paper import (
     _normalized_loss,
     _seed_axis_applicability,
@@ -7035,8 +6616,8 @@ from research.conductance_gat.paper_data import (
 )
 from research.conductance_gat.public_data import (
     deduplicate_undirected_edges,
-    make_public_fixtures,
     prepare_public_data,
+    validate_public_cache,
 )
 from research.conductance_gat.sparse import (
     SparseIncidenceConductanceLayer,
@@ -7044,6 +6625,32 @@ from research.conductance_gat.sparse import (
     edge_gradient,
     pack_graph_examples,
 )
+
+
+@pytest.fixture(scope="module")
+def full_core():
+    """Generate the real scientific protocol once; never run model training."""
+
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        return generate_core(seed=9)
+    finally:
+        torch.set_num_threads(previous_threads)
+
+
+def _unit_public_model_input(task: str):
+    """One tensor-level model input, not a public dataset or CLI data source."""
+
+    return {
+        "graph_id": "unit-model-input",
+        "x": torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+        "edge_index": torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        "edge_features": torch.ones(2, 2),
+        "y": torch.tensor([0, 1, 2]) if task == "node" else torch.tensor([1.0]),
+        "task": task,
+        "categorical": False,
+    }
 
 
 def _explicit_incidence(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
@@ -7161,8 +6768,16 @@ def test_training_objectives_keep_headline_independent_of_flux_labels() -> None:
 
 
 def test_node_message_nnls_recovers_static_conductance_without_flux_labels() -> None:
-    suite = generate_core(seed=19, tiny=True)["s1"]
-    examples = suite["test"]
+    examples = [
+        make_example(
+            graph_id="unit-nnls",
+            num_nodes=7,
+            family="er",
+            graph_seed=31,
+            excitation_seed=40 + excitation,
+        )
+        for excitation in range(3)
+    ]
     for example in examples:
         example["observed_flux"] = torch.full_like(example["observed_flux"], float("nan"))
     metrics = node_message_nnls_metrics(examples)
@@ -7172,8 +6787,8 @@ def test_node_message_nnls_recovers_static_conductance_without_flux_labels() -> 
     assert metrics["graph_macro_conductance_pearson"] == pytest.approx(1.0, abs=1.0e-5)
 
 
-def test_s1_s4_splits_and_factorial_are_leakage_safe() -> None:
-    core = generate_core(seed=7, tiny=True)
+def test_s1_s4_splits_and_factorial_are_leakage_safe(full_core) -> None:
+    core = full_core
     s1 = core["s1"]
     train_ids = {example["graph_id"] for example in s1["train"]}
     validation_ids = {example["graph_id"] for example in s1["validation"]}
@@ -7190,8 +6805,10 @@ def test_s1_s4_splits_and_factorial_are_leakage_safe() -> None:
     )
 
     s3 = core["s3"]
-    assert s3["horizons"] == [1, 5, 10]
-    assert all(trajectory["states"].shape[0] == 11 for trajectory in s3["rollout_test"])
+    assert s3["horizons"] == [1, 5, 10, 50]
+    assert all(trajectory["states"].shape[0] == 51 for trajectory in s3["rollout_test"])
+    assert core_data_module._split_counts(core) == _expected_split_counts()
+    assert "tiny" not in core
 
     s4 = core["s4"]
     ids = [
@@ -7212,7 +6829,7 @@ def test_s1_s4_splits_and_factorial_are_leakage_safe() -> None:
 def test_full_s2_cache_cardinality_matches_graph_and_excitation_protocol() -> None:
     # Check the full cache contract without materializing the 52 full-size
     # graphs and their 184 excitation examples.
-    expected = _expected_split_counts(tiny=False)["s2"]
+    expected = _expected_split_counts()["s2"]
     graph_counts = {"train": 28, "validation": 8, "test": 16}
     excitations_per_graph = {"train": 4, "validation": 3, "test": 3}
     assert expected == {
@@ -7221,12 +6838,17 @@ def test_full_s2_cache_cardinality_matches_graph_and_excitation_protocol() -> No
     assert expected == {"train": 112, "validation": 24, "test": 48}
 
 
-def test_cache_manifest_is_deterministic_and_checksum_verified(tmp_path) -> None:
-    first, first_path, first_manifest = prepare_core_cache(tmp_path, seed=9, tiny=True)
-    second, second_path, second_manifest = prepare_core_cache(tmp_path, seed=9, tiny=True)
-    _, _, independent_manifest = prepare_core_cache(
-        tmp_path / "independent-root", seed=9, tiny=True
-    )
+def test_cache_manifest_is_deterministic_and_checksum_verified(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, full_core
+) -> None:
+    def cached_generation(seed):
+        assert seed == 9
+        return full_core
+
+    monkeypatch.setattr(core_data_module, "generate_core", cached_generation)
+    first, first_path, first_manifest = prepare_core_cache(tmp_path, seed=9)
+    second, second_path, second_manifest = prepare_core_cache(tmp_path, seed=9)
+    _, _, independent_manifest = prepare_core_cache(tmp_path / "independent-root", seed=9)
     assert first_path == second_path
     assert first_manifest == second_manifest
     assert first_manifest["content_sha256"] == second_manifest["content_sha256"]
@@ -7234,7 +6856,7 @@ def test_cache_manifest_is_deterministic_and_checksum_verified(tmp_path) -> None
     assert first["s1"]["train"][0]["graph_id"] == second["s1"]["train"][0]["graph_id"]
 
 
-def test_public_fixture_uses_same_reciprocal_edge_adapter_without_network(tmp_path) -> None:
+def test_public_reciprocal_edge_adapter_without_network() -> None:
     directed = torch.tensor([[0, 1, 1, 0, 2], [1, 0, 1, 2, 0]], dtype=torch.long)
     attributes = torch.arange(10, dtype=torch.float32).reshape(5, 2)
     edges, features = deduplicate_undirected_edges(directed, attributes, 3)
@@ -7249,19 +6871,11 @@ def test_public_fixture_uses_same_reciprocal_edge_adapter_without_network(tmp_pa
     with pytest.raises(ValueError, match="conflicting categorical reciprocal"):
         deduplicate_undirected_edges(reciprocal, categorical, 2)
 
-    fixture = make_public_fixtures(5)
-    assert fixture["fixture"] is True
-    labels = [int(graph["y"].item()) for graph in fixture["ogbg_molhiv"]["test"]]
-    assert set(labels) == {0, 1}
-    _, marker, manifest = prepare_public_data(tmp_path, seed=5, tiny=True)
-    assert marker.exists() and manifest["fixture"] is True
-
 
 def test_public_loss_weight_and_inactive_edge_encoders_match_active_computation() -> None:
-    fixture = make_public_fixtures(7)
-    node_sample = fixture["pascalvoc_sp"]["train"][0]
+    node_sample = _unit_public_model_input("node")
     assert paper_module._public_loss_weight(node_sample["y"], "node") == node_sample["y"].numel()
-    graph_sample = fixture["ogbg_molhiv"]["train"][0]
+    graph_sample = _unit_public_model_input("graph")
     assert paper_module._public_loss_weight(graph_sample["y"], "graph") == 1
 
     gcn = paper_module.PublicConductanceModel(
@@ -7297,7 +6911,6 @@ def test_cli_refuses_nonempty_output_without_touching_existing_artifacts(
                 "--suite",
                 "core",
                 "--prepare-only",
-                "--tiny",
                 "--device",
                 "cpu",
                 "--data-root",
@@ -7311,65 +6924,104 @@ def test_cli_refuses_nonempty_output_without_touching_existing_artifacts(
     assert not (tmp_path / "data").exists()
 
 
-def test_tiny_all_cli_writes_machine_readable_results(tmp_path) -> None:
-    output = tmp_path / "output"
-    summary = paper_main(
-        [
-            "--suite",
-            "all",
-            "--tiny",
-            "--device",
-            "cpu",
-            "--no-amp",
-            "--epochs",
-            "1",
-            "--batch-size",
-            "64",
-            "--workers",
-            "0",
-            "--seed",
-            "13",
-            "--data-root",
-            str(tmp_path / "data"),
-            "--output-dir",
-            str(output),
-        ]
+@pytest.mark.parametrize("suite", ["core", "public", "all"])
+def test_paper_cli_rejects_removed_tiny_option_before_writes(tmp_path, suite) -> None:
+    with pytest.raises(SystemExit) as caught:
+        paper_main(
+            [
+                "--suite",
+                suite,
+                "--tiny",
+                "--data-root",
+                str(tmp_path / "data"),
+                "--output-dir",
+                str(tmp_path / "output"),
+            ]
+        )
+    assert caught.value.code == 2
+    assert not (tmp_path / "data").exists()
+    assert not (tmp_path / "output").exists()
+
+
+def test_missing_official_data_fails_without_loader_or_fabricated_fallback(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden_loader(_root):
+        pytest.fail("A missing cache must not invoke the downloader without permission")
+
+    monkeypatch.setattr(public_data_module, "_load_official", forbidden_loader)
+    data_root = tmp_path / "data"
+    with pytest.raises(RuntimeError, match="Official public data is not marked prepared"):
+        prepare_public_data(data_root)
+    assert not data_root.exists()
+    assert not hasattr(public_data_module, "make_public_fixtures")
+
+
+def test_legacy_fabricated_public_marker_is_rejected_before_loading(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    public_root = tmp_path / "conductance_gat" / "public"
+    public_root.mkdir(parents=True)
+    marker = public_root / "official-ready.json"
+    marker.write_text(
+        json.dumps({"schema_version": public_data_module.PUBLIC_SCHEMA_VERSION, "fixture": True}),
+        encoding="utf-8",
     )
-    assert summary["runtime"]["amp"] is False
-    assert summary["seed_axes"] == {"data": 13, "split": 13, "chart": 13, "model": 13}
-    assert summary["results"]["public"]["pascalvoc_sp"]["fixture"] is True
-    expected_public_baselines = {
-        "no_message_mlp",
-        "gcn",
-        "gat",
-        "gine",
-        "conductance_model",
-    }
-    for dataset_name in ("pascalvoc_sp", "ogbg_molhiv"):
-        public_result = summary["results"]["public"][dataset_name]
-        assert set(public_result["baselines"]) == expected_public_baselines
-        assert all(result["parameter_count"] > 0 for result in public_result["baselines"].values())
-        assert public_result["comparison_protocol"]["backbone_depth"] == 1
-    assert summary["results"]["core"]["s3"]["baselines"]["oracle"]["rollout"][
-        "horizon_10_relative_l2"
-    ] == pytest.approx(0.0)
-    for suite_name in ("s1", "s2", "s3", "s4"):
-        core_result = summary["results"]["core"][suite_name]
-        assert core_result["headline_baseline"] == "full"
-        assert core_result["baselines"]["full"]["training_objective"] == "node_only"
-        assert core_result["baselines"]["full_flux_supervised"]["training_objective"] == "flux_only"
-        assert core_result["baselines"]["full_joint"]["training_objective"] == "joint"
-        assert core_result["baselines"]["gradient_only"]["training_objective"] == "node_only"
-    assert "node_message_nnls" in summary["results"]["core"]["s1"]["baselines"]
-    assert "node_message_nnls" in summary["results"]["core"]["s4"]["baselines"]
-    assert (output / "summary.json").exists()
-    assert (output / "metrics.csv").exists()
-    assert (output / "history.csv").exists()
-    assert (output / "models.pt").exists()
-    history_header = (output / "history.csv").read_text(encoding="utf-8").splitlines()[0]
-    assert "training_objective" in history_header
-    parsed = json.loads((output / "summary.json").read_text(encoding="utf-8"))
-    assert parsed["scope"] == "independent_sparse_incidence_conductance_attention"
+    before = marker.read_bytes()
+    monkeypatch.setattr(
+        public_data_module, "_load_official", lambda _root: pytest.fail("must not load")
+    )
+    with pytest.raises(CacheWrongRequestError, match="only official public data"):
+        prepare_public_data(tmp_path)
+    assert marker.read_bytes() == before
+
+
+def test_public_download_failure_propagates_without_generating_substitute(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failed_download(_root):
+        raise OSError("official endpoint unavailable")
+
+    monkeypatch.setattr(public_data_module, "_load_official", failed_download)
+    with pytest.raises(OSError, match="official endpoint unavailable"):
+        prepare_public_data(tmp_path, allow_download=True)
+    assert not list(tmp_path.rglob("*.json"))
+    with pytest.raises(FileNotFoundError):
+        validate_public_cache(tmp_path)
+
+
+def test_public_training_rejects_legacy_generated_payload_before_any_model() -> None:
+    with pytest.raises(ValueError, match="require official data"):
+        paper_module.run_public(
+            {"fixture": True},
+            device=torch.device("cpu"),
+            epochs=1,
+            learning_rate=0.001,
+            batch_size=2,
+            amp=False,
+            pin_memory=False,
+            num_workers=0,
+            seed=7,
+        )
+
+
+def test_public_cli_missing_real_data_never_writes_result_summary(tmp_path) -> None:
+    with pytest.raises(RuntimeError, match="Official public data is not marked prepared"):
+        paper_main(
+            [
+                "--suite",
+                "public",
+                "--prepare-only",
+                "--device",
+                "cpu",
+                "--data-root",
+                str(tmp_path / "data"),
+                "--output-dir",
+                str(tmp_path / "output"),
+            ]
+        )
+    assert not (tmp_path / "data").exists()
+    assert not list((tmp_path / "output").iterdir())
 
 
 def test_explicit_seed_axes_route_data_and_model_randomness_independently(
@@ -7381,12 +7033,16 @@ def test_explicit_seed_axes_route_data_and_model_randomness_independently(
         captured["model_seed"] = kwargs["seed"]
         return {}, [], {}
 
+    def fake_prepare_core(data_root, *, seed):
+        captured["data_seed"] = seed
+        return {}, data_root / "unit-dispatch-manifest.json", {"cache_key": "unit-dispatch"}
+
+    monkeypatch.setattr(paper_module, "prepare_core_cache", fake_prepare_core)
     monkeypatch.setattr(paper_module, "run_core", fake_run_core)
     summary = paper_module.main(
         [
             "--suite",
             "core",
-            "--tiny",
             "--device",
             "cpu",
             "--epochs",
@@ -7410,17 +7066,14 @@ def test_explicit_seed_axes_route_data_and_model_randomness_independently(
     assert "seed" not in summary
     assert summary["seed_axes"] == {"data": 3, "split": 4, "chart": 5, "model": 6}
     assert captured["model_seed"] == 6
-    core_manifest = json.loads(
-        Path(summary["prepared"]["core"]["manifest"]).read_text(encoding="utf-8")
-    )
-    assert core_manifest["request"]["seed"] == 3
+    assert captured["data_seed"] == 3
     assert summary["prepared"]["core"]["data_seed"] == 3
     assert summary["seed_axis_applicability"]["core"]["split"]["applicable"] is False
     assert summary["seed_axis_applicability"]["core"]["chart"]["applicable"] is False
 
 
 def test_official_public_split_and_chart_seed_axes_are_not_applicable() -> None:
-    applicability = _seed_axis_applicability("public", public_fixture=False)["public"]
+    applicability = _seed_axis_applicability("public")["public"]
     assert applicability["data"]["applicable"] is False
     assert applicability["split"]["applicable"] is False
     assert "official" in applicability["split"]["use"]
@@ -7502,7 +7155,7 @@ def _pyg_processed_count(path: Path) -> int:
     return counts.pop()
 
 
-def _validate_zinc(data_root: Path, *, tiny: bool) -> dict[str, Any]:
+def _validate_zinc(data_root: Path) -> dict[str, Any]:
     processed = data_root.expanduser().resolve() / "ZINC12K" / "subset" / "processed"
     paths = {split: processed / f"{split}.pt" for split in ("train", "val", "test")}
     present = {name: path.is_file() for name, path in paths.items()}
@@ -7513,11 +7166,8 @@ def _validate_zinc(data_root: Path, *, tiny: bool) -> dict[str, Any]:
         raise CacheIncompleteError(f"Cycle PE ZINC processed splits are missing: {missing}")
     counts = {name: _pyg_processed_count(path) for name, path in paths.items()}
     expected = {"train": 10_000, "val": 1_000, "test": 1_000}
-    if not tiny and counts != expected:
+    if counts != expected:
         raise CacheCorruptError(f"Cycle PE ZINC official split cardinalities are invalid: {counts}")
-    minimum = {"train": 32, "val": 8, "test": 8}
-    if tiny and any(counts[name] < minimum[name] for name in counts):
-        raise CacheCorruptError(f"Cycle PE ZINC cache is too small for tiny validation: {counts}")
     return {
         "paths": [str(path) for path in paths.values()],
         "split_sizes": counts,
@@ -7525,21 +7175,14 @@ def _validate_zinc(data_root: Path, *, tiny: bool) -> dict[str, Any]:
     }
 
 
-def _validate_brec(data_root: Path, *, tiny: bool) -> dict[str, Any]:
-    if tiny:
-        path = data_root.expanduser().resolve() / "cycle_pe_fixtures" / "brec_v3_q32.npy"
-        if not path.is_file():
-            raise FileNotFoundError(f"tiny BREC fixture is missing: {path}")
-        expected_pairs = 2
-    else:
-        path = find_brec_v3(data_root)
-        expected_pairs = 400
+def _validate_brec(data_root: Path) -> dict[str, Any]:
+    path = find_brec_v3(data_root)
+    expected_pairs = 400
     try:
         adapter = BRECAdapter(
             path,
             num_relabel=32,
-            fixture=tiny,
-            protocol="custom" if tiny else "official",
+            protocol="official",
         )
     except RuntimeError as error:
         raise CacheCorruptError(f"invalid BREC cache: {path}") from error
@@ -7566,7 +7209,6 @@ def validate_dataset_cache(
     *,
     data_seeds: tuple[int, ...],
     split_seeds: tuple[int, ...],
-    tiny: bool,
 ) -> dict[str, Any]:
     """Validate every requested cycle cache without generating or downloading data."""
 
@@ -7574,35 +7216,18 @@ def validate_dataset_cache(
     if dataset_id == "cyclecount_ood":
         paths = []
         for seed in data_seeds:
-            bundle = validate_cycle_count_ood_cache(data_root, seed=seed, tiny=tiny)
+            bundle = validate_cycle_count_ood_cache(data_root, seed=seed)
             if bundle.cache_path is not None:
                 paths.append(str(bundle.cache_path))
         return {"paths": paths, "requested_data_seeds": list(data_seeds)}
     if dataset_id == "brec_v3":
-        return _validate_brec(data_root, tiny=tiny)
+        return _validate_brec(data_root)
     if dataset_id == "zinc12k":
-        return _validate_zinc(data_root, tiny=tiny)
+        return _validate_zinc(data_root)
     raise ValueError(f"unsupported cycle cache dataset {dataset_id!r}")
 
 
 __all__ = ["validate_dataset_cache"]
-````
-
-# research/cycle_pe/config.yaml
-
-````yaml
-# Independent static cycle-PE probe.  All PE tensors are computed once from
-# topology before the linear probe is fitted.
-seed: 7
-samples_per_family: 8
-max_cycles: 12
-
-probe:
-  steps: 1200
-  learning_rate: 0.15
-  l2: 0.001
-
-output: results/summary.json
 ````
 
 # research/cycle_pe/datasets.yaml
@@ -7614,19 +7239,6 @@ paper_suite_complete: true
 claim: Static cycle-space PE is evaluated on independent cycle-count targets, official BREC RPC, and ZINC-12K.
 
 datasets:
-  - id: cycle_membership_smoke
-    name: Bridge versus any-cycle smoke probe
-    tier: smoke
-    status: implemented
-    data_policy: generated
-    source_url: generated://research.cycle_pe.synthetic
-    task: Classify whether an edge belongs to any cycle across small graph families.
-    split: 16 training and 16 test graphs from disjoint generator families.
-    metrics: [balanced_accuracy, f1, auroc, graph_macro_accuracy]
-    claim: Feature, batching, and invariance pipeline certification only.
-    adapter: research.cycle_pe.synthetic.make_graph_family_split
-    leakage_guard: Projector leverage directly reveals this target, so it is excluded from headline evidence.
-
   - id: cyclecount_ood
     name: CycleCount-OOD
     tier: paper_core
@@ -7915,8 +7527,6 @@ Examples
 --------
 python -m research.cycle_pe.paper --suite core --data-root data --output-dir runs/cycle \
     --device cuda --seed 2025
-python -m research.cycle_pe.paper --suite core --data-root data --output-dir /tmp/cycle \
-    --device cpu --seed 7 --tiny
 """
 
 from __future__ import annotations
@@ -7984,7 +7594,7 @@ COMMAND_CONTRACT = (
     "python -m research.cycle_pe.paper --suite core|brec|zinc|all "
     "--data-root PATH --output-dir PATH --device cuda --seed N "
     "[--data-seed N --split-seed N --chart-seed N --model-seed N] [--workers N] "
-    "[--prepare-only] [--tiny] [--allow-download] [--brec-protocol official|custom] "
+    "[--prepare-only] [--allow-download] [--brec-protocol official|custom] "
     "[--brec-seeds 100,...,1000]"
 )
 
@@ -8186,7 +7796,7 @@ def _settings(args: argparse.Namespace, device: torch.device, suite: str) -> Tra
     default_epochs = {"core": 60, "zinc": 100, "brec": 20}
     default_lr = {"core": 1e-3, "zinc": 1e-3, "brec": 1e-4}
     default_weight_decay = {"core": 1e-5, "zinc": 1e-5, "brec": 1e-4}
-    epochs = args.epochs if args.epochs is not None else (2 if args.tiny else default_epochs[suite])
+    epochs = args.epochs if args.epochs is not None else default_epochs[suite]
     return TrainSettings(
         device=device,
         seed=_resolve_seed_axes(args).model,
@@ -8206,7 +7816,7 @@ def _settings(args: argparse.Namespace, device: torch.device, suite: str) -> Tra
 def _effective_brec_protocol(args: argparse.Namespace) -> str:
     requested = getattr(args, "brec_protocol", None)
     if requested is None:
-        return "custom" if args.tiny else "official"
+        return "official"
     return str(requested)
 
 
@@ -8247,9 +7857,9 @@ def _brec_settings(args: argparse.Namespace, device: torch.device, protocol: str
 
 
 def _model_dimensions(args: argparse.Namespace) -> tuple[int, int, int]:
-    hidden = args.hidden_dim if args.hidden_dim is not None else (24 if args.tiny else 64)
-    pe = args.pe_dim if args.pe_dim is not None else (12 if args.tiny else 32)
-    layers = args.layers if args.layers is not None else (2 if args.tiny else 3)
+    hidden = args.hidden_dim if args.hidden_dim is not None else 64
+    pe = args.pe_dim if args.pe_dim is not None else 32
+    layers = args.layers if args.layers is not None else 3
     return hidden, pe, layers
 
 
@@ -8319,7 +7929,6 @@ def _run_supervised_bundle(
         "created_utc": datetime.now(UTC).isoformat(),
         "seed_axes": seed_axes.to_manifest(),
         "seed_axis_policy": _seed_axis_policy(suite, seed_axes),
-        "tiny": args.tiny,
         "prepare_only": args.prepare_only,
         "command_contract": COMMAND_CONTRACT,
         "cli_arguments": _argument_manifest(args),
@@ -8513,7 +8122,7 @@ def _run_supervised_bundle(
 
 def run_core(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
     seed_axes = _resolve_seed_axes(args)
-    bundle = load_or_generate_cycle_count_ood(args.data_root, seed=seed_axes.data, tiny=args.tiny)
+    bundle = load_or_generate_cycle_count_ood(args.data_root, seed=seed_axes.data)
     if bundle.metadata is None:
         bundle.metadata = {}
     bundle.metadata.update(
@@ -8553,7 +8162,7 @@ def run_core(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
 
 def run_zinc(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
     seed_axes = _resolve_seed_axes(args)
-    bundle = load_zinc12k(args.data_root, tiny=args.tiny, allow_download=args.allow_download)
+    bundle = load_zinc12k(args.data_root, allow_download=args.allow_download)
     if bundle.metadata is None:
         bundle.metadata = {}
     bundle.metadata["seed_axis_policy"] = _seed_axis_policy("zinc", seed_axes)
@@ -8915,8 +8524,6 @@ def _brec_model_seed(search_seed: int, pair_index: int) -> int:
 
 
 def _validate_official_brec_arguments(args: argparse.Namespace) -> None:
-    if args.tiny:
-        raise ValueError("official BREC mode requires the full 400-pair artifact, not --tiny")
     if args.brec_num_relabel != BREC_OFFICIAL_NUM_RELABEL:
         raise ValueError("official BREC mode requires --brec-num-relabel 32")
     if args.brec_threshold is not None and not math.isclose(
@@ -9048,7 +8655,6 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
         args.data_root,
         num_relabel=args.brec_num_relabel,
         allow_download=args.allow_download,
-        tiny=args.tiny,
         protocol=protocol,
     )
     if protocol == "official":
@@ -9065,7 +8671,7 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
     suite_root = args.output_dir / "brec"
     settings = _brec_settings(args, device, protocol)
     hidden_dim, pe_dim, layers = _model_dimensions(args)
-    pair_indices = list(range(min(adapter.pair_count, 2 if args.tiny else adapter.pair_count)))
+    pair_indices = list(range(adapter.pair_count))
     manifest: dict[str, Any] = {
         "schema_version": PAPER_SCHEMA_VERSION,
         "suite": "brec",
@@ -9078,7 +8684,6 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
             brec_protocol=protocol,
             brec_seeds=args.brec_seeds,
         ),
-        "tiny": args.tiny,
         "prepare_only": args.prepare_only,
         "command_contract": COMMAND_CONTRACT,
         "cli_arguments": _argument_manifest(args),
@@ -9086,7 +8691,7 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
         "dataset_metadata": adapter.metadata,
         "brec_protocol": {
             "effective": protocol,
-            "default_policy": "official for full runs; custom for --tiny fixtures",
+            "default_policy": "official unless --brec-protocol custom is explicitly requested",
             "official_reference_compatibility": _brec_reference_compatibility(protocol),
             "custom_metric": "custom_pairwise_union" if protocol == "custom" else None,
             "outer_model_seed_used": False,
@@ -9161,7 +8766,7 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
     # Parse representative complete RPC pairs even in prepare-only mode. This
     # catches malformed graph6, disconnected graphs, and PE extraction failures.
     if args.prepare_only:
-        check_indices = pair_indices if args.tiny else [pair_indices[0], pair_indices[-1]]
+        check_indices = list(dict.fromkeys((pair_indices[0], pair_indices[-1])))
         checks: list[dict[str, Any]] = []
         for pair_index in check_indices:
             category, prepared, raw_width, _, _ = _prepare_brec_pair(
@@ -9181,9 +8786,7 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
                 }
             )
         manifest["preparation_checks"] = checks
-        manifest["preparation_check_policy"] = (
-            "all selected pairs in tiny mode; first and last pair in full mode"
-        )
+        manifest["preparation_check_policy"] = "first and last pair of the supplied artifact"
         manifest["variants"] = list(args.variants)
         manifest["artifacts"] = _artifact_checksums(suite_root)
         _write_json(suite_root / "manifest.json", manifest)
@@ -9317,7 +8920,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="supervised initialization/minibatch axis; defaults to --seed",
     )
     parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument("--tiny", action="store_true")
     parser.add_argument(
         "--variants",
         default=",".join(PE_VARIANTS),
@@ -9348,7 +8950,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--brec-protocol",
         choices=BREC_PROTOCOLS,
         default=None,
-        help="official for full paper runs; omitted --tiny runs resolve to custom",
+        help="official by default; custom must be requested explicitly on a supplied artifact",
     )
     parser.add_argument("--brec-num-relabel", type=int, default=32)
     parser.add_argument("--brec-threshold", type=float)
@@ -9582,7 +9184,7 @@ from typing import Any
 import networkx as nx
 import numpy as np
 
-from chartgat.cache import atomic_publish, atomic_write_json
+from chartgat.cache import atomic_write_json
 from research.cycle_pe.paper_data import (
     DatasetBundle,
     PaperGraph,
@@ -9610,6 +9212,7 @@ BREC_CATEGORIES = {
 BREC_OFFICIAL_NUM_RELABEL = 32
 BREC_OFFICIAL_PAIR_COUNT = 400
 BREC_OFFICIAL_RECORD_COUNT = 4 * BREC_OFFICIAL_NUM_RELABEL * BREC_OFFICIAL_PAIR_COUNT
+ZINC_SPLIT_SIZES = {"train": 10_000, "validation": 1_000, "test": 1_000}
 
 _BREC_DOWNLOAD_LIMIT = 512 * 1024 * 1024
 _BREC_EXTRACT_LIMIT = 512 * 1024 * 1024
@@ -9630,15 +9233,6 @@ def _load_brec_records(path: Path) -> np.ndarray:
     if records.ndim != 1 or len(records) < 1:
         raise RuntimeError("BREC artifact must be a non-empty one-dimensional NumPy array")
     return records
-
-
-def _atomic_save_npy(path: Path, records: np.ndarray) -> None:
-    def write(temporary: Path) -> None:
-        with temporary.open("wb") as stream:
-            np.save(stream, records, allow_pickle=True)
-            stream.flush()
-
-    atomic_publish(path, write, validator=lambda temporary: _load_brec_records(temporary))
 
 
 def _require_pyg_zinc() -> type:
@@ -9735,9 +9329,7 @@ def _zinc_cache_hashes(root: Path) -> dict[str, str]:
     }
 
 
-def load_zinc12k(
-    data_root: Path, *, tiny: bool = False, allow_download: bool = False
-) -> DatasetBundle:
+def load_zinc12k(data_root: Path, *, allow_download: bool = False) -> DatasetBundle:
     """Load PyG's official 10k/1k/1k ZINC subset partitions."""
 
     zinc_class = _require_pyg_zinc()
@@ -9749,19 +9341,22 @@ def load_zinc12k(
             f"`--allow-download`. Loader documentation: {ZINC_SOURCE_URL}"
         )
     requested = {"train": "train", "validation": "val", "test": "test"}
-    tiny_limits = {"train": 32, "validation": 8, "test": 8}
     splits: dict[str, list[PaperGraph]] = {}
     official_sizes: dict[str, int] = {}
     try:
         for split, pyg_split in requested.items():
             dataset = zinc_class(root=str(root), subset=True, split=pyg_split)
             official_sizes[split] = len(dataset)
-            limit = min(len(dataset), tiny_limits[split]) if tiny else len(dataset)
+            if len(dataset) != ZINC_SPLIT_SIZES[split]:
+                raise RuntimeError(
+                    f"ZINC-12K {split} must contain {ZINC_SPLIT_SIZES[split]} graphs, "
+                    f"found {len(dataset)}"
+                )
             splits[split] = [
                 _pyg_zinc_graph(
                     dataset[index], graph_id=f"zinc12k:{split}:{index:05d}", split=split
                 )
-                for index in range(limit)
+                for index in range(len(dataset))
             ]
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         raise RuntimeError(
@@ -9779,7 +9374,6 @@ def load_zinc12k(
             "official_split_names": requested,
             "official_split_sizes": official_sizes,
             "loaded_split_sizes": {name: len(graphs) for name, graphs in splits.items()},
-            "tiny": bool(tiny),
             "download_allowed": bool(allow_download),
             "cache_sha256": _zinc_cache_hashes(root),
         },
@@ -9838,8 +9432,7 @@ class BRECAdapter:
         path: Path,
         *,
         num_relabel: int = BREC_OFFICIAL_NUM_RELABEL,
-        fixture: bool = False,
-        protocol: str = "custom",
+        protocol: str = "official",
     ) -> None:
         if num_relabel < 2:
             raise ValueError("BREC RPC needs at least two relabelings")
@@ -9847,7 +9440,6 @@ class BRECAdapter:
             raise ValueError("BREC protocol must be 'official' or 'custom'")
         self.path = path.expanduser().resolve()
         self.num_relabel = int(num_relabel)
-        self.fixture = bool(fixture)
         self.protocol = protocol
         self._records = _load_brec_records(self.path)
         block = 4 * self.num_relabel
@@ -9859,8 +9451,6 @@ class BRECAdapter:
         if self.pair_count < 1:
             raise RuntimeError("BREC artifact contains no RPC pairs")
         if self.protocol == "official":
-            if self.fixture:
-                raise RuntimeError("offline BREC fixtures cannot be used in official mode")
             if self.num_relabel != BREC_OFFICIAL_NUM_RELABEL:
                 raise RuntimeError(
                     "official BREC requires q=32; use --brec-protocol custom for other q values"
@@ -9887,7 +9477,6 @@ class BRECAdapter:
             "records": len(self._records),
             "pair_count": self.pair_count,
             "num_relabel": self.num_relabel,
-            "offline_fixture": self.fixture,
             "protocol": self.protocol,
             "rpc_threshold": 72.34 if self.num_relabel == 32 else None,
             "categories": BREC_CATEGORIES,
@@ -10095,20 +9684,9 @@ def load_brec_v3(
     *,
     num_relabel: int = BREC_OFFICIAL_NUM_RELABEL,
     allow_download: bool = False,
-    tiny: bool = False,
-    protocol: str = "custom",
+    protocol: str = "official",
 ) -> BRECAdapter:
     root = data_root.expanduser().resolve()
-    if tiny:
-        fixture_path = root / "cycle_pe_fixtures" / f"brec_v3_q{num_relabel}.npy"
-        if not fixture_path.is_file():
-            write_tiny_brec_fixture(fixture_path, num_relabel=num_relabel)
-        return BRECAdapter(
-            fixture_path,
-            num_relabel=num_relabel,
-            fixture=True,
-            protocol=protocol,
-        )
     try:
         path = find_brec_v3(root)
     except FileNotFoundError:
@@ -10116,46 +9694,6 @@ def load_brec_v3(
             raise
         path = download_brec_v3(root)
     return BRECAdapter(path, num_relabel=num_relabel, protocol=protocol)
-
-
-def write_tiny_brec_fixture(path: Path, *, num_relabel: int = 2) -> Path:
-    """Write a two-pair graph6 fixture matching the official RPC block layout."""
-
-    if num_relabel < 2:
-        raise ValueError("num_relabel must be at least two")
-    path = path.expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pairs = (
-        (nx.cycle_graph(5), nx.complete_bipartite_graph(2, 3)),
-        (nx.cycle_graph(6), nx.disjoint_union(nx.path_graph(3), nx.path_graph(3))),
-    )
-    # The second H must be connected for the paper model; add one joining edge.
-    pairs[1][1].add_edge(2, 3)
-    train_records: list[bytes] = []
-    reliability_records: list[bytes] = []
-    for left, right in pairs:
-        for relabel in range(num_relabel):
-            permutation = np.random.default_rng(relabel).permutation(left.number_of_nodes())
-            mapping = {node: int(permutation[node]) for node in left.nodes()}
-            train_records.append(
-                nx.to_graph6_bytes(nx.relabel_nodes(left, mapping), header=False).strip()
-            )
-            permutation = np.random.default_rng(100 + relabel).permutation(right.number_of_nodes())
-            mapping = {node: int(permutation[node]) for node in right.nodes()}
-            train_records.append(
-                nx.to_graph6_bytes(nx.relabel_nodes(right, mapping), header=False).strip()
-            )
-        for relabel in range(num_relabel):
-            for offset in (200, 300):
-                permutation = np.random.default_rng(offset + relabel).permutation(
-                    left.number_of_nodes()
-                )
-                mapping = {node: int(permutation[node]) for node in left.nodes()}
-                reliability_records.append(
-                    nx.to_graph6_bytes(nx.relabel_nodes(left, mapping), header=False).strip()
-                )
-    _atomic_save_npy(path, np.asarray(train_records + reliability_records, dtype=object))
-    return path
 
 
 __all__ = [
@@ -10173,7 +9711,6 @@ __all__ = [
     "load_brec_v3",
     "validate_brec_v3",
     "load_zinc12k",
-    "write_tiny_brec_fixture",
 ]
 ````
 
@@ -10479,15 +10016,7 @@ def _generate_graph(split: str, index: int, seed: int) -> PaperGraph:
     )
 
 
-def cycle_count_split_sizes(tiny: bool) -> dict[str, int]:
-    if tiny:
-        return {
-            "train": 10,
-            "validation": 4,
-            "id_test": 4,
-            "size_ood": 4,
-            "family_ood": 4,
-        }
+def cycle_count_split_sizes() -> dict[str, int]:
     return {
         "train": 10_000,
         "validation": 2_000,
@@ -10538,9 +10067,9 @@ def sha256_file(path: Path) -> str:
 
 
 def _cycle_count_specification(
-    *, seed: int, tiny: bool, split_sizes: dict[str, int] | None
+    *, seed: int, split_sizes: dict[str, int] | None
 ) -> tuple[dict[str, int], dict[str, Any], Path]:
-    sizes = dict(cycle_count_split_sizes(tiny) if split_sizes is None else split_sizes)
+    sizes = dict(cycle_count_split_sizes() if split_sizes is None else split_sizes)
     if set(sizes) != set(CORE_SPLITS) or any(int(value) < 1 for value in sizes.values()):
         raise ValueError(f"split_sizes must provide positive counts for {CORE_SPLITS}")
     specification = {
@@ -10625,14 +10154,11 @@ def validate_cycle_count_ood_cache(
     data_root: Path,
     *,
     seed: int,
-    tiny: bool = False,
     split_sizes: dict[str, int] | None = None,
 ) -> DatasetBundle:
     """Read and fully validate a requested CycleCount-OOD cache without writing."""
 
-    _, specification, filename = _cycle_count_specification(
-        seed=seed, tiny=tiny, split_sizes=split_sizes
-    )
+    _, specification, filename = _cycle_count_specification(seed=seed, split_sizes=split_sizes)
     cache_path = data_root.expanduser().resolve() / "cycle_count_ood" / filename
     if not cache_path.is_file():
         raise FileNotFoundError(f"CycleCount cache is missing for seed={seed}: {cache_path}")
@@ -10658,22 +10184,17 @@ def load_or_generate_cycle_count_ood(
     data_root: Path,
     *,
     seed: int,
-    tiny: bool = False,
     split_sizes: dict[str, int] | None = None,
 ) -> DatasetBundle:
     """Load a content-addressed cache or deterministically build CycleCount-OOD."""
 
-    sizes, specification, filename = _cycle_count_specification(
-        seed=seed, tiny=tiny, split_sizes=split_sizes
-    )
+    sizes, specification, filename = _cycle_count_specification(seed=seed, split_sizes=split_sizes)
     cache_dir = data_root.expanduser().resolve() / "cycle_count_ood"
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / filename
 
     if cache_path.exists():
-        return validate_cycle_count_ood_cache(
-            data_root, seed=seed, tiny=tiny, split_sizes=split_sizes
-        )
+        return validate_cycle_count_ood_cache(data_root, seed=seed, split_sizes=split_sizes)
     records = []
     for split in CORE_SPLITS:
         for index in range(int(sizes[split])):
@@ -10702,7 +10223,7 @@ def load_or_generate_cycle_count_ood(
             _validate_cycle_count_payload(json.load(stream), specification)
 
     atomic_publish(cache_path, write, validator=validate_temporary)
-    return validate_cycle_count_ood_cache(data_root, seed=seed, tiny=tiny, split_sizes=split_sizes)
+    return validate_cycle_count_ood_cache(data_root, seed=seed, split_sizes=split_sizes)
 
 
 def structural_input_features(graph: PaperGraph) -> tuple[FloatArray, FloatArray]:
@@ -11286,8 +10807,8 @@ def resolve_device(requested: str) -> torch.device:
         if not torch.cuda.is_available():
             raise RuntimeError(
                 "CUDA was requested but this PyTorch build cannot access CUDA. On the "
-                "Linux/MobaXterm host, verify `nvidia-smi`, then install the matching "
-                "CUDA-enabled PyTorch wheel. Use `--device cpu --tiny` only for smoke tests."
+                "Linux GPU workstation or server, verify `nvidia-smi`, then install the matching "
+                "CUDA-enabled PyTorch wheel using `bash scripts/setup_gpu.sh`."
             )
         index = torch.cuda.current_device() if device.index is None else device.index
         if index >= torch.cuda.device_count():
@@ -11628,457 +11149,65 @@ __all__ = [
 ]
 ````
 
-# research/cycle_pe/run.py
+# research/cycle_pe/tests/fixtures.py
 
 ````python
-"""Run the graph-family structural probe for static cycle PE."""
+"""Small in-memory/file fixtures for unit tests, never production datasets."""
 
-from __future__ import annotations
-
-import argparse
-import json
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
-
-import numpy as np
-import yaml
-from numpy.typing import NDArray
-
-from .synthetic import PROBE_VARIANTS, make_graph_family_split, stack_probe_graphs
-
-FloatArray = NDArray[np.float64]
-IntArray = NDArray[np.int64]
-
-
-@dataclass(frozen=True)
-class LogisticProbe:
-    """A deterministic linear probe fitted on frozen static PE features."""
-
-    mean: FloatArray
-    scale: FloatArray
-    weights: FloatArray
-    bias: float
-
-    def decision_function(self, features: FloatArray) -> FloatArray:
-        standardized = (np.asarray(features, dtype=np.float64) - self.mean) / self.scale
-        return standardized @ self.weights + self.bias
-
-    def predict_proba(self, features: FloatArray) -> FloatArray:
-        logits = np.clip(self.decision_function(features), -40.0, 40.0)
-        return 1.0 / (1.0 + np.exp(-logits))
-
-
-def fit_logistic_probe(
-    features: FloatArray,
-    targets: IntArray,
-    *,
-    steps: int,
-    learning_rate: float,
-    l2: float,
-) -> LogisticProbe:
-    """Fit a full-batch logistic probe without modifying the PE extractor."""
-
-    x = np.asarray(features, dtype=np.float64)
-    y = np.asarray(targets, dtype=np.float64)
-    if x.ndim != 2 or y.shape != (x.shape[0],):
-        raise ValueError("features/targets have incompatible shapes")
-    if steps < 1 or learning_rate <= 0.0 or l2 < 0.0:
-        raise ValueError("invalid probe optimizer configuration")
-    if np.unique(y).size != 2:
-        raise ValueError("the training split must contain both edge classes")
-
-    mean = x.mean(axis=0)
-    scale = x.std(axis=0)
-    scale[scale < 1e-12] = 1.0
-    standardized = (x - mean) / scale
-    weights = np.zeros(x.shape[1], dtype=np.float64)
-    prevalence = float(np.clip(y.mean(), 1e-6, 1.0 - 1e-6))
-    bias = float(np.log(prevalence / (1.0 - prevalence)))
-
-    for step in range(steps):
-        logits = np.clip(standardized @ weights + bias, -40.0, 40.0)
-        probabilities = 1.0 / (1.0 + np.exp(-logits))
-        residual = probabilities - y
-        gradient_weights = standardized.T @ residual / len(y) + l2 * weights
-        gradient_bias = float(residual.mean())
-        # Mild decay makes the small deterministic optimizer insensitive to the
-        # exact requested step count while preserving a fast smoke configuration.
-        rate = learning_rate / np.sqrt(1.0 + step / 250.0)
-        weights -= rate * gradient_weights
-        bias -= rate * gradient_bias
-    return LogisticProbe(mean, scale, weights, bias)
-
-
-def _binary_metrics(
-    targets: IntArray,
-    probabilities: FloatArray,
-    graph_ids: tuple[str, ...],
-) -> dict[str, float]:
-    y = np.asarray(targets, dtype=np.int64)
-    scores = np.asarray(probabilities, dtype=np.float64)
-    predictions = (scores >= 0.5).astype(np.int64)
-    positives = y == 1
-    negatives = ~positives
-    true_positive = int(np.count_nonzero(predictions[positives] == 1))
-    true_negative = int(np.count_nonzero(predictions[negatives] == 0))
-    false_positive = int(np.count_nonzero(predictions[negatives] == 1))
-    false_negative = int(np.count_nonzero(predictions[positives] == 0))
-    recall_positive = true_positive / max(1, true_positive + false_negative)
-    recall_negative = true_negative / max(1, true_negative + false_positive)
-    precision = true_positive / max(1, true_positive + false_positive)
-    f1 = 2.0 * precision * recall_positive / max(1e-12, precision + recall_positive)
-
-    positive_scores = scores[positives]
-    negative_scores = scores[negatives]
-    if len(positive_scores) and len(negative_scores):
-        comparisons = positive_scores[:, None] - negative_scores[None, :]
-        auroc = float(np.mean(comparisons > 0.0) + 0.5 * np.mean(comparisons == 0.0))
-    else:
-        auroc = float("nan")
-
-    graph_accuracy = []
-    ids = np.asarray(graph_ids, dtype=object)
-    for graph_id in dict.fromkeys(graph_ids):
-        mask = ids == graph_id
-        graph_accuracy.append(float(np.mean(predictions[mask] == y[mask])))
-    return {
-        "accuracy": float(np.mean(predictions == y)),
-        "balanced_accuracy": float(0.5 * (recall_positive + recall_negative)),
-        "f1": float(f1),
-        "auroc": auroc,
-        "macro_graph_accuracy": float(np.mean(graph_accuracy)),
-    }
-
-
-def run_structural_probe(
-    *,
-    samples_per_family: int = 8,
-    seed: int = 7,
-    max_cycles: int = 12,
-    steps: int = 1200,
-    learning_rate: float = 0.15,
-    l2: float = 1e-3,
-) -> dict[str, Any]:
-    """Compare degree-only features with three frozen static cycle PEs."""
-
-    train_graphs, test_graphs = make_graph_family_split(
-        samples_per_family=samples_per_family,
-        seed=seed,
-    )
-    results: dict[str, Any] = {
-        "scope": "static_graph_cycle_pe_only",
-        "task": "edge_is_in_any_cycle",
-        "split": {
-            "train_families": sorted({graph.family for graph in train_graphs}),
-            "test_families": sorted({graph.family for graph in test_graphs}),
-            "train_graphs": len(train_graphs),
-            "test_graphs": len(test_graphs),
-        },
-        "variants": {},
-        "notes": {
-            "raw": "diagnostic; column order/sign and spanning-tree dependent",
-            "cycle_set": "invariant only to sign/permutation of a fixed cycle set",
-            "projector_leverage": "basis-invariant prior-style baseline, not novelty",
-        },
-    }
-
-    for variant in PROBE_VARIANTS:
-        train = stack_probe_graphs(train_graphs, variant, max_cycles=max_cycles)
-        test = stack_probe_graphs(test_graphs, variant, max_cycles=max_cycles)
-        probe = fit_logistic_probe(
-            train.features,
-            train.targets,
-            steps=steps,
-            learning_rate=learning_rate,
-            l2=l2,
-        )
-        results["variants"][variant] = {
-            "feature_dim": int(train.features.shape[1]),
-            "train_edges": int(train.features.shape[0]),
-            "test_edges": int(test.features.shape[0]),
-            "train": _binary_metrics(
-                train.targets, probe.predict_proba(train.features), train.graph_ids
-            ),
-            "test": _binary_metrics(
-                test.targets, probe.predict_proba(test.features), test.graph_ids
-            ),
-        }
-    return results
-
-
-def _read_config(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle) or {}
-    if not isinstance(config, dict):
-        raise ValueError("config root must be a mapping")
-    return config
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=Path(__file__).with_name("config.yaml"),
-    )
-    parser.add_argument("--output", type=Path, default=None)
-    args = parser.parse_args()
-
-    config_path = args.config.expanduser().resolve()
-    config = _read_config(config_path)
-    probe_config = config.get("probe", {})
-    results = run_structural_probe(
-        samples_per_family=int(config.get("samples_per_family", 8)),
-        seed=int(config.get("seed", 7)),
-        max_cycles=int(config.get("max_cycles", 12)),
-        steps=int(probe_config.get("steps", 1200)),
-        learning_rate=float(probe_config.get("learning_rate", 0.15)),
-        l2=float(probe_config.get("l2", 1e-3)),
-    )
-    if args.output is not None:
-        output = args.output.expanduser()
-    else:
-        output = Path(config.get("output", "results/summary.json")).expanduser()
-        if not output.is_absolute():
-            output = config_path.parent / output
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", encoding="utf-8") as handle:
-        json.dump(results, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    print(json.dumps(results, indent=2, sort_keys=True))
-    print(f"wrote {output}")
-
-
-if __name__ == "__main__":
-    main()
-````
-
-# research/cycle_pe/synthetic.py
-
-````python
-"""Graph-family splits for static cycle-PE structural probes."""
-
-from __future__ import annotations
-
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
 
 import networkx as nx
 import numpy as np
-from numpy.typing import NDArray
 
-from chartgat.algebra import incidence_matrix
-from chartgat.graphs import make_connected_graph, spanning_tree_indices
+from research.cycle_pe.paper_data import load_or_generate_cycle_count_ood
 
-from .features import degree_only_edge_features, static_cycle_feature_bundle
-
-FloatArray = NDArray[np.float64]
-IntArray = NDArray[np.int64]
-
-PROBE_VARIANTS = (
-    "degree_only",
-    "degree_plus_raw",
-    "degree_plus_cycle_set",
-    "degree_plus_projector_leverage",
-)
+CORE_TEST_SPLIT_SIZES = {
+    "train": 10,
+    "validation": 4,
+    "id_test": 4,
+    "size_ood": 4,
+    "family_ood": 4,
+}
 
 
-@dataclass(frozen=True)
-class ProbeGraph:
-    """One topology-only graph example in a graph-family split."""
-
-    family: str
-    split: str
-    num_nodes: int
-    edges: tuple[tuple[int, int], ...]
+def small_cyclecount_loader(data_root: Path, *, seed: int):
+    return load_or_generate_cycle_count_ood(data_root, seed=seed, split_sizes=CORE_TEST_SPLIT_SIZES)
 
 
-@dataclass(frozen=True)
-class ProbeMatrix:
-    """Stacked edge examples for one split and one PE variant."""
+def write_brec_fixture(path: Path, *, num_relabel: int = 2) -> Path:
+    """Create two RPC-layout pairs exclusively for unit tests."""
 
-    features: FloatArray
-    targets: IntArray
-    graph_ids: tuple[str, ...]
-
-
-def _canonical_edges(edges: Iterable[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
-    canonical = {tuple(sorted((int(u), int(v)))) for u, v in edges if u != v}
-    return tuple(sorted(canonical))
-
-
-def _cycle_edges(offset: int, size: int) -> list[tuple[int, int]]:
-    if size < 3:
-        raise ValueError("cycle size must be at least three")
-    nodes = list(range(offset, offset + size))
-    return [(nodes[index], nodes[(index + 1) % size]) for index in range(size)]
-
-
-def cycle_with_tail(cycle_size: int, tail_length: int) -> tuple[int, tuple[tuple[int, int], ...]]:
-    """A single cycle with an attached bridge path."""
-
-    if tail_length < 1:
-        raise ValueError("tail_length must be positive")
-    edges = _cycle_edges(0, cycle_size)
-    previous = 0
-    for node in range(cycle_size, cycle_size + tail_length):
-        edges.append((previous, node))
-        previous = node
-    return cycle_size + tail_length, _canonical_edges(edges)
-
-
-def double_cycle_bridge(
-    left_size: int,
-    right_size: int,
-    bridge_length: int,
-) -> tuple[int, tuple[tuple[int, int], ...]]:
-    """Two disjoint cycles connected by a bridge path."""
-
-    if bridge_length < 1:
-        raise ValueError("bridge_length must be positive")
-    intermediate_count = bridge_length - 1
-    right_offset = left_size + intermediate_count
-    edges = _cycle_edges(0, left_size)
-    edges.extend(_cycle_edges(right_offset, right_size))
-    path = [0, *range(left_size, right_offset), right_offset]
-    edges.extend(zip(path[:-1], path[1:], strict=True))
-    return right_offset + right_size, _canonical_edges(edges)
-
-
-def cactus_cycle_chain(
-    cycle_sizes: Sequence[int],
-) -> tuple[int, tuple[tuple[int, int], ...]]:
-    """A chain of vertex-disjoint cycles connected by single bridge edges."""
-
-    if len(cycle_sizes) < 2:
-        raise ValueError("a cactus chain needs at least two cycles")
-    edges: list[tuple[int, int]] = []
-    offsets: list[int] = []
-    offset = 0
-    for size in cycle_sizes:
-        offsets.append(offset)
-        edges.extend(_cycle_edges(offset, int(size)))
-        offset += int(size)
-    edges.extend((offsets[index], offsets[index + 1]) for index in range(len(offsets) - 1))
-    return offset, _canonical_edges(edges)
-
-
-def bridge_cycle_labels(graph: ProbeGraph) -> IntArray:
-    """Label an edge one iff it belongs to at least one undirected cycle."""
-
-    nx_graph = nx.Graph()
-    nx_graph.add_nodes_from(range(graph.num_nodes))
-    nx_graph.add_edges_from(graph.edges)
-    if not nx.is_connected(nx_graph):
-        raise ValueError("probe graphs must be connected")
-    bridges = {tuple(sorted(edge)) for edge in nx.bridges(nx_graph)}
-    return np.asarray([int(edge not in bridges) for edge in graph.edges], dtype=np.int64)
-
-
-def make_graph_family_split(
-    *,
-    samples_per_family: int = 8,
-    seed: int = 0,
-) -> tuple[list[ProbeGraph], list[ProbeGraph]]:
-    """Build train/test sets with disjoint graph-generator families.
-
-    Training uses ``cycle_tail`` and ``random_tree_plus_chords``.  Testing uses
-    only the unseen ``double_cycle_bridge`` and ``cactus_cycle_chain`` families.
-    The split therefore probes family transfer rather than random edge leakage.
-    """
-
-    if samples_per_family < 1:
-        raise ValueError("samples_per_family must be positive")
-    rng = np.random.default_rng(seed)
-    train: list[ProbeGraph] = []
-    test: list[ProbeGraph] = []
-
-    for sample in range(samples_per_family):
-        cycle_size = int(rng.integers(4, 9))
-        tail_length = int(rng.integers(3, 8))
-        node_count, edges = cycle_with_tail(cycle_size, tail_length)
-        train.append(ProbeGraph("cycle_tail", "train", node_count, edges))
-
-        node_count = int(rng.integers(9, 16))
-        extra_edges = int(rng.integers(1, min(4, node_count - 2)))
-        edges = tuple(make_connected_graph(node_count, extra_edges, seed=seed * 1009 + sample))
-        train.append(ProbeGraph("random_tree_plus_chords", "train", node_count, edges))
-
-        left_size = int(rng.integers(3, 8))
-        right_size = int(rng.integers(3, 8))
-        bridge_length = int(rng.integers(2, 7))
-        node_count, edges = double_cycle_bridge(left_size, right_size, bridge_length)
-        test.append(ProbeGraph("double_cycle_bridge", "test", node_count, edges))
-
-        sizes = tuple(int(value) for value in rng.integers(3, 8, size=3))
-        node_count, edges = cactus_cycle_chain(sizes)
-        test.append(ProbeGraph("cactus_cycle_chain", "test", node_count, edges))
-
-    return train, test
-
-
-def graph_feature_matrix(
-    graph: ProbeGraph,
-    variant: str,
-    *,
-    max_cycles: int,
-) -> FloatArray:
-    """Create one static edge-feature matrix for the requested PE variant."""
-
-    if variant not in PROBE_VARIANTS:
-        raise ValueError(f"unknown variant {variant!r}; choose one of {PROBE_VARIANTS}")
-    incidence = incidence_matrix(graph.num_nodes, graph.edges)
-    tree = spanning_tree_indices(graph.num_nodes, graph.edges, mode="bfs")
-    cycle = static_cycle_feature_bundle(incidence, tree, max_cycles=max_cycles)
-    degree = degree_only_edge_features(graph.num_nodes, graph.edges)
-    if variant == "degree_only":
-        return degree
-    if variant == "degree_plus_raw":
-        return np.concatenate((degree, cycle["raw_padded"]), axis=1)
-    if variant == "degree_plus_cycle_set":
-        return np.concatenate((degree, cycle["cycle_set"]), axis=1)
-    return np.concatenate((degree, cycle["projector_leverage"]), axis=1)
-
-
-def stack_probe_graphs(
-    graphs: Sequence[ProbeGraph],
-    variant: str,
-    *,
-    max_cycles: int,
-) -> ProbeMatrix:
-    """Stack edges across graphs while retaining graph identifiers."""
-
-    if not graphs:
-        raise ValueError("graphs must not be empty")
-    feature_parts: list[FloatArray] = []
-    target_parts: list[IntArray] = []
-    graph_ids: list[str] = []
-    for index, graph in enumerate(graphs):
-        features = graph_feature_matrix(graph, variant, max_cycles=max_cycles)
-        targets = bridge_cycle_labels(graph)
-        feature_parts.append(features)
-        target_parts.append(targets)
-        graph_ids.extend([f"{graph.split}:{graph.family}:{index}"] * len(graph.edges))
-    return ProbeMatrix(
-        np.concatenate(feature_parts, axis=0),
-        np.concatenate(target_parts, axis=0),
-        tuple(graph_ids),
+    if num_relabel < 2:
+        raise ValueError("num_relabel must be at least two")
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pairs = (
+        (nx.cycle_graph(5), nx.complete_bipartite_graph(2, 3)),
+        (nx.cycle_graph(6), nx.path_graph(6)),
     )
-
-
-__all__ = [
-    "PROBE_VARIANTS",
-    "ProbeGraph",
-    "ProbeMatrix",
-    "bridge_cycle_labels",
-    "cactus_cycle_chain",
-    "cycle_with_tail",
-    "double_cycle_bridge",
-    "graph_feature_matrix",
-    "make_graph_family_split",
-    "stack_probe_graphs",
-]
+    train_records: list[bytes] = []
+    reliability_records: list[bytes] = []
+    for left, right in pairs:
+        for relabel in range(num_relabel):
+            for graph, offset in ((left, 0), (right, 100)):
+                permutation = np.random.default_rng(offset + relabel).permutation(
+                    graph.number_of_nodes()
+                )
+                mapping = {node: int(permutation[node]) for node in graph.nodes()}
+                train_records.append(
+                    nx.to_graph6_bytes(nx.relabel_nodes(graph, mapping), header=False).strip()
+                )
+        for relabel in range(num_relabel):
+            for offset in (200, 300):
+                permutation = np.random.default_rng(offset + relabel).permutation(
+                    left.number_of_nodes()
+                )
+                mapping = {node: int(permutation[node]) for node in left.nodes()}
+                reliability_records.append(
+                    nx.to_graph6_bytes(nx.relabel_nodes(left, mapping), header=False).strip()
+                )
+    np.save(path, np.asarray(train_records + reliability_records, dtype=object), allow_pickle=True)
+    return path
 ````
 
 # research/cycle_pe/tests/test_brec_protocol.py
@@ -12224,8 +11353,8 @@ def test_official_mode_resolves_for_full_runs_and_forces_reference_settings() ->
     assert settings.amp_requested is False
     assert settings.pin_memory_requested is False
 
-    tiny = build_parser().parse_args(["--suite", "brec", "--tiny"])
-    assert _effective_brec_protocol(tiny) == "custom"
+    custom = build_parser().parse_args(["--suite", "brec", "--brec-protocol", "custom"])
+    assert _effective_brec_protocol(custom) == "custom"
 
 
 def test_official_reference_compatibility_does_not_claim_differential_parity() -> None:
@@ -12255,13 +11384,6 @@ from research.cycle_pe.features import (
     raw_padded_basis_pe,
     static_cycle_feature_bundle,
     static_fundamental_basis,
-)
-from research.cycle_pe.run import run_structural_probe
-from research.cycle_pe.synthetic import (
-    PROBE_VARIANTS,
-    ProbeGraph,
-    bridge_cycle_labels,
-    cycle_with_tail,
 )
 
 
@@ -12353,37 +11475,6 @@ def test_tree_graph_has_zero_width_cycle_space_and_zero_static_pe() -> None:
     np.testing.assert_array_equal(raw_padded_basis_pe(basis, 2), np.zeros((3, 2)))
     np.testing.assert_array_equal(cycle_set_statistics(basis), np.zeros((3, len(SET_STAT_NAMES))))
     np.testing.assert_array_equal(projector_leverage_pe(basis), np.zeros((3, 1)))
-
-
-def test_bridge_labels_match_cycle_with_tail_construction() -> None:
-    node_count, edges = cycle_with_tail(cycle_size=5, tail_length=4)
-    graph = ProbeGraph("cycle_tail", "test", node_count, edges)
-    labels = bridge_cycle_labels(graph)
-    assert int(labels.sum()) == 5
-    assert int((labels == 0).sum()) == 4
-
-
-def test_graph_family_probe_smoke() -> None:
-    results = run_structural_probe(
-        samples_per_family=2,
-        seed=3,
-        max_cycles=8,
-        steps=350,
-        learning_rate=0.15,
-        l2=1e-3,
-    )
-    assert results["scope"] == "static_graph_cycle_pe_only"
-    assert set(results["variants"]) == set(PROBE_VARIANTS)
-    assert set(results["split"]["train_families"]).isdisjoint(results["split"]["test_families"])
-    for variant in PROBE_VARIANTS:
-        metrics = results["variants"][variant]["test"]
-        assert all(np.isfinite(value) for value in metrics.values())
-        assert 0.0 <= metrics["balanced_accuracy"] <= 1.0
-
-    leverage = results["variants"]["degree_plus_projector_leverage"]["test"]
-    degree = results["variants"]["degree_only"]["test"]
-    assert leverage["balanced_accuracy"] >= 0.95
-    assert leverage["balanced_accuracy"] >= degree["balanced_accuracy"]
 ````
 
 # research/cycle_pe/tests/test_paper_adapters.py
@@ -12408,16 +11499,14 @@ from research.cycle_pe.paper_adapters import (
     find_brec_v3,
     load_brec_v3,
     validate_brec_v3,
-    write_tiny_brec_fixture,
 )
+from research.cycle_pe.tests.fixtures import write_brec_fixture
 
 
-def test_tiny_brec_fixture_matches_lazy_rpc_layout(tmp_path) -> None:
-    path = write_tiny_brec_fixture(
-        tmp_path / "BREC" / "Data" / "raw" / "brec_v3.npy", num_relabel=2
-    )
+def test_brec_fixture_matches_lazy_rpc_layout(tmp_path) -> None:
+    path = write_brec_fixture(tmp_path / "BREC" / "Data" / "raw" / "brec_v3.npy", num_relabel=2)
     assert find_brec_v3(tmp_path) == path
-    adapter = BRECAdapter(path, num_relabel=2)
+    adapter = BRECAdapter(path, num_relabel=2, protocol="custom")
     assert adapter.pair_count == 2
     pair = adapter.load_pair(0)
     assert len(pair.train_test) == 4
@@ -12465,19 +11554,21 @@ def test_brec_full_load_is_fail_closed_without_opt_in(monkeypatch, tmp_path) -> 
         load_brec_v3(tmp_path, allow_download=False)
 
 
-def test_brec_tiny_fixture_is_always_offline(monkeypatch, tmp_path) -> None:
+def test_brec_load_uses_explicit_supplied_artifact_without_network(monkeypatch, tmp_path) -> None:
+    write_brec_fixture(tmp_path / "BREC" / "Data" / "raw" / "brec_v3.npy")
+
     def unexpected_network(*args, **kwargs):
-        raise AssertionError("tiny BREC fixture must never use the network")
+        raise AssertionError("an existing artifact must not trigger a download")
 
     monkeypatch.setattr(paper_adapters.urllib.request, "urlopen", unexpected_network)
     adapter = load_brec_v3(
         tmp_path,
         num_relabel=2,
         allow_download=True,
-        tiny=True,
+        protocol="custom",
     )
     assert adapter.pair_count == 2
-    assert adapter.metadata["offline_fixture"] is True
+    assert adapter.metadata["protocol"] == "custom"
 
 
 class _FakeHTTPResponse(io.BytesIO):
@@ -12504,7 +11595,7 @@ def _zip_payload(members: dict[str, bytes]) -> bytes:
 
 
 def test_explicit_brec_download_extracts_only_valid_npy(monkeypatch, tmp_path) -> None:
-    fixture = write_tiny_brec_fixture(tmp_path / "source.npy", num_relabel=2)
+    fixture = write_brec_fixture(tmp_path / "source.npy", num_relabel=2)
     payload = _zip_payload({"BREC/Data/raw/brec_v3.npy": fixture.read_bytes()})
     monkeypatch.setattr(
         paper_adapters.urllib.request,
@@ -12564,7 +11655,7 @@ def test_zinc_download_requires_explicit_opt_in(monkeypatch, tmp_path) -> None:
 
     monkeypatch.setattr(paper_adapters, "_require_pyg_zinc", lambda: UnexpectedZincConstruction)
     with pytest.raises(FileNotFoundError, match="--allow-download"):
-        paper_adapters.load_zinc12k(tmp_path, tiny=True, allow_download=False)
+        paper_adapters.load_zinc12k(tmp_path, allow_download=False)
 
 
 def test_zinc_adapter_uses_official_split_names_without_network(monkeypatch, tmp_path) -> None:
@@ -12594,7 +11685,10 @@ def test_zinc_adapter_uses_official_split_names_without_network(monkeypatch, tmp
             return FakeData()
 
     monkeypatch.setattr(paper_adapters, "_require_pyg_zinc", lambda: FakeZinc)
-    bundle = paper_adapters.load_zinc12k(tmp_path, tiny=True, allow_download=False)
+    monkeypatch.setattr(
+        paper_adapters, "ZINC_SPLIT_SIZES", {"train": 1, "validation": 1, "test": 1}
+    )
+    bundle = paper_adapters.load_zinc12k(tmp_path, allow_download=False)
     assert calls == [(True, "train"), (True, "val"), (True, "test")]
     assert {name: len(graphs) for name, graphs in bundle.splits.items()} == {
         "train": 1,
@@ -12611,6 +11705,23 @@ def test_zinc_adapter_uses_official_split_names_without_network(monkeypatch, tmp
         "subset/processed/val.pt",
         "subset/processed/test.pt",
     }
+
+
+def test_zinc_rejects_nonofficial_split_cardinality(monkeypatch, tmp_path) -> None:
+    class IncompleteZinc:
+        def __init__(self, **kwargs):
+            pass
+
+        def __len__(self):
+            return 1
+
+    monkeypatch.setattr(paper_adapters, "_require_pyg_zinc", lambda: IncompleteZinc)
+    with pytest.raises(RuntimeError, match="must contain 10000 graphs"):
+        paper_adapters.load_zinc12k(tmp_path, allow_download=True)
+
+
+def test_public_adapter_has_no_fixture_generator() -> None:
+    assert not hasattr(paper_adapters, "write_tiny_brec_fixture")
 ````
 
 # research/cycle_pe/tests/test_paper_cli.py
@@ -12624,11 +11735,17 @@ import pytest
 import torch
 
 from research.cycle_pe import paper
+from research.cycle_pe.tests.fixtures import small_cyclecount_loader, write_brec_fixture
 
 main = paper.main
 
 
-def test_core_tiny_cli_trains_without_download_and_writes_manifest(tmp_path) -> None:
+@pytest.fixture(autouse=True)
+def unit_test_core_loader(monkeypatch) -> None:
+    monkeypatch.setattr(paper, "load_or_generate_cycle_count_ood", small_cyclecount_loader)
+
+
+def test_core_cli_trains_injected_data_and_writes_manifest(tmp_path) -> None:
     data_root = tmp_path / "data"
     output_root = tmp_path / "runs"
     exit_code = main(
@@ -12647,7 +11764,6 @@ def test_core_tiny_cli_trains_without_download_and_writes_manifest(tmp_path) -> 
             "19",
             "--model-seed",
             "37",
-            "--tiny",
             "--epochs",
             "1",
             "--batch-size",
@@ -12694,7 +11810,7 @@ def test_core_tiny_cli_trains_without_download_and_writes_manifest(tmp_path) -> 
     assert checkpoint["model_seed"] == 37
 
 
-def test_core_tiny_prepare_only_stops_before_training(tmp_path) -> None:
+def test_core_prepare_only_stops_before_training(tmp_path) -> None:
     output_root = tmp_path / "runs"
     assert (
         main(
@@ -12707,7 +11823,6 @@ def test_core_tiny_prepare_only_stops_before_training(tmp_path) -> None:
                 str(output_root),
                 "--device",
                 "cpu",
-                "--tiny",
                 "--prepare-only",
                 "--workers",
                 "1",
@@ -12723,7 +11838,8 @@ def test_core_tiny_prepare_only_stops_before_training(tmp_path) -> None:
     assert not list((output_root / "core").glob("*/model.pt"))
 
 
-def test_brec_tiny_prepare_only_uses_offline_rpc_fixture(tmp_path) -> None:
+def test_brec_prepare_only_uses_explicit_custom_artifact(tmp_path) -> None:
+    write_brec_fixture(tmp_path / "data" / "BREC" / "Data" / "raw" / "brec_v3.npy")
     output_root = tmp_path / "runs"
     assert (
         main(
@@ -12736,7 +11852,8 @@ def test_brec_tiny_prepare_only_uses_offline_rpc_fixture(tmp_path) -> None:
                 str(output_root),
                 "--device",
                 "cpu",
-                "--tiny",
+                "--brec-protocol",
+                "custom",
                 "--prepare-only",
                 "--brec-num-relabel",
                 "2",
@@ -12749,7 +11866,7 @@ def test_brec_tiny_prepare_only_uses_offline_rpc_fixture(tmp_path) -> None:
         == 0
     )
     manifest = json.loads((output_root / "brec" / "manifest.json").read_text("utf-8"))
-    assert manifest["dataset_metadata"]["offline_fixture"] is True
+    assert manifest["dataset_metadata"]["pair_count"] == 2
     assert manifest["brec_protocol"]["effective"] == "custom"
     assert "official_training_reference_matched" not in manifest["brec_protocol"]
     compatibility = manifest["brec_protocol"]["official_reference_compatibility"]
@@ -12761,7 +11878,8 @@ def test_brec_tiny_prepare_only_uses_offline_rpc_fixture(tmp_path) -> None:
     assert len(manifest["preparation_checks"]) == 2
 
 
-def test_brec_tiny_custom_training_is_labeled_separately(tmp_path) -> None:
+def test_brec_custom_training_is_labeled_separately(tmp_path) -> None:
+    write_brec_fixture(tmp_path / "data" / "BREC" / "Data" / "raw" / "brec_v3.npy")
     output_root = tmp_path / "runs"
     assert (
         main(
@@ -12774,7 +11892,6 @@ def test_brec_tiny_custom_training_is_labeled_separately(tmp_path) -> None:
                 str(output_root),
                 "--device",
                 "cpu",
-                "--tiny",
                 "--brec-protocol",
                 "custom",
                 "--brec-num-relabel",
@@ -12857,7 +11974,6 @@ def test_existing_output_collision_is_rejected_without_modification(tmp_path) ->
                 str(output_root),
                 "--device",
                 "cpu",
-                "--tiny",
                 "--prepare-only",
             ]
         )
@@ -12908,6 +12024,12 @@ def test_all_suite_failure_preserves_completed_and_removes_failed_suite_artifact
     assert manifest["status"] == "failed"
     assert manifest["failed_suite"] == "brec"
     assert manifest["completed_suites"] == ["core"]
+
+
+@pytest.mark.parametrize("suite", ["core", "brec", "zinc"])
+def test_production_cli_rejects_removed_tiny_option(suite) -> None:
+    with pytest.raises(SystemExit):
+        paper.build_parser().parse_args(["--suite", suite, "--tiny"])
 ````
 
 # research/cycle_pe/tests/test_paper_data.py
@@ -12925,10 +12047,11 @@ from research.cycle_pe.paper_data import (
     exact_cycle_targets,
     load_or_generate_cycle_count_ood,
 )
+from research.cycle_pe.tests.fixtures import CORE_TEST_SPLIT_SIZES
 
 
 def test_full_cycle_count_protocol_contains_exactly_twenty_thousand_graphs() -> None:
-    sizes = cycle_count_split_sizes(tiny=False)
+    sizes = cycle_count_split_sizes()
     assert sizes == {
         "train": 10_000,
         "validation": 2_000,
@@ -12964,10 +12087,10 @@ def test_exact_short_cycle_targets_cover_edge_node_and_graph_levels() -> None:
 
 
 def test_cycle_count_ood_cache_and_splits_are_deterministic(tmp_path) -> None:
-    first = load_or_generate_cycle_count_ood(tmp_path, seed=19, tiny=True)
-    second = load_or_generate_cycle_count_ood(tmp_path, seed=19, tiny=True)
+    first = load_or_generate_cycle_count_ood(tmp_path, seed=19, split_sizes=CORE_TEST_SPLIT_SIZES)
+    second = load_or_generate_cycle_count_ood(tmp_path, seed=19, split_sizes=CORE_TEST_SPLIT_SIZES)
     independent = load_or_generate_cycle_count_ood(
-        tmp_path / "independent-root", seed=19, tiny=True
+        tmp_path / "independent-root", seed=19, split_sizes=CORE_TEST_SPLIT_SIZES
     )
 
     assert first.cache_path == second.cache_path
@@ -13182,7 +12305,9 @@ import json
 import torch
 
 from chartgat.seeds import SeedAxes
+from research.cycle_pe import paper
 from research.cycle_pe.paper import _seed_axis_policy, _settings, build_parser, main
+from research.cycle_pe.tests.fixtures import small_cyclecount_loader
 
 
 def test_cycle_settings_use_model_axis_and_record_not_applicable_axes() -> None:
@@ -13216,7 +12341,8 @@ def test_cycle_settings_use_model_axis_and_record_not_applicable_axes() -> None:
     assert zinc["chart"]["status"] == "not_applicable"
 
 
-def test_cyclecount_cache_identity_uses_data_seed_not_model_seed(tmp_path) -> None:
+def test_cyclecount_cache_identity_uses_data_seed_not_model_seed(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(paper, "load_or_generate_cycle_count_ood", small_cyclecount_loader)
     data_root = tmp_path / "data"
     manifests = []
     for model_seed in (31, 37):
@@ -13232,7 +12358,6 @@ def test_cyclecount_cache_identity_uses_data_seed_not_model_seed(tmp_path) -> No
                     str(output_root),
                     "--device",
                     "cpu",
-                    "--tiny",
                     "--prepare-only",
                     "--seed",
                     "5",
@@ -13281,16 +12406,12 @@ does not expose conductance, attention, potential, or flow-completion models.
 from .augmentation import (
     TreeChart,
     build_tree_chart,
-    chart_probe_features,
     cycle_projector,
     cycle_projector_diagonal,
     ensure_full_cycle_budget,
-    evaluate_probe,
     find_unseen_chart,
     lossless_transition_error,
-    run_static_cycle_pe_probe,
     sample_tree_charts,
-    train_probe,
     transition_cocycle_error,
     transport_coordinates,
 )
@@ -13302,16 +12423,12 @@ __all__ = [
     "VariableBetaCycleEncoder",
     "build_paper_chart",
     "build_tree_chart",
-    "chart_probe_features",
     "cycle_projector",
     "cycle_projector_diagonal",
     "ensure_full_cycle_budget",
-    "evaluate_probe",
     "find_unseen_chart",
     "lossless_transition_error",
-    "run_static_cycle_pe_probe",
     "sample_tree_charts",
-    "train_probe",
     "transition_cocycle_error",
     "transport_coordinates",
     "wilson_ust_indices",
@@ -13321,7 +12438,7 @@ __all__ = [
 # research/tree_augmentation/augmentation.py
 
 ````python
-"""Tree-chart resampling and a small static Cycle-PE augmentation probe.
+"""Tree-chart resampling and lossless coordinate-change certification.
 
 No conductance, GAT, node-potential, or flow-completion object is imported or
 used in this module.  Every enabled chart keeps the full cycle rank ``beta``.
@@ -13329,13 +12446,11 @@ used in this module.  Every enabled chart keeps the full cycle rank ``beta``.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
-import torch
 from numpy.typing import ArrayLike, NDArray
-from torch import Tensor, nn
 
 from chartgat.algebra import chart_transition, fundamental_cycle_basis, incidence_matrix
 from chartgat.graphs import spanning_tree_indices
@@ -13537,157 +12652,6 @@ def cycle_projector_diagonal(cycle_basis: ArrayLike) -> FloatArray:
     """Return chart-independent static edge cycle leverage scores."""
 
     return np.diag(cycle_projector(cycle_basis)).copy()
-
-
-def chart_probe_features(cycle_basis: ArrayLike) -> FloatArray:
-    """Build deliberately chart-dependent raw features for the diagnostic probe.
-
-    Each edge receives its raw fundamental-cycle row, the squared row, and the
-    flattened inverse chart Gram matrix.  All are static topology quantities;
-    no node/flow state is involved.
-    """
-
-    basis = np.asarray(cycle_basis, dtype=np.float64)
-    if basis.ndim != 2:
-        raise ValueError("cycle_basis must be two-dimensional")
-    m, beta = basis.shape
-    if beta == 0:
-        return np.ones((m, 1), dtype=np.float64)
-    gram_inverse = np.linalg.inv(basis.T @ basis)
-    global_features = np.broadcast_to(gram_inverse.reshape(1, -1), (m, beta * beta))
-    return np.concatenate((basis, basis**2, global_features), axis=1)
-
-
-class _StaticCycleProbe(nn.Module):
-    """Small raw-coordinate MLP used only for the augmentation comparison."""
-
-    def __init__(self, input_dim: int, hidden_dim: int) -> None:
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, features: Tensor) -> Tensor:
-        return self.network(features).squeeze(-1)
-
-
-def _probe_arrays(charts: Iterable[TreeChart], target: FloatArray) -> tuple[Tensor, Tensor]:
-    feature_blocks: list[FloatArray] = []
-    target_blocks: list[FloatArray] = []
-    for chart in charts:
-        feature_blocks.append(chart_probe_features(chart.basis))
-        target_blocks.append(target)
-    if not feature_blocks:
-        raise ValueError("at least one training chart is required")
-    features = torch.as_tensor(np.concatenate(feature_blocks), dtype=torch.float64)
-    targets = torch.as_tensor(np.concatenate(target_blocks), dtype=torch.float64)
-    return features, targets
-
-
-def train_probe(
-    charts: Sequence[TreeChart],
-    target: ArrayLike,
-    *,
-    hidden_dim: int = 48,
-    epochs: int = 800,
-    learning_rate: float = 0.01,
-    weight_decay: float = 1e-5,
-    seed: int = 0,
-) -> nn.Module:
-    """Fit the raw-coordinate static Cycle-PE probe on one or many tree charts."""
-
-    if epochs < 1:
-        raise ValueError("epochs must be positive")
-    if hidden_dim < 1:
-        raise ValueError("hidden_dim must be positive")
-    if learning_rate <= 0:
-        raise ValueError("learning_rate must be positive")
-    values = np.asarray(target, dtype=np.float64)
-    if values.shape != (charts[0].num_edges,):
-        raise ValueError("target must contain one scalar per physical edge")
-    torch.manual_seed(seed)
-    features, targets = _probe_arrays(charts, values)
-    model = _StaticCycleProbe(features.shape[1], hidden_dim).double()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    for _ in range(epochs):
-        optimizer.zero_grad(set_to_none=True)
-        loss = torch.mean((model(features) - targets) ** 2)
-        loss.backward()
-        optimizer.step()
-    return model
-
-
-@torch.no_grad()
-def evaluate_probe(model: nn.Module, chart: TreeChart, target: ArrayLike) -> float:
-    """Return mean squared error for one chart of the same physical graph."""
-
-    values = np.asarray(target, dtype=np.float64)
-    if values.shape != (chart.num_edges,):
-        raise ValueError("target must contain one scalar per physical edge")
-    features = torch.as_tensor(chart_probe_features(chart.basis), dtype=torch.float64)
-    targets = torch.as_tensor(values, dtype=torch.float64)
-    return float(torch.mean((model(features) - targets) ** 2))
-
-
-def run_static_cycle_pe_probe(
-    training_charts: Sequence[TreeChart],
-    unseen_chart: TreeChart,
-    *,
-    hidden_dim: int = 48,
-    epochs: int = 800,
-    learning_rate: float = 0.01,
-    weight_decay: float = 1e-5,
-    seed: int = 0,
-) -> dict[str, float | int | str]:
-    """Compare fixed-tree training, multi-tree augmentation, and unseen-tree tests."""
-
-    if not training_charts:
-        raise ValueError("training_charts must not be empty")
-    reference = training_charts[0]
-    if any(chart.basis.shape != reference.basis.shape for chart in training_charts):
-        raise ValueError("all charts must describe the same physical graph")
-    if unseen_chart.basis.shape != reference.basis.shape:
-        raise ValueError("unseen_chart must describe the same physical graph")
-
-    target = cycle_projector_diagonal(reference.basis)
-    if not np.allclose(cycle_projector_diagonal(unseen_chart.basis), target, atol=1e-10, rtol=0.0):
-        raise ValueError("charts do not represent the same physical cycle space")
-
-    settings = {
-        "hidden_dim": hidden_dim,
-        "epochs": epochs,
-        "learning_rate": learning_rate,
-        "weight_decay": weight_decay,
-        "seed": seed,
-    }
-    fixed_model = train_probe([reference], target, **settings)
-    multi_model = train_probe(training_charts, target, **settings)
-    fixed_train_mse = evaluate_probe(fixed_model, reference, target)
-    multi_train_mse = float(
-        np.mean([evaluate_probe(multi_model, chart, target) for chart in training_charts])
-    )
-    fixed_unseen_mse = evaluate_probe(fixed_model, unseen_chart, target)
-    multi_unseen_mse = evaluate_probe(multi_model, unseen_chart, target)
-    oracle_target = cycle_projector_diagonal(unseen_chart.basis)
-    oracle_unseen_mse = float(np.mean((oracle_target - target) ** 2))
-
-    return {
-        "cycle_rank_beta": reference.beta,
-        "num_training_charts": len(training_charts),
-        "fixed_chart": reference.name,
-        "unseen_chart": unseen_chart.name,
-        "fixed_train_mse": fixed_train_mse,
-        "multi_train_mse": multi_train_mse,
-        "fixed_unseen_mse": fixed_unseen_mse,
-        "multi_unseen_mse": multi_unseen_mse,
-        "unseen_mse_ratio_multi_over_fixed": multi_unseen_mse
-        / max(fixed_unseen_mse, np.finfo(np.float64).tiny),
-        "projector_oracle_unseen_mse": oracle_unseen_mse,
-    }
 ````
 
 # research/tree_augmentation/cache_validation.py
@@ -13715,7 +12679,6 @@ def validate_dataset_cache(
     *,
     data_seeds: tuple[int, ...],
     split_seeds: tuple[int, ...],
-    tiny: bool,
 ) -> dict[str, Any]:
     """Validate every requested processed tree cache without writing."""
 
@@ -13726,7 +12689,7 @@ def validate_dataset_cache(
     seeds = split_seeds if suite == "csl" else data_seeds
     paths: list[str] = []
     for seed in seeds:
-        prepared = validate_prepared_cache(suite, data_root, seed=seed, tiny=tiny)
+        prepared = validate_prepared_cache(suite, data_root, seed=seed)
         paths.extend((str(prepared.data_path), str(prepared.manifest_path)))
     return {
         "paths": sorted(set(paths)),
@@ -13741,33 +12704,7 @@ __all__ = ["validate_dataset_cache"]
 # research/tree_augmentation/config.yaml
 
 ````yaml
-seed: 17
-
-graph:
-  num_nodes: 12
-  extra_edges: 7
-  seed: 29
-
-augmentation:
-  include_bfs: true
-  include_dfs: true
-  random_count: 14
-  random_seed_start: 100
-  unseen_seed_start: 10000
-  # null means k = beta. Any integer k < beta is deliberately rejected.
-  k: null
-  lossy_extension_enabled: false
-
-probe:
-  hidden_dim: 48
-  epochs: 800
-  learning_rate: 0.01
-  weight_decay: 0.00001
-
-output: results/summary.json
-
-# Independent downstream paper protocol. The legacy projector smoke above
-# remains unchanged and is never reported as the paper headline.
+# Independent downstream paper protocol; no reduced or demonstration profile.
 paper:
   learning_rate: 0.002
   weight_decay: 0.00001
@@ -13780,12 +12717,6 @@ paper:
     batch_size: 16
     train_charts_per_graph: 8
     eval_charts_per_graph: 8
-  tiny:
-    hidden_dim: 16
-    optimizer_updates: 24
-    batch_size: 4
-    train_charts_per_graph: 3
-    eval_charts_per_graph: 2
 ````
 
 # research/tree_augmentation/datasets.yaml
@@ -13797,19 +12728,6 @@ paper_suite_complete: true
 claim: Spanning-tree chart augmentation improves robustness without changing downstream labels or graph splits.
 
 datasets:
-  - id: single_graph_chart_smoke
-    name: Current single-graph chart transition sanity check
-    tier: smoke
-    status: implemented
-    data_policy: generated
-    source_url: generated://research.tree_augmentation.run
-    task: Certify lossless chart transitions and compare fixed versus multiple charts on one graph.
-    split: One 12-node graph, 16 training trees, one unseen tree.
-    metrics: [transition_error, cocycle_error, unseen_chart_mse]
-    claim: Algebra and augmentation-pipeline certification only.
-    adapter: research.tree_augmentation.augmentation
-    leakage_guard: Target is projector-derived and cannot support a downstream novelty claim.
-
   - id: cyclecount_ood_multichart
     name: CycleCount-OOD multi-chart protocol
     tier: paper_core
@@ -13887,7 +12805,6 @@ chart_protocol:
 
 Examples
 --------
-python -m research.tree_augmentation.paper --suite core --tiny --device cpu
 python -m research.tree_augmentation.paper --suite core --device cuda --amp
 """
 
@@ -14026,18 +12943,17 @@ def _prepare_output_dir(path: Path) -> Path:
     return resolved
 
 
-def _load_settings(*, tiny: bool) -> tuple[dict[str, Any], Path]:
+def _load_settings() -> tuple[dict[str, Any], Path]:
     config_path = Path(__file__).with_name("config.yaml").resolve()
     with config_path.open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
     if not isinstance(config, dict) or not isinstance(config.get("paper"), dict):
         raise ValueError("config.yaml must contain a paper mapping")
     paper = dict(config["paper"])
-    profile_name = "tiny" if tiny else "full"
-    profile = paper.get(profile_name)
+    profile = paper.get("full")
     if not isinstance(profile, dict):
-        raise ValueError(f"paper.{profile_name} must be a mapping")
-    merged = {key: value for key, value in paper.items() if key not in {"tiny", "full"}}
+        raise ValueError("paper.full must be a mapping")
+    merged = {key: value for key, value in paper.items() if key != "full"}
     merged.update(profile)
     return merged, config_path
 
@@ -14047,17 +12963,15 @@ def _prepare_dataset(
     data_root: Path,
     *,
     seed_axes: SeedAxes,
-    tiny: bool,
     allow_download: bool,
 ) -> PreparedDataset:
     if suite == "core":
-        return prepare_cyclecount_dataset(data_root, seed=seed_axes.data, tiny=tiny)
+        return prepare_cyclecount_dataset(data_root, seed=seed_axes.data)
     cache_seed = seed_axes.split if suite == "csl" else seed_axes.data
     return prepare_optional_pyg_dataset(
         suite,
         data_root,
         seed=cache_seed,
-        tiny=tiny,
         allow_download=allow_download,
     )
 
@@ -14264,18 +13178,15 @@ def _output_dim(dataset: PreparedDataset) -> int:
     return len(dataset.records[0].target)
 
 
-def _headline_comparison(metrics: dict[str, Any], *, suite: str, tiny: bool) -> dict[str, Any]:
-    eligible = not tiny
-    if tiny:
-        eligibility_reason = "tiny fixture; pipeline validation only"
-    elif suite == "core":
+def _headline_comparison(metrics: dict[str, Any], *, suite: str) -> dict[str, Any]:
+    if suite == "core":
         eligibility_reason = "full independent CycleCount-style core protocol"
     elif suite == "zinc":
         eligibility_reason = "official ZINC-12K split with atom/bond chemistry and held-out charts"
     else:
         eligibility_reason = "full CSL controlled chart-robustness protocol"
     comparison: dict[str, Any] = {
-        "paper_headline_eligible": eligible,
+        "paper_headline_eligible": True,
         "paper_headline_eligibility_reason": eligibility_reason,
         "projector_target_used": False,
         "fixed_and_multi_optimizer_updates_matched": True,
@@ -14325,7 +13236,6 @@ def run_suite(
     split_seed: int | None = None,
     chart_seed: int | None = None,
     model_seed: int | None = None,
-    tiny: bool,
     prepare_only: bool,
     amp_override: bool | None,
     batch_size_override: int | None,
@@ -14343,7 +13253,7 @@ def run_suite(
         chart_seed=chart_seed,
         model_seed=model_seed,
     )
-    settings, config_path = _load_settings(tiny=tiny)
+    settings, config_path = _load_settings()
     output = _prepare_output_dir(output_dir)
     manifest_path = output / "manifest.json"
     manifest: dict[str, Any] = {
@@ -14352,7 +13262,6 @@ def run_suite(
         "protocol": _protocol_name(suite),
         "seed_axes": seed_axes.to_manifest(),
         "dataset_seed_policy": _dataset_seed_policy(suite),
-        "tiny": tiny,
         "prepare_only": prepare_only,
         "allow_download": allow_download,
         "workers": workers,
@@ -14387,7 +13296,6 @@ def run_suite(
             suite,
             data_root,
             seed_axes=seed_axes,
-            tiny=tiny,
             allow_download=allow_download,
         )
         manifest["dataset"] = {
@@ -14484,7 +13392,6 @@ def run_suite(
             "protocol": _protocol_name(suite),
             "downstream_target": list(dataset.target_names),
             "target_is_independent_of_chart": True,
-            "legacy_projector_smoke_preserved_separately": True,
             "samplers": {
                 "uniform": "wilson_ust",
                 "traversal": ["bfs_random_root", "dfs_random_root"],
@@ -14516,7 +13423,7 @@ def run_suite(
             },
             "runtime": runtime,
             "models": metrics,
-            "comparison": _headline_comparison(metrics, suite=suite, tiny=tiny),
+            "comparison": _headline_comparison(metrics, suite=suite),
             "checkpoints": model_paths,
         }
         summary_path = output / "summary.json"
@@ -14587,11 +13494,6 @@ def _parser() -> argparse.ArgumentParser:
         help="model initialization/minibatch axis; defaults to --seed",
     )
     parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument(
-        "--tiny",
-        action="store_true",
-        help="small profile (core is offline; CSL/ZINC still require a cache or download)",
-    )
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument(
@@ -14621,7 +13523,6 @@ def _run_from_args(args: argparse.Namespace, suite: str, output_dir: Path) -> di
         split_seed=args.split_seed,
         chart_seed=args.chart_seed,
         model_seed=args.model_seed,
-        tiny=args.tiny,
         prepare_only=args.prepare_only,
         amp_override=args.amp,
         batch_size_override=args.batch_size,
@@ -14648,7 +13549,6 @@ def _run_all(args: argparse.Namespace, output_root: Path) -> int:
         "status": "preparing",
         "suite": "all",
         "seed_axes": seed_axes.to_manifest(),
-        "tiny": args.tiny,
         "prepare_only": args.prepare_only,
         "allow_download": args.allow_download,
         "workers": args.workers,
@@ -14740,8 +13640,7 @@ if __name__ == "__main__":
 ````python
 """Datasets and spanning-tree charts for the independent paper protocol.
 
-The existing :mod:`research.tree_augmentation.run` smoke experiment is kept
-separate.  This module adds graph-level downstream labels, a true uniform
+This module supplies graph-level downstream labels, a true uniform
 spanning-tree sampler, deterministic caches, and optional PyG dataset adapters.
 """
 
@@ -15225,14 +14124,10 @@ def _register_unique_graph(
     return True
 
 
-def build_cyclecount_records(*, seed: int, tiny: bool) -> tuple[GraphRecord, ...]:
+def build_cyclecount_records(*, seed: int) -> tuple[GraphRecord, ...]:
     """Create graph-first ID/OOD splits with chart-independent cycle-count labels."""
 
-    counts = (
-        {"train": 8, "validation": 3, "id_test": 4, "ood_test": 4}
-        if tiny
-        else {"train": 128, "validation": 24, "id_test": 40, "ood_test": 40}
-    )
+    counts = {"train": 128, "validation": 24, "id_test": 40, "ood_test": 40}
     records: list[GraphRecord] = []
     graph_buckets: dict[tuple[int, int], list[nx.Graph]] = {}
     for split in ("train", "validation", "id_test"):
@@ -15360,7 +14255,6 @@ def _cache_records(
     task_type: str,
     source: str,
     seed: int,
-    tiny: bool,
 ) -> PreparedDataset:
     payload = {
         "dataset_version": DATASET_VERSION,
@@ -15384,7 +14278,7 @@ def _cache_records(
         "suite": suite,
         "source": source,
         "seed": seed,
-        "tiny": tiny,
+        "profile": "full",
         "task_type": task_type,
         "target_names": list(target_names),
         "data_path": str(data_path),
@@ -15406,23 +14300,26 @@ def _cache_records(
     return _load_cached_dataset(suite=suite, data_path=data_path, manifest_path=manifest_path)
 
 
-def prepare_cyclecount_dataset(data_root: Path, *, seed: int, tiny: bool) -> PreparedDataset:
+def prepare_cyclecount_dataset(data_root: Path, *, seed: int) -> PreparedDataset:
     """Create or verify the offline CycleCount-style deterministic cache."""
 
-    variant = "tiny" if tiny else "full"
     cache_dir = data_root.expanduser().resolve() / "cyclecount_ood_v2"
-    stem = f"seed-{seed}-{variant}"
-    records = build_cyclecount_records(seed=seed, tiny=tiny)
+    stem = f"seed-{seed}-full"
+    data_path = cache_dir / f"{stem}.json"
+    manifest_path = cache_dir / f"{stem}.manifest.json"
+    if data_path.exists() or manifest_path.exists():
+        return validate_prepared_cache("core", data_root, seed=seed)
+    records = build_cyclecount_records(seed=seed)
+    _validate_protocol_records("core", records)
     return _cache_records(
         suite="core",
         records=records,
-        data_path=cache_dir / f"{stem}.json",
-        manifest_path=cache_dir / f"{stem}.manifest.json",
+        data_path=data_path,
+        manifest_path=manifest_path,
         target_names=tuple(f"cycles_len_{length}" for length in TARGET_CYCLE_LENGTHS),
         task_type="regression",
         source="generated://tree_augmentation/cyclecount_ood_v2",
         seed=seed,
-        tiny=tiny,
     )
 
 
@@ -15534,7 +14431,7 @@ def zinc_record_from_pyg(
     )
 
 
-def _prepare_csl_records(data_root: Path, *, seed: int, tiny: bool) -> tuple[GraphRecord, ...]:
+def _prepare_csl_records(data_root: Path, *, seed: int) -> tuple[GraphRecord, ...]:
     GNNBenchmarkDataset, _ = _require_pyg("csl")
     raw_root = data_root / "pyg" / "CSL"
     try:
@@ -15552,18 +14449,7 @@ def _prepare_csl_records(data_root: Path, *, seed: int, tiny: bool) -> tuple[Gra
         for position, index in enumerate(rng.permutation(members)):
             folds[int(index)] = position % 5
     records: list[GraphRecord] = []
-    if tiny:
-        selected = []
-        for label in sorted(set(labels)):
-            members = [index for index, value in enumerate(labels) if value == label]
-            for fold in range(5):
-                candidates = [index for index in members if folds[index] == fold]
-                if candidates:
-                    selected.append(candidates[0])
-        selected.sort()
-    else:
-        selected = list(range(len(dataset)))
-    for index in selected:
+    for index in range(len(dataset)):
         data = dataset[index]
         num_nodes, edges = _pyg_edges(data)
         fold = folds[index]
@@ -15582,7 +14468,7 @@ def _prepare_csl_records(data_root: Path, *, seed: int, tiny: bool) -> tuple[Gra
     return tuple(records)
 
 
-def _prepare_zinc_records(data_root: Path, *, tiny: bool) -> tuple[GraphRecord, ...]:
+def _prepare_zinc_records(data_root: Path) -> tuple[GraphRecord, ...]:
     _, ZINC = _require_pyg("zinc")
     raw_root = data_root / "pyg" / "ZINC"
     records: list[GraphRecord] = []
@@ -15594,9 +14480,8 @@ def _prepare_zinc_records(data_root: Path, *, tiny: bool) -> tuple[GraphRecord, 
                 f"failed to prepare ZINC-12K split {split!r} under {raw_root}. Check network "
                 f"access, write permission, and the PyG dataset download; original error: {error}"
             ) from error
-        limit = min(len(dataset), 32 if split == "train" else 12) if tiny else len(dataset)
         normalized_split = "validation" if split == "val" else split
-        for index in range(limit):
+        for index in range(len(dataset)):
             data = dataset[index]
             records.append(
                 zinc_record_from_pyg(
@@ -15613,7 +14498,6 @@ def prepare_optional_pyg_dataset(
     data_root: Path,
     *,
     seed: int,
-    tiny: bool,
     allow_download: bool = False,
 ) -> PreparedDataset:
     """Prepare CSL or ZINC through optional PyG adapters with verified caches."""
@@ -15622,14 +14506,11 @@ def prepare_optional_pyg_dataset(
     if normalized not in {"csl", "zinc"}:
         raise ValueError("optional PyG suite must be csl or zinc")
     cache_dir = data_root.expanduser().resolve() / f"{normalized}_pyg_v2"
-    variant = "tiny" if tiny else "full"
-    stem = f"seed-{seed}-{variant}"
+    stem = f"seed-{seed}-full"
     data_path = cache_dir / f"{stem}.json"
     manifest_path = cache_dir / f"{stem}.manifest.json"
     if data_path.exists() or manifest_path.exists():
-        return _load_cached_dataset(
-            suite=normalized, data_path=data_path, manifest_path=manifest_path
-        )
+        return validate_prepared_cache(normalized, data_root, seed=seed)
     if not allow_download:
         raise OptionalDatasetError(
             f"suite {normalized!r} has no verified processed cache under {cache_dir}. "
@@ -15637,15 +14518,16 @@ def prepare_optional_pyg_dataset(
             "public dataset endpoint, or copy a complete cache plus manifest here."
         )
     if normalized == "csl":
-        records = _prepare_csl_records(data_root.expanduser().resolve(), seed=seed, tiny=tiny)
+        records = _prepare_csl_records(data_root.expanduser().resolve(), seed=seed)
         target_names = tuple(f"class_{index}" for index in range(10))
         task_type = "classification"
         source = "PyG:GNNBenchmarkDataset/CSL"
     else:
-        records = _prepare_zinc_records(data_root.expanduser().resolve(), tiny=tiny)
+        records = _prepare_zinc_records(data_root.expanduser().resolve())
         target_names = ("constrained_logP",)
         task_type = "regression"
         source = "PyG:ZINC(subset=True)"
+    _validate_protocol_records(normalized, records)
     return _cache_records(
         suite=normalized,
         records=records,
@@ -15655,7 +14537,6 @@ def prepare_optional_pyg_dataset(
         task_type=task_type,
         source=source,
         seed=seed,
-        tiny=tiny,
     )
 
 
@@ -15664,17 +14545,15 @@ def validate_prepared_cache(
     data_root: Path,
     *,
     seed: int,
-    tiny: bool,
 ) -> PreparedDataset:
     """Validate one requested processed cache without generating or downloading data."""
 
     normalized = suite.lower()
     if normalized not in {"core", "csl", "zinc"}:
         raise ValueError("suite must be core, csl, or zinc")
-    variant = "tiny" if tiny else "full"
     cache_name = "cyclecount_ood_v2" if normalized == "core" else f"{normalized}_pyg_v2"
     cache_dir = data_root.expanduser().resolve() / cache_name
-    stem = f"seed-{seed}-{variant}"
+    stem = f"seed-{seed}-full"
     data_path = cache_dir / f"{stem}.json"
     manifest_path = cache_dir / f"{stem}.manifest.json"
     present = (data_path.is_file(), manifest_path.is_file())
@@ -15691,7 +14570,13 @@ def validate_prepared_cache(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
         raise CacheCorruptError(f"invalid tree {normalized} processed cache") from error
-    if manifest.get("seed") != int(seed) or manifest.get("tiny") is not bool(tiny):
+    # Existing full v2 caches used tiny=false. Accept those without rewriting
+    # their records or fingerprints, but never accept a reduced legacy cache.
+    if (
+        manifest.get("seed") != int(seed)
+        or manifest.get("tiny", False) is not False
+        or manifest.get("profile", "full") != "full"
+    ):
         raise CacheWrongRequestError(f"tree {normalized} cache seed/profile mismatch")
     expected_source = {
         "core": "generated://tree_augmentation/cyclecount_ood_v2",
@@ -15700,31 +14585,28 @@ def validate_prepared_cache(
     }[normalized]
     if manifest.get("source") != expected_source:
         raise CacheWrongRequestError(f"tree {normalized} cache source mismatch")
+    _validate_protocol_records(normalized, prepared.records)
+    return prepared
+
+
+def _validate_protocol_records(suite: str, records: Sequence[GraphRecord]) -> None:
+    """Reject incomplete public splits and reduced caches before paper training."""
+
     expected_counts = {
-        "core": (
-            {"train": 8, "validation": 3, "id_test": 4, "ood_test": 4}
-            if tiny
-            else {"train": 128, "validation": 24, "id_test": 40, "ood_test": 40}
-        ),
-        "csl": (
-            {"train": 30, "validation": 10, "test": 10}
-            if tiny
-            else {"train": 90, "validation": 30, "test": 30}
-        ),
-        "zinc": (
-            {"train": 32, "validation": 12, "test": 12}
-            if tiny
-            else {"train": 10_000, "validation": 1_000, "test": 1_000}
-        ),
-    }[normalized]
-    actual_counts = {name: len(ids) for name, ids in manifest["split_graph_ids"].items()}
+        "core": {"train": 128, "validation": 24, "id_test": 40, "ood_test": 40},
+        "csl": {"train": 90, "validation": 30, "test": 30},
+        "zinc": {"train": 10_000, "validation": 1_000, "test": 1_000},
+    }[suite]
+    actual_counts: dict[str, int] = {}
+    for record in records:
+        actual_counts[record.split] = actual_counts.get(record.split, 0) + 1
     if actual_counts != expected_counts:
-        raise CacheCorruptError(f"tree {normalized} split cardinalities are invalid")
-    expected_target_width = 4 if normalized == "core" else 1
-    for record in prepared.records:
+        raise CacheCorruptError(f"tree {suite} split cardinalities are invalid")
+    expected_target_width = 4 if suite == "core" else 1
+    for record in records:
         if len(record.target) != expected_target_width or not np.all(np.isfinite(record.target)):
-            raise CacheCorruptError(f"tree {normalized} target shape or value is invalid")
-        if normalized == "zinc":
+            raise CacheCorruptError(f"tree {suite} target shape or value is invalid")
+        if suite == "zinc":
             if record.x is None or len(record.x) != record.num_nodes:
                 raise CacheCorruptError("tree ZINC atom features are missing or misaligned")
             if record.edge_attr is None or len(record.edge_attr) != len(record.edges):
@@ -15733,7 +14615,6 @@ def validate_prepared_cache(
                 raise CacheCorruptError("tree ZINC atom category is outside the supported range")
             if any(not 0 <= int(value) < ZINC_NUM_BOND_TYPES for value in record.edge_attr):
                 raise CacheCorruptError("tree ZINC bond category is outside the supported range")
-    return prepared
 
 
 __all__ = [
@@ -16449,129 +15330,6 @@ __all__ = [
 ]
 ````
 
-# research/tree_augmentation/run.py
-
-````python
-"""Run the standalone spanning-tree augmentation experiment."""
-
-from __future__ import annotations
-
-import argparse
-import json
-from pathlib import Path
-from typing import Any
-
-import numpy as np
-import yaml
-
-from chartgat.graphs import make_connected_graph
-from research.tree_augmentation.augmentation import (
-    ensure_full_cycle_budget,
-    find_unseen_chart,
-    lossless_transition_error,
-    run_static_cycle_pe_probe,
-    sample_tree_charts,
-    transition_cocycle_error,
-)
-
-
-def _load_config(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as stream:
-        config = yaml.safe_load(stream)
-    if not isinstance(config, dict):
-        raise ValueError("configuration root must be a mapping")
-    return config
-
-
-def run(config: dict[str, Any]) -> dict[str, Any]:
-    """Execute chart certification and the fixed/multi/unseen static probe."""
-
-    graph_config = config["graph"]
-    augmentation_config = config["augmentation"]
-    probe_config = config["probe"]
-    seed = int(config.get("seed", 0))
-
-    if augmentation_config.get("lossy_extension_enabled", False):
-        raise NotImplementedError("the k < beta lossy extension is intentionally disabled")
-
-    num_nodes = int(graph_config["num_nodes"])
-    edges = make_connected_graph(
-        num_nodes,
-        int(graph_config["extra_edges"]),
-        seed=int(graph_config["seed"]),
-    )
-    charts = sample_tree_charts(
-        num_nodes,
-        edges,
-        include_bfs=bool(augmentation_config.get("include_bfs", True)),
-        include_dfs=bool(augmentation_config.get("include_dfs", True)),
-        random_count=int(augmentation_config.get("random_count", 0)),
-        random_seed_start=int(augmentation_config.get("random_seed_start", 0)),
-    )
-    beta = charts[0].beta
-    ensure_full_cycle_budget(beta, augmentation_config.get("k"))
-    unseen = find_unseen_chart(
-        num_nodes,
-        edges,
-        charts,
-        seed_start=int(augmentation_config.get("unseen_seed_start", 10_000)),
-    )
-
-    rng = np.random.default_rng(seed)
-    coordinates = rng.normal(size=beta)
-    certification_charts = [*charts, unseen]
-    certification = {
-        "num_nodes": num_nodes,
-        "num_edges": len(edges),
-        "cycle_rank_beta": beta,
-        "full_beta_enabled": True,
-        "lossy_k_lt_beta_enabled": False,
-        "unique_training_trees": len(charts),
-        "lossless_transition_error": lossless_transition_error(certification_charts, coordinates),
-        "transition_cocycle_error": transition_cocycle_error(certification_charts),
-    }
-    probe = run_static_cycle_pe_probe(
-        charts,
-        unseen,
-        hidden_dim=int(probe_config.get("hidden_dim", 48)),
-        epochs=int(probe_config.get("epochs", 800)),
-        learning_rate=float(probe_config.get("learning_rate", 0.01)),
-        weight_decay=float(probe_config.get("weight_decay", 1e-5)),
-        seed=seed,
-    )
-    return {
-        "track": "static_cycle_pe_tree_augmentation",
-        "certification": certification,
-        "probe": probe,
-    }
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    default_config = Path(__file__).with_name("config.yaml")
-    parser.add_argument("--config", type=Path, default=default_config)
-    parser.add_argument("--output", type=Path, default=None)
-    args = parser.parse_args()
-
-    config_path = args.config.expanduser().resolve()
-    config = _load_config(config_path)
-    result = run(config)
-    if args.output is not None:
-        output = args.output.expanduser()
-    else:
-        output = Path(config.get("output", "results/summary.json")).expanduser()
-        if not output.is_absolute():
-            output = config_path.parent / output
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    print(json.dumps(result, indent=2))
-    print(f"wrote {output}")
-
-
-if __name__ == "__main__":
-    main()
-````
-
 # research/tree_augmentation/tests/test_paper.py
 
 ````python
@@ -16591,17 +15349,21 @@ import pytest
 import torch
 
 from chartgat.algebra import fundamental_cycle_basis, incidence_matrix, validate_spanning_tree
+from chartgat.cache import CacheCorruptError, CacheWrongRequestError
 from chartgat.seeds import SeedAxes
 from research.tree_augmentation import paper as tree_paper
 from research.tree_augmentation.paper import main, run_suite
 from research.tree_augmentation.paper_data import (
     GraphRecord,
     OptionalDatasetError,
+    _cache_records,
+    _load_cached_dataset,
     build_paper_chart,
     prepare_cyclecount_dataset,
     prepare_optional_pyg_dataset,
     simple_cycle_counts,
     traversal_tree_indices,
+    validate_prepared_cache,
     wilson_ust_indices,
     zinc_record_from_pyg,
 )
@@ -16811,8 +15573,8 @@ def test_encoder_ignores_same_tree_node_relabeling_with_mapped_chemistry() -> No
 
 
 def test_core_cache_is_deterministic_and_graph_splits_are_disjoint(tmp_path: Path) -> None:
-    first = prepare_cyclecount_dataset(tmp_path, seed=31, tiny=True)
-    second = prepare_cyclecount_dataset(tmp_path, seed=31, tiny=True)
+    first = prepare_cyclecount_dataset(tmp_path, seed=31)
+    second = prepare_cyclecount_dataset(tmp_path, seed=31)
     assert first.data_sha256 == second.data_sha256
     manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
     split_sets = [set(ids) for ids in manifest["split_graph_ids"].values()]
@@ -16820,20 +15582,41 @@ def test_core_cache_is_deterministic_and_graph_splits_are_disjoint(tmp_path: Pat
         for right in split_sets[index + 1 :]:
             assert left.isdisjoint(right)
     assert manifest["graph_split_before_chart_sampling"] is True
+    assert {name: len(ids) for name, ids in manifest["split_graph_ids"].items()} == {
+        "train": 128,
+        "validation": 24,
+        "id_test": 40,
+        "ood_test": 40,
+    }
+    assert manifest["profile"] == "full"
+    assert "tiny" not in manifest
+
+    # Old full-cache manifests remain valid without rewriting the cached data.
+    manifest.pop("profile")
+    manifest["tiny"] = False
+    first.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert validate_prepared_cache("core", tmp_path, seed=31).data_sha256 == first.data_sha256
+    manifest["tiny"] = True
+    first.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(CacheWrongRequestError, match="seed/profile mismatch"):
+        prepare_cyclecount_dataset(tmp_path, seed=31)
 
 
 def test_optional_pyg_adapter_has_actionable_dependency_error(tmp_path: Path) -> None:
     if importlib.util.find_spec("torch_geometric") is not None:
         pytest.skip("PyG is installed; download behavior is environment-specific")
     with pytest.raises(OptionalDatasetError, match="torch-geometric"):
-        prepare_optional_pyg_dataset("csl", tmp_path, seed=1, tiny=True, allow_download=True)
+        prepare_optional_pyg_dataset("csl", tmp_path, seed=1, allow_download=True)
 
 
+@pytest.mark.parametrize("suite", ["csl", "zinc"])
 def test_optional_pyg_adapter_requires_explicit_download_permission(
     tmp_path: Path,
+    suite: str,
 ) -> None:
     with pytest.raises(OptionalDatasetError, match="--allow-download"):
-        prepare_optional_pyg_dataset("zinc", tmp_path, seed=1, tiny=True)
+        prepare_optional_pyg_dataset(suite, tmp_path, seed=1)
+    assert not list(tmp_path.rglob("*.json"))
 
 
 def test_dataset_seed_axes_route_to_their_declared_protocols(
@@ -16842,7 +15625,7 @@ def test_dataset_seed_axes_route_to_their_declared_protocols(
     calls: list[tuple[str, int]] = []
     sentinel = object()
 
-    def prepare_core(data_root: Path, *, seed: int, tiny: bool) -> object:
+    def prepare_core(data_root: Path, *, seed: int) -> object:
         calls.append(("core", seed))
         return sentinel
 
@@ -16851,7 +15634,6 @@ def test_dataset_seed_axes_route_to_their_declared_protocols(
         data_root: Path,
         *,
         seed: int,
-        tiny: bool,
         allow_download: bool,
     ) -> object:
         calls.append((suite, seed))
@@ -16866,7 +15648,6 @@ def test_dataset_seed_axes_route_to_their_declared_protocols(
                 suite,
                 tmp_path,
                 seed_axes=axes,
-                tiny=True,
                 allow_download=False,
             )
             is sentinel
@@ -16900,7 +15681,7 @@ def _pyg_like_zinc_fixture() -> SimpleNamespace:
 
 
 def test_zinc_pyg_fixture_chemistry_is_lossless_and_cache_roundtrips(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
 ) -> None:
     record = zinc_record_from_pyg(
         _pyg_like_zinc_fixture(), graph_id="zinc-test-00000", split="test"
@@ -16909,14 +15690,20 @@ def test_zinc_pyg_fixture_chemistry_is_lossless_and_cache_roundtrips(
     assert record.edges == ((0, 1), (0, 2), (1, 2), (1, 3), (2, 3))
     assert record.edge_attr == (0, 1, 1, 2, 3)
 
-    monkeypatch.setattr(
-        "research.tree_augmentation.paper_data._prepare_zinc_records",
-        lambda data_root, *, tiny: (record,),
+    # Exercise serialization directly; the public loader must reject a one-record dataset.
+    prepared = _cache_records(
+        suite="zinc",
+        records=(record,),
+        data_path=tmp_path / "unit-record.json",
+        manifest_path=tmp_path / "unit-record.manifest.json",
+        target_names=("constrained_logP",),
+        task_type="regression",
+        source="unit-test-only",
+        seed=9,
     )
-    prepared = prepare_optional_pyg_dataset(
-        "zinc", tmp_path, seed=9, tiny=True, allow_download=True
+    loaded = _load_cached_dataset(
+        suite="zinc", data_path=prepared.data_path, manifest_path=prepared.manifest_path
     )
-    loaded = prepare_optional_pyg_dataset("zinc", tmp_path, seed=9, tiny=True, allow_download=False)
     assert loaded.records == prepared.records == (record,)
     payload = json.loads(prepared.data_path.read_text(encoding="utf-8"))
     manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
@@ -16924,6 +15711,69 @@ def test_zinc_pyg_fixture_chemistry_is_lossless_and_cache_roundtrips(
     assert payload["records"][0]["x"] == [3, 7, 2, 11]
     assert payload["records"][0]["edge_attr"] == [0, 1, 1, 2, 3]
     assert "canonical undirected edge" in manifest["categorical_feature_schema"]["edge_attr"]
+
+
+def test_public_loader_rejects_reduced_records_without_creating_paper_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = zinc_record_from_pyg(_pyg_like_zinc_fixture(), graph_id="unit-zinc", split="train")
+    monkeypatch.setattr(
+        "research.tree_augmentation.paper_data._prepare_zinc_records", lambda _root: (record,)
+    )
+    with pytest.raises(CacheCorruptError, match="split cardinalities"):
+        prepare_optional_pyg_dataset("zinc", tmp_path, seed=9, allow_download=True)
+    assert not list(tmp_path.rglob("*.json"))
+
+
+@pytest.mark.parametrize("suite", ["csl", "zinc"])
+def test_public_loader_rejects_reduced_cache_even_with_valid_checksum(
+    tmp_path: Path, suite: str
+) -> None:
+    record = zinc_record_from_pyg(_pyg_like_zinc_fixture(), graph_id="unit-record", split="train")
+    source = "PyG:ZINC(subset=True)"
+    if suite == "csl":
+        record = replace(record, family="CSL", task_type="classification", target=(0.0,))
+        source = "PyG:GNNBenchmarkDataset/CSL"
+    cache = tmp_path / f"{suite}_pyg_v2"
+    _cache_records(
+        suite=suite,
+        records=(record,),
+        data_path=cache / "seed-9-full.json",
+        manifest_path=cache / "seed-9-full.manifest.json",
+        target_names=("unit-target",),
+        task_type=record.task_type,
+        source=source,
+        seed=9,
+    )
+    with pytest.raises(CacheCorruptError, match="split cardinalities"):
+        prepare_optional_pyg_dataset(suite, tmp_path, seed=9)
+
+
+@pytest.mark.parametrize("suite", ["csl", "zinc"])
+def test_public_download_failure_does_not_generate_substitute_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suite: str
+) -> None:
+    def unavailable(*_args: object, **_kwargs: object) -> None:
+        raise OptionalDatasetError("public download unavailable")
+
+    monkeypatch.setattr(
+        f"research.tree_augmentation.paper_data._prepare_{suite}_records", unavailable
+    )
+    with pytest.raises(OptionalDatasetError, match="public download unavailable"):
+        prepare_optional_pyg_dataset(suite, tmp_path, seed=9, allow_download=True)
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_cli_rejects_tiny_and_keeps_full_reference_settings() -> None:
+    with pytest.raises(SystemExit) as caught:
+        tree_paper._parser().parse_args(["--tiny"])
+    assert caught.value.code == 2
+    settings, _ = tree_paper._load_settings()
+    assert settings["hidden_dim"] == 64
+    assert settings["optimizer_updates"] == 800
+    assert settings["batch_size"] == 16
+    assert settings["train_charts_per_graph"] == settings["eval_charts_per_graph"] == 8
+    assert "tiny" not in settings
 
 
 def test_chemistry_is_chart_invariant_and_changes_model_input_and_prediction() -> None:
@@ -16977,14 +15827,43 @@ def test_chemistry_is_chart_invariant_and_changes_model_input_and_prediction() -
     assert not torch.allclose(prediction[0], prediction[1])
 
 
-def test_tiny_cpu_core_cli_path_writes_2x2_results(tmp_path: Path) -> None:
+def test_core_orchestration_with_unit_test_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    records = tuple(
+        GraphRecord(
+            f"unit-{split}-{index}",
+            "unit-test-only",
+            split,
+            4,
+            ((0, 1), (0, 3), (1, 2), (2, 3)),
+            (0.0, 1.0, 0.0, 0.0),
+        )
+        for split in ("train", "validation", "id_test", "ood_test")
+        for index in range(2)
+    )
+    dataset = _cache_records(
+        suite="core",
+        records=records,
+        data_path=tmp_path / "unit-records.json",
+        manifest_path=tmp_path / "unit-records.manifest.json",
+        target_names=("cycles_len_3", "cycles_len_4", "cycles_len_5", "cycles_len_6"),
+        task_type="regression",
+        source="unit-test-only",
+        seed=43,
+    )
+    settings, config_path = tree_paper._load_settings()
+    settings.update(
+        hidden_dim=8, optimizer_updates=2, train_charts_per_graph=3, eval_charts_per_graph=2
+    )
+    monkeypatch.setattr(tree_paper, "_load_settings", lambda: (settings, config_path))
+    monkeypatch.setattr(tree_paper, "_prepare_dataset", lambda *_args, **_kwargs: dataset)
     summary = run_suite(
         "core",
         data_root=tmp_path / "data",
         output_dir=tmp_path / "results",
         requested_device="cpu",
         seed=43,
-        tiny=True,
         prepare_only=False,
         amp_override=False,
         batch_size_override=4,
@@ -16997,7 +15876,7 @@ def test_tiny_cpu_core_cli_path_writes_2x2_results(tmp_path: Path) -> None:
     assert summary["seed_axes"] == {"data": 43, "split": 43, "chart": 43, "model": 43}
     assert "seed" not in summary
     assert summary["protocol"] == "cyclecount_graph_x_fresh_chart_family_2x2_v2"
-    assert summary["comparison"]["paper_headline_eligible"] is False
+    assert "tiny" not in summary
     assert summary["comparison"]["projector_target_used"] is False
     expected = {
         "id_graph_fresh_chart_seen_family",
@@ -17053,7 +15932,6 @@ def test_tiny_cpu_core_cli_path_writes_2x2_results(tmp_path: Path) -> None:
         split_seed=43,
         chart_seed=43,
         model_seed=43,
-        tiny=True,
         prepare_only=False,
         amp_override=False,
         batch_size_override=4,
@@ -17090,7 +15968,6 @@ def test_prepare_only_all_attempts_every_suite_without_download(
             "11",
             "--model-seed",
             "13",
-            "--tiny",
             "--prepare-only",
             "--workers",
             "0",
@@ -17127,7 +16004,6 @@ from research.tree_augmentation.augmentation import (
     ensure_full_cycle_budget,
     find_unseen_chart,
     lossless_transition_error,
-    run_static_cycle_pe_probe,
     sample_tree_charts,
     transition_cocycle_error,
     transport_coordinates,
@@ -17198,7 +16074,7 @@ def test_lossy_cycle_budget_is_explicitly_disabled() -> None:
         ensure_full_cycle_budget(6, 5)
 
 
-def test_static_probe_reports_fixed_multi_and_unseen_evaluation(
+def test_unseen_chart_is_disjoint_and_preserves_physical_cycle_space(
     graph: tuple[int, list[tuple[int, int]]],
 ) -> None:
     num_nodes, edges = graph
@@ -17209,27 +16085,13 @@ def test_static_probe_reports_fixed_multi_and_unseen_evaluation(
         random_seed_start=120,
     )
     unseen = find_unseen_chart(num_nodes, edges, training, seed_start=900)
-    result = run_static_cycle_pe_probe(
-        training,
-        unseen,
-        hidden_dim=16,
-        epochs=12,
-        learning_rate=0.01,
-        seed=3,
+    assert tuple(unseen.tree_edge_indices) not in {
+        tuple(chart.tree_edge_indices) for chart in training
+    }
+    assert unseen.beta == len(edges) - num_nodes + 1
+    np.testing.assert_allclose(
+        cycle_projector(unseen.basis), cycle_projector(training[0].basis), atol=1e-10
     )
-
-    assert result["num_training_charts"] == len(training)
-    assert result["cycle_rank_beta"] == len(edges) - num_nodes + 1
-    for key in (
-        "fixed_train_mse",
-        "multi_train_mse",
-        "fixed_unseen_mse",
-        "multi_unseen_mse",
-        "projector_oracle_unseen_mse",
-    ):
-        assert np.isfinite(result[key])
-        assert result[key] >= 0.0
-    assert result["projector_oracle_unseen_mse"] < 1e-20
 ````
 
 # scripts/aggregate_paper.py
@@ -17996,7 +16858,7 @@ REQUIRED_ENTRY_FIELDS = {
     "adapter",
     "leakage_guard",
 }
-ALLOWED_TIERS = {"smoke", "paper_core", "conditional", "optional"}
+ALLOWED_TIERS = {"paper_core", "conditional", "optional"}
 # ``status`` is code readiness. Dataset optionality belongs in ``tier``.
 ALLOWED_STATUSES = {"implemented", "planned", "blocked"}
 ALLOWED_DATA_POLICIES = {"generated", "download", "manual", "none"}
@@ -18164,9 +17026,6 @@ def validate_registry(track: str, registry: dict[str, Any]) -> list[str]:
                     if not callable(resolved):
                         errors.append(f"{label}: cache validator must be callable")
 
-    smoke = [entry for entry in datasets if entry.get("tier") == "smoke"]
-    if not smoke or any(entry.get("status") != "implemented" for entry in smoke):
-        errors.append(f"{track}: every smoke entry must be implemented")
     paper_core = [entry for entry in datasets if entry.get("tier") == "paper_core"]
     if not paper_core:
         errors.append(f"{track}: at least one paper_core dataset is required")
@@ -18187,7 +17046,6 @@ def _validate_cache(
     seeds: tuple[int, ...] | None = None,
     data_seeds: tuple[int, ...] | None = None,
     split_seeds: tuple[int, ...] | None = None,
-    tiny: bool,
 ) -> dict[str, Any]:
     resolved_data_seeds = data_seeds if data_seeds is not None else seeds or (0,)
     resolved_split_seeds = split_seeds if split_seeds is not None else resolved_data_seeds
@@ -18208,7 +17066,6 @@ def _validate_cache(
             data_root,
             data_seeds=resolved_data_seeds,
             split_seeds=resolved_split_seeds,
-            tiny=tiny,
         )
     except FileNotFoundError as error:
         return {"cache_status": "missing", "cache_detail": str(error)}
@@ -18240,9 +17097,10 @@ def readiness(
     data_root: Path | None = None,
     data_seeds: tuple[int, ...] = (0,),
     split_seeds: tuple[int, ...] | None = None,
-    tiny: bool = False,
 ) -> list[dict[str, Any]]:
-    tier = "smoke" if profile == "smoke" else "paper_core"
+    if profile != "paper":
+        raise ValueError("only the full paper dataset profile is supported")
+    tier = "paper_core"
     rows: list[dict[str, Any]] = []
     validation_cache: dict[tuple[str, str], dict[str, Any]] = {}
     for track, registry in registries.items():
@@ -18259,7 +17117,6 @@ def readiness(
                         data_root,
                         data_seeds=data_seeds,
                         split_seeds=split_seeds,
-                        tiny=tiny,
                     )
                     validation_cache[validation_key] = cache_result
                 rows.append(
@@ -18288,7 +17145,7 @@ def _parse_seeds(parser: argparse.ArgumentParser, value: str, option: str) -> tu
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", choices=("smoke", "paper"), default="smoke")
+    parser.add_argument("--profile", choices=("paper",), default="paper")
     parser.add_argument("--data-root", type=Path)
     parser.add_argument(
         "--data-seeds",
@@ -18300,11 +17157,6 @@ def main() -> int:
     parser.add_argument(
         "--split-seeds",
         help="comma-separated split/cache seeds; defaults to --data-seeds",
-    )
-    parser.add_argument(
-        "--tiny",
-        action="store_true",
-        help="validate tiny/fixture caches instead of full paper caches",
     )
     parser.add_argument(
         "--require-cache",
@@ -18335,7 +17187,6 @@ def main() -> int:
         data_root=data_root,
         data_seeds=data_seeds,
         split_seeds=split_seeds,
-        tiny=bool(args.tiny),
     )
     code_ready = not errors and all(row["code_ready"] for row in rows)
     cache_ready: bool | None = None
@@ -18355,7 +17206,6 @@ def main() -> int:
             "data": list(data_seeds),
             "split": list(split_seeds),
         },
-        "tiny": bool(args.tiny),
         "paper_benchmark_suite_complete": not errors
         and all(registry["paper_suite_complete"] for registry in registries.values()),
         "rows": rows,
@@ -18556,34 +17406,27 @@ if __name__ == "__main__":
 
 ````python
 #!/usr/bin/env python3
-"""Fail-fast CUDA and paper-dependency validation for a Linux experiment host."""
+"""Check CUDA hardware and package imports without creating data or training a model."""
 
 from __future__ import annotations
 
 import argparse
-import gc
 import importlib
 import importlib.metadata
-import importlib.util
 import json
 import math
-import os
 import platform
-import shutil
-import subprocess
-import time
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+import sys
 from pathlib import Path
 from typing import Any
 
 import torch
-from torch import Tensor
-from torch.nn import functional as nnf
+
+from chartgat.cache import atomic_write_json
 
 
 class PreflightError(RuntimeError):
-    """A server cannot safely run the requested experiment profile."""
+    """The requested GPU or dependency environment is unavailable."""
 
 
 PAPER_IMPORTS = {
@@ -18597,1027 +17440,126 @@ PAPER_IMPORTS = {
     "PyYAML": "yaml",
 }
 
-PROFILE_NAMES = (
-    "conductance",
-    "cycle-projector",
-    "tree-chart",
-    "brec",
-    "public-pyg",
-)
-CYCLE_VARIANTS = ("no_pe", "raw", "set", "projector")
-BREC_PROTOCOLS = ("official", "custom")
-
-
-@dataclass(frozen=True)
-class ProfileConfig:
-    """Synthetic envelope used to exercise one production training path."""
-
-    batch_size: int = 32
-    brec_batch_size: int = 16
-    nodes_per_graph: int = 64
-    edges_per_graph: int = 128
-    cycle_rank: int = 64
-    amp: bool = True
-    cycle_variants: tuple[str, ...] = ("projector",)
-    brec_protocol: str = "official"
-    brec_amp: bool = False
-
-    def validate(self) -> None:
-        values = {
-            "batch_size": self.batch_size,
-            "brec_batch_size": self.brec_batch_size,
-            "nodes_per_graph": self.nodes_per_graph,
-            "edges_per_graph": self.edges_per_graph,
-            "cycle_rank": self.cycle_rank,
-        }
-        invalid = [name for name, value in values.items() if value < 1]
-        if invalid:
-            raise PreflightError("profile dimensions must be positive: " + ", ".join(invalid))
-        if self.nodes_per_graph < 2:
-            raise PreflightError("--nodes-per-graph must be at least 2")
-        if self.cycle_rank > self.edges_per_graph:
-            raise PreflightError("--cycle-rank cannot exceed --edges-per-graph")
-        if not self.cycle_variants or len(set(self.cycle_variants)) != len(self.cycle_variants):
-            raise PreflightError("--cycle-variants must be non-empty and unique")
-        unknown_variants = sorted(set(self.cycle_variants) - set(CYCLE_VARIANTS))
-        if unknown_variants:
-            raise PreflightError(f"unknown cycle variants: {unknown_variants}")
-        if self.brec_protocol not in BREC_PROTOCOLS:
-            raise PreflightError(f"--brec-protocol must be one of {BREC_PROTOCOLS}")
-        if self.brec_protocol == "official":
-            if self.brec_batch_size != 16:
-                raise PreflightError("official BREC profile requires --brec-batch-size 16")
-            if self.brec_amp:
-                raise PreflightError("official BREC profile requires --no-brec-amp")
-
-
-def _package_versions() -> dict[str, str | None]:
-    versions: dict[str, str | None] = {"torch": torch.__version__}
-    for distribution in PAPER_IMPORTS:
-        try:
-            versions[distribution] = importlib.metadata.version(distribution)
-        except importlib.metadata.PackageNotFoundError:
-            versions[distribution] = None
-    return versions
-
-
-def _missing_paper_dependencies() -> list[str]:
-    return sorted(
-        distribution
-        for distribution, module in PAPER_IMPORTS.items()
-        if importlib.util.find_spec(module) is None
-    )
-
 
 def _paper_dependency_import_errors() -> dict[str, str]:
-    """Import paper packages so an ABI-broken environment fails before training."""
-
-    errors: dict[str, str] = {}
+    errors = {}
     for distribution, module in PAPER_IMPORTS.items():
-        if importlib.util.find_spec(module) is None:
-            errors[distribution] = "module not installed"
-            continue
         try:
             importlib.import_module(module)
-        except Exception as error:  # dependency imports can raise ABI/runtime errors
+        except Exception as error:
             errors[distribution] = f"{type(error).__name__}: {error}"
     return errors
 
 
-def _nvidia_smi() -> dict[str, Any]:
-    executable = shutil.which("nvidia-smi")
-    if executable is None:
-        return {"available": False, "rows": [], "error": "nvidia-smi not found"}
-    completed = subprocess.run(
-        [
-            executable,
-            "--query-gpu=index,name,driver_version,memory.total,memory.free",
-            "--format=csv,noheader,nounits",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    rows = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
-    return {
-        "available": completed.returncode == 0,
-        "rows": rows,
-        "error": completed.stderr.strip() or None,
-    }
-
-
-def _resolve_device(requested: str, *, allow_cpu: bool) -> torch.device:
-    normalized = requested.strip().lower()
-    if normalized == "auto":
-        normalized = "cuda" if torch.cuda.is_available() else "cpu"
-    device = torch.device(normalized)
-    if device.type == "cpu":
-        if not allow_cpu:
-            raise PreflightError(
-                "paper execution requires CUDA; pass --allow-cpu only for tiny local tests"
-            )
-        return device
+def _resolve_device(requested: str) -> torch.device:
+    try:
+        device = torch.device(requested.strip().lower())
+    except (RuntimeError, ValueError) as error:
+        raise PreflightError(f"invalid device: {requested!r}") from error
     if device.type != "cuda":
-        raise PreflightError(f"unsupported accelerator request: {requested!r}")
-    if not torch.cuda.is_available():
+        raise PreflightError("paper execution requires CUDA; no CPU fallback is available")
+    try:
+        available = torch.cuda.is_available()
+        index = torch.cuda.current_device() if available and device.index is None else device.index
+        visible_count = torch.cuda.device_count() if available else 0
+    except (RuntimeError, AssertionError) as error:
+        raise PreflightError(f"CUDA initialization failed: {error}") from error
+    if not available:
         raise PreflightError(
-            "torch.cuda.is_available() is false; install a CUDA PyTorch wheel and expose the GPU"
+            "CUDA is unavailable; activate the CUDA environment and expose an NVIDIA GPU"
         )
-    index = torch.cuda.current_device() if device.index is None else device.index
-    if index < 0 or index >= torch.cuda.device_count():
-        visible_count = torch.cuda.device_count()
+    assert index is not None
+    if index < 0 or index >= visible_count:
         raise PreflightError(
-            f"CUDA device index {index} is invalid; visible device count is {visible_count}"
+            f"CUDA device index {index} is invalid; visible count is {visible_count}"
         )
     return torch.device("cuda", index)
-
-
-def _effective_profile_config(config: ProfileConfig, device: torch.device) -> ProfileConfig:
-    """Keep the CPU path a code smoke while preserving exact requested CUDA sizes."""
-
-    if device.type == "cuda":
-        return config
-    edges = min(config.edges_per_graph, 24)
-    return ProfileConfig(
-        batch_size=min(config.batch_size, 2),
-        brec_batch_size=(
-            4 if config.brec_protocol == "official" else min(config.brec_batch_size, 4)
-        ),
-        nodes_per_graph=min(config.nodes_per_graph, 12),
-        edges_per_graph=edges,
-        cycle_rank=min(config.cycle_rank, edges, 6),
-        amp=config.amp,
-        cycle_variants=config.cycle_variants,
-        brec_protocol=config.brec_protocol,
-        brec_amp=config.brec_amp,
-    )
-
-
-def _base_edges(num_nodes: int, num_edges: int) -> Tensor:
-    columns = torch.arange(num_edges, dtype=torch.long)
-    tail = columns.remainder(num_nodes)
-    hop = 1 + torch.div(columns, num_nodes, rounding_mode="floor").remainder(num_nodes - 1)
-    head = (tail + hop).remainder(num_nodes)
-    return torch.stack((tail, head))
-
-
-def _packed_edges(batch_size: int, num_nodes: int, num_edges: int) -> Tensor:
-    base = _base_edges(num_nodes, num_edges)
-    offsets = torch.arange(batch_size, dtype=torch.long) * num_nodes
-    return (base.unsqueeze(0) + offsets[:, None, None]).permute(1, 0, 2).reshape(2, -1)
-
-
-def _tensor_bytes(value: Any, seen: set[int] | None = None) -> int:
-    """Count the logical tensor payload requested by a synthetic host-side batch."""
-
-    visited = set() if seen is None else seen
-    identity = id(value)
-    if identity in visited:
-        return 0
-    visited.add(identity)
-    if isinstance(value, Tensor):
-        return value.numel() * value.element_size()
-    if isinstance(value, dict):
-        return sum(_tensor_bytes(item, visited) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return sum(_tensor_bytes(item, visited) for item in value)
-    if hasattr(value, "__dict__"):
-        return _tensor_bytes(vars(value), visited)
-    return 0
-
-
-def _current_rss_bytes() -> int | None:
-    """Return Linux current RSS without adding a preflight dependency."""
-
-    status = Path("/proc/self/statm")
-    if not status.is_file():
-        return None
-    try:
-        resident_pages = int(status.read_text(encoding="ascii").split()[1])
-        return resident_pages * os.sysconf("SC_PAGE_SIZE")
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def _peak_rss_bytes() -> int | None:
-    try:
-        import resource
-    except ImportError:  # pragma: no cover - Windows developer host
-        return None
-    value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
-    # Linux reports KiB; macOS reports bytes.
-    return value if platform.system() == "Darwin" else value * 1024
-
-
-def _assert_finite(name: str, *values: Tensor | None) -> None:
-    if any(value is None or not bool(torch.isfinite(value).all()) for value in values):
-        raise PreflightError(f"{name} produced a missing or non-finite tensor")
-
-
-def _seed_profile(seed: int) -> None:
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def _first_parameter_gradient(module: torch.nn.Module) -> Tensor:
-    gradient = next(
-        (parameter.grad for parameter in module.parameters() if parameter.grad is not None),
-        None,
-    )
-    if gradient is None:
-        raise PreflightError("backward produced no parameter gradient")
-    return gradient
-
-
-ProfileWorkload = Callable[[], tuple[dict[str, Any], Any]]
-
-
-def _measure_profile(
-    name: str,
-    device: torch.device,
-    spec: dict[str, Any],
-    workload: ProfileWorkload,
-) -> dict[str, Any]:
-    """Measure one isolated forward/backward path, including saved-tensor peak."""
-
-    if device.type == "cuda":
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize(device)
-        baseline_allocated = int(torch.cuda.memory_allocated(device))
-        baseline_reserved = int(torch.cuda.memory_reserved(device))
-        torch.cuda.reset_peak_memory_stats(device)
-    else:
-        baseline_allocated = 0
-        baseline_reserved = 0
-    rss_before = _current_rss_bytes()
-    started = time.perf_counter()
-    keepalive: Any = None
-    try:
-        details, keepalive = workload()
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-            allocated = int(torch.cuda.memory_allocated(device))
-            reserved = int(torch.cuda.memory_reserved(device))
-            peak_allocated = int(torch.cuda.max_memory_allocated(device))
-            peak_reserved = int(torch.cuda.max_memory_reserved(device))
-        else:
-            allocated = reserved = peak_allocated = peak_reserved = 0
-    except (torch.OutOfMemoryError, RuntimeError) as error:
-        if isinstance(error, torch.OutOfMemoryError) or "out of memory" in str(error).lower():
-            raise PreflightError(
-                f"profile {name!r} exhausted accelerator memory for envelope {spec}"
-            ) from error
-        raise
-    wall_time = time.perf_counter() - started
-    rss_after = _current_rss_bytes()
-    result = {
-        "status": "passed",
-        "profile": name,
-        "spec": spec,
-        "memory_unit": "bytes",
-        "wall_time_unit": "seconds",
-        "allocated": allocated,
-        "reserved": reserved,
-        "peak_allocated": peak_allocated,
-        "peak_reserved": peak_reserved,
-        "baseline_allocated": baseline_allocated,
-        "baseline_reserved": baseline_reserved,
-        "peak_allocated_above_baseline": max(0, peak_allocated - baseline_allocated),
-        "peak_reserved_above_baseline": max(0, peak_reserved - baseline_reserved),
-        "wall_time": wall_time,
-        "cpu_rss_before": rss_before,
-        "cpu_rss_after": rss_after,
-        "cpu_rss_above_before": (
-            None if rss_before is None or rss_after is None else max(0, rss_after - rss_before)
-        ),
-        "cpu_peak_rss": _peak_rss_bytes(),
-        **details,
-    }
-    del keepalive
-    if device.type == "cuda":
-        gc.collect()
-        torch.cuda.empty_cache()
-    return result
-
-
-def _conductance_profile(device: torch.device, config: ProfileConfig) -> dict[str, Any]:
-    from research.conductance_gat.sparse import (
-        PackedGraphBatch,
-        SparseIncidenceConductanceLayer,
-    )
-
-    batch_size = config.batch_size
-    nodes = config.nodes_per_graph
-    edges = config.edges_per_graph
-    channels = 64 if device.type == "cuda" else 8
-    edge_width = 3
-    use_amp = config.amp and device.type == "cuda"
-    spec = {
-        "batch_size_graphs": batch_size,
-        "nodes_per_graph": nodes,
-        "edges_per_graph": edges,
-        "channels": channels,
-        "edge_feature_channels": edge_width,
-        "amp": use_amp,
-        "production_path": "SparseIncidenceConductanceLayer",
-    }
-
-    def workload() -> tuple[dict[str, Any], Any]:
-        _seed_profile(20260829)
-        generator = torch.Generator(device="cpu").manual_seed(20260829)
-        host_batch = PackedGraphBatch(
-            node_state=torch.randn(batch_size * nodes, channels, generator=generator),
-            edge_index=_packed_edges(batch_size, nodes, edges),
-            edge_features=torch.randn(batch_size * edges, edge_width, generator=generator),
-            node_graph=torch.arange(batch_size).repeat_interleave(nodes),
-            edge_graph=torch.arange(batch_size).repeat_interleave(edges),
-            graph_ids=[f"preflight-{index}" for index in range(batch_size)],
-            requested_step=torch.full((batch_size,), 0.02),
-        )
-        host_bytes = _tensor_bytes(host_batch)
-        batch = host_batch.to(device)
-        batch.node_state.requires_grad_(True)
-        model = SparseIncidenceConductanceLayer(
-            channels=channels,
-            edge_feature_channels=edge_width,
-            hidden_channels=channels,
-            requested_step=0.02,
-            mode="full",
-        ).to(device)
-        with torch.autocast(device_type="cuda", enabled=use_amp):
-            output, diagnostics = model(batch, return_diagnostics=True)
-            loss = output.square().mean()
-        loss.backward()
-        first_gradient = _first_parameter_gradient(model)
-        _assert_finite("conductance profile", output, loss, batch.node_state.grad, first_gradient)
-        return {
-            "loss": float(loss.detach().cpu()),
-            "message_sum_abs": float(
-                diagnostics["node_message"].sum(dim=0).abs().max().detach().cpu()
-            ),
-            "host_input_tensor_bytes": host_bytes,
-        }, (host_batch, batch, model, output, diagnostics, loss)
-
-    return _measure_profile("conductance", device, spec, workload)
-
-
-def _prepared_cycle_graphs(
-    *,
-    required_variants: Sequence[str],
-    batch_size: int,
-    nodes: int,
-    edges: int,
-    cycle_rank: int,
-    generator: torch.Generator,
-) -> list[Any]:
-    from research.cycle_pe.features import cycle_set_statistics
-    from research.cycle_pe.paper_model import PreparedGraph
-
-    raw = torch.randn(edges, cycle_rank, generator=generator)
-    orthogonal, _ = torch.linalg.qr(raw, mode="reduced")
-    cycle_set = (
-        torch.as_tensor(cycle_set_statistics(orthogonal.numpy()), dtype=torch.float32)
-        if "set" in required_variants
-        else None
-    )
-    projector = orthogonal @ orthogonal.T if "projector" in required_variants else None
-    edge_pairs = _base_edges(nodes, edges).T.contiguous()
-    result = []
-    for index in range(batch_size):
-        result.append(
-            PreparedGraph(
-                graph_id=f"preflight-{index}",
-                split="preflight",
-                family="synthetic-envelope",
-                num_nodes=nodes,
-                cycle_rank=cycle_rank,
-                edges=edge_pairs.clone(),
-                node_features=torch.randn(nodes, 5, generator=generator),
-                edge_features=torch.randn(edges, 3, generator=generator),
-                raw_basis=orthogonal.clone(),
-                cycle_set=None if cycle_set is None else cycle_set.clone(),
-                projector=None if projector is None else projector.clone(),
-                edge_targets=None,
-                node_targets=None,
-                graph_targets=torch.zeros(1),
-            )
-        )
-    return result
-
-
-def _cycle_projector_profile(device: torch.device, config: ProfileConfig) -> dict[str, Any]:
-    from research.cycle_pe.paper_model import PaperCycleModel
-
-    batch_size = config.batch_size
-    nodes = config.nodes_per_graph
-    edges = config.edges_per_graph
-    cycle_rank = config.cycle_rank
-    hidden = 64 if device.type == "cuda" else 8
-    pe_dim = 32 if device.type == "cuda" else 8
-    layers = 3 if device.type == "cuda" else 1
-    use_amp = config.amp and device.type == "cuda"
-    variants = config.cycle_variants
-    spec = {
-        "batch_size_graphs": batch_size,
-        "nodes_per_graph": nodes,
-        "edges_per_graph": edges,
-        "cycle_rank": cycle_rank,
-        "selected_variants": list(variants),
-        "projector_shape_per_graph": [edges, edges] if "projector" in variants else None,
-        "hidden_dim": hidden,
-        "pe_dim": pe_dim,
-        "layers": layers,
-        "amp": use_amp,
-        "production_path": "PaperCycleModel(selected variants)",
-    }
-
-    def workload() -> tuple[dict[str, Any], Any]:
-        _seed_profile(20260830)
-        generator = torch.Generator(device="cpu").manual_seed(20260830)
-        host_graphs = _prepared_cycle_graphs(
-            required_variants=variants,
-            batch_size=batch_size,
-            nodes=nodes,
-            edges=edges,
-            cycle_rank=cycle_rank,
-            generator=generator,
-        )
-        variant_losses: dict[str, float] = {}
-        host_bytes = _tensor_bytes(host_graphs)
-        for variant in variants:
-            _seed_profile(20260830)
-            graphs = [graph.to(device) for graph in host_graphs]
-            model = PaperCycleModel(
-                variant=variant,
-                raw_width=cycle_rank,
-                node_input_dim=5,
-                edge_input_dim=3,
-                edge_output_dim=0,
-                node_output_dim=0,
-                graph_output_dim=1,
-                hidden_dim=hidden,
-                pe_dim=pe_dim,
-                layers=layers,
-                embedding_dim=16,
-            ).to(device)
-            with torch.autocast(device_type="cuda", enabled=use_amp):
-                outputs = model(graphs)
-                predictions = torch.cat(
-                    [output.graph for output in outputs if output.graph is not None]
-                )
-                embeddings = torch.stack([output.embedding for output in outputs])
-                loss = predictions.square().mean() + embeddings.square().mean()
-            loss.backward()
-            first_gradient = _first_parameter_gradient(model)
-            _assert_finite(
-                f"cycle profile ({variant})",
-                predictions,
-                embeddings,
-                loss,
-                first_gradient,
-            )
-            variant_losses[variant] = float(loss.detach().cpu())
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            del first_gradient, predictions, embeddings, loss, outputs, model, graphs
-            if device.type == "cuda":
-                gc.collect()
-                torch.cuda.empty_cache()
-        return {
-            "loss": max(variant_losses.values()),
-            "variant_losses": variant_losses,
-            "host_input_tensor_bytes": host_bytes,
-        }, None
-
-    return _measure_profile("cycle-projector", device, spec, workload)
-
-
-def _tree_chart_profile(device: torch.device, config: ProfileConfig) -> dict[str, Any]:
-    from research.tree_augmentation.paper_model import PaddedChartBatch, VariableBetaCycleEncoder
-
-    batch_size = config.batch_size
-    nodes = config.nodes_per_graph
-    edges = config.edges_per_graph
-    cycle_rank = config.cycle_rank
-    hidden = 64 if device.type == "cuda" else 8
-    use_amp = config.amp and device.type == "cuda"
-    spec = {
-        "batch_size_graphs": batch_size,
-        "nodes_per_graph": nodes,
-        "edges_per_graph": edges,
-        "cycle_rank": cycle_rank,
-        "dense_chart_shape": [batch_size, edges, cycle_rank],
-        "hidden_dim": hidden,
-        "amp": use_amp,
-        "production_path": "VariableBetaCycleEncoder(PaddedChartBatch)",
-    }
-
-    def workload() -> tuple[dict[str, Any], Any]:
-        _seed_profile(20260831)
-        generator = torch.Generator(device="cpu").manual_seed(20260831)
-        basis = torch.randn(batch_size, edges, cycle_rank, generator=generator)
-        base_pairs = _base_edges(nodes, edges).T
-        host_batch = PaddedChartBatch(
-            basis=basis,
-            edge_features=torch.randn(batch_size, edges, 4, generator=generator),
-            edge_mask=torch.ones(batch_size, edges, dtype=torch.bool),
-            cycle_mask=torch.ones(batch_size, cycle_rank, dtype=torch.bool),
-            edge_index=base_pairs.unsqueeze(0).expand(batch_size, -1, -1).clone(),
-            node_categories=torch.zeros(batch_size, nodes, dtype=torch.long),
-            edge_categories=torch.zeros(batch_size, edges, dtype=torch.long),
-            node_mask=torch.ones(batch_size, nodes, dtype=torch.bool),
-            targets=torch.randn(batch_size, 1, generator=generator),
-            graph_ids=tuple(f"preflight-{index}" for index in range(batch_size)),
-        )
-        host_bytes = _tensor_bytes(host_batch)
-        batch = host_batch.to(device, pin_memory=False, non_blocking=False)
-        model = VariableBetaCycleEncoder(hidden_dim=hidden, output_dim=1).to(device)
-        with torch.autocast(device_type="cuda", enabled=use_amp):
-            predictions = model(batch)
-            loss = nnf.mse_loss(predictions, batch.targets)
-        loss.backward()
-        first_gradient = _first_parameter_gradient(model)
-        _assert_finite("tree-chart profile", predictions, loss, first_gradient)
-        return {
-            "loss": float(loss.detach().cpu()),
-            "host_input_tensor_bytes": host_bytes,
-        }, (host_batch, batch, model, predictions, loss)
-
-    return _measure_profile("tree-chart", device, spec, workload)
-
-
-def _brec_profile(device: torch.device, config: ProfileConfig) -> dict[str, Any]:
-    from research.cycle_pe.paper import brec_hotelling_t2
-    from research.cycle_pe.paper_model import PaperCycleModel
-
-    protocol = config.brec_protocol
-    requested_batch_size = config.brec_batch_size
-    if device.type == "cuda" and protocol == "official" and requested_batch_size != 16:
-        raise PreflightError("official BREC CUDA profile requires --brec-batch-size 16")
-    # ``research.cycle_pe.paper._brec_batches`` consumes whole graph pairs.
-    # Preserve that exact behavior for custom/tiny odd batch-size requests.
-    pairs_per_batch = max(1, requested_batch_size // 2)
-    batch_size = 2 * pairs_per_batch
-    nodes = config.nodes_per_graph
-    edges = config.edges_per_graph
-    cycle_rank = config.cycle_rank
-    hidden = 64 if device.type == "cuda" else 8
-    pe_dim = 32 if device.type == "cuda" else 8
-    layers = 3 if device.type == "cuda" else 1
-    num_relabel = 32
-    embedding_dim = 16
-    variants = config.cycle_variants
-    use_amp = protocol == "custom" and config.brec_amp and device.type == "cuda"
-    spec = {
-        "protocol": protocol,
-        "requested_batch_size": requested_batch_size,
-        "batch_size_graphs": batch_size,
-        "official_batch_size": 16,
-        "official_batch_size_match": batch_size == 16 if protocol == "official" else None,
-        "selected_variants": list(variants),
-        "dtype": "mixed_float32_autocast" if use_amp else "float32",
-        "model_parameter_dtype": "float32",
-        "amp": use_amp,
-        "nodes_per_graph": nodes,
-        "edges_per_graph": edges,
-        "cycle_rank": cycle_rank,
-        "projector_shape_per_graph": [edges, edges] if "projector" in variants else None,
-        "num_relabel_pairs_for_t2": num_relabel,
-        "covariance_shape": [embedding_dim, embedding_dim],
-        "production_path": "PaperCycleModel(selected variants) + brec_hotelling_t2(cov/pinv)",
-    }
-
-    def workload() -> tuple[dict[str, Any], Any]:
-        _seed_profile(20260901)
-        generator = torch.Generator(device="cpu").manual_seed(20260901)
-        host_graphs = _prepared_cycle_graphs(
-            required_variants=variants,
-            batch_size=batch_size,
-            nodes=nodes,
-            edges=edges,
-            cycle_rank=cycle_rank,
-            generator=generator,
-        )
-        variant_losses: dict[str, float] = {}
-        variant_t2: dict[str, float] = {}
-        host_bytes = _tensor_bytes(host_graphs)
-        for variant in variants:
-            _seed_profile(20260901)
-            graphs = [graph.to(device) for graph in host_graphs]
-            model = PaperCycleModel(
-                variant=variant,
-                raw_width=cycle_rank,
-                node_input_dim=5,
-                edge_input_dim=3,
-                edge_output_dim=0,
-                node_output_dim=0,
-                graph_output_dim=0,
-                hidden_dim=hidden,
-                pe_dim=pe_dim,
-                layers=layers,
-                embedding_dim=embedding_dim,
-            ).to(device=device, dtype=torch.float32)
-            with torch.autocast(device_type="cuda", enabled=use_amp):
-                outputs = model(graphs)
-                embeddings = torch.stack([output.embedding for output in outputs])
-                targets = -torch.ones(
-                    batch_size // 2,
-                    device=device,
-                    dtype=embeddings.dtype,
-                )
-                loss = nnf.cosine_embedding_loss(embeddings[0::2], embeddings[1::2], targets)
-            loss.backward()
-            repeat_count = math.ceil((2 * num_relabel) / embeddings.shape[0])
-            t2_embeddings = embeddings.detach().float().repeat(repeat_count, 1)[: 2 * num_relabel]
-            jitter = torch.linspace(
-                -1.0e-3,
-                1.0e-3,
-                t2_embeddings.numel(),
-                device=device,
-                dtype=torch.float32,
-            ).reshape_as(t2_embeddings)
-            t2 = brec_hotelling_t2(t2_embeddings + jitter)
-            first_gradient = _first_parameter_gradient(model)
-            _assert_finite(f"BREC profile ({variant})", embeddings, loss, t2, first_gradient)
-            variant_losses[variant] = float(loss.detach().cpu())
-            variant_t2[variant] = float(t2.detach().cpu())
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            del (
-                first_gradient,
-                t2,
-                jitter,
-                t2_embeddings,
-                repeat_count,
-                loss,
-                targets,
-                embeddings,
-                outputs,
-                model,
-                graphs,
-            )
-            if device.type == "cuda":
-                gc.collect()
-                torch.cuda.empty_cache()
-        return {
-            "loss": max(variant_losses.values()),
-            "hotelling_t2": max(variant_t2.values()),
-            "variant_losses": variant_losses,
-            "variant_hotelling_t2": variant_t2,
-            "host_input_tensor_bytes": host_bytes,
-        }, None
-
-    return _measure_profile("brec", device, spec, workload)
-
-
-def _reciprocal_pyg_data(
-    *,
-    nodes: int,
-    edges: int,
-    task: str,
-    categorical: bool,
-    seed: int,
-) -> Any:
-    try:
-        from torch_geometric.data import Data
-    except (ImportError, OSError) as error:
-        raise PreflightError(
-            "public-pyg profile requires torch-geometric; run scripts/setup_gpu.sh"
-        ) from error
-
-    generator = torch.Generator(device="cpu").manual_seed(seed)
-    undirected = _base_edges(nodes, edges)
-    directed = torch.cat((undirected, undirected.flip(0)), dim=1)
-    if categorical:
-        x = torch.randint(0, 2, (nodes, 9), generator=generator)
-        base_attributes = torch.randint(0, 2, (edges, 3), generator=generator)
-        y = torch.tensor([float(seed % 2)])
-    else:
-        x = torch.randn(nodes, 14, generator=generator)
-        base_attributes = torch.randn(edges, 2, generator=generator)
-        y = torch.arange(nodes).remainder(21)
-    edge_attr = torch.cat((base_attributes, base_attributes), dim=0)
-    return Data(x=x, edge_index=directed, edge_attr=edge_attr, y=y), task
-
-
-def _public_pyg_profile(device: torch.device, config: ProfileConfig) -> dict[str, Any]:
-    try:
-        import ogb  # noqa: F401
-        import torch_geometric  # noqa: F401
-    except (ImportError, OSError) as error:
-        raise PreflightError(
-            "public-pyg profile requires importable torch-geometric and ogb; "
-            "run scripts/setup_gpu.sh"
-        ) from error
-
-    from research.conductance_gat.paper import (
-        PublicConductanceModel,
-        _public_loader,
-        _public_loss,
-    )
-    from research.conductance_gat.public_data import adapt_pyg_graph
-
-    batch_size = config.batch_size
-    nodes = config.nodes_per_graph
-    edges = config.edges_per_graph
-    hidden = 64 if device.type == "cuda" else 8
-    use_amp = config.amp and device.type == "cuda"
-    spec = {
-        "batch_size_graphs": batch_size,
-        "nodes_per_graph": nodes,
-        "physical_edges_per_graph": edges,
-        "hidden_dim": hidden,
-        "amp": use_amp,
-        "tasks": ["pascalvoc_sp/node", "ogbg_molhiv/graph"],
-        "production_path": "PyG Data -> adapt_pyg_graph -> DataLoader -> PublicConductanceModel",
-        "downloads": False,
-    }
-
-    def records(task: str, categorical: bool, seed_offset: int) -> list[dict[str, Any]]:
-        result = []
-        for index in range(batch_size):
-            data, selected_task = _reciprocal_pyg_data(
-                nodes=nodes,
-                edges=edges,
-                task=task,
-                categorical=categorical,
-                seed=20260902 + seed_offset + index,
-            )
-            result.append(adapt_pyg_graph(data, f"preflight-{task}-{index}", task=selected_task))
-        return result
-
-    def workload() -> tuple[dict[str, Any], Any]:
-        _seed_profile(20260902)
-        pascal_records = records("node", False, 0)
-        pascal_host_bytes = _tensor_bytes(pascal_records)
-        pascal_loader = _public_loader(
-            pascal_records,
-            batch_size=batch_size,
-            shuffle=False,
-            seed=20260902,
-            pin_memory=False,
-            num_workers=0,
-        )
-        pascal_batch = next(iter(pascal_loader)).to(device, non_blocking=False)
-        pascal_model = PublicConductanceModel(
-            pascal_records[0],
-            hidden=hidden,
-            num_classes=21,
-            official_molecule=False,
-            backbone="conductance_model",
-        ).to(device)
-        with torch.autocast(device_type="cuda", enabled=use_amp):
-            pascal_logits = pascal_model(pascal_batch)
-            pascal_loss = _public_loss(pascal_logits, pascal_batch.y, "node")
-        pascal_loss.backward()
-        _assert_finite("public PascalVOC-SP profile", pascal_logits, pascal_loss)
-        pascal_loss_value = float(pascal_loss.detach().cpu())
-        del pascal_loader, pascal_batch, pascal_model, pascal_logits, pascal_loss
-        if device.type == "cuda":
-            gc.collect()
-
-        molecule_records = records("graph", True, 10_000)
-        molecule_host_bytes = _tensor_bytes(molecule_records)
-        molecule_loader = _public_loader(
-            molecule_records,
-            batch_size=batch_size,
-            shuffle=False,
-            seed=20260903,
-            pin_memory=False,
-            num_workers=0,
-        )
-        molecule_batch = next(iter(molecule_loader)).to(device, non_blocking=False)
-        molecule_model = PublicConductanceModel(
-            molecule_records[0],
-            hidden=hidden,
-            num_classes=2,
-            official_molecule=True,
-            backbone="conductance_model",
-        ).to(device)
-        with torch.autocast(device_type="cuda", enabled=use_amp):
-            molecule_logits = molecule_model(molecule_batch)
-            molecule_loss = _public_loss(molecule_logits, molecule_batch.y, "graph")
-        molecule_loss.backward()
-        first_gradient = _first_parameter_gradient(molecule_model)
-        _assert_finite(
-            "public ogbg-molhiv profile",
-            molecule_logits,
-            molecule_loss,
-            first_gradient,
-        )
-        return {
-            "pascalvoc_node_loss": pascal_loss_value,
-            "molhiv_graph_loss": float(molecule_loss.detach().cpu()),
-            "host_input_tensor_bytes": pascal_host_bytes + molecule_host_bytes,
-        }, (
-            pascal_records,
-            molecule_records,
-            molecule_loader,
-            molecule_batch,
-            molecule_model,
-            molecule_logits,
-            molecule_loss,
-        )
-
-    return _measure_profile("public-pyg", device, spec, workload)
-
-
-PROFILE_RUNNERS: dict[str, Callable[[torch.device, ProfileConfig], dict[str, Any]]] = {
-    "conductance": _conductance_profile,
-    "cycle-projector": _cycle_projector_profile,
-    "tree-chart": _tree_chart_profile,
-    "brec": _brec_profile,
-    "public-pyg": _public_pyg_profile,
-}
-
-
-def _normalize_profiles(profiles: Sequence[str] | None) -> tuple[str, ...]:
-    selected = ("conductance",) if profiles is None else tuple(profiles)
-    if not selected:
-        raise PreflightError("at least one --profile is required")
-    if "all" in selected:
-        if len(selected) != 1:
-            raise PreflightError("--profile all cannot be combined with another profile")
-        return PROFILE_NAMES
-    unknown = sorted(set(selected) - set(PROFILE_NAMES))
-    if unknown:
-        raise PreflightError(f"unknown preflight profiles: {unknown}")
-    return tuple(dict.fromkeys(selected))
-
-
-def _cycle_variants(value: str) -> tuple[str, ...]:
-    selected = tuple(item.strip() for item in value.split(",") if item.strip())
-    if not selected:
-        raise argparse.ArgumentTypeError("--cycle-variants must be non-empty")
-    if len(set(selected)) != len(selected):
-        raise argparse.ArgumentTypeError("--cycle-variants must not contain duplicates")
-    unknown = sorted(set(selected) - set(CYCLE_VARIANTS))
-    if unknown:
-        raise argparse.ArgumentTypeError(
-            f"--cycle-variants contains unsupported values {unknown}; "
-            f"choose from {list(CYCLE_VARIANTS)}"
-        )
-    return selected
 
 
 def build_report(
     requested_device: str,
     *,
-    allow_cpu: bool,
-    require_paper_dependencies: bool,
-    min_free_gb: float,
-    profiles: Sequence[str] | None = None,
-    profile_config: ProfileConfig | None = None,
+    require_paper_dependencies: bool = False,
+    min_free_gb: float = 2.0,
 ) -> dict[str, Any]:
-    if min_free_gb < 0.0 or not math.isfinite(min_free_gb):
-        raise PreflightError("--min-free-gb must be a finite non-negative number")
-    dependency_errors = _paper_dependency_import_errors()
-    missing = _missing_paper_dependencies()
-    if require_paper_dependencies and dependency_errors:
-        rendered_errors = "; ".join(
-            f"{name}: {message}" for name, message in sorted(dependency_errors.items())
-        )
+    if not math.isfinite(min_free_gb) or min_free_gb < 0:
+        raise PreflightError("--min-free-gb must be finite and non-negative")
+    device = _resolve_device(requested_device)
+    if require_paper_dependencies:
+        errors = _paper_dependency_import_errors()
+        if errors:
+            raise PreflightError(f"paper dependency imports failed: {errors}")
+    try:
+        properties = torch.cuda.get_device_properties(device)
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    except RuntimeError as error:
+        raise PreflightError(f"cannot query CUDA device {device}: {error}") from error
+    if free_bytes < min_free_gb * (1024**3):
         raise PreflightError(
-            "paper dependency import check failed: "
-            + rendered_errors
-            + "; run scripts/setup_gpu.sh"
+            f"{device} has {free_bytes / (1024**3):.2f} GiB free; "
+            f"at least {min_free_gb:g} GiB was requested"
         )
-    selected_profiles = _normalize_profiles(profiles)
-    requested_config = ProfileConfig() if profile_config is None else profile_config
-    requested_config.validate()
-    device = _resolve_device(requested_device, allow_cpu=allow_cpu)
-    effective_config = _effective_profile_config(requested_config, device)
-    report: dict[str, Any] = {
+    versions = {"torch": str(torch.__version__)}
+    if require_paper_dependencies:
+        for distribution in PAPER_IMPORTS:
+            try:
+                versions[distribution] = importlib.metadata.version(distribution)
+            except importlib.metadata.PackageNotFoundError:
+                versions[distribution] = "unknown"
+    return {
         "status": "passed",
+        "kind": "hardware_and_dependency_check",
         "requested_device": requested_device,
         "resolved_device": str(device),
-        "platform": platform.platform(),
         "python": platform.python_version(),
-        "torch": torch.__version__,
+        "platform": platform.platform(),
         "torch_cuda_runtime": torch.version.cuda,
-        "cuda_available": torch.cuda.is_available(),
-        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "paper_dependencies": _package_versions(),
-        "missing_paper_dependencies": missing,
-        "paper_dependency_import_errors": dependency_errors,
-        "nvidia_smi": _nvidia_smi(),
-        "profile_kind": "synthetic_shape_stress_not_dataset_e2e",
-        "selected_profiles": list(selected_profiles),
-        "requested_profile_config": vars(requested_config),
-        "effective_profile_config": vars(effective_config),
-    }
-    if device.type == "cuda":
-        index = device.index
-        assert index is not None
-        free_bytes, total_bytes = torch.cuda.mem_get_info(index)
-        free_gb = free_bytes / 1024**3
-        if free_gb < min_free_gb:
-            raise PreflightError(
-                f"CUDA device {index} has {free_gb:.2f} GiB free, below {min_free_gb:.2f} GiB"
-            )
-        properties = torch.cuda.get_device_properties(index)
-        report["gpu"] = {
-            "index": index,
+        "packages": versions,
+        "gpu": {
             "name": properties.name,
-            "compute_capability": list(torch.cuda.get_device_capability(index)),
-            "total_memory_gb": total_bytes / 1024**3,
-            "free_memory_gb": free_gb,
-            "device_count": torch.cuda.device_count(),
-        }
-    else:
-        report["gpu"] = None
-    profile_results: dict[str, Any] = {}
-    for name in selected_profiles:
-        try:
-            profile_results[name] = PROFILE_RUNNERS[name](device, effective_config)
-        except PreflightError:
-            raise
-        except Exception as error:
-            raise PreflightError(
-                f"profile {name!r} failed: {type(error).__name__}: {error}"
-            ) from error
-    report["profiles"] = profile_results
-    # Compatibility for callers of the original single-path preflight report.
-    if "conductance" in profile_results:
-        report["incidence_forward_backward"] = profile_results["conductance"]
-    return report
+            "free_bytes": free_bytes,
+            "total_bytes": total_bytes,
+            "compute_capability": [properties.major, properties.minor],
+        },
+        "min_free_gb": min_free_gb,
+        "dataset_loaded": False,
+        "model_executed": False,
+        "scope": "availability only; does not certify dataset fit or experiment results",
+    }
+
+
+def _save_report(path: Path | None, report: dict[str, Any]) -> bool:
+    if path is None:
+        return True
+    try:
+        atomic_write_json(path, report)
+    except OSError as error:
+        print(f"cannot save GPU report to {path}: {error}", file=sys.stderr)
+        return False
+    return True
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument("--allow-cpu", action="store_true")
-    parser.add_argument("--require-paper-deps", action="store_true")
     parser.add_argument("--min-free-gb", type=float, default=2.0)
-    parser.add_argument(
-        "--profile",
-        dest="profiles",
-        action="append",
-        choices=("all", *PROFILE_NAMES),
-        help="repeat for every experiment path to shape-stress; default: conductance",
-    )
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--brec-batch-size", type=int, default=16)
-    parser.add_argument("--nodes-per-graph", type=int, default=64)
-    parser.add_argument("--edges-per-graph", type=int, default=128)
-    parser.add_argument("--cycle-rank", type=int, default=64)
-    parser.add_argument(
-        "--cycle-variants",
-        type=_cycle_variants,
-        default=("projector",),
-        help="comma-separated PaperCycleModel variants to exercise",
-    )
-    parser.add_argument(
-        "--brec-protocol",
-        choices=BREC_PROTOCOLS,
-        default="official",
-        help="match the selected paper runner's official or tiny/custom BREC path",
-    )
-    parser.add_argument(
-        "--brec-amp",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="match AMP in custom BREC; the official protocol rejects AMP",
-    )
-    parser.add_argument(
-        "--amp",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="match AMP-enabled suites; BREC official always remains float32/no-AMP",
-    )
+    parser.add_argument("--require-paper-deps", action="store_true")
     parser.add_argument("--json-out", type=Path)
     args = parser.parse_args()
-
     try:
         report = build_report(
             args.device,
-            allow_cpu=args.allow_cpu,
             require_paper_dependencies=args.require_paper_deps,
             min_free_gb=args.min_free_gb,
-            profiles=args.profiles,
-            profile_config=ProfileConfig(
-                batch_size=args.batch_size,
-                brec_batch_size=args.brec_batch_size,
-                nodes_per_graph=args.nodes_per_graph,
-                edges_per_graph=args.edges_per_graph,
-                cycle_rank=args.cycle_rank,
-                amp=args.amp,
-                cycle_variants=args.cycle_variants,
-                brec_protocol=args.brec_protocol,
-                brec_amp=args.brec_amp,
-            ),
         )
-    except (PreflightError, RuntimeError) as error:
-        print(f"GPU PREFLIGHT FAILED: {error}")
+    except PreflightError as error:
+        report = {"status": "failed", "kind": "hardware_and_dependency_check", "error": str(error)}
+        print(str(error), file=sys.stderr)
+        _save_report(args.json_out, report)
         return 2
-    rendered = json.dumps(report, indent=2, ensure_ascii=False)
-    print(rendered)
-    if args.json_out is not None:
-        args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(rendered + "\n", encoding="utf-8")
+    if not _save_report(args.json_out, report):
+        return 2
+    print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -19637,396 +17579,6 @@ source "${project_root}/scripts/conda_env.sh"
 export PYTHONPATH="${project_root}/src:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
 cd "${project_root}"
 "${environment_python}" scripts/run_paper.py "$@"
-````
-
-# scripts/run_all.py
-
-````python
-#!/usr/bin/env python3
-"""Run every currently implemented research track without combining models."""
-
-from __future__ import annotations
-
-import argparse
-import hashlib
-import importlib.metadata
-import json
-import math
-import os
-import platform
-import re
-import shutil
-import subprocess
-import sys
-from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-ACTIVE_SOURCE_DIRS = (
-    "src",
-    "tests",
-    "research/conductance_gat",
-    "research/cycle_pe",
-    "research/tree_augmentation",
-    "scripts",
-)
-RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-
-
-def _default_run_id() -> str:
-    return datetime.now(UTC).strftime("smoke-%Y%m%dT%H%M%S%fZ")
-
-
-def _validate_run_id(value: str) -> str:
-    if not RUN_ID_PATTERN.fullmatch(value):
-        raise argparse.ArgumentTypeError(
-            "run id must contain only letters, digits, dot, underscore, or hyphen"
-        )
-    return value
-
-
-def _commands(
-    *,
-    python: str,
-    device: str,
-    run_id: str,
-    skip_tests: bool,
-    skip_lint: bool,
-) -> list[tuple[str, list[str]]]:
-    conductance_output = PROJECT_ROOT / "research" / "conductance_gat" / "results" / run_id
-    cycle_output = PROJECT_ROOT / "research" / "cycle_pe" / "results" / run_id / "summary.json"
-    tree_output = (
-        PROJECT_ROOT / "research" / "tree_augmentation" / "results" / run_id / "summary.json"
-    )
-    commands: list[tuple[str, list[str]]] = []
-    commands.append(("dependencies", [python, "-m", "pip", "check"]))
-    commands.append(
-        (
-            "dataset_plan",
-            [python, str(PROJECT_ROOT / "scripts" / "check_datasets.py"), "--profile", "smoke"],
-        )
-    )
-    if not skip_tests:
-        commands.append(("tests", [python, "-m", "pytest", "-q"]))
-    if not skip_lint:
-        commands.append(("lint", [python, "-m", "ruff", "check", *ACTIVE_SOURCE_DIRS]))
-    commands.extend(
-        [
-            (
-                "conductance_gat",
-                [
-                    python,
-                    "-m",
-                    "research.conductance_gat.run",
-                    "--config",
-                    str(PROJECT_ROOT / "research" / "conductance_gat" / "config.yaml"),
-                    "--device",
-                    device,
-                    "--output-dir",
-                    str(conductance_output),
-                ],
-            ),
-            (
-                "cycle_pe",
-                [
-                    python,
-                    "-m",
-                    "research.cycle_pe.run",
-                    "--config",
-                    str(PROJECT_ROOT / "research" / "cycle_pe" / "config.yaml"),
-                    "--output",
-                    str(cycle_output),
-                ],
-            ),
-            (
-                "tree_augmentation",
-                [
-                    python,
-                    "-m",
-                    "research.tree_augmentation.run",
-                    "--config",
-                    str(PROJECT_ROOT / "research" / "tree_augmentation" / "config.yaml"),
-                    "--output",
-                    str(tree_output),
-                ],
-            ),
-        ]
-    )
-    return commands
-
-
-def _output_paths(run_id: str) -> dict[str, Path]:
-    return {
-        "conductance_gat": PROJECT_ROOT / "research" / "conductance_gat" / "results" / run_id,
-        "cycle_pe": PROJECT_ROOT / "research" / "cycle_pe" / "results" / run_id / "summary.json",
-        "tree_augmentation": PROJECT_ROOT
-        / "research"
-        / "tree_augmentation"
-        / "results"
-        / run_id
-        / "summary.json",
-    }
-
-
-def _expected_artifacts(outputs: dict[str, Path]) -> tuple[Path, ...]:
-    conductance = outputs["conductance_gat"]
-    return (
-        conductance / "summary.json",
-        conductance / "learned_history.csv",
-        conductance / "isotropic_history.csv",
-        conductance / "learned_model.pt",
-        outputs["cycle_pe"],
-        outputs["tree_augmentation"],
-    )
-
-
-def _command_text(command: list[str]) -> str:
-    return subprocess.list2cmdline(command)
-
-
-def _write_manifest(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _snapshot_run(run_dir: Path) -> dict[str, Any]:
-    config_dir = run_dir / "configs"
-    config_dir.mkdir(parents=True, exist_ok=False)
-    snapshots: dict[str, Any] = {}
-    for track in ("conductance_gat", "cycle_pe", "tree_augmentation"):
-        for source_name in ("config.yaml", "datasets.yaml"):
-            source = PROJECT_ROOT / "research" / track / source_name
-            target = config_dir / f"{track}-{source_name}"
-            shutil.copy2(source, target)
-            snapshots[f"{track}-{source_name}"] = {
-                "path": str(target),
-                "sha256": _sha256(target),
-            }
-
-    distributions = sorted(
-        {
-            f"{distribution.metadata['Name']}=={distribution.version}"
-            for distribution in importlib.metadata.distributions()
-            if distribution.metadata.get("Name")
-        },
-        key=str.casefold,
-    )
-    environment_path = run_dir / "environment.txt"
-    environment_path.write_text("\n".join(distributions) + "\n", encoding="utf-8")
-    snapshots["environment"] = {
-        "path": str(environment_path),
-        "sha256": _sha256(environment_path),
-    }
-    return snapshots
-
-
-def _source_revision() -> dict[str, Any]:
-    if not (PROJECT_ROOT / ".git").exists():
-        return {"git_available": False, "revision": None, "dirty": None}
-    revision = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=PROJECT_ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=PROJECT_ROOT,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    return {
-        "git_available": revision.returncode == 0,
-        "revision": revision.stdout.strip() if revision.returncode == 0 else None,
-        "dirty": bool(dirty.stdout.strip()) if dirty.returncode == 0 else None,
-    }
-
-
-def _all_finite(value: Any) -> bool:
-    if isinstance(value, float):
-        return math.isfinite(value)
-    if isinstance(value, dict):
-        return all(_all_finite(item) for item in value.values())
-    if isinstance(value, list):
-        return all(_all_finite(item) for item in value)
-    return True
-
-
-def _run_logged(
-    command: list[str],
-    *,
-    cwd: Path,
-    environment: dict[str, str],
-    log_path: Path,
-) -> int:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8", newline="") as log:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        assert process.stdout is not None
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            log.write(line)
-        return process.wait()
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")
-    parser.add_argument("--run-id", type=_validate_run_id, default=None)
-    parser.add_argument("--skip-tests", action="store_true")
-    parser.add_argument("--skip-lint", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
-
-    run_id = args.run_id or _default_run_id()
-    commands = _commands(
-        python=sys.executable,
-        device=args.device,
-        run_id=run_id,
-        skip_tests=args.skip_tests,
-        skip_lint=args.skip_lint,
-    )
-    run_dir = PROJECT_ROOT / "runs" / run_id
-    manifest_path = run_dir / "manifest.json"
-    outputs = _output_paths(run_id)
-    payload: dict[str, Any] = {
-        "scope": "all_currently_implemented_independent_smoke_tracks",
-        "paper_benchmark_suite_complete": False,
-        "run_id": run_id,
-        "started_at_utc": datetime.now(UTC).isoformat(),
-        "python": platform.python_version(),
-        "platform": platform.platform(),
-        "source": _source_revision(),
-        "device_request": args.device,
-        "commands": [],
-    }
-
-    environment = os.environ.copy()
-    python_path = [str(PROJECT_ROOT / "src"), str(PROJECT_ROOT)]
-    if environment.get("PYTHONPATH"):
-        python_path.append(environment["PYTHONPATH"])
-    environment["PYTHONPATH"] = os.pathsep.join(python_path)
-    environment["PYTHONUTF8"] = "1"
-
-    if args.dry_run:
-        for name, command in commands:
-            print(f"[{name}] {_command_text(command)}")
-        print(f"[manifest] {manifest_path}")
-        return 0
-
-    collisions = [
-        path
-        for path in (
-            run_dir,
-            outputs["conductance_gat"],
-            outputs["cycle_pe"].parent,
-            outputs["tree_augmentation"].parent,
-        )
-        if path.exists()
-    ]
-    if collisions:
-        joined = ", ".join(str(path) for path in collisions)
-        print(f"run id {run_id!r} already exists; refusing to overwrite: {joined}", file=sys.stderr)
-        return 2
-
-    run_dir.mkdir(parents=True, exist_ok=False)
-    payload["snapshots"] = _snapshot_run(run_dir)
-    payload["status"] = "running"
-    _write_manifest(manifest_path, payload)
-
-    try:
-        for name, command in commands:
-            print(f"\n== {name}: {_command_text(command)} ==", flush=True)
-            started = datetime.now(UTC)
-            log_path = run_dir / "logs" / f"{name}.log"
-            returncode = _run_logged(
-                command,
-                cwd=PROJECT_ROOT,
-                environment=environment,
-                log_path=log_path,
-            )
-            record = {
-                "name": name,
-                "command": command,
-                "returncode": returncode,
-                "elapsed_seconds": (datetime.now(UTC) - started).total_seconds(),
-                "log": str(log_path),
-            }
-            payload["commands"].append(record)
-            _write_manifest(manifest_path, payload)
-            if returncode != 0:
-                payload["status"] = "failed"
-                payload["failed_step"] = name
-                payload["finished_at_utc"] = datetime.now(UTC).isoformat()
-                _write_manifest(manifest_path, payload)
-                print(f"failed at {name}; manifest: {manifest_path}", file=sys.stderr)
-                return returncode
-    except KeyboardInterrupt:
-        payload["status"] = "interrupted"
-        payload["finished_at_utc"] = datetime.now(UTC).isoformat()
-        _write_manifest(manifest_path, payload)
-        print(f"interrupted; manifest: {manifest_path}", file=sys.stderr)
-        return 130
-
-    missing = [str(path) for path in _expected_artifacts(outputs) if not path.is_file()]
-    if missing:
-        payload["status"] = "failed"
-        payload["failed_step"] = "artifact_validation"
-        payload["missing_artifacts"] = missing
-        payload["finished_at_utc"] = datetime.now(UTC).isoformat()
-        _write_manifest(manifest_path, payload)
-        print(f"missing expected artifacts: {missing}", file=sys.stderr)
-        return 1
-
-    try:
-        for summary in (
-            outputs["conductance_gat"] / "summary.json",
-            outputs["cycle_pe"],
-            outputs["tree_augmentation"],
-        ):
-            content = json.loads(summary.read_text(encoding="utf-8"))
-            if not _all_finite(content):
-                raise ValueError(f"non-finite value in {summary}")
-    except (json.JSONDecodeError, ValueError) as error:
-        payload["status"] = "failed"
-        payload["failed_step"] = "artifact_validation"
-        payload["artifact_error"] = str(error)
-        payload["finished_at_utc"] = datetime.now(UTC).isoformat()
-        _write_manifest(manifest_path, payload)
-        print(f"invalid result artifact: {error}", file=sys.stderr)
-        return 1
-
-    payload["status"] = "passed"
-    payload["finished_at_utc"] = datetime.now(UTC).isoformat()
-    payload["outputs"] = {name: str(path) for name, path in outputs.items()}
-    _write_manifest(manifest_path, payload)
-    print(f"\nall implemented tracks passed; manifest: {manifest_path}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
 ````
 
 # scripts/run_paper.py
@@ -20143,68 +17695,22 @@ def _output_dir(
 def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str], Path | None]]:
     commands: list[tuple[str, list[str], Path | None]] = []
     selected_tracks = _selected_tracks(args.tracks)
-    preflight_output = PROJECT_ROOT / "runs" / "paper" / run_id / "gpu-preflight.json"
-    preflight_device = "cpu" if args.prepare_only else args.device
-    brec_protocol = "custom" if args.tiny else "official"
-    preflight_brec_batch_size = args.batch_size if args.tiny else 16
-    preflight_brec_amp = (
-        brec_protocol == "custom" and args.amp and preflight_device.lower().startswith("cuda")
-    )
-    preflight = [
-        sys.executable,
-        str(PROJECT_ROOT / "scripts" / "gpu_preflight.py"),
-        "--device",
-        preflight_device,
-        "--min-free-gb",
-        str(0.0 if args.prepare_only else args.min_free_gb),
-        "--batch-size",
-        str(args.batch_size),
-        "--brec-batch-size",
-        str(preflight_brec_batch_size),
-        "--nodes-per-graph",
-        str(args.preflight_nodes_per_graph),
-        "--edges-per-graph",
-        str(args.preflight_edges_per_graph),
-        "--cycle-rank",
-        str(args.preflight_cycle_rank),
-        "--cycle-variants",
-        ",".join(args.cycle_variants),
-        "--brec-protocol",
-        brec_protocol,
-        "--json-out",
-        str(preflight_output),
-    ]
-    if args.amp and preflight_device.lower().startswith("cuda"):
-        preflight.append("--amp")
-    else:
-        preflight.append("--no-amp")
-    preflight.append("--brec-amp" if preflight_brec_amp else "--no-brec-amp")
-    if args.prepare_only or args.allow_cpu:
-        preflight.append("--allow-cpu")
-    if args.suite == "all":
-        preflight.append("--require-paper-deps")
-    profiles: list[str] = []
-    if args.prepare_only:
-        # Data preparation needs an inexpensive CPU code smoke, not a claim
-        # about accelerator capacity.  The CUDA training invocation below runs
-        # the selected high-memory envelopes at their exact requested sizes.
-        profiles.append("conductance")
-    else:
-        if "conductance_gat" in selected_tracks:
-            profiles.append("conductance")
-        if "cycle_pe" in selected_tracks:
-            profiles.append("cycle-projector")
-        if "tree_augmentation" in selected_tracks:
-            profiles.append("tree-chart")
-        if args.suite == "all" and "cycle_pe" in selected_tracks:
-            profiles.append("brec")
-        if args.suite == "all" and "conductance_gat" in selected_tracks:
-            profiles.append("public-pyg")
-        if not profiles:
-            profiles.append("conductance")
-    for profile in dict.fromkeys(profiles):
-        preflight.extend(("--profile", profile))
-    commands.append(("gpu_preflight", preflight, preflight_output))
+    if not args.prepare_only:
+        preflight_output = PROJECT_ROOT / "runs" / "paper" / run_id / "gpu-preflight.json"
+        preflight = [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "gpu_preflight.py"),
+            "--device",
+            args.device,
+            "--min-free-gb",
+            str(args.min_free_gb),
+            "--json-out",
+            str(preflight_output),
+        ]
+        if args.suite == "all":
+            preflight.append("--require-paper-deps")
+        commands.append(("gpu_preflight", preflight, preflight_output))
+    brec_protocol = "official"
 
     data_root = args.data_root.expanduser().resolve()
 
@@ -20213,8 +17719,8 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
         if suite == "core":
             values.extend(("--core-targets", ",".join(args.cycle_core_targets)))
         # Official BREC owns its fixed 20-epoch/1e-4 optimization protocol.
-        # Master tuning knobs apply to CycleCount/ZINC and to tiny custom BREC only.
-        if suite != "brec" or args.tiny:
+        # Master tuning knobs apply only to CycleCount/ZINC.
+        if suite != "brec":
             if args.cycle_epochs is not None:
                 values.extend(("--epochs", str(args.cycle_epochs)))
             if args.cycle_learning_rate is not None:
@@ -20265,8 +17771,6 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
             command.append("--prepare-only")
         if args.allow_download:
             command.append("--allow-download")
-        if args.tiny:
-            command.append("--tiny")
         if not args.prepare_only:
             if effective_amp and args.device.lower().startswith("cuda"):
                 command.append("--amp")
@@ -20293,7 +17797,7 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
                         output_dir=cycle_root / f"model-seed-{model_seed}" / suite,
                         extra_arguments=cycle_arguments(suite),
                     )
-            brec_label = "custom-tiny" if args.tiny else "official-10-seed"
+            brec_label = "official-10-seed"
             brec_run_name = f"brec-{brec_label}"
             add_child(
                 track=track,
@@ -20308,9 +17812,9 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
                     "--brec-seeds",
                     ",".join(str(seed) for seed in CYCLE_BREC_OFFICIAL_SEEDS),
                 ),
-                batch_size=(args.batch_size if args.tiny else 16),
-                workers=(args.workers if args.tiny else 0),
-                amp=(args.amp if args.tiny else False),
+                batch_size=16,
+                workers=0,
+                amp=False,
             )
             continue
 
@@ -20506,32 +18010,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--min-free-gb", type=float, default=2.0)
-    parser.add_argument(
-        "--preflight-nodes-per-graph",
-        type=int,
-        default=64,
-        help="synthetic shape-stress envelope; this is not inferred from a dataset cache",
-    )
-    parser.add_argument(
-        "--preflight-edges-per-graph",
-        type=int,
-        default=128,
-        help="synthetic shape-stress envelope; increase for a larger intended graph regime",
-    )
-    parser.add_argument(
-        "--preflight-cycle-rank",
-        type=int,
-        default=64,
-        help="synthetic projector/chart rank envelope; must not exceed preflight edges",
-    )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument(
         "--allow-download",
         action="store_true",
         help="allow official public datasets to be downloaded into --data-root",
     )
-    parser.add_argument("--tiny", action="store_true")
-    parser.add_argument("--allow-cpu", action="store_true")
     failure = parser.add_mutually_exclusive_group()
     failure.add_argument(
         "--fail-fast",
@@ -20563,34 +18047,11 @@ def main() -> int:
     if args.cycle_learning_rate is not None and args.cycle_learning_rate <= 0:
         print("--cycle-learning-rate must be positive", file=sys.stderr)
         return 2
-    if (
-        min(
-            args.preflight_nodes_per_graph,
-            args.preflight_edges_per_graph,
-            args.preflight_cycle_rank,
-        )
-        < 1
-    ):
-        print("preflight graph dimensions must be positive", file=sys.stderr)
-        return 2
-    if args.preflight_nodes_per_graph < 2:
-        print("--preflight-nodes-per-graph must be at least 2", file=sys.stderr)
-        return 2
-    if args.preflight_cycle_rank > args.preflight_edges_per_graph:
-        print("--preflight-cycle-rank cannot exceed --preflight-edges-per-graph", file=sys.stderr)
-        return 2
-    if (
-        args.device.startswith("cpu")
-        and not args.prepare_only
-        and not (args.allow_cpu and args.tiny)
-    ):
+    if not args.device.lower().startswith("cuda") and not args.prepare_only:
         print(
-            "CPU is allowed only with --tiny --allow-cpu; paper training requires CUDA",
+            "paper training requires CUDA; CPU is supported only for --prepare-only",
             file=sys.stderr,
         )
-        return 2
-    if args.allow_cpu and not args.tiny and not args.prepare_only:
-        print("--allow-cpu is restricted to --tiny validation", file=sys.stderr)
         return 2
 
     run_id = args.run_id or _default_run_id()
@@ -20645,26 +18106,18 @@ def main() -> int:
                     "core_targets": list(args.cycle_core_targets),
                     "epochs_override": args.cycle_epochs,
                     "learning_rate_override": args.cycle_learning_rate,
-                    "official_brec_optimization_overrides_ignored": not args.tiny,
+                    "official_brec_optimization_overrides_ignored": True,
                 }
                 if "cycle_pe" in tracks
                 else None
             ),
-            "gpu_preflight": {
-                "kind": "synthetic_shape_stress_not_dataset_e2e",
-                "batch_size": args.batch_size,
-                "brec_batch_size": args.batch_size if args.tiny else 16,
-                "brec_protocol": "custom" if args.tiny else "official",
-                "brec_amp": bool(
-                    args.tiny
-                    and args.amp
-                    and not args.prepare_only
-                    and args.device.lower().startswith("cuda")
-                ),
-                "cycle_variants": list(args.cycle_variants),
-                "nodes_per_graph": args.preflight_nodes_per_graph,
-                "edges_per_graph": args.preflight_edges_per_graph,
-                "cycle_rank": args.preflight_cycle_rank,
+            "gpu_preflight": None
+            if args.prepare_only
+            else {
+                "kind": "hardware_and_dependency_check",
+                "min_free_gb": args.min_free_gb,
+                "dataset_loaded": False,
+                "model_executed": False,
             },
             "cycle_brec_internal_seeds": (
                 list(CYCLE_BREC_OFFICIAL_SEEDS)
@@ -20673,26 +18126,18 @@ def main() -> int:
             ),
             "cycle_brec_dispatch_count": (1 if args.suite == "all" and "cycle_pe" in tracks else 0),
             "cycle_brec_protocol": (
-                ("custom" if args.tiny else "official")
-                if args.suite == "all" and "cycle_pe" in tracks
-                else None
+                "official" if args.suite == "all" and "cycle_pe" in tracks else None
             ),
             "cycle_brec_training": (
                 {
-                    "batch_size": args.batch_size if args.tiny else 16,
-                    "workers": args.workers if args.tiny else 0,
-                    "amp": bool(
-                        args.tiny
-                        and args.amp
-                        and not args.prepare_only
-                        and args.device.lower().startswith("cuda")
-                    ),
+                    "batch_size": 16,
+                    "workers": 0,
+                    "amp": False,
                 }
                 if args.suite == "all" and "cycle_pe" in tracks
                 else None
             ),
         },
-        "tiny": args.tiny,
         "prepare_only": args.prepare_only,
         "environment": _environment_snapshot(run_dir / "environment.txt"),
         "dataset_registries": _snapshot_registries(run_dir, tracks),
@@ -20767,70 +18212,6 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ````
 
-# scripts/setup.ps1
-
-````powershell
-param(
-    [string]$Python = "python"
-)
-
-$ErrorActionPreference = "Stop"
-$ProjectRoot = Split-Path -Parent $PSScriptRoot
-$CodexPython = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
-
-if (-not (Get-Command $Python -ErrorAction SilentlyContinue)) {
-    if (Test-Path -LiteralPath $CodexPython) {
-        $Python = $CodexPython
-    } else {
-        throw "Python was not found. Pass its path with -Python."
-    }
-}
-
-$VenvPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
-if (-not (Test-Path -LiteralPath $VenvPython)) {
-    & $Python -m venv (Join-Path $ProjectRoot ".venv")
-}
-
-& $VenvPython -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)"
-if ($LASTEXITCODE -ne 0) {
-    throw "Python 3.11 or newer is required: $VenvPython"
-}
-
-& $VenvPython -m pip install --upgrade pip
-& $VenvPython -m pip install -r (Join-Path $ProjectRoot "requirements-lock.txt")
-& $VenvPython -m pip install --no-deps --no-build-isolation -e $ProjectRoot
-& $VenvPython -m pytest
-````
-
-# scripts/setup.sh
-
-````bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "${project_root}/scripts/conda_env.sh"
-
-if [[ "${SKIP_DEPS:-0}" == "1" ]]; then
-    # Use an already-provisioned cluster environment without changing its packages.
-    "${environment_python}" -m pip install --no-deps --no-build-isolation -e "${project_root}"
-elif [[ "${USE_LOCK:-0}" == "1" ]]; then
-    "${environment_python}" -m pip install --upgrade pip
-    "${environment_python}" -m pip install "setuptools>=75" wheel
-    "${environment_python}" -m pip install -r "${project_root}/requirements-lock.txt"
-    "${environment_python}" -m pip install --no-deps --no-build-isolation -e "${project_root}"
-else
-    "${environment_python}" -m pip install --upgrade pip
-    "${environment_python}" -m pip install "setuptools>=75" wheel
-    # Flexible minimum versions from pyproject.toml are the portable default.
-    # A preinstalled CUDA-specific PyTorch satisfying torch>=2.2 is preserved.
-    "${environment_python}" -m pip install --no-build-isolation -e "${project_root}[dev]"
-fi
-
-cd "${project_root}"
-"${environment_python}" -m pytest -q
-````
-
 # scripts/setup_gpu.sh
 
 ````bash
@@ -20840,13 +18221,13 @@ set -euo pipefail
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
-    echo "scripts/setup_gpu.sh targets the Linux host reached through MobaXterm." >&2
+    echo "scripts/setup_gpu.sh requires Linux with an NVIDIA GPU (workstation or server)." >&2
     exit 2
 fi
 source "${project_root}/scripts/conda_env.sh"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
-    echo "nvidia-smi was not found; request a GPU node before running setup_gpu.sh." >&2
+    echo "nvidia-smi was not found; verify the NVIDIA driver, or request a GPU allocation on a managed cluster." >&2
     exit 2
 fi
 nvidia-smi -L
@@ -20861,21 +18242,8 @@ cuda_minor="${cuda_version#*.}"
 cuda_minor="${cuda_minor%%.*}"
 driver_cuda_code=$((10#${cuda_major} * 100 + 10#${cuda_minor}))
 
-wheel_tag="${CUDA_WHEEL_TAG:-}"
-if [[ -z "${wheel_tag}" ]]; then
-    if (( driver_cuda_code >= 1302 )); then
-        wheel_tag="cu132"
-    elif (( driver_cuda_code >= 1300 )); then
-        wheel_tag="cu130"
-    elif (( driver_cuda_code >= 1206 )); then
-        wheel_tag="cu126"
-    else
-        echo "The locked torch 2.13 stack requires a driver supporting CUDA 12.6+." >&2
-        echo "Driver compatibility reported by nvidia-smi: CUDA ${cuda_version}." >&2
-        echo "This script will not silently install an older cu118 PyTorch release." >&2
-        exit 2
-    fi
-fi
+# Use the same reference runtime on every compatible host. Alternatives are explicit.
+wheel_tag="${CUDA_WHEEL_TAG:-cu126}"
 
 case "${wheel_tag}" in
     cu126) required_cuda_code=1206; expected_cuda_runtime="12.6" ;;
@@ -20887,6 +18255,7 @@ case "${wheel_tag}" in
         ;;
 esac
 if (( driver_cuda_code < required_cuda_code )); then
+    echo "The reference stack requires a driver supporting CUDA 12.6+." >&2
     echo "CUDA_WHEEL_TAG=${wheel_tag} needs CUDA ${expected_cuda_runtime}+ driver compatibility." >&2
     echo "nvidia-smi reports CUDA ${cuda_version}." >&2
     exit 2
@@ -20941,44 +18310,13 @@ mv -f "${freeze_temporary}" "${freeze_report}"
     --require-paper-deps \
     --min-free-gb "${MIN_FREE_GB:-2}"
 
-if [[ "${SKIP_TESTS:-0}" != "1" ]]; then
+if [[ "${RUN_TESTS:-0}" == "1" ]]; then
     "${environment_python}" -m pytest -q
 fi
 
 echo "Exact environment report: ${lock_report}"
 echo "Resolved transitive snapshot: ${freeze_report}"
-echo "GPU environment ready. Run: bash scripts/paper.sh --help"
-````
-
-# scripts/smoke.ps1
-
-````powershell
-$ErrorActionPreference = "Stop"
-$ProjectRoot = Split-Path -Parent $PSScriptRoot
-$Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
-$env:MPLCONFIGDIR = Join-Path $ProjectRoot ".matplotlib"
-$env:PYTHONPATH = "$(Join-Path $ProjectRoot 'src');$ProjectRoot"
-
-if (-not (Test-Path -LiteralPath $Python)) {
-    throw "Missing .venv. Run .\scripts\setup.ps1 first."
-}
-
-& $Python (Join-Path $ProjectRoot "scripts\run_all.py") @args
-````
-
-# scripts/smoke.sh
-
-````bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-source "${project_root}/scripts/conda_env.sh"
-
-export PYTHONPATH="${project_root}/src:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
-cd "${project_root}"
-
-"${environment_python}" scripts/run_all.py --device "${DEVICE:-auto}" "$@"
+echo "GPU environment ready. Follow README.md for dataset preparation and experiments."
 ````
 
 # scripts/verify_conda_env.py
@@ -22451,7 +19789,7 @@ import pytest
 from scripts import verify_conda_env
 
 ROOT = Path(__file__).resolve().parents[1]
-BASH_ENTRYPOINTS = ("setup.sh", "setup_gpu.sh", "paper.sh", "smoke.sh")
+BASH_ENTRYPOINTS = ("setup_gpu.sh", "paper.sh")
 BASH = shutil.which("bash")
 LINUX_BASH_ONLY = pytest.mark.skipif(
     sys.platform != "linux" or BASH is None,
@@ -22778,6 +20116,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from chartgat.cache import CacheCorruptError, CacheIncompleteError, CacheWrongRequestError
 from scripts import check_datasets
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22793,7 +20134,6 @@ def _check(
     require_cache: bool = False,
     seeds: tuple[int, ...] = (0,),
     split_seeds: tuple[int, ...] | None = None,
-    tiny: bool = False,
 ) -> SimpleNamespace:
     command = [str(CHECKER), "--profile", profile]
     if as_json:
@@ -22805,8 +20145,6 @@ def _check(
     command.extend(("--seeds", ",".join(str(seed) for seed in seeds)))
     if split_seeds is not None:
         command.extend(("--split-seeds", ",".join(str(seed) for seed in split_seeds)))
-    if tiny:
-        command.append("--tiny")
     stdout = StringIO()
     stderr = StringIO()
     with (
@@ -22828,11 +20166,10 @@ def _check(
     )
 
 
-def test_smoke_dataset_profile_is_implemented(tmp_path: Path) -> None:
+def test_removed_smoke_dataset_profile_is_rejected(tmp_path: Path) -> None:
     result = _check("smoke", tmp_path)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "READY" in result.stdout
-    assert "code=implemented" in result.stdout
+    assert result.returncode == 2
+    assert "invalid choice" in result.stderr
 
 
 def test_paper_dataset_profile_matches_complete_core_code(tmp_path: Path) -> None:
@@ -22923,168 +20260,71 @@ def test_require_cache_controls_ready_and_exit_status(tmp_path: Path) -> None:
     )
 
 
-def _prepare_valid_tiny_paper_caches(data_root: Path, seed: int) -> None:
-    import torch
+def test_checker_routes_requested_axes_to_full_dataset_validators(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_resolver = check_datasets._load_python_reference
+    calls: list[tuple[str, Path, dict[str, object]]] = []
 
-    from research.conductance_gat.paper_data import prepare_core_cache
-    from research.conductance_gat.public_data import prepare_public_data
-    from research.cycle_pe.paper_adapters import write_tiny_brec_fixture
-    from research.cycle_pe.paper_data import load_or_generate_cycle_count_ood
-    from research.tree_augmentation.paper_data import (
-        GraphRecord,
-        _cache_records,
-        prepare_cyclecount_dataset,
-    )
+    def validator(dataset_id: str, data_root: Path, **kwargs: object) -> dict[str, object]:
+        calls.append((dataset_id, data_root, kwargs))
+        return {"validated": dataset_id}
 
-    prepare_core_cache(data_root, seed=seed, tiny=True)
-    prepare_public_data(data_root, seed=seed, tiny=True)
-    load_or_generate_cycle_count_ood(data_root, seed=seed, tiny=True)
-    write_tiny_brec_fixture(data_root / "cycle_pe_fixtures" / "brec_v3_q32.npy", num_relabel=32)
-    processed = data_root / "ZINC12K" / "subset" / "processed"
-    processed.mkdir(parents=True, exist_ok=True)
-    for split, count in {"train": 32, "val": 8, "test": 8}.items():
-        torch.save(({}, {"x": torch.arange(count + 1)}), processed / f"{split}.pt")
+    def resolve(reference: str) -> object:
+        if reference.endswith(".validate_dataset_cache"):
+            return validator
+        return original_resolver(reference)
 
-    prepare_cyclecount_dataset(data_root, seed=seed, tiny=True)
-
-    def records(counts: dict[str, int], *, zinc: bool) -> tuple[GraphRecord, ...]:
-        result = []
-        for split, count in counts.items():
-            for index in range(count):
-                result.append(
-                    GraphRecord(
-                        graph_id=f"fixture-{'zinc' if zinc else 'csl'}-{split}-{index}",
-                        family="fixture",
-                        split=split,
-                        num_nodes=3,
-                        edges=((0, 1), (0, 2), (1, 2)),
-                        target=(float(index % 10) if not zinc else float(index) / 10.0,),
-                        task_type="regression" if zinc else "classification",
-                        x=(0, 1, 2) if zinc else None,
-                        edge_attr=(0, 0, 0) if zinc else None,
-                    )
-                )
-        return tuple(result)
-
-    tree_specs = {
-        "csl": (
-            {"train": 30, "validation": 10, "test": 10},
-            tuple(f"class_{index}" for index in range(10)),
-            "classification",
-            "PyG:GNNBenchmarkDataset/CSL",
-        ),
-        "zinc": (
-            {"train": 32, "validation": 12, "test": 12},
-            ("constrained_logP",),
-            "regression",
-            "PyG:ZINC(subset=True)",
-        ),
-    }
-    for suite, (counts, target_names, task_type, source) in tree_specs.items():
-        cache_dir = data_root / f"{suite}_pyg_v2"
-        _cache_records(
-            suite=suite,
-            records=records(counts, zinc=suite == "zinc"),
-            data_path=cache_dir / f"seed-{seed}-tiny.json",
-            manifest_path=cache_dir / f"seed-{seed}-tiny.manifest.json",
-            target_names=target_names,
-            task_type=task_type,
-            source=source,
-            seed=seed,
-            tiny=True,
-        )
-
-
-def test_require_cache_runs_content_validators_for_requested_tiny_seed(tmp_path: Path) -> None:
-    data_root = tmp_path / "valid-data"
-    seed = 7
-    _prepare_valid_tiny_paper_caches(data_root, seed)
+    monkeypatch.setattr(check_datasets, "_load_python_reference", resolve)
     result = _check(
         "paper",
         tmp_path,
         as_json=True,
-        data_root=data_root,
+        data_root=tmp_path,
         require_cache=True,
-        seeds=(seed,),
-        tiny=True,
+        seeds=(11, 17),
+        split_seeds=(13,),
     )
     payload = json.loads(result.stdout)
     assert result.returncode == 0, result.stdout + result.stderr
     assert payload["cached_data_ready"] is True
-    assert payload["requested_seeds"] == [seed]
-    assert payload["requested_seed_axes"] == {"data": [seed], "split": [seed]}
-    assert payload["tiny"] is True
-    assert all(row["cache_status"] == "valid" for row in payload["rows"])
+    assert payload["requested_seed_axes"] == {"data": [11, 17], "split": [13]}
+    assert "tiny" not in payload
+    assert calls
+    for _, root, kwargs in calls:
+        assert root == tmp_path.resolve()
+        assert kwargs == {"data_seeds": (11, 17), "split_seeds": (13,)}
 
 
-def test_require_cache_rejects_corrupt_requested_cache(tmp_path: Path) -> None:
-    data_root = tmp_path / "corrupt-data"
-    seed = 11
-    _prepare_valid_tiny_paper_caches(data_root, seed)
-    cycle_cache = next((data_root / "cycle_count_ood").glob("*.json.gz"))
-    cycle_cache.write_bytes(b"truncated")
-    result = _check(
-        "paper",
-        tmp_path,
-        as_json=True,
-        data_root=data_root,
-        require_cache=True,
-        seeds=(seed,),
-        tiny=True,
-    )
-    payload = json.loads(result.stdout)
-    cycle_row = next(row for row in payload["rows"] if row["id"] == "cyclecount_ood")
-    assert result.returncode == 2
-    assert cycle_row["cache_status"] == "corrupt"
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        (FileNotFoundError("missing"), "missing"),
+        (CacheIncompleteError("incomplete"), "incomplete"),
+        (CacheWrongRequestError("wrong seed"), "wrong_request"),
+        (CacheCorruptError("bad checksum"), "corrupt"),
+        (RuntimeError("unexpected parser failure"), "corrupt"),
+    ],
+)
+def test_read_only_validator_failures_are_not_reported_as_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception, status: str
+) -> None:
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise error
+
+    monkeypatch.setattr(check_datasets, "_load_python_reference", lambda _reference: fail)
+    entry = {"id": "requested", "cache_glob": "requested.json", "validator": "unit.validator"}
+    result = check_datasets._validate_cache(entry, tmp_path, data_seeds=(3,))
+    assert result["cache_status"] == status
+    assert str(error) in result["cache_detail"]
+    assert not list(tmp_path.iterdir())
 
 
-def test_validator_distinguishes_wrong_request_and_incomplete_cache(tmp_path: Path) -> None:
-    from research.conductance_gat.paper_data import prepare_core_cache
-
-    entry = next(
-        item
-        for item in check_datasets.load_registry("conductance_gat")["datasets"]
-        if item["id"] == "static_multigraph_identification"
-    )
-
-    wrong_root = tmp_path / "wrong"
-    _, manifest_path, manifest = prepare_core_cache(wrong_root, seed=3, tiny=True)
-    manifest["request"]["seed"] = 999
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    wrong = check_datasets._validate_cache(entry, wrong_root, seeds=(3,), tiny=True)
-    assert wrong["cache_status"] == "wrong_request"
-
-    incomplete_root = tmp_path / "incomplete"
-    _, incomplete_manifest, _ = prepare_core_cache(incomplete_root, seed=3, tiny=True)
-    incomplete_manifest.with_name("core.pt").unlink()
-    incomplete = check_datasets._validate_cache(entry, incomplete_root, seeds=(3,), tiny=True)
-    assert incomplete["cache_status"] == "incomplete"
-
-
-def test_checker_routes_tree_csl_cache_to_split_seed_axis(tmp_path: Path) -> None:
-    data_root = tmp_path / "independent-seed-axes"
-    _prepare_valid_tiny_paper_caches(data_root, 11)
-    _prepare_valid_tiny_paper_caches(data_root, 13)
-
-    result = _check(
-        "paper",
-        tmp_path,
-        as_json=True,
-        data_root=data_root,
-        require_cache=True,
-        seeds=(11,),
-        split_seeds=(13,),
-        tiny=True,
-    )
-    payload = json.loads(result.stdout)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert payload["requested_seed_axes"] == {"data": [11], "split": [13]}
-    csl = next(row for row in payload["rows"] if row["id"] == "csl_chart_sanity")
-    tree_core = next(row for row in payload["rows"] if row["id"] == "cyclecount_ood_multichart")
-    assert csl["cache_detail"]["requested_axis"] == "split"
-    assert csl["cache_detail"]["requested_seeds"] == [13]
-    assert tree_core["cache_detail"]["requested_axis"] == "data"
-    assert tree_core["cache_detail"]["requested_seeds"] == [11]
+def test_checker_has_no_dummy_cache_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", [str(CHECKER), "--tiny"])
+    with pytest.raises(SystemExit) as caught:
+        check_datasets.main()
+    assert caught.value.code == 2
 
 
 def test_implemented_adapters_and_generated_sources_resolve() -> None:
@@ -23109,158 +20349,137 @@ def test_optional_is_a_tier_not_a_code_status() -> None:
 ````python
 from __future__ import annotations
 
+import json
 import sys
-from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
 
 import pytest
 
-from scripts.gpu_preflight import (
-    PROFILE_NAMES,
-    PreflightError,
-    ProfileConfig,
-    _normalize_profiles,
-    _paper_dependency_import_errors,
-    build_report,
-    main,
-)
-
-ROOT = Path(__file__).resolve().parents[1]
-PREFLIGHT = ROOT / "scripts" / "gpu_preflight.py"
+from scripts import gpu_preflight as preflight
 
 
-def test_cpu_preflight_exercises_incidence_path() -> None:
-    report = build_report(
-        "cpu",
-        allow_cpu=True,
-        require_paper_dependencies=False,
-        min_free_gb=0.0,
+@pytest.fixture
+def cuda_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(preflight.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(preflight.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(preflight.torch.cuda, "device_count", lambda: 1)
+    monkeypatch.setattr(
+        preflight.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(name="unit metadata", major=8, minor=0),
     )
+    monkeypatch.setattr(
+        preflight.torch.cuda,
+        "mem_get_info",
+        lambda _device: (4 * 1024**3, 8 * 1024**3),
+    )
+
+
+def test_hardware_report_never_creates_data_or_executes_models(
+    cuda_metadata: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbid(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("hardware validation must not allocate sample tensors")
+
+    for name in ("tensor", "randn", "rand", "zeros", "ones", "empty"):
+        monkeypatch.setattr(preflight.torch, name, forbid)
+    report = preflight.build_report("cuda")
     assert report["status"] == "passed"
-    assert report["resolved_device"] == "cpu"
-    assert report["gpu"] is None
-    assert report["profile_kind"] == "synthetic_shape_stress_not_dataset_e2e"
-    assert report["selected_profiles"] == ["conductance"]
-    assert set(report["profiles"]) == {"conductance"}
-    assert report["incidence_forward_backward"]["loss"] > 0.0
-    assert report["incidence_forward_backward"]["message_sum_abs"] < 1.0e-3
-    assert report["profiles"]["conductance"]["peak_allocated"] == 0
+    assert report["kind"] == "hardware_and_dependency_check"
+    assert report["resolved_device"] == "cuda:0"
+    assert report["dataset_loaded"] is False
+    assert report["model_executed"] is False
+    assert report["gpu"]["free_bytes"] == 4 * 1024**3
 
 
-def test_cpu_suite_profiles_cover_dense_forward_backward_and_brec_pinv() -> None:
-    selected = ("cycle-projector", "tree-chart", "brec")
-    report = build_report(
-        "cpu",
-        allow_cpu=True,
-        require_paper_dependencies=False,
-        min_free_gb=0.0,
-        profiles=selected,
-        profile_config=ProfileConfig(
-            batch_size=3,
-            brec_batch_size=3,
-            nodes_per_graph=10,
-            edges_per_graph=16,
-            cycle_rank=5,
-            cycle_variants=("no_pe", "raw", "set", "projector"),
-            brec_protocol="custom",
-            brec_amp=True,
-        ),
-    )
-    assert tuple(report["profiles"]) == selected
-    for profile in report["profiles"].values():
-        assert profile["status"] == "passed"
-        assert profile["loss"] >= 0.0
-        assert profile["memory_unit"] == "bytes"
-        assert profile["wall_time_unit"] == "seconds"
-        assert profile["wall_time"] > 0.0
-        assert {
-            "allocated",
-            "reserved",
-            "peak_allocated",
-            "peak_reserved",
-        } <= set(profile)
-    assert report["profiles"]["cycle-projector"]["spec"]["projector_shape_per_graph"] == [
-        16,
-        16,
-    ]
-    assert report["profiles"]["cycle-projector"]["spec"]["selected_variants"] == [
-        "no_pe",
-        "raw",
-        "set",
-        "projector",
-    ]
-    assert set(report["profiles"]["cycle-projector"]["variant_losses"]) == {
-        "no_pe",
-        "raw",
-        "set",
-        "projector",
-    }
-    assert report["profiles"]["tree-chart"]["spec"]["dense_chart_shape"] == [2, 16, 5]
-    assert report["profiles"]["brec"]["spec"]["dtype"] == "float32"
-    assert report["profiles"]["brec"]["spec"]["amp"] is False
-    assert report["profiles"]["brec"]["spec"]["protocol"] == "custom"
-    assert report["profiles"]["brec"]["spec"]["requested_batch_size"] == 3
-    assert report["profiles"]["brec"]["spec"]["batch_size_graphs"] == 2
-    assert set(report["profiles"]["brec"]["variant_losses"]) == {
-        "no_pe",
-        "raw",
-        "set",
-        "projector",
-    }
-    assert set(report["profiles"]["brec"]["variant_hotelling_t2"]) == {
-        "no_pe",
-        "raw",
-        "set",
-        "projector",
-    }
-    assert report["profiles"]["brec"]["spec"]["num_relabel_pairs_for_t2"] == 32
+@pytest.mark.parametrize("device", ["cpu", "mps", "auto", "not-a-device"])
+def test_non_cuda_devices_are_rejected(device: str) -> None:
+    with pytest.raises(preflight.PreflightError):
+        preflight.build_report(device)
 
 
-def test_profile_selection_and_shape_validation_are_fail_closed() -> None:
-    assert _normalize_profiles(("all",)) == PROFILE_NAMES
-    assert _normalize_profiles(("conductance", "conductance")) == ("conductance",)
-    with pytest.raises(PreflightError, match="cannot be combined"):
-        _normalize_profiles(("all", "conductance"))
-    with pytest.raises(PreflightError, match="cycle-rank"):
-        ProfileConfig(edges_per_graph=8, cycle_rank=9).validate()
-    with pytest.raises(PreflightError, match="requires --brec-batch-size 16"):
-        ProfileConfig(brec_batch_size=15).validate()
-    with pytest.raises(PreflightError, match="requires --no-brec-amp"):
-        ProfileConfig(brec_amp=True).validate()
-    ProfileConfig(
-        brec_batch_size=15,
-        brec_protocol="custom",
-        brec_amp=True,
-    ).validate()
+def test_missing_cuda_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(preflight.torch.cuda, "is_available", lambda: False)
+    with pytest.raises(preflight.PreflightError, match="CUDA is unavailable"):
+        preflight.build_report("cuda")
 
 
-def test_gpu_preflight_refuses_cpu_by_default(capsys: pytest.CaptureFixture[str]) -> None:
-    with patch.object(
+def test_out_of_range_gpu_is_rejected(cuda_metadata: None) -> None:
+    with pytest.raises(preflight.PreflightError, match="index 2"):
+        preflight.build_report("cuda:2")
+
+
+def test_cuda_initialization_failure_is_normalized(
+    cuda_metadata: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unavailable() -> int:
+        raise RuntimeError("driver initialization error")
+
+    monkeypatch.setattr(preflight.torch.cuda, "current_device", unavailable)
+    with pytest.raises(preflight.PreflightError, match="CUDA initialization failed"):
+        preflight.build_report("cuda")
+
+
+def test_report_write_error_does_not_hide_original_gpu_failure(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def unwritable(*_args: object) -> None:
+        raise PermissionError("read-only output")
+
+    monkeypatch.setattr(preflight, "atomic_write_json", unwritable)
+    monkeypatch.setattr(
         sys,
         "argv",
-        [str(PREFLIGHT), "--device", "cpu", "--min-free-gb", "0"],
-    ):
-        assert main() == 2
-    assert "requires CUDA" in capsys.readouterr().out
+        ["gpu_preflight.py", "--device", "cpu", "--json-out", str(tmp_path / "gpu.json")],
+    )
+    assert preflight.main() == 2
+    stderr = capsys.readouterr().err
+    assert stderr.index("requires CUDA") < stderr.index("cannot save GPU report")
 
 
-def test_paper_dependency_check_detects_import_time_abi_failure() -> None:
-    import scripts.gpu_preflight as preflight
+@pytest.mark.parametrize("minimum", [-1, float("nan"), float("inf")])
+def test_invalid_memory_requirement_is_rejected(minimum: float) -> None:
+    with pytest.raises(preflight.PreflightError, match="finite and non-negative"):
+        preflight.build_report("cuda", min_free_gb=minimum)
 
-    real_import = preflight.importlib.import_module
 
-    def broken_scipy(name: str):
-        if name == "scipy":
-            raise OSError("undefined symbol from binary extension")
-        return real_import(name)
+def test_insufficient_free_memory_is_rejected(cuda_metadata: None) -> None:
+    with pytest.raises(preflight.PreflightError, match="4.00 GiB free"):
+        preflight.build_report("cuda", min_free_gb=5)
 
-    with (
-        patch.dict(preflight.PAPER_IMPORTS, {"scipy": "scipy"}, clear=True),
-        patch.object(preflight.importlib.util, "find_spec", return_value=object()),
-        patch.object(preflight.importlib, "import_module", side_effect=broken_scipy),
-    ):
-        errors = _paper_dependency_import_errors()
-    assert errors["scipy"].startswith("OSError: undefined symbol")
+
+def test_import_time_abi_failure_is_reported(
+    cuda_metadata: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(preflight, "PAPER_IMPORTS", {"scipy": "scipy"})
+
+    def broken_import(_name: str) -> None:
+        raise OSError("undefined symbol")
+
+    monkeypatch.setattr(preflight.importlib, "import_module", broken_import)
+    errors = preflight._paper_dependency_import_errors()
+    assert errors == {"scipy": "OSError: undefined symbol"}
+    with pytest.raises(preflight.PreflightError, match="dependency imports failed"):
+        preflight.build_report("cuda", require_paper_dependencies=True)
+
+
+def test_failed_cli_preserves_failure_report(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "gpu.json"
+    monkeypatch.setattr(
+        sys, "argv", ["gpu_preflight.py", "--device", "cpu", "--json-out", str(path)]
+    )
+    assert preflight.main() == 2
+    assert json.loads(path.read_text(encoding="utf-8"))["status"] == "failed"
+
+
+@pytest.mark.parametrize("option", ["--allow-cpu", "--profile", "--nodes-per-graph"])
+def test_removed_synthetic_profile_options_are_rejected(
+    option: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["gpu_preflight.py", option])
+    with pytest.raises(SystemExit) as caught:
+        preflight.main()
+    assert caught.value.code == 2
 ````
 
 # tests/test_gpu_setup_lock.py
@@ -23358,6 +20577,24 @@ def test_gpu_setup_uses_lock_and_has_no_cu118_install_branch() -> None:
     assert "TORCH_SPEC" not in source
     assert "TORCH_INDEX_URL" not in source
     assert "requires a driver supporting CUDA 12.6+" in source
+
+
+def test_gpu_setup_uses_fixed_reference_runtime_and_opt_in_unit_tests() -> None:
+    source = (ROOT / "scripts" / "setup_gpu.sh").read_text(encoding="utf-8")
+    assert 'wheel_tag="${CUDA_WHEEL_TAG:-cu126}"' in source
+    assert 'if [[ "${RUN_TESTS:-0}" == "1" ]]' in source
+    assert "SKIP_TESTS" not in source
+    assert 'wheel_tag="cu132"' not in source
+
+
+def test_conda_bootstrap_uses_named_environment_and_python_311() -> None:
+    import yaml
+
+    environment = yaml.safe_load((ROOT / "environment.yml").read_text(encoding="utf-8"))
+    assert environment["name"] == "new-gat"
+    assert environment["channels"] == ["conda-forge", "nodefaults"]
+    assert "python=3.11" in environment["dependencies"]
+    assert "pip" in environment["dependencies"]
 ````
 
 # tests/test_research_boundaries.py
@@ -23430,61 +20667,14 @@ def test_tree_augmentation_depends_on_neither_conductance_nor_combined_track() -
     )
 ````
 
-# tests/test_run_all.py
-
-````python
-from __future__ import annotations
-
-import subprocess
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-RUNNER = ROOT / "scripts" / "run_all.py"
-
-
-def test_master_runner_dry_run_lists_every_independent_track(tmp_path: Path) -> None:
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(RUNNER),
-            "--dry-run",
-            "--run-id",
-            "portable-dry-run",
-            "--device",
-            "cpu",
-        ],
-        cwd=tmp_path,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "research.conductance_gat.run" in result.stdout
-    assert "research.cycle_pe.run" in result.stdout
-    assert "research.tree_augmentation.run" in result.stdout
-    assert "combined_later" not in result.stdout
-    assert "paper_benchmark" not in result.stdout
-
-
-def test_master_runner_rejects_unsafe_run_id(tmp_path: Path) -> None:
-    result = subprocess.run(
-        [sys.executable, str(RUNNER), "--dry-run", "--run-id", "../escape"],
-        cwd=tmp_path,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode != 0
-    assert "run id" in result.stderr.lower()
-````
-
 # tests/test_run_paper.py
 
 ````python
 from __future__ import annotations
 
 import ast
+import re
+import shlex
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -23556,17 +20746,9 @@ def test_paper_runner_defaults_to_cuda_and_every_independent_track(
     )
     assert completed.returncode == 0, completed.stderr
     assert "gpu_preflight.py" in completed.stdout
+    assert "--profile" not in completed.stdout
+    assert "--nodes-per-graph" not in completed.stdout
     assert "--device cuda" in completed.stdout
-    preflight_line = next(
-        line for line in completed.stdout.splitlines() if line.startswith("[gpu_preflight]")
-    )
-    for profile in ("conductance", "cycle-projector", "tree-chart", "brec", "public-pyg"):
-        assert f"--profile {profile}" in preflight_line
-    assert "--batch-size 32" in preflight_line
-    assert "--brec-batch-size 16" in preflight_line
-    assert "--cycle-variants no_pe,raw,set,projector" in preflight_line
-    assert "--brec-protocol official" in preflight_line
-    assert "--no-brec-amp" in preflight_line
     for module in (
         "research.conductance_gat.paper",
         "research.cycle_pe.paper",
@@ -23603,7 +20785,7 @@ def test_paper_runner_refuses_full_cpu_execution(capsys: pytest.CaptureFixture[s
     assert "requires CUDA" in completed.stderr
 
 
-def test_paper_runner_allows_only_explicit_tiny_cpu_validation(
+def test_paper_runner_routes_custom_output_and_seed_without_dummy_data(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     result_root = tmp_path / "scratch results"
@@ -23611,11 +20793,10 @@ def test_paper_runner_allows_only_explicit_tiny_cpu_validation(
         [
             "--dry-run",
             "--run-id",
-            "tiny-cpu",
+            "custom-output",
             "--device",
-            "cpu",
-            "--tiny",
-            "--allow-cpu",
+            "cuda",
+            "--no-amp",
             "--seeds",
             "7",
             "--results-root",
@@ -23624,7 +20805,7 @@ def test_paper_runner_allows_only_explicit_tiny_cpu_validation(
         capsys,
     )
     assert completed.returncode == 0, completed.stderr
-    assert "--tiny" in completed.stdout
+    assert "--tiny" not in completed.stdout
     assert "--no-amp" in completed.stdout
     assert "model-seed-7" in completed.stdout
     assert "--model-seed 7" in completed.stdout
@@ -23659,13 +20840,8 @@ def test_paper_runner_allows_cpu_data_preparation_without_training(
     assert completed.stdout.count("--model-seed 11") == 5
     assert "--model-seed 12" not in completed.stdout
     assert "--seed" not in completed.stdout
-    preflight_line = next(
-        line for line in completed.stdout.splitlines() if line.startswith("[gpu_preflight]")
-    )
-    assert "--device cpu" in preflight_line
-    assert "--profile conductance" in preflight_line
-    for expensive_profile in ("cycle-projector", "tree-chart", "brec", "public-pyg"):
-        assert f"--profile {expensive_profile}" not in preflight_line
+    assert "gpu_preflight.py" not in completed.stdout
+    assert "--allow-cpu" not in completed.stdout
 
 
 def test_paper_runner_routes_independent_seed_axes(capsys: pytest.CaptureFixture[str]) -> None:
@@ -23739,21 +20915,9 @@ def test_paper_runner_exposes_cycle_candidate_reduction_without_overriding_offic
     assert "--learning-rate 0.002" in zinc_line
     assert "--epochs" not in brec_line
     assert "--learning-rate" not in brec_line
-    preflight_line = next(
-        line for line in completed.stdout.splitlines() if line.startswith("[gpu_preflight]")
-    )
-    assert "--profile cycle-projector" in preflight_line
-    assert "--profile brec" in preflight_line
-    assert "--profile public-pyg" not in preflight_line
-    assert "--profile conductance" not in preflight_line
-    assert "--profile tree-chart" not in preflight_line
-    assert "--cycle-variants no_pe,projector" in preflight_line
-    assert "--brec-protocol official" in preflight_line
-    assert "--brec-batch-size 16" in preflight_line
-    assert "--no-brec-amp" in preflight_line
 
 
-def test_cycle_preflight_runs_selected_non_projector_variants(
+def test_cycle_runner_forwards_selected_non_projector_variants(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     completed = _dry_run(
@@ -23773,27 +20937,20 @@ def test_cycle_preflight_runs_selected_non_projector_variants(
         capsys,
     )
     assert completed.returncode == 0, completed.stderr
-    preflight_line = next(
-        line for line in completed.stdout.splitlines() if line.startswith("[gpu_preflight]")
-    )
-    assert "--profile cycle-projector" in preflight_line
-    assert "--profile conductance" not in preflight_line
-    assert "--cycle-variants no_pe,raw,set" in preflight_line
 
 
-def test_tiny_custom_brec_preflight_matches_batch_amp_and_variants(
+def test_brec_keeps_official_protocol_when_other_batch_sizes_are_overridden(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     completed = _dry_run(
         [
             "--dry-run",
             "--run-id",
-            "cycle-tiny-custom",
+            "cycle-official",
             "--tracks",
             "cycle_pe",
             "--suite",
             "all",
-            "--tiny",
             "--batch-size",
             "7",
             "--model-seeds",
@@ -23804,23 +20961,71 @@ def test_tiny_custom_brec_preflight_matches_batch_amp_and_variants(
         capsys,
     )
     assert completed.returncode == 0, completed.stderr
-    preflight_line = next(
-        line for line in completed.stdout.splitlines() if line.startswith("[gpu_preflight]")
-    )
-    assert "--profile cycle-projector" in preflight_line
-    assert "--profile brec" in preflight_line
-    assert "--profile public-pyg" not in preflight_line
-    assert "--cycle-variants no_pe,raw" in preflight_line
-    assert "--brec-protocol custom" in preflight_line
-    assert "--brec-batch-size 7" in preflight_line
-    assert "--brec-amp" in preflight_line
     brec_line = next(
-        line for line in completed.stdout.splitlines() if "[cycle_pe:brec:custom-tiny]" in line
+        line for line in completed.stdout.splitlines() if "[cycle_pe:brec:official-10-seed]" in line
     )
-    assert "--batch-size 7" in brec_line
-    assert "--amp" in brec_line
-    assert "--brec-protocol custom" in brec_line
+    assert "--batch-size 16" in brec_line
+    assert "--no-amp" in brec_line
+    assert "--brec-protocol official" in brec_line
     assert "--variants no_pe,raw" in brec_line
+
+
+@pytest.mark.parametrize("argument", ["--tiny", "--allow-cpu"])
+def test_paper_runner_rejects_removed_dummy_options(argument: str) -> None:
+    from scripts.run_paper import _parser
+
+    with pytest.raises(SystemExit) as caught:
+        _parser().parse_args([argument])
+    assert caught.value.code == 2
+
+
+def test_paper_runner_rejects_unsafe_run_id() -> None:
+    from scripts.run_paper import _parser
+
+    with pytest.raises(SystemExit) as caught:
+        _parser().parse_args(["--run-id", "../escape"])
+    assert caught.value.code == 2
+
+
+def test_readme_commands_use_full_independent_protocols() -> None:
+    from scripts.run_paper import _parser
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    blocks = re.findall(r"```bash\n(.*?)```", readme, flags=re.DOTALL)
+    commands = [
+        line
+        for block in blocks
+        for line in block.splitlines()
+        if line.startswith("bash scripts/paper.sh ")
+    ]
+    assert len(commands) == 5
+    parsed = [_parser().parse_args(shlex.split(line)[2:]) for line in commands]
+    assert sum(args.prepare_only for args in parsed) == 1
+    assert all(args.suite == "all" for args in parsed)
+    assert {tuple(args.tracks) for args in parsed if not args.prepare_only} == {
+        ("conductance_gat",),
+        ("cycle_pe",),
+        ("tree_augmentation",),
+        ("all",),
+    }
+    assert all(args.device == "cuda" and args.model_seeds == (0, 1, 2, 3, 4) for args in parsed)
+    assert "--tiny" not in readme
+    assert "python -c" not in readme
+    assert "\\\n" not in readme
+
+
+def test_legacy_demo_entrypoints_are_removed() -> None:
+    paths = [
+        "scripts/run_all.py",
+        "scripts/smoke.sh",
+        "scripts/smoke.ps1",
+        "scripts/setup.sh",
+        "scripts/setup.ps1",
+        "research/conductance_gat/run.py",
+        "research/cycle_pe/run.py",
+        "research/tree_augmentation/run.py",
+    ]
+    assert all(not (ROOT / path).exists() for path in paths)
 ````
 
 # tests/test_seed_protocol.py

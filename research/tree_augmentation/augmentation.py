@@ -1,4 +1,4 @@
-"""Tree-chart resampling and a small static Cycle-PE augmentation probe.
+"""Tree-chart resampling and lossless coordinate-change certification.
 
 No conductance, GAT, node-potential, or flow-completion object is imported or
 used in this module.  Every enabled chart keeps the full cycle rank ``beta``.
@@ -6,13 +6,11 @@ used in this module.  Every enabled chart keeps the full cycle rank ``beta``.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
-import torch
 from numpy.typing import ArrayLike, NDArray
-from torch import Tensor, nn
 
 from chartgat.algebra import chart_transition, fundamental_cycle_basis, incidence_matrix
 from chartgat.graphs import spanning_tree_indices
@@ -214,154 +212,3 @@ def cycle_projector_diagonal(cycle_basis: ArrayLike) -> FloatArray:
     """Return chart-independent static edge cycle leverage scores."""
 
     return np.diag(cycle_projector(cycle_basis)).copy()
-
-
-def chart_probe_features(cycle_basis: ArrayLike) -> FloatArray:
-    """Build deliberately chart-dependent raw features for the diagnostic probe.
-
-    Each edge receives its raw fundamental-cycle row, the squared row, and the
-    flattened inverse chart Gram matrix.  All are static topology quantities;
-    no node/flow state is involved.
-    """
-
-    basis = np.asarray(cycle_basis, dtype=np.float64)
-    if basis.ndim != 2:
-        raise ValueError("cycle_basis must be two-dimensional")
-    m, beta = basis.shape
-    if beta == 0:
-        return np.ones((m, 1), dtype=np.float64)
-    gram_inverse = np.linalg.inv(basis.T @ basis)
-    global_features = np.broadcast_to(gram_inverse.reshape(1, -1), (m, beta * beta))
-    return np.concatenate((basis, basis**2, global_features), axis=1)
-
-
-class _StaticCycleProbe(nn.Module):
-    """Small raw-coordinate MLP used only for the augmentation comparison."""
-
-    def __init__(self, input_dim: int, hidden_dim: int) -> None:
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, features: Tensor) -> Tensor:
-        return self.network(features).squeeze(-1)
-
-
-def _probe_arrays(charts: Iterable[TreeChart], target: FloatArray) -> tuple[Tensor, Tensor]:
-    feature_blocks: list[FloatArray] = []
-    target_blocks: list[FloatArray] = []
-    for chart in charts:
-        feature_blocks.append(chart_probe_features(chart.basis))
-        target_blocks.append(target)
-    if not feature_blocks:
-        raise ValueError("at least one training chart is required")
-    features = torch.as_tensor(np.concatenate(feature_blocks), dtype=torch.float64)
-    targets = torch.as_tensor(np.concatenate(target_blocks), dtype=torch.float64)
-    return features, targets
-
-
-def train_probe(
-    charts: Sequence[TreeChart],
-    target: ArrayLike,
-    *,
-    hidden_dim: int = 48,
-    epochs: int = 800,
-    learning_rate: float = 0.01,
-    weight_decay: float = 1e-5,
-    seed: int = 0,
-) -> nn.Module:
-    """Fit the raw-coordinate static Cycle-PE probe on one or many tree charts."""
-
-    if epochs < 1:
-        raise ValueError("epochs must be positive")
-    if hidden_dim < 1:
-        raise ValueError("hidden_dim must be positive")
-    if learning_rate <= 0:
-        raise ValueError("learning_rate must be positive")
-    values = np.asarray(target, dtype=np.float64)
-    if values.shape != (charts[0].num_edges,):
-        raise ValueError("target must contain one scalar per physical edge")
-    torch.manual_seed(seed)
-    features, targets = _probe_arrays(charts, values)
-    model = _StaticCycleProbe(features.shape[1], hidden_dim).double()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    for _ in range(epochs):
-        optimizer.zero_grad(set_to_none=True)
-        loss = torch.mean((model(features) - targets) ** 2)
-        loss.backward()
-        optimizer.step()
-    return model
-
-
-@torch.no_grad()
-def evaluate_probe(model: nn.Module, chart: TreeChart, target: ArrayLike) -> float:
-    """Return mean squared error for one chart of the same physical graph."""
-
-    values = np.asarray(target, dtype=np.float64)
-    if values.shape != (chart.num_edges,):
-        raise ValueError("target must contain one scalar per physical edge")
-    features = torch.as_tensor(chart_probe_features(chart.basis), dtype=torch.float64)
-    targets = torch.as_tensor(values, dtype=torch.float64)
-    return float(torch.mean((model(features) - targets) ** 2))
-
-
-def run_static_cycle_pe_probe(
-    training_charts: Sequence[TreeChart],
-    unseen_chart: TreeChart,
-    *,
-    hidden_dim: int = 48,
-    epochs: int = 800,
-    learning_rate: float = 0.01,
-    weight_decay: float = 1e-5,
-    seed: int = 0,
-) -> dict[str, float | int | str]:
-    """Compare fixed-tree training, multi-tree augmentation, and unseen-tree tests."""
-
-    if not training_charts:
-        raise ValueError("training_charts must not be empty")
-    reference = training_charts[0]
-    if any(chart.basis.shape != reference.basis.shape for chart in training_charts):
-        raise ValueError("all charts must describe the same physical graph")
-    if unseen_chart.basis.shape != reference.basis.shape:
-        raise ValueError("unseen_chart must describe the same physical graph")
-
-    target = cycle_projector_diagonal(reference.basis)
-    if not np.allclose(cycle_projector_diagonal(unseen_chart.basis), target, atol=1e-10, rtol=0.0):
-        raise ValueError("charts do not represent the same physical cycle space")
-
-    settings = {
-        "hidden_dim": hidden_dim,
-        "epochs": epochs,
-        "learning_rate": learning_rate,
-        "weight_decay": weight_decay,
-        "seed": seed,
-    }
-    fixed_model = train_probe([reference], target, **settings)
-    multi_model = train_probe(training_charts, target, **settings)
-    fixed_train_mse = evaluate_probe(fixed_model, reference, target)
-    multi_train_mse = float(
-        np.mean([evaluate_probe(multi_model, chart, target) for chart in training_charts])
-    )
-    fixed_unseen_mse = evaluate_probe(fixed_model, unseen_chart, target)
-    multi_unseen_mse = evaluate_probe(multi_model, unseen_chart, target)
-    oracle_target = cycle_projector_diagonal(unseen_chart.basis)
-    oracle_unseen_mse = float(np.mean((oracle_target - target) ** 2))
-
-    return {
-        "cycle_rank_beta": reference.beta,
-        "num_training_charts": len(training_charts),
-        "fixed_chart": reference.name,
-        "unseen_chart": unseen_chart.name,
-        "fixed_train_mse": fixed_train_mse,
-        "multi_train_mse": multi_train_mse,
-        "fixed_unseen_mse": fixed_unseen_mse,
-        "multi_unseen_mse": multi_unseen_mse,
-        "unseen_mse_ratio_multi_over_fixed": multi_unseen_mse
-        / max(fixed_unseen_mse, np.finfo(np.float64).tiny),
-        "projector_oracle_unseen_mse": oracle_unseen_mse,
-    }

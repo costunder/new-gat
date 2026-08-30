@@ -138,8 +138,8 @@ def test_official_mode_resolves_for_full_runs_and_forces_reference_settings() ->
     assert settings.amp_requested is False
     assert settings.pin_memory_requested is False
 
-    tiny = build_parser().parse_args(["--suite", "brec", "--tiny"])
-    assert _effective_brec_protocol(tiny) == "custom"
+    custom = build_parser().parse_args(["--suite", "brec", "--brec-protocol", "custom"])
+    assert _effective_brec_protocol(custom) == "custom"
 
 
 def test_official_reference_compatibility_does_not_claim_differential_parity() -> None:

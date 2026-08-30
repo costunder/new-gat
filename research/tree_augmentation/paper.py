@@ -2,7 +2,6 @@
 
 Examples
 --------
-python -m research.tree_augmentation.paper --suite core --tiny --device cpu
 python -m research.tree_augmentation.paper --suite core --device cuda --amp
 """
 
@@ -141,18 +140,17 @@ def _prepare_output_dir(path: Path) -> Path:
     return resolved
 
 
-def _load_settings(*, tiny: bool) -> tuple[dict[str, Any], Path]:
+def _load_settings() -> tuple[dict[str, Any], Path]:
     config_path = Path(__file__).with_name("config.yaml").resolve()
     with config_path.open("r", encoding="utf-8") as stream:
         config = yaml.safe_load(stream)
     if not isinstance(config, dict) or not isinstance(config.get("paper"), dict):
         raise ValueError("config.yaml must contain a paper mapping")
     paper = dict(config["paper"])
-    profile_name = "tiny" if tiny else "full"
-    profile = paper.get(profile_name)
+    profile = paper.get("full")
     if not isinstance(profile, dict):
-        raise ValueError(f"paper.{profile_name} must be a mapping")
-    merged = {key: value for key, value in paper.items() if key not in {"tiny", "full"}}
+        raise ValueError("paper.full must be a mapping")
+    merged = {key: value for key, value in paper.items() if key != "full"}
     merged.update(profile)
     return merged, config_path
 
@@ -162,17 +160,15 @@ def _prepare_dataset(
     data_root: Path,
     *,
     seed_axes: SeedAxes,
-    tiny: bool,
     allow_download: bool,
 ) -> PreparedDataset:
     if suite == "core":
-        return prepare_cyclecount_dataset(data_root, seed=seed_axes.data, tiny=tiny)
+        return prepare_cyclecount_dataset(data_root, seed=seed_axes.data)
     cache_seed = seed_axes.split if suite == "csl" else seed_axes.data
     return prepare_optional_pyg_dataset(
         suite,
         data_root,
         seed=cache_seed,
-        tiny=tiny,
         allow_download=allow_download,
     )
 
@@ -379,18 +375,15 @@ def _output_dim(dataset: PreparedDataset) -> int:
     return len(dataset.records[0].target)
 
 
-def _headline_comparison(metrics: dict[str, Any], *, suite: str, tiny: bool) -> dict[str, Any]:
-    eligible = not tiny
-    if tiny:
-        eligibility_reason = "tiny fixture; pipeline validation only"
-    elif suite == "core":
+def _headline_comparison(metrics: dict[str, Any], *, suite: str) -> dict[str, Any]:
+    if suite == "core":
         eligibility_reason = "full independent CycleCount-style core protocol"
     elif suite == "zinc":
         eligibility_reason = "official ZINC-12K split with atom/bond chemistry and held-out charts"
     else:
         eligibility_reason = "full CSL controlled chart-robustness protocol"
     comparison: dict[str, Any] = {
-        "paper_headline_eligible": eligible,
+        "paper_headline_eligible": True,
         "paper_headline_eligibility_reason": eligibility_reason,
         "projector_target_used": False,
         "fixed_and_multi_optimizer_updates_matched": True,
@@ -440,7 +433,6 @@ def run_suite(
     split_seed: int | None = None,
     chart_seed: int | None = None,
     model_seed: int | None = None,
-    tiny: bool,
     prepare_only: bool,
     amp_override: bool | None,
     batch_size_override: int | None,
@@ -458,7 +450,7 @@ def run_suite(
         chart_seed=chart_seed,
         model_seed=model_seed,
     )
-    settings, config_path = _load_settings(tiny=tiny)
+    settings, config_path = _load_settings()
     output = _prepare_output_dir(output_dir)
     manifest_path = output / "manifest.json"
     manifest: dict[str, Any] = {
@@ -467,7 +459,6 @@ def run_suite(
         "protocol": _protocol_name(suite),
         "seed_axes": seed_axes.to_manifest(),
         "dataset_seed_policy": _dataset_seed_policy(suite),
-        "tiny": tiny,
         "prepare_only": prepare_only,
         "allow_download": allow_download,
         "workers": workers,
@@ -502,7 +493,6 @@ def run_suite(
             suite,
             data_root,
             seed_axes=seed_axes,
-            tiny=tiny,
             allow_download=allow_download,
         )
         manifest["dataset"] = {
@@ -599,7 +589,6 @@ def run_suite(
             "protocol": _protocol_name(suite),
             "downstream_target": list(dataset.target_names),
             "target_is_independent_of_chart": True,
-            "legacy_projector_smoke_preserved_separately": True,
             "samplers": {
                 "uniform": "wilson_ust",
                 "traversal": ["bfs_random_root", "dfs_random_root"],
@@ -631,7 +620,7 @@ def run_suite(
             },
             "runtime": runtime,
             "models": metrics,
-            "comparison": _headline_comparison(metrics, suite=suite, tiny=tiny),
+            "comparison": _headline_comparison(metrics, suite=suite),
             "checkpoints": model_paths,
         }
         summary_path = output / "summary.json"
@@ -702,11 +691,6 @@ def _parser() -> argparse.ArgumentParser:
         help="model initialization/minibatch axis; defaults to --seed",
     )
     parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument(
-        "--tiny",
-        action="store_true",
-        help="small profile (core is offline; CSL/ZINC still require a cache or download)",
-    )
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument(
@@ -736,7 +720,6 @@ def _run_from_args(args: argparse.Namespace, suite: str, output_dir: Path) -> di
         split_seed=args.split_seed,
         chart_seed=args.chart_seed,
         model_seed=args.model_seed,
-        tiny=args.tiny,
         prepare_only=args.prepare_only,
         amp_override=args.amp,
         batch_size_override=args.batch_size,
@@ -763,7 +746,6 @@ def _run_all(args: argparse.Namespace, output_root: Path) -> int:
         "status": "preparing",
         "suite": "all",
         "seed_axes": seed_axes.to_manifest(),
-        "tiny": args.tiny,
         "prepare_only": args.prepare_only,
         "allow_download": args.allow_download,
         "workers": args.workers,

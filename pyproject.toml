@@ -41,8 +41,8 @@ exclude = ["research.combined_later*", "research.*.tests*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-"research.conductance_gat" = ["config.yaml", "datasets.yaml"]
-"research.cycle_pe" = ["config.yaml", "datasets.yaml"]
+"research.conductance_gat" = ["datasets.yaml"]
+"research.cycle_pe" = ["datasets.yaml"]
 "research.tree_augmentation" = ["config.yaml", "datasets.yaml"]
 
 [tool.pytest.ini_options]

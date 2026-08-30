@@ -15,14 +15,14 @@ edge `tail -> head`, `sparse.py` gathers `H[head] - H[tail]`; two PyTorch
 of different sizes are concatenated into one `PackedGraphBatch`, so memory is
 linear in nodes and edges and the same code runs on CPU or CUDA.
 
-The older `run.py` single-graph dense experiment remains only as a backwards
-compatible smoke test. Paper claims and paper results must use `paper.py`.
+All experiments use the `paper.py` entry point.
 
 ## Linux/CUDA setup
 
-Use the Linux GPU host reached through MobaXterm. Conda must first be available
-through the server's supported installation/module; ask the administrator if
-`conda --version` fails. From the repository root, create a dedicated environment:
+Use a Linux workstation or server with an NVIDIA GPU, directly from a local
+terminal or through any SSH client. Neither MobaXterm nor tmux is required.
+Follow the [root README](../../README.md) for the supported hardware/software
+requirements and Conda installation. From the repository root, create a dedicated environment:
 
 ```bash
 source "$(conda info --base)/etc/profile.d/conda.sh"
@@ -35,10 +35,13 @@ If you already created this project's environment using the
 [root README](../../README.md), skip creation and activate that same environment.
 Do not install into `base`, a shared environment, or another project's environment.
 The setup script installs the repository's exact CUDA/package pins, including
-PyG/OGB dependencies for PascalVOC-SP and ogbg-molhiv, then verifies CUDA and tests.
+PyG/OGB dependencies for PascalVOC-SP and ogbg-molhiv, then verifies the lock,
+package compatibility, and CUDA. The default wheel channel is `cu126`; do not
+change it between reproductions of the same run. Tests are optional:
+`RUN_TESTS=1 bash scripts/setup_gpu.sh`.
 
 Every `python` command below assumes this Conda environment is active and the
-working directory is the repository root. In each new SSH/tmux shell, run the
+working directory is the repository root. In each new terminal, run the
 `source` and `conda activate new-gat` commands again; no environment recreation
 is needed. See the root README for data paths, GPU allocation, and wheel selection.
 The runner checks CUDA availability before doing any work and gives an explicit
@@ -85,24 +88,12 @@ DataLoader memory, and non-blocking host-to-device transfer; all are explicit:
 CUDA device/runtime and peak allocated/reserved memory. An OOM error reports the
 batch-size recovery command instead of silently falling back to CPU.
 
-Run an offline end-to-end fixture (core plus both public adapter paths):
-
-```bash
-python -m research.conductance_gat.paper \
-  --suite all --tiny --device cpu --no-amp \
-  --data-root ./data/conductance-ci \
-  --output-dir ./results/conductance-ci --seed 17
-```
-
-`--tiny` public numbers are labelled `fixture: true` and
-`official_result: false`; they are pipeline tests, never benchmark results.
-
 ## Implemented core datasets
 
 | ID | Implemented protocol | Claim tested |
 |---|---|---|
 | S1 static identification | Shared positive static edge law; full profile has 42/9/9 independently seeded, graph-ID-disjoint train/validation/test graphs (70/15/15), plus new excitations on training graph IDs. | Held-ID recovery is not fixed-edge-ID memorization; canonical topology/feature/conductance uniqueness is not certified. |
-| S2 topology/size OOD | Train/validation on ER-like/RGG-like graph generators with 16--32 nodes; test only grid/barbell graphs with 48--96 nodes. Tiny keeps the same strict size/family separation at smaller sizes. Exact cross-split isomorphism deduplication is not implemented. | Sparse variable-graph topology and size transfer. |
+| S2 topology/size OOD | Train/validation on ER-like/RGG-like graph generators with 16--32 nodes; test only grid/barbell graphs with 48--96 nodes. Exact cross-split isomorphism deduplication is not implemented. | Sparse variable-graph topology and size transfer. |
 | S3 nonlinear rollout | Positive `c_e=f(x_e, abs(H_v-H_u))`; there is one trajectory per graph, so graph-ID disjointness also makes trajectories disjoint. Full evaluation reports horizons 1/5/10/50. | Held-graph rollout for one initial condition per graph; unseen-initial-condition and unseen-graph effects are not separated. |
 | S4 robustness | Every train/validation/test split contains all 18 known-condition cells: contrast 1/10/100 × active-node fraction 1/0.25 × SNR infinity/40/20 dB, with independently seeded graph IDs. | Conditional factor-grid held-ID empirical recovery, not blind contrast identification or factor OOD. |
 
@@ -192,7 +183,7 @@ are averaged into an orientation-free physical-edge attribute.
 The adapter marker under `--data-root` records source URLs, split counts, and
 required processed files. Later runs without `--allow-download` verify those
 files before constructing a PyG dataset, so a damaged cache cannot silently
-trigger a network request. `--suite all --tiny` is always fully offline.
+trigger a network request. Missing public data is never replaced by generated stand-ins.
 
 ## Deterministic cache and outputs
 
@@ -228,16 +219,15 @@ Tests cover sparse-vs-explicit algebra, orientation gauge invariance, positivity
 variable-graph isolation/mass conservation, objective isolation from flux labels,
 node-message NNLS recovery, S1--S4 split leakage, topology/size OOD boundaries,
 deterministic checksummed cache reload, reciprocal public edge adaptation,
-offline fixtures, legacy smoke behavior, and a full CPU tiny CLI run.
+unit-test adapter fixtures and CLI artifact handling.
 
 ## Files
 
 - `sparse.py`: dense-`B`-free gather/scatter layer and variable-graph packing;
 - `paper_data.py`: deterministic S1--S4 generation, splits, and cache manifests;
-- `public_data.py`: optional official PyG/OGB adapters and offline fixtures;
+- `public_data.py`: official PyG/OGB adapters;
 - `paper.py`: prepare/train/evaluate CLI, baselines, metrics, AMP, JSON/CSV;
-- `model.py`, `synthetic.py`, `run.py`: legacy single-graph smoke path;
-- `tests/`: algebra, datasets, adapter, cache, CLI, and legacy regression tests.
+- `tests/`: algebra, datasets, adapter, cache, and CLI regression tests.
 
 This directory tests only the incidence-conductance-attention hypothesis. It
 does not import or combine the other research tracks.

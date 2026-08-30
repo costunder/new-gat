@@ -22,7 +22,7 @@ from typing import Any
 import networkx as nx
 import numpy as np
 
-from chartgat.cache import atomic_publish, atomic_write_json
+from chartgat.cache import atomic_write_json
 from research.cycle_pe.paper_data import (
     DatasetBundle,
     PaperGraph,
@@ -50,6 +50,7 @@ BREC_CATEGORIES = {
 BREC_OFFICIAL_NUM_RELABEL = 32
 BREC_OFFICIAL_PAIR_COUNT = 400
 BREC_OFFICIAL_RECORD_COUNT = 4 * BREC_OFFICIAL_NUM_RELABEL * BREC_OFFICIAL_PAIR_COUNT
+ZINC_SPLIT_SIZES = {"train": 10_000, "validation": 1_000, "test": 1_000}
 
 _BREC_DOWNLOAD_LIMIT = 512 * 1024 * 1024
 _BREC_EXTRACT_LIMIT = 512 * 1024 * 1024
@@ -70,15 +71,6 @@ def _load_brec_records(path: Path) -> np.ndarray:
     if records.ndim != 1 or len(records) < 1:
         raise RuntimeError("BREC artifact must be a non-empty one-dimensional NumPy array")
     return records
-
-
-def _atomic_save_npy(path: Path, records: np.ndarray) -> None:
-    def write(temporary: Path) -> None:
-        with temporary.open("wb") as stream:
-            np.save(stream, records, allow_pickle=True)
-            stream.flush()
-
-    atomic_publish(path, write, validator=lambda temporary: _load_brec_records(temporary))
 
 
 def _require_pyg_zinc() -> type:
@@ -175,9 +167,7 @@ def _zinc_cache_hashes(root: Path) -> dict[str, str]:
     }
 
 
-def load_zinc12k(
-    data_root: Path, *, tiny: bool = False, allow_download: bool = False
-) -> DatasetBundle:
+def load_zinc12k(data_root: Path, *, allow_download: bool = False) -> DatasetBundle:
     """Load PyG's official 10k/1k/1k ZINC subset partitions."""
 
     zinc_class = _require_pyg_zinc()
@@ -189,19 +179,22 @@ def load_zinc12k(
             f"`--allow-download`. Loader documentation: {ZINC_SOURCE_URL}"
         )
     requested = {"train": "train", "validation": "val", "test": "test"}
-    tiny_limits = {"train": 32, "validation": 8, "test": 8}
     splits: dict[str, list[PaperGraph]] = {}
     official_sizes: dict[str, int] = {}
     try:
         for split, pyg_split in requested.items():
             dataset = zinc_class(root=str(root), subset=True, split=pyg_split)
             official_sizes[split] = len(dataset)
-            limit = min(len(dataset), tiny_limits[split]) if tiny else len(dataset)
+            if len(dataset) != ZINC_SPLIT_SIZES[split]:
+                raise RuntimeError(
+                    f"ZINC-12K {split} must contain {ZINC_SPLIT_SIZES[split]} graphs, "
+                    f"found {len(dataset)}"
+                )
             splits[split] = [
                 _pyg_zinc_graph(
                     dataset[index], graph_id=f"zinc12k:{split}:{index:05d}", split=split
                 )
-                for index in range(limit)
+                for index in range(len(dataset))
             ]
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         raise RuntimeError(
@@ -219,7 +212,6 @@ def load_zinc12k(
             "official_split_names": requested,
             "official_split_sizes": official_sizes,
             "loaded_split_sizes": {name: len(graphs) for name, graphs in splits.items()},
-            "tiny": bool(tiny),
             "download_allowed": bool(allow_download),
             "cache_sha256": _zinc_cache_hashes(root),
         },
@@ -278,8 +270,7 @@ class BRECAdapter:
         path: Path,
         *,
         num_relabel: int = BREC_OFFICIAL_NUM_RELABEL,
-        fixture: bool = False,
-        protocol: str = "custom",
+        protocol: str = "official",
     ) -> None:
         if num_relabel < 2:
             raise ValueError("BREC RPC needs at least two relabelings")
@@ -287,7 +278,6 @@ class BRECAdapter:
             raise ValueError("BREC protocol must be 'official' or 'custom'")
         self.path = path.expanduser().resolve()
         self.num_relabel = int(num_relabel)
-        self.fixture = bool(fixture)
         self.protocol = protocol
         self._records = _load_brec_records(self.path)
         block = 4 * self.num_relabel
@@ -299,8 +289,6 @@ class BRECAdapter:
         if self.pair_count < 1:
             raise RuntimeError("BREC artifact contains no RPC pairs")
         if self.protocol == "official":
-            if self.fixture:
-                raise RuntimeError("offline BREC fixtures cannot be used in official mode")
             if self.num_relabel != BREC_OFFICIAL_NUM_RELABEL:
                 raise RuntimeError(
                     "official BREC requires q=32; use --brec-protocol custom for other q values"
@@ -327,7 +315,6 @@ class BRECAdapter:
             "records": len(self._records),
             "pair_count": self.pair_count,
             "num_relabel": self.num_relabel,
-            "offline_fixture": self.fixture,
             "protocol": self.protocol,
             "rpc_threshold": 72.34 if self.num_relabel == 32 else None,
             "categories": BREC_CATEGORIES,
@@ -535,20 +522,9 @@ def load_brec_v3(
     *,
     num_relabel: int = BREC_OFFICIAL_NUM_RELABEL,
     allow_download: bool = False,
-    tiny: bool = False,
-    protocol: str = "custom",
+    protocol: str = "official",
 ) -> BRECAdapter:
     root = data_root.expanduser().resolve()
-    if tiny:
-        fixture_path = root / "cycle_pe_fixtures" / f"brec_v3_q{num_relabel}.npy"
-        if not fixture_path.is_file():
-            write_tiny_brec_fixture(fixture_path, num_relabel=num_relabel)
-        return BRECAdapter(
-            fixture_path,
-            num_relabel=num_relabel,
-            fixture=True,
-            protocol=protocol,
-        )
     try:
         path = find_brec_v3(root)
     except FileNotFoundError:
@@ -556,46 +532,6 @@ def load_brec_v3(
             raise
         path = download_brec_v3(root)
     return BRECAdapter(path, num_relabel=num_relabel, protocol=protocol)
-
-
-def write_tiny_brec_fixture(path: Path, *, num_relabel: int = 2) -> Path:
-    """Write a two-pair graph6 fixture matching the official RPC block layout."""
-
-    if num_relabel < 2:
-        raise ValueError("num_relabel must be at least two")
-    path = path.expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    pairs = (
-        (nx.cycle_graph(5), nx.complete_bipartite_graph(2, 3)),
-        (nx.cycle_graph(6), nx.disjoint_union(nx.path_graph(3), nx.path_graph(3))),
-    )
-    # The second H must be connected for the paper model; add one joining edge.
-    pairs[1][1].add_edge(2, 3)
-    train_records: list[bytes] = []
-    reliability_records: list[bytes] = []
-    for left, right in pairs:
-        for relabel in range(num_relabel):
-            permutation = np.random.default_rng(relabel).permutation(left.number_of_nodes())
-            mapping = {node: int(permutation[node]) for node in left.nodes()}
-            train_records.append(
-                nx.to_graph6_bytes(nx.relabel_nodes(left, mapping), header=False).strip()
-            )
-            permutation = np.random.default_rng(100 + relabel).permutation(right.number_of_nodes())
-            mapping = {node: int(permutation[node]) for node in right.nodes()}
-            train_records.append(
-                nx.to_graph6_bytes(nx.relabel_nodes(right, mapping), header=False).strip()
-            )
-        for relabel in range(num_relabel):
-            for offset in (200, 300):
-                permutation = np.random.default_rng(offset + relabel).permutation(
-                    left.number_of_nodes()
-                )
-                mapping = {node: int(permutation[node]) for node in left.nodes()}
-                reliability_records.append(
-                    nx.to_graph6_bytes(nx.relabel_nodes(left, mapping), header=False).strip()
-                )
-    _atomic_save_npy(path, np.asarray(train_records + reliability_records, dtype=object))
-    return path
 
 
 __all__ = [
@@ -613,5 +549,4 @@ __all__ = [
     "load_brec_v3",
     "validate_brec_v3",
     "load_zinc12k",
-    "write_tiny_brec_fixture",
 ]

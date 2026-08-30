@@ -7,6 +7,9 @@ import pytest
 import torch
 
 import research.conductance_gat.paper as paper_module
+import research.conductance_gat.paper_data as core_data_module
+import research.conductance_gat.public_data as public_data_module
+from chartgat.cache import CacheWrongRequestError
 from research.conductance_gat.paper import (
     _normalized_loss,
     _seed_axis_applicability,
@@ -21,8 +24,8 @@ from research.conductance_gat.paper_data import (
 )
 from research.conductance_gat.public_data import (
     deduplicate_undirected_edges,
-    make_public_fixtures,
     prepare_public_data,
+    validate_public_cache,
 )
 from research.conductance_gat.sparse import (
     SparseIncidenceConductanceLayer,
@@ -30,6 +33,32 @@ from research.conductance_gat.sparse import (
     edge_gradient,
     pack_graph_examples,
 )
+
+
+@pytest.fixture(scope="module")
+def full_core():
+    """Generate the real scientific protocol once; never run model training."""
+
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        return generate_core(seed=9)
+    finally:
+        torch.set_num_threads(previous_threads)
+
+
+def _unit_public_model_input(task: str):
+    """One tensor-level model input, not a public dataset or CLI data source."""
+
+    return {
+        "graph_id": "unit-model-input",
+        "x": torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+        "edge_index": torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        "edge_features": torch.ones(2, 2),
+        "y": torch.tensor([0, 1, 2]) if task == "node" else torch.tensor([1.0]),
+        "task": task,
+        "categorical": False,
+    }
 
 
 def _explicit_incidence(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
@@ -147,8 +176,16 @@ def test_training_objectives_keep_headline_independent_of_flux_labels() -> None:
 
 
 def test_node_message_nnls_recovers_static_conductance_without_flux_labels() -> None:
-    suite = generate_core(seed=19, tiny=True)["s1"]
-    examples = suite["test"]
+    examples = [
+        make_example(
+            graph_id="unit-nnls",
+            num_nodes=7,
+            family="er",
+            graph_seed=31,
+            excitation_seed=40 + excitation,
+        )
+        for excitation in range(3)
+    ]
     for example in examples:
         example["observed_flux"] = torch.full_like(example["observed_flux"], float("nan"))
     metrics = node_message_nnls_metrics(examples)
@@ -158,8 +195,8 @@ def test_node_message_nnls_recovers_static_conductance_without_flux_labels() -> 
     assert metrics["graph_macro_conductance_pearson"] == pytest.approx(1.0, abs=1.0e-5)
 
 
-def test_s1_s4_splits_and_factorial_are_leakage_safe() -> None:
-    core = generate_core(seed=7, tiny=True)
+def test_s1_s4_splits_and_factorial_are_leakage_safe(full_core) -> None:
+    core = full_core
     s1 = core["s1"]
     train_ids = {example["graph_id"] for example in s1["train"]}
     validation_ids = {example["graph_id"] for example in s1["validation"]}
@@ -176,8 +213,10 @@ def test_s1_s4_splits_and_factorial_are_leakage_safe() -> None:
     )
 
     s3 = core["s3"]
-    assert s3["horizons"] == [1, 5, 10]
-    assert all(trajectory["states"].shape[0] == 11 for trajectory in s3["rollout_test"])
+    assert s3["horizons"] == [1, 5, 10, 50]
+    assert all(trajectory["states"].shape[0] == 51 for trajectory in s3["rollout_test"])
+    assert core_data_module._split_counts(core) == _expected_split_counts()
+    assert "tiny" not in core
 
     s4 = core["s4"]
     ids = [
@@ -198,7 +237,7 @@ def test_s1_s4_splits_and_factorial_are_leakage_safe() -> None:
 def test_full_s2_cache_cardinality_matches_graph_and_excitation_protocol() -> None:
     # Check the full cache contract without materializing the 52 full-size
     # graphs and their 184 excitation examples.
-    expected = _expected_split_counts(tiny=False)["s2"]
+    expected = _expected_split_counts()["s2"]
     graph_counts = {"train": 28, "validation": 8, "test": 16}
     excitations_per_graph = {"train": 4, "validation": 3, "test": 3}
     assert expected == {
@@ -207,12 +246,17 @@ def test_full_s2_cache_cardinality_matches_graph_and_excitation_protocol() -> No
     assert expected == {"train": 112, "validation": 24, "test": 48}
 
 
-def test_cache_manifest_is_deterministic_and_checksum_verified(tmp_path) -> None:
-    first, first_path, first_manifest = prepare_core_cache(tmp_path, seed=9, tiny=True)
-    second, second_path, second_manifest = prepare_core_cache(tmp_path, seed=9, tiny=True)
-    _, _, independent_manifest = prepare_core_cache(
-        tmp_path / "independent-root", seed=9, tiny=True
-    )
+def test_cache_manifest_is_deterministic_and_checksum_verified(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, full_core
+) -> None:
+    def cached_generation(seed):
+        assert seed == 9
+        return full_core
+
+    monkeypatch.setattr(core_data_module, "generate_core", cached_generation)
+    first, first_path, first_manifest = prepare_core_cache(tmp_path, seed=9)
+    second, second_path, second_manifest = prepare_core_cache(tmp_path, seed=9)
+    _, _, independent_manifest = prepare_core_cache(tmp_path / "independent-root", seed=9)
     assert first_path == second_path
     assert first_manifest == second_manifest
     assert first_manifest["content_sha256"] == second_manifest["content_sha256"]
@@ -220,7 +264,7 @@ def test_cache_manifest_is_deterministic_and_checksum_verified(tmp_path) -> None
     assert first["s1"]["train"][0]["graph_id"] == second["s1"]["train"][0]["graph_id"]
 
 
-def test_public_fixture_uses_same_reciprocal_edge_adapter_without_network(tmp_path) -> None:
+def test_public_reciprocal_edge_adapter_without_network() -> None:
     directed = torch.tensor([[0, 1, 1, 0, 2], [1, 0, 1, 2, 0]], dtype=torch.long)
     attributes = torch.arange(10, dtype=torch.float32).reshape(5, 2)
     edges, features = deduplicate_undirected_edges(directed, attributes, 3)
@@ -235,19 +279,11 @@ def test_public_fixture_uses_same_reciprocal_edge_adapter_without_network(tmp_pa
     with pytest.raises(ValueError, match="conflicting categorical reciprocal"):
         deduplicate_undirected_edges(reciprocal, categorical, 2)
 
-    fixture = make_public_fixtures(5)
-    assert fixture["fixture"] is True
-    labels = [int(graph["y"].item()) for graph in fixture["ogbg_molhiv"]["test"]]
-    assert set(labels) == {0, 1}
-    _, marker, manifest = prepare_public_data(tmp_path, seed=5, tiny=True)
-    assert marker.exists() and manifest["fixture"] is True
-
 
 def test_public_loss_weight_and_inactive_edge_encoders_match_active_computation() -> None:
-    fixture = make_public_fixtures(7)
-    node_sample = fixture["pascalvoc_sp"]["train"][0]
+    node_sample = _unit_public_model_input("node")
     assert paper_module._public_loss_weight(node_sample["y"], "node") == node_sample["y"].numel()
-    graph_sample = fixture["ogbg_molhiv"]["train"][0]
+    graph_sample = _unit_public_model_input("graph")
     assert paper_module._public_loss_weight(graph_sample["y"], "graph") == 1
 
     gcn = paper_module.PublicConductanceModel(
@@ -283,7 +319,6 @@ def test_cli_refuses_nonempty_output_without_touching_existing_artifacts(
                 "--suite",
                 "core",
                 "--prepare-only",
-                "--tiny",
                 "--device",
                 "cpu",
                 "--data-root",
@@ -297,65 +332,104 @@ def test_cli_refuses_nonempty_output_without_touching_existing_artifacts(
     assert not (tmp_path / "data").exists()
 
 
-def test_tiny_all_cli_writes_machine_readable_results(tmp_path) -> None:
-    output = tmp_path / "output"
-    summary = paper_main(
-        [
-            "--suite",
-            "all",
-            "--tiny",
-            "--device",
-            "cpu",
-            "--no-amp",
-            "--epochs",
-            "1",
-            "--batch-size",
-            "64",
-            "--workers",
-            "0",
-            "--seed",
-            "13",
-            "--data-root",
-            str(tmp_path / "data"),
-            "--output-dir",
-            str(output),
-        ]
+@pytest.mark.parametrize("suite", ["core", "public", "all"])
+def test_paper_cli_rejects_removed_tiny_option_before_writes(tmp_path, suite) -> None:
+    with pytest.raises(SystemExit) as caught:
+        paper_main(
+            [
+                "--suite",
+                suite,
+                "--tiny",
+                "--data-root",
+                str(tmp_path / "data"),
+                "--output-dir",
+                str(tmp_path / "output"),
+            ]
+        )
+    assert caught.value.code == 2
+    assert not (tmp_path / "data").exists()
+    assert not (tmp_path / "output").exists()
+
+
+def test_missing_official_data_fails_without_loader_or_fabricated_fallback(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden_loader(_root):
+        pytest.fail("A missing cache must not invoke the downloader without permission")
+
+    monkeypatch.setattr(public_data_module, "_load_official", forbidden_loader)
+    data_root = tmp_path / "data"
+    with pytest.raises(RuntimeError, match="Official public data is not marked prepared"):
+        prepare_public_data(data_root)
+    assert not data_root.exists()
+    assert not hasattr(public_data_module, "make_public_fixtures")
+
+
+def test_legacy_fabricated_public_marker_is_rejected_before_loading(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    public_root = tmp_path / "conductance_gat" / "public"
+    public_root.mkdir(parents=True)
+    marker = public_root / "official-ready.json"
+    marker.write_text(
+        json.dumps({"schema_version": public_data_module.PUBLIC_SCHEMA_VERSION, "fixture": True}),
+        encoding="utf-8",
     )
-    assert summary["runtime"]["amp"] is False
-    assert summary["seed_axes"] == {"data": 13, "split": 13, "chart": 13, "model": 13}
-    assert summary["results"]["public"]["pascalvoc_sp"]["fixture"] is True
-    expected_public_baselines = {
-        "no_message_mlp",
-        "gcn",
-        "gat",
-        "gine",
-        "conductance_model",
-    }
-    for dataset_name in ("pascalvoc_sp", "ogbg_molhiv"):
-        public_result = summary["results"]["public"][dataset_name]
-        assert set(public_result["baselines"]) == expected_public_baselines
-        assert all(result["parameter_count"] > 0 for result in public_result["baselines"].values())
-        assert public_result["comparison_protocol"]["backbone_depth"] == 1
-    assert summary["results"]["core"]["s3"]["baselines"]["oracle"]["rollout"][
-        "horizon_10_relative_l2"
-    ] == pytest.approx(0.0)
-    for suite_name in ("s1", "s2", "s3", "s4"):
-        core_result = summary["results"]["core"][suite_name]
-        assert core_result["headline_baseline"] == "full"
-        assert core_result["baselines"]["full"]["training_objective"] == "node_only"
-        assert core_result["baselines"]["full_flux_supervised"]["training_objective"] == "flux_only"
-        assert core_result["baselines"]["full_joint"]["training_objective"] == "joint"
-        assert core_result["baselines"]["gradient_only"]["training_objective"] == "node_only"
-    assert "node_message_nnls" in summary["results"]["core"]["s1"]["baselines"]
-    assert "node_message_nnls" in summary["results"]["core"]["s4"]["baselines"]
-    assert (output / "summary.json").exists()
-    assert (output / "metrics.csv").exists()
-    assert (output / "history.csv").exists()
-    assert (output / "models.pt").exists()
-    history_header = (output / "history.csv").read_text(encoding="utf-8").splitlines()[0]
-    assert "training_objective" in history_header
-    parsed = json.loads((output / "summary.json").read_text(encoding="utf-8"))
-    assert parsed["scope"] == "independent_sparse_incidence_conductance_attention"
+    before = marker.read_bytes()
+    monkeypatch.setattr(
+        public_data_module, "_load_official", lambda _root: pytest.fail("must not load")
+    )
+    with pytest.raises(CacheWrongRequestError, match="only official public data"):
+        prepare_public_data(tmp_path)
+    assert marker.read_bytes() == before
+
+
+def test_public_download_failure_propagates_without_generating_substitute(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failed_download(_root):
+        raise OSError("official endpoint unavailable")
+
+    monkeypatch.setattr(public_data_module, "_load_official", failed_download)
+    with pytest.raises(OSError, match="official endpoint unavailable"):
+        prepare_public_data(tmp_path, allow_download=True)
+    assert not list(tmp_path.rglob("*.json"))
+    with pytest.raises(FileNotFoundError):
+        validate_public_cache(tmp_path)
+
+
+def test_public_training_rejects_legacy_generated_payload_before_any_model() -> None:
+    with pytest.raises(ValueError, match="require official data"):
+        paper_module.run_public(
+            {"fixture": True},
+            device=torch.device("cpu"),
+            epochs=1,
+            learning_rate=0.001,
+            batch_size=2,
+            amp=False,
+            pin_memory=False,
+            num_workers=0,
+            seed=7,
+        )
+
+
+def test_public_cli_missing_real_data_never_writes_result_summary(tmp_path) -> None:
+    with pytest.raises(RuntimeError, match="Official public data is not marked prepared"):
+        paper_main(
+            [
+                "--suite",
+                "public",
+                "--prepare-only",
+                "--device",
+                "cpu",
+                "--data-root",
+                str(tmp_path / "data"),
+                "--output-dir",
+                str(tmp_path / "output"),
+            ]
+        )
+    assert not (tmp_path / "data").exists()
+    assert not list((tmp_path / "output").iterdir())
 
 
 def test_explicit_seed_axes_route_data_and_model_randomness_independently(
@@ -367,12 +441,16 @@ def test_explicit_seed_axes_route_data_and_model_randomness_independently(
         captured["model_seed"] = kwargs["seed"]
         return {}, [], {}
 
+    def fake_prepare_core(data_root, *, seed):
+        captured["data_seed"] = seed
+        return {}, data_root / "unit-dispatch-manifest.json", {"cache_key": "unit-dispatch"}
+
+    monkeypatch.setattr(paper_module, "prepare_core_cache", fake_prepare_core)
     monkeypatch.setattr(paper_module, "run_core", fake_run_core)
     summary = paper_module.main(
         [
             "--suite",
             "core",
-            "--tiny",
             "--device",
             "cpu",
             "--epochs",
@@ -396,17 +474,14 @@ def test_explicit_seed_axes_route_data_and_model_randomness_independently(
     assert "seed" not in summary
     assert summary["seed_axes"] == {"data": 3, "split": 4, "chart": 5, "model": 6}
     assert captured["model_seed"] == 6
-    core_manifest = json.loads(
-        Path(summary["prepared"]["core"]["manifest"]).read_text(encoding="utf-8")
-    )
-    assert core_manifest["request"]["seed"] == 3
+    assert captured["data_seed"] == 3
     assert summary["prepared"]["core"]["data_seed"] == 3
     assert summary["seed_axis_applicability"]["core"]["split"]["applicable"] is False
     assert summary["seed_axis_applicability"]["core"]["chart"]["applicable"] is False
 
 
 def test_official_public_split_and_chart_seed_axes_are_not_applicable() -> None:
-    applicability = _seed_axis_applicability("public", public_fixture=False)["public"]
+    applicability = _seed_axis_applicability("public")["public"]
     assert applicability["data"]["applicable"] is False
     assert applicability["split"]["applicable"] is False
     assert "official" in applicability["split"]["use"]

@@ -1,0 +1,10 @@
+name: new-gat
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.11
+  - pip
+# Install the pinned CUDA research packages with: bash scripts/setup_gpu.sh
+# CUDA packages are kept out of the bootstrap environment so the official
+# PyTorch wheel index and constraints file are always applied together.

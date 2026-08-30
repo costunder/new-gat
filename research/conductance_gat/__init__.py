@@ -13,10 +13,8 @@ from .sparse import (
     edge_gradient,
     pack_graph_examples,
 )
-from .synthetic import ConductanceDataset, make_conductance_dataset
 
 __all__ = [
-    "ConductanceDataset",
     "IncidenceConductanceAttention",
     "IsotropicConductanceAttention",
     "PositiveInvariantScalarConductance",
@@ -25,6 +23,5 @@ __all__ = [
     "SparsePositiveConductance",
     "edge_divergence",
     "edge_gradient",
-    "make_conductance_dataset",
     "pack_graph_examples",
 ]

@@ -5,7 +5,9 @@ import json
 import torch
 
 from chartgat.seeds import SeedAxes
+from research.cycle_pe import paper
 from research.cycle_pe.paper import _seed_axis_policy, _settings, build_parser, main
+from research.cycle_pe.tests.fixtures import small_cyclecount_loader
 
 
 def test_cycle_settings_use_model_axis_and_record_not_applicable_axes() -> None:
@@ -39,7 +41,8 @@ def test_cycle_settings_use_model_axis_and_record_not_applicable_axes() -> None:
     assert zinc["chart"]["status"] == "not_applicable"
 
 
-def test_cyclecount_cache_identity_uses_data_seed_not_model_seed(tmp_path) -> None:
+def test_cyclecount_cache_identity_uses_data_seed_not_model_seed(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(paper, "load_or_generate_cycle_count_ood", small_cyclecount_loader)
     data_root = tmp_path / "data"
     manifests = []
     for model_seed in (31, 37):
@@ -55,7 +58,6 @@ def test_cyclecount_cache_identity_uses_data_seed_not_model_seed(tmp_path) -> No
                     str(output_root),
                     "--device",
                     "cpu",
-                    "--tiny",
                     "--prepare-only",
                     "--seed",
                     "5",

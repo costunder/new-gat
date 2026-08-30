@@ -23,7 +23,6 @@ def validate_dataset_cache(
     *,
     data_seeds: tuple[int, ...],
     split_seeds: tuple[int, ...],
-    tiny: bool,
 ) -> dict[str, Any]:
     """Validate every requested cache for one conductance registry entry."""
 
@@ -31,13 +30,11 @@ def validate_dataset_cache(
     paths: list[str] = []
     if dataset_id in CORE_DATASETS:
         for seed in data_seeds:
-            _, manifest_path, _ = validate_core_cache(data_root, seed=seed, tiny=tiny)
+            _, manifest_path, _ = validate_core_cache(data_root, seed=seed)
             paths.append(str(manifest_path))
     elif dataset_id in PUBLIC_DATASETS:
-        validation_seeds = data_seeds if tiny else data_seeds[:1]
-        for seed in validation_seeds:
-            marker, _ = validate_public_cache(data_root, seed=seed, tiny=tiny)
-            paths.append(str(marker))
+        marker, _ = validate_public_cache(data_root)
+        paths.append(str(marker))
     else:
         raise ValueError(f"unsupported conductance cache dataset {dataset_id!r}")
     return {"paths": sorted(set(paths)), "requested_data_seeds": list(data_seeds)}

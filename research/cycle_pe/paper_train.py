@@ -93,8 +93,8 @@ def resolve_device(requested: str) -> torch.device:
         if not torch.cuda.is_available():
             raise RuntimeError(
                 "CUDA was requested but this PyTorch build cannot access CUDA. On the "
-                "Linux/MobaXterm host, verify `nvidia-smi`, then install the matching "
-                "CUDA-enabled PyTorch wheel. Use `--device cpu --tiny` only for smoke tests."
+                "Linux GPU workstation or server, verify `nvidia-smi`, then install the matching "
+                "CUDA-enabled PyTorch wheel using `bash scripts/setup_gpu.sh`."
             )
         index = torch.cuda.current_device() if device.index is None else device.index
         if index >= torch.cuda.device_count():

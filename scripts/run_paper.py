@@ -109,68 +109,22 @@ def _output_dir(
 def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str], Path | None]]:
     commands: list[tuple[str, list[str], Path | None]] = []
     selected_tracks = _selected_tracks(args.tracks)
-    preflight_output = PROJECT_ROOT / "runs" / "paper" / run_id / "gpu-preflight.json"
-    preflight_device = "cpu" if args.prepare_only else args.device
-    brec_protocol = "custom" if args.tiny else "official"
-    preflight_brec_batch_size = args.batch_size if args.tiny else 16
-    preflight_brec_amp = (
-        brec_protocol == "custom" and args.amp and preflight_device.lower().startswith("cuda")
-    )
-    preflight = [
-        sys.executable,
-        str(PROJECT_ROOT / "scripts" / "gpu_preflight.py"),
-        "--device",
-        preflight_device,
-        "--min-free-gb",
-        str(0.0 if args.prepare_only else args.min_free_gb),
-        "--batch-size",
-        str(args.batch_size),
-        "--brec-batch-size",
-        str(preflight_brec_batch_size),
-        "--nodes-per-graph",
-        str(args.preflight_nodes_per_graph),
-        "--edges-per-graph",
-        str(args.preflight_edges_per_graph),
-        "--cycle-rank",
-        str(args.preflight_cycle_rank),
-        "--cycle-variants",
-        ",".join(args.cycle_variants),
-        "--brec-protocol",
-        brec_protocol,
-        "--json-out",
-        str(preflight_output),
-    ]
-    if args.amp and preflight_device.lower().startswith("cuda"):
-        preflight.append("--amp")
-    else:
-        preflight.append("--no-amp")
-    preflight.append("--brec-amp" if preflight_brec_amp else "--no-brec-amp")
-    if args.prepare_only or args.allow_cpu:
-        preflight.append("--allow-cpu")
-    if args.suite == "all":
-        preflight.append("--require-paper-deps")
-    profiles: list[str] = []
-    if args.prepare_only:
-        # Data preparation needs an inexpensive CPU code smoke, not a claim
-        # about accelerator capacity.  The CUDA training invocation below runs
-        # the selected high-memory envelopes at their exact requested sizes.
-        profiles.append("conductance")
-    else:
-        if "conductance_gat" in selected_tracks:
-            profiles.append("conductance")
-        if "cycle_pe" in selected_tracks:
-            profiles.append("cycle-projector")
-        if "tree_augmentation" in selected_tracks:
-            profiles.append("tree-chart")
-        if args.suite == "all" and "cycle_pe" in selected_tracks:
-            profiles.append("brec")
-        if args.suite == "all" and "conductance_gat" in selected_tracks:
-            profiles.append("public-pyg")
-        if not profiles:
-            profiles.append("conductance")
-    for profile in dict.fromkeys(profiles):
-        preflight.extend(("--profile", profile))
-    commands.append(("gpu_preflight", preflight, preflight_output))
+    if not args.prepare_only:
+        preflight_output = PROJECT_ROOT / "runs" / "paper" / run_id / "gpu-preflight.json"
+        preflight = [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "gpu_preflight.py"),
+            "--device",
+            args.device,
+            "--min-free-gb",
+            str(args.min_free_gb),
+            "--json-out",
+            str(preflight_output),
+        ]
+        if args.suite == "all":
+            preflight.append("--require-paper-deps")
+        commands.append(("gpu_preflight", preflight, preflight_output))
+    brec_protocol = "official"
 
     data_root = args.data_root.expanduser().resolve()
 
@@ -179,8 +133,8 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
         if suite == "core":
             values.extend(("--core-targets", ",".join(args.cycle_core_targets)))
         # Official BREC owns its fixed 20-epoch/1e-4 optimization protocol.
-        # Master tuning knobs apply to CycleCount/ZINC and to tiny custom BREC only.
-        if suite != "brec" or args.tiny:
+        # Master tuning knobs apply only to CycleCount/ZINC.
+        if suite != "brec":
             if args.cycle_epochs is not None:
                 values.extend(("--epochs", str(args.cycle_epochs)))
             if args.cycle_learning_rate is not None:
@@ -231,8 +185,6 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
             command.append("--prepare-only")
         if args.allow_download:
             command.append("--allow-download")
-        if args.tiny:
-            command.append("--tiny")
         if not args.prepare_only:
             if effective_amp and args.device.lower().startswith("cuda"):
                 command.append("--amp")
@@ -259,7 +211,7 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
                         output_dir=cycle_root / f"model-seed-{model_seed}" / suite,
                         extra_arguments=cycle_arguments(suite),
                     )
-            brec_label = "custom-tiny" if args.tiny else "official-10-seed"
+            brec_label = "official-10-seed"
             brec_run_name = f"brec-{brec_label}"
             add_child(
                 track=track,
@@ -274,9 +226,9 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
                     "--brec-seeds",
                     ",".join(str(seed) for seed in CYCLE_BREC_OFFICIAL_SEEDS),
                 ),
-                batch_size=(args.batch_size if args.tiny else 16),
-                workers=(args.workers if args.tiny else 0),
-                amp=(args.amp if args.tiny else False),
+                batch_size=16,
+                workers=0,
+                amp=False,
             )
             continue
 
@@ -472,32 +424,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--min-free-gb", type=float, default=2.0)
-    parser.add_argument(
-        "--preflight-nodes-per-graph",
-        type=int,
-        default=64,
-        help="synthetic shape-stress envelope; this is not inferred from a dataset cache",
-    )
-    parser.add_argument(
-        "--preflight-edges-per-graph",
-        type=int,
-        default=128,
-        help="synthetic shape-stress envelope; increase for a larger intended graph regime",
-    )
-    parser.add_argument(
-        "--preflight-cycle-rank",
-        type=int,
-        default=64,
-        help="synthetic projector/chart rank envelope; must not exceed preflight edges",
-    )
     parser.add_argument("--prepare-only", action="store_true")
     parser.add_argument(
         "--allow-download",
         action="store_true",
         help="allow official public datasets to be downloaded into --data-root",
     )
-    parser.add_argument("--tiny", action="store_true")
-    parser.add_argument("--allow-cpu", action="store_true")
     failure = parser.add_mutually_exclusive_group()
     failure.add_argument(
         "--fail-fast",
@@ -529,34 +461,11 @@ def main() -> int:
     if args.cycle_learning_rate is not None and args.cycle_learning_rate <= 0:
         print("--cycle-learning-rate must be positive", file=sys.stderr)
         return 2
-    if (
-        min(
-            args.preflight_nodes_per_graph,
-            args.preflight_edges_per_graph,
-            args.preflight_cycle_rank,
-        )
-        < 1
-    ):
-        print("preflight graph dimensions must be positive", file=sys.stderr)
-        return 2
-    if args.preflight_nodes_per_graph < 2:
-        print("--preflight-nodes-per-graph must be at least 2", file=sys.stderr)
-        return 2
-    if args.preflight_cycle_rank > args.preflight_edges_per_graph:
-        print("--preflight-cycle-rank cannot exceed --preflight-edges-per-graph", file=sys.stderr)
-        return 2
-    if (
-        args.device.startswith("cpu")
-        and not args.prepare_only
-        and not (args.allow_cpu and args.tiny)
-    ):
+    if not args.device.lower().startswith("cuda") and not args.prepare_only:
         print(
-            "CPU is allowed only with --tiny --allow-cpu; paper training requires CUDA",
+            "paper training requires CUDA; CPU is supported only for --prepare-only",
             file=sys.stderr,
         )
-        return 2
-    if args.allow_cpu and not args.tiny and not args.prepare_only:
-        print("--allow-cpu is restricted to --tiny validation", file=sys.stderr)
         return 2
 
     run_id = args.run_id or _default_run_id()
@@ -611,26 +520,18 @@ def main() -> int:
                     "core_targets": list(args.cycle_core_targets),
                     "epochs_override": args.cycle_epochs,
                     "learning_rate_override": args.cycle_learning_rate,
-                    "official_brec_optimization_overrides_ignored": not args.tiny,
+                    "official_brec_optimization_overrides_ignored": True,
                 }
                 if "cycle_pe" in tracks
                 else None
             ),
-            "gpu_preflight": {
-                "kind": "synthetic_shape_stress_not_dataset_e2e",
-                "batch_size": args.batch_size,
-                "brec_batch_size": args.batch_size if args.tiny else 16,
-                "brec_protocol": "custom" if args.tiny else "official",
-                "brec_amp": bool(
-                    args.tiny
-                    and args.amp
-                    and not args.prepare_only
-                    and args.device.lower().startswith("cuda")
-                ),
-                "cycle_variants": list(args.cycle_variants),
-                "nodes_per_graph": args.preflight_nodes_per_graph,
-                "edges_per_graph": args.preflight_edges_per_graph,
-                "cycle_rank": args.preflight_cycle_rank,
+            "gpu_preflight": None
+            if args.prepare_only
+            else {
+                "kind": "hardware_and_dependency_check",
+                "min_free_gb": args.min_free_gb,
+                "dataset_loaded": False,
+                "model_executed": False,
             },
             "cycle_brec_internal_seeds": (
                 list(CYCLE_BREC_OFFICIAL_SEEDS)
@@ -639,26 +540,18 @@ def main() -> int:
             ),
             "cycle_brec_dispatch_count": (1 if args.suite == "all" and "cycle_pe" in tracks else 0),
             "cycle_brec_protocol": (
-                ("custom" if args.tiny else "official")
-                if args.suite == "all" and "cycle_pe" in tracks
-                else None
+                "official" if args.suite == "all" and "cycle_pe" in tracks else None
             ),
             "cycle_brec_training": (
                 {
-                    "batch_size": args.batch_size if args.tiny else 16,
-                    "workers": args.workers if args.tiny else 0,
-                    "amp": bool(
-                        args.tiny
-                        and args.amp
-                        and not args.prepare_only
-                        and args.device.lower().startswith("cuda")
-                    ),
+                    "batch_size": 16,
+                    "workers": 0,
+                    "amp": False,
                 }
                 if args.suite == "all" and "cycle_pe" in tracks
                 else None
             ),
         },
-        "tiny": args.tiny,
         "prepare_only": args.prepare_only,
         "environment": _environment_snapshot(run_dir / "environment.txt"),
         "dataset_registries": _snapshot_registries(run_dir, tracks),

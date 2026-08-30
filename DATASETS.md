@@ -10,12 +10,12 @@ metric, leakage guard를 정리한다. 계획과 구현을 혼동하지 않도�
 - `cached_data_ready`: 요청한 `--data-root`에 검증 가능한 cache가 실제로 존재
 
 현재 모든 `paper_core` entry는 `implemented`다. 이 작업 공간에는 public 원본 cache가
-없으므로 `cached_data_ready`는 GPU 서버에서 준비 명령을 실행하기 전까지 false다.
+없으므로 `cached_data_ready`는 실행 환경에서 준비 명령을 실행하기 전까지 false다.
 
 ```bash
 python scripts/check_datasets.py --profile paper --json
 python scripts/check_datasets.py \
-  --profile paper --data-root /scratch/$USER/new-gat-data \
+  --profile paper --data-root ./data/paper \
   --seeds 0 --require-cache --json
 ```
 
@@ -33,7 +33,7 @@ python scripts/check_datasets.py \
 4. `--allow-download` 없이는 network 접근을 하지 않는다.
 5. Generated cache는 seed/config/schema hash로 구분하고 기존 cache를 검증한다.
 6. Dataset preparation과 training output을 분리하고 기존 non-empty run을 덮어쓰지 않는다.
-7. Tiny fixture와 legacy smoke 숫자는 paper result로 쓰지 않는다.
+7. Public data가 없으면 명시적인 준비·다운로드를 요구하며 가짜 대체 데이터를 만들지 않는다.
 8. 모든 run은 dependency, CLI, split, source/cache hash, runtime, peak GPU memory를 기록한다.
 
 ## 1. Conductance GAT
@@ -189,7 +189,7 @@ fixed public records와 official PyG split이라 data/split seed가 `not_applica
 `--allow-download`일 때만 GraphPKU Release ZIP을 받아 path traversal, symlink, 크기를
 검사하고 `brec_v3.npy` 하나만 추출한다. Official mode는 q=32, 400 pairs, 51,200
 records를 검사한다. ZIP/NPY SHA256은 provenance로 저장하지만 upstream canonical pin으로
-표현하지 않는다. Tiny BREC은 offline custom fixture이며 공식 점수가 아니다.
+표현하지 않는다. Custom BREC도 사용자가 제공한 실제 artifact에만 실행하며 자동 fixture는 없다.
 
 Official full run은 pair/seed별 incremental checkpoint와 resume가 없고 전체 loop 뒤 결과를
 기록한다. 4 variants 전체 실행은 최대 16,000 pair trainings이므로 중단 복구와 wall-clock은
@@ -236,7 +236,7 @@ UST 분포가 BFS output에 조건부로 바뀌기 때문이다. 두 축의 exac
 
 Mean task error/accuracy, worst-chart metric, prediction spread/std, flip rate를 기록한다.
 `beta=0`을 포함한 variable-edge/variable-beta masked batch를 지원한다. Core는 graph-level
-C3–C6 count를 downstream target으로 사용하며 projector-derived smoke target은 headline에
+C3–C6 count를 downstream target으로 사용하며 projector-derived target은 headline에
 포함하지 않는다.
 
 Encoder의 chart-coordinate 입력은 `|F|`, `F²`, normalized cycle support로 sign-even하다. 같은
@@ -264,8 +264,6 @@ Lossy `k<beta` chord selection이나 MST sparsification은 이 core protocol에 
 ```bash
 bash scripts/paper.sh \
   --suite all --prepare-only --allow-download \
-  --data-root /scratch/$USER/new-gat-data \
-  --results-root /scratch/$USER/new-gat-results \
   --data-seed 0 --split-seed 0 --chart-seed 0 \
   --run-id prepare-all-v1
 ```
@@ -273,9 +271,9 @@ bash scripts/paper.sh \
 준비 후 strict 확인:
 
 ```bash
-.venv-gpu/bin/python scripts/check_datasets.py \
+python scripts/check_datasets.py \
   --profile paper \
-  --data-root /scratch/$USER/new-gat-data \
+  --data-root ./data/paper \
   --seeds 0 \
   --require-cache
 ```
@@ -284,8 +282,8 @@ bash scripts/paper.sh \
 요청한 모든 seed의 schema/profile, split graph IDs/counts, feature/target shape와 finite
 값, data/manifest checksum을 검사하고 public full cache의 필수 split과 official
 cardinality를 강제한다. Network 접근이나 cache 생성은 하지 않는다. 결과는 `valid`,
-`missing`, `incomplete`, `corrupt`, `wrong_request`로 구분된다. Tiny cache 검증에는
-`--tiny`를 함께 준다.
+`missing`, `incomplete`, `corrupt`, `wrong_request`로 구분된다. 기본 데이터 경로는
+저장소의 `data/paper`이며 결과는 각 트랙의 `results/paper/<run-id>`에 저장된다.
 Dataset checker의 `--seeds`는 `--data-seeds` 호환 alias이고 model seed가 아니다. 독립
 split cache 축은 `--split-seeds`로 검증한다.
 

@@ -20,7 +20,6 @@ def validate_dataset_cache(
     *,
     data_seeds: tuple[int, ...],
     split_seeds: tuple[int, ...],
-    tiny: bool,
 ) -> dict[str, Any]:
     """Validate every requested processed tree cache without writing."""
 
@@ -31,7 +30,7 @@ def validate_dataset_cache(
     seeds = split_seeds if suite == "csl" else data_seeds
     paths: list[str] = []
     for seed in seeds:
-        prepared = validate_prepared_cache(suite, data_root, seed=seed, tiny=tiny)
+        prepared = validate_prepared_cache(suite, data_root, seed=seed)
         paths.extend((str(prepared.data_path), str(prepared.manifest_path)))
     return {
         "paths": sorted(set(paths)),

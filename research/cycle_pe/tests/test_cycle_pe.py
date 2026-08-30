@@ -12,13 +12,6 @@ from research.cycle_pe.features import (
     static_cycle_feature_bundle,
     static_fundamental_basis,
 )
-from research.cycle_pe.run import run_structural_probe
-from research.cycle_pe.synthetic import (
-    PROBE_VARIANTS,
-    ProbeGraph,
-    bridge_cycle_labels,
-    cycle_with_tail,
-)
 
 
 def _two_cycle_graph() -> tuple[np.ndarray, np.ndarray]:
@@ -109,34 +102,3 @@ def test_tree_graph_has_zero_width_cycle_space_and_zero_static_pe() -> None:
     np.testing.assert_array_equal(raw_padded_basis_pe(basis, 2), np.zeros((3, 2)))
     np.testing.assert_array_equal(cycle_set_statistics(basis), np.zeros((3, len(SET_STAT_NAMES))))
     np.testing.assert_array_equal(projector_leverage_pe(basis), np.zeros((3, 1)))
-
-
-def test_bridge_labels_match_cycle_with_tail_construction() -> None:
-    node_count, edges = cycle_with_tail(cycle_size=5, tail_length=4)
-    graph = ProbeGraph("cycle_tail", "test", node_count, edges)
-    labels = bridge_cycle_labels(graph)
-    assert int(labels.sum()) == 5
-    assert int((labels == 0).sum()) == 4
-
-
-def test_graph_family_probe_smoke() -> None:
-    results = run_structural_probe(
-        samples_per_family=2,
-        seed=3,
-        max_cycles=8,
-        steps=350,
-        learning_rate=0.15,
-        l2=1e-3,
-    )
-    assert results["scope"] == "static_graph_cycle_pe_only"
-    assert set(results["variants"]) == set(PROBE_VARIANTS)
-    assert set(results["split"]["train_families"]).isdisjoint(results["split"]["test_families"])
-    for variant in PROBE_VARIANTS:
-        metrics = results["variants"][variant]["test"]
-        assert all(np.isfinite(value) for value in metrics.values())
-        assert 0.0 <= metrics["balanced_accuracy"] <= 1.0
-
-    leverage = results["variants"]["degree_plus_projector_leverage"]["test"]
-    degree = results["variants"]["degree_only"]["test"]
-    assert leverage["balanced_accuracy"] >= 0.95
-    assert leverage["balanced_accuracy"] >= degree["balanced_accuracy"]

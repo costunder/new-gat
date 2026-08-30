@@ -4,19 +4,6 @@ paper_suite_complete: true
 claim: Static cycle-space PE is evaluated on independent cycle-count targets, official BREC RPC, and ZINC-12K.
 
 datasets:
-  - id: cycle_membership_smoke
-    name: Bridge versus any-cycle smoke probe
-    tier: smoke
-    status: implemented
-    data_policy: generated
-    source_url: generated://research.cycle_pe.synthetic
-    task: Classify whether an edge belongs to any cycle across small graph families.
-    split: 16 training and 16 test graphs from disjoint generator families.
-    metrics: [balanced_accuracy, f1, auroc, graph_macro_accuracy]
-    claim: Feature, batching, and invariance pipeline certification only.
-    adapter: research.cycle_pe.synthetic.make_graph_family_split
-    leakage_guard: Projector leverage directly reveals this target, so it is excluded from headline evidence.
-
   - id: cyclecount_ood
     name: CycleCount-OOD
     tier: paper_core

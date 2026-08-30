@@ -13,7 +13,7 @@ import pytest
 from scripts import verify_conda_env
 
 ROOT = Path(__file__).resolve().parents[1]
-BASH_ENTRYPOINTS = ("setup.sh", "setup_gpu.sh", "paper.sh", "smoke.sh")
+BASH_ENTRYPOINTS = ("setup_gpu.sh", "paper.sh")
 BASH = shutil.which("bash")
 LINUX_BASH_ONLY = pytest.mark.skipif(
     sys.platform != "linux" or BASH is None,

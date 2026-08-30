@@ -14,7 +14,6 @@ from research.tree_augmentation.augmentation import (
     ensure_full_cycle_budget,
     find_unseen_chart,
     lossless_transition_error,
-    run_static_cycle_pe_probe,
     sample_tree_charts,
     transition_cocycle_error,
     transport_coordinates,
@@ -85,7 +84,7 @@ def test_lossy_cycle_budget_is_explicitly_disabled() -> None:
         ensure_full_cycle_budget(6, 5)
 
 
-def test_static_probe_reports_fixed_multi_and_unseen_evaluation(
+def test_unseen_chart_is_disjoint_and_preserves_physical_cycle_space(
     graph: tuple[int, list[tuple[int, int]]],
 ) -> None:
     num_nodes, edges = graph
@@ -96,24 +95,10 @@ def test_static_probe_reports_fixed_multi_and_unseen_evaluation(
         random_seed_start=120,
     )
     unseen = find_unseen_chart(num_nodes, edges, training, seed_start=900)
-    result = run_static_cycle_pe_probe(
-        training,
-        unseen,
-        hidden_dim=16,
-        epochs=12,
-        learning_rate=0.01,
-        seed=3,
+    assert tuple(unseen.tree_edge_indices) not in {
+        tuple(chart.tree_edge_indices) for chart in training
+    }
+    assert unseen.beta == len(edges) - num_nodes + 1
+    np.testing.assert_allclose(
+        cycle_projector(unseen.basis), cycle_projector(training[0].basis), atol=1e-10
     )
-
-    assert result["num_training_charts"] == len(training)
-    assert result["cycle_rank_beta"] == len(edges) - num_nodes + 1
-    for key in (
-        "fixed_train_mse",
-        "multi_train_mse",
-        "fixed_unseen_mse",
-        "multi_unseen_mse",
-        "projector_oracle_unseen_mse",
-    ):
-        assert np.isfinite(result[key])
-        assert result[key] >= 0.0
-    assert result["projector_oracle_unseen_mse"] < 1e-20
