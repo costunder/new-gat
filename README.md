@@ -17,12 +17,21 @@ GAT 트랙은 GAT/GATv2 논문의 데이터셋을, PE 트랙은 SignNet/PEARL �
 
 ## 환경
 
-기준 실행 환경은 **Linux, NVIDIA GPU, Conda Python 3.11, PyTorch 2.13.0 / CUDA 12.6**이다.
+실행 환경은 **Linux, NVIDIA GPU, Conda Python 3.11**이다.
 Linux GPU 워크스테이션에서 직접 실행하거나 SSH로 GPU 서버에 접속해서 실행한다.
 접속 프로그램은 실행 환경과 무관하며, MobaXterm과 tmux는 필수 의존성이 아니다.
 공용 클러스터에서는 해당 시스템의 GPU 작업 할당 정책을 따른다.
 
-필요한 준비물은 Git, Bash, Conda, CUDA 12.6 이상을 지원하는 NVIDIA 드라이버다.
+필요한 준비물은 Git, Bash, Conda, NVIDIA 드라이버, glibc 2.28 이상이다.
+설치기는 `nvidia-smi`의 CUDA 표시값에 따라 다음 **고정 버전 조합**을 선택한다.
+
+| 드라이버의 CUDA 표시값 | 설치 조합 |
+|---|---|
+| 11.8 이상, 12.6 미만 (CUDA 12.2 서버 포함) | PyTorch 2.7.1 / CUDA 11.8 / PyG 2.7.0 |
+| 12.6 이상 | PyTorch 2.13.0 / CUDA 12.6 / PyG 2.8.0.post1 |
+
+CUDA 11.8 호환 조합은 Linux x86_64용이다. 시스템 CUDA Toolkit을 재설치하거나
+서버 드라이버를 변경하지 않는다. 다른 조합의 결과는 같은 환경의 반복 실험으로 합치지 않는다.
 Conda가 없다면 [Miniforge 설치 안내](https://github.com/conda-forge/miniforge#install)를 따른다.
 설치와 데이터 준비에는 패키지·데이터 배포 서버에 대한 네트워크 접근이 필요하다.
 네이티브 Windows/macOS 및 AMD GPU는 이 재현 환경의 지원 대상이 아니다.
@@ -39,9 +48,11 @@ bash scripts/setup_gpu.sh
 
 이후 명령은 모두 저장소 최상위 폴더에서, `new-gat` 환경을 활성화한 상태로 실행한다.
 설치 스크립트는 연구 패키지 버전, CUDA runtime, import 호환성을 확인하고 실제 설치 내역을 저장한다.
-서버 드라이버 버전에 따라 CUDA 패키지를 자동으로 바꾸지 않는다.
+선택한 조합을 설치 로그에 표시하며, 이미 설치된 조합은 데이터 준비·학습 때 자동 변경하지 않는다.
 `conda env create`는 Python과 pip를 준비하며, **연구 의존성 전체 설치는 `setup_gpu.sh`가 수행한다.**
 설치 중 오류가 나면 그 상태를 설치 완료로 보지 않는다.
+이미 `new-gat` 환경이 있다면 `conda env create`를 반복하지 않고,
+`conda activate new-gat` 후 `bash scripts/setup_gpu.sh`를 실행한다.
 
 별도 CUDA runtime 선택, Conda 활성화 문제와 검사 명령은 [환경 안내](docs/ENVIRONMENT.md)에 있다.
 

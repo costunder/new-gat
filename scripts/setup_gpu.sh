@@ -20,49 +20,35 @@ if [[ -z "${cuda_version}" ]]; then
     echo "Could not read the driver CUDA compatibility from nvidia-smi." >&2
     exit 2
 fi
-cuda_major="${cuda_version%%.*}"
-cuda_minor="${cuda_version#*.}"
-cuda_minor="${cuda_minor%%.*}"
-driver_cuda_code=$((10#${cuda_major} * 100 + 10#${cuda_minor}))
-
-# Use the same reference runtime on every compatible host. Alternatives are explicit.
-wheel_tag="${CUDA_WHEEL_TAG:-cu126}"
-
-case "${wheel_tag}" in
-    cu126) required_cuda_code=1206; expected_cuda_runtime="12.6" ;;
-    cu130) required_cuda_code=1300; expected_cuda_runtime="13.0" ;;
-    cu132) required_cuda_code=1302; expected_cuda_runtime="13.2" ;;
-    *)
-        echo "Unsupported CUDA_WHEEL_TAG=${wheel_tag}; choose cu126, cu130, or cu132." >&2
-        exit 2
-        ;;
-esac
-if (( driver_cuda_code < required_cuda_code )); then
-    echo "The reference stack requires a driver supporting CUDA 12.6+." >&2
-    echo "CUDA_WHEEL_TAG=${wheel_tag} needs CUDA ${expected_cuda_runtime}+ driver compatibility." >&2
-    echo "nvidia-smi reports CUDA ${cuda_version}." >&2
-    exit 2
-fi
+# Select a complete, versioned profile before changing the active environment.
+# Explicit CUDA_WHEEL_TAG requests are validated, never silently downgraded.
+requested_tag="${CUDA_WHEEL_TAG:-auto}"
+profile_selection="$("${environment_python}" "${project_root}/scripts/gpu_profiles.py" \
+    --driver-cuda "${cuda_version}" --cuda-tag "${requested_tag}" --check-host)"
+read -r wheel_tag lock_name <<< "${profile_selection}"
 
 constraints_file="${project_root}/constraints-${wheel_tag}.txt"
-lock_file="${project_root}/requirements-lock.txt"
+lock_file="${project_root}/${lock_name}"
 torch_index_url="https://download.pytorch.org/whl/${wheel_tag}"
 if [[ ! -f "${constraints_file}" || ! -f "${lock_file}" ]]; then
     echo "GPU lock files are missing: ${constraints_file} or ${lock_file}" >&2
     exit 2
 fi
 
-"${environment_python}" -m pip install --upgrade pip
-"${environment_python}" -m pip install "setuptools>=75" wheel
 torch_version="$(sed -n 's/^torch==//p' "${constraints_file}")"
 if [[ -z "${torch_version}" || "${torch_version}" == *$'\n'* ]]; then
     echo "${constraints_file} must contain exactly one torch==version pin." >&2
     exit 2
 fi
-echo "Installing torch==${torch_version} from ${torch_index_url}"
+echo "GPU profile: ${wheel_tag} (requested: ${requested_tag}; nvidia-smi CUDA compatibility: ${cuda_version})"
+echo "Locked dependencies: ${lock_name}; torch==${torch_version}"
+
+"${environment_python}" -m pip install --upgrade pip
+"${environment_python}" -m pip install "setuptools>=75" wheel
+echo "Installing torch==${torch_version}+${wheel_tag} from ${torch_index_url}"
 "${environment_python}" -m pip install --upgrade \
     --constraint "${constraints_file}" \
-    "torch==${torch_version}" \
+    "torch==${torch_version}+${wheel_tag}" \
     --index-url "${torch_index_url}"
 "${environment_python}" -m pip install \
     --constraint "${constraints_file}" \

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import json
 import os
 import subprocess
 import sys
@@ -12,13 +13,24 @@ import pytest
 
 from scripts import check_dependencies as checker
 from scripts import run_paper
+from scripts.gpu_profiles import CUDA_RUNTIMES, lock_for_tag
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _installed(monkeypatch: pytest.MonkeyPatch, *, runtime: str | None = "12.6") -> dict[str, str]:
-    pins = checker.read_exact_pins(ROOT / "requirements-lock.txt")
-    installed = {**pins, "torch": f"{pins['torch']}+cu126"}
+@pytest.fixture(autouse=True)
+def _no_external_profile_selection(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("CUDA_WHEEL_TAG", raising=False)
+
+
+def _installed(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    runtime: str | None = "12.6",
+    tag: str = "cu126",
+) -> dict[str, str]:
+    pins = checker.read_exact_pins(lock_for_tag(tag))
+    installed = {**pins, "torch": f"{pins['torch']}+{tag}"}
     monkeypatch.setattr(checker.importlib.metadata, "version", installed.__getitem__)
     # The dependency checker must not require a GPU allocation or run kernels.
     torch = SimpleNamespace(version=SimpleNamespace(cuda=runtime))
@@ -50,6 +62,56 @@ def test_complete_stack_is_valid_without_gpu_allocation(monkeypatch: pytest.Monk
     assert report["installed"] == installed
     assert report["cuda_runtime"] == "12.6"
     assert report["python"] == sys.executable
+
+
+@pytest.mark.parametrize("tag", CUDA_RUNTIMES)
+def test_installed_profile_is_reused_without_driver_query(
+    monkeypatch: pytest.MonkeyPatch, tag: str
+):
+    installed = _installed(monkeypatch, runtime=CUDA_RUNTIMES[tag], tag=tag)
+    report = checker.check_dependencies()
+    assert report["installed"] == installed
+    assert report["cuda_wheel_tag"] == tag
+    assert Path(report["lock_path"]) == lock_for_tag(tag).resolve()
+    assert len(report["lock_sha256"]) == 64
+
+
+def test_cu118_does_not_accept_newer_unsupported_pyg(monkeypatch: pytest.MonkeyPatch):
+    installed = _installed(monkeypatch, runtime="11.8", tag="cu118")
+    installed["torch-geometric"] = "2.8.0.post1"
+    with pytest.raises(checker.DependencyCheckError, match="required 2.7.0"):
+        checker.check_dependencies()
+
+
+def test_profile_runtime_mismatch_is_not_accepted(monkeypatch: pytest.MonkeyPatch):
+    _installed(monkeypatch, runtime="12.6", tag="cu118")
+    with pytest.raises(checker.DependencyCheckError, match="expected 11.8 for cu118"):
+        checker.check_dependencies()
+
+
+def test_explicit_profile_is_enforced_by_dependency_checker(monkeypatch: pytest.MonkeyPatch):
+    _installed(monkeypatch, runtime="11.8", tag="cu118")
+    monkeypatch.setenv("CUDA_WHEEL_TAG", "cu126")
+    with pytest.raises(checker.DependencyCheckError, match="required 2.13.0"):
+        checker.check_dependencies()
+
+
+def test_bad_profile_has_an_actionable_error(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("CUDA_WHEEL_TAG", "typo")
+    with pytest.raises(checker.DependencyCheckError, match="Unsupported CUDA_WHEEL_TAG"):
+        checker.check_dependencies()
+
+
+@pytest.mark.parametrize("torch_version", ["2.7.1+custom", "2.7.1+cpu", "2.7.1"])
+def test_explicit_profile_does_not_accept_a_custom_or_cpu_build(
+    monkeypatch: pytest.MonkeyPatch,
+    torch_version: str,
+):
+    installed = _installed(monkeypatch, runtime="11.8", tag="cu118")
+    installed["torch"] = torch_version
+    monkeypatch.setenv("CUDA_WHEEL_TAG", "cu118")
+    with pytest.raises(checker.DependencyCheckError, match=r"required 2.7.1\+cu118"):
+        checker.check_dependencies()
 
 
 def test_wrong_package_version_is_reported(monkeypatch: pytest.MonkeyPatch):
@@ -98,6 +160,31 @@ def test_direct_runner_stops_before_creating_output_when_dependencies_are_missin
     assert "bash scripts/setup_gpu.sh" in error
     assert "Traceback" not in error
     assert not list(tmp_path.iterdir())
+
+
+def test_runner_records_the_checked_profile_in_its_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    _installed(monkeypatch, runtime="11.8", tag="cu118")
+    report = checker.check_dependencies()
+    monkeypatch.setattr(run_paper, "check_dependencies", lambda: report)
+    monkeypatch.setattr(run_paper, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(run_paper, "_commands", lambda *_args: [])
+    monkeypatch.setattr(run_paper, "_source_revision", lambda: {"revision": "unit-test"})
+    monkeypatch.setattr(run_paper, "_environment_snapshot", lambda *_args: {})
+    monkeypatch.setattr(run_paper, "_snapshot_registries", lambda *_args: {})
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_paper.py", "--prepare-only", "--run-id", "profile-record-test"],
+    )
+    assert run_paper.main() == 0
+    manifest = json.loads(
+        (tmp_path / "runs/paper/profile-record-test/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["research_environment"] == report
+    assert manifest["research_environment"]["installed"]["torch"] == "2.7.1+cu118"
 
 
 def _bare_python(tmp_path: Path, arguments: list[str]) -> subprocess.CompletedProcess[str]:

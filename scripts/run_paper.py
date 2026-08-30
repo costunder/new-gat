@@ -526,7 +526,7 @@ def main() -> int:
         return 0
 
     try:
-        check_dependencies()
+        dependency_report = check_dependencies()
     except DependencyCheckError as error:
         print(error_message(error), file=sys.stderr)
         return 2
@@ -612,6 +612,7 @@ def main() -> int:
         },
         "prepare_only": args.prepare_only,
         "environment": _environment_snapshot(run_dir / "environment.txt"),
+        "research_environment": dependency_report,
         "dataset_registries": _snapshot_registries(run_dir, tracks),
         "commands": [],
     }

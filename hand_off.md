@@ -10,6 +10,40 @@
 
 ## 0. 리뷰어가 먼저 알아야 할 판정
 
+### 2026-08-30 CUDA 12.2 서버의 설치 차단 교정
+
+사용자 서버는 RTX A6000 4개이며 `nvidia-smi`가 CUDA 12.2를 표시했다. 이전 setup은
+CUDA 12.6 이상을 요구하여 **첫 pip 설치 전에 종료**했다. 따라서 이어진 학습의 전체
+의존성 누락은 설치가 성공하지 않은 데 따른 결과이며, Conda를 다시 만드는 문제는 아니다.
+
+- `scripts/gpu_profiles.py`는 stdlib만으로 고정 조합을 선택한다. 기본 `auto`는 CUDA 표시값
+  11.8 이상/12.6 미만에서 **Torch 2.7.1+cu118 / PyG 2.7.0**, 12.6 이상에서 기존
+  **Torch 2.13.0+cu126 / PyG 2.8.0.post1**을 선택한다. 다른 직접 의존성 pin은 같다.
+- `requirements-cu118-lock.txt`와 `constraints-cu118.txt`를 함께 추가했다. PyG 2.8은
+  Torch 2.7 지원 대상이 아니므로 Torch만 낮추지 않았다. 근거는
+  [PyTorch 공식 wheel](https://download.pytorch.org/whl/cu118/torch/) 및
+  [PyG 2.7 지원 조합](https://github.com/pyg-team/pytorch_geometric/releases/tag/2.7.0)이다.
+- 명시적 `CUDA_WHEEL_TAG`는 임의로 대체하지 않는다. 설치 중 드라이버/시스템 CUDA를
+  변경하지 않으며 CPU fallback도 없다. glibc >=2.28 및 cu118의 x86_64/Python 3.11–3.13
+  wheel 조건을 첫 pip 전에 검사한다. 재현용 Python은 기존 `environment.yml`의 3.11이다.
+- NVIDIA minor-version compatibility 때문에 cu126이 이 드라이버에서 어떤 경우에도
+  불가능하다고 판정한 것은 아니다. 설치 정책은 그 기능·PTX 제한에 의존하지 않는 보수적 선택이다.
+- 데이터 준비·학습 검사는 GPU를 조회하지 않고 **설치된 wheel tag의 동일한 lock**을 사용한다.
+  cu118 설치를 다시 2.13 요구로 거부하거나 재설치하지 않는다. 명시적 선택은 검사에도 적용한다.
+  설치와 검사는 `torch==버전+CUDA tag`까지 요구하므로 CPU/custom build를 인정하지 않는다.
+- 설치 후 NumPy↔Torch 빈 배열 변환을 검사해 import만 통과한 ABI 문제도 보고한다.
+  데이터나 학습 결과를 만들지 않는다. 실제 NumPy 2.4.6/구버전 Torch 조합의 서버 검증은
+  이 설치 검사가 담당하며, 이 작업 공간에서 그 조합을 설치해 확인했다고 주장하지 않는다.
+- 실행 manifest의 `research_environment`에 CUDA tag, lock SHA-256, 직접 의존성 버전을
+  추가 기록한다. 기존 전체 패키지 snapshot도 유지한다. 서로 다른 조합을 동일 환경의 seed
+  반복으로 합치지 않는다. 모델/데이터/평가 protocol 변경은 없다.
+
+전체 pytest **314 passed, 32 skipped**, Ruff 통과. 생략은 Linux/Bash 동적 검사 31개와
+로컬 PyG 미설치에 따른 batching 검사 1개다. CUDA 12.2→cu118 선택, 고정 pin/runtime 검사,
+custom/CPU wheel 거부, Python/glibc 조건, manifest 기록을 검증했다. 새 Linux 설치 스텁
+8건은 추가했지만 이 Windows 호스트에서는 실행하지 못했다. 실제 서버 설치·CUDA 학습은
+수행하지 않았으며 CPU 학습 결과를 만들지 않았다.
+
 ### 2026-08-30 서버의 NumPy 누락 오류에 대한 설치 경로 교정
 
 서버의 활성 `new-gat` Python에서 데이터 준비 중 `ModuleNotFoundError: numpy`가 보고됐다.
@@ -123,14 +157,14 @@ Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 
    entrypoint는 활성 non-base Conda Python을 검증한 뒤 설치·실행하며 venv를 생성하지 않는다.
    전체 연구 모델·데이터·평가 protocol은 유지하고, 축소 데이터 실행 경로는 제거했다.
 9. 공개 재현 안내는 `environment.yml` → `setup_gpu.sh` → 데이터 준비 → 트랙별 실험으로 정리했다.
-   기본 CUDA wheel은 `cu126`으로 고정하고 전체 pytest는 `RUN_TESTS=1`일 때만 실행한다.
+   설치 기본값은 위의 두 고정 조합을 고르는 `auto`이며 전체 pytest는 `RUN_TESTS=1`일 때만 실행한다.
 
 ### 코드 스냅샷
 
 - 파일: `code_summary.md`
-- 포함 파일: 98개
-- 크기: 907,044 bytes, 23,951 lines (`str.splitlines()` 기준)
-- SHA-256: `9A71842E17A3DC29FFEBC6B9BCB95A4C32A9803F86396FFA3A5F6D8B4AAB5A00`
+- 포함 파일: 103개
+- 크기: 932,683 bytes, 24,638 lines (`str.splitlines()` 기준)
+- SHA-256: `E10D1314817BB96B8D6A4D5BBFAACAF3A08D01F6FBF2D1A2FA6DC7FA5E1F0229`
 - 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`, `.gitattributes`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
 
@@ -224,8 +258,9 @@ representation으로 제공하는 inductive bias다.
 - `README.md`: Linux NVIDIA GPU 환경의 설치부터 전체 재현까지의 실행 명령.
 - `DATASETS.md`: 사람이 읽는 데이터·split·metric 계약.
 - `pyproject.toml`: Python 3.11+, core/dev/paper dependency와 pytest/Ruff 설정.
-- `requirements-lock.txt`, `constraints-cu*.txt`: Python 3.11 호환 exact top-level 연구 stack과
-  CUDA 12.6/13.0/13.2별 official torch channel 계약.
+- `requirements-lock.txt`, `requirements-cu118-lock.txt`, `constraints-cu*.txt`: Python 3.11 호환
+  exact top-level 연구 stack과 CUDA 11.8/12.6/13.0/13.2별 official torch channel 계약.
+- `scripts/gpu_profiles.py`: 설치 시 보수적 드라이버/호스트 조건에 따른 고정 조합 선택.
 - `requirements-paper.txt`: portable paper dependency가 같은 lock을 사용하게 하는 진입점.
 - `scripts/setup_gpu.sh`, `scripts/verify_gpu_lock.py`: 활성 프로젝트 전용 Conda 환경에 exact
   package 설치, ABI/CUDA runtime 검증과 transitive freeze snapshot.
@@ -291,9 +326,9 @@ conda activate new-gat
 bash scripts/setup_gpu.sh
 ```
 
-Setup은 활성 non-base Conda의 Python만 사용한다. 기본 CUDA wheel은 `cu126`이며,
-다른 runtime은 `CUDA_WHEEL_TAG`로 명시한 경우만 선택한다.
-직접 의존성은 `requirements-lock.txt`와 해당 constraints 파일의 exact pin으로 설치한다.
+Setup은 활성 non-base Conda의 Python만 사용한다. 기본 `auto`는 위의 cu118/cu126 조합을
+선택하며 `CUDA_WHEEL_TAG`로 명시적 선택도 가능하다. 이후 준비/학습은 설치된 조합을 유지한다.
+직접 의존성은 선택한 requirements lock과 해당 constraints 파일의 exact pin으로 설치한다.
 전이 의존성 전체를 사전에 잠근 것은 아니며 실제 설치 결과는
 `.gpu-environment.json`, `.gpu-environment.freeze.txt`에 기록한다.
 Version/import ABI/CUDA 검증은 유지하고 전체 pytest는 `RUN_TESTS=1`일 때만 실행한다.

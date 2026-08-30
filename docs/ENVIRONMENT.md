@@ -5,7 +5,7 @@
 ## Conda
 
 `environment.yml`은 Python 3.11과 pip를 준비한다. 연구 패키지는 `setup_gpu.sh`가
-공식 PyTorch CUDA wheel 저장소와 `requirements-lock.txt`, `constraints-cu126.txt`를 함께 사용해 설치한다.
+공식 PyTorch CUDA wheel 저장소와 선택한 조합의 requirements/constraints 파일을 함께 사용해 설치한다.
 Conda base 환경과 중첩된 venv는 설치 대상에서 제외한다.
 
 `prepare_data.sh`는 NumPy를 포함한 전체 lock의 설치 버전과 실제 runtime import를 먼저
@@ -34,18 +34,46 @@ Conda 설치 시 해당 터미널의 shell 초기화까지 완료해야 한다. 
 
 ## CUDA runtime
 
-기본값은 `cu126`이다. `nvidia-smi`에 더 높은 CUDA 버전이 표시되어도 동일한 reference runtime을 설치한다.
-설치기는 드라이버가 선택한 runtime을 지원하는지 검사한다. CUDA Toolkit을 별도로 빌드하지 않는다.
+기본값은 `auto`다. 버전 범위를 풀어 최신 패키지를 임의로 설치하는 것이 아니라,
+아래 두 고정 조합 중에서만 선택한다. CUDA 12.2로 표시되는 RTX A6000 서버는 `cu118`을 선택한다.
 
-하드웨어 요구로 다른 runtime이 필요할 때만 명시적으로 선택한다.
+| CUDA 표시값 / 명시적 선택 | Torch / PyG | requirements lock | constraints |
+|---|---|---|---|
+| 11.8 ≤ 표시값 < 12.6, 또는 `cu118` | 2.7.1 / 2.7.0 | `requirements-cu118-lock.txt` | `constraints-cu118.txt` |
+| 표시값 ≥ 12.6, 또는 `cu126` | 2.13.0 / 2.8.0.post1 | `requirements-lock.txt` | `constraints-cu126.txt` |
+| 명시적 `cu130` / `cu132` | 2.13.0 / 2.8.0.post1 | `requirements-lock.txt` | 해당 `constraints-cu*.txt` |
+
+다른 직접 의존성은 두 조합에서 동일하게 고정한다. 이후 데이터 준비·학습에서는 설치된
+Torch wheel의 CUDA tag로 같은 lock을 선택하고 모든 pin과 runtime을 검사한다.
+이 단계에서는 드라이버를 다시 조회하거나 `cu118`을 기준 조합으로 재설치하지 않는다.
+
+`nvidia-smi`의 CUDA 표시는 드라이버의 호환 수준이지 설치된 Toolkit 버전이 아니다.
+[NVIDIA의 minor-version compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
+때문에 표시값보다 높은 같은 CUDA major의 runtime이 항상 실행 불가능한 것은 아니다.
+다만 이 설치기는 그 기능·PTX 제약에 의존하지 않는 보수적 정책으로 조합을 선택한다.
+명시적으로 선택한 runtime이 표시값보다 높으면 안내하고 중단하며 다른 조합으로 몰래 바꾸지 않는다.
+드라이버나 시스템 라이브러리를 설치·변경하지 않고 CPU wheel로 대체하지 않는다.
+
+공식 [PyTorch 배포 조합](https://pytorch.org/get-started/previous-versions/)과
+[PyG 2.7 지원 조합](https://github.com/pyg-team/pytorch_geometric/releases/tag/2.7.0)을 따른다.
+`cu118` 조합은 Linux x86_64용이며, [공식 wheel](https://download.pytorch.org/whl/cu118/torch/)의
+`manylinux_2_28` 요건에 따라 glibc 2.28 이상인지 다운로드 전에 검사한다.
+기준 CUDA 12.6 조합도 glibc 2.28 이상이 필요하다. 이 검사는 실제 GPU 학습 검증을 대신하지 않는다.
+설치 후에는 import 검사 외에 빈 배열의 NumPy↔Torch 변환도 검사해 ABI 오류를 확인한다.
+이는 의존성 검사이며 데이터셋 생성이나 모델 학습이 아니다.
+
+다른 서버에서도 CUDA 12.2 서버와 같은 조합을 재현하려면 명시적으로 고정한다.
 
 ```bash
-CUDA_WHEEL_TAG=cu130 bash scripts/setup_gpu.sh
+CUDA_WHEEL_TAG=cu118 bash scripts/setup_gpu.sh
 ```
 
-`cu126`, `cu130`, `cu132`에 대응하는 constraints 파일이 있다. 다른 runtime으로 실행한 결과는
-기준 환경과 구분해 기록한다. 설치 보고서는 `.gpu-environment.json`,
-전체 패키지 snapshot은 `.gpu-environment.freeze.txt`에 저장된다.
+`CUDA_WHEEL_TAG`를 명시한 데이터 준비·학습은 그 조합을 엄격하게 검사한다.
+기본값(`auto` 또는 미지정)은 이미 설치된 조합을 유지한다.
+다른 runtime으로 실행한 결과는 기준 환경과 구분해 기록한다. 설치 보고서는
+`.gpu-environment.json`, 전체 패키지 snapshot은 `.gpu-environment.freeze.txt`에 저장된다.
+각 실행의 `manifest.json`에도 `research_environment`에 CUDA tag, lock checksum,
+실제 직접 의존성 버전을 저장한다. 서로 다른 조합은 동일 환경의 seed 반복으로 합치지 않는다.
 
 ## 데이터 검사
 

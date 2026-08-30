@@ -8,13 +8,16 @@ packages, creates run output, or requires an allocated GPU for data preparation.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import importlib.metadata
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
 try:
+    from scripts.gpu_profiles import GPUProfileError, lock_for_tag
     from scripts.verify_gpu_lock import (
         CUDA_RUNTIMES,
         IMPORT_NAMES,
@@ -23,6 +26,7 @@ try:
         version_matches,
     )
 except ModuleNotFoundError:
+    from gpu_profiles import GPUProfileError, lock_for_tag
     from verify_gpu_lock import (
         CUDA_RUNTIMES,
         IMPORT_NAMES,
@@ -38,11 +42,31 @@ class DependencyCheckError(RuntimeError):
     """The active interpreter is missing the installed research environment."""
 
 
-def check_dependencies(lock_path: Path = ROOT / "requirements-lock.txt") -> dict[str, Any]:
+def _installed_cuda_tag() -> str:
+    """Identify the installed official wheel without importing Torch or querying a GPU."""
+    requested = os.environ.get("CUDA_WHEEL_TAG", "auto") or "auto"
+    if requested != "auto":
+        lock_for_tag(requested)
+        return requested
+    try:
+        version = importlib.metadata.version("torch")
+    except importlib.metadata.PackageNotFoundError:
+        return "cu126"  # Missing stack: report reference pins; setup selects using the driver.
+    tag = version.partition("+")[2]
+    if tag in CUDA_RUNTIMES:
+        return tag
+    # Still report missing/wrong versions together for an absent or non-CUDA wheel.
+    return "cu126"
+
+
+def check_dependencies(lock_path: Path | None = None) -> dict[str, Any]:
     """Check every direct pin, runtime import, and CUDA wheel without using a GPU."""
     try:
+        cuda_tag = _installed_cuda_tag()
+        if lock_path is None:
+            lock_path = lock_for_tag(cuda_tag)
         pins = read_exact_pins(lock_path)
-    except (LockVerificationError, OSError) as error:
+    except (GPUProfileError, LockVerificationError, OSError) as error:
         raise DependencyCheckError(f"Cannot read the research dependency lock: {error}") from error
 
     installed: dict[str, str] = {}
@@ -54,8 +78,9 @@ def check_dependencies(lock_path: Path = ROOT / "requirements-lock.txt") -> dict
             problems.append(f"{name}: missing (required {expected})")
             continue
         installed[name] = actual
-        if not version_matches(name, expected, actual):
-            problems.append(f"{name}: installed {actual}, required {expected}")
+        if not version_matches(name, expected, actual, cuda_tag=cuda_tag):
+            expected_label = f"{expected}+{cuda_tag}" if name == "torch" else expected
+            problems.append(f"{name}: installed {actual}, required {expected_label}")
     if problems:
         # Report the entire missing stack at once, before trying NumPy or Torch.
         raise DependencyCheckError("\n  ".join(problems))
@@ -69,11 +94,20 @@ def check_dependencies(lock_path: Path = ROOT / "requirements-lock.txt") -> dict
     if problems:
         raise DependencyCheckError("\n  ".join(problems))
     runtime = str(modules["torch"].version.cuda)
-    if runtime not in CUDA_RUNTIMES.values():
+    expected_runtime = CUDA_RUNTIMES[cuda_tag]
+    if runtime != expected_runtime:
         raise DependencyCheckError(
-            f"torch CUDA runtime is {runtime}; install the project's CUDA wheel with setup_gpu.sh"
+            f"torch CUDA runtime is {runtime}, expected {expected_runtime} for {cuda_tag}; "
+            "install the project's CUDA wheel with setup_gpu.sh"
         )
-    return {"python": sys.executable, "installed": installed, "cuda_runtime": runtime}
+    return {
+        "python": sys.executable,
+        "installed": installed,
+        "cuda_runtime": runtime,
+        "cuda_wheel_tag": cuda_tag,
+        "lock_path": str(lock_path.resolve()),
+        "lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+    }
 
 
 def error_message(error: Exception) -> str:
@@ -87,7 +121,7 @@ def error_message(error: Exception) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lock", type=Path, default=ROOT / "requirements-lock.txt")
+    parser.add_argument("--lock", type=Path, help="override the installed CUDA profile's lock")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
     try:

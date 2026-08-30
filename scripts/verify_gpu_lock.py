@@ -16,12 +16,16 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+try:
+    from scripts.gpu_profiles import CUDA_RUNTIMES
+except ModuleNotFoundError:
+    from gpu_profiles import CUDA_RUNTIMES
+
 
 class LockVerificationError(RuntimeError):
     """The installed environment does not satisfy the selected GPU lock."""
 
 
-CUDA_RUNTIMES = {"cu126": "12.6", "cu130": "13.0", "cu132": "13.2"}
 REQUIRED_RESEARCH_PACKAGES = {
     "networkx",
     "numpy",
@@ -90,18 +94,36 @@ def assert_same_pins(lock_path: Path, constraints_path: Path) -> dict[str, str]:
             if lock_pins[name] != constraint_pins[name]
         )
         raise LockVerificationError(
-            "CUDA constraints drift from requirements-lock.txt: "
+            f"CUDA constraints drift from {lock_path.name}: "
             f"missing={missing}, extra={extra}, changed={changed}"
         )
     return constraint_pins
 
 
-def version_matches(name: str, expected: str, actual: str) -> bool:
+def version_matches(
+    name: str,
+    expected: str,
+    actual: str,
+    *,
+    cuda_tag: str | None = None,
+) -> bool:
     """Allow only the official CUDA local suffix on the pinned torch version."""
 
     if name == "torch":
-        return actual.split("+", 1)[0] == expected
+        if cuda_tag is not None:
+            return actual == f"{expected}+{cuda_tag}"
+        return re.fullmatch(re.escape(expected) + r"(?:\+cu[0-9]+)?", actual) is not None
     return actual == expected
+
+
+def verify_numpy_bridge(torch: Any, numpy: Any) -> None:
+    """Check the binary conversion boundary using an empty, non-GPU array."""
+    try:
+        torch.from_numpy(numpy.empty(0, dtype=numpy.float32)).numpy()
+    except Exception as error:
+        raise LockVerificationError(
+            f"NumPy/Torch interoperability failed: {type(error).__name__}: {error}"
+        ) from error
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -138,8 +160,9 @@ def verify_environment(*, lock_path: Path, constraints_path: Path, cuda_tag: str
             mismatches.append(f"{name}: missing (expected {expected})")
             continue
         installed[name] = actual
-        if not version_matches(name, expected, actual):
-            mismatches.append(f"{name}: installed {actual}, expected {expected}")
+        if not version_matches(name, expected, actual, cuda_tag=cuda_tag):
+            expected_label = f"{expected}+{cuda_tag}" if name == "torch" else expected
+            mismatches.append(f"{name}: installed {actual}, expected {expected_label}")
     if mismatches:
         raise LockVerificationError("exact package assertion failed: " + "; ".join(mismatches))
 
@@ -159,6 +182,7 @@ def verify_environment(*, lock_path: Path, constraints_path: Path, cuda_tag: str
         raise LockVerificationError(
             f"torch CUDA runtime is {actual_runtime}, expected {expected_runtime} for {cuda_tag}"
         )
+    verify_numpy_bridge(torch, importlib.import_module("numpy"))
     if not torch.cuda.is_available():
         raise LockVerificationError("torch.cuda.is_available() is false")
 
@@ -169,6 +193,7 @@ def verify_environment(*, lock_path: Path, constraints_path: Path, cuda_tag: str
         "platform": platform.platform(),
         "cuda_wheel_tag": cuda_tag,
         "torch_cuda_runtime": actual_runtime,
+        "numpy_torch_interop": "passed",
         "constraints_path": str(constraints_path.resolve()),
         "constraints_sha256": hashlib.sha256(constraints_path.read_bytes()).hexdigest(),
         "lock_path": str(lock_path.resolve()),
