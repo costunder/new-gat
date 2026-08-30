@@ -8,12 +8,9 @@
 공식 PyTorch CUDA wheel 저장소와 `requirements-lock.txt`, `constraints-cu126.txt`를 함께 사용해 설치한다.
 Conda base 환경과 중첩된 venv는 설치 대상에서 제외한다.
 
-`conda activate`가 초기화 오류를 내는 Bash 세션에서는 다음을 실행한 뒤 활성화한다.
-
-```bash
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate new-gat
-```
+Conda 설치 시 해당 터미널의 shell 초기화까지 완료해야 한다. `conda activate`가 초기화
+오류를 내면 Conda 설치 안내에 따라 shell을 초기화하고 새 터미널에서 활성화한다.
+저장소 실행 명령마다 shell 초기화 코드를 붙이지 않는다.
 
 `conda` 자체가 없다면 [Miniforge 공식 설치 안내](https://github.com/conda-forge/miniforge#install)를 따르거나
 사용 중인 클러스터의 Conda module 안내를 확인한다. 저장소는 Conda나 NVIDIA 드라이버를 설치하지 않는다.
@@ -59,7 +56,7 @@ python -m ruff check src scripts research tests
 명령 구성만 확인하려면 데이터 다운로드나 학습 없이 dry-run할 수 있다.
 
 ```bash
-bash scripts/paper.sh --suite all --dry-run
+bash scripts/reproduce.sh --dry-run
 ```
 
 Linux/Bash 전용 검사는 해당 환경에서 실행해야 한다. 다른 OS에서 skipped된 검사를

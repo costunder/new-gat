@@ -43,10 +43,12 @@ bash scripts/setup_gpu.sh
 고정된 생성 규칙과 seed로 생성한다. **공개 데이터가 없을 때 가짜 데이터로 대체하지 않는다.**
 
 ```bash
-bash scripts/paper.sh --suite all --prepare-only --allow-download --run-id prepare
+bash scripts/prepare_data.sh
 ```
 
 기본 저장 경로는 `data/paper/`다. 준비만 수행하며 모델을 학습하지 않는다.
+`data/`와 트랙별 `results/` 디렉터리는 저장소에 포함되어 있고, 하위 디렉터리는 실행기가
+자동 생성한다. 별도의 `export`나 `mkdir` 명령은 필요 없다.
 데이터의 원본, split, 생성 규칙, 지표는 [DATASETS.md](DATASETS.md)에 정리되어 있다.
 
 ## 실험
@@ -56,19 +58,19 @@ bash scripts/paper.sh --suite all --prepare-only --allow-download --run-id prepa
 ### Conductance GAT
 
 ```bash
-bash scripts/paper.sh --tracks conductance_gat --suite all --run-id conductance
+bash research/conductance_gat/reproduce.sh
 ```
 
 ### Cycle PE
 
 ```bash
-bash scripts/paper.sh --tracks cycle_pe --suite all --run-id cycle-pe
+bash research/cycle_pe/reproduce.sh
 ```
 
 ### Tree Augmentation
 
 ```bash
-bash scripts/paper.sh --tracks tree_augmentation --suite all --run-id tree-augmentation
+bash research/tree_augmentation/reproduce.sh
 ```
 
 공통 기본값은 CUDA, model seeds `0,1,2,3,4`, data/split/chart seed `0`,
@@ -81,12 +83,12 @@ BREC는 별도의 공식 10-seed 프로토콜을 한 번 실행한다.
 세 트랙을 순서대로 실행하려면 위 세 명령 **대신** 다음 명령을 사용한다.
 
 ```bash
-bash scripts/paper.sh --suite all --run-id all-tracks
+bash scripts/reproduce.sh
 ```
 
-데이터 준비가 끝난 뒤 학습 명령에는 `--allow-download`를 붙이지 않는다.
-누락되거나 손상된 데이터는 오류로 보고한다. 기존 run을 덮어쓰거나 자동 재개하지 않으므로
-재실행할 때는 새 `--run-id`를 지정한다. 한 트랙이 실패해도 다른 독립 run은 계속하며,
+실행 파일에는 전체 데이터·비교군 실행 설정이 들어 있다. 학습 파일은 다운로드를 수행하지 않는다.
+누락되거나 손상된 데이터는 오류로 보고한다. 실행마다 고유한 run ID를 자동 생성하고
+기존 run을 덮어쓰거나 자동 재개하지 않는다. 한 트랙이 실패해도 다른 독립 run은 계속하며,
 첫 실패에서 중단하려면 `--fail-fast`를 추가한다.
 
 ## 결과
@@ -102,6 +104,7 @@ bash scripts/paper.sh --suite all --run-id all-tracks
 실패하면 종료 코드는 0이 아니며, 해당 run의 로그와 `aggregate/failures.csv`를 확인한다.
 공통 환경 검사 단계에서 중단된 경우에는 집계 파일이 없을 수 있다.
 
+이 실행 파일에 `--run-id experiment-name`을 추가하면 결과 이름을 직접 지정할 수 있다.
 데이터나 결과를 다른 디스크에 저장하려면 `--data-root /path/to/data`,
 `--results-root /path/to/results`를 사용한다.
 데이터 경로는 준비와 학습에서 같아야 한다.

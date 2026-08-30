@@ -41,10 +41,10 @@
 ### 코드 스냅샷
 
 - 파일: `code_summary.md`
-- 포함 파일: 83개
-- 크기: 790,514 bytes, 21,062 lines (`str.splitlines()` 기준)
-- SHA-256: `5E904D4357CEFD9D5F4CCB0631561FDA5688D63E88AE436D8A5BBE89BE89AF3F`
-- 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`
+- 포함 파일: 89개
+- 크기: 794,172 bytes, 21,185 lines (`str.splitlines()` 기준)
+- SHA-256: `61E87F7D7809EFB1C7DB639A4168C1A5982B15894B2289F42BA70B956B9AFAAB`
+- 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`, `.gitattributes`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
 
 이 디렉터리는 Git repository로 초기화되어 있으며 원격은
@@ -147,6 +147,8 @@ representation으로 제공하는 inductive bias다.
 - `scripts/gpu_preflight.py`: CUDA device, 여유 메모리, dependency import 검사. 데이터 생성·학습 없음.
 - `scripts/paper.sh`: 활성 Conda 환경의 Python으로 master runner 실행.
 - `scripts/run_paper.py`: 세 독립 트랙을 model-seed별 subprocess로 dispatch하고 중앙 manifest 작성.
+- `scripts/prepare_data.sh`: 전체 데이터 준비 명령을 담은 실행 파일.
+- `scripts/reproduce.sh`, `research/<track>/reproduce.sh`: 전체 또는 트랙별 정식 실험 실행 파일.
 - `scripts/aggregate_paper.py`: 폐쇄형 paper metric/efficiency registry와 seed-aligned 통계.
 - `scripts/generate_code_summary.py`: 외부 교차검증용 exact source snapshot 생성/검사.
 - `scripts/check_datasets.py`: 세 `datasets.yaml`의 code/cache readiness 검사.
@@ -216,7 +218,7 @@ Version/import ABI/CUDA 검증은 유지하고 전체 pytest는 `RUN_TESTS=1`일
 ### 3.2 데이터 준비와 cache 확인
 
 ```bash
-bash scripts/paper.sh --suite all --prepare-only --allow-download --run-id prepare
+bash scripts/prepare_data.sh
 python scripts/check_datasets.py --data-root data/paper --require-cache
 ```
 
@@ -234,16 +236,18 @@ Data와 split seed가 다르면 `--data-seeds`, `--split-seeds`를 각각 지정
 ### 3.3 독립 실행
 
 ```bash
-bash scripts/paper.sh --tracks conductance_gat --suite all --run-id conductance
-bash scripts/paper.sh --tracks cycle_pe --suite all --run-id cycle-pe
-bash scripts/paper.sh --tracks tree_augmentation --suite all --run-id tree-augmentation
+bash research/conductance_gat/reproduce.sh
+bash research/cycle_pe/reproduce.sh
+bash research/tree_augmentation/reproduce.sh
 ```
 
 위 세 명령을 순서대로 실행하는 대안은
-`bash scripts/paper.sh --suite all --run-id all-tracks`다. 두 방식을 중복 실행할 필요는 없다.
+`bash scripts/reproduce.sh`다. 두 방식을 중복 실행할 필요는 없다.
 
 기본값은 CUDA, model seeds `0..4`, data/split/chart seed `0`, batch32/workers4다.
-같은 run ID를 덮어쓰거나 자동 resume하지 않는다. 트랙 실패 시 기본적으로 다른 독립 run은
+Run ID는 실행마다 자동 생성하며 같은 ID를 덮어쓰거나 자동 resume하지 않는다.
+기본 data/와 트랙별 results/는 clone에 포함되고 하위 run 디렉터리는 자동 생성된다.
+트랙 실패 시 기본적으로 다른 독립 run은
 계속하며 `--fail-fast`로 전체 중단을 선택할 수 있다.
 공통 GPU 검사 실패는 child 학습 전에 전체를 중단한다.
 
@@ -739,20 +743,21 @@ roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사�
 
 ## 8. 자동 검증 상태
 
-2026-08-30 더미 실행 경로 제거 후 최종 로컬 검증:
+2026-08-30 더미 실행 경로 제거 및 실제 재현 실행 파일 추가 후 최종 로컬 검증:
 
 ```text
-pytest -q                     203 passed, 7 skipped (19.79 s, exit 0)
+pytest -q                     204 passed, 12 skipped (11.61 s, exit 0)
 ruff check .                 All checks passed
 ruff format --check .        77 files already formatted
-README command contract      5 full-protocol examples passed
-code_summary --check         current, 83 source files
+README command contract      5 script entrypoints resolve to full protocols
+code_summary --check         current, 89 source files
 git diff --check             passed
 ```
 
 트랙별 단위시험은 Conductance 27개, Cycle PE 46개, Tree augmentation 28개다.
-나머지 102개는 공통 수학, cache, runner, 집계, 환경·문서 계약 검사다.
-Linux/Bash 전용 7개는 현재 Windows 환경에 Bash가 없어 skip했다.
+나머지 103개는 공통 수학, cache, runner, 집계, 환경·문서 계약 검사다.
+Linux/Bash 전용 12개는 현재 Windows 환경에 Bash가 없어 skip했다.
+이 중 5개는 새 실행 파일의 인자·종료 코드 전달을 검증하는 Linux shell 검사다.
 이 결과는 실제 Linux Conda/Bash/CUDA 실행 성공을 인증하지 않는다.
 
 이번 검증은 실험 CLI의 더미 옵션 거부, 공개 데이터 부재·다운로드 실패의 오류 처리,

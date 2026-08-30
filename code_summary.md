@@ -1,3 +1,9 @@
+# .gitattributes
+
+````text
+*.sh text eol=lf
+````
+
 # .gitignore
 
 ````text
@@ -17,6 +23,7 @@ dist/
 *.egg-info/
 runs/
 research/*/results/*
+!research/*/results/.gitkeep
 results/*
 !results/.gitkeep
 data/*
@@ -5811,6 +5818,16 @@ __all__ = [
 ]
 ````
 
+# research/conductance_gat/reproduce.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+exec bash "${project_root}/scripts/paper.sh" --suite all --tracks conductance_gat "$@"
+````
+
 # research/conductance_gat/sparse.py
 
 ````python
@@ -11149,6 +11166,16 @@ __all__ = [
 ]
 ````
 
+# research/cycle_pe/reproduce.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+exec bash "${project_root}/scripts/paper.sh" --suite all --tracks cycle_pe "$@"
+````
+
 # research/cycle_pe/tests/fixtures.py
 
 ````python
@@ -15330,6 +15357,16 @@ __all__ = [
 ]
 ````
 
+# research/tree_augmentation/reproduce.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+exec bash "${project_root}/scripts/paper.sh" --suite all --tracks tree_augmentation "$@"
+````
+
 # research/tree_augmentation/tests/test_paper.py
 
 ````python
@@ -17312,7 +17349,7 @@ def _excluded(path: Path, *, root: Path) -> bool:
 def _is_source(path: Path, *, root: Path) -> bool:
     if not path.is_file() or _excluded(path, root=root):
         return False
-    if path.name == ".gitignore":
+    if path.name in {".gitignore", ".gitattributes"}:
         return True
     if path.suffix in SOURCE_SUFFIXES:
         return True
@@ -17579,6 +17616,26 @@ source "${project_root}/scripts/conda_env.sh"
 export PYTHONPATH="${project_root}/src:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
 cd "${project_root}"
 "${environment_python}" scripts/run_paper.py "$@"
+````
+
+# scripts/prepare_data.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec bash "${project_root}/scripts/paper.sh" --suite all --prepare-only --allow-download "$@"
+````
+
+# scripts/reproduce.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec bash "${project_root}/scripts/paper.sh" --suite all "$@"
 ````
 
 # scripts/run_paper.py
@@ -20100,6 +20157,48 @@ def test_paper_bash_preserves_arguments_exit_code_and_conda_selection(tmp_path: 
     forwarded = dispatch_args.read_bytes().split(b"\0")[:-1]
     assert [value.decode("utf-8") for value in forwarded] == ["scripts/run_paper.py", *arguments]
     assert not Path(environ["VENV_DIR"]).exists()
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize(
+    ("script", "defaults"),
+    [
+        ("scripts/prepare_data.sh", ["--suite", "all", "--prepare-only", "--allow-download"]),
+        ("scripts/reproduce.sh", ["--suite", "all"]),
+        (
+            "research/conductance_gat/reproduce.sh",
+            ["--suite", "all", "--tracks", "conductance_gat"],
+        ),
+        ("research/cycle_pe/reproduce.sh", ["--suite", "all", "--tracks", "cycle_pe"]),
+        (
+            "research/tree_augmentation/reproduce.sh",
+            ["--suite", "all", "--tracks", "tree_augmentation"],
+        ),
+    ],
+)
+def test_reproduction_scripts_forward_defaults_arguments_and_exit_status(
+    tmp_path: Path, script: str, defaults: list[str]
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    environ["TEST_RUN_EXIT"] = "37"
+    arguments = ["--run-id", "space value", "--model-seeds", "1,2"]
+    result = subprocess.run(
+        [BASH, str(ROOT / script), *arguments],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 37, result.stderr
+    assert call_log.read_text(encoding="utf-8").splitlines() == ["verify", "paper"]
+    forwarded = dispatch_args.read_bytes().split(b"\0")[:-1]
+    assert [value.decode("utf-8") for value in forwarded] == [
+        "scripts/run_paper.py",
+        *defaults,
+        *arguments,
+    ]
 ````
 
 # tests/test_dataset_plans.py
@@ -20996,10 +21095,21 @@ def test_readme_commands_use_full_independent_protocols() -> None:
         line
         for block in blocks
         for line in block.splitlines()
-        if line.startswith("bash scripts/paper.sh ")
+        if line.startswith("bash ") and line != "bash scripts/setup_gpu.sh"
     ]
     assert len(commands) == 5
-    parsed = [_parser().parse_args(shlex.split(line)[2:]) for line in commands]
+    parsed = []
+    for line in commands:
+        command = shlex.split(line)
+        assert len(command) == 2
+        wrapper = ROOT / command[1]
+        source = wrapper.read_text(encoding="utf-8")
+        dispatch = next(row for row in source.splitlines() if row.startswith("exec bash "))
+        words = shlex.split(dispatch)
+        assert words[2] == "${project_root}/scripts/paper.sh"
+        assert words[-1] == "$@"
+        assert "set -euo pipefail" in source
+        parsed.append(_parser().parse_args(words[3:-1]))
     assert sum(args.prepare_only for args in parsed) == 1
     assert all(args.suite == "all" for args in parsed)
     assert {tuple(args.tracks) for args in parsed if not args.prepare_only} == {
@@ -21012,6 +21122,19 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert "--tiny" not in readme
     assert "python -c" not in readme
     assert "\\\n" not in readme
+    assert "tmux new" not in readme
+    assert 'source "$(conda info --base)' not in readme
+
+
+def test_default_workspace_directories_exist_in_a_clone() -> None:
+    paths = [
+        "data/.gitkeep",
+        "results/.gitkeep",
+        "research/conductance_gat/results/.gitkeep",
+        "research/cycle_pe/results/.gitkeep",
+        "research/tree_augmentation/results/.gitkeep",
+    ]
+    assert all((ROOT / path).is_file() for path in paths)
 
 
 def test_legacy_demo_entrypoints_are_removed() -> None:

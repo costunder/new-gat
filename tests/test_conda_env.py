@@ -324,3 +324,45 @@ def test_paper_bash_preserves_arguments_exit_code_and_conda_selection(tmp_path: 
     forwarded = dispatch_args.read_bytes().split(b"\0")[:-1]
     assert [value.decode("utf-8") for value in forwarded] == ["scripts/run_paper.py", *arguments]
     assert not Path(environ["VENV_DIR"]).exists()
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize(
+    ("script", "defaults"),
+    [
+        ("scripts/prepare_data.sh", ["--suite", "all", "--prepare-only", "--allow-download"]),
+        ("scripts/reproduce.sh", ["--suite", "all"]),
+        (
+            "research/conductance_gat/reproduce.sh",
+            ["--suite", "all", "--tracks", "conductance_gat"],
+        ),
+        ("research/cycle_pe/reproduce.sh", ["--suite", "all", "--tracks", "cycle_pe"]),
+        (
+            "research/tree_augmentation/reproduce.sh",
+            ["--suite", "all", "--tracks", "tree_augmentation"],
+        ),
+    ],
+)
+def test_reproduction_scripts_forward_defaults_arguments_and_exit_status(
+    tmp_path: Path, script: str, defaults: list[str]
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    environ["TEST_RUN_EXIT"] = "37"
+    arguments = ["--run-id", "space value", "--model-seeds", "1,2"]
+    result = subprocess.run(
+        [BASH, str(ROOT / script), *arguments],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 37, result.stderr
+    assert call_log.read_text(encoding="utf-8").splitlines() == ["verify", "paper"]
+    forwarded = dispatch_args.read_bytes().split(b"\0")[:-1]
+    assert [value.decode("utf-8") for value in forwarded] == [
+        "scripts/run_paper.py",
+        *defaults,
+        *arguments,
+    ]

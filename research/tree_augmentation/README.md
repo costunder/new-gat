@@ -84,34 +84,23 @@ one categorical bond type per canonical undirected edge in its verified cache.
 The model combines those chart-invariant chemistry embeddings with its topology
 and cycle-chart representation; it is not a topology-only ZINC baseline.
 
-### Linux/CUDA setup
+## Reproduce this track
 
-Use a Linux workstation or server with an NVIDIA GPU, directly from a local
-terminal or through any SSH client. Neither MobaXterm nor tmux is required.
-Follow the [root README](../../README.md) for the supported hardware/software
-requirements and Conda installation. From the repository root, create a dedicated environment:
+Complete the environment installation and dataset preparation in the
+[root README](../../README.md). With the project's Conda environment active,
+run this script from the repository root:
 
 ```bash
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda create -n new-gat python=3.11 pip -y
-conda activate new-gat
-bash scripts/setup_gpu.sh
+bash research/tree_augmentation/reproduce.sh
 ```
 
-If you already created this project's environment using the
-[root README](../../README.md), skip creation and activate that same environment.
-Do not install into `base`, a shared environment, or another project's environment.
-Setup installs the repository's exact CUDA/package pins, including the public PyG
-adapters, then verifies the lock, package compatibility, and CUDA. The default
-wheel channel is `cu126`; do not change it between reproductions of the same run.
-Tests are optional: `RUN_TESTS=1 bash scripts/setup_gpu.sh`.
+The script runs the full CycleCount, CSL, and ZINC suites on CUDA, with model
+seeds `0,1,2,3,4` and data/split/chart seeds fixed to `0`. It runs only this
+track's fixed-chart and multi-chart comparisons. Dataset and result locations,
+run identifiers, and shared overrides follow the root README. Missing or damaged
+public data is an error; training does not download a substitute.
 
-Every `python` command below assumes this Conda environment is active. Run paper
-and test commands from the repository root. In each new terminal, run the
-`source` and `conda activate new-gat` commands again; no environment recreation
-is needed. See the root README for data paths, GPU allocation, and wheel selection.
-
-### Exact CLI
+### Seed axes and runtime controls
 
 Randomness is split into four auditable axes:
 
@@ -130,39 +119,12 @@ resolved data seed, and a missing model seed falls back to `--seed`. Every run
 manifest and summary records the resolved `seed_axes`; no single mixed seed is
 reported as the experiment identity.
 
-For independent paper axes, pass all four explicitly:
-
-```bash
-python -m research.tree_augmentation.paper \
-  --suite core --data-root ./data/tree-augmentation \
-  --output-dir results/tree-core-axes --device cuda:0 \
-  --data-seed 11 --split-seed 13 --chart-seed 17 --model-seed 19 \
-  --amp --batch-size 16 --workers 4 --pin-memory --non-blocking
-```
-
-Prepare the deterministic offline cache without training:
-
-```bash
-python -m research.tree_augmentation.paper \
-  --suite core --data-root ./data/tree-augmentation \
-  --output-dir results/tree-core-prepared --seed 17 --prepare-only --workers 0
-```
-
-Run the full CUDA path with autocast/GradScaler, pinned host transfers, and
-non-blocking copies enabled by the configuration:
-
-```bash
-python -m research.tree_augmentation.paper \
-  --suite core --data-root ./data/tree-augmentation \
-  --output-dir results/tree-core-cuda --device cuda:0 --seed 17 \
-  --amp --batch-size 16 --workers 4 --pin-memory --non-blocking
-```
-
-Optional adapters use `--suite csl`, `--suite zinc`, or `--suite all`. The GPU
-setup above installs their pinned PyG dependencies. A missing verified processed
-cache is network-safe by default: pass
-`--allow-download` explicitly to permit the PyG adapters to access their public
-dataset endpoints. No generated stand-in replaces a missing public dataset.
+The reproduction script passes all four seed axes explicitly. CUDA training
+uses AMP, pinned host transfers, and non-blocking copies by default.
+The standalone module supports `core`, `csl`, `zinc`, and `all` suites; the
+reproduction script selects `all`. Setup installs the pinned PyG dependencies.
+Only the data-preparation step explicitly permits public downloads with
+`--allow-download`; no generated stand-in replaces a missing public dataset.
 `--workers` is passed directly to every
 training and evaluation `DataLoader`. With `--suite all`, each suite gets its
 own subdirectory and the output root gets an aggregate manifest; all three are

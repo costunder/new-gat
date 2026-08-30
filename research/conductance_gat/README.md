@@ -15,59 +15,23 @@ edge `tail -> head`, `sparse.py` gathers `H[head] - H[tail]`; two PyTorch
 of different sizes are concatenated into one `PackedGraphBatch`, so memory is
 linear in nodes and edges and the same code runs on CPU or CUDA.
 
-All experiments use the `paper.py` entry point.
+## Reproduce this track
 
-## Linux/CUDA setup
-
-Use a Linux workstation or server with an NVIDIA GPU, directly from a local
-terminal or through any SSH client. Neither MobaXterm nor tmux is required.
-Follow the [root README](../../README.md) for the supported hardware/software
-requirements and Conda installation. From the repository root, create a dedicated environment:
+Complete the environment installation and dataset preparation in the
+[root README](../../README.md). With the project's Conda environment active,
+run this script from the repository root:
 
 ```bash
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda create -n new-gat python=3.11 pip -y
-conda activate new-gat
-bash scripts/setup_gpu.sh
+bash research/conductance_gat/reproduce.sh
 ```
 
-If you already created this project's environment using the
-[root README](../../README.md), skip creation and activate that same environment.
-Do not install into `base`, a shared environment, or another project's environment.
-The setup script installs the repository's exact CUDA/package pins, including
-PyG/OGB dependencies for PascalVOC-SP and ogbg-molhiv, then verifies the lock,
-package compatibility, and CUDA. The default wheel channel is `cu126`; do not
-change it between reproductions of the same run. Tests are optional:
-`RUN_TESTS=1 bash scripts/setup_gpu.sh`.
+The script runs the full conductance suite: S1--S4, PascalVOC-SP, and ogbg-molhiv.
+It uses CUDA and model seeds `0,1,2,3,4`, with data/split/chart seeds fixed to `0`.
+It executes only this track, through its own `paper.py` entry point. Dataset and
+result locations, run identifiers, and shared overrides follow the root README.
+Missing or damaged public data is an error; training does not download a substitute.
 
-Every `python` command below assumes this Conda environment is active and the
-working directory is the repository root. In each new terminal, run the
-`source` and `conda activate new-gat` commands again; no environment recreation
-is needed. See the root README for data paths, GPU allocation, and wheel selection.
-The runner checks CUDA availability before doing any work and gives an explicit
-error when a requested optional dependency or prepared public dataset is absent.
-
-## One paper entry point
-
-Prepare deterministic core data without training:
-
-```bash
-python -m research.conductance_gat.paper \
-  --suite core --prepare-only \
-  --data-root ./data/conductance \
-  --output-dir ./results/conductance-prepare \
-  --data-seed 17
-```
-
-Run the core paper suite on CUDA:
-
-```bash
-python -m research.conductance_gat.paper \
-  --suite core \
-  --data-root ./data/conductance \
-  --output-dir ./results/conductance-core-seed17 \
-  --device cuda --data-seed 17 --model-seed 17 --batch-size 16 --amp
-```
+## Seed axes and runtime controls
 
 Randomness is separated into `--data-seed`, `--split-seed`, `--chart-seed`, and
 `--model-seed`. Generated S1--S4 graphs, excitations, trajectories, labels, and
@@ -78,8 +42,8 @@ applicable independently. This conductance track has no tree-chart sampling, so
 `chart_seed` is also marked not applicable. Official PascalVOC-SP/MolHIV split
 and chart axes are explicitly `not_applicable` in `summary.json`.
 
-Standalone `--seed 17` remains compatible: every omitted axis resolves to 17.
-For auditable paper runs, pass data and model axes explicitly.
+The standalone module retains `--seed` as a compatibility fallback for omitted
+axes. The reproduction script passes the independent axes explicitly.
 
 If GPU memory is limited, lower `--batch-size`. CUDA defaults to AMP, pinned
 DataLoader memory, and non-blocking host-to-device transfer; all are explicit:
@@ -145,20 +109,9 @@ every factorial cell.
 
 ## Required paper public benchmarks (optional loader dependencies)
 
-Preparation is network-opt-in. No official dataset class is instantiated for a
-download unless `--allow-download` is supplied:
-
-```bash
-python -m research.conductance_gat.paper \
-  --suite public --prepare-only --allow-download \
-  --data-root ./data/conductance \
-  --output-dir ./results/conductance-public-prepare
-
-python -m research.conductance_gat.paper \
-  --suite public --device cuda --amp \
-  --data-root ./data/conductance \
-  --output-dir ./results/conductance-public-seed17
-```
+Both public benchmarks are included in the reproduction script. Preparation is
+network-opt-in: no official dataset class is instantiated for a download unless
+`--allow-download` is supplied during the root README's data-preparation step.
 
 - [LRGB PascalVOC-SP](https://github.com/vijaydwivedi75/lrgb): official
   train/validation/test split and node macro-F1.

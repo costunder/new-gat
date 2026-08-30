@@ -4,6 +4,21 @@
 독립적으로 검증한다. Linux/CUDA 논문 경로는 `research.cycle_pe.paper`이며,
 CycleCount-OOD, BREC v3, ZINC-12K를 같은 batch-safe backbone에서 실행한다.
 
+## 이 트랙 재현
+
+[루트 README](../../README.md)의 환경 설치와 데이터 준비를 완료한 뒤,
+프로젝트 Conda 환경이 활성화된 저장소 최상위 폴더에서 실행한다.
+
+```bash
+bash research/cycle_pe/reproduce.sh
+```
+
+CycleCount-OOD와 ZINC-12K를 CUDA에서 model seeds `0,1,2,3,4`로 각각 실행한다.
+data/split/chart seed는 `0`으로 고정하며, 네 PE 비교군과 세 CycleCount target을 모두
+포함한다. BREC는 별도의 공식 10-seed 프로토콜을 한 번 실행한다. 다른 연구 트랙의 모델을
+호출하거나 결합하지 않는다. 데이터·결과 경로, run ID와 공통 옵션은 루트 README를 따른다.
+학습 중 누락되거나 손상된 공개 데이터는 다운로드나 대체 없이 오류로 처리한다.
+
 ## 구현 경계와 PE 비교군
 
 모든 PE는 edge-by-node incidence matrix와 BFS spanning tree로 만든 fundamental cycle
@@ -128,109 +143,18 @@ CLI는 `--data-seed`, `--split-seed`, `--chart-seed`, `--model-seed`를 독립�
 각 suite manifest의 `seed_axes`는 resolve된 네 값을, `seed_axis_policy`는 실제 사용 여부와
 `not_applicable` 사유를 기록한다.
 
-## Linux/CUDA 설치
+## 개별 프로토콜 설정
 
-NVIDIA GPU가 있는 Linux 워크스테이션 또는 서버에서 실행한다. 로컬 터미널과 임의의 SSH
-client 모두 사용할 수 있으며 MobaXterm과 tmux는 필수가 아니다. 지원 환경과 Conda 설치는
-[루트 README](../../README.md)를 따른다. 저장소 root에서 프로젝트 전용 환경을 만들고
-활성화한 뒤 설치한다.
+재현 스크립트의 `--cycle-variants`, `--cycle-core-targets`로 비교군과 target을 선택할 수 있다.
+`--cycle-epochs`, `--cycle-learning-rate`는 CycleCount와 ZINC에만 적용되며 공식 BREC의
+고정 학습 설정을 바꾸지 않는다. 기본값을 변경한 결과는 기준 재현 실험과 구분해서 기록한다.
 
-```bash
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda create -n new-gat python=3.11 pip -y
-conda activate new-gat
-bash scripts/setup_gpu.sh
-```
-
-[루트 README](../../README.md)에서 이미 이 프로젝트용 환경을 만들었다면 생성만 건너뛰고
-같은 환경을 활성화한다. `base`, 공유 환경 또는 다른 프로젝트의 환경에는 설치하지 않는다.
-Setup은 저장소의 exact CUDA/package pin과 public adapter 의존성을 설치하고 lock·package
-호환성·CUDA를 검증한다. 기본 wheel channel은 `cu126`이며 같은 실험을 재현할 때는 이를
-동일하게 유지한다. 테스트 실행은 `RUN_TESTS=1 bash scripts/setup_gpu.sh`로 선택한다.
-
-아래 모든 `python` 명령은 **이 Conda 환경이 활성화된 저장소 root**에서 실행한다.
-새 터미널에서는 위 `source`와 `conda activate new-gat`을 다시 실행한다.
-데이터 경로와 GPU 할당, wheel 선택은 루트 README를 따른다. 결과 재현성 때문에 실제 GPU
-실행 환경의 Python, CUDA, torch, GPU 이름은 각 manifest에 자동 기록된다.
-
-## 정확한 실행 명령
-
-각 실행의 `--output-dir`는 존재하지 않거나 비어 있어야 한다. 기존 artifact가 있으면
-덮어쓰지 않고 종료한다.
-
-CycleCount-OOD 전체 CUDA run:
-
-```bash
-python -m research.cycle_pe.paper \
-  --suite core \
-  --data-root ./data \
-  --output-dir ./paper_runs/cycle-core-seed2025 \
-  --device cuda \
-  --seed 2025 --data-seed 2025 --model-seed 2025 \
-  --workers 8 \
-  --batch-size 64 \
-  --variants no_pe,raw,set,projector \
-  --core-targets edge,node,graph \
-  --amp --pin-memory --non-blocking
-```
-
-BREC v3 전체 CUDA run(공식 열 seed가 기본값):
-
-```bash
-python -m research.cycle_pe.paper \
-  --suite brec \
-  --data-root ./data \
-  --output-dir ./paper_runs/cycle-brec \
-  --device cuda \
-  --seed 2025 \
-  --brec-protocol official \
-  --workers 0 \
-  --batch-size 16 \
-  --variants no_pe,raw,set,projector \
-  --brec-num-relabel 32 \
-  --brec-seeds 100,200,300,400,500,600,700,800,900,1000 \
-  --allow-download \
-  --no-amp --no-pin-memory --no-non-blocking
-```
-
-이미 공식 BREC 파일을 배치했다면 `--allow-download`를 빼는 편이 더 엄격하다.
-
-ZINC-12K 전체 CUDA run:
-
-```bash
-python -m research.cycle_pe.paper \
-  --suite zinc \
-  --data-root ./data \
-  --output-dir ./paper_runs/cycle-zinc-seed2025 \
-  --device cuda \
-  --seed 2025 --model-seed 2025 \
-  --workers 8 \
-  --batch-size 64 \
-  --variants no_pe,raw,set,projector \
-  --allow-download \
-  --amp --pin-memory --non-blocking
-```
-
-모든 suite의 cache/graph/PE만 검증하고 학습을 생략하려면 다음처럼 실행한다. `all`은
-core → BREC → ZINC 순서이며 어느 suite라도 실패하면 그 실패 suite의 불완전 artifact만
-정리한다. 이미 완료된 suite는 보존하고 최상위 `run_manifest.json`에 완료 suite hash와 실패
-원인을 남긴다.
-
-```bash
-python -m research.cycle_pe.paper \
-  --suite all \
-  --data-root ./data \
-  --output-dir ./paper_runs/cycle-prepare \
-  --device cuda \
-  --seed 2025 \
-  --workers 8 \
-  --prepare-only \
-  --allow-download
-```
-
-`--epochs`, `--learning-rate`, `--weight-decay`, `--hidden-dim`, `--pe-dim`, `--layers`로
-학습 설정을 override할 수 있다. CPU에서는 AMP, pinned memory, non-blocking transfer가
-자동으로 비활성화된다.
+하위 `research.cycle_pe.paper` 모듈은 `core`, `brec`, `zinc`, `all` suite와
+`--epochs`, `--learning-rate`, `--weight-decay`, `--hidden-dim`, `--pe-dim`, `--layers`를
+제공한다. 이 단일 실행 모듈을 직접 호출하는 것은 재현 스크립트의 seed sweep과 다르다.
+각 `--output-dir`는 새 경로이거나 비어 있어야 하며 기존 artifact를 덮어쓰지 않는다.
+모듈의 `all` 실행은 core → BREC → ZINC 순서로 진행하고, 실패한 suite의 불완전 artifact만
+정리한다. 완료된 suite는 보존하고 `run_manifest.json`에 완료 suite hash와 실패 원인을 남긴다.
 
 ## Artifact 구조
 

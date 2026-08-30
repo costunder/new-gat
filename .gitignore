@@ -14,6 +14,7 @@ dist/
 *.egg-info/
 runs/
 research/*/results/*
+!research/*/results/.gitkeep
 results/*
 !results/.gitkeep
 data/*

@@ -48,7 +48,7 @@ def _excluded(path: Path, *, root: Path) -> bool:
 def _is_source(path: Path, *, root: Path) -> bool:
     if not path.is_file() or _excluded(path, root=root):
         return False
-    if path.name == ".gitignore":
+    if path.name in {".gitignore", ".gitattributes"}:
         return True
     if path.suffix in SOURCE_SUFFIXES:
         return True

@@ -324,10 +324,21 @@ def test_readme_commands_use_full_independent_protocols() -> None:
         line
         for block in blocks
         for line in block.splitlines()
-        if line.startswith("bash scripts/paper.sh ")
+        if line.startswith("bash ") and line != "bash scripts/setup_gpu.sh"
     ]
     assert len(commands) == 5
-    parsed = [_parser().parse_args(shlex.split(line)[2:]) for line in commands]
+    parsed = []
+    for line in commands:
+        command = shlex.split(line)
+        assert len(command) == 2
+        wrapper = ROOT / command[1]
+        source = wrapper.read_text(encoding="utf-8")
+        dispatch = next(row for row in source.splitlines() if row.startswith("exec bash "))
+        words = shlex.split(dispatch)
+        assert words[2] == "${project_root}/scripts/paper.sh"
+        assert words[-1] == "$@"
+        assert "set -euo pipefail" in source
+        parsed.append(_parser().parse_args(words[3:-1]))
     assert sum(args.prepare_only for args in parsed) == 1
     assert all(args.suite == "all" for args in parsed)
     assert {tuple(args.tracks) for args in parsed if not args.prepare_only} == {
@@ -340,6 +351,19 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert "--tiny" not in readme
     assert "python -c" not in readme
     assert "\\\n" not in readme
+    assert "tmux new" not in readme
+    assert 'source "$(conda info --base)' not in readme
+
+
+def test_default_workspace_directories_exist_in_a_clone() -> None:
+    paths = [
+        "data/.gitkeep",
+        "results/.gitkeep",
+        "research/conductance_gat/results/.gitkeep",
+        "research/cycle_pe/results/.gitkeep",
+        "research/tree_augmentation/results/.gitkeep",
+    ]
+    assert all((ROOT / path).is_file() for path in paths)
 
 
 def test_legacy_demo_entrypoints_are_removed() -> None:
