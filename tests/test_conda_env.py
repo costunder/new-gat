@@ -225,9 +225,14 @@ def test_paper_checks_preparation_dependencies_only_after_conda_validation() -> 
         '"${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet'
     )
     installer = 'bash "${project_root}/scripts/setup_gpu.sh"'
+    profile_query = (
+        '"${environment_python}" "${project_root}/scripts/gpu_profiles.py" --installed-profile'
+    )
     assert source.index(guard) < source.index(dependency_check)
     assert source.count(dependency_check) == 2
     assert source.count(installer) == 1
+    assert source.index(dependency_check) < source.index(profile_query) < source.index(installer)
+    assert f'{installer} --profile "${{bootstrap_profile}}"' in source
     assert (
         source.index(dependency_check) < source.index(installer) < source.rindex(dependency_check)
     )
@@ -237,6 +242,11 @@ def test_paper_checks_preparation_dependencies_only_after_conda_validation() -> 
     assert "--prepare-only) prepare_only=1" in source
     assert "--help|-h|--dry-run) inspection_only=1" in source
     assert '"${prepare_only}" == "1" && "${inspection_only}" == "0"' in source
+    assert f"{dependency_check} || dependency_status=$?" in source
+    assert f"if ! {dependency_check}" not in source
+    assert 'case "${dependency_status}" in' in source
+    assert 'exit "${dependency_status}"' in source
+    assert source.index("        2)") < source.index(installer) < source.index("        *)")
     assert "-m pip" not in source
 
 
@@ -255,8 +265,17 @@ def _shell_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
         "  */check_dependencies.py)\n"
         '    printf "dependencies\\n" >> "$TEST_CALL_LOG"\n'
         '    printf "%s\\0" "$0" "$@" >> "$TEST_DEPENDENCY_ARGS"\n'
-        '    if [ -f "$TEST_DEPENDENCY_READY" ]; then exit 0; fi\n'
+        '    if [ -f "$TEST_DEPENDENCY_READY" ]; then\n'
+        '      exit "${TEST_DEPENDENCY_AFTER_SETUP_EXIT:-0}"\n'
+        "    fi\n"
         '    exit "${TEST_DEPENDENCY_EXIT:-0}" ;;\n'
+        "  */gpu_profiles.py)\n"
+        '    printf "profile\\n" >> "$TEST_CALL_LOG"\n'
+        '    if [ "$2" != "--installed-profile" ]; then exit 98; fi\n'
+        '    if [ "${TEST_PROFILE_QUERY_EXIT:-0}" != "0" ]; then\n'
+        '      exit "$TEST_PROFILE_QUERY_EXIT"\n'
+        "    fi\n"
+        '    printf "%s\\n" "${TEST_INSTALLED_PROFILE:-auto}" ;;\n'
         "  scripts/run_paper.py)\n"
         '    printf "paper\\n" >> "$TEST_CALL_LOG"\n'
         '    printf "%s\\0" "$@" > "$TEST_DISPATCH_ARGS"\n'
@@ -279,8 +298,12 @@ def _shell_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
             "TEST_VERIFY_EXIT": "0",
             "TEST_RUN_EXIT": "0",
             "TEST_DEPENDENCY_EXIT": "0",
+            "TEST_DEPENDENCY_AFTER_SETUP_EXIT": "0",
             "TEST_DEPENDENCY_ARGS": str(tmp_path / "dependency.args"),
             "TEST_DEPENDENCY_READY": str(tmp_path / "dependencies.ready"),
+            "TEST_SETUP_ARGS": str(tmp_path / "setup.args"),
+            "TEST_INSTALLED_PROFILE": "auto",
+            "TEST_PROFILE_QUERY_EXIT": "0",
             "PYTHON": str(tmp_path / "wrong-python"),
             "VENV_DIR": str(tmp_path / "must-not-be-created"),
             "USE_ACTIVE_ENV": "0",
@@ -298,8 +321,10 @@ def test_bash_guard_failure_stops_before_pip_or_dispatch(
 ) -> None:
     environ, call_log, dispatch_args = _shell_environment(tmp_path)
     environ.update({"TEST_VERIFY_EXIT": "23", "SKIP_DEPS": skip_deps})
+    # Setup help deliberately exits before requiring an active environment.
+    arguments = [] if script_name == "setup_gpu.sh" else ["--help"]
     result = subprocess.run(
-        [BASH, str(ROOT / "scripts" / script_name), "--help"],
+        [BASH, str(ROOT / "scripts" / script_name), *arguments],
         cwd=tmp_path,
         env=environ,
         capture_output=True,
@@ -321,8 +346,9 @@ def test_bash_without_active_conda_stops_before_invoking_python(
 ) -> None:
     environ, call_log, _ = _shell_environment(tmp_path)
     environ.pop("CONDA_PREFIX")
+    arguments = [] if script_name == "setup_gpu.sh" else ["--help"]
     result = subprocess.run(
-        [BASH, str(ROOT / "scripts" / script_name), "--help"],
+        [BASH, str(ROOT / "scripts" / script_name), *arguments],
         cwd=tmp_path,
         env=environ,
         capture_output=True,
@@ -408,13 +434,14 @@ def _bootstrap_project(tmp_path: Path) -> Path:
     project = tmp_path / "Research project with spaces"
     scripts = project / "scripts"
     scripts.mkdir(parents=True)
-    for filename in ("paper.sh", "conda_env.sh", "prepare_data.sh"):
+    for filename in ("paper.sh", "conda_env.sh", "prepare_data.sh", "gpu_profiles.py"):
         shutil.copy2(ROOT / "scripts" / filename, scripts / filename)
     (scripts / "setup_gpu.sh").write_text(
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         'printf "setup\\n" >> "$TEST_CALL_LOG"\n'
         'printf "%s" "$CONDA_PREFIX" > "$TEST_SETUP_PREFIX"\n'
+        'printf "%s\\0" "$@" > "$TEST_SETUP_ARGS"\n'
         'if [[ "${TEST_SETUP_EXIT:-0}" != "0" ]]; then exit "$TEST_SETUP_EXIT"; fi\n'
         'if [[ "${TEST_SETUP_MARK_READY:-1}" == "1" ]]; then\n'
         '    touch "$TEST_DEPENDENCY_READY"\n'
@@ -452,8 +479,12 @@ def test_prepare_bootstraps_only_missing_dependencies_and_rechecks_same_python(
     assert result.returncode == 37, result.stderr
     expected = ["verify", "dependencies"]
     if initial_exit:
-        expected.extend(["setup", "dependencies"])
+        expected.extend(["profile", "setup", "dependencies"])
         assert setup_prefix.read_text(encoding="utf-8") == environ["CONDA_PREFIX"]
+        assert Path(environ["TEST_SETUP_ARGS"]).read_bytes().split(b"\0")[:-1] == [
+            b"--profile",
+            b"auto",
+        ]
         assert "Installing the complete locked GPU environment" in result.stdout
     else:
         assert not setup_prefix.exists()
@@ -479,15 +510,47 @@ def test_prepare_bootstraps_only_missing_dependencies_and_rechecks_same_python(
 
 
 @LINUX_BASH_ONLY
-@pytest.mark.parametrize("setup_exit,mark_ready,expected_exit", [(19, "1", 19), (0, "0", 2)])
+@pytest.mark.parametrize("initial_exit", [3, 41, 126, 127])
+def test_prepare_does_not_install_or_dispatch_after_host_or_unexpected_dependency_error(
+    tmp_path: Path, initial_exit: int
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    project = _bootstrap_project(tmp_path)
+    setup_prefix = tmp_path / "setup.prefix"
+    environ.update(
+        {"TEST_DEPENDENCY_EXIT": str(initial_exit), "TEST_SETUP_PREFIX": str(setup_prefix)}
+    )
+    result = subprocess.run(
+        [BASH, str(project / "scripts" / "prepare_data.sh")],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == initial_exit, result.stderr
+    assert call_log.read_text(encoding="utf-8").splitlines() == ["verify", "dependencies"]
+    assert not setup_prefix.exists()
+    assert not Path(environ["TEST_DEPENDENCY_READY"]).exists()
+    assert not dispatch_args.exists()
+    assert "Installing the complete locked GPU environment" not in result.stdout
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize(
+    "setup_exit,mark_ready,recheck_exit,expected_exit",
+    [(19, "1", 0, 19), (0, "0", 0, 2), (0, "1", 3, 3), (0, "1", 41, 41)],
+)
 def test_prepare_never_dispatches_after_failed_install_or_dependency_recheck(
-    tmp_path: Path, setup_exit: int, mark_ready: str, expected_exit: int
+    tmp_path: Path, setup_exit: int, mark_ready: str, recheck_exit: int, expected_exit: int
 ) -> None:
     environ, call_log, dispatch_args = _shell_environment(tmp_path)
     project = _bootstrap_project(tmp_path)
     environ.update(
         {
             "TEST_DEPENDENCY_EXIT": "2",
+            "TEST_DEPENDENCY_AFTER_SETUP_EXIT": str(recheck_exit),
             "TEST_SETUP_EXIT": str(setup_exit),
             "TEST_SETUP_MARK_READY": mark_ready,
             "TEST_SETUP_PREFIX": str(tmp_path / "setup.prefix"),
@@ -503,10 +566,74 @@ def test_prepare_never_dispatches_after_failed_install_or_dependency_recheck(
         timeout=15,
     )
     assert result.returncode == expected_exit, result.stderr
-    expected = ["verify", "dependencies", "setup"]
+    expected = ["verify", "dependencies", "profile", "setup"]
     if setup_exit == 0:
         expected.append("dependencies")
     assert call_log.read_text(encoding="utf-8").splitlines() == expected
+    assert not dispatch_args.exists()
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize("profile_id", ["legacy-cu118", "cu118", "cu126", "cu130", "cu132"])
+def test_dependency_bootstrap_forwards_the_exact_installed_profile(
+    tmp_path: Path, profile_id: str
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    project = _bootstrap_project(tmp_path)
+    environ.update(
+        {
+            "TEST_DEPENDENCY_EXIT": "2",
+            "TEST_INSTALLED_PROFILE": profile_id,
+            "TEST_SETUP_PREFIX": str(tmp_path / "setup.prefix"),
+        }
+    )
+    result = subprocess.run(
+        [BASH, str(project / "scripts" / "prepare_data.sh")],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    forwarded = Path(environ["TEST_SETUP_ARGS"]).read_bytes().split(b"\0")[:-1]
+    assert [value.decode("utf-8") for value in forwarded] == ["--profile", profile_id]
+    assert call_log.read_text(encoding="utf-8").splitlines() == [
+        "verify",
+        "dependencies",
+        "profile",
+        "setup",
+        "dependencies",
+        "paper",
+    ]
+    assert dispatch_args.exists()
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize("query_exit", [2, 41])
+def test_dependency_bootstrap_never_installs_when_profile_identity_is_unknown(
+    tmp_path: Path, query_exit: int
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    project = _bootstrap_project(tmp_path)
+    environ.update({"TEST_DEPENDENCY_EXIT": "2", "TEST_PROFILE_QUERY_EXIT": str(query_exit)})
+    result = subprocess.run(
+        [BASH, str(project / "scripts" / "prepare_data.sh")],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == query_exit, result.stderr
+    assert call_log.read_text(encoding="utf-8").splitlines() == [
+        "verify",
+        "dependencies",
+        "profile",
+    ]
+    assert not Path(environ["TEST_SETUP_ARGS"]).exists()
     assert not dispatch_args.exists()
 
 

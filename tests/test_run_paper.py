@@ -332,12 +332,20 @@ def test_readme_commands_use_full_independent_protocols() -> None:
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     blocks = re.findall(r"```bash\n(.*?)```", readme, flags=re.DOTALL)
-    commands = [
+    bash_commands = [
         line
         for block in blocks
         for line in block.splitlines()
-        if line.startswith("bash ") and line != "bash scripts/setup_gpu.sh"
+        if line.startswith("bash ")
     ]
+    setup_commands = [
+        line for line in bash_commands if shlex.split(line)[1] == "scripts/setup_gpu.sh"
+    ]
+    assert setup_commands == [
+        "bash scripts/setup_gpu.sh",
+        "bash scripts/setup_gpu.sh --profile legacy-cu118",
+    ]
+    commands = [line for line in bash_commands if line not in setup_commands]
     assert len(commands) == 5
     parsed = []
     for line in commands:

@@ -17,9 +17,21 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from scripts.gpu_profiles import CUDA_RUNTIMES
+    from scripts.gpu_profiles import (
+        CUDA_RUNTIMES,
+        GPUProfileError,
+        cuda_tag_for_profile,
+        lock_for_profile,
+        profile_for_torch_version,
+    )
 except ModuleNotFoundError:
-    from gpu_profiles import CUDA_RUNTIMES
+    from gpu_profiles import (
+        CUDA_RUNTIMES,
+        GPUProfileError,
+        cuda_tag_for_profile,
+        lock_for_profile,
+        profile_for_torch_version,
+    )
 
 
 class LockVerificationError(RuntimeError):
@@ -144,12 +156,31 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
-def verify_environment(*, lock_path: Path, constraints_path: Path, cuda_tag: str) -> dict[str, Any]:
+def verify_environment(
+    *,
+    lock_path: Path,
+    constraints_path: Path,
+    cuda_tag: str,
+    profile_id: str | None = None,
+) -> dict[str, Any]:
     """Check package versions, import-time ABI health, and the CUDA runtime."""
 
     if cuda_tag not in CUDA_RUNTIMES:
         raise LockVerificationError(f"unsupported CUDA wheel tag: {cuda_tag}")
     expected_pins = assert_same_pins(lock_path, constraints_path)
+    inferred_profile = profile_for_torch_version(f"{expected_pins['torch']}+{cuda_tag}")
+    if profile_id is None:
+        profile_id = inferred_profile
+    try:
+        if profile_id is None or cuda_tag_for_profile(profile_id) != cuda_tag:
+            raise LockVerificationError("lock does not identify a supported GPU profile")
+        if profile_id != inferred_profile:
+            raise LockVerificationError("selected profile does not match the lock's Torch pin")
+        registered_pins = read_exact_pins(lock_for_profile(profile_id))
+        if registered_pins != expected_pins:
+            raise LockVerificationError("selected lock differs from the registered profile pins")
+    except GPUProfileError as error:
+        raise LockVerificationError(str(error)) from error
 
     installed: dict[str, str] = {}
     mismatches: list[str] = []
@@ -192,6 +223,7 @@ def verify_environment(*, lock_path: Path, constraints_path: Path, cuda_tag: str
         "python_executable": sys.executable,
         "platform": platform.platform(),
         "cuda_wheel_tag": cuda_tag,
+        "profile_id": profile_id,
         "torch_cuda_runtime": actual_runtime,
         "numpy_torch_interop": "passed",
         "constraints_path": str(constraints_path.resolve()),
@@ -207,6 +239,7 @@ def main() -> int:
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--constraints", type=Path, required=True)
     parser.add_argument("--cuda-tag", choices=sorted(CUDA_RUNTIMES), required=True)
+    parser.add_argument("--profile", help="assert the selected registered profile identity")
     parser.add_argument("--json-out", type=Path)
     args = parser.parse_args()
     try:
@@ -214,6 +247,7 @@ def main() -> int:
             lock_path=args.lock,
             constraints_path=args.constraints,
             cuda_tag=args.cuda_tag,
+            profile_id=args.profile,
         )
     except (LockVerificationError, OSError) as error:
         print(f"GPU LOCK VERIFICATION FAILED: {error}", file=sys.stderr)

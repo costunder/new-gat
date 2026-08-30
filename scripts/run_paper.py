@@ -529,7 +529,7 @@ def main() -> int:
         dependency_report = check_dependencies()
     except DependencyCheckError as error:
         print(error_message(error), file=sys.stderr)
-        return 2
+        return error.exit_code
 
     run_dir = PROJECT_ROOT / "runs" / "paper" / run_id
     if run_dir.exists() or any(

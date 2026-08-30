@@ -1,6 +1,6 @@
 # NEW GAT 연구 프로젝트 Hand-off
 
-작성 기준일: 2026-08-30 (Asia/Seoul)
+작성 기준일: 2026-08-31 (Asia/Seoul)
 
 이 문서는 외부 ChatGPT 또는 연구 리뷰어가 저장소를 처음 받아도 수학적 가설, 구현 경계,
 데이터 계약, 실행법, 검증 범위와 미완료 항목을 혼동하지 않도록 만든 인수인계 문서다.
@@ -9,6 +9,49 @@
 이 문서는 실행 입문서가 아니라 연구·구현 교차검토용이다.
 
 ## 0. 리뷰어가 먼저 알아야 할 판정
+
+### 2026-08-31 Ubuntu 18.04 Singularity의 glibc 호환 경로
+
+사용자가 제공한 실제 실행 환경은 Ubuntu 18.04.5 / glibc 2.27이다. Torch import는
+`GLIBC_2.28 not found`로 실패했다. `/tools/scripts/ssu_a6gpu`는 stripped ELF 실행기이고
+Conda는 `/tools/anaconda3`의 공용 설치본이다. 이미지 선택 옵션은 확인되지 않았으므로
+실행기를 수정하거나 임의 플래그를 추측하지 않았다. 이전의 CUDA 12.2→cu118 교정만으로는
+이 libc 충돌이 해결되지 않는다. 아래 기록의 기본 cu118은 여전히 Torch 2.7.1이다.
+
+- 명시적 `legacy-cu118` profile을 추가했다. Python 3.11 / Torch 2.6.0+cu118 / PyG 2.7.0이며
+  별도의 `requirements-legacy-cu118-lock.txt`와 `constraints-legacy-cu118.txt`를 사용한다.
+  기본 `auto` 및 기존 cu118/cu126/cu130/cu132 선택은 바꾸지 않았다.
+- 사용자는 새 `new-gat-legacy` Conda 환경에서 `setup_gpu.sh --profile legacy-cu118`을 실행한다.
+  설치 전 보호 검사는 `new-gat` 환경 자체와 다른 Torch 버전이 이미 설치된 환경을 거부한다.
+  기존 환경/진행 중인 학습, 공용 Conda base, 컨테이너 이미지, glibc, 드라이버는 변경하지 않는다.
+- Torch 2.6 cu118의 Manylinux2014 배포는 glibc 2.17부터지만, NumPy/SciPy 등의 직접 pin을
+  포함한 조합은 glibc 2.27 이상으로 제한한다. Python 3.11/x86_64용 직접 의존성 wheel 제공
+  여부를 공식 PyPI/PyTorch 메타데이터로 확인했다. 전이 의존성을 전부 사전 잠근 것은 아니다.
+- `check_dependencies.py`는 runtime import 전에 호스트 ABI를 검사한다. 호스트 오류는 별도
+  종료 코드 `3`이며 `paper.sh`와 `run_paper.py`가 이를 보존한다. 데이터 준비가 동일한
+  비호환 패키지 설치를 자동 반복하지 않는다. 일반 의존성 누락만 기존 1회 보완 경로를 쓴다.
+  보완 시 metadata로 인식한 기존 profile을 유지하고, 미등록/CPU/custom Torch는 자동 교체하지 않는다.
+- 동일한 `cu118` runtime이라도 정확한 Torch 버전으로 두 profile을 구분한다. 설치 verifier와
+  실행 manifest에 `profile_id`를 추가했다. CPU/custom Torch, 다른 pin과 runtime은 계속 거부한다.
+  legacy 설치 기록은 활성 Conda prefix의 `.new-gat-environment/`에 별도로 저장한다.
+- 모델, 데이터셋, split, 학습·평가 설정은 변경하지 않았다. 새 profile의 결과는 기존 profile의
+  seed 반복으로 합치지 않는다. 기존 run을 자동 재개하거나 덮어쓰지 않는다.
+- 구버전 Torch에는 공개된 체크포인트 로딩 취약점이 있다. Torch 2.6뿐 아니라 2.7도 해당하며
+  `weights_only=True`를 보안 보장으로 취급하지 않는다. 공식 출처가 확인된 데이터와 직접 만든
+  체크포인트만 사용한다. 별도 Conda 환경은 보안 sandbox가 아니다. 최신 보안 패치가 필요하면
+  더 새 컨테이너가 필요하다. [환경 안내](docs/ENVIRONMENT.md)에 설치 절차와 제약을 정리했다.
+
+근거: [PyTorch Linux wheel 플랫폼 공지](https://dev-discuss.pytorch.org/t/pytorch-linux-wheels-switching-to-new-wheel-build-platform-manylinux-2-28-on-november-12-2024/2581),
+[공식 cu118 wheel 목록](https://download.pytorch.org/whl/cu118/torch/),
+[PyG 2.7 지원 목록](https://github.com/pyg-team/pytorch_geometric/releases/tag/2.7.0),
+[체크포인트 로딩 보안 공지](https://github.com/pytorch/pytorch/security/advisories/GHSA-63cw-57p8-fm3p).
+
+전체 pytest **387 passed, 63 skipped**, Ruff 및 diff 검사 통과. 생략은 Linux/Bash 동적
+검사 62개와 로컬 PyG 미설치에 따른 batching 검사 1개다. profile 선택/정확한 pin/CUDA
+runtime, glibc 경계, 기존 환경 보호, 의존성 보완 시 profile 유지, manifest, README 실행
+계약을 검증했다. `code_summary.md`도 현재 105개 소스/설정 파일에서 다시 생성했다.
+이 호스트에서 실제 Ubuntu 18.04 설치·CUDA 학습은 실행하지 않았다. 아래 이전 날짜의
+pytest 수치는 해당 시점의 이력이며 최신 회귀 결과와 구분한다.
 
 ### 2026-08-30 CUDA 12.2 서버의 설치 차단 교정
 
@@ -162,9 +205,9 @@ Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 
 ### 코드 스냅샷
 
 - 파일: `code_summary.md`
-- 포함 파일: 103개
-- 크기: 932,683 bytes, 24,638 lines (`str.splitlines()` 기준)
-- SHA-256: `E10D1314817BB96B8D6A4D5BBFAACAF3A08D01F6FBF2D1A2FA6DC7FA5E1F0229`
+- 포함 파일: 105개
+- 크기: 972,654 bytes, 25,646 lines (`str.splitlines()` 기준)
+- SHA-256: `2D49D4080AE0F2DB4D181D31D3FC97F9C53302A8D864FFD41FE6BB6A02B9017D`
 - 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`, `.gitattributes`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
 
@@ -258,9 +301,10 @@ representation으로 제공하는 inductive bias다.
 - `README.md`: Linux NVIDIA GPU 환경의 설치부터 전체 재현까지의 실행 명령.
 - `DATASETS.md`: 사람이 읽는 데이터·split·metric 계약.
 - `pyproject.toml`: Python 3.11+, core/dev/paper dependency와 pytest/Ruff 설정.
-- `requirements-lock.txt`, `requirements-cu118-lock.txt`, `constraints-cu*.txt`: Python 3.11 호환
-  exact top-level 연구 stack과 CUDA 11.8/12.6/13.0/13.2별 official torch channel 계약.
-- `scripts/gpu_profiles.py`: 설치 시 보수적 드라이버/호스트 조건에 따른 고정 조합 선택.
+- `requirements-lock.txt`, `requirements-cu118-lock.txt`, `requirements-legacy-cu118-lock.txt`,
+  `constraints-*.txt`: Python 3.11 호환 exact top-level 연구 stack과 profile별 official Torch 계약.
+- `scripts/gpu_profiles.py`: 보수적 드라이버/호스트 조건, 정확한 설치 버전으로 고정 조합 선택.
+- `scripts/check_dependencies.py`: 연구 import 전 profile/pin/ABI 검사, 별도 호스트 오류 종료 코드.
 - `requirements-paper.txt`: portable paper dependency가 같은 lock을 사용하게 하는 진입점.
 - `scripts/setup_gpu.sh`, `scripts/verify_gpu_lock.py`: 활성 프로젝트 전용 Conda 환경에 exact
   package 설치, ABI/CUDA runtime 검증과 transitive freeze snapshot.
@@ -332,6 +376,8 @@ Setup은 활성 non-base Conda의 Python만 사용한다. 기본 `auto`는 위�
 전이 의존성 전체를 사전에 잠근 것은 아니며 실제 설치 결과는
 `.gpu-environment.json`, `.gpu-environment.freeze.txt`에 기록한다.
 Version/import ABI/CUDA 검증은 유지하고 전체 pytest는 `RUN_TESTS=1`일 때만 실행한다.
+Ubuntu 18.04/glibc 2.27은 위 기본 설치 대신 README의 별도 `new-gat-legacy` 생성과
+`--profile legacy-cu118` 설치 경로를 사용한다. 설치 기록도 해당 Conda 환경 안에 분리한다.
 
 삭제된 entrypoint는 `setup.sh`, `setup.ps1`, `smoke.sh`, `smoke.ps1`,
 `run_all.py`와 세 트랙의 legacy `run.py`다. 설치·실험 안내는 위 단일 경로를 사용한다.

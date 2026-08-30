@@ -22,7 +22,8 @@ Linux GPU 워크스테이션에서 직접 실행하거나 SSH로 GPU 서버에 �
 접속 프로그램은 실행 환경과 무관하며, MobaXterm과 tmux는 필수 의존성이 아니다.
 공용 클러스터에서는 해당 시스템의 GPU 작업 할당 정책을 따른다.
 
-필요한 준비물은 Git, Bash, Conda, NVIDIA 드라이버, glibc 2.28 이상이다.
+필요한 준비물은 Git, Bash, Conda, NVIDIA 드라이버다. 기본 설치는 glibc 2.28 이상을
+요구한다. **Ubuntu 18.04 / glibc 2.27 컨테이너는 아래 별도 설치 경로를 사용한다.**
 설치기는 `nvidia-smi`의 CUDA 표시값에 따라 다음 **고정 버전 조합**을 선택한다.
 
 | 드라이버의 CUDA 표시값 | 설치 조합 |
@@ -46,7 +47,7 @@ conda activate new-gat
 bash scripts/setup_gpu.sh
 ```
 
-이후 명령은 모두 저장소 최상위 폴더에서, `new-gat` 환경을 활성화한 상태로 실행한다.
+이후 명령은 모두 저장소 최상위 폴더에서, 설치한 Conda 환경을 활성화한 상태로 실행한다.
 설치 스크립트는 연구 패키지 버전, CUDA runtime, import 호환성을 확인하고 실제 설치 내역을 저장한다.
 선택한 조합을 설치 로그에 표시하며, 이미 설치된 조합은 데이터 준비·학습 때 자동 변경하지 않는다.
 `conda env create`는 Python과 pip를 준비하며, **연구 의존성 전체 설치는 `setup_gpu.sh`가 수행한다.**
@@ -55,6 +56,29 @@ bash scripts/setup_gpu.sh
 `conda activate new-gat` 후 `bash scripts/setup_gpu.sh`를 실행한다.
 
 별도 CUDA runtime 선택, Conda 활성화 문제와 검사 명령은 [환경 안내](docs/ENVIRONMENT.md)에 있다.
+
+### Ubuntu 18.04 / glibc 2.27 컨테이너에서 설치
+
+이 환경에서는 위 기본 설치 **대신** 명시적인 `legacy-cu118` 조합을 사용한다.
+GPU가 할당된 현재 컨테이너의 저장소 폴더에서 실행한다. 기존 `new-gat` 환경을
+교체하지 않도록 새 환경을 만든다. 이미 저장소를 받았다면 다시 clone할 필요 없다.
+
+```bash
+conda env create -n new-gat-legacy -f environment.yml
+conda activate new-gat-legacy
+bash scripts/setup_gpu.sh --profile legacy-cu118
+```
+
+설치 조합은 **PyTorch 2.6.0+cu118 / PyG 2.7.0 / Python 3.11**이다.
+Linux x86_64, glibc 2.27 이상, 드라이버 CUDA 표시값 11.8 이상이 필요하다.
+이미 이 전용 환경을 만들었다면 첫 줄을 생략하고 활성화·설치만 반복한다.
+설치기가 다른 Torch가 들어 있는 환경은 변경하지 않고 중단한다.
+설치 성공 후 아래 데이터 준비·실험 명령은 그대로 사용한다.
+
+이 경로는 호환용 구버전이며 최신 보안 패치 환경이 아니다. PyTorch 2.6과 2.7에는
+[공개된 체크포인트 로딩 취약점](https://github.com/pytorch/pytorch/security/advisories/GHSA-63cw-57p8-fm3p)이
+있으므로 출처 불명의 `.pt`·`.pth`·pickle 파일을 읽지 않는다. 자세한 제약은
+[환경 안내](docs/ENVIRONMENT.md)에 있다. 실제 서버 설치·GPU 실행은 설치 후 별도로 확인해야 한다.
 
 ## 데이터 준비
 
@@ -68,6 +92,7 @@ bash scripts/prepare_data.sh
 이 명령은 활성 Conda 환경의 필수 패키지 버전과 import를 먼저 확인한다. NumPy 등 의존성이
 누락되었으면 전체 설치 스크립트를 한 번 실행하고, 설치·검사가 성공한 경우에만 데이터를 준비한다.
 자동 설치에도 위의 Linux/NVIDIA GPU 환경과 네트워크가 필요하다. 설치가 실패하면 데이터 준비도 중단된다.
+glibc 등 호스트 호환성 오류는 자동 재설치하지 않고 중단한다.
 학습 명령은 패키지를 자동 변경하지 않으며, 설치가 불완전하면 설치 명령을 안내하고 중단한다.
 
 기본 저장 경로는 `data/paper/`다. 준비만 수행하며 모델을 학습하지 않는다.

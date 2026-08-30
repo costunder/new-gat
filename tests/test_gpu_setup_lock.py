@@ -20,6 +20,7 @@ from scripts.verify_gpu_lock import (
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = ROOT / "requirements-lock.txt"
 CUDA_TAGS = ("cu118", "cu126", "cu130", "cu132")
+PROFILE_IDS = (*CUDA_TAGS, "legacy-cu118")
 
 
 @pytest.mark.parametrize("tag", CUDA_TAGS)
@@ -48,6 +49,15 @@ def test_cu118_profile_only_changes_torch_and_matching_pyg() -> None:
     assert compatibility == {**reference, "torch": "2.7.1", "torch-geometric": "2.7.0"}
 
 
+def test_legacy_cu118_lock_is_separate_and_preserves_other_research_pins() -> None:
+    reference = read_exact_pins(LOCK)
+    legacy_lock = ROOT / "requirements-legacy-cu118-lock.txt"
+    legacy_constraints = ROOT / "constraints-legacy-cu118.txt"
+    expected = {**reference, "torch": "2.6.0", "torch-geometric": "2.7.0"}
+    assert assert_same_pins(legacy_lock, legacy_constraints) == expected
+    assert legacy_lock != lock_for_tag("cu118", root=ROOT)
+
+
 def test_exact_pin_parser_rejects_ranges(tmp_path: Path) -> None:
     invalid = tmp_path / "invalid.txt"
     invalid.write_text("torch>=2.2\n", encoding="utf-8")
@@ -65,9 +75,14 @@ def test_only_torch_may_have_a_cuda_local_version_suffix() -> None:
     assert not version_matches("torch", "2.7.1", "2.7.1", cuda_tag="cu118")
 
 
-@pytest.mark.parametrize("tag", CUDA_TAGS)
-def test_environment_verifier_checks_exact_versions_and_cuda_runtime(tag: str) -> None:
-    lock = lock_for_tag(tag, root=ROOT)
+@pytest.mark.parametrize("profile_id", PROFILE_IDS)
+def test_environment_verifier_checks_exact_versions_and_cuda_runtime(profile_id: str) -> None:
+    tag = "cu118" if profile_id == "legacy-cu118" else profile_id
+    lock = (
+        ROOT / "requirements-legacy-cu118-lock.txt"
+        if profile_id == "legacy-cu118"
+        else lock_for_tag(tag, root=ROOT)
+    )
     pins = read_exact_pins(lock)
     installed = {**pins, "torch": f"{pins['torch']}+{tag}"}
     fake_torch = SimpleNamespace(
@@ -91,8 +106,9 @@ def test_environment_verifier_checks_exact_versions_and_cuda_runtime(tag: str) -
     ):
         report = verify_environment(
             lock_path=lock,
-            constraints_path=ROOT / f"constraints-{tag}.txt",
+            constraints_path=ROOT / f"constraints-{profile_id}.txt",
             cuda_tag=tag,
+            profile_id=profile_id,
         )
 
     assert report["status"] == "passed"
@@ -113,11 +129,15 @@ def test_numpy_bridge_failure_is_an_actionable_setup_failure() -> None:
 
 def test_gpu_setup_uses_selected_profile_lock() -> None:
     source = (ROOT / "scripts" / "setup_gpu.sh").read_text(encoding="utf-8")
-    assert 'constraints_file="${project_root}/constraints-${wheel_tag}.txt"' in source
+    assert 'constraints_file="${project_root}/${constraints_name}"' in source
     assert 'lock_file="${project_root}/${lock_name}"' in source
-    assert 'read -r wheel_tag lock_name <<< "${profile_selection}"' in source
+    assert (
+        'read -r profile_id wheel_tag lock_name constraints_name <<< "${profile_selection}"'
+        in source
+    )
     assert '--requirement "${lock_file}"' in source
     assert "scripts/verify_gpu_lock.py" in source
+    assert '--profile "${profile_id}"' in source
     assert "TORCH_SPEC" not in source
     assert "TORCH_INDEX_URL" not in source
     assert "requires a driver supporting CUDA 12.6+" not in source
@@ -129,10 +149,29 @@ def test_gpu_setup_delegates_auto_profile_selection_and_keeps_unit_tests_opt_in(
     source = (ROOT / "scripts" / "setup_gpu.sh").read_text(encoding="utf-8")
     assert 'requested_tag="${CUDA_WHEEL_TAG:-auto}"' in source
     assert '"${environment_python}" "${project_root}/scripts/gpu_profiles.py"' in source
-    assert '--driver-cuda "${cuda_version}" --cuda-tag "${requested_tag}" --check-host' in source
+    assert 'requested_profile="auto"' in source
+    assert '--driver-cuda "${cuda_version}" --cuda-tag "${requested_tag}"' in source
+    assert '--profile "${requested_profile}" --check-host' in source
     assert 'if [[ "${RUN_TESTS:-0}" == "1" ]]' in source
     assert "SKIP_TESTS" not in source
     assert 'wheel_tag="cu132"' not in source
+
+
+def test_setup_parses_arguments_before_environment_checks() -> None:
+    source = (ROOT / "scripts" / "setup_gpu.sh").read_text(encoding="utf-8")
+    conda_guard = source.index('source "${project_root}/scripts/conda_env.sh"')
+    assert source.index("--help|-h)") < conda_guard
+    assert source.index("--profile requires a profile name") < conda_guard
+    assert source.index("Unknown setup argument") < conda_guard
+    assert source.index("Unsupported profile") < conda_guard
+    assert "eval " not in source
+
+
+def test_legacy_snapshot_default_does_not_overwrite_project_snapshot() -> None:
+    source = (ROOT / "scripts" / "setup_gpu.sh").read_text(encoding="utf-8")
+    assert 'if [[ "${profile_id}" == "legacy-cu118" ]]' in source
+    assert 'default_snapshot_dir="${CONDA_PREFIX%/}/.new-gat-environment"' in source
+    assert 'snapshot_dir="${ENVIRONMENT_SNAPSHOT_DIR:-${default_snapshot_dir}}"' in source
 
 
 def test_gpu_setup_always_installs_full_locked_dependencies() -> None:

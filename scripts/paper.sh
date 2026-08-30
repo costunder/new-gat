@@ -14,12 +14,25 @@ for argument in "$@"; do
 done
 
 if [[ "${prepare_only}" == "1" && "${inspection_only}" == "0" ]]; then
-    if ! "${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet; then
-        echo "Research dependencies are missing or incompatible in ${CONDA_PREFIX}."
-        echo "Installing the complete locked GPU environment before preparing data."
-        bash "${project_root}/scripts/setup_gpu.sh"
-        "${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet
-    fi
+    dependency_status=0
+    "${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet || dependency_status=$?
+    case "${dependency_status}" in
+        0) ;;
+        2)
+            # Repair the installed stack, never reselect it from the current
+            # driver's capability. Unknown Torch builds stop before installation.
+            bootstrap_profile="$("${environment_python}" "${project_root}/scripts/gpu_profiles.py" --installed-profile)"
+            echo "Research dependencies are missing or incompatible in ${CONDA_PREFIX}."
+            echo "Installing the complete locked GPU environment before preparing data."
+            bash "${project_root}/scripts/setup_gpu.sh" --profile "${bootstrap_profile}"
+            "${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet
+            ;;
+        *)
+            # Host ABI failures (3) and unexpected checker errors are not
+            # repaired by reinstalling wheels. Preserve the checker's status.
+            exit "${dependency_status}"
+            ;;
+    esac
 fi
 
 export PYTHONPATH="${project_root}/src:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"

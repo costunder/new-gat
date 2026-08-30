@@ -1,6 +1,58 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+    printf '%s\n' \
+        'Usage: bash scripts/setup_gpu.sh [--profile PROFILE]' \
+        '' \
+        'Profiles: auto (default), cu118, cu126, cu130, cu132, legacy-cu118.' \
+        'legacy-cu118 is opt-in and requires a separate, dedicated Conda environment.' \
+        'CUDA_WHEEL_TAG remains optional; conflicts with --profile are rejected.' \
+        'The installer does not create environments or change NVIDIA drivers.'
+}
+
+requested_profile="auto"
+profile_seen=0
+while (( $# > 0 )); do
+    case "$1" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --profile|--profile=*)
+            if (( profile_seen )); then
+                echo "--profile may only be specified once." >&2
+                exit 2
+            fi
+            profile_seen=1
+            if [[ "$1" == "--profile" ]]; then
+                if (( $# < 2 )) || [[ -z "$2" || "$2" == -* ]]; then
+                    echo "--profile requires a profile name." >&2
+                    exit 2
+                fi
+                requested_profile="$2"
+                shift 2
+            else
+                requested_profile="${1#--profile=}"
+                shift
+            fi
+            case "${requested_profile}" in
+                auto|cu118|cu126|cu130|cu132|legacy-cu118) ;;
+                *)
+                    echo "Unsupported profile: ${requested_profile}" >&2
+                    usage >&2
+                    exit 2
+                    ;;
+            esac
+            ;;
+        *)
+            echo "Unknown setup argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
@@ -24,10 +76,11 @@ fi
 # Explicit CUDA_WHEEL_TAG requests are validated, never silently downgraded.
 requested_tag="${CUDA_WHEEL_TAG:-auto}"
 profile_selection="$("${environment_python}" "${project_root}/scripts/gpu_profiles.py" \
-    --driver-cuda "${cuda_version}" --cuda-tag "${requested_tag}" --check-host)"
-read -r wheel_tag lock_name <<< "${profile_selection}"
+    --driver-cuda "${cuda_version}" --cuda-tag "${requested_tag}" \
+    --profile "${requested_profile}" --check-host)"
+read -r profile_id wheel_tag lock_name constraints_name <<< "${profile_selection}"
 
-constraints_file="${project_root}/constraints-${wheel_tag}.txt"
+constraints_file="${project_root}/${constraints_name}"
 lock_file="${project_root}/${lock_name}"
 torch_index_url="https://download.pytorch.org/whl/${wheel_tag}"
 if [[ ! -f "${constraints_file}" || ! -f "${lock_file}" ]]; then
@@ -40,7 +93,8 @@ if [[ -z "${torch_version}" || "${torch_version}" == *$'\n'* ]]; then
     echo "${constraints_file} must contain exactly one torch==version pin." >&2
     exit 2
 fi
-echo "GPU profile: ${wheel_tag} (requested: ${requested_tag}; nvidia-smi CUDA compatibility: ${cuda_version})"
+echo "GPU profile: ${profile_id}; CUDA wheel: ${wheel_tag}"
+echo "Requested profile: ${requested_profile}; CUDA_WHEEL_TAG: ${requested_tag}; nvidia-smi CUDA compatibility: ${cuda_version}"
 echo "Locked dependencies: ${lock_name}; torch==${torch_version}"
 
 "${environment_python}" -m pip install --upgrade pip
@@ -58,7 +112,12 @@ echo "Installing torch==${torch_version}+${wheel_tag} from ${torch_index_url}"
 
 cd "${project_root}"
 "${environment_python}" -m pip check
-snapshot_dir="${ENVIRONMENT_SNAPSHOT_DIR:-${project_root}}"
+if [[ "${profile_id}" == "legacy-cu118" ]]; then
+    default_snapshot_dir="${CONDA_PREFIX%/}/.new-gat-environment"
+else
+    default_snapshot_dir="${project_root}"
+fi
+snapshot_dir="${ENVIRONMENT_SNAPSHOT_DIR:-${default_snapshot_dir}}"
 mkdir -p "${snapshot_dir}"
 lock_report="${snapshot_dir}/.gpu-environment.json"
 freeze_report="${snapshot_dir}/.gpu-environment.freeze.txt"
@@ -66,6 +125,7 @@ freeze_report="${snapshot_dir}/.gpu-environment.freeze.txt"
     --lock "${lock_file}" \
     --constraints "${constraints_file}" \
     --cuda-tag "${wheel_tag}" \
+    --profile "${profile_id}" \
     --json-out "${lock_report}"
 freeze_temporary="$(mktemp "${freeze_report}.tmp.XXXXXX")"
 "${environment_python}" -m pip freeze --all > "${freeze_temporary}"

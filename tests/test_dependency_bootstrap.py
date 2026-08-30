@@ -13,7 +13,13 @@ import pytest
 
 from scripts import check_dependencies as checker
 from scripts import run_paper
-from scripts.gpu_profiles import CUDA_RUNTIMES, lock_for_tag
+from scripts.gpu_profiles import (
+    CUDA_RUNTIMES,
+    GPUProfileError,
+    cuda_tag_for_profile,
+    lock_for_profile,
+    lock_for_tag,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,6 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.fixture(autouse=True)
 def _no_external_profile_selection(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("CUDA_WHEEL_TAG", raising=False)
+    # Package-check tests simulate installed wheels, not the machine running pytest.
+    monkeypatch.setattr(checker, "check_wheel_host", lambda _profile: None)
 
 
 def _installed(
@@ -28,8 +36,11 @@ def _installed(
     *,
     runtime: str | None = "12.6",
     tag: str = "cu126",
+    profile: str | None = None,
 ) -> dict[str, str]:
-    pins = checker.read_exact_pins(lock_for_tag(tag))
+    profile = profile or tag
+    tag = cuda_tag_for_profile(profile)
+    pins = checker.read_exact_pins(lock_for_profile(profile))
     installed = {**pins, "torch": f"{pins['torch']}+{tag}"}
     monkeypatch.setattr(checker.importlib.metadata, "version", installed.__getitem__)
     # The dependency checker must not require a GPU allocation or run kernels.
@@ -74,6 +85,91 @@ def test_installed_profile_is_reused_without_driver_query(
     assert report["cuda_wheel_tag"] == tag
     assert Path(report["lock_path"]) == lock_for_tag(tag).resolve()
     assert len(report["lock_sha256"]) == 64
+
+
+@pytest.mark.parametrize("requested_tag", [None, "auto", "cu118"])
+def test_legacy_identity_uses_its_own_lock_even_with_the_same_cuda_tag(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_tag: str | None,
+):
+    installed = _installed(monkeypatch, runtime="11.8", profile="legacy-cu118")
+    if requested_tag is not None:
+        monkeypatch.setenv("CUDA_WHEEL_TAG", requested_tag)
+    report = checker.check_dependencies()
+    assert report["profile_id"] == "legacy-cu118"
+    assert report["cuda_wheel_tag"] == "cu118"
+    assert report["installed"] == installed
+    assert installed["torch"] == "2.6.0+cu118"
+    assert Path(report["lock_path"]) == lock_for_profile("legacy-cu118").resolve()
+
+
+def test_modern_cu118_environment_is_not_reclassified_as_legacy(monkeypatch: pytest.MonkeyPatch):
+    _installed(monkeypatch, runtime="11.8", tag="cu118")
+    report = checker.check_dependencies()
+    assert report["profile_id"] == "cu118"
+    assert report["installed"]["torch"] == "2.7.1+cu118"
+
+
+def test_legacy_rejects_wrong_pyg_and_unregistered_torch(monkeypatch: pytest.MonkeyPatch):
+    installed = _installed(monkeypatch, runtime="11.8", profile="legacy-cu118")
+    installed["torch-geometric"] = "2.8.0.post1"
+    with pytest.raises(checker.DependencyCheckError, match="required 2.7.0"):
+        checker.check_dependencies()
+    installed["torch-geometric"] = "2.7.0"
+    installed["torch"] = "2.6.1+cu118"
+    with pytest.raises(checker.DependencyCheckError, match="torch: installed 2.6.1"):
+        checker.check_dependencies()
+
+
+def test_host_abi_error_is_distinct_and_precedes_any_runtime_import(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    _installed(monkeypatch, runtime="11.8", tag="cu118")
+    monkeypatch.setattr(checker.sys, "platform", "linux")
+
+    def incompatible(profile: str) -> None:
+        assert profile == "cu118"
+        raise GPUProfileError("glibc 2.27 is older than required 2.28")
+
+    def forbidden_import(_name: str) -> None:
+        raise AssertionError("A host ABI error must stop before importing NumPy/Torch")
+
+    monkeypatch.setattr(checker, "check_wheel_host", incompatible)
+    monkeypatch.setattr(checker.importlib, "import_module", forbidden_import)
+    assert checker.main([]) == 3
+    error = capsys.readouterr().err
+    assert "RESEARCH HOST NOT COMPATIBLE" in error
+    assert "glibc 2.27" in error
+    assert "legacy-cu118" in error
+    assert "Run: bash scripts/setup_gpu.sh" not in error
+
+
+def test_legacy_checker_checks_legacy_host_contract(monkeypatch: pytest.MonkeyPatch):
+    _installed(monkeypatch, runtime="11.8", profile="legacy-cu118")
+    monkeypatch.setattr(checker.sys, "platform", "linux")
+    checked: list[str] = []
+    monkeypatch.setattr(checker, "check_wheel_host", checked.append)
+    assert checker.check_dependencies()["profile_id"] == "legacy-cu118"
+    assert checked == ["legacy-cu118"]
+
+
+@pytest.mark.parametrize("profile", ["cu118", "cu126", "legacy-cu118"])
+def test_repair_message_preserves_the_installed_profile(
+    monkeypatch: pytest.MonkeyPatch, profile: str
+):
+    _installed(monkeypatch, profile=profile)
+    message = checker.error_message(checker.DependencyCheckError("numpy: missing"))
+    assert f"Run: bash scripts/setup_gpu.sh --profile {profile}\n" in message
+
+
+def test_repair_message_survives_unreadable_metadata(monkeypatch: pytest.MonkeyPatch):
+    def broken_metadata(_name: str) -> str:
+        raise ValueError("unreadable metadata")
+
+    monkeypatch.setattr(checker.importlib.metadata, "version", broken_metadata)
+    message = checker.error_message(checker.DependencyCheckError("metadata damaged"))
+    assert "Run: bash scripts/setup_gpu.sh\n" in message
 
 
 def test_cu118_does_not_accept_newer_unsupported_pyg(monkeypatch: pytest.MonkeyPatch):
@@ -162,11 +258,13 @@ def test_direct_runner_stops_before_creating_output_when_dependencies_are_missin
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize("profile", ["cu118", "legacy-cu118"])
 def test_runner_records_the_checked_profile_in_its_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    profile: str,
 ):
-    _installed(monkeypatch, runtime="11.8", tag="cu118")
+    _installed(monkeypatch, runtime="11.8", profile=profile)
     report = checker.check_dependencies()
     monkeypatch.setattr(run_paper, "check_dependencies", lambda: report)
     monkeypatch.setattr(run_paper, "PROJECT_ROOT", tmp_path)
@@ -184,7 +282,9 @@ def test_runner_records_the_checked_profile_in_its_manifest(
         (tmp_path / "runs/paper/profile-record-test/manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["research_environment"] == report
-    assert manifest["research_environment"]["installed"]["torch"] == "2.7.1+cu118"
+    assert manifest["research_environment"]["profile_id"] == profile
+    expected = "2.6.0+cu118" if profile == "legacy-cu118" else "2.7.1+cu118"
+    assert manifest["research_environment"]["installed"]["torch"] == expected
 
 
 def _bare_python(tmp_path: Path, arguments: list[str]) -> subprocess.CompletedProcess[str]:
@@ -225,9 +325,13 @@ def test_runner_read_only_commands_work_without_site_packages(tmp_path: Path, op
 
 def test_checker_cli_works_without_site_packages(tmp_path: Path):
     completed = _bare_python(tmp_path, [str(ROOT / "scripts" / "check_dependencies.py")])
-    assert completed.returncode == 2
-    assert "numpy: missing" in completed.stderr
-    assert "bash scripts/setup_gpu.sh" in completed.stderr
+    assert completed.returncode in {2, 3}
+    if completed.returncode == 3:
+        assert "RESEARCH HOST NOT COMPATIBLE" in completed.stderr
+        assert "legacy-cu118" in completed.stderr
+    else:
+        assert "numpy: missing" in completed.stderr
+        assert "bash scripts/setup_gpu.sh" in completed.stderr
     assert "Traceback" not in completed.stderr
 
 

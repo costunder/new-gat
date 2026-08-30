@@ -118,6 +118,28 @@ torch-geometric==2.8.0.post1
 tqdm==4.70.0
 ````
 
+# constraints-legacy-cu118.txt
+
+````text
+# PROFILE=legacy-cu118; CUDA_WHEEL_TAG=cu118
+# Official wheel channel: https://download.pytorch.org/whl/cu118
+# Must match requirements-legacy-cu118-lock.txt; never merge with cu118's 2.7.1 lock.
+matplotlib==3.11.1
+networkx==3.6.1
+numpy==2.4.6
+ogb==1.3.6
+pandas==3.0.5
+pytest==9.1.1
+pytest-cov==7.1.0
+PyYAML==6.0.3
+ruff==0.16.5
+scikit-learn==1.9.0
+scipy==1.17.1
+torch==2.6.0
+torch-geometric==2.7.0
+tqdm==4.70.0
+````
+
 # environment.yml
 
 ````yaml
@@ -221,6 +243,29 @@ ruff==0.16.5
 scikit-learn==1.9.0
 scipy==1.17.1
 torch==2.7.1
+torch-geometric==2.7.0
+tqdm==4.70.0
+````
+
+# requirements-legacy-cu118-lock.txt
+
+````text
+# Opt-in Ubuntu 18.04 / glibc 2.27 compatibility profile; use a dedicated Conda env.
+# Official Torch 2.6.0 cu118 manylinux2014 + supported PyG 2.7.0.
+# Other pinned scientific wheels set this whole profile's minimum glibc to 2.27.
+# Not a current security-patched stack. Do not load untrusted checkpoints.
+matplotlib==3.11.1
+networkx==3.6.1
+numpy==2.4.6
+ogb==1.3.6
+pandas==3.0.5
+pytest==9.1.1
+pytest-cov==7.1.0
+PyYAML==6.0.3
+ruff==0.16.5
+scikit-learn==1.9.0
+scipy==1.17.1
+torch==2.6.0
 torch-geometric==2.7.0
 tqdm==4.70.0
 ````
@@ -19404,7 +19449,14 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from scripts.gpu_profiles import GPUProfileError, lock_for_tag
+    from scripts.gpu_profiles import (
+        GPUProfileError,
+        check_wheel_host,
+        cuda_tag_for_profile,
+        lock_for_profile,
+        lock_for_tag,
+        profile_for_torch_version,
+    )
     from scripts.verify_gpu_lock import (
         CUDA_RUNTIMES,
         IMPORT_NAMES,
@@ -19413,7 +19465,14 @@ try:
         version_matches,
     )
 except ModuleNotFoundError:
-    from gpu_profiles import GPUProfileError, lock_for_tag
+    from gpu_profiles import (
+        GPUProfileError,
+        check_wheel_host,
+        cuda_tag_for_profile,
+        lock_for_profile,
+        lock_for_tag,
+        profile_for_torch_version,
+    )
     from verify_gpu_lock import (
         CUDA_RUNTIMES,
         IMPORT_NAMES,
@@ -19428,17 +19487,30 @@ ROOT = Path(__file__).resolve().parents[1]
 class DependencyCheckError(RuntimeError):
     """The active interpreter is missing the installed research environment."""
 
+    exit_code = 2
 
-def _installed_cuda_tag() -> str:
+
+class HostCompatibilityError(DependencyCheckError):
+    """Package reinstallation cannot fix the current operating-system ABI."""
+
+    exit_code = 3
+
+
+def _installed_profile() -> str:
     """Identify the installed official wheel without importing Torch or querying a GPU."""
     requested = os.environ.get("CUDA_WHEEL_TAG", "auto") or "auto"
-    if requested != "auto":
-        lock_for_tag(requested)
-        return requested
     try:
         version = importlib.metadata.version("torch")
     except importlib.metadata.PackageNotFoundError:
-        return "cu126"  # Missing stack: report reference pins; setup selects using the driver.
+        version = ""
+    detected = profile_for_torch_version(version)
+    if requested != "auto":
+        lock_for_tag(requested)  # This variable is a CUDA tag, not a profile identifier.
+        if detected is not None and cuda_tag_for_profile(detected) == requested:
+            return detected
+        return requested
+    if detected is not None:
+        return detected
     tag = version.partition("+")[2]
     if tag in CUDA_RUNTIMES:
         return tag
@@ -19449,12 +19521,19 @@ def _installed_cuda_tag() -> str:
 def check_dependencies(lock_path: Path | None = None) -> dict[str, Any]:
     """Check every direct pin, runtime import, and CUDA wheel without using a GPU."""
     try:
-        cuda_tag = _installed_cuda_tag()
+        profile_id = _installed_profile()
+        cuda_tag = cuda_tag_for_profile(profile_id)
         if lock_path is None:
-            lock_path = lock_for_tag(cuda_tag)
+            lock_path = lock_for_profile(profile_id)
         pins = read_exact_pins(lock_path)
     except (GPUProfileError, LockVerificationError, OSError) as error:
         raise DependencyCheckError(f"Cannot read the research dependency lock: {error}") from error
+
+    if sys.platform == "linux":
+        try:
+            check_wheel_host(profile_id)
+        except GPUProfileError as error:
+            raise HostCompatibilityError(str(error)) from error
 
     installed: dict[str, str] = {}
     problems: list[str] = []
@@ -19492,16 +19571,33 @@ def check_dependencies(lock_path: Path | None = None) -> dict[str, Any]:
         "installed": installed,
         "cuda_runtime": runtime,
         "cuda_wheel_tag": cuda_tag,
+        "profile_id": profile_id,
         "lock_path": str(lock_path.resolve()),
         "lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
     }
 
 
 def error_message(error: Exception) -> str:
+    if isinstance(error, HostCompatibilityError):
+        return (
+            f"RESEARCH HOST NOT COMPATIBLE\nPython: {sys.executable}\n  {error}\n"
+            "Automatic package reinstallation is disabled for host ABI errors.\n"
+            "For Ubuntu 18.04/glibc 2.27, see docs/ENVIRONMENT.md: "
+            "use the opt-in legacy-cu118 profile in a NEW dedicated Conda environment.\n"
+            "Do not replace system libc or downgrade an environment used by another run."
+        )
+    setup_command = "bash scripts/setup_gpu.sh"
+    try:
+        installed_profile = profile_for_torch_version(importlib.metadata.version("torch"))
+    except Exception:
+        # Error reporting must still work with absent or damaged distribution metadata.
+        installed_profile = None
+    if installed_profile is not None:
+        setup_command += f" --profile {installed_profile}"
     return (
         f"RESEARCH DEPENDENCIES NOT READY\nPython: {sys.executable}\n  {error}\n"
         "Conda activation alone does not install the research packages.\n"
-        "Run: bash scripts/setup_gpu.sh\n"
+        f"Run: {setup_command}\n"
         "Data preparation also installs missing dependencies automatically on a Linux GPU host."
     )
 
@@ -19515,7 +19611,7 @@ def main(argv: list[str] | None = None) -> int:
         report = check_dependencies(args.lock)
     except DependencyCheckError as error:
         print(error_message(error), file=sys.stderr)
-        return 2
+        return error.exit_code
     if not args.quiet:
         print(f"Research dependencies ready: {report['python']} (CUDA {report['cuda_runtime']})")
     return 0
@@ -19873,6 +19969,7 @@ Package versions are fixed by the selected lock, never by the package resolver.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import platform
 import re
 import sys
@@ -19886,6 +19983,23 @@ LOCK_FILES = {
     "cu130": "requirements-lock.txt",
     "cu132": "requirements-lock.txt",
 }
+# A profile identifies the entire pinned stack, not merely its CUDA runtime.
+# Legacy support is deliberately opt-in; the cu118 profile remains PyTorch 2.7.1.
+PROFILE_LOCK_FILES = {
+    **LOCK_FILES,
+    "legacy-cu118": "requirements-legacy-cu118-lock.txt",
+}
+PROFILE_CUDA_TAGS = {**{tag: tag for tag in CUDA_RUNTIMES}, "legacy-cu118": "cu118"}
+PROFILE_CONSTRAINT_FILES = {
+    profile_id: f"constraints-{profile_id}.txt" for profile_id in PROFILE_LOCK_FILES
+}
+TORCH_PROFILES = {
+    "2.7.1+cu118": "cu118",
+    "2.13.0+cu126": "cu126",
+    "2.13.0+cu130": "cu130",
+    "2.13.0+cu132": "cu132",
+    "2.6.0+cu118": "legacy-cu118",
+}
 
 
 class GPUProfileError(ValueError):
@@ -19898,6 +20012,52 @@ def lock_for_tag(tag: str, root: Path = ROOT) -> Path:
             f"Unsupported CUDA_WHEEL_TAG={tag}; choose auto, {', '.join(LOCK_FILES)}."
         )
     return root / LOCK_FILES[tag]
+
+
+def _validate_profile(profile_id: str) -> None:
+    if profile_id not in PROFILE_LOCK_FILES:
+        raise GPUProfileError(
+            f"Unsupported GPU profile={profile_id}; choose auto, {', '.join(PROFILE_LOCK_FILES)}."
+        )
+
+
+def lock_for_profile(profile_id: str, root: Path = ROOT) -> Path:
+    """Return a registered profile's lock, never a user-supplied relative path."""
+    _validate_profile(profile_id)
+    return root / PROFILE_LOCK_FILES[profile_id]
+
+
+def cuda_tag_for_profile(profile_id: str) -> str:
+    _validate_profile(profile_id)
+    return PROFILE_CUDA_TAGS[profile_id]
+
+
+def profile_for_torch_version(exactinstalled: str) -> str | None:
+    """Recognize only the five exact official Torch identities in the locks."""
+    return TORCH_PROFILES.get(exactinstalled)
+
+
+def installed_profile_for_bootstrap() -> str:
+    """Preserve a known installed stack; only a Torch-free environment selects auto.
+
+    Distribution metadata remains readable when Torch cannot import because
+    another dependency is missing. An unknown installed build is not permission
+    to replace it with a different research stack.
+    """
+    try:
+        installed = importlib.metadata.version("torch")
+    except importlib.metadata.PackageNotFoundError:
+        return "auto"
+    except Exception as error:
+        raise GPUProfileError(f"Cannot inspect the installed Torch metadata: {error}") from error
+    profile_id = profile_for_torch_version(installed)
+    if profile_id is None:
+        raise GPUProfileError(
+            f"Cannot automatically repair unregistered torch=={installed}. "
+            "Choose a documented profile explicitly in a dedicated Conda environment; "
+            "no installed Torch build will be replaced automatically."
+        )
+    return profile_id
 
 
 def _cuda_version(value: str) -> tuple[int, int]:
@@ -19937,46 +20097,126 @@ def select_install_tag(driver_cuda: str, requested_tag: str = "auto") -> str:
     return tag
 
 
-def check_wheel_host(tag: str) -> None:
+def select_install_profile(
+    driver_cuda: str,
+    requested_profile: str = "auto",
+    requested_tag: str = "auto",
+) -> str:
+    """Select a complete stack without implicitly opting into legacy PyTorch."""
+    if requested_profile != "auto":
+        _validate_profile(requested_profile)
+    if requested_tag != "auto":
+        lock_for_tag(requested_tag)
+    if requested_profile == "auto":
+        return select_install_tag(driver_cuda, requested_tag)
+    tag = cuda_tag_for_profile(requested_profile)
+    if requested_tag not in {"auto", tag}:
+        raise GPUProfileError(
+            f"GPU profile={requested_profile} requires CUDA_WHEEL_TAG={tag}, "
+            f"not {requested_tag}; explicit selections must agree."
+        )
+    select_install_tag(driver_cuda, tag)
+    return requested_profile
+
+
+def check_wheel_host(profile_id: str) -> None:
     """Reject known binary-platform mismatches before downloading large wheels."""
+    tag = cuda_tag_for_profile(profile_id)
     if platform.system() != "Linux":
         raise GPUProfileError("The GPU installation profiles require Linux.")
     if tag == "cu118" and platform.machine().lower() not in {"x86_64", "amd64"}:
-        raise GPUProfileError("The locked PyTorch 2.7.1 cu118 Linux wheel requires x86_64.")
+        raise GPUProfileError(f"The {profile_id} Linux wheel requires x86_64.")
     if tag == "cu118" and not (3, 11) <= sys.version_info[:2] <= (3, 13):
         raise GPUProfileError(
             "The cu118 research profile requires Python 3.11-3.13; "
             "environment.yml uses the reference Python 3.11."
         )
+    # Torch 2.6 cu118 itself targets manylinux2014 (glibc 2.17), but the
+    # complete legacy research stack is supported only from glibc 2.27.
+    minimum = (2, 27) if profile_id == "legacy-cu118" else (2, 28)
+    minimum_label = ".".join(str(part) for part in minimum)
     libc, version = platform.libc_ver()
     if libc != "glibc" or not version:
-        raise GPUProfileError("Cannot verify glibc; the locked GPU wheels require glibc >= 2.28.")
-    try:
-        release = tuple(int(part) for part in version.split(".")[:2])
-    except ValueError as error:
-        raise GPUProfileError(f"Cannot parse glibc version: {version!r}") from error
-    if release < (2, 28):
         raise GPUProfileError(
-            f"glibc {version} is older than the locked wheels' minimum 2.28. "
+            f"Cannot verify glibc; profile {profile_id} requires glibc >= {minimum_label}."
+        )
+    if not re.fullmatch(r"[0-9]+\.[0-9]+(?:\.[0-9]+)*", version):
+        raise GPUProfileError(f"Cannot parse glibc version: {version!r}")
+    release = tuple(int(part) for part in version.split(".")[:2])
+    if release < minimum:
+        raise GPUProfileError(
+            f"glibc {version} is older than profile {profile_id}'s minimum {minimum_label}. "
             "Use a compatible Linux host/container; this script will not modify system libraries."
+        )
+
+
+def check_install_target(profile_id: str) -> None:
+    """Protect existing environments from an in-place, legacy-only downgrade.
+
+    This installation guard uses distribution metadata, not a Torch import. It
+    must not be used by read-only runtime checks: a valid installed profile can
+    be checked independently of the environment's name.
+    """
+    _validate_profile(profile_id)
+    if profile_id != "legacy-cu118":
+        return
+    if Path(sys.prefix).name.casefold() == "new-gat":
+        raise GPUProfileError(
+            "legacy-cu118 must use a separate Conda environment, not new-gat. "
+            "Create and activate a dedicated environment before installation; "
+            "the existing environment will not be downgraded."
+        )
+    try:
+        installed = importlib.metadata.version("torch")
+    except importlib.metadata.PackageNotFoundError:
+        return
+    except Exception as error:
+        raise GPUProfileError(
+            f"Cannot inspect the installation target's Torch metadata: {error}"
+        ) from error
+    if installed != "2.6.0+cu118":
+        raise GPUProfileError(
+            f"legacy-cu118 cannot replace existing torch=={installed} in {sys.prefix}. "
+            "Use a fresh dedicated Conda environment; only an existing exact "
+            "torch==2.6.0+cu118 installation may be reused."
         )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--driver-cuda", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--driver-cuda")
+    mode.add_argument(
+        "--installed-profile",
+        action="store_true",
+        help="print the exact installed profile, or auto only when Torch is absent; read-only",
+    )
+    parser.add_argument("--profile", default="auto")
     parser.add_argument("--cuda-tag", default="auto")
     parser.add_argument("--check-host", action="store_true")
     args = parser.parse_args(argv)
+    if args.installed_profile and (
+        args.profile != "auto" or args.cuda_tag != "auto" or args.check_host
+    ):
+        parser.error("--installed-profile cannot be combined with installation selection options")
     try:
-        tag = select_install_tag(args.driver_cuda, args.cuda_tag)
+        if args.installed_profile:
+            print(installed_profile_for_bootstrap())
+            return 0
+        profile_id = select_install_profile(args.driver_cuda, args.profile, args.cuda_tag)
         if args.check_host:
-            check_wheel_host(tag)
+            check_wheel_host(profile_id)
+            check_install_target(profile_id)
     except GPUProfileError as error:
         print(error, file=sys.stderr)
         return 2
     # This restricted output is consumed by Bash read, never eval.
-    print(tag, lock_for_tag(tag).name)
+    print(
+        profile_id,
+        cuda_tag_for_profile(profile_id),
+        lock_for_profile(profile_id).name,
+        PROFILE_CONSTRAINT_FILES[profile_id],
+    )
     return 0
 
 
@@ -20003,12 +20243,25 @@ for argument in "$@"; do
 done
 
 if [[ "${prepare_only}" == "1" && "${inspection_only}" == "0" ]]; then
-    if ! "${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet; then
-        echo "Research dependencies are missing or incompatible in ${CONDA_PREFIX}."
-        echo "Installing the complete locked GPU environment before preparing data."
-        bash "${project_root}/scripts/setup_gpu.sh"
-        "${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet
-    fi
+    dependency_status=0
+    "${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet || dependency_status=$?
+    case "${dependency_status}" in
+        0) ;;
+        2)
+            # Repair the installed stack, never reselect it from the current
+            # driver's capability. Unknown Torch builds stop before installation.
+            bootstrap_profile="$("${environment_python}" "${project_root}/scripts/gpu_profiles.py" --installed-profile)"
+            echo "Research dependencies are missing or incompatible in ${CONDA_PREFIX}."
+            echo "Installing the complete locked GPU environment before preparing data."
+            bash "${project_root}/scripts/setup_gpu.sh" --profile "${bootstrap_profile}"
+            "${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet
+            ;;
+        *)
+            # Host ABI failures (3) and unexpected checker errors are not
+            # repaired by reinstalling wheels. Preserve the checker's status.
+            exit "${dependency_status}"
+            ;;
+    esac
 fi
 
 export PYTHONPATH="${project_root}/src:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -20570,7 +20823,7 @@ def main() -> int:
         dependency_report = check_dependencies()
     except DependencyCheckError as error:
         print(error_message(error), file=sys.stderr)
-        return 2
+        return error.exit_code
 
     run_dir = PROJECT_ROOT / "runs" / "paper" / run_id
     if run_dir.exists() or any(
@@ -20732,6 +20985,58 @@ if __name__ == "__main__":
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+    printf '%s\n' \
+        'Usage: bash scripts/setup_gpu.sh [--profile PROFILE]' \
+        '' \
+        'Profiles: auto (default), cu118, cu126, cu130, cu132, legacy-cu118.' \
+        'legacy-cu118 is opt-in and requires a separate, dedicated Conda environment.' \
+        'CUDA_WHEEL_TAG remains optional; conflicts with --profile are rejected.' \
+        'The installer does not create environments or change NVIDIA drivers.'
+}
+
+requested_profile="auto"
+profile_seen=0
+while (( $# > 0 )); do
+    case "$1" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --profile|--profile=*)
+            if (( profile_seen )); then
+                echo "--profile may only be specified once." >&2
+                exit 2
+            fi
+            profile_seen=1
+            if [[ "$1" == "--profile" ]]; then
+                if (( $# < 2 )) || [[ -z "$2" || "$2" == -* ]]; then
+                    echo "--profile requires a profile name." >&2
+                    exit 2
+                fi
+                requested_profile="$2"
+                shift 2
+            else
+                requested_profile="${1#--profile=}"
+                shift
+            fi
+            case "${requested_profile}" in
+                auto|cu118|cu126|cu130|cu132|legacy-cu118) ;;
+                *)
+                    echo "Unsupported profile: ${requested_profile}" >&2
+                    usage >&2
+                    exit 2
+                    ;;
+            esac
+            ;;
+        *)
+            echo "Unknown setup argument: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
@@ -20755,10 +21060,11 @@ fi
 # Explicit CUDA_WHEEL_TAG requests are validated, never silently downgraded.
 requested_tag="${CUDA_WHEEL_TAG:-auto}"
 profile_selection="$("${environment_python}" "${project_root}/scripts/gpu_profiles.py" \
-    --driver-cuda "${cuda_version}" --cuda-tag "${requested_tag}" --check-host)"
-read -r wheel_tag lock_name <<< "${profile_selection}"
+    --driver-cuda "${cuda_version}" --cuda-tag "${requested_tag}" \
+    --profile "${requested_profile}" --check-host)"
+read -r profile_id wheel_tag lock_name constraints_name <<< "${profile_selection}"
 
-constraints_file="${project_root}/constraints-${wheel_tag}.txt"
+constraints_file="${project_root}/${constraints_name}"
 lock_file="${project_root}/${lock_name}"
 torch_index_url="https://download.pytorch.org/whl/${wheel_tag}"
 if [[ ! -f "${constraints_file}" || ! -f "${lock_file}" ]]; then
@@ -20771,7 +21077,8 @@ if [[ -z "${torch_version}" || "${torch_version}" == *$'\n'* ]]; then
     echo "${constraints_file} must contain exactly one torch==version pin." >&2
     exit 2
 fi
-echo "GPU profile: ${wheel_tag} (requested: ${requested_tag}; nvidia-smi CUDA compatibility: ${cuda_version})"
+echo "GPU profile: ${profile_id}; CUDA wheel: ${wheel_tag}"
+echo "Requested profile: ${requested_profile}; CUDA_WHEEL_TAG: ${requested_tag}; nvidia-smi CUDA compatibility: ${cuda_version}"
 echo "Locked dependencies: ${lock_name}; torch==${torch_version}"
 
 "${environment_python}" -m pip install --upgrade pip
@@ -20789,7 +21096,12 @@ echo "Installing torch==${torch_version}+${wheel_tag} from ${torch_index_url}"
 
 cd "${project_root}"
 "${environment_python}" -m pip check
-snapshot_dir="${ENVIRONMENT_SNAPSHOT_DIR:-${project_root}}"
+if [[ "${profile_id}" == "legacy-cu118" ]]; then
+    default_snapshot_dir="${CONDA_PREFIX%/}/.new-gat-environment"
+else
+    default_snapshot_dir="${project_root}"
+fi
+snapshot_dir="${ENVIRONMENT_SNAPSHOT_DIR:-${default_snapshot_dir}}"
 mkdir -p "${snapshot_dir}"
 lock_report="${snapshot_dir}/.gpu-environment.json"
 freeze_report="${snapshot_dir}/.gpu-environment.freeze.txt"
@@ -20797,6 +21109,7 @@ freeze_report="${snapshot_dir}/.gpu-environment.freeze.txt"
     --lock "${lock_file}" \
     --constraints "${constraints_file}" \
     --cuda-tag "${wheel_tag}" \
+    --profile "${profile_id}" \
     --json-out "${lock_report}"
 freeze_temporary="$(mktemp "${freeze_report}.tmp.XXXXXX")"
 "${environment_python}" -m pip freeze --all > "${freeze_temporary}"
@@ -20927,9 +21240,21 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from scripts.gpu_profiles import CUDA_RUNTIMES
+    from scripts.gpu_profiles import (
+        CUDA_RUNTIMES,
+        GPUProfileError,
+        cuda_tag_for_profile,
+        lock_for_profile,
+        profile_for_torch_version,
+    )
 except ModuleNotFoundError:
-    from gpu_profiles import CUDA_RUNTIMES
+    from gpu_profiles import (
+        CUDA_RUNTIMES,
+        GPUProfileError,
+        cuda_tag_for_profile,
+        lock_for_profile,
+        profile_for_torch_version,
+    )
 
 
 class LockVerificationError(RuntimeError):
@@ -21054,12 +21379,31 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         raise
 
 
-def verify_environment(*, lock_path: Path, constraints_path: Path, cuda_tag: str) -> dict[str, Any]:
+def verify_environment(
+    *,
+    lock_path: Path,
+    constraints_path: Path,
+    cuda_tag: str,
+    profile_id: str | None = None,
+) -> dict[str, Any]:
     """Check package versions, import-time ABI health, and the CUDA runtime."""
 
     if cuda_tag not in CUDA_RUNTIMES:
         raise LockVerificationError(f"unsupported CUDA wheel tag: {cuda_tag}")
     expected_pins = assert_same_pins(lock_path, constraints_path)
+    inferred_profile = profile_for_torch_version(f"{expected_pins['torch']}+{cuda_tag}")
+    if profile_id is None:
+        profile_id = inferred_profile
+    try:
+        if profile_id is None or cuda_tag_for_profile(profile_id) != cuda_tag:
+            raise LockVerificationError("lock does not identify a supported GPU profile")
+        if profile_id != inferred_profile:
+            raise LockVerificationError("selected profile does not match the lock's Torch pin")
+        registered_pins = read_exact_pins(lock_for_profile(profile_id))
+        if registered_pins != expected_pins:
+            raise LockVerificationError("selected lock differs from the registered profile pins")
+    except GPUProfileError as error:
+        raise LockVerificationError(str(error)) from error
 
     installed: dict[str, str] = {}
     mismatches: list[str] = []
@@ -21102,6 +21446,7 @@ def verify_environment(*, lock_path: Path, constraints_path: Path, cuda_tag: str
         "python_executable": sys.executable,
         "platform": platform.platform(),
         "cuda_wheel_tag": cuda_tag,
+        "profile_id": profile_id,
         "torch_cuda_runtime": actual_runtime,
         "numpy_torch_interop": "passed",
         "constraints_path": str(constraints_path.resolve()),
@@ -21117,6 +21462,7 @@ def main() -> int:
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--constraints", type=Path, required=True)
     parser.add_argument("--cuda-tag", choices=sorted(CUDA_RUNTIMES), required=True)
+    parser.add_argument("--profile", help="assert the selected registered profile identity")
     parser.add_argument("--json-out", type=Path)
     args = parser.parse_args()
     try:
@@ -21124,6 +21470,7 @@ def main() -> int:
             lock_path=args.lock,
             constraints_path=args.constraints,
             cuda_tag=args.cuda_tag,
+            profile_id=args.profile,
         )
     except (LockVerificationError, OSError) as error:
         print(f"GPU LOCK VERIFICATION FAILED: {error}", file=sys.stderr)
@@ -22597,9 +22944,14 @@ def test_paper_checks_preparation_dependencies_only_after_conda_validation() -> 
         '"${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet'
     )
     installer = 'bash "${project_root}/scripts/setup_gpu.sh"'
+    profile_query = (
+        '"${environment_python}" "${project_root}/scripts/gpu_profiles.py" --installed-profile'
+    )
     assert source.index(guard) < source.index(dependency_check)
     assert source.count(dependency_check) == 2
     assert source.count(installer) == 1
+    assert source.index(dependency_check) < source.index(profile_query) < source.index(installer)
+    assert f'{installer} --profile "${{bootstrap_profile}}"' in source
     assert (
         source.index(dependency_check) < source.index(installer) < source.rindex(dependency_check)
     )
@@ -22609,6 +22961,11 @@ def test_paper_checks_preparation_dependencies_only_after_conda_validation() -> 
     assert "--prepare-only) prepare_only=1" in source
     assert "--help|-h|--dry-run) inspection_only=1" in source
     assert '"${prepare_only}" == "1" && "${inspection_only}" == "0"' in source
+    assert f"{dependency_check} || dependency_status=$?" in source
+    assert f"if ! {dependency_check}" not in source
+    assert 'case "${dependency_status}" in' in source
+    assert 'exit "${dependency_status}"' in source
+    assert source.index("        2)") < source.index(installer) < source.index("        *)")
     assert "-m pip" not in source
 
 
@@ -22627,8 +22984,17 @@ def _shell_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
         "  */check_dependencies.py)\n"
         '    printf "dependencies\\n" >> "$TEST_CALL_LOG"\n'
         '    printf "%s\\0" "$0" "$@" >> "$TEST_DEPENDENCY_ARGS"\n'
-        '    if [ -f "$TEST_DEPENDENCY_READY" ]; then exit 0; fi\n'
+        '    if [ -f "$TEST_DEPENDENCY_READY" ]; then\n'
+        '      exit "${TEST_DEPENDENCY_AFTER_SETUP_EXIT:-0}"\n'
+        "    fi\n"
         '    exit "${TEST_DEPENDENCY_EXIT:-0}" ;;\n'
+        "  */gpu_profiles.py)\n"
+        '    printf "profile\\n" >> "$TEST_CALL_LOG"\n'
+        '    if [ "$2" != "--installed-profile" ]; then exit 98; fi\n'
+        '    if [ "${TEST_PROFILE_QUERY_EXIT:-0}" != "0" ]; then\n'
+        '      exit "$TEST_PROFILE_QUERY_EXIT"\n'
+        "    fi\n"
+        '    printf "%s\\n" "${TEST_INSTALLED_PROFILE:-auto}" ;;\n'
         "  scripts/run_paper.py)\n"
         '    printf "paper\\n" >> "$TEST_CALL_LOG"\n'
         '    printf "%s\\0" "$@" > "$TEST_DISPATCH_ARGS"\n'
@@ -22651,8 +23017,12 @@ def _shell_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
             "TEST_VERIFY_EXIT": "0",
             "TEST_RUN_EXIT": "0",
             "TEST_DEPENDENCY_EXIT": "0",
+            "TEST_DEPENDENCY_AFTER_SETUP_EXIT": "0",
             "TEST_DEPENDENCY_ARGS": str(tmp_path / "dependency.args"),
             "TEST_DEPENDENCY_READY": str(tmp_path / "dependencies.ready"),
+            "TEST_SETUP_ARGS": str(tmp_path / "setup.args"),
+            "TEST_INSTALLED_PROFILE": "auto",
+            "TEST_PROFILE_QUERY_EXIT": "0",
             "PYTHON": str(tmp_path / "wrong-python"),
             "VENV_DIR": str(tmp_path / "must-not-be-created"),
             "USE_ACTIVE_ENV": "0",
@@ -22670,8 +23040,10 @@ def test_bash_guard_failure_stops_before_pip_or_dispatch(
 ) -> None:
     environ, call_log, dispatch_args = _shell_environment(tmp_path)
     environ.update({"TEST_VERIFY_EXIT": "23", "SKIP_DEPS": skip_deps})
+    # Setup help deliberately exits before requiring an active environment.
+    arguments = [] if script_name == "setup_gpu.sh" else ["--help"]
     result = subprocess.run(
-        [BASH, str(ROOT / "scripts" / script_name), "--help"],
+        [BASH, str(ROOT / "scripts" / script_name), *arguments],
         cwd=tmp_path,
         env=environ,
         capture_output=True,
@@ -22693,8 +23065,9 @@ def test_bash_without_active_conda_stops_before_invoking_python(
 ) -> None:
     environ, call_log, _ = _shell_environment(tmp_path)
     environ.pop("CONDA_PREFIX")
+    arguments = [] if script_name == "setup_gpu.sh" else ["--help"]
     result = subprocess.run(
-        [BASH, str(ROOT / "scripts" / script_name), "--help"],
+        [BASH, str(ROOT / "scripts" / script_name), *arguments],
         cwd=tmp_path,
         env=environ,
         capture_output=True,
@@ -22780,13 +23153,14 @@ def _bootstrap_project(tmp_path: Path) -> Path:
     project = tmp_path / "Research project with spaces"
     scripts = project / "scripts"
     scripts.mkdir(parents=True)
-    for filename in ("paper.sh", "conda_env.sh", "prepare_data.sh"):
+    for filename in ("paper.sh", "conda_env.sh", "prepare_data.sh", "gpu_profiles.py"):
         shutil.copy2(ROOT / "scripts" / filename, scripts / filename)
     (scripts / "setup_gpu.sh").write_text(
         "#!/usr/bin/env bash\n"
         "set -euo pipefail\n"
         'printf "setup\\n" >> "$TEST_CALL_LOG"\n'
         'printf "%s" "$CONDA_PREFIX" > "$TEST_SETUP_PREFIX"\n'
+        'printf "%s\\0" "$@" > "$TEST_SETUP_ARGS"\n'
         'if [[ "${TEST_SETUP_EXIT:-0}" != "0" ]]; then exit "$TEST_SETUP_EXIT"; fi\n'
         'if [[ "${TEST_SETUP_MARK_READY:-1}" == "1" ]]; then\n'
         '    touch "$TEST_DEPENDENCY_READY"\n'
@@ -22824,8 +23198,12 @@ def test_prepare_bootstraps_only_missing_dependencies_and_rechecks_same_python(
     assert result.returncode == 37, result.stderr
     expected = ["verify", "dependencies"]
     if initial_exit:
-        expected.extend(["setup", "dependencies"])
+        expected.extend(["profile", "setup", "dependencies"])
         assert setup_prefix.read_text(encoding="utf-8") == environ["CONDA_PREFIX"]
+        assert Path(environ["TEST_SETUP_ARGS"]).read_bytes().split(b"\0")[:-1] == [
+            b"--profile",
+            b"auto",
+        ]
         assert "Installing the complete locked GPU environment" in result.stdout
     else:
         assert not setup_prefix.exists()
@@ -22851,15 +23229,47 @@ def test_prepare_bootstraps_only_missing_dependencies_and_rechecks_same_python(
 
 
 @LINUX_BASH_ONLY
-@pytest.mark.parametrize("setup_exit,mark_ready,expected_exit", [(19, "1", 19), (0, "0", 2)])
+@pytest.mark.parametrize("initial_exit", [3, 41, 126, 127])
+def test_prepare_does_not_install_or_dispatch_after_host_or_unexpected_dependency_error(
+    tmp_path: Path, initial_exit: int
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    project = _bootstrap_project(tmp_path)
+    setup_prefix = tmp_path / "setup.prefix"
+    environ.update(
+        {"TEST_DEPENDENCY_EXIT": str(initial_exit), "TEST_SETUP_PREFIX": str(setup_prefix)}
+    )
+    result = subprocess.run(
+        [BASH, str(project / "scripts" / "prepare_data.sh")],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == initial_exit, result.stderr
+    assert call_log.read_text(encoding="utf-8").splitlines() == ["verify", "dependencies"]
+    assert not setup_prefix.exists()
+    assert not Path(environ["TEST_DEPENDENCY_READY"]).exists()
+    assert not dispatch_args.exists()
+    assert "Installing the complete locked GPU environment" not in result.stdout
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize(
+    "setup_exit,mark_ready,recheck_exit,expected_exit",
+    [(19, "1", 0, 19), (0, "0", 0, 2), (0, "1", 3, 3), (0, "1", 41, 41)],
+)
 def test_prepare_never_dispatches_after_failed_install_or_dependency_recheck(
-    tmp_path: Path, setup_exit: int, mark_ready: str, expected_exit: int
+    tmp_path: Path, setup_exit: int, mark_ready: str, recheck_exit: int, expected_exit: int
 ) -> None:
     environ, call_log, dispatch_args = _shell_environment(tmp_path)
     project = _bootstrap_project(tmp_path)
     environ.update(
         {
             "TEST_DEPENDENCY_EXIT": "2",
+            "TEST_DEPENDENCY_AFTER_SETUP_EXIT": str(recheck_exit),
             "TEST_SETUP_EXIT": str(setup_exit),
             "TEST_SETUP_MARK_READY": mark_ready,
             "TEST_SETUP_PREFIX": str(tmp_path / "setup.prefix"),
@@ -22875,10 +23285,74 @@ def test_prepare_never_dispatches_after_failed_install_or_dependency_recheck(
         timeout=15,
     )
     assert result.returncode == expected_exit, result.stderr
-    expected = ["verify", "dependencies", "setup"]
+    expected = ["verify", "dependencies", "profile", "setup"]
     if setup_exit == 0:
         expected.append("dependencies")
     assert call_log.read_text(encoding="utf-8").splitlines() == expected
+    assert not dispatch_args.exists()
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize("profile_id", ["legacy-cu118", "cu118", "cu126", "cu130", "cu132"])
+def test_dependency_bootstrap_forwards_the_exact_installed_profile(
+    tmp_path: Path, profile_id: str
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    project = _bootstrap_project(tmp_path)
+    environ.update(
+        {
+            "TEST_DEPENDENCY_EXIT": "2",
+            "TEST_INSTALLED_PROFILE": profile_id,
+            "TEST_SETUP_PREFIX": str(tmp_path / "setup.prefix"),
+        }
+    )
+    result = subprocess.run(
+        [BASH, str(project / "scripts" / "prepare_data.sh")],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    forwarded = Path(environ["TEST_SETUP_ARGS"]).read_bytes().split(b"\0")[:-1]
+    assert [value.decode("utf-8") for value in forwarded] == ["--profile", profile_id]
+    assert call_log.read_text(encoding="utf-8").splitlines() == [
+        "verify",
+        "dependencies",
+        "profile",
+        "setup",
+        "dependencies",
+        "paper",
+    ]
+    assert dispatch_args.exists()
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize("query_exit", [2, 41])
+def test_dependency_bootstrap_never_installs_when_profile_identity_is_unknown(
+    tmp_path: Path, query_exit: int
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    project = _bootstrap_project(tmp_path)
+    environ.update({"TEST_DEPENDENCY_EXIT": "2", "TEST_PROFILE_QUERY_EXIT": str(query_exit)})
+    result = subprocess.run(
+        [BASH, str(project / "scripts" / "prepare_data.sh")],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == query_exit, result.stderr
+    assert call_log.read_text(encoding="utf-8").splitlines() == [
+        "verify",
+        "dependencies",
+        "profile",
+    ]
+    assert not Path(environ["TEST_SETUP_ARGS"]).exists()
     assert not dispatch_args.exists()
 
 
@@ -23204,7 +23678,13 @@ import pytest
 
 from scripts import check_dependencies as checker
 from scripts import run_paper
-from scripts.gpu_profiles import CUDA_RUNTIMES, lock_for_tag
+from scripts.gpu_profiles import (
+    CUDA_RUNTIMES,
+    GPUProfileError,
+    cuda_tag_for_profile,
+    lock_for_profile,
+    lock_for_tag,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -23212,6 +23692,8 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.fixture(autouse=True)
 def _no_external_profile_selection(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("CUDA_WHEEL_TAG", raising=False)
+    # Package-check tests simulate installed wheels, not the machine running pytest.
+    monkeypatch.setattr(checker, "check_wheel_host", lambda _profile: None)
 
 
 def _installed(
@@ -23219,8 +23701,11 @@ def _installed(
     *,
     runtime: str | None = "12.6",
     tag: str = "cu126",
+    profile: str | None = None,
 ) -> dict[str, str]:
-    pins = checker.read_exact_pins(lock_for_tag(tag))
+    profile = profile or tag
+    tag = cuda_tag_for_profile(profile)
+    pins = checker.read_exact_pins(lock_for_profile(profile))
     installed = {**pins, "torch": f"{pins['torch']}+{tag}"}
     monkeypatch.setattr(checker.importlib.metadata, "version", installed.__getitem__)
     # The dependency checker must not require a GPU allocation or run kernels.
@@ -23265,6 +23750,91 @@ def test_installed_profile_is_reused_without_driver_query(
     assert report["cuda_wheel_tag"] == tag
     assert Path(report["lock_path"]) == lock_for_tag(tag).resolve()
     assert len(report["lock_sha256"]) == 64
+
+
+@pytest.mark.parametrize("requested_tag", [None, "auto", "cu118"])
+def test_legacy_identity_uses_its_own_lock_even_with_the_same_cuda_tag(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_tag: str | None,
+):
+    installed = _installed(monkeypatch, runtime="11.8", profile="legacy-cu118")
+    if requested_tag is not None:
+        monkeypatch.setenv("CUDA_WHEEL_TAG", requested_tag)
+    report = checker.check_dependencies()
+    assert report["profile_id"] == "legacy-cu118"
+    assert report["cuda_wheel_tag"] == "cu118"
+    assert report["installed"] == installed
+    assert installed["torch"] == "2.6.0+cu118"
+    assert Path(report["lock_path"]) == lock_for_profile("legacy-cu118").resolve()
+
+
+def test_modern_cu118_environment_is_not_reclassified_as_legacy(monkeypatch: pytest.MonkeyPatch):
+    _installed(monkeypatch, runtime="11.8", tag="cu118")
+    report = checker.check_dependencies()
+    assert report["profile_id"] == "cu118"
+    assert report["installed"]["torch"] == "2.7.1+cu118"
+
+
+def test_legacy_rejects_wrong_pyg_and_unregistered_torch(monkeypatch: pytest.MonkeyPatch):
+    installed = _installed(monkeypatch, runtime="11.8", profile="legacy-cu118")
+    installed["torch-geometric"] = "2.8.0.post1"
+    with pytest.raises(checker.DependencyCheckError, match="required 2.7.0"):
+        checker.check_dependencies()
+    installed["torch-geometric"] = "2.7.0"
+    installed["torch"] = "2.6.1+cu118"
+    with pytest.raises(checker.DependencyCheckError, match="torch: installed 2.6.1"):
+        checker.check_dependencies()
+
+
+def test_host_abi_error_is_distinct_and_precedes_any_runtime_import(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    _installed(monkeypatch, runtime="11.8", tag="cu118")
+    monkeypatch.setattr(checker.sys, "platform", "linux")
+
+    def incompatible(profile: str) -> None:
+        assert profile == "cu118"
+        raise GPUProfileError("glibc 2.27 is older than required 2.28")
+
+    def forbidden_import(_name: str) -> None:
+        raise AssertionError("A host ABI error must stop before importing NumPy/Torch")
+
+    monkeypatch.setattr(checker, "check_wheel_host", incompatible)
+    monkeypatch.setattr(checker.importlib, "import_module", forbidden_import)
+    assert checker.main([]) == 3
+    error = capsys.readouterr().err
+    assert "RESEARCH HOST NOT COMPATIBLE" in error
+    assert "glibc 2.27" in error
+    assert "legacy-cu118" in error
+    assert "Run: bash scripts/setup_gpu.sh" not in error
+
+
+def test_legacy_checker_checks_legacy_host_contract(monkeypatch: pytest.MonkeyPatch):
+    _installed(monkeypatch, runtime="11.8", profile="legacy-cu118")
+    monkeypatch.setattr(checker.sys, "platform", "linux")
+    checked: list[str] = []
+    monkeypatch.setattr(checker, "check_wheel_host", checked.append)
+    assert checker.check_dependencies()["profile_id"] == "legacy-cu118"
+    assert checked == ["legacy-cu118"]
+
+
+@pytest.mark.parametrize("profile", ["cu118", "cu126", "legacy-cu118"])
+def test_repair_message_preserves_the_installed_profile(
+    monkeypatch: pytest.MonkeyPatch, profile: str
+):
+    _installed(monkeypatch, profile=profile)
+    message = checker.error_message(checker.DependencyCheckError("numpy: missing"))
+    assert f"Run: bash scripts/setup_gpu.sh --profile {profile}\n" in message
+
+
+def test_repair_message_survives_unreadable_metadata(monkeypatch: pytest.MonkeyPatch):
+    def broken_metadata(_name: str) -> str:
+        raise ValueError("unreadable metadata")
+
+    monkeypatch.setattr(checker.importlib.metadata, "version", broken_metadata)
+    message = checker.error_message(checker.DependencyCheckError("metadata damaged"))
+    assert "Run: bash scripts/setup_gpu.sh\n" in message
 
 
 def test_cu118_does_not_accept_newer_unsupported_pyg(monkeypatch: pytest.MonkeyPatch):
@@ -23353,11 +23923,13 @@ def test_direct_runner_stops_before_creating_output_when_dependencies_are_missin
     assert not list(tmp_path.iterdir())
 
 
+@pytest.mark.parametrize("profile", ["cu118", "legacy-cu118"])
 def test_runner_records_the_checked_profile_in_its_manifest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    profile: str,
 ):
-    _installed(monkeypatch, runtime="11.8", tag="cu118")
+    _installed(monkeypatch, runtime="11.8", profile=profile)
     report = checker.check_dependencies()
     monkeypatch.setattr(run_paper, "check_dependencies", lambda: report)
     monkeypatch.setattr(run_paper, "PROJECT_ROOT", tmp_path)
@@ -23375,7 +23947,9 @@ def test_runner_records_the_checked_profile_in_its_manifest(
         (tmp_path / "runs/paper/profile-record-test/manifest.json").read_text(encoding="utf-8")
     )
     assert manifest["research_environment"] == report
-    assert manifest["research_environment"]["installed"]["torch"] == "2.7.1+cu118"
+    assert manifest["research_environment"]["profile_id"] == profile
+    expected = "2.6.0+cu118" if profile == "legacy-cu118" else "2.7.1+cu118"
+    assert manifest["research_environment"]["installed"]["torch"] == expected
 
 
 def _bare_python(tmp_path: Path, arguments: list[str]) -> subprocess.CompletedProcess[str]:
@@ -23416,9 +23990,13 @@ def test_runner_read_only_commands_work_without_site_packages(tmp_path: Path, op
 
 def test_checker_cli_works_without_site_packages(tmp_path: Path):
     completed = _bare_python(tmp_path, [str(ROOT / "scripts" / "check_dependencies.py")])
-    assert completed.returncode == 2
-    assert "numpy: missing" in completed.stderr
-    assert "bash scripts/setup_gpu.sh" in completed.stderr
+    assert completed.returncode in {2, 3}
+    if completed.returncode == 3:
+        assert "RESEARCH HOST NOT COMPATIBLE" in completed.stderr
+        assert "legacy-cu118" in completed.stderr
+    else:
+        assert "numpy: missing" in completed.stderr
+        assert "bash scripts/setup_gpu.sh" in completed.stderr
     assert "Traceback" not in completed.stderr
 
 
@@ -23601,6 +24179,7 @@ ROOT = Path(__file__).resolve().parents[1]
 )
 def test_auto_selection_uses_two_fixed_profiles(capability: str, tag: str):
     assert profiles.select_install_tag(capability) == tag
+    assert profiles.select_install_profile(capability) == tag
 
 
 @pytest.mark.parametrize("capability", ["10.2", "11.0", "11.7"])
@@ -23626,7 +24205,7 @@ def test_explicit_newer_runtime_is_not_silently_downgraded(tag: str):
         profiles.select_install_tag("12.2", tag)
 
 
-@pytest.mark.parametrize("tag", ["cu121", "cpu", "../../other", ""])
+@pytest.mark.parametrize("tag", ["cu121", "cpu", "legacy-cu118", "../../other", ""])
 def test_only_registered_profiles_can_select_a_lock(tag: str):
     with pytest.raises(profiles.GPUProfileError, match="Unsupported CUDA_WHEEL_TAG"):
         profiles.select_install_tag("13.2", tag)
@@ -23639,12 +24218,101 @@ def test_compatibility_profile_has_its_own_lock():
     assert profiles.lock_for_tag("cu126") == ROOT / "requirements-lock.txt"
 
 
+def test_legacy_profile_is_separate_from_the_cuda_tag(tmp_path: Path):
+    assert profiles.lock_for_profile("legacy-cu118", tmp_path) == (
+        tmp_path / "requirements-legacy-cu118-lock.txt"
+    )
+    assert profiles.cuda_tag_for_profile("legacy-cu118") == "cu118"
+    assert profiles.PROFILE_CONSTRAINT_FILES["legacy-cu118"] == "constraints-legacy-cu118.txt"
+    assert "legacy-cu118" not in profiles.CUDA_RUNTIMES
+    assert "legacy-cu118" not in profiles.LOCK_FILES
+
+
+@pytest.mark.parametrize("profile_id", ["auto", "cpu", "../requirements.txt", "", "cu121"])
+def test_unregistered_profile_never_becomes_a_path(profile_id: str):
+    for function in (
+        profiles.lock_for_profile,
+        profiles.cuda_tag_for_profile,
+        profiles.check_wheel_host,
+        profiles.check_install_target,
+    ):
+        with pytest.raises(profiles.GPUProfileError, match="Unsupported GPU profile"):
+            function(profile_id)
+
+
+@pytest.mark.parametrize("profile_id", profiles.PROFILE_LOCK_FILES)
+def test_explicit_named_profile_is_preserved(profile_id: str):
+    assert profiles.select_install_profile("13.2", profile_id) == profile_id
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "tag"),
+    [("legacy-cu118", "cu126"), ("cu118", "cu130"), ("cu126", "cu118")],
+)
+def test_conflicting_explicit_profile_and_tag_are_rejected(profile_id: str, tag: str):
+    with pytest.raises(profiles.GPUProfileError, match="explicit selections must agree"):
+        profiles.select_install_profile("13.2", profile_id, tag)
+
+
+def test_profile_cannot_bypass_driver_or_raw_tag_validation():
+    with pytest.raises(profiles.GPUProfileError, match="does not rely on CUDA minor-version"):
+        profiles.select_install_profile("11.7", "legacy-cu118")
+    with pytest.raises(profiles.GPUProfileError, match="Unsupported CUDA_WHEEL_TAG"):
+        profiles.select_install_profile("12.2", "legacy-cu118", "legacy-cu118")
+    with pytest.raises(profiles.GPUProfileError, match="Unsupported GPU profile"):
+        profiles.select_install_profile("12.2", "../../other")
+
+
+@pytest.mark.parametrize(
+    ("version", "profile_id"),
+    [
+        ("2.6.0+cu118", "legacy-cu118"),
+        ("2.7.1+cu118", "cu118"),
+        ("2.13.0+cu126", "cu126"),
+        ("2.13.0+cu130", "cu130"),
+        ("2.13.0+cu132", "cu132"),
+    ],
+)
+def test_installed_profile_identity_is_exact(version: str, profile_id: str):
+    assert profiles.profile_for_torch_version(version) == profile_id
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["2.6.0", "2.6.0+cpu", "2.6.0+cu126", "2.6.0+cu118.custom", "2.7.0+cu118", ""],
+)
+def test_unknown_torch_identity_has_no_profile(version: str):
+    assert profiles.profile_for_torch_version(version) is None
+
+
 @pytest.mark.parametrize("version", ["2.28", "2.31", "2.35"])
 def test_compatible_glibc_host_is_accepted(monkeypatch: pytest.MonkeyPatch, version: str):
     monkeypatch.setattr(profiles.platform, "system", lambda: "Linux")
     monkeypatch.setattr(profiles.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(profiles.platform, "libc_ver", lambda: ("glibc", version))
     profiles.check_wheel_host("cu118")
+
+
+def test_ubuntu_1804_accepts_only_opt_in_legacy(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(profiles.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(profiles.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(profiles.platform, "libc_ver", lambda: ("glibc", "2.27"))
+    monkeypatch.setattr(profiles.sys, "version_info", (3, 11, 0))
+    assert profiles.select_install_profile("12.2") == "cu118"
+    with pytest.raises(profiles.GPUProfileError, match="minimum 2.28"):
+        profiles.check_wheel_host(profiles.select_install_profile("12.2"))
+    selected = profiles.select_install_profile("12.2", "legacy-cu118")
+    assert selected == "legacy-cu118"
+    profiles.check_wheel_host(selected)
+
+
+@pytest.mark.parametrize("version", ["2.17", "2.26"])
+def test_legacy_whole_stack_still_needs_glibc_227(monkeypatch: pytest.MonkeyPatch, version: str):
+    monkeypatch.setattr(profiles.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(profiles.platform, "machine", lambda: "x86_64")
+    monkeypatch.setattr(profiles.platform, "libc_ver", lambda: ("glibc", version))
+    with pytest.raises(profiles.GPUProfileError, match="minimum 2.27"):
+        profiles.check_wheel_host("legacy-cu118")
 
 
 @pytest.mark.parametrize(("libc", "version"), [("glibc", "2.17"), ("musl", "1.2"), ("", "")])
@@ -23660,19 +24328,149 @@ def test_incompatible_glibc_host_stops_before_install(
         profiles.check_wheel_host("cu118")
 
 
-def test_cu118_arm_host_is_not_given_an_x86_wheel(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("profile_id", ["cu118", "legacy-cu118"])
+def test_cu118_arm_host_is_not_given_an_x86_wheel(monkeypatch: pytest.MonkeyPatch, profile_id: str):
     monkeypatch.setattr(profiles.platform, "system", lambda: "Linux")
     monkeypatch.setattr(profiles.platform, "machine", lambda: "aarch64")
     with pytest.raises(profiles.GPUProfileError, match="x86_64"):
-        profiles.check_wheel_host("cu118")
+        profiles.check_wheel_host(profile_id)
 
 
-def test_python_without_a_cu118_wheel_stops_before_install(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("profile_id", ["cu118", "legacy-cu118"])
+@pytest.mark.parametrize("version", [(3, 10, 0), (3, 14, 0)])
+def test_python_without_a_cu118_wheel_stops_before_install(
+    monkeypatch: pytest.MonkeyPatch, profile_id: str, version: tuple[int, int, int]
+):
     monkeypatch.setattr(profiles.platform, "system", lambda: "Linux")
     monkeypatch.setattr(profiles.platform, "machine", lambda: "x86_64")
-    monkeypatch.setattr(profiles.sys, "version_info", (3, 14, 0))
+    monkeypatch.setattr(profiles.sys, "version_info", version)
     with pytest.raises(profiles.GPUProfileError, match="Python 3.11-3.13"):
-        profiles.check_wheel_host("cu118")
+        profiles.check_wheel_host(profile_id)
+
+
+def _missing_torch(name: str) -> str:
+    assert name == "torch"
+    raise profiles.importlib.metadata.PackageNotFoundError(name)
+
+
+@pytest.mark.parametrize(("version", "profile_id"), profiles.TORCH_PROFILES.items())
+def test_bootstrap_query_preserves_every_exact_installed_profile_without_imports(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    version: str,
+    profile_id: str,
+):
+    monkeypatch.setattr(profiles.importlib.metadata, "version", lambda name: version)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("The installed-profile query must not inspect a GPU, host ABI, or import Torch")
+
+    monkeypatch.setattr(profiles.importlib, "import_module", forbidden)
+    monkeypatch.setattr(profiles, "check_wheel_host", forbidden)
+    monkeypatch.setattr(profiles, "check_install_target", forbidden)
+    assert profiles.main(["--installed-profile"]) == 0
+    assert capsys.readouterr().out.strip() == profile_id
+
+
+def test_only_missing_torch_allows_default_bootstrap_selection(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    monkeypatch.setattr(profiles.importlib.metadata, "version", _missing_torch)
+    assert profiles.main(["--installed-profile"]) == 0
+    assert capsys.readouterr().out.strip() == "auto"
+
+
+@pytest.mark.parametrize("version", ["2.6.0", "2.6.0+cpu", "2.6.0+cu118.custom", "2.14.0+cu126"])
+def test_unknown_installed_torch_cannot_trigger_an_automatic_profile_change(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], version: str
+):
+    monkeypatch.setattr(profiles.importlib.metadata, "version", lambda name: version)
+    assert profiles.main(["--installed-profile"]) == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert f"Cannot automatically repair unregistered torch=={version}" in output.err
+
+
+def test_broken_torch_metadata_cannot_be_treated_as_an_empty_environment(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    def corrupt_metadata(name: str) -> str:
+        raise OSError("unreadable distribution metadata")
+
+    monkeypatch.setattr(profiles.importlib.metadata, "version", corrupt_metadata)
+    assert profiles.main(["--installed-profile"]) == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "Cannot inspect" in output.err
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [["--driver-cuda", "12.2"], ["--profile", "legacy-cu118"], ["--check-host"]],
+)
+def test_readonly_profile_query_cannot_mix_installation_arguments(extra_args: list[str]):
+    with pytest.raises(SystemExit) as error:
+        profiles.main(["--installed-profile", *extra_args])
+    assert error.value.code == 2
+
+
+def test_legacy_install_requires_a_separate_named_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(profiles.sys, "prefix", str(tmp_path / "new-gat"))
+    monkeypatch.setattr(profiles.importlib.metadata, "version", _missing_torch)
+    with pytest.raises(profiles.GPUProfileError, match="separate Conda environment"):
+        profiles.check_install_target("legacy-cu118")
+
+
+@pytest.mark.parametrize("version", ["2.7.1+cu118", "2.13.0+cu126", "2.6.0", "2.6.0+cpu"])
+def test_legacy_install_never_replaces_a_different_torch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, version: str
+):
+    monkeypatch.setattr(profiles.sys, "prefix", str(tmp_path / "new-gat-legacy"))
+    monkeypatch.setattr(profiles.importlib.metadata, "version", lambda name: version)
+    with pytest.raises(profiles.GPUProfileError, match="cannot replace existing torch"):
+        profiles.check_install_target("legacy-cu118")
+
+
+def test_legacy_install_allows_fresh_dedicated_or_exact_existing_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(profiles.sys, "prefix", str(tmp_path / "new-gat-legacy"))
+    monkeypatch.setattr(profiles.importlib.metadata, "version", _missing_torch)
+    profiles.check_install_target("legacy-cu118")
+    monkeypatch.setattr(profiles.importlib.metadata, "version", lambda name: "2.6.0+cu118")
+    profiles.check_install_target("legacy-cu118")
+
+
+def test_modern_install_does_not_apply_the_legacy_target_guard(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(profiles.sys, "prefix", "/envs/new-gat")
+
+    def unexpected_metadata_query(name: str):
+        pytest.fail("modern installation must not inspect existing Torch through this guard")
+
+    monkeypatch.setattr(profiles.importlib.metadata, "version", unexpected_metadata_query)
+    for profile_id in profiles.LOCK_FILES:
+        profiles.check_install_target(profile_id)
+
+
+def test_profile_cli_checks_host_then_install_target(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    checked: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        profiles, "check_wheel_host", lambda profile_id: checked.append(("host", profile_id))
+    )
+    monkeypatch.setattr(
+        profiles, "check_install_target", lambda profile_id: checked.append(("target", profile_id))
+    )
+    assert (
+        profiles.main(["--driver-cuda", "12.2", "--profile", "legacy-cu118", "--check-host"]) == 0
+    )
+    assert checked == [("host", "legacy-cu118"), ("target", "legacy-cu118")]
+    assert capsys.readouterr().out.strip() == (
+        "legacy-cu118 cu118 requirements-legacy-cu118-lock.txt constraints-legacy-cu118.txt"
+    )
 
 
 def test_profile_cli_needs_no_installed_research_packages(tmp_path: Path):
@@ -23685,7 +24483,23 @@ def test_profile_cli_needs_no_installed_research_packages(tmp_path: Path):
         check=False,
     )
     assert completed.returncode == 0, completed.stderr
-    assert completed.stdout.strip() == "cu118 requirements-cu118-lock.txt"
+    assert completed.stdout.strip() == (
+        "cu118 cu118 requirements-cu118-lock.txt constraints-cu118.txt"
+    )
+    assert not list(tmp_path.iterdir())
+
+
+def test_installed_profile_query_works_without_site_packages(tmp_path: Path):
+    completed = subprocess.run(
+        [sys.executable, "-S", str(ROOT / "scripts" / "gpu_profiles.py"), "--installed-profile"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "auto"
     assert not list(tmp_path.iterdir())
 ````
 
@@ -23714,6 +24528,7 @@ from scripts.verify_gpu_lock import (
 ROOT = Path(__file__).resolve().parents[1]
 LOCK = ROOT / "requirements-lock.txt"
 CUDA_TAGS = ("cu118", "cu126", "cu130", "cu132")
+PROFILE_IDS = (*CUDA_TAGS, "legacy-cu118")
 
 
 @pytest.mark.parametrize("tag", CUDA_TAGS)
@@ -23742,6 +24557,15 @@ def test_cu118_profile_only_changes_torch_and_matching_pyg() -> None:
     assert compatibility == {**reference, "torch": "2.7.1", "torch-geometric": "2.7.0"}
 
 
+def test_legacy_cu118_lock_is_separate_and_preserves_other_research_pins() -> None:
+    reference = read_exact_pins(LOCK)
+    legacy_lock = ROOT / "requirements-legacy-cu118-lock.txt"
+    legacy_constraints = ROOT / "constraints-legacy-cu118.txt"
+    expected = {**reference, "torch": "2.6.0", "torch-geometric": "2.7.0"}
+    assert assert_same_pins(legacy_lock, legacy_constraints) == expected
+    assert legacy_lock != lock_for_tag("cu118", root=ROOT)
+
+
 def test_exact_pin_parser_rejects_ranges(tmp_path: Path) -> None:
     invalid = tmp_path / "invalid.txt"
     invalid.write_text("torch>=2.2\n", encoding="utf-8")
@@ -23759,9 +24583,14 @@ def test_only_torch_may_have_a_cuda_local_version_suffix() -> None:
     assert not version_matches("torch", "2.7.1", "2.7.1", cuda_tag="cu118")
 
 
-@pytest.mark.parametrize("tag", CUDA_TAGS)
-def test_environment_verifier_checks_exact_versions_and_cuda_runtime(tag: str) -> None:
-    lock = lock_for_tag(tag, root=ROOT)
+@pytest.mark.parametrize("profile_id", PROFILE_IDS)
+def test_environment_verifier_checks_exact_versions_and_cuda_runtime(profile_id: str) -> None:
+    tag = "cu118" if profile_id == "legacy-cu118" else profile_id
+    lock = (
+        ROOT / "requirements-legacy-cu118-lock.txt"
+        if profile_id == "legacy-cu118"
+        else lock_for_tag(tag, root=ROOT)
+    )
     pins = read_exact_pins(lock)
     installed = {**pins, "torch": f"{pins['torch']}+{tag}"}
     fake_torch = SimpleNamespace(
@@ -23785,8 +24614,9 @@ def test_environment_verifier_checks_exact_versions_and_cuda_runtime(tag: str) -
     ):
         report = verify_environment(
             lock_path=lock,
-            constraints_path=ROOT / f"constraints-{tag}.txt",
+            constraints_path=ROOT / f"constraints-{profile_id}.txt",
             cuda_tag=tag,
+            profile_id=profile_id,
         )
 
     assert report["status"] == "passed"
@@ -23807,11 +24637,15 @@ def test_numpy_bridge_failure_is_an_actionable_setup_failure() -> None:
 
 def test_gpu_setup_uses_selected_profile_lock() -> None:
     source = (ROOT / "scripts" / "setup_gpu.sh").read_text(encoding="utf-8")
-    assert 'constraints_file="${project_root}/constraints-${wheel_tag}.txt"' in source
+    assert 'constraints_file="${project_root}/${constraints_name}"' in source
     assert 'lock_file="${project_root}/${lock_name}"' in source
-    assert 'read -r wheel_tag lock_name <<< "${profile_selection}"' in source
+    assert (
+        'read -r profile_id wheel_tag lock_name constraints_name <<< "${profile_selection}"'
+        in source
+    )
     assert '--requirement "${lock_file}"' in source
     assert "scripts/verify_gpu_lock.py" in source
+    assert '--profile "${profile_id}"' in source
     assert "TORCH_SPEC" not in source
     assert "TORCH_INDEX_URL" not in source
     assert "requires a driver supporting CUDA 12.6+" not in source
@@ -23823,10 +24657,29 @@ def test_gpu_setup_delegates_auto_profile_selection_and_keeps_unit_tests_opt_in(
     source = (ROOT / "scripts" / "setup_gpu.sh").read_text(encoding="utf-8")
     assert 'requested_tag="${CUDA_WHEEL_TAG:-auto}"' in source
     assert '"${environment_python}" "${project_root}/scripts/gpu_profiles.py"' in source
-    assert '--driver-cuda "${cuda_version}" --cuda-tag "${requested_tag}" --check-host' in source
+    assert 'requested_profile="auto"' in source
+    assert '--driver-cuda "${cuda_version}" --cuda-tag "${requested_tag}"' in source
+    assert '--profile "${requested_profile}" --check-host' in source
     assert 'if [[ "${RUN_TESTS:-0}" == "1" ]]' in source
     assert "SKIP_TESTS" not in source
     assert 'wheel_tag="cu132"' not in source
+
+
+def test_setup_parses_arguments_before_environment_checks() -> None:
+    source = (ROOT / "scripts" / "setup_gpu.sh").read_text(encoding="utf-8")
+    conda_guard = source.index('source "${project_root}/scripts/conda_env.sh"')
+    assert source.index("--help|-h)") < conda_guard
+    assert source.index("--profile requires a profile name") < conda_guard
+    assert source.index("Unknown setup argument") < conda_guard
+    assert source.index("Unsupported profile") < conda_guard
+    assert "eval " not in source
+
+
+def test_legacy_snapshot_default_does_not_overwrite_project_snapshot() -> None:
+    source = (ROOT / "scripts" / "setup_gpu.sh").read_text(encoding="utf-8")
+    assert 'if [[ "${profile_id}" == "legacy-cu118" ]]' in source
+    assert 'default_snapshot_dir="${CONDA_PREFIX%/}/.new-gat-environment"' in source
+    assert 'snapshot_dir="${ENVIRONMENT_SNAPSHOT_DIR:-${default_snapshot_dir}}"' in source
 
 
 def test_gpu_setup_always_installs_full_locked_dependencies() -> None:
@@ -23890,7 +24743,9 @@ def setup_sandbox(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
     for name in (
         "requirements-lock.txt",
         "requirements-cu118-lock.txt",
+        "requirements-legacy-cu118-lock.txt",
         "constraints-cu118.txt",
+        "constraints-legacy-cu118.txt",
         "constraints-cu126.txt",
         "constraints-cu130.txt",
         "constraints-cu132.txt",
@@ -23908,6 +24763,7 @@ def setup_sandbox(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
         textwrap.dedent(
             """\
             import json
+            import importlib.metadata
             import os
             from pathlib import Path
             import platform
@@ -23923,7 +24779,14 @@ def setup_sandbox(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
                 # Simulate an explicitly supported host independently of the test host.
                 platform.system = lambda: "Linux"
                 platform.machine = lambda: "x86_64"
-                platform.libc_ver = lambda: ("glibc", "2.35")
+                platform.libc_ver = lambda: ("glibc", os.environ.get("TEST_GLIBC", "2.35"))
+                sys.prefix = os.environ["CONDA_PREFIX"]
+                def installed_version(name):
+                    installed = os.environ.get("TEST_INSTALLED_TORCH")
+                    if name == "torch" and installed:
+                        return installed
+                    raise importlib.metadata.PackageNotFoundError(name)
+                importlib.metadata.version = installed_version
                 sys.argv = arguments
                 runpy.run_path(arguments[0], run_name="__main__")
                 raise SystemExit(0)
@@ -23975,17 +24838,22 @@ def setup_sandbox(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
 
 def _run_setup(
     setup_sandbox: tuple[Path, dict[str, str], Path],
+    *arguments: str,
 ) -> tuple[subprocess.CompletedProcess[str], list[list[str]]]:
     project, env, log = setup_sandbox
     result = subprocess.run(
-        ["bash", str(project / "scripts" / "setup_gpu.sh")],
+        ["bash", str(project / "scripts" / "setup_gpu.sh"), *arguments],
         cwd=project.parent,
         env=env,
         capture_output=True,
         text=True,
         check=False,
     )
-    calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+    calls = (
+        [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        if log.exists()
+        else []
+    )
     return result, calls
 
 
@@ -24014,6 +24882,8 @@ def test_setup_auto_selects_complete_profile_with_spaced_paths(
         driver,
         "--cuda-tag",
         "auto",
+        "--profile",
+        "auto",
         "--check-host",
     ]
     constraints = str(project / f"constraints-{tag}.txt")
@@ -24040,11 +24910,141 @@ def test_setup_auto_selects_complete_profile_with_spaced_paths(
     verification = next(call for call in calls if call[0] == "scripts/verify_gpu_lock.py")
     assert verification[verification.index("--lock") + 1] == str(project / lock_name)
     assert verification[verification.index("--cuda-tag") + 1] == tag
+    assert verification[verification.index("--profile") + 1] == tag
     preflight = next(call for call in calls if call[0] == "scripts/gpu_preflight.py")
     assert preflight[preflight.index("--device") + 1] == "cuda"
     assert "--require-paper-deps" in preflight
     assert f"GPU profile: {tag}" in result.stdout
     assert f"nvidia-smi CUDA compatibility: {driver}" in result.stdout
+
+
+@pytest.mark.parametrize("syntax", [("--profile", "legacy-cu118"), ("--profile=legacy-cu118",)])
+def test_legacy_profile_uses_real_cu118_wheel_and_separate_snapshot(
+    setup_sandbox: tuple[Path, dict[str, str], Path],
+    syntax: tuple[str, ...],
+) -> None:
+    project, env, _ = setup_sandbox
+    env["TEST_GLIBC"] = "2.27"
+    result, calls = _run_setup(setup_sandbox, *syntax)
+    assert result.returncode == 0, result.stderr
+    selection = calls[1]
+    assert selection[selection.index("--profile") + 1] == "legacy-cu118"
+    constraints = str(project / "constraints-legacy-cu118.txt")
+    assert [
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--constraint",
+        constraints,
+        "torch==2.6.0+cu118",
+        "--index-url",
+        "https://download.pytorch.org/whl/cu118",
+    ] in calls
+    assert [
+        "-m",
+        "pip",
+        "install",
+        "--constraint",
+        constraints,
+        "--requirement",
+        str(project / "requirements-legacy-cu118-lock.txt"),
+    ] in calls
+    verification = next(call for call in calls if call[0] == "scripts/verify_gpu_lock.py")
+    assert verification[verification.index("--profile") + 1] == "legacy-cu118"
+    assert verification[verification.index("--cuda-tag") + 1] == "cu118"
+    snapshot = Path(env["CONDA_PREFIX"]) / ".new-gat-environment" / ".gpu-environment.json"
+    assert verification[verification.index("--json-out") + 1] == str(snapshot)
+    assert not (project / ".gpu-environment.freeze.txt").exists()
+    assert snapshot.with_name(".gpu-environment.freeze.txt").is_file()
+    assert "GPU profile: legacy-cu118; CUDA wheel: cu118" in result.stdout
+
+
+def test_legacy_snapshot_override_is_respected(
+    setup_sandbox: tuple[Path, dict[str, str], Path],
+) -> None:
+    project, env, _ = setup_sandbox
+    target = project.parent / "custom snapshot directory"
+    env["ENVIRONMENT_SNAPSHOT_DIR"] = str(target)
+    result, calls = _run_setup(setup_sandbox, "--profile", "legacy-cu118")
+    assert result.returncode == 0, result.stderr
+    verification = next(call for call in calls if call[0] == "scripts/verify_gpu_lock.py")
+    assert verification[verification.index("--json-out") + 1] == str(
+        target / ".gpu-environment.json"
+    )
+
+
+@pytest.mark.parametrize(
+    ("arguments", "returncode", "message"),
+    [
+        (("--help",), 0, "Usage:"),
+        (("-h",), 0, "Usage:"),
+        (("--unknown",), 2, "Unknown setup argument"),
+        (("legacy-cu118",), 2, "Unknown setup argument"),
+        (("--profile",), 2, "requires a profile name"),
+        (("--profile", "--help"), 2, "requires a profile name"),
+        (("--profile=",), 2, "Unsupported profile"),
+        (("--profile", "bad"), 2, "Unsupported profile"),
+        (("--profile", "auto", "--profile", "cu118"), 2, "only be specified once"),
+    ],
+)
+def test_setup_argument_handling_precedes_conda_and_installation(
+    setup_sandbox: tuple[Path, dict[str, str], Path],
+    arguments: tuple[str, ...],
+    returncode: int,
+    message: str,
+) -> None:
+    _, env, _ = setup_sandbox
+    env.pop("CONDA_PREFIX")
+    result, calls = _run_setup(setup_sandbox, *arguments)
+    assert result.returncode == returncode
+    assert message in result.stdout + result.stderr
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("existing_new_gat", "new-gat"),
+        ("other_torch", "2.7.1"),
+        ("wrong_wheel", "2.6.0+cu126"),
+        ("old_glibc", "2.27"),
+        ("conflicting_tag", "cu126"),
+    ],
+)
+def test_legacy_preflight_failures_cannot_modify_the_environment(
+    setup_sandbox: tuple[Path, dict[str, str], Path],
+    failure: str,
+    message: str,
+) -> None:
+    _, env, _ = setup_sandbox
+    if failure == "existing_new_gat":
+        prefix = Path(env["CONDA_PREFIX"])
+        protected_prefix = prefix.with_name("new-gat")
+        prefix.rename(protected_prefix)
+        env["CONDA_PREFIX"] = str(protected_prefix)
+    elif failure == "other_torch":
+        env["TEST_INSTALLED_TORCH"] = "2.7.1+cu118"
+    elif failure == "wrong_wheel":
+        env["TEST_INSTALLED_TORCH"] = "2.6.0+cu126"
+    elif failure == "old_glibc":
+        env["TEST_GLIBC"] = "2.26"
+    else:
+        env["CUDA_WHEEL_TAG"] = "cu126"
+    result, calls = _run_setup(setup_sandbox, "--profile", "legacy-cu118")
+    assert result.returncode == 2
+    assert message in result.stderr
+    assert not any(call[:2] == ["-m", "pip"] for call in calls)
+
+
+def test_auto_profile_does_not_silently_choose_legacy_on_old_glibc(
+    setup_sandbox: tuple[Path, dict[str, str], Path],
+) -> None:
+    _, env, _ = setup_sandbox
+    env["TEST_GLIBC"] = "2.27"
+    result, calls = _run_setup(setup_sandbox)
+    assert result.returncode == 2
+    assert not any(call[:2] == ["-m", "pip"] for call in calls)
 
 
 @pytest.mark.parametrize(
@@ -24489,12 +25489,20 @@ def test_readme_commands_use_full_independent_protocols() -> None:
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     blocks = re.findall(r"```bash\n(.*?)```", readme, flags=re.DOTALL)
-    commands = [
+    bash_commands = [
         line
         for block in blocks
         for line in block.splitlines()
-        if line.startswith("bash ") and line != "bash scripts/setup_gpu.sh"
+        if line.startswith("bash ")
     ]
+    setup_commands = [
+        line for line in bash_commands if shlex.split(line)[1] == "scripts/setup_gpu.sh"
+    ]
+    assert setup_commands == [
+        "bash scripts/setup_gpu.sh",
+        "bash scripts/setup_gpu.sh --profile legacy-cu118",
+    ]
+    commands = [line for line in bash_commands if line not in setup_commands]
     assert len(commands) == 5
     parsed = []
     for line in commands:
