@@ -106,7 +106,9 @@ channels:
 dependencies:
   - python=3.11
   - pip
-# Install the pinned CUDA research packages with: bash scripts/setup_gpu.sh
+# Bootstrap only: create/activate does not yet install NumPy or the research stack.
+# Install ALL pinned CUDA research packages with: bash scripts/setup_gpu.sh
+# prepare_data.sh also runs that installer if the active environment is incomplete.
 # CUDA packages are kept out of the bootstrap environment so the official
 # PyTorch wheel index and constraints file are always applied together.
 ````
@@ -19336,6 +19338,115 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ````
 
+# scripts/check_dependencies.py
+
+````python
+#!/usr/bin/env python3
+"""Check the full research stack before importing any project training code.
+
+This checker itself uses only Python's standard library. It never installs
+packages, creates run output, or requires an allocated GPU for data preparation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import importlib.metadata
+import sys
+from pathlib import Path
+from typing import Any
+
+try:
+    from scripts.verify_gpu_lock import (
+        CUDA_RUNTIMES,
+        IMPORT_NAMES,
+        LockVerificationError,
+        read_exact_pins,
+        version_matches,
+    )
+except ModuleNotFoundError:
+    from verify_gpu_lock import (
+        CUDA_RUNTIMES,
+        IMPORT_NAMES,
+        LockVerificationError,
+        read_exact_pins,
+        version_matches,
+    )
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class DependencyCheckError(RuntimeError):
+    """The active interpreter is missing the installed research environment."""
+
+
+def check_dependencies(lock_path: Path = ROOT / "requirements-lock.txt") -> dict[str, Any]:
+    """Check every direct pin, runtime import, and CUDA wheel without using a GPU."""
+    try:
+        pins = read_exact_pins(lock_path)
+    except (LockVerificationError, OSError) as error:
+        raise DependencyCheckError(f"Cannot read the research dependency lock: {error}") from error
+
+    installed: dict[str, str] = {}
+    problems: list[str] = []
+    for name, expected in sorted(pins.items()):
+        try:
+            actual = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            problems.append(f"{name}: missing (required {expected})")
+            continue
+        installed[name] = actual
+        if not version_matches(name, expected, actual):
+            problems.append(f"{name}: installed {actual}, required {expected}")
+    if problems:
+        # Report the entire missing stack at once, before trying NumPy or Torch.
+        raise DependencyCheckError("\n  ".join(problems))
+
+    modules: dict[str, Any] = {}
+    for distribution, module_name in {**IMPORT_NAMES, "torch": "torch", "tqdm": "tqdm"}.items():
+        try:
+            modules[distribution] = importlib.import_module(module_name)
+        except Exception as error:
+            problems.append(f"{distribution}: import failed ({type(error).__name__}: {error})")
+    if problems:
+        raise DependencyCheckError("\n  ".join(problems))
+    runtime = str(modules["torch"].version.cuda)
+    if runtime not in CUDA_RUNTIMES.values():
+        raise DependencyCheckError(
+            f"torch CUDA runtime is {runtime}; install the project's CUDA wheel with setup_gpu.sh"
+        )
+    return {"python": sys.executable, "installed": installed, "cuda_runtime": runtime}
+
+
+def error_message(error: Exception) -> str:
+    return (
+        f"RESEARCH DEPENDENCIES NOT READY\nPython: {sys.executable}\n  {error}\n"
+        "Conda activation alone does not install the research packages.\n"
+        "Run: bash scripts/setup_gpu.sh\n"
+        "Data preparation also installs missing dependencies automatically on a Linux GPU host."
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--lock", type=Path, default=ROOT / "requirements-lock.txt")
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        report = check_dependencies(args.lock)
+    except DependencyCheckError as error:
+        print(error_message(error), file=sys.stderr)
+        return 2
+    if not args.quiet:
+        print(f"Research dependencies ready: {report['python']} (CUDA {report['cuda_runtime']})")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # scripts/conda_env.sh
 
 ````bash
@@ -19679,6 +19790,24 @@ set -euo pipefail
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${project_root}/scripts/conda_env.sh"
 
+prepare_only=0
+inspection_only=0
+for argument in "$@"; do
+    case "${argument}" in
+        --prepare-only) prepare_only=1 ;;
+        --help|-h|--dry-run) inspection_only=1 ;;
+    esac
+done
+
+if [[ "${prepare_only}" == "1" && "${inspection_only}" == "0" ]]; then
+    if ! "${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet; then
+        echo "Research dependencies are missing or incompatible in ${CONDA_PREFIX}."
+        echo "Installing the complete locked GPU environment before preparing data."
+        bash "${project_root}/scripts/setup_gpu.sh"
+        "${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet
+    fi
+fi
+
 export PYTHONPATH="${project_root}/src:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
 cd "${project_root}"
 "${environment_python}" scripts/run_paper.py "$@"
@@ -19731,8 +19860,10 @@ from chartgat.cache import atomic_write_bytes, atomic_write_json
 
 try:
     from scripts.aggregate_paper import aggregate_manifest
+    from scripts.check_dependencies import DependencyCheckError, check_dependencies, error_message
 except ModuleNotFoundError:  # Direct ``python scripts/run_paper.py`` execution.
     from aggregate_paper import aggregate_manifest
+    from check_dependencies import DependencyCheckError, check_dependencies, error_message
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TRACK_MODULES = {
@@ -20232,6 +20363,12 @@ def main() -> int:
                 print(f"  output: {output}")
         return 0
 
+    try:
+        check_dependencies()
+    except DependencyCheckError as error:
+        print(error_message(error), file=sys.stderr)
+        return 2
+
     run_dir = PROJECT_ROOT / "runs" / "paper" / run_id
     if run_dir.exists() or any(
         _track_run_root(track, run_id, args.results_root).exists() for track in tracks
@@ -20442,27 +20579,23 @@ if [[ ! -f "${constraints_file}" || ! -f "${lock_file}" ]]; then
     exit 2
 fi
 
-if [[ "${SKIP_DEPS:-0}" != "1" ]]; then
-    "${environment_python}" -m pip install --upgrade pip
-    "${environment_python}" -m pip install "setuptools>=75" wheel
-    torch_version="$(sed -n 's/^torch==//p' "${constraints_file}")"
-    if [[ -z "${torch_version}" || "${torch_version}" == *$'\n'* ]]; then
-        echo "${constraints_file} must contain exactly one torch==version pin." >&2
-        exit 2
-    fi
-    echo "Installing torch==${torch_version} from ${torch_index_url}"
-    "${environment_python}" -m pip install --upgrade \
-        --constraint "${constraints_file}" \
-        "torch==${torch_version}" \
-        --index-url "${torch_index_url}"
-    "${environment_python}" -m pip install \
-        --constraint "${constraints_file}" \
-        --requirement "${lock_file}"
-    "${environment_python}" -m pip install \
-        --no-deps --no-build-isolation -e "${project_root}"
-else
-    "${environment_python}" -m pip install --no-deps --no-build-isolation -e "${project_root}"
+"${environment_python}" -m pip install --upgrade pip
+"${environment_python}" -m pip install "setuptools>=75" wheel
+torch_version="$(sed -n 's/^torch==//p' "${constraints_file}")"
+if [[ -z "${torch_version}" || "${torch_version}" == *$'\n'* ]]; then
+    echo "${constraints_file} must contain exactly one torch==version pin." >&2
+    exit 2
 fi
+echo "Installing torch==${torch_version} from ${torch_index_url}"
+"${environment_python}" -m pip install --upgrade \
+    --constraint "${constraints_file}" \
+    "torch==${torch_version}" \
+    --index-url "${torch_index_url}"
+"${environment_python}" -m pip install \
+    --constraint "${constraints_file}" \
+    --requirement "${lock_file}"
+"${environment_python}" -m pip install \
+    --no-deps --no-build-isolation -e "${project_root}"
 
 cd "${project_root}"
 "${environment_python}" -m pip check
@@ -20793,20 +20926,10 @@ if __name__ == "__main__":
 # src/chartgat/__init__.py
 
 ````python
-"""Shared incidence and graph-algebra primitives for independent tracks."""
+"""Shared primitives; stdlib-only cache/CLI use must not import NumPy eagerly."""
 
-from .algebra import (
-    chart_transition,
-    decode_edge_state,
-    encode_edge_state,
-    flip_cycle_basis,
-    flip_edge_quantity,
-    flip_incidence,
-    fundamental_cycle_basis,
-    incidence_matrix,
-    orthonormal_cycle_basis,
-    validate_spanning_tree,
-)
+from importlib import import_module
+from typing import Any
 
 __all__ = [
     "chart_transition",
@@ -20820,6 +20943,18 @@ __all__ = [
     "orthonormal_cycle_basis",
     "validate_spanning_tree",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(".algebra", __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
 ````
 
 # src/chartgat/algebra.py
@@ -22240,6 +22375,28 @@ def test_shared_bash_guard_uses_only_conda_python_and_runs_verification() -> Non
     assert not re.search(r"^\s*conda\s+(?:create|install)\b", source, flags=re.MULTILINE)
 
 
+def test_paper_checks_preparation_dependencies_only_after_conda_validation() -> None:
+    source = (ROOT / "scripts" / "paper.sh").read_text(encoding="utf-8")
+    guard = 'source "${project_root}/scripts/conda_env.sh"'
+    dependency_check = (
+        '"${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet'
+    )
+    installer = 'bash "${project_root}/scripts/setup_gpu.sh"'
+    assert source.index(guard) < source.index(dependency_check)
+    assert source.count(dependency_check) == 2
+    assert source.count(installer) == 1
+    assert (
+        source.index(dependency_check) < source.index(installer) < source.rindex(dependency_check)
+    )
+    assert source.rindex(dependency_check) < source.index(
+        '"${environment_python}" scripts/run_paper.py'
+    )
+    assert "--prepare-only) prepare_only=1" in source
+    assert "--help|-h|--dry-run) inspection_only=1" in source
+    assert '"${prepare_only}" == "1" && "${inspection_only}" == "0"' in source
+    assert "-m pip" not in source
+
+
 def _shell_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
     """Stub only dispatch; Python unit tests above validate real guard decisions."""
 
@@ -22252,6 +22409,11 @@ def _shell_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
         "  */verify_conda_env.py)\n"
         '    printf "verify\\n" >> "$TEST_CALL_LOG"\n'
         '    exit "${TEST_VERIFY_EXIT:-0}" ;;\n'
+        "  */check_dependencies.py)\n"
+        '    printf "dependencies\\n" >> "$TEST_CALL_LOG"\n'
+        '    printf "%s\\0" "$0" "$@" >> "$TEST_DEPENDENCY_ARGS"\n'
+        '    if [ -f "$TEST_DEPENDENCY_READY" ]; then exit 0; fi\n'
+        '    exit "${TEST_DEPENDENCY_EXIT:-0}" ;;\n'
         "  scripts/run_paper.py)\n"
         '    printf "paper\\n" >> "$TEST_CALL_LOG"\n'
         '    printf "%s\\0" "$@" > "$TEST_DISPATCH_ARGS"\n'
@@ -22273,6 +22435,9 @@ def _shell_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
             "TEST_DISPATCH_ARGS": str(dispatch_args),
             "TEST_VERIFY_EXIT": "0",
             "TEST_RUN_EXIT": "0",
+            "TEST_DEPENDENCY_EXIT": "0",
+            "TEST_DEPENDENCY_ARGS": str(tmp_path / "dependency.args"),
+            "TEST_DEPENDENCY_READY": str(tmp_path / "dependencies.ready"),
             "PYTHON": str(tmp_path / "wrong-python"),
             "VENV_DIR": str(tmp_path / "must-not-be-created"),
             "USE_ACTIVE_ENV": "0",
@@ -22352,16 +22517,16 @@ def test_paper_bash_preserves_arguments_exit_code_and_conda_selection(tmp_path: 
 @pytest.mark.parametrize(
     ("script", "defaults"),
     [
-        ("scripts/prepare_data.sh", ["--suite", "all", "--prepare-only", "--allow-download"]),
-        ("scripts/reproduce.sh", ["--suite", "all"]),
+        ("scripts/prepare_data.sh", ["--suite", "benchmark", "--prepare-only", "--allow-download"]),
+        ("scripts/reproduce.sh", ["--suite", "benchmark"]),
         (
             "research/conductance_gat/reproduce.sh",
-            ["--suite", "all", "--tracks", "conductance_gat"],
+            ["--suite", "benchmark", "--tracks", "conductance_gat"],
         ),
-        ("research/cycle_pe/reproduce.sh", ["--suite", "all", "--tracks", "cycle_pe"]),
+        ("research/cycle_pe/reproduce.sh", ["--suite", "benchmark", "--tracks", "cycle_pe"]),
         (
             "research/tree_augmentation/reproduce.sh",
-            ["--suite", "all", "--tracks", "tree_augmentation"],
+            ["--suite", "benchmark", "--tracks", "tree_augmentation"],
         ),
     ],
 )
@@ -22381,11 +22546,167 @@ def test_reproduction_scripts_forward_defaults_arguments_and_exit_status(
         timeout=15,
     )
     assert result.returncode == 37, result.stderr
-    assert call_log.read_text(encoding="utf-8").splitlines() == ["verify", "paper"]
+    expected_calls = ["verify"]
+    if "--prepare-only" in defaults:
+        expected_calls.append("dependencies")
+    expected_calls.append("paper")
+    assert call_log.read_text(encoding="utf-8").splitlines() == expected_calls
     forwarded = dispatch_args.read_bytes().split(b"\0")[:-1]
     assert [value.decode("utf-8") for value in forwarded] == [
         "scripts/run_paper.py",
         *defaults,
+        *arguments,
+    ]
+
+
+def _bootstrap_project(tmp_path: Path) -> Path:
+    """Copy real dispatch/guard scripts, replacing only installation with a stub."""
+
+    project = tmp_path / "Research project with spaces"
+    scripts = project / "scripts"
+    scripts.mkdir(parents=True)
+    for filename in ("paper.sh", "conda_env.sh", "prepare_data.sh"):
+        shutil.copy2(ROOT / "scripts" / filename, scripts / filename)
+    (scripts / "setup_gpu.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'printf "setup\\n" >> "$TEST_CALL_LOG"\n'
+        'printf "%s" "$CONDA_PREFIX" > "$TEST_SETUP_PREFIX"\n'
+        'if [[ "${TEST_SETUP_EXIT:-0}" != "0" ]]; then exit "$TEST_SETUP_EXIT"; fi\n'
+        'if [[ "${TEST_SETUP_MARK_READY:-1}" == "1" ]]; then\n'
+        '    touch "$TEST_DEPENDENCY_READY"\n'
+        "fi\n",
+        encoding="utf-8",
+    )
+    return project
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize("initial_exit", [0, 2])
+def test_prepare_bootstraps_only_missing_dependencies_and_rechecks_same_python(
+    tmp_path: Path, initial_exit: int
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    project = _bootstrap_project(tmp_path)
+    setup_prefix = tmp_path / "setup.prefix"
+    environ.update(
+        {
+            "TEST_DEPENDENCY_EXIT": str(initial_exit),
+            "TEST_SETUP_PREFIX": str(setup_prefix),
+            "TEST_RUN_EXIT": "37",
+        }
+    )
+    arguments = ["--run-id", "space value", "", "literal;$HOME"]
+    result = subprocess.run(
+        [BASH, str(project / "scripts" / "prepare_data.sh"), *arguments],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 37, result.stderr
+    expected = ["verify", "dependencies"]
+    if initial_exit:
+        expected.extend(["setup", "dependencies"])
+        assert setup_prefix.read_text(encoding="utf-8") == environ["CONDA_PREFIX"]
+        assert "Installing the complete locked GPU environment" in result.stdout
+    else:
+        assert not setup_prefix.exists()
+    assert call_log.read_text(encoding="utf-8").splitlines() == [*expected, "paper"]
+    dependency_arguments = Path(environ["TEST_DEPENDENCY_ARGS"]).read_bytes().split(b"\0")[:-1]
+    expected_dependency_call = [
+        str(Path(environ["CONDA_PREFIX"]) / "bin" / "python"),
+        str(project / "scripts" / "check_dependencies.py"),
+        "--quiet",
+    ]
+    assert [value.decode("utf-8") for value in dependency_arguments] == (
+        expected_dependency_call * (2 if initial_exit else 1)
+    )
+    forwarded = dispatch_args.read_bytes().split(b"\0")[:-1]
+    assert [value.decode("utf-8") for value in forwarded] == [
+        "scripts/run_paper.py",
+        "--suite",
+        "benchmark",
+        "--prepare-only",
+        "--allow-download",
+        *arguments,
+    ]
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize("setup_exit,mark_ready,expected_exit", [(19, "1", 19), (0, "0", 2)])
+def test_prepare_never_dispatches_after_failed_install_or_dependency_recheck(
+    tmp_path: Path, setup_exit: int, mark_ready: str, expected_exit: int
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    project = _bootstrap_project(tmp_path)
+    environ.update(
+        {
+            "TEST_DEPENDENCY_EXIT": "2",
+            "TEST_SETUP_EXIT": str(setup_exit),
+            "TEST_SETUP_MARK_READY": mark_ready,
+            "TEST_SETUP_PREFIX": str(tmp_path / "setup.prefix"),
+        }
+    )
+    result = subprocess.run(
+        [BASH, str(project / "scripts" / "prepare_data.sh")],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == expected_exit, result.stderr
+    expected = ["verify", "dependencies", "setup"]
+    if setup_exit == 0:
+        expected.append("dependencies")
+    assert call_log.read_text(encoding="utf-8").splitlines() == expected
+    assert not dispatch_args.exists()
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [],
+        ["--help"],
+        ["--dry-run"],
+        ["--prepare-only", "--help"],
+        ["--prepare-only", "-h"],
+        ["--prepare-only", "--dry-run"],
+        ["--help", "--prepare-only"],
+    ],
+)
+def test_training_help_and_dry_run_never_bootstrap_dependencies(
+    tmp_path: Path, arguments: list[str]
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    project = _bootstrap_project(tmp_path)
+    environ.update(
+        {
+            "TEST_DEPENDENCY_EXIT": "2",
+            "TEST_SETUP_PREFIX": str(tmp_path / "setup.prefix"),
+        }
+    )
+    result = subprocess.run(
+        [BASH, str(project / "scripts" / "paper.sh"), *arguments],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert call_log.read_text(encoding="utf-8").splitlines() == ["verify", "paper"]
+    assert not Path(environ["TEST_DEPENDENCY_ARGS"]).exists()
+    assert not Path(environ["TEST_SETUP_PREFIX"]).exists()
+    forwarded = dispatch_args.read_bytes().split(b"\0")[:-1]
+    assert [value.decode("utf-8") for value in forwarded] == [
+        "scripts/run_paper.py",
         *arguments,
     ]
 ````
@@ -22650,6 +22971,165 @@ def test_optional_is_a_tier_not_a_code_status() -> None:
             assert entry["status"] not in {"optional", "implemented_optional"}
 ````
 
+# tests/test_dependency_bootstrap.py
+
+````python
+from __future__ import annotations
+
+import importlib
+import importlib.metadata
+import os
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from scripts import check_dependencies as checker
+from scripts import run_paper
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _installed(monkeypatch: pytest.MonkeyPatch, *, runtime: str | None = "12.6") -> dict[str, str]:
+    pins = checker.read_exact_pins(ROOT / "requirements-lock.txt")
+    installed = {**pins, "torch": f"{pins['torch']}+cu126"}
+    monkeypatch.setattr(checker.importlib.metadata, "version", installed.__getitem__)
+    # The dependency checker must not require a GPU allocation or run kernels.
+    torch = SimpleNamespace(version=SimpleNamespace(cuda=runtime))
+    monkeypatch.setattr(
+        checker.importlib, "import_module", lambda name: torch if name == "torch" else object()
+    )
+    return installed
+
+
+def test_missing_stack_is_reported_before_any_runtime_import(monkeypatch: pytest.MonkeyPatch):
+    def missing(name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    def forbidden_import(name: str) -> None:
+        raise AssertionError(f"Premature dependency import: {name}")
+
+    monkeypatch.setattr(checker.importlib.metadata, "version", missing)
+    monkeypatch.setattr(checker.importlib, "import_module", forbidden_import)
+    with pytest.raises(checker.DependencyCheckError) as caught:
+        checker.check_dependencies()
+    assert "numpy: missing" in str(caught.value)
+    assert "torch: missing" in str(caught.value)
+    assert "torch-geometric: missing" in str(caught.value)
+
+
+def test_complete_stack_is_valid_without_gpu_allocation(monkeypatch: pytest.MonkeyPatch):
+    installed = _installed(monkeypatch)
+    report = checker.check_dependencies()
+    assert report["installed"] == installed
+    assert report["cuda_runtime"] == "12.6"
+    assert report["python"] == sys.executable
+
+
+def test_wrong_package_version_is_reported(monkeypatch: pytest.MonkeyPatch):
+    installed = _installed(monkeypatch)
+    installed["numpy"] = "1.0.0"
+    with pytest.raises(checker.DependencyCheckError, match="numpy: installed 1.0.0"):
+        checker.check_dependencies()
+
+
+def test_matching_versions_with_import_failure_are_not_ready(monkeypatch: pytest.MonkeyPatch):
+    _installed(monkeypatch)
+
+    def broken_import(name: str) -> object:
+        if name == "numpy":
+            raise OSError("binary dependency unavailable")
+        return SimpleNamespace(version=SimpleNamespace(cuda="12.6"))
+
+    monkeypatch.setattr(checker.importlib, "import_module", broken_import)
+    with pytest.raises(checker.DependencyCheckError, match="numpy: import failed"):
+        checker.check_dependencies()
+
+
+def test_cpu_only_torch_is_not_the_research_stack(monkeypatch: pytest.MonkeyPatch):
+    _installed(monkeypatch, runtime=None)
+    with pytest.raises(checker.DependencyCheckError, match="torch CUDA runtime is None"):
+        checker.check_dependencies()
+
+
+def test_missing_lock_is_an_actionable_error(tmp_path: Path):
+    with pytest.raises(checker.DependencyCheckError, match="Cannot read"):
+        checker.check_dependencies(tmp_path / "missing.txt")
+
+
+def test_direct_runner_stops_before_creating_output_when_dependencies_are_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    def missing() -> None:
+        raise checker.DependencyCheckError("numpy: missing")
+
+    monkeypatch.setattr(run_paper, "check_dependencies", missing)
+    monkeypatch.setattr(run_paper, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["run_paper.py", "--prepare-only"])
+    assert run_paper.main() == 2
+    error = capsys.readouterr().err
+    assert "numpy: missing" in error
+    assert "bash scripts/setup_gpu.sh" in error
+    assert "Traceback" not in error
+    assert not list(tmp_path.iterdir())
+
+
+def _bare_python(tmp_path: Path, arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join((str(ROOT / "src"), str(ROOT)))
+    environment["PYTHONIOENCODING"] = "utf-8"
+    return subprocess.run(
+        [sys.executable, "-S", *arguments],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+        check=False,
+    )
+
+
+def test_cache_import_does_not_require_numpy_or_torch(tmp_path: Path):
+    completed = _bare_python(
+        tmp_path,
+        [
+            "-c",
+            "import sys; import chartgat.cache; "
+            "assert 'numpy' not in sys.modules; assert 'torch' not in sys.modules",
+        ],
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+@pytest.mark.parametrize("option", ["--help", "--dry-run"])
+def test_runner_read_only_commands_work_without_site_packages(tmp_path: Path, option: str):
+    completed = _bare_python(tmp_path, [str(ROOT / "scripts" / "run_paper.py"), option])
+    assert completed.returncode == 0, completed.stderr
+    assert "Traceback" not in completed.stderr
+    assert not list(tmp_path.iterdir())
+
+
+def test_checker_cli_works_without_site_packages(tmp_path: Path):
+    completed = _bare_python(tmp_path, [str(ROOT / "scripts" / "check_dependencies.py")])
+    assert completed.returncode == 2
+    assert "numpy: missing" in completed.stderr
+    assert "bash scripts/setup_gpu.sh" in completed.stderr
+    assert "Traceback" not in completed.stderr
+
+
+def test_lazy_algebra_exports_preserve_public_api():
+    import chartgat
+    from chartgat import algebra
+
+    for name in chartgat.__all__:
+        assert getattr(chartgat, name) is getattr(algebra, name)
+    with pytest.raises(AttributeError):
+        _ = chartgat.not_a_public_primitive
+````
+
 # tests/test_gpu_preflight.py
 
 ````python
@@ -22891,6 +23371,18 @@ def test_gpu_setup_uses_fixed_reference_runtime_and_opt_in_unit_tests() -> None:
     assert 'if [[ "${RUN_TESTS:-0}" == "1" ]]' in source
     assert "SKIP_TESTS" not in source
     assert 'wheel_tag="cu132"' not in source
+
+
+def test_gpu_setup_always_installs_full_locked_dependencies() -> None:
+    source = (ROOT / "scripts" / "setup_gpu.sh").read_text(encoding="utf-8")
+    assert "SKIP_DEPS" not in source
+    assert source.count('--requirement "${lock_file}"') == 1
+    assert source.count('--no-deps --no-build-isolation -e "${project_root}"') == 1
+    assert source.index("command -v nvidia-smi") < source.index("-m pip install")
+    assert source.index('--requirement "${lock_file}"') < source.index(
+        '--no-deps --no-build-isolation -e "${project_root}"'
+    )
+    assert source.index('--requirement "${lock_file}"') < source.index("scripts/verify_gpu_lock.py")
 
 
 def test_conda_bootstrap_uses_named_environment_and_python_311() -> None:

@@ -52,27 +52,23 @@ if [[ ! -f "${constraints_file}" || ! -f "${lock_file}" ]]; then
     exit 2
 fi
 
-if [[ "${SKIP_DEPS:-0}" != "1" ]]; then
-    "${environment_python}" -m pip install --upgrade pip
-    "${environment_python}" -m pip install "setuptools>=75" wheel
-    torch_version="$(sed -n 's/^torch==//p' "${constraints_file}")"
-    if [[ -z "${torch_version}" || "${torch_version}" == *$'\n'* ]]; then
-        echo "${constraints_file} must contain exactly one torch==version pin." >&2
-        exit 2
-    fi
-    echo "Installing torch==${torch_version} from ${torch_index_url}"
-    "${environment_python}" -m pip install --upgrade \
-        --constraint "${constraints_file}" \
-        "torch==${torch_version}" \
-        --index-url "${torch_index_url}"
-    "${environment_python}" -m pip install \
-        --constraint "${constraints_file}" \
-        --requirement "${lock_file}"
-    "${environment_python}" -m pip install \
-        --no-deps --no-build-isolation -e "${project_root}"
-else
-    "${environment_python}" -m pip install --no-deps --no-build-isolation -e "${project_root}"
+"${environment_python}" -m pip install --upgrade pip
+"${environment_python}" -m pip install "setuptools>=75" wheel
+torch_version="$(sed -n 's/^torch==//p' "${constraints_file}")"
+if [[ -z "${torch_version}" || "${torch_version}" == *$'\n'* ]]; then
+    echo "${constraints_file} must contain exactly one torch==version pin." >&2
+    exit 2
 fi
+echo "Installing torch==${torch_version} from ${torch_index_url}"
+"${environment_python}" -m pip install --upgrade \
+    --constraint "${constraints_file}" \
+    "torch==${torch_version}" \
+    --index-url "${torch_index_url}"
+"${environment_python}" -m pip install \
+    --constraint "${constraints_file}" \
+    --requirement "${lock_file}"
+"${environment_python}" -m pip install \
+    --no-deps --no-build-isolation -e "${project_root}"
 
 cd "${project_root}"
 "${environment_python}" -m pip check

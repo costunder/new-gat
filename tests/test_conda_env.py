@@ -218,6 +218,28 @@ def test_shared_bash_guard_uses_only_conda_python_and_runs_verification() -> Non
     assert not re.search(r"^\s*conda\s+(?:create|install)\b", source, flags=re.MULTILINE)
 
 
+def test_paper_checks_preparation_dependencies_only_after_conda_validation() -> None:
+    source = (ROOT / "scripts" / "paper.sh").read_text(encoding="utf-8")
+    guard = 'source "${project_root}/scripts/conda_env.sh"'
+    dependency_check = (
+        '"${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet'
+    )
+    installer = 'bash "${project_root}/scripts/setup_gpu.sh"'
+    assert source.index(guard) < source.index(dependency_check)
+    assert source.count(dependency_check) == 2
+    assert source.count(installer) == 1
+    assert (
+        source.index(dependency_check) < source.index(installer) < source.rindex(dependency_check)
+    )
+    assert source.rindex(dependency_check) < source.index(
+        '"${environment_python}" scripts/run_paper.py'
+    )
+    assert "--prepare-only) prepare_only=1" in source
+    assert "--help|-h|--dry-run) inspection_only=1" in source
+    assert '"${prepare_only}" == "1" && "${inspection_only}" == "0"' in source
+    assert "-m pip" not in source
+
+
 def _shell_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
     """Stub only dispatch; Python unit tests above validate real guard decisions."""
 
@@ -230,6 +252,11 @@ def _shell_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
         "  */verify_conda_env.py)\n"
         '    printf "verify\\n" >> "$TEST_CALL_LOG"\n'
         '    exit "${TEST_VERIFY_EXIT:-0}" ;;\n'
+        "  */check_dependencies.py)\n"
+        '    printf "dependencies\\n" >> "$TEST_CALL_LOG"\n'
+        '    printf "%s\\0" "$0" "$@" >> "$TEST_DEPENDENCY_ARGS"\n'
+        '    if [ -f "$TEST_DEPENDENCY_READY" ]; then exit 0; fi\n'
+        '    exit "${TEST_DEPENDENCY_EXIT:-0}" ;;\n'
         "  scripts/run_paper.py)\n"
         '    printf "paper\\n" >> "$TEST_CALL_LOG"\n'
         '    printf "%s\\0" "$@" > "$TEST_DISPATCH_ARGS"\n'
@@ -251,6 +278,9 @@ def _shell_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
             "TEST_DISPATCH_ARGS": str(dispatch_args),
             "TEST_VERIFY_EXIT": "0",
             "TEST_RUN_EXIT": "0",
+            "TEST_DEPENDENCY_EXIT": "0",
+            "TEST_DEPENDENCY_ARGS": str(tmp_path / "dependency.args"),
+            "TEST_DEPENDENCY_READY": str(tmp_path / "dependencies.ready"),
             "PYTHON": str(tmp_path / "wrong-python"),
             "VENV_DIR": str(tmp_path / "must-not-be-created"),
             "USE_ACTIVE_ENV": "0",
@@ -330,16 +360,16 @@ def test_paper_bash_preserves_arguments_exit_code_and_conda_selection(tmp_path: 
 @pytest.mark.parametrize(
     ("script", "defaults"),
     [
-        ("scripts/prepare_data.sh", ["--suite", "all", "--prepare-only", "--allow-download"]),
-        ("scripts/reproduce.sh", ["--suite", "all"]),
+        ("scripts/prepare_data.sh", ["--suite", "benchmark", "--prepare-only", "--allow-download"]),
+        ("scripts/reproduce.sh", ["--suite", "benchmark"]),
         (
             "research/conductance_gat/reproduce.sh",
-            ["--suite", "all", "--tracks", "conductance_gat"],
+            ["--suite", "benchmark", "--tracks", "conductance_gat"],
         ),
-        ("research/cycle_pe/reproduce.sh", ["--suite", "all", "--tracks", "cycle_pe"]),
+        ("research/cycle_pe/reproduce.sh", ["--suite", "benchmark", "--tracks", "cycle_pe"]),
         (
             "research/tree_augmentation/reproduce.sh",
-            ["--suite", "all", "--tracks", "tree_augmentation"],
+            ["--suite", "benchmark", "--tracks", "tree_augmentation"],
         ),
     ],
 )
@@ -359,10 +389,166 @@ def test_reproduction_scripts_forward_defaults_arguments_and_exit_status(
         timeout=15,
     )
     assert result.returncode == 37, result.stderr
-    assert call_log.read_text(encoding="utf-8").splitlines() == ["verify", "paper"]
+    expected_calls = ["verify"]
+    if "--prepare-only" in defaults:
+        expected_calls.append("dependencies")
+    expected_calls.append("paper")
+    assert call_log.read_text(encoding="utf-8").splitlines() == expected_calls
     forwarded = dispatch_args.read_bytes().split(b"\0")[:-1]
     assert [value.decode("utf-8") for value in forwarded] == [
         "scripts/run_paper.py",
         *defaults,
+        *arguments,
+    ]
+
+
+def _bootstrap_project(tmp_path: Path) -> Path:
+    """Copy real dispatch/guard scripts, replacing only installation with a stub."""
+
+    project = tmp_path / "Research project with spaces"
+    scripts = project / "scripts"
+    scripts.mkdir(parents=True)
+    for filename in ("paper.sh", "conda_env.sh", "prepare_data.sh"):
+        shutil.copy2(ROOT / "scripts" / filename, scripts / filename)
+    (scripts / "setup_gpu.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'printf "setup\\n" >> "$TEST_CALL_LOG"\n'
+        'printf "%s" "$CONDA_PREFIX" > "$TEST_SETUP_PREFIX"\n'
+        'if [[ "${TEST_SETUP_EXIT:-0}" != "0" ]]; then exit "$TEST_SETUP_EXIT"; fi\n'
+        'if [[ "${TEST_SETUP_MARK_READY:-1}" == "1" ]]; then\n'
+        '    touch "$TEST_DEPENDENCY_READY"\n'
+        "fi\n",
+        encoding="utf-8",
+    )
+    return project
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize("initial_exit", [0, 2])
+def test_prepare_bootstraps_only_missing_dependencies_and_rechecks_same_python(
+    tmp_path: Path, initial_exit: int
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    project = _bootstrap_project(tmp_path)
+    setup_prefix = tmp_path / "setup.prefix"
+    environ.update(
+        {
+            "TEST_DEPENDENCY_EXIT": str(initial_exit),
+            "TEST_SETUP_PREFIX": str(setup_prefix),
+            "TEST_RUN_EXIT": "37",
+        }
+    )
+    arguments = ["--run-id", "space value", "", "literal;$HOME"]
+    result = subprocess.run(
+        [BASH, str(project / "scripts" / "prepare_data.sh"), *arguments],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 37, result.stderr
+    expected = ["verify", "dependencies"]
+    if initial_exit:
+        expected.extend(["setup", "dependencies"])
+        assert setup_prefix.read_text(encoding="utf-8") == environ["CONDA_PREFIX"]
+        assert "Installing the complete locked GPU environment" in result.stdout
+    else:
+        assert not setup_prefix.exists()
+    assert call_log.read_text(encoding="utf-8").splitlines() == [*expected, "paper"]
+    dependency_arguments = Path(environ["TEST_DEPENDENCY_ARGS"]).read_bytes().split(b"\0")[:-1]
+    expected_dependency_call = [
+        str(Path(environ["CONDA_PREFIX"]) / "bin" / "python"),
+        str(project / "scripts" / "check_dependencies.py"),
+        "--quiet",
+    ]
+    assert [value.decode("utf-8") for value in dependency_arguments] == (
+        expected_dependency_call * (2 if initial_exit else 1)
+    )
+    forwarded = dispatch_args.read_bytes().split(b"\0")[:-1]
+    assert [value.decode("utf-8") for value in forwarded] == [
+        "scripts/run_paper.py",
+        "--suite",
+        "benchmark",
+        "--prepare-only",
+        "--allow-download",
+        *arguments,
+    ]
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize("setup_exit,mark_ready,expected_exit", [(19, "1", 19), (0, "0", 2)])
+def test_prepare_never_dispatches_after_failed_install_or_dependency_recheck(
+    tmp_path: Path, setup_exit: int, mark_ready: str, expected_exit: int
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    project = _bootstrap_project(tmp_path)
+    environ.update(
+        {
+            "TEST_DEPENDENCY_EXIT": "2",
+            "TEST_SETUP_EXIT": str(setup_exit),
+            "TEST_SETUP_MARK_READY": mark_ready,
+            "TEST_SETUP_PREFIX": str(tmp_path / "setup.prefix"),
+        }
+    )
+    result = subprocess.run(
+        [BASH, str(project / "scripts" / "prepare_data.sh")],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == expected_exit, result.stderr
+    expected = ["verify", "dependencies", "setup"]
+    if setup_exit == 0:
+        expected.append("dependencies")
+    assert call_log.read_text(encoding="utf-8").splitlines() == expected
+    assert not dispatch_args.exists()
+
+
+@LINUX_BASH_ONLY
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        [],
+        ["--help"],
+        ["--dry-run"],
+        ["--prepare-only", "--help"],
+        ["--prepare-only", "-h"],
+        ["--prepare-only", "--dry-run"],
+        ["--help", "--prepare-only"],
+    ],
+)
+def test_training_help_and_dry_run_never_bootstrap_dependencies(
+    tmp_path: Path, arguments: list[str]
+) -> None:
+    environ, call_log, dispatch_args = _shell_environment(tmp_path)
+    project = _bootstrap_project(tmp_path)
+    environ.update(
+        {
+            "TEST_DEPENDENCY_EXIT": "2",
+            "TEST_SETUP_PREFIX": str(tmp_path / "setup.prefix"),
+        }
+    )
+    result = subprocess.run(
+        [BASH, str(project / "scripts" / "paper.sh"), *arguments],
+        cwd=tmp_path,
+        env=environ,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert call_log.read_text(encoding="utf-8").splitlines() == ["verify", "paper"]
+    assert not Path(environ["TEST_DEPENDENCY_ARGS"]).exists()
+    assert not Path(environ["TEST_SETUP_PREFIX"]).exists()
+    forwarded = dispatch_args.read_bytes().split(b"\0")[:-1]
+    assert [value.decode("utf-8") for value in forwarded] == [
+        "scripts/run_paper.py",
         *arguments,
     ]

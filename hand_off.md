@@ -10,6 +10,28 @@
 
 ## 0. 리뷰어가 먼저 알아야 할 판정
 
+### 2026-08-30 서버의 NumPy 누락 오류에 대한 설치 경로 교정
+
+서버의 활성 `new-gat` Python에서 데이터 준비 중 `ModuleNotFoundError: numpy`가 보고됐다.
+`environment.yml`은 Python/pip만 만드는 bootstrap이며, 기존 `paper.sh`는 Conda interpreter만
+확인한 뒤 의존성 검사 없이 runner를 시작했다. `chartgat.cache` import가 package initializer의
+eager algebra import를 통해 NumPy부터 요구하여 실제 준비 전 traceback으로 종료됐다.
+서버의 이전 설치 로그가 없으므로 setup을 건너뛰었는지, 설치가 중간에 실패했는지는 단정하지 않는다.
+
+- `scripts/check_dependencies.py`는 표준 라이브러리만으로 시작해 전체 lock의 누락/버전 불일치를
+  한 번에 보고하고, runtime import와 CUDA wheel 종류도 검사한다. GPU allocation 자체는 요구하지 않는다.
+- `paper.sh --prepare-only`는 검증된 Conda Python으로 먼저 검사하고, 불완전하면 전체 setup을
+  한 번 실행한 뒤 재검사한다. 어느 단계든 실패하면 데이터 준비로 넘어가지 않는다.
+- `setup_gpu.sh`의 `SKIP_DEPS` 분기를 제거했다. 기본 설치와 자동 보완 모두 전체 고정 의존성을
+  설치한다. 설치 자체의 Linux/NVIDIA 드라이버·GPU 할당·네트워크 요건은 그대로다.
+- 학습 진입점은 설치 상태를 읽기 전용으로 확인하며 누락되면 run 폴더 생성 전에 설치 명령을 안내한다.
+  `chartgat`의 algebra export는 lazy loading으로 바꿔 cache/도움말이 NumPy에 의존하지 않게 했다.
+  `--help`/`--dry-run`은 설치·다운로드 없이 실행되며 자동 보완 대상이 아니다.
+- 패키지를 볼 수 없는 `python -S` subprocess로 cache import, CLI 도움말/dry-run, 누락 오류 안내를
+  검증했다. 기존 public algebra API도 유지된다. 전체 pytest **256 passed, 24 skipped**, Ruff 통과.
+  생략은 Linux/Bash 동적 검사 23개와 PyG batching 검사 1개다. 기존 Windows faulthandler 진단이
+  출력됐지만 pytest 프로세스는 종료 코드 0이었다. 실제 서버 설치와 CUDA 학습은 여기서 실행하지 않았다.
+
 ### 2026-08-30 최종 실행 범위: 트랙별 데이터에서 우리 모델만 실행
 
 기본 실행은 `--suite benchmark`로 변경했다. Conductance GAT는 GAT/GATv2 논문에
@@ -106,9 +128,9 @@ Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 
 ### 코드 스냅샷
 
 - 파일: `code_summary.md`
-- 포함 파일: 96개
-- 크기: 888,612 bytes, 23,459 lines (`str.splitlines()` 기준)
-- SHA-256: `6992248634329AC31A129FCDB1D78E6A969F7A5182F9556FAC9B361095D8F332`
+- 포함 파일: 98개
+- 크기: 907,044 bytes, 23,951 lines (`str.splitlines()` 기준)
+- SHA-256: `9A71842E17A3DC29FFEBC6B9BCB95A4C32A9803F86396FFA3A5F6D8B4AAB5A00`
 - 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`, `.gitattributes`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
 

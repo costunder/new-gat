@@ -22,8 +22,10 @@ from chartgat.cache import atomic_write_bytes, atomic_write_json
 
 try:
     from scripts.aggregate_paper import aggregate_manifest
+    from scripts.check_dependencies import DependencyCheckError, check_dependencies, error_message
 except ModuleNotFoundError:  # Direct ``python scripts/run_paper.py`` execution.
     from aggregate_paper import aggregate_manifest
+    from check_dependencies import DependencyCheckError, check_dependencies, error_message
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TRACK_MODULES = {
@@ -522,6 +524,12 @@ def main() -> int:
             if output is not None:
                 print(f"  output: {output}")
         return 0
+
+    try:
+        check_dependencies()
+    except DependencyCheckError as error:
+        print(error_message(error), file=sys.stderr)
+        return 2
 
     run_dir = PROJECT_ROOT / "runs" / "paper" / run_id
     if run_dir.exists() or any(

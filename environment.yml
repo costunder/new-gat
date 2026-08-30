@@ -5,6 +5,8 @@ channels:
 dependencies:
   - python=3.11
   - pip
-# Install the pinned CUDA research packages with: bash scripts/setup_gpu.sh
+# Bootstrap only: create/activate does not yet install NumPy or the research stack.
+# Install ALL pinned CUDA research packages with: bash scripts/setup_gpu.sh
+# prepare_data.sh also runs that installer if the active environment is incomplete.
 # CUDA packages are kept out of the bootstrap environment so the official
 # PyTorch wheel index and constraints file are always applied together.

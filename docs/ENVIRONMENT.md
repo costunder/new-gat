@@ -8,6 +8,23 @@
 공식 PyTorch CUDA wheel 저장소와 `requirements-lock.txt`, `constraints-cu126.txt`를 함께 사용해 설치한다.
 Conda base 환경과 중첩된 venv는 설치 대상에서 제외한다.
 
+`prepare_data.sh`는 NumPy를 포함한 전체 lock의 설치 버전과 실제 runtime import를 먼저
+검사한다. 누락·버전 불일치·import 오류가 있으면 `setup_gpu.sh`를 한 번 실행하고 재검사한다.
+설치 스크립트는 의존성을 생략하는 `SKIP_DEPS` 경로를 더 이상 제공하지 않는다.
+자동 설치가 실패하면 데이터 준비도 중단하며, 설치나 다운로드를 반복 시도하지 않는다.
+자동 설치는 수동 설치와 같은 Linux/NVIDIA 드라이버·GPU 할당·네트워크 조건을 요구한다.
+이미 설치된 CUDA 패키지의 검사와 데이터 준비 자체에는 GPU 할당이 필요하지 않지만 학습에는 필요하다.
+
+설치를 명시적으로 다시 실행하려면 활성 `new-gat` 환경의 저장소 폴더에서 다음을 사용한다.
+
+```bash
+bash scripts/setup_gpu.sh && bash scripts/prepare_data.sh
+```
+
+학습 실행기는 패키지를 자동 설치하지 않는다. 의존성이 없으면 interpreter 경로와 전체 누락
+패키지 목록, 위 설치 명령을 알려주고 run 폴더를 만들기 전에 종료한다.
+`--help`와 `--dry-run`은 연구 패키지 없이도 확인할 수 있으며 설치나 다운로드를 수행하지 않는다.
+
 Conda 설치 시 해당 터미널의 shell 초기화까지 완료해야 한다. `conda activate`가 초기화
 오류를 내면 Conda 설치 안내에 따라 shell을 초기화하고 새 터미널에서 활성화한다.
 저장소 실행 명령마다 shell 초기화 코드를 붙이지 않는다.

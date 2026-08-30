@@ -100,6 +100,18 @@ def test_gpu_setup_uses_fixed_reference_runtime_and_opt_in_unit_tests() -> None:
     assert 'wheel_tag="cu132"' not in source
 
 
+def test_gpu_setup_always_installs_full_locked_dependencies() -> None:
+    source = (ROOT / "scripts" / "setup_gpu.sh").read_text(encoding="utf-8")
+    assert "SKIP_DEPS" not in source
+    assert source.count('--requirement "${lock_file}"') == 1
+    assert source.count('--no-deps --no-build-isolation -e "${project_root}"') == 1
+    assert source.index("command -v nvidia-smi") < source.index("-m pip install")
+    assert source.index('--requirement "${lock_file}"') < source.index(
+        '--no-deps --no-build-isolation -e "${project_root}"'
+    )
+    assert source.index('--requirement "${lock_file}"') < source.index("scripts/verify_gpu_lock.py")
+
+
 def test_conda_bootstrap_uses_named_environment_and_python_311() -> None:
     import yaml
 

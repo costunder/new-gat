@@ -40,6 +40,8 @@ bash scripts/setup_gpu.sh
 이후 명령은 모두 저장소 최상위 폴더에서, `new-gat` 환경을 활성화한 상태로 실행한다.
 설치 스크립트는 연구 패키지 버전, CUDA runtime, import 호환성을 확인하고 실제 설치 내역을 저장한다.
 서버 드라이버 버전에 따라 CUDA 패키지를 자동으로 바꾸지 않는다.
+`conda env create`는 Python과 pip를 준비하며, **연구 의존성 전체 설치는 `setup_gpu.sh`가 수행한다.**
+설치 중 오류가 나면 그 상태를 설치 완료로 보지 않는다.
 
 별도 CUDA runtime 선택, Conda 활성화 문제와 검사 명령은 [환경 안내](docs/ENVIRONMENT.md)에 있다.
 
@@ -51,6 +53,11 @@ bash scripts/setup_gpu.sh
 ```bash
 bash scripts/prepare_data.sh
 ```
+
+이 명령은 활성 Conda 환경의 필수 패키지 버전과 import를 먼저 확인한다. NumPy 등 의존성이
+누락되었으면 전체 설치 스크립트를 한 번 실행하고, 설치·검사가 성공한 경우에만 데이터를 준비한다.
+자동 설치에도 위의 Linux/NVIDIA GPU 환경과 네트워크가 필요하다. 설치가 실패하면 데이터 준비도 중단된다.
+학습 명령은 패키지를 자동 변경하지 않으며, 설치가 불완전하면 설치 명령을 안내하고 중단한다.
 
 기본 저장 경로는 `data/paper/`다. 준비만 수행하며 모델을 학습하지 않는다.
 `data/`와 트랙별 `results/` 디렉터리는 저장소에 포함되어 있고, 하위 디렉터리는 실행기가
