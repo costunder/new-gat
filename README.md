@@ -1,392 +1,380 @@
-# NEW GAT — 독립 연구 트랙 GPU 재현 가이드
+# NEW GAT — 처음부터 서버에서 실행하기
 
-이 저장소는 세 가설을 **서로 결합하지 않고** 각각 학습·평가한다.
+이 문서는 **MobaXterm으로 Linux NVIDIA GPU 서버에 접속한 뒤, 저장소를 받아 실험을
+실행하고 결과를 확인하는 순서**를 안내한다. 아래 명령은 Windows 로컬 터미널이 아니라
+접속한 **Linux 서버의 Bash 터미널**에서 실행한다.
 
-1. `conductance_gat`: sparse incidence conductance attention
-2. `cycle_pe`: 정적 fundamental-cycle positional encoding
-3. `tree_augmentation`: spanning-tree chart augmentation
+저장소: <https://github.com/costunder/new-gat>
 
-이전 결합 prototype은 `research/combined_later/`에 격리되어 있으며 paper runner가
-import하거나 실행하지 않는다.
+세 연구는 서로 독립이다. 전체 실행 명령도 모델을 합치지 않고 각 트랙을 따로 실행한다.
 
-## MobaXterm에서 바로 실행
+| 트랙 | 실행하는 연구 | 코드 폴더 |
+|---|---|---|
+| `conductance_gat` | 학습 가능한 edge conductance 연산자 | `research/conductance_gat/` |
+| `cycle_pe` | 정적 cycle-space positional encoding | `research/cycle_pe/` |
+| `tree_augmentation` | spanning-tree chart 증강 | `research/tree_augmentation/` |
 
-MobaXterm은 SSH terminal이다. 먼저 실제 Linux GPU node에 접속하거나 cluster의 GPU
-allocation을 받은 뒤 저장소 root에서 실행한다. 첫 확인은 반드시 다음이어야 한다.
+**처음 실행한다면 1 → 7번을 순서대로 진행한다.** 수학적 검토와 미완료 연구 항목은
+[hand_off.md](hand_off.md), 데이터·평가 규칙은 [DATASETS.md](DATASETS.md)에 별도로 정리했다.
+
+## 1. GPU 서버에 접속하고 준비물 확인
+
+MobaXterm에서 `Session → SSH`를 선택하고 서버 주소·계정·SSH port로 접속한다.
+공용 cluster라면 관리자가 안내한 방법으로 GPU node를 먼저 할당받는다. 로그인 전용
+node에서 설치·학습을 시작하지 않는다. `srun`, `qsub` 등의 정확한 할당 명령은 서버마다 다르다.
+
+접속한 서버에서 실행한다.
 
 ```bash
+hostname
 nvidia-smi
+git --version
+python3 --version
+python3 -m venv --help
+tmux -V
 ```
 
-`nvidia-smi`가 login node에서 실패하면 그 상태에서 학습하지 말고 해당 cluster의
-`srun`, `qsub`, `bsub` 등으로 GPU node를 먼저 할당한다.
+다음 조건을 확인한다.
 
-### 1. CUDA 환경 설치 및 검증
+- `nvidia-smi`에 사용할 NVIDIA GPU가 보인다.
+- `nvidia-smi` 상단의 `CUDA Version`이 **12.6 이상**이다. 이 값은 driver의 CUDA 호환 범위다.
+- Python은 **3.11 이상**이고 `venv`를 사용할 수 있다.
+- Git과 tmux가 설치되어 있다.
+- GitHub, PyPI, PyTorch wheel 저장소와 데이터셋 다운로드 주소에 접속할 수 있다.
+- 코드·가상환경·데이터·결과를 쓸 수 있는 디스크 공간과 quota가 있다.
+
+준비물이 없다면 서버의 Python/CUDA module 또는 관리자 제공 환경을 먼저 사용한다.
+이 저장소의 설치 스크립트는 NVIDIA driver나 시스템 Python을 설치하지 않는다.
+
+## 2. 공개 저장소 받기
+
+공개 상태에서는 GitHub 로그인이나 token 없이 다음 명령으로 받는다.
+
+```bash
+mkdir -p "$HOME/projects"
+cd "$HOME/projects"
+git clone https://github.com/costunder/new-gat.git
+cd new-gat
+```
+
+이미 받아 둔 저장소라면 다시 clone하지 않고 그 폴더에서 업데이트한다.
+
+```bash
+git pull --ff-only
+```
+
+이후 모든 명령은 `README.md`, `scripts/`, `research/`가 보이는 **저장소 최상위 폴더**에서
+실행한다. `pwd`의 마지막 부분이 `new-gat`인지 확인한다.
+
+긴 설치·학습 중 SSH 연결이 끊겨도 작업을 유지하려면 여기서 tmux를 시작한다.
+
+```bash
+tmux new -s new-gat
+```
+
+- tmux에서 빠져나오기: `Ctrl+b`를 누른 뒤 손을 떼고 `d`.
+- 다시 들어가기: `tmux attach -t new-gat`.
+- tmux는 cluster의 GPU 할당 만료나 작업 시간 제한을 연장하지 않는다.
+
+데이터와 결과를 저장할 위치를 **tmux 안에서** 지정한다. 아래 기본값은 저장소 안의
+`data/`, `results/`이며 Git 업로드 대상에서 제외되어 있다.
+
+```bash
+export NEW_GAT_DATA_ROOT="$PWD/data"
+export NEW_GAT_RESULTS_ROOT="$PWD/results"
+mkdir -p "$NEW_GAT_DATA_ROOT" "$NEW_GAT_RESULTS_ROOT"
+```
+
+서버가 scratch 사용을 요구한다면 위 두 경로를 서버에서 허용한 경로로 바꾼다. 예를 들어
+`/scratch/$USER/new-gat-data`, `/scratch/$USER/new-gat-results`를 사용할 수 있지만,
+해당 경로가 실제 서버에 존재하고 쓰기 가능한지 먼저 확인한다.
+새 SSH/tmux 세션에서는 두 `export` 명령을 다시 실행하고 **기존과 같은 경로**를 지정한다.
+
+## 3. GPU 실행 환경 설치
 
 ```bash
 bash scripts/setup_gpu.sh
 ```
 
-이 스크립트는 다음을 실제로 수행한다.
+이 명령 하나가 `.venv-gpu` 가상환경 생성, 고정 버전 의존성 설치, CUDA 연산 확인,
+단위 테스트를 실행한다. 처음에는 패키지 다운로드 때문에 시간이 걸린다.
+마지막에 다음 문장이 출력되어야 다음 단계로 간다.
 
-- `.venv-gpu` 생성
-- NVIDIA driver가 지원하는 공식 `cu126`, `cu130`, `cu132` PyTorch wheel channel 선택
-- 선택한 `constraints-cu*.txt`와 `requirements-lock.txt`의 exact pin으로 설치
-- PyG, OGB, SciPy, scikit-learn을 포함한 모든 top-level pin의 설치 버전 재검증
-- import-time ABI와 `torch.version.cuda`가 선택한 wheel tag와 일치하는지 검증
-- `torch.cuda.is_available()` 및 선택 GPU 검증
-- sparse `B -> C -> B^T` gather/scatter forward, backward, finite-value 검증
-- 전체 pytest 실행
-- `.gpu-environment.json`과 `.gpu-environment.freeze.txt`에 실제 해석된 환경 기록
-
-기본 lock은 `torch==2.13.0`이며 Python 3.11에서도 wheel이 존재하는 NumPy/SciPy
-버전을 사용한다. 이 torch lock은 CUDA 12.6+ wheel만 지원하므로 `nvidia-smi`가 12.6
-미만을 보고하면 과거 `cu118` torch로 조용히 후퇴하지 않고 설치를 중단한다.
-
-서버가 제공하는 active Conda 환경의 **위치**를 재사용하려면:
-
-```bash
-conda activate YOUR_ENV
-USE_ACTIVE_ENV=1 bash scripts/setup_gpu.sh
+```text
+GPU environment ready. Run: bash scripts/paper.sh --help
 ```
 
-이 경우에도 setup은 기본적으로 torch와 모든 top-level exact pin을 설치·정렬한다. 기존
-의존성을 전혀 바꾸지 않으려면 `USE_ACTIVE_ENV=1 SKIP_DEPS=1`을 함께 지정해야 하며, 이미
-설치된 환경이 exact pin, ABI, CUDA runtime 검증을 모두 만족하지 않으면 즉시 실패한다.
-
-driver가 여러 wheel runtime을 지원할 때 channel을 고정하려면 tag를 명시한다. 예를 들어
-CUDA 13.2 호환 driver에서도 `cu126`을 의도적으로 사용할 수 있다.
+실제 Python과 GPU를 한 번 더 확인한다.
 
 ```bash
-CUDA_WHEEL_TAG=cu126 \
-  USE_ACTIVE_ENV=1 bash scripts/setup_gpu.sh
+.venv-gpu/bin/python -c 'import sys, torch; print(sys.executable); print(torch.__version__); print(torch.version.cuda); print(torch.cuda.get_device_name(0))'
+bash scripts/paper.sh --help
 ```
 
-허용 tag는 `cu126`, `cu130`, `cu132`뿐이며 각각 같은 이름의 constraints 파일과
-공식 `download.pytorch.org` channel에 고정된다. 설치가 끝난 뒤 exact top-level pin과
-실제 CUDA runtime이 다르면 setup은 성공 메시지를 내지 않는다. Transitive dependency는
-setup 시점의 전체 `pip freeze`를 함께 남기므로 서버 실행 기록에 두 snapshot 파일도
-보관한다. 이 Windows 작업공간에서는 constraints의 정적 일관성과 CPU 단위 테스트만
-검증했으며, 각 CUDA tag의 실제 kernel 인증은 해당 GPU 서버에서 setup을 실행해야 한다.
+이후 `bash scripts/paper.sh`는 자동으로 `.venv-gpu/bin/python`을 사용한다.
+다른 Python 스크립트를 직접 호출할 때도 아래 예제처럼 `.venv-gpu/bin/python`을 쓴다.
+환경 활성화 명령은 필수가 아니다.
 
-### 2. 전체 데이터 준비
+설치 기록은 `.gpu-environment.json`, `.gpu-environment.freeze.txt`에 남는다.
+현재 lock은 `torch==2.13.0`이며 driver에 따라 `cu126`, `cu130`, `cu132` 중 하나를 선택한다.
+CUDA 12.6 미만 driver에서는 설치를 중단하며 CPU로 자동 전환하지 않는다.
 
-데이터와 결과를 scratch에 두는 예시다. 경로는 서버 정책에 맞게 바꾼다.
+## 4. 먼저 아주 작은 GPU 테스트 실행
+
+공개 데이터셋을 내려받기 전에 세 트랙의 학습·평가·결과 저장 경로가 작동하는지 확인한다.
+이 단계는 작은 자체 생성 데이터만 사용한다.
 
 ```bash
-paper_data_root=/scratch/$USER/new-gat-data
-paper_results_root=/scratch/$USER/new-gat-results
-
 bash scripts/paper.sh \
-  --suite all \
-  --prepare-only \
-  --allow-download \
-  --data-root "$paper_data_root" \
-  --results-root "$paper_results_root" \
+  --suite core --tiny --device cuda \
+  --data-root "$NEW_GAT_DATA_ROOT" \
+  --results-root "$NEW_GAT_RESULTS_ROOT" \
+  --model-seeds 0 \
+  --data-seed 0 --split-seed 0 --chart-seed 0 \
+  --batch-size 16 --workers 0 --fail-fast \
+  --run-id first-gpu-smoke
+```
+
+종료 후 성공 여부를 확인한다. 출력이 `passed`여야 한다.
+
+```bash
+.venv-gpu/bin/python -c 'import json; print(json.load(open("runs/paper/first-gpu-smoke/manifest.json"))["status"])'
+```
+
+`--tiny`는 실행 경로 점검용이다. 여기서 얻은 숫자를 정식 실험 결과로 쓰지 않는다.
+같은 명령을 재실행할 때는 `--run-id first-gpu-smoke-v2`처럼 새 이름을 사용한다.
+
+## 5. 정식 데이터셋 준비
+
+데이터셋은 Git 저장소에 들어 있지 않다. 다음 명령이 자체 생성 데이터와 공개 benchmark를
+준비한다. **이 단계에서는 학습하지 않는다.**
+
+```bash
+bash scripts/paper.sh \
+  --suite all --prepare-only --allow-download \
+  --data-root "$NEW_GAT_DATA_ROOT" \
+  --results-root "$NEW_GAT_RESULTS_ROOT" \
+  --model-seeds 0 \
   --data-seed 0 --split-seed 0 --chart-seed 0 \
   --run-id prepare-all-v1
 ```
 
-`--allow-download`는 이 단계에서만 public endpoint 접근을 허용한다. 이후 실행은
-검증된 cache를 사용하며, cache가 없거나 깨졌다면 조용히 다른 데이터로 대체하지
-않고 실패한다. 모델 seed sweep에서 benchmark가 바뀌지 않도록 generated dataset은
-`--data-seed`로 한 번만 만들고, `--prepare-only`는 model seed 수만큼 같은 cache를 중복
-생성하지 않는다.
+| 트랙 | `--suite core` | `--suite all`에서 추가되는 데이터 |
+|---|---|---|
+| Conductance | S1–S4 자체 생성 데이터 | PascalVOC-SP, ogbg-molhiv |
+| Cycle PE | CycleCount-OOD | BREC v3, ZINC-12K |
+| Tree augmentation | CycleCount multi-chart | CSL, ZINC-12K |
 
-준비 상태 확인:
+준비가 끝나면 파일 존재뿐 아니라 split·shape·checksum까지 검사한다.
 
 ```bash
 .venv-gpu/bin/python scripts/check_datasets.py \
   --profile paper \
-  --data-root "$paper_data_root" \
-  --seeds 0 \
+  --data-root "$NEW_GAT_DATA_ROOT" \
+  --data-seeds 0 --split-seeds 0 \
   --require-cache
 ```
 
-이 검사는 glob 존재 여부만 보지 않는다. 각 트랙의 read-only validator가 요청 seed의
-schema/profile, split cardinality, ID와 target shape/finite 값, manifest/data checksum을
-검사한다. Public cache는 필수 split과 full protocol cardinality까지 확인하며 network나
-cache 생성을 수행하지 않는다. 결과 상태는 `valid`, `missing`, `incomplete`, `corrupt`,
-`wrong_request`로 구분된다. Tiny fixture를 검사할 때만 같은 명령에 `--tiny`를 추가한다.
-여기서 dataset checker의 `--seeds`는 `--data-seeds` 호환 alias이며 model seed 목록이
-아니다. Data와 split cache seed가 다르면 `--data-seeds 11 --split-seeds 13`처럼 각각 준다.
+모든 필수 cache가 `valid`여야 한다. `missing`, `incomplete`, `corrupt`, `wrong_request`가
+있으면 학습을 시작하지 말고 출력에 나온 데이터·경로·seed를 확인한다.
+다운로드가 중단됐다면 같은 data root와 seed로 준비 명령을 다시 실행하되,
+`--run-id prepare-all-v2`처럼 새 run ID를 준다. 손상 cache를 무조건 덮어쓰는 기능은 없다.
 
-### 3. GPU 경로 짧은 인증
+`--allow-download`는 공개 데이터 다운로드를 허용하는 옵션이다. 이후 학습 명령에서는
+이 옵션을 빼고 검증된 cache를 사용한다. 준비 단계가 CPU 데이터 생성 작업을 수행하는
+것은 정상이며, 정식 모델 학습은 CUDA에서 실행한다.
 
-먼저 데이터 다운로드 없이 트랙별 실제 모델 경로를 shape-stress한다. `--profile`은
-반복할 수 있고 `--profile all`은 아래 5개를 모두 고른다.
+## 6. 정식 크기로 1 seed 점검
 
-```bash
-python scripts/gpu_preflight.py \
-  --device cuda --require-paper-deps \
-  --profile conductance \
-  --profile cycle-projector \
-  --profile tree-chart \
-  --profile brec \
-  --profile public-pyg \
-  --batch-size 32 --brec-batch-size 16 \
-  --nodes-per-graph 64 --edges-per-graph 128 --cycle-rank 64 \
-  --cycle-variants no_pe,raw,set,projector --brec-protocol official --no-brec-amp \
-  --amp --min-free-gb 8 \
-  --json-out runs/preflight/paper-envelope.json
-```
-
-각 profile은 다음 production path를 forward/backward까지 실행한다.
-
-| profile | 검사 경로 |
-|---|---|
-| `conductance` | packed sparse gather → learned positive conductance → scatter |
-| `cycle-projector` | 선택한 Cycle variant 각각의 `PaperCycleModel`; projector는 선택됐을 때만 dense `m×m` |
-| `tree-chart` | padded dense `batch×m×beta` chart → variable-beta encoder |
-| `brec` | 선택 variant별 BREC model backward와 32쌍 covariance/pinv; official은 float32/no-AMP batch 16 |
-| `public-pyg` | synthetic PyG `Data` → 실제 adapter/DataLoader → PascalVOC-SP와 MolHIV model |
-
-JSON의 각 profile에는 `allocated`, `reserved`, `peak_allocated`, `peak_reserved`(bytes),
-`wall_time`(seconds), host tensor/RSS와 실제 검사 shape가 기록된다. CUDA에서는 지정한
-batch/shape를 그대로 쓰고 CPU `--allow-cpu`에서는 작은 코드-smoke shape로 자동 축소한다.
-`--cycle-variants`가 Cycle/BREC 양쪽 model path를 정한다. Full official BREC는
-`--brec-protocol official --brec-batch-size 16 --no-brec-amp`를 강제하고, tiny custom은
-master의 요청 batch/AMP를 따른다. 다른 profile은 `--amp/--no-amp`를 따른다.
-
-중요하게, 이것은 명시한 shape의 **synthetic memory/compute stress**이며 public dataset을
-디스크에서 읽은 E2E 인증이나 결과 재현이 아니다. 실제 cache에서 관측한 최대
-`nodes/edges/beta`가 기본값보다 크면 세 shape 인자를 올려 다시 인증해야 한다. 아래
-tiny CUDA run은 adapter부터 artifact까지의 짧은 E2E이고, 둘 다 성능 결과로 쓰지 않는다.
-Master runner는 선택한 track/suite/PE variant에 맞춰 이 profile들을 자동으로 고른다.
-`public-pyg`는 conductance `suite=all`에만 붙고 cycle/tree-only run에는 붙지 않는다.
-`--prepare-only`는 accelerator capacity 인증이 아니므로 CPU conductance code-smoke만 실행한다.
-Master에서 envelope를 바꿀 때는 `--preflight-nodes-per-graph`,
-`--preflight-edges-per-graph`, `--preflight-cycle-rank`를 사용한다.
-
-```bash
-bash scripts/paper.sh \
-  --suite core \
-  --tiny \
-  --device cuda \
-  --data-root "$paper_data_root" \
-  --results-root "$paper_results_root" \
-  --model-seeds 0 \
-  --data-seed 0 --split-seed 0 --chart-seed 0 \
-  --run-id gpu-sanity-v1
-```
-
-### 4. 한 seed kill test
-
-BREC를 포함한 전체 실행 전에 각 트랙의 core를 한 model seed로 먼저 확인한다.
+전체 5 seed를 시작하기 전에 세 트랙의 `core`를 정식 데이터 크기로 한 번 실행한다.
 
 ```bash
 bash scripts/paper.sh \
   --suite core --device cuda \
-  --data-root "$paper_data_root" \
-  --results-root "$paper_results_root" \
+  --data-root "$NEW_GAT_DATA_ROOT" \
+  --results-root "$NEW_GAT_RESULTS_ROOT" \
   --model-seeds 0 \
   --data-seed 0 --split-seed 0 --chart-seed 0 \
-  --batch-size 16 --workers 2 --min-free-gb 8 \
-  --run-id core-kill-test-v1
+  --batch-size 16 --workers 2 --min-free-gb 8 --fail-fast \
+  --run-id core-one-seed-v1
 ```
 
-Cycle 후보를 먼저 줄일 때는 master에서도 variant, target, optimization budget을 전달할 수
-있다. 이 명령은 CycleCount core만 실행하며 official BREC를 시작하지 않는다.
+```bash
+.venv-gpu/bin/python -c 'import json; print(json.load(open("runs/paper/core-one-seed-v1/manifest.json"))["status"])'
+```
+
+`passed`와 결과 파일을 확인한 뒤 다음 단계로 간다. 이 실행은 공개 benchmark와 BREC를
+아직 학습하지 않는다. `--min-free-gb 8`은 시작 시 여유 GPU 메모리 검사값이지,
+전체 학습이 8 GB 안에 들어간다는 보장은 아니다.
+
+## 7. 정식 실험 실행
+
+### 세 트랙을 모두 5 seeds로 실행
+
+**주의:** `suite=all`에는 장시간의 official BREC가 포함된다. 기본 4 PE variants ×
+내부 10 search seeds × 400 graph pairs를 학습하며 pair별 중단 복구/resume는 없다.
+작은 GPU 테스트와 1 seed 점검을 통과하고 서버의 작업 시간 제한을 확인한 뒤 실행한다.
+
+```bash
+bash scripts/paper.sh \
+  --suite all --device cuda \
+  --data-root "$NEW_GAT_DATA_ROOT" \
+  --results-root "$NEW_GAT_RESULTS_ROOT" \
+  --model-seeds 0,1,2,3,4 \
+  --data-seed 0 --split-seed 0 --chart-seed 0 \
+  --cycle-variants no_pe,raw,set,projector \
+  --batch-size 32 --workers 4 --min-free-gb 8 \
+  --run-id paper-all-v1
+```
+
+각 트랙과 model seed는 별도 프로세스·결과 폴더로 순서대로 실행된다. BREC만 자체
+official 10-seed protocol을 정확히 한 번 실행하며 바깥 5 seeds와 중복해서 곱하지 않는다.
+한 트랙이 실패하면 기본적으로 나머지는 계속 실행하고 마지막에 실패를 보고한다.
+첫 실패에서 즉시 멈추려면 `--fail-fast`를 추가한다.
+
+### 한 트랙만 실행
+
+아래 명령에서 `conductance_gat`을 `cycle_pe` 또는 `tree_augmentation`으로 바꾸면 된다.
+run ID도 실행마다 새 이름으로 바꾼다.
+
+```bash
+bash scripts/paper.sh \
+  --tracks conductance_gat --suite all --device cuda \
+  --data-root "$NEW_GAT_DATA_ROOT" \
+  --results-root "$NEW_GAT_RESULTS_ROOT" \
+  --model-seeds 0,1,2,3,4 \
+  --data-seed 0 --split-seed 0 --chart-seed 0 \
+  --batch-size 32 --workers 4 --min-free-gb 8 \
+  --run-id conductance-all-v1
+```
+
+공개 benchmark를 제외하고 자체 생성 실험만 하려면 `--suite all`을 `--suite core`로 바꾼다.
+Cycle PE 후보만 짧게 비교하려면 다음처럼 graph target과 두 후보로 제한할 수 있다.
 
 ```bash
 bash scripts/paper.sh \
   --tracks cycle_pe --suite core --device cuda \
+  --data-root "$NEW_GAT_DATA_ROOT" \
+  --results-root "$NEW_GAT_RESULTS_ROOT" \
   --model-seeds 0 \
-  --cycle-variants no_pe,projector \
-  --cycle-core-targets graph \
+  --data-seed 0 --split-seed 0 --chart-seed 0 \
+  --cycle-variants no_pe,projector --cycle-core-targets graph \
   --cycle-epochs 20 --cycle-learning-rate 0.001 \
   --batch-size 16 --workers 2 \
-  --run-id cycle-candidate-kill-v1
+  --run-id cycle-candidates-v1
 ```
 
-Official BREC는 고정 20 epochs/LR `1e-4` protocol이므로 위 optimization override를
-무시하고, `--cycle-variants`로 확정한 후보만 받는다.
+이 후보 비교는 official BREC를 실행하지 않는다. Official BREC를 선택하면 epochs/LR,
+batch 16, float32/no-AMP 등은 고정 protocol을 따른다.
 
-### 5. 전체 독립 실험
+## 8. 진행 상황과 결과 확인
 
-SSH가 끊겨도 계속 돌도록 `tmux` 안에서 실행하는 것을 권장한다.
+학습 출력은 터미널과 로그 파일에 동시에 기록된다. 다른 SSH 창에서도 저장소 폴더로
+이동한 뒤 다음 명령으로 확인할 수 있다.
 
 ```bash
-tmux new -s new-gat
-
-bash scripts/paper.sh \
-  --suite all \
-  --device cuda \
-  --data-root "$paper_data_root" \
-  --results-root "$paper_results_root" \
-  --model-seeds 0,1,2,3,4 \
-  --data-seed 0 --split-seed 0 --chart-seed 0 \
-  --batch-size 32 \
-  --workers 4 \
-  --min-free-gb 8 \
-  --run-id paper-all-v1
+nvidia-smi
+ls runs/paper/paper-all-v1/logs/
+tail -n 50 runs/paper/paper-all-v1/logs/*.log
 ```
 
-다른 GPU를 직접 고를 때는 `--device cuda:1`을 사용한다. cluster가
-`CUDA_VISIBLE_DEVICES`를 설정한다면 보통 그 allocation 안에서 `--device cuda`가
-맞다. OOM이면 같은 `run-id`를 재사용하지 말고 batch size를 낮춘 새 run을 만든다.
-`suite=all`은 official BREC만 해도 4 variants × 10 search seeds × 400 pairs이므로 매우
-비싸다. Kill test와 트랙별 후보 축소를 통과한 뒤 실행한다.
-
-## CPU에 대한 명확한 경계
-
-Full paper training은 CPU로 자동 fallback하지 않는다. `scripts/run_paper.py`는 full
-CPU 실행을 거부한다. CPU는 오직 코드/fixture 검증에만 명시적으로 허용된다.
+실행 종료 후 전체 성공 여부를 확인한다.
 
 ```bash
-python scripts/run_paper.py \
-  --suite core --tiny --device cpu --allow-cpu \
-  --model-seeds 0 --data-seed 0 --split-seed 0 --chart-seed 0 \
-  --run-id cpu-code-check
+.venv-gpu/bin/python -c 'import json; print(json.load(open("runs/paper/paper-all-v1/manifest.json"))["status"])'
+ls runs/paper/paper-all-v1/aggregate/
 ```
 
-이 숫자는 논문 결과가 아니다. 실제 결과에는 CUDA preflight가 통과한 run만 쓴다.
+첫 명령이 `passed`여야 전체 명령이 성공한 것이다. `failed`이면
+`aggregate/failures.csv`, `manifest.json`의 command 항목과 해당 로그를 확인한다.
 
-## 세 연구의 경계
+| 파일/폴더 | 확인할 내용 |
+|---|---|
+| `runs/paper/<run-id>/manifest.json` | 전체 상태, 실제 명령, seed, source revision, 각 작업의 성공/실패 |
+| `runs/paper/<run-id>/logs/` | 트랙·seed별 stdout/stderr |
+| `runs/paper/<run-id>/gpu-preflight.json` | GPU 사전검사와 검사한 shape·메모리 |
+| `runs/paper/<run-id>/aggregate/metrics.csv` | 등록된 test metric의 seed 평균·표준편차·95% CI |
+| `runs/paper/<run-id>/aggregate/paired.csv` | seed를 맞춘 비교군 차이 |
+| `runs/paper/<run-id>/aggregate/efficiency.csv` | 시간·메모리·active parameter 관측 |
+| `runs/paper/<run-id>/aggregate/failures.csv` | 실패한 실행 목록 |
+| `$NEW_GAT_RESULTS_ROOT/<track>/<run-id>/` | 각 트랙의 상세 결과와 checkpoint |
 
-| 폴더 | 독립 가설 | 포함 | 포함하지 않음 |
-|---|---|---|---|
-| `research/conductance_gat/` | \(H\to BH\to C_\theta BH\to B^\top C_\theta BH\) | positive learned conductance, sparse variable-graph batching | cycle basis, tree chart, flow completion |
-| `research/cycle_pe/` | \(F_T\subset\ker(B^\top)\)를 정적 edge PE로 전달 | raw/set/projector 비교, cycle counting, BREC, ZINC | learned conductance, sample circulation, chart augmentation |
-| `research/tree_augmentation/` | 같은 graph에서 \(T\)를 바꾼 full-\(\beta\) chart 증강 | BFS/DFS multi-chart training, held-out Wilson UST 평가 | conductance, potential, lossy \(k<\beta\) |
+Cycle `suite=all` 결과는 model seed별 `core/`, `zinc/`와 별도의
+`brec-official-10-seed/`로 나뉜다. 데이터 준비만 한 run에는 metric 집계가 없다.
 
-교차 import는 `tests/test_research_boundaries.py`가 막는다. 공통 사용이 허용된 것은
-`src/chartgat/`의 저수준 incidence/tree algebra뿐이다.
+결과를 PC로 가져올 때는 MobaXterm의 SFTP 패널에서 **트랙 결과 폴더와
+`runs/paper/<run-id>/`를 함께** 받는다. 환경 재현을 위해 `.gpu-environment.json`,
+`.gpu-environment.freeze.txt`도 보관한다. 데이터·결과·checkpoint는 GitHub에 자동 업로드되지 않는다.
 
-## 실제 구현된 데이터 및 비교
+## 9. 자주 막히는 문제
 
-| 트랙 | `core` | `all`에서 추가 |
-|---|---|---|
-| Conductance GAT | S1 multi-graph identification, S2 topology/size OOD, S3 nonlinear rollout, S4 noise×coverage×contrast | PascalVOC-SP, ogbg-molhiv |
-| Static Cycle PE | 20k CycleCount-OOD, C3–C6 edge/node/graph task를 독립 학습 | BREC v3 official RPC, ZINC-12K official split |
-| Tree augmentation | graph-first CycleCount multi-chart 2×2 ID/OOD×seen/unseen-chart | CSL, chemistry-preserving ZINC-12K multi-chart |
+| 증상 | 할 일 |
+|---|---|
+| `nvidia-smi: command not found` 또는 GPU가 안 보임 | GPU node/allocation인지 확인한다. CPU로 학습을 대신 실행하지 않는다. |
+| Python 버전 또는 `venv` 오류 | Python 3.11+ module/환경을 준비한다. 다른 executable은 `PYTHON=python3.11 bash scripts/setup_gpu.sh`처럼 지정한다. |
+| CUDA 12.6 미만 / driver 호환 오류 | 관리자에게 driver 환경을 확인한다. 현재 lock은 구형 torch로 자동 하향하지 않는다. |
+| `GPU Python was not found` | 저장소 root에서 `bash scripts/setup_gpu.sh`를 먼저 끝낸다. |
+| `ModuleNotFoundError` | 직접 호출 시 `.venv-gpu/bin/python`을 쓰는지 확인한다. 설치를 끝낸 환경과 실행 환경이 같아야 한다. |
+| 데이터 cache가 없다고 나옴 | 5번 준비·검사를 실행하고 data root와 data/split seed가 학습 명령과 같은지 확인한다. |
+| `run id already exists` | 기존 결과를 지우지 말고 새 `--run-id`를 사용한다. 자동 resume 옵션은 없다. |
+| CUDA OOM | 해당 작업을 멈추고 batch를 `32 → 16 → 8`로 낮춰 새 run ID로 실행한다. Official BREC batch는 16 고정이다. |
+| `DataLoader worker ...` 또는 공유 메모리 오류 | `--workers 0`으로 다시 점검한다. |
+| SSH 연결이 끊어짐 | tmux를 사용했다면 같은 서버에서 `tmux attach -t new-gat`로 복귀한다. |
+| `git clone`에 인증 요구 / repository not found | 저장소가 다시 Private이 됐는지 확인한다. Private은 권한 있는 GitHub 계정 인증이 필요하다. |
 
-Conductance headline model은 per-edge flux label을 읽지 않고 **node message만으로**
-학습한다. `full_flux_supervised`는 별도 ceiling, `full_joint`는 ablation이다. 비교에는
-isotropic, edge-only, gradient-only, node-message NNLS, flux LS, oracle이 포함된다.
-Public task에서는 동일 adapter/split/hidden/depth/head/optimizer 아래 no-message MLP, GCN, GAT,
-GINE, conductance model을 비교하고 active parameter count를 기록한다. 계산하지 않는 edge encoder는
-freeze/skip되지만 custom one-layer backbone의 budget을 정확히 같게 맞춘 비교는 아니다.
-S4는 contrast를 edge condition으로 명시적으로 입력하는 `known-contrast conditional recovery`이며
-blind contrast identification, unseen-contrast OOD 또는 unknown conductivity-range recovery 실험이
-아니다. Graph-global min/max로 만든 truth law와 edge-local estimator의 function-class mismatch도
-오차에 포함된다.
+GPU를 직접 고를 때는 `--device cuda:1`처럼 지정할 수 있다. Cluster가
+`CUDA_VISIBLE_DEVICES`를 설정했다면 보통 할당 내부의 `--device cuda`를 사용한다.
 
-Cycle PE의 projector는 기존 계열에 가까운 prior baseline이며 새 기여라고 부르지
-않는다. 모든 variant가 incidence/BFS tree/fundamental basis `F_T`를 계산하고, set 통계와
-dense projector만 요청 여부에 따라 조건부로 만든다. 따라서 no-PE/raw/set 실행은 dense
-projector를 만들지 않지만 no-PE도 basis 전처리 비용까지 제거하지는 않는다. Raw PE 폭은
-train split만으로 결정하고 OOD의 더 큰 cycle rank를 잘라 넣거나 test 정보로 input dimension을
-정하지 않는다. BREC는 distinguishability와 isomorphic reliability를 함께 판정한다. Seed별
-`Correct/Fail/Real_correct`는 upstream 호환 field지만, 모든 seed의 reliability를 요구하는
-`global_valid`는 저장소 자체의 보수적 gate다.
+Runner는 선택한 트랙의 synthetic GPU 사전검사를 자동 실행하지만 실제 데이터의 최대
+graph 크기를 자동 추정하지 않는다. 더 큰 graph를 검사하려면
+`--preflight-nodes-per-graph`, `--preflight-edges-per-graph`, `--preflight-cycle-rank`를
+실제 사용할 크기에 맞춰 늘린다. 사전검사 통과가 전체 데이터의 OOM 부재를 보장하지는 않는다.
 
-또한 `B^Tq`가 `ker(B^T)` circulation을 구별하지 못한다는 사실과 full graph Laplacian
-`L=D-A`가 simple unweighted graph topology를 결정한다는 사실은 다르다. Static Cycle PE는
-sample circulation 복구가 아니라 topology inductive bias다. 현재는 degree/`(n,m,β)`-matched 또는
-1-WL known-contrast, raw/set relabel robustness, LapPE·RWSE·CycleNet·표준 GNN/Graph Transformer
-baseline, variant별 preprocessing time/RSS와 large-graph scaling 결과가 없다. Official BREC도
-incremental pair checkpoint/resume를 지원하지 않는다.
+## 10. 기존 Conda 환경을 사용해야 하는 서버
 
-Tree protocol은 물리 graph split을 먼저 고정한 뒤 graph 내부에서 chart를 만든다.
-Wilson sampler는 uniform spanning tree이고, 기존 random-priority Kruskal은 별도
-non-uniform baseline으로 이름을 유지한다. ZINC cache/model은 atom과 bond categorical
-feature를 보존하며 topology-only 회귀로 바꾸지 않는다.
-Multi training에는 BFS/DFS만 사용하고 Wilson은 실제 held-out sampler family로 남긴다.
-Encoder는 sign-even cycle membership을 사용해 같은 physical tree의 orientation/order gauge에는
-불변이지만, label-dependent traversal이 다른 tree를 고르는 경우는 chart shift로 평가한다.
-
-세부 split, metric, leakage guard와 source는 [DATASETS.md](DATASETS.md) 및 각
-`research/<track>/datasets.yaml`에 있다.
-
-## Runner가 보장하는 것
-
-`scripts/run_paper.py`는 각 `track × model seed`를 별도 subprocess와 별도 출력 폴더에서
-실행한다. 예외적으로 BREC는 자체 official 10-seed loop를 가지므로 `suite=all`에서
-정확히 한 번만 dispatch한다. 따라서 바깥 5 seeds와 곱해 50회 중복 실행하지 않는다.
-한 독립 run이 실패해도 기본적으로 나머지는 계속 실행하고 중앙 manifest에 실패를
-남긴다. 첫 실패에서 중단하려면 `--fail-fast`를 사용한다.
-
-- 기본 device: `cuda`
-- 기본 model seeds: `0,1,2,3,4`
-- 기본 data/split/chart seed: 각각 `0`
-- CUDA에서 AMP 사용(BREC official은 float32/no-AMP 고정)
-- 선택 suite의 synthetic shape-stress와 실제 gather/scatter backward 사전검사
-- run-id 충돌 거부
-- dependency, source revision, registry SHA256 snapshot
-- 모든 JSON의 parse 및 non-finite number 검사
-- track/model-seed별 stdout log
-- 폐쇄형 paper-metric registry에 등록된 지표만 mean/std/bootstrap 95% CI와
-  seed-aligned paired difference로 자동 집계
-- runtime/peak-memory/active-parameter 관측은 통계 검정과 분리된 efficiency table에 기록
-- 실패 및 CUDA OOM log 판정
-
-명령만 확인하고 아무 파일도 만들지 않으려면:
+기본 `.venv-gpu` 경로를 사용했다면 이 절은 건너뛴다. 서버가 지정한 Conda 환경을
+써야 한다면 설치뿐 아니라 **이후 실행에서도** `USE_ACTIVE_ENV=1`을 지정한다.
 
 ```bash
-bash scripts/paper.sh \
-  --suite all --device cuda --model-seeds 0,1,2,3,4 \
-  --data-seed 0 --split-seed 0 --chart-seed 0 \
-  --run-id inspect-only --dry-run
+conda activate YOUR_ENV
+USE_ACTIVE_ENV=1 bash scripts/setup_gpu.sh
+USE_ACTIVE_ENV=1 bash scripts/paper.sh --help
 ```
 
-## 결과 위치
+이 경우 setup은 활성 환경의 패키지를 저장소 exact pin으로 설치·정렬하므로 공유 환경에
+무작정 실행하지 않는다. 의존성을 변경하지 않으려면 `USE_ACTIVE_ENV=1 SKIP_DEPS=1`로
+검증하되 이미 설치된 버전·ABI·CUDA가 lock과 다르면 실패한다.
+직접 Python 스크립트를 실행할 때는 활성 환경의 `python`을 사용한다.
 
-`--results-root`를 생략하면 track별 결과가 연구 폴더 아래에 분리된다.
-
-```text
-research/<track>/results/paper/<run-id>/model-seed-<seed>/
-```
-
-`--results-root /scratch/...`를 주면 다음처럼 저장된다.
-
-```text
-/scratch/.../<track>/<run-id>/model-seed-<seed>/
-```
-
-Cycle `suite=all`은 `cycle_pe/<run-id>/model-seed-<seed>/{core,zinc}/`와
-`cycle_pe/<run-id>/brec-official-10-seed/`로 더 분리된다.
-
-중앙에는 모델을 합치지 않고 재현 metadata만 둔다.
-
-```text
-runs/paper/<run-id>/
-├── manifest.json
-├── environment.txt
-├── gpu-preflight.json
-├── dataset-registries/
-├── aggregate/{aggregate.json,samples.csv,metrics.csv,paired.csv,efficiency.csv,failures.csv}
-└── logs/
-```
-
-같은 `run-id`가 이미 있으면 덮어쓰지 않는다.
-
-`metrics.csv`는 JSON의 모든 숫자를 재귀 수집하지 않는다. Track별 폐쇄형 schema에 등록된
-test metric만 포함하며 각 rule이 paired comparison 가능 여부를 명시한다. Seed, epoch,
-batch size, configuration, history, sample count와 임의 parameter count는 paper 통계에서
-제외된다. `efficiency.csv`도 elapsed time, peak GPU memory와
-`trainable_active_parameters_only`로 인증된 count만 허용하고 bootstrap/paired test를 하지
-않는다. 제외된 숫자의 수는 `aggregate.json::ignored_numeric_fields`에 남는다.
-
-## 트랙 하나만 실행
-
-Master runner로 특정 트랙만 고르는 것이 가장 안전하다.
+Wheel channel을 고정해야 할 때만 다음처럼 지정한다.
 
 ```bash
-bash scripts/paper.sh \
-  --tracks conductance_gat \
-  --suite all --device cuda \
-  --data-root "$paper_data_root" \
-  --results-root "$paper_results_root" \
-  --model-seeds 0,1,2,3,4 \
-  --data-seed 0 --split-seed 0 --chart-seed 0 \
-  --run-id conductance-v1
+CUDA_WHEEL_TAG=cu126 bash scripts/setup_gpu.sh
 ```
 
-`cycle_pe`, `tree_augmentation`도 같은 방식으로 바꿔 실행한다. 각 폴더의 README에는
-더 세부적인 standalone CLI와 artifact schema가 있다.
+## 11. 업데이트와 Private 복귀
 
-## 검증 명령
+실행 중에는 source를 바꾸지 않는다. 다음 새 실험 전에 최신 코드를 받으려면 저장소에서
+`git pull --ff-only`를 실행하고, 의존성이 바뀌었다면 setup을 다시 실행한다.
+
+서버 실행을 마치고 저장소를 비공개로 되돌리려면 GitHub 저장소의
+`Settings → General → Danger Zone → Change visibility → Change to private`에서 확인한다.
+
+이미 clone된 코드와 서버의 결과 파일은 Private 전환으로 지워지지 않으며 로컬 학습도
+계속 실행된다. 추가 `git pull`이 필요 없다면 clone 직후에 비공개로 돌려도 된다.
+Private 전환 후 새 clone/pull에는 권한 있는 계정의 SSH key 또는 HTTPS 인증이 필요하다.
+공개 기간에 다른 사람이 만든 복제본은 비공개 전환으로 회수되지 않는다.
+
+## 추가 문서와 개발용 검사
+
+- [DATASETS.md](DATASETS.md): 데이터셋, split, metric, cache 규칙
+- [Conductance README](research/conductance_gat/README.md): 트랙 단독 CLI
+- [Cycle PE README](research/cycle_pe/README.md): 트랙 단독 CLI
+- [Tree augmentation README](research/tree_augmentation/README.md): 트랙 단독 CLI
+- [hand_off.md](hand_off.md): 수학·구현 경계·검증 범위·미완료 항목을 검토하는 문서
+- [code_summary.md](code_summary.md): 파일 경로별 원문 코드 스냅샷
+
+코드를 수정한 뒤 검증할 때는 다음을 사용한다.
 
 ```bash
 .venv-gpu/bin/python -m pytest -q
@@ -395,27 +383,6 @@ bash scripts/paper.sh \
 .venv-gpu/bin/python scripts/generate_code_summary.py --check
 ```
 
-Dataset code 준비와 cache 준비는 구분해서 확인한다.
-
-```bash
-.venv-gpu/bin/python scripts/check_datasets.py --profile paper
-.venv-gpu/bin/python scripts/check_datasets.py \
-  --profile paper --data-root "$paper_data_root" \
-  --seeds 0 --require-cache
-```
-
-## 현재 검증 범위
-
-이 작업 공간에서는 Windows CPU로 수학·cache·fixture·CLI·artifact 회귀 테스트를
-검증했다. 실제 public dataset 전체 다운로드와 CUDA kernel 실행은 GPU 서버에서 위
-명령으로 검증해야 한다. 따라서 저장소가 CUDA 실행을 준비하고 강제하는 것과, 이미
-논문 결과가 생성됐다는 것은 구분한다.
-
-기존 소형 smoke가 필요할 때만 다음을 사용한다.
-
-```bash
-bash scripts/setup.sh
-bash scripts/smoke.sh --run-id legacy-smoke-v1
-```
-
-Paper 결과에는 이 legacy smoke를 사용하지 않는다.
+`research/combined_later/`는 격리된 과거 prototype이다. 위 paper 명령은 이를 실행하지 않는다.
+이 저장소에는 실행 코드와 회귀 테스트가 있으며, 실제 Linux CUDA 서버에서 전체 학습을
+완료한 성능 결과가 이미 포함되어 있다는 뜻은 아니다. 정식 CPU 학습으로 자동 fallback하지 않는다.

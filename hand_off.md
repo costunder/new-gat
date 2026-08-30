@@ -1,10 +1,12 @@
 # NEW GAT 연구 프로젝트 Hand-off
 
-작성 기준일: 2026-08-29 (Asia/Seoul)
+작성 기준일: 2026-08-30 (Asia/Seoul)
 
 이 문서는 외부 ChatGPT 또는 연구 리뷰어가 저장소를 처음 받아도 수학적 가설, 구현 경계,
 데이터 계약, 실행법, 검증 범위와 미완료 항목을 혼동하지 않도록 만든 인수인계 문서다.
 원문 코드는 같은 폴더의 `code_summary.md`에 파일별로 들어 있다.
+처음 서버에서 설치·실행하는 사용자는 [README.md](README.md)의 순서를 따른다.
+이 문서는 실행 입문서가 아니라 연구·구현 교차검토용이다.
 
 ## 0. 리뷰어가 먼저 알아야 할 판정
 
@@ -39,8 +41,9 @@
 - 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
 
-이 디렉터리는 현재 Git repository가 아니므로 commit hash 기반 재현성은 없다. GPU 서버로
-옮기기 전에 Git 저장소로 초기화하고 최초 검증 상태를 commit/tag하는 것이 권장된다.
+이 디렉터리는 Git repository로 초기화되어 있으며 원격은
+`https://github.com/costunder/new-gat.git`이다. 서버에서는 실행 전에 `git rev-parse HEAD`를
+확인한다. Paper runner도 source revision과 dirty 상태를 manifest에 기록한다.
 
 ## 1. 공통 수학 관례와 원래 문제의식
 
