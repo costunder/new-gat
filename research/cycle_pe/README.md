@@ -1,5 +1,8 @@
 # Static Cycle PE 연구 트랙
 
+좌영공간 기저벡터 자체를 입력하는 새 버전은 [Cycle PE v2](v2/README.md)에 있다.
+아래 기본 실행은 기존 6개 통계형 v1이며, v2와 캐시·모델·결과를 공유하지 않는다.
+
 이 폴더는 그래프 topology에서 계산하는 **우리 Cycle PE 모델만** 학습·평가한다.
 기본 실행 경로는 `research.cycle_pe.benchmark`다. SignNet·PEARL이 사용한 ZINC-12K와
 PEARL이 사용한 Peptides-struct의 공식 데이터·split을 쓰되, **해당 논문 모델을
@@ -15,8 +18,9 @@ PEARL이 사용한 Peptides-struct의 공식 데이터·split을 쓰되, **해�
 bash research/cycle_pe/reproduce.sh
 ```
 
-ZINC-12K와 Peptides-struct에서 우리 `cycle_set` 모델을 CUDA model seeds
-`0,1,2,3,4`로 실행한다. 학습/검증/시험은 공식 split 그대로이며 seed로 다시 나누지 않는다.
+ZINC-12K와 Peptides-struct에서 우리 `cycle_set` 모델을 CUDA model seed `0`으로 실행한다.
+여러 seed 반복은 `--model-seeds 0,1,2,3,4`처럼 명시한다. 학습/검증/시험은 공식 split
+그대로이며 seed로 다시 나누지 않는다.
 학습에 필요한 공개 데이터가 없거나 손상되면 자동 다운로드나 대체 없이 오류로 종료한다.
 데이터·결과 경로, run ID와 공통 옵션은 루트 README를 따른다.
 
@@ -194,7 +198,7 @@ CLI는 `--data-seed`, `--split-seed`, `--chart-seed`, `--model-seed`를 독립�
 - ZINC는 fixed public data와 PyG official split을 그대로 사용하므로 data/split seed가
   `not_applicable`이고 model seed만 학습에 사용된다.
 - BREC official mode는 바깥 `model_seed`를 사용하지 않는다. 내부 official search seed
-  `100,200,...,1000`이 별도 protocol axis다.
+  `100,200,...,1000`이 별도 protocol axis이며, 바깥 model seed 기본값 변경의 영향을 받지 않는다.
 
 각 suite manifest의 `seed_axes`는 resolve된 네 값을, `seed_axis_policy`는 실제 사용 여부와
 `not_applicable` 사유를 기록한다.

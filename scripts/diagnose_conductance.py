@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import io
 import json
@@ -26,14 +27,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--model-seed", type=int, default=0)
-    parser.add_argument(
-        "--datasets", nargs="+", choices=DATASETS, default=["cora", "ppi", "ogbn-arxiv"]
-    )
+    parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--results-root", type=Path)
     parser.add_argument(
-        "--output-dir", type=Path, help="Optional NEW directory; default is stdout only"
+        "--output-dir",
+        type=Path,
+        help="Optional NEW directory; extended audits auto-save, basic diagnostics use stdout",
     )
     parser.add_argument("--edge-chunk-size", type=int, default=16384)
     parser.add_argument(
@@ -41,7 +42,51 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Validation-only identity-convolution ablation; no retraining",
     )
+    parser.add_argument(
+        "--full-audit",
+        action="store_true",
+        help="single-checkpoint C interventions plus a train-label gate/gradient audit",
+    )
+    parser.add_argument(
+        "--interventions",
+        action="store_true",
+        help="validation-only learned/mean/shuffled/off C interventions",
+    )
+    parser.add_argument(
+        "--gate-audit",
+        action="store_true",
+        help="optimizer-free gate input/parameter/task-gradient audit on train labels",
+    )
+    parser.add_argument(
+        "--layerwise-interventions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="also intervene on one conductance layer at a time (default: enabled)",
+    )
+    parser.add_argument("--shuffle-seed", type=int, default=0)
+    parser.add_argument("--gradient-mode", choices=("eval", "train"), default="eval")
+    parser.add_argument("--gradient-batches", type=int, default=1)
+    parser.add_argument("--gradient-sample-limit", type=int, default=4096)
+    parser.add_argument("--near-zero-threshold", type=float, default=1e-8)
     return parser
+
+
+def _extended_requested(args: argparse.Namespace) -> bool:
+    return bool(args.full_audit or args.interventions or args.gate_audit)
+
+
+def _automatic_output(args: argparse.Namespace) -> Path | None:
+    if args.output_dir is not None:
+        return args.output_dir.expanduser().resolve()
+    if not _extended_requested(args):
+        return None
+    timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return (
+        ROOT
+        / "runs"
+        / "diagnostics"
+        / f"conductance-{args.run_id}-model-seed-{args.model_seed}-{timestamp}"
+    ).resolve()
 
 
 def resolve_run(args: argparse.Namespace) -> Path:
@@ -450,6 +495,100 @@ def _print_layer(index: int, layer: dict) -> None:
     )
 
 
+def additional_audits(model, payload, device, args, config, item: dict) -> None:
+    """Extend the current item incrementally so a failed audit keeps earlier evidence."""
+
+    if args.full_audit or args.interventions:
+        from scripts.conductance_interventions import evaluate_interventions
+
+        item["stage"] = "validation_interventions"
+        print("  Comparing C interventions on validation only...", flush=True)
+        item["interventions"] = evaluate_interventions(
+            model,
+            payload,
+            device,
+            edge_chunk_size=args.edge_chunk_size,
+            shuffle_seed=args.shuffle_seed,
+            layerwise=args.layerwise_interventions,
+            progress=lambda name: print(f"    validation intervention: {name}", flush=True),
+        )
+        reference = item["interventions"]["variants"][0]["prediction"]
+        baseline = item["baseline"]["validation"]["prediction"]
+        if any(abs(reference[key] - baseline[key]) > 1e-4 for key in ("metric", "loss")):
+            raise RuntimeError("Intervention learned reference disagrees with baseline recheck")
+        for variant in item["interventions"]["variants"]:
+            prediction = variant["prediction"]
+            delta = variant["delta_vs_learned"]
+            print(
+                f"    {variant['name']}: {prediction['metric_name']}={prediction['metric']:.6f} "
+                f"delta={delta['metric']:+.6f} loss={prediction['loss']:.6f} "
+                f"logit_change={_number(delta['logits_relative_l2'])} "
+                f"prediction_flip={_number(delta['prediction_flip_fraction'])}",
+                flush=True,
+            )
+        if args.ablate_graph:
+            off = next(
+                variant
+                for variant in item["interventions"]["variants"]
+                if variant["name"] == "graph_off_all"
+            )
+            item["identity_convolution_validation"] = {"prediction": off["prediction"]}
+            item["identity_minus_original_validation"] = (
+                off["prediction"]["metric"] - item["baseline"]["validation"]["prediction"]["metric"]
+            )
+    elif args.ablate_graph:
+        item["identity_convolution_validation"] = evaluate_checkpoint(
+            model, payload, device, args.edge_chunk_size, ablate=True
+        )["validation"]
+        item["identity_minus_original_validation"] = (
+            item["identity_convolution_validation"]["prediction"]["metric"]
+            - item["baseline"]["validation"]["prediction"]["metric"]
+        )
+    if args.full_audit or args.gate_audit:
+        from scripts.conductance_gate_audit import audit_gate_gradients
+
+        if "weight_decay" not in config:
+            raise ValueError("Saved weight_decay is required for the gradient/decay audit")
+        item["stage"] = "train_label_gradient_audit"
+        print(
+            f"  Gate audit: {args.gradient_mode} mode, autograd ON, train labels only; "
+            "no optimizer step...",
+            flush=True,
+        )
+        item["gate_audit"] = audit_gate_gradients(
+            model,
+            payload,
+            device,
+            weight_decay=config["weight_decay"],
+            mode=args.gradient_mode,
+            ppi_batches=args.gradient_batches,
+            ppi_batch_size=config.get("batch_size", 2),
+            rng_seed=args.model_seed,
+            sample_limit=args.gradient_sample_limit,
+            near_zero=args.near_zero_threshold,
+        )
+        audit = item["gate_audit"]
+        print("    audited train loss:", json.dumps(audit["loss"]), flush=True)
+        for layer in audit["layers"]:
+            raw = layer["tensors"]["raw_logit"]["all_element_moments"] or {}
+            raw_gradient = layer["tensors"]["raw_logit_gradient"]["all_element_moments"] or {}
+            print(
+                f"    layer {layer['layer']}: raw-logit mean={_number(raw.get('mean'))} "
+                f"std={_number(raw.get('std_population'))} "
+                f"raw-logit task-gradient norm={_number(raw_gradient.get('l2_norm'))}",
+                flush=True,
+            )
+        for name, parameter in audit["parameters"].items():
+            print(
+                f"    {name}: norm={_number(parameter['parameter']['l2_norm'])} "
+                f"task_grad={_number(parameter['task_gradient']['l2_norm'])} "
+                f"decay={_number(parameter['weight_decay_term_norm'])} "
+                f"ratio={_number(parameter['task_to_decay_norm_ratio'])} "
+                f"cosine={_number(parameter['task_decay_cosine'])}",
+                flush=True,
+            )
+
+
 def _diagnose(args, run: Path, report: dict) -> None:
     import torch
 
@@ -514,7 +653,13 @@ def _diagnose(args, run: Path, report: dict) -> None:
             "WARNING: source hashes differ from the saved run; verify changes are execution-only:",
             report["source_hash_mismatches"],
         )
-    for dataset in args.datasets:
+    for dataset_index, dataset in enumerate(args.datasets, start=1):
+        report["active_dataset"] = dataset
+        print(
+            f"\n[{dataset_index}/{len(args.datasets)}] {dataset}, model seed {args.model_seed}: "
+            "checking existing cache/checkpoint...",
+            flush=True,
+        )
         directory = run / dataset / "conductance"
         history = json.loads((directory / "history.json").read_text(encoding="utf-8"))
         saved = json.loads((directory / "metrics.json").read_text(encoding="utf-8"))
@@ -532,25 +677,27 @@ def _diagnose(args, run: Path, report: dict) -> None:
         model = restore_model(checkpoint, payload, config, saved, history, device)
         before = _state_hash(model)
         item = {
+            "status": "running",
+            "stage": "baseline_train_validation",
             "history": summarize_history(history, saved),
             "saved_test_historical_only": saved["test"],
             "checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
             "checkpoint_path": str(directory / "best.pt"),
             "data_sha256": protocol["data_sha256"],
-            "baseline": evaluate_checkpoint(model, payload, device, args.edge_chunk_size),
         }
+        report["datasets"][dataset] = item
+        print("  Rechecking train/validation and C/rho distributions...", flush=True)
+        item["baseline"] = evaluate_checkpoint(model, payload, device, args.edge_chunk_size)
         item["validation_recheck_minus_saved"] = (
             item["baseline"]["validation"]["prediction"]["metric"] - saved["validation"]
         )
         item["validation_recheck_warning"] = abs(item["validation_recheck_minus_saved"]) > 1e-4
-        if args.ablate_graph:
-            item["identity_convolution_validation"] = evaluate_checkpoint(
-                model, payload, device, args.edge_chunk_size, ablate=True
-            )["validation"]
-            item["identity_minus_original_validation"] = (
-                item["identity_convolution_validation"]["prediction"]["metric"]
-                - item["baseline"]["validation"]["prediction"]["metric"]
+        if item["validation_recheck_warning"] and _extended_requested(args):
+            raise RuntimeError(
+                "Validation recheck differs from saved checkpoint by >1e-4; "
+                "inspect source/software/precision before extended interventions"
             )
+        additional_audits(model, payload, device, args, config, item)
         if (
             _state_hash(model) != before
             or hashlib.sha256((directory / "best.pt").read_bytes()).hexdigest()
@@ -558,7 +705,7 @@ def _diagnose(args, run: Path, report: dict) -> None:
         ):
             raise RuntimeError("Model/checkpoint changed during read-only diagnostics")
         item["model_state_unchanged"] = True
-        report["datasets"][dataset] = item
+        item.update(status="passed", stage="complete")
         print(
             f"\n{dataset}: best epoch {saved['best_epoch']}/{saved['epochs_run']}; "
             f"saved test ONLY={saved['test']:.6f}"
@@ -593,6 +740,135 @@ def _diagnose(args, run: Path, report: dict) -> None:
             )
         del model, payload, checkpoint
         torch.cuda.empty_cache()
+    report.pop("active_dataset", None)
+
+
+def render_report(report: dict) -> str:
+    """A readable companion to the complete machine-readable diagnostic report."""
+
+    lines = [
+        "# Conductance checkpoint audit",
+        "",
+        f"Status: {report['status']}. Model seed: {report['model_seed']} "
+        "(one checkpoint per dataset).",
+        "",
+        "No training, optimizer steps, downloads, original artifact writes or new test queries.",
+        "C interventions use validation; gradient audits use train labels only.",
+        "These are checkpoint-local observations, not proof of the cause of collapse.",
+        "",
+    ]
+    if report.get("error"):
+        lines.extend((f"Error: {report['error']}", ""))
+    for dataset, item in report["datasets"].items():
+        lines.extend((f"## {dataset}", "", f"Stage: {item.get('stage', 'unknown')}", ""))
+        if item.get("error"):
+            lines.extend((f"Error: {item['error']}", ""))
+        if "baseline" in item:
+            lines.extend(("| Split | Metric | Value | Loss |", "|---|---|---:|---:|"))
+            for split, values in item["baseline"].items():
+                prediction = values["prediction"]
+                lines.append(
+                    f"| {split} | {prediction['metric_name']} | {prediction['metric']:.8f} | "
+                    f"{prediction['loss']:.8f} |"
+                )
+            lines.extend(("", "Historical test values were read, not re-evaluated.", ""))
+            lines.extend(
+                (
+                    "| Split / layer | C mean | C CV | rho median (ratio) | Conv relative change |",
+                    "|---|---:|---:|---:|---:|",
+                )
+            )
+            for split, values in item["baseline"].items():
+                for index, layer in enumerate(values["layers"]):
+                    edge = layer["edge_pooled"]
+                    rho = layer["node_pooled"]["rho"]["quantiles"] or {}
+                    lines.append(
+                        f"| {split} / {index} | {_number(edge['conductance']['mean'])} | "
+                        f"{_number(edge['c_cv'])} | {_number(rho.get('median'))} | "
+                        f"{_number(layer['global_update_ratio'])} |"
+                    )
+            lines.append("")
+        if "interventions" in item:
+            lines.extend(
+                (
+                    "### Validation C interventions",
+                    "",
+                    "| Variant | Metric | Delta | Loss | Logit relative L2 | Prediction flip |",
+                    "|---|---:|---:|---:|---:|---:|",
+                )
+            )
+            for variant in item["interventions"]["variants"]:
+                p, d = variant["prediction"], variant["delta_vs_learned"]
+                lines.append(
+                    f"| {variant['name']} | {p['metric']:.8f} | {d['metric']:+.8f} | "
+                    f"{p['loss']:.8f} | {_number(d['logits_relative_l2'])} | "
+                    f"{_number(d['prediction_flip_fraction'])} |"
+                )
+            lines.extend(
+                (
+                    "",
+                    "The degree cap is recomputed after C replacement. "
+                    "Shuffle changes rho as well as edge alignment.",
+                    "Prediction flip is nodewise for multiclass tasks and labelwise for PPI.",
+                    "C/rho/update distributions per layer and intervention are in report.json.",
+                    "",
+                )
+            )
+        if "gate_audit" in item:
+            audit = item["gate_audit"]
+            lines.extend(
+                (
+                    "### Train-label gate/gradient audit",
+                    "",
+                    f"Mode: {audit['mode']}; loss: `{json.dumps(audit['loss'])}`.",
+                    "",
+                    "| Parameter | Norm | Task gradient norm | Decay term norm | "
+                    "Task/decay | Cosine |",
+                    "|---|---:|---:|---:|---:|---:|",
+                )
+            )
+            for name, parameter in audit["parameters"].items():
+                lines.append(
+                    f"| {name} | {_number(parameter['parameter']['l2_norm'])} | "
+                    f"{_number(parameter['task_gradient']['l2_norm'])} | "
+                    f"{_number(parameter['weight_decay_term_norm'])} | "
+                    f"{_number(parameter['task_to_decay_norm_ratio'])} | "
+                    f"{_number(parameter['task_decay_cosine'])} |"
+                )
+            lines.extend(
+                (
+                    "",
+                    "This compares raw task gradient with lambda*parameter, "
+                    "not Adam's historical update.",
+                    "",
+                    "| Layer / tensor | Mean | Population std | L2 norm | Zero fraction |",
+                    "|---|---:|---:|---:|---:|",
+                )
+            )
+            for layer in audit["layers"]:
+                for name in (
+                    "input_abs_bh",
+                    "input_squared_bh",
+                    "raw_logit",
+                    "conductance",
+                    "raw_logit_gradient",
+                ):
+                    moments = layer["tensors"][name]["all_element_moments"] or {}
+                    lines.append(
+                        f"| {layer['layer']} / {name} | {_number(moments.get('mean'))} | "
+                        f"{_number(moments.get('std_population'))} | "
+                        f"{_number(moments.get('l2_norm'))} | "
+                        f"{_number(moments.get('zero_fraction'))} |"
+                    )
+            lines.extend(
+                (
+                    "",
+                    "Moments use all elements; quantiles use explicitly labelled bounded samples.",
+                    "Activation/gradient distributions and sample metadata are in report.json.",
+                    "",
+                )
+            )
+    return "\n".join(lines) + "\n"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -600,7 +876,15 @@ def main(argv: list[str] | None = None) -> int:
     run = resolve_run(args)
     if args.edge_chunk_size < 1:
         raise ValueError("edge chunk size must be positive")
-    output = args.output_dir.expanduser().resolve() if args.output_dir else None
+    if (
+        args.shuffle_seed < 0
+        or args.gradient_batches < 1
+        or args.gradient_sample_limit < 1
+        or not math.isfinite(args.near_zero_threshold)
+        or args.near_zero_threshold < 0
+    ):
+        raise ValueError("Invalid audit seed, batch/sample limit, or near-zero threshold")
+    output = _automatic_output(args)
     if output:
         source_manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
         recorded_data_root = Path(
@@ -619,16 +903,40 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("Diagnostic output must not be inside the source run/data")
         output.mkdir(parents=True, exist_ok=False)
     report: dict[str, Any] = {
+        "schema_version": 2,
         "status": "running",
         "run": str(run),
         "model_seed": args.model_seed,
         "diagnostic_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "audit_helper_sha256": {
+            name: hashlib.sha256((ROOT / "scripts" / name).read_bytes()).hexdigest()
+            for name in ("conductance_interventions.py", "conductance_gate_audit.py")
+            if (ROOT / "scripts" / name).is_file()
+        },
+        "arguments": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
+        "output_directory": str(output) if output else None,
         "datasets": {},
         "policy": {
             "optimizer_steps": 0,
             "downloads": False,
             "cache_writes": False,
             "new_test_queries": False,
+            "model_seed_count": 1,
+            "gradient_audit": (
+                f"{args.gradient_mode} mode, autograd ON, train labels only; "
+                "checkpoint-local task gradient, not historical Adam updates"
+                if args.full_audit or args.gate_audit
+                else "disabled"
+            ),
+            "interventions": (
+                "Validation only; graph/layer-local C replacement and recomputed degree cap; "
+                "one fixed shuffle seed, no retraining or surrogate-gradient changes"
+                if args.full_audit or args.interventions
+                else "disabled"
+            ),
             "precision": "FP32; AMP/TF32 disabled even if original run used AMP",
             "structural_stats": (
                 "All nodes in each graph; transductive test-node features remain visible; "
@@ -650,18 +958,39 @@ def main(argv: list[str] | None = None) -> int:
     try:
         print(
             "Read-only diagnostic: FP32 inference, AMP/TF32 disabled; train+validation only. "
-            "Test scores are saved historical values, not re-evaluated."
+            "Test scores are saved historical values, not re-evaluated.",
+            flush=True,
         )
+        print(
+            f"One model seed: {args.model_seed}; datasets: {', '.join(args.datasets)}. "
+            f"Gradient audit PPI batches: {args.gradient_batches} (default one).",
+            flush=True,
+        )
+        if output:
+            print(f"Reports will be saved to: {output}", flush=True)
         _diagnose(args, run, report)
         report["status"] = "passed"
     except Exception as exc:
         report.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        active = report.get("active_dataset")
+        if active in report["datasets"]:
+            report["datasets"][active].update(status="failed", error=report["error"])
+        if "out of memory" in str(exc).lower():
+            report["recovery_note"] = (
+                "No CPU fallback or smaller replacement graph was used. Earlier diagnostics "
+                "from completed stages are preserved, not unfinished variants within a stage. "
+                "Free GPU memory or select one dataset; --interventions skips "
+                "backward, while --gate-audit requests backward only after baseline recheck. "
+                "The edge chunk option does not bound the original model's backward memory."
+            )
         print(report["error"], file=sys.stderr)
     if output:
         (output / "report.json").write_text(
             json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8"
         )
+        (output / "report.md").write_text(render_report(report), encoding="utf-8")
         print(f"Diagnostic report: {output / 'report.json'}")
+        print(f"Readable report: {output / 'report.md'}")
     print(f"Diagnostic status: {report['status']}" + (" (stdout only)" if output is None else ""))
     return 0 if report["status"] == "passed" else 1
 

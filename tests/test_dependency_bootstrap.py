@@ -271,7 +271,7 @@ def test_runner_records_the_checked_profile_in_its_manifest(
     monkeypatch.setattr(run_paper, "_commands", lambda *_args: [])
     monkeypatch.setattr(run_paper, "_source_revision", lambda: {"revision": "unit-test"})
     monkeypatch.setattr(run_paper, "_environment_snapshot", lambda *_args: {})
-    monkeypatch.setattr(run_paper, "_snapshot_registries", lambda *_args: {})
+    monkeypatch.setattr(run_paper, "_snapshot_registries", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
         sys,
         "argv",

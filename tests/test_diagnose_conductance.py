@@ -36,6 +36,8 @@ def test_help_works_without_site_packages_or_torch():
     assert result.returncode == 0, result.stderr
     assert "--ablate-graph" in result.stdout
     assert "--device" in result.stdout
+    assert "--full-audit" in result.stdout
+    assert "--gradient-mode" in result.stdout
     assert "Traceback" not in result.stderr
 
 
@@ -209,6 +211,10 @@ def test_relative_run_root_and_cli_defaults(diag, tmp_path, monkeypatch):
     assert args.device == "cuda"
     assert args.output_dir is None
     assert args.ablate_graph is False
+    assert args.model_seed == 0
+    assert args.datasets == list(diag.DATASETS)
+    assert args.gradient_batches == 1
+    assert args.gradient_mode == "eval"
     assert "test" not in vars(args)
     args.run_id = "../elsewhere"
     with pytest.raises(ValueError):
@@ -256,6 +262,128 @@ def test_output_protection_precedes_any_new_directory(diag, tmp_path, monkeypatc
         diag.main([*args, "--output-dir", str(output)])
     assert not output.exists()
     assert _file_snapshot(tmp_path) == before
+
+
+def test_extended_audit_auto_output_is_new_and_separate_from_source(diag, tmp_path, monkeypatch):
+    monkeypatch.setattr(diag, "ROOT", tmp_path)
+    run = tmp_path / "research/conductance_gat/results/paper/example/model-seed-0/benchmark"
+    run.mkdir(parents=True)
+    (run / "manifest.json").write_text(json.dumps({"config": {}}), encoding="utf-8")
+    seen = []
+
+    def fake_diagnose(args, source, report):
+        seen.append((args.model_seed, args.datasets, source))
+        assert args.full_audit
+        report["datasets"]["cora"] = {"status": "passed", "stage": "complete"}
+
+    monkeypatch.setattr(diag, "_diagnose", fake_diagnose)
+    source_before = _file_snapshot(run)
+    assert diag.main(["--run-id", "example", "--full-audit"]) == 0
+    output = next((tmp_path / "runs/diagnostics").iterdir())
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert report["policy"]["model_seed_count"] == 1
+    assert report["policy"]["optimizer_steps"] == 0
+    assert report["policy"]["new_test_queries"] is False
+    assert report["model_seed"] == 0
+    assert report["status"] == "passed"
+    assert (output / "report.md").is_file()
+    assert seen == [(0, list(diag.DATASETS), run)]
+    assert _file_snapshot(run) == source_before
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--shuffle-seed", "-1"],
+        ["--gradient-batches", "0"],
+        ["--gradient-sample-limit", "0"],
+        ["--near-zero-threshold", "nan"],
+        ["--near-zero-threshold", "-1"],
+    ],
+)
+def test_invalid_extended_arguments_fail_before_any_output(diag, tmp_path, arguments):
+    with pytest.raises(ValueError, match="Invalid audit"):
+        diag.main(
+            [
+                "--run-id",
+                "example",
+                "--full-audit",
+                "--output-dir",
+                str(tmp_path / "new"),
+                *arguments,
+            ]
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_extended_failure_preserves_completed_diagnostics_in_reports(diag, tmp_path, monkeypatch):
+    monkeypatch.setattr(diag, "ROOT", tmp_path)
+    run = tmp_path / "research/conductance_gat/results/paper/example/model-seed-0/benchmark"
+    run.mkdir(parents=True)
+    (run / "manifest.json").write_text(json.dumps({"config": {}}), encoding="utf-8")
+
+    def fail_after_first(_args, _source, report):
+        report["datasets"]["cora"] = {"status": "passed", "stage": "complete"}
+        report["active_dataset"] = "ogbn-arxiv"
+        report["datasets"]["ogbn-arxiv"] = {
+            "status": "running",
+            "stage": "train_label_gradient_audit",
+        }
+        raise RuntimeError("CUDA out of memory: unit-only injected failure")
+
+    monkeypatch.setattr(diag, "_diagnose", fail_after_first)
+    assert diag.main(["--run-id", "example", "--full-audit"]) == 1
+    output = next((tmp_path / "runs/diagnostics").iterdir())
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["datasets"]["cora"]["status"] == "passed"
+    assert report["datasets"]["ogbn-arxiv"]["status"] == "failed"
+    assert "No CPU fallback" in report["recovery_note"]
+    assert "out of memory" in (output / "report.md").read_text(encoding="utf-8")
+
+
+def test_audit_cli_accepts_one_checkpoint_seed_not_seed_sweep(diag):
+    assert (
+        diag.build_parser().parse_args(["--run-id", "example", "--model-seed", "3"]).model_seed == 3
+    )
+    with pytest.raises(SystemExit):
+        diag.build_parser().parse_args(["--run-id", "example", "--model-seed", "0", "1"])
+
+
+def test_full_audit_real_helpers_integrate_without_optimizer_or_test_labels(
+    diag, torch, monkeypatch
+):
+    payload, checkpoint, _, _, config, saved, history = _payload_and_checkpoint(torch)
+    config["weight_decay"] = 0.0005
+    payload["graphs"][0]["y"][payload["splits"]["test"]] = 999
+    model = diag.restore_model(checkpoint, payload, config, saved, history, torch.device("cpu"))
+    before = diag._state_hash(model)
+    original_grads = [parameter.grad for parameter in model.parameters()]
+    args = diag.build_parser().parse_args(["--run-id", "example", "--full-audit", "--ablate-graph"])
+    item = {"baseline": diag.evaluate_checkpoint(model, payload, torch.device("cpu"), 2)}
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Diagnostic audit must not construct an optimizer")
+
+    monkeypatch.setattr(torch.optim, "Adam", forbidden)
+    diag.additional_audits(model, payload, torch.device("cpu"), args, config, item)
+    assert len(item["interventions"]["variants"]) == 10
+    assert item["gate_audit"]["label_scope"] == "train_only"
+    assert item["gate_audit"]["loss"]["batches"] == 1
+    assert item["gate_audit"]["loss"]["train_label_elements"] == 2
+    assert item["gate_audit"]["mode"] == "eval"
+    assert diag._state_hash(model) == before
+    assert all(
+        parameter.grad is gradient
+        for parameter, gradient in zip(model.parameters(), original_grads, strict=True)
+    )
+    assert all(not module._forward_hooks for module in model.modules())
+    report = {"status": "passed", "model_seed": 0, "datasets": {"cora": item}}
+    json.dumps(report, allow_nan=False)
+    readable = diag.render_report(report)
+    assert "mean_C_all" in readable
+    assert "Task gradient norm" in readable
+    assert "operators.0.estimator.network.0.weight" in readable
 
 
 def test_existing_output_directory_is_never_overwritten(diag, tmp_path, monkeypatch):

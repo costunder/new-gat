@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.aggregate_paper import aggregate_manifest
+from scripts.aggregate_paper import _summary, aggregate_manifest
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -14,11 +14,48 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+@pytest.mark.parametrize("bootstrap_samples", [0, 100])
+def test_singleton_summary_has_no_estimated_seed_uncertainty(bootstrap_samples: int) -> None:
+    summary = _summary([0.625], key="single-seed", bootstrap_samples=bootstrap_samples)
+
+    assert summary["n"] == 1
+    assert summary["mean"] == summary["median"] == summary["minimum"] == summary["maximum"] == 0.625
+    assert summary["uncertainty_status"] == "insufficient_samples"
+    serialized = json.loads(json.dumps(summary, allow_nan=False))
+    for key in ("sample_std", "bootstrap_95_low", "bootstrap_95_high"):
+        assert serialized[key] is None
+
+
+@pytest.mark.parametrize(
+    "values,mean,std,low,high",
+    [([0.0, 1.0], 0.5, 2**-0.5, 0.0, 1.0), ([0.3, 0.3], 0.3, 0.0, 0.3, 0.3)],
+)
+def test_explicit_multiple_seeds_keep_existing_estimated_statistics(values, mean, std, low, high):
+    summary = _summary(values, key="multi-seed-regression", bootstrap_samples=100)
+
+    assert summary["n"] == 2
+    assert summary["mean"] == pytest.approx(mean)
+    assert summary["sample_std"] == pytest.approx(std)
+    assert summary["bootstrap_95_low"] == pytest.approx(low)
+    assert summary["bootstrap_95_high"] == pytest.approx(high)
+    assert summary["uncertainty_status"] == "bootstrap_estimated"
+
+
+def test_disabled_bootstrap_keeps_multi_seed_statistics_but_is_explicitly_labelled() -> None:
+    summary = _summary([0.0, 1.0], key="bootstrap-off", bootstrap_samples=0)
+
+    assert summary["n"] == 2
+    assert summary["sample_std"] == pytest.approx(2**-0.5)
+    assert summary["bootstrap_95_low"] == summary["bootstrap_95_high"] == summary["mean"] == 0.5
+    assert summary["uncertainty_status"] == "bootstrap_disabled"
+
+
 @pytest.mark.parametrize(
     ("track", "dataset", "model"),
     [
         ("conductance_gat", "cora", "conductance"),
         ("cycle_pe", "zinc12k", "cycle_set"),
+        ("cycle_pe", "zinc12k", "cycle_basis_v2"),
     ],
 )
 def test_benchmarks_aggregate_only_our_model_and_ignore_published_scores(
@@ -45,6 +82,7 @@ def test_benchmarks_aggregate_only_our_model_and_ignore_published_scores(
                                 "trainable_parameters": 1000,
                                 "elapsed_seconds": 3.0,
                                 "peak_gpu_memory_bytes": 2048,
+                                "history": [{"test": 0.001, "validation": 0.002}],
                             },
                             "external_model": {"test": 0.5, "elapsed_seconds": 8.0},
                         },
@@ -85,6 +123,96 @@ def test_benchmarks_aggregate_only_our_model_and_ignore_published_scores(
     with (tmp_path / "aggregate" / "paired.csv").open(encoding="utf-8", newline="") as stream:
         pairs = list(csv.DictReader(stream))
     assert pairs == []
+
+
+def test_cycle_v1_and_basis_v2_keep_independent_summary_and_efficiency_rows(
+    tmp_path: Path,
+) -> None:
+    commands = []
+    for seed in (0, 1):
+        output = tmp_path / f"seed-{seed}"
+        models = {}
+        for model, offset in (("cycle_set", 0.1), ("cycle_basis_v2", 0.7)):
+            models[model] = {
+                "test": offset + seed * 0.02,
+                "validation": 9.0,
+                "trainable_parameters": 1000,
+                "elapsed_seconds": 3.0,
+                "peak_gpu_memory_bytes": 2048,
+                "history": [{"test": 8.0, "validation": 7.0}],
+            }
+        models["external_model"] = {"test": 6.0, "elapsed_seconds": 5.0}
+        _write_json(
+            output / "metrics.json",
+            {
+                "track": "cycle_pe",
+                "suite": "benchmark",
+                "datasets": {
+                    "zinc12k": {
+                        "models": models,
+                        "published_reference": {"test": 4.0, "std": 0.02},
+                    }
+                },
+            },
+        )
+        commands.append(
+            {
+                "name": f"cycle_pe:benchmark:model-seed-{seed}",
+                "command": [
+                    "python",
+                    "--suite",
+                    "benchmark",
+                    "--model-seed",
+                    str(seed),
+                    "--data-seed",
+                    "0",
+                    "--split-seed",
+                    "0",
+                    "--chart-seed",
+                    "0",
+                ],
+                "returncode": 0,
+                "artifact_errors": [],
+                "output": str(output),
+            }
+        )
+    manifest = tmp_path / "manifest.json"
+    _write_json(manifest, {"run_id": "both-versions", "status": "passed", "commands": commands})
+
+    result = aggregate_manifest(manifest, bootstrap_samples=0)
+
+    assert result["sample_rows"] == 4
+    assert result["metric_groups"] == 2
+    assert result["efficiency_rows"] == 12
+    assert result["paired_groups"] == 0
+    assert result["ignored_numeric_fields"] == result["numeric_fields_seen"] - 16
+    with (tmp_path / "aggregate" / "metrics.csv").open(encoding="utf-8", newline="") as stream:
+        summaries = {row["metric"]: row for row in csv.DictReader(stream)}
+    assert set(summaries) == {
+        "datasets.zinc12k.models.cycle_set.test",
+        "datasets.zinc12k.models.cycle_basis_v2.test",
+    }
+    for model, expected_mean, expected_rule in (
+        ("cycle_set", 0.11, "cycle.our_model.test"),
+        ("cycle_basis_v2", 0.71, "cycle.basis_v2.test"),
+    ):
+        row = summaries[f"datasets.zinc12k.models.{model}.test"]
+        assert float(row["mean"]) == pytest.approx(expected_mean)
+        assert row["model_seeds"] == "0,1"
+        assert row["metric_rule"] == expected_rule
+    with (tmp_path / "aggregate" / "efficiency.csv").open(encoding="utf-8", newline="") as stream:
+        efficiency = list(csv.DictReader(stream))
+    assert {row["metric_rule"] for row in efficiency} == {
+        "cycle.our_model.efficiency",
+        "cycle.basis_v2.efficiency",
+    }
+    assert {row["metric"] for row in efficiency} == {
+        f"datasets.zinc12k.models.{model}.{metric}"
+        for model in ("cycle_set", "cycle_basis_v2")
+        for metric in ("trainable_parameters", "elapsed_seconds", "peak_gpu_memory_bytes")
+    }
+    with (tmp_path / "aggregate" / "paired.csv").open(encoding="utf-8", newline="") as stream:
+        assert list(csv.DictReader(stream)) == []
 
 
 def test_aggregate_keeps_data_axes_fixed_and_pairs_model_seeds(tmp_path: Path) -> None:
@@ -329,9 +457,12 @@ def test_aggregate_reads_oom_logs_and_ignores_outer_seed_for_official_brec(
     assert failure["oom"] == "True"
 
 
-def test_aggregate_tree_schema_pairs_only_registered_downstream_metrics(tmp_path: Path) -> None:
+@pytest.mark.parametrize("seed_count", [1, 2])
+def test_aggregate_tree_schema_pairs_only_registered_downstream_metrics(
+    tmp_path: Path, seed_count: int
+) -> None:
     commands = []
-    for model_seed, fixed, multi in ((1, 0.8, 0.5), (2, 0.6, 0.4)):
+    for model_seed, fixed, multi in ((1, 0.8, 0.5), (2, 0.6, 0.4))[:seed_count]:
         output = tmp_path / f"tree-{model_seed}"
         _write_json(
             output / "summary.json",
@@ -388,18 +519,39 @@ def test_aggregate_tree_schema_pairs_only_registered_downstream_metrics(tmp_path
 
     payload = aggregate_manifest(manifest, bootstrap_samples=0)
 
-    assert payload["sample_rows"] == 6
-    assert payload["efficiency_rows"] == 4
+    assert payload["schema_version"] == 3
+    assert payload["sample_rows"] == 3 * seed_count
+    assert payload["efficiency_rows"] == 2 * seed_count
     assert payload["metric_groups"] == 3
     assert payload["paired_groups"] == 1
-    assert payload["ignored_numeric_fields"] == payload["numeric_fields_seen"] - 10
+    assert payload["ignored_numeric_fields"] == payload["numeric_fields_seen"] - 5 * seed_count
+    assert "not confidence intervals" in payload["uncertainty_policy"]["bootstrap_disabled"]
+    for filename in ("metrics.csv", "paired.csv"):
+        with (tmp_path / "aggregate" / filename).open(encoding="utf-8", newline="") as stream:
+            summaries = list(csv.DictReader(stream))
+        for row in summaries:
+            assert int(row["n"]) == seed_count
+            if seed_count == 1:
+                assert row["uncertainty_status"] == "insufficient_samples"
+                for key in ("sample_std", "bootstrap_95_low", "bootstrap_95_high"):
+                    assert row[key] == ""
+                if filename == "paired.csv":
+                    assert row["effect_size"] == ""
+            else:
+                assert row["uncertainty_status"] == "bootstrap_disabled"
+                assert row["sample_std"] != ""
+                assert row["bootstrap_95_low"] == row["bootstrap_95_high"] == row["mean"]
+                if filename == "paired.csv":
+                    assert float(row["effect_size"]) == pytest.approx(
+                        float(row["mean"]) / float(row["sample_std"])
+                    )
     with (tmp_path / "aggregate" / "samples.csv").open(encoding="utf-8", newline="") as stream:
         samples = list(csv.DictReader(stream))
     assert all("history" not in row["metric"] for row in samples)
     assert all("runtime" not in row["metric"] for row in samples)
     assert all("settings" not in row["metric"] for row in samples)
     improvements = [row for row in samples if row["metric_rule"] == "tree.precomputed_improvement"]
-    assert len(improvements) == 2
+    assert len(improvements) == seed_count
     assert all(row["pairable"] == "False" for row in improvements)
     with (tmp_path / "aggregate" / "efficiency.csv").open(encoding="utf-8", newline="") as stream:
         efficiency = list(csv.DictReader(stream))

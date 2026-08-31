@@ -104,9 +104,10 @@ run this script from the repository root:
 bash research/tree_augmentation/reproduce.sh
 ```
 
-The script runs CSL and ZINC independently on CUDA, with model
-seeds `0,1,2,3,4` and data/split/chart seeds fixed to `0`. It runs only this
-track's fixed-chart and multi-chart comparisons. Dataset and result locations,
+The script runs CSL and ZINC independently on CUDA, with model seed `0` and
+data/split/chart seeds fixed to `0`. Pass `--model-seeds 0,1,2,3,4` for an
+explicit five-seed sweep. It runs only this track's fixed-chart and multi-chart
+comparisons. Dataset and result locations,
 run identifiers, and shared overrides follow the root README. Missing or damaged
 public data is an error; training does not download a substitute.
 

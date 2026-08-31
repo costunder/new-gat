@@ -367,7 +367,7 @@ def test_readme_commands_use_full_independent_protocols() -> None:
         ("tree_augmentation",),
         ("all",),
     }
-    assert all(args.device == "cuda" and args.model_seeds == (0, 1, 2, 3, 4) for args in parsed)
+    assert all(args.device == "cuda" and args.model_seeds == (0,) for args in parsed)
     assert "--tiny" not in readme
     assert "python -c" not in readme
     assert "\\\n" not in readme
@@ -389,7 +389,7 @@ def test_default_workspace_directories_exist_in_a_clone() -> None:
 def test_default_benchmarks_match_each_track_without_generated_data(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    completed = _dry_run(["--dry-run", "--model-seeds", "0"], capsys)
+    completed = _dry_run(["--dry-run"], capsys)
     assert completed.returncode == 0, completed.stderr
     assert "research.conductance_gat.benchmark" in completed.stdout
     assert "research.cycle_pe.benchmark" in completed.stdout
@@ -401,6 +401,38 @@ def test_default_benchmarks_match_each_track_without_generated_data(
     assert "--variants" not in completed.stdout
     assert "--baselines" not in completed.stdout
     assert "research.conductance_gat.paper" not in completed.stdout
+    assert completed.stdout.count("--model-seed 0") == 4
+
+
+@pytest.mark.parametrize("prepare_only", [False, True])
+@pytest.mark.parametrize(
+    "selection,expected_seeds",
+    [([], (0,)), (["--model-seeds", "2,5"], (2, 5)), (["--seeds", "11,12"], (11, 12))],
+)
+def test_benchmark_default_and_explicit_seed_sweeps(prepare_only, selection, expected_seeds):
+    from scripts.run_paper import _commands, _parser
+
+    args = _parser().parse_args(selection + (["--prepare-only"] if prepare_only else []))
+    assert args.model_seeds == expected_seeds
+    children = [
+        command
+        for name, command, _ in _commands(args, "seed-dispatch-contract")
+        if name != "gpu_preflight"
+    ]
+    executed_seeds = expected_seeds[:1] if prepare_only else expected_seeds
+    assert len(children) == 4 * len(executed_seeds)
+    for seed in executed_seeds:
+        seed_children = [
+            command
+            for command in children
+            if command[command.index("--model-seed") + 1] == str(seed)
+        ]
+        assert [command[2] for command in seed_children] == [
+            "research.conductance_gat.benchmark",
+            "research.cycle_pe.benchmark",
+            "research.tree_augmentation.paper",
+            "research.tree_augmentation.paper",
+        ]
 
 
 def test_benchmark_prepares_each_public_suite_once(
@@ -432,10 +464,11 @@ def test_own_model_child_arguments_parse_with_actual_track_clis(prepare_only: bo
     args = _parser().parse_args(["--prepare-only", "--allow-download"] if prepare_only else [])
     commands = _commands(args, "argument-contract")
     children = [command for name, command, _ in commands if name != "gpu_preflight"]
-    assert len(children) == (4 if prepare_only else 20)
+    assert len(children) == 4
     for command in children:
         parsed = parsers[command[2]].parse_args(command[3:])
         assert parsed.prepare_only is prepare_only
+        assert parsed.model_seed == 0
         assert parsed.device == ("cpu" if prepare_only else "cuda")
         assert not hasattr(parsed, "baselines")
         assert not parsed.amp

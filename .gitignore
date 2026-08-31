@@ -15,6 +15,8 @@ dist/
 runs/
 research/*/results/*
 !research/*/results/.gitkeep
+research/cycle_pe/v2/results/*
+!research/cycle_pe/v2/results/.gitkeep
 results/*
 !results/.gitkeep
 data/*

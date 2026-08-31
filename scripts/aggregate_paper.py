@@ -99,7 +99,7 @@ _TREE_EVALUATION_METRICS = (
 # axes, and optimization histories therefore cannot leak into hypothesis tests.
 # Published competitor scores belong in the cited manuscript table, not in this
 # run registry or in paired statistics with our own experiment seeds.
-PAPER_METRIC_SCHEMA_VERSION = 4
+PAPER_METRIC_SCHEMA_VERSION = 5
 PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
     _metric_rule(
         "conductance.our_model.test",
@@ -113,6 +113,15 @@ PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "cycle_pe",
         r"metrics\.json",
         r"datasets\.[^.]+\.models\.cycle_set\.test",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.basis_v2.test",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_basis_v2\.test",
+        # The basis-input experiment is a separate model, not another seed or
+        # condition of the existing six-statistic cycle-set experiment.
         pairable=False,
     ),
     _metric_rule(
@@ -198,7 +207,7 @@ PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
 # deliberately limited to elapsed time, peak accelerator memory, and active
 # trainable parameter counts; epochs, batch size, workers, and seeds are not
 # efficiency outcomes.
-EFFICIENCY_METRIC_SCHEMA_VERSION = 3
+EFFICIENCY_METRIC_SCHEMA_VERSION = 4
 EFFICIENCY_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
     _metric_rule(
         "conductance.our_model.efficiency",
@@ -213,6 +222,14 @@ EFFICIENCY_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "cycle_pe",
         r"metrics\.json",
         r"datasets\.[^.]+\.models\.cycle_set\."
+        r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.basis_v2.efficiency",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_basis_v2\."
         r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
         pairable=False,
     ),
@@ -359,8 +376,14 @@ def _summary(values: list[float], *, key: str, bootstrap_samples: int) -> dict[s
     if not values:
         raise ValueError("cannot summarize an empty sample")
     mean = statistics.fmean(values)
-    if len(values) == 1 or bootstrap_samples == 0:
+    if len(values) == 1:
+        low = high = None
+        uncertainty_status = "insufficient_samples"
+    elif bootstrap_samples == 0:
+        # Preserve the historical disabled-bootstrap point placeholders, but
+        # explicitly label them as disabled rather than estimated intervals.
         low = high = mean
+        uncertainty_status = "bootstrap_disabled"
     else:
         seed = int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:8], "big")
         generator = random.Random(seed)
@@ -370,15 +393,17 @@ def _summary(values: list[float], *, key: str, bootstrap_samples: int) -> dict[s
         )
         low = _quantile(means, 0.025)
         high = _quantile(means, 0.975)
+        uncertainty_status = "bootstrap_estimated"
     return {
         "n": len(values),
         "mean": mean,
-        "sample_std": statistics.stdev(values) if len(values) > 1 else 0.0,
+        "sample_std": statistics.stdev(values) if len(values) > 1 else None,
         "median": statistics.median(values),
         "minimum": min(values),
         "maximum": max(values),
         "bootstrap_95_low": low,
         "bootstrap_95_high": high,
+        "uncertainty_status": uncertainty_status,
     }
 
 
@@ -680,7 +705,7 @@ def aggregate_manifest(
                 )
 
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "paper_metric_schema_version": PAPER_METRIC_SCHEMA_VERSION,
         "efficiency_metric_schema_version": EFFICIENCY_METRIC_SCHEMA_VERSION,
         "paper_metric_rules": [rule.name for rule in PAPER_METRIC_SCHEMA],
@@ -692,6 +717,20 @@ def aggregate_manifest(
             "group by data/split/chart seed; summarize and pair only aligned model seeds"
         ),
         "bootstrap_samples": bootstrap_samples,
+        "uncertainty_policy": {
+            "insufficient_samples": (
+                "n=1: sample_std and bootstrap_95 bounds are unavailable (null/empty), "
+                "not zero uncertainty"
+            ),
+            "bootstrap_disabled": (
+                "n>=2 and bootstrap_samples=0: sample_std is available; bootstrap_95 "
+                "bounds retain legacy mean placeholders and are not confidence intervals"
+            ),
+            "bootstrap_estimated": (
+                "n>=2: sample standard deviation and deterministic percentile-bootstrap "
+                "95% interval of the model-seed mean"
+            ),
+        },
         "numeric_fields_seen": numeric_fields_seen,
         "ignored_numeric_fields": ignored_numeric_fields,
         "sample_rows": len(samples),

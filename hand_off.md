@@ -10,6 +10,172 @@
 
 ## 0. 리뷰어가 먼저 알아야 할 판정
 
+### 2026-08-31 단일 seed 기본값과 읽기 전용 확장 검사
+
+사용자 요청에 따라 향후 기본 model seed는 **0 하나**다. 기본 benchmark는 GAT 1개,
+Cycle v1 1개, Tree CSL/ZINC 2개의 총 4개 child만 실행한다. 데이터 준비는 기존 4개 child다.
+명시적 `--model-seeds 0,1,2,3,4`는 선택적으로 유지하지만 자동 반복하지 않는다. 보조 `all`의
+공식 BREC 내부 10-search-seed는 별도 protocol이며 기본 benchmark에는 실행되지 않는다.
+과거에 이미 받은 5-seed 집계는 삭제하거나 1-seed 결과로 재분류하지 않았다.
+
+`scripts/diagnose_conductance.py --full-audit`도 선택한 model seed 하나만 사용한다.
+기본 대상은 seed 0의 Cora/CiteSeer/PubMed/PPI/arxiv다. 주요 추가 내용은 다음과 같다.
+
+- `scripts/conductance_interventions.py`: validation의 learned/mean/shuffled/off C, 전체 층과
+  층별 개입. 변경한 C로 degree/dmax/rho를 재계산하고 metric/loss/logit/flip/전파량을 저장한다.
+- `scripts/conductance_gate_audit.py`: 기존 checkpoint의 train-label gradient만 계산한다.
+  기본 eval+autograd ON, PPI 첫 1 batch, citation/arxiv full graph의 train mask를 사용한다.
+  실제 gate 입력·Linear/SiLU·raw logit·C·raw-logit gradient와 parameter/gradient/decay 항을 기록한다.
+- 정량 moment는 전체 원소의 float64 블록 집계이며 큰 activation quantile만 명시적인 유한
+  deterministic sample이다. 전체 quantile 또는 전체 PPI train gradient로 과장하지 않는다.
+- `report.md`와 `report.json`을 `runs/diagnostics/`의 고유한 새 폴더에 자동 저장한다.
+  재학습·optimizer step·다운로드·새 test 평가·원본 덮어쓰기·CPU fallback은 없다.
+- hook/forward/mode/gradient/RNG 복구, 기존 checkpoint hash 보호와 finite JSON을 검사한다.
+  validation 재현 차이가 크면 확장 검사 전에 중단하고 실패 시 앞선 진단은 별도 보고서에 남긴다.
+- C 상수화와 dmax 전파 감쇠를 구분한다. WD 원인은 가설이며 `detach(dmax)`나 정규화 변경,
+  외부 모델·내부 모델 재학습을 이 진단에 조용히 추가하지 않았다.
+- 집계 artifact schema는 3, metric registry는 5, efficiency registry는 4다. 1-seed std/CI는
+  `null`(CSV 빈칸)과 `uncertainty_status=insufficient_samples`로 표시한다. 숫자 0의 불확실성으로
+  보고하지 않는다. 명시적 여러 seed의 기존 통계는 유지한다.
+
+실행은 [진단 안내](docs/CONDUCTANCE_DIAGNOSTICS.md)를 따른다. 확장 검사와 단일 seed 변경은
+현재 소스 버전에 포함되며 이전 진단 전용 게시 commit에는 없었다. 새 확장 검사의 실제
+GPU 결과는 아직 없다.
+로컬 전체 회귀는 **680 passed / 63 skipped** (30.54 s, exit 0), 확장 진단 관련 3개 파일은
+**89 passed** (4.28 s)다. Windows faulthandler의 기존 `access violation` 경고가 출력됐으나
+검사는 위 결과와 exit 0으로 완료됐다. Linux/Bash 62개와 로컬 PyG 미설치 1개는 생략했으며,
+이 수치는 실제 서버 GPU 학습·진단 완료의 증거가 아니다.
+기존 게시 commit `ebf8cd1`의 모델 소스를 메모리에 로드한 호환성 검사도 **89 passed**
+(2.47 s)다. 소스를 checkout하거나 기존 checkpoint를 변경하지 않고 3-인자 Conv API와
+새 검사 모듈의 호환성을 확인했다.
+
+### 현재 상태와 읽는 순서
+
+사용자가 제공한 **세 트랙의 기존 5-model-seed 집계**와 **Conductance seed 0의 실제 GPU
+checkpoint 진단**이 있다. 결과 수치, run ID, 평가 범위, 근거 파일 hash와 미확정 원인은
+[EXPERIMENT_STATUS.md](docs/EXPERIMENT_STATUS.md)에 정리했다. 이 문서의 과거 감사 기록을
+현재의 결과 미수집 상태로 해석하면 안 된다.
+
+- 이전 진단 전용 게시 commit은 `ebf8cd19b80e6cd6c742b132e2bb1dadb97b019c`다.
+  해당 commit은 진단 Python/Bash, 테스트, 안내, 트랙 README의 **5개 파일만** 추가·갱신했다.
+- 이번 소스 버전에는 기저벡터 Cycle PE v2, 실행 최적화·속도 도구, 단일 seed 기본값과
+  확장 진단이 모두 포함된다. `code_summary.md`는 이전 commit이 아닌 이 버전의 스냅샷이다.
+- 제공된 Cycle 결과는 `cycle_set` v1이다. 이를 `cycle_basis_v2`의 학습 결과로 쓰지 않는다.
+  기존 benchmark 결과와 당시 진단은 이번 최적화의 가속 실측도 아니다.
+- 원격 서버의 전체 checkpoint/manifest를 직접 내려받아 검사한 것은 아니다. 사용자 로그로
+  확인한 사실, 로컬 단위 검증, 추가 검증이 필요한 가설을 분리한다.
+- 소스 게시·서버 pull과 모델 재학습·GPU 진단 완료는 다르다. 실행 revision과 결과를 별도로 보존한다.
+
+처음 실행할 때는 README, 실제 측정값은 실험 상태 문서, 수학·코드 감사는 이 handoff와
+code summary를 읽는다. 세 연구는 계속 독립이며 결합 모델을 추가하지 않았다.
+
+### 2026-08-31 Conductance checkpoint 성능 진단
+
+`scripts/diagnose_conductance.py`와 active-Conda wrapper를 추가했다. 완료된 공식 benchmark의
+기록과 checkpoint를 읽어 GPU에서 train/validation 추론만 수행하며 재학습·다운로드·optimizer
+update·원래 산출물 덮어쓰기는 없다. 기본 출력은 터미널이고 새 별도 경로의 보고서는 선택 사항이다.
+사용법과 해석은 [CONDUCTANCE_DIAGNOSTICS.md](docs/CONDUCTANCE_DIAGNOSTICS.md)에 있다.
+
+- 층별 C 분포, 가중 차수, `rho_i = .95 d_i^C / d_max^C`, 전파 전후 상대 변화량을 확인한다.
+  최대 차수는 각 그래프 안에서 계산하며 PPI 그래프를 합친 최대값으로 대체하지 않는다.
+- 같은 checkpoint의 train/validation 지표와 PPI 양성 비율을 확인한다. 기존 test 점수는
+  저장된 값만 읽으며 test 대상의 신규 평가·ablation은 수행하지 않는다.
+- 선택적 `--ablate-graph`는 validation에서만 conductance 전파를 항등 연산으로 우회한다.
+  재학습한 MLP baseline이나 원인 확정 실험이 아니며, 해당 checkpoint의 개입 민감도다.
+- 전역 최대 가중 차수 스텝은 C 전체의 공통 스케일을 상쇄한다. 작은 `rho`는 이웃 전달 제한의
+  증거일 수 있지만 낮은 정확도의 주원인이라는 결론은 성능·학습 곡선과 함께 검토해야 한다.
+- 모델·학습 설정은 수정하지 않았다. 사용자가 제공한 실행 로그에서 seed 0의 Cora/PPI/arxiv
+  GPU 진단이 `passed`로 끝났고 validation 재계산 오차는 약 `0~5e-8`임을 확인했다.
+- PPI/arxiv의 관측한 FP32 eval 입력에서 두 층 C의 변동계수는 0이다. Cora는 첫 층만
+  거의 상수이고 두 번째 층은 비상수다. arxiv의 이웃 혼합량 중앙값은 약 0.0433%다.
+  상수화의 원인이 weight decay라는 주장은 아직 가설이며 다른 seed까지 일반화하지 않는다.
+
+확장 전 진단 전용 검사는 **42 passed**였다. CUDA-only CLI, 의존성 없는 help, checkpoint/학습 기록
+일치, graph-local rho와 pooled 통계, PPI global micro-F1, test 평가 배제, 원본 파일
+SHA/mtime 불변과 저장 경로 보호를 검증했다. 로컬 tensor/helper 검증이며 실제 GPU 실행은 아니다.
+확장 전 문서 갱신의 전체 회귀는 **619 passed, 63 skipped** (21.84 s, exit 0),
+Ruff/diff 검사와 갱신 문서의 로컬 링크 34개 검사 통과다.
+생략은 기존 Linux/Bash 전용 62개 및 로컬 PyG 미설치 1개다.
+이번 실행에서도 Windows faulthandler의 `access violation` 메시지가 출력됐으나 pytest는
+끝까지 실행되어 위 결과와 exit 0을 반환했다. 이 호스트 진단을 숨기거나 실제 Linux/CUDA
+성공의 근거로 사용하지 않는다.
+
+### 2026-08-31 실행 최적화 추가
+
+모델의 수식·parameter/state_dict·공식 split·loss·checkpoint 선택은 유지하고 실행 경로를
+최적화했다. 변경 전후의 부동소수점 합산 순서는 일부 다르므로 bitwise 학습 재현을 주장하지 않는다.
+
+- Conductance: CPU graph-count metadata 전달로 층별 scalar GPU sync 제거, split indices
+  사전 준비, loss와 PPI global micro-F1 count의 device 누적. nonfinite fail-closed 검사는 유지.
+- Cycle PE 공통: categorical field stack 제거, 고정 크기 pooling count, FP32 benchmark의
+  message topology를 forward당 1회 준비해 layer stack에서 재사용.
+- v2: `basis_execution=batched` 기본. 모든 signed U_c entry를 `(graph,column)`별로 묶어
+  two-pass context/edge encoding 수행. reference 경로와 checkpoint 호환. pair_budget은
+  MLP 호출당 pair 수만 제한하며 전체 basis/autograd 메모리의 상한을 뜻하지 않는다.
+- `src/chartgat/execution.py`: 선택적 `--compile`, Inductor/dynamic shapes, in-place
+  tensor MLP 블록의 bound forward를 컴파일해 checkpoint 키 유지. 가변 기저 Python 루프 전체를
+  compile했을 때 반복 재컴파일이 재현되어 해당 scheduling은 eager로 유지한다.
+  기본 OFF/AMP 기본 OFF, compiler 오류를 잡아 성공으로 숨기지 않는다.
+- 정식 runner는 train 지표와 `epoch_seconds`를 기록하고 로그를 즉시 flush한다.
+  `scripts/benchmark_speed.sh`는 공식 train 입력만 사용하는 CUDA forward/backward 비교이며
+  warmup·steady-state·동등성 검사·peak memory를 `runs/performance/`에 분리 기록한다.
+  optimizer update 및 전체 학습 속도/정확도 실험과 구분한다.
+- GPU 실측·전체 학습 완료·가속 배수는 확인하지 않았다. 사용법과 측정 경계는
+  [PERFORMANCE.md](docs/PERFORMANCE.md)에 있다. 구형 Singularity에서 opt-in compiler
+  호환성을 보장하지 않으며 환경/드라이버/공용 라이브러리를 자동 변경하지 않는다.
+
+이후의 과거 감사 수치와 한계는 해당 시점의 기록이며, 현재 최적화의 GPU 검증 결과가 아니다.
+
+진단 도구 추가 전, 최적화 구현 시점의 전체 회귀는 **577 passed, 63 skipped** (19.96 s, exit 0),
+Ruff 및 diff 검사 통과다. 생략은 Linux/Bash 전용 62개와 로컬 PyG 미설치 1개다.
+추가된 Dynamo 검사는 CPU tensor/counting backend에서 10개 ragged shape와 실제 블록
+컴파일 경로 실행, 출력·입력/전체 parameter gradient 및 checkpoint 호환성을 확인한다.
+이는 GPU Inductor 코드 생성·구형 Singularity compiler 호환성·실제 GPU 가속 검증이 아니다.
+
+### 2026-08-31 Cycle PE v2: 좌영공간 기저벡터 자체를 입력
+
+사용자는 기존 기본 Cycle PE가 기저벡터 자체를 받는다고 이해했으나, 실제 v1 기본 경로는
+기저를 계산한 뒤 여섯 수작업 통계로 요약한 `cycle_set`이었다. 두 표현을 동일시하지 않는다.
+요청에 따라 `research/cycle_pe/v2/`에 **기저벡터 입력 버전**을 독립 구현했다. 연구 트랙은
+여전히 세 개이고, Cycle PE에 별도 버전을 추가한 것이며 다른 트랙과 결합하지 않았다.
+
+- `basis.py`: canonical `u<v` incidence `B[m,n]`에서 float64 full SVD로 전체 좌영공간
+  `U_c[m,beta]`를 계산한다. `beta=m-n+c`, `B.T @ U_c≈0`, `U_c.T @ U_c≈I`를 검사하고
+  float32로 저장한다. 모든 열을 보존하며 원핫·6개 통계·projector·상위 k개로 대체하지 않는다.
+- `data.py`: 기존 공식 ZINC-12K/Peptides-struct 원본·split adapter만 재사용한다. v1의
+  통계 전처리는 호출하지 않는다. 기저마다 edge-row를 일치시키고 가변 `[m_i,beta_i]` 행렬을
+  배치 내에서도 별도로 보존한다. forest/disconnected/isolates/edgeless 입력을 처리한다.
+  namespace는 `cycle_pe_v2_benchmark`; 구현/NumPy/원본 checksum과 수학 조건을 검사한다.
+- `model.py`: 각 기저벡터의 signed coefficient와 bond embedding을 먼저 학습층에 넣고,
+  열별 전체 엣지 문맥을 학습한 뒤 엣지 PE로 전달한다. `f(u)+f(-u)` 비선형 대칭화와 모든 열의
+  집계로 부호/열 순서 불변성을 구현한다. 입력 기저는 topology-only이나 encoder는 bond에도
+  조건화된다. 가변 rank를 자르거나 train 최대 폭을 test에 강제하지 않는다.
+- 임의의 `U_c Q` 직교 회전이나 엣지 재정향 불변성은 없다. SVD를 재계산하는 graph relabeling은
+  기저 회전을 일으킬 수 있으므로 graph-isomorphism invariance를 주장하지 않는다. 고정 폭의
+  학습 PE는 무손실 codec이 아니다. Dense SVD 전처리와 모든 열을 통한 학습의 비용도 남는다.
+- `benchmark.py`: CUDA-only, float32 기본, 기존 message backbone과 공식 입력/target 유지,
+  validation checkpoint 선택 후 test 1회. 모델 이름은 `cycle_basis_v2`, track은 `cycle_pe`,
+  version은 `v2`다. 기본 데이터·batch·epochs·optimizer는 v1과 같고 파라미터 수는 따로 기록한다.
+- 전용 `prepare_data.sh`/`reproduce.sh`는 root runner의 `--cycle-pe-version v2`를 사용한다.
+  v2는 `cycle_pe` 단독 benchmark만 허용한다. 기본 전체 실행과 v1 경로는 그대로다.
+  결과는 `research/cycle_pe/v2/results/paper/`, custom root는 `cycle_pe_v2/` 아래에 분리한다.
+- 집계 schema는 paper 5 / efficiency 4이며 `cycle_basis_v2.test` 및 효율 지표만 명시적으로
+  추가했다. v1·v2는 별도 model metric path로 집계하며 외부 논문 수치·validation과 합치지 않는다.
+- `v2/datasets.yaml`은 v2 run에 보존하는 데이터/표현 계약이다. 기존 일반 `check_datasets.py`의
+  v1 registry 검증이 v2 기저를 검증했다고 해석하지 않는다. v2 로더 자체가 수학·내용을 검사한다.
+
+설치 완료 후 실행 명령은 [v2 README](research/cycle_pe/v2/README.md)에 있다. 이번 작업에서
+공식 데이터 다운로드나 CPU/GPU 연구 학습은 실행하지 않았다. 작은 개발 fixture의 수학·배치·미분
+검사는 실제 공개 데이터의 학습 완료나 성능/novelty 입증과 구분한다.
+
+최적화·진단 추가 전, v2 구현 시점의 전체 회귀는 **482 passed, 63 skipped**,
+Ruff 및 diff 검사 통과다. 생략된 63개는
+기존 Linux/Bash 전용 62개와 로컬 PyG 미설치 검사 1개다. 새 검사는 전체 기저의 nullity/
+orthonormality/큰 rank 허용오차, cache 무결성·원본 정렬, 가변 rank 배치, 실제 signed 계수의
+학습층 입력, 모든 열의 gradient, sign/order symmetry, chunk 결과 일치, forest/빈 엣지,
+CUDA 학습 guard, val→test 순서, v2 CLI/manifest/결과 분리와 집계 배제를 포함한다.
+이 검증은 실제 Linux shell 또는 GPU 실행 성공을 대신하지 않는다.
+
 ### 2026-08-31 Ubuntu 18.04 Singularity의 glibc 호환 경로
 
 사용자가 제공한 실제 실행 환경은 Ubuntu 18.04.5 / glibc 2.27이다. Torch import는
@@ -147,12 +313,13 @@ Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 
   PE를 downstream 예측으로 읽는 neural layer는 우리 모델의 구성요소이며 외부 비교 모델이 아니다.
 - Cycle-set은 cycle-column sign/order에는 불변이지만 chart 교체에는 불변이 아니다.
   원 논문과 같은 데이터셋을 쓰는 것과 논문 모델의 수치를 재현하는 것은 구분한다.
-- 학습은 CUDA 전용이다. 기본 float32, PPI batch 2, 분자/tree batch 32, model seeds 0–4다.
+- 학습은 CUDA 전용이다. 기본 float32, PPI batch 2, 분자/tree batch 32다. 당시 model seeds는
+  0–4였으며 이후 사용자 요청으로 현재 기본값은 0 하나로 변경했다.
   GAT/PE는 validation으로 checkpoint를 선택한 뒤 test를 한 번 평가한다. GAT는 accuracy,
   PPI는 전체 node-label micro-F1, PE는 MAE를 사용한다. 시간/메모리/파라미터도 따로 저장한다.
 - Root `scripts/run_paper.py` 기본값과 다섯 Bash wrapper를 새 `benchmark`로 연결했다.
   준비는 GAT/PE/CSL/ZINC 네 child만 한 번씩 수행한다. 기본 재현은 preflight 이후
-  GAT 5개 + PE 5개 + tree 10개 child이며 세 트랙 결과 폴더를 분리한다.
+  당시 GAT 5개 + PE 5개 + tree 10개 child였고 현재는 1+1+2개다. 세 트랙 결과 폴더는 분리한다.
 - Benchmark schema v2는 `datasets.<dataset>.models.conductance` 또는 `.models.cycle_set`를
   사용한다. `scripts/aggregate_paper.py`는 이 경로의 test만 성능으로 집계하고
   validation/history/외부 모델 점수/인용 수치를 제외한다. Paired 비교는 우리 모델의
@@ -163,7 +330,7 @@ Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 
 
 - 외부 모델 제거 후 root runner/집계/registry 및 세 트랙 관련 검사: **174 passed, 1 skipped**.
   생략된 한 검사는 로컬 PyG 미설치로 실행하지 못한 데이터 batching 검사다.
-- 수정 Python의 Ruff 검사 통과. 기본 재현의 20개 학습 child와 준비의 4개 child 명령은
+- 수정 Python의 Ruff 검사 통과. 당시 기본 재현의 20개 학습 child와 준비의 4개 child 명령은
   실제 각 트랙의 CLI parser로 검증했다. 외부 모델 선택 옵션은 거부되고, 논문 인용 점수는
   우리 결과 집계와 paired 통계에 포함되지 않는 것을 테스트했다.
 - Windows 검사 중 `Windows fatal exception: access violation` 진단 출력이 있었으나
@@ -182,8 +349,9 @@ Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 
      spanning-tree chart로 바꾸는 augmentation.
 2. 위 세 연구를 결합한 모델은 아직 없다. `research/combined_later`는 격리된 과거
    prototype이며 paper runner가 import하거나 실행하지 않는다.
-3. 구현과 가설 입증은 다르다. 현재 코드·CLI·fixture·artifact 회귀 테스트는 통과했지만,
-   실제 Linux CUDA 실행 환경에서 official public dataset 전체 학습 결과는 아직 생성하지 않았다.
+3. 구현과 가설 입증은 다르다. 로컬 코드·CLI·fixture·artifact 회귀 검사와 사용자가 제공한
+   benchmark 5-seed 집계는 별도 근거다. 보조 `core/all` 전체 결과, v2 GPU 결과,
+   최적화의 GPU 가속 실측을 모두 확보한 상태는 아니다.
 4. 실험 CLI의 `--tiny`, 공개 데이터 대체용 가짜 데이터 생성, legacy smoke 실행기는 제거했다.
    테스트 내부의 작은 입력과 실제 연구용 S1–S4/CycleCount 합성 벤치마크는 별개다.
 5. dataset registry의 `implemented/code_ready`는 adapter와 runner가 있다는 뜻이다. 현재 로컬에
@@ -205,11 +373,21 @@ Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 
 ### 코드 스냅샷
 
 - 파일: `code_summary.md`
-- 포함 파일: 105개
-- 크기: 972,654 bytes, 25,646 lines (`str.splitlines()` 기준)
-- SHA-256: `2D49D4080AE0F2DB4D181D31D3FC97F9C53302A8D864FFD41FE6BB6A02B9017D`
+- 포함 파일: 133개
+- 크기: 1,295,476 bytes, 33,367 lines (`str.splitlines()` 기준)
+- SHA-256: `3C9515E92F2F9CC6EA01BB9A5FC063DF55EE85BA09FCBAD4CEC07352FAAD6AC8`
 - 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`, `.gitattributes`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
+- 범위: 이 버전의 전체 source/test/config/script. 생성기는 작업본 변경도 포함하므로 게시 전
+  `--check`로 같은 revision의 소스와 맞는지 확인한다.
+- 형식: `# 파일경로` 다음에 해당 파일의 코드 전체를 넣으며 코드 내용을 요약·생략하지 않는다.
+
+재생성과 원본 일치 검사는 저장소 루트에서 실행한다.
+
+```bash
+python scripts/generate_code_summary.py
+python scripts/generate_code_summary.py --check
+```
 
 이 디렉터리는 Git repository로 초기화되어 있으며 원격은
 `https://github.com/costunder/new-gat.git`이다. 실행 환경에서는 먼저 `git rev-parse HEAD`를
@@ -300,6 +478,9 @@ representation으로 제공하는 inductive bias다.
 
 - `README.md`: Linux NVIDIA GPU 환경의 설치부터 전체 재현까지의 실행 명령.
 - `DATASETS.md`: 사람이 읽는 데이터·split·metric 계약.
+- `docs/EXPERIMENT_STATUS.md`: 기존 5-seed 결과, 실제 seed 0 GPU 진단과 미확정 원인.
+- `docs/CONDUCTANCE_DIAGNOSTICS.md`: 기존 checkpoint의 읽기 전용 GPU 진단 실행·해석.
+- `docs/PERFORMANCE.md`: 실행 최적화 옵션과 미측정 GPU 가속의 검증 경계.
 - `pyproject.toml`: Python 3.11+, core/dev/paper dependency와 pytest/Ruff 설정.
 - `requirements-lock.txt`, `requirements-cu118-lock.txt`, `requirements-legacy-cu118-lock.txt`,
   `constraints-*.txt`: Python 3.11 호환 exact top-level 연구 stack과 profile별 official Torch 계약.
@@ -316,6 +497,8 @@ representation으로 제공하는 inductive bias다.
 - `scripts/prepare_data.sh`: 전체 데이터 준비 명령을 담은 실행 파일.
 - `scripts/reproduce.sh`, `research/<track>/reproduce.sh`: 전체 또는 트랙별 정식 실험 실행 파일.
 - `scripts/aggregate_paper.py`: 폐쇄형 paper metric/efficiency registry와 seed-aligned 통계.
+- `scripts/conductance_interventions.py`, `scripts/conductance_gate_audit.py`: 단일 checkpoint의
+  validation C 개입 및 train-label 국소 gradient 검사. production 학습 경로에는 import하지 않는다.
 - `scripts/generate_code_summary.py`: 외부 교차검증용 exact source snapshot 생성/검사.
 - `scripts/check_datasets.py`: 세 `datasets.yaml`의 code/cache readiness 검사.
 - `src/chartgat/algebra.py`: incidence, fundamental cycle basis, chart transition 등 공통 저수준 수학.
@@ -327,12 +510,15 @@ representation으로 제공하는 inductive bias다.
 ### 활성 연구 폴더
 
 - `research/conductance_gat/`
+  - `benchmark_data.py`, `benchmark.py`: 기본 5개 공개 데이터의 cache·우리 모델 학습/평가.
   - `sparse.py`: paper headline sparse operator와 packed variable-graph batch.
   - `paper_data.py`: S1–S4 generated protocols와 deterministic cache.
   - `public_data.py`: PascalVOC-SP와 ogbg-molhiv adapter.
-  - `paper.py`: 독립 paper runner, models/baselines/metrics/artifacts.
+  - `paper.py`: 보조 `core/all` runner, 우리 모델의 내부 ablation/metrics/artifacts.
   - `model.py`: 저수준 연산 및 수학 단위 검증용 유틸리티. legacy 실행기와 production synthetic generator는 제거했다.
 - `research/cycle_pe/`
+  - `benchmark_data.py`, `benchmark_models.py`, `benchmark.py`: 기본 ZINC/Peptides v1 학습/평가.
+  - `v2/`: 전체 좌영공간 기저, 별도 cache·encoder·benchmark·실행 파일.
   - `features.py`: fundamental basis, set statistics, projector 수학.
   - `paper_data.py`: CycleCount-OOD generator와 exact cycle labels.
   - `paper_adapters.py`: BREC/ZINC adapter와 안전한 download/cache 처리.
@@ -387,15 +573,22 @@ Ubuntu 18.04/glibc 2.27은 위 기본 설치 대신 README의 별도 `new-gat-le
 
 ```bash
 bash scripts/prepare_data.sh
-python scripts/check_datasets.py --data-root data/paper --require-cache
 ```
 
 기본 데이터 경로는 `data/paper/`다. 준비 단계는 모델 학습이나 CPU 시험 학습을 하지 않는다.
-공개 데이터에 대한 가짜 데이터 fallback은 없다.
-`--allow-download`가 없으면 public endpoint를 호출하지 않는다.
-Generated benchmark는 고정 data seed로 한 번 준비하며 model seed마다 다시 생성하지 않는다.
+위 wrapper는 기본 `benchmark`에 `--prepare-only --allow-download`를 넘기며 공식 원본과
+검증된 cache를 준비한다. 기본 실행은 S1–S4/CycleCount를 생성하지 않는다. GAT/PE benchmark
+loader는 원본·전처리·분할 checksum을 검사하며, 학습 중 다운로드나 가짜 데이터 fallback은 없다.
+v2는 `bash research/cycle_pe/v2/prepare_data.sh`로 별도 기저 cache를 준비한다.
 
-Checker는 request/schema, split cardinality, graph IDs, tensor/target shape, finite 값,
+아래 checker는 **보조 `core/all` 데이터 레지스트리 전용**이다. 위 기본 준비 다음에
+모든 보조 cache까지 준비됐다고 인증하는 명령이 아니며 v2 기저 검증도 대신하지 않는다.
+
+```bash
+python scripts/check_datasets.py --profile paper --data-root data/paper --require-cache
+```
+
+보조 checker는 request/schema, split cardinality, graph IDs, tensor/target shape, finite 값,
 content/artifact hash를 읽기 전용으로 검증한다. 상태는
 `valid/missing/incomplete/corrupt/wrong_request`로 구분한다.
 Data와 split seed가 다르면 `--data-seeds`, `--split-seeds`를 각각 지정한다.
@@ -412,7 +605,8 @@ bash research/tree_augmentation/reproduce.sh
 위 세 명령을 순서대로 실행하는 대안은
 `bash scripts/reproduce.sh`다. 두 방식을 중복 실행할 필요는 없다.
 
-기본값은 CUDA, model seeds `0..4`, data/split/chart seed `0`, batch32/workers4다.
+기본값은 `benchmark`, CUDA FP32/AMP OFF, model seed `0` 하나, data/split/chart seed `0`,
+workers 4다. PPI batch는 2, 분자/tree batch는 32이고 Cora/CiteSeer/PubMed/arxiv는 full-batch다.
 Run ID는 실행마다 자동 생성하며 같은 ID를 덮어쓰거나 자동 resume하지 않는다.
 기본 data/와 트랙별 results/는 clone에 포함되고 하위 run 디렉터리는 자동 생성된다.
 트랙 실패 시 기본적으로 다른 독립 run은
@@ -423,9 +617,12 @@ GPU 사전검사는 CUDA 사용 가능 여부, device index, 현재 여유 메�
 가짜 그래프 생성, tensor 학습 입력 생성, 모델 forward/backward는 수행하지 않는다.
 이 검사는 실제 데이터의 메모리 적합성이나 학습 성공을 보장하지 않는다.
 데이터 준비에는 GPU 검사를 실행하지 않는다.
-공식 BREC는 batch16/workers0/no-AMP, 내부 seed 10개를 사용하는 단일 child다.
-CycleCount/ZINC만 외부 model seeds마다 반복한다.
-Master의 cycle optimizer override는 공식 BREC에 적용하지 않는다.
+기본 실행은 Conductance 1개, Cycle v1 1개, Tree CSL/ZINC 2개 child를 실행한다.
+v2는 전용 `reproduce.sh`로 Cycle PE만 독립 실행한다.
+보조 `all`을 명시한 경우에만 BREC는 batch16/workers0/no-AMP, 내부 seed 10개의 단일
+child로 실행한다. 보조 Cycle PE의 `core`는 CycleCount만 실행하고 `all`의 CycleCount/ZINC는
+외부 model seeds마다 반복한다.
+공식 BREC에는 master의 cycle optimizer override를 적용하지 않는다.
 
 ### 3.4 중앙 및 트랙별 산출물
 
@@ -457,8 +654,17 @@ Seed/epoch/batch/config/history/count는 제외된다. Elapsed time, peak memory
 `trainable_active_parameters_only` count는 raw `efficiency.csv`로 분리하고 bootstrap/paired test를
 하지 않는다. `ignored_numeric_fields`가 제외 수를 감사 가능하게 남긴다. 이 집계도 논문별
 multiple-comparison correction이나 task-specific significance test를 대신하지 않는다.
+단일 seed에서는 표본 std·bootstrap 구간·paired effect size를 추정하지 않고 null로 남긴다.
+Aggregate schema 3의 `uncertainty_status`/`uncertainty_policy`를 확인하며, 명시적으로 bootstrap을
+끈 경우의 과거 mean placeholder도 신뢰구간으로 해석하지 않는다.
 
 ## 4. 연구 트랙 A — Sparse Positive Conductance Operator
+
+**기본 실행 범위:** `benchmark.py`에서 Cora/CiteSeer/PubMed/PPI/ogbn-arxiv의 노드 예측을
+학습한다. hidden 64의 encoder, conductance 2층, LayerNorm/ELU/dropout, decoder를 사용하며
+gate는 엣지 속성 없이 `abs(BH)`와 `(BH)^2`를 읽는다. CE/PPI BCE 학습, validation 선택 후
+test 평가다. 아래 `node_only`/flux supervision 표는 이 노드 분류 loss가 아니라 보조
+S1–S4 operator-identification 실험의 계약이다. 기본 결과·진단은 실험 상태 문서를 따른다.
 
 ### 4.1 실제 가설
 
@@ -485,13 +691,15 @@ channel-coupled matrix conductance는 구현하지 않았다.
 
 Orientation을 뒤집으면 gradient/flux 부호는 바뀌지만 undirected orientation-invariant edge
 feature라는 전제에서 conductance와 node update는 불변이다. `sum(B^Tq)=0`이므로 node-state
-총합을 보존한다. Step은 graph별 maximum weighted degree에 따라 stability cap을 둔다.
+총합을 보존한다. 이 보존성은 conductance 전파 블록에 대한 것이지 encoder/LN/ELU/decoder를
+포함한 분류기 전체의 보존성은 아니다. 기본 benchmark의 step은 그래프별
+`0.95 / max_i(d_i^C)`이며, 보조 연산은 요청 step에 graph별 stability cap을 적용한다.
 
 이 구조는 original softmax-neighbor GAT라기보다 positive symmetric diffusion/transport
 operator에 가깝다. 논문 명칭과 novelty claim은 GRAND류 diffusion, anisotropic diffusion,
 edge-conditioned convolution, graph neural PDE 문헌과 다시 대조해야 한다.
 
-### 4.2 학습 objective와 비교군
+### 4.2 보조 S1–S4의 학습 objective와 내부 비교군
 
 | 이름 | 입력/구조 | supervision | 해석 |
 |---|---|---|---|
@@ -505,7 +713,7 @@ edge-conditioned convolution, graph neural PDE 문헌과 다시 대조해야 한
 | `node_message_nnls` | projected NNLS | evaluation node message | identifiability ceiling |
 | `oracle` | true C | none | data/operator oracle |
 
-Headline `full`의 loss path는 flux target을 읽지 않는다. Regression test가 flux label을
+보조 S1–S4 headline `full`의 loss path는 flux target을 읽지 않는다. Regression test가 flux label을
 삭제하거나 바꿔도 node-only loss가 동일함을 확인한다. LS/NNLS는 inductive learned
 baseline으로 해석하면 안 된다.
 
@@ -529,7 +737,7 @@ conductance는 graph별 edge-feature min/max로 정규화되어 graph-global con
 headline estimator는 edge-local 입력만 보므로, S4 오차에는 identifiability뿐 아니라
 function-class misspecification도 섞인다.
 
-### 4.4 Public benchmarks
+### 4.4 보조 Public benchmarks (`all`)
 
 - PascalVOC-SP: PyG LRGB official train/val/test, node classification, macro-F1.
 - ogbg-molhiv: OGB official scaffold split, graph classification, OGB ROC-AUC evaluator.
@@ -539,7 +747,7 @@ custom single-head edge-aware GAT, GINE 경쟁 모델 구현은 제거했다. Pa
 MolHIV의 OGB AtomEncoder/BondEncoder는 원자·결합 입력을 읽는 구성요소로 유지한다.
 외부 점수는 논문 표를 인용하며 모델·학습 조건 차이를 표시한다.
 
-### 4.5 산출물과 테스트
+### 4.5 보조 suite 산출물과 테스트
 
 Standalone:
 
@@ -560,14 +768,16 @@ graph/excitation/trajectory 생성에는 `data_seed`만, model 초기화와 trai
 MolHIV의 split/chart seed는 명시적으로 `not_applicable`이다. 기존 `--seed`는 명시하지 않은
 축의 standalone fallback으로만 유지한다.
 
-Conductance track test 20개가 sparse-vs-dense algebra, variable graph isolation, positivity,
+초기 보조 프로토콜의 Conductance test 20개는 sparse-vs-dense algebra, variable graph isolation, positivity,
 orientation, mass conservation, objective leakage, S1/S2/S3/S4 split, deterministic cache,
 S2 full cardinality contract, real public adapter, collision refusal와 가짜 데이터 옵션 거부를
 검사한다.
 
 ### 4.6 반드시 재검토할 gap
 
-1. 실제 CUDA full S1–S4 및 official PascalVOC-SP/MolHIV 결과가 없다.
+1. 보조 S1–S4 및 PascalVOC-SP/MolHIV 결과는 제공받지 않았다. 기본 benchmark 5개
+   데이터의 5-seed 집계와 seed 0 세 데이터 진단은 별도로 확보했다. 상수 C·약한 전파의
+   원인, 다른 seed의 재현 여부, 외부 논문과의 조건 차이는 아직 검토 대상이다.
 2. S1/S2는 graph ID를 분리하지만 cross-split exact isomorphism/feature/C-law content hash
    guard가 없다. Registry는 더 이상 구현되지 않은 dedup을 claim하지 않는다.
 3. generator 내부 명칭 `er`와 `rgg`는 엄밀한 G(n,p)/radius RGG가 아니다. 각각 connected
@@ -577,9 +787,9 @@ S2 full cardinality contract, real public adapter, collision refusal와 가짜 �
    unseen initial-condition 효과를 분리하지 못한다.
 5. Core neural ablation은 input과 capacity가 함께 바뀌며 active parameter count를 기록하지 않는다.
    따라서 edge-only/gradient-only/full 차이를 순수 input contribution으로 해석하면 안 된다.
-6. Public baseline은 custom 1-layer이고 tuning/depth/dropout/scheduler study가 없다. 사용하지
-   않는 edge encoder는 이제 frozen/skipped되어 active trainable parameter count에서 제외되지만,
-   backbone 사이 exact budget matching은 하지 않는다.
+6. 보조 public 경로는 우리 conductance 1-layer 모델만 사용한다. 기본 benchmark는 2-layer
+   모델이며 외부 GCN/GAT/GATv2/SAGE 구현은 없다. 외부 논문 표와의 파라미터 예산·depth·
+   dropout·scheduler·tuning 조건을 동일하게 맞췄다고 주장할 수 없다.
 7. `suite=all` public 단계가 실패하면 그 child 안에서 이미 끝난 core를 독립 partial artifact로
     보존하지 않고 중앙 log만 남을 수 있다.
 8. Real sensor conductance recovery dataset과 signed/directed/channel-matrix negative control이
@@ -591,6 +801,11 @@ label 수로 train/validation 합산한다.
 
 ## 5. 연구 트랙 B — Static Cycle-space PE
 
+**기본 실행 범위:** `benchmark.py`는 ZINC-12K/Peptides-struct에서 여섯 통계형 `cycle_set`
+v1만 학습한다. 좌영공간 기저벡터 전체를 입력하는 모델은 별도 `v2/`의 `cycle_basis_v2`이며
+아직 GPU 결과를 받지 않았다. 아래 네 variant, CycleCount/BREC/보조 ZINC 설명은 명시적으로
+선택하는 `core/all` suite 계약이다. 기본 benchmark가 이 네 모델을 모두 실행하는 것은 아니다.
+
 ### 5.1 실제 가설
 
 Root-0 BFS tree로 topology에서 `F_T`를 학습 전에 한 번 계산하고 edge PE로 전달했을 때,
@@ -598,7 +813,7 @@ ordinary degree/topology feature만 쓰는 같은 backbone보다 cycle-compositi
 task에 도움이 되는지 검증한다. Learned conductance, node potential, sample circulation
 coefficient, layer-to-layer cycle state는 없다.
 
-### 5.2 네 PE variant
+### 5.2 보조 suite의 네 PE variant
 
 | Variant | 실제 입력 | 불변성/주의 |
 |---|---|---|
@@ -621,6 +836,8 @@ Raw width는 train split의 최대 `β`만으로 정한다. OOD graph의 `β`가
 test-fit하지 않고 해당 split을 N/A로 기록하며 다른 PE variant 평가는 계속한다. Validation
 일부가 overflow면 compatible subset만 early stopping에 사용하고 full validation raw metric은
 N/A다.
+여기의 `raw`는 `cycle_basis_v2`가 아니다. Train-width/overflow 제약은 전체 가변 기저를
+보존하는 v2에 적용되지 않는다.
 
 공통 backbone은 variable-edge/variable-β graph list batch, node/edge encoder, symmetric endpoint
 edge update, 양방향 mean message passing, residual LayerNorm, node/edge mean-max graph pooling을
@@ -690,21 +907,22 @@ Adapter는 official mode에서 q=32, 400 pairs, 51,200 records를 강제하고 p
 decode한다. Full download는
 opt-in이며 HTTPS host, archive path traversal, Windows path, symlink, member/size/ratio와 NPY magic을
 검사하고 ZIP/NPY SHA-256을 provenance로 저장한다. Upstream이 canonical SHA-256 pin을
-공개했다고 주장하지 않는다. Tiny BREC은 2-pair offline custom fixture다.
+공개했다고 주장하지 않는다. 2-pair offline custom 입력은 tests 내부의 단위검사 fixture이며,
+실험 CLI의 축소 BREC 옵션이 아니다.
 
 중요: full `--prepare-only`는 400 pair 전체가 아니라 first/last pair만 decode/PE sanity check한다.
 
-### 5.5 ZINC-12K
+### 5.5 보조 suite의 ZINC-12K
 
 PyG `ZINC(subset=True)` official train/validation/test adapter를 사용한다. Atom은 28-way,
 bond는 4-way categorical one-hot으로 변환하고 reciprocal bond type 불일치를 거부한다.
 Graph regression target은 constrained solubility다. 네 PE variant를 같은 backbone에서 비교한다.
 
 코드는 PyG adapter가 official split을 준다고 신뢰하며 loader length가 정확히
-10,000/1,000/1,000인지 별도 assert하지 않는다. Tiny는 앞 32/8/8이지만 PyG/cache가 여전히
-필요하다.
+10,000/1,000/1,000인지 별도 assert하지 않는다. 축소 데이터 실행 옵션은 제거했으며
+공식 전체 split과 실제 cache만 사용한다. 기본 `benchmark`의 별도 split 검증과 구분한다.
 
-### 5.6 산출물과 테스트
+### 5.6 보조 suite 산출물과 테스트
 
 Standalone 예시:
 
@@ -724,13 +942,15 @@ Master runner에서는 child output container에 suite 이름이 한 번 더 생
 core manifest는 `.../model-seed-0/core/core/manifest.json`, BREC는
 `.../brec-official-10-seed/brec/...` 구조다.
 
-Cycle track focused test 43개가 PE invariance/non-invariance, β=0, exact labels, 20k split specification,
+초기 보조 프로토콜의 Cycle test 43개는 PE invariance/non-invariance, β=0, exact labels, 20k split specification,
 deterministic cache, train-only raw width, variable batch, BREC layout/download/T²/reliability/seed
 aggregation, variant-lazy projector, ZINC fixture와 CLI collision/partial preservation을 검사한다.
 
 ### 5.7 반드시 재검토할 gap
 
-1. 실제 CUDA full 20k training, official BREC 400-pair E2E, real ZINC full 결과가 없다.
+1. 보조 CycleCount 20k/BREC 400-pair 전체 결과는 제공받지 않았다. 기본 benchmark의
+   ZINC-12K/Peptides-struct `cycle_set` v1 5-seed 결과는 확보했지만, 기저벡터 v2의
+   GPU 학습 결과와 같은 backbone의 PE 제외 효과 분리는 아직 없다.
 2. 모든 variant가 `F_T`를 계산한다. Set 통계와 projector만 요청에 따라 생략되며,
    `no_pe/raw/set`은 dense projector를 만들지 않는다. Projector variant 자체는 dense `m×m`,
    O(m²)이고 대형 graph scaling 검증이 없다.
@@ -868,14 +1088,16 @@ python -m research.tree_augmentation.paper \
 성공 artifact는 `summary.json`, `manifest.json`, `fixed_bfs_model.pt`,
 `multi_chart_model.pt`. Checkpoint는 CPU state dict와 target normalization/settings를 저장한다.
 
-Tree track test 21개가 full-β lossless basis, chart transition/cocycle, Wilson UST 분포,
+초기 Tree protocol test 21개는 full-β lossless basis, chart transition/cocycle, Wilson UST 분포,
 training/held-out sampler 분리, chart-independent target, β=0/1/2 masks, orientation/column-sign/
 edge-order/same-tree-node-relabel gauge invariance, deterministic cache/split, ZINC chemistry
 roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사한다.
 
 ### 6.6 반드시 재검토할 gap
 
-1. 실제 CUDA full/core/CSL/ZINC 결과가 없다.
+1. 기본 CSL/ZINC 5-seed 집계는 확보했다. CSL 정확도는 개선되지만 unseen 절대 성능은
+   낮고 flip rate는 악화한다. ZINC 평균 MAE도 개선되지 않았다. 보조 core 결과와
+   표준 논문 protocol 재현, 유의성 검정은 확보한 근거에 포함되지 않는다.
 2. Adaptive/learned MST, trainable spanning tree, MST sparsification은 구현하지 않았다.
 3. Multi-chart는 finite offline bank이지 online resampling algorithm이 아니다.
 4. Validation split은 cache에는 있으나 현재 fixed 800-update training의 early stopping 또는
@@ -894,8 +1116,17 @@ roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사�
 
 ## 7. 데이터 레지스트리 상태
 
-`scripts/check_datasets.py --profile paper --json` 기준으로 12개 paper entry의 adapter/runner가
-구현되어 있다.
+기본 `prepare_data.sh`/`reproduce.sh`는 `benchmark`다. 해당 데이터와 이번 결과 범위는 다음과 같다.
+
+| Track / 버전 | 기본 benchmark | 제공된 결과 |
+|---|---|---|
+| Conductance | Cora, CiteSeer, PubMed, PPI, ogbn-arxiv | 5개 데이터 5-seed 집계; Cora/PPI/arxiv seed 0 진단 |
+| Cycle PE v1 | ZINC-12K, Peptides-struct | `cycle_set` 5-seed 집계 |
+| Cycle PE v2 | 위와 같은 공식 원본·split, 별도 기저 cache | 구현·단위 검증; GPU 결과 미수령 |
+| Tree augmentation | CSL, ZINC-12K | fixed-BFS/multi-chart 5-seed 집계 |
+
+아래 12개는 `scripts/check_datasets.py --profile paper --json`이 확인하는 **보조 `core/all`
+계약**이다. 기본 benchmark나 v2 기저 cache 검증으로 대체해서 해석하지 않는다.
 
 | Track | Generated/core | Public/all |
 |---|---|---|
@@ -903,12 +1134,19 @@ roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사�
 | Cycle PE | CycleCount-OOD v4 | BREC v3, ZINC-12K |
 | Tree augmentation | CycleCount-OOD v2 multi-chart | CSL, ZINC-12K multi-chart |
 
-현재 로컬 public cache는 없으므로 `--require-cache`를 통과했다고 기록하면 안 된다. 실제
-실험 환경에서 prepare/download 후 strict checker를 다시 실행해야 한다.
+현재 로컬 public cache는 없으므로 로컬에서 `--require-cache`를 통과했다고 기록하면 안 된다.
+사용자 서버의 benchmark 실행 결과가 있다는 사실과 이 작업 공간의 cache 준비 여부는 다르다.
+새 환경에서는 해당 버전의 준비 명령과 loader의 checksum·split 검증을 수행한다.
 
 ## 8. 자동 검증 상태
 
-2026-08-30 더미 실행 경로 제거 및 실제 재현 실행 파일 추가 후 최종 로컬 검증:
+최신 전체 회귀는 **680 passed / 63 skipped**, 확장 진단 전용은 **89 passed**다.
+이 로컬 단위 검증과 사용자 제공 실제 GPU 진단의 범위는 0절과 실험 상태 문서에 구분했다.
+
+### 과거 기록 — 2026-08-30
+
+아래는 더미 실행 경로 제거 및 실제 재현 실행 파일 추가 **당시**의 로컬 검증이다.
+테스트·소스 파일 수는 현재 값이 아니며, Windows 진단 메시지도 해당 실행의 기록이다.
 
 ```text
 pytest -q                     204 passed, 12 skipped (11.61 s, exit 0)
@@ -932,7 +1170,8 @@ GPU 사전검사가 sample tensor나 모델을 생성하지 않는지도 mocked 
 
 전체 pytest는 exit 0으로 끝났지만 실행 중 기존 Windows faulthandler
 `access violation` 진단이 다시 출력됐다. 이를 숨기거나 Linux GPU 성공의 증거로 해석하지 않는다.
-지원 Linux GPU 환경에서 실제 의존성 설치, cache 준비, 전체 학습·평가를 별도로 확인해야 한다.
+당시에는 지원 Linux GPU 환경에서 실제 의존성 설치, cache 준비, 학습·평가 확인이 남아 있었다.
+이후 사용자 benchmark 결과와 seed 0 진단을 받았으며 범위는 실험 상태 문서를 따른다.
 과거 삭제된 더미 실행기의 숫자는 현재 검증·논문 결과로 이 문서에 재사용하지 않는다.
 
 Read-only protocol 교차검토에서는 CycleCount full specification/hash가 이전 full protocol과
@@ -941,28 +1180,34 @@ Read-only protocol 교차검토에서는 CycleCount full specification/hash가 �
 
 ## 9. 논문 claim 전 우선순위
 
-### P0 — 외부 GPU에서 결과를 만들기 전에 남은 일
+### P0 — 이미 나온 결과의 검증과 Conductance 실패 원인 분리
 
-1. 실제 target GPU node에서 `setup_gpu.sh`와 CUDA preflight 실행.
-2. 모든 public dataset cache 준비 후 `check_datasets --require-cache` 통과.
-3. 트랙별 one-model-seed kill test와 peak-memory 확인 후 후보 variant를 확정.
-4. 확정 후보만 five-model-seed로 실행하고 중앙 `aggregate/`의 failure/NaN/OOM, raw path,
-   mean/std/CI/paired effect를 검토.
-5. Official public cache로 split size/checksum/evaluator contract를 재검증.
+1. 기존 run ID, source revision/dirty 상태, lock, data checksum, best checkpoint, history와
+   seed별 원본 지표를 보존한다. 제공된 집계 텍스트와 서버 원본 artifact의 검증을 혼동하지 않는다.
+2. Conductance C-MLP의 weight/bias norm·0 비율, raw logit 분산, `abs(BH)` 입력과 task
+   gradient/weight decay의 상대 크기를 확인한다. 관측된 C 상수화의 원인을 아직 확정하지 않는다.
+3. 다른 model seed 및 CiteSeer/PubMed에서 같은 현상이 재현되는지 확인한다. 재학습 없는
+   validation 전파 우회와 새 모델 학습 비교를 구분하고 test 점수에 맞춘 튜닝은 하지 않는다.
+4. v2는 별도 코드·cache·run으로 GPU 검증한다. 기존 `cycle_set` 결과를 기저벡터 실적으로
+   재분류하지 않는다. 실행 최적화 역시 동등성·peak memory·GPU 속도를 별도로 측정한다.
+5. Tree의 chart-family OOD, validation 미사용, 연속 target에 부적절한 rounded 지표를
+   반영해 claim을 제한한다. 지표/학습 변경은 문서 수정과 별도 작업으로 다룬다.
 
 코드 수준 P0 교정은 완료됐다: semantic strict cache와 atomic publish, BREC official/custom
 분리와 global reliability gate, Wilson train-family 제거, tree orientation gauge test, 네 seed 축,
 closed root metric/efficiency 집계, exact CUDA constraints/verification,
 cycle candidate CLI, stale S2 full-cache cardinality(112/24/48) 계약 교정을 반영했다.
-과거 shape-stress는 더미 모델 실행 제거에 맞춰 hardware/import 검사로 교체했다. 실제
-CUDA/public full 결과가 없다는 경계는 그대로다.
+과거 shape-stress는 더미 모델 실행 제거에 맞춰 hardware/import 검사로 교체했다.
+위 코드 gate의 완료는 모든 scientific gap 해소를 의미하지 않는다. 기본 benchmark 집계와
+seed 0 진단은 있지만 보조 suite 전체, v2 결과, 가속 실측까지 완료된 것은 아니다.
 
 ### P1 — 강한 scientific claim 전에
 
 1. Conductance: 관련 논문 표를 인용한 비교의 조건 확인, real physical/sensor conductance data
    또는 명확한 synthetic-only claim. 외부 모델을 저장소에 추가하는 작업은 현재 범위 밖이다.
-2. Cycle PE: degree/`(n,m,β)` matched counterfactual, 기존 cycle PE 논문과의 수학적 차이 설명,
-   dense projector scaling 측정.
+2. Cycle PE: v1/v2 및 같은 backbone의 PE 제외 효과 분리, degree/`(n,m,β)` matched
+   counterfactual, 기존 논문과의 수학적 차이 설명. v2의 임의 기저 회전/재정향 비불변성과
+   dense SVD·전체 기저 메모리 비용을 확인하고, 보조 projector 비용은 별도로 측정한다.
 3. Tree augmentation: 우리 모델의 BFS-only/DFS-only/Wilson-only ablation, validation 기반 selection,
    large-β scaling.
 4. Leakage negative tests와 graph/canonical hash guard 강화.
@@ -980,14 +1225,16 @@ CUDA/public full 결과가 없다는 경계는 그대로다.
 
 ## 10. 외부 ChatGPT에게 권장하는 교차검증 질문
 
-`code_summary.md`와 이 파일을 함께 주고 다음을 순서대로 요청하는 것이 좋다.
+`code_summary.md`, 이 파일과 `docs/EXPERIMENT_STATUS.md`를 함께 주고 다음을 요청한다.
+먼저 기본 benchmark/기저벡터 v2/보조 `core/all` 범위를 구분한다.
 
 1. `B∈R^{m×n}` convention에서 `ker(B^T)`, `L=B^TB`, fundamental basis와 pseudoinverse 설명이
    수학적으로 정확한가?
 2. 세 트랙 사이에 import, label, cache 또는 artifact를 통한 숨은 결합이 있는가?
 3. Conductance `full node_only`가 실제로 flux target을 전혀 읽지 않는가?
 4. S1–S4의 split이 graph/excitation/trajectory leakage를 충분히 막는가?
-5. Conductance public 5-model 비교가 architecture/parameter/optimization 측면에서 공정한가?
+5. Conductance 5개 데이터셋 결과를 외부 논문 표와 비교할 때 split·전처리·모델 크기·학습
+   조건 차이를 충분히 공개하는가? 이 저장소는 외부 5-model 비교를 실행하지 않는다.
 6. CycleCount edge/node/graph task가 auxiliary-label leakage 없이 완전히 독립적인가?
 7. Raw/set/projector의 invariance claim이 코드와 정확히 일치하는가?
 8. BREC T², no-q convention, `isclose`, reliability와 10-seed aggregation이 official protocol과
@@ -999,6 +1246,12 @@ CUDA/public full 결과가 없다는 경계는 그대로다.
 12. Existing tests가 놓친 failure mode를 우선순위와 함께 제시할 수 있는가?
 13. 각 아이디어의 closest prior work와 실제 novelty boundary는 무엇인가?
 14. 현재 artifact만으로 허용되는 claim과 금지해야 할 claim을 분리해 달라.
+15. seed 0의 C 상수화·rho·전파 우회 결과에서 관측과 원인 가설을 정확히 구분하는가?
+    그래프별 최대 차수 스텝과 C 공통 스케일 상쇄가 어떤 최적화 한계를 만드는가?
+16. Cycle `cycle_set` 결과와 `cycle_basis_v2` 구현, GitHub 게시본과 로컬 소스 스냅샷을
+    혼동하지 않는가? v2의 sign/order 불변성을 arbitrary basis-rotation 불변성으로 과장하는가?
+17. Tree의 CSL 5-seed/단일 split과 chart-sampler OOD, ZINC MAE 및 부적절한 rounded
+    보조 지표를 실제 의미에 맞게 해석하는가?
 
 ## 11. 공식 데이터/프로토콜 출처
 
@@ -1013,7 +1266,8 @@ CUDA/public full 결과가 없다는 경계는 그대로다.
 
 ## 12. 최종 인수인계 문장
 
-현재 저장소는 세 아이디어를 섞지 않고 각각 실행할 수 있는 연구 scaffold와 검증 가능한
-artifact pipeline을 갖췄다. 그러나 아직 논문 결과가 나온 상태는 아니다. 다음 작업자는 먼저
-P0 GPU/public full run과 생성된 통계 집계를 검토하고, 그 결과가 지지하는 트랙만 독립 contribution으로
-발전시켜야 한다. Adaptive MST나 세 트랙 결합은 그 이후 별도 실험으로 다룬다.
+현재 저장소에는 세 독립 연구의 실행·artifact pipeline이 있고 사용자 제공 기존 benchmark
+5-seed 결과와 Conductance seed 0 GPU 진단도 있다. 그러나 경쟁력·novelty·모든 트랙의
+일관된 개선을 입증한 상태는 아니다. 다음 작업자는 C 상수화·약한 전파의 원인을 분리하고,
+v2/최적화의 실제 GPU 검증과 Tree protocol 한계를 독립적으로 다뤄야 한다.
+Adaptive MST나 세 트랙 결합은 이후 별도 실험이며 기존 결과를 덮어쓰지 않는다.

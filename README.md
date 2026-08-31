@@ -15,6 +15,14 @@ GAT 트랙은 GAT/GATv2 논문의 데이터셋을, PE 트랙은 SignNet/PEARL �
 데이터 버전·split·지표·학습 조건이 다른 경우 차이를 명시한다. 데이터셋 이름이 같다는 것만으로
 조건이 모두 일치하는 비교라고 주장하지 않는다.
 
+Cycle PE의 좌영공간 **기저벡터 전체를 입력하는 v2**는
+[별도 폴더와 실행 안내](research/cycle_pe/v2/README.md)에 있다. 아래 기본 전체 실행은
+기존 통계형 v1을 유지하며, v2는 자체 명령·기저 캐시·결과 폴더로 독립 실행한다.
+
+이 소스 버전에는 v2, 실행 최적화, 단일 seed 기본값과 확장 진단이 포함되어 있다.
+이전 진단 전용 버전(`ebf8cd1`)과의 차이 및 실제 측정 결과는
+[실험 상태](docs/EXPERIMENT_STATUS.md)에 구분했다.
+
 ## 환경
 
 실행 환경은 **Linux, NVIDIA GPU, Conda Python 3.11**이다.
@@ -122,12 +130,21 @@ bash research/cycle_pe/reproduce.sh
 bash research/tree_augmentation/reproduce.sh
 ```
 
-공통 기본값은 CUDA, model seeds `0,1,2,3,4`, data/split/chart seed `0`, workers `4`다.
+공통 기본값은 CUDA, model seed `0`, data/split/chart seed `0`, workers `4`다.
 PPI batch size는 `2`, 분자·트리 데이터는 `32`이며 인용 그래프는 full-batch다.
 각 트랙의 우리 모델 구성과 평가 규칙은 해당 트랙 문서에 있다.
 
+여러 model seed를 반복하려면 실행 명령 뒤에 `--model-seeds 0,1,2,3,4`처럼 명시한다.
+이 옵션은 각 트랙의 우리 benchmark에 적용된다. Cycle PE 보조 BREC official suite의 내부
+`100,200,...,1000` 10-seed search는 BREC 프로토콜 축이므로 이 기본값과 별개다.
+
 기본 학습은 float32로 실행한다. GAT는 accuracy/PPI micro-F1, PE는 MAE,
 트리 증강은 CSL accuracy/ZINC MAE를 사용하며 각 트랙 안에서 비교한다.
+
+Conductance의 반복 GPU 동기화 제거와 Cycle PE의 연결 정보 재사용은 기본 적용된다.
+기저벡터 v2는 여러 그래프의 기저 연산을 묶는 배치 인코더를 기본 사용한다.
+선택적 `--compile`과 실제 train 데이터로 실행하는 GPU 속도 비교는
+[PERFORMANCE.md](docs/PERFORMANCE.md)를 따른다. 기본 명령이나 패키지 설치를 바꿀 필요는 없다.
 
 세 트랙을 순서대로 실행하려면 위 세 명령 **대신** 다음 명령을 사용한다.
 
@@ -153,6 +170,9 @@ bash scripts/reproduce.sh
 실패하면 종료 코드는 0이 아니며, 해당 run의 로그와 `aggregate/failures.csv`를 확인한다.
 공통 환경 검사 단계에서 중단된 경우에는 집계 파일이 없을 수 있다.
 
+Conductance GAT의 낮은 성능을 확인하려면 [기존 checkpoint 진단](docs/CONDUCTANCE_DIAGNOSTICS.md)을
+따른다. 재학습 없이 train/validation 성능과 이웃 혼합량을 확인하며, 원래 결과를 덮어쓰지 않는다.
+
 이 실행 파일에 `--run-id experiment-name`을 추가하면 결과 이름을 직접 지정할 수 있다.
 데이터나 결과를 다른 디스크에 저장하려면 `--data-root /path/to/data`,
 `--results-root /path/to/results`를 사용한다.
@@ -171,7 +191,8 @@ Python patch 버전과 모든 전이 의존성을 잠근 환경은 아니며,
 서로 다른 GPU·드라이버에서 비트 단위 동일한 결과를 보장하지 않는다.
 [PyTorch 재현성 안내](https://docs.pytorch.org/docs/stable/notes/randomness.html)도 참고한다.
 
-이 저장소의 구현·단위 검증과 전체 공개 데이터 GPU 실험 완료는 별개다.
-현재 전체 GPU 실험이 완료됐다고 주장하지 않으며, 검증 이력과 연구상 한계는
-[hand_off.md](hand_off.md)에 기록한다.
-전체 소스 스냅샷은 [code_summary.md](code_summary.md)에 있다.
+사용자 제공 기존 benchmark 5-seed 집계와 Conductance seed 0 GPU 진단은
+[실험 상태](docs/EXPERIMENT_STATUS.md)에 기록했다. 기저벡터 v2의 GPU 학습 결과와
+실행 최적화의 가속 실측은 아직 확인하지 않았다. 구현 검증 이력과 연구상 한계는
+[hand_off.md](hand_off.md), 이 소스 버전의 코드 전체는
+[code_summary.md](code_summary.md)에 있다.

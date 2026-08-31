@@ -43,6 +43,7 @@ namespaces = false
 [tool.setuptools.package-data]
 "research.conductance_gat" = ["datasets.yaml"]
 "research.cycle_pe" = ["datasets.yaml"]
+"research.cycle_pe.v2" = ["datasets.yaml"]
 "research.tree_augmentation" = ["config.yaml", "datasets.yaml"]
 
 [tool.pytest.ini_options]

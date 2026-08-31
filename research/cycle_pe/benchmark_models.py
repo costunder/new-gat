@@ -12,7 +12,7 @@ from torch import Tensor, nn
 
 from research.cycle_pe.benchmark_data import DATASETS, Batch
 from research.cycle_pe.features import SET_STAT_NAMES
-from research.cycle_pe.paper_model import _MessageLayer
+from research.cycle_pe.paper_model import _message_topology, _MessageLayer
 
 MODEL_NAME = "cycle_set"
 ATOM_DIMS = (119, 4, 12, 12, 10, 6, 6, 2, 2)
@@ -27,12 +27,22 @@ class CategoricalEncoder(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if x.shape[1] != len(self.embeddings):
             raise ValueError("categorical input field count disagrees with official schema")
-        return torch.stack([layer(x[:, i]) for i, layer in enumerate(self.embeddings)]).sum(0)
+        # Keep only the running sum, not a fields x items x hidden stack. The
+        # field order and sum are unchanged; floating-point reduction roundoff
+        # can differ from torch.stack(...).sum(0).
+        encoded = self.embeddings[0](x[:, 0])
+        for i in range(1, len(self.embeddings)):
+            encoded = encoded + self.embeddings[i](x[:, i])
+        return encoded
 
 
 def _pool(values: Tensor, assignment: Tensor, count: int) -> tuple[Tensor, Tensor]:
     total = values.new_zeros((count, values.shape[1])).index_add(0, assignment, values)
-    sizes = torch.bincount(assignment, minlength=count).clamp_min(1).unsqueeze(1)
+    # bincount's output size depends on assignment.max() even with minlength.
+    # The graph count is already known, so keep this allocation shape-static.
+    sizes = torch.zeros(count, dtype=torch.long, device=assignment.device)
+    sizes.index_add_(0, assignment, torch.ones_like(assignment))
+    sizes = sizes.clamp_min(1).unsqueeze(1)
     maximum = values.new_full((count, values.shape[1]), -torch.inf)
     maximum.scatter_reduce_(
         0, assignment[:, None].expand_as(values), values, reduce="amax", include_self=True
@@ -72,8 +82,10 @@ class CyclePEModel(nn.Module):
         # and feature encoders may use autocast.
         with torch.autocast(device_type=node.device.type, enabled=False):
             node, edge = node.float(), edge.float()
+            edge_index = batch.edge_index.T
+            topology = _message_topology(node, edge_index)
             for layer in self.layers:
-                node, edge = layer(node, edge, batch.edge_index.T)
+                node, edge = layer(node, edge, edge_index, topology=topology)
             graph_count = len(batch.ptr) - 1
             node_mean, node_max = _pool(node, batch.batch, graph_count)
             edge_graph = batch.batch[batch.edge_index[0]]

@@ -28,7 +28,9 @@ bash research/conductance_gat/reproduce.sh
 
 The script trains **only our conductance model on datasets used by GAT/GATv2**:
 **Cora, CiteSeer, PubMed, PPI, and ogbn-arxiv**.
-It uses CUDA and model seeds `0,1,2,3,4`, with data/split/chart seeds fixed to `0`.
+It uses CUDA and model seed `0` by default, with data/split/chart seeds fixed to `0`.
+Pass `--model-seeds 0,1,2,3,4` to the reproduction script when an explicit
+five-seed sweep is required.
 It executes only this track, through its own `benchmark.py` entry point. Dataset and
 result locations, run identifiers, and shared overrides follow the root README.
 Missing or damaged public data is an error; training does not download a substitute.
@@ -81,9 +83,15 @@ Use [the checkpoint diagnostic guide](../../docs/CONDUCTANCE_DIAGNOSTICS.md) to 
 training history, train/validation performance, learned conductance, and each node's
 neighbor mixing weight without retraining. `scripts/diagnose_conductance.sh` uses
 the active Conda environment and GPU inference on existing official caches only.
+The full audit also computes train-label gradients without an optimizer step;
+it checks one model seed and automatically writes a separate readable/JSON report.
 It does not modify the model or original results, and does not re-evaluate test labels.
 An optional validation-only graph-bypass intervention uses the same checkpoint;
 it is not a separately trained baseline or proof of causation.
+
+The supplied five-seed benchmark aggregates and seed-0 GPU diagnostic observations
+are recorded in [experiment status](../../docs/EXPERIMENT_STATUS.md), separately
+from unmeasured hypotheses and unpublished local execution changes.
 
 ## Supplementary suites (not the default matched benchmark)
 

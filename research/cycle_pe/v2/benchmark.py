@@ -1,7 +1,7 @@
-"""Train only our cycle-set PE on official molecular benchmark splits.
+"""Train Cycle PE v2 from full left-nullspace bases on official molecular splits.
 
-Other papers' model results belong in an external comparison table, not this run.
-Actual training requires CUDA. Preparation never trains or generates substitutes.
+This is an isolated experiment: it does not change or invoke the v1 cycle-set
+model, and it never trains comparison-paper models. Actual training is CUDA-only.
 """
 
 from __future__ import annotations
@@ -22,8 +22,30 @@ from torch.utils.data import DataLoader
 
 from chartgat.cache import atomic_publish, atomic_write_json
 from chartgat.execution import add_execution_arguments, configure_execution
-from research.cycle_pe.benchmark_data import DATASETS, Graph, collate, load_benchmark
-from research.cycle_pe.benchmark_models import MODEL_NAME, CyclePEModel, architecture_protocol
+from research.cycle_pe.v2.data import DATASETS, Graph, collate, load_benchmark
+from research.cycle_pe.v2.model import MODEL_NAME, CycleBasisPEModel, architecture_protocol
+
+TRACK_NAME = "cycle_pe"
+IMPLEMENTATION_FILES = (
+    "research/cycle_pe/v2/benchmark.py",
+    "research/cycle_pe/v2/basis.py",
+    "research/cycle_pe/v2/data.py",
+    "research/cycle_pe/v2/model.py",
+    "research/cycle_pe/benchmark_data.py",
+    "research/cycle_pe/benchmark_models.py",
+    "research/cycle_pe/paper_model.py",
+    "src/chartgat/algebra.py",
+    "src/chartgat/cache.py",
+    "src/chartgat/execution.py",
+)
+
+
+def implementation_hashes() -> dict[str, str]:
+    root = Path(__file__).resolve().parents[3]
+    return {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in IMPLEMENTATION_FILES
+    }
 
 
 def parser() -> argparse.ArgumentParser:
@@ -31,7 +53,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--suite", choices=("benchmark",), default="benchmark")
     result.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
     result.add_argument("--data-root", type=Path, default=Path("data/paper"))
-    result.add_argument("--output-dir", type=Path, default=Path("results/cycle_pe/benchmark"))
+    result.add_argument("--output-dir", type=Path, default=Path("results/cycle_pe_v2/benchmark"))
     result.add_argument("--device", default="cuda")
     for seed in ("data", "split", "chart", "model"):
         result.add_argument(f"--{seed}-seed", type=int, default=0)
@@ -48,6 +70,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--pe-dim", type=int, default=32)
     result.add_argument("--layers", type=int, default=3)
     result.add_argument("--max-parameters", type=int, default=500_000)
+    result.add_argument(
+        "--column-chunk-size",
+        type=int,
+        default=16,
+        help="basis columns processed per temporary chunk; never truncates the cycle rank",
+    )
+    result.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
+    result.add_argument("--basis-pair-budget", type=int, default=32768)
     add_execution_arguments(result)
     return result
 
@@ -63,6 +93,8 @@ def _validate(args: argparse.Namespace) -> None:
         "pe_dim",
         "layers",
         "max_parameters",
+        "column_chunk_size",
+        "basis_pair_budget",
     ):
         if getattr(args, key) < 1:
             raise ValueError(f"--{key.replace('_', '-')} must be positive")
@@ -73,7 +105,7 @@ def _validate(args: argparse.Namespace) -> None:
     if not args.prepare_only and (
         torch.device(args.device).type != "cuda" or not torch.cuda.is_available()
     ):
-        raise RuntimeError("Cycle PE benchmark training requires CUDA; no CPU fallback")
+        raise RuntimeError("Cycle PE v2 benchmark training requires CUDA; no CPU fallback")
 
 
 def _seed(seed: int) -> None:
@@ -92,7 +124,6 @@ def _worker_seed(_: int) -> None:
 
 
 def _loader(graphs: list[Graph], args: argparse.Namespace, *, train: bool) -> DataLoader:
-    # Keep data ordering independent of model RNG consumption.
     generator = torch.Generator().manual_seed(args.model_seed)
     return DataLoader(
         graphs,
@@ -108,7 +139,7 @@ def _loader(graphs: list[Graph], args: argparse.Namespace, *, train: bool) -> Da
 
 
 @torch.no_grad()
-def evaluate(model: CyclePEModel, loader: DataLoader, device: torch.device) -> float:
+def evaluate(model: CycleBasisPEModel, loader: DataLoader, device: torch.device) -> float:
     model.eval()
     total = torch.zeros((), device=device, dtype=torch.float64)
     count = 0
@@ -130,16 +161,22 @@ def _train_model(
     args: argparse.Namespace,
 ) -> dict[str, Any]:
     if torch.device(args.device).type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("Cycle PE benchmark training requires CUDA; no CPU fallback")
+        raise RuntimeError("Cycle PE v2 benchmark training requires CUDA; no CPU fallback")
     _seed(args.model_seed)
     device = torch.device(args.device)
-    model = CyclePEModel(
+    model = CycleBasisPEModel(
         dataset=dataset,
         hidden=args.hidden_dim,
         pe_dim=args.pe_dim,
         layers=args.layers,
+        column_chunk_size=args.column_chunk_size,
+        basis_execution=args.basis_execution,
+        basis_pair_budget=args.basis_pair_budget,
     ).to(device)
     execution = configure_execution(model, args, device)
+    execution.update(
+        basis_execution=args.basis_execution, basis_pair_budget=args.basis_pair_budget
+    )
     parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if parameters > args.max_parameters:
         raise ValueError(
@@ -225,7 +262,6 @@ def _train_model(
     # Test is touched only once, after validation selects the checkpoint.
     test = evaluate(model, test_loader, device)
     torch.cuda.synchronize(device)
-    elapsed = time.perf_counter() - started
     return {
         "validation": best,
         "test": test,
@@ -233,7 +269,7 @@ def _train_model(
         "trainable_parameters": parameters,
         "checkpoint": str(checkpoint),
         "history": str(history_path),
-        "elapsed_seconds": elapsed,
+        "elapsed_seconds": time.perf_counter() - started,
         "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
         "epochs_completed": len(history),
         "execution": execution,
@@ -265,28 +301,20 @@ def main(argv: list[str] | None = None) -> int:
             versions[library] = "not_installed"
     manifest = {
         "schema_version": 2,
-        "track": "cycle_pe",
+        "track": TRACK_NAME,
+        "version": "v2",
         "suite": "benchmark",
         "status": "running",
         "protocol": "ours_only_on_official_benchmark_splits",
         "arguments": arguments,
         "software": versions,
         "architecture": architecture_protocol(),
-        "implementation_sha256": {
-            name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-            for name in (
-                "benchmark.py",
-                "benchmark_data.py",
-                "benchmark_models.py",
-                "features.py",
-                "paper_model.py",
-            )
-        },
+        "implementation_sha256": implementation_hashes(),
         "seeds": {
             "model_seed": args.model_seed,
             "data_seed": "unused: fixed official graphs",
             "split_seed": "unused: official splits",
-            "chart_seed": "unused: one deterministic BFS chart, no augmentation",
+            "chart_seed": "unused: canonical incidence with full numerical SVD basis",
         },
         "controls": {
             "model": MODEL_NAME,
@@ -294,11 +322,16 @@ def main(argv: list[str] | None = None) -> int:
             "test_checkpoint_selection": False,
             "parameter_budget": args.max_parameters,
             "target_policy": "official labels unchanged",
+            "basis_input": "all signed left-nullspace basis columns, no truncation",
+            "basis_rank_dependent_parameters": False,
+            "column_chunk_size": args.column_chunk_size,
+            "column_chunk_policy": "allocation only; every basis column is processed",
         },
     }
     metrics: dict[str, Any] = {
         "schema_version": 2,
-        "track": "cycle_pe",
+        "track": TRACK_NAME,
+        "version": "v2",
         "suite": "benchmark",
         "status": "running",
         "model_seed": args.model_seed,
@@ -309,9 +342,7 @@ def main(argv: list[str] | None = None) -> int:
         for dataset in args.datasets:
             started = time.perf_counter()
             splits, protocol = load_benchmark(
-                args.data_root,
-                dataset,
-                allow_download=args.allow_download,
+                args.data_root, dataset, allow_download=args.allow_download
             )
             dataset_metrics: dict[str, Any] = {
                 "metric": "mae",

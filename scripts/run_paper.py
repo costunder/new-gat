@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from chartgat.cache import atomic_write_bytes, atomic_write_json
+from chartgat.execution import add_execution_arguments
 
 try:
     from scripts.aggregate_paper import aggregate_manifest
@@ -96,11 +97,21 @@ def _selected_tracks(values: list[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _track_run_root(track: str, run_id: str, results_root: Path | None = None) -> Path:
+def _track_run_root(
+    track: str,
+    run_id: str,
+    results_root: Path | None = None,
+    *,
+    cycle_pe_version: str = "v1",
+) -> Path:
+    is_cycle_v2 = track == "cycle_pe" and cycle_pe_version == "v2"
     if results_root is None:
-        base = PROJECT_ROOT / "research" / track / "results" / "paper"
+        track_path = PROJECT_ROOT / "research" / track
+        if is_cycle_v2:
+            track_path = track_path / "v2"
+        base = track_path / "results" / "paper"
     else:
-        base = results_root.expanduser().resolve() / track
+        base = results_root.expanduser().resolve() / ("cycle_pe_v2" if is_cycle_v2 else track)
     return base / run_id
 
 
@@ -109,8 +120,13 @@ def _output_dir(
     run_id: str,
     model_seed: int,
     results_root: Path | None = None,
+    *,
+    cycle_pe_version: str = "v1",
 ) -> Path:
-    return _track_run_root(track, run_id, results_root) / f"model-seed-{model_seed}"
+    return (
+        _track_run_root(track, run_id, results_root, cycle_pe_version=cycle_pe_version)
+        / f"model-seed-{model_seed}"
+    )
 
 
 def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str], Path | None]]:
@@ -168,10 +184,13 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
         effective_workers = args.workers if workers is None else workers
         requested_amp = args.amp if args.amp is not None else args.suite != "benchmark"
         effective_amp = requested_amp if amp is None else amp
+        module = BENCHMARK_MODULES[track] if suite == "benchmark" else TRACK_MODULES[track]
+        if track == "cycle_pe" and args.cycle_pe_version == "v2":
+            module = "research.cycle_pe.v2.benchmark"
         command = [
             sys.executable,
             "-m",
-            BENCHMARK_MODULES[track] if suite == "benchmark" else TRACK_MODULES[track],
+            module,
             "--suite",
             suite,
             "--data-root",
@@ -198,6 +217,8 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
         if args.allow_download:
             command.append("--allow-download")
         if not args.prepare_only:
+            if args.compile and suite == "benchmark":
+                command.append("--compile")
             if effective_amp and args.device.lower().startswith("cuda"):
                 command.append("--amp")
             elif not effective_amp or args.device.lower().startswith("cpu"):
@@ -214,14 +235,34 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
             suites = ("csl", "zinc") if track == "tree_augmentation" else ("benchmark",)
             for model_seed in executed_model_seeds:
                 for suite in suites:
+                    cycle_v2 = track == "cycle_pe" and args.cycle_pe_version == "v2"
+                    label = "benchmark-v2" if cycle_v2 else suite
+                    overrides: list[str] = []
+                    if cycle_v2:
+                        overrides.extend((
+                            "--basis-execution", args.basis_execution,
+                            "--basis-pair-budget", str(args.basis_pair_budget),
+                        ))
+                        if args.cycle_epochs is not None:
+                            overrides.extend(("--epochs", str(args.cycle_epochs)))
+                        if args.cycle_learning_rate is not None:
+                            overrides.extend(("--lr", str(args.cycle_learning_rate)))
                     add_child(
                         track=track,
                         suite=suite,
                         model_seed=model_seed,
-                        name=f"{track}:{suite}:model-seed-{model_seed}",
+                        name=f"{track}:{label}:model-seed-{model_seed}",
                         output_dir=(
-                            _output_dir(track, run_id, model_seed, args.results_root) / suite
+                            _output_dir(
+                                track,
+                                run_id,
+                                model_seed,
+                                args.results_root,
+                                cycle_pe_version=args.cycle_pe_version,
+                            )
+                            / suite
                         ),
+                        extra_arguments=tuple(overrides),
                     )
             continue
 
@@ -326,12 +367,17 @@ def _environment_snapshot(path: Path) -> dict[str, Any]:
     return {"path": str(path), "sha256": _sha256(path)}
 
 
-def _snapshot_registries(run_dir: Path, tracks: tuple[str, ...]) -> dict[str, Any]:
+def _snapshot_registries(
+    run_dir: Path, tracks: tuple[str, ...], *, cycle_pe_version: str = "v1"
+) -> dict[str, Any]:
     directory = run_dir / "dataset-registries"
     directory.mkdir(parents=True, exist_ok=False)
     snapshots: dict[str, Any] = {}
     for track in tracks:
-        source = PROJECT_ROOT / "research" / track / "datasets.yaml"
+        source_root = PROJECT_ROOT / "research" / track
+        if track == "cycle_pe" and cycle_pe_version == "v2":
+            source_root = source_root / "v2"
+        source = source_root / "datasets.yaml"
         target = directory / f"{track}.yaml"
         shutil.copy2(source, target)
         snapshots[track] = {"path": str(target), "sha256": _sha256(target)}
@@ -400,6 +446,7 @@ def _run_logged(command: list[str], *, log_path: Path) -> int:
                 )
                 print(safe_line, end="", flush=True)
             log.write(line)
+            log.flush()
         return process.wait()
 
 
@@ -439,12 +486,21 @@ def _parser() -> argparse.ArgumentParser:
         "--seeds",
         dest="model_seeds",
         type=_seeds,
-        default=(0, 1, 2, 3, 4),
-        help="model/minibatch seeds; --seeds is a compatibility alias",
+        default=(0,),
+        help=(
+            "model/minibatch seeds (default: 0); pass a comma-separated list for a sweep; "
+            "--seeds is a compatibility alias"
+        ),
     )
     parser.add_argument("--data-seed", type=int, default=0)
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--chart-seed", type=int, default=0)
+    parser.add_argument(
+        "--cycle-pe-version",
+        choices=("v1", "v2"),
+        default="v1",
+        help="v2: full left-nullspace basis; select --tracks cycle_pe --suite benchmark",
+    )
     parser.add_argument(
         "--cycle-variants",
         type=_cycle_variants,
@@ -459,6 +515,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cycle-epochs", type=int)
     parser.add_argument("--cycle-learning-rate", type=float)
+    parser.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
+    parser.add_argument("--basis-pair-budget", type=int, default=32768)
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -491,11 +549,28 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="override precision (benchmark defaults to float32; supplementary suites use AMP)",
     )
+    add_execution_arguments(parser)
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
+    if args.compile and (
+        args.suite != "benchmark" or "tree_augmentation" in _selected_tracks(args.tracks)
+    ):
+        print("--compile supports conductance_gat/cycle_pe benchmark tracks only", file=sys.stderr)
+        return 2
+    if args.basis_pair_budget < 1:
+        print("--basis-pair-budget must be positive", file=sys.stderr)
+        return 2
+    if args.cycle_pe_version == "v2" and (
+        args.suite != "benchmark" or _selected_tracks(args.tracks) != ("cycle_pe",)
+    ):
+        print(
+            "Cycle PE v2 is independent: use --tracks cycle_pe --suite benchmark",
+            file=sys.stderr,
+        )
+        return 2
     if (args.batch_size is not None and args.batch_size < 1) or args.workers < 0:
         print("batch size must be positive and workers must be non-negative", file=sys.stderr)
         return 2
@@ -533,7 +608,10 @@ def main() -> int:
 
     run_dir = PROJECT_ROOT / "runs" / "paper" / run_id
     if run_dir.exists() or any(
-        _track_run_root(track, run_id, args.results_root).exists() for track in tracks
+        _track_run_root(
+            track, run_id, args.results_root, cycle_pe_version=args.cycle_pe_version
+        ).exists()
+        for track in tracks
     ):
         print(f"run id already exists: {run_id}", file=sys.stderr)
         return 2
@@ -565,6 +643,10 @@ def main() -> int:
         "requested_model_seeds": list(args.model_seeds),
         "executed_model_seeds": ([] if args.prepare_only else list(args.model_seeds)),
         "execution_protocol": {
+            "torch_compile": args.compile and not args.prepare_only,
+            "basis_execution": args.basis_execution if args.cycle_pe_version == "v2" else None,
+            "basis_pair_budget": args.basis_pair_budget if args.cycle_pe_version == "v2" else None,
+            "cycle_pe_version": args.cycle_pe_version if "cycle_pe" in tracks else None,
             "outer_model_seeds": list(args.model_seeds),
             "prepare_once_for_fixed_non_model_axes": args.prepare_only,
             "cycle_selection": (
@@ -613,7 +695,9 @@ def main() -> int:
         "prepare_only": args.prepare_only,
         "environment": _environment_snapshot(run_dir / "environment.txt"),
         "research_environment": dependency_report,
-        "dataset_registries": _snapshot_registries(run_dir, tracks),
+        "dataset_registries": _snapshot_registries(
+            run_dir, tracks, cycle_pe_version=args.cycle_pe_version
+        ),
         "commands": [],
     }
     _write_manifest(manifest_path, manifest)

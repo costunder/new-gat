@@ -19,6 +19,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from chartgat.cache import atomic_publish, atomic_write_json
+from chartgat.execution import add_execution_arguments, configure_execution
 
 from .benchmark_data import DATASETS, load_dataset, sha256_file
 from .sparse import SparsePositiveConductance
@@ -38,7 +39,17 @@ class ConductanceConv(nn.Module):
         super().__init__()
         self.estimator = SparsePositiveConductance(channels, 0, channels, mode="full")
 
-    def forward(self, x: Tensor, incidence: Tensor, node_graph: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        incidence: Tensor,
+        node_graph: Tensor,
+        num_graphs: int | None = None,
+    ) -> Tensor:
+        # Tensor-only callers retain the old API. The classifier supplies CPU-side
+        # graph-count metadata so its normal GPU path never synchronizes for max().
+        if num_graphs is None:
+            num_graphs = int(node_graph.max()) + 1
         # Computing the positive edge law and degree cap in fp32 avoids fp16 squares/overflow.
         with torch.autocast(device_type=x.device.type, enabled=False):
             state = x.float()
@@ -52,7 +63,7 @@ class ConductanceConv(nn.Module):
             degree = state.new_zeros(state.shape[0])
             degree.index_add_(0, head, c)
             degree.index_add_(0, tail, c)
-            max_degree = state.new_zeros(int(node_graph.max()) + 1)
+            max_degree = state.new_zeros(num_graphs)
             max_degree.scatter_reduce_(0, node_graph, degree, reduce="amax", include_self=True)
             step = 0.95 / max_degree.clamp_min(1e-12)
             result = state - step[node_graph, None] * divergence
@@ -85,18 +96,38 @@ class ConductanceNodeClassifier(nn.Module):
         node_graph = getattr(graph, "batch", None)
         if node_graph is None:
             node_graph = torch.zeros(h.shape[0], dtype=torch.long, device=h.device)
+            num_graphs = 1
+        else:
+            ptr = getattr(graph, "ptr", None)
+            if ptr is not None:
+                num_graphs = ptr.numel() - 1
+            else:
+                num_graphs = getattr(graph, "num_graphs", None)
+                if num_graphs is None:
+                    # Compatibility for custom tensor containers without PyG metadata.
+                    # Resolve once here, rather than once per conductance layer.
+                    num_graphs = int(node_graph.max()) + 1
         for operator, norm in zip(self.operators, self.norms, strict=True):
-            h = operator(h, graph.incidence_edge_index, node_graph)
+            h = operator(h, graph.incidence_edge_index, node_graph, num_graphs)
             h = F.dropout(F.elu(norm(h)), self.dropout, self.training)
         return self.decoder(h)
 
 
+def _binary_counts(logits: Tensor, labels: Tensor) -> Tensor:
+    """Device-side counts, so graph minibatches need no scalar CPU transfers."""
+    predicted, truth = logits > 0, labels > 0
+    return torch.stack(((predicted & truth).sum(), predicted.sum(), truth.sum()))
+
+
+def _micro_f1_from_counts(counts: Tensor) -> float:
+    true_positive, predicted_count, truth_count = counts.tolist()
+    denominator = predicted_count + truth_count
+    return float(2 * true_positive / denominator) if denominator else 0.0
+
+
 def micro_f1(logits: Tensor, labels: Tensor) -> float:
     """Global node-label micro-F1, not per-graph averaging or multiclass argmax."""
-    predicted, truth = logits > 0, labels > 0
-    true_positive = (predicted & truth).sum().item()
-    denominator = predicted.sum().item() + truth.sum().item()
-    return float(2 * true_positive / denominator) if denominator else 0.0
+    return _micro_f1_from_counts(_binary_counts(logits, labels))
 
 
 def _seed(seed: int) -> None:
@@ -142,6 +173,14 @@ def _selection(values: list[str], allowed: tuple[str, ...]) -> list[str]:
     return selected
 
 
+def _prepare_split_indices(splits: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
+    # Verified payload masks are CPU tensors. Find indices there once, rather than
+    # repeating CUDA boolean indexing (and its dynamic-shape synchronization).
+    return {
+        name: mask.nonzero(as_tuple=False).flatten().to(device) for name, mask in splits.items()
+    }
+
+
 def _make_loaders(payload: dict[str, Any], args: argparse.Namespace, device: torch.device):
     from torch_geometric.data import Data
     from torch_geometric.loader import DataLoader
@@ -149,9 +188,8 @@ def _make_loaders(payload: dict[str, Any], args: argparse.Namespace, device: tor
     graphs = [Data(**graph) for graph in payload["graphs"]]
     if payload["dataset"] != "ppi":
         # Full graph/features are visible transductively; ONLY training-mask labels enter loss.
-        return graphs[0].to(device), {
-            name: mask.to(device) for name, mask in payload["splits"].items()
-        }
+        indices = _prepare_split_indices(payload["splits"], device)
+        return graphs[0].to(device), indices
     loaders = {}
     for split, indices in payload["splits"].items():
         generator = torch.Generator().manual_seed(args.model_seed)
@@ -176,7 +214,9 @@ def train_model(
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("Benchmark training requires CUDA (including direct train_model calls).")
     _seed(args.model_seed)
-    data, masks = _make_loaders(payload, args, device)
+    data, split_indices = _make_loaders(payload, args, device)
+    train_indices = None if split_indices is None else split_indices["train"]
+    train_label_count = 0 if train_indices is None else train_indices.numel()
     model = ConductanceNodeClassifier(
         payload["graphs"][0]["x"].shape[1],
         payload["classes"],
@@ -184,6 +224,7 @@ def train_model(
         layers=args.layers,
         dropout=args.dropout,
     ).to(device)
+    execution = configure_execution(model, args, device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and amp_dtype == torch.float16)
@@ -191,46 +232,50 @@ def train_model(
     history: list[dict[str, Any]] = []
     best_validation, best_epoch = -float("inf"), 0
     torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
     start_time = time.perf_counter()
 
     @torch.no_grad()
     def evaluate(split: str) -> float:
         model.eval()
-        if masks is not None:
+        if split_indices is not None:
             with torch.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
                 logits = model(data)
             if not torch.isfinite(logits).all():
                 raise RuntimeError(f"Non-finite {split} logits: {payload['dataset']}/conductance")
-            mask = masks[split]
-            return float((logits[mask].argmax(dim=-1) == data.y[mask]).float().mean())
-        true_positive = predicted_count = truth_count = 0
+            indices = split_indices[split]
+            predicted = logits.index_select(0, indices).argmax(dim=-1)
+            truth = data.y.index_select(0, indices)
+            return float((predicted == truth).float().mean())
+        counts = torch.zeros(3, dtype=torch.int64, device=device)
         for graph in data[split]:
             graph = graph.to(device, non_blocking=args.pin_memory)
             with torch.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
                 logits = model(graph)
             if not torch.isfinite(logits).all():
                 raise RuntimeError(f"Non-finite {split} logits: {payload['dataset']}/conductance")
-            predicted = logits > 0
-            truth = graph.y > 0
-            true_positive += int((predicted & truth).sum())
-            predicted_count += int(predicted.sum())
-            truth_count += int(truth.sum())
-        denominator = predicted_count + truth_count
-        return float(2 * true_positive / denominator) if denominator else 0.0
+            counts.add_(_binary_counts(logits, graph.y))
+        return _micro_f1_from_counts(counts)
 
     for epoch in range(1, args.epochs + 1):
+        torch.cuda.synchronize(device)
+        epoch_start = time.perf_counter()
         model.train()
-        loss_sum, label_count = 0.0, 0
-        batches = [data] if masks is not None else data["train"]
+        loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+        label_count = 0
+        batches = [data] if split_indices is not None else data["train"]
         for graph in batches:
-            if masks is None:
+            if split_indices is None:
                 graph = graph.to(device, non_blocking=args.pin_memory)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
                 logits = model(graph)
-                if masks is not None:
-                    loss = F.cross_entropy(logits[masks["train"]], graph.y[masks["train"]])
-                    count = int(masks["train"].sum())
+                if train_indices is not None:
+                    loss = F.cross_entropy(
+                        logits.index_select(0, train_indices),
+                        graph.y.index_select(0, train_indices),
+                    )
+                    count = train_label_count
                 else:
                     loss = F.binary_cross_entropy_with_logits(logits, graph.y)
                     count = graph.y.numel()
@@ -241,11 +286,20 @@ def train_model(
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            loss_sum += float(loss.detach()) * count
+            loss_sum.add_(loss.detach().to(torch.float64) * count)
             label_count += count
         validation = evaluate("validation")
+        train_loss = float(loss_sum / label_count)
+        # Synchronized train+validation wall time; checkpoint/history I/O is excluded.
+        torch.cuda.synchronize(device)
+        epoch_seconds = time.perf_counter() - epoch_start
         history.append(
-            {"epoch": epoch, "train_loss": loss_sum / label_count, "validation": validation}
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "validation": validation,
+                "epoch_seconds": epoch_seconds,
+            }
         )
         atomic_write_json(output / "history.json", history)
         if validation > best_validation:
@@ -265,8 +319,12 @@ def train_model(
             }
             atomic_publish(checkpoint, lambda path, saved=checkpoint_data: torch.save(saved, path))
         if epoch == 1 or epoch % 10 == 0:
+            metric_name = "micro_f1" if payload["dataset"] == "ppi" else "accuracy"
             print(
-                f"{payload['dataset']}/conductance epoch={epoch} val={validation:.6f}", flush=True
+                f"{payload['dataset']}/conductance epoch={epoch} "
+                f"train_loss={train_loss:.6f} val_{metric_name}={validation:.6f} "
+                f"epoch_seconds={epoch_seconds:.3f}",
+                flush=True,
             )
         if epoch - best_epoch >= args.patience:
             break
@@ -287,7 +345,11 @@ def train_model(
         "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
         "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
         "amp_dtype": str(amp_dtype) if args.amp else "float32",
-        "training": "full_batch" if masks is not None else "official_inductive_graph_minibatch",
+        "training": "full_batch"
+        if split_indices is not None
+        else "official_inductive_graph_minibatch",
+        "execution": execution,
+        "epoch_timing": "cuda_synchronized_train_and_validation_excluding_checkpoint_io",
         "model_seed": args.model_seed,
         "test_selection": "best_validation_checkpoint_only",
     }
@@ -321,6 +383,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
+    add_execution_arguments(parser)
     return parser
 
 

@@ -4,6 +4,8 @@
 
 `prepare_data.sh`, `reproduce.sh`, 트랙별 `reproduce.sh`의 기본 suite는 `benchmark`다.
 기본 실행에서는 아래 공개 데이터만 사용하며 S1–S4/CycleCount를 생성하지 않는다.
+향후 기본 model seed는 사용자 요청대로 `0` 하나이며 공식 데이터·분할·전체 학습 크기는 유지한다.
+명시적 seed 목록은 선택 사항이다. 단일 seed의 std/CI는 추정하지 않으며 기존 5-seed 결과는 보존한다.
 
 | 트랙 | 기본 데이터 | 경쟁 논문과의 연결 | 이 저장소에서 실행하는 모델 | 지표 |
 |---|---|---|---|---|
@@ -21,6 +23,11 @@
 다른 부분은 표 주석에 남긴다. 특히 현재 ogbn-arxiv full-batch 설정은 GATv2 논문의
 GraphSAINT 설정과 다르므로 동일 학습 조건의 재실험으로 표현하지 않는다.
 트랙 간 모델을 결합하거나 GAT 트랙에 새 cycle PE를 주입하지 않는다.
+
+기저벡터 입력 [Cycle PE v2](research/cycle_pe/v2/README.md)는 ZINC-12K와 Peptides-struct의
+같은 공식 원본·split을 사용하되 전체 좌영공간 기저를 별도 cache에 저장한다. 기본 실행은
+여전히 통계형 `cycle_set` v1이다. v2는 이 소스 버전에 포함되지만, 제공된 5-seed 결과를 v2 결과로
+해석하면 안 된다. 실행 결과와 진단의 범위는 [실험 상태](docs/EXPERIMENT_STATUS.md)를 따른다.
 
 논문 원문: [GAT](https://arxiv.org/pdf/1710.10903),
 [GATv2](https://arxiv.org/pdf/2105.14491),

@@ -24,6 +24,8 @@ dist/
 runs/
 research/*/results/*
 !research/*/results/.gitkeep
+research/cycle_pe/v2/results/*
+!research/cycle_pe/v2/results/.gitkeep
 results/*
 !results/.gitkeep
 data/*
@@ -205,6 +207,7 @@ namespaces = false
 [tool.setuptools.package-data]
 "research.conductance_gat" = ["datasets.yaml"]
 "research.cycle_pe" = ["datasets.yaml"]
+"research.cycle_pe.v2" = ["datasets.yaml"]
 "research.tree_augmentation" = ["config.yaml", "datasets.yaml"]
 
 [tool.pytest.ini_options]
@@ -2637,6 +2640,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from chartgat.cache import atomic_publish, atomic_write_json
+from chartgat.execution import add_execution_arguments, configure_execution
 
 from .benchmark_data import DATASETS, load_dataset, sha256_file
 from .sparse import SparsePositiveConductance
@@ -2656,7 +2660,17 @@ class ConductanceConv(nn.Module):
         super().__init__()
         self.estimator = SparsePositiveConductance(channels, 0, channels, mode="full")
 
-    def forward(self, x: Tensor, incidence: Tensor, node_graph: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        incidence: Tensor,
+        node_graph: Tensor,
+        num_graphs: int | None = None,
+    ) -> Tensor:
+        # Tensor-only callers retain the old API. The classifier supplies CPU-side
+        # graph-count metadata so its normal GPU path never synchronizes for max().
+        if num_graphs is None:
+            num_graphs = int(node_graph.max()) + 1
         # Computing the positive edge law and degree cap in fp32 avoids fp16 squares/overflow.
         with torch.autocast(device_type=x.device.type, enabled=False):
             state = x.float()
@@ -2670,7 +2684,7 @@ class ConductanceConv(nn.Module):
             degree = state.new_zeros(state.shape[0])
             degree.index_add_(0, head, c)
             degree.index_add_(0, tail, c)
-            max_degree = state.new_zeros(int(node_graph.max()) + 1)
+            max_degree = state.new_zeros(num_graphs)
             max_degree.scatter_reduce_(0, node_graph, degree, reduce="amax", include_self=True)
             step = 0.95 / max_degree.clamp_min(1e-12)
             result = state - step[node_graph, None] * divergence
@@ -2703,18 +2717,38 @@ class ConductanceNodeClassifier(nn.Module):
         node_graph = getattr(graph, "batch", None)
         if node_graph is None:
             node_graph = torch.zeros(h.shape[0], dtype=torch.long, device=h.device)
+            num_graphs = 1
+        else:
+            ptr = getattr(graph, "ptr", None)
+            if ptr is not None:
+                num_graphs = ptr.numel() - 1
+            else:
+                num_graphs = getattr(graph, "num_graphs", None)
+                if num_graphs is None:
+                    # Compatibility for custom tensor containers without PyG metadata.
+                    # Resolve once here, rather than once per conductance layer.
+                    num_graphs = int(node_graph.max()) + 1
         for operator, norm in zip(self.operators, self.norms, strict=True):
-            h = operator(h, graph.incidence_edge_index, node_graph)
+            h = operator(h, graph.incidence_edge_index, node_graph, num_graphs)
             h = F.dropout(F.elu(norm(h)), self.dropout, self.training)
         return self.decoder(h)
 
 
+def _binary_counts(logits: Tensor, labels: Tensor) -> Tensor:
+    """Device-side counts, so graph minibatches need no scalar CPU transfers."""
+    predicted, truth = logits > 0, labels > 0
+    return torch.stack(((predicted & truth).sum(), predicted.sum(), truth.sum()))
+
+
+def _micro_f1_from_counts(counts: Tensor) -> float:
+    true_positive, predicted_count, truth_count = counts.tolist()
+    denominator = predicted_count + truth_count
+    return float(2 * true_positive / denominator) if denominator else 0.0
+
+
 def micro_f1(logits: Tensor, labels: Tensor) -> float:
     """Global node-label micro-F1, not per-graph averaging or multiclass argmax."""
-    predicted, truth = logits > 0, labels > 0
-    true_positive = (predicted & truth).sum().item()
-    denominator = predicted.sum().item() + truth.sum().item()
-    return float(2 * true_positive / denominator) if denominator else 0.0
+    return _micro_f1_from_counts(_binary_counts(logits, labels))
 
 
 def _seed(seed: int) -> None:
@@ -2760,6 +2794,14 @@ def _selection(values: list[str], allowed: tuple[str, ...]) -> list[str]:
     return selected
 
 
+def _prepare_split_indices(splits: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
+    # Verified payload masks are CPU tensors. Find indices there once, rather than
+    # repeating CUDA boolean indexing (and its dynamic-shape synchronization).
+    return {
+        name: mask.nonzero(as_tuple=False).flatten().to(device) for name, mask in splits.items()
+    }
+
+
 def _make_loaders(payload: dict[str, Any], args: argparse.Namespace, device: torch.device):
     from torch_geometric.data import Data
     from torch_geometric.loader import DataLoader
@@ -2767,9 +2809,8 @@ def _make_loaders(payload: dict[str, Any], args: argparse.Namespace, device: tor
     graphs = [Data(**graph) for graph in payload["graphs"]]
     if payload["dataset"] != "ppi":
         # Full graph/features are visible transductively; ONLY training-mask labels enter loss.
-        return graphs[0].to(device), {
-            name: mask.to(device) for name, mask in payload["splits"].items()
-        }
+        indices = _prepare_split_indices(payload["splits"], device)
+        return graphs[0].to(device), indices
     loaders = {}
     for split, indices in payload["splits"].items():
         generator = torch.Generator().manual_seed(args.model_seed)
@@ -2794,7 +2835,9 @@ def train_model(
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("Benchmark training requires CUDA (including direct train_model calls).")
     _seed(args.model_seed)
-    data, masks = _make_loaders(payload, args, device)
+    data, split_indices = _make_loaders(payload, args, device)
+    train_indices = None if split_indices is None else split_indices["train"]
+    train_label_count = 0 if train_indices is None else train_indices.numel()
     model = ConductanceNodeClassifier(
         payload["graphs"][0]["x"].shape[1],
         payload["classes"],
@@ -2802,6 +2845,7 @@ def train_model(
         layers=args.layers,
         dropout=args.dropout,
     ).to(device)
+    execution = configure_execution(model, args, device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and amp_dtype == torch.float16)
@@ -2809,46 +2853,50 @@ def train_model(
     history: list[dict[str, Any]] = []
     best_validation, best_epoch = -float("inf"), 0
     torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
     start_time = time.perf_counter()
 
     @torch.no_grad()
     def evaluate(split: str) -> float:
         model.eval()
-        if masks is not None:
+        if split_indices is not None:
             with torch.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
                 logits = model(data)
             if not torch.isfinite(logits).all():
                 raise RuntimeError(f"Non-finite {split} logits: {payload['dataset']}/conductance")
-            mask = masks[split]
-            return float((logits[mask].argmax(dim=-1) == data.y[mask]).float().mean())
-        true_positive = predicted_count = truth_count = 0
+            indices = split_indices[split]
+            predicted = logits.index_select(0, indices).argmax(dim=-1)
+            truth = data.y.index_select(0, indices)
+            return float((predicted == truth).float().mean())
+        counts = torch.zeros(3, dtype=torch.int64, device=device)
         for graph in data[split]:
             graph = graph.to(device, non_blocking=args.pin_memory)
             with torch.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
                 logits = model(graph)
             if not torch.isfinite(logits).all():
                 raise RuntimeError(f"Non-finite {split} logits: {payload['dataset']}/conductance")
-            predicted = logits > 0
-            truth = graph.y > 0
-            true_positive += int((predicted & truth).sum())
-            predicted_count += int(predicted.sum())
-            truth_count += int(truth.sum())
-        denominator = predicted_count + truth_count
-        return float(2 * true_positive / denominator) if denominator else 0.0
+            counts.add_(_binary_counts(logits, graph.y))
+        return _micro_f1_from_counts(counts)
 
     for epoch in range(1, args.epochs + 1):
+        torch.cuda.synchronize(device)
+        epoch_start = time.perf_counter()
         model.train()
-        loss_sum, label_count = 0.0, 0
-        batches = [data] if masks is not None else data["train"]
+        loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+        label_count = 0
+        batches = [data] if split_indices is not None else data["train"]
         for graph in batches:
-            if masks is None:
+            if split_indices is None:
                 graph = graph.to(device, non_blocking=args.pin_memory)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
                 logits = model(graph)
-                if masks is not None:
-                    loss = F.cross_entropy(logits[masks["train"]], graph.y[masks["train"]])
-                    count = int(masks["train"].sum())
+                if train_indices is not None:
+                    loss = F.cross_entropy(
+                        logits.index_select(0, train_indices),
+                        graph.y.index_select(0, train_indices),
+                    )
+                    count = train_label_count
                 else:
                     loss = F.binary_cross_entropy_with_logits(logits, graph.y)
                     count = graph.y.numel()
@@ -2859,11 +2907,20 @@ def train_model(
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            loss_sum += float(loss.detach()) * count
+            loss_sum.add_(loss.detach().to(torch.float64) * count)
             label_count += count
         validation = evaluate("validation")
+        train_loss = float(loss_sum / label_count)
+        # Synchronized train+validation wall time; checkpoint/history I/O is excluded.
+        torch.cuda.synchronize(device)
+        epoch_seconds = time.perf_counter() - epoch_start
         history.append(
-            {"epoch": epoch, "train_loss": loss_sum / label_count, "validation": validation}
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "validation": validation,
+                "epoch_seconds": epoch_seconds,
+            }
         )
         atomic_write_json(output / "history.json", history)
         if validation > best_validation:
@@ -2883,8 +2940,12 @@ def train_model(
             }
             atomic_publish(checkpoint, lambda path, saved=checkpoint_data: torch.save(saved, path))
         if epoch == 1 or epoch % 10 == 0:
+            metric_name = "micro_f1" if payload["dataset"] == "ppi" else "accuracy"
             print(
-                f"{payload['dataset']}/conductance epoch={epoch} val={validation:.6f}", flush=True
+                f"{payload['dataset']}/conductance epoch={epoch} "
+                f"train_loss={train_loss:.6f} val_{metric_name}={validation:.6f} "
+                f"epoch_seconds={epoch_seconds:.3f}",
+                flush=True,
             )
         if epoch - best_epoch >= args.patience:
             break
@@ -2905,7 +2966,11 @@ def train_model(
         "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
         "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
         "amp_dtype": str(amp_dtype) if args.amp else "float32",
-        "training": "full_batch" if masks is not None else "official_inductive_graph_minibatch",
+        "training": "full_batch"
+        if split_indices is not None
+        else "official_inductive_graph_minibatch",
+        "execution": execution,
+        "epoch_timing": "cuda_synchronized_train_and_validation_excluding_checkpoint_io",
         "model_seed": args.model_seed,
         "test_selection": "best_validation_checkpoint_only",
     }
@@ -2939,6 +3004,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-download", action="store_true")
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
+    add_execution_arguments(parser)
     return parser
 
 
@@ -7252,6 +7318,179 @@ __all__ = [
 ]
 ````
 
+# research/conductance_gat/tests/test_benchmark_execution.py
+
+````python
+"""Tensor-level execution equivalence only; no benchmark training or downloads."""
+
+from __future__ import annotations
+
+import copy
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch.nn import functional as F
+
+from research.conductance_gat.benchmark import (
+    ConductanceConv,
+    ConductanceNodeClassifier,
+    _binary_counts,
+    _micro_f1_from_counts,
+    _prepare_split_indices,
+    build_parser,
+)
+
+
+def _previous_conv_forward(model, state, incidence, node_graph):
+    """Literal pre-optimization operator for forward AND parameter-gradient checks."""
+    state = state.float()
+    tail, head = incidence
+    gradient = state[head] - state[tail]
+    conductance = model.estimator(gradient, state.new_empty((gradient.shape[0], 0)))
+    flux = conductance[:, None] * gradient
+    divergence = torch.zeros_like(state)
+    divergence.index_add_(0, head, flux)
+    divergence.index_add_(0, tail, -flux)
+    degree = state.new_zeros(state.shape[0])
+    degree.index_add_(0, head, conductance)
+    degree.index_add_(0, tail, conductance)
+    max_degree = state.new_zeros(int(node_graph.max()) + 1)
+    max_degree.scatter_reduce_(0, node_graph, degree, reduce="amax", include_self=True)
+    step = 0.95 / max_degree.clamp_min(1e-12)
+    return state - step[node_graph, None] * divergence
+
+
+def test_metadata_graph_count_preserves_forward_and_every_gradient():
+    torch.manual_seed(271)
+    previous = ConductanceConv(4)
+    optimized = copy.deepcopy(previous)
+    state = torch.randn(8, 4)
+    old_state = state.clone().requires_grad_()
+    new_state = state.clone().requires_grad_()
+    edges = torch.tensor([[0, 1, 3, 3, 4, 5], [1, 2, 4, 5, 6, 6]])
+    node_graph = torch.tensor([0, 0, 0, 1, 1, 1, 1, 2])
+    target = torch.randn_like(state)
+
+    old_output = _previous_conv_forward(previous, old_state, edges, node_graph)
+    new_output = optimized(new_state, edges, node_graph, num_graphs=3)
+    torch.testing.assert_close(new_output, old_output, rtol=0, atol=0)
+    (old_output * target).sum().backward()
+    (new_output * target).sum().backward()
+    torch.testing.assert_close(new_state.grad, old_state.grad, rtol=0, atol=0)
+    for old_parameter, new_parameter in zip(
+        previous.parameters(), optimized.parameters(), strict=True
+    ):
+        assert old_parameter.grad is not None and new_parameter.grad is not None
+        torch.testing.assert_close(new_parameter.grad, old_parameter.grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("metadata", ["single", "ptr", "num_graphs"])
+def test_classifier_uses_graph_metadata_without_tensor_max(monkeypatch, metadata):
+    torch.manual_seed(14)
+    graph = SimpleNamespace(
+        x=torch.randn(6, 3),
+        incidence_edge_index=torch.tensor([[0, 1, 3, 4], [1, 2, 4, 5]]),
+    )
+    if metadata != "single":
+        graph.batch = torch.tensor([0, 0, 0, 1, 1, 1])
+        if metadata == "ptr":
+            graph.ptr = torch.tensor([0, 3, 6])
+        else:
+            graph.num_graphs = 2
+    model = ConductanceNodeClassifier(3, 2, hidden_channels=8, layers=2, dropout=0)
+
+    def forbidden_max(*args, **kwargs):
+        raise AssertionError("graph count must come from CPU metadata, not a GPU reduction")
+
+    monkeypatch.setattr(torch.Tensor, "max", forbidden_max)
+    output = model(graph)
+    assert output.shape == (6, 2)
+    assert torch.isfinite(output).all()
+
+
+def test_tensor_only_operator_api_keeps_graph_count_fallback():
+    torch.manual_seed(91)
+    model = ConductanceConv(2)
+    state = torch.randn(4, 2)
+    incidence = torch.tensor([[0, 2], [1, 3]])
+    node_graph = torch.tensor([0, 0, 1, 1])
+    torch.testing.assert_close(
+        model(state, incidence, node_graph),
+        model(state, incidence, node_graph, num_graphs=2),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_precomputed_indices_preserve_masked_loss_and_gradients():
+    torch.manual_seed(52)
+    masks = {
+        "train": torch.tensor([True, False, True, False, True, False]),
+        "validation": torch.tensor([False, True, False, False, False, False]),
+        "test": torch.tensor([False, False, False, True, False, True]),
+    }
+    original_masks = {name: mask.clone() for name, mask in masks.items()}
+    indices = _prepare_split_indices(masks, torch.device("cpu"))
+    assert indices["train"].tolist() == [0, 2, 4]
+    assert indices["train"].numel() == 3
+    for name, mask in masks.items():
+        assert torch.equal(mask, original_masks[name])
+        assert indices[name].dtype == torch.long
+
+    logits = torch.randn(6, 3)
+    old_logits = logits.clone().requires_grad_()
+    new_logits = logits.clone().requires_grad_()
+    labels = torch.tensor([0, 2, 1, 1, 2, 0])
+    old_loss = F.cross_entropy(old_logits[masks["train"]], labels[masks["train"]])
+    new_loss = F.cross_entropy(
+        new_logits.index_select(0, indices["train"]),
+        labels.index_select(0, indices["train"]),
+    )
+    torch.testing.assert_close(new_loss, old_loss, rtol=0, atol=0)
+    old_loss.backward()
+    new_loss.backward()
+    torch.testing.assert_close(new_logits.grad, old_logits.grad, rtol=0, atol=0)
+    assert torch.count_nonzero(new_logits.grad[~masks["train"]]) == 0
+
+
+def test_device_count_accumulation_preserves_global_micro_f1():
+    logits = [
+        torch.tensor([[1.0, -1.0, 2.0]]),
+        torch.tensor([[-1.0, 2.0, -1.0], [1.0, -1.0, -1.0]]),
+    ]
+    labels = [
+        torch.tensor([[1.0, 1.0, 0.0]]),
+        torch.tensor([[0.0, 1.0, 1.0], [1.0, 0.0, 0.0]]),
+    ]
+    counts = torch.zeros(3, dtype=torch.int64)
+    for batch_logits, batch_labels in zip(logits, labels, strict=True):
+        counts.add_(_binary_counts(batch_logits, batch_labels))
+    assert counts.tolist() == [3, 4, 5]
+    assert _micro_f1_from_counts(counts) == pytest.approx(2 / 3)
+    assert _micro_f1_from_counts(torch.zeros(3, dtype=torch.int64)) == 0.0
+
+
+def test_device_loss_accumulation_matches_previous_label_weighted_mean():
+    losses = [torch.tensor(0.12345679), torch.tensor(1.375), torch.tensor(0.5)]
+    label_counts = [121, 363, 242]
+    previous = sum(
+        float(loss) * count for loss, count in zip(losses, label_counts, strict=True)
+    ) / sum(label_counts)
+    loss_sum = torch.zeros((), dtype=torch.float64)
+    for loss, count in zip(losses, label_counts, strict=True):
+        loss_sum.add_(loss.detach().to(torch.float64) * count)
+    assert float(loss_sum / sum(label_counts)) == previous
+    assert not loss_sum.requires_grad
+
+
+def test_execution_optimization_is_opt_in_and_amp_default_is_unchanged():
+    defaults = build_parser().parse_args([])
+    assert defaults.compile is False
+    assert defaults.amp is False
+    assert build_parser().parse_args(["--compile"]).compile is True
+````
+
 # research/conductance_gat/tests/test_conductance_gat.py
 
 ````python
@@ -8243,6 +8482,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from chartgat.cache import atomic_publish, atomic_write_json
+from chartgat.execution import add_execution_arguments, configure_execution
 from research.cycle_pe.benchmark_data import DATASETS, Graph, collate, load_benchmark
 from research.cycle_pe.benchmark_models import MODEL_NAME, CyclePEModel, architecture_protocol
 
@@ -8269,6 +8509,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--pe-dim", type=int, default=32)
     result.add_argument("--layers", type=int, default=3)
     result.add_argument("--max-parameters", type=int, default=500_000)
+    add_execution_arguments(result)
     return result
 
 
@@ -8330,18 +8571,18 @@ def _loader(graphs: list[Graph], args: argparse.Namespace, *, train: bool) -> Da
 @torch.no_grad()
 def evaluate(model: CyclePEModel, loader: DataLoader, device: torch.device) -> float:
     model.eval()
-    total = 0.0
+    total = torch.zeros((), device=device, dtype=torch.float64)
     count = 0
     for batch in loader:
         batch = batch.to(device)
         predicted = model(batch).float()
         if not torch.isfinite(predicted).all():
             raise FloatingPointError("nonfinite validation/test prediction")
-        total += float((predicted - batch.y).abs().sum())
+        total += (predicted - batch.y).abs().sum().double()
         count += batch.y.numel()
     if count == 0:
         raise ValueError("cannot evaluate an empty official split")
-    return total / count
+    return float(total / count)
 
 
 def _train_model(
@@ -8359,6 +8600,7 @@ def _train_model(
         pe_dim=args.pe_dim,
         layers=args.layers,
     ).to(device)
+    execution = configure_execution(model, args, device)
     parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if parameters > args.max_parameters:
         raise ValueError(
@@ -8383,8 +8625,9 @@ def _train_model(
     torch.cuda.synchronize(device)
     started = time.perf_counter()
     for epoch in range(1, args.epochs + 1):
+        epoch_started = time.perf_counter()
         model.train()
-        train_sum = 0.0
+        train_sum = torch.zeros((), device=device, dtype=torch.float64)
         train_count = 0
         for batch in train_loader:
             batch = batch.to(device)
@@ -8399,15 +8642,19 @@ def _train_model(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0, error_if_nonfinite=True)
             scaler.step(optimizer)
             scaler.update()
-            train_sum += float(loss.detach()) * batch.y.numel()
+            train_sum += loss.detach().double() * batch.y.numel()
             train_count += batch.y.numel()
         validation = evaluate(model, validation_loader, device)
+        train_mae = float(train_sum / train_count)
+        torch.cuda.synchronize(device)
+        epoch_seconds = time.perf_counter() - epoch_started
         scheduler.step(validation)
         history.append(
             {
                 "epoch": epoch,
-                "train_mae": train_sum / train_count,
+                "train_mae": train_mae,
                 "validation_mae": validation,
+                "epoch_seconds": epoch_seconds,
                 "learning_rate": optimizer.param_groups[0]["lr"],
             }
         )
@@ -8428,8 +8675,8 @@ def _train_model(
             }
             atomic_publish(checkpoint, lambda path, state=payload: torch.save(state, path))
         print(
-            f"{dataset}/{MODEL_NAME} epoch={epoch} train_mae={train_sum / train_count:.6f} "
-            f"validation_mae={validation:.6f} best={best:.6f}",
+            f"{dataset}/{MODEL_NAME} epoch={epoch} train_mae={train_mae:.6f} "
+            f"validation_mae={validation:.6f} best={best:.6f} seconds={epoch_seconds:.2f}",
             flush=True,
         )
         if epoch - best_epoch >= args.patience:
@@ -8450,6 +8697,8 @@ def _train_model(
         "elapsed_seconds": elapsed,
         "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
         "epochs_completed": len(history),
+        "execution": execution,
+        "epoch_timing": "cuda_synchronized_train_and_validation_excluding_checkpoint_io",
     }
 
 
@@ -8863,7 +9112,7 @@ from torch import Tensor, nn
 
 from research.cycle_pe.benchmark_data import DATASETS, Batch
 from research.cycle_pe.features import SET_STAT_NAMES
-from research.cycle_pe.paper_model import _MessageLayer
+from research.cycle_pe.paper_model import _message_topology, _MessageLayer
 
 MODEL_NAME = "cycle_set"
 ATOM_DIMS = (119, 4, 12, 12, 10, 6, 6, 2, 2)
@@ -8878,12 +9127,22 @@ class CategoricalEncoder(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         if x.shape[1] != len(self.embeddings):
             raise ValueError("categorical input field count disagrees with official schema")
-        return torch.stack([layer(x[:, i]) for i, layer in enumerate(self.embeddings)]).sum(0)
+        # Keep only the running sum, not a fields x items x hidden stack. The
+        # field order and sum are unchanged; floating-point reduction roundoff
+        # can differ from torch.stack(...).sum(0).
+        encoded = self.embeddings[0](x[:, 0])
+        for i in range(1, len(self.embeddings)):
+            encoded = encoded + self.embeddings[i](x[:, i])
+        return encoded
 
 
 def _pool(values: Tensor, assignment: Tensor, count: int) -> tuple[Tensor, Tensor]:
     total = values.new_zeros((count, values.shape[1])).index_add(0, assignment, values)
-    sizes = torch.bincount(assignment, minlength=count).clamp_min(1).unsqueeze(1)
+    # bincount's output size depends on assignment.max() even with minlength.
+    # The graph count is already known, so keep this allocation shape-static.
+    sizes = torch.zeros(count, dtype=torch.long, device=assignment.device)
+    sizes.index_add_(0, assignment, torch.ones_like(assignment))
+    sizes = sizes.clamp_min(1).unsqueeze(1)
     maximum = values.new_full((count, values.shape[1]), -torch.inf)
     maximum.scatter_reduce_(
         0, assignment[:, None].expand_as(values), values, reduce="amax", include_self=True
@@ -8923,8 +9182,10 @@ class CyclePEModel(nn.Module):
         # and feature encoders may use autocast.
         with torch.autocast(device_type=node.device.type, enabled=False):
             node, edge = node.float(), edge.float()
+            edge_index = batch.edge_index.T
+            topology = _message_topology(node, edge_index)
             for layer in self.layers:
-                node, edge = layer(node, edge, batch.edge_index.T)
+                node, edge = layer(node, edge, edge_index, topology=topology)
             graph_count = len(batch.ptr) - 1
             node_mean, node_max = _pool(node, batch.batch, graph_count)
             edge_graph = batch.batch[batch.edge_index[0]]
@@ -12441,6 +12702,27 @@ class GraphOutput(NamedTuple):
     embedding: Tensor
 
 
+class _MessageTopology(NamedTuple):
+    source: Tensor
+    target: Tensor
+    degree: Tensor
+
+
+def _message_topology(node: Tensor, edge_index: Tensor) -> _MessageTopology:
+    """Prepare fixed connectivity once for a stack, including isolated nodes.
+
+    This is local to one forward pass: it contains no learned values, buffers,
+    or cross-batch cache and therefore leaves checkpoint state unchanged.
+    Reuse requires unchanged node dtype/device and connectivity across layers.
+    """
+    u, v = edge_index[:, 0], edge_index[:, 1]
+    source = torch.cat((u, v), dim=0)
+    target = torch.cat((v, u), dim=0)
+    degree = node.new_zeros(node.shape[0])
+    degree.index_add_(0, target, torch.ones_like(target, dtype=node.dtype))
+    return _MessageTopology(source, target, degree.clamp_min(1.0))
+
+
 class _MessageLayer(nn.Module):
     def __init__(self, hidden_dim: int) -> None:
         super().__init__()
@@ -12462,20 +12744,26 @@ class _MessageLayer(nn.Module):
         self.edge_norm = nn.LayerNorm(hidden_dim)
         self.node_norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, node: Tensor, edge: Tensor, edge_index: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        node: Tensor,
+        edge: Tensor,
+        edge_index: Tensor,
+        *,
+        topology: _MessageTopology | None = None,
+    ) -> tuple[Tensor, Tensor]:
         u, v = edge_index[:, 0], edge_index[:, 1]
         symmetric = torch.cat((node[u] + node[v], (node[u] - node[v]).abs(), edge), dim=1)
         updated_edge = self.edge_norm(edge + self.edge_update(symmetric))
 
-        source = torch.cat((u, v), dim=0)
-        target = torch.cat((v, u), dim=0)
+        source, target, degree = (
+            _message_topology(node, edge_index) if topology is None else topology
+        )
         directed_edge = torch.cat((updated_edge, updated_edge), dim=0)
         messages = self.message(torch.cat((node[source], node[target], directed_edge), dim=1))
         aggregate = torch.zeros_like(node)
         aggregate.index_add_(0, target, messages)
-        degree = torch.zeros(node.shape[0], device=node.device, dtype=node.dtype)
-        degree.index_add_(0, target, torch.ones_like(target, dtype=node.dtype))
-        aggregate = aggregate / degree.clamp_min(1.0)[:, None]
+        aggregate = aggregate / degree[:, None]
         updated_node = self.node_norm(node + self.node_update(torch.cat((node, aggregate), dim=1)))
         return updated_node, updated_edge
 
@@ -14546,6 +14834,2219 @@ def test_brec_policy_uses_internal_protocol_seed_axis_only() -> None:
     assert policy["model"]["used"] is False
     assert policy["protocol"]["used"] is True
     assert policy["protocol"]["values"] == [100, 200]
+````
+
+# research/cycle_pe/tests/test_v2_benchmark.py
+
+````python
+"""Runner protocol checks use bounded mocks, never GPU training or downloads."""
+
+from __future__ import annotations
+
+import hashlib
+import inspect
+import json
+from pathlib import Path
+
+import pytest
+
+from research.cycle_pe.v2 import benchmark
+from research.cycle_pe.v2.data import DATASETS
+from research.cycle_pe.v2.model import MODEL_NAME
+
+
+def test_v2_defaults_match_official_v1_protocol_but_not_its_representation() -> None:
+    args = benchmark.parser().parse_args([])
+    assert tuple(args.datasets) == DATASETS == ("zinc12k", "peptides_struct")
+    assert (args.hidden_dim, args.pe_dim, args.layers) == (64, 32, 3)
+    assert (args.epochs, args.patience, args.lr, args.batch_size) == (300, 50, 1e-3, 32)
+    assert args.max_parameters == 500_000
+    assert args.column_chunk_size == 16
+    assert args.output_dir == Path("results/cycle_pe_v2/benchmark")
+    assert MODEL_NAME == "cycle_basis_v2"
+    assert not hasattr(args, "baselines")
+    assert not hasattr(args, "tiny")
+    assert not hasattr(args, "max_cycle_rank")
+
+
+@pytest.mark.parametrize("flag", ["--baselines", "--tiny", "--max-cycle-rank"])
+def test_no_baseline_dummy_or_cycle_truncation_options(flag):
+    with pytest.raises(SystemExit):
+        benchmark.parser().parse_args([flag])
+
+
+def test_cpu_benchmark_training_and_invalid_chunk_size_are_rejected() -> None:
+    args = benchmark.parser().parse_args(["--device", "cpu"])
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        benchmark._validate(args)
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        benchmark._train_model("zinc12k", {}, args)
+    args.prepare_only = True
+    benchmark._validate(args)
+    args.column_chunk_size = 0
+    with pytest.raises(ValueError, match="column-chunk-size"):
+        benchmark._validate(args)
+
+
+def test_hashes_include_basis_data_encoder_and_reused_backbone_sources() -> None:
+    hashes = benchmark.implementation_hashes()
+    assert {
+        "research/cycle_pe/v2/benchmark.py",
+        "research/cycle_pe/v2/basis.py",
+        "research/cycle_pe/v2/data.py",
+        "research/cycle_pe/v2/model.py",
+        "research/cycle_pe/benchmark_data.py",
+        "research/cycle_pe/benchmark_models.py",
+        "research/cycle_pe/paper_model.py",
+    } <= set(hashes)
+    root = Path(benchmark.__file__).resolve().parents[3]
+    for name, value in hashes.items():
+        assert value == hashlib.sha256((root / name).read_bytes()).hexdigest()
+
+
+def test_prepare_only_records_separate_version_without_claiming_training(tmp_path, monkeypatch):
+    loaded = []
+
+    def fake_load(root, dataset, *, allow_download):
+        loaded.append((dataset, allow_download))
+        return {}, {"official_splits": True, "unit_fixture_only": True, "basis": "full_left_null"}
+
+    monkeypatch.setattr(benchmark, "load_benchmark", fake_load)
+    monkeypatch.setattr(benchmark, "_train_model", lambda *a: pytest.fail("must not train"))
+    output = tmp_path / "v2"
+    assert (
+        benchmark.main(
+            [
+                "--datasets",
+                "zinc12k",
+                "--prepare-only",
+                "--device",
+                "cpu",
+                "--output-dir",
+                str(output),
+                "--data-root",
+                str(tmp_path),
+            ]
+        )
+        == 0
+    )
+    assert loaded == [("zinc12k", False)]
+    metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    for document in (metrics, manifest):
+        assert document["status"] == "prepared"
+        assert document["track"] == "cycle_pe"
+        assert document["version"] == "v2"
+    assert metrics["datasets"]["zinc12k"]["models"] == {}
+    assert manifest["controls"]["model"] == "cycle_basis_v2"
+    assert "no truncation" in manifest["controls"]["basis_input"]
+    assert manifest["controls"]["basis_rank_dependent_parameters"] is False
+    assert "SVD basis" in manifest["seeds"]["chart_seed"]
+    with pytest.raises(FileExistsError):
+        benchmark.main(["--prepare-only", "--output-dir", str(output)])
+
+
+def test_only_v2_model_is_dispatched_once_per_official_dataset(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(benchmark, "_validate", lambda args: None)
+    monkeypatch.setattr(benchmark, "load_benchmark", lambda *args, **kwargs: ({}, {}))
+
+    def fake_train(dataset, splits, args):
+        calls.append(dataset)
+        return {"test": 0.5, "validation": 0.4}
+
+    monkeypatch.setattr(benchmark, "_train_model", fake_train)
+    output = tmp_path / "v2_only"
+    benchmark.main(["--output-dir", str(output), "--data-root", str(tmp_path)])
+    assert calls == list(DATASETS)
+    metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["status"] == "passed"
+    assert all(set(entry["models"]) == {MODEL_NAME} for entry in metrics["datasets"].values())
+
+
+def test_preparation_failure_is_persisted_not_reported_as_success(tmp_path, monkeypatch):
+    def broken(*args, **kwargs):
+        raise ValueError("invalid left-nullspace basis")
+
+    monkeypatch.setattr(benchmark, "load_benchmark", broken)
+    output = tmp_path / "failed"
+    with pytest.raises(ValueError, match="left-nullspace"):
+        benchmark.main(["--prepare-only", "--output-dir", str(output)])
+    for filename in ("manifest.json", "metrics.json"):
+        document = json.loads((output / filename).read_text(encoding="utf-8"))
+        assert document["status"] == "failed"
+        assert document["version"] == "v2"
+
+
+def test_runner_selects_validation_checkpoint_before_single_test_evaluation() -> None:
+    source = inspect.getsource(benchmark._train_model)
+    assert source.count("evaluate(model, test_loader, device)") == 1
+    assert source.index('model.load_state_dict(selected["state_dict"])') < source.index(
+        "evaluate(model, test_loader, device)"
+    )
+    assert "if validation < best:" in source
+    assert "weights_only=True" in source
+````
+
+# research/cycle_pe/tests/test_v2_data.py
+
+````python
+"""Small algebra/schema fixtures only; never run training or download datasets."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import fields, replace
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from chartgat.cache import CacheCorruptError, CacheIncompleteError, CacheWrongRequestError
+from research.cycle_pe.v2 import basis, data
+
+
+def _official(num_nodes=4, edges=((0, 1), (1, 2), (2, 3), (0, 3)), *, dataset="zinc12k"):
+    pairs = [*edges, *((v, u) for u, v in edges)]
+    atom_width, bond_width, targets = (1, 1, 1) if dataset == "zinc12k" else (9, 3, 11)
+    return SimpleNamespace(
+        num_nodes=num_nodes,
+        x=torch.zeros((num_nodes, atom_width), dtype=torch.long),
+        edge_index=torch.tensor(pairs, dtype=torch.long).reshape(-1, 2).T.contiguous(),
+        edge_attr=torch.zeros((len(pairs), bond_width), dtype=torch.long),
+        y=torch.arange(targets, dtype=torch.float32) + 0.75,
+    )
+
+
+def _graph(*args, **kwargs):
+    return data.prepare_graph(_official(*args, **kwargs), dataset=kwargs.get("dataset", "zinc12k"))
+
+
+def _edges(pairs):
+    return np.asarray(pairs, dtype=np.int64).reshape(-1, 2).T
+
+
+@pytest.mark.parametrize(
+    "nodes,edges,rank",
+    [
+        (1, (), 0),
+        (5, (), 0),
+        (4, ((0, 1), (1, 2)), 0),
+        (3, ((0, 1), (0, 2), (1, 2)), 1),
+        (4, ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)), 3),
+        (8, ((0, 1), (0, 2), (1, 2), (3, 4), (3, 5), (4, 5), (6, 7)), 2),
+    ],
+)
+def test_entire_left_nullspace_is_returned_for_connected_disconnected_and_empty(nodes, edges, rank):
+    edge_index = _edges(edges)
+    incidence, actual_rank = basis.incidence_and_cycle_rank(nodes, edge_index)
+    values = basis.left_nullspace_basis(nodes, edge_index)
+    assert actual_rank == rank
+    assert values.shape == (len(edges), rank)
+    assert values.dtype == np.float32
+    assert values.flags.c_contiguous
+    np.testing.assert_allclose(incidence.T @ values, 0, atol=2e-7)
+    np.testing.assert_allclose(values.T @ values, np.eye(rank), atol=3e-7)
+    basis.validate_cycle_basis(nodes, edge_index, values)
+
+
+def test_uses_full_svd_not_reduced_svd_or_fixed_cycle_width(monkeypatch):
+    original = np.linalg.svd
+    calls = []
+
+    def observed(values, *, full_matrices):
+        calls.append((values.shape, full_matrices))
+        return original(values, full_matrices=full_matrices)
+
+    monkeypatch.setattr(basis.np.linalg, "svd", observed)
+    pairs = [(u, v) for u in range(8) for v in range(u + 1, 8)]
+    values = basis.left_nullspace_basis(8, _edges(pairs))
+    assert values.shape == (28, 21)
+    assert calls == [((28, 8), True)]
+
+
+def test_svd_rank_must_agree_with_graph_rank(monkeypatch):
+    original = np.linalg.svd
+
+    def incorrect(values, *, full_matrices):
+        left, singular, right = original(values, full_matrices=full_matrices)
+        singular[:] = 1.0
+        return left, singular, right
+
+    monkeypatch.setattr(basis.np.linalg, "svd", incorrect)
+    with pytest.raises(ValueError, match="disagrees"):
+        basis.left_nullspace_basis(3, _edges([(0, 1), (0, 2), (1, 2)]))
+
+
+@pytest.mark.parametrize(
+    "nodes,edges,error",
+    [
+        (0, _edges([]), "positive integer"),
+        (True, _edges([]), "positive integer"),
+        (3, np.array([[0.0], [1.0]]), "integer node"),
+        (3, np.array([[True], [False]]), "integer node"),
+        (3, np.array([0, 1]), "shape"),
+        (3, _edges([(0, 3)]), "out of range"),
+        (3, _edges([(-1, 1)]), "out of range"),
+        (3, _edges([(0, 0)]), "orientation"),
+        (3, _edges([(1, 0)]), "orientation"),
+        (3, _edges([(0, 1), (0, 1)]), "duplicate"),
+    ],
+)
+def test_basis_input_contract_rejects_invalid_incidence_inputs(nodes, edges, error):
+    with pytest.raises(ValueError, match=error):
+        basis.left_nullspace_basis(nodes, edges)
+
+
+@pytest.mark.parametrize("kind", ["nonfinite", "wrong_width", "outside_nullspace", "rank", "half"])
+def test_basis_validation_rejects_incomplete_or_corrupt_coordinates(kind):
+    edge_index = _edges([(0, 1), (0, 2), (1, 2)])
+    values = basis.left_nullspace_basis(3, edge_index)
+    if kind == "nonfinite":
+        values[0, 0] = np.nan
+    elif kind == "wrong_width":
+        values = values[:, :0]
+    elif kind == "outside_nullspace":
+        values[0, 0] += 0.1
+    elif kind == "rank":
+        values[:] = 0
+    else:
+        values = values.astype(np.float16)
+    with pytest.raises(ValueError):
+        basis.validate_cycle_basis(3, edge_index, values)
+
+
+@pytest.mark.parametrize("num_nodes", [4, 100, 1000, 100_000])
+def test_orthonormality_tolerance_never_accepts_rank_deficiency_on_large_graphs(num_nodes):
+    edges = num_nodes * (num_nodes - 1) // 2
+    rank = edges - num_nodes + 1
+    # No large allocation or SVD is needed to check the validation bound.
+    tolerance = basis._orthonormality_tolerance(np.dtype("float32"), edges, rank)
+    assert 0 < tolerance <= 0.01 < 1.0
+
+
+def test_edge_order_alignment_is_exact_not_assumed_lexicographic():
+    pairs = _edges([(0, 1), (0, 2), (0, 3), (1, 2), (2, 3)])
+    original = basis.left_nullspace_basis(4, pairs)
+    permutation = np.array([3, 0, 4, 1, 2])
+    transformed = basis.left_nullspace_basis(4, pairs[:, permutation])
+    # SVD may rotate coordinates; the two spans must agree after row transport.
+    transported = original[permutation]
+    alignment = transported.T @ transformed
+    np.testing.assert_allclose(transported @ alignment, transformed, atol=2e-7)
+
+
+@pytest.mark.parametrize("dataset", data.DATASETS)
+def test_official_chemistry_targets_preserved_and_directed_copies_sorted(dataset):
+    source = _official(4, [(2, 3), (0, 3), (1, 2), (0, 1)], dataset=dataset)
+    source.edge_attr[:, 0] = torch.tensor([1, 2, 1, 3, 1, 2, 1, 3])
+    graph = data.prepare_graph(source, dataset=dataset)
+    assert {field.name for field in fields(graph)} == {
+        "x",
+        "edge_index",
+        "edge_attr",
+        "y",
+        "cycle_basis",
+    }
+    torch.testing.assert_close(graph.x, source.x)
+    torch.testing.assert_close(graph.y, source.y)
+    torch.testing.assert_close(graph.edge_index, torch.tensor([[0, 0, 1, 2], [1, 3, 2, 3]]))
+    torch.testing.assert_close(graph.edge_attr[:, 0], torch.tensor([3, 2, 1, 1]))
+    assert graph.cycle_basis.shape == (4, 1)
+    assert graph.cycle_basis.dtype == torch.float32
+    incidence, _ = basis.incidence_and_cycle_rank(4, graph.edge_index.numpy())
+    np.testing.assert_allclose(incidence.T @ graph.cycle_basis.numpy(), 0, atol=1e-7)
+
+
+@pytest.mark.parametrize("kind", ["fractional_atom", "nonfinite_bond", "range", "copies", "loop"])
+def test_official_graphs_are_not_silently_coerced_to_valid_inputs(kind):
+    source = _official()
+    if kind == "fractional_atom":
+        source.x = source.x.float()
+        source.x[0, 0] = 0.5
+    elif kind == "nonfinite_bond":
+        source.edge_attr = source.edge_attr.float()
+        source.edge_attr[0, 0] = torch.nan
+    elif kind == "range":
+        source.edge_index[0, 0] = 4
+    elif kind == "copies":
+        source.edge_attr[0, 0] = 1
+    else:
+        source.edge_index[0, 0] = source.edge_index[1, 0]
+    with pytest.raises(ValueError):
+        data.prepare_graph(source)
+
+
+@pytest.mark.parametrize("kind", ["atom_width", "atom_value", "bond_width", "bond_value", "target"])
+def test_dataset_categorical_and_target_schema_is_checked(kind):
+    source = _official()
+    if kind == "atom_width":
+        source.x = torch.zeros((4, 2), dtype=torch.long)
+    elif kind == "atom_value":
+        source.x[0, 0] = 28
+    elif kind == "bond_width":
+        source.edge_attr = torch.zeros((8, 3), dtype=torch.long)
+    elif kind == "bond_value":
+        source.edge_attr[:] = 4
+    else:
+        source.y = torch.zeros(11)
+    with pytest.raises(ValueError):
+        data.prepare_graph(source, dataset="zinc12k")
+
+
+def test_ragged_batch_keeps_whole_matrices_and_never_mixes_columns():
+    graphs = [
+        _graph(2, [(0, 1)]),
+        _graph(4, [(0, 1), (0, 2), (0, 3), (1, 2), (2, 3)]),
+        _graph(1, []),
+        _graph(),
+    ]
+    batch = data.collate(graphs)
+    assert isinstance(batch.cycle_bases, tuple)
+    assert [matrix.shape for matrix in batch.cycle_bases] == [(1, 0), (5, 2), (0, 0), (4, 1)]
+    torch.testing.assert_close(batch.ptr, torch.tensor([0, 2, 6, 7, 11]))
+    torch.testing.assert_close(batch.edge_ptr, torch.tensor([0, 1, 6, 6, 10]))
+    for index, graph in enumerate(graphs):
+        assert batch.cycle_bases[index] is graph.cycle_basis
+        start, end = batch.edge_ptr[index : index + 2]
+        torch.testing.assert_close(
+            batch.edge_index[:, start:end] - batch.ptr[index], graph.edge_index
+        )
+    moved = batch.to(torch.device("cpu"))
+    assert isinstance(moved.cycle_bases, tuple)
+    for before, after in zip(batch.cycle_bases, moved.cycle_bases, strict=True):
+        torch.testing.assert_close(before, after)
+
+
+def test_ragged_pin_memory_visits_basis_matrices(monkeypatch):
+    batch = data.collate([_graph(), _graph(1, [])])
+    called = []
+
+    def pin(tensor):
+        called.append(id(tensor))
+        return tensor
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", pin)
+    pinned = batch.pin_memory()
+    assert isinstance(pinned.cycle_bases, tuple)
+    assert all(id(matrix) in called for matrix in batch.cycle_bases)
+    assert len(called) == len(fields(batch)) - 1 + len(batch.cycle_bases)
+
+
+def test_collation_rejects_empty_or_inconsistent_graph_schemas():
+    with pytest.raises(ValueError, match="empty"):
+        data.collate([])
+    with pytest.raises(ValueError, match="different molecular schemas"):
+        data.collate([_graph(), _graph(dataset="peptides_struct")])
+    with pytest.raises(ValueError, match="cycle-basis schema"):
+        data.collate([replace(_graph(), cycle_basis=torch.ones(2, 1))])
+
+
+def _install_official_fixture(monkeypatch):
+    official = {split: [_official(), _official(2, [])] for split in data.SPLITS}
+    monkeypatch.setattr(data, "load_official_splits", lambda *args, **kwargs: official)
+    return official
+
+
+def _cache_paths(tmp_path, protocol):
+    directory = tmp_path / data.CACHE_NAMESPACE / "zinc12k"
+    assert str(next(directory.iterdir())) == protocol["cache_directory"]
+    return next(directory.iterdir()) / "train.pt", next(directory.iterdir()) / "train.json"
+
+
+def _rewrite_cache(cache, meta, rows):
+    torch.save(rows, cache)
+    metadata = json.loads(meta.read_text())
+    metadata["cache_sha256"] = hashlib.sha256(cache.read_bytes()).hexdigest()
+    meta.write_text(json.dumps(metadata))
+
+
+def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_svd(tmp_path, monkeypatch):
+    _install_official_fixture(monkeypatch)
+    first, protocol = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
+    assert protocol["official_splits"]
+    assert protocol["preparation"]["representation"] == "complete_orthonormal_left_nullspace_basis"
+    assert set(protocol["preparation"]["implementation_sha256"]) == {
+        "v2/basis.py",
+        "v2/data.py",
+        "official_adapter",
+    }
+    assert not (tmp_path / "cycle_pe_benchmark").exists()
+
+    def no_svd(*args, **kwargs):
+        raise AssertionError("cached bases must not be recomputed")
+
+    monkeypatch.setattr(data, "left_nullspace_basis", no_svd)
+    second, restored = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
+    assert restored == protocol
+    for split in data.SPLITS:
+        for original, cached in zip(first[split], second[split], strict=True):
+            for field in fields(original):
+                torch.testing.assert_close(
+                    getattr(original, field.name), getattr(cached, field.name)
+                )
+
+
+@pytest.mark.parametrize("missing", ["payload", "metadata"])
+def test_incomplete_cache_fails_closed(tmp_path, monkeypatch, missing):
+    _install_official_fixture(monkeypatch)
+    _, protocol = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
+    cache, meta = _cache_paths(tmp_path, protocol)
+    (cache if missing == "payload" else meta).unlink()
+    with pytest.raises(CacheIncompleteError):
+        data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
+
+
+@pytest.mark.parametrize("damage", ["metadata", "checksum", "schema", "basis", "target", "count"])
+def test_damaged_or_numeric_invalid_cache_is_rejected_not_rebuilt(tmp_path, monkeypatch, damage):
+    _install_official_fixture(monkeypatch)
+    _, protocol = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
+    cache, meta = _cache_paths(tmp_path, protocol)
+    if damage == "metadata":
+        meta.write_text("broken json")
+    elif damage == "checksum":
+        cache.write_bytes(b"invalid archive")
+    else:
+        rows = torch.load(cache, weights_only=True)
+        if damage == "schema":
+            rows[0]["cycle_set"] = rows[0].pop("cycle_basis")
+        elif damage == "basis":
+            rows[0]["cycle_basis"].zero_()
+        elif damage == "target":
+            rows[0]["y"] += 1
+        else:
+            rows.pop()
+        _rewrite_cache(cache, meta, rows)
+    before = cache.read_bytes()
+    with pytest.raises(CacheCorruptError):
+        data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
+    assert cache.read_bytes() == before
+
+
+def test_changed_official_inputs_do_not_reuse_cached_basis_graphs(tmp_path, monkeypatch):
+    official = _install_official_fixture(monkeypatch)
+    data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
+    official["train"][0].y += 1
+    with pytest.raises(CacheWrongRequestError):
+        data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
+
+
+def test_no_v1_summary_or_preparer_is_used(monkeypatch):
+    from research.cycle_pe import benchmark_data
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("v2 must not compute v1 cycle-set statistics")
+
+    monkeypatch.setattr(benchmark_data, "prepare_graph", forbidden)
+    monkeypatch.setattr(benchmark_data, "cycle_statistics", forbidden)
+    graph = _graph()
+    assert graph.cycle_basis.shape == (4, 1)
+````
+
+# research/cycle_pe/tests/test_v2_model.py
+
+````python
+"""Bounded forward/backward unit fixtures, never benchmark training or datasets."""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from research.cycle_pe.paper_model import _MessageLayer
+from research.cycle_pe.v2.data import Graph, collate, prepare_graph
+from research.cycle_pe.v2.model import (
+    MODEL_NAME,
+    CycleBasisPEModel,
+    LeftNullBasisEncoder,
+    architecture_protocol,
+)
+
+
+def _graph(n: int = 4, *, complete: bool = False, forest: bool = False) -> Graph:
+    if complete:
+        edges = [(u, v) for u in range(n) for v in range(u + 1, n)]
+    elif forest:
+        edges = [(i, i + 1) for i in range(n - 1)]
+    else:
+        edges = sorted({tuple(sorted((i, (i + 1) % n))) for i in range(n)})
+    return prepare_graph(
+        SimpleNamespace(
+            num_nodes=n,
+            x=torch.arange(n).reshape(-1, 1),
+            edge_index=torch.tensor(edges + [(v, u) for u, v in edges], dtype=torch.long)
+            .reshape(-1, 2)
+            .T.contiguous(),
+            edge_attr=torch.ones((2 * len(edges), 1), dtype=torch.long),
+            y=torch.tensor([0.7]),
+        )
+    )
+
+
+def test_raw_signed_coordinates_reach_first_learned_layer_without_truncation() -> None:
+    graph = _graph(7, complete=True)
+    basis = graph.cycle_basis
+    encoder = LeftNullBasisEncoder(5, 8, column_chunk_size=4)
+    observed = []
+    hook = encoder.column_phi[0].register_forward_pre_hook(
+        lambda _module, args: observed.append(args[0][:, :, -1].detach().clone())
+    )
+    output = encoder(torch.randn(len(basis), 5), basis)
+    hook.remove()
+    assert basis.shape == (21, 15)
+    assert output.shape == (21, 8)
+    assert max(value.shape[1] for value in observed) <= 4
+    torch.testing.assert_close(torch.cat(observed[::2], dim=1), basis)
+    torch.testing.assert_close(torch.cat(observed[1::2], dim=1), -basis)
+
+
+def test_every_basis_column_participates_in_autograd_and_parameters_are_rank_independent() -> None:
+    torch.manual_seed(23)
+    encoder = LeftNullBasisEncoder(7, 11, column_chunk_size=3)
+    parameters_before = sum(p.numel() for p in encoder.parameters())
+    for graph in (_graph(3), _graph(7, complete=True)):
+        basis = graph.cycle_basis.clone().requires_grad_()
+        output = encoder(torch.randn(len(basis), 7), basis)
+        output.square().sum().backward()
+        assert basis.grad is not None and torch.isfinite(basis.grad).all()
+        assert (basis.grad.abs().sum(dim=0) > 0).all()
+        assert sum(p.numel() for p in encoder.parameters()) == parameters_before
+
+
+def test_chunk_size_changes_allocation_not_values_or_gradients() -> None:
+    torch.manual_seed(7)
+    graph = _graph(6, complete=True)
+    encoder = LeftNullBasisEncoder(5, 9, column_chunk_size=1)
+    bond = torch.randn(len(graph.edge_attr), 5)
+    basis = graph.cycle_basis.clone().requires_grad_()
+    expected = encoder(bond, basis)
+    expected.sum().backward()
+    gradient = basis.grad.clone()
+    basis.grad = None
+    encoder.column_chunk_size = 4
+    actual = encoder(bond, basis)
+    actual.sum().backward()
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+    torch.testing.assert_close(basis.grad, gradient, atol=2e-6, rtol=2e-6)
+
+
+def test_column_sign_and_order_symmetry_after_nonlinear_column_encoding() -> None:
+    torch.manual_seed(13)
+    graph = _graph(6, complete=True)
+    encoder = LeftNullBasisEncoder(7, 11, column_chunk_size=3)
+    bond = torch.randn(len(graph.edge_attr), 7)
+    rank = graph.cycle_basis.shape[1]
+    permutation = torch.randperm(rank)
+    signs = torch.where(torch.arange(rank) % 2 == 0, 1.0, -1.0)
+    changed = graph.cycle_basis[:, permutation] * signs
+    torch.testing.assert_close(encoder(bond, graph.cycle_basis), encoder(bond, changed))
+
+
+def test_relative_sign_structure_is_not_replaced_by_entrywise_absolute_values() -> None:
+    torch.manual_seed(17)
+    encoder = LeftNullBasisEncoder(7, 8)
+    bond = torch.randn(4, 7)
+    basis = torch.tensor([[0.2], [-0.3], [0.4], [-0.5]])
+    changed = basis.clone()
+    changed[1] *= -1
+    torch.testing.assert_close(basis.abs(), changed.abs())
+    assert not torch.allclose(encoder(bond, basis), encoder(bond, changed), atol=1e-8, rtol=1e-7)
+
+
+def test_edge_order_equivariance_with_transported_full_basis() -> None:
+    torch.manual_seed(11)
+    graph = _graph(5, complete=True)
+    encoder = LeftNullBasisEncoder(7, 8)
+    bond = torch.randn(len(graph.edge_attr), 7)
+    order = torch.randperm(len(bond))
+    torch.testing.assert_close(
+        encoder(bond, graph.cycle_basis)[order],
+        encoder(bond[order], graph.cycle_basis[order]),
+    )
+
+
+def test_forest_has_exact_zero_pe_even_with_nonzero_mlp_biases() -> None:
+    encoder = LeftNullBasisEncoder(5, 8)
+    for parameter in encoder.parameters():
+        torch.nn.init.constant_(parameter, 0.3)
+    for edges in (0, 4):
+        value = encoder(torch.randn(edges, 5), torch.empty(edges, 0))
+        assert value.shape == (edges, 8)
+        assert torch.equal(value, torch.zeros_like(value))
+
+
+def test_full_model_ragged_batch_matches_individual_graphs_and_backpropagates() -> None:
+    torch.manual_seed(5)
+    model = CycleBasisPEModel(dataset="zinc12k", hidden=12, pe_dim=6, layers=2, column_chunk_size=2)
+    graphs = [_graph(4), _graph(5, complete=True), _graph(3, forest=True)]
+    batch = collate(graphs)
+    output = model(batch)
+    assert output.shape == (3, 1)
+    assert all(isinstance(layer, _MessageLayer) for layer in model.layers)
+    (output - batch.y).abs().mean().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    model.eval()
+    with torch.no_grad():
+        combined = model(batch)
+        separate = torch.cat([model(collate([graph])) for graph in graphs])
+    torch.testing.assert_close(combined, separate, atol=3e-6, rtol=3e-6)
+
+
+def test_full_model_is_node_permutation_invariant_only_with_transported_chart() -> None:
+    torch.manual_seed(4)
+    graph = _graph(5, complete=True)
+    model = CycleBasisPEModel(dataset="zinc12k", hidden=12, pe_dim=6, layers=2).eval()
+    permutation = torch.tensor([3, 0, 4, 1, 2])
+    inverse = torch.argsort(permutation)
+    transported = replace(graph, x=graph.x[permutation], edge_index=inverse[graph.edge_index])
+    # Keep each incidence edge's original orientation and its entire U row.
+    torch.testing.assert_close(model(collate([graph])), model(collate([transported])))
+
+
+def test_optional_amp_keeps_full_basis_and_scatter_arithmetic_valid() -> None:
+    model = CycleBasisPEModel(dataset="zinc12k", hidden=12, pe_dim=6, layers=2)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        result = model(collate([_graph(4), _graph(5, complete=True)]))
+    assert torch.isfinite(result).all()
+
+
+@pytest.mark.parametrize("dataset,width,targets", [("zinc12k", 1, 1), ("peptides_struct", 9, 11)])
+def test_official_target_width_parameter_budget_and_edgeless_readout(dataset, width, targets):
+    model = CycleBasisPEModel(dataset=dataset)
+    graph = _graph(1, forest=True)
+    graph.x = torch.zeros((1, width), dtype=torch.long)
+    graph.edge_attr = torch.empty((0, 1 if dataset == "zinc12k" else 3), dtype=torch.long)
+    graph.y = torch.zeros(targets)
+    output = model(collate([graph]))
+    assert output.shape == (1, targets)
+    assert torch.isfinite(output).all()
+    assert sum(p.numel() for p in model.parameters()) <= 500_000
+
+
+@pytest.mark.parametrize("kwargs", [{"bond_dim": 0}, {"pe_dim": 0}, {"column_chunk_size": 0}])
+def test_encoder_rejects_invalid_sizes(kwargs):
+    arguments = {"bond_dim": 5, "pe_dim": 8, **kwargs}
+    with pytest.raises(ValueError, match="positive"):
+        LeftNullBasisEncoder(**arguments)
+
+
+def test_basis_schema_errors_fail_loudly() -> None:
+    encoder = LeftNullBasisEncoder(5, 8)
+    with pytest.raises(ValueError, match="shape"):
+        encoder(torch.zeros(3, 5), torch.zeros(2, 1))
+    with pytest.raises(ValueError, match="floating point"):
+        encoder(torch.zeros(3, 5), torch.zeros(3, 1, dtype=torch.long))
+    with pytest.raises(ValueError, match="edgeless"):
+        encoder(torch.zeros(0, 5), torch.zeros(0, 1))
+
+
+def test_protocol_names_actual_basis_input_and_states_gauge_and_compression_limits() -> None:
+    protocol = architecture_protocol()
+    assert MODEL_NAME == "cycle_basis_v2"
+    assert "full signed left-nullspace basis" in protocol["positional_encoding"]
+    assert "no train-fitted padding, truncation" in protocol["basis_width"]
+    assert "not arbitrary O(beta)" in protocol["cycle_symmetry"]
+    assert "not guaranteed injective" in protocol["limits"]
+
+
+def _disconnected_graph() -> Graph:
+    edges = [(0, 1), (0, 2), (1, 2), (3, 4), (3, 5), (4, 5)]
+    return prepare_graph(
+        SimpleNamespace(
+            num_nodes=6,
+            x=torch.arange(6).reshape(-1, 1),
+            edge_index=torch.tensor(edges + [(v, u) for u, v in edges], dtype=torch.long).T,
+            edge_attr=torch.ones((2 * len(edges), 1), dtype=torch.long),
+            y=torch.tensor([0.7]),
+        )
+    )
+
+
+def _assert_parameter_gradients_match(first: torch.nn.Module, second: torch.nn.Module) -> None:
+    actual = dict(first.named_parameters())
+    expected = dict(second.named_parameters())
+    assert actual.keys() == expected.keys()
+    for name, parameter in actual.items():
+        wanted = expected[name]
+        assert (parameter.grad is None) == (wanted.grad is None), name
+        if parameter.grad is not None:
+            torch.testing.assert_close(parameter.grad, wanted.grad, atol=3e-6, rtol=3e-5, msg=name)
+
+
+@pytest.mark.parametrize("budget", [1, 5, 29, 32768])
+def test_batched_pair_encoder_matches_reference_outputs_and_every_gradient(budget):
+    torch.manual_seed(37)
+    graphs = [
+        _graph(4),
+        _graph(5, complete=True),
+        _graph(4, forest=True),
+        _graph(1, forest=True),
+        _disconnected_graph(),
+    ]
+    counts = [len(graph.edge_attr) for graph in graphs]
+    reference = LeftNullBasisEncoder(5, 9, column_chunk_size=3)
+    batched = copy.deepcopy(reference)
+    ref_bond = torch.randn(sum(counts), 5, requires_grad=True)
+    new_bond = ref_bond.detach().clone().requires_grad_()
+    ref_bases = tuple(graph.cycle_basis.clone().requires_grad_() for graph in graphs)
+    new_bases = tuple(basis.detach().clone().requires_grad_() for basis in ref_bases)
+    expected = torch.cat(
+        [
+            reference(part, basis)
+            for part, basis in zip(ref_bond.split(counts), ref_bases, strict=True)
+        ]
+    )
+    actual = batched.forward_batch(new_bond, new_bases, pair_budget=budget)
+    torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+    weights = torch.randn_like(expected)
+    (expected * weights).sum().backward()
+    (actual * weights).sum().backward()
+    torch.testing.assert_close(new_bond.grad, ref_bond.grad, atol=3e-6, rtol=3e-5)
+    for wanted, value in zip(ref_bases, new_bases, strict=True):
+        assert (wanted.grad is None) == (value.grad is None)
+        if wanted.grad is not None:
+            torch.testing.assert_close(value.grad, wanted.grad, atol=3e-6, rtol=3e-5)
+            assert (value.grad.abs().sum(dim=0) > 0).all()
+    _assert_parameter_gradients_match(batched, reference)
+    assert reference.state_dict().keys() == batched.state_dict().keys()
+
+
+@pytest.mark.parametrize("budget", [1, 7, 32768])
+def test_batched_encoder_keeps_graph_column_segments_signs_and_edge_order_separate(budget):
+    torch.manual_seed(31)
+    encoder = LeftNullBasisEncoder(5, 9, column_chunk_size=3)
+    bases = tuple(graph.cycle_basis for graph in [_graph(4, complete=True), _disconnected_graph()])
+    bonds = [torch.randn(len(basis), 5) for basis in bases]
+    expected = encoder.forward_batch(torch.cat(bonds), bases, pair_budget=budget)
+    changed, orders = [], []
+    for basis in bases:
+        rank = basis.shape[1]
+        columns, order = torch.randperm(rank), torch.randperm(len(basis))
+        signs = torch.where(torch.arange(rank) % 2 == 0, 1.0, -1.0)
+        changed.append(basis[order][:, columns] * signs)
+        orders.append(order)
+    actual = encoder.forward_batch(
+        torch.cat([bond[order] for bond, order in zip(bonds, orders, strict=True)]),
+        changed,
+        pair_budget=budget,
+    )
+    expected_parts = expected.split([len(basis) for basis in bases])
+    torch.testing.assert_close(
+        actual,
+        torch.cat([part[order] for part, order in zip(expected_parts, orders, strict=True)]),
+        atol=3e-6,
+        rtol=3e-5,
+    )
+    # A different graph's features must never change the first graph's context.
+    altered_bonds = torch.cat((bonds[0], 20.0 * bonds[1]))
+    altered = encoder.forward_batch(altered_bonds, bases, pair_budget=budget)
+    torch.testing.assert_close(altered[: len(bases[0])], expected[: len(bases[0])])
+
+
+def test_batched_encoder_shares_mlp_calls_and_honors_pair_budget_without_truncation() -> None:
+    encoder = LeftNullBasisEncoder(5, 9, column_chunk_size=2)
+    bases = tuple(_graph(5, complete=True).cycle_basis for _ in range(3))
+    bond = torch.randn(sum(len(basis) for basis in bases), 5)
+    pair_count = sum(basis.numel() for basis in bases)
+    calls: dict[str, list[torch.Tensor]] = {"phi": [], "psi": []}
+    hooks = [
+        module.register_forward_pre_hook(
+            lambda _module, args, key=key: calls[key].append(args[0].detach().clone())
+        )
+        for key, module in (("phi", encoder.column_phi[0]), ("psi", encoder.edge_psi[0]))
+    ]
+    try:
+        encoder.forward_batch(bond, bases, pair_budget=pair_count)
+        assert len(calls["phi"]) == len(calls["psi"]) == 2
+        # One shared positive and one shared negative call cover all entries.
+        assert sum(len(value) for value in calls["phi"]) == 2 * pair_count
+        assert calls["phi"][0].shape == (pair_count, 6)
+        torch.testing.assert_close(calls["phi"][0][:, -1], -calls["phi"][1][:, -1])
+        for values in calls.values():
+            values.clear()
+        encoder.forward_batch(bond, bases, pair_budget=7)
+        for values in calls.values():
+            assert max(len(value) for value in values) <= 7
+            assert sum(len(value) for value in values) == 2 * pair_count
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
+def test_batched_forest_and_empty_inputs_never_create_bias_pe() -> None:
+    encoder = LeftNullBasisEncoder(5, 8)
+    for parameter in encoder.parameters():
+        torch.nn.init.constant_(parameter, 0.3)
+    for bases in ((), (torch.empty(0, 0),), (torch.empty(4, 0), torch.empty(0, 0))):
+        edges = sum(len(basis) for basis in bases)
+        value = encoder.forward_batch(torch.randn(edges, 5), bases, pair_budget=1)
+        assert torch.equal(value, torch.zeros(edges, 8))
+
+
+def test_full_batched_model_matches_reference_state_dict_outputs_and_gradients() -> None:
+    torch.manual_seed(47)
+    reference = CycleBasisPEModel(
+        dataset="zinc12k",
+        hidden=12,
+        pe_dim=6,
+        layers=2,
+        column_chunk_size=2,
+        basis_execution="reference",
+    )
+    batched = CycleBasisPEModel(
+        dataset="zinc12k",
+        hidden=12,
+        pe_dim=6,
+        layers=2,
+        column_chunk_size=2,
+        basis_execution="batched",
+        basis_pair_budget=7,
+    )
+    batched.load_state_dict(reference.state_dict(), strict=True)
+    graphs = [_graph(4), _graph(5, complete=True), _graph(4, forest=True), _disconnected_graph()]
+    batch = collate(graphs)
+    expected, actual = reference(batch), batched(batch)
+    torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+    weights = torch.randn_like(actual)
+    (expected * weights).sum().backward()
+    (actual * weights).sum().backward()
+    _assert_parameter_gradients_match(batched, reference)
+
+
+@pytest.mark.parametrize("kwargs", [{"basis_execution": "unknown"}, {"basis_pair_budget": 0}])
+def test_full_model_rejects_invalid_execution_settings(kwargs):
+    with pytest.raises(ValueError, match="basis_"):
+        CycleBasisPEModel(dataset="zinc12k", **kwargs)
+
+
+def test_batched_encoder_rejects_invalid_schema_and_budget() -> None:
+    encoder = LeftNullBasisEncoder(5, 8)
+    with pytest.raises(ValueError, match="positive"):
+        encoder.forward_batch(torch.zeros(3, 5), (torch.zeros(3, 1),), pair_budget=0)
+    with pytest.raises(ValueError, match="align"):
+        encoder.forward_batch(torch.zeros(3, 5), (torch.zeros(2, 1),))
+    with pytest.raises(ValueError, match="shape"):
+        encoder.forward_batch(torch.zeros(3, 5), (torch.zeros(3),))
+    with pytest.raises(ValueError, match="floating point"):
+        encoder.forward_batch(torch.zeros(3, 5), (torch.zeros(3, 1, dtype=torch.long),))
+    with pytest.raises(ValueError, match="edgeless"):
+        encoder.forward_batch(torch.zeros(0, 5), (torch.zeros(0, 1),))
+````
+
+# research/cycle_pe/v2/__init__.py
+
+````python
+"""Cycle PE v2: complete incidence left-nullspace basis inputs.
+
+The original cycle-set summary experiment remains unchanged in the parent
+package. This package has separate data, cache, model and experiment entrypoints.
+"""
+````
+
+# research/cycle_pe/v2/basis.py
+
+````python
+"""Complete orthonormal left-nullspace bases of oriented graph incidence.
+
+Rows correspond to the supplied, canonical undirected edges. Columns are all
+``beta = m - n + c`` basis vectors of ``ker(B.T)``. No statistics, projector,
+padding width or truncated spectrum replaces these vectors.
+
+An SVD basis is coordinate-dependent: signs, column order and rotations within
+the nullspace are not intrinsic graph labels. Canonical edge ordering stabilizes
+one input convention but does not promise relabeling or cross-LAPACK invariance.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+from numpy.typing import ArrayLike, NDArray
+
+
+def incidence_and_cycle_rank(
+    num_nodes: int, edge_index: ArrayLike
+) -> tuple[NDArray[np.float64], int]:
+    """Return ``B[m,n]`` (tail -1, head +1) and exact combinatorial nullity.
+
+    The graph must be simple and loop-free, with exactly one row per bond and
+    orientation ``u < v``. Isolated vertices count as connected components.
+    Input edge order is preserved, so returned basis rows remain aligned.
+    """
+    if isinstance(num_nodes, bool) or not isinstance(num_nodes, (int, np.integer)):
+        raise ValueError("num_nodes must be a positive integer")
+    if num_nodes < 1:
+        raise ValueError("num_nodes must be a positive integer")
+    edges = np.asarray(edge_index)
+    if edges.ndim != 2 or edges.shape[0] != 2:
+        raise ValueError("edge_index must have shape (2, num_edges)")
+    if not np.issubdtype(edges.dtype, np.integer) or np.issubdtype(edges.dtype, np.bool_):
+        raise ValueError("edge_index must contain integer node indices")
+    if np.any(edges < 0) or np.any(edges >= num_nodes):
+        raise ValueError("edge endpoint out of range")
+    if np.any(edges[0] >= edges[1]):
+        raise ValueError("edges must have canonical loop-free orientation u < v")
+    pairs = list(map(tuple, edges.T.tolist()))
+    if len(set(pairs)) != len(pairs):
+        raise ValueError("duplicate undirected edge")
+
+    parent = list(range(num_nodes))
+
+    def find(vertex: int) -> int:
+        while parent[vertex] != vertex:
+            parent[vertex] = parent[parent[vertex]]
+            vertex = parent[vertex]
+        return vertex
+
+    components = num_nodes
+    for u, v in pairs:
+        left, right = find(u), find(v)
+        if left != right:
+            parent[right] = left
+            components -= 1
+    edge_count = edges.shape[1]
+    incidence = np.zeros((edge_count, num_nodes), dtype=np.float64)
+    rows = np.arange(edge_count)
+    incidence[rows, edges[0]] = -1.0
+    incidence[rows, edges[1]] = 1.0
+    return incidence, edge_count - num_nodes + components
+
+
+def _orthonormality_tolerance(dtype: np.dtype, edge_count: int, cycle_rank: int) -> float:
+    # A rank-deficient Gram matrix has distance at least 1 from identity.
+    # Never let size scaling weaken the full-rank certificate to that point.
+    return min(
+        0.01,
+        32.0 * np.finfo(dtype).eps * max(1.0, np.sqrt(edge_count)) * max(1, cycle_rank),
+    )
+
+
+def validate_cycle_basis(num_nodes: int, edge_index: ArrayLike, basis: ArrayLike) -> None:
+    """Reject wrong dimension, nonfinite, non-null or non-orthonormal columns.
+
+    Float32 storage is intentional. Checks are accumulated in float64, with
+    tolerances scaled by the stored precision, matrix size and input norm.
+    Together, exact nullity and orthonormal columns certify a full basis rather
+    than merely a collection of vectors from the nullspace.
+    """
+    incidence, cycle_rank = incidence_and_cycle_rank(num_nodes, edge_index)
+    raw = np.asarray(basis)
+    if raw.ndim != 2 or raw.shape != (len(incidence), cycle_rank):
+        raise ValueError(
+            f"cycle_basis must have shape ({len(incidence)}, {cycle_rank}); got {raw.shape}"
+        )
+    if not np.issubdtype(raw.dtype, np.floating) or not np.all(np.isfinite(raw)):
+        raise ValueError("cycle_basis must contain finite floating-point values")
+    if raw.dtype.itemsize < 4:
+        raise ValueError("cycle_basis storage requires float32 or float64 precision")
+    if not cycle_rank:
+        return
+    values = raw.astype(np.float64, copy=False)
+    epsilon = np.finfo(raw.dtype).eps
+    residual = np.linalg.norm(incidence.T @ values, ord="fro")
+    residual_scale = max(1.0, np.linalg.norm(incidence, ord="fro")) * max(
+        1.0, np.linalg.norm(values, ord="fro")
+    )
+    if residual > 32.0 * epsilon * residual_scale:
+        raise ValueError("cycle_basis is not in the left nullspace: B.T @ U_c != 0")
+    gram_error = np.linalg.norm(values.T @ values - np.eye(cycle_rank), ord="fro")
+    gram_tolerance = _orthonormality_tolerance(raw.dtype, len(values), cycle_rank)
+    if gram_error > gram_tolerance:
+        raise ValueError("cycle_basis columns must be orthonormal and full rank")
+
+
+def left_nullspace_basis(num_nodes: int, edge_index: ArrayLike) -> NDArray[np.float32]:
+    """Compute every left-nullspace vector with full SVD, preserving edge rows.
+
+    ``B = U S V.T`` implies ``U_c = U[:, rank(B):]``. The rank is checked
+    against ``n-c``; it is not chosen by a user-specified width. Forests have
+    shape ``(m, 0)`` and edgeless graphs ``(0, 0)``.
+    """
+    incidence, cycle_rank = incidence_and_cycle_rank(num_nodes, edge_index)
+    edge_count = len(incidence)
+    if not cycle_rank:
+        return np.empty((edge_count, 0), dtype=np.float32)
+    left, singular_values, _ = np.linalg.svd(incidence, full_matrices=True)
+    threshold = (
+        np.finfo(np.float64).eps
+        * max(incidence.shape)
+        * (float(singular_values[0]) if len(singular_values) else 0.0)
+    )
+    numerical_rank = int(np.count_nonzero(singular_values > threshold))
+    expected_rank = edge_count - cycle_rank
+    if numerical_rank != expected_rank:
+        raise ValueError(f"incidence SVD rank {numerical_rank} disagrees with n-c={expected_rank}")
+    basis = np.ascontiguousarray(left[:, expected_rank:], dtype=np.float64)
+    validate_cycle_basis(num_nodes, edge_index, basis)
+    result = basis.astype(np.float32)
+    validate_cycle_basis(num_nodes, edge_index, result)
+    return result
+
+
+__all__ = ["incidence_and_cycle_rank", "left_nullspace_basis", "validate_cycle_basis"]
+````
+
+# research/cycle_pe/v2/benchmark.py
+
+````python
+"""Train Cycle PE v2 from full left-nullspace bases on official molecular splits.
+
+This is an isolated experiment: it does not change or invoke the v1 cycle-set
+model, and it never trains comparison-paper models. Actual training is CUDA-only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.metadata
+import json
+import math
+import random
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+
+from chartgat.cache import atomic_publish, atomic_write_json
+from chartgat.execution import add_execution_arguments, configure_execution
+from research.cycle_pe.v2.data import DATASETS, Graph, collate, load_benchmark
+from research.cycle_pe.v2.model import MODEL_NAME, CycleBasisPEModel, architecture_protocol
+
+TRACK_NAME = "cycle_pe"
+IMPLEMENTATION_FILES = (
+    "research/cycle_pe/v2/benchmark.py",
+    "research/cycle_pe/v2/basis.py",
+    "research/cycle_pe/v2/data.py",
+    "research/cycle_pe/v2/model.py",
+    "research/cycle_pe/benchmark_data.py",
+    "research/cycle_pe/benchmark_models.py",
+    "research/cycle_pe/paper_model.py",
+    "src/chartgat/algebra.py",
+    "src/chartgat/cache.py",
+    "src/chartgat/execution.py",
+)
+
+
+def implementation_hashes() -> dict[str, str]:
+    root = Path(__file__).resolve().parents[3]
+    return {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in IMPLEMENTATION_FILES
+    }
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--suite", choices=("benchmark",), default="benchmark")
+    result.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    result.add_argument("--data-root", type=Path, default=Path("data/paper"))
+    result.add_argument("--output-dir", type=Path, default=Path("results/cycle_pe_v2/benchmark"))
+    result.add_argument("--device", default="cuda")
+    for seed in ("data", "split", "chart", "model"):
+        result.add_argument(f"--{seed}-seed", type=int, default=0)
+    result.add_argument("--batch-size", type=int, default=32)
+    result.add_argument("--workers", type=int, default=0)
+    result.add_argument("--prepare-only", action="store_true")
+    result.add_argument("--allow-download", action="store_true")
+    result.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
+    result.add_argument("--epochs", type=int, default=300)
+    result.add_argument("--patience", type=int, default=50)
+    result.add_argument("--lr", type=float, default=1e-3)
+    result.add_argument("--weight-decay", type=float, default=0.0)
+    result.add_argument("--hidden-dim", type=int, default=64)
+    result.add_argument("--pe-dim", type=int, default=32)
+    result.add_argument("--layers", type=int, default=3)
+    result.add_argument("--max-parameters", type=int, default=500_000)
+    result.add_argument(
+        "--column-chunk-size",
+        type=int,
+        default=16,
+        help="basis columns processed per temporary chunk; never truncates the cycle rank",
+    )
+    result.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
+    result.add_argument("--basis-pair-budget", type=int, default=32768)
+    add_execution_arguments(result)
+    return result
+
+
+def _validate(args: argparse.Namespace) -> None:
+    if any(getattr(args, f"{seed}_seed") < 0 for seed in ("data", "split", "chart", "model")):
+        raise ValueError("seeds must be nonnegative")
+    for key in (
+        "batch_size",
+        "epochs",
+        "patience",
+        "hidden_dim",
+        "pe_dim",
+        "layers",
+        "max_parameters",
+        "column_chunk_size",
+        "basis_pair_budget",
+    ):
+        if getattr(args, key) < 1:
+            raise ValueError(f"--{key.replace('_', '-')} must be positive")
+    if args.workers < 0 or args.lr <= 0 or args.weight_decay < 0:
+        raise ValueError("invalid worker count or optimizer settings")
+    if len(set(args.datasets)) != len(args.datasets):
+        raise ValueError("datasets must not contain duplicates")
+    if not args.prepare_only and (
+        torch.device(args.device).type != "cuda" or not torch.cuda.is_available()
+    ):
+        raise RuntimeError("Cycle PE v2 benchmark training requires CUDA; no CPU fallback")
+
+
+def _seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+
+
+def _worker_seed(_: int) -> None:
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
+
+
+def _loader(graphs: list[Graph], args: argparse.Namespace, *, train: bool) -> DataLoader:
+    generator = torch.Generator().manual_seed(args.model_seed)
+    return DataLoader(
+        graphs,
+        batch_size=args.batch_size,
+        shuffle=train,
+        num_workers=args.workers,
+        pin_memory=True,
+        collate_fn=collate,
+        generator=generator,
+        worker_init_fn=_worker_seed,
+        persistent_workers=args.workers > 0,
+    )
+
+
+@torch.no_grad()
+def evaluate(model: CycleBasisPEModel, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    total = torch.zeros((), device=device, dtype=torch.float64)
+    count = 0
+    for batch in loader:
+        batch = batch.to(device)
+        predicted = model(batch).float()
+        if not torch.isfinite(predicted).all():
+            raise FloatingPointError("nonfinite validation/test prediction")
+        total += (predicted - batch.y).abs().sum().double()
+        count += batch.y.numel()
+    if count == 0:
+        raise ValueError("cannot evaluate an empty official split")
+    return float(total / count)
+
+
+def _train_model(
+    dataset: str,
+    splits: dict[str, list[Graph]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if torch.device(args.device).type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("Cycle PE v2 benchmark training requires CUDA; no CPU fallback")
+    _seed(args.model_seed)
+    device = torch.device(args.device)
+    model = CycleBasisPEModel(
+        dataset=dataset,
+        hidden=args.hidden_dim,
+        pe_dim=args.pe_dim,
+        layers=args.layers,
+        column_chunk_size=args.column_chunk_size,
+        basis_execution=args.basis_execution,
+        basis_pair_budget=args.basis_pair_budget,
+    ).to(device)
+    execution = configure_execution(model, args, device)
+    execution.update(
+        basis_execution=args.basis_execution, basis_pair_budget=args.basis_pair_budget
+    )
+    parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if parameters > args.max_parameters:
+        raise ValueError(
+            f"{dataset}/{MODEL_NAME}: {parameters} parameters exceeds budget {args.max_parameters}"
+        )
+    train_loader = _loader(splits["train"], args, train=True)
+    validation_loader = _loader(splits["validation"], args, train=False)
+    test_loader = _loader(splits["test"], args, train=False)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, factor=0.5, patience=25, min_lr=1e-6
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
+    run = args.output_dir / dataset / MODEL_NAME
+    run.mkdir(parents=True, exist_ok=False)
+    checkpoint = run / "best.pt"
+    history_path = run / "history.json"
+    history = []
+    best = math.inf
+    best_epoch = 0
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    for epoch in range(1, args.epochs + 1):
+        epoch_started = time.perf_counter()
+        model.train()
+        train_sum = torch.zeros((), device=device, dtype=torch.float64)
+        train_count = 0
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
+                predicted = model(batch)
+                loss = (predicted.float() - batch.y).abs().mean()
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"{dataset}/{MODEL_NAME}: nonfinite training loss")
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0, error_if_nonfinite=True)
+            scaler.step(optimizer)
+            scaler.update()
+            train_sum += loss.detach().double() * batch.y.numel()
+            train_count += batch.y.numel()
+        validation = evaluate(model, validation_loader, device)
+        train_mae = float(train_sum / train_count)
+        torch.cuda.synchronize(device)
+        epoch_seconds = time.perf_counter() - epoch_started
+        scheduler.step(validation)
+        history.append(
+            {
+                "epoch": epoch,
+                "train_mae": train_mae,
+                "validation_mae": validation,
+                "epoch_seconds": epoch_seconds,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+            }
+        )
+        atomic_write_json(history_path, history)
+        if validation < best:
+            best, best_epoch = validation, epoch
+            payload = {
+                "state_dict": model.state_dict(),
+                "epoch": epoch,
+                "validation_mae": validation,
+                "dataset": dataset,
+                "model": MODEL_NAME,
+                "model_seed": args.model_seed,
+                "arguments": {
+                    key: str(value) if isinstance(value, Path) else value
+                    for key, value in vars(args).items()
+                },
+            }
+            atomic_publish(checkpoint, lambda path, state=payload: torch.save(state, path))
+        print(
+            f"{dataset}/{MODEL_NAME} epoch={epoch} train_mae={train_mae:.6f} "
+            f"validation_mae={validation:.6f} best={best:.6f} seconds={epoch_seconds:.2f}",
+            flush=True,
+        )
+        if epoch - best_epoch >= args.patience:
+            break
+    selected = torch.load(checkpoint, map_location=device, weights_only=True)
+    model.load_state_dict(selected["state_dict"])
+    # Test is touched only once, after validation selects the checkpoint.
+    test = evaluate(model, test_loader, device)
+    torch.cuda.synchronize(device)
+    return {
+        "validation": best,
+        "test": test,
+        "best_epoch": best_epoch,
+        "trainable_parameters": parameters,
+        "checkpoint": str(checkpoint),
+        "history": str(history_path),
+        "elapsed_seconds": time.perf_counter() - started,
+        "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
+        "epochs_completed": len(history),
+        "execution": execution,
+        "epoch_timing": "cuda_synchronized_train_and_validation_excluding_checkpoint_io",
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    _validate(args)
+    args.data_root = args.data_root.expanduser().resolve()
+    args.output_dir = args.output_dir.expanduser().resolve()
+    if args.output_dir.exists() and any(args.output_dir.iterdir()):
+        raise FileExistsError(f"Output directory is not empty: {args.output_dir}; choose a new run")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = args.output_dir / "manifest.json"
+    if manifest_path.exists():
+        raise FileExistsError(
+            f"Run already exists: {args.output_dir}; choose a new output directory"
+        )
+    arguments = {
+        key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
+    }
+    versions = {"torch": torch.__version__, "cuda": torch.version.cuda}
+    for library in ("torch-geometric", "numpy", "networkx"):
+        try:
+            versions[library] = importlib.metadata.version(library)
+        except importlib.metadata.PackageNotFoundError:
+            versions[library] = "not_installed"
+    manifest = {
+        "schema_version": 2,
+        "track": TRACK_NAME,
+        "version": "v2",
+        "suite": "benchmark",
+        "status": "running",
+        "protocol": "ours_only_on_official_benchmark_splits",
+        "arguments": arguments,
+        "software": versions,
+        "architecture": architecture_protocol(),
+        "implementation_sha256": implementation_hashes(),
+        "seeds": {
+            "model_seed": args.model_seed,
+            "data_seed": "unused: fixed official graphs",
+            "split_seed": "unused: official splits",
+            "chart_seed": "unused: canonical incidence with full numerical SVD basis",
+        },
+        "controls": {
+            "model": MODEL_NAME,
+            "external_models_trained": False,
+            "test_checkpoint_selection": False,
+            "parameter_budget": args.max_parameters,
+            "target_policy": "official labels unchanged",
+            "basis_input": "all signed left-nullspace basis columns, no truncation",
+            "basis_rank_dependent_parameters": False,
+            "column_chunk_size": args.column_chunk_size,
+            "column_chunk_policy": "allocation only; every basis column is processed",
+        },
+    }
+    metrics: dict[str, Any] = {
+        "schema_version": 2,
+        "track": TRACK_NAME,
+        "version": "v2",
+        "suite": "benchmark",
+        "status": "running",
+        "model_seed": args.model_seed,
+        "datasets": {},
+    }
+    atomic_write_json(manifest_path, manifest)
+    try:
+        for dataset in args.datasets:
+            started = time.perf_counter()
+            splits, protocol = load_benchmark(
+                args.data_root, dataset, allow_download=args.allow_download
+            )
+            dataset_metrics: dict[str, Any] = {
+                "metric": "mae",
+                "protocol": protocol,
+                "models": {},
+                "data_preparation_seconds": time.perf_counter() - started,
+            }
+            metrics["datasets"][dataset] = dataset_metrics
+            if not args.prepare_only:
+                dataset_metrics["models"][MODEL_NAME] = _train_model(dataset, splits, args)
+                atomic_write_json(args.output_dir / "metrics.json", metrics)
+            del splits
+        metrics["status"] = manifest["status"] = "prepared" if args.prepare_only else "passed"
+        atomic_write_json(args.output_dir / "metrics.json", metrics)
+        manifest["dataset_protocols"] = {
+            name: data["protocol"] for name, data in metrics["datasets"].items()
+        }
+        atomic_write_json(manifest_path, manifest)
+    except Exception as exc:
+        manifest["status"] = metrics["status"] = "failed"
+        manifest["error"] = f"{type(exc).__name__}: {exc}"
+        atomic_write_json(manifest_path, manifest)
+        atomic_write_json(args.output_dir / "metrics.json", metrics)
+        raise
+    print(json.dumps({"status": metrics["status"], "output_dir": str(args.output_dir)}), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# research/cycle_pe/v2/data.py
+
+````python
+"""Official molecular splits with complete, graph-local cycle basis matrices.
+
+Only the official split adapter and source fingerprint are shared with v1.
+Neither v1 graph preparation nor cycle-set statistics are used here. Cached
+columns and ragged batches retain all cycle vectors without global column IDs.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import dataclass, fields
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from torch import Tensor
+
+from chartgat.cache import (
+    CacheCorruptError,
+    CacheIncompleteError,
+    CacheWrongRequestError,
+    atomic_publish,
+    atomic_write_json,
+)
+from research.cycle_pe.benchmark_data import graph_fingerprint, load_official_splits
+from research.cycle_pe.v2.basis import left_nullspace_basis, validate_cycle_basis
+
+DATASETS = ("zinc12k", "peptides_struct")
+SPLITS = ("train", "validation", "test")
+CACHE_VERSION = "complete-left-nullspace-svd-v2-1"
+CACHE_NAMESPACE = "cycle_pe_v2_benchmark"
+SCHEMAS = {
+    "zinc12k": {"atoms": (28,), "bonds": (4,), "targets": 1},
+    "peptides_struct": {
+        "atoms": (119, 4, 12, 12, 10, 6, 6, 2, 2),
+        "bonds": (5, 6, 2),
+        "targets": 11,
+    },
+}
+SOURCES = {
+    "zinc12k": "https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.ZINC.html",
+    "peptides_struct": "https://github.com/vijaydwivedi75/lrgb",
+}
+
+
+@dataclass
+class Graph:
+    x: Tensor
+    edge_index: Tensor
+    edge_attr: Tensor
+    y: Tensor
+    cycle_basis: Tensor
+
+
+@dataclass
+class Batch:
+    x: Tensor
+    edge_index: Tensor
+    edge_attr: Tensor
+    y: Tensor
+    batch: Tensor
+    ptr: Tensor
+    cycle_bases: tuple[Tensor, ...]
+    edge_ptr: Tensor
+
+    def to(self, device: torch.device | str) -> Batch:
+        return Batch(
+            **{
+                field.name: tuple(value.to(device, non_blocking=True) for value in current)
+                if field.name == "cycle_bases"
+                else current.to(device, non_blocking=True)
+                for field in fields(self)
+                for current in (getattr(self, field.name),)
+            }
+        )
+
+    def pin_memory(self) -> Batch:
+        return Batch(
+            **{
+                field.name: tuple(value.pin_memory() for value in current)
+                if field.name == "cycle_bases"
+                else current.pin_memory()
+                for field in fields(self)
+                for current in (getattr(self, field.name),)
+            }
+        )
+
+
+def collate(graphs: list[Graph]) -> Batch:
+    """Concatenate graph tensors, keeping every basis in its own coordinate chart."""
+    if not graphs:
+        raise ValueError("cannot collate an empty graph list")
+    for graph in graphs:
+        validate_graph(graph, check_basis=False)
+    widths = {(g.x.shape[1], g.edge_attr.shape[1], g.y.numel()) for g in graphs}
+    if len(widths) != 1:
+        raise ValueError("cannot collate graphs with different molecular schemas")
+    counts = [len(graph.x) for graph in graphs]
+    ptr = torch.tensor([0, *np.cumsum(counts).tolist()], dtype=torch.long)
+    edge_ptr = torch.tensor(
+        [0, *np.cumsum([graph.edge_index.shape[1] for graph in graphs]).tolist()],
+        dtype=torch.long,
+    )
+    return Batch(
+        x=torch.cat([graph.x for graph in graphs]),
+        edge_index=torch.cat(
+            [graph.edge_index + ptr[index] for index, graph in enumerate(graphs)], dim=1
+        ),
+        edge_attr=torch.cat([graph.edge_attr for graph in graphs]),
+        y=torch.stack([graph.y for graph in graphs]),
+        batch=torch.repeat_interleave(torch.arange(len(graphs)), torch.tensor(counts)),
+        ptr=ptr,
+        cycle_bases=tuple(graph.cycle_basis for graph in graphs),
+        edge_ptr=edge_ptr,
+    )
+
+
+def _integer_tensor(value: Any, name: str) -> Tensor:
+    if not isinstance(value, Tensor) or value.is_complex() or value.dtype == torch.bool:
+        raise ValueError(f"{name} must be an integer tensor")
+    value = value.detach().cpu()
+    if not torch.isfinite(value).all() or (
+        value.is_floating_point() and not torch.equal(value, value.round())
+    ):
+        raise ValueError(f"{name} must contain finite integer values")
+    return value.long().contiguous()
+
+
+def _canonical_inputs(data: Any) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    raw_nodes = data.num_nodes
+    if isinstance(raw_nodes, bool) or not isinstance(raw_nodes, (int, np.integer)):
+        raise ValueError("num_nodes must be a positive integer")
+    num_nodes = int(raw_nodes)
+    if num_nodes < 1:
+        raise ValueError("official graph must contain at least one node")
+    x = _integer_tensor(data.x, "atom features")
+    if x.ndim == 1:
+        x = x.unsqueeze(1)
+    if x.ndim != 2 or x.shape[0] != num_nodes or x.shape[1] < 1:
+        raise ValueError("invalid official atom-feature shape")
+    edge_index = _integer_tensor(data.edge_index, "edge_index")
+    if edge_index.ndim != 2 or edge_index.shape[0] != 2:
+        raise ValueError("edge_index must have shape (2, num_edges)")
+    if (edge_index < 0).any() or (edge_index >= num_nodes).any():
+        raise ValueError("edge endpoint out of range")
+    edge_attr = _integer_tensor(data.edge_attr, "bond features")
+    if edge_attr.ndim == 1:
+        edge_attr = edge_attr.unsqueeze(1)
+    if edge_attr.ndim != 2 or edge_attr.shape[0] != edge_index.shape[1]:
+        raise ValueError("invalid official bond-feature shape")
+    if edge_attr.shape[1] < 1:
+        raise ValueError("official bonds require categorical features")
+    if not isinstance(data.y, Tensor) or data.y.is_complex():
+        raise ValueError("official target must be a real tensor")
+    y = data.y.detach().cpu().float().reshape(-1)
+    if not len(y) or not torch.isfinite(y).all():
+        raise ValueError("official targets must be finite and nonempty")
+    pairs = list(map(tuple, edge_index.T.tolist()))
+    if len(set(pairs)) != len(pairs) or any(u == v for u, v in pairs):
+        raise ValueError("molecular benchmark requires simple loop-free edges")
+    attributes = {edge: edge_attr[index] for index, edge in enumerate(pairs)}
+    for u, v in pairs:
+        if (v, u) not in attributes or not torch.equal(attributes[u, v], attributes[v, u]):
+            raise ValueError("molecular bonds must have agreeing directed copies")
+    canonical = sorted((u, v) for u, v in pairs if u < v)
+    canonical_index = torch.tensor(canonical, dtype=torch.long).reshape(-1, 2).T.contiguous()
+    canonical_attr = (
+        torch.stack([attributes[pair] for pair in canonical])
+        if canonical
+        else edge_attr.new_empty((0, edge_attr.shape[1]))
+    )
+    return x, canonical_index, canonical_attr, y
+
+
+def validate_graph(graph: Graph, *, dataset: str | None = None, check_basis: bool = True) -> None:
+    """Validate prepared/cache schema and, on preparation/load, basis identities."""
+    for field in fields(Graph):
+        value = getattr(graph, field.name)
+        if not isinstance(value, Tensor) or value.device.type != "cpu":
+            raise ValueError("prepared graph fields must be CPU tensors")
+        if not torch.isfinite(value).all():
+            raise ValueError(f"nonfinite prepared graph field: {field.name}")
+    if graph.x.dtype != torch.long or graph.x.ndim != 2 or min(graph.x.shape) < 1:
+        raise ValueError("invalid prepared atom-feature schema")
+    if (
+        graph.edge_index.dtype != torch.long
+        or graph.edge_index.ndim != 2
+        or graph.edge_index.shape[0] != 2
+    ):
+        raise ValueError("invalid prepared edge_index schema")
+    edge_count = graph.edge_index.shape[1]
+    if (
+        graph.edge_attr.dtype != torch.long
+        or graph.edge_attr.ndim != 2
+        or graph.edge_attr.shape[0] != edge_count
+        or graph.edge_attr.shape[1] < 1
+    ):
+        raise ValueError("invalid prepared bond-feature schema")
+    if graph.y.dtype != torch.float32 or graph.y.ndim != 1 or not graph.y.numel():
+        raise ValueError("invalid prepared target schema")
+    if (
+        graph.cycle_basis.dtype != torch.float32
+        or graph.cycle_basis.ndim != 2
+        or graph.cycle_basis.shape[0] != edge_count
+    ):
+        raise ValueError("invalid prepared cycle-basis schema")
+    if (graph.x < 0).any() or (graph.edge_attr < 0).any():
+        raise ValueError("categorical features must be nonnegative")
+    if dataset is not None:
+        if dataset not in DATASETS:
+            raise ValueError(f"unknown cycle PE v2 dataset: {dataset}")
+        schema = SCHEMAS[dataset]
+        if graph.y.numel() != schema["targets"]:
+            raise ValueError(f"{dataset}: unexpected target width")
+        for values, name in ((graph.x, "atoms"), (graph.edge_attr, "bonds")):
+            cardinalities = schema[name]
+            if values.shape[1] != len(cardinalities):
+                raise ValueError(f"{dataset}: unexpected {name} field count")
+            if any((values[:, i] >= size).any() for i, size in enumerate(cardinalities)):
+                raise ValueError(f"{dataset}: categorical {name} index out of range")
+    if check_basis:
+        validate_cycle_basis(len(graph.x), graph.edge_index.numpy(), graph.cycle_basis.numpy())
+
+
+def prepare_graph(data: Any, *, dataset: str | None = None) -> Graph:
+    """Preserve official chemistry/targets and attach the full raw SVD basis."""
+    x, edge_index, edge_attr, y = _canonical_inputs(data)
+    graph = Graph(
+        x=x,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        y=y,
+        cycle_basis=torch.from_numpy(left_nullspace_basis(len(x), edge_index.numpy())),
+    )
+    validate_graph(graph, dataset=dataset)
+    return graph
+
+
+def preparation_signature(dataset: str) -> dict[str, Any]:
+    if dataset not in DATASETS:
+        raise ValueError(f"unknown cycle PE v2 dataset: {dataset}")
+    directory = Path(__file__).resolve().parent
+    return {
+        "version": CACHE_VERSION,
+        "dataset": dataset,
+        "representation": "complete_orthonormal_left_nullspace_basis",
+        "incidence": "B[m,n], canonical sorted u<v edges, tail -1 and head +1",
+        "basis": "numpy.linalg.svd(B, full_matrices=True); all m-n+c left-null columns",
+        "storage": "float32 matrices [num_edges, cycle_rank], graph-local ragged columns",
+        "numpy_version": np.__version__,
+        "implementation_sha256": {
+            "v2/basis.py": hashlib.sha256((directory / "basis.py").read_bytes()).hexdigest(),
+            "v2/data.py": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "official_adapter": hashlib.sha256(
+                (directory.parent / "benchmark_data.py").read_bytes()
+            ).hexdigest(),
+        },
+    }
+
+
+def _validate_cached_graphs(rows: Any, official: Any, dataset: str) -> list[Graph]:
+    if not isinstance(rows, list) or len(rows) != len(official):
+        raise ValueError("cached graph count/schema mismatch")
+    names = {field.name for field in fields(Graph)}
+    graphs = []
+    for row, source in zip(rows, official, strict=True):
+        if not isinstance(row, dict) or set(row) != names:
+            raise ValueError("cached graph field schema mismatch")
+        graph = Graph(**row)
+        validate_graph(graph, dataset=dataset)
+        expected = _canonical_inputs(source)
+        for name, source_value in zip(("x", "edge_index", "edge_attr", "y"), expected, strict=True):
+            if not torch.equal(getattr(graph, name), source_value):
+                raise ValueError(f"cached {name} disagrees with official graph content/order")
+        graphs.append(graph)
+    return graphs
+
+
+def load_benchmark(
+    data_root: Path,
+    dataset: str,
+    *,
+    allow_download: bool,
+) -> tuple[dict[str, list[Graph]], dict[str, Any]]:
+    """Load fixed official splits, validating immutable basis caches fail-closed."""
+    signature = preparation_signature(dataset)
+    official = load_official_splits(data_root, dataset, allow_download=allow_download)
+    key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:16]
+    cache_dir = data_root / CACHE_NAMESPACE / dataset / key
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    result: dict[str, list[Graph]] = {}
+    split_hashes = {}
+    for split in SPLITS:
+        digest = hashlib.sha256()
+        for data in official[split]:
+            graph_fingerprint(data, digest)
+        source_hash = split_hashes[split] = digest.hexdigest()
+        cache, meta = cache_dir / f"{split}.pt", cache_dir / f"{split}.json"
+        if cache.exists() != meta.exists():
+            raise CacheIncompleteError(
+                f"Incomplete cycle PE v2 cache at {cache}; no silent rebuild"
+            )
+        if cache.exists():
+            try:
+                metadata = json.loads(meta.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise CacheCorruptError(f"Unreadable cycle PE v2 metadata: {meta}") from exc
+            if not isinstance(metadata, dict):
+                raise CacheCorruptError(f"Invalid cycle PE v2 metadata schema: {meta}")
+            if (
+                metadata.get("signature") != signature
+                or metadata.get("source_sha256") != source_hash
+                or metadata.get("split") != split
+            ):
+                raise CacheWrongRequestError(f"Mismatched cycle PE v2 cache: {cache}; no rebuild")
+            if metadata.get("cache_sha256") != hashlib.sha256(cache.read_bytes()).hexdigest():
+                raise CacheCorruptError(f"Corrupt cycle PE v2 cache payload: {cache}; no rebuild")
+            try:
+                rows = torch.load(cache, map_location="cpu", weights_only=True)
+                graphs = _validate_cached_graphs(rows, official[split], dataset)
+            except Exception as exc:
+                raise CacheCorruptError(
+                    f"Invalid cycle PE v2 cache content: {cache}: {exc}"
+                ) from exc
+        else:
+            graphs = []
+            for index, data in enumerate(official[split]):
+                graphs.append(prepare_graph(data, dataset=dataset))
+                if (index + 1) % 1000 == 0:
+                    print(
+                        f"{dataset}/{split}: full cycle bases {index + 1}/{len(official[split])}",
+                        flush=True,
+                    )
+            rows = [
+                {field.name: getattr(graph, field.name) for field in fields(Graph)}
+                for graph in graphs
+            ]
+            atomic_publish(cache, lambda path, payload=rows: torch.save(payload, path))
+            atomic_write_json(
+                meta,
+                {
+                    "signature": signature,
+                    "split": split,
+                    "source_sha256": source_hash,
+                    "cache_sha256": hashlib.sha256(cache.read_bytes()).hexdigest(),
+                },
+            )
+        result[split] = graphs
+    protocol = {
+        "comparison": "ours_only_on_official_benchmark_splits",
+        "source_url": SOURCES[dataset],
+        "official_splits": True,
+        "split_sizes": {split: len(result[split]) for split in SPLITS},
+        "split_content_sha256": split_hashes,
+        "target_width": SCHEMAS[dataset]["targets"],
+        "target_scaling": "official supplied labels, unchanged; no fitted target scaling",
+        "input_features": "ZINC categorical atoms/bonds"
+        if dataset == "zinc12k"
+        else "OGB 9 atom / 3 bond categorical fields",
+        "preparation": signature,
+        "cache_directory": str(cache_dir),
+        "basis_storage": "all beta=m-n+c columns per graph; no padding or truncation",
+        "basis_coordinates": "SVD coordinates are not invariant to arbitrary nullspace rotations",
+    }
+    return result, protocol
+
+
+__all__ = [
+    "Batch",
+    "CACHE_NAMESPACE",
+    "CACHE_VERSION",
+    "DATASETS",
+    "Graph",
+    "collate",
+    "load_benchmark",
+    "preparation_signature",
+    "prepare_graph",
+    "validate_graph",
+]
+````
+
+# research/cycle_pe/v2/datasets.yaml
+
+````yaml
+registry_version: 1
+track: cycle_pe
+version: v2
+model: cycle_basis_v2
+claim: Full orthonormal left-nullspace basis is input to a learned encoder; no six-statistic PE.
+gpu_training_verified: false
+representation:
+  construction: full SVD of the canonical edge-by-node incidence matrix
+  basis_contract: B.T @ U_c = 0; U_c.T @ U_c = I; beta = m - n + components
+  truncation: none
+  symmetries: cycle-column signs and permutations only; not arbitrary basis rotation
+datasets:
+  - id: zinc12k
+    name: ZINC-12K
+    source_url: https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.ZINC.html
+    split: official 10000/1000/1000 train/validation/test
+    metrics: [mae]
+    adapter: research.cycle_pe.v2.data.load_benchmark
+    cache_namespace: cycle_pe_v2_benchmark/zinc12k
+    targets: official supplied labels unchanged
+  - id: peptides_struct
+    name: LRGB Peptides-struct
+    source_url: https://github.com/vijaydwivedi75/lrgb
+    split: official 10873/2331/2331 train/validation/test
+    metrics: [mae]
+    adapter: research.cycle_pe.v2.data.load_benchmark
+    cache_namespace: cycle_pe_v2_benchmark/peptides_struct
+    targets: all 11 official supplied labels unchanged
+````
+
+# research/cycle_pe/v2/model.py
+
+````python
+"""Cycle PE v2: learn from every signed vector of the left-nullspace basis.
+
+No precomputed cycle statistics, projector, train-fitted width or truncation is
+used here. The variable number of columns is handled by a learned column-set
+encoder. Its fixed-width output is a learned PE, not a lossless basis codec.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Iterator, Sequence
+
+import torch
+from torch import Tensor, nn
+
+from research.cycle_pe.benchmark_models import (
+    ATOM_DIMS,
+    BOND_DIMS,
+    CategoricalEncoder,
+    _pool,
+)
+from research.cycle_pe.paper_model import _message_topology, _MessageLayer
+from research.cycle_pe.v2.data import DATASETS, Batch
+
+MODEL_NAME = "cycle_basis_v2"
+BASIS_EXECUTIONS = ("batched", "reference")
+
+# graph index, first column, block width, flattened start, flattened stop
+PairSlice = tuple[int, int, int, int, int]
+
+
+class LeftNullBasisEncoder(nn.Module):
+    """Contextual encoder of all columns of U in ker(B.T).
+
+    For each signed column u, phi([bond_e, u_e]) is learned BEFORE the edge
+    aggregation. The pooled column context is then passed to each edge through
+    psi([bond_e, u_e, context]). Averaging the full nonlinear encodings f(u) and
+    f(-u) handles column signs; summing columns handles their ordering. Applying
+    an entrywise absolute value before the learned encoder would discard relative
+    sign structure and is deliberately not done.
+
+    This is not invariant to arbitrary orthogonal rotations U -> UQ or independent
+    edge orientation changes. Data preparation fixes canonical edge orientations.
+    Column chunking changes temporary allocation, never the selected basis rank.
+    """
+
+    def __init__(self, bond_dim: int, pe_dim: int, *, column_chunk_size: int = 16):
+        super().__init__()
+        if min(bond_dim, pe_dim, column_chunk_size) < 1:
+            raise ValueError("bond_dim, pe_dim and column_chunk_size must be positive")
+        self.bond_dim = bond_dim
+        self.pe_dim = pe_dim
+        self.column_chunk_size = column_chunk_size
+        self.column_phi = nn.Sequential(
+            nn.Linear(bond_dim + 1, pe_dim),
+            nn.GELU(),
+            nn.Linear(pe_dim, pe_dim),
+            nn.GELU(),
+        )
+        self.edge_psi = nn.Sequential(
+            nn.Linear(bond_dim + 1 + pe_dim, pe_dim),
+            nn.GELU(),
+            nn.Linear(pe_dim, pe_dim),
+            nn.GELU(),
+        )
+        self.output = nn.Sequential(nn.Linear(pe_dim, pe_dim), nn.GELU(), nn.Linear(pe_dim, pe_dim))
+
+    def _signed_columns(self, bond: Tensor, columns: Tensor) -> Tensor:
+        edge_count, column_count = columns.shape
+        local = torch.cat(
+            (
+                bond[:, None, :].expand(edge_count, column_count, self.bond_dim),
+                columns[:, :, None],
+            ),
+            dim=2,
+        )
+        context = self.column_phi(local).mean(dim=0, keepdim=True)
+        return self.edge_psi(torch.cat((local, context.expand(edge_count, -1, -1)), dim=2))
+
+    def forward(self, bond: Tensor, basis: Tensor) -> Tensor:
+        """Original single-graph reference, retained for execution comparisons."""
+        if bond.ndim != 2 or bond.shape[1] != self.bond_dim:
+            raise ValueError("bond embeddings have an invalid shape")
+        if basis.ndim != 2 or basis.shape[0] != bond.shape[0]:
+            raise ValueError("basis must have shape (num_edges, cycle_rank)")
+        if basis.device != bond.device or not basis.is_floating_point():
+            raise ValueError("basis must be floating point on the bond embedding device")
+        edge_count, rank = basis.shape
+        if rank == 0:
+            # A forest has no cycle coordinates. Do not create a learned bias PE.
+            return bond.new_zeros((edge_count, self.pe_dim))
+        if edge_count == 0:
+            raise ValueError("an edgeless graph cannot have nonzero cycle rank")
+        # Float32 also keeps small signed SVD coordinates intact under AMP.
+        with torch.autocast(device_type=bond.device.type, enabled=False):
+            bond, basis = bond.float(), basis.float()
+            encoded = bond.new_zeros((edge_count, self.pe_dim))
+            for start in range(0, rank, self.column_chunk_size):
+                columns = basis[:, start : start + self.column_chunk_size]
+                positive = self._signed_columns(bond, columns)
+                negative = self._signed_columns(bond, -columns)
+                encoded = encoded + (0.5 * (positive + negative)).sum(dim=1)
+            return self.output(encoded / math.sqrt(rank))
+
+    def _pair_groups(self, bases: Sequence[Tensor], budget: int) -> Iterator[list[PairSlice]]:
+        """Pack graph-local column blocks without allocating all pair indices.
+
+        Splitting a column across groups is allowed: its complete edge mean is
+        accumulated in the first pass before any second-pass edge encoding.
+        """
+        group: list[PairSlice] = []
+        available = budget
+        for graph, basis in enumerate(bases):
+            edge_count, rank = basis.shape
+            for first in range(0, rank, self.column_chunk_size):
+                width = min(self.column_chunk_size, rank - first)
+                start, size = 0, edge_count * width
+                while start < size:
+                    stop = min(size, start + available)
+                    group.append((graph, first, width, start, stop))
+                    available -= stop - start
+                    start = stop
+                    if not available:
+                        yield group
+                        group, available = [], budget
+        if group:
+            yield group
+
+    def _pack_pairs(
+        self,
+        bond: Tensor,
+        bases: Sequence[Tensor],
+        group: list[PairSlice],
+        edge_offsets: list[int],
+        column_offsets: list[int],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        edge_ids, column_ids, values = [], [], []
+        for graph, first, width, start, stop in group:
+            flat = torch.arange(start, stop, device=bond.device)
+            rows = flat.div(width, rounding_mode="floor")
+            columns = first + flat.remainder(width)
+            edge_ids.append(rows + edge_offsets[graph])
+            column_ids.append(columns + column_offsets[graph])
+            # Index only this bounded slice: flattening a noncontiguous column
+            # block first could silently allocate its entire m-by-block array.
+            values.append(bases[graph][rows, columns])
+        edge_index = torch.cat(edge_ids)
+        column_index = torch.cat(column_ids)
+        local = torch.cat((bond[edge_index], torch.cat(values)[:, None]), dim=1)
+        return local, edge_index, column_index
+
+    def forward_batch(
+        self, bond: Tensor, bases: Sequence[Tensor], *, pair_budget: int = 32768
+    ) -> Tensor:
+        """Same signed-column encoder with shared, bounded batched MLP calls.
+
+        A segment identifies one (graph, basis column), never merely its column
+        number. Two passes retain each column's full edge-mean context even if
+        one column has more edges than the budget. Every basis entry is used.
+
+        ``pair_budget`` bounds rows per phi/psi call for each sign, not total
+        autograd memory: backward still retains activations from all groups.
+        No persistent buffers or trainable parameters are added.
+        """
+        if pair_budget < 1:
+            raise ValueError("pair_budget must be positive")
+        if bond.ndim != 2 or bond.shape[1] != self.bond_dim:
+            raise ValueError("bond embeddings have an invalid shape")
+        edge_offsets, column_offsets = [0], [0]
+        counts, ranks = [], []
+        for basis in bases:
+            if basis.ndim != 2:
+                raise ValueError("basis must have shape (num_edges, cycle_rank)")
+            if basis.device != bond.device or not basis.is_floating_point():
+                raise ValueError("basis must be floating point on the bond embedding device")
+            edge_count, rank = basis.shape
+            if not edge_count and rank:
+                raise ValueError("an edgeless graph cannot have nonzero cycle rank")
+            counts.append(edge_count)
+            ranks.append(rank)
+            edge_offsets.append(edge_offsets[-1] + edge_count)
+            column_offsets.append(column_offsets[-1] + rank)
+        if edge_offsets[-1] != len(bond):
+            raise ValueError("basis rows must align with the concatenated bond embeddings")
+        if not column_offsets[-1]:
+            return bond.new_zeros((len(bond), self.pe_dim))
+
+        with torch.autocast(device_type=bond.device.type, enabled=False):
+            bond = bond.float()
+            bases = tuple(basis.float() for basis in bases)
+            groups = list(self._pair_groups(bases, pair_budget))
+            count_tensor = torch.tensor(counts, device=bond.device, dtype=torch.long)
+            rank_tensor = torch.tensor(ranks, device=bond.device, dtype=torch.long)
+            column_sizes = torch.repeat_interleave(
+                count_tensor, rank_tensor, output_size=column_offsets[-1]
+            ).to(bond.dtype)
+            positive_context = bond.new_zeros((column_offsets[-1], self.pe_dim))
+            negative_context = torch.zeros_like(positive_context)
+            for group in groups:
+                local, _, column_index = self._pack_pairs(
+                    bond, bases, group, edge_offsets, column_offsets
+                )
+                negative = torch.cat((local[:, :-1], -local[:, -1:]), dim=1)
+                positive_context.index_add_(0, column_index, self.column_phi(local))
+                negative_context.index_add_(0, column_index, self.column_phi(negative))
+            positive_context = positive_context / column_sizes[:, None]
+            negative_context = negative_context / column_sizes[:, None]
+
+            encoded = bond.new_zeros((len(bond), self.pe_dim))
+            for group in groups:
+                local, edge_index, column_index = self._pack_pairs(
+                    bond, bases, group, edge_offsets, column_offsets
+                )
+                negative = torch.cat((local[:, :-1], -local[:, -1:]), dim=1)
+                positive = self.edge_psi(torch.cat((local, positive_context[column_index]), dim=1))
+                negative = self.edge_psi(
+                    torch.cat((negative, negative_context[column_index]), dim=1)
+                )
+                encoded.index_add_(0, edge_index, 0.5 * (positive + negative))
+            edge_ranks = torch.repeat_interleave(rank_tensor, count_tensor, output_size=len(bond))
+            result = self.output(encoded / edge_ranks.clamp_min(1).to(bond.dtype).sqrt()[:, None])
+            # Forest edges remain exactly zero, including output-MLP biases.
+            return torch.where(edge_ranks[:, None] > 0, result, torch.zeros_like(result))
+
+
+class CycleBasisPEModel(nn.Module):
+    """V2 basis-vector PE with the unchanged cycle-track message backbone."""
+
+    def __init__(
+        self,
+        *,
+        dataset: str,
+        hidden: int = 64,
+        pe_dim: int = 32,
+        layers: int = 3,
+        column_chunk_size: int = 16,
+        basis_execution: str = "batched",
+        basis_pair_budget: int = 32768,
+    ):
+        super().__init__()
+        if dataset not in DATASETS:
+            raise ValueError(f"unknown dataset: {dataset}")
+        if min(hidden, pe_dim, layers) < 1:
+            raise ValueError("hidden, pe_dim and layers must be positive")
+        if basis_execution not in BASIS_EXECUTIONS:
+            raise ValueError(f"basis_execution must be one of {BASIS_EXECUTIONS}")
+        if basis_pair_budget < 1:
+            raise ValueError("basis_pair_budget must be positive")
+        self.basis_execution = basis_execution
+        self.basis_pair_budget = basis_pair_budget
+        self.node_encoder = CategoricalEncoder((28,) if dataset == "zinc12k" else ATOM_DIMS, hidden)
+        self.bond_encoder = CategoricalEncoder((4,) if dataset == "zinc12k" else BOND_DIMS, hidden)
+        self.pe_encoder = LeftNullBasisEncoder(hidden, pe_dim, column_chunk_size=column_chunk_size)
+        self.edge_encoder = nn.Sequential(nn.Linear(hidden + pe_dim, hidden), nn.GELU())
+        self.layers = nn.ModuleList(_MessageLayer(hidden) for _ in range(layers))
+        self.graph_trunk = nn.Sequential(
+            nn.Linear(4 * hidden, hidden), nn.GELU(), nn.Linear(hidden, hidden)
+        )
+        self.graph_head = nn.Linear(hidden, 1 if dataset == "zinc12k" else 11)
+
+    def forward(self, batch: Batch) -> Tensor:
+        graph_count = len(batch.ptr) - 1
+        if len(batch.cycle_bases) != graph_count:
+            raise ValueError("one left-nullspace basis is required per graph")
+        counts = [basis.shape[0] for basis in batch.cycle_bases]
+        if sum(counts) != len(batch.edge_attr):
+            raise ValueError("ragged basis rows do not align with batch bonds")
+        node = self.node_encoder(batch.x)
+        bond = self.bond_encoder(batch.edge_attr)
+        if self.basis_execution == "reference":
+            positional = torch.cat(
+                [
+                    self.pe_encoder(part, basis)
+                    for part, basis in zip(
+                        torch.split(bond, counts), batch.cycle_bases, strict=True
+                    )
+                ]
+            )
+        else:
+            positional = self.pe_encoder.forward_batch(
+                bond, batch.cycle_bases, pair_budget=self.basis_pair_budget
+            )
+        edge = self.edge_encoder(torch.cat((bond, positional), dim=1))
+        with torch.autocast(device_type=node.device.type, enabled=False):
+            node, edge = node.float(), edge.float()
+            topology = _message_topology(node, batch.edge_index.T)
+            for layer in self.layers:
+                node, edge = layer(node, edge, batch.edge_index.T, topology=topology)
+            node_mean, node_max = _pool(node, batch.batch, graph_count)
+            edge_graph = batch.batch[batch.edge_index[0]]
+            edge_mean, edge_max = _pool(edge, edge_graph, graph_count)
+            pooled = torch.cat((node_mean, node_max, edge_mean, edge_max), dim=1)
+        return self.graph_head(self.graph_trunk(pooled))
+
+
+def architecture_protocol() -> dict[str, str]:
+    return {
+        "model": MODEL_NAME,
+        "positional_encoding": (
+            "full signed left-nullspace basis U_c of incidence B; B.T @ U_c = 0; "
+            "every beta=m-n+components column enters a learned contextual column encoder"
+        ),
+        "basis_aggregation": (
+            "phi([bond_e,U_e,k]) then edge-axis mean column context; "
+            "psi([bond_e,U_e,k,context]); average nonlinear f(u),f(-u); "
+            "sum all columns / sqrt(beta), then learned PE MLP"
+        ),
+        "basis_execution": (
+            "batched (default): budget-bounded edge/column pairs with distinct graph-column "
+            "segments and two-pass complete column context; reference: original per-graph "
+            "encoder; identical parameters and basis formula, floating-point reductions may differ"
+        ),
+        "basis_width": (
+            "ragged graph-local full rank; no train-fitted padding, truncation, "
+            "projector or handcrafted cycle statistics; forests receive zero PE"
+        ),
+        "backbone": (
+            "unchanged cycle_pe.paper_model._MessageLayer edge-aware GNN; "
+            "not a separately trained external-model baseline"
+        ),
+        "pe_injection": "concatenate learned full-basis PE with categorical bond embedding",
+        "pooling": "node mean/max and edge mean/max, then graph MLP",
+        "cycle_symmetry": (
+            "cycle-column sign and permutation invariant; not arbitrary O(beta) "
+            "basis-rotation invariant, not invariant to independent edge reorientation"
+        ),
+        "limits": (
+            "canonical incidence orientation and numerical SVD basis are part of the protocol; "
+            "fixed-width learned PE is not guaranteed injective or a lossless cycle codec"
+        ),
+        "reference_comparison": "external published tables only; trains only our cycle_basis_v2",
+        "numeric_policy": "basis encoder, message layers and scatter pooling stay FP32 under AMP",
+    }
+````
+
+# research/cycle_pe/v2/prepare_data.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+exec bash "${project_root}/scripts/paper.sh" "$@" --suite benchmark --tracks cycle_pe --cycle-pe-version v2 --prepare-only --allow-download
+````
+
+# research/cycle_pe/v2/reproduce.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+# Keep this entrypoint on v2 even if generic selection flags are supplied.
+exec bash "${project_root}/scripts/paper.sh" "$@" --suite benchmark --tracks cycle_pe --cycle-pe-version v2
 ````
 
 # research/tree_augmentation/__init__.py
@@ -18362,7 +20863,7 @@ _TREE_EVALUATION_METRICS = (
 # axes, and optimization histories therefore cannot leak into hypothesis tests.
 # Published competitor scores belong in the cited manuscript table, not in this
 # run registry or in paired statistics with our own experiment seeds.
-PAPER_METRIC_SCHEMA_VERSION = 4
+PAPER_METRIC_SCHEMA_VERSION = 5
 PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
     _metric_rule(
         "conductance.our_model.test",
@@ -18376,6 +20877,15 @@ PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "cycle_pe",
         r"metrics\.json",
         r"datasets\.[^.]+\.models\.cycle_set\.test",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.basis_v2.test",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_basis_v2\.test",
+        # The basis-input experiment is a separate model, not another seed or
+        # condition of the existing six-statistic cycle-set experiment.
         pairable=False,
     ),
     _metric_rule(
@@ -18461,7 +20971,7 @@ PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
 # deliberately limited to elapsed time, peak accelerator memory, and active
 # trainable parameter counts; epochs, batch size, workers, and seeds are not
 # efficiency outcomes.
-EFFICIENCY_METRIC_SCHEMA_VERSION = 3
+EFFICIENCY_METRIC_SCHEMA_VERSION = 4
 EFFICIENCY_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
     _metric_rule(
         "conductance.our_model.efficiency",
@@ -18476,6 +20986,14 @@ EFFICIENCY_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "cycle_pe",
         r"metrics\.json",
         r"datasets\.[^.]+\.models\.cycle_set\."
+        r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.basis_v2.efficiency",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_basis_v2\."
         r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
         pairable=False,
     ),
@@ -18622,8 +21140,14 @@ def _summary(values: list[float], *, key: str, bootstrap_samples: int) -> dict[s
     if not values:
         raise ValueError("cannot summarize an empty sample")
     mean = statistics.fmean(values)
-    if len(values) == 1 or bootstrap_samples == 0:
+    if len(values) == 1:
+        low = high = None
+        uncertainty_status = "insufficient_samples"
+    elif bootstrap_samples == 0:
+        # Preserve the historical disabled-bootstrap point placeholders, but
+        # explicitly label them as disabled rather than estimated intervals.
         low = high = mean
+        uncertainty_status = "bootstrap_disabled"
     else:
         seed = int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:8], "big")
         generator = random.Random(seed)
@@ -18633,15 +21157,17 @@ def _summary(values: list[float], *, key: str, bootstrap_samples: int) -> dict[s
         )
         low = _quantile(means, 0.025)
         high = _quantile(means, 0.975)
+        uncertainty_status = "bootstrap_estimated"
     return {
         "n": len(values),
         "mean": mean,
-        "sample_std": statistics.stdev(values) if len(values) > 1 else 0.0,
+        "sample_std": statistics.stdev(values) if len(values) > 1 else None,
         "median": statistics.median(values),
         "minimum": min(values),
         "maximum": max(values),
         "bootstrap_95_low": low,
         "bootstrap_95_high": high,
+        "uncertainty_status": uncertainty_status,
     }
 
 
@@ -18943,7 +21469,7 @@ def aggregate_manifest(
                 )
 
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "paper_metric_schema_version": PAPER_METRIC_SCHEMA_VERSION,
         "efficiency_metric_schema_version": EFFICIENCY_METRIC_SCHEMA_VERSION,
         "paper_metric_rules": [rule.name for rule in PAPER_METRIC_SCHEMA],
@@ -18955,6 +21481,20 @@ def aggregate_manifest(
             "group by data/split/chart seed; summarize and pair only aligned model seeds"
         ),
         "bootstrap_samples": bootstrap_samples,
+        "uncertainty_policy": {
+            "insufficient_samples": (
+                "n=1: sample_std and bootstrap_95 bounds are unavailable (null/empty), "
+                "not zero uncertainty"
+            ),
+            "bootstrap_disabled": (
+                "n>=2 and bootstrap_samples=0: sample_std is available; bootstrap_95 "
+                "bounds retain legacy mean placeholders and are not confidence intervals"
+            ),
+            "bootstrap_estimated": (
+                "n>=2: sample standard deviation and deterministic percentile-bootstrap "
+                "95% interval of the model-seed mean"
+            ),
+        },
         "numeric_fields_seen": numeric_fields_seen,
         "ignored_numeric_fields": ignored_numeric_fields,
         "sample_rows": len(samples),
@@ -19007,6 +21547,547 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+````
+
+# scripts/benchmark_speed.py
+
+````python
+#!/usr/bin/env python3
+"""Measure fixed official training-batch CUDA forward/backward, without an optimizer.
+
+This is an execution microbenchmark, not a paper accuracy experiment. It never
+downloads data, evaluates validation/test metrics, or updates model parameters.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import gc
+import hashlib
+import io
+import random
+import re
+import sys
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+for import_path in (ROOT, ROOT / "src"):
+    if str(import_path) not in sys.path:
+        sys.path.insert(0, str(import_path))
+
+DATASETS = {
+    "conductance_gat": ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"),
+    "cycle_pe_v2": ("zinc12k", "peptides_struct"),
+}
+ATOL, RTOL = 2e-5, 2e-4
+
+
+@dataclass
+class SpeedCase:
+    batch: Any
+    make_model: Callable[[str], Any]
+    objective: Callable[[Any], Any]
+    protocol: dict[str, Any]
+    description: dict[str, Any]
+    comparison_scope: str
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--track", choices=tuple(DATASETS), required=True)
+    parser.add_argument("--dataset")
+    parser.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--include-compile", action="store_true")
+    return parser
+
+
+def _validate(args: argparse.Namespace) -> None:
+    args.dataset = args.dataset or DATASETS[args.track][0]
+    if args.dataset not in DATASETS[args.track]:
+        raise ValueError(f"{args.track} datasets: {DATASETS[args.track]}")
+    if args.steps < 1 or args.warmup < 1 or args.seed < 0:
+        raise ValueError("steps/warmup must be positive and seed nonnegative")
+    if args.batch_size is None:
+        args.batch_size = 2 if args.track == "conductance_gat" else 32
+    if args.batch_size < 1:
+        raise ValueError("batch size must be positive")
+    if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
+        raise ValueError("Performance measurements require CUDA; no CPU fallback")
+    args.data_root = args.data_root.expanduser().resolve()
+
+
+def _seed(seed: int) -> None:
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _require_cuda(device_name: str):
+    import torch
+
+    device = torch.device(device_name)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU required; no CPU performance/research fallback")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    torch.cuda.set_device(device)
+    torch.cuda.get_device_properties(device)
+    return device
+
+
+def _build_conductance_case(args: argparse.Namespace, device) -> SpeedCase:
+    import torch
+    from torch.nn import functional as F
+
+    from research.conductance_gat.benchmark import ConductanceNodeClassifier, _make_loaders
+    from research.conductance_gat.benchmark_data import load_dataset
+
+    class ReferenceClassifier(ConductanceNodeClassifier):
+        def forward(self, graph):
+            # The pre-optimization classifier: graph count is inferred on-device
+            # inside each operator. Everything else is the SAME current model.
+            hidden = F.dropout(F.elu(self.encoder(graph.x)), self.dropout, self.training)
+            node_graph = getattr(graph, "batch", None)
+            if node_graph is None:
+                node_graph = torch.zeros(len(hidden), dtype=torch.long, device=hidden.device)
+            for operator, norm in zip(self.operators, self.norms, strict=True):
+                hidden = operator(hidden, graph.incidence_edge_index, node_graph)
+                hidden = F.dropout(F.elu(norm(hidden)), self.dropout, self.training)
+            return self.decoder(hidden)
+
+    payload, protocol = load_dataset(args.dataset, args.data_root, allow_download=False)
+    loader_args = argparse.Namespace(
+        model_seed=args.seed, batch_size=args.batch_size, workers=0, pin_memory=True
+    )
+    data, indices = _make_loaders(payload, loader_args, device)
+    if indices is None:
+        batch = next(iter(data["train"])).to(device)
+        selected = None
+        selection = "first seeded/shuffled official training graph minibatch"
+    else:
+        batch = data
+        selected = indices["train"]
+        selection = "full official transductive graph; loss uses train indices only"
+
+    def make_model(kind):
+        model_type = ReferenceClassifier if kind == "reference" else ConductanceNodeClassifier
+        return model_type(
+            batch.x.shape[1], payload["classes"], hidden_channels=64, layers=2, dropout=0.5
+        )
+
+    def objective(predicted):
+        if selected is None:
+            return F.binary_cross_entropy_with_logits(predicted, batch.y)
+        return F.cross_entropy(
+            predicted.index_select(0, selected), batch.y.index_select(0, selected)
+        )
+
+    return SpeedCase(
+        batch,
+        make_model,
+        objective,
+        protocol,
+        {
+            "selection": selection,
+            "nodes": batch.x.shape[0],
+            "physical_edges": batch.incidence_edge_index.shape[1],
+            "graphs": int(batch.num_graphs) if indices is None else 1,
+            "labels_in_loss": batch.y.numel() if selected is None else selected.numel(),
+        },
+        "Same current classifier; reference restores per-layer GPU graph-count max(). "
+        "Both variants use the same indexed loss. Excludes epoch metric accumulation, "
+        "loader/transfer, optimizer, checkpoint and validation overhead; NOT a whole-repo speedup.",
+    )
+
+
+def _build_cycle_case(args: argparse.Namespace, device) -> SpeedCase:
+    from research.cycle_pe.v2.data import collate, load_benchmark
+    from research.cycle_pe.v2.model import CycleBasisPEModel
+
+    splits, protocol = load_benchmark(args.data_root, args.dataset, allow_download=False)
+    selected = splits["train"][: args.batch_size]
+    batch = collate(selected).to(device)
+
+    def make_model(kind):
+        return CycleBasisPEModel(
+            dataset=args.dataset,
+            basis_execution="reference" if kind == "reference" else "batched",
+        )
+
+    return SpeedCase(
+        batch,
+        make_model,
+        lambda predicted: (predicted.float() - batch.y).abs().mean(),
+        protocol,
+        {
+            "selection": "first official training graphs in source order",
+            "nodes": batch.x.shape[0],
+            "physical_edges": batch.edge_index.shape[1],
+            "graphs": len(selected),
+            "basis_ranks": [basis.shape[1] for basis in batch.cycle_bases],
+            "basis_pairs": sum(basis.numel() for basis in batch.cycle_bases),
+        },
+        "Same current Cycle PE v2 backbone/parameters; compares reference per-graph "
+        "full-basis encoder with bounded batched full-basis encoder. Excludes data "
+        "preparation/transfer, optimizer, checkpoint and validation; no basis truncation.",
+    )
+
+
+def _build_case(args: argparse.Namespace, device) -> SpeedCase:
+    if args.track == "conductance_gat":
+        return _build_conductance_case(args, device)
+    return _build_cycle_case(args, device)
+
+
+def _implementation_hashes(track: str) -> dict[str, str]:
+    files = [
+        "scripts/benchmark_speed.py",
+        "scripts/benchmark_speed.sh",
+        "src/chartgat/execution.py",
+    ]
+    if track == "conductance_gat":
+        files.extend(
+            f"research/conductance_gat/{name}"
+            for name in ("benchmark.py", "benchmark_data.py", "sparse.py")
+        )
+        hashes = {}
+    else:
+        from research.cycle_pe.v2.benchmark import implementation_hashes
+
+        hashes = implementation_hashes()
+    hashes.update({name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in files})
+    return hashes
+
+
+def _probe(model, case: SpeedCase) -> dict[str, Any]:
+    """One eval-mode train-label objective/gradient probe; never a test evaluation."""
+    import torch
+
+    model.eval()
+    model.zero_grad(set_to_none=True)
+    predicted = model(case.batch).float()
+    loss = case.objective(predicted)
+    if not torch.isfinite(predicted).all() or not torch.isfinite(loss):
+        raise FloatingPointError("Nonfinite correctness-probe prediction/loss")
+    loss.backward()
+    gradients = {}
+    for name, parameter in model.named_parameters():
+        gradient = None if parameter.grad is None else parameter.grad.detach().cpu().clone()
+        if gradient is not None and not torch.isfinite(gradient).all():
+            raise FloatingPointError(f"Nonfinite correctness-probe gradient: {name}")
+        gradients[name] = gradient
+    result = {
+        "prediction": predicted.detach().cpu(),
+        "loss": loss.detach().cpu(),
+        "gradients": gradients,
+    }
+    model.zero_grad(set_to_none=True)
+    return result
+
+
+def _compare_probes(reference: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+    import torch
+
+    torch.testing.assert_close(
+        candidate["prediction"], reference["prediction"], atol=ATOL, rtol=RTOL
+    )
+    torch.testing.assert_close(candidate["loss"], reference["loss"], atol=ATOL, rtol=RTOL)
+    if candidate["gradients"].keys() != reference["gradients"].keys():
+        raise AssertionError("Parameter names differ between execution variants")
+    maximum_gradient_error = 0.0
+    gradients_compared = 0
+    for name, expected in reference["gradients"].items():
+        actual = candidate["gradients"][name]
+        if expected is None or actual is None:
+            if expected is not actual:
+                raise AssertionError(f"Gradient participation differs: {name}")
+            continue
+        torch.testing.assert_close(actual, expected, atol=ATOL, rtol=RTOL, msg=f"gradient: {name}")
+        maximum_gradient_error = max(maximum_gradient_error, float((actual - expected).abs().max()))
+        gradients_compared += 1
+    return {
+        "passed": True,
+        "atol": ATOL,
+        "rtol": RTOL,
+        "prediction_max_abs_error": float(
+            (candidate["prediction"] - reference["prediction"]).abs().max()
+        ),
+        "gradient_max_abs_error": maximum_gradient_error,
+        "parameter_gradients_compared": gradients_compared,
+        "mode": "eval-mode forward and train-label-loss backward; dropout disabled",
+    }
+
+
+def _measure_block(model, case: SpeedCase, steps: int, device) -> dict[str, float]:
+    import torch
+
+    finite = torch.ones((), dtype=torch.bool, device=device)
+    start_event, end_event = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
+    )
+    torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    stream = torch.cuda.current_stream(device)
+    start_event.record(stream)
+    for _ in range(steps):
+        model.zero_grad(set_to_none=True)
+        predicted = model(case.batch).float()
+        loss = case.objective(predicted)
+        loss.backward()
+        # Catch failure in ANY step, with one host transfer after the measured block.
+        finite.logical_and_(torch.isfinite(loss.detach()))
+    end_event.record(stream)
+    torch.cuda.synchronize(device)
+    seconds = time.perf_counter() - started
+    if not finite:
+        raise FloatingPointError("Nonfinite loss during performance block")
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.grad is not None]
+    if gradients and not torch.stack([torch.isfinite(g).all() for g in gradients]).all():
+        raise FloatingPointError("Nonfinite final gradient during performance block")
+    return {
+        "wall_seconds": seconds,
+        "cuda_event_seconds": start_event.elapsed_time(end_event) / 1000,
+        "seconds_per_step": seconds / steps,
+        "steps_per_second": steps / seconds,
+    }
+
+
+def _run_variant(args, device, case, state, variant, reference):
+    import torch
+
+    from chartgat.execution import configure_execution
+
+    _seed(args.seed)
+    model = case.make_model("reference" if variant == "reference" else "optimized").to(device)
+    model.load_state_dict(state)
+    execution = configure_execution(
+        model, argparse.Namespace(compile=variant == "compiled"), device
+    )
+    _seed(args.seed)
+    torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    probe = _probe(model, case)
+    torch.cuda.synchronize(device)
+    probe_seconds = time.perf_counter() - started
+    equivalence = _compare_probes(reference or probe, probe)
+    model.train()
+    _seed(args.seed + 1)
+    warmup = _measure_block(model, case, args.warmup, device)
+    model.zero_grad(set_to_none=True)
+    torch.cuda.synchronize(device)
+    baseline_bytes = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
+    _seed(args.seed + 2)
+    measured = _measure_block(model, case, args.steps, device)
+    row = {
+        "variant": variant,
+        "execution": execution,
+        "equivalence": equivalence,
+        "eval_probe_seconds_including_lazy_compile": probe_seconds,
+        "train_warmup_seconds_including_lazy_compile": warmup["wall_seconds"],
+        "warmup_steps_excluded": args.warmup,
+        "measured_steps": args.steps,
+        **measured,
+        "baseline_cuda_allocated_bytes": baseline_bytes,
+        "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
+    }
+    row["peak_cuda_incremental_bytes"] = row["peak_cuda_allocated_bytes"] - baseline_bytes
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+    return row, probe
+
+
+def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    from chartgat.cache import atomic_write_bytes
+
+    columns = (
+        "variant",
+        "measured_steps",
+        "seconds_per_step",
+        "steps_per_second",
+        "speedup_vs_reference",
+        "cuda_event_seconds",
+        "peak_cuda_allocated_bytes",
+        "peak_cuda_incremental_bytes",
+        "eval_probe_seconds_including_lazy_compile",
+        "train_warmup_seconds_including_lazy_compile",
+    )
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    atomic_write_bytes(path, buffer.getvalue().encode("utf-8"))
+
+
+def _execute(args, report: dict[str, Any], output: Path) -> None:
+    import torch
+
+    from chartgat.cache import atomic_write_json
+
+    device = _require_cuda(args.device)
+    report["implementation_sha256"] = _implementation_hashes(args.track)
+    # Explicit common FP32 correctness/performance policy; no AMP/TF32 comparison.
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
+    report["hardware"] = {
+        "gpu": torch.cuda.get_device_name(device),
+        "torch": str(torch.__version__),
+        "cuda_runtime": torch.version.cuda,
+        "device": str(device),
+    }
+    _seed(args.seed)
+    case = _build_case(args, device)
+    report.update(
+        protocol=case.protocol, batch=case.description, comparison_scope=case.comparison_scope
+    )
+    initial = case.make_model("optimized")
+    state = {name: value.detach().cpu().clone() for name, value in initial.state_dict().items()}
+    fingerprint = hashlib.sha256()
+    for name, value in state.items():
+        fingerprint.update(name.encode("utf-8"))
+        fingerprint.update(value.numpy().tobytes())
+    report["initial_state_sha256"] = fingerprint.hexdigest()
+    report["trainable_parameters"] = sum(p.numel() for p in initial.parameters() if p.requires_grad)
+    del initial
+    reference = None
+    variants = ["reference", "optimized"] + (["compiled"] if args.include_compile else [])
+    print(
+        "variant       ms/step     steps/s    ratio vs reference    peak allocated MiB", flush=True
+    )
+    for variant in variants:
+        report["active_variant"] = variant
+        atomic_write_json(output / "report.json", report)
+        row, probe = _run_variant(args, device, case, state, variant, reference)
+        if reference is None:
+            reference = probe
+        reference_seconds = (
+            report["variants"][0]["seconds_per_step"]
+            if report["variants"]
+            else row["seconds_per_step"]
+        )
+        row["speedup_vs_reference"] = reference_seconds / row["seconds_per_step"]
+        report["variants"].append(row)
+        atomic_write_json(output / "report.json", report)
+        _write_csv(output / "summary.csv", report["variants"])
+        print(
+            f"{variant:<12} {1000 * row['seconds_per_step']:>9.3f} "
+            f"{row['steps_per_second']:>10.2f} {row['speedup_vs_reference']:>16.3f}x "
+            f"{row['peak_cuda_allocated_bytes'] / 2**20:>21.1f}",
+            flush=True,
+        )
+    report.pop("active_variant", None)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        _validate(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    output = args.output_dir or ROOT / "runs/performance" / datetime.now(UTC).strftime(
+        "speed-%Y%m%dT%H%M%S%fZ"
+    )
+    output = output.expanduser().resolve()
+    # Even an existing empty directory is refused: every report has one owner.
+    output.mkdir(parents=True, exist_ok=False)
+    from chartgat.cache import atomic_write_json
+
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "kind": "execution_microbenchmark_not_paper_training",
+        "status": "running",
+        "arguments": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
+        "output_dir": str(output),
+        "controls": {
+            "official_training_batch_only": True,
+            "allow_download": False,
+            "optimizer_steps": 0,
+            "validation_or_test_metrics": False,
+            "precision": "float32; AMP and TF32 disabled",
+            "equivalence": "same initial state/batch; eval prediction and every parameter gradient",
+            "timing": (
+                "train-mode fixed-batch forward/loss/backward; "
+                "CUDA-synchronized wall and event clocks"
+            ),
+            "warmup": (
+                "excluded from steady-state steps; costs include lazy compilation, "
+                "not compile-only time"
+            ),
+            "memory": "model, fixed batch, forward/backward; no optimizer state",
+            "rng": "identical seeds per variant/phase; CUDA scatter is not bitwise deterministic",
+            "throughput_unit": (
+                "fixed-batch forward/backward steps, not epoch or dataset throughput"
+            ),
+        },
+        "variants": [],
+    }
+    atomic_write_json(output / "report.json", report)
+    try:
+        _execute(args, report, output)
+    except Exception as exc:
+        report.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        atomic_write_json(output / "report.json", report)
+        _write_csv(output / "summary.csv", report["variants"])
+        print(f"FAILED: {exc}\nReport: {output / 'report.json'}", file=sys.stderr, flush=True)
+        return 1
+    report["status"] = "passed"
+    atomic_write_json(output / "report.json", report)
+    _write_csv(output / "summary.csv", report["variants"])
+    print(f"Performance report: {output}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# scripts/benchmark_speed.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${project_root}/scripts/conda_env.sh"
+
+inspection_only=0
+for argument in "$@"; do
+    case "${argument}" in
+        --help|-h) inspection_only=1 ;;
+    esac
+done
+if [[ "${inspection_only}" == "0" ]]; then
+    "${environment_python}" "${project_root}/scripts/check_dependencies.py" --quiet
+fi
+
+export PYTHONPATH="${project_root}/src:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
+cd "${project_root}"
+exec "${environment_python}" scripts/benchmark_speed.py "$@"
 ````
 
 # scripts/check_datasets.py
@@ -19645,6 +22726,1972 @@ fi
 if ! "${environment_python}" "${project_root}/scripts/verify_conda_env.py"; then
     exit 2
 fi
+````
+
+# scripts/conductance_gate_audit.py
+
+````python
+#!/usr/bin/env python3
+"""Train-label-only gradient audit for one restored conductance checkpoint.
+
+This module deliberately contains no checkpoint, dataset, optimizer, or file I/O.
+The owning diagnostic command restores and validates those artifacts, then calls
+``audit_gate_gradients``.  Hooks observe the tensors used by the real model
+forward; no diagnostic recomputation is presented as an exact task gradient.
+"""
+
+from __future__ import annotations
+
+import bisect
+import json
+import math
+from types import SimpleNamespace
+from typing import Any
+
+_BLOCK_ELEMENTS = 1_048_576
+
+
+class _StreamingDistribution:
+    """Exact scalar moments plus a bounded, deterministic systematic sample."""
+
+    def __init__(self, expected_count: int, sample_limit: int, near_zero: float) -> None:
+        import torch
+
+        if expected_count < 0:
+            raise ValueError("expected_count must be nonnegative")
+        self.expected_count = int(expected_count)
+        self.sample_limit = int(sample_limit)
+        self.near_zero = float(near_zero)
+        sample_count = min(int(sample_limit), self.expected_count)
+        if sample_count:
+            # Integer midpoints of equal-width bins.  The sample is deterministic,
+            # bounded, duplicate-free, and spans the concatenated tensor stream.
+            self.sample_positions = [
+                ((2 * index + 1) * self.expected_count) // (2 * sample_count)
+                for index in range(sample_count)
+            ]
+        else:
+            self.sample_positions = []
+        self.samples: list[float] = []
+        self.count = 0
+        self.calls = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+        self.minimum = math.inf
+        self.maximum = -math.inf
+        self.absolute_sum = 0.0
+        self.squared_sum = 0.0
+        self.zeros = 0
+        self.near_zeros = 0
+        self.negatives = 0
+        self._torch = torch
+
+    @staticmethod
+    def _blocks(value, limit: int = _BLOCK_ELEMENTS):
+        """Yield row-major flat blocks without flattening a whole strided tensor."""
+        if value.numel() == 0:
+            return
+        if value.is_contiguous():
+            flat = value.view(-1)
+            for start in range(0, flat.numel(), limit):
+                yield flat[start : start + limit]
+            return
+        if value.ndim == 0:
+            yield value.reshape(1)
+            return
+        per_row = max(1, value[0].numel())
+        rows = max(1, limit // per_row)
+        for start in range(0, value.shape[0], rows):
+            yield value[start : start + rows].contiguous().view(-1)
+
+    def append(self, value) -> None:
+        torch = self._torch
+        value = value.detach()
+        self.calls += 1
+        for raw_block in self._blocks(value):
+            block = raw_block.to(dtype=torch.float64)
+            if not bool(torch.isfinite(block).all()):
+                raise FloatingPointError("nonfinite tensor encountered in gate audit")
+            size = int(block.numel())
+            if size == 0:
+                continue
+            global_start = self.count
+            global_end = global_start + size
+            left = bisect.bisect_left(self.sample_positions, global_start)
+            right = bisect.bisect_left(self.sample_positions, global_end)
+            if right > left:
+                offsets = torch.tensor(
+                    [position - global_start for position in self.sample_positions[left:right]],
+                    dtype=torch.long,
+                    device=block.device,
+                )
+                self.samples.extend(float(item) for item in block[offsets].cpu().tolist())
+
+            block_variance, block_mean = torch.var_mean(block, correction=0)
+            numbers = (
+                torch.stack(
+                    (
+                        block_mean,
+                        block_variance,
+                        block.min(),
+                        block.max(),
+                        block.abs().sum(),
+                        block.square().sum(),
+                        (block == 0).sum(),
+                        (block.abs() <= self.near_zero).sum(),
+                        (block < 0).sum(),
+                    )
+                )
+                .cpu()
+                .tolist()
+            )
+            other_mean, other_variance = float(numbers[0]), float(numbers[1])
+            if self.count:
+                delta = other_mean - self.mean
+                combined = self.count + size
+                self.m2 += other_variance * size + delta * delta * self.count * size / combined
+                self.mean += delta * size / combined
+            else:
+                self.mean = other_mean
+                self.m2 = other_variance * size
+            self.minimum = min(self.minimum, float(numbers[2]))
+            self.maximum = max(self.maximum, float(numbers[3]))
+            self.absolute_sum += float(numbers[4])
+            self.squared_sum += float(numbers[5])
+            self.zeros += int(numbers[6])
+            self.near_zeros += int(numbers[7])
+            self.negatives += int(numbers[8])
+            self.count += size
+        if self.count > self.expected_count:
+            raise RuntimeError("hook observed more elements than the declared forward stream")
+
+    def report(self) -> dict[str, Any]:
+        torch = self._torch
+        if self.count == 0:
+            moments = None
+        else:
+            moments = {
+                "mean": self.mean,
+                "std_population": math.sqrt(max(0.0, self.m2 / self.count)),
+                "min": self.minimum,
+                "max": self.maximum,
+                "mean_absolute": self.absolute_sum / self.count,
+                "l2_norm": math.sqrt(max(0.0, self.squared_sum)),
+                "zero_fraction": self.zeros / self.count,
+                "near_zero_fraction": self.near_zeros / self.count,
+                "negative_fraction": self.negatives / self.count,
+            }
+            moments["coefficient_of_variation"] = (
+                moments["std_population"] / abs(self.mean) if self.mean != 0 else None
+            )
+        quantiles = None
+        if self.samples:
+            sample = torch.tensor(self.samples, dtype=torch.float64)
+            values = torch.quantile(
+                sample, torch.tensor([0, 0.1, 0.5, 0.9, 1.0], dtype=torch.float64)
+            ).tolist()
+            quantiles = dict(zip(("min", "p10", "median", "p90", "max"), values, strict=True))
+        return {
+            "observed_elements": self.count,
+            "expected_elements": self.expected_count,
+            "observed_calls": self.calls,
+            "near_zero_threshold": self.near_zero,
+            "all_element_moments": moments,
+            "quantile_sample": {
+                "strategy": "deterministic_equal_width_bin_midpoints_over_concatenated_stream",
+                "sample_count": len(self.samples),
+                "sample_limit": self.sample_limit,
+                "quantiles": quantiles,
+                "note": "Quantiles are sampled; all_element_moments use every observed element.",
+            },
+        }
+
+
+def _new_stats(expected: int, sample_limit: int, near_zero: float):
+    return _StreamingDistribution(expected, sample_limit, near_zero)
+
+
+def _pack_ppi_graphs(graphs: list[dict[str, Any]], indices: list[int], device):
+    import torch
+
+    features, labels, incidences, node_graph = [], [], [], []
+    ptr = [0]
+    for local_index, graph_index in enumerate(indices):
+        raw = graphs[graph_index]
+        x = raw["x"].to(device)
+        y = raw["y"].to(device)
+        edges = raw["incidence_edge_index"].to(device)
+        features.append(x)
+        labels.append(y)
+        incidences.append(edges + ptr[-1])
+        node_graph.append(torch.full((len(x),), local_index, dtype=torch.long, device=device))
+        ptr.append(ptr[-1] + len(x))
+    return (
+        SimpleNamespace(
+            x=torch.cat(features),
+            incidence_edge_index=torch.cat(incidences, dim=1),
+            batch=torch.cat(node_graph),
+            ptr=torch.tensor(ptr, dtype=torch.long, device=device),
+            num_graphs=len(indices),
+        ),
+        torch.cat(labels),
+    )
+
+
+def _audit_batches(payload: dict[str, Any], device, ppi_batches: int, ppi_batch_size: int):
+    import torch
+
+    dataset = str(payload.get("dataset", ""))
+    graphs = payload["graphs"]
+    splits = payload["splits"]
+    if dataset == "ppi":
+        train = [int(item) for item in splits["train"]]
+        held_out = {int(item) for name in ("validation", "test") for item in splits[name]}
+        if len(train) != len(set(train)) or set(train) & held_out:
+            raise ValueError("PPI train graphs must be unique and disjoint from held-out graphs")
+        selected = train[: ppi_batches * ppi_batch_size]
+        if not selected:
+            raise ValueError("PPI audit selected no training graph")
+        output = []
+        for start in range(0, len(selected), ppi_batch_size):
+            graph_indices = selected[start : start + ppi_batch_size]
+            graph, labels = _pack_ppi_graphs(graphs, graph_indices, device)
+            output.append((graph, labels.float(), graph_indices))
+        return output
+
+    raw = graphs[0]
+    train_mask = splits["train"]
+    if train_mask.dtype != torch.bool or train_mask.shape != (len(raw["x"]),):
+        raise ValueError("node benchmark train split must be a boolean node mask")
+    for name in ("validation", "test"):
+        other = splits[name]
+        if other.shape != train_mask.shape or bool(torch.any(train_mask & other)):
+            raise ValueError("node train mask overlaps or disagrees with a held-out split")
+    train_indices = train_mask.nonzero(as_tuple=False).flatten().to(device)
+    if train_indices.numel() == 0:
+        raise ValueError("node benchmark train split is empty")
+    graph = SimpleNamespace(
+        x=raw["x"].to(device),
+        incidence_edge_index=raw["incidence_edge_index"].to(device),
+    )
+    # Only train labels cross the device boundary.  Held-out labels are never read.
+    labels = raw["y"][train_mask].to(device).long()
+    return [(graph, (train_indices, labels), [0])]
+
+
+def _layer_expected(operator, total_edges: int) -> dict[str, int]:
+    linears = tuple(operator.estimator.network[index] for index in (0, 2, 4))
+    return {
+        "input_abs_bh": total_edges * operator.estimator.channels,
+        "input_squared_bh": total_edges * operator.estimator.channels,
+        "linear_0_input": total_edges * linears[0].in_features,
+        "linear_0_preactivation": total_edges * linears[0].out_features,
+        "silu_1_output": total_edges * linears[0].out_features,
+        "linear_2_input": total_edges * linears[1].in_features,
+        "linear_2_preactivation": total_edges * linears[1].out_features,
+        "silu_3_output": total_edges * linears[1].out_features,
+        "linear_4_input": total_edges * linears[2].in_features,
+        "linear_4_preactivation": total_edges * linears[2].out_features,
+        "raw_logit": total_edges,
+        "conductance": total_edges,
+        "raw_logit_gradient": total_edges,
+    }
+
+
+def _install_layer_hooks(
+    model, total_edges: int, sample_limit: int, near_zero: float, handles, tensor_handles
+):
+    reports = []
+    for layer_index, operator in enumerate(model.operators):
+        estimator = operator.estimator
+        if getattr(estimator, "mode", None) != "full":
+            raise ValueError("gate audit requires the full |BH|, (BH)^2 conductance estimator")
+        expected = _layer_expected(operator, total_edges)
+        stats = {key: _new_stats(count, sample_limit, near_zero) for key, count in expected.items()}
+
+        def linear_hook(number: int, *, _stats=stats, _channels=estimator.channels):
+            def capture(_module, inputs, output):
+                _stats[f"linear_{number}_input"].append(inputs[0])
+                _stats[f"linear_{number}_preactivation"].append(output)
+                if number == 0:
+                    channels = _channels
+                    _stats["input_abs_bh"].append(inputs[0][:, :channels])
+                    _stats["input_squared_bh"].append(inputs[0][:, channels : 2 * channels])
+                if number == 4:
+                    _stats["raw_logit"].append(output)
+
+                    def raw_gradient(gradient):
+                        _stats["raw_logit_gradient"].append(gradient)
+
+                    if output.requires_grad:
+                        tensor_handles.append(output.register_hook(raw_gradient))
+
+            return capture
+
+        def silu_hook(number: int, *, _stats=stats):
+            return lambda _module, _inputs, output: _stats[f"silu_{number}_output"].append(output)
+
+        def estimator_hook(_module, _inputs, output, *, _stats=stats):
+            _stats["conductance"].append(output)
+
+        for module, hook in (
+            (estimator.network[0], linear_hook(0)),
+            (estimator.network[1], silu_hook(1)),
+            (estimator.network[2], linear_hook(2)),
+            (estimator.network[3], silu_hook(3)),
+            (estimator.network[4], linear_hook(4)),
+            (estimator, estimator_hook),
+        ):
+            handles.append(module.register_forward_hook(hook))
+        reports.append((layer_index, stats))
+    return reports
+
+
+def _tensor_norm(value) -> float:
+    return math.sqrt(float(value.detach().double().square().sum().cpu()))
+
+
+def _parameter_report(model, accumulated: dict[int, Any], weight_decay: float, near_zero: float):
+    output = {}
+    epsilon = 1.0e-12
+    for name, parameter in model.named_parameters():
+        values = parameter.detach()
+        count = values.numel()
+        norm = _tensor_norm(values)
+        gradient = accumulated.get(id(parameter))
+        gradient_norm = None if gradient is None else _tensor_norm(gradient)
+        decay_norm = weight_decay * norm
+        ratio = None if gradient_norm is None else gradient_norm / max(decay_norm, epsilon)
+        cosine = None
+        if gradient is not None and gradient_norm > 0 and decay_norm > 0:
+            cosine = float(
+                (gradient.detach().double() * values.double()).sum().cpu() / (gradient_norm * norm)
+            )
+        output[name] = {
+            "requires_grad": parameter.requires_grad,
+            "parameter": {
+                "elements": count,
+                "l2_norm": norm,
+                "max_absolute": float(values.abs().max().cpu()) if count else None,
+                "zero_fraction": float((values == 0).sum().cpu()) / count if count else None,
+                "near_zero_fraction": (
+                    float((values.abs() <= near_zero).sum().cpu()) / count if count else None
+                ),
+            },
+            "task_gradient": {
+                "is_none": gradient is None,
+                "l2_norm": gradient_norm,
+                "max_absolute": (
+                    float(gradient.abs().max().cpu()) if gradient is not None and count else None
+                ),
+            },
+            "weight_decay_term_norm": decay_norm,
+            "task_to_decay_norm_ratio": ratio,
+            "ratio_denominator_epsilon": epsilon,
+            "ratio_denominator_was_clamped": decay_norm < epsilon,
+            "task_decay_cosine": cosine,
+            "near_zero_threshold": near_zero,
+            "cosine_note": "null when task gradient or weight-decay vector has zero norm",
+        }
+    return output
+
+
+def audit_gate_gradients(
+    model,
+    payload: dict[str, Any],
+    device,
+    *,
+    weight_decay: float,
+    mode: str = "eval",
+    ppi_batches: int = 1,
+    ppi_batch_size: int = 2,
+    rng_seed: int = 0,
+    sample_limit: int = 4096,
+    near_zero: float = 1e-8,
+) -> dict[str, Any]:
+    """Audit exact task gradients from training labels without changing model state.
+
+    ``mode='eval'`` is the default: autograd remains enabled while dropout is off.
+    ``mode='train'`` permits a controlled dropout audit under a private RNG fork.
+    The result is strict-JSON-finite.  It is a local first-order audit, not an Adam
+    update reconstruction and not evidence of a causal training intervention.
+    """
+    import torch
+    from torch.nn import functional as F
+
+    device = torch.device(device)
+    if mode not in {"eval", "train"}:
+        raise ValueError("mode must be eval or train")
+    if (
+        not math.isfinite(weight_decay)
+        or weight_decay < 0
+        or ppi_batches < 1
+        or ppi_batch_size < 1
+        or sample_limit < 1
+        or near_zero < 0
+        or not math.isfinite(near_zero)
+    ):
+        raise ValueError("invalid gradient-audit controls")
+    modules = list(model.modules())
+    module_modes = [module.training for module in modules]
+    parameters = list(model.parameters())
+    original_grads = [parameter.grad for parameter in parameters]
+    buffers = [(buffer, buffer.detach().clone()) for buffer in model.buffers()]
+    handles: list[Any] = []
+    tensor_handles: list[Any] = []
+    batches: list[dict[str, Any]] = []
+    accumulated: dict[int, Any] = {}
+    cuda_devices = []
+    if device.type == "cuda":
+        cuda_devices = [device.index if device.index is not None else torch.cuda.current_device()]
+
+    try:
+        with torch.inference_mode(False), torch.random.fork_rng(devices=cuda_devices, enabled=True):
+            # torch.manual_seed also seeds every CUDA device.  Seed only the CPU
+            # and the explicitly forked device so unrelated GPU RNGs stay intact.
+            torch.random.default_generator.manual_seed(rng_seed)
+            if device.type == "cuda":
+                torch.cuda.default_generators[cuda_devices[0]].manual_seed(rng_seed)
+            model.train(mode == "train")
+            # Keep future PPI batches on the CPU; only the current packed batch
+            # needs device memory for forward/backward.
+            prepared = _audit_batches(payload, torch.device("cpu"), ppi_batches, ppi_batch_size)
+            total_edges = sum(int(graph.incidence_edge_index.shape[1]) for graph, _, _ in prepared)
+            layer_stats = _install_layer_hooks(
+                model, total_edges, sample_limit, near_zero, handles, tensor_handles
+            )
+            if payload["dataset"] == "ppi":
+                total_labels = sum(int(labels.numel()) for _, labels, _ in prepared)
+                loss_name, reduction = "binary_cross_entropy_with_logits", "label_element_mean"
+            else:
+                total_labels = int(prepared[0][1][1].numel())
+                loss_name, reduction = "cross_entropy", "train_node_mean"
+
+            trainable = [parameter for parameter in parameters if parameter.requires_grad]
+            if not trainable:
+                raise ValueError("model has no trainable parameter")
+            loss_value = 0.0
+            with torch.enable_grad(), torch.autocast(device_type=device.type, enabled=False):
+                for batch_index, (graph, targets, graph_indices) in enumerate(prepared):
+                    graph = SimpleNamespace(
+                        **{
+                            name: value.to(device) if isinstance(value, torch.Tensor) else value
+                            for name, value in vars(graph).items()
+                        }
+                    )
+                    logits = model(graph)
+                    if payload["dataset"] == "ppi":
+                        targets = targets.to(device)
+                        label_count = int(targets.numel())
+                        batch_loss = F.binary_cross_entropy_with_logits(logits, targets)
+                    else:
+                        train_indices, labels = (target.to(device) for target in targets)
+                        label_count = int(labels.numel())
+                        batch_loss = F.cross_entropy(logits[train_indices], labels)
+                    if not bool(torch.isfinite(batch_loss.detach())):
+                        raise FloatingPointError("nonfinite train-only loss in gate audit")
+                    objective_weight = label_count / total_labels
+                    objective = batch_loss * objective_weight
+                    gradients = torch.autograd.grad(objective, trainable, allow_unused=True)
+                    for parameter, gradient in zip(trainable, gradients, strict=True):
+                        if gradient is None:
+                            continue
+                        key = id(parameter)
+                        if key not in accumulated:
+                            accumulated[key] = gradient.detach().clone()
+                        else:
+                            accumulated[key].add_(gradient.detach())
+                    contribution = float(objective.detach().cpu())
+                    loss_value += contribution
+                    batches.append(
+                        {
+                            "batch": batch_index,
+                            "graph_indices": graph_indices,
+                            "graphs": len(graph_indices),
+                            "nodes": int(graph.x.shape[0]),
+                            "train_nodes": (
+                                int(graph.x.shape[0])
+                                if payload["dataset"] == "ppi"
+                                else label_count
+                            ),
+                            "edges": int(graph.incidence_edge_index.shape[1]),
+                            "train_label_elements": label_count,
+                            "batch_mean_loss": float(batch_loss.detach().cpu()),
+                            "objective_weight": objective_weight,
+                            "weighted_loss_contribution": contribution,
+                        }
+                    )
+
+            layers = [
+                {
+                    "layer": layer_index,
+                    "tensors": {name: statistic.report() for name, statistic in stats.items()},
+                }
+                for layer_index, stats in layer_stats
+            ]
+            report = {
+                "schema_version": 1,
+                "dataset": payload["dataset"],
+                "mode": mode,
+                "rng_seed": rng_seed,
+                "label_scope": "train_only",
+                "controls": {
+                    "weight_decay": weight_decay,
+                    "near_zero_threshold": near_zero,
+                    "sample_limit": sample_limit,
+                    "ppi_requested_batches": ppi_batches,
+                    "ppi_batch_size": ppi_batch_size,
+                    "actual_batches": len(batches),
+                },
+                "loss": {
+                    "name": loss_name,
+                    "value": loss_value,
+                    "reduction": reduction,
+                    "batches": len(batches),
+                    "train_label_elements": total_labels,
+                    "batch_aggregation": (
+                        "PPI batch means weighted by label-element count; this is one combined "
+                        "audit objective, not a replay of sequential optimizer steps"
+                        if payload["dataset"] == "ppi"
+                        else "one full-graph forward with loss restricted to training nodes"
+                    ),
+                },
+                "batches": batches,
+                "parameters": _parameter_report(model, accumulated, weight_decay, near_zero),
+                "layers": layers,
+                "notes": {
+                    "autograd": "enabled; default eval mode disables dropout only",
+                    "gradient_scope": (
+                        "training labels only; full graph features remain transductive"
+                    ),
+                    "ppi_selection": (
+                        "deterministic first requested training batches in split order"
+                    ),
+                    "weight_decay": (
+                        "lambda_times_parameter only; no optimizer moments or update reconstructed"
+                    ),
+                    "interpretation": "local checkpoint gradient audit, not a causal intervention",
+                },
+            }
+            json.dumps(report, allow_nan=False)
+            return report
+    finally:
+        for handle in reversed(tensor_handles):
+            handle.remove()
+        for handle in reversed(handles):
+            handle.remove()
+        with torch.no_grad():
+            for buffer, saved in buffers:
+                buffer.copy_(saved)
+        for module, training in zip(modules, module_modes, strict=True):
+            module.training = training
+        for parameter, gradient in zip(parameters, original_grads, strict=True):
+            parameter.grad = gradient
+````
+
+# scripts/conductance_interventions.py
+
+````python
+"""Validation-only interventions on an existing conductance checkpoint.
+
+This module performs no training, downloads, cache writes, or test-label queries.
+The learned reference uses the original Conv, including its original degree cap.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from contextlib import contextmanager
+from types import MethodType, SimpleNamespace
+
+
+def _shuffle_generator(seed, graph_index, layer_index):
+    import torch
+
+    key = f"conductance-intervention:{seed}:{graph_index}:{layer_index}".encode()
+    value = int.from_bytes(hashlib.sha256(key).digest()[:8], "little") % (2**63 - 1)
+    return torch.Generator(device="cpu").manual_seed(value)
+
+
+def _check_inputs(state, edges, node_graph):
+    import torch
+
+    if state.ndim != 2 or len(state) == 0 or not torch.isfinite(state).all():
+        raise ValueError("Interventions require finite, nonempty node states")
+    if (
+        node_graph.shape != (len(state),)
+        or torch.any(node_graph != 0)
+        or edges.ndim != 2
+        or edges.shape[0] != 2
+        or edges.dtype != torch.long
+    ):
+        raise ValueError("Interventions evaluate exactly one graph per forward")
+    if edges.numel() and (edges.min() < 0 or edges.max() >= len(state)):
+        raise ValueError("An intervention edge refers to an invalid node")
+
+
+def _weighted_degree(state, edges, conductance):
+    degree = state.new_zeros(len(state))
+    degree.index_add_(0, edges[1], conductance)
+    degree.index_add_(0, edges[0], conductance)
+    return degree
+
+
+def _layer_record(state, edges, conductance, output, degree=None):
+    import torch
+
+    state, output = state.float(), output.float()
+    if (
+        conductance.shape != (edges.shape[1],)
+        or not torch.isfinite(conductance).all()
+        or torch.any(conductance < 0)
+        or not torch.isfinite(output).all()
+    ):
+        raise FloatingPointError("Invalid intervention conductance/output")
+    if degree is None:
+        degree = _weighted_degree(state, edges, conductance)
+    if not torch.isfinite(degree).all():
+        raise FloatingPointError("Nonfinite intervention weighted degree")
+    rho = 0.95 * degree / degree.max().clamp_min(1e-12)
+    c = conductance.detach().double().cpu()
+    delta = output.double() - state.double()
+    input_squared = float(state.double().square().sum())
+    delta_squared = float(delta.square().sum())
+    change = delta.norm(dim=1) / state.double().norm(dim=1).clamp_min(1e-12)
+    return {
+        "_c": c,
+        "_rho": rho.cpu(),
+        "_degree": degree.cpu(),
+        "_node_change": change.cpu(),
+        "rho_mean": float(rho.mean()),
+        # For graph_off, effective C is zero and the coefficient of variation
+        # is undefined, not zero. summarize_layers handles that case below.
+        "c_cv": float(c.std(unbiased=False) / c.mean()) if c.numel() and c.mean() else None,
+        "c_count": c.numel(),
+        "c_sum": float(c.sum()),
+        "c_squared_sum": float(c.square().sum()),
+        "input_squared_sum": input_squared,
+        "delta_squared_sum": delta_squared,
+        "global_update_ratio": math.sqrt(delta_squared) / max(math.sqrt(input_squared), 1e-12),
+        "zero_input_nodes": int((state.norm(dim=1) == 0).sum()),
+    }
+
+
+def _substituted_forward(operator, state, edges, node_graph, *, mode, chunk_size, generator):
+    """Return the actual substituted update and C; never call original Conv twice."""
+    import torch
+
+    _check_inputs(state, edges, node_graph)
+    with torch.autocast(device_type=state.device.type, enabled=False):
+        fp32 = state.float()
+        if mode == "graph_off":
+            c = fp32.new_zeros(edges.shape[1])
+            return state, c, fp32.new_zeros(len(fp32))
+        parts = []
+        for start in range(0, edges.shape[1], chunk_size):
+            tail, head = edges[:, start : start + chunk_size]
+            gradient = fp32[head] - fp32[tail]
+            c = operator.estimator(gradient, fp32.new_empty((len(tail), 0)))
+            if not torch.isfinite(c).all() or torch.any(c <= 0):
+                raise FloatingPointError("Nonfinite/nonpositive learned conductance")
+            parts.append(c)
+        c = torch.cat(parts) if parts else fp32.new_empty(0)
+        if c.numel():
+            if mode == "mean_C":
+                c = c.mean().expand_as(c)
+            elif mode == "shuffled_C":
+                permutation = torch.randperm(len(c), generator=generator).to(c.device)
+                c = c.index_select(0, permutation)
+            else:
+                raise ValueError(f"Unknown conductance intervention: {mode}")
+        elif mode not in {"mean_C", "shuffled_C"}:
+            raise ValueError(f"Unknown conductance intervention: {mode}")
+        degree = _weighted_degree(fp32, edges, c)
+        step = 0.95 / degree.max().clamp_min(1e-12)
+        divergence = torch.zeros_like(fp32)
+        for start in range(0, edges.shape[1], chunk_size):
+            tail, head = edges[:, start : start + chunk_size]
+            flux = c[start : start + len(tail), None] * (fp32[head] - fp32[tail])
+            divergence.index_add_(0, head, flux)
+            divergence.index_add_(0, tail, -flux)
+        output = fp32 - step * divergence
+    return output.to(state.dtype), c, degree
+
+
+@contextmanager
+def _instrument_operators(model, records, mode, selected_layers, graph_index, seed, chunk_size):
+    """Restore exact instance-forward attributes and every installed hook on failure."""
+    handles, replacements = [], []
+    try:
+        for layer_index, operator in enumerate(model.operators):
+            pending = {}
+            if layer_index in selected_layers:
+                had_forward = "forward" in vars(operator)
+                original_forward = vars(operator).get("forward")
+                replacements.append((operator, had_forward, original_forward))
+                generator = _shuffle_generator(seed, graph_index, layer_index)
+
+                def replacement(
+                    module,
+                    state,
+                    edges,
+                    node_graph,
+                    num_graphs=None,
+                    pending=pending,
+                    generator=generator,
+                ):
+                    if num_graphs is not None and num_graphs != 1:
+                        raise ValueError("Interventions require one graph per forward")
+                    output, c, degree = _substituted_forward(
+                        module,
+                        state,
+                        edges,
+                        node_graph,
+                        mode=mode,
+                        chunk_size=chunk_size,
+                        generator=generator,
+                    )
+                    pending.update(c=c, degree=degree)
+                    return output
+
+                operator.forward = MethodType(replacement, operator)
+            else:
+
+                def capture_c(_module, _inputs, output, pending=pending):
+                    if "c" in pending:
+                        raise RuntimeError("Expected one estimator call per original Conv")
+                    pending["c"] = output.detach()
+
+                handles.append(operator.estimator.register_forward_hook(capture_c))
+
+            def capture_layer(_module, inputs, output, index=layer_index, pending=pending):
+                state, edges, node_graph = inputs[:3]
+                _check_inputs(state, edges, node_graph)
+                if "c" not in pending:
+                    raise RuntimeError("Original Conv did not expose estimator conductance")
+                records[index].append(
+                    _layer_record(state, edges, pending["c"], output, pending.get("degree"))
+                )
+                pending.clear()
+
+            handles.append(operator.register_forward_hook(capture_layer))
+        yield
+    finally:
+        for handle in handles:
+            handle.remove()
+        for operator, had_forward, original_forward in reversed(replacements):
+            if had_forward:
+                operator.forward = original_forward
+            else:
+                del operator.forward
+
+
+def _validation_items(payload):
+    """Select validation labels before transfer; no train/test split is accessed."""
+    import torch
+
+    selected = payload["splits"]["validation"]
+    if payload["dataset"] == "ppi":
+        if not len(selected):
+            raise ValueError("No validation graphs")
+        for graph_index in selected:
+            graph_index = int(graph_index)
+            raw = payload["graphs"][graph_index]
+            yield graph_index, raw, None, raw["y"]
+    else:
+        if selected.dtype != torch.bool or selected.ndim != 1:
+            raise ValueError("Transductive validation split must be a Boolean node mask")
+        indices = selected.nonzero(as_tuple=False).flatten()
+        if not len(indices):
+            raise ValueError("No validation nodes")
+        raw = payload["graphs"][0]
+        yield 0, raw, indices, raw["y"].index_select(0, indices)
+
+
+def _summarize_layer(records):
+    from scripts.diagnose_conductance import summarize_layers
+
+    # The existing positive-C helper assumes a nonzero mean. Effective C=0
+    # is special to the identity intervention, so avoid producing NaN CV.
+    if sum(record["c_sum"] for record in records) == 0:
+        empty_c_records = [{**record, "_c": record["_c"][:0]} for record in records]
+        result = summarize_layers(empty_c_records)
+        edge_count = sum(record["c_count"] for record in records)
+        result["edge_pooled"]["conductance"] = {
+            "count": edge_count,
+            "mean": 0.0 if edge_count else None,
+            "quantiles": dict.fromkeys(("min", "p10", "median", "p90", "p99", "max"), 0.0)
+            if edge_count
+            else None,
+        }
+        return result
+    return summarize_layers(records)
+
+
+def evaluate_interventions(
+    model,
+    payload,
+    device,
+    *,
+    edge_chunk_size=16384,
+    shuffle_seed=0,
+    layerwise=True,
+    progress=None,
+):
+    """Evaluate fixed-checkpoint C interventions on validation, never retrain.
+
+    Only one caller-selected model checkpoint is used. ``shuffle_seed`` controls
+    edge reassignment, not initialization or a repeated model-seed experiment.
+    The return value is JSON-safe. Existing parameters/gradients are untouched;
+    module modes, forward attributes, hooks, and PyTorch RNG are restored.
+    """
+    import torch
+
+    from scripts.diagnose_conductance import merge_predictions, prediction_statistics
+
+    if not isinstance(edge_chunk_size, int) or edge_chunk_size < 1:
+        raise ValueError("edge_chunk_size must be positive")
+    if not isinstance(shuffle_seed, int) or shuffle_seed < 0:
+        raise ValueError("shuffle_seed must be a nonnegative integer")
+    if not len(model.operators):
+        raise ValueError("Interventions require at least one conductance layer")
+    device = torch.device(device)
+    if any(parameter.dtype != torch.float32 for parameter in model.parameters()):
+        raise ValueError("Interventions require an FP32 checkpoint")
+    items = list(_validation_items(payload))
+    multilabel = payload["dataset"] == "ppi"
+    all_layers = list(range(len(model.operators)))
+    specifications = [("learned_C", "learned_C", [])]
+    for mode in ("mean_C", "shuffled_C", "graph_off"):
+        specifications.append((f"{mode}_all", mode, all_layers))
+        if layerwise:
+            specifications.extend((f"{mode}_layer_{index}", mode, [index]) for index in all_layers)
+    module_modes = [(module, module.training) for module in model.modules()]
+    cuda_devices = (
+        [device.index if device.index is not None else torch.cuda.current_device()]
+        if device.type == "cuda"
+        else []
+    )
+    baseline_logits, variants = {}, []
+    try:
+        model.eval()
+        with (
+            torch.random.fork_rng(devices=cuda_devices),
+            torch.inference_mode(),
+            torch.autocast(device_type=device.type, enabled=False),
+        ):
+            for name, mode, selected_layers in specifications:
+                if progress is not None:
+                    progress(name)
+                layers = [[] for _ in model.operators]
+                predictions = []
+                squared_delta = squared_reference = 0.0
+                flipped = node_flipped = prediction_count = node_count = 0
+                for graph_index, raw, indices, labels in items:
+                    graph = SimpleNamespace(
+                        x=raw["x"].to(device),
+                        incidence_edge_index=raw["incidence_edge_index"].to(device),
+                    )
+                    with _instrument_operators(
+                        model,
+                        layers,
+                        mode,
+                        selected_layers,
+                        graph_index,
+                        shuffle_seed,
+                        edge_chunk_size,
+                    ):
+                        logits = model(graph)
+                    if indices is not None:
+                        logits = logits.index_select(0, indices.to(device))
+                    predictions.append(prediction_statistics(logits, labels.to(device), multilabel))
+                    current = logits.detach().float().cpu()
+                    if mode == "learned_C":
+                        baseline_logits[graph_index] = current
+                    reference = baseline_logits[graph_index]
+                    squared_delta += float((current.double() - reference.double()).square().sum())
+                    squared_reference += float(reference.double().square().sum())
+                    difference = (
+                        (current > 0) != (reference > 0)
+                        if multilabel
+                        else current.argmax(dim=-1) != reference.argmax(dim=-1)
+                    )
+                    flipped += int(difference.sum())
+                    node_flipped += (
+                        int(difference.any(dim=-1).sum()) if multilabel else int(difference.sum())
+                    )
+                    prediction_count += difference.numel()
+                    node_count += len(current)
+                prediction = merge_predictions(predictions, multilabel)
+                reference_prediction = variants[0]["prediction"] if variants else prediction
+                delta = {
+                    "loss": prediction["loss"] - reference_prediction["loss"],
+                    "metric": prediction["metric"] - reference_prediction["metric"],
+                    "logits_relative_l2": math.sqrt(squared_delta)
+                    / max(math.sqrt(squared_reference), 1e-12),
+                    "prediction_flip_fraction": flipped / prediction_count,
+                }
+                if multilabel:
+                    delta["node_any_label_flip_fraction"] = node_flipped / node_count
+                variants.append(
+                    {
+                        "name": name,
+                        "intervention": mode,
+                        "selected_layers": selected_layers,
+                        "prediction": prediction,
+                        "delta_vs_learned": delta,
+                        "layers": [_summarize_layer(records) for records in layers],
+                    }
+                )
+    finally:
+        for module, training in module_modes:
+            module.training = training
+    result = {
+        "schema_version": 1,
+        "split": "validation",
+        "shuffle_seed": shuffle_seed,
+        "layerwise": layerwise,
+        "notes": [
+            "One fixed model checkpoint; no training, test-label queries, or model-seed repeats.",
+            "Learned/unselected Conv uses its original forward; "
+            "C is captured from estimator output.",
+            "Selected mean/shuffle C is computed once in FP32 edge chunks; "
+            "GEMM/chunk accumulation may change last bits.",
+            "Each graph and layer is treated independently; "
+            "weighted degree and 0.95/dmax are recomputed after C substitution.",
+            "graph_off bypasses selected Conv only; "
+            "effective C/degree/rho/update are zero and C-CV is undefined.",
+            "Layer statistics cover full transductive graphs or all validation PPI graphs; "
+            "metrics/flips use validation labels only.",
+            "PPI prediction_flip_fraction is labelwise; "
+            "node_any_label_flip_fraction counts nodes with any changed label.",
+            "Validation deltas are interventions at this checkpoint, "
+            "not causal proof about training or significance tests.",
+        ],
+        "variants": variants,
+    }
+    json.dumps(result, allow_nan=False)
+    return result
+````
+
+# scripts/diagnose_conductance.py
+
+````python
+#!/usr/bin/env python3
+"""Read-only CUDA checkpoint diagnostics; no training, downloads, or new test queries."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import io
+import json
+import math
+import re
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parents[1]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+DATASETS = ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--model-seed", type=int, default=0)
+    parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--results-root", type=Path)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Optional NEW directory; extended audits auto-save, basic diagnostics use stdout",
+    )
+    parser.add_argument("--edge-chunk-size", type=int, default=16384)
+    parser.add_argument(
+        "--ablate-graph",
+        action="store_true",
+        help="Validation-only identity-convolution ablation; no retraining",
+    )
+    parser.add_argument(
+        "--full-audit",
+        action="store_true",
+        help="single-checkpoint C interventions plus a train-label gate/gradient audit",
+    )
+    parser.add_argument(
+        "--interventions",
+        action="store_true",
+        help="validation-only learned/mean/shuffled/off C interventions",
+    )
+    parser.add_argument(
+        "--gate-audit",
+        action="store_true",
+        help="optimizer-free gate input/parameter/task-gradient audit on train labels",
+    )
+    parser.add_argument(
+        "--layerwise-interventions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="also intervene on one conductance layer at a time (default: enabled)",
+    )
+    parser.add_argument("--shuffle-seed", type=int, default=0)
+    parser.add_argument("--gradient-mode", choices=("eval", "train"), default="eval")
+    parser.add_argument("--gradient-batches", type=int, default=1)
+    parser.add_argument("--gradient-sample-limit", type=int, default=4096)
+    parser.add_argument("--near-zero-threshold", type=float, default=1e-8)
+    return parser
+
+
+def _extended_requested(args: argparse.Namespace) -> bool:
+    return bool(args.full_audit or args.interventions or args.gate_audit)
+
+
+def _automatic_output(args: argparse.Namespace) -> Path | None:
+    if args.output_dir is not None:
+        return args.output_dir.expanduser().resolve()
+    if not _extended_requested(args):
+        return None
+    timestamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    return (
+        ROOT
+        / "runs"
+        / "diagnostics"
+        / f"conductance-{args.run_id}-model-seed-{args.model_seed}-{timestamp}"
+    ).resolve()
+
+
+def resolve_run(args: argparse.Namespace) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", args.run_id) or args.model_seed < 0:
+        raise ValueError("Invalid run ID or model seed")
+    base = (
+        (args.results_root / "conductance_gat")
+        if args.results_root is not None
+        else ROOT / "research/conductance_gat/results/paper"
+    )
+    return (
+        (base / args.run_id / f"model-seed-{args.model_seed}" / "benchmark").expanduser().resolve()
+    )
+
+
+def validate_run(manifest: dict, metrics: dict, model_seed: int, datasets: list[str]) -> dict:
+    for record in (manifest, metrics):
+        if any(
+            record.get(key) != value
+            for key, value in {
+                "schema_version": 2,
+                "track": "conductance_gat",
+                "suite": "benchmark",
+                "status": "passed",
+            }.items()
+        ):
+            raise ValueError("Require a completed/passed conductance benchmark run")
+    config = manifest["config"]
+    if config.get("model_seed") != model_seed or metrics.get("model_seed") != model_seed:
+        raise ValueError("Run model seed mismatch")
+    expected = [f"{name}/conductance" for name in config["datasets"]]
+    if (
+        not expected
+        or len(expected) != len(set(expected))
+        or manifest.get("expected") != expected
+        or manifest.get("completed") != expected
+    ):
+        raise ValueError("Run expected/completed datasets disagree")
+    if (
+        not datasets
+        or len(set(datasets)) != len(datasets)
+        or not set(datasets).issubset(config["datasets"])
+    ):
+        raise ValueError("Selected datasets are missing or duplicated")
+    for dataset in config["datasets"]:
+        if "conductance" not in metrics["datasets"][dataset]["models"]:
+            raise ValueError(f"Missing completed model metrics: {dataset}")
+        saved = metrics["datasets"][dataset]["models"]["conductance"]
+        if any(
+            not math.isfinite(saved[key]) or not 0 <= saved[key] <= 1
+            for key in ("validation", "test")
+        ):
+            raise ValueError(f"Invalid saved validation/test metric: {dataset}")
+    return config
+
+
+def summarize_history(history: list[dict], saved_metrics: dict) -> dict:
+    if not history or [row["epoch"] for row in history] != list(range(1, len(history) + 1)):
+        raise ValueError("Training history must contain contiguous epochs")
+    for row in history:
+        if (
+            not all(math.isfinite(row[key]) for key in ("train_loss", "validation"))
+            or row["train_loss"] < 0
+            or not 0 <= row["validation"] <= 1
+        ):
+            raise ValueError("Invalid/nonfinite training history")
+    best = max(history, key=lambda row: row["validation"])
+    if (
+        saved_metrics["best_epoch"] != best["epoch"]
+        or saved_metrics["epochs_run"] != len(history)
+        or not math.isclose(saved_metrics["validation"], best["validation"], abs_tol=1e-7)
+    ):
+        raise ValueError("Saved metrics disagree with validation-selected history checkpoint")
+    return {
+        "epochs_run": len(history),
+        "best_epoch": best["epoch"],
+        "train_loss_first": history[0]["train_loss"],
+        "train_loss_min": min(row["train_loss"] for row in history),
+        "train_loss_last": history[-1]["train_loss"],
+        "train_loss_at_selected_epoch": best["train_loss"],
+        "validation_first": history[0]["validation"],
+        "validation_best": best["validation"],
+        "validation_last": history[-1]["validation"],
+        "train_loss_note": (
+            "Original train-mode loss; not directly comparable to eval-mode train loss"
+        ),
+    }
+
+
+def validate_checkpoint(
+    checkpoint: dict, dataset: str, config: dict, saved_metrics: dict, history: list[dict]
+) -> dict:
+    summarize_history(history, saved_metrics)
+    if checkpoint.get("dataset") != dataset or checkpoint.get("model") != "conductance":
+        raise ValueError("Checkpoint dataset/model mismatch")
+    if checkpoint.get("best_epoch") != saved_metrics["best_epoch"] or not math.isclose(
+        checkpoint.get("validation", float("nan")), saved_metrics["validation"], abs_tol=1e-7
+    ):
+        raise ValueError("Checkpoint selection metadata mismatch")
+    architecture = checkpoint["architecture"]
+    expected = {key: config[key] for key in ("hidden_channels", "layers", "dropout")}
+    if architecture != expected or not isinstance(checkpoint.get("state_dict"), dict):
+        raise ValueError("Checkpoint architecture/state_dict mismatch")
+    if (
+        any(
+            type(expected[key]) is not int or expected[key] < 1
+            for key in ("hidden_channels", "layers")
+        )
+        or not 0 <= expected["dropout"] < 1
+    ):
+        raise ValueError("Invalid checkpoint architecture")
+    return expected
+
+
+def restore_model(checkpoint, payload, config, saved_metrics, history, device):
+    from research.conductance_gat.benchmark import ConductanceNodeClassifier
+
+    architecture = validate_checkpoint(
+        checkpoint, payload["dataset"], config, saved_metrics, history
+    )
+    model = ConductanceNodeClassifier(
+        payload["graphs"][0]["x"].shape[1], payload["classes"], **architecture
+    )
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
+    return model.to(device).eval()
+
+
+def require_cuda(name: str):
+    import torch
+
+    device = torch.device(name)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("Checkpoint inference requires CUDA; no CPU fallback")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    torch.cuda.set_device(device)
+    torch.cuda.get_device_properties(device)
+    return device
+
+
+def _distribution(values) -> dict:
+    import torch
+
+    values = values.double().cpu()
+    if not torch.isfinite(values).all():
+        raise FloatingPointError("Nonfinite diagnostic distribution")
+    if not values.numel():
+        return {"count": 0, "mean": None, "quantiles": None}
+    return {
+        "count": values.numel(),
+        "mean": float(values.mean()),
+        "quantiles": dict(
+            zip(
+                ("min", "p10", "median", "p90", "p99", "max"),
+                torch.quantile(
+                    values, torch.tensor([0, 0.1, 0.5, 0.9, 0.99, 1], dtype=torch.float64)
+                ).tolist(),
+                strict=True,
+            )
+        ),
+    }
+
+
+def layer_diagnostics(module, inputs: tuple, output, edge_chunk_size: int = 16384) -> dict:
+    import torch
+
+    state, edges, node_graph = inputs[:3]
+    if edge_chunk_size < 1 or torch.any(node_graph != 0):
+        raise ValueError("Layer diagnostics require one graph and a positive chunk size")
+    state, output = state.float(), output.float()
+    if not torch.isfinite(state).all() or not torch.isfinite(output).all():
+        raise FloatingPointError("Nonfinite layer input/output")
+    degree = state.new_zeros(len(state))
+    conductances = []
+    with torch.inference_mode(), torch.autocast(device_type=state.device.type, enabled=False):
+        for start in range(0, edges.shape[1], edge_chunk_size):
+            tail, head = edges[:, start : start + edge_chunk_size]
+            gradient = state[head] - state[tail]
+            c = module.estimator(gradient, state.new_empty((len(tail), 0)))
+            if not torch.isfinite(c).all() or torch.any(c <= 0):
+                raise FloatingPointError("Nonfinite/nonpositive conductance")
+            degree.index_add_(0, head, c)
+            degree.index_add_(0, tail, c)
+            conductances.append(c.cpu())
+        if not torch.isfinite(degree).all() or not torch.isfinite(output).all():
+            raise FloatingPointError("Nonfinite layer output/weighted degree")
+        rho = 0.95 * degree / degree.max().clamp_min(1e-12)
+        delta = output.double() - state.double()
+        input_squared = float(state.double().square().sum())
+        delta_squared = float(delta.square().sum())
+        change = delta.norm(dim=1) / state.double().norm(dim=1).clamp_min(1e-12)
+        c = (
+            torch.cat(conductances).double()
+            if conductances
+            else torch.empty(0, dtype=torch.float64)
+        )
+    return {
+        "_c": c,
+        "_rho": rho.cpu(),
+        "_degree": degree.cpu(),
+        "_node_change": change.cpu(),
+        "rho_mean": float(rho.mean()),
+        "c_cv": float(c.std(unbiased=False) / c.mean()) if c.numel() else None,
+        "c_count": c.numel(),
+        "c_sum": float(c.sum()),
+        "c_squared_sum": float(c.square().sum()),
+        "input_squared_sum": input_squared,
+        "delta_squared_sum": delta_squared,
+        "global_update_ratio": math.sqrt(delta_squared) / max(math.sqrt(input_squared), 1e-12),
+        "zero_input_nodes": int((state.norm(dim=1) == 0).sum()),
+    }
+
+
+def summarize_layers(records: list[dict]) -> dict:
+    import torch
+
+    if not records:
+        raise ValueError("No layer records")
+    pooled = {
+        key: torch.cat([record[key] for record in records])
+        for key in ("_c", "_rho", "_degree", "_node_change")
+    }
+    c = pooled["_c"]
+    cvs = [record["c_cv"] for record in records if record["c_cv"] is not None]
+    return {
+        "graphs": len(records),
+        "graph_macro": {
+            "rho_mean": sum(r["rho_mean"] for r in records) / len(records),
+            "update_ratio_mean": sum(r["global_update_ratio"] for r in records) / len(records),
+            "c_cv_mean": sum(cvs) / len(cvs) if cvs else None,
+        },
+        "node_pooled": {
+            "rho": _distribution(pooled["_rho"]),
+            "rho_below": {
+                str(t): float((pooled["_rho"] < t).double().mean()) for t in (0.01, 0.05, 0.1)
+            },
+            "weighted_degree": _distribution(pooled["_degree"]),
+            "relative_conv_change": _distribution(pooled["_node_change"]),
+            "zero_input_nodes": sum(r["zero_input_nodes"] for r in records),
+        },
+        "edge_pooled": {
+            "conductance": _distribution(c),
+            "c_cv": float(c.std(unbiased=False) / c.mean()) if c.numel() else None,
+        },
+        "global_update_ratio": math.sqrt(sum(r["delta_squared_sum"] for r in records))
+        / max(math.sqrt(sum(r["input_squared_sum"] for r in records)), 1e-12),
+    }
+
+
+def prediction_statistics(logits, labels, multilabel: bool) -> dict:
+    import torch
+    from torch.nn import functional as F
+
+    if not torch.isfinite(logits).all() or not labels.numel():
+        raise FloatingPointError("Nonfinite logits or empty evaluation labels")
+    if multilabel:
+        prediction, truth = logits > 0, labels > 0
+        loss_sum = F.binary_cross_entropy_with_logits(logits, labels, reduction="sum")
+        if not torch.isfinite(loss_sum):
+            raise FloatingPointError("Nonfinite summed BCE loss")
+        return {
+            "count": labels.numel(),
+            "nodes": len(labels),
+            "loss_sum": float(loss_sum),
+            "tp": int((prediction & truth).sum()),
+            "predicted_positive": int(prediction.sum()),
+            "true_positive_labels": int(truth.sum()),
+        }
+    loss_sum = F.cross_entropy(logits, labels, reduction="sum")
+    if not torch.isfinite(loss_sum):
+        raise FloatingPointError("Nonfinite summed CE loss")
+    return {
+        "count": labels.numel(),
+        "nodes": len(labels),
+        "loss_sum": float(loss_sum),
+        "correct": int((logits.argmax(dim=-1) == labels).sum()),
+    }
+
+
+def merge_predictions(records: list[dict], multilabel: bool) -> dict:
+    count = sum(row["count"] for row in records)
+    if count <= 0:
+        raise ValueError("Cannot evaluate an empty split")
+    result = {
+        "count": count,
+        "nodes": sum(r["nodes"] for r in records),
+        "loss": sum(row["loss_sum"] for row in records) / count,
+        "metric_name": "micro_f1" if multilabel else "accuracy",
+    }
+    if multilabel:
+        tp, predicted, truth = (
+            sum(row[key] for row in records)
+            for key in ("tp", "predicted_positive", "true_positive_labels")
+        )
+        result.update(
+            metric=2 * tp / (predicted + truth) if predicted + truth else 0,
+            predicted_positive_fraction=predicted / count,
+            true_positive_fraction=truth / count,
+        )
+    else:
+        result["metric"] = sum(row["correct"] for row in records) / count
+    return result
+
+
+def _forward(model, graph, records, chunk_size, ablate=False):
+    hooks = []
+    try:
+        for index, operator in enumerate(model.operators):
+
+            def hook(module, inputs, output, index=index):
+                if ablate:
+                    return inputs[0]
+                records[index].append(layer_diagnostics(module, inputs, output, chunk_size))
+                return None
+
+            hooks.append(operator.register_forward_hook(hook))
+        return model(graph)
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
+def evaluate_checkpoint(model, payload, device, chunk_size, *, ablate=False) -> dict:
+    import torch
+
+    results = {}
+    splits = ("validation",) if ablate else ("train", "validation")
+    shared_logits, shared_layers = None, None
+    with torch.inference_mode():
+        for split in splits:
+            layers = [[] for _ in model.operators]
+            statistics = []
+            indices = payload["splits"][split] if payload["dataset"] == "ppi" else [0]
+            for index in indices:
+                raw = payload["graphs"][index]
+                graph = SimpleNamespace(
+                    **{key: raw[key].to(device) for key in ("x", "y", "incidence_edge_index")}
+                )
+                if shared_logits is None:
+                    logits = _forward(model, graph, layers, chunk_size, ablate)
+                else:
+                    logits, layers = shared_logits, shared_layers
+                labels = graph.y
+                if payload["dataset"] != "ppi":
+                    shared_logits, shared_layers = logits, layers
+                    selected = payload["splits"][split].nonzero(as_tuple=False).flatten().to(device)
+                    logits, labels = (
+                        logits.index_select(0, selected),
+                        labels.index_select(0, selected),
+                    )
+                statistics.append(
+                    prediction_statistics(logits, labels, payload["dataset"] == "ppi")
+                )
+            results[split] = {
+                "prediction": merge_predictions(statistics, payload["dataset"] == "ppi")
+            }
+            if not ablate:
+                results[split]["layers"] = [summarize_layers(record) for record in layers]
+    return results
+
+
+def _state_hash(model) -> str:
+    digest = hashlib.sha256()
+    for name, value in model.state_dict().items():
+        digest.update(name.encode())
+        digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _number(value) -> str:
+    return "n/a" if value is None else f"{value:.4g}"
+
+
+def _quantile_text(distribution: dict) -> str:
+    values = distribution["quantiles"]
+    return (
+        "empty"
+        if values is None
+        else " ".join(f"{key}={_number(value)}" for key, value in values.items())
+    )
+
+
+def _print_layer(index: int, layer: dict) -> None:
+    nodes, edges, macro = layer["node_pooled"], layer["edge_pooled"], layer["graph_macro"]
+    print(
+        f"    layer {index}: graphs={layer['graphs']} nodes={nodes['rho']['count']} "
+        f"edges={edges['conductance']['count']}"
+    )
+    print(
+        f"      C(edge pooled): mean={_number(edges['conductance']['mean'])} "
+        f"CV={_number(edges['c_cv'])}; {_quantile_text(edges['conductance'])}"
+    )
+    print("      weighted degree(node pooled):", _quantile_text(nodes["weighted_degree"]))
+    print("      rho(node pooled):", _quantile_text(nodes["rho"]))
+    print(
+        "      fraction rho below:",
+        " ".join(f"{key}={value:.2%}" for key, value in nodes["rho_below"].items()),
+    )
+    print(
+        f"      Conv change: global ||out-in||/||in||={_number(layer['global_update_ratio'])}; "
+        f"node ratios {_quantile_text(nodes['relative_conv_change'])}"
+    )
+    print(
+        f"      graph-macro means: rho={_number(macro['rho_mean'])} "
+        f"change={_number(macro['update_ratio_mean'])} C-CV={_number(macro['c_cv_mean'])}"
+    )
+
+
+def additional_audits(model, payload, device, args, config, item: dict) -> None:
+    """Extend the current item incrementally so a failed audit keeps earlier evidence."""
+
+    if args.full_audit or args.interventions:
+        from scripts.conductance_interventions import evaluate_interventions
+
+        item["stage"] = "validation_interventions"
+        print("  Comparing C interventions on validation only...", flush=True)
+        item["interventions"] = evaluate_interventions(
+            model,
+            payload,
+            device,
+            edge_chunk_size=args.edge_chunk_size,
+            shuffle_seed=args.shuffle_seed,
+            layerwise=args.layerwise_interventions,
+            progress=lambda name: print(f"    validation intervention: {name}", flush=True),
+        )
+        reference = item["interventions"]["variants"][0]["prediction"]
+        baseline = item["baseline"]["validation"]["prediction"]
+        if any(abs(reference[key] - baseline[key]) > 1e-4 for key in ("metric", "loss")):
+            raise RuntimeError("Intervention learned reference disagrees with baseline recheck")
+        for variant in item["interventions"]["variants"]:
+            prediction = variant["prediction"]
+            delta = variant["delta_vs_learned"]
+            print(
+                f"    {variant['name']}: {prediction['metric_name']}={prediction['metric']:.6f} "
+                f"delta={delta['metric']:+.6f} loss={prediction['loss']:.6f} "
+                f"logit_change={_number(delta['logits_relative_l2'])} "
+                f"prediction_flip={_number(delta['prediction_flip_fraction'])}",
+                flush=True,
+            )
+        if args.ablate_graph:
+            off = next(
+                variant
+                for variant in item["interventions"]["variants"]
+                if variant["name"] == "graph_off_all"
+            )
+            item["identity_convolution_validation"] = {"prediction": off["prediction"]}
+            item["identity_minus_original_validation"] = (
+                off["prediction"]["metric"] - item["baseline"]["validation"]["prediction"]["metric"]
+            )
+    elif args.ablate_graph:
+        item["identity_convolution_validation"] = evaluate_checkpoint(
+            model, payload, device, args.edge_chunk_size, ablate=True
+        )["validation"]
+        item["identity_minus_original_validation"] = (
+            item["identity_convolution_validation"]["prediction"]["metric"]
+            - item["baseline"]["validation"]["prediction"]["metric"]
+        )
+    if args.full_audit or args.gate_audit:
+        from scripts.conductance_gate_audit import audit_gate_gradients
+
+        if "weight_decay" not in config:
+            raise ValueError("Saved weight_decay is required for the gradient/decay audit")
+        item["stage"] = "train_label_gradient_audit"
+        print(
+            f"  Gate audit: {args.gradient_mode} mode, autograd ON, train labels only; "
+            "no optimizer step...",
+            flush=True,
+        )
+        item["gate_audit"] = audit_gate_gradients(
+            model,
+            payload,
+            device,
+            weight_decay=config["weight_decay"],
+            mode=args.gradient_mode,
+            ppi_batches=args.gradient_batches,
+            ppi_batch_size=config.get("batch_size", 2),
+            rng_seed=args.model_seed,
+            sample_limit=args.gradient_sample_limit,
+            near_zero=args.near_zero_threshold,
+        )
+        audit = item["gate_audit"]
+        print("    audited train loss:", json.dumps(audit["loss"]), flush=True)
+        for layer in audit["layers"]:
+            raw = layer["tensors"]["raw_logit"]["all_element_moments"] or {}
+            raw_gradient = layer["tensors"]["raw_logit_gradient"]["all_element_moments"] or {}
+            print(
+                f"    layer {layer['layer']}: raw-logit mean={_number(raw.get('mean'))} "
+                f"std={_number(raw.get('std_population'))} "
+                f"raw-logit task-gradient norm={_number(raw_gradient.get('l2_norm'))}",
+                flush=True,
+            )
+        for name, parameter in audit["parameters"].items():
+            print(
+                f"    {name}: norm={_number(parameter['parameter']['l2_norm'])} "
+                f"task_grad={_number(parameter['task_gradient']['l2_norm'])} "
+                f"decay={_number(parameter['weight_decay_term_norm'])} "
+                f"ratio={_number(parameter['task_to_decay_norm_ratio'])} "
+                f"cosine={_number(parameter['task_decay_cosine'])}",
+                flush=True,
+            )
+
+
+def _diagnose(args, run: Path, report: dict) -> None:
+    import torch
+
+    from research.conductance_gat.benchmark_data import load_dataset
+
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    metrics = json.loads((run / "metrics.json").read_text(encoding="utf-8"))
+    # Python's JSON reader permits NaN/Infinity; reject them before copying source metadata.
+    json.dumps(manifest, allow_nan=False)
+    json.dumps(metrics, allow_nan=False)
+    config = validate_run(manifest, metrics, args.model_seed, args.datasets)
+    print(
+        "Saved training configuration:",
+        json.dumps(
+            {
+                key: config[key]
+                for key in (
+                    "hidden_channels",
+                    "layers",
+                    "dropout",
+                    "lr",
+                    "weight_decay",
+                    "epochs",
+                    "patience",
+                    "batch_size",
+                )
+                if key in config
+            }
+        ),
+    )
+    data_root = args.data_root or Path(config.get("data_root", ROOT / "data/paper"))
+    data_root = data_root.expanduser().resolve()
+    if not data_root.is_dir():
+        raise FileNotFoundError(
+            f"Recorded data root unavailable: {data_root}; supply --data-root explicitly"
+        )
+    device = require_cuda(args.device)
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    current_hashes = {
+        name: hashlib.sha256((ROOT / "research/conductance_gat" / name).read_bytes()).hexdigest()
+        for name in ("benchmark.py", "benchmark_data.py", "sparse.py")
+    }
+    report.update(
+        config=config,
+        data_root=str(data_root),
+        software={
+            "torch": str(torch.__version__),
+            "cuda": torch.version.cuda,
+            "gpu": torch.cuda.get_device_name(device),
+        },
+        implementation_sha256=current_hashes,
+        source_run_implementation_sha256=manifest.get("implementation_sha256"),
+        source_hash_mismatches=[
+            name
+            for name, digest in current_hashes.items()
+            if manifest.get("implementation_sha256", {}).get(name) != digest
+        ],
+    )
+    if report["source_hash_mismatches"]:
+        print(
+            "WARNING: source hashes differ from the saved run; verify changes are execution-only:",
+            report["source_hash_mismatches"],
+        )
+    for dataset_index, dataset in enumerate(args.datasets, start=1):
+        report["active_dataset"] = dataset
+        print(
+            f"\n[{dataset_index}/{len(args.datasets)}] {dataset}, model seed {args.model_seed}: "
+            "checking existing cache/checkpoint...",
+            flush=True,
+        )
+        directory = run / dataset / "conductance"
+        history = json.loads((directory / "history.json").read_text(encoding="utf-8"))
+        saved = json.loads((directory / "metrics.json").read_text(encoding="utf-8"))
+        if saved != metrics["datasets"][dataset]["models"]["conductance"]:
+            raise ValueError(f"Child/root model metrics disagree: {dataset}")
+        cache = data_root / "conductance_gat/matched_benchmark_v1" / dataset
+        if not all((cache / name).is_file() for name in ("data.pt", "manifest.json")):
+            raise FileNotFoundError(f"Existing complete cache required: {cache}")
+        payload, protocol = load_dataset(dataset, data_root, allow_download=False)
+        for key in ("data_sha256", "split_sha256"):
+            if protocol[key] != metrics["datasets"][dataset]["protocol"][key]:
+                raise ValueError(f"Dataset differs from the saved run: {dataset}/{key}")
+        checkpoint_bytes = (directory / "best.pt").read_bytes()
+        checkpoint = torch.load(io.BytesIO(checkpoint_bytes), map_location="cpu", weights_only=True)
+        model = restore_model(checkpoint, payload, config, saved, history, device)
+        before = _state_hash(model)
+        item = {
+            "status": "running",
+            "stage": "baseline_train_validation",
+            "history": summarize_history(history, saved),
+            "saved_test_historical_only": saved["test"],
+            "checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
+            "checkpoint_path": str(directory / "best.pt"),
+            "data_sha256": protocol["data_sha256"],
+        }
+        report["datasets"][dataset] = item
+        print("  Rechecking train/validation and C/rho distributions...", flush=True)
+        item["baseline"] = evaluate_checkpoint(model, payload, device, args.edge_chunk_size)
+        item["validation_recheck_minus_saved"] = (
+            item["baseline"]["validation"]["prediction"]["metric"] - saved["validation"]
+        )
+        item["validation_recheck_warning"] = abs(item["validation_recheck_minus_saved"]) > 1e-4
+        if item["validation_recheck_warning"] and _extended_requested(args):
+            raise RuntimeError(
+                "Validation recheck differs from saved checkpoint by >1e-4; "
+                "inspect source/software/precision before extended interventions"
+            )
+        additional_audits(model, payload, device, args, config, item)
+        if (
+            _state_hash(model) != before
+            or hashlib.sha256((directory / "best.pt").read_bytes()).hexdigest()
+            != item["checkpoint_sha256"]
+        ):
+            raise RuntimeError("Model/checkpoint changed during read-only diagnostics")
+        item["model_state_unchanged"] = True
+        item.update(status="passed", stage="complete")
+        print(
+            f"\n{dataset}: best epoch {saved['best_epoch']}/{saved['epochs_run']}; "
+            f"saved test ONLY={saved['test']:.6f}"
+        )
+        history_summary = item["history"]
+        print(
+            f"  train-mode loss: first={history_summary['train_loss_first']:.6f} "
+            f"last={history_summary['train_loss_last']:.6f} "
+            f"min={history_summary['train_loss_min']:.6f} "
+            f"selected={history_summary['train_loss_at_selected_epoch']:.6f}"
+        )
+        print(
+            f"  historical validation: first={history_summary['validation_first']:.6f} "
+            f"best={history_summary['validation_best']:.6f} "
+            f"last={history_summary['validation_last']:.6f}"
+        )
+        print(f"  validation recheck minus saved: {item['validation_recheck_minus_saved']:+.8f}")
+        if item["validation_recheck_warning"]:
+            print(
+                "  WARNING: validation recheck differs by >1e-4; inspect "
+                "precision/software/source/checkpoint consistency before interpreting ablations."
+            )
+        for split, values in item["baseline"].items():
+            print(f"  {split}:", json.dumps(values["prediction"]))
+            for index, layer in enumerate(values["layers"]):
+                _print_layer(index, layer)
+        if args.ablate_graph:
+            print(
+                "  identity-convolution validation delta "
+                "(distribution-shift ablation, NOT causal proof):",
+                item["identity_minus_original_validation"],
+            )
+        del model, payload, checkpoint
+        torch.cuda.empty_cache()
+    report.pop("active_dataset", None)
+
+
+def render_report(report: dict) -> str:
+    """A readable companion to the complete machine-readable diagnostic report."""
+
+    lines = [
+        "# Conductance checkpoint audit",
+        "",
+        f"Status: {report['status']}. Model seed: {report['model_seed']} "
+        "(one checkpoint per dataset).",
+        "",
+        "No training, optimizer steps, downloads, original artifact writes or new test queries.",
+        "C interventions use validation; gradient audits use train labels only.",
+        "These are checkpoint-local observations, not proof of the cause of collapse.",
+        "",
+    ]
+    if report.get("error"):
+        lines.extend((f"Error: {report['error']}", ""))
+    for dataset, item in report["datasets"].items():
+        lines.extend((f"## {dataset}", "", f"Stage: {item.get('stage', 'unknown')}", ""))
+        if item.get("error"):
+            lines.extend((f"Error: {item['error']}", ""))
+        if "baseline" in item:
+            lines.extend(("| Split | Metric | Value | Loss |", "|---|---|---:|---:|"))
+            for split, values in item["baseline"].items():
+                prediction = values["prediction"]
+                lines.append(
+                    f"| {split} | {prediction['metric_name']} | {prediction['metric']:.8f} | "
+                    f"{prediction['loss']:.8f} |"
+                )
+            lines.extend(("", "Historical test values were read, not re-evaluated.", ""))
+            lines.extend(
+                (
+                    "| Split / layer | C mean | C CV | rho median (ratio) | Conv relative change |",
+                    "|---|---:|---:|---:|---:|",
+                )
+            )
+            for split, values in item["baseline"].items():
+                for index, layer in enumerate(values["layers"]):
+                    edge = layer["edge_pooled"]
+                    rho = layer["node_pooled"]["rho"]["quantiles"] or {}
+                    lines.append(
+                        f"| {split} / {index} | {_number(edge['conductance']['mean'])} | "
+                        f"{_number(edge['c_cv'])} | {_number(rho.get('median'))} | "
+                        f"{_number(layer['global_update_ratio'])} |"
+                    )
+            lines.append("")
+        if "interventions" in item:
+            lines.extend(
+                (
+                    "### Validation C interventions",
+                    "",
+                    "| Variant | Metric | Delta | Loss | Logit relative L2 | Prediction flip |",
+                    "|---|---:|---:|---:|---:|---:|",
+                )
+            )
+            for variant in item["interventions"]["variants"]:
+                p, d = variant["prediction"], variant["delta_vs_learned"]
+                lines.append(
+                    f"| {variant['name']} | {p['metric']:.8f} | {d['metric']:+.8f} | "
+                    f"{p['loss']:.8f} | {_number(d['logits_relative_l2'])} | "
+                    f"{_number(d['prediction_flip_fraction'])} |"
+                )
+            lines.extend(
+                (
+                    "",
+                    "The degree cap is recomputed after C replacement. "
+                    "Shuffle changes rho as well as edge alignment.",
+                    "Prediction flip is nodewise for multiclass tasks and labelwise for PPI.",
+                    "C/rho/update distributions per layer and intervention are in report.json.",
+                    "",
+                )
+            )
+        if "gate_audit" in item:
+            audit = item["gate_audit"]
+            lines.extend(
+                (
+                    "### Train-label gate/gradient audit",
+                    "",
+                    f"Mode: {audit['mode']}; loss: `{json.dumps(audit['loss'])}`.",
+                    "",
+                    "| Parameter | Norm | Task gradient norm | Decay term norm | "
+                    "Task/decay | Cosine |",
+                    "|---|---:|---:|---:|---:|---:|",
+                )
+            )
+            for name, parameter in audit["parameters"].items():
+                lines.append(
+                    f"| {name} | {_number(parameter['parameter']['l2_norm'])} | "
+                    f"{_number(parameter['task_gradient']['l2_norm'])} | "
+                    f"{_number(parameter['weight_decay_term_norm'])} | "
+                    f"{_number(parameter['task_to_decay_norm_ratio'])} | "
+                    f"{_number(parameter['task_decay_cosine'])} |"
+                )
+            lines.extend(
+                (
+                    "",
+                    "This compares raw task gradient with lambda*parameter, "
+                    "not Adam's historical update.",
+                    "",
+                    "| Layer / tensor | Mean | Population std | L2 norm | Zero fraction |",
+                    "|---|---:|---:|---:|---:|",
+                )
+            )
+            for layer in audit["layers"]:
+                for name in (
+                    "input_abs_bh",
+                    "input_squared_bh",
+                    "raw_logit",
+                    "conductance",
+                    "raw_logit_gradient",
+                ):
+                    moments = layer["tensors"][name]["all_element_moments"] or {}
+                    lines.append(
+                        f"| {layer['layer']} / {name} | {_number(moments.get('mean'))} | "
+                        f"{_number(moments.get('std_population'))} | "
+                        f"{_number(moments.get('l2_norm'))} | "
+                        f"{_number(moments.get('zero_fraction'))} |"
+                    )
+            lines.extend(
+                (
+                    "",
+                    "Moments use all elements; quantiles use explicitly labelled bounded samples.",
+                    "Activation/gradient distributions and sample metadata are in report.json.",
+                    "",
+                )
+            )
+    return "\n".join(lines) + "\n"
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    run = resolve_run(args)
+    if args.edge_chunk_size < 1:
+        raise ValueError("edge chunk size must be positive")
+    if (
+        args.shuffle_seed < 0
+        or args.gradient_batches < 1
+        or args.gradient_sample_limit < 1
+        or not math.isfinite(args.near_zero_threshold)
+        or args.near_zero_threshold < 0
+    ):
+        raise ValueError("Invalid audit seed, batch/sample limit, or near-zero threshold")
+    output = _automatic_output(args)
+    if output:
+        source_manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+        recorded_data_root = Path(
+            source_manifest.get("config", {}).get("data_root", ROOT / "data/paper")
+        )
+        recorded_data_root = recorded_data_root.expanduser().resolve()
+        active_data_root = (
+            args.data_root.expanduser().resolve() if args.data_root else recorded_data_root
+        )
+        if (
+            output.is_relative_to(run.parents[1])
+            or output.is_relative_to(recorded_data_root)
+            or output.is_relative_to(active_data_root)
+            or output.is_relative_to(ROOT / "data")
+        ):
+            raise ValueError("Diagnostic output must not be inside the source run/data")
+        output.mkdir(parents=True, exist_ok=False)
+    report: dict[str, Any] = {
+        "schema_version": 2,
+        "status": "running",
+        "run": str(run),
+        "model_seed": args.model_seed,
+        "diagnostic_source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "audit_helper_sha256": {
+            name: hashlib.sha256((ROOT / "scripts" / name).read_bytes()).hexdigest()
+            for name in ("conductance_interventions.py", "conductance_gate_audit.py")
+            if (ROOT / "scripts" / name).is_file()
+        },
+        "arguments": {
+            key: str(value) if isinstance(value, Path) else value
+            for key, value in vars(args).items()
+        },
+        "output_directory": str(output) if output else None,
+        "datasets": {},
+        "policy": {
+            "optimizer_steps": 0,
+            "downloads": False,
+            "cache_writes": False,
+            "new_test_queries": False,
+            "model_seed_count": 1,
+            "gradient_audit": (
+                f"{args.gradient_mode} mode, autograd ON, train labels only; "
+                "checkpoint-local task gradient, not historical Adam updates"
+                if args.full_audit or args.gate_audit
+                else "disabled"
+            ),
+            "interventions": (
+                "Validation only; graph/layer-local C replacement and recomputed degree cap; "
+                "one fixed shuffle seed, no retraining or surrogate-gradient changes"
+                if args.full_audit or args.interventions
+                else "disabled"
+            ),
+            "precision": "FP32; AMP/TF32 disabled even if original run used AMP",
+            "structural_stats": (
+                "All nodes in each graph; transductive test-node features remain visible; "
+                "no test-label loss/metric evaluation"
+            ),
+            "rho": (
+                ".95 * weighted_degree / SAME_GRAPH_max_weighted_degree; "
+                "gate recomputed in FP32 edge chunks"
+            ),
+            "c_scale": (
+                "Absolute conductance scale is not identifiable; interpret CV and rho together"
+            ),
+            "ablation": (
+                "Optional validation-only same-checkpoint Conv identity; "
+                "no retraining, not causal proof"
+            ),
+        },
+    }
+    try:
+        print(
+            "Read-only diagnostic: FP32 inference, AMP/TF32 disabled; train+validation only. "
+            "Test scores are saved historical values, not re-evaluated.",
+            flush=True,
+        )
+        print(
+            f"One model seed: {args.model_seed}; datasets: {', '.join(args.datasets)}. "
+            f"Gradient audit PPI batches: {args.gradient_batches} (default one).",
+            flush=True,
+        )
+        if output:
+            print(f"Reports will be saved to: {output}", flush=True)
+        _diagnose(args, run, report)
+        report["status"] = "passed"
+    except Exception as exc:
+        report.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        active = report.get("active_dataset")
+        if active in report["datasets"]:
+            report["datasets"][active].update(status="failed", error=report["error"])
+        if "out of memory" in str(exc).lower():
+            report["recovery_note"] = (
+                "No CPU fallback or smaller replacement graph was used. Earlier diagnostics "
+                "from completed stages are preserved, not unfinished variants within a stage. "
+                "Free GPU memory or select one dataset; --interventions skips "
+                "backward, while --gate-audit requests backward only after baseline recheck. "
+                "The edge chunk option does not bound the original model's backward memory."
+            )
+        print(report["error"], file=sys.stderr)
+    if output:
+        (output / "report.json").write_text(
+            json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8"
+        )
+        (output / "report.md").write_text(render_report(report), encoding="utf-8")
+        print(f"Diagnostic report: {output / 'report.json'}")
+        print(f"Readable report: {output / 'report.md'}")
+    print(f"Diagnostic status: {report['status']}" + (" (stdout only)" if output is None else ""))
+    return 0 if report["status"] == "passed" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# scripts/diagnose_conductance.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "${project_root}/scripts/conda_env.sh"
+
+export PYTHONPATH="${project_root}/src:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
+cd "${project_root}"
+exec "${environment_python}" -B scripts/diagnose_conductance.py "$@"
 ````
 
 # scripts/generate_code_summary.py
@@ -20313,6 +25360,7 @@ from pathlib import Path
 from typing import Any
 
 from chartgat.cache import atomic_write_bytes, atomic_write_json
+from chartgat.execution import add_execution_arguments
 
 try:
     from scripts.aggregate_paper import aggregate_manifest
@@ -20390,11 +25438,21 @@ def _selected_tracks(values: list[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(values))
 
 
-def _track_run_root(track: str, run_id: str, results_root: Path | None = None) -> Path:
+def _track_run_root(
+    track: str,
+    run_id: str,
+    results_root: Path | None = None,
+    *,
+    cycle_pe_version: str = "v1",
+) -> Path:
+    is_cycle_v2 = track == "cycle_pe" and cycle_pe_version == "v2"
     if results_root is None:
-        base = PROJECT_ROOT / "research" / track / "results" / "paper"
+        track_path = PROJECT_ROOT / "research" / track
+        if is_cycle_v2:
+            track_path = track_path / "v2"
+        base = track_path / "results" / "paper"
     else:
-        base = results_root.expanduser().resolve() / track
+        base = results_root.expanduser().resolve() / ("cycle_pe_v2" if is_cycle_v2 else track)
     return base / run_id
 
 
@@ -20403,8 +25461,13 @@ def _output_dir(
     run_id: str,
     model_seed: int,
     results_root: Path | None = None,
+    *,
+    cycle_pe_version: str = "v1",
 ) -> Path:
-    return _track_run_root(track, run_id, results_root) / f"model-seed-{model_seed}"
+    return (
+        _track_run_root(track, run_id, results_root, cycle_pe_version=cycle_pe_version)
+        / f"model-seed-{model_seed}"
+    )
 
 
 def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str], Path | None]]:
@@ -20462,10 +25525,13 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
         effective_workers = args.workers if workers is None else workers
         requested_amp = args.amp if args.amp is not None else args.suite != "benchmark"
         effective_amp = requested_amp if amp is None else amp
+        module = BENCHMARK_MODULES[track] if suite == "benchmark" else TRACK_MODULES[track]
+        if track == "cycle_pe" and args.cycle_pe_version == "v2":
+            module = "research.cycle_pe.v2.benchmark"
         command = [
             sys.executable,
             "-m",
-            BENCHMARK_MODULES[track] if suite == "benchmark" else TRACK_MODULES[track],
+            module,
             "--suite",
             suite,
             "--data-root",
@@ -20492,6 +25558,8 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
         if args.allow_download:
             command.append("--allow-download")
         if not args.prepare_only:
+            if args.compile and suite == "benchmark":
+                command.append("--compile")
             if effective_amp and args.device.lower().startswith("cuda"):
                 command.append("--amp")
             elif not effective_amp or args.device.lower().startswith("cpu"):
@@ -20508,14 +25576,34 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
             suites = ("csl", "zinc") if track == "tree_augmentation" else ("benchmark",)
             for model_seed in executed_model_seeds:
                 for suite in suites:
+                    cycle_v2 = track == "cycle_pe" and args.cycle_pe_version == "v2"
+                    label = "benchmark-v2" if cycle_v2 else suite
+                    overrides: list[str] = []
+                    if cycle_v2:
+                        overrides.extend((
+                            "--basis-execution", args.basis_execution,
+                            "--basis-pair-budget", str(args.basis_pair_budget),
+                        ))
+                        if args.cycle_epochs is not None:
+                            overrides.extend(("--epochs", str(args.cycle_epochs)))
+                        if args.cycle_learning_rate is not None:
+                            overrides.extend(("--lr", str(args.cycle_learning_rate)))
                     add_child(
                         track=track,
                         suite=suite,
                         model_seed=model_seed,
-                        name=f"{track}:{suite}:model-seed-{model_seed}",
+                        name=f"{track}:{label}:model-seed-{model_seed}",
                         output_dir=(
-                            _output_dir(track, run_id, model_seed, args.results_root) / suite
+                            _output_dir(
+                                track,
+                                run_id,
+                                model_seed,
+                                args.results_root,
+                                cycle_pe_version=args.cycle_pe_version,
+                            )
+                            / suite
                         ),
+                        extra_arguments=tuple(overrides),
                     )
             continue
 
@@ -20620,12 +25708,17 @@ def _environment_snapshot(path: Path) -> dict[str, Any]:
     return {"path": str(path), "sha256": _sha256(path)}
 
 
-def _snapshot_registries(run_dir: Path, tracks: tuple[str, ...]) -> dict[str, Any]:
+def _snapshot_registries(
+    run_dir: Path, tracks: tuple[str, ...], *, cycle_pe_version: str = "v1"
+) -> dict[str, Any]:
     directory = run_dir / "dataset-registries"
     directory.mkdir(parents=True, exist_ok=False)
     snapshots: dict[str, Any] = {}
     for track in tracks:
-        source = PROJECT_ROOT / "research" / track / "datasets.yaml"
+        source_root = PROJECT_ROOT / "research" / track
+        if track == "cycle_pe" and cycle_pe_version == "v2":
+            source_root = source_root / "v2"
+        source = source_root / "datasets.yaml"
         target = directory / f"{track}.yaml"
         shutil.copy2(source, target)
         snapshots[track] = {"path": str(target), "sha256": _sha256(target)}
@@ -20694,6 +25787,7 @@ def _run_logged(command: list[str], *, log_path: Path) -> int:
                 )
                 print(safe_line, end="", flush=True)
             log.write(line)
+            log.flush()
         return process.wait()
 
 
@@ -20733,12 +25827,21 @@ def _parser() -> argparse.ArgumentParser:
         "--seeds",
         dest="model_seeds",
         type=_seeds,
-        default=(0, 1, 2, 3, 4),
-        help="model/minibatch seeds; --seeds is a compatibility alias",
+        default=(0,),
+        help=(
+            "model/minibatch seeds (default: 0); pass a comma-separated list for a sweep; "
+            "--seeds is a compatibility alias"
+        ),
     )
     parser.add_argument("--data-seed", type=int, default=0)
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--chart-seed", type=int, default=0)
+    parser.add_argument(
+        "--cycle-pe-version",
+        choices=("v1", "v2"),
+        default="v1",
+        help="v2: full left-nullspace basis; select --tracks cycle_pe --suite benchmark",
+    )
     parser.add_argument(
         "--cycle-variants",
         type=_cycle_variants,
@@ -20753,6 +25856,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cycle-epochs", type=int)
     parser.add_argument("--cycle-learning-rate", type=float)
+    parser.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
+    parser.add_argument("--basis-pair-budget", type=int, default=32768)
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -20785,11 +25890,28 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help="override precision (benchmark defaults to float32; supplementary suites use AMP)",
     )
+    add_execution_arguments(parser)
     return parser
 
 
 def main() -> int:
     args = _parser().parse_args()
+    if args.compile and (
+        args.suite != "benchmark" or "tree_augmentation" in _selected_tracks(args.tracks)
+    ):
+        print("--compile supports conductance_gat/cycle_pe benchmark tracks only", file=sys.stderr)
+        return 2
+    if args.basis_pair_budget < 1:
+        print("--basis-pair-budget must be positive", file=sys.stderr)
+        return 2
+    if args.cycle_pe_version == "v2" and (
+        args.suite != "benchmark" or _selected_tracks(args.tracks) != ("cycle_pe",)
+    ):
+        print(
+            "Cycle PE v2 is independent: use --tracks cycle_pe --suite benchmark",
+            file=sys.stderr,
+        )
+        return 2
     if (args.batch_size is not None and args.batch_size < 1) or args.workers < 0:
         print("batch size must be positive and workers must be non-negative", file=sys.stderr)
         return 2
@@ -20827,7 +25949,10 @@ def main() -> int:
 
     run_dir = PROJECT_ROOT / "runs" / "paper" / run_id
     if run_dir.exists() or any(
-        _track_run_root(track, run_id, args.results_root).exists() for track in tracks
+        _track_run_root(
+            track, run_id, args.results_root, cycle_pe_version=args.cycle_pe_version
+        ).exists()
+        for track in tracks
     ):
         print(f"run id already exists: {run_id}", file=sys.stderr)
         return 2
@@ -20859,6 +25984,10 @@ def main() -> int:
         "requested_model_seeds": list(args.model_seeds),
         "executed_model_seeds": ([] if args.prepare_only else list(args.model_seeds)),
         "execution_protocol": {
+            "torch_compile": args.compile and not args.prepare_only,
+            "basis_execution": args.basis_execution if args.cycle_pe_version == "v2" else None,
+            "basis_pair_budget": args.basis_pair_budget if args.cycle_pe_version == "v2" else None,
+            "cycle_pe_version": args.cycle_pe_version if "cycle_pe" in tracks else None,
             "outer_model_seeds": list(args.model_seeds),
             "prepare_once_for_fixed_non_model_axes": args.prepare_only,
             "cycle_selection": (
@@ -20907,7 +26036,9 @@ def main() -> int:
         "prepare_only": args.prepare_only,
         "environment": _environment_snapshot(run_dir / "environment.txt"),
         "research_environment": dependency_report,
-        "dataset_registries": _snapshot_registries(run_dir, tracks),
+        "dataset_registries": _snapshot_registries(
+            run_dir, tracks, cycle_pe_version=args.cycle_pe_version
+        ),
         "commands": [],
     }
     _write_manifest(manifest_path, manifest)
@@ -21958,6 +27089,78 @@ __all__ = [
 ]
 ````
 
+# src/chartgat/execution.py
+
+````python
+"""Execution-only options shared by independent research tracks.
+
+Compilation is opt-in: it changes execution, not parameters or the optimizer.
+No custom extension, system compiler installation, precision change or silent
+fallback is performed here. Imports stay lazy so CLI help needs no Torch import.
+"""
+
+from __future__ import annotations
+
+import argparse
+from typing import Any
+
+
+def add_execution_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--compile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compile tensor MLP blocks with Inductor (CUDA); first calls include compile cost.",
+    )
+
+
+def configure_execution(model: Any, args: argparse.Namespace, device: Any) -> dict[str, Any]:
+    """Compile tensor-only Sequential blocks, preserving ordinary checkpoint keys.
+
+    Do not replace the model by an OptimizedModule wrapper: existing checkpoints
+    must remain loadable by the eager implementation and vice versa. Keep ragged
+    graph/column scheduling outside Dynamo: tracing those Python loops specializes
+    on every graph's cycle rank and can exhaust the recompilation cache quickly.
+    Compiler errors, including errors on the first lazy invocation, propagate.
+    """
+    enabled = bool(getattr(args, "compile", False))
+    metadata = {
+        "torch_compile": enabled,
+        "backend": "inductor" if enabled else "eager",
+        "dynamic_shapes": enabled,
+        "scope": "tensor_mlp_blocks" if enabled else "eager",
+        "compiled_modules": [],
+        "precision_changed_by_execution_option": False,
+        "checkpoint_format": "ordinary_module_state_dict",
+    }
+    if not enabled:
+        return metadata
+    import torch
+    import torch._dynamo
+
+    if torch.device(device).type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("--compile requires CUDA; no CPU research fallback")
+    if torch._dynamo.config.suppress_errors:
+        raise RuntimeError("--compile requires Dynamo suppress_errors=False; no silent fallback")
+    targets = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Sequential)
+        and not any(isinstance(child, torch.nn.Sequential) for child in module.children())
+    ]
+    if not targets:
+        raise RuntimeError("--compile found no tensor MLP blocks in this model")
+    if not callable(getattr(torch, "compile", None)):
+        raise RuntimeError("This PyTorch build does not support torch.compile")
+    for name, module in targets:
+        # Target the bound forward explicitly. Some Torch releases skip a
+        # Sequential's generic _call_impl when Module.compile wraps it, leaving
+        # no compiled frames. Keep Module.__call__ (and its hooks) unchanged.
+        module.forward = torch.compile(module.forward, backend="inductor", dynamic=True)
+        metadata["compiled_modules"].append(name or "<root>")
+    return metadata
+````
+
 # src/chartgat/graphs.py
 
 ````python
@@ -22161,7 +27364,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.aggregate_paper import aggregate_manifest
+from scripts.aggregate_paper import _summary, aggregate_manifest
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -22169,11 +27372,48 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+@pytest.mark.parametrize("bootstrap_samples", [0, 100])
+def test_singleton_summary_has_no_estimated_seed_uncertainty(bootstrap_samples: int) -> None:
+    summary = _summary([0.625], key="single-seed", bootstrap_samples=bootstrap_samples)
+
+    assert summary["n"] == 1
+    assert summary["mean"] == summary["median"] == summary["minimum"] == summary["maximum"] == 0.625
+    assert summary["uncertainty_status"] == "insufficient_samples"
+    serialized = json.loads(json.dumps(summary, allow_nan=False))
+    for key in ("sample_std", "bootstrap_95_low", "bootstrap_95_high"):
+        assert serialized[key] is None
+
+
+@pytest.mark.parametrize(
+    "values,mean,std,low,high",
+    [([0.0, 1.0], 0.5, 2**-0.5, 0.0, 1.0), ([0.3, 0.3], 0.3, 0.0, 0.3, 0.3)],
+)
+def test_explicit_multiple_seeds_keep_existing_estimated_statistics(values, mean, std, low, high):
+    summary = _summary(values, key="multi-seed-regression", bootstrap_samples=100)
+
+    assert summary["n"] == 2
+    assert summary["mean"] == pytest.approx(mean)
+    assert summary["sample_std"] == pytest.approx(std)
+    assert summary["bootstrap_95_low"] == pytest.approx(low)
+    assert summary["bootstrap_95_high"] == pytest.approx(high)
+    assert summary["uncertainty_status"] == "bootstrap_estimated"
+
+
+def test_disabled_bootstrap_keeps_multi_seed_statistics_but_is_explicitly_labelled() -> None:
+    summary = _summary([0.0, 1.0], key="bootstrap-off", bootstrap_samples=0)
+
+    assert summary["n"] == 2
+    assert summary["sample_std"] == pytest.approx(2**-0.5)
+    assert summary["bootstrap_95_low"] == summary["bootstrap_95_high"] == summary["mean"] == 0.5
+    assert summary["uncertainty_status"] == "bootstrap_disabled"
+
+
 @pytest.mark.parametrize(
     ("track", "dataset", "model"),
     [
         ("conductance_gat", "cora", "conductance"),
         ("cycle_pe", "zinc12k", "cycle_set"),
+        ("cycle_pe", "zinc12k", "cycle_basis_v2"),
     ],
 )
 def test_benchmarks_aggregate_only_our_model_and_ignore_published_scores(
@@ -22200,6 +27440,7 @@ def test_benchmarks_aggregate_only_our_model_and_ignore_published_scores(
                                 "trainable_parameters": 1000,
                                 "elapsed_seconds": 3.0,
                                 "peak_gpu_memory_bytes": 2048,
+                                "history": [{"test": 0.001, "validation": 0.002}],
                             },
                             "external_model": {"test": 0.5, "elapsed_seconds": 8.0},
                         },
@@ -22240,6 +27481,96 @@ def test_benchmarks_aggregate_only_our_model_and_ignore_published_scores(
     with (tmp_path / "aggregate" / "paired.csv").open(encoding="utf-8", newline="") as stream:
         pairs = list(csv.DictReader(stream))
     assert pairs == []
+
+
+def test_cycle_v1_and_basis_v2_keep_independent_summary_and_efficiency_rows(
+    tmp_path: Path,
+) -> None:
+    commands = []
+    for seed in (0, 1):
+        output = tmp_path / f"seed-{seed}"
+        models = {}
+        for model, offset in (("cycle_set", 0.1), ("cycle_basis_v2", 0.7)):
+            models[model] = {
+                "test": offset + seed * 0.02,
+                "validation": 9.0,
+                "trainable_parameters": 1000,
+                "elapsed_seconds": 3.0,
+                "peak_gpu_memory_bytes": 2048,
+                "history": [{"test": 8.0, "validation": 7.0}],
+            }
+        models["external_model"] = {"test": 6.0, "elapsed_seconds": 5.0}
+        _write_json(
+            output / "metrics.json",
+            {
+                "track": "cycle_pe",
+                "suite": "benchmark",
+                "datasets": {
+                    "zinc12k": {
+                        "models": models,
+                        "published_reference": {"test": 4.0, "std": 0.02},
+                    }
+                },
+            },
+        )
+        commands.append(
+            {
+                "name": f"cycle_pe:benchmark:model-seed-{seed}",
+                "command": [
+                    "python",
+                    "--suite",
+                    "benchmark",
+                    "--model-seed",
+                    str(seed),
+                    "--data-seed",
+                    "0",
+                    "--split-seed",
+                    "0",
+                    "--chart-seed",
+                    "0",
+                ],
+                "returncode": 0,
+                "artifact_errors": [],
+                "output": str(output),
+            }
+        )
+    manifest = tmp_path / "manifest.json"
+    _write_json(manifest, {"run_id": "both-versions", "status": "passed", "commands": commands})
+
+    result = aggregate_manifest(manifest, bootstrap_samples=0)
+
+    assert result["sample_rows"] == 4
+    assert result["metric_groups"] == 2
+    assert result["efficiency_rows"] == 12
+    assert result["paired_groups"] == 0
+    assert result["ignored_numeric_fields"] == result["numeric_fields_seen"] - 16
+    with (tmp_path / "aggregate" / "metrics.csv").open(encoding="utf-8", newline="") as stream:
+        summaries = {row["metric"]: row for row in csv.DictReader(stream)}
+    assert set(summaries) == {
+        "datasets.zinc12k.models.cycle_set.test",
+        "datasets.zinc12k.models.cycle_basis_v2.test",
+    }
+    for model, expected_mean, expected_rule in (
+        ("cycle_set", 0.11, "cycle.our_model.test"),
+        ("cycle_basis_v2", 0.71, "cycle.basis_v2.test"),
+    ):
+        row = summaries[f"datasets.zinc12k.models.{model}.test"]
+        assert float(row["mean"]) == pytest.approx(expected_mean)
+        assert row["model_seeds"] == "0,1"
+        assert row["metric_rule"] == expected_rule
+    with (tmp_path / "aggregate" / "efficiency.csv").open(encoding="utf-8", newline="") as stream:
+        efficiency = list(csv.DictReader(stream))
+    assert {row["metric_rule"] for row in efficiency} == {
+        "cycle.our_model.efficiency",
+        "cycle.basis_v2.efficiency",
+    }
+    assert {row["metric"] for row in efficiency} == {
+        f"datasets.zinc12k.models.{model}.{metric}"
+        for model in ("cycle_set", "cycle_basis_v2")
+        for metric in ("trainable_parameters", "elapsed_seconds", "peak_gpu_memory_bytes")
+    }
+    with (tmp_path / "aggregate" / "paired.csv").open(encoding="utf-8", newline="") as stream:
+        assert list(csv.DictReader(stream)) == []
 
 
 def test_aggregate_keeps_data_axes_fixed_and_pairs_model_seeds(tmp_path: Path) -> None:
@@ -22484,9 +27815,12 @@ def test_aggregate_reads_oom_logs_and_ignores_outer_seed_for_official_brec(
     assert failure["oom"] == "True"
 
 
-def test_aggregate_tree_schema_pairs_only_registered_downstream_metrics(tmp_path: Path) -> None:
+@pytest.mark.parametrize("seed_count", [1, 2])
+def test_aggregate_tree_schema_pairs_only_registered_downstream_metrics(
+    tmp_path: Path, seed_count: int
+) -> None:
     commands = []
-    for model_seed, fixed, multi in ((1, 0.8, 0.5), (2, 0.6, 0.4)):
+    for model_seed, fixed, multi in ((1, 0.8, 0.5), (2, 0.6, 0.4))[:seed_count]:
         output = tmp_path / f"tree-{model_seed}"
         _write_json(
             output / "summary.json",
@@ -22543,18 +27877,39 @@ def test_aggregate_tree_schema_pairs_only_registered_downstream_metrics(tmp_path
 
     payload = aggregate_manifest(manifest, bootstrap_samples=0)
 
-    assert payload["sample_rows"] == 6
-    assert payload["efficiency_rows"] == 4
+    assert payload["schema_version"] == 3
+    assert payload["sample_rows"] == 3 * seed_count
+    assert payload["efficiency_rows"] == 2 * seed_count
     assert payload["metric_groups"] == 3
     assert payload["paired_groups"] == 1
-    assert payload["ignored_numeric_fields"] == payload["numeric_fields_seen"] - 10
+    assert payload["ignored_numeric_fields"] == payload["numeric_fields_seen"] - 5 * seed_count
+    assert "not confidence intervals" in payload["uncertainty_policy"]["bootstrap_disabled"]
+    for filename in ("metrics.csv", "paired.csv"):
+        with (tmp_path / "aggregate" / filename).open(encoding="utf-8", newline="") as stream:
+            summaries = list(csv.DictReader(stream))
+        for row in summaries:
+            assert int(row["n"]) == seed_count
+            if seed_count == 1:
+                assert row["uncertainty_status"] == "insufficient_samples"
+                for key in ("sample_std", "bootstrap_95_low", "bootstrap_95_high"):
+                    assert row[key] == ""
+                if filename == "paired.csv":
+                    assert row["effect_size"] == ""
+            else:
+                assert row["uncertainty_status"] == "bootstrap_disabled"
+                assert row["sample_std"] != ""
+                assert row["bootstrap_95_low"] == row["bootstrap_95_high"] == row["mean"]
+                if filename == "paired.csv":
+                    assert float(row["effect_size"]) == pytest.approx(
+                        float(row["mean"]) / float(row["sample_std"])
+                    )
     with (tmp_path / "aggregate" / "samples.csv").open(encoding="utf-8", newline="") as stream:
         samples = list(csv.DictReader(stream))
     assert all("history" not in row["metric"] for row in samples)
     assert all("runtime" not in row["metric"] for row in samples)
     assert all("settings" not in row["metric"] for row in samples)
     improvements = [row for row in samples if row["metric_rule"] == "tree.precomputed_improvement"]
-    assert len(improvements) == 2
+    assert len(improvements) == seed_count
     assert all(row["pairable"] == "False" for row in improvements)
     with (tmp_path / "aggregate" / "efficiency.csv").open(encoding="utf-8", newline="") as stream:
         efficiency = list(csv.DictReader(stream))
@@ -22676,6 +28031,303 @@ def test_orientation_flips_preserve_physical_relations(B):
     np.testing.assert_allclose(F_flipped @ a, flip_edge_quantity(F @ a, signs))
 ````
 
+# tests/test_benchmark_speed.py
+
+````python
+"""Performance-tool contracts using unit tensors/mocks, never a speed experiment."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from scripts import benchmark_speed as speed
+
+
+def test_help_needs_no_site_packages_or_gpu():
+    result = subprocess.run(
+        [sys.executable, "-S", str(Path(speed.__file__)), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "--include-compile" in result.stdout
+    assert "--track" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("track", "dataset", "batch_size"),
+    [("conductance_gat", "cora", 2), ("cycle_pe_v2", "zinc12k", 32)],
+)
+def test_defaults_resolve_to_official_data_and_no_compile(track, dataset, batch_size):
+    args = speed.build_parser().parse_args(["--track", track])
+    speed._validate(args)
+    assert args.dataset == dataset and args.batch_size == batch_size
+    assert args.steps == 20 and args.warmup == 5 and not args.include_compile
+    assert args.data_root == speed.ROOT / "data/paper"
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--device", "cpu"],
+        ["--dataset", "toy"],
+        ["--steps", "0"],
+        ["--warmup", "0"],
+        ["--batch-size", "0"],
+        ["--seed", "-1"],
+    ],
+)
+def test_invalid_request_fails_before_artifacts(tmp_path, extra):
+    output = tmp_path / "run"
+    with pytest.raises(SystemExit) as caught:
+        speed.main(["--track", "conductance_gat", "--output-dir", str(output), *extra])
+    assert caught.value.code == 2
+    assert not output.exists()
+
+
+def test_cpu_gpu_absence_has_no_fallback(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="no CPU"):
+        speed._require_cuda("cuda")
+
+
+@pytest.mark.parametrize(("requested", "resolved"), [("cuda", "cuda:2"), ("cuda:1", "cuda:1")])
+def test_cuda_device_resolves_index_and_sets_event_device(monkeypatch, requested, resolved):
+    selected = []
+    checked = []
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda device: selected.append(str(device)))
+    monkeypatch.setattr(
+        torch.cuda, "get_device_properties", lambda device: checked.append(str(device))
+    )
+    assert str(speed._require_cuda(requested)) == resolved
+    assert selected == checked == [resolved]
+
+
+@pytest.mark.parametrize("existing_report", [True, False])
+def test_existing_output_even_empty_is_not_overwritten(tmp_path, existing_report):
+    output = tmp_path / "owned"
+    output.mkdir()
+    if existing_report:
+        (output / "report.json").write_text("existing report", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        speed.main(["--track", "conductance_gat", "--output-dir", str(output)])
+    if existing_report:
+        assert (output / "report.json").read_text(encoding="utf-8") == "existing report"
+    else:
+        assert list(output.iterdir()) == []
+
+
+def test_execution_error_writes_failed_report_not_success(monkeypatch, tmp_path):
+    def fail(*args):
+        raise RuntimeError("unit-mocked compiler error")
+
+    monkeypatch.setattr(speed, "_execute", fail)
+    output = tmp_path / "failed"
+    assert (
+        speed.main(
+            [
+                "--track",
+                "cycle_pe_v2",
+                "--include-compile",
+                "--output-dir",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert "compiler error" in report["error"]
+    assert report["variants"] == []
+    assert report["controls"]["optimizer_steps"] == 0
+    with (output / "summary.csv").open(newline="", encoding="utf-8") as stream:
+        assert list(csv.DictReader(stream)) == []
+
+
+def test_partial_results_stay_failed_on_optional_compile_error(monkeypatch, tmp_path):
+    def fail_after_reference(args, report, output):
+        report["variants"].append({"variant": "reference", "measured_steps": 0})
+        report["active_variant"] = "compiled"
+        raise RuntimeError("unit-mocked optional compile failure")
+
+    monkeypatch.setattr(speed, "_execute", fail_after_reference)
+    output = tmp_path / "partial"
+    assert (
+        speed.main(
+            [
+                "--track",
+                "conductance_gat",
+                "--include-compile",
+                "--output-dir",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["active_variant"] == "compiled"
+    assert report["variants"][0]["variant"] == "reference"
+
+
+def _unit_case():
+    batch = torch.tensor([[0.1, 0.2], [0.3, 0.4]])
+    return speed.SpeedCase(
+        batch=batch,
+        make_model=lambda _: torch.nn.Linear(2, 1),
+        objective=lambda prediction: prediction.square().mean(),
+        protocol={},
+        description={},
+        comparison_scope="unit tensor only",
+    )
+
+
+def test_probe_checks_forward_and_every_gradient_without_updating_parameters():
+    torch.manual_seed(7)
+    case = _unit_case()
+    model = case.make_model("reference")
+    other = copy.deepcopy(model)
+    initial = {key: value.clone() for key, value in model.state_dict().items()}
+    reference, candidate = speed._probe(model, case), speed._probe(other, case)
+    result = speed._compare_probes(reference, candidate)
+    assert result["passed"] and result["parameter_gradients_compared"] == 2
+    assert result["prediction_max_abs_error"] == result["gradient_max_abs_error"] == 0
+    for key, value in model.state_dict().items():
+        assert torch.equal(initial[key], value)
+    assert all(parameter.grad is None for parameter in model.parameters())
+
+
+def test_correctness_mismatch_stops_before_performance_acceptance():
+    case = _unit_case()
+    model = case.make_model("reference")
+    reference = speed._probe(model, case)
+    candidate = copy.deepcopy(reference)
+    candidate["gradients"]["weight"].add_(1)
+    with pytest.raises(AssertionError, match="gradient"):
+        speed._compare_probes(reference, candidate)
+    candidate = copy.deepcopy(reference)
+    candidate["gradients"]["weight"] = None
+    with pytest.raises(AssertionError, match="participation"):
+        speed._compare_probes(reference, candidate)
+
+
+def test_nonfinite_probe_fails_closed():
+    case = _unit_case()
+    model = case.make_model("reference")
+    with torch.no_grad():
+        model.weight.fill_(float("nan"))
+    with pytest.raises(FloatingPointError):
+        speed._probe(model, case)
+
+
+def test_conductance_builder_uses_offline_loader_and_only_training_indices(monkeypatch, tmp_path):
+    from research.conductance_gat import benchmark, benchmark_data
+
+    seen = {}
+    graph = SimpleNamespace(
+        x=torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+        y=torch.tensor([0, 1, 0]),
+        incidence_edge_index=torch.tensor([[0, 1], [1, 2]]),
+    )
+
+    def load(dataset, root, *, allow_download):
+        seen.update(dataset=dataset, root=root, allow_download=allow_download)
+        return {"classes": 2}, {"source": "unit mocked official-loader contract"}
+
+    monkeypatch.setattr(benchmark_data, "load_dataset", load)
+    monkeypatch.setattr(
+        benchmark,
+        "_make_loaders",
+        lambda *args: (graph, {"train": torch.tensor([0]), "test": torch.tensor([1, 2])}),
+    )
+    args = argparse.Namespace(dataset="cora", data_root=tmp_path, seed=0, batch_size=2)
+    case = speed._build_conductance_case(args, torch.device("cpu"))
+    assert seen == {"dataset": "cora", "root": tmp_path, "allow_download": False}
+    prediction = torch.tensor([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    expected = torch.nn.functional.cross_entropy(prediction[:1], graph.y[:1])
+    assert torch.equal(case.objective(prediction), expected)
+    graph.y[1:] = 0
+    assert torch.equal(case.objective(prediction), expected)
+    reference = case.make_model("reference")
+    optimized = case.make_model("optimized")
+    optimized.load_state_dict(reference.state_dict())
+    comparison = speed._compare_probes(speed._probe(reference, case), speed._probe(optimized, case))
+    assert comparison["passed"]
+
+
+def test_cycle_builder_selects_train_only_and_no_download(monkeypatch, tmp_path):
+    from research.cycle_pe.v2 import data
+
+    seen = {}
+    train_graphs = [object(), object(), object()]
+    batch = SimpleNamespace(
+        x=torch.zeros(4, 1, dtype=torch.long),
+        edge_index=torch.tensor([[0, 1], [1, 2]]),
+        cycle_bases=(torch.ones(2, 1),),
+        y=torch.zeros(1, 1),
+    )
+    batch.to = lambda _: batch
+
+    def load(root, dataset, *, allow_download):
+        seen.update(root=root, dataset=dataset, allow_download=allow_download)
+        return {"train": train_graphs, "validation": object(), "test": object()}, {}
+
+    def collate(graphs):
+        seen["selected"] = graphs
+        return batch
+
+    monkeypatch.setattr(data, "load_benchmark", load)
+    monkeypatch.setattr(data, "collate", collate)
+    args = argparse.Namespace(dataset="zinc12k", data_root=tmp_path, batch_size=1)
+    case = speed._build_cycle_case(args, torch.device("cpu"))
+    assert seen["allow_download"] is False and seen["selected"] == train_graphs[:1]
+    assert case.description["basis_pairs"] == 2
+    assert case.make_model("reference").basis_execution == "reference"
+    assert case.make_model("optimized").basis_execution == "batched"
+
+
+def test_shell_wrapper_uses_conda_and_has_no_install_or_download_step():
+    content = (speed.ROOT / "scripts/benchmark_speed.sh").read_text(encoding="utf-8")
+    assert 'source "${project_root}/scripts/conda_env.sh"' in content
+    assert "--help|-h) inspection_only=1" in content
+    assert 'if [[ "${inspection_only}" == "0" ]]' in content
+    assert 'scripts/check_dependencies.py" --quiet' in content
+    assert "setup_gpu.sh" not in content and "pip install" not in content
+    assert 'exec "${environment_python}" scripts/benchmark_speed.py "$@"' in content
+
+
+@pytest.mark.parametrize("track", ["conductance_gat", "cycle_pe_v2"])
+def test_report_source_hashes_include_execution_and_active_model(track):
+    hashes = speed._implementation_hashes(track)
+    assert {
+        "scripts/benchmark_speed.py",
+        "scripts/benchmark_speed.sh",
+        "src/chartgat/execution.py",
+    } <= hashes.keys()
+    model_file = (
+        "research/conductance_gat/sparse.py"
+        if track == "conductance_gat"
+        else "research/cycle_pe/v2/model.py"
+    )
+    assert model_file in hashes
+    for name, digest in hashes.items():
+        assert digest == hashlib.sha256((speed.ROOT / name).read_bytes()).hexdigest()
+````
+
 # tests/test_cache_io.py
 
 ````python
@@ -22712,6 +28364,192 @@ def test_atomic_write_validates_then_replaces(tmp_path: Path) -> None:
         validator=lambda temporary: temporary.read_bytes() == b"new" or None,
     )
     assert destination.read_bytes() == b"new"
+````
+
+# tests/test_compile_blocks.py
+
+````python
+"""Dynamo graph-unit tests using CPU tensors and a counted eager graph backend.
+
+These check compilation boundaries and autograd equivalence, not CUDA/Inductor
+performance or research training. No optimizer or public dataset is used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+from collections import Counter
+
+import pytest
+import torch
+import torch._dynamo
+
+from chartgat.execution import configure_execution
+from research.cycle_pe.v2.data import Graph, collate
+from research.cycle_pe.v2.model import CycleBasisPEModel, LeftNullBasisEncoder
+
+
+@pytest.fixture
+def fresh_dynamo_cache():
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
+
+
+def _configure_counted_cpu_blocks(model, monkeypatch):
+    """Exercise production target selection, replacing only its hardware/backend."""
+    counts = Counter()
+    executions = Counter()
+    active_module = [None]
+    module_names = {id(module): name for name, module in model.named_modules()}
+    original_compile = torch.compile
+    state_keys = tuple(model.state_dict())
+
+    def backend(graph_module, example_inputs):
+        counts[active_module[0]] += 1
+
+        def execute_graph(*args):
+            executions[active_module[0]] += 1
+            return graph_module.forward(*args)
+
+        return execute_graph
+
+    def record_module(module, args):
+        active_module[0] = module_names[id(module)]
+
+    def counted_compile(function, **kwargs):
+        assert kwargs == {"backend": "inductor", "dynamic": True}
+        assert function.__name__ == "forward"
+        module = function.__self__
+        # Reuse one backend like production's shared Inductor backend. Creating
+        # a separate callable per block would itself cause BACKEND_MATCH guards.
+        module.register_forward_pre_hook(record_module)
+        return original_compile(function, backend=backend, dynamic=True)
+
+    # Restore the real hardware predicate before any model execution. Only the
+    # configuration guard is stubbed; all inputs/modules remain on the CPU.
+    with monkeypatch.context() as context:
+        context.setattr(torch.cuda, "is_available", lambda: True)
+        context.setattr(torch, "compile", counted_compile)
+        report = configure_execution(model, argparse.Namespace(compile=True), "cuda")
+    assert report["scope"] == "tensor_mlp_blocks"
+    assert tuple(model.state_dict()) == state_keys
+    assert model._compiled_call_impl is None
+    assert all(
+        isinstance(model.get_submodule(name), torch.nn.Sequential)
+        for name in report["compiled_modules"]
+    )
+    return counts, executions, report
+
+
+def _compare_parameter_gradients(actual, reference):
+    parameters = dict(actual.named_parameters())
+    expected = dict(reference.named_parameters())
+    assert parameters.keys() == expected.keys()
+    for name, parameter in parameters.items():
+        expected_gradient = expected[name].grad
+        assert (parameter.grad is None) == (expected_gradient is None), name
+        if expected_gradient is not None:
+            torch.testing.assert_close(parameter.grad, expected_gradient, atol=3e-6, rtol=3e-5)
+
+
+@pytest.mark.usefixtures("fresh_dynamo_cache")
+def test_compiled_basis_mlp_blocks_keep_ten_ragged_shapes_outside_dynamo(monkeypatch, caplog):
+    torch.manual_seed(601)
+    reference = LeftNullBasisEncoder(3, 4, column_chunk_size=2)
+    model = copy.deepcopy(reference)
+    counts, executions, report = _configure_counted_cpu_blocks(model, monkeypatch)
+    assert set(report["compiled_modules"]) == {"column_phi", "edge_psi", "output"}
+    assert not counts  # Module.compile is lazy.
+    middle_counts = None
+    for edge_count in range(4, 14):
+        model.zero_grad(set_to_none=True)
+        reference.zero_grad(set_to_none=True)
+        bond = torch.randn(edge_count + 3, 3, requires_grad=True)
+        reference_bond = bond.detach().clone().requires_grad_(True)
+        bases = (
+            torch.randn(edge_count, 2, requires_grad=True),
+            torch.randn(3, 1, requires_grad=True),
+        )
+        reference_bases = tuple(basis.detach().clone().requires_grad_(True) for basis in bases)
+        actual = model.forward_batch(bond, bases, pair_budget=5)
+        expected = reference.forward_batch(reference_bond, reference_bases, pair_budget=5)
+        torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+        weights = torch.randn_like(actual)
+        (actual.square() * weights).sum().backward()
+        (expected.square() * weights).sum().backward()
+        torch.testing.assert_close(bond.grad, reference_bond.grad, atol=3e-6, rtol=3e-5)
+        for basis, reference_basis in zip(bases, reference_bases, strict=True):
+            torch.testing.assert_close(basis.grad, reference_basis.grad, atol=3e-6, rtol=3e-5)
+        _compare_parameter_gradients(model, reference)
+        if edge_count == 8:
+            middle_counts = counts.copy()
+    # Varying the ragged Python pair scheduler no longer compiles the complete
+    # encoder for each shape. Size-one dimensions may have a separate graph.
+    assert counts == middle_counts
+    assert counts
+    assert set(executions) == set(report["compiled_modules"])
+    assert all(count <= 3 for count in counts.values()), counts
+    assert "hit config.recompile_limit" not in caplog.text
+    reference.load_state_dict(model.state_dict(), strict=True)
+
+
+def _cycle_graph(nodes: int) -> Graph:
+    edges = [(node, node + 1) for node in range(nodes - 1)] + [(0, nodes - 1)]
+    basis = torch.ones(nodes, 1) / nodes**0.5
+    basis[-1] = -basis[-1]
+    return Graph(
+        x=torch.randint(28, (nodes, 1)),
+        edge_index=torch.tensor(edges, dtype=torch.long).T,
+        edge_attr=torch.randint(4, (nodes, 1)),
+        y=torch.zeros(1),
+        cycle_basis=basis,
+    )
+
+
+@pytest.mark.usefixtures("fresh_dynamo_cache")
+def test_compiled_full_model_blocks_preserve_forward_backward_and_empty_graphs(monkeypatch):
+    torch.manual_seed(702)
+    reference = CycleBasisPEModel(
+        dataset="zinc12k", hidden=6, pe_dim=4, layers=2, basis_pair_budget=5
+    )
+    model = copy.deepcopy(reference)
+    counts, executions, report = _configure_counted_cpu_blocks(model, monkeypatch)
+    assert "pe_encoder.column_phi" in report["compiled_modules"]
+    assert "layers.0.message" in report["compiled_modules"]
+    assert "graph_trunk" in report["compiled_modules"]
+    assert "pe_encoder" not in report["compiled_modules"]
+    assert "layers.0" not in report["compiled_modules"]
+    forest = Graph(
+        x=torch.tensor([[1], [2]]),
+        edge_index=torch.tensor([[0], [1]]),
+        edge_attr=torch.tensor([[0]]),
+        y=torch.zeros(1),
+        cycle_basis=torch.empty(1, 0),
+    )
+    edgeless = Graph(
+        x=torch.tensor([[3]]),
+        edge_index=torch.empty(2, 0, dtype=torch.long),
+        edge_attr=torch.empty(0, 1, dtype=torch.long),
+        y=torch.zeros(1),
+        cycle_basis=torch.empty(0, 0),
+    )
+    for nodes in (4, 7):
+        model.zero_grad(set_to_none=True)
+        reference.zero_grad(set_to_none=True)
+        batch = collate([_cycle_graph(nodes), forest, edgeless])
+        actual = model(batch)
+        expected = reference(batch)
+        torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+        weights = torch.randn_like(actual)
+        (actual.square() * weights).sum().backward()
+        (expected.square() * weights).sum().backward()
+        _compare_parameter_gradients(model, reference)
+    assert counts
+    assert set(executions) == set(report["compiled_modules"])
+    assert all(count <= 3 for count in counts.values()), counts
+    reference.load_state_dict(model.state_dict(), strict=True)
 ````
 
 # tests/test_conda_env.py
@@ -23400,6 +29238,893 @@ def test_training_help_and_dry_run_never_bootstrap_dependencies(
     ]
 ````
 
+# tests/test_conductance_gate_audit.py
+
+````python
+"""Exact small-graph math checks, never research training or CUDA fallbacks."""
+
+from __future__ import annotations
+
+import copy
+import importlib
+import json
+from types import SimpleNamespace
+
+import pytest
+
+
+@pytest.fixture
+def torch():
+    return pytest.importorskip("torch")
+
+
+@pytest.fixture
+def audit():
+    return importlib.import_module("scripts.conductance_gate_audit")
+
+
+def _fixture(torch, *, dropout=0.4, empty_edges=False):
+    from research.conductance_gat.benchmark import ConductanceNodeClassifier
+
+    with torch.random.fork_rng():
+        torch.manual_seed(73)
+        model = ConductanceNodeClassifier(3, 3, hidden_channels=4, layers=2, dropout=dropout)
+        x = torch.randn(6, 3)
+    edges = torch.tensor([[0, 1, 2, 0, 3, 4], [1, 2, 3, 3, 4, 5]])
+    if empty_edges:
+        edges = torch.empty((2, 0), dtype=torch.long)
+    raw = {"x": x, "y": torch.tensor([0, 1, 2, 0, 1, 2]), "incidence_edge_index": edges}
+    payload = {
+        "dataset": "cora",
+        "classes": 3,
+        "graphs": [raw],
+        "splits": {
+            "train": torch.tensor([True, True, False, False, False, False]),
+            "validation": torch.tensor([False, False, True, True, False, False]),
+            "test": torch.tensor([False, False, False, False, True, True]),
+        },
+    }
+    return model, payload
+
+
+def _snapshot(torch, model):
+    return (
+        {name: value.detach().clone() for name, value in model.state_dict().items()},
+        [module.training for module in model.modules()],
+        [
+            (parameter.grad, None if parameter.grad is None else parameter.grad.clone())
+            for parameter in model.parameters()
+        ],
+        torch.get_rng_state().clone(),
+        [
+            (len(module._forward_hooks), len(module._forward_pre_hooks))
+            for module in model.modules()
+        ],
+    )
+
+
+def _assert_unchanged(torch, model, before):
+    state, modes, grads, rng, hooks = before
+    assert modes == [module.training for module in model.modules()]
+    assert hooks == [
+        (len(module._forward_hooks), len(module._forward_pre_hooks)) for module in model.modules()
+    ]
+    for name, value in model.state_dict().items():
+        assert torch.equal(value, state[name])
+    for parameter, (reference, value) in zip(model.parameters(), grads, strict=True):
+        assert parameter.grad is reference
+        if value is not None:
+            assert torch.equal(parameter.grad, value)
+    assert torch.equal(torch.get_rng_state(), rng)
+
+
+def test_exact_train_gradient_and_raw_logit_gradient(audit, torch):
+    model, payload = _fixture(torch)
+    model.eval()
+    raw_outputs = []
+
+    def capture(_module, _inputs, output):
+        output.retain_grad()
+        raw_outputs.append(output)
+
+    handles = [
+        operator.estimator.network[4].register_forward_hook(capture) for operator in model.operators
+    ]
+    graph = SimpleNamespace(
+        **{key: value for key, value in payload["graphs"][0].items() if key != "y"}
+    )
+    logits = model(graph)
+    mask = payload["splits"]["train"]
+    loss = torch.nn.functional.cross_entropy(logits[mask], payload["graphs"][0]["y"][mask])
+    parameters = list(model.parameters())
+    expected_gradients = torch.autograd.grad(loss, parameters)
+    for handle in handles:
+        handle.remove()
+    report = audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005)
+    assert report["label_scope"] == "train_only"
+    assert report["loss"]["value"] == pytest.approx(float(loss.detach()))
+    for (name, parameter), expected in zip(
+        model.named_parameters(), expected_gradients, strict=True
+    ):
+        record = report["parameters"][name]
+        norm = float(expected.double().norm())
+        assert record["task_gradient"]["l2_norm"] == pytest.approx(norm, abs=1e-12)
+        assert record["weight_decay_term_norm"] == pytest.approx(
+            0.0005 * float(parameter.detach().double().norm())
+        )
+    for layer, raw in zip(report["layers"], raw_outputs, strict=True):
+        moments = layer["tensors"]["raw_logit_gradient"]["all_element_moments"]
+        assert moments["l2_norm"] == pytest.approx(float(raw.grad.double().norm()))
+        assert layer["tensors"]["raw_logit_gradient"]["observed_elements"] == raw.numel()
+    json.dumps(report, allow_nan=False)
+
+
+def test_never_reads_held_out_node_labels(audit, torch):
+    model, payload = _fixture(torch)
+    first = audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.01)
+    poisoned = copy.deepcopy(payload)
+    poisoned["graphs"][0]["y"][~poisoned["splits"]["train"]] = -999999
+    second = audit.audit_gate_gradients(model, poisoned, "cpu", weight_decay=0.01)
+    assert first == second
+
+
+@pytest.mark.parametrize("mode", ["eval", "train"])
+def test_restores_modes_existing_grads_rng_buffers_and_hooks(audit, torch, mode):
+    model, payload = _fixture(torch)
+    model.train()
+    model.operators[0].eval()
+    model.register_buffer("audit_buffer", torch.tensor([3.0]))
+    for index, parameter in enumerate(model.parameters()):
+        parameter.grad = torch.full_like(parameter, 2.0) if index % 2 else None
+    before = _snapshot(torch, model)
+    result = audit.audit_gate_gradients(
+        model, payload, "cpu", weight_decay=0.0005, mode=mode, rng_seed=17
+    )
+    _assert_unchanged(torch, model, before)
+    again = audit.audit_gate_gradients(
+        model, payload, "cpu", weight_decay=0.0005, mode=mode, rng_seed=17
+    )
+    assert result == again
+    _assert_unchanged(torch, model, before)
+
+
+def test_failure_removes_hooks_and_restores_state(audit, torch, monkeypatch):
+    model, payload = _fixture(torch)
+    model.train()
+    model.operators[0].eval()
+    before = _snapshot(torch, model)
+
+    def fail(_input):
+        raise RuntimeError("forced decoder failure")
+
+    monkeypatch.setattr(model.decoder, "forward", fail)
+    with pytest.raises(RuntimeError, match="forced decoder"):
+        audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005, mode="train")
+    _assert_unchanged(torch, model, before)
+
+
+def test_partial_hook_install_failure_is_cleaned(audit, torch):
+    model, payload = _fixture(torch)
+    model.operators[1].estimator.mode = "gradient_only"
+    before = _snapshot(torch, model)
+    with pytest.raises(ValueError, match="full"):
+        audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005)
+    _assert_unchanged(torch, model, before)
+
+
+def test_buffer_mutation_and_failure_after_gradients_are_restored(audit, torch, monkeypatch):
+    model, payload = _fixture(torch)
+    model.register_buffer("counter", torch.tensor(0))
+    original_forward = model.forward
+
+    def changing_forward(graph):
+        model.counter.add_(1)
+        return original_forward(graph)
+
+    monkeypatch.setattr(model, "forward", changing_forward)
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    before = _snapshot(torch, model)
+    audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005, mode="train")
+    _assert_unchanged(torch, model, before)
+
+    def fail_report(*_args, **_kwargs):
+        raise RuntimeError("report failure after gradient computation")
+
+    monkeypatch.setattr(audit, "_parameter_report", fail_report)
+    with pytest.raises(RuntimeError, match="after gradient"):
+        audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005, mode="train")
+    _assert_unchanged(torch, model, before)
+
+
+def test_nonfinite_forward_is_rejected_with_hooks_removed(audit, torch):
+    model, payload = _fixture(torch)
+    payload["graphs"][0]["x"][0, 0] = float("nan")
+    before = _snapshot(torch, model)
+    with pytest.raises(FloatingPointError, match="nonfinite"):
+        audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005)
+    _assert_unchanged(torch, model, before)
+
+
+def test_audit_enables_autograd_inside_outer_inference_context(audit, torch):
+    model, payload = _fixture(torch)
+    with torch.inference_mode():
+        report = audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005)
+    assert report["parameters"]["decoder.weight"]["task_gradient"]["l2_norm"] > 0
+
+
+def test_zero_gates_and_empty_edges_stay_json_finite(audit, torch):
+    model, payload = _fixture(torch, empty_edges=True)
+    with torch.no_grad():
+        for operator in model.operators:
+            for parameter in operator.estimator.parameters():
+                parameter.zero_()
+    report = audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0)
+    json.dumps(report, allow_nan=False)
+    for layer in report["layers"]:
+        for statistic in layer["tensors"].values():
+            assert statistic["observed_elements"] == 0
+            assert statistic["all_element_moments"] is None
+            assert statistic["quantile_sample"]["sample_count"] == 0
+    for name, record in report["parameters"].items():
+        assert record["task_decay_cosine"] is None
+        if ".estimator." in name:
+            assert record["parameter"]["l2_norm"] == 0
+            assert record["parameter"]["zero_fraction"] == 1
+
+
+def test_frozen_parameter_reports_missing_not_zero_gradient(audit, torch):
+    model, payload = _fixture(torch)
+    parameter = model.operators[0].estimator.network[0].weight
+    parameter.requires_grad_(False)
+    report = audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005)
+    record = report["parameters"]["operators.0.estimator.network.0.weight"]
+    assert record["requires_grad"] is False
+    assert record["task_gradient"] == {"is_none": True, "l2_norm": None, "max_absolute": None}
+    assert record["task_to_decay_norm_ratio"] is None
+
+
+def _ppi_fixture(torch):
+    model, _ = _fixture(torch)
+    graphs = []
+    for index, nodes in enumerate([3, 5, 2, 4, 3]):
+        x = torch.arange(nodes * 3, dtype=torch.float32).reshape(nodes, 3) / 10 + index
+        y = (torch.arange(nodes * 3).reshape(nodes, 3) % 2).float()
+        edges = torch.stack((torch.arange(nodes - 1), torch.arange(1, nodes)))
+        graphs.append({"x": x, "y": y, "incidence_edge_index": edges})
+    return model, {
+        "dataset": "ppi",
+        "classes": 3,
+        "graphs": graphs,
+        "splits": {"train": [0, 1, 2], "validation": [3], "test": [4]},
+    }
+
+
+def test_ppi_packed_batch_and_label_weighted_multi_batch_gradient(audit, torch):
+    model, payload = _ppi_fixture(torch)
+    model.eval()
+    graph, labels = audit._pack_ppi_graphs(payload["graphs"], [0, 1, 2], "cpu")
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(model(graph), labels)
+    expected = torch.autograd.grad(loss, tuple(model.parameters()))
+    report = audit.audit_gate_gradients(
+        model, payload, "cpu", weight_decay=0.0005, ppi_batches=2, ppi_batch_size=2
+    )
+    assert [batch["graph_indices"] for batch in report["batches"]] == [[0, 1], [2]]
+    assert report["loss"]["train_label_elements"] == 30
+    assert report["loss"]["value"] == pytest.approx(float(loss.detach()))
+    assert [batch["objective_weight"] for batch in report["batches"]] == [0.8, 0.2]
+    for (name, _), gradient in zip(model.named_parameters(), expected, strict=True):
+        assert report["parameters"][name]["task_gradient"]["l2_norm"] == pytest.approx(
+            float(gradient.double().norm()), rel=2e-5, abs=1e-8
+        )
+
+
+def test_ppi_default_uses_one_train_batch_and_never_held_out_graphs(audit, torch):
+    model, payload = _ppi_fixture(torch)
+    first = audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005)
+    assert [batch["graph_indices"] for batch in first["batches"]] == [[0, 1]]
+    payload["graphs"][2]["x"].fill_(float("nan"))
+    for index in [3, 4]:
+        payload["graphs"][index]["x"].fill_(float("nan"))
+        payload["graphs"][index]["y"].fill_(float("nan"))
+    second = audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005)
+    assert first == second
+
+
+def test_rejects_overlapping_train_splits(audit, torch):
+    model, payload = _fixture(torch)
+    payload["splits"]["test"][0] = True
+    with pytest.raises(ValueError, match="overlaps"):
+        audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005)
+    model, payload = _ppi_fixture(torch)
+    payload["splits"]["test"].append(0)
+    with pytest.raises(ValueError, match="disjoint"):
+        audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005)
+
+
+def test_streaming_stats_are_exact_but_quantiles_explicitly_sampled(audit, torch):
+    statistic = audit._StreamingDistribution(expected_count=24, sample_limit=5, near_zero=1e-8)
+    first = torch.arange(24, dtype=torch.float32).reshape(4, 6)[:, ::2]
+    second = first + 100
+    statistic.append(first)
+    statistic.append(second)
+    expected = torch.cat((first.reshape(-1), second.reshape(-1))).double()
+    report = statistic.report()
+    moments = report["all_element_moments"]
+    assert report["observed_elements"] == 24
+    assert report["observed_calls"] == 2
+    assert moments["mean"] == pytest.approx(float(expected.mean()))
+    assert moments["std_population"] == pytest.approx(float(expected.std(correction=0)))
+    assert moments["l2_norm"] == pytest.approx(float(expected.norm()))
+    assert moments["min"] == 0
+    assert moments["max"] == 122
+    sample = report["quantile_sample"]
+    assert sample["sample_count"] == sample["sample_limit"] == 5
+    positions = torch.tensor([2, 7, 12, 16, 21])
+    expected_quantiles = torch.quantile(
+        expected[positions], torch.tensor([0, 0.1, 0.5, 0.9, 1], dtype=torch.float64)
+    ).tolist()
+    assert list(sample["quantiles"].values()) == pytest.approx(expected_quantiles)
+
+
+def test_actual_hooks_capture_input_feature_halves(audit, torch):
+    model, payload = _fixture(torch)
+    report = audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005)
+    layer = report["layers"][0]["tensors"]
+    assert layer["input_abs_bh"]["observed_elements"] == 24
+    assert layer["input_squared_bh"]["observed_elements"] == 24
+    assert layer["linear_0_input"]["observed_elements"] == 48
+    assert layer["input_abs_bh"]["all_element_moments"]["min"] >= 0
+    abs_norm = layer["input_abs_bh"]["all_element_moments"]["l2_norm"]
+    squared_mean = layer["input_squared_bh"]["all_element_moments"]["mean"]
+    assert abs_norm**2 / 24 == pytest.approx(squared_mean, rel=1e-6)
+
+
+def test_audit_does_not_construct_any_optimizer(audit, torch, monkeypatch):
+    model, payload = _fixture(torch)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("gradient audit must not instantiate or step an optimizer")
+
+    monkeypatch.setattr(torch.optim.Adam, "__init__", forbidden)
+    monkeypatch.setattr(torch.optim.Adam, "step", forbidden)
+    audit.audit_gate_gradients(model, payload, "cpu", weight_decay=0.0005)
+
+
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"mode": "bad"},
+        {"ppi_batches": 0},
+        {"ppi_batch_size": 0},
+        {"sample_limit": 0},
+        {"near_zero": -1},
+        {"near_zero": float("nan")},
+        {"weight_decay": -1},
+    ],
+)
+def test_invalid_controls_fail_without_changes(audit, torch, controls):
+    model, payload = _fixture(torch)
+    before = _snapshot(torch, model)
+    kwargs = {"weight_decay": 0.0005, **controls}
+    with pytest.raises(ValueError):
+        audit.audit_gate_gradients(model, payload, "cpu", **kwargs)
+    _assert_unchanged(torch, model, before)
+````
+
+# tests/test_conductance_interventions.py
+
+````python
+"""Unit-only math/cleanup fixtures for validation C interventions; no training."""
+
+from __future__ import annotations
+
+import importlib
+import json
+from types import SimpleNamespace
+
+import pytest
+
+
+@pytest.fixture
+def torch():
+    return pytest.importorskip("torch")
+
+
+@pytest.fixture
+def interventions():
+    return importlib.import_module("scripts.conductance_interventions")
+
+
+def _model(torch, layers=2):
+    from research.conductance_gat.benchmark import ConductanceConv
+
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.operators = torch.nn.ModuleList([ConductanceConv(2) for _ in range(layers)])
+            self.seen_training = []
+
+        def forward(self, graph):
+            assert not hasattr(graph, "y"), "Inference model must not receive held-out labels"
+            self.seen_training.append(self.training)
+            h = graph.x
+            batch = torch.zeros(len(h), dtype=torch.long, device=h.device)
+            for operator in self.operators:
+                # Public legacy model API has exactly three positional inputs.
+                h = operator(h, graph.incidence_edge_index, batch)
+            return h
+
+    return Model()
+
+
+def _payload(torch):
+    return {
+        "dataset": "cora",
+        "classes": 2,
+        "graphs": [
+            {
+                "x": torch.tensor([[2.0, -1.0], [-1.0, 0.2], [0.5, 3.0], [3.0, -2.0]]),
+                # Invalid train/test labels will break CE if ever evaluated.
+                "y": torch.tensor([-999, 0, 1, -999]),
+                "incidence_edge_index": torch.tensor([[0, 1, 1], [1, 2, 3]]),
+            }
+        ],
+        "splits": {
+            "train": None,
+            "validation": torch.tensor([False, True, True, False]),
+            "test": None,
+        },
+    }
+
+
+def _fixed_gate(torch, model, value=2.0):
+    for operator in model.operators:
+        operator.estimator.forward = lambda gradient, _edge_features: gradient.new_full(
+            (len(gradient),), value
+        )
+
+
+def _variable_gate(model):
+    for operator in model.operators:
+        operator.estimator.forward = lambda gradient, _edge_features: gradient[:, 0].abs() + 0.3
+
+
+def _variants(result):
+    return {row["name"]: row for row in result["variants"]}
+
+
+def test_validation_only_constant_c_matches_learned_and_reports_all_variants(interventions, torch):
+    model, payload = _model(torch), _payload(torch)
+    _fixed_gate(torch, model)
+    progress = []
+    result = interventions.evaluate_interventions(
+        model, payload, "cpu", edge_chunk_size=1, progress=progress.append
+    )
+    json.dumps(result, allow_nan=False)
+    rows = _variants(result)
+    assert result["split"] == "validation"
+    assert len(rows) == 10
+    assert progress == list(rows)
+    for name, row in rows.items():
+        assert row["prediction"]["count"] == 2
+        if name.startswith(("learned_C", "mean_C", "shuffled_C")):
+            assert row["delta_vs_learned"]["metric"] == 0
+            assert row["delta_vs_learned"]["loss"] == pytest.approx(0, abs=1e-6)
+            assert row["delta_vs_learned"]["logits_relative_l2"] == pytest.approx(0, abs=1e-6)
+            assert row["delta_vs_learned"]["prediction_flip_fraction"] == 0
+    for layer in rows["graph_off_all"]["layers"]:
+        assert layer["edge_pooled"]["conductance"]["mean"] == 0
+        assert layer["edge_pooled"]["conductance"]["count"] == 3
+        assert layer["edge_pooled"]["c_cv"] is None
+        assert layer["node_pooled"]["rho"]["mean"] == 0
+        assert layer["global_update_ratio"] == 0
+
+
+@pytest.mark.parametrize("mode", ["mean_C", "shuffled_C", "graph_off"])
+def test_substituted_forward_matches_dense_laplacian_and_recomputes_dmax(
+    interventions, torch, mode
+):
+    model, payload = _model(torch, layers=1), _payload(torch)
+    _variable_gate(model)
+    raw = payload["graphs"][0]
+    # Unlike a star, this path changes its maximum weighted degree when C
+    # is replaced by its edge mean, exposing a stale-denominator error.
+    raw["incidence_edge_index"] = torch.tensor([[0, 1, 2], [1, 2, 3]])
+    x, edges = raw["x"], raw["incidence_edge_index"]
+    node_graph = torch.zeros(len(x), dtype=torch.long)
+    original_c = (x[edges[1], 0] - x[edges[0], 0]).abs() + 0.3
+    with torch.inference_mode():
+        actual, c, degree = interventions._substituted_forward(
+            model.operators[0],
+            x,
+            edges,
+            node_graph,
+            mode=mode,
+            chunk_size=1,
+            generator=interventions._shuffle_generator(0, 0, 0),
+        )
+    b = torch.zeros(edges.shape[1], len(x))
+    b[torch.arange(len(c)), edges[0]] = -1
+    b[torch.arange(len(c)), edges[1]] = 1
+    dense_degree = b.abs().T @ c
+    dense_update = x - (0.95 / dense_degree.max().clamp_min(1e-12)) * b.T @ (c[:, None] * (b @ x))
+    torch.testing.assert_close(actual, dense_update)
+    torch.testing.assert_close(degree, dense_degree)
+    if mode == "mean_C":
+        torch.testing.assert_close(c, original_c.mean().expand_as(c))
+        assert float(degree.max()) != pytest.approx(float((b.abs().T @ original_c).max()))
+    if mode == "shuffled_C":
+        torch.testing.assert_close(c.sort().values, original_c.sort().values)
+    if mode == "graph_off":
+        torch.testing.assert_close(actual, x, rtol=0, atol=0)
+
+
+def test_learned_reference_uses_exact_original_forward_and_c_not_recomputed(interventions, torch):
+    model, payload = _model(torch, layers=1), _payload(torch)
+    operator = model.operators[0]
+    calls = []
+    original_estimator_forward = operator.estimator.forward
+
+    def counted(gradient, features):
+        calls.append(len(gradient))
+        return original_estimator_forward(gradient, features)
+
+    operator.estimator.forward = counted
+    raw = payload["graphs"][0]
+    with torch.inference_mode():
+        expected = model(
+            SimpleNamespace(x=raw["x"], incidence_edge_index=raw["incidence_edge_index"])
+        )
+    calls.clear()
+    records = [[]]
+    with (
+        torch.inference_mode(),
+        interventions._instrument_operators(model, records, "learned_C", [], 0, 0, 1),
+    ):
+        actual = model(
+            SimpleNamespace(x=raw["x"], incidence_edge_index=raw["incidence_edge_index"])
+        )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert calls == [3]
+    assert len(records[0]) == 1
+    # Intervened gate is computed once per edge chunk, not followed by the
+    # original Conv's second estimator invocation.
+    calls.clear()
+    with (
+        torch.inference_mode(),
+        interventions._instrument_operators(model, [[]], "mean_C", [0], 0, 0, 1),
+    ):
+        model(SimpleNamespace(x=raw["x"], incidence_edge_index=raw["incidence_edge_index"]))
+    assert calls == [1, 1, 1]
+
+
+def test_shuffle_determinism_is_independent_of_global_rng(interventions, torch):
+    model, payload = _model(torch), _payload(torch)
+    _variable_gate(model)
+    torch.manual_seed(37)
+    before = torch.random.get_rng_state().clone()
+    first = interventions.evaluate_interventions(model, payload, "cpu", shuffle_seed=9)
+    torch.testing.assert_close(torch.random.get_rng_state(), before, rtol=0, atol=0)
+    torch.manual_seed(93)
+    second = interventions.evaluate_interventions(model, payload, "cpu", shuffle_seed=9)
+    assert first == second
+
+
+def test_layerwise_only_selected_layer_is_substituted(interventions, torch):
+    model, payload = _model(torch), _payload(torch)
+    _variable_gate(model)
+    rows = _variants(interventions.evaluate_interventions(model, payload, "cpu"))
+    learned = rows["learned_C"]
+    second_only = rows["mean_C_layer_1"]
+    assert second_only["selected_layers"] == [1]
+    assert second_only["layers"][0] == learned["layers"][0]
+    assert second_only["layers"][1]["edge_pooled"]["c_cv"] == pytest.approx(0)
+    assert learned["layers"][1]["edge_pooled"]["c_cv"] > 0
+    assert rows["graph_off_layer_0"]["layers"][0]["global_update_ratio"] == 0
+    assert rows["graph_off_layer_0"]["layers"][1]["global_update_ratio"] > 0
+
+
+def test_ppi_all_validation_graphs_mean_shuffle_graph_isolation_and_global_metrics(
+    interventions, torch
+):
+    model = _model(torch, layers=1)
+    _variable_gate(model)
+    graph_one = {
+        "x": torch.tensor([[1.0, -1.0], [2.0, 0.0], [5.0, 1.0]]),
+        "y": torch.tensor([[1.0, 0.0], [1.0, 0.0], [1.0, 1.0]]),
+        "incidence_edge_index": torch.tensor([[0, 1], [1, 2]]),
+    }
+    graph_two = {
+        "x": torch.tensor([[-20.0, 1.0], [10.0, 0.0]]),
+        "y": torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+        "incidence_edge_index": torch.tensor([[0], [1]]),
+    }
+    payload = {
+        "dataset": "ppi",
+        "classes": 2,
+        "graphs": [{}, graph_one, graph_two, {}],
+        "splits": {"train": None, "validation": [1, 2], "test": None},
+    }
+    rows = _variants(interventions.evaluate_interventions(model, payload, "cpu", layerwise=False))
+    assert len(rows) == 4
+    for row in rows.values():
+        assert row["prediction"]["count"] == 10
+        assert row["prediction"]["nodes"] == 5
+        assert row["prediction"]["metric_name"] == "micro_f1"
+        assert row["layers"][0]["graphs"] == 2
+        assert "node_any_label_flip_fraction" in row["delta_vs_learned"]
+    mean_summary = rows["mean_C_all"]["layers"][0]
+    # Graph-local means are 2.3 and 30.3, not a pooled mean across all edges.
+    assert mean_summary["edge_pooled"]["conductance"]["mean"] == pytest.approx((2.3 * 2 + 30.3) / 3)
+    assert mean_summary["edge_pooled"]["conductance"]["quantiles"]["min"] == pytest.approx(2.3)
+    assert mean_summary["edge_pooled"]["conductance"]["quantiles"]["max"] == pytest.approx(30.3)
+    assert mean_summary["graph_macro"]["c_cv_mean"] == pytest.approx(0)
+    assert mean_summary["edge_pooled"]["c_cv"] > 0  # Between-graph scale differences.
+    assert (
+        rows["shuffled_C_all"]["layers"][0]["edge_pooled"]
+        == rows["learned_C"]["layers"][0]["edge_pooled"]
+    )
+    assert mean_summary["node_pooled"]["rho"]["mean"] == pytest.approx(
+        (0.475 + 0.95 + 0.475 + 0.95 + 0.95) / 5
+    )
+
+
+def test_parameters_gradients_modes_hooks_forward_and_rng_are_unchanged(interventions, torch):
+    model, payload = _model(torch), _payload(torch)
+    model.train()
+    model.operators[1].eval()  # Preserve mixed child modes, not only root mode.
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    grads = [parameter.grad.clone() for parameter in model.parameters()]
+    modes = [module.training for module in model.modules()]
+    forward_attributes = [dict(vars(operator)).get("forward") for operator in model.operators]
+    existing = model.operators[0].register_forward_hook(lambda *_: None)
+    hook_ids = list(model.operators[0]._forward_hooks)
+    interventions.evaluate_interventions(model, payload, "cpu")
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+    for parameter, grad in zip(model.parameters(), grads, strict=True):
+        torch.testing.assert_close(parameter.grad, grad, rtol=0, atol=0)
+    assert [module.training for module in model.modules()] == modes
+    assert [vars(operator).get("forward") for operator in model.operators] == forward_attributes
+    assert list(model.operators[0]._forward_hooks) == hook_ids
+    assert not model.operators[1]._forward_hooks
+    assert all(not operator.estimator._forward_hooks for operator in model.operators)
+    assert model.seen_training and not any(model.seen_training)
+    existing.remove()
+
+
+def test_exception_restores_modes_rng_forward_and_hooks(interventions, torch):
+    model, payload = _model(torch), _payload(torch)
+    original_forward = model.operators[1].forward
+
+    def consume_rng_then_fail(*_args, **_kwargs):
+        torch.rand(11)
+        raise RuntimeError("deliberate validation failure")
+
+    model.operators[1].forward = consume_rng_then_fail
+    rng = torch.random.get_rng_state().clone()
+    model.train()
+    with pytest.raises(RuntimeError, match="deliberate"):
+        interventions.evaluate_interventions(model, payload, "cpu")
+    assert model.training
+    assert model.operators[1].forward is consume_rng_then_fail
+    torch.testing.assert_close(torch.random.get_rng_state(), rng, rtol=0, atol=0)
+    assert all(not operator._forward_hooks for operator in model.operators)
+    assert all(not operator.estimator._forward_hooks for operator in model.operators)
+    model.operators[1].forward = original_forward
+
+    # Fail inside an actual replaced Conv as well, ensuring its override is removed.
+    def gate_failure(*_args, **_kwargs):
+        raise RuntimeError("gate failure")
+
+    model.operators[0].estimator.forward = gate_failure
+    graph = payload["graphs"][0]
+    with pytest.raises(RuntimeError, match="gate failure"), torch.inference_mode():
+        with interventions._instrument_operators(model, [[], []], "mean_C", [0], 0, 0, 1):
+            model(SimpleNamespace(x=graph["x"], incidence_edge_index=graph["incidence_edge_index"]))
+    assert "forward" not in vars(model.operators[0])
+    assert all(not operator._forward_hooks for operator in model.operators)
+
+
+@pytest.mark.parametrize("chunk,seed", [(0, 0), (-1, 0), (2, -1)])
+def test_invalid_options_are_rejected_without_mutation(interventions, torch, chunk, seed):
+    model = _model(torch)
+    with pytest.raises(ValueError):
+        interventions.evaluate_interventions(
+            model, _payload(torch), "cpu", edge_chunk_size=chunk, shuffle_seed=seed
+        )
+    assert model.training
+    assert all(not operator._forward_hooks for operator in model.operators)
+
+
+def test_no_edges_and_nonfinite_c_are_explicit(interventions, torch):
+    model, payload = _model(torch), _payload(torch)
+    payload["graphs"][0]["incidence_edge_index"] = torch.empty(2, 0, dtype=torch.long)
+    result = interventions.evaluate_interventions(model, payload, "cpu", layerwise=False)
+    json.dumps(result, allow_nan=False)
+    for row in result["variants"]:
+        assert row["delta_vs_learned"]["logits_relative_l2"] == 0
+        assert row["layers"][0]["edge_pooled"]["conductance"]["count"] == 0
+    payload = _payload(torch)
+    _fixed_gate(torch, model, float("nan"))
+    with pytest.raises((FloatingPointError, ValueError), match="finite|Invalid"):
+        interventions.evaluate_interventions(model, payload, "cpu")
+    assert all(not operator._forward_hooks for operator in model.operators)
+````
+
+# tests/test_cycle_v2_runner.py
+
+````python
+"""Dispatch/artifact contracts only; no research training or downloads."""
+
+from __future__ import annotations
+
+import json
+import shlex
+import sys
+from pathlib import Path
+
+import pytest
+
+from scripts import run_paper
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _args(*extra: str):
+    return run_paper._parser().parse_args(
+        ["--tracks", "cycle_pe", "--cycle-pe-version", "v2", *extra]
+    )
+
+
+@pytest.mark.parametrize("prepare", [False, True])
+@pytest.mark.parametrize(
+    "selection,expected_seeds", [([], (0,)), (["--model-seeds", "3,7"], (3, 7))]
+)
+def test_v2_dispatch_is_only_basis_model_and_keeps_requested_seeds(
+    prepare: bool, selection, expected_seeds
+):
+    from research.cycle_pe.v2.benchmark import parser
+
+    args = _args(*selection, *(["--prepare-only", "--allow-download"] if prepare else []))
+    commands = run_paper._commands(args, "v2-unit-contract")
+    children = [entry for entry in commands if entry[0] != "gpu_preflight"]
+    executed_seeds = expected_seeds[:1] if prepare else expected_seeds
+    assert len(children) == len(executed_seeds)
+    for seed, (name, command, output) in zip(executed_seeds, children, strict=True):
+        assert name == f"cycle_pe:benchmark-v2:model-seed-{seed}"
+        assert command[2] == "research.cycle_pe.v2.benchmark"
+        child = parser().parse_args(command[3:])
+        assert child.model_seed == seed
+        assert child.prepare_only is prepare
+        assert child.allow_download is prepare
+        assert child.batch_size == 32 and child.workers == 4
+        assert child.device == ("cpu" if prepare else "cuda")
+        assert output == (
+            ROOT
+            / "research/cycle_pe/v2/results/paper/v2-unit-contract"
+            / f"model-seed-{seed}/benchmark"
+        )
+    assert sum(name == "gpu_preflight" for name, _, _ in commands) == (0 if prepare else 1)
+
+
+def test_v1_default_dispatch_and_paths_remain_unchanged():
+    args = run_paper._parser().parse_args(["--tracks", "cycle_pe", "--model-seeds", "0"])
+    assert args.cycle_pe_version == "v1"
+    name, command, output = run_paper._commands(args, "same-id")[-1]
+    assert name == "cycle_pe:benchmark:model-seed-0"
+    assert command[2] == "research.cycle_pe.benchmark"
+    assert output == ROOT / "research/cycle_pe/results/paper/same-id/model-seed-0/benchmark"
+
+
+def test_v2_custom_output_and_optimizer_overrides_are_version_specific(tmp_path):
+    args = _args(
+        "--results-root",
+        str(tmp_path),
+        "--model-seeds",
+        "7",
+        "--cycle-epochs",
+        "123",
+        "--cycle-learning-rate",
+        "0.002",
+    )
+    name, command, output = run_paper._commands(args, "same-id")[-1]
+    assert name.endswith("model-seed-7")
+    assert output == tmp_path / "cycle_pe_v2/same-id/model-seed-7/benchmark"
+    assert command[command.index("--epochs") + 1] == "123"
+    assert command[command.index("--lr") + 1] == "0.002"
+    assert run_paper._track_run_root("cycle_pe", "same-id", tmp_path) != (
+        run_paper._track_run_root("cycle_pe", "same-id", tmp_path, cycle_pe_version="v2")
+    )
+
+
+@pytest.mark.parametrize(
+    "selection", [[], ["--tracks", "conductance_gat"], ["--suite", "all"], ["--suite", "core"]]
+)
+def test_v2_rejects_unrelated_or_supplementary_tracks_before_dependency_checks(
+    selection, monkeypatch, capsys
+):
+    arguments = ["--cycle-pe-version", "v2", "--dry-run"]
+    if selection and selection[0] == "--suite":
+        arguments.extend(["--tracks", "cycle_pe"])
+    monkeypatch.setattr(sys, "argv", ["run_paper.py", *arguments, *selection])
+    assert run_paper.main() == 2
+    assert "v2 is independent" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("script", ["prepare_data.sh", "reproduce.sh"])
+def test_v2_wrappers_lock_the_version_and_track(script):
+    source = (ROOT / "research/cycle_pe/v2" / script).read_text(encoding="utf-8")
+    dispatch = shlex.split(next(row for row in source.splitlines() if row.startswith("exec bash ")))
+    assert dispatch[2:4] == ["${project_root}/scripts/paper.sh", "$@"]
+    args = run_paper._parser().parse_args(
+        ["--tracks", "all", "--cycle-pe-version", "v1", *dispatch[4:]]
+    )
+    assert args.tracks == ["cycle_pe"] and args.cycle_pe_version == "v2"
+    assert args.suite == "benchmark"
+    assert args.prepare_only is (script == "prepare_data.sh")
+    assert args.allow_download is (script == "prepare_data.sh")
+    assert "set -euo pipefail" in source
+
+
+def test_registry_snapshot_describes_basis_v2_not_six_statistics(tmp_path):
+    snapshot = run_paper._snapshot_registries(tmp_path, ("cycle_pe",), cycle_pe_version="v2")
+    payload = Path(snapshot["cycle_pe"]["path"]).read_text(encoding="utf-8")
+    assert "model: cycle_basis_v2" in payload and "version: v2" in payload
+    assert "full SVD" in payload and "truncation: none" in payload
+
+
+def test_v2_manifest_records_version_and_will_not_reuse_existing_output(tmp_path, monkeypatch):
+    monkeypatch.setattr(run_paper, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(run_paper, "check_dependencies", lambda: {"profile_id": "legacy-cu118"})
+    monkeypatch.setattr(run_paper, "_commands", lambda *_args: [])
+    monkeypatch.setattr(run_paper, "_source_revision", lambda: {})
+    monkeypatch.setattr(run_paper, "_environment_snapshot", lambda *_args: {})
+    monkeypatch.setattr(run_paper, "_snapshot_registries", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paper.py",
+            "--tracks",
+            "cycle_pe",
+            "--cycle-pe-version",
+            "v2",
+            "--prepare-only",
+            "--run-id",
+            "version-record",
+        ],
+    )
+    assert run_paper.main() == 0
+    manifest = json.loads((tmp_path / "runs/paper/version-record/manifest.json").read_text())
+    assert manifest["execution_protocol"]["cycle_pe_version"] == "v2"
+    assert manifest["research_environment"]["profile_id"] == "legacy-cu118"
+    assert manifest["tracks"] == ["cycle_pe"]
+    assert run_paper.main() == 2
+    # Independently check the v2 track-root guard, without relying on a global run folder.
+    isolated = tmp_path / "research/cycle_pe/v2/results/paper/already-exists"
+    isolated.mkdir(parents=True)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_paper.py",
+            "--tracks",
+            "cycle_pe",
+            "--cycle-pe-version",
+            "v2",
+            "--prepare-only",
+            "--run-id",
+            "already-exists",
+        ],
+    )
+    assert run_paper.main() == 2
+    assert not (tmp_path / "runs/paper/already-exists").exists()
+````
+
 # tests/test_dataset_plans.py
 
 ````python
@@ -23936,7 +30661,7 @@ def test_runner_records_the_checked_profile_in_its_manifest(
     monkeypatch.setattr(run_paper, "_commands", lambda *_args: [])
     monkeypatch.setattr(run_paper, "_source_revision", lambda: {"revision": "unit-test"})
     monkeypatch.setattr(run_paper, "_environment_snapshot", lambda *_args: {})
-    monkeypatch.setattr(run_paper, "_snapshot_registries", lambda *_args: {})
+    monkeypatch.setattr(run_paper, "_snapshot_registries", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
         sys,
         "argv",
@@ -24008,6 +30733,891 @@ def test_lazy_algebra_exports_preserve_public_api():
         assert getattr(chartgat, name) is getattr(algebra, name)
     with pytest.raises(AttributeError):
         _ = chartgat.not_a_public_primitive
+````
+
+# tests/test_diagnose_conductance.py
+
+````python
+"""Read-only diagnosis contracts; CPU math fixtures, never research training."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts" / "diagnose_conductance.py"
+
+
+@pytest.fixture
+def diag():
+    return importlib.import_module("scripts.diagnose_conductance")
+
+
+@pytest.fixture
+def torch():
+    return pytest.importorskip("torch")
+
+
+def test_help_works_without_site_packages_or_torch():
+    result = subprocess.run(
+        [sys.executable, "-S", str(SCRIPT), "--help"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--ablate-graph" in result.stdout
+    assert "--device" in result.stdout
+    assert "--full-audit" in result.stdout
+    assert "--gradient-mode" in result.stdout
+    assert "Traceback" not in result.stderr
+
+
+def test_cuda_gate_rejects_cpu_and_missing_gpu(diag, torch, monkeypatch):
+    with pytest.raises((RuntimeError, ValueError), match="CUDA|cuda|GPU"):
+        diag.require_cuda("cpu")
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises((RuntimeError, ValueError), match="CUDA|cuda|GPU"):
+        diag.require_cuda("cuda")
+
+
+def _layer_record(diag, torch, states, edges, monkeypatch):
+    from research.conductance_gat.benchmark import ConductanceConv
+
+    module = ConductanceConv(1)
+    monkeypatch.setattr(module.estimator, "forward", lambda gradient, _: gradient[:, 0].abs() + 1)
+    state = torch.tensor(states, dtype=torch.float32).reshape(-1, 1)
+    incidence = torch.tensor(edges, dtype=torch.long).reshape(-1, 2).T
+    graph_ids = torch.zeros(len(state), dtype=torch.long)
+    # Keep the public diagnostic compatible with the pre-optimization server API.
+    inputs = (state, incidence, graph_ids)
+    with torch.no_grad():
+        output = module(*inputs)
+        return diag.layer_diagnostics(module, inputs, output, edge_chunk_size=1)
+
+
+def test_layer_diagnostics_c_cv_and_graph_local_rho(diag, torch, monkeypatch):
+    # c=(2,4), weighted degrees=(2,6,4,0), including one isolated node.
+    record = _layer_record(diag, torch, [0, 1, 4, 5], [(0, 1), (1, 2)], monkeypatch)
+    torch.testing.assert_close(record["_c"], torch.tensor([2.0, 4.0], dtype=torch.float64))
+    torch.testing.assert_close(record["_degree"], torch.tensor([2.0, 6.0, 4.0, 0.0]))
+    torch.testing.assert_close(record["_rho"], torch.tensor([0.95 / 3, 0.95, 1.9 / 3, 0.0]))
+    assert record["c_cv"] == pytest.approx(1 / 3)
+    assert record["c_count"] == 2
+    assert record["c_sum"] == pytest.approx(6)
+    assert record["c_squared_sum"] == pytest.approx(20)
+    # A separate graph has its own maximum; the first graph's degree six must
+    # not suppress this graph's degree-two nodes.
+    other = _layer_record(diag, torch, [0, 1], [(0, 1)], monkeypatch)
+    torch.testing.assert_close(other["_rho"], torch.tensor([0.95, 0.95]))
+
+
+def test_layer_diagnostics_empty_edges_are_finite_and_explicit(diag, torch, monkeypatch):
+    record = _layer_record(diag, torch, [1, 2, 3], [], monkeypatch)
+    assert record["_c"].numel() == 0
+    assert record["c_count"] == 0
+    assert record["c_cv"] is None
+    assert record["global_update_ratio"] == pytest.approx(0)
+    torch.testing.assert_close(record["_rho"], torch.zeros(3))
+    torch.testing.assert_close(record["_degree"], torch.zeros(3))
+
+
+def test_prediction_helpers_use_global_ppi_counts_not_graph_macro(diag, torch):
+    first = diag.prediction_statistics(
+        torch.tensor([[1.0, -1.0]]), torch.tensor([[1.0, 0.0]]), multilabel=True
+    )
+    second = diag.prediction_statistics(-torch.ones(3, 2), torch.ones(3, 2), multilabel=True)
+    result = diag.merge_predictions([first, second], multilabel=True)
+    # Global TP=1, predicted positives=1, true positives=7 -> F1=0.25.
+    # Averaging the two graph F1 values would incorrectly give 0.5.
+    assert result["metric"] == pytest.approx(0.25)
+    assert result["metric_name"] == "micro_f1"
+    assert result["predicted_positive_fraction"] == pytest.approx(1 / 8)
+    assert result["true_positive_fraction"] == pytest.approx(7 / 8)
+
+
+def test_layer_pooled_statistics_do_not_average_unequal_graph_sizes(diag, torch, monkeypatch):
+    first = _layer_record(diag, torch, [0, 1, 4, 5], [(0, 1), (1, 2)], monkeypatch)
+    second = _layer_record(diag, torch, [0, 1], [(0, 1)], monkeypatch)
+    summary = diag.summarize_layers([first, second])
+    assert summary["graphs"] == 2
+    assert summary["graph_macro"]["rho_mean"] == pytest.approx(0.7125)
+    assert summary["node_pooled"]["rho"]["mean"] == pytest.approx(3.8 / 6)
+    assert summary["edge_pooled"]["conductance"]["mean"] == pytest.approx(8 / 3)
+    assert summary["edge_pooled"]["c_cv"] == pytest.approx(2**0.5 / 4)
+    assert summary["node_pooled"]["rho_below"]["0.01"] == pytest.approx(1 / 6)
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1])
+def test_layer_diagnostics_reject_invalid_chunks(diag, torch, chunk_size):
+    from research.conductance_gat.benchmark import ConductanceConv
+
+    state = torch.ones(2, 1)
+    inputs = (state, torch.empty(2, 0, dtype=torch.long), torch.zeros(2, dtype=torch.long), 1)
+    with pytest.raises(ValueError):
+        diag.layer_diagnostics(ConductanceConv(1), inputs, state, edge_chunk_size=chunk_size)
+
+
+def test_layer_diagnostics_reject_multi_graph_inputs(diag, torch):
+    from research.conductance_gat.benchmark import ConductanceConv
+
+    state = torch.ones(2, 1)
+    inputs = (state, torch.empty(2, 0, dtype=torch.long), torch.tensor([0, 1]), 2)
+    with pytest.raises(ValueError, match="one graph"):
+        diag.layer_diagnostics(ConductanceConv(1), inputs, state)
+
+
+def _run_records():
+    config = {
+        "datasets": ["cora"],
+        "model_seed": 0,
+        "hidden_channels": 4,
+        "layers": 2,
+        "dropout": 0.1,
+    }
+    history = [
+        {"epoch": 1, "train_loss": 1.0, "validation": 0.5},
+        {"epoch": 2, "train_loss": 0.9, "validation": 0.6},
+        {"epoch": 3, "train_loss": 0.8, "validation": 0.6},
+    ]
+    saved = {"best_epoch": 2, "epochs_run": 3, "validation": 0.6, "test": 0.4}
+    common = {
+        "schema_version": 2,
+        "track": "conductance_gat",
+        "suite": "benchmark",
+        "status": "passed",
+    }
+    manifest = {
+        **common,
+        "config": config,
+        "completed": ["cora/conductance"],
+        "expected": ["cora/conductance"],
+    }
+    metrics = {**common, "model_seed": 0, "datasets": {"cora": {"models": {"conductance": saved}}}}
+    return manifest, metrics, config, saved, history
+
+
+def test_run_and_history_validate_first_tied_best_checkpoint(diag):
+    manifest, metrics, config, saved, history = _run_records()
+    assert diag.validate_run(manifest, metrics, 0, ["cora"]) == config
+    summary = diag.summarize_history(history, saved)
+    assert summary["best_epoch"] == 2
+    assert summary["train_loss_min"] == 0.8
+    assert summary["train_loss_at_selected_epoch"] == 0.9
+    with pytest.raises(ValueError):
+        diag.summarize_history(history, {**saved, "best_epoch": 3})
+
+
+@pytest.mark.parametrize("status", ["failed", "running", "prepared", None])
+@pytest.mark.parametrize("which", ["manifest", "metrics"])
+def test_incomplete_and_preparation_runs_rejected(diag, status, which):
+    manifest, metrics, *_ = _run_records()
+    (manifest if which == "manifest" else metrics)["status"] = status
+    with pytest.raises(ValueError, match="completed|passed"):
+        diag.validate_run(manifest, metrics, 0, ["cora"])
+
+
+@pytest.mark.parametrize("selected", [[], ["ppi"], ["cora", "cora"]])
+def test_missing_or_duplicate_dataset_selection_rejected(diag, selected):
+    manifest, metrics, *_ = _run_records()
+    with pytest.raises(ValueError):
+        diag.validate_run(manifest, metrics, 0, selected)
+
+
+def test_wrong_seed_and_completion_manifest_rejected(diag):
+    manifest, metrics, *_ = _run_records()
+    with pytest.raises(ValueError, match="seed"):
+        diag.validate_run(manifest, metrics, 2, ["cora"])
+    manifest["completed"] = []
+    with pytest.raises(ValueError, match="expected|completed"):
+        diag.validate_run(manifest, metrics, 0, ["cora"])
+
+
+def test_relative_run_root_and_cli_defaults(diag, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    args = diag.build_parser().parse_args(["--run-id", "example", "--results-root", "outputs"])
+    assert (
+        diag.resolve_run(args)
+        == tmp_path / "outputs/conductance_gat/example/model-seed-0/benchmark"
+    )
+    assert args.device == "cuda"
+    assert args.output_dir is None
+    assert args.ablate_graph is False
+    assert args.model_seed == 0
+    assert args.datasets == list(diag.DATASETS)
+    assert args.gradient_batches == 1
+    assert args.gradient_mode == "eval"
+    assert "test" not in vars(args)
+    args.run_id = "../elsewhere"
+    with pytest.raises(ValueError):
+        diag.resolve_run(args)
+
+
+def test_missing_manifest_fails_without_creating_a_run(diag, torch, tmp_path, capsys):
+    assert diag.main(["--run-id", "missing", "--results-root", str(tmp_path)]) == 1
+    assert "FileNotFoundError" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["recorded_data", "recorded_data_with_override", "explicit_data", "source_seed", "other_seed"],
+)
+def test_output_protection_precedes_any_new_directory(diag, tmp_path, monkeypatch, target):
+    results_root = tmp_path / "outputs"
+    run = results_root / "conductance_gat/example/model-seed-0/benchmark"
+    run.mkdir(parents=True)
+    data_root = tmp_path / "external_dataset_store"
+    (run / "manifest.json").write_text(
+        json.dumps({"config": {"data_root": str(data_root)}}), encoding="utf-8"
+    )
+    args = ["--run-id", "example", "--results-root", str(results_root)]
+    if target in {"recorded_data", "recorded_data_with_override"}:
+        output = data_root / "diagnosis"
+        if target == "recorded_data_with_override":
+            args += ["--data-root", str(tmp_path / "override_dataset_store")]
+    elif target == "explicit_data":
+        data_root = tmp_path / "override_dataset_store"
+        args += ["--data-root", str(data_root)]
+        output = data_root / "diagnosis"
+    elif target == "source_seed":
+        output = run / "diagnosis"
+    else:
+        output = run.parents[1] / "model-seed-4/diagnosis"
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Protected output must be rejected before diagnostic work")
+
+    monkeypatch.setattr(diag, "_diagnose", forbidden)
+    before = _file_snapshot(tmp_path)
+    with pytest.raises(ValueError, match="source run/data"):
+        diag.main([*args, "--output-dir", str(output)])
+    assert not output.exists()
+    assert _file_snapshot(tmp_path) == before
+
+
+def test_extended_audit_auto_output_is_new_and_separate_from_source(diag, tmp_path, monkeypatch):
+    monkeypatch.setattr(diag, "ROOT", tmp_path)
+    run = tmp_path / "research/conductance_gat/results/paper/example/model-seed-0/benchmark"
+    run.mkdir(parents=True)
+    (run / "manifest.json").write_text(json.dumps({"config": {}}), encoding="utf-8")
+    seen = []
+
+    def fake_diagnose(args, source, report):
+        seen.append((args.model_seed, args.datasets, source))
+        assert args.full_audit
+        report["datasets"]["cora"] = {"status": "passed", "stage": "complete"}
+
+    monkeypatch.setattr(diag, "_diagnose", fake_diagnose)
+    source_before = _file_snapshot(run)
+    assert diag.main(["--run-id", "example", "--full-audit"]) == 0
+    output = next((tmp_path / "runs/diagnostics").iterdir())
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert report["policy"]["model_seed_count"] == 1
+    assert report["policy"]["optimizer_steps"] == 0
+    assert report["policy"]["new_test_queries"] is False
+    assert report["model_seed"] == 0
+    assert report["status"] == "passed"
+    assert (output / "report.md").is_file()
+    assert seen == [(0, list(diag.DATASETS), run)]
+    assert _file_snapshot(run) == source_before
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--shuffle-seed", "-1"],
+        ["--gradient-batches", "0"],
+        ["--gradient-sample-limit", "0"],
+        ["--near-zero-threshold", "nan"],
+        ["--near-zero-threshold", "-1"],
+    ],
+)
+def test_invalid_extended_arguments_fail_before_any_output(diag, tmp_path, arguments):
+    with pytest.raises(ValueError, match="Invalid audit"):
+        diag.main(
+            [
+                "--run-id",
+                "example",
+                "--full-audit",
+                "--output-dir",
+                str(tmp_path / "new"),
+                *arguments,
+            ]
+        )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_extended_failure_preserves_completed_diagnostics_in_reports(diag, tmp_path, monkeypatch):
+    monkeypatch.setattr(diag, "ROOT", tmp_path)
+    run = tmp_path / "research/conductance_gat/results/paper/example/model-seed-0/benchmark"
+    run.mkdir(parents=True)
+    (run / "manifest.json").write_text(json.dumps({"config": {}}), encoding="utf-8")
+
+    def fail_after_first(_args, _source, report):
+        report["datasets"]["cora"] = {"status": "passed", "stage": "complete"}
+        report["active_dataset"] = "ogbn-arxiv"
+        report["datasets"]["ogbn-arxiv"] = {
+            "status": "running",
+            "stage": "train_label_gradient_audit",
+        }
+        raise RuntimeError("CUDA out of memory: unit-only injected failure")
+
+    monkeypatch.setattr(diag, "_diagnose", fail_after_first)
+    assert diag.main(["--run-id", "example", "--full-audit"]) == 1
+    output = next((tmp_path / "runs/diagnostics").iterdir())
+    report = json.loads((output / "report.json").read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert report["datasets"]["cora"]["status"] == "passed"
+    assert report["datasets"]["ogbn-arxiv"]["status"] == "failed"
+    assert "No CPU fallback" in report["recovery_note"]
+    assert "out of memory" in (output / "report.md").read_text(encoding="utf-8")
+
+
+def test_audit_cli_accepts_one_checkpoint_seed_not_seed_sweep(diag):
+    assert (
+        diag.build_parser().parse_args(["--run-id", "example", "--model-seed", "3"]).model_seed == 3
+    )
+    with pytest.raises(SystemExit):
+        diag.build_parser().parse_args(["--run-id", "example", "--model-seed", "0", "1"])
+
+
+def test_full_audit_real_helpers_integrate_without_optimizer_or_test_labels(
+    diag, torch, monkeypatch
+):
+    payload, checkpoint, _, _, config, saved, history = _payload_and_checkpoint(torch)
+    config["weight_decay"] = 0.0005
+    payload["graphs"][0]["y"][payload["splits"]["test"]] = 999
+    model = diag.restore_model(checkpoint, payload, config, saved, history, torch.device("cpu"))
+    before = diag._state_hash(model)
+    original_grads = [parameter.grad for parameter in model.parameters()]
+    args = diag.build_parser().parse_args(["--run-id", "example", "--full-audit", "--ablate-graph"])
+    item = {"baseline": diag.evaluate_checkpoint(model, payload, torch.device("cpu"), 2)}
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Diagnostic audit must not construct an optimizer")
+
+    monkeypatch.setattr(torch.optim, "Adam", forbidden)
+    diag.additional_audits(model, payload, torch.device("cpu"), args, config, item)
+    assert len(item["interventions"]["variants"]) == 10
+    assert item["gate_audit"]["label_scope"] == "train_only"
+    assert item["gate_audit"]["loss"]["batches"] == 1
+    assert item["gate_audit"]["loss"]["train_label_elements"] == 2
+    assert item["gate_audit"]["mode"] == "eval"
+    assert diag._state_hash(model) == before
+    assert all(
+        parameter.grad is gradient
+        for parameter, gradient in zip(model.parameters(), original_grads, strict=True)
+    )
+    assert all(not module._forward_hooks for module in model.modules())
+    report = {"status": "passed", "model_seed": 0, "datasets": {"cora": item}}
+    json.dumps(report, allow_nan=False)
+    readable = diag.render_report(report)
+    assert "mean_C_all" in readable
+    assert "Task gradient norm" in readable
+    assert "operators.0.estimator.network.0.weight" in readable
+
+
+def test_existing_output_directory_is_never_overwritten(diag, tmp_path, monkeypatch):
+    results_root = tmp_path / "outputs"
+    run = results_root / "conductance_gat/example/model-seed-0/benchmark"
+    run.mkdir(parents=True)
+    (run / "manifest.json").write_text(json.dumps({"config": {}}), encoding="utf-8")
+    output = tmp_path / "diagnosis"
+    output.mkdir()
+    (output / "report.json").write_text("keep existing report", encoding="utf-8")
+    before = _file_snapshot(tmp_path)
+    with pytest.raises(FileExistsError):
+        diag.main(
+            [
+                "--run-id",
+                "example",
+                "--results-root",
+                str(results_root),
+                "--output-dir",
+                str(output),
+            ]
+        )
+    assert _file_snapshot(tmp_path) == before
+
+
+def _payload_and_checkpoint(torch):
+    from research.conductance_gat.benchmark import ConductanceNodeClassifier
+    from research.conductance_gat.benchmark_data import canonical_edges
+
+    manifest, metrics, config, saved, history = _run_records()
+    edges, incidence = canonical_edges(torch.tensor([[0, 1, 3], [1, 2, 4]]), 6)
+    graph = {
+        "x": torch.arange(18, dtype=torch.float32).reshape(6, 3) / 18,
+        "y": torch.tensor([0, 1, 0, 1, 0, 1]),
+        "edge_index": edges,
+        "incidence_edge_index": incidence,
+    }
+    masks = {
+        name: torch.tensor([index in positions for index in range(6)])
+        for name, positions in {"train": [0, 1], "validation": [2, 3], "test": [4, 5]}.items()
+    }
+    payload = {"dataset": "cora", "classes": 2, "graphs": [graph], "splits": masks}
+    architecture = {key: config[key] for key in ("hidden_channels", "layers", "dropout")}
+    model = ConductanceNodeClassifier(3, 2, **architecture).eval()
+    checkpoint = {
+        "model": "conductance",
+        "dataset": "cora",
+        "best_epoch": 2,
+        "validation": 0.6,
+        "architecture": architecture,
+        "state_dict": model.state_dict(),
+    }
+    return payload, checkpoint, manifest, metrics, config, saved, history
+
+
+@pytest.mark.parametrize(
+    "bad_field,bad_value",
+    [("dataset", "ppi"), ("model", "gcn"), ("best_epoch", 1), ("validation", 0.5)],
+)
+def test_checkpoint_metadata_must_match_saved_run(diag, torch, bad_field, bad_value):
+    payload, checkpoint, _, _, config, saved, history = _payload_and_checkpoint(torch)
+    checkpoint[bad_field] = bad_value
+    with pytest.raises(ValueError):
+        diag.restore_model(checkpoint, payload, config, saved, history, torch.device("cpu"))
+
+
+@pytest.mark.parametrize("fault", ["architecture", "missing_key", "unexpected_key", "shape"])
+def test_checkpoint_strict_architecture_and_parameter_load(diag, torch, fault):
+    payload, checkpoint, _, _, config, saved, history = _payload_and_checkpoint(torch)
+    if fault == "architecture":
+        checkpoint["architecture"]["layers"] = 3
+    elif fault == "missing_key":
+        checkpoint["state_dict"].pop("encoder.weight")
+    elif fault == "unexpected_key":
+        checkpoint["state_dict"]["not_a_parameter"] = torch.zeros(1)
+    else:
+        checkpoint["state_dict"]["encoder.weight"] = torch.zeros(1, 1)
+    with pytest.raises((ValueError, RuntimeError)):
+        diag.restore_model(checkpoint, payload, config, saved, history, torch.device("cpu"))
+
+
+def test_full_train_and_validation_only_eval_preserves_parameters_and_hooks(diag, torch):
+    payload, checkpoint, _, _, config, saved, history = _payload_and_checkpoint(torch)
+    model = diag.restore_model(checkpoint, payload, config, saved, history, torch.device("cpu"))
+    before = {key: value.clone() for key, value in model.state_dict().items()}
+    # Out-of-domain test labels make an accidental test loss evaluation fail.
+    payload["graphs"][0]["y"][payload["splits"]["test"]] = 999
+    assert not model.training
+    baseline = diag.evaluate_checkpoint(model, payload, torch.device("cpu"), 2)
+    ablated = diag.evaluate_checkpoint(model, payload, torch.device("cpu"), 2, ablate=True)
+    assert set(baseline) == {"train", "validation"}
+    assert set(ablated) == {"validation"}
+    for split in baseline:
+        assert baseline[split]["prediction"]["count"] == int(payload["splits"][split].sum())
+    assert "layers" not in ablated["validation"]
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(value, before[key], rtol=0, atol=0)
+    assert all(not operator._forward_hooks for operator in model.operators)
+
+
+def test_ppi_evaluation_includes_every_train_graph_not_test_graphs(diag, torch):
+    from research.conductance_gat.benchmark import ConductanceNodeClassifier
+
+    # Unit-only graphs carry logits directly; model evaluation still exercises
+    # the real per-split loop and prediction merger without a PyG dependency.
+    class LogitModel(ConductanceNodeClassifier):
+        def __init__(self):
+            super().__init__(2, 2, hidden_channels=2, layers=1, dropout=0)
+            self.operators = torch.nn.ModuleList()
+
+        def forward(self, graph):
+            return graph.x
+
+    def graph(x, y):
+        return {"x": x, "y": y, "incidence_edge_index": torch.empty(2, 0, dtype=torch.long)}
+
+    payload = {
+        "dataset": "ppi",
+        "classes": 2,
+        "graphs": [
+            graph(torch.tensor([[1.0, -1.0]]), torch.tensor([[1.0, 0.0]])),
+            graph(-torch.ones(3, 2), torch.ones(3, 2)),
+            graph(torch.ones(2, 2), torch.ones(2, 2)),
+            {},  # Accessing a held-out graph is forbidden.
+        ],
+        "splits": {"train": [0, 1], "validation": [2], "test": [3]},
+    }
+    model = LogitModel().eval()
+    result = diag.evaluate_checkpoint(model, payload, torch.device("cpu"), 2)
+    assert result["train"]["prediction"]["nodes"] == 4
+    assert result["train"]["prediction"]["metric"] == pytest.approx(0.25)
+    assert result["validation"]["prediction"]["metric"] == pytest.approx(1)
+    assert set(diag.evaluate_checkpoint(model, payload, torch.device("cpu"), 2, ablate=True)) == {
+        "validation"
+    }
+
+
+def test_missing_cache_never_calls_downloader_or_creates_directory(torch, tmp_path, monkeypatch):
+    from research.conductance_gat import benchmark_data
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Offline diagnosis must not call a dataset downloader")
+
+    monkeypatch.setattr(benchmark_data, "_download_official", forbidden)
+    missing = tmp_path / "data"
+    with pytest.raises(FileNotFoundError):
+        benchmark_data.load_dataset("cora", missing, allow_download=False)
+    assert not missing.exists()
+
+
+def _file_snapshot(directory):
+    return {
+        str(path.relative_to(directory)): (
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+            path.stat().st_mtime_ns,
+        )
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+
+
+def test_checkpoint_restore_eval_and_offline_cache_are_read_only(
+    diag, torch, tmp_path, monkeypatch
+):
+    from research.conductance_gat import benchmark_data
+
+    payload, checkpoint, manifest, metrics, config, saved, history = _payload_and_checkpoint(torch)
+    monkeypatch.setitem(
+        benchmark_data.EXPECTED,
+        "cora",
+        {"nodes": 6, "features": 3, "classes": 2, "splits": [2, 2, 2]},
+    )
+    cache = tmp_path / "data/conductance_gat/matched_benchmark_v1/cora"
+    cache.mkdir(parents=True)
+    torch.save(payload, cache / "data.pt")
+    protocol = {
+        "schema_version": 1,
+        "dataset": "cora",
+        "source_url": benchmark_data.SOURCES["cora"],
+        "source_files_sha256": {"unit-only-fixture": "not-an-official-download"},
+        "data_sha256": benchmark_data.sha256_file(cache / "data.pt"),
+        "split_sha256": {
+            key: benchmark_data.tensor_hash(value) for key, value in payload["splits"].items()
+        },
+        "preprocessing": {"self_loops": "unit fixture"},
+    }
+    (cache / "manifest.json").write_text(json.dumps(protocol), encoding="utf-8")
+    run = tmp_path / "run"
+    run.mkdir()
+    for name, content in {
+        "manifest.json": manifest,
+        "metrics.json": metrics,
+        "history.json": history,
+    }.items():
+        (run / name).write_text(json.dumps(content), encoding="utf-8")
+    torch.save(checkpoint, run / "best.pt")
+    before = _file_snapshot(tmp_path)
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("A verified existing cache must not trigger downloads")
+
+    monkeypatch.setattr(benchmark_data, "_download_official", forbidden)
+    loaded, _ = benchmark_data.load_dataset("cora", tmp_path / "data", allow_download=False)
+    restored = torch.load(run / "best.pt", map_location="cpu", weights_only=True)
+    model = diag.restore_model(restored, loaded, config, saved, history, torch.device("cpu"))
+    diag.evaluate_checkpoint(model, loaded, torch.device("cpu"), 2)
+    diag.evaluate_checkpoint(model, loaded, torch.device("cpu"), 2, ablate=True)
+    assert _file_snapshot(tmp_path) == before
+````
+
+# tests/test_execution_optimization.py
+
+````python
+"""CPU unit equivalence checks only; no datasets, optimizer, or research training."""
+
+from __future__ import annotations
+
+import copy
+
+import pytest
+import torch
+from torch import Tensor
+
+from research.cycle_pe import benchmark_models, paper_model
+from research.cycle_pe.benchmark_data import Batch
+from research.cycle_pe.benchmark_models import (
+    ATOM_DIMS,
+    BOND_DIMS,
+    CategoricalEncoder,
+    CyclePEModel,
+    _pool,
+)
+from research.cycle_pe.paper_model import _message_topology, _MessageLayer
+
+
+def _legacy_categorical(model: CategoricalEncoder, values: Tensor) -> Tensor:
+    return torch.stack([layer(values[:, i]) for i, layer in enumerate(model.embeddings)]).sum(0)
+
+
+def _legacy_pool(values: Tensor, assignment: Tensor, count: int) -> tuple[Tensor, Tensor]:
+    total = values.new_zeros((count, values.shape[1])).index_add(0, assignment, values)
+    sizes = torch.bincount(assignment, minlength=count).clamp_min(1).unsqueeze(1)
+    maximum = values.new_full((count, values.shape[1]), -torch.inf)
+    maximum.scatter_reduce_(
+        0, assignment[:, None].expand_as(values), values, reduce="amax", include_self=True
+    )
+    maximum = torch.where(torch.isfinite(maximum), maximum, torch.zeros_like(maximum))
+    return total / sizes, maximum
+
+
+def _legacy_message(
+    model: _MessageLayer, node: Tensor, edge: Tensor, edge_index: Tensor
+) -> tuple[Tensor, Tensor]:
+    u, v = edge_index[:, 0], edge_index[:, 1]
+    symmetric = torch.cat((node[u] + node[v], (node[u] - node[v]).abs(), edge), dim=1)
+    updated_edge = model.edge_norm(edge + model.edge_update(symmetric))
+    source = torch.cat((u, v), dim=0)
+    target = torch.cat((v, u), dim=0)
+    directed_edge = torch.cat((updated_edge, updated_edge), dim=0)
+    messages = model.message(torch.cat((node[source], node[target], directed_edge), dim=1))
+    aggregate = torch.zeros_like(node)
+    aggregate.index_add_(0, target, messages)
+    degree = torch.zeros(node.shape[0], device=node.device, dtype=node.dtype)
+    degree.index_add_(0, target, torch.ones_like(target, dtype=node.dtype))
+    aggregate = aggregate / degree.clamp_min(1.0)[:, None]
+    updated_node = model.node_norm(node + model.node_update(torch.cat((node, aggregate), dim=1)))
+    return updated_node, updated_edge
+
+
+def _assert_gradients(actual: torch.nn.Module, expected: torch.nn.Module) -> None:
+    assert actual.state_dict().keys() == expected.state_dict().keys()
+    for (name, parameter), (reference_name, reference) in zip(
+        actual.named_parameters(), expected.named_parameters(), strict=True
+    ):
+        assert name == reference_name
+        assert parameter.grad is not None, name
+        assert reference.grad is not None, name
+        tolerance = (
+            {"rtol": 1e-12, "atol": 1e-12}
+            if parameter.dtype == torch.float64
+            else {"rtol": 3e-5, "atol": 3e-6}
+        )
+        torch.testing.assert_close(parameter.grad, reference.grad, **tolerance)
+
+
+@pytest.mark.parametrize("cardinalities", [(28,), BOND_DIMS, ATOM_DIMS])
+@pytest.mark.parametrize("rows", [0, 13])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_categorical_running_sum_matches_stack_values_and_parameter_gradients(
+    cardinalities, rows, dtype, monkeypatch
+):
+    torch.manual_seed(102)
+    model = CategoricalEncoder(cardinalities, 7).to(dtype=dtype)
+    reference = copy.deepcopy(model)
+    values = torch.stack([torch.randint(width, (rows,)) for width in cardinalities], dim=1)
+    expected = _legacy_categorical(reference, values)
+
+    def no_stack(*args, **kwargs):
+        raise AssertionError("categorical encoding must not materialize a field stack")
+
+    monkeypatch.setattr(torch, "stack", no_stack)
+    actual = model(values)
+    tolerance = (
+        {"rtol": 1e-12, "atol": 1e-12}
+        if dtype == torch.float64
+        else {"rtol": 3e-6, "atol": 2e-6}
+    )
+    torch.testing.assert_close(actual, expected, **tolerance)
+    weights = torch.randn_like(actual)
+    (actual.cos() * weights).sum().backward()
+    (expected.cos() * weights).sum().backward()
+    _assert_gradients(model, reference)
+    assert set(model.state_dict()) == {f"embeddings.{i}.weight" for i in range(len(cardinalities))}
+
+
+@pytest.mark.parametrize("assignment,count", [([0, 0, 2, 2, 2], 4), ([], 3), ([], 0)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_fixed_shape_pool_matches_values_and_input_gradients(assignment, count, dtype, monkeypatch):
+    torch.manual_seed(203)
+    indices = torch.tensor(assignment, dtype=torch.long)
+    values = torch.randn(len(indices), 5, dtype=dtype, requires_grad=True)
+    reference = values.detach().clone().requires_grad_(True)
+    expected = _legacy_pool(reference, indices, count)
+
+    def no_bincount(*args, **kwargs):
+        raise AssertionError("pool sizes must use the known graph count")
+
+    monkeypatch.setattr(torch, "bincount", no_bincount)
+    actual = _pool(values, indices, count)
+    for result, original in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, original, rtol=0, atol=0)
+        assert result.shape == (count, 5)
+        assert torch.isfinite(result).all()
+    weights = [torch.randn_like(part) for part in actual]
+    sum((result * weight).sum() for result, weight in zip(actual, weights, strict=True)).backward()
+    sum(
+        (result * weight).sum() for result, weight in zip(expected, weights, strict=True)
+    ).backward()
+    torch.testing.assert_close(values.grad, reference.grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("edges", [[], [(0, 1)], [(0, 1), (1, 2), (3, 4)]])
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_message_topology_reuse_preserves_outputs_input_and_parameter_gradients(
+    edges, prepared, dtype
+):
+    torch.manual_seed(304)
+    model = _MessageLayer(5).to(dtype=dtype)
+    reference = copy.deepcopy(model)
+    # Node 5 remains isolated, including when every graph has no edges.
+    node = torch.randn(6, 5, dtype=dtype, requires_grad=True)
+    edge = torch.randn(len(edges), 5, dtype=dtype, requires_grad=True)
+    reference_node = node.detach().clone().requires_grad_(True)
+    reference_edge = edge.detach().clone().requires_grad_(True)
+    indices = torch.tensor(edges, dtype=torch.long).reshape(-1, 2)
+    topology = _message_topology(node, indices) if prepared else None
+    actual = model(node, edge, indices, topology=topology)
+    expected = _legacy_message(reference, reference_node, reference_edge, indices)
+    for result, original in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, original, rtol=0, atol=0)
+    weights = [torch.randn_like(part) for part in actual]
+    sum((result * weight).sum() for result, weight in zip(actual, weights, strict=True)).backward()
+    sum(
+        (result * weight).sum() for result, weight in zip(expected, weights, strict=True)
+    ).backward()
+    torch.testing.assert_close(node.grad, reference_node.grad, rtol=0, atol=0)
+    torch.testing.assert_close(edge.grad, reference_edge.grad, rtol=0, atol=0)
+    _assert_gradients(model, reference)
+
+
+def _batch(dataset: str, *, empty_edges: bool) -> Batch:
+    atom_dims, bond_dims = ((28,), (4,)) if dataset == "zinc12k" else (ATOM_DIMS, BOND_DIMS)
+    edges = [] if empty_edges else [(0, 1), (1, 2), (3, 4)]
+    return Batch(
+        x=torch.stack([torch.randint(width, (6,)) for width in atom_dims], dim=1),
+        edge_index=torch.tensor(edges, dtype=torch.long).reshape(-1, 2).T,
+        edge_attr=torch.stack([torch.randint(width, (len(edges),)) for width in bond_dims], dim=1),
+        y=torch.zeros(3, 1 if dataset == "zinc12k" else 11),
+        cycle_set=torch.randn(len(edges), 6, requires_grad=True),
+        batch=torch.tensor([0, 0, 0, 1, 1, 2]),
+        ptr=torch.tensor([0, 3, 5, 6]),
+    )
+
+
+def _legacy_cycle_forward(model: CyclePEModel, batch: Batch) -> Tensor:
+    node = _legacy_categorical(model.node_encoder, batch.x)
+    edge = model.edge_encoder(
+        torch.cat(
+            (
+                _legacy_categorical(model.bond_encoder, batch.edge_attr),
+                model.pe_encoder(batch.cycle_set),
+            ),
+            dim=1,
+        )
+    )
+    for layer in model.layers:
+        node, edge = _legacy_message(layer, node, edge, batch.edge_index.T)
+    node_mean, node_max = _legacy_pool(node, batch.batch, len(batch.ptr) - 1)
+    edge_mean, edge_max = _legacy_pool(edge, batch.batch[batch.edge_index[0]], len(batch.ptr) - 1)
+    pooled = torch.cat((node_mean, node_max, edge_mean, edge_max), dim=1)
+    return model.graph_head(model.graph_trunk(pooled))
+
+
+@pytest.mark.parametrize("dataset", ["zinc12k", "peptides_struct"])
+@pytest.mark.parametrize("empty_edges", [False, True])
+def test_shared_model_optimization_preserves_complete_forward_and_backward(
+    dataset, empty_edges, monkeypatch
+):
+    torch.manual_seed(405)
+    model = CyclePEModel(dataset=dataset, hidden=8, pe_dim=4, layers=3)
+    reference = copy.deepcopy(model)
+    reference.load_state_dict(model.state_dict(), strict=True)
+    batch = _batch(dataset, empty_edges=empty_edges)
+    reference_batch = copy.deepcopy(batch)
+    topology_calls = []
+
+    def prepare_once(node, indices):
+        topology_calls.append(indices.shape[0])
+        return _message_topology(node, indices)
+
+    def no_layer_recompute(*args, **kwargs):
+        raise AssertionError("layer stack must reuse the forward's prepared connectivity")
+
+    monkeypatch.setattr(benchmark_models, "_message_topology", prepare_once)
+    monkeypatch.setattr(paper_model, "_message_topology", no_layer_recompute)
+    actual = model(batch)
+    expected = _legacy_cycle_forward(reference, reference_batch)
+    assert topology_calls == [batch.edge_index.shape[1]]
+    torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-6)
+    weights = torch.randn_like(actual)
+    (actual.square() * weights).sum().backward()
+    (expected.square() * weights).sum().backward()
+    torch.testing.assert_close(
+        batch.cycle_set.grad, reference_batch.cycle_set.grad, rtol=3e-5, atol=3e-6
+    )
+    _assert_gradients(model, reference)
+````
+
+# tests/test_execution_options.py
+
+````python
+"""Execution configuration tests; no research training or CUDA compilation."""
+
+import argparse
+from unittest.mock import Mock
+
+import pytest
+import torch
+
+from chartgat.execution import add_execution_arguments, configure_execution
+
+
+def test_compile_is_explicit_and_eager_does_not_wrap_model(monkeypatch):
+    parser = argparse.ArgumentParser()
+    add_execution_arguments(parser)
+    model = torch.nn.Sequential(torch.nn.Linear(2, 1))
+    compiler = Mock()
+    monkeypatch.setattr(torch, "compile", compiler)
+    before = tuple(model.state_dict())
+    report = configure_execution(model, parser.parse_args([]), torch.device("cpu"))
+    assert report["backend"] == "eager"
+    assert tuple(model.state_dict()) == before
+    compiler.assert_not_called()
+    assert parser.parse_args(["--compile", "--no-compile"]).compile is False
+
+
+def test_compile_targets_forward_without_changing_state_keys(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    model = torch.nn.Sequential(torch.nn.Linear(2, 1))
+    original_forward = model.forward
+    compiled_forward = Mock(wraps=original_forward)
+    compiler = Mock(return_value=compiled_forward)
+    monkeypatch.setattr(torch, "compile", compiler)
+    report = configure_execution(model, argparse.Namespace(compile=True), torch.device("cuda"))
+    compiler.assert_called_once_with(original_forward, backend="inductor", dynamic=True)
+    assert model.forward is compiled_forward
+    assert report["torch_compile"] is True
+    assert list(model.state_dict()) == ["0.weight", "0.bias"]
+    assert report["compiled_modules"] == ["<root>"]
+    assert report["scope"] == "tensor_mlp_blocks"
+
+
+def test_compile_refuses_cpu():
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        configure_execution(torch.nn.Linear(2, 1), argparse.Namespace(compile=True), "cpu")
+
+
+def test_compiler_errors_are_not_silently_fallback(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    model = torch.nn.Sequential(torch.nn.Linear(2, 1))
+    monkeypatch.setattr(torch, "compile", Mock(side_effect=RuntimeError("compiler missing")))
+    with pytest.raises(RuntimeError, match="compiler missing"):
+        configure_execution(model, argparse.Namespace(compile=True), "cuda")
 ````
 
 # tests/test_gpu_preflight.py
@@ -25082,6 +32692,84 @@ def test_setup_validates_profile_files_before_any_pip(
     assert "GPU environment ready" not in result.stdout
 ````
 
+# tests/test_optimized_runner.py
+
+````python
+"""Optimization flags must preserve track, seed, precision and dataset contracts."""
+
+import sys
+
+import pytest
+
+from scripts import run_paper
+
+
+@pytest.mark.parametrize(
+    "track,version", [("conductance_gat", "v1"), ("cycle_pe", "v1"), ("cycle_pe", "v2")]
+)
+def test_compile_is_forwarded_only_when_requested(track, version):
+    common = ["--tracks", track, "--cycle-pe-version", version, "--model-seeds", "0"]
+    for enabled in (False, True):
+        args = run_paper._parser().parse_args(common + (["--compile"] if enabled else []))
+        command = run_paper._commands(args, "optimization-unit")[-1][1]
+        assert ("--compile" in command) is enabled
+        assert "--no-amp" in command
+        assert "--amp" not in command
+        module = __import__(command[2], fromlist=["parser"])
+        parser = module.build_parser() if track == "conductance_gat" else module.parser()
+        parsed = parser.parse_args(command[3:])
+        assert parsed.compile is enabled
+        assert parsed.model_seed == 0
+
+
+def test_preparation_never_compiles():
+    args = run_paper._parser().parse_args(
+        ["--tracks", "conductance_gat", "--compile", "--prepare-only"]
+    )
+    for _, command, _ in run_paper._commands(args, "prepare-unit"):
+        assert "--compile" not in command
+
+
+def test_v2_basis_execution_options_reach_child():
+    args = run_paper._parser().parse_args(
+        [
+            "--tracks",
+            "cycle_pe",
+            "--cycle-pe-version",
+            "v2",
+            "--basis-execution",
+            "reference",
+            "--basis-pair-budget",
+            "1024",
+            "--model-seeds",
+            "0",
+        ]
+    )
+    command = run_paper._commands(args, "basis-unit")[-1][1]
+    from research.cycle_pe.v2.benchmark import parser
+
+    child = parser().parse_args(command[3:])
+    assert child.basis_execution == "reference"
+    assert child.basis_pair_budget == 1024
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [["--tracks", "tree_augmentation"], ["--suite", "core", "--tracks", "conductance_gat"], []],
+)
+def test_unsupported_compilation_rejected_before_dependencies(selection, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["run_paper.py", "--compile", "--dry-run", *selection])
+    monkeypatch.setattr(run_paper, "check_dependencies", lambda: pytest.fail("too late"))
+    assert run_paper.main() == 2
+    assert "--compile supports" in capsys.readouterr().err
+
+
+def test_basis_budget_rejected_before_data(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["run_paper.py", "--basis-pair-budget", "0", "--dry-run"])
+    assert run_paper.main() == 2
+    assert "must be positive" in capsys.readouterr().err
+````
+
 # tests/test_research_boundaries.py
 
 ````python
@@ -25524,7 +33212,7 @@ def test_readme_commands_use_full_independent_protocols() -> None:
         ("tree_augmentation",),
         ("all",),
     }
-    assert all(args.device == "cuda" and args.model_seeds == (0, 1, 2, 3, 4) for args in parsed)
+    assert all(args.device == "cuda" and args.model_seeds == (0,) for args in parsed)
     assert "--tiny" not in readme
     assert "python -c" not in readme
     assert "\\\n" not in readme
@@ -25546,7 +33234,7 @@ def test_default_workspace_directories_exist_in_a_clone() -> None:
 def test_default_benchmarks_match_each_track_without_generated_data(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    completed = _dry_run(["--dry-run", "--model-seeds", "0"], capsys)
+    completed = _dry_run(["--dry-run"], capsys)
     assert completed.returncode == 0, completed.stderr
     assert "research.conductance_gat.benchmark" in completed.stdout
     assert "research.cycle_pe.benchmark" in completed.stdout
@@ -25558,6 +33246,38 @@ def test_default_benchmarks_match_each_track_without_generated_data(
     assert "--variants" not in completed.stdout
     assert "--baselines" not in completed.stdout
     assert "research.conductance_gat.paper" not in completed.stdout
+    assert completed.stdout.count("--model-seed 0") == 4
+
+
+@pytest.mark.parametrize("prepare_only", [False, True])
+@pytest.mark.parametrize(
+    "selection,expected_seeds",
+    [([], (0,)), (["--model-seeds", "2,5"], (2, 5)), (["--seeds", "11,12"], (11, 12))],
+)
+def test_benchmark_default_and_explicit_seed_sweeps(prepare_only, selection, expected_seeds):
+    from scripts.run_paper import _commands, _parser
+
+    args = _parser().parse_args(selection + (["--prepare-only"] if prepare_only else []))
+    assert args.model_seeds == expected_seeds
+    children = [
+        command
+        for name, command, _ in _commands(args, "seed-dispatch-contract")
+        if name != "gpu_preflight"
+    ]
+    executed_seeds = expected_seeds[:1] if prepare_only else expected_seeds
+    assert len(children) == 4 * len(executed_seeds)
+    for seed in executed_seeds:
+        seed_children = [
+            command
+            for command in children
+            if command[command.index("--model-seed") + 1] == str(seed)
+        ]
+        assert [command[2] for command in seed_children] == [
+            "research.conductance_gat.benchmark",
+            "research.cycle_pe.benchmark",
+            "research.tree_augmentation.paper",
+            "research.tree_augmentation.paper",
+        ]
 
 
 def test_benchmark_prepares_each_public_suite_once(
@@ -25589,10 +33309,11 @@ def test_own_model_child_arguments_parse_with_actual_track_clis(prepare_only: bo
     args = _parser().parse_args(["--prepare-only", "--allow-download"] if prepare_only else [])
     commands = _commands(args, "argument-contract")
     children = [command for name, command, _ in commands if name != "gpu_preflight"]
-    assert len(children) == (4 if prepare_only else 20)
+    assert len(children) == 4
     for command in children:
         parsed = parsers[command[2]].parse_args(command[3:])
         assert parsed.prepare_only is prepare_only
+        assert parsed.model_seed == 0
         assert parsed.device == ("cpu" if prepare_only else "cuda")
         assert not hasattr(parsed, "baselines")
         assert not parsed.amp

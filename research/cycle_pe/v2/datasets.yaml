@@ -1,0 +1,28 @@
+registry_version: 1
+track: cycle_pe
+version: v2
+model: cycle_basis_v2
+claim: Full orthonormal left-nullspace basis is input to a learned encoder; no six-statistic PE.
+gpu_training_verified: false
+representation:
+  construction: full SVD of the canonical edge-by-node incidence matrix
+  basis_contract: B.T @ U_c = 0; U_c.T @ U_c = I; beta = m - n + components
+  truncation: none
+  symmetries: cycle-column signs and permutations only; not arbitrary basis rotation
+datasets:
+  - id: zinc12k
+    name: ZINC-12K
+    source_url: https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.datasets.ZINC.html
+    split: official 10000/1000/1000 train/validation/test
+    metrics: [mae]
+    adapter: research.cycle_pe.v2.data.load_benchmark
+    cache_namespace: cycle_pe_v2_benchmark/zinc12k
+    targets: official supplied labels unchanged
+  - id: peptides_struct
+    name: LRGB Peptides-struct
+    source_url: https://github.com/vijaydwivedi75/lrgb
+    split: official 10873/2331/2331 train/validation/test
+    metrics: [mae]
+    adapter: research.cycle_pe.v2.data.load_benchmark
+    cache_namespace: cycle_pe_v2_benchmark/peptides_struct
+    targets: all 11 official supplied labels unchanged

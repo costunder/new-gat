@@ -264,6 +264,27 @@ class GraphOutput(NamedTuple):
     embedding: Tensor
 
 
+class _MessageTopology(NamedTuple):
+    source: Tensor
+    target: Tensor
+    degree: Tensor
+
+
+def _message_topology(node: Tensor, edge_index: Tensor) -> _MessageTopology:
+    """Prepare fixed connectivity once for a stack, including isolated nodes.
+
+    This is local to one forward pass: it contains no learned values, buffers,
+    or cross-batch cache and therefore leaves checkpoint state unchanged.
+    Reuse requires unchanged node dtype/device and connectivity across layers.
+    """
+    u, v = edge_index[:, 0], edge_index[:, 1]
+    source = torch.cat((u, v), dim=0)
+    target = torch.cat((v, u), dim=0)
+    degree = node.new_zeros(node.shape[0])
+    degree.index_add_(0, target, torch.ones_like(target, dtype=node.dtype))
+    return _MessageTopology(source, target, degree.clamp_min(1.0))
+
+
 class _MessageLayer(nn.Module):
     def __init__(self, hidden_dim: int) -> None:
         super().__init__()
@@ -285,20 +306,26 @@ class _MessageLayer(nn.Module):
         self.edge_norm = nn.LayerNorm(hidden_dim)
         self.node_norm = nn.LayerNorm(hidden_dim)
 
-    def forward(self, node: Tensor, edge: Tensor, edge_index: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        node: Tensor,
+        edge: Tensor,
+        edge_index: Tensor,
+        *,
+        topology: _MessageTopology | None = None,
+    ) -> tuple[Tensor, Tensor]:
         u, v = edge_index[:, 0], edge_index[:, 1]
         symmetric = torch.cat((node[u] + node[v], (node[u] - node[v]).abs(), edge), dim=1)
         updated_edge = self.edge_norm(edge + self.edge_update(symmetric))
 
-        source = torch.cat((u, v), dim=0)
-        target = torch.cat((v, u), dim=0)
+        source, target, degree = (
+            _message_topology(node, edge_index) if topology is None else topology
+        )
         directed_edge = torch.cat((updated_edge, updated_edge), dim=0)
         messages = self.message(torch.cat((node[source], node[target], directed_edge), dim=1))
         aggregate = torch.zeros_like(node)
         aggregate.index_add_(0, target, messages)
-        degree = torch.zeros(node.shape[0], device=node.device, dtype=node.dtype)
-        degree.index_add_(0, target, torch.ones_like(target, dtype=node.dtype))
-        aggregate = aggregate / degree.clamp_min(1.0)[:, None]
+        aggregate = aggregate / degree[:, None]
         updated_node = self.node_norm(node + self.node_update(torch.cat((node, aggregate), dim=1)))
         return updated_node, updated_edge
 

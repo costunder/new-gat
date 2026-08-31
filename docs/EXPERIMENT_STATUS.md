@@ -1,0 +1,224 @@
+# 실험 결과와 구현 상태
+
+기준일: 2026-08-31 (Asia/Seoul).
+
+이 문서는 사용자가 제공한 **서버 결과 출력**과 **현재 소스 버전의 구현**을 구분한 기록이다.
+새로운 학습·모델 수정·성능 개선 결과가 아니다. 수치는 사용자 로그에서 확인했으며,
+서버의 전체 원본 checkpoint/manifest/history 파일을 로컬로 받아 독립 재검증한 것은 아니다.
+
+## 1. 소스 버전과 측정 범위
+
+후속 사용자 요청으로 현재 기본 실행은 model seed **0 하나**다. 기존 5-seed 측정값은 아래에
+그대로 보존하며, 기본값 변경이 과거 결과나 source revision을 바꾸지는 않는다.
+단일 seed의 std/CI는 null로 기록한다. 새 read-only `--full-audit`는 C 평균/셔플/전파 제거와
+train-label gradient를 검사하지만 **그 새 GPU 결과를 아직 수령한 것은 아니다.**
+
+| 구분 | 확인된 상태 |
+|---|---|
+| 이전 진단 전용 게시 commit | `ebf8cd19b80e6cd6c742b132e2bb1dadb97b019c` |
+| 이전 commit의 추가 내용 | Conductance 진단 Python/Bash, 전용 테스트, 안내 문서, 트랙 README의 5개 파일 |
+| 기존 학습 코드 | 위 진단 commit은 기존 benchmark의 모델·학습 수식을 변경하지 않음 |
+| Cycle PE 기저벡터 v2 | 이 소스 버전에 포함, 로컬 단위 검증 완료. 실제 GPU 결과 미수령 |
+| 실행 최적화·선택적 compile·속도 도구 | 이 소스 버전에 포함, 로컬 단위 검증 완료. GPU 가속 실측 미수령 |
+| 단일 seed 기본값·확장 checkpoint 검사 | 이 소스 버전에 포함. 새 mean/shuffle·gradient audit GPU 결과 미수령 |
+| `code_summary.md` | 이 버전의 source/test/config/script 전체를 파일별로 보존한 스냅샷 |
+
+`ebf8cd1`까지만 받은 서버에는 새 기능이 없으므로 업데이트 후 `git rev-parse HEAD`로
+실행 revision을 확인한다. 소스 업데이트가 서버에서의 실행 완료를 뜻하지는 않는다.
+아래 기존 실험을 v2·최적화·확장 진단 적용 결과로 재분류하면 안 된다.
+
+## 2. 사용자가 제공한 5-seed test 집계
+
+모든 항목의 model seeds는 `0,1,2,3,4`다. `±`는 seed 사이 **표본 표준편차**이며,
+표준오차·신뢰구간·5-fold 교차검증이 아니다. 모델·데이터·평가 조건이 다른 트랙끼리
+수치를 직접 차감해 기여도를 추정하지 않는다.
+
+### Conductance GAT
+
+Run: `paper-20260830T150244764889Z`.
+
+| 데이터셋 | 지표 | Test 평균 ± 표준편차 |
+|---|---|---:|
+| Cora | accuracy | 0.661600 ± 0.023639 |
+| CiteSeer | accuracy | 0.626800 ± 0.007918 |
+| PubMed | accuracy | 0.721200 ± 0.005630 |
+| ogbn-arxiv | accuracy | 0.486089 ± 0.002813 |
+| PPI | global micro-F1 | 0.500051 ± 0.004877 |
+
+이 값은 실행·집계 결과이지 경쟁력 또는 novelty의 증명이 아니다. 외부 논문 표와
+비교하려면 split·입력 전처리·모델 크기·학습 설정·모델 선택 절차를 별도로 확인해야 한다.
+
+### Cycle PE v1
+
+Run: `paper-20260831T015711388279Z`. 모델 키는 **`cycle_set`**이다.
+
+| 데이터셋 | 지표 | Test 평균 ± 표준편차 |
+|---|---|---:|
+| ZINC-12K | MAE, 낮을수록 좋음 | 0.189090 ± 0.016624 |
+| Peptides-struct | MAE, 낮을수록 좋음 | 0.259728 ± 0.002816 |
+
+이것은 cycle 기저를 여섯 통계로 요약하는 v1의 결과다. 좌영공간 기저벡터 전체를 입력하는
+**`cycle_basis_v2` 결과가 아니다.** `schema_version=2` 같은 저장 형식 버전과 모델 v2도
+구분한다. 같은 backbone의 PE 제외 ablation이 없으므로 이 표만으로 PE의 순수 효과를
+분리할 수 없다. 두 데이터셋이 회귀 과제이므로 MAE 사용 자체는 맞다.
+
+### Tree Augmentation
+
+Run: `paper-20260831T060149709584Z`.
+
+| 데이터·평가 조건 | 지표 | Fixed BFS | Multi-chart |
+|---|---|---:|---:|
+| CSL / seen family | accuracy | 0.400000 ± 0.028260 | 0.768333 ± 0.029404 |
+| CSL / unseen family | accuracy | 0.059167 ± 0.009501 | 0.137500 ± 0.002946 |
+| ZINC / seen family | MAE | 0.730009 ± 0.081641 | 0.753210 ± 0.156958 |
+| ZINC / unseen family | MAE | 0.727205 ± 0.083463 | 0.749209 ± 0.155026 |
+
+- `seen/unseen family`는 원본 그래프 종류가 아니라 **spanning-tree 생성 방식**이다.
+  Fixed는 root-0 BFS, multi는 random-root BFS/DFS로 학습한다. 같은 test 그래프에
+  fresh random-root BFS(seen)와 학습에서 제외한 Wilson UST(unseen)를 적용한다.
+- CSL은 단일 고정 label-stratified 90/30/30 분할이다. 5개 모델 seed는 5-fold가 아니다.
+  정확도는 chart별 정확도의 평균이며 여러 chart의 logits을 앙상블한 값이 아니다.
+- CSL seen에서는 큰 개선이 있지만 unseen의 절대 성능은 낮다. unseen prediction flip rate도
+  0.200000 → 0.319167로 증가하여 모든 chart 변화에 더 안정적이라고 주장할 수 없다.
+- ZINC의 평균 MAE는 두 조건 모두 개선되지 않았다. Chart prediction std는 seen에서
+  0.053970 → 0.041503, unseen에서 0.053139 → 0.041492로 줄었지만 이는 **한 그래프의
+  chart 변경에 따른 흔들림**이지 model-seed 사이 성능 변동 감소나 MAE 개선이 아니다.
+- `rounded_exact_vector_accuracy=0`은 정수 count용 일치 지표를 연속값 ZINC에도 노출한
+  부적절한 보조 지표다. 코드가 반올림한 예측과 연속 정답의 완전 일치를 검사하므로,
+  이를 회귀 학습 실패 또는 정확도 0%로 해석하지 않는다. 아직 코드에서는 제거하지 않았다.
+- 현재 Tree 기본 구현은 고정 800 optimizer updates 후 모델을 평가하며 validation-best
+  checkpoint 선택을 하지 않는다. 이 내부 fixed-vs-multi 실험을 표준 논문 표와 동일한
+  재현이라고 제시하지 않는다. 표의 차이에 대한 paired 유의성 검정은 수행하지 않았다.
+
+## 3. Conductance의 실제 GPU checkpoint 진단
+
+사용자가 `ebf8cd1`을 pull한 뒤 아래 명령을 실행했고,
+`Diagnostic status: passed (stdout only)` 출력을 제공했다.
+
+```bash
+bash scripts/diagnose_conductance.sh --run-id paper-20260830T150244764889Z --ablate-graph
+```
+
+대상은 **당시 기본값**인 model seed 0, Cora/PPI/ogbn-arxiv다. FP32 추론이며 AMP/TF32는 껐다.
+이후 CLI 기본 데이터 목록에 CiteSeer/PubMed를 추가했지만 이 과거 로그에는 포함되지 않는다.
+새로 계산한 지표는 train/validation뿐이고, test는 기존 저장값만 출력했다.
+원래 validation과 재계산값의 차이는 약 `0~5e-8`이다. 소스 불일치 경고는 제공된 출력에 없다.
+이 로그는 실제 GPU 추론 완료의 근거지만 전체 seed의 gate 상태나 GPU 가속의 근거는 아니다.
+
+저장된 학습 설정은 hidden 64, conductance 2층, dropout 0.5, Adam lr 0.005,
+weight decay 0.0005, 최대 200 epochs, patience 50, PPI batch size 2다.
+
+### 선택된 checkpoint의 성능과 학습 기록
+
+| 데이터 | Best epoch / 실행 epoch | Eval train 지표 | Eval validation 지표 | Eval train / validation loss |
+|---|---:|---:|---:|---:|
+| Cora | 23 / 73 | accuracy 1.000000 | accuracy 0.658000 | CE 0.083452 / 1.163915 |
+| PPI | 69 / 119 | micro-F1 0.496796 | micro-F1 0.487508 | BCE 0.541717 / 0.536941 |
+| ogbn-arxiv | 199 / 200 | accuracy 0.495695 | accuracy 0.509279 | CE 1.879628 / 1.826401 |
+
+Train-mode loss의 first → selected → last는 Cora `2.118194 → 0.720689 → 0.172052`,
+PPI `0.699084 → 0.541241 → 0.541466`, arxiv `3.944757 → 2.252732 → 2.251006`이다.
+진단의 train도 **dropout을 끈 eval 추론**이다. 학습 중 dropout을 켜고 기록한 loss와
+시점·모드가 다르므로 두 값을 직접 비교해 checkpoint 오류라고 판단하지 않는다.
+
+- Cora: 선택된 모델도 train 정확도 100%인 반면 validation은 65.8%다. 훈련 노드 적합은
+  충분하며 큰 일반화 차이가 확인됐다. 단순 epoch 부족이라고 보기 어렵다.
+- PPI: train에서도 F1이 낮아 현재 표현·정규화·최적화의 적합 부족을 의심한다. validation의
+  예측 양성 비율은 0.202331, 실제 양성 비율은 0.294568이다. 제공된 micro-F1과 양성 비율에서
+  계산한 precision은 약 0.598629, recall은 약 0.411182다. 원 로그가 직접 출력한 지표와
+  이 후처리 계산값을 구분한다. 낮은 recall의 원인은 아직 확정하지 않았다.
+- arxiv: 마지막 loss가 최저이고 best epoch가 199/200이라 추가 학습 여지가 있다.
+  그러나 아래의 극도로 약한 이웃 전달 문제도 병존한다.
+- Cora `23+50=73`, PPI `69+50=119`로 patience 설정과 종료 시점은 일치한다.
+
+### 층별 엣지 가중치와 이웃 혼합량
+
+층 번호는 코드의 `layer 0/1`을 따른다. Cora/arxiv 통계는 전체 transductive 그래프,
+PPI 표는 **validation 그래프 두 개**의 node/edge-pooled 통계다. 차수 최대값은
+그래프별로 계산한 뒤 통계를 모았다. `rho`는 0~1의 비율이며 퍼센트가 아니다.
+
+| 데이터 / 층 | C 평균 | C의 CV | rho 중앙값 | rho < 0.01 노드 비율 | 전파 상대 변화량 |
+|---|---:|---:|---:|---:|---:|
+| Cora / 0 | 0.6984 | 6.623e-7 | 0.01696 | 17.91% | 0.02989 |
+| Cora / 1 | 2.266 | 0.7224 | 0.02779 | 14.96% | 0.05120 |
+| PPI / 0 | 0.6932 | 0 | 0.02653 | 23.03% | 0.09871 |
+| PPI / 1 | 0.6932 | 0 | 0.02653 | 23.03% | 0.09498 |
+| arxiv / 0 | 0.6933 | 0 | 0.0004331 | 99.35% | 0.003041 |
+| arxiv / 1 | 0.6933 | 0 | 0.0004330 | 99.35% | 0.002101 |
+
+CV는 `std(C)/mean(C)`이고, 전파 상대 변화량은 LayerNorm/ELU 이전
+`||H_after_conv - H_before_conv|| / ||H_before_conv||`이다. PPI train 그래프 20개에서도
+두 층의 C CV는 0이며 rho 중앙값은 0.03308이다.
+
+PPI/arxiv의 **관측한 FP32 eval 입력**에서 C가 상수인 현상이 확인됐다. 표시는 작은 양수도
+지수 표기로 출력하므로 `CV=0`은 단순 표시 반올림 설명으로 지울 수 없다. C는 FP32로
+chunk 재계산하고 분산은 float64로 집계했다. 전체-batch GEMM과의 bitwise 동일성이나
+모든 가능한 입력에서 함수가 상수라는 결론까지 보장하지는 않는다.
+
+Cora의 layer 1에는 비상수 C가 있으므로 구현이 항상 C를 상수로 강제한다는 설명은 틀린다.
+또 진단은 학습 중 C 궤적을 기록한 것이 아니므로 학습 내내 C가 고정돼 있었다고 할 수 없다.
+
+현재 전파식은 다음과 같다.
+
+\[
+H'=H-\frac{0.95}{d_{\max}^C}B^\top C B H,\qquad
+\rho_i=0.95\frac{d_i^C}{d_{\max}^C}.
+\]
+
+`C=cI`이면 공통 c가 상쇄되어 `H'=H-(0.95/d_max)L_unweighted H`가 된다.
+따라서 관측한 PPI/arxiv 입력에서는 적응적 엣지 가중치가 아니라 동일 가중치의 전파로
+작동한다. arxiv rho 중앙값 `0.0004331`은 이웃 총가중치 **0.04331%**다.
+이는 안정성용 스텝 선택의 효과이며 `L=B^T B`라는 라플라시안 정의 자체의 필수 조건이 아니다.
+
+### 같은 checkpoint에서 전파만 우회한 validation 결과
+
+| 데이터 / 지표 | 원래 값 | 전파 우회 값 | 우회 − 원래 |
+|---|---:|---:|---:|
+| Cora accuracy | 0.658000 | 0.632000 | -0.026000 = -2.6000%p |
+| PPI micro-F1 | 0.487508 | 0.452144 | -0.035364 |
+| arxiv accuracy | 0.509279 | 0.508876 | -0.000403 ≈ -0.04027%p |
+
+전파 우회 값은 원 로그의 원래 지표와 delta를 합산했다. arxiv의 차이는 validation
+29,799개 노드에서 정답 수 순감소 12개에 해당하며, 예측이 12개만 바뀌었다는 뜻은 아니다.
+우회는 encoder/LN/ELU/decoder를 남기는 추론 개입이다. 별도 MLP를 재학습한 baseline이나
+저성능 원인을 단독으로 증명하는 실험이 아니다. Cora/PPI에는 분명한 지표 하락이 있으므로
+모든 데이터에서 그래프 연산을 전혀 사용하지 않는다고 말하면 안 된다.
+
+## 4. 미확정 원인과 다음 검증
+
+관측된 상수 C와 약한 전달량은 사실이지만, 그 발생 원인은 아직 확정되지 않았다.
+`softplus(0)+1e-5 ≈ 0.693157`이므로 PPI의 C 평균은 softplus 이전 gate raw logit이
+0 부근인 상황과 맞는다.
+이것만으로 모든 gate 파라미터가 0이라고 증명되지는 않는다. `softplus'(0)=0.5`이므로
+이를 softplus의 출력 포화라고 설명하는 것도 부정확하다.
+
+후속 확인 후보는 C-MLP 각 Linear의 weight/bias norm·0 비율, raw logit 분산,
+`abs(BH)` 입력 분포, 학습 손실에서 오는 gradient와 weight decay 항의 상대 크기다.
+약한 task gradient와 C-MLP 정규화가 입력 의존성 소실에 기여했을 가능성은 **가설**이다.
+
+아직 정규화 방식·C 파라미터 그룹·dropout·epoch 등의 수정이나 재학습을 시행하지 않았다.
+노드별 정규화로 바꾸면 기존 대칭성·보존성의 의미도 바뀌므로 단순 버그 수정으로 처리하지
+않는다. 이미 관측한 test에 맞춘 튜닝도 하지 않는다. 다른 model seed 및 CiteSeer/PubMed의
+gate 상태, v2 학습 결과, GPU 속도 개선은 별도 확인이 필요하다.
+
+## 5. 근거와 검증 범위
+
+| 근거 | 식별자 / SHA-256 |
+|---|---|
+| 사용자 제공 5-seed 집계 출력 | 첨부 `d4acb1eb-bd9d-40ef-af24-e5f7ba34f138`; `CEF76E8494C462E8302AF2811CCCD19BBB6D8DC8266DB852866237ED95DD5CEC` |
+| 사용자 제공 GPU 진단 stdout | 첨부 `5db2e997-c8ab-495e-b762-c32fa620c02c`; `C0E89FC76A438D1707FE90C889923390FDF8277F05780B2811FF4D444DD01A21` |
+
+이 hash는 **제공된 텍스트 파일의 hash**이며 서버의 checkpoint/원본 데이터 hash가 아니다.
+개인 서버 계정·호스트 경로와 원본 로그 전체는 이 문서에 복제하지 않았다.
+
+확장 검사 구현 전 문서 갱신의 로컬 회귀는 619 passed / 63 skipped (21.84 s, exit 0),
+당시 진단 전용은 42 passed였다. Ruff/diff 및 당시 문서 로컬 링크 34개 검사도 통과했다.
+최신 확장 검사 결과는 handoff의 최신 검증 항목을 따른다.
+단일 seed·확장 진단 구현 후 전체 회귀는 **680 passed / 63 skipped**, 진단 전용은
+**89 passed**다. 이 새 검사도 로컬 단위 검증이며 실제 GPU audit 결과는 아직 없다.
+기존 게시 학습 코드 `a64c235`와의 진단 호환성도 메모리 로딩을 통한 42개 단위 검사로 확인했다.
+생략된 63개는 Linux/Bash 전용 62개와 로컬 PyG 미설치 1개다. 이번에도 Windows faulthandler의
+`access violation` 메시지가 있었으나 pytest는 위 결과와 exit 0까지 실행됐다.
+이 호스트 경고를 Linux 성공의 근거로 해석하지 않는다. 로컬 단위 검사는 GPU 학습
+또는 가속 배수의 검증을 대신하지 않는다. 현재 소스 스냅샷 checksum은
+[hand_off.md](../hand_off.md)의 코드 스냅샷 항목을 따른다.
