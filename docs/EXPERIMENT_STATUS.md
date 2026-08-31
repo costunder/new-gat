@@ -3,7 +3,7 @@
 기준일: 2026-08-31 (Asia/Seoul).
 
 이 문서는 사용자가 제공한 **서버 결과 출력**과 **현재 소스 버전의 구현**을 구분한 기록이다.
-새로운 학습·모델 수정·성능 개선 결과가 아니다. 수치는 사용자 로그에서 확인했으며,
+문서 작성 자체가 새 학습을 실행했다는 뜻은 아니다. 수치는 사용자 로그에서 확인했으며,
 서버의 전체 원본 checkpoint/manifest/history 파일을 로컬로 받아 독립 재검증한 것은 아니다.
 
 ## 1. 소스 버전과 측정 범위
@@ -12,7 +12,12 @@
 그대로 보존하며, 기본값 변경이 과거 결과나 source revision을 바꾸지는 않는다.
 단일 seed의 std/CI는 null로 기록한다. 새 read-only `--full-audit`는 C 평균/셔플/전파 제거와
 train-label gradient를 검사하며 **5e801c3 실행의 새 GPU 로그를 수령했다.** 아래 확장 검사 절에
-기록했다. 후속 2×2 재학습은 구현만 완료한 별개 실험이며 아직 GPU 비교 결과가 없다.
+기록했다. 이후 **43afd63의 2×2 GPU 재학습 결과도 수령했으며 여덟 조건 모두 passed**다.
+이 결과를 근거로 추가한 C-learning 비교와 평균-C 검사는 아직 새 GPU 결과가 없다.
+
+후속 코드의 로컬 회귀는 **890 passed / 64 skipped** (30.76 s, exit 0), Ruff 통과다.
+새 학습 두 조건과 평균-C 검사는 작은 단위 fixture로 검증했고 공개 데이터 학습은 실행하지 않았다.
+생략은 Linux/Bash 62개, 로컬 PyG 미설치 1개, Windows 실제 symlink 권한 1개다.
 
 | 구분 | 확인된 상태 |
 |---|---|
@@ -22,12 +27,38 @@ train-label gradient를 검사하며 **5e801c3 실행의 새 GPU 로그를 수�
 | Cycle PE 기저벡터 v2 | 이 소스 버전에 포함, 로컬 단위 검증 완료. 실제 GPU 결과 미수령 |
 | 실행 최적화·선택적 compile·속도 도구 | 이 소스 버전에 포함, 로컬 단위 검증 완료. GPU 가속 실측 미수령 |
 | 단일 seed 기본값·확장 checkpoint 검사 | 5e801c3 GPU full audit 수령, seed 0 다섯 데이터셋 passed |
-| Gate WD × normalization 2×2 | 별도 ablation 폴더에 구현, PPI/arxiv × 4조건 × seed 0. 실제 GPU 학습 미실행 |
+| Gate WD × normalization 2×2 | 43afd63 실제 GPU 결과 수령. PPI/arxiv × 4조건 × seed 0 모두 passed |
+| Node-degree의 learned C vs fixed C | 별도 `c_learning` 코드 추가. 2데이터 × 2조건 × seed 0, 새 GPU 결과 미수령 |
+| Node-degree checkpoint mean-C 개입 | 별도 읽기 전용 검사 추가. 새 GPU 결과 미수령 |
 | `code_summary.md` | 이 버전의 source/test/config/script 전체를 파일별로 보존한 스냅샷 |
 
 `ebf8cd1`까지만 받은 서버에는 새 기능이 없으므로 업데이트 후 `git rev-parse HEAD`로
 실행 revision을 확인한다. 소스 업데이트가 서버에서의 실행 완료를 뜻하지는 않는다.
-아래 기존 학습 결과를 v2·최적화·새 2×2 재학습 결과로 재분류하면 안 된다.
+아래 기존 학습 결과를 v2·최적화·새 2×2/C-learning 결과로 재분류하면 안 된다.
+
+### 수령한 2×2 GPU 재학습: 정규화 효과와 C 학습은 별개
+
+Run `gat-factorial-seed0-v1`, 소스 `43afd632b97a4285dfeae26847b4f12a8fd1a1e4`,
+model seed 0. NVIDIA RTX A6000, Python 3.11.16, Torch 2.7.1+cu118, PyG 2.7.0,
+Linux glibc 2.35에서 여덟 fresh training과 최종 비교표가 모두 `passed`다.
+Train 정답으로 학습하고 validation으로 선택했으며 **test는 평가하지 않았다**.
+
+| 조건 | PPI validation micro-F1 (%) | arxiv validation accuracy (%) |
+|---|---:|---:|
+| baseline | 48.986770 | 50.927883 |
+| gate_no_wd | 49.378028 | 50.565451 |
+| node_degree | 52.465469 | 68.317723 |
+| node_degree_gate_no_wd | 50.340520 | 67.995566 |
+
+두 데이터 모두 **node_degree + gate WD 0.0005**가 최고다. 기존 정규화 대비 PPI
++3.478699pp, arxiv +17.389840pp다. WD를 제거하면 C 변동은 커지지만 성능은 일관되게
+좋아지지 않았다. 특히 arxiv 최고 조건의 두 층 C CV는 0과 약 0.00948이므로
+이 결과만으로 학습 C의 기여를 입증할 수 없다. PPI에는 비상수 C가 남아 있어
+반대로 C가 항상 불필요하다는 결론도 성립하지 않는다.
+
+정확한 epoch·5개 대비·층별 C/rho/전파량·해석 경계와 다음 분석은
+[Conductance 실험 정리](CONDUCTANCE_FACTORIAL_FINDINGS.md)에 보존했다.
+단일 seed의 탐색적 validation 결과이며 유의성·일반적 최적값·SOTA 주장은 하지 않는다.
 
 ### 수령한 확장 검사: 기존 checkpoint에 대한 개입
 
@@ -185,7 +216,7 @@ chunk 재계산하고 분산은 float64로 집계했다. 전체-batch GEMM과의
 Cora의 layer 1에는 비상수 C가 있으므로 구현이 항상 C를 상수로 강제한다는 설명은 틀린다.
 또 진단은 학습 중 C 궤적을 기록한 것이 아니므로 학습 내내 C가 고정돼 있었다고 할 수 없다.
 
-현재 전파식은 다음과 같다.
+이 과거 checkpoint와 변경하지 않은 기본 benchmark의 전파식은 다음과 같다.
 
 \[
 H'=H-\frac{0.95}{d_{\max}^C}B^\top C B H,\qquad
@@ -213,20 +244,27 @@ H'=H-\frac{0.95}{d_{\max}^C}B^\top C B H,\qquad
 
 ## 4. 미확정 원인과 다음 검증
 
-관측된 상수 C와 약한 전달량은 사실이지만, 그 발생 원인은 아직 확정되지 않았다.
+기존 checkpoint에서 관측된 상수 C와 약한 전달량은 사실이다. 이후 2×2 새 학습에서
+node-degree 정규화가 개선을 이끈 결과를 확보했지만, 모든 데이터·seed에 대한 원인 설명이나
+학습 C의 필요성까지 확정된 것은 아니다.
 `softplus(0)+1e-5 ≈ 0.693157`이므로 PPI의 C 평균은 softplus 이전 gate raw logit이
 0 부근인 상황과 맞는다.
 이것만으로 모든 gate 파라미터가 0이라고 증명되지는 않는다. `softplus'(0)=0.5`이므로
 이를 softplus의 출력 포화라고 설명하는 것도 부정확하다.
 
-후속 확인 후보는 C-MLP 각 Linear의 weight/bias norm·0 비율, raw logit 분산,
-`abs(BH)` 입력 분포, 학습 손실에서 오는 gradient와 weight decay 항의 상대 크기다.
-약한 task gradient와 C-MLP 정규화가 입력 의존성 소실에 기여했을 가능성은 **가설**이다.
+확장 audit에는 gate 입력·raw logit·gradient 검사가 있고, 2×2 학습에는 실제 train-mode
+첫 batch의 task gradient와 decay 관찰값이 있다. Gate WD 제거 후 선택된 C의 변동이
+커졌다는 결과와 WD 제거가 성능을 높인다는 주장은 분리한다.
 
-아직 정규화 방식·C 파라미터 그룹·dropout·epoch 등의 수정이나 재학습을 시행하지 않았다.
-노드별 정규화로 바꾸면 기존 대칭성·보존성의 의미도 바뀌므로 단순 버그 수정으로 처리하지
-않는다. 이미 관측한 test에 맞춘 튜닝도 하지 않는다. 다른 model seed 및 CiteSeer/PubMed의
-gate 상태, v2 학습 결과, GPU 속도 개선은 별도 확인이 필요하다.
+다음은 [C-learning 전용 실행](../research/conductance_gat/c_learning/README.md)이다.
+기존 `node_degree` checkpoint의 C를 평균으로 바꿔 현재 의존도를 검사하는 **재학습 없는
+개입**과, 같은 정규화에서 `learned_c`/`fixed_c=1`을 처음부터 학습하는 **4개 새 학습**을
+분리한다. 두 데이터와 seed 0을 유지하고 새 learned 점수도 같은 run에서 얻는다.
+이 두 후속 분석은 구현 상태이며 GPU 결과를 아직 수령하지 않았다.
+
+노드별 정규화는 기존 대칭성·보존성의 의미를 바꾸는 실험이므로 단순 속도 최적화나
+버그 수정으로 부르지 않는다. 기존 기본 benchmark는 유지한다. 다른 model seed의
+일반화, v2 학습 결과, GPU 가속 실측은 여전히 별도 검증 대상이다.
 
 ## 5. 근거와 검증 범위
 
@@ -234,6 +272,8 @@ gate 상태, v2 학습 결과, GPU 속도 개선은 별도 확인이 필요하�
 |---|---|
 | 사용자 제공 5-seed 집계 출력 | 첨부 `d4acb1eb-bd9d-40ef-af24-e5f7ba34f138`; `CEF76E8494C462E8302AF2811CCCD19BBB6D8DC8266DB852866237ED95DD5CEC` |
 | 사용자 제공 GPU 진단 stdout | 첨부 `5db2e997-c8ab-495e-b762-c32fa620c02c`; `C0E89FC76A438D1707FE90C889923390FDF8277F05780B2811FF4D444DD01A21` |
+| 사용자 제공 5e801c3 full-audit stdout | 첨부 `c4abbad1-654a-4f5e-a774-f84f7e88e4dd`; `CFA2118D4B9257CA8772FC16BE9834D1D0FB402FA375DDCB4E652D6FB37D564F` |
+| 사용자 제공 43afd63 2×2 GPU 학습·비교 stdout | 첨부 `20b4a93d-06ed-4cff-9fe5-530eacf39766`; `2C78D02BB210BF00865AB7207DF651B02B2081EE4FAE6E8A6A83665A5D331161` |
 
 이 hash는 **제공된 텍스트 파일의 hash**이며 서버의 checkpoint/원본 데이터 hash가 아니다.
 개인 서버 계정·호스트 경로와 원본 로그 전체는 이 문서에 복제하지 않았다.
@@ -245,7 +285,8 @@ gate 상태, v2 학습 결과, GPU 속도 개선은 별도 확인이 필요하�
 **89 passed**다. 이는 당시 로컬 단위 검증이며, 이후 수령한 실제 GPU full-audit 로그는 위에
 별도로 기록했다. 후속 2×2 구현 후 전체 검사는 **794 passed / 64 skipped** (31.83 s, exit 0),
 Ruff 통과다. 기존 생략 사유에 Windows 실제 symlink 권한 1개가 추가됐으며 차단 로직은 별도
-mock 검사로 확인했다. 새 조건의 실제 GPU 재학습·성능 비교는 아직 실행하지 않았다.
+mock 검사로 확인했다. 이 수치는 2×2 코드 구현 당시의 로컬 검사이며, 이후 수령한
+43afd63의 실제 GPU 재학습·성능 비교는 위에 별도 기록했다.
 기존 게시 학습 코드 `a64c235`와의 진단 호환성도 메모리 로딩을 통한 42개 단위 검사로 확인했다.
 생략된 63개는 Linux/Bash 전용 62개와 로컬 PyG 미설치 1개다. 이번에도 Windows faulthandler의
 `access violation` 메시지가 있었으나 pytest는 위 결과와 exit 0까지 실행됐다.

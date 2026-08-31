@@ -106,6 +106,9 @@ def _load_child(
     run_dir: Path,
     job: dict[str, Any],
     common: dict[str, Any],
+    *,
+    suite: str = "conductance_factorial",
+    conditions: dict[str, dict[str, Any]] = CONDITIONS,
 ) -> dict[str, Any]:
     dataset, condition = job["dataset"], job["condition"]
     label = f"{dataset}/{condition}"
@@ -124,12 +127,12 @@ def _load_child(
     expected = {
         "schema_version": 1,
         "status": "passed",
-        "research_suite": "conductance_factorial",
+        "research_suite": suite,
         "dataset": dataset,
         "condition": condition,
         "model_seed": common["model_seed"],
-        "normalization": CONDITIONS[condition]["normalization"],
-        "gate_weight_decay": CONDITIONS[condition]["gate_weight_decay"],
+        "normalization": conditions[condition]["normalization"],
+        "gate_weight_decay": conditions[condition]["gate_weight_decay"],
         "non_gate_weight_decay": common["weight_decay"],
         "metric_name": _metric_name(dataset),
         "test_evaluated": False,

@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import math
 import time
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,30 @@ from ..benchmark import _binary_counts, _micro_f1_from_counts, _seed, _versions
 from ..benchmark_data import load_dataset, sha256_file
 from .model import FactorialNodeClassifier, is_gate_parameter, make_optimizer, state_sha256
 from .protocol import COMMON, CONDITIONS, DATASETS
+
+
+@dataclass(frozen=True)
+class TrainingDefinition:
+    """Explicit suite injection; existing factorial behavior remains the default.
+
+    Related, separately reported experiments share this audited train/validation
+    loop without replacing globals or silently changing the factorial protocol.
+    """
+
+    suite: str
+    conditions: Mapping[str, Mapping[str, Any]]
+    model_factory: Callable[..., nn.Module]
+    optimizer_factory: Callable[[nn.Module, str], torch.optim.Optimizer]
+    description: str | None = None
+
+
+def _training_definition(definition: TrainingDefinition | None) -> TrainingDefinition:
+    if definition is not None:
+        return definition
+    return TrainingDefinition(
+        "conductance_factorial", CONDITIONS, FactorialNodeClassifier, make_optimizer
+    )
+
 
 OBSERVATION_POLICY = {
     "validation": "eval mode, no gradients, official validation labels only",
@@ -65,7 +91,7 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
 
 def _require_cuda(device: torch.device) -> None:
     if device.type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("Factorial training requires a CUDA GPU; no CPU fallback is allowed.")
+        raise RuntimeError("Conductance training requires a CUDA GPU; no CPU fallback is allowed.")
     torch.cuda.get_device_properties(device)
 
 
@@ -287,23 +313,25 @@ def parameter_norms(model: nn.Module) -> dict[str, float]:
     }
 
 
-def gradient_observation(model: nn.Module, condition: str) -> dict[str, Any]:
+def gradient_observation(
+    model: nn.Module, condition: str, *, definition: TrainingDefinition | None = None
+) -> dict[str, Any]:
+    specification = _training_definition(definition).conditions[condition]
     groups: dict[str, list[tuple[str, nn.Parameter]]] = {"non_gate": []}
     for name, parameter in model.named_parameters():
         group = name.split(".estimator.")[0] if is_gate_parameter(name) else "non_gate"
         groups.setdefault(group, []).append((name, parameter))
     output = {}
     for group, parameters in groups.items():
-        wd = (
-            COMMON["weight_decay"]
-            if group == "non_gate"
-            else CONDITIONS[condition]["gate_weight_decay"]
-        )
+        wd = COMMON["weight_decay"] if group == "non_gate" else specification["gate_weight_decay"]
+        trainable = [p for _, p in parameters if p.requires_grad]
+        if not trainable:
+            wd = 0.0
         parameter_norm = math.sqrt(sum(_tensor_squared_norm(p) for _, p in parameters))
         task_norm = math.sqrt(
             sum(_tensor_squared_norm(p.grad) for _, p in parameters if p.grad is not None)
         )
-        decay_norm = wd * parameter_norm
+        decay_norm = wd * math.sqrt(sum(_tensor_squared_norm(p) for p in trainable))
         output[group] = {
             "parameter_norm": parameter_norm,
             "task_gradient_norm": task_norm,
@@ -312,6 +340,8 @@ def gradient_observation(model: nn.Module, condition: str) -> dict[str, Any]:
             "task_to_decay_ratio": task_norm / decay_norm if decay_norm > 0 else None,
             "ratio_policy": "exact" if decay_norm > 0 else "undefined_zero_decay_norm",
             "parameter_count": sum(p.numel() for _, p in parameters),
+            "trainable_parameter_count": sum(p.numel() for p in trainable),
+            "optimizer_included": bool(trainable),
             "missing_gradient_parameters": [name for name, p in parameters if p.grad is None],
         }
     return output
@@ -377,12 +407,17 @@ def checkpoint_payload(
     epoch: int,
     validation: float,
     optimizer_steps: int = 0,
+    *,
+    definition: TrainingDefinition | None = None,
 ) -> dict[str, Any]:
+    experiment = _training_definition(definition)
+    spec = experiment.conditions[args.condition]
+    gate_metadata = {"gate_mode": spec["gate_mode"]} if "gate_mode" in spec else {}
     return {
         "state_dict": {name: value.detach().cpu() for name, value in model.state_dict().items()},
-        "research_suite": "conductance_factorial",
+        "research_suite": experiment.suite,
         # Distinct model identity makes the existing baseline diagnostics reject it.
-        "model": "conductance_factorial",
+        "model": experiment.suite,
         "dataset": args.dataset,
         "condition": args.condition,
         "model_seed": args.model_seed,
@@ -390,11 +425,16 @@ def checkpoint_payload(
             "hidden_channels": COMMON["hidden_channels"],
             "layers": COMMON["layers"],
             "dropout": COMMON["dropout"],
-            "normalization": CONDITIONS[args.condition]["normalization"],
+            "normalization": spec["normalization"],
+            **gate_metadata,
         },
+        **gate_metadata,
         "configuration": configuration(args),
-        "gate_weight_decay": CONDITIONS[args.condition]["gate_weight_decay"],
+        "gate_weight_decay": spec["gate_weight_decay"],
         "non_gate_weight_decay": COMMON["weight_decay"],
+        "total_parameters": sum(p.numel() for p in model.parameters()),
+        "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        "frozen_parameters": sum(p.numel() for p in model.parameters() if not p.requires_grad),
         "cache_sha256": protocol["data_sha256"],
         "initial_state_sha256": initial_hash,
         "best_epoch": epoch,
@@ -411,22 +451,28 @@ def train_model(
     args: argparse.Namespace,
     device: torch.device,
     output: Path,
+    *,
+    definition: TrainingDefinition | None = None,
 ) -> dict[str, Any]:
     _require_cuda(device)
+    experiment = _training_definition(definition)
+    spec = experiment.conditions[args.condition]
     _configure_fp32()
     _seed(args.model_seed)
     data, split_indices = _make_data(payload, args, device)
     train_indices = None if split_indices is None else split_indices["train"]
-    model = FactorialNodeClassifier(
+    gate_kwargs = {"gate_mode": spec["gate_mode"]} if "gate_mode" in spec else {}
+    model = experiment.model_factory(
         payload["graphs"][0]["x"].shape[1],
         payload["classes"],
-        normalization=CONDITIONS[args.condition]["normalization"],
+        normalization=spec["normalization"],
         hidden_channels=COMMON["hidden_channels"],
         layers=COMMON["layers"],
         dropout=COMMON["dropout"],
+        **gate_kwargs,
     ).to(device)
     initial_hash = state_sha256(model)
-    optimizer = make_optimizer(model, args.condition)
+    optimizer = experiment.optimizer_factory(model, args.condition)
     checkpoint = output / "best.pt"
     history: list[dict[str, Any]] = []
     trajectory: list[dict[str, Any]] = []
@@ -471,7 +517,9 @@ def train_model(
                         "label_count": count,
                         "train_loss": float(loss.detach()),
                         "layers": training_observation.summary(),
-                        "parameter_groups": gradient_observation(model, args.condition),
+                        "parameter_groups": gradient_observation(
+                            model, args.condition, definition=experiment
+                        ),
                     }
                 )
             optimizer.step()
@@ -501,7 +549,14 @@ def train_model(
             best_optimizer_steps = optimizer_steps
             best_observation = validation_observation
             saved = checkpoint_payload(
-                model, args, protocol, initial_hash, epoch, validation, optimizer_steps
+                model,
+                args,
+                protocol,
+                initial_hash,
+                epoch,
+                validation,
+                optimizer_steps,
+                definition=experiment,
             )
             atomic_publish(checkpoint, lambda path, state=saved: torch.save(state, path))
         if epoch == 1 or epoch % 10 == 0:
@@ -522,11 +577,11 @@ def train_model(
     return {
         "schema_version": 1,
         "status": "passed",
-        "research_suite": "conductance_factorial",
+        "research_suite": experiment.suite,
         "dataset": args.dataset,
         "condition": args.condition,
         "model_seed": args.model_seed,
-        **CONDITIONS[args.condition],
+        **spec,
         "non_gate_weight_decay": COMMON["weight_decay"],
         "configuration": configuration(args),
         "cache_sha256": protocol["data_sha256"],
@@ -548,7 +603,9 @@ def train_model(
         "elapsed_seconds": time.perf_counter() - started,
         "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(device),
         "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
-        "trainable_parameters": sum(p.numel() for p in model.parameters()),
+        "total_parameters": sum(p.numel() for p in model.parameters()),
+        "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        "frozen_parameters": sum(p.numel() for p in model.parameters() if not p.requires_grad),
         "evaluation_split": "validation",
         "test_evaluated": False,
         "versions": _versions(),
@@ -566,10 +623,11 @@ def train_model(
     }
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser(*, definition: TrainingDefinition | None = None) -> argparse.ArgumentParser:
+    experiment = _training_definition(definition)
+    parser = argparse.ArgumentParser(description=experiment.description or __doc__)
     parser.add_argument("--dataset", required=True, choices=DATASETS)
-    parser.add_argument("--condition", required=True, choices=tuple(CONDITIONS))
+    parser.add_argument("--condition", required=True, choices=tuple(experiment.conditions))
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--data-root", type=Path, default=Path("data/paper"))
     parser.add_argument("--device", default="cuda")
@@ -581,8 +639,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def main(argv: list[str] | None = None, *, definition: TrainingDefinition | None = None) -> int:
+    experiment = _training_definition(definition)
+    args = build_parser(definition=experiment).parse_args(argv)
     if min(args.epochs, args.patience, args.batch_size) < 1:
         raise ValueError("epochs, patience and batch size must be positive")
     if min(args.workers, args.model_seed) < 0:
@@ -599,11 +658,11 @@ def main(argv: list[str] | None = None) -> int:
     record: dict[str, Any] = {
         "schema_version": 1,
         "status": "running",
-        "research_suite": "conductance_factorial",
+        "research_suite": experiment.suite,
         "dataset": args.dataset,
         "condition": args.condition,
         "model_seed": args.model_seed,
-        **CONDITIONS[args.condition],
+        **experiment.conditions[args.condition],
         "non_gate_weight_decay": COMMON["weight_decay"],
         "configuration": configuration(args),
         "evaluation_split": "validation",
@@ -613,7 +672,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         payload, protocol = load_dataset(args.dataset, data_root, allow_download=False)
         record.update(cache_sha256=protocol["data_sha256"], protocol=protocol)
-        result = train_model(payload, protocol, args, device, output)
+        result = train_model(payload, protocol, args, device, output, definition=experiment)
         record.update(result)
     except BaseException as exc:
         record.update(status="failed", error=f"{type(exc).__name__}: {exc}")

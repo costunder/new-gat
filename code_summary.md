@@ -2878,6 +2878,9 @@ def _load_child(
     run_dir: Path,
     job: dict[str, Any],
     common: dict[str, Any],
+    *,
+    suite: str = "conductance_factorial",
+    conditions: dict[str, dict[str, Any]] = CONDITIONS,
 ) -> dict[str, Any]:
     dataset, condition = job["dataset"], job["condition"]
     label = f"{dataset}/{condition}"
@@ -2896,12 +2899,12 @@ def _load_child(
     expected = {
         "schema_version": 1,
         "status": "passed",
-        "research_suite": "conductance_factorial",
+        "research_suite": suite,
         "dataset": dataset,
         "condition": condition,
         "model_seed": common["model_seed"],
-        "normalization": CONDITIONS[condition]["normalization"],
-        "gate_weight_decay": CONDITIONS[condition]["gate_weight_decay"],
+        "normalization": conditions[condition]["normalization"],
+        "gate_weight_decay": conditions[condition]["gate_weight_decay"],
         "non_gate_weight_decay": common["weight_decay"],
         "metric_name": _metric_name(dataset),
         "test_evaluated": False,
@@ -3490,7 +3493,9 @@ from __future__ import annotations
 import argparse
 import math
 import time
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -3504,6 +3509,30 @@ from ..benchmark import _binary_counts, _micro_f1_from_counts, _seed, _versions
 from ..benchmark_data import load_dataset, sha256_file
 from .model import FactorialNodeClassifier, is_gate_parameter, make_optimizer, state_sha256
 from .protocol import COMMON, CONDITIONS, DATASETS
+
+
+@dataclass(frozen=True)
+class TrainingDefinition:
+    """Explicit suite injection; existing factorial behavior remains the default.
+
+    Related, separately reported experiments share this audited train/validation
+    loop without replacing globals or silently changing the factorial protocol.
+    """
+
+    suite: str
+    conditions: Mapping[str, Mapping[str, Any]]
+    model_factory: Callable[..., nn.Module]
+    optimizer_factory: Callable[[nn.Module, str], torch.optim.Optimizer]
+    description: str | None = None
+
+
+def _training_definition(definition: TrainingDefinition | None) -> TrainingDefinition:
+    if definition is not None:
+        return definition
+    return TrainingDefinition(
+        "conductance_factorial", CONDITIONS, FactorialNodeClassifier, make_optimizer
+    )
+
 
 OBSERVATION_POLICY = {
     "validation": "eval mode, no gradients, official validation labels only",
@@ -3545,7 +3574,7 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
 
 def _require_cuda(device: torch.device) -> None:
     if device.type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("Factorial training requires a CUDA GPU; no CPU fallback is allowed.")
+        raise RuntimeError("Conductance training requires a CUDA GPU; no CPU fallback is allowed.")
     torch.cuda.get_device_properties(device)
 
 
@@ -3767,23 +3796,25 @@ def parameter_norms(model: nn.Module) -> dict[str, float]:
     }
 
 
-def gradient_observation(model: nn.Module, condition: str) -> dict[str, Any]:
+def gradient_observation(
+    model: nn.Module, condition: str, *, definition: TrainingDefinition | None = None
+) -> dict[str, Any]:
+    specification = _training_definition(definition).conditions[condition]
     groups: dict[str, list[tuple[str, nn.Parameter]]] = {"non_gate": []}
     for name, parameter in model.named_parameters():
         group = name.split(".estimator.")[0] if is_gate_parameter(name) else "non_gate"
         groups.setdefault(group, []).append((name, parameter))
     output = {}
     for group, parameters in groups.items():
-        wd = (
-            COMMON["weight_decay"]
-            if group == "non_gate"
-            else CONDITIONS[condition]["gate_weight_decay"]
-        )
+        wd = COMMON["weight_decay"] if group == "non_gate" else specification["gate_weight_decay"]
+        trainable = [p for _, p in parameters if p.requires_grad]
+        if not trainable:
+            wd = 0.0
         parameter_norm = math.sqrt(sum(_tensor_squared_norm(p) for _, p in parameters))
         task_norm = math.sqrt(
             sum(_tensor_squared_norm(p.grad) for _, p in parameters if p.grad is not None)
         )
-        decay_norm = wd * parameter_norm
+        decay_norm = wd * math.sqrt(sum(_tensor_squared_norm(p) for p in trainable))
         output[group] = {
             "parameter_norm": parameter_norm,
             "task_gradient_norm": task_norm,
@@ -3792,6 +3823,8 @@ def gradient_observation(model: nn.Module, condition: str) -> dict[str, Any]:
             "task_to_decay_ratio": task_norm / decay_norm if decay_norm > 0 else None,
             "ratio_policy": "exact" if decay_norm > 0 else "undefined_zero_decay_norm",
             "parameter_count": sum(p.numel() for _, p in parameters),
+            "trainable_parameter_count": sum(p.numel() for p in trainable),
+            "optimizer_included": bool(trainable),
             "missing_gradient_parameters": [name for name, p in parameters if p.grad is None],
         }
     return output
@@ -3857,12 +3890,17 @@ def checkpoint_payload(
     epoch: int,
     validation: float,
     optimizer_steps: int = 0,
+    *,
+    definition: TrainingDefinition | None = None,
 ) -> dict[str, Any]:
+    experiment = _training_definition(definition)
+    spec = experiment.conditions[args.condition]
+    gate_metadata = {"gate_mode": spec["gate_mode"]} if "gate_mode" in spec else {}
     return {
         "state_dict": {name: value.detach().cpu() for name, value in model.state_dict().items()},
-        "research_suite": "conductance_factorial",
+        "research_suite": experiment.suite,
         # Distinct model identity makes the existing baseline diagnostics reject it.
-        "model": "conductance_factorial",
+        "model": experiment.suite,
         "dataset": args.dataset,
         "condition": args.condition,
         "model_seed": args.model_seed,
@@ -3870,11 +3908,16 @@ def checkpoint_payload(
             "hidden_channels": COMMON["hidden_channels"],
             "layers": COMMON["layers"],
             "dropout": COMMON["dropout"],
-            "normalization": CONDITIONS[args.condition]["normalization"],
+            "normalization": spec["normalization"],
+            **gate_metadata,
         },
+        **gate_metadata,
         "configuration": configuration(args),
-        "gate_weight_decay": CONDITIONS[args.condition]["gate_weight_decay"],
+        "gate_weight_decay": spec["gate_weight_decay"],
         "non_gate_weight_decay": COMMON["weight_decay"],
+        "total_parameters": sum(p.numel() for p in model.parameters()),
+        "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        "frozen_parameters": sum(p.numel() for p in model.parameters() if not p.requires_grad),
         "cache_sha256": protocol["data_sha256"],
         "initial_state_sha256": initial_hash,
         "best_epoch": epoch,
@@ -3891,22 +3934,28 @@ def train_model(
     args: argparse.Namespace,
     device: torch.device,
     output: Path,
+    *,
+    definition: TrainingDefinition | None = None,
 ) -> dict[str, Any]:
     _require_cuda(device)
+    experiment = _training_definition(definition)
+    spec = experiment.conditions[args.condition]
     _configure_fp32()
     _seed(args.model_seed)
     data, split_indices = _make_data(payload, args, device)
     train_indices = None if split_indices is None else split_indices["train"]
-    model = FactorialNodeClassifier(
+    gate_kwargs = {"gate_mode": spec["gate_mode"]} if "gate_mode" in spec else {}
+    model = experiment.model_factory(
         payload["graphs"][0]["x"].shape[1],
         payload["classes"],
-        normalization=CONDITIONS[args.condition]["normalization"],
+        normalization=spec["normalization"],
         hidden_channels=COMMON["hidden_channels"],
         layers=COMMON["layers"],
         dropout=COMMON["dropout"],
+        **gate_kwargs,
     ).to(device)
     initial_hash = state_sha256(model)
-    optimizer = make_optimizer(model, args.condition)
+    optimizer = experiment.optimizer_factory(model, args.condition)
     checkpoint = output / "best.pt"
     history: list[dict[str, Any]] = []
     trajectory: list[dict[str, Any]] = []
@@ -3951,7 +4000,9 @@ def train_model(
                         "label_count": count,
                         "train_loss": float(loss.detach()),
                         "layers": training_observation.summary(),
-                        "parameter_groups": gradient_observation(model, args.condition),
+                        "parameter_groups": gradient_observation(
+                            model, args.condition, definition=experiment
+                        ),
                     }
                 )
             optimizer.step()
@@ -3981,7 +4032,14 @@ def train_model(
             best_optimizer_steps = optimizer_steps
             best_observation = validation_observation
             saved = checkpoint_payload(
-                model, args, protocol, initial_hash, epoch, validation, optimizer_steps
+                model,
+                args,
+                protocol,
+                initial_hash,
+                epoch,
+                validation,
+                optimizer_steps,
+                definition=experiment,
             )
             atomic_publish(checkpoint, lambda path, state=saved: torch.save(state, path))
         if epoch == 1 or epoch % 10 == 0:
@@ -4002,11 +4060,11 @@ def train_model(
     return {
         "schema_version": 1,
         "status": "passed",
-        "research_suite": "conductance_factorial",
+        "research_suite": experiment.suite,
         "dataset": args.dataset,
         "condition": args.condition,
         "model_seed": args.model_seed,
-        **CONDITIONS[args.condition],
+        **spec,
         "non_gate_weight_decay": COMMON["weight_decay"],
         "configuration": configuration(args),
         "cache_sha256": protocol["data_sha256"],
@@ -4028,7 +4086,9 @@ def train_model(
         "elapsed_seconds": time.perf_counter() - started,
         "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(device),
         "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
-        "trainable_parameters": sum(p.numel() for p in model.parameters()),
+        "total_parameters": sum(p.numel() for p in model.parameters()),
+        "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        "frozen_parameters": sum(p.numel() for p in model.parameters() if not p.requires_grad),
         "evaluation_split": "validation",
         "test_evaluated": False,
         "versions": _versions(),
@@ -4046,10 +4106,11 @@ def train_model(
     }
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+def build_parser(*, definition: TrainingDefinition | None = None) -> argparse.ArgumentParser:
+    experiment = _training_definition(definition)
+    parser = argparse.ArgumentParser(description=experiment.description or __doc__)
     parser.add_argument("--dataset", required=True, choices=DATASETS)
-    parser.add_argument("--condition", required=True, choices=tuple(CONDITIONS))
+    parser.add_argument("--condition", required=True, choices=tuple(experiment.conditions))
     parser.add_argument("--output-dir", required=True, type=Path)
     parser.add_argument("--data-root", type=Path, default=Path("data/paper"))
     parser.add_argument("--device", default="cuda")
@@ -4061,8 +4122,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def main(argv: list[str] | None = None, *, definition: TrainingDefinition | None = None) -> int:
+    experiment = _training_definition(definition)
+    args = build_parser(definition=experiment).parse_args(argv)
     if min(args.epochs, args.patience, args.batch_size) < 1:
         raise ValueError("epochs, patience and batch size must be positive")
     if min(args.workers, args.model_seed) < 0:
@@ -4079,11 +4141,11 @@ def main(argv: list[str] | None = None) -> int:
     record: dict[str, Any] = {
         "schema_version": 1,
         "status": "running",
-        "research_suite": "conductance_factorial",
+        "research_suite": experiment.suite,
         "dataset": args.dataset,
         "condition": args.condition,
         "model_seed": args.model_seed,
-        **CONDITIONS[args.condition],
+        **experiment.conditions[args.condition],
         "non_gate_weight_decay": COMMON["weight_decay"],
         "configuration": configuration(args),
         "evaluation_split": "validation",
@@ -4093,7 +4155,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         payload, protocol = load_dataset(args.dataset, data_root, allow_download=False)
         record.update(cache_sha256=protocol["data_sha256"], protocol=protocol)
-        result = train_model(payload, protocol, args, device, output)
+        result = train_model(payload, protocol, args, device, output, definition=experiment)
         record.update(result)
     except BaseException as exc:
         record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
@@ -4928,6 +4990,1111 @@ def load_dataset(
     }
     atomic_write_json(manifest_path, manifest)
     return payload, manifest
+````
+
+# research/conductance_gat/c_learning/__init__.py
+
+````python
+"""Isolated learned-versus-fixed conductance investigation (validation only)."""
+````
+
+# research/conductance_gat/c_learning/audit.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+source "${project_root}/scripts/conda_env.sh"
+export PYTHONPATH="${project_root}/src:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
+cd "${project_root}"
+exec "${environment_python}" -B -u -m research.conductance_gat.c_learning.intervene "$@"
+````
+
+# research/conductance_gat/c_learning/intervene.py
+
+````python
+"""Read-only validation interventions on completed factorial node-degree checkpoints.
+
+This does not retrain, evaluate a test split, or modify source artifacts. Replacing
+C by its arithmetic mean within each graph/layer tests reliance of this selected
+checkpoint on relative edge weights, not the benefit of learning C from scratch.
+For row normalization, positive constant C has the same operator as C=1 (up to
+floating-point rounding); the original operator recomputes its weighted degree.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import math
+import random
+import sys
+from collections.abc import Iterable
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from torch import Tensor
+
+from chartgat.cache import atomic_write_bytes, atomic_write_json
+
+from ..ablation.model import FactorialNodeClassifier, state_sha256
+from ..ablation.protocol import COMMON, CONDITIONS, DATASETS, DEFAULT_DATASETS
+from ..ablation.report import (
+    _build_comparison,
+    _contained,
+    _load_child,
+    _reject_nonfinite_json,
+    _same,
+)
+from ..benchmark import _binary_counts, _micro_f1_from_counts, _versions
+from ..benchmark_data import load_dataset, sha256_file
+
+ROOT = Path(__file__).resolve().parents[3]
+BASELINE_TOLERANCE = 1e-4
+MODEL_SOURCES = (
+    "research/conductance_gat/ablation/model.py",
+    "research/conductance_gat/ablation/protocol.py",
+    "research/conductance_gat/benchmark.py",
+    "research/conductance_gat/sparse.py",
+    "research/conductance_gat/benchmark_data.py",
+)
+AUDIT_SOURCES = MODEL_SOURCES + (
+    "research/conductance_gat/c_learning/intervene.py",
+    "research/conductance_gat/ablation/report.py",
+    "src/chartgat/cache.py",
+)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_nonfinite_json)
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected a JSON object: {path}")
+    return value
+
+
+def _hashes(paths: Iterable[Path]) -> dict[str, str]:
+    return {str(path): sha256_file(path) for path in paths}
+
+
+def _assert_unchanged(snapshot: dict[str, str], label: str) -> None:
+    if _hashes(Path(path) for path in snapshot) != snapshot:
+        raise ValueError(f"{label} changed during the audit; contrasts are invalid")
+
+
+def validate_source(root: Path, datasets: list[str]) -> tuple[dict, dict, dict]:
+    """Validate without calling the factorial report writer or touching old results."""
+    manifest_path = _contained("manifest.json", root, "source manifest")
+    manifest = _read_json(manifest_path)
+    if manifest.get("source_integrity_valid") is not True:
+        raise ValueError("Source manifest must explicitly certify source_integrity_valid=true")
+    if not _same(manifest.get("conditions"), CONDITIONS):
+        raise ValueError("Source manifest condition definitions differ from the fixed factorial")
+    comparison = _build_comparison(root, manifest)
+    if comparison["status"] != "passed":
+        raise ValueError("Source factorial is not complete and valid: " + str(comparison["errors"]))
+    if any(dataset not in manifest["config"]["datasets"] for dataset in datasets):
+        raise ValueError("Requested dataset is absent from the source run")
+    historical = manifest.get("sources", {}).get("sha256", {})
+    for name in MODEL_SOURCES:
+        if historical.get(name) != sha256_file(ROOT / name):
+            raise ValueError(f"Executed model/cache source differs from historical run: {name}")
+    selected = {}
+    paths = [manifest_path]
+    for job in manifest["jobs"]:
+        metrics_path = _contained(job["metrics_path"], root, "source metrics")
+        metrics = _load_child(root, job, manifest["config"])
+        output = _contained(job["output_dir"], root, "source job")
+        paths += [metrics_path]
+        paths += [_contained(metrics[key], output, key) for key in ("checkpoint", "history")]
+        if job["condition"] == "node_degree" and job["dataset"] in datasets:
+            selected[job["dataset"]] = metrics
+    return manifest, selected, _hashes(paths)
+
+
+def validate_checkpoint(saved: dict, metrics: dict) -> None:
+    if not isinstance(saved, dict):
+        raise ValueError("Checkpoint must contain metadata and a state_dict")
+    expected = {
+        "research_suite": "conductance_factorial",
+        "model": "conductance_factorial",
+        "condition": "node_degree",
+        "architecture": {
+            "hidden_channels": COMMON["hidden_channels"],
+            "layers": COMMON["layers"],
+            "dropout": COMMON["dropout"],
+            "normalization": "node_degree",
+        },
+        **{
+            key: metrics[key]
+            for key in (
+                "dataset",
+                "model_seed",
+                "configuration",
+                "gate_weight_decay",
+                "non_gate_weight_decay",
+                "cache_sha256",
+                "initial_state_sha256",
+                "best_epoch",
+                "validation",
+                "evaluation_split",
+                "test_evaluated",
+            )
+        },
+        "optimizer_steps": metrics["best_checkpoint_optimizer_steps"],
+    }
+    for key, value in expected.items():
+        if not _same(saved.get(key), value):
+            raise ValueError(f"Checkpoint {key} disagrees with selected source metrics")
+    if not isinstance(saved.get("state_dict"), dict) or not saved["state_dict"]:
+        raise ValueError("Checkpoint state_dict is missing")
+
+
+@contextmanager
+def preserved_runtime():
+    """Restore RNG and FP32 backend settings even when validation fails."""
+    python_rng, numpy_rng = random.getstate(), np.random.get_state()
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    dtype, precision = torch.get_default_dtype(), torch.get_float32_matmul_precision()
+    flags = (
+        torch.backends.cuda.matmul.allow_tf32,
+        torch.backends.cudnn.allow_tf32,
+        torch.backends.cudnn.benchmark,
+    )
+    try:
+        torch.set_default_dtype(torch.float32)
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+        yield
+    finally:
+        random.setstate(python_rng)
+        np.random.set_state(numpy_rng)
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state_all(cuda_rng)
+        torch.set_default_dtype(dtype)
+        torch.set_float32_matmul_precision(precision)
+        (
+            torch.backends.cuda.matmul.allow_tf32,
+            torch.backends.cudnn.allow_tf32,
+            torch.backends.cudnn.benchmark,
+        ) = flags
+
+
+def graphwise_mean(c: Tensor, edge_graph: Tensor, num_graphs: int) -> Tensor:
+    """Arithmetic mean PER graph, never pooled across a PPI minibatch."""
+    if c.ndim != 1 or c.shape != edge_graph.shape:
+        raise ValueError("Expected one conductance and graph id per undirected edge")
+    if not bool(torch.isfinite(c).all()) or bool((c <= 0).any()):
+        raise ValueError("Conductance must be finite and positive")
+    sums = torch.zeros(num_graphs, dtype=torch.float64, device=c.device)
+    counts = torch.zeros_like(sums)
+    sums.index_add_(0, edge_graph, c.double())
+    counts.index_add_(0, edge_graph, torch.ones_like(c, dtype=torch.float64))
+    means = sums / counts.clamp_min(1)
+    return means[edge_graph].to(c.dtype)
+
+
+class MeanConductance:
+    """Temporary estimator-output hooks; use the actual operator's denominator."""
+
+    def __init__(self, model: FactorialNodeClassifier, layers: tuple[int, ...]) -> None:
+        if model.normalization != "node_degree":
+            raise ValueError("Mean-C audit only supports node_degree normalization")
+        if len(set(layers)) != len(layers) or any(
+            i not in range(len(model.operators)) for i in layers
+        ):
+            raise ValueError("Intervention layers must be unique valid layer indices")
+        self.model, self.layers = model, layers
+        self.handles: list[Any] = []
+        self.graphs: dict[int, tuple[Tensor, int]] = {}
+
+    def _before(self, index: int, inputs: tuple) -> None:
+        _, incidence, node_graph, *rest = inputs
+        tail, head = incidence
+        if not torch.equal(node_graph[tail], node_graph[head]):
+            raise ValueError("An incidence edge crosses graph boundaries")
+        count = int(rest[0]) if rest else int(node_graph.max()) + 1
+        self.graphs[index] = (node_graph[tail], count)
+
+    def _replace(self, index: int, c: Tensor) -> Tensor:
+        edge_graph, count = self.graphs.pop(index)
+        return graphwise_mean(c, edge_graph, count)
+
+    def __enter__(self):
+        try:
+            for index in self.layers:
+                operator = self.model.operators[index]
+                self.handles.append(
+                    operator.register_forward_pre_hook(
+                        lambda module, inputs, i=index: self._before(i, inputs)
+                    )
+                )
+                self.handles.append(
+                    operator.estimator.register_forward_hook(
+                        lambda module, inputs, output, i=index: self._replace(i, output)
+                    )
+                )
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+        self.graphs.clear()
+
+
+def validation_data(payload: dict, metrics: dict, device: torch.device):
+    """Construct validation ONLY; full-graph tasks still use all graph features."""
+    from torch_geometric.data import Data
+    from torch_geometric.loader import DataLoader
+
+    if payload["dataset"] != "ppi":
+        graph = Data(**payload["graphs"][0]).to(device)
+        indices = payload["splits"]["validation"].nonzero(as_tuple=False).flatten().to(device)
+        return [graph], indices
+    generator = torch.Generator().manual_seed(metrics["model_seed"])
+    loader = DataLoader(
+        [Data(**payload["graphs"][index]) for index in payload["splits"]["validation"]],
+        batch_size=metrics["configuration"]["batch_size"],
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True,
+        generator=generator,
+    )
+    return loader, None
+
+
+def evaluate(
+    model: FactorialNodeClassifier,
+    batches: Any,
+    indices: Tensor | None,
+    device: torch.device,
+    layers: tuple[int, ...] = (),
+    reference: list[Tensor] | None = None,
+) -> tuple[dict, list[Tensor]]:
+    """Pure evaluation helper; CPU is used only by bounded unit fixtures."""
+    modes = [(module, module.training) for module in model.modules()]
+    generator = getattr(batches, "generator", None)
+    loader_rng = generator.get_state() if generator is not None else None
+    outputs = []
+    counts = torch.zeros(3, dtype=torch.int64, device=device)
+    correct = total = changed = logit_count = 0
+    abs_sum = square_sum = reference_square = max_delta = 0.0
+    try:
+        model.eval()
+        with preserved_runtime(), torch.no_grad(), MeanConductance(model, layers):
+            for batch_index, graph in enumerate(batches):
+                graph = graph.to(device, non_blocking=True)
+                logits = model(graph)
+                # Read only the validation labels for transductive graphs.
+                labels = graph.y if indices is None else graph.y.index_select(0, indices)
+                if indices is not None:
+                    logits = logits.index_select(0, indices)
+                if not bool(torch.isfinite(logits).all()):
+                    raise ValueError("Non-finite validation logits")
+                if indices is None:
+                    counts.add_(_binary_counts(logits, labels))
+                    total += logits.numel()
+                else:
+                    correct += int((logits.argmax(-1) == labels).sum())
+                    total += labels.numel()
+                current = logits.detach().cpu()
+                outputs.append(current)
+                if reference is not None:
+                    if (
+                        batch_index >= len(reference)
+                        or reference[batch_index].shape != current.shape
+                    ):
+                        raise ValueError("Validation batch alignment changed between interventions")
+                    before = reference[batch_index]
+                    old_prediction = before > 0 if indices is None else before.argmax(-1)
+                    prediction = current > 0 if indices is None else current.argmax(-1)
+                    changed += int((prediction != old_prediction).sum())
+                    difference = current.double() - before.double()
+                    abs_sum += float(difference.abs().sum())
+                    square_sum += float(difference.square().sum())
+                    reference_square += float(before.double().square().sum())
+                    max_delta = max(max_delta, float(difference.abs().max()))
+                    logit_count += current.numel()
+            if reference is not None and len(reference) != len(outputs):
+                raise ValueError("Validation batch count changed between interventions")
+            if not total:
+                raise ValueError("Validation contains no labels")
+            metric = _micro_f1_from_counts(counts) if indices is None else correct / total
+    finally:
+        for module, mode in modes:
+            module.training = mode
+        if generator is not None:
+            generator.set_state(loader_rng)
+    return {
+        "validation": metric,
+        "metric_name": "micro_f1" if indices is None else "accuracy",
+        "intervened_layers": list(layers),
+        "prediction_count": total,
+        "prediction_unit": "node-label decision" if indices is None else "node class",
+        "changed_predictions": changed if reference is not None else None,
+        "changed_prediction_fraction": changed / total if reference is not None else None,
+        "logit_mean_absolute_delta": abs_sum / logit_count if logit_count else None,
+        "logit_max_absolute_delta": max_delta if reference is not None else None,
+        "logit_relative_l2_delta": math.sqrt(square_sum / reference_square)
+        if reference_square
+        else None,
+    }, outputs
+
+
+def audit_model(model, batches, indices, device, saved_validation: float) -> dict:
+    """No contrasts are produced if the original selected score cannot be reproduced."""
+    before = state_sha256(model)
+    original, reference = evaluate(model, batches, indices, device)
+    difference = abs(original["validation"] - saved_validation)
+    if not math.isfinite(saved_validation) or difference > BASELINE_TOLERANCE:
+        raise ValueError(
+            f"Original checkpoint validation mismatch: saved={saved_validation:.9f}, "
+            f"rerun={original['validation']:.9f}, tolerance={BASELINE_TOLERANCE}"
+        )
+    records = []
+    cases = [("mean_c_all_layers", tuple(range(len(model.operators))))]
+    cases += [(f"mean_c_layer_{i}", (i,)) for i in range(len(model.operators))]
+    for name, layers in cases:
+        result, _ = evaluate(model, batches, indices, device, layers, reference)
+        delta = result["validation"] - original["validation"]
+        records.append(
+            {"intervention": name, **result, "score_delta": delta, "percentage_points": 100 * delta}
+        )
+    if state_sha256(model) != before:
+        raise ValueError("Model parameters/buffers changed during read-only audit")
+    return {
+        "original": original,
+        "saved_validation": saved_validation,
+        "baseline_absolute_error": difference,
+        "baseline_tolerance": BASELINE_TOLERANCE,
+        "interventions": records,
+        "model_state_sha256": before,
+    }
+
+
+def _markdown(report: dict) -> str:
+    lines = [
+        "# Selected-checkpoint mean-C validation audit",
+        "",
+        f"Status: **{report['status']}**. No training; validation only; test not evaluated.",
+        "",
+        "Positive graph/layer-constant C cancels under row node-degree normalization, so "
+        "this intervention is mathematically equivalent to C=1 at that layer (rounding aside). "
+        "It measures reliance of this selected checkpoint, not whether learning C improves "
+        "training. All-layer and individual-layer interventions are separate forwards.",
+        "",
+    ]
+    if report.get("error"):
+        lines += [f"Audit invalid: {report['error']}", "Contrasts withheld.", ""]
+    for item in report["datasets"]:
+        lines += [
+            f"## {item['dataset']} ({item['metric_name']})",
+            "",
+            f"Saved validation: {100 * item['saved_validation']:.6f}%; "
+            f"original rerun: {100 * item['original']['validation']:.6f}%.",
+            "",
+            "| Intervention | Validation (%) | Delta original (pp) | Changed predictions (%) "
+            "| Mean absolute logit delta |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        ]
+        for row in item["interventions"]:
+            lines.append(
+                f"| {row['intervention']} | {100 * row['validation']:.6f} | "
+                f"{row['percentage_points']:+.6f} | "
+                f"{100 * row['changed_prediction_fraction']:.6f} | "
+                f"{row['logit_mean_absolute_delta']:.6g} |"
+            )
+        lines.append("")
+    lines += [
+        "One model seed; no test scores, confidence interval, or significance estimate. "
+        "A small metric change does not imply identical logits, and a checkpoint intervention "
+        "does not replace the separate learned-C versus fixed-C retraining experiment.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-run", type=Path, required=True)
+    parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DEFAULT_DATASETS))
+    parser.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--device", default="cuda")
+    return parser
+
+
+def _require_cuda(device: torch.device) -> None:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("Checkpoint audit requires a CUDA GPU; no CPU fallback")
+    torch.cuda.get_device_properties(device)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    device = torch.device(args.device)
+    _require_cuda(device)
+    if len(set(args.datasets)) != len(args.datasets):
+        raise ValueError("Duplicate datasets are not allowed")
+    source = args.source_run.expanduser().resolve(strict=True)
+    data_root = args.data_root.expanduser().resolve()
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    output = (
+        (
+            args.output_dir
+            or ROOT / "results/conductance_gat/c_learning_audits" / f"{source.name}-{stamp}"
+        )
+        .expanduser()
+        .resolve()
+    )
+    for protected in (source, data_root):
+        if (
+            output == protected
+            or output.is_relative_to(protected)
+            or protected.is_relative_to(output)
+        ):
+            raise ValueError("Audit output must be separate from source results and dataset cache")
+    if output.exists():
+        raise FileExistsError(f"Audit output already exists; choose a fresh directory: {output}")
+    manifest, selected, source_hashes = validate_source(source, args.datasets)
+    audit_hashes = _hashes(ROOT / name for name in AUDIT_SOURCES)
+    output.mkdir(parents=True, exist_ok=False)
+    report = {
+        "schema_version": 1,
+        "suite": "conductance_mean_c_audit",
+        "status": "running",
+        "source_run": str(source),
+        "source_git_revision": manifest["sources"].get("git_revision"),
+        "source_manifest_sha256": source_hashes[str(source / "manifest.json")],
+        "source_artifact_sha256": source_hashes,
+        "executed_audit_source_sha256": audit_hashes,
+        "historical_model_source_sha256": {
+            name: manifest["sources"]["sha256"][name] for name in MODEL_SOURCES
+        },
+        "n_model_seeds": 1,
+        "model_seed": manifest["config"]["model_seed"],
+        "training_performed": False,
+        "test_evaluated": False,
+        "evaluation_split": "validation",
+        "interpretation": "selected-checkpoint reliance, NOT benefit of learning C from scratch",
+        "dataset_artifact_sha256": {},
+        "datasets": [],
+        "versions": _versions(),
+        "device": str(device),
+        "gpu": torch.cuda.get_device_name(device),
+        "baseline_tolerance": BASELINE_TOLERANCE,
+    }
+    atomic_write_json(output / "audit.json", report)
+    try:
+        with preserved_runtime():
+            for dataset in args.datasets:
+                print(f"Read-only mean-C audit: {dataset} / node_degree", flush=True)
+                metrics = selected[dataset]
+                payload, protocol = load_dataset(dataset, data_root, allow_download=False)
+                if (
+                    not _same(protocol, metrics["protocol"])
+                    or protocol["data_sha256"] != metrics["cache_sha256"]
+                ):
+                    raise ValueError(f"{dataset}: dataset cache/protocol differs from source run")
+                cache = data_root / "conductance_gat/matched_benchmark_v1" / dataset
+                report["dataset_artifact_sha256"].update(
+                    _hashes(cache / filename for filename in ("data.pt", "manifest.json"))
+                )
+                saved = torch.load(metrics["checkpoint"], map_location="cpu", weights_only=True)
+                validate_checkpoint(saved, metrics)
+                model = FactorialNodeClassifier(
+                    payload["graphs"][0]["x"].shape[1],
+                    payload["classes"],
+                    **saved["architecture"],
+                ).to(device)
+                model.load_state_dict(saved["state_dict"], strict=True)
+                batches, indices = validation_data(payload, metrics, device)
+                result = audit_model(model, batches, indices, device, metrics["validation"])
+                report["datasets"].append(
+                    {
+                        "dataset": dataset,
+                        "metric_name": metrics["metric_name"],
+                        "checkpoint_sha256": metrics["checkpoint_sha256"],
+                        "cache_sha256": metrics["cache_sha256"],
+                        **result,
+                    }
+                )
+                _assert_unchanged(source_hashes, "Source artifacts")
+                _assert_unchanged(audit_hashes, "Audit/model sources")
+                _assert_unchanged(report["dataset_artifact_sha256"], "Dataset artifacts")
+                del model, batches, indices, payload, saved
+        report["status"] = "passed"
+    except (Exception, KeyboardInterrupt) as exc:
+        report["status"] = "invalid"
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        # One failed provenance/baseline check invalidates the whole derived report.
+        report["datasets"] = []
+    atomic_write_json(output / "audit.json", report)
+    atomic_write_bytes(output / "report.md", _markdown(report).encode("utf-8"))
+    print(_markdown(report), flush=True)
+    print(f"Reports: {output / 'report.md'}; {output / 'audit.json'}", flush=True)
+    return 0 if report["status"] == "passed" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+````
+
+# research/conductance_gat/c_learning/model.py
+
+````python
+"""A single change: learn edge C, or use exactly one on every incidence edge.
+
+Both arms use H - .95 D_C^dagger B.T C B H and the same classifier. The fixed
+arm retains identical initialized gate tensors solely for state/RNG matching;
+they are frozen, not evaluated and excluded from the optimizer. Consequently
+C=1 yields .05 H_i + .95 mean_neighbors(H_j) on nonisolated nodes, and identity
+on isolates. This is an internal ablation, not an external GCN/GAT baseline.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor, nn
+
+from ..ablation.model import FactorialNodeClassifier, is_gate_parameter
+from ..sparse import SparsePositiveConductance
+from .protocol import COMMON, CONDITIONS
+
+
+class FixedOneConductance(nn.Module):
+    """Expose effective C to the usual hook without evaluating the frozen gate."""
+
+    def __init__(self, initialized_estimator: SparsePositiveConductance) -> None:
+        super().__init__()
+        # Transfer the already initialized network without any RNG draws and
+        # retain the exact estimator.network.* state-dictionary key structure.
+        self.network = initialized_estimator.network
+        self.network.requires_grad_(False)
+
+    def forward(self, gradient: Tensor, edge_features: Tensor) -> Tensor:
+        return gradient.new_ones(gradient.shape[0])
+
+
+class CLearningNodeClassifier(FactorialNodeClassifier):
+    def __init__(
+        self,
+        in_channels: int,
+        classes: int,
+        *,
+        gate_mode: str = "learned",
+        normalization: str = "node_degree",
+        hidden_channels: int = 64,
+        layers: int = 2,
+        dropout: float = 0.5,
+    ) -> None:
+        if normalization != "node_degree":
+            raise ValueError("C-learning keeps node_degree normalization fixed")
+        if gate_mode not in {"learned", "fixed_one"}:
+            raise ValueError(f"Unsupported gate mode: {gate_mode}")
+        super().__init__(
+            in_channels,
+            classes,
+            normalization=normalization,
+            hidden_channels=hidden_channels,
+            layers=layers,
+            dropout=dropout,
+        )
+        self.gate_mode = gate_mode
+        if gate_mode == "fixed_one":
+            for operator in self.operators:
+                operator.estimator = FixedOneConductance(operator.estimator)
+
+
+def make_optimizer(model: CLearningNodeClassifier, condition: str) -> torch.optim.Adam:
+    specification = CONDITIONS[condition]
+    if model.gate_mode != specification["gate_mode"] or model.normalization != "node_degree":
+        raise ValueError("Model and C-learning condition disagree")
+    gate, other = [], []
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            (gate if is_gate_parameter(name) else other).append(parameter)
+    if not other or bool(gate) != (model.gate_mode == "learned"):
+        raise ValueError("C-learning trainable parameter groups do not match the gate mode")
+    groups = [{"params": other, "weight_decay": COMMON["weight_decay"], "name": "non_gate"}]
+    if gate:
+        groups.append(
+            {"params": gate, "weight_decay": specification["gate_weight_decay"], "name": "gate"}
+        )
+    return torch.optim.Adam(groups, lr=COMMON["lr"])
+````
+
+# research/conductance_gat/c_learning/protocol.py
+
+````python
+"""Dependency-free, single-seed learned-C contribution experiment specification."""
+
+from ..ablation.protocol import COMMON, DATASETS, DEFAULT_DATASETS
+
+SUITE = "conductance_c_learning"
+CONDITIONS = {
+    "learned_c": {
+        "normalization": "node_degree",
+        "gate_mode": "learned",
+        "gate_weight_decay": 0.0005,
+    },
+    "fixed_c": {
+        "normalization": "node_degree",
+        "gate_mode": "fixed_one",
+        # There is no trainable gate in this arm; its frozen initialization
+        # scaffold is excluded from the optimizer, not trained with a new WD.
+        "gate_weight_decay": 0.0,
+    },
+}
+
+__all__ = ["COMMON", "CONDITIONS", "DATASETS", "DEFAULT_DATASETS", "SUITE"]
+````
+
+# research/conductance_gat/c_learning/report.py
+
+````python
+"""Fail-closed fresh learned-C minus fixed-C validation comparison; no Torch required."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import sys
+from pathlib import Path
+from typing import Any
+
+from ..ablation.report import (
+    REPORT_FILENAMES,
+    _atomic_write,
+    _best_validation_summary,
+    _cell,
+    _contained,
+    _diagnostic_markdown,
+    _display,
+    _integer,
+    _load_child,
+    _metric_name,
+    _pair_metadata,
+    _reject_nonfinite_json,
+    _same,
+)
+from .protocol import COMMON, CONDITIONS, DATASETS
+
+SUITE = "conductance_c_learning"
+CAVEATS = [
+    "n=1; exploratory validation comparison, test not evaluated. No CI, p-value or seed std.",
+    "Both arms train freshly with the same initialization, data, nongate Adam L2 and policy. "
+    "Actual early-stopping epochs may differ. No previous factorial score is reused.",
+    "The contrast is learned_c minus fixed_c (percentage points); positive favors learned C. "
+    "This is an internal architecture ablation, not an external GCN/GAT benchmark baseline.",
+    "Fixed C=1 uses no trainable gate. Its initialized gate scaffold is frozen, excluded from "
+    "the optimizer and trainable count, but included in the full-state initialization hash. "
+    "A frozen scaffold's L2 below does not describe an active gate.",
+    "Both arms use node-degree normalization. Common positive C scale cancels; rho=.95 on "
+    "nonisolated nodes is imposed by the operator, not evidence that learned C is useful.",
+    "This retraining contrast and a checkpoint mean-C intervention answer different questions. "
+    "Do not treat a small intervention delta as proof of no benefit from learning C.",
+    "Repeated validation-guided decisions can overfit validation. Same seed/state does not "
+    "guarantee bitwise CUDA scatter determinism. Do not average PPI F1 and arxiv accuracy.",
+]
+
+
+class ComparisonIntegrityError(ValueError):
+    def __init__(self, report: dict[str, Any]):
+        self.report = report
+        super().__init__("C-learning comparison integrity failed: " + "; ".join(report["errors"]))
+
+
+def _load(run_dir, job, common):
+    child = _load_child(run_dir, job, common, suite=SUITE, conditions=CONDITIONS)
+    spec = CONDITIONS[job["condition"]]
+    if child.get("gate_mode") != spec["gate_mode"]:
+        raise ValueError(f"{job['dataset']}/{job['condition']}: gate_mode mismatch")
+    if "gate_mode" in child["configuration"]:
+        raise ValueError("gate_mode must be arm metadata, not the held-fixed configuration")
+    total = _integer(child.get("total_parameters"), "total_parameters", minimum=1)
+    trainable = _integer(child.get("trainable_parameters"), "trainable_parameters", minimum=1)
+    frozen = _integer(child.get("frozen_parameters"), "frozen_parameters")
+    if total != trainable + frozen:
+        raise ValueError("trainable/frozen parameter counts do not sum to total")
+    if (job["condition"] == "learned_c" and frozen != 0) or (
+        job["condition"] == "fixed_c" and frozen == 0
+    ):
+        raise ValueError("frozen parameter count disagrees with C-learning condition")
+    if not child.get("versions") or not isinstance(child["versions"], dict):
+        raise ValueError("Missing runtime versions")
+    if not isinstance(child.get("gpu"), str) or not child["gpu"]:
+        raise ValueError("Missing GPU identity")
+    if child["protocol"].get("data_sha256") != child["cache_sha256"]:
+        raise ValueError("cache_sha256 disagrees with dataset protocol")
+    return child
+
+
+def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    errors = []
+    config = manifest.get("config", {})
+    if not isinstance(config, dict):
+        config = {}
+        errors.append("manifest.config must be an object")
+    datasets = config.get("datasets", [])
+    if (
+        not isinstance(datasets, list)
+        or not datasets
+        or any(not isinstance(d, str) or d not in DATASETS for d in datasets)
+        or len(set(datasets)) != len(datasets)
+    ):
+        datasets = []
+        errors.append("datasets must list unique supported datasets")
+    for key, value in (
+        ("schema_version", 1),
+        ("suite", SUITE),
+        ("conditions", CONDITIONS),
+        ("source_integrity_valid", True),
+    ):
+        if not _same(manifest.get(key), value):
+            errors.append(f"manifest.{key} mismatch")
+    if manifest.get("status") not in {"running", "failed", "passed"}:
+        errors.append("invalid manifest.status")
+    try:
+        _integer(config.get("model_seed"), "model_seed")
+        for key in ("epochs", "patience", "batch_size"):
+            _integer(config.get(key), key, minimum=1)
+        _integer(config.get("workers"), "workers")
+        for key, value in COMMON.items():
+            if not _same(config.get(key), value):
+                raise ValueError(f"fixed configuration.{key} mismatch")
+    except ValueError as exc:
+        errors.append(str(exc))
+    jobs = manifest.get("jobs", [])
+    if not isinstance(jobs, list):
+        jobs = []
+        errors.append("manifest.jobs must be a list")
+    indexed = {}
+    for job in jobs:
+        if not isinstance(job, dict):
+            errors.append("invalid manifest job")
+            continue
+        dataset, condition = job.get("dataset"), job.get("condition")
+        if (
+            not isinstance(dataset, str)
+            or dataset not in datasets
+            or not isinstance(condition, str)
+            or condition not in CONDITIONS
+        ):
+            errors.append("job references an unknown dataset/condition")
+            continue
+        key = dataset, condition
+        if key in indexed:
+            errors.append(f"duplicate job: {key}")
+            continue
+        indexed[key] = job
+        if job.get("status") not in {"pending", "running", "failed", "passed"}:
+            errors.append(f"{key}: invalid job status")
+        try:
+            output = _contained(job.get("output_dir"), root, f"{key} output")
+            metrics = _contained(job.get("metrics_path"), root, f"{key} metrics")
+            if not metrics.is_relative_to(output):
+                raise ValueError(f"{key}: metrics outside job output")
+        except ValueError as exc:
+            errors.append(str(exc))
+    reports = []
+    for dataset in datasets:
+        loaded, rows = {}, []
+        for condition, spec in CONDITIONS.items():
+            job = indexed.get((dataset, condition))
+            row = {
+                "condition": condition,
+                **spec,
+                "status": job.get("status") if job else "missing",
+                "validation": None,
+                "validation_percent": None,
+                "best_epoch": None,
+                "epochs_run": None,
+                "trainable_parameters": None,
+                "frozen_parameters": None,
+                "best_validation_diagnostics": _best_validation_summary(None),
+            }
+            if job and job.get("error"):
+                row["error"] = str(job["error"])
+            if job and job.get("status") == "passed":
+                try:
+                    child = _load(root, job, config)
+                    loaded[condition] = child
+                    for key in (
+                        "validation",
+                        "best_epoch",
+                        "epochs_run",
+                        "train_loss",
+                        "trainable_parameters",
+                        "frozen_parameters",
+                        "total_parameters",
+                        "elapsed_seconds",
+                        "peak_cuda_allocated_bytes",
+                    ):
+                        row[key] = child[key]
+                    row["validation_percent"] = 100.0 * child["validation"]
+                    row["best_validation_diagnostics"] = _best_validation_summary(
+                        child.get("diagnostics")
+                    )
+                except (ValueError, KeyError, TypeError) as exc:
+                    row.update(status="invalid", error=str(exc))
+                    errors.append(f"{dataset}/{condition}: {exc}")
+            rows.append(row)
+        reference = next(iter(loaded.values()), None)
+        metadata = _pair_metadata(reference) if reference else None
+        if reference:
+            metadata.update(
+                {key: reference[key] for key in ("versions", "gpu", "total_parameters")}
+            )
+            for condition, child in loaded.items():
+                actual = _pair_metadata(child)
+                actual.update({key: child[key] for key in ("versions", "gpu", "total_parameters")})
+                for key in metadata:
+                    if not _same(metadata[key], actual[key]):
+                        errors.append(f"{dataset}/{condition}: held-fixed {key} mismatch")
+        reports.append(
+            {
+                "dataset": dataset,
+                "metric_name": _metric_name(dataset),
+                "model_seed": config.get("model_seed"),
+                "conditions": rows,
+                "complete": len(loaded) == len(CONDITIONS),
+                "held_fixed": metadata,
+                "learned_minus_fixed": None,
+            }
+        )
+    all_complete = bool(reports) and all(row["complete"] for row in reports)
+    if manifest.get("status") == "passed" and not all_complete:
+        errors.append("passed manifest lacks a complete two-arm matrix")
+    for item in reports:
+        if errors:
+            item["complete"] = False
+        elif item["complete"]:
+            scores = {row["condition"]: row["validation"] for row in item["conditions"]}
+            delta = scores["learned_c"] - scores["fixed_c"]
+            item["learned_minus_fixed"] = {
+                "score_delta": delta,
+                "percentage_points": 100.0 * delta,
+            }
+    failed = manifest.get("status") == "failed" or any(
+        job.get("status") == "failed" for job in indexed.values()
+    )
+    complete = all_complete and not errors and not failed and manifest.get("status") == "passed"
+    return {
+        "schema_version": 1,
+        "suite": SUITE,
+        "status": "invalid"
+        if errors
+        else "passed"
+        if complete
+        else "failed"
+        if failed
+        else "running",
+        "complete": complete,
+        "n_model_seeds": 1,
+        "model_seed": config.get("model_seed"),
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+        "uncertainty_status": "not_estimated_single_seed",
+        "source_integrity_valid": manifest.get("source_integrity_valid"),
+        "datasets": reports,
+        "errors": errors,
+        "caveats": CAVEATS,
+    }
+
+
+def markdown(report):
+    lines = [
+        "# Learned C vs fixed C=1: node-degree normalization",
+        "",
+        f"Status: **{report['status']}**; model seed {report['model_seed']}; validation only.",
+        "",
+    ]
+    if report["errors"]:
+        lines += ["## Integrity errors: contrasts withheld", ""]
+        lines += [f"- {_cell(error)}" for error in report["errors"]] + [""]
+    for dataset in report["datasets"]:
+        lines += [
+            f"## {dataset['dataset']} ({dataset['metric_name']}, higher is better)",
+            "",
+            "| Condition | Status | Validation (%) | Best epoch | Epochs run "
+            "| Trainable parameters | Frozen scaffold |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for row in dataset["conditions"]:
+            cells = [row["condition"], row["status"], _display(row["validation_percent"])]
+            cells += [
+                str(row[key]) if row[key] is not None else "—"
+                for key in ("best_epoch", "epochs_run", "trainable_parameters", "frozen_parameters")
+            ]
+            lines += ["| " + " | ".join(cells) + " |"]
+        contrast = dataset["learned_minus_fixed"]
+        lines += [
+            "",
+            "Learned − fixed: "
+            + (
+                _display(contrast["percentage_points"], signed=True) + " pp."
+                if contrast
+                else "withheld until both arms pass integrity checks."
+            ),
+            "",
+        ]
+        lines += _diagnostic_markdown(dataset["conditions"])
+    lines += ["## Interpretation limits", ""] + [f"- {c}" for c in CAVEATS] + [""]
+    return "\n".join(lines)
+
+
+def csv_text(report):
+    buffer = io.StringIO(newline="")
+    fields = [
+        "dataset",
+        "metric_name",
+        "model_seed",
+        "condition",
+        "status",
+        "validation",
+        "validation_percent",
+        "best_epoch",
+        "epochs_run",
+        "trainable_parameters",
+        "frozen_parameters",
+        "learned_minus_fixed_pp",
+    ]
+    writer = csv.DictWriter(buffer, fieldnames=fields)
+    writer.writeheader()
+    for dataset in report["datasets"]:
+        for row in dataset["conditions"]:
+            record = {key: row[key] for key in fields if key in row}
+            record.update({key: dataset[key] for key in ("dataset", "metric_name", "model_seed")})
+            contrast = dataset["learned_minus_fixed"]
+            record["learned_minus_fixed_pp"] = contrast["percentage_points"] if contrast else None
+            writer.writerow(record)
+    return buffer.getvalue()
+
+
+def write_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    root = Path(run_dir).expanduser().resolve(strict=True)
+    if not root.is_dir() or not isinstance(manifest, dict):
+        raise ValueError("expected an existing run directory and manifest object")
+    destinations = [_contained(name, root, name) for name in REPORT_FILENAMES]
+    if any((root / name).is_symlink() for name in REPORT_FILENAMES):
+        raise ValueError("report destinations must not be symlinks")
+    report = build_comparison(root, manifest)
+    contents = [
+        json.dumps(report, indent=2, allow_nan=False) + "\n",
+        markdown(report),
+        csv_text(report),
+    ]
+    for destination, content in zip(destinations, contents, strict=True):
+        _atomic_write(destination, content)
+    if report["errors"]:
+        raise ComparisonIntegrityError(report)
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_dir", type=Path)
+    args = parser.parse_args(argv)
+    try:
+        root = args.run_dir.expanduser().resolve(strict=True)
+        manifest = json.loads(
+            _contained("manifest.json", root, "manifest").read_text(encoding="utf-8"),
+            parse_constant=_reject_nonfinite_json,
+        )
+        report = write_comparison(root, manifest)
+    except (OSError, ValueError) as exc:
+        print(f"Comparison failed: {exc}", file=sys.stderr)
+        return 1
+    print(markdown(report))
+    print(f"Reports: {root / 'comparison.md'}")
+    return 0 if report["status"] == "passed" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# research/conductance_gat/c_learning/reproduce.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+source "${project_root}/scripts/conda_env.sh"
+export PYTHONPATH="${project_root}/src:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
+cd "${project_root}"
+exec "${environment_python}" -B scripts/run_conductance_c_learning.py "$@"
+````
+
+# research/conductance_gat/c_learning/train.py
+
+````python
+"""Train one fresh learned-C/fixed-C arm, CUDA and official caches only.
+
+This separate suite explicitly injects its model and optimizer into the audited
+factorial training loop. It never reuses old checkpoints for the training contrast
+and never constructs a test loader or reports a test metric.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from ..ablation import train as shared
+from .model import CLearningNodeClassifier, make_optimizer
+from .protocol import CONDITIONS, SUITE
+
+DEFINITION = shared.TrainingDefinition(
+    SUITE, CONDITIONS, CLearningNodeClassifier, make_optimizer, description=__doc__
+)
+
+
+def configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return shared.configuration(args)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = shared.build_parser(definition=DEFINITION)
+    parser.description = __doc__
+    return parser
+
+
+def train_model(
+    payload: dict[str, Any],
+    protocol: dict[str, Any],
+    args: argparse.Namespace,
+    device: torch.device,
+    output: Path,
+) -> dict[str, Any]:
+    return shared.train_model(payload, protocol, args, device, output, definition=DEFINITION)
+
+
+def main(argv: list[str] | None = None) -> int:
+    return shared.main(argv, definition=DEFINITION)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ````
 
 # research/conductance_gat/cache_validation.py
@@ -8981,6 +10148,955 @@ def test_execution_optimization_is_opt_in_and_amp_default_is_unchanged():
     assert defaults.compile is False
     assert defaults.amp is False
     assert build_parser().parse_args(["--compile"]).compile is True
+````
+
+# research/conductance_gat/tests/test_c_learning_integration.py
+
+````python
+"""Real new-runner/two-arm/artifact/report path on an explicit four-node fixture.
+
+CUDA hardware, dependencies, subprocess dispatch and official data access alone
+are mocked. This is not a public-dataset or CPU research-performance experiment.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import torch
+
+from chartgat.cache import atomic_publish, atomic_write_json
+from research.conductance_gat.ablation import train as shared_train
+from research.conductance_gat.benchmark_data import sha256_file
+from research.conductance_gat.c_learning import report, train
+from research.conductance_gat.c_learning.protocol import CONDITIONS, SUITE
+from scripts import run_conductance_c_learning as runner
+
+
+def test_two_real_arms_artifacts_pass_new_runner_and_comparison(monkeypatch, tmp_path):
+    graph = SimpleNamespace(
+        x=torch.tensor([[0.5, 1.0, 2.0], [1.0, 2.0, 0.5], [2.0, 0.5, 1.0], [3.0, 1.0, 2.0]]),
+        y=torch.tensor([0, 1, 0, 999999]),
+        incidence_edge_index=torch.tensor([[0, 0, 1], [1, 2, 3]]),
+    )
+
+    class NoTestIndices(dict):
+        def __getitem__(self, key):
+            if key == "test":
+                raise AssertionError("C-learning must never read test indices")
+            return super().__getitem__(key)
+
+    indices = NoTestIndices(train=torch.tensor([0, 1]), validation=torch.tensor([2]))
+    payload = {"dataset": "cora", "classes": 2, "graphs": [vars(graph)]}
+    fixture_path = tmp_path / "unit-fixture-data.pt"
+    atomic_publish(fixture_path, lambda path: torch.save(payload, path))
+    fixture_hash = sha256_file(fixture_path)
+    protocol = {"data_sha256": fixture_hash, "unit_fixture_only": True}
+
+    monkeypatch.setattr(shared_train, "_require_cuda", lambda device: None)
+    monkeypatch.setattr(shared_train, "_configure_fp32", lambda: None)
+    monkeypatch.setattr(shared_train, "_make_data", lambda *args: (graph, indices))
+    monkeypatch.setattr(torch.cuda, "manual_seed_all", lambda *args: None)
+    for name in ("reset_peak_memory_stats", "synchronize"):
+        monkeypatch.setattr(torch.cuda, name, lambda *args: None)
+    for name in ("max_memory_allocated", "max_memory_reserved"):
+        monkeypatch.setattr(torch.cuda, name, lambda *args: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *args: "unit_fixture_mocked_cuda")
+    monkeypatch.setattr(runner, "check_dependencies", lambda: {"unit_fixture_only": True})
+    monkeypatch.setattr(
+        runner,
+        "_source_snapshot",
+        lambda: {"sha256": {"unit_fixture": fixture_hash}, "git_revision": None},
+    )
+
+    trained, preflights = {}, []
+
+    def dispatch_fixture(command, log, environment):
+        if any(Path(argument).name == "gpu_preflight.py" for argument in command):
+            preflights.append(command)
+            return 0
+        module_index = command.index("research.conductance_gat.c_learning.train")
+        args = train.build_parser().parse_args(command[module_index + 1 :])
+        assert args.dataset == "cora" and args.model_seed == 0 and args.device == "cuda"
+        assert args.epochs == 2 and args.workers == 0
+        args.output_dir.mkdir(parents=True, exist_ok=False)
+        metrics = train.train_model(payload, protocol, args, torch.device("cpu"), args.output_dir)
+        metrics.update(unit_fixture_only=True, hardware_mocked=True)
+        atomic_write_json(args.output_dir / "metrics.json", metrics)
+        trained[args.condition] = metrics
+        return 0
+
+    monkeypatch.setattr(runner, "run_logged", dispatch_fixture)
+    status = runner.main(
+        [
+            "--datasets",
+            "cora",
+            "--model-seed",
+            "0",
+            "--device",
+            "cuda",
+            "--epochs",
+            "2",
+            "--patience",
+            "2",
+            "--workers",
+            "0",
+            "--results-root",
+            str(tmp_path / "results"),
+            "--data-root",
+            str(tmp_path / "cache"),
+            "--run-id",
+            "c-learning-integration-fixture",
+        ]
+    )
+    assert status == 0 and len(preflights) == 1 and list(trained) == list(CONDITIONS)
+    assert len({metrics["initial_state_sha256"] for metrics in trained.values()}) == 1
+    for condition, metrics in trained.items():
+        assert metrics["status"] == "passed" and metrics["research_suite"] == SUITE
+        assert metrics["configuration"]["model_seed"] == 0
+        assert "gate_mode" not in metrics["configuration"]
+        assert metrics["gate_mode"] == CONDITIONS[condition]["gate_mode"]
+        assert metrics["normalization"] == "node_degree"
+        assert metrics["test_evaluated"] is False and "test" not in metrics
+        assert metrics["evaluation_split"] == "validation"
+        assert metrics["checkpoint_sha256"] == sha256_file(Path(metrics["checkpoint"]))
+        assert metrics["history_sha256"] == sha256_file(Path(metrics["history"]))
+        checkpoint = torch.load(metrics["checkpoint"], weights_only=True)
+        assert checkpoint["model"] == checkpoint["research_suite"] == SUITE
+        assert checkpoint["gate_mode"] == metrics["gate_mode"]
+        assert checkpoint["initial_state_sha256"] == metrics["initial_state_sha256"]
+    root = tmp_path / "results/conductance_gat/c_learning/c-learning-integration-fixture"
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "passed" and manifest["suite"] == SUITE
+    comparison = report.write_comparison(root, manifest)
+    assert comparison["status"] == "passed" and comparison["complete"] is True
+    assert comparison["source_integrity_valid"] is True and comparison["errors"] == []
+    assert comparison["uncertainty_status"] == "not_estimated_single_seed"
+    assert comparison["n_model_seeds"] == 1 and comparison["test_evaluated"] is False
+    dataset = comparison["datasets"][0]
+    contrast = dataset["learned_minus_fixed"]
+    expected = trained["learned_c"]["validation"] - trained["fixed_c"]["validation"]
+    assert contrast == {"score_delta": expected, "percentage_points": expected * 100}
+    rows = {row["condition"]: row for row in dataset["conditions"]}
+    assert rows["learned_c"]["frozen_parameters"] == 0
+    assert rows["fixed_c"]["frozen_parameters"] > 0
+    assert rows["learned_c"]["trainable_parameters"] > rows["fixed_c"]["trainable_parameters"]
+    assert all(
+        layer["conductance_cv"]["mean"] == 0.0
+        for layer in rows["fixed_c"]["best_validation_diagnostics"]
+    )
+    for filename in ("comparison.json", "comparison.md", "comparison.csv"):
+        assert (root / filename).is_file()
+````
+
+# research/conductance_gat/tests/test_c_learning_model.py
+
+````python
+"""Pure tensor tests of the isolated learned-C contribution, not GPU experiments."""
+
+from __future__ import annotations
+
+import copy
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.ablation import train as shared
+from research.conductance_gat.ablation.model import (
+    FactorialNodeClassifier,
+    is_gate_parameter,
+    state_sha256,
+)
+from research.conductance_gat.ablation.model import (
+    make_optimizer as factorial_optimizer,
+)
+from research.conductance_gat.c_learning.model import CLearningNodeClassifier, make_optimizer
+from research.conductance_gat.c_learning.protocol import CONDITIONS
+from research.conductance_gat.c_learning.train import DEFINITION
+
+
+def graph_fixture():
+    return SimpleNamespace(
+        x=torch.tensor([[0.2, 1.0, 2.0], [1.0, 2.0, 0.3], [3.0, 0.4, 1.0], [2.0, 3.0, 4.0]]),
+        y=torch.tensor([0, 1, 0, 999999]),
+        incidence_edge_index=torch.tensor([[0, 0], [1, 2]]),
+    )
+
+
+@pytest.mark.parametrize("gate_mode", ["learned", "fixed_one"])
+def test_same_initial_full_state_rng_and_non_gate_parameters_as_node_degree(gate_mode):
+    torch.manual_seed(903)
+    original = FactorialNodeClassifier(3, 2, hidden_channels=8, normalization="node_degree")
+    reference_rng = torch.get_rng_state().clone()
+    torch.manual_seed(903)
+    model = CLearningNodeClassifier(3, 2, hidden_channels=8, gate_mode=gate_mode)
+    assert state_sha256(model) == state_sha256(original)
+    assert torch.equal(torch.get_rng_state(), reference_rng)
+    assert list(model.state_dict()) == list(original.state_dict())
+    for name, parameter in model.named_parameters():
+        assert parameter.requires_grad == (gate_mode == "learned" or not is_gate_parameter(name))
+
+
+@pytest.mark.parametrize("training", [True, False])
+def test_learned_arm_exactly_preserves_existing_node_degree_forward_gradients_and_adam(training):
+    torch.manual_seed(62)
+    original = FactorialNodeClassifier(3, 2, hidden_channels=8, normalization="node_degree")
+    model = CLearningNodeClassifier(3, 2, hidden_channels=8)
+    model.load_state_dict(original.state_dict())
+    original.train(training)
+    model.train(training)
+    before_optimizer = factorial_optimizer(original, "node_degree")
+    after_optimizer = make_optimizer(model, "learned_c")
+    graph = graph_fixture()
+    torch.manual_seed(31)
+    expected = original(graph)
+    expected.square().mean().backward()
+    before_optimizer.step()
+    expected_rng = torch.get_rng_state().clone()
+    torch.manual_seed(31)
+    actual = model(graph)
+    actual.square().mean().backward()
+    after_optimizer.step()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(
+            parameter.grad, dict(original.named_parameters())[name].grad, atol=0, rtol=0
+        )
+    assert state_sha256(model) == state_sha256(original)
+    assert torch.equal(torch.get_rng_state(), expected_rng)
+
+
+def test_fixed_operator_is_exact_unweighted_neighbor_mean_with_isolate_and_orientation():
+    model = CLearningNodeClassifier(3, 2, hidden_channels=3, gate_mode="fixed_one")
+    operator = model.operators[0]
+    graph = graph_fixture()
+    state = graph.x.clone().requires_grad_()
+    actual = operator(state, graph.incidence_edge_index, torch.zeros(4).long(), 1)
+    expected = torch.stack(
+        [
+            0.05 * state[0] + 0.95 * (state[1] + state[2]) / 2,
+            0.05 * state[1] + 0.95 * state[0],
+            0.05 * state[2] + 0.95 * state[0],
+            state[3],
+        ]
+    )
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(actual[3], state[3], atol=0, rtol=0)
+    reverse = operator(state, graph.incidence_edge_index.flip(0), torch.zeros(4).long(), 1)
+    torch.testing.assert_close(reverse, actual, atol=0, rtol=0)
+    weights = torch.arange(1, actual.numel() + 1).reshape_as(actual)
+    grad = torch.autograd.grad((actual * weights).sum(), state, retain_graph=True)[0]
+    ref_grad = torch.autograd.grad((expected * weights).sum(), state)[0]
+    torch.testing.assert_close(grad, ref_grad, atol=1e-6, rtol=1e-6)
+
+
+def test_fixed_gate_is_not_evaluated_and_effective_c_is_exact_one(monkeypatch):
+    model = CLearningNodeClassifier(3, 2, hidden_channels=8, gate_mode="fixed_one").eval()
+    for operator in model.operators:
+        monkeypatch.setattr(
+            operator.estimator.network,
+            "forward",
+            lambda *args: pytest.fail("Frozen gate scaffold must never be evaluated"),
+        )
+    with shared.ForwardObservation(model) as observation:
+        model(graph_fixture())
+    for layer in observation.summary():
+        assert layer["conductance"]["mean"] == 1.0
+        assert layer["conductance"]["std"] == layer["conductance"]["cv"] == 0.0
+        assert layer["conductance"]["count"] == 2
+        assert layer["rho"]["isolated_node_count"] == 1
+    gate = model.operators[0].estimator
+    c = gate(torch.full((5, 8), float("nan"), requires_grad=True), torch.empty(5, 0))
+    assert torch.equal(c, torch.ones(5)) and not c.requires_grad
+
+
+def test_fixed_output_cannot_depend_on_frozen_scaffold_values():
+    model = CLearningNodeClassifier(3, 2, hidden_channels=8, gate_mode="fixed_one").eval()
+    graph = graph_fixture()
+    original = model(graph)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if is_gate_parameter(name):
+                parameter.fill_(float("nan"))
+    torch.testing.assert_close(model(graph), original, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("condition", CONDITIONS)
+def test_optimizer_exactly_partitions_trainable_parameters_and_excludes_frozen(condition):
+    model = CLearningNodeClassifier(
+        3, 2, hidden_channels=8, **{"gate_mode": CONDITIONS[condition]["gate_mode"]}
+    )
+    optimizer = make_optimizer(model, condition)
+    expected = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    included = [id(parameter) for group in optimizer.param_groups for parameter in group["params"]]
+    assert len(included) == len(set(included)) == len(expected)
+    assert set(included) == expected
+    assert all(group["weight_decay"] == 0.0005 for group in optimizer.param_groups)
+    assert len(optimizer.param_groups) == (2 if condition == "learned_c" else 1)
+
+
+def test_fixed_gate_no_grad_update_or_adam_state_and_telemetry_is_explicit():
+    model = CLearningNodeClassifier(3, 2, hidden_channels=8, gate_mode="fixed_one")
+    before = copy.deepcopy(model.state_dict())
+    optimizer = make_optimizer(model, "fixed_c")
+    graph = graph_fixture()
+    loss, _ = shared.training_loss(model(graph), graph, torch.tensor([0, 1]))
+    loss.backward()
+    telemetry = shared.gradient_observation(model, "fixed_c", definition=DEFINITION)
+    optimizer.step()
+    for name, parameter in model.named_parameters():
+        if is_gate_parameter(name):
+            assert parameter.grad is None and parameter not in optimizer.state
+            torch.testing.assert_close(parameter, before[name], atol=0, rtol=0)
+    assert not torch.equal(model.encoder.weight, before["encoder.weight"])
+    gate = telemetry["operators.0"]
+    assert gate["optimizer_included"] is False and gate["trainable_parameter_count"] == 0
+    assert gate["weight_decay"] == gate["decay_term_norm"] == gate["task_gradient_norm"] == 0
+    assert gate["task_to_decay_ratio"] is None
+    assert telemetry["non_gate"]["weight_decay"] == 0.0005
+
+
+@pytest.mark.parametrize("kwargs", [{"normalization": "global_max"}, {"gate_mode": "other"}])
+def test_invalid_architecture_factor_rejected(kwargs):
+    with pytest.raises(ValueError):
+        CLearningNodeClassifier(3, 2, **kwargs)
+
+
+def test_mismatched_optimizer_condition_rejected():
+    model = CLearningNodeClassifier(3, 2, gate_mode="fixed_one")
+    with pytest.raises(ValueError, match="disagree"):
+        make_optimizer(model, "learned_c")
+````
+
+# research/conductance_gat/tests/test_c_learning_train.py
+
+````python
+"""Bounded training-loop fixtures with mocked CUDA; no public-data CPU training."""
+
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.ablation import train as shared
+from research.conductance_gat.ablation.model import is_gate_parameter, state_sha256
+from research.conductance_gat.c_learning import train
+from research.conductance_gat.c_learning.model import CLearningNodeClassifier
+from research.conductance_gat.c_learning.protocol import CONDITIONS, SUITE
+
+
+def args_for(tmp_path, condition="learned_c"):
+    return train.build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            condition,
+            "--output-dir",
+            str(tmp_path / condition),
+            "--data-root",
+            str(tmp_path / "data"),
+        ]
+    )
+
+
+def test_new_protocol_preserves_one_seed_and_locked_common_configuration(tmp_path):
+    args = args_for(tmp_path)
+    assert args.model_seed == 0 and args.device == "cuda"
+    assert args.epochs == 200 and args.patience == 50
+    assert train.configuration(args) == shared.configuration(args)
+    assert set(CONDITIONS) == {"learned_c", "fixed_c"}
+    assert all(spec["normalization"] == "node_degree" for spec in CONDITIONS.values())
+    with pytest.raises(SystemExit):
+        args_for(tmp_path, "baseline")
+
+
+def test_direct_and_cli_require_gpu_before_outputs(tmp_path):
+    with pytest.raises(RuntimeError, match="CUDA GPU"):
+        train.train_model({}, {}, args_for(tmp_path), torch.device("cpu"), tmp_path / "output")
+    with pytest.raises(RuntimeError, match="CUDA GPU"):
+        train.main(
+            [
+                "--dataset",
+                "cora",
+                "--condition",
+                "fixed_c",
+                "--device",
+                "cpu",
+                "--output-dir",
+                str(tmp_path / "output"),
+            ]
+        )
+    assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("condition", CONDITIONS)
+def test_checkpoint_is_separate_suite_and_discloses_gate_mode_parameter_counts(tmp_path, condition):
+    args = args_for(tmp_path, condition)
+    model = CLearningNodeClassifier(3, 2, gate_mode=CONDITIONS[condition]["gate_mode"])
+    saved = shared.checkpoint_payload(
+        model,
+        args,
+        {"data_sha256": "a" * 64},
+        state_sha256(model),
+        3,
+        0.5,
+        definition=train.DEFINITION,
+    )
+    assert saved["research_suite"] == saved["model"] == SUITE
+    assert saved["gate_mode"] == saved["architecture"]["gate_mode"] == model.gate_mode
+    assert saved["architecture"]["normalization"] == "node_degree"
+    assert saved["gate_weight_decay"] == CONDITIONS[condition]["gate_weight_decay"]
+    assert saved["total_parameters"] == saved["trainable_parameters"] + saved["frozen_parameters"]
+    assert (saved["frozen_parameters"] > 0) == (condition == "fixed_c")
+    assert saved["evaluation_split"] == "validation" and saved["test_evaluated"] is False
+
+
+def test_cli_offline_cache_failure_saves_new_suite_metadata(monkeypatch, tmp_path):
+    monkeypatch.setattr(shared, "_require_cuda", lambda device: None)
+    calls = []
+
+    def missing(dataset, data_root, *, allow_download):
+        calls.append(allow_download)
+        raise FileNotFoundError("No verified cache")
+
+    monkeypatch.setattr(shared, "load_dataset", missing)
+    with pytest.raises(FileNotFoundError, match="verified cache"):
+        train.main(
+            [
+                "--dataset",
+                "cora",
+                "--condition",
+                "fixed_c",
+                "--output-dir",
+                str(tmp_path / "out"),
+            ]
+        )
+    saved = json.loads((tmp_path / "out/metrics.json").read_text())
+    assert calls == [False]
+    assert saved["status"] == "failed" and saved["research_suite"] == SUITE
+    assert saved["gate_mode"] == "fixed_one" and saved["test_evaluated"] is False
+
+
+def test_both_fixture_arms_same_initial_hash_fixed_scaffold_unchanged_and_no_test(
+    monkeypatch, tmp_path
+):
+    # Only this unit fixture mocks hardware and data access. The public train
+    # entrypoints still reject CPU before loading data (separately tested above).
+    monkeypatch.setattr(shared, "_require_cuda", lambda device: None)
+    monkeypatch.setattr(shared, "_configure_fp32", lambda: None)
+    for name in ("reset_peak_memory_stats", "synchronize"):
+        monkeypatch.setattr(torch.cuda, name, lambda *args: None)
+    for name in ("max_memory_allocated", "max_memory_reserved"):
+        monkeypatch.setattr(torch.cuda, name, lambda *args: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *args: "unit_fixture_only")
+    graph = SimpleNamespace(
+        x=torch.tensor([[0.5, 1.0, 2.0], [1.0, 2.0, 0.5], [2.0, 0.5, 1.0], [3.0, 1.0, 2.0]]),
+        y=torch.tensor([0, 1, 0, 999999]),
+        incidence_edge_index=torch.tensor([[0, 0, 1], [1, 2, 3]]),
+    )
+
+    class NoTest(dict):
+        def __getitem__(self, key):
+            if key == "test":
+                raise AssertionError("Do not read test indices")
+            return super().__getitem__(key)
+
+    splits = NoTest(train=torch.tensor([0, 1]), validation=torch.tensor([2]))
+    monkeypatch.setattr(shared, "_make_data", lambda *args: (graph, splits))
+    payload = {"dataset": "cora", "graphs": [vars(graph)], "classes": 2}
+    results = []
+    for condition in CONDITIONS:
+        args = args_for(tmp_path, condition)
+        args.epochs = 2
+        args.patience = 2
+        args.output_dir.mkdir()
+        result = train.train_model(
+            payload, {"data_sha256": "f" * 64}, args, torch.device("cpu"), args.output_dir
+        )
+        results.append(result)
+        assert result["status"] == "passed" and result["research_suite"] == SUITE
+        assert result["test_evaluated"] is False and "test" not in result
+        assert result["epochs_run"] == result["optimizer_steps"] == 2
+        saved = torch.load(result["checkpoint"], weights_only=True)
+        assert saved["model"] == SUITE and saved["condition"] == condition
+        assert saved["trainable_parameters"] == result["trainable_parameters"]
+        if condition == "fixed_c":
+            torch.manual_seed(args.model_seed)
+            initial = CLearningNodeClassifier(3, 2, gate_mode="fixed_one")
+            for name, parameter in initial.named_parameters():
+                if is_gate_parameter(name):
+                    torch.testing.assert_close(saved["state_dict"][name], parameter, rtol=0, atol=0)
+            for record in result["diagnostics"]["train_trajectory"]:
+                assert record["parameter_groups"]["operators.0"]["optimizer_included"] is False
+                assert all(layer["conductance"]["cv"] == 0 for layer in record["layers"])
+    assert results[0]["initial_state_sha256"] == results[1]["initial_state_sha256"]
+    assert results[0]["total_parameters"] == results[1]["total_parameters"]
+    assert results[0]["trainable_parameters"] > results[1]["trainable_parameters"]
+````
+
+# research/conductance_gat/tests/test_c_mean_audit.py
+
+````python
+"""Small tensor/unit-artifact fixtures only; never CPU research or public data."""
+
+from __future__ import annotations
+
+import copy
+import json
+import random
+import sys
+from types import ModuleType, SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from chartgat.cache import atomic_publish, atomic_write_json
+from research.conductance_gat.ablation.model import FactorialNodeClassifier, state_sha256
+from research.conductance_gat.ablation.protocol import COMMON, CONDITIONS
+from research.conductance_gat.ablation.train import checkpoint_payload
+from research.conductance_gat.benchmark_data import sha256_file
+from research.conductance_gat.c_learning import intervene as audit
+
+
+class Graph(SimpleNamespace):
+    def to(self, device, **kwargs):
+        return Graph(
+            **{
+                key: value.to(device) if isinstance(value, torch.Tensor) else value
+                for key, value in vars(self).items()
+            }
+        )
+
+
+class ValidationOnly(dict):
+    def __getitem__(self, key):
+        if key != "validation":
+            raise AssertionError("Audit must not read train/test indices")
+        return super().__getitem__(key)
+
+
+def graph():
+    return Graph(
+        x=torch.tensor([[0.3, 0.2], [1.2, -0.7], [3.1, 4.0], [-1.0, 0.7]]),
+        y=torch.tensor([999999, 0, 1, 999999]),
+        incidence_edge_index=torch.tensor([[0, 0, 1], [1, 2, 3]]),
+    )
+
+
+def model():
+    torch.manual_seed(11)
+    return FactorialNodeClassifier(2, 2, normalization="node_degree", hidden_channels=8)
+
+
+def test_graphwise_mean_is_not_minibatch_mean_and_handles_empty_graphs():
+    values = torch.tensor([1.0, 3.0, 10.0, 40.0])
+    groups = torch.tensor([0, 0, 2, 2])
+    torch.testing.assert_close(
+        audit.graphwise_mean(values, groups, 4), torch.tensor([2.0, 2.0, 25.0, 25.0])
+    )
+    assert audit.graphwise_mean(torch.empty(0), torch.empty(0, dtype=torch.long), 2).numel() == 0
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, float("inf"), float("nan")])
+def test_mean_rejects_nonpositive_or_nonfinite_conductance(value):
+    with pytest.raises(ValueError, match="finite and positive"):
+        audit.graphwise_mean(torch.tensor([value]), torch.tensor([0]), 1)
+
+
+def test_mean_operator_recomputes_degree_and_equals_uniform_row_average():
+    network = model()
+    operator = network.operators[0]
+    state = torch.randn(7, 8)
+    incidence = torch.tensor([[0, 0, 3, 3, 4], [1, 2, 4, 5, 5]])
+    groups = torch.tensor([0, 0, 0, 1, 1, 1, 2])
+    tail, head = incidence
+    sums, degree = torch.zeros_like(state), torch.zeros(7)
+    sums.index_add_(0, tail, state[head])
+    sums.index_add_(0, head, state[tail])
+    degree.index_add_(0, tail, torch.ones(5))
+    degree.index_add_(0, head, torch.ones(5))
+    expected = state.clone()
+    mask = degree > 0
+    expected[mask] = 0.05 * state[mask] + 0.95 * sums[mask] / degree[mask, None]
+    with audit.MeanConductance(network, (0,)):
+        actual = operator(state, incidence, groups, 3)
+    torch.testing.assert_close(actual, expected, atol=4e-7, rtol=1e-5)
+    torch.testing.assert_close(actual[6], state[6], atol=0, rtol=0)
+    assert not operator._forward_pre_hooks and not operator.estimator._forward_hooks
+
+
+def test_cross_graph_edge_rejected_and_hooks_removed_after_forward_failure():
+    network = model()
+    with pytest.raises(ValueError, match="crosses graph"):
+        with audit.MeanConductance(network, (0,)):
+            network.operators[0](
+                torch.randn(2, 8), torch.tensor([[0], [1]]), torch.tensor([0, 1]), 2
+            )
+    assert not any(op._forward_pre_hooks or op.estimator._forward_hooks for op in network.operators)
+
+
+def test_eval_reads_only_validation_labels_preserves_modes_state_gradients_rng():
+    network = model()
+    network.train()
+    network.norms[0].eval()
+    for parameter in network.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    before = state_sha256(network)
+    modes = [module.training for module in network.modules()]
+    gradients = [parameter.grad.clone() for parameter in network.parameters()]
+    rng = torch.get_rng_state().clone()
+    result, _ = audit.evaluate(
+        network, [graph()], torch.tensor([1, 2]), torch.device("cpu"), (0, 1)
+    )
+    assert result["metric_name"] == "accuracy" and result["prediction_count"] == 2
+    assert state_sha256(network) == before
+    assert [module.training for module in network.modules()] == modes
+    assert torch.equal(torch.get_rng_state(), rng)
+    for saved, parameter in zip(gradients, network.parameters(), strict=True):
+        torch.testing.assert_close(saved, parameter.grad, atol=0, rtol=0)
+
+
+def test_runtime_restores_rng_and_flags_on_error():
+    python_rng, numpy_rng, torch_rng = (
+        random.getstate(),
+        np.random.get_state(),
+        torch.get_rng_state(),
+    )
+    dtype = torch.get_default_dtype()
+    with pytest.raises(RuntimeError):
+        with audit.preserved_runtime():
+            random.random()
+            np.random.rand()
+            torch.rand(3)
+            torch.set_default_dtype(torch.float64)
+            raise RuntimeError("fixture failure")
+    assert random.getstate() == python_rng
+    np.testing.assert_equal(np.random.get_state(), numpy_rng)
+    assert torch.equal(torch.get_rng_state(), torch_rng)
+    assert torch.get_default_dtype() == dtype
+
+
+def test_bad_baseline_stops_before_any_mean_intervention(monkeypatch):
+    network = model()
+    calls = []
+    original = audit.evaluate
+
+    def observed(*args, **kwargs):
+        calls.append(args[4:] or ())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(audit, "evaluate", observed)
+    with pytest.raises(ValueError, match="Original checkpoint validation mismatch"):
+        audit.audit_model(network, [graph()], torch.tensor([1, 2]), torch.device("cpu"), 0.123456)
+    assert len(calls) == 1
+
+
+def test_audit_runs_all_and_individual_layers_not_training():
+    network = model()
+    original, _ = audit.evaluate(network, [graph()], torch.tensor([1, 2]), torch.device("cpu"))
+    result = audit.audit_model(
+        network, [graph()], torch.tensor([1, 2]), torch.device("cpu"), original["validation"]
+    )
+    assert [row["intervened_layers"] for row in result["interventions"]] == [[0, 1], [0], [1]]
+    for row in result["interventions"]:
+        assert row["percentage_points"] == 100 * (row["validation"] - original["validation"])
+        assert 0 <= row["changed_prediction_fraction"] <= 1
+        assert row["logit_max_absolute_delta"] >= row["logit_mean_absolute_delta"] >= 0
+    assert result["baseline_absolute_error"] == 0
+
+
+def test_ppi_micro_f1_uses_all_validation_node_label_decisions():
+    network = model()
+    item = graph()
+    item.y = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.0, 0.0]])
+    result, outputs = audit.evaluate(network, [item], None, torch.device("cpu"))
+    prediction = outputs[0] > 0
+    truth = item.y > 0
+    expected = float(2 * (prediction & truth).sum() / (prediction.sum() + truth.sum()))
+    assert result["validation"] == pytest.approx(expected)
+    assert result["prediction_count"] == 8 and result["metric_name"] == "micro_f1"
+
+
+def test_validation_data_never_constructs_training_or_test_loader(monkeypatch):
+    modules = {
+        name: ModuleType(name)
+        for name in ("torch_geometric", "torch_geometric.data", "torch_geometric.loader")
+    }
+    modules["torch_geometric.data"].Data = Graph
+    created = []
+
+    def loader(items, **kwargs):
+        created.append((items, kwargs))
+        return items
+
+    modules["torch_geometric.loader"].DataLoader = loader
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    payload = {
+        "dataset": "ppi",
+        "graphs": [{"id": i} for i in range(4)],
+        "splits": ValidationOnly(validation=[1, 2]),
+    }
+    batches, indices = audit.validation_data(
+        payload, {"model_seed": 0, "configuration": {"batch_size": 2}}, torch.device("cpu")
+    )
+    assert indices is None and [item.id for item in batches] == [1, 2]
+    assert len(created) == 1 and created[0][1]["shuffle"] is False
+
+
+def source_fixture(tmp_path):
+    root = tmp_path / "source"
+    root.mkdir()
+    cache = tmp_path / "data/conductance_gat/matched_benchmark_v1/cora"
+    cache.mkdir(parents=True)
+    fixture = graph()
+    payload = {"dataset": "cora", "classes": 2, "graphs": [vars(fixture)]}
+    atomic_publish(cache / "data.pt", lambda path: torch.save(payload, path))
+    protocol = {"data_sha256": sha256_file(cache / "data.pt"), "unit_fixture_only": True}
+    atomic_write_json(cache / "manifest.json", protocol)
+    config = {
+        **COMMON,
+        "datasets": ["cora"],
+        "model_seed": 0,
+        "epochs": 2,
+        "patience": 2,
+        "batch_size": 2,
+        "workers": 0,
+        "device": "cuda",
+        "data_root": str(tmp_path / "data"),
+    }
+    manifest = {
+        "schema_version": 1,
+        "suite": "conductance_factorial",
+        "status": "passed",
+        "source_integrity_valid": True,
+        "conditions": CONDITIONS,
+        "config": config,
+        "sources": {
+            "git_revision": "unit-fixture-no-training",
+            "sha256": {name: sha256_file(audit.ROOT / name) for name in audit.MODEL_SOURCES},
+        },
+        "jobs": [],
+    }
+    network = FactorialNodeClassifier(2, 2, normalization="node_degree")
+    original, _ = audit.evaluate(network, [fixture], torch.tensor([1, 2]), torch.device("cpu"))
+    for condition, factors in CONDITIONS.items():
+        output = root / "cora" / condition
+        output.mkdir(parents=True)
+        args = SimpleNamespace(
+            **{key: value for key, value in config.items() if key not in COMMON},
+            dataset="cora",
+            condition=condition,
+        )
+        saved = checkpoint_payload(network, args, protocol, "a" * 64, 1, original["validation"], 1)
+        atomic_publish(output / "best.pt", lambda path, value=saved: torch.save(value, path))
+        atomic_write_json(output / "history.json", [])
+        metrics = {
+            "schema_version": 1,
+            "research_suite": "conductance_factorial",
+            "status": "passed",
+            "dataset": "cora",
+            "condition": condition,
+            "model_seed": 0,
+            **factors,
+            "configuration": saved["configuration"],
+            "non_gate_weight_decay": 0.0005,
+            "cache_sha256": protocol["data_sha256"],
+            "protocol": protocol,
+            "initial_state_sha256": "a" * 64,
+            "best_epoch": 1,
+            "epochs_run": 2,
+            "best_checkpoint_optimizer_steps": 1,
+            "validation": original["validation"],
+            "metric_name": "accuracy",
+            "train_loss": 0.7,
+            "elapsed_seconds": 1.0,
+            "peak_cuda_allocated_bytes": 0,
+            "test_evaluated": False,
+            "evaluation_split": "validation",
+            "checkpoint": str(output / "best.pt"),
+            "checkpoint_sha256": sha256_file(output / "best.pt"),
+            "history": str(output / "history.json"),
+            "history_sha256": sha256_file(output / "history.json"),
+        }
+        atomic_write_json(output / "metrics.json", metrics)
+        manifest["jobs"].append(
+            {
+                "dataset": "cora",
+                "condition": condition,
+                "status": "passed",
+                "output_dir": str(output),
+                "metrics_path": str(output / "metrics.json"),
+            }
+        )
+    atomic_write_json(root / "manifest.json", manifest)
+    return root, manifest, payload, protocol
+
+
+def test_completed_source_read_is_strict_and_does_not_regenerate_old_reports(tmp_path):
+    root, _, _, _ = source_fixture(tmp_path)
+    before = audit._hashes(root.rglob("*.*"))
+    manifest, selected, hashes = audit.validate_source(root, ["cora"])
+    assert manifest["status"] == "passed" and set(selected) == {"cora"}
+    audit._assert_unchanged(hashes, "fixture")
+    assert audit._hashes(root.rglob("*.*")) == before
+    assert not (root / "comparison.json").exists()
+
+
+@pytest.mark.parametrize(
+    "mutation", ["checkpoint", "metrics", "source_code", "source_integrity", "missing_dataset"]
+)
+def test_invalid_source_rejected_without_writes(tmp_path, mutation):
+    root, manifest, _, _ = source_fixture(tmp_path)
+    requested = ["cora"]
+    if mutation == "checkpoint":
+        (root / "cora/node_degree/best.pt").write_bytes(b"changed fixture")
+    elif mutation == "metrics":
+        path = root / "cora/node_degree/metrics.json"
+        metrics = json.loads(path.read_text())
+        metrics["configuration"]["dropout"] = 0.8
+        atomic_write_json(path, metrics)
+    elif mutation == "source_code":
+        manifest["sources"]["sha256"][audit.MODEL_SOURCES[0]] = "f" * 64
+    elif mutation == "source_integrity":
+        manifest["source_integrity_valid"] = False
+    else:
+        requested = ["ppi"]
+    atomic_write_json(root / "manifest.json", manifest)
+    before = audit._hashes(root.rglob("*.*"))
+    with pytest.raises(ValueError):
+        audit.validate_source(root, requested)
+    assert audit._hashes(root.rglob("*.*")) == before
+
+
+@pytest.mark.parametrize(
+    "key", ["model", "architecture", "model_seed", "validation", "cache_sha256", "optimizer_steps"]
+)
+def test_checkpoint_metadata_must_match_metrics(tmp_path, key):
+    root, _, _, _ = source_fixture(tmp_path)
+    _, selected, _ = audit.validate_source(root, ["cora"])
+    metrics = selected["cora"]
+    saved = torch.load(metrics["checkpoint"], weights_only=True)
+    audit.validate_checkpoint(saved, metrics)
+    changed = copy.deepcopy(saved)
+    changed[key] = "tampered fixture"
+    with pytest.raises(ValueError, match="Checkpoint"):
+        audit.validate_checkpoint(changed, metrics)
+
+
+def test_production_cli_rejects_cpu_without_outputs(tmp_path):
+    with pytest.raises(RuntimeError, match="CUDA GPU"):
+        audit.main(
+            [
+                "--source-run",
+                str(tmp_path),
+                "--device",
+                "cpu",
+                "--output-dir",
+                str(tmp_path / "out"),
+            ]
+        )
+    assert not (tmp_path / "out").exists()
+
+
+def test_complete_cli_on_bounded_fixture_preserves_all_input_bytes(monkeypatch, tmp_path):
+    root, _, payload, protocol = source_fixture(tmp_path)
+    monkeypatch.setattr(audit, "_require_cuda", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "unit-fixture-no-gpu")
+    seen = []
+
+    def offline(name, data_root, *, allow_download):
+        seen.append(allow_download)
+        return payload, protocol
+
+    monkeypatch.setattr(audit, "load_dataset", offline)
+    monkeypatch.setattr(audit, "validation_data", lambda *args: ([graph()], torch.tensor([1, 2])))
+    before = audit._hashes(path for path in tmp_path.rglob("*") if path.is_file())
+    output = tmp_path / "audit-output"
+    result = audit.main(
+        [
+            "--source-run",
+            str(root),
+            "--datasets",
+            "cora",
+            "--device",
+            "cpu",
+            "--data-root",
+            str(tmp_path / "data"),
+            "--output-dir",
+            str(output),
+        ]
+    )
+    assert result == 0 and seen == [False]
+    audit._assert_unchanged(before, "all source/cache fixture files")
+    record = json.loads((output / "audit.json").read_text(encoding="utf-8"))
+    assert record["status"] == "passed"
+    assert record["training_performed"] is record["test_evaluated"] is False
+    assert record["datasets"][0]["baseline_absolute_error"] == 0
+    assert len(record["datasets"][0]["interventions"]) == 3
+    assert "not whether learning C improves" in (output / "report.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("relative", ["source/nested", "data/nested", "."])
+def test_output_cannot_overlap_source_or_cache(monkeypatch, tmp_path, relative):
+    root, _, _, _ = source_fixture(tmp_path)
+    monkeypatch.setattr(audit, "_require_cuda", lambda device: None)
+    with pytest.raises(ValueError, match="separate"):
+        audit.main(
+            [
+                "--source-run",
+                str(root),
+                "--data-root",
+                str(tmp_path / "data"),
+                "--output-dir",
+                str(tmp_path / relative),
+                "--device",
+                "cpu",
+            ]
+        )
+
+
+def test_late_source_change_invalidates_and_withholds_all_contrasts(monkeypatch, tmp_path):
+    root, _, payload, protocol = source_fixture(tmp_path)
+    monkeypatch.setattr(audit, "_require_cuda", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "unit-fixture-no-gpu")
+    monkeypatch.setattr(audit, "load_dataset", lambda *args, **kwargs: (payload, protocol))
+    monkeypatch.setattr(audit, "validation_data", lambda *args: ([graph()], torch.tensor([1, 2])))
+    original = audit.audit_model
+
+    def changed(*args):
+        result = original(*args)
+        (root / "cora/node_degree/history.json").write_bytes(b"changed fixture")
+        return result
+
+    monkeypatch.setattr(audit, "audit_model", changed)
+    output = tmp_path / "invalid-output"
+    result = audit.main(
+        [
+            "--source-run",
+            str(root),
+            "--datasets",
+            "cora",
+            "--device",
+            "cpu",
+            "--data-root",
+            str(tmp_path / "data"),
+            "--output-dir",
+            str(output),
+        ]
+    )
+    assert result == 1
+    report = json.loads((output / "audit.json").read_text(encoding="utf-8"))
+    assert report["status"] == "invalid" and report["datasets"] == []
+    assert "changed during the audit" in report["error"]
 ````
 
 # research/conductance_gat/tests/test_conductance_gat.py
@@ -27532,6 +29648,245 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 exec bash "${project_root}/scripts/paper.sh" --suite benchmark "$@"
 ````
 
+# scripts/run_conductance_c_learning.py
+
+````python
+#!/usr/bin/env python3
+"""Fresh learned-C vs fixed-C=1 training under node-degree normalization, one seed."""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import shlex
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_json  # noqa: E402
+from research.conductance_gat.c_learning.protocol import COMMON, CONDITIONS  # noqa: E402
+from scripts import run_conductance_factorial as shared  # noqa: E402
+from scripts.check_dependencies import (  # noqa: E402
+    DependencyCheckError,
+    check_dependencies,
+    error_message,
+)
+
+SUITE = "conductance_c_learning"
+run_logged = shared.run_logged
+
+
+def parser():
+    result = shared.parser()
+    result.description = __doc__
+    return result
+
+
+def make_jobs(args, run_dir: Path) -> list[dict[str, Any]]:
+    jobs = []
+    for dataset in args.datasets:
+        for condition in CONDITIONS:
+            output = run_dir / dataset / condition
+            command = [
+                sys.executable,
+                "-B",
+                "-u",
+                "-m",
+                "research.conductance_gat.c_learning.train",
+                "--dataset",
+                dataset,
+                "--condition",
+                condition,
+                "--output-dir",
+                str(output),
+                "--data-root",
+                str(args.data_root.expanduser().resolve()),
+            ]
+            for key in ("device", "model_seed", "epochs", "patience", "batch_size", "workers"):
+                command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
+            jobs.append(
+                {
+                    "dataset": dataset,
+                    "condition": condition,
+                    "status": "pending",
+                    "output_dir": str(output),
+                    "metrics_path": str(output / "metrics.json"),
+                    "log_path": str(run_dir / "logs" / f"{dataset}--{condition}.log"),
+                    "command": command,
+                }
+            )
+    return jobs
+
+
+def _source_snapshot() -> dict[str, Any]:
+    snapshot = shared._source_snapshot()
+    files = list((ROOT / "research/conductance_gat/c_learning").glob("*.py"))
+    files += [Path(__file__), ROOT / "src/chartgat/cache.py"]
+    for path in files:
+        snapshot["sha256"][path.relative_to(ROOT).as_posix()] = hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+    return snapshot
+
+
+def _comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    from research.conductance_gat.c_learning.report import write_comparison
+
+    return write_comparison(run_dir, manifest)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        shared._validate(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    run_id = args.run_id or "c-learning-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    run_dir = (
+        args.results_root.expanduser().resolve() / "conductance_gat/c_learning" / run_id
+    ).resolve()
+    data_root = args.data_root.expanduser().resolve()
+    if run_dir == data_root or run_dir.is_relative_to(data_root):
+        print("Experiment outputs must be outside the dataset directory", file=sys.stderr)
+        return 2
+    jobs = make_jobs(args, run_dir)
+    if args.dry_run:
+        print(f"One model seed: {args.model_seed}; {len(jobs)} fresh trainings; validation only")
+        for job in jobs:
+            print(shlex.join(job["command"]))
+        print(f"Comparison: {run_dir / 'comparison.md'}")
+        return 0
+    if run_dir.exists():
+        print(f"Run already exists; use a new run ID: {run_dir}", file=sys.stderr)
+        return 2
+    try:
+        dependencies = check_dependencies()
+    except DependencyCheckError as exc:
+        print(error_message(exc), file=sys.stderr)
+        return exc.exit_code
+    run_dir.mkdir(parents=True, exist_ok=False)
+    common = {
+        **COMMON,
+        **{
+            key: getattr(args, key)
+            for key in (
+                "datasets",
+                "model_seed",
+                "epochs",
+                "patience",
+                "batch_size",
+                "workers",
+                "device",
+            )
+        },
+        "data_root": str(data_root),
+    }
+    manifest = {
+        "schema_version": 1,
+        "suite": SUITE,
+        "run_id": run_id,
+        "status": "running",
+        "source_integrity_valid": True,
+        "config": common,
+        "conditions": CONDITIONS,
+        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "jobs": jobs,
+        "dependencies": dependencies,
+        "sources": _source_snapshot(),
+        "protocol": {
+            "selection": "best validation checkpoint per arm; same early-stopping policy",
+            "test": "not evaluated; exploratory validation comparison",
+            "initialization": "same full state hash including unused frozen gate scaffold",
+            "data": "same verified official cache/split per dataset; no downloads",
+            "contrast": "fresh learned_c minus fresh fixed_c; never reuse an older score",
+            "fixed_c": "exact C=1; scaffold frozen and excluded from optimizer/trainable count",
+            "normalization": "node_degree in both arms; nongate Adam L2=0.0005",
+            "uncertainty": "n=1; no CI, seed standard deviation or significance claim",
+            "reproducibility": "same seeds; CUDA scatter need not be bitwise deterministic",
+        },
+    }
+    manifest_path = run_dir / "manifest.json"
+    atomic_write_json(manifest_path, manifest)
+    current_job = None
+    environment = shared._environment()
+    try:
+        _comparison(run_dir, manifest)
+        preflight = [
+            sys.executable,
+            "-B",
+            str(ROOT / "scripts/gpu_preflight.py"),
+            "--device",
+            args.device,
+            "--require-paper-deps",
+            "--min-free-gb",
+            str(args.min_free_gb),
+            "--json-out",
+            str(run_dir / "gpu-preflight.json"),
+        ]
+        status = run_logged(preflight, run_dir / "logs/preflight.log", environment)
+        if status:
+            raise RuntimeError(f"GPU preflight failed with exit code {status}")
+        print(f"Run: {run_id}; seed {args.model_seed}; {len(jobs)} fresh trainings", flush=True)
+        for index, job in enumerate(jobs, start=1):
+            current_job = job
+            if _source_snapshot()["sha256"] != manifest["sources"]["sha256"]:
+                manifest["source_integrity_valid"] = False
+                raise RuntimeError(
+                    "Experiment source changed during the run; refusing mixed sources"
+                )
+            job["status"] = "running"
+            atomic_write_json(manifest_path, manifest)
+            print(f"\n[{index}/{len(jobs)}] {job['dataset']} / {job['condition']}", flush=True)
+            started = time.monotonic()
+            status = run_logged(job["command"], Path(job["log_path"]), environment)
+            job.update(elapsed_seconds=time.monotonic() - started, exit_code=status)
+            if status:
+                raise RuntimeError(
+                    f"{job['dataset']}/{job['condition']} failed with exit code {status}"
+                )
+            if not Path(job["metrics_path"]).is_file():
+                raise RuntimeError(f"Child returned without metrics: {job['metrics_path']}")
+            job["status"] = "passed"
+            atomic_write_json(manifest_path, manifest)
+            _comparison(run_dir, manifest)
+            current_job = None
+        if _source_snapshot()["sha256"] != manifest["sources"]["sha256"]:
+            manifest["source_integrity_valid"] = False
+            raise RuntimeError("Experiment source changed during the run; refusing mixed sources")
+        manifest.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+        _comparison(run_dir, manifest)
+    except (Exception, KeyboardInterrupt) as exc:
+        manifest.update(
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}",
+            finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+        )
+        if current_job is not None:
+            current_job.update(status="failed", error=manifest["error"])
+        atomic_write_json(manifest_path, manifest)
+        try:
+            _comparison(run_dir, manifest)
+        except (ValueError, OSError) as report_error:
+            print(f"Comparison integrity error: {report_error}", file=sys.stderr)
+        print(f"Failed: {manifest['error']}\nSaved partial results: {run_dir}", file=sys.stderr)
+        return 130 if isinstance(exc, KeyboardInterrupt) else 1
+    atomic_write_json(manifest_path, manifest)
+    print((run_dir / "comparison.md").read_text(encoding="utf-8"), flush=True)
+    print(f"Comparison: {run_dir / 'comparison.md'}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # scripts/run_conductance_factorial.py
 
 ````python
@@ -31788,6 +34143,381 @@ def test_training_help_and_dry_run_never_bootstrap_dependencies(
         "scripts/run_paper.py",
         *arguments,
     ]
+````
+
+# tests/test_conductance_c_learning_report.py
+
+````python
+"""Report integrity fixtures only: these files contain no trained model or dataset."""
+
+from __future__ import annotations
+
+import copy
+import csv
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+from research.conductance_gat.c_learning.protocol import COMMON, CONDITIONS
+from research.conductance_gat.c_learning.report import (
+    ComparisonIntegrityError,
+    main,
+    write_comparison,
+)
+
+
+def _fixture(tmp_path, datasets=("ppi",)):
+    root = tmp_path / "c-learning"
+    root.mkdir()
+    config = {
+        **COMMON,
+        "datasets": list(datasets),
+        "model_seed": 0,
+        "epochs": 100,
+        "patience": 20,
+        "batch_size": 2,
+        "workers": 0,
+        "device": "cuda",
+    }
+    manifest = {
+        "schema_version": 1,
+        "suite": "conductance_c_learning",
+        "status": "passed",
+        "source_integrity_valid": True,
+        "config": config,
+        "conditions": CONDITIONS,
+        "jobs": [],
+    }
+    configuration = {k: v for k, v in config.items() if k != "datasets"}
+    configuration.update(tf32=False, pin_memory=True)
+    for dataset in datasets:
+        for condition, spec in CONDITIONS.items():
+            output = root / dataset / condition
+            output.mkdir(parents=True)
+            checkpoint, history = output / "best.pt", output / "history.json"
+            checkpoint.write_bytes(b"unit-fixture-no-trained-model")
+            history.write_text("[]", encoding="utf-8")
+            data_hash = hashlib.sha256(dataset.encode()).hexdigest()
+            frozen = 100 if condition == "fixed_c" else 0
+            metrics = {
+                "schema_version": 1,
+                "research_suite": "conductance_c_learning",
+                "status": "passed",
+                "dataset": dataset,
+                "condition": condition,
+                "model_seed": 0,
+                **spec,
+                "non_gate_weight_decay": 0.0005,
+                "configuration": copy.deepcopy(configuration),
+                "cache_sha256": data_hash,
+                "protocol": {"data_sha256": data_hash, "official": True},
+                "initial_state_sha256": "a" * 64,
+                "best_epoch": 10,
+                "epochs_run": 30,
+                "validation": 0.55 if condition == "learned_c" else 0.50,
+                "metric_name": "micro_f1" if dataset == "ppi" else "accuracy",
+                "train_loss": 0.7,
+                "elapsed_seconds": 2.0,
+                "peak_cuda_allocated_bytes": 100,
+                "evaluation_split": "validation",
+                "test_evaluated": False,
+                "versions": {"torch": "unit-fixture"},
+                "gpu": "unit-fixture",
+                "total_parameters": 200,
+                "trainable_parameters": 200 - frozen,
+                "frozen_parameters": frozen,
+            }
+            for name, path in (("checkpoint", checkpoint), ("history", history)):
+                metrics[name] = str(path)
+                metrics[name + "_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            metrics_path = output / "metrics.json"
+            metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+            manifest["jobs"].append(
+                {
+                    "dataset": dataset,
+                    "condition": condition,
+                    "status": "passed",
+                    "output_dir": str(output),
+                    "metrics_path": str(metrics_path),
+                }
+            )
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return root, manifest
+
+
+def _edit(manifest, callback, index=0):
+    path = Path(manifest["jobs"][index]["metrics_path"])
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    callback(metrics)
+    path.write_text(json.dumps(metrics), encoding="utf-8")
+
+
+def test_complete_report_contrast_units_metrics_and_readonly_children(tmp_path):
+    root, manifest = _fixture(tmp_path, ("ppi", "ogbn-arxiv"))
+    before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    report = write_comparison(root, manifest)
+    assert report["status"] == "passed" and report["complete"]
+    assert report["n_model_seeds"] == 1 and report["test_evaluated"] is False
+    assert [row["metric_name"] for row in report["datasets"]] == ["micro_f1", "accuracy"]
+    for dataset in report["datasets"]:
+        assert dataset["learned_minus_fixed"]["score_delta"] == pytest.approx(0.05)
+        assert dataset["learned_minus_fixed"]["percentage_points"] == pytest.approx(5.0)
+    assert all(path.read_bytes() == data for path, data in before.items())
+    text = (root / "comparison.md").read_text(encoding="utf-8")
+    assert "+5.000000 pp" in text and "n=1" in text and "frozen" in text
+    with (root / "comparison.csv").open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 4 and float(rows[0]["learned_minus_fixed_pp"]) == pytest.approx(5.0)
+    assert main([str(root)]) == 0
+
+
+@pytest.mark.parametrize("status", ["pending", "running", "failed"])
+def test_partial_results_withhold_contrast(tmp_path, status):
+    root, manifest = _fixture(tmp_path)
+    manifest["status"] = "failed" if status == "failed" else "running"
+    manifest["jobs"][1]["status"] = status
+    report = write_comparison(root, manifest)
+    assert not report["complete"]
+    assert report["datasets"][0]["learned_minus_fixed"] is None
+    assert report["datasets"][0]["conditions"][1]["validation"] is None
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("cache_sha256", "b" * 64),
+        ("initial_state_sha256", "b" * 64),
+        ("test_evaluated", True),
+        ("model_seed", 1),
+        ("normalization", "global_max"),
+        ("gate_mode", "fixed_one"),
+        ("gate_weight_decay", 0.0),
+        ("non_gate_weight_decay", 0.0),
+        ("frozen_parameters", 100),
+        ("total_parameters", 300),
+        ("research_suite", "conductance_factorial"),
+        ("validation", float("nan")),
+        ("versions", {"torch": "mismatched"}),
+        ("gpu", "different"),
+    ],
+)
+def test_mismatch_invalidates_all_deltas(tmp_path, key, value):
+    root, manifest = _fixture(tmp_path)
+    _edit(manifest, lambda metrics: metrics.update({key: value}))
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+    report = json.loads((root / "comparison.json").read_text(encoding="utf-8"))
+    assert report["status"] == "invalid"
+    assert all(row["learned_minus_fixed"] is None for row in report["datasets"])
+
+
+@pytest.mark.parametrize("change", ["source", "missing_source", "duplicate", "missing", "spec"])
+def test_invalid_manifest_withholds_deltas(tmp_path, change):
+    root, manifest = _fixture(tmp_path)
+    if change == "source":
+        manifest["source_integrity_valid"] = False
+    elif change == "missing_source":
+        manifest.pop("source_integrity_valid")
+    elif change == "duplicate":
+        manifest["jobs"].append(manifest["jobs"][0])
+    elif change == "missing":
+        manifest["jobs"].pop()
+    else:
+        manifest["conditions"] = {}
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize("artifact", ["checkpoint", "history"])
+def test_modified_artifacts_rejected(tmp_path, artifact):
+    root, manifest = _fixture(tmp_path)
+    child = json.loads(Path(manifest["jobs"][0]["metrics_path"]).read_text(encoding="utf-8"))
+    Path(child[artifact]).write_bytes(b"modified")
+    with pytest.raises(ComparisonIntegrityError, match="SHA-256 mismatch"):
+        write_comparison(root, manifest)
+
+
+def test_escaping_artifact_cannot_make_valid_report(tmp_path):
+    root, manifest = _fixture(tmp_path)
+    _edit(manifest, lambda child: child.update(checkpoint=str(tmp_path / "outside.pt")))
+    with pytest.raises(ComparisonIntegrityError, match="escapes"):
+        write_comparison(root, manifest)
+
+
+def test_output_symlink_is_rejected_before_writes(tmp_path, monkeypatch):
+    root, manifest = _fixture(tmp_path)
+    original = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda p: p.name == "comparison.md" or original(p))
+    with pytest.raises(ValueError, match="symlinks"):
+        write_comparison(root, manifest)
+    assert not (root / "comparison.json").exists()
+
+
+def test_common_config_and_cross_arm_extra_config_cannot_drift(tmp_path):
+    root, manifest = _fixture(tmp_path)
+    _edit(manifest, lambda child: child["configuration"].update(unknown_training_flag=True))
+    with pytest.raises(ComparisonIntegrityError, match="configuration"):
+        write_comparison(root, manifest)
+````
+
+# tests/test_conductance_c_learning_runner.py
+
+````python
+"""One-seed C-learning orchestration, with no GPU training in these contract tests."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from scripts import run_conductance_c_learning as runner
+
+
+def test_exact_default_plan():
+    args = runner.parser().parse_args([])
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert args.model_seed == 0 and args.datasets == ["ppi", "ogbn-arxiv"]
+    assert len(jobs) == 4
+    assert [job["condition"] for job in jobs] == ["learned_c", "fixed_c"] * 2
+    for job in jobs:
+        command = job["command"]
+        assert command[command.index("-m") + 1] == "research.conductance_gat.c_learning.train"
+        assert command[command.index("--model-seed") + 1] == "0"
+        assert "--amp" not in command and "--allow-download" not in command
+
+
+@pytest.mark.parametrize("option", ["--help", "--dry-run"])
+def test_inspection_stdlib_only_no_writes(tmp_path, option):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            str(runner.ROOT / "scripts/run_conductance_c_learning.py"),
+            option,
+            "--results-root",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--device", "cpu"],
+        ["--model-seed", "-1"],
+        ["--epochs", "0"],
+        ["--datasets", "ppi", "ppi"],
+        ["--run-id", "../old"],
+        ["--min-free-gb", "nan"],
+    ],
+)
+def test_bad_input_no_install_or_training(monkeypatch, options):
+    monkeypatch.setattr(runner, "check_dependencies", lambda: pytest.fail("must not check"))
+    assert runner.main(options) == 2
+
+
+def _stub(tmp_path, monkeypatch, failure=None, change_after=None):
+    calls, reports = [], []
+    snapshots = 0
+    monkeypatch.setattr(runner, "check_dependencies", lambda: {"unit_fixture_only": True})
+
+    def snapshot():
+        nonlocal snapshots
+        snapshots += 1
+        changed = change_after is not None and snapshots >= change_after
+        return {"sha256": {"unit-source": "changed" if changed else "original"}}
+
+    def dispatch(command, log, environment):
+        calls.append(command)
+        if any(Path(part).name == "gpu_preflight.py" for part in command):
+            return 2 if failure == "preflight" else 0
+        condition = command[command.index("--condition") + 1]
+        if failure == condition:
+            return 9
+        output = Path(command[command.index("--output-dir") + 1])
+        output.mkdir(parents=True)
+        (output / "metrics.json").write_text("{}", encoding="utf-8")
+        return 0
+
+    def report(root, manifest):
+        reports.append(json.loads(json.dumps(manifest)))
+        (root / "comparison.md").write_text("unit-fixture report", encoding="utf-8")
+        return {"status": manifest["status"]}
+
+    monkeypatch.setattr(runner, "_source_snapshot", snapshot)
+    monkeypatch.setattr(runner, "run_logged", dispatch)
+    monkeypatch.setattr(runner, "_comparison", report)
+    options = ["--datasets", "ppi", "--results-root", str(tmp_path), "--run-id", "unit-fixture"]
+    return options, calls, reports
+
+
+def test_two_fresh_processes_success_and_one_seed(tmp_path, monkeypatch):
+    options, calls, reports = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0 and len(calls) == 3
+    assert reports[-1]["status"] == "passed"
+    assert reports[-1]["config"]["model_seed"] == 0
+    assert [job["status"] for job in reports[-1]["jobs"]] == ["passed", "passed"]
+    assert "never reuse" in reports[-1]["protocol"]["contrast"]
+
+
+@pytest.mark.parametrize("failure,expected_calls", [("fixed_c", 3), ("preflight", 1)])
+def test_failure_no_following_training(tmp_path, monkeypatch, failure, expected_calls):
+    options, calls, reports = _stub(tmp_path, monkeypatch, failure=failure)
+    assert runner.main(options) == 1 and len(calls) == expected_calls
+    assert reports[-1]["status"] == "failed"
+    if failure == "fixed_c":
+        assert [job["status"] for job in reports[-1]["jobs"]] == ["passed", "failed"]
+
+
+@pytest.mark.parametrize("change_after,calls_expected", [(2, 1), (4, 3)])
+def test_source_changes_before_or_after_training_invalid(
+    tmp_path, monkeypatch, change_after, calls_expected
+):
+    options, calls, reports = _stub(tmp_path, monkeypatch, change_after=change_after)
+    assert runner.main(options) == 1
+    assert len(calls) == calls_expected
+    assert reports[-1]["source_integrity_valid"] is False
+
+
+def test_existing_run_untouched(tmp_path, monkeypatch):
+    root = tmp_path / "conductance_gat/c_learning/existing"
+    root.mkdir(parents=True)
+    sentinel = root / "best.pt"
+    sentinel.write_bytes(b"preserve")
+    monkeypatch.setattr(runner, "check_dependencies", lambda: pytest.fail("no install"))
+    assert runner.main(["--run-id", "existing", "--results-root", str(tmp_path)]) == 2
+    assert sentinel.read_bytes() == b"preserve"
+
+
+def test_outputs_outside_data(tmp_path):
+    assert (
+        runner.main(["--results-root", str(tmp_path), "--data-root", str(tmp_path), "--dry-run"])
+        == 2
+    )
+
+
+def test_source_snapshot_covers_shared_and_new_execution_code():
+    snapshot = runner._source_snapshot()["sha256"]
+    for name in (
+        "research/conductance_gat/c_learning/model.py",
+        "research/conductance_gat/c_learning/train.py",
+        "research/conductance_gat/ablation/train.py",
+        "research/conductance_gat/ablation/model.py",
+        "scripts/run_conductance_c_learning.py",
+        "scripts/run_conductance_factorial.py",
+        "src/chartgat/cache.py",
+    ):
+        assert name in snapshot and len(snapshot[name]) == 64
 ````
 
 # tests/test_conductance_factorial_report.py

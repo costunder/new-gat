@@ -4,6 +4,11 @@
 2×2 실험으로 분리한다. 기본 benchmark, Cycle PE, Tree Augmentation은 변경하지 않는다.
 외부 비교 모델을 추가하는 실험도 아니다.
 
+`43afd63`으로 실행한 `gat-factorial-seed0-v1`의 8개 GPU 학습과 비교표는 모두 완료됐다.
+정확한 결과와 제한은 [실험 정리](../../../docs/CONDUCTANCE_FACTORIAL_FINDINGS.md)에 있다.
+다음 단계인 node-degree 아래의 learned/fixed C 비교와 읽기 전용 평균-C 검사는
+[별도 C-learning 폴더](../c_learning/README.md)를 사용한다. 이미 완료한 run을 덮어쓰지 않는다.
+
 ## 실행
 
 저장소 README에 따라 GPU Conda 환경과 공식 데이터 캐시를 준비한 뒤 저장소 루트에서 실행한다.
@@ -109,4 +114,5 @@ bash research/conductance_gat/ablation/reproduce.sh --datasets ogbn-arxiv --run-
 `--epochs`, `--patience`, `--batch-size`, `--workers`는 네 조건 모두에 동일하게 적용된다.
 다른 단일 seed는 `--model-seed 1`, 다른 디스크는 `--data-root`·`--results-root`로 지정한다.
 `--dry-run`은 명령 목록만 출력하고 데이터/모델/결과를 만들지 않는 개발용 옵션이다.
-단위 검증과 실제 GPU 성능 비교는 별개다. 새 4조건의 실측값은 서버 실행 후에만 얻어진다.
+단위 검증과 실제 GPU 성능 비교는 별개다. `gat-factorial-seed0-v1` 실측은 위 결과 문서에
+보존하며, 다른 seed·설정으로 실행한 값은 해당 run의 새 결과로 구분한다.
