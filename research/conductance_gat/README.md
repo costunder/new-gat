@@ -1,15 +1,22 @@
-# Independent Research Track A: Sparse Incidence Conductance Attention
+# Independent Research Track A: Sparse Incidence Conductance
+
+**엣지별 C 자체를 직접 학습하는 [v2](v2/README.md)**는 별도 폴더와 실행 경로를 쓴다.
+기존 shared-MLP 모델을 변경하지 않으며, ogbn-arxiv에서 direct C / fixed C=1을
+model seed 0 하나로 새로 비교한다. MLP나 고유분해 없이 `c_e=exp(alpha_e)`를 학습하고,
+정확한 chunked backward로 엣지 중간값 메모리를 제한한다. 그래프별 파라미터를 사용하므로
+PPI의 미관측 그래프 전이와 합치지 않으며, 기본 benchmark나 전체 실행에 자동 추가하지 않는다.
 
 Gate weight decay와 정규화의 2×2 원인 비교는 [별도 실험 폴더](ablation/README.md)에 있다.
 PPI·ogbn-arxiv에서 seed 0 하나로 4조건을 새로 학습하며, 아래 기존 benchmark는 변경하지 않는다.
 완료된 [GPU 결과와 해석](../../docs/CONDUCTANCE_FACTORIAL_FINDINGS.md)을 바탕으로,
 [C-learning 실험](c_learning/README.md)은 node-degree 아래 learned C/fixed C=1을
 4개의 fresh training으로 비교하며 [완료 결과](../../docs/CONDUCTANCE_C_LEARNING_FINDINGS.md)를 수령했다.
-다음은 **그 새 run의 learned checkpoint**에 대한 평균-C 개입이며 추가 학습은 없다.
+그 새 run의 learned checkpoint 평균-C 검사도 완료 보고서를 수령했다. PPI는 현재
+checkpoint의 C 의존성이 컸고 arxiv는 작았지만, 이것이 fresh training의 성능 이득은 아니다.
 이전 2×2 node-degree checkpoint도 별도 source로 지원한다.
 이 두 경로에도 Cycle PE/Tree나 외부 비교 모델을 섞지 않는다.
 
-This directory is a self-contained executable paper track for
+The existing shared-generator v1 in this directory implements
 
 \[
 H \xrightarrow{B} BH
@@ -100,8 +107,9 @@ it is not a separately trained baseline or proof of causation.
 
 The supplied five-seed benchmark aggregates, seed-0 GPU diagnostics, and completed
 single-seed factorial and C-learning results are recorded in
-[experiment status](../../docs/EXPERIMENT_STATUS.md). The next read-only mean-C
-intervention uses the new C-learning learned checkpoint; its GPU output has not yet been supplied.
+[experiment status](../../docs/EXPERIMENT_STATUS.md). The new C-learning learned-checkpoint
+mean-C audit output has also been supplied and is preserved separately from retraining scores.
+The direct-parameter v2 is implemented separately; its GPU training results remain pending.
 
 ## Supplementary suites (not the default matched benchmark)
 
@@ -261,5 +269,5 @@ unit-test adapter fixtures and CLI artifact handling.
 - `paper.py`: supplementary conductance models/own ablations, metrics, AMP, JSON/CSV;
 - `tests/`: algebra, datasets, adapter, cache, and CLI regression tests.
 
-This directory tests only the incidence-conductance-attention hypothesis. It
+This directory tests only the incidence-conductance hypothesis. It
 does not import or combine the other research tracks.

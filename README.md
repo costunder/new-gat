@@ -19,6 +19,11 @@ Cycle PE의 좌영공간 **기저벡터 전체를 입력하는 v2**는
 [별도 폴더와 실행 안내](research/cycle_pe/v2/README.md)에 있다. 아래 기본 전체 실행은
 기존 통계형 v1을 유지하며, v2는 자체 명령·기저 캐시·결과 폴더로 독립 실행한다.
 
+Conductance의 **엣지별 C 자체를 직접 학습하는 v2**도
+[별도 폴더](research/conductance_gat/v2/README.md)에 있다. 기존 MLP 생성 방식과 섞지 않으며,
+기본 비교는 ogbn-arxiv에서 직접 C / 고정 C=1을 model seed 0으로 각각 새로 학습한다.
+그래프별 엣지 파라미터이므로 새로운 PPI 그래프로 전이하는 실험에는 사용하지 않는다.
+
 이 소스 버전에는 v2, 실행 최적화, 단일 seed 기본값과 확장 진단이 포함되어 있다.
 이전 진단 전용 버전(`ebf8cd1`)과의 차이 및 실제 측정 결과는
 [실험 상태](docs/EXPERIMENT_STATUS.md)에 구분했다.
@@ -125,8 +130,24 @@ Gate weight decay와 정규화의 영향을 분리하는 **PPI/arxiv × 4조건 
 그 결과를 바탕으로 진행하는 **학습 C vs 고정 C=1 비교**와 기존 checkpoint의 평균-C 검사는
 [C-learning 실행 안내](research/conductance_gat/c_learning/README.md)에 있다. 새 학습은
 PPI/arxiv × 2조건 × seed 0으로 총 4개이며, 읽기 전용 검사는 재학습과 분리한다.
-이미 `gat-c-learning-seed0-v1`을 완료했다면 해당 안내의 **learned checkpoint 검사**만 실행한다.
-이번 단계는 기존 새 run을 읽으며 추가 학습하지 않는다.
+`gat-c-learning-seed0-v1`의 비교 학습과 learned checkpoint 검사는 완료 보고서를 수령했다.
+결과는 [C-learning 기록](docs/CONDUCTANCE_C_LEARNING_FINDINGS.md)에 보존한다.
+
+### Conductance v2: 엣지별 C 직접 학습
+
+기존 공식 데이터 캐시와 Conda 환경을 사용한다. 아래 명령은 **ogbn-arxiv × 두 조건 × seed 0**을
+별도로 학습한다. 기존 모델·결과를 바꾸거나 checkpoint를 재사용하지 않는다.
+
+```bash
+bash research/conductance_gat/v2/reproduce.sh --run-id gat-direct-c-v2-seed0-v1
+cat results/conductance_gat/v2/gat-direct-c-v2-seed0-v1/comparison.md
+```
+
+C는 엣지별 log 파라미터에서 양수로 변환하며, C=1 초기 상태에서 시작한다.
+큰 엣지 중간값을 모두 저장하지 않도록 정확한 chunked forward/backward를 사용한다.
+아직 full-graph 학습이며 이웃 샘플링을 구현한 것은 아니다. 데이터 범위·추가 인자·
+계산량과 메모리 해석은 [v2 실행 안내](research/conductance_gat/v2/README.md)를 따른다.
+같은 run ID는 덮어쓰지 않으므로 재실행할 때는 새 ID를 사용한다.
 
 ### Cycle PE
 

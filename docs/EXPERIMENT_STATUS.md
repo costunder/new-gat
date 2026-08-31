@@ -14,12 +14,16 @@
 train-label gradient를 검사하며 **5e801c3 실행의 새 GPU 로그를 수령했다.** 아래 확장 검사 절에
 기록했다. 이후 **43afd63의 2×2 GPU 재학습 결과도 수령했으며 여덟 조건 모두 passed**다.
 이어 **C-learning의 네 조건 비교도 모두 passed인 보고서를 수령했다.** 새 run의
-`learned_c` checkpoint를 대상으로 확장한 평균-C 검사는 아직 GPU 출력이 없다.
+`learned_c` checkpoint의 평균-C 검사도 이후 `passed` GPU 출력을 수령했다.
+다음은 MLP 없이 엣지별 C를 직접 학습하는 별도 Conductance v2이며 실제 GPU 결과는 아직 없다.
 
-후속 코드의 로컬 회귀는 **924 passed / 64 skipped** (32.11 s, exit 0), Ruff 통과다.
-직전 C-learning 구현의 890개에서 검사 34개를 추가했다. 새 학습 checkpoint→평균-C 검사의
-연결과 suite 구분은 작은 단위 fixture로 검증했고 공개 데이터 학습은 실행하지 않았다.
+직접 C v2 추가 후 로컬 회귀는 **1042 passed / 64 skipped** (47.41 s, exit 0), Ruff 통과다.
+직전 평균-C 검사 확장의 924개에 v2 전용 118개를 추가했다. 직접 C의 FP64 미분·chunk 연산,
+graph binding과 학습 루프→checkpoint→비교표 연결 및 실제 C gradient coverage를 검사했다.
+이전 shared-MLP와 그 평균-C 검사도 전체 회귀에 포함했다. 공개 데이터 학습은 실행하지 않았다.
 생략은 Linux/Bash 62개, 로컬 PyG 미설치 1개, Windows 실제 symlink 권한 1개다.
+이번에도 Windows faulthandler의 access-violation 출력은 있었으나 위 결과와 exit 0까지
+완료됐으며 Linux/CUDA 실행 또는 GPU 가속의 증거로 제시하지 않는다.
 
 | 구분 | 확인된 상태 |
 |---|---|
@@ -31,7 +35,8 @@ train-label gradient를 검사하며 **5e801c3 실행의 새 GPU 로그를 수�
 | 단일 seed 기본값·확장 checkpoint 검사 | 5e801c3 GPU full audit 수령, seed 0 다섯 데이터셋 passed |
 | Gate WD × normalization 2×2 | 43afd63 실제 GPU 결과 수령. PPI/arxiv × 4조건 × seed 0 모두 passed |
 | Node-degree의 learned C vs fixed C | `gat-c-learning-seed0-v1`, 2데이터 × 2조건 × seed 0, 모두 passed 보고서 수령 |
-| Node-degree checkpoint mean-C 개입 | 기존 factorial/node_degree와 새 c_learning/learned_c를 구분하는 읽기 전용 검사. 새 GPU 출력 미수령 |
+| Node-degree checkpoint mean-C 개입 | 새 c_learning/learned_c의 PPI/arxiv GPU 출력 수령, passed. 기존 factorial도 별도 지원 |
+| Conductance 직접 C v2 | `conductance_direct_c_v2`, 기본 arxiv × direct/fixed × seed 0. 구현 경로 추가, 실제 GPU 결과 없음 |
 | `code_summary.md` | 이 버전의 source/test/config/script 전체를 파일별로 보존한 스냅샷 |
 
 `ebf8cd1`까지만 받은 서버에는 새 기능이 없으므로 업데이트 후 `git rev-parse HEAD`로
@@ -58,9 +63,44 @@ C-learning 구현 게시본은 `25ca328`이지만 제공된 비교표에는 실�
 이번 근거는 inline 붙여넣기라 별도 첨부 파일/SHA-256도 없다. 정확한 파라미터 수·층별
 진단과 이전 PPI 점수와의 구분은 [C-learning 결과](CONDUCTANCE_C_LEARNING_FINDINGS.md)를 따른다.
 
-다음은 **같은 새 C-learning run의 learned checkpoint**에 대한 읽기 전용 평균-C 검사다.
-원 validation 및 원본 무결성 확인 후 그래프·층별 C 변동에 대한 현재 의존도를 본다.
-이 다음 단계는 재학습하지 않으며 실제 GPU 개입 출력은 아직 수령하지 않았다.
+이어 **같은 새 C-learning run의 learned checkpoint**에 대한 읽기 전용 평균-C 검사도
+수령했다. 원 validation 및 원본 무결성 확인 후 그래프·층별 C 변동에 대한 현재 의존도를
+검사했으며 재학습·optimizer step·test 평가는 없다. 구체적인 결과는 바로 다음 절을 따른다.
+
+### 수령한 평균-C 검사: PPI checkpoint 의존도와 재학습 이득은 다름
+
+사용자가 제공한 inline terminal 출력의 revision 표시는 `8f6b4da`, 검사 상태는 `passed`다.
+대상은 `gat-c-learning-seed0-v1`의 seed 0 `learned_c`다. 원 validation은 PPI
+52.564966% 그대로 재현됐고 arxiv는 저장 68.317723%, 재계산 68.317729%다.
+
+| 데이터 | 전체 층 평균 C 후 validation (%) | 원 재계산 값 대비 Δ(pp) | 바뀐 예측 (%) |
+|---|---:|---:|---:|
+| PPI micro-F1 | 45.915526 | −6.649440 | 7.619317 |
+| ogbn-arxiv accuracy | 68.284171 | −0.033558 | 0.184570 |
+
+PPI에서 layer 0만 평균화한 차이는 −6.198266pp, layer 1만 평균화한 차이는 −0.238916pp다.
+따라서 그 learned checkpoint는 엣지별 C 패턴에 의존한다. 그러나 처음부터 학습한 fixed C
+모델은 52.705738%였다. **고정된 checkpoint의 개입 민감도와 다른 모델을 새로 학습한
+성능 차이는 다른 질문**이다. 층별 효과도 더해서 전체 효과로 만들지 않는다.
+arxiv는 layer 0 prediction flip이 0이며 layer 1 개입이 전체 개입과 같은 작은 점수 차이를 냈다.
+6개 개입의 정확한 점수·flip 단위·logit 변화는 [C-learning 결과](CONDUCTANCE_C_LEARNING_FINDINGS.md)에 있다.
+
+이 근거는 사용자 출력이며 서버의 원본 artifact 전체를 독립 검사한 것은 아니다.
+단일 model seed의 validation 결과이므로 test·유의성·보편적 동등성 주장은 하지 않는다.
+
+### 다음 실험: graph-bound 직접 C v2
+
+[Conductance v2](../research/conductance_gat/v2/README.md)는 canonical 물리 엣지마다
+층별 alpha를 두고 `c_e=exp(alpha_e)`를 직접 학습한다. Alpha=0에서 C=1로 시작하며
+C 생성 MLP·고유분해 없이 implicit diagonal C와 기존 node-degree 전파를 사용한다.
+직접 alpha의 WD는 0, 나머지 파라미터의 WD는 0.0005다. 같은 초기 상태의 direct/fixed를
+별도 새 run에서 학습하므로 기존 MLP 결과를 v2의 점수로 가져오지 않는다.
+
+기본은 **ogbn-arxiv × direct_c/fixed_c × seed 0 = 2개 CUDA 학습**이다.
+Cora/CiteSeer/PubMed는 명시적으로 선택할 수 있고, unseen 독립 그래프에 엣지 파라미터를
+전달하는 규칙이 없으므로 PPI는 지원하지 않는다. Arxiv는 여전히 full-batch다.
+Chunk 연산은 전체 엣지의 forward/backward를 처리하는 메모리 제어이며 GraphSAGE식 sampling이 아니다.
+기존 공유 MLP 설계도 유효하다. V2는 별도 직접 파라미터화 가설이며 아직 GPU 성능·가속 결과는 없다.
 
 ### 수령한 2×2 GPU 재학습: 정규화 효과와 C 학습은 별개
 
@@ -282,15 +322,20 @@ node-degree 정규화가 개선을 이끈 결과를 확보했지만, 모든 데�
 첫 batch의 task gradient와 decay 관찰값이 있다. Gate WD 제거 후 선택된 C의 변동이
 커졌다는 결과와 WD 제거가 성능을 높인다는 주장은 분리한다.
 
-`learned_c`/`fixed_c=1`의 네 새 학습은 완료 보고서를 수령했다. 다음
-[C-learning 전용 검사](../research/conductance_gat/c_learning/README.md)는 **그 새 run의
-learned checkpoint**에 대한 재학습 없는 평균-C 개입이다. 원 validation을 먼저 재현하고
-그래프·층별 평균 C로 바꾼 뒤 node degree도 다시 계산한다. 개입의 GPU 결과는 아직 없다.
-이전 2×2 `node_degree` 검사도 지원하지만 다른 source run의 결과로 분리한다.
+`learned_c`/`fixed_c=1`의 네 새 학습과 **그 새 run의 learned checkpoint** 평균-C 개입은
+모두 사용자 GPU 보고서를 수령했다. PPI의 현재 checkpoint 의존도가 크다는 결과와
+fresh-training 이득을 관측하지 못했다는 결과를 함께 보존한다. 이전 2×2 `node_degree` 검사도
+지원하지만 다른 source run의 결과로 분리한다.
+
+다음 검증은 [직접 C v2](../research/conductance_gat/v2/README.md)의 같은 그래프에 묶인
+direct/fixed C 비교다. 이는 MLP 구현의 수학 오류 수정이 아니며 정규화·공유 함수·직접
+파라미터화 효과를 분리한다. C 공통 스케일의 비식별성, 엣지 수에 비례하는 파라미터 수와
+transductive 범위를 명시한다. 실제 v2 GPU 결과는 아직 없다.
 
 노드별 정규화는 기존 대칭성·보존성의 의미를 바꾸는 실험이므로 단순 속도 최적화나
 버그 수정으로 부르지 않는다. 기존 기본 benchmark는 유지한다. 다른 model seed의
-일반화, v2 학습 결과, GPU 가속 실측은 여전히 별도 검증 대상이다.
+일반화, Conductance 직접 C v2와 Cycle PE 기저벡터 v2의 학습 결과, GPU 가속 실측은
+여전히 별도 검증 대상이다.
 
 ## 5. 근거와 검증 범위
 
@@ -301,6 +346,7 @@ learned checkpoint**에 대한 재학습 없는 평균-C 개입이다. 원 valid
 | 사용자 제공 5e801c3 full-audit stdout | 첨부 `c4abbad1-654a-4f5e-a774-f84f7e88e4dd`; `CFA2118D4B9257CA8772FC16BE9834D1D0FB402FA375DDCB4E652D6FB37D564F` |
 | 사용자 제공 43afd63 2×2 GPU 학습·비교 stdout | 첨부 `20b4a93d-06ed-4cff-9fe5-530eacf39766`; `2C78D02BB210BF00865AB7207DF651B02B2081EE4FAE6E8A6A83665A5D331161` |
 | 사용자 제공 C-learning GPU 비교 | 2026-09-01 inline 보고서, `gat-c-learning-seed0-v1`; 별도 첨부 파일/SHA 없음, 실행 revision 미확인 |
+| 사용자 제공 C-learning 평균-C GPU 검사 | 2026-09-01 inline terminal 출력, revision 표시 `8f6b4da`, `gat-c-learning-seed0-v1`의 각 데이터셋 `learned_c`; 별도 첨부 파일/SHA 없음 |
 
 이 hash는 **제공된 텍스트 파일의 hash**이며 서버의 checkpoint/원본 데이터 hash가 아니다.
 개인 서버 계정·호스트 경로와 원본 로그 전체는 이 문서에 복제하지 않았다.

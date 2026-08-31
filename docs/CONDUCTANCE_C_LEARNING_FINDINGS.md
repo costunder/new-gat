@@ -1,9 +1,11 @@
-# Conductance C-learning: 결과와 다음 checkpoint 검사
+# Conductance C-learning: 학습 비교와 checkpoint 검사 결과
 
 기준일: 2026-09-01. 사용자가 대화에 붙여 넣은 `gat-c-learning-seed0-v1` 비교 보고서에
 근거한 기록이다. 전체 보고서와 네 조건 모두 `passed`, model seed는 0이다.
 **현재 결과에서는 학습 C가 고정 C=1보다 나은 validation 성능을 보이지 않았다.**
 두 방법의 일반적인 동등성이나 C가 항상 불필요하다는 증명은 아니다.
+이후 같은 learned checkpoint의 평균-C 검사도 `passed` 출력을 수령했다.
+PPI에서는 checkpoint가 엣지별 C 변동에 의존했지만 fresh-training 이득과는 별개였다.
 
 ## 1. 근거와 실행 범위
 
@@ -18,8 +20,8 @@
 | 근거 형태 | 사용자 inline 보고서. 별도 첨부 파일이나 그 파일의 SHA-256은 없음 |
 
 구현 게시 commit을 실제 서버에서 실행한 commit이라고 단정하지 않는다. 서버의 checkpoint,
-manifest, history 전체도 로컬로 받아 독립 재검증하지 않았다. 이번에 추가한 checkpoint 검사는
-해당 서버의 원본 artifact·source/cache 무결성과 원 validation 재현을 실제로 확인하는 단계다.
+manifest, history 전체도 로컬로 받아 독립 재검증하지 않았다. 이후 사용자 terminal 출력에서
+원 validation 재현과 평균-C 검사의 완료를 확인했으며 그 범위는 6절에 별도 기록했다.
 
 이 비교는 node-degree 정규화 아래에서 adaptive C만 분리한 내부 실험이다.
 구현의 공통 학습 정책은 hidden 64, conductance 2층, dropout 0.5, Adam lr 0.005,
@@ -103,7 +105,7 @@ arxiv learned 모델은 첫 층 C가 상수이고 둘째 층 변동도 작으며
   평가하지 않았으므로 최종 test 성능, 논문 경쟁력 또는 novelty 주장을 붙이지 않는다.
 - 이번 표는 환경 호환성 전반이나 실행 최적화의 가속 실측이 아니다.
 
-## 6. 다음은 같은 새 run의 learned checkpoint만 검사
+## 6. 수령한 같은 run의 learned checkpoint 평균-C 검사
 
 추가 학습 없이 **`gat-c-learning-seed0-v1`의 각 데이터셋 `learned_c`** 원 validation을 먼저 재현하고,
 C를 그래프·층별 평균으로 교체해 검증한다. 전체 층 교체와 한 층씩 교체를 분리하며
@@ -122,8 +124,50 @@ cat results/conductance_gat/c_learning_audits/gat-c-learning-seed0-v1/report.md
 원본 model/source/cache/checkpoint와 validation 재현 검사에 실패하면 유효한 대비를 만들지
 않는다. 새 보고서만 별도 폴더에 기록하고 원본 checkpoint·학습 결과는 덮어쓰지 않는다.
 이미 같은 보고서 폴더가 있으면 `--output-dir`에 새 이름을 지정한다. 재학습·optimizer step·
-test 평가·다운로드·더미 데이터 생성은 없다. 이 확장 검사의 실제 GPU 출력은 아직 수령하지 않았다.
+test 평가·다운로드·더미 데이터 생성은 없다. 이 확장 검사의 실제 GPU terminal 출력을
+이후 수령했으며 상태는 `passed`다. 사용자 terminal 출력에 표시된 short revision은 `8f6b4da`다.
+원본 서버를 직접 조사한 것은 아니고 inline 근거이므로 첨부 파일 hash를 만들지 않는다.
+
+원 run은 `gat-c-learning-seed0-v1`, condition은 `learned_c`, model seed는 0이다.
+PPI 저장/재계산 validation은 모두 52.564966%이고, arxiv는 저장 68.317723%,
+재계산 68.317729%다. 아래 delta는 저장된 반올림 값이 아니라 **검사에서 재계산한 원래 값**에 대한 차이다.
+
+| 데이터 / 지표 | 평균 C로 바꾼 층 | Validation (%) | Δ 원래 (pp) | 바뀐 예측 (%) | Logit 평균 절대 차이 |
+|---|---|---:|---:|---:|---:|
+| PPI micro-F1 | 전체 층 | 45.915526 | −6.649440 | 7.619317 | 0.340052 |
+| PPI micro-F1 | layer 0만 | 46.366699 | −6.198266 | 7.279934 | 0.332338 |
+| PPI micro-F1 | layer 1만 | 52.326050 | −0.238916 | 1.572709 | 0.0758783 |
+| arxiv accuracy | 전체 층 | 68.284171 | −0.033558 | 0.184570 | 0.00299709 |
+| arxiv accuracy | layer 0만 | 68.317729 | 0 | 0 | 1.66161e-7 |
+| arxiv accuracy | layer 1만 | 68.284171 | −0.033558 | 0.184570 | 0.00299709 |
+
+PPI의 바뀐 예측 비율은 node-label 이진 판정 전체에서의 flip 비율이다. arxiv는 validation
+노드의 argmax class flip 비율이다. 둘을 동일한 표본 단위로 해석하거나 합산하지 않는다.
+표는 사용자 출력의 반올림 값을 그대로 보존했다.
+
+PPI에서 전체 층 평균화 시 −6.649440pp이며 큰 변화는 layer 0 개입에서 나타났다.
+즉 **선택된 learned checkpoint는 학습한 엣지별 C 패턴을 실제로 사용한다.** 하지만 앞서
+새로 학습한 fixed 모델은 52.705738%였고 learned보다 낮지 않았다. 다른 파라미터를 고정한
+추론 개입과 처음부터 고정 C에 적응하도록 학습한 모델은 다른 질문이므로 모순이 아니다.
+층별 개입 효과는 더해서 전체 층 효과로 만들 수 없다. 비선형 층과 이후 층의 입력이 함께 변한다.
+
+arxiv는 layer 0 개입의 예측 flip이 0이고 수치 수준의 작은 logit 변화만 있다.
+Layer 1/전체 층 개입도 −0.033558pp로 작다. 이를 일반적인 함수 동등성이나 다른 seed의
+결과로 확대하지 않는다. 모든 값은 validation이고 새로운 test 평가는 없다.
 
 해석할 때는 PPI와 arxiv 각각 원 validation 일치 여부, all-layer/층별 점수 차이,
 logit 변화와 prediction flip을 확인한다. 점수가 유지돼도 logits가 바뀔 수 있으므로 점수 하나만
 보지 않는다. 개입 민감도가 있어도 fresh-training 이득이 없을 수 있으며 두 결과는 모순이 아니다.
+
+## 7. 다음 독립 가설: MLP 없이 엣지별 C 직접 학습
+
+다음 실험은 [Conductance v2](../research/conductance_gat/v2/README.md)다.
+고정 그래프의 canonical 물리 엣지·층마다 alpha를 두고 `c_e=exp(alpha_e)`를 직접 학습한다.
+Alpha는 0으로 초기화해 C=1에서 시작한다. C 생성 MLP와 고유분해는 없고,
+node-degree 전파·backbone은 유지한 채 직접 C와 fixed C=1의 두 조건을 새로 비교한다.
+
+기존 MLP는 공유 edge 함수를 학습하는 올바른 설계다. V2는 수학 오류를 고치는 것이 아니라
+**graph-bound 직접 파라미터화**라는 다른 가설이다. 특정 그래프의 엣지에 파라미터가 묶이므로
+PPI의 unseen 독립 그래프에는 적용하지 않는다. 기본은 arxiv × direct/fixed × seed 0의
+2개 CUDA 학습이고 arxiv는 여전히 full-batch다. Cora/CiteSeer/PubMed는 명시적으로 선택할 수 있다.
+이 v2의 실제 GPU 결과는 아직 없으며 이전 결과를 v2 성능으로 재사용하지 않는다.

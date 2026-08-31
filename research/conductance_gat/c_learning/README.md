@@ -11,8 +11,11 @@
 정확한 값·파라미터 수·진단·근거의 한계는
 [C-learning 결과](../../../docs/CONDUCTANCE_C_LEARNING_FINDINGS.md)에 기록했다.
 
-**다음 단계는 새 C-learning run의 learned checkpoint 검사이며 재학습하지 않는다.**
-새로 비교 학습을 재현하는 명령은 별도 절에 남겨뒀다.
+**새 C-learning run의 learned checkpoint 검사도 완료 보고서를 수령했다.**
+PPI의 전체 층 평균-C 교체는 -6.649440 pp, arxiv는 -0.033558 pp였다.
+선택된 checkpoint의 의존성과 fresh training의 이득은 별개다.
+이 폴더는 기존 MLP 실험과 검사 재현용으로 유지한다. 다음 직접 엣지 C 학습은
+[v2](../v2/README.md)의 별도 명령으로 실행하며 과거 결과에 덮어쓰지 않는다.
 
 ## 준비
 
@@ -25,7 +28,7 @@
 git pull --ff-only
 ```
 
-## 1. 완료된 C-learning의 learned checkpoint 검사
+## 1. 완료된 learned checkpoint 검사를 다시 재현할 때
 
 이미 `gat-c-learning-seed0-v1`을 완료한 서버에서 실행한다.
 
@@ -129,5 +132,5 @@ cat results/conductance_gat/c_learning/gat-c-learning-seed0-v1/comparison.md
 
 Model seed는 하나이므로 표준편차·CI·p-value나 SOTA를 주장하지 않는다.
 반복적인 validation 분석으로 선택 편향이 생길 수 있으며 아직 보지 않은 test 성능도 아니다.
-학습 비교의 GPU 보고서는 수령했으며 위 결과 문서에 보존했다. 이번에 확장한
-`conductance_c_learning/learned_c` 평균-C 검사의 실제 GPU 출력은 아직 수령하지 않았다.
+학습 비교와 `conductance_c_learning/learned_c` 평균-C 검사 모두 GPU 보고서를 수령했으며,
+위 결과 문서에 별도로 보존했다. 로컬에서 서버의 전체 원본 artifact를 독립 검증한 것은 아니다.

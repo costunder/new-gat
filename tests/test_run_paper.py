@@ -328,15 +328,13 @@ def test_paper_runner_rejects_unsafe_run_id() -> None:
 
 
 def test_readme_commands_use_full_independent_protocols() -> None:
+    from scripts import run_conductance_v2
     from scripts.run_paper import _parser
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     blocks = re.findall(r"```bash\n(.*?)```", readme, flags=re.DOTALL)
     bash_commands = [
-        line
-        for block in blocks
-        for line in block.splitlines()
-        if line.startswith("bash ")
+        line for block in blocks for line in block.splitlines() if line.startswith("bash ")
     ]
     setup_commands = [
         line for line in bash_commands if shlex.split(line)[1] == "scripts/setup_gpu.sh"
@@ -346,7 +344,23 @@ def test_readme_commands_use_full_independent_protocols() -> None:
         "bash scripts/setup_gpu.sh --profile legacy-cu118",
     ]
     commands = [line for line in bash_commands if line not in setup_commands]
-    assert len(commands) == 5
+    v2_commands = [
+        line
+        for line in commands
+        if shlex.split(line)[1] == "research/conductance_gat/v2/reproduce.sh"
+    ]
+    assert len(v2_commands) == 1
+    v2_command = shlex.split(v2_commands[0])
+    v2_source = (ROOT / v2_command[1]).read_text(encoding="utf-8")
+    assert "set -euo pipefail" in v2_source
+    assert 'source "${project_root}/scripts/conda_env.sh"' in v2_source
+    assert 'exec "${environment_python}" -B scripts/run_conductance_v2.py "$@"' in v2_source
+    v2_args = run_conductance_v2.parser().parse_args(v2_command[2:])
+    run_conductance_v2._validate(v2_args)
+    assert v2_args.datasets == ["ogbn-arxiv"] and v2_args.model_seed == 0
+    assert len(run_conductance_v2.make_jobs(v2_args, ROOT / "results/unit-contract")) == 2
+    commands = [line for line in commands if line not in v2_commands]
+    assert len(commands) == 5  # original full protocols remain unchanged
     parsed = []
     for line in commands:
         command = shlex.split(line)
