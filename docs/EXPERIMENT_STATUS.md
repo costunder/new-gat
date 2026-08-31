@@ -1,6 +1,6 @@
 # 실험 결과와 구현 상태
 
-기준일: 2026-08-31 (Asia/Seoul).
+기준일: 2026-09-01 (Asia/Seoul).
 
 이 문서는 사용자가 제공한 **서버 결과 출력**과 **현재 소스 버전의 구현**을 구분한 기록이다.
 문서 작성 자체가 새 학습을 실행했다는 뜻은 아니다. 수치는 사용자 로그에서 확인했으며,
@@ -13,10 +13,12 @@
 단일 seed의 std/CI는 null로 기록한다. 새 read-only `--full-audit`는 C 평균/셔플/전파 제거와
 train-label gradient를 검사하며 **5e801c3 실행의 새 GPU 로그를 수령했다.** 아래 확장 검사 절에
 기록했다. 이후 **43afd63의 2×2 GPU 재학습 결과도 수령했으며 여덟 조건 모두 passed**다.
-이 결과를 근거로 추가한 C-learning 비교와 평균-C 검사는 아직 새 GPU 결과가 없다.
+이어 **C-learning의 네 조건 비교도 모두 passed인 보고서를 수령했다.** 새 run의
+`learned_c` checkpoint를 대상으로 확장한 평균-C 검사는 아직 GPU 출력이 없다.
 
-후속 코드의 로컬 회귀는 **890 passed / 64 skipped** (30.76 s, exit 0), Ruff 통과다.
-새 학습 두 조건과 평균-C 검사는 작은 단위 fixture로 검증했고 공개 데이터 학습은 실행하지 않았다.
+후속 코드의 로컬 회귀는 **924 passed / 64 skipped** (32.11 s, exit 0), Ruff 통과다.
+직전 C-learning 구현의 890개에서 검사 34개를 추가했다. 새 학습 checkpoint→평균-C 검사의
+연결과 suite 구분은 작은 단위 fixture로 검증했고 공개 데이터 학습은 실행하지 않았다.
 생략은 Linux/Bash 62개, 로컬 PyG 미설치 1개, Windows 실제 symlink 권한 1개다.
 
 | 구분 | 확인된 상태 |
@@ -28,13 +30,37 @@ train-label gradient를 검사하며 **5e801c3 실행의 새 GPU 로그를 수�
 | 실행 최적화·선택적 compile·속도 도구 | 이 소스 버전에 포함, 로컬 단위 검증 완료. GPU 가속 실측 미수령 |
 | 단일 seed 기본값·확장 checkpoint 검사 | 5e801c3 GPU full audit 수령, seed 0 다섯 데이터셋 passed |
 | Gate WD × normalization 2×2 | 43afd63 실제 GPU 결과 수령. PPI/arxiv × 4조건 × seed 0 모두 passed |
-| Node-degree의 learned C vs fixed C | 별도 `c_learning` 코드 추가. 2데이터 × 2조건 × seed 0, 새 GPU 결과 미수령 |
-| Node-degree checkpoint mean-C 개입 | 별도 읽기 전용 검사 추가. 새 GPU 결과 미수령 |
+| Node-degree의 learned C vs fixed C | `gat-c-learning-seed0-v1`, 2데이터 × 2조건 × seed 0, 모두 passed 보고서 수령 |
+| Node-degree checkpoint mean-C 개입 | 기존 factorial/node_degree와 새 c_learning/learned_c를 구분하는 읽기 전용 검사. 새 GPU 출력 미수령 |
 | `code_summary.md` | 이 버전의 source/test/config/script 전체를 파일별로 보존한 스냅샷 |
 
 `ebf8cd1`까지만 받은 서버에는 새 기능이 없으므로 업데이트 후 `git rev-parse HEAD`로
 실행 revision을 확인한다. 소스 업데이트가 서버에서의 실행 완료를 뜻하지는 않는다.
 아래 기존 학습 결과를 v2·최적화·새 2×2/C-learning 결과로 재분류하면 안 된다.
+
+### 수령한 C-learning 비교: 학습 C의 성능 이득은 관측하지 못함
+
+2026-09-01 수령한 `gat-c-learning-seed0-v1` 보고서는 model seed 0이며 네 조건과
+전체 비교가 `passed`다. Validation만 평가했고 test는 읽지 않았다.
+
+| 데이터 | Learned C (%) | Fixed C=1 (%) | Learned − fixed (pp) | Best / 실행 epoch (learned; fixed) |
+|---|---:|---:|---:|---|
+| PPI micro-F1 | 52.564966 | 52.705738 | −0.140772 | 64 / 114; 90 / 140 |
+| ogbn-arxiv accuracy | 68.317723 | 68.324435 | −0.006711 | 195 / 200; 195 / 200 |
+
+PPI learned에는 비상수 C가 남아 있지만 성능 이득은 없었고, arxiv learned는 C 변동과
+점수 차이가 모두 작다. 이는 이 seed·설정에서 이득을 관측하지 못했다는 결과이지
+일반적 동등성이나 C의 보편적 무용성을 증명한 것이 아니다. 동결 gate scaffold를 보존하므로
+약 69%의 **활성 학습 파라미터 감소**를 저장 공간·GPU 메모리·속도 개선으로 바꾸어 말하지 않는다.
+
+C-learning 구현 게시본은 `25ca328`이지만 제공된 비교표에는 실제 서버 source revision이
+없다. 해당 manifest revision을 독립 확인하지 않았으므로 실행 commit으로 단정하지 않는다.
+이번 근거는 inline 붙여넣기라 별도 첨부 파일/SHA-256도 없다. 정확한 파라미터 수·층별
+진단과 이전 PPI 점수와의 구분은 [C-learning 결과](CONDUCTANCE_C_LEARNING_FINDINGS.md)를 따른다.
+
+다음은 **같은 새 C-learning run의 learned checkpoint**에 대한 읽기 전용 평균-C 검사다.
+원 validation 및 원본 무결성 확인 후 그래프·층별 C 변동에 대한 현재 의존도를 본다.
+이 다음 단계는 재학습하지 않으며 실제 GPU 개입 출력은 아직 수령하지 않았다.
 
 ### 수령한 2×2 GPU 재학습: 정규화 효과와 C 학습은 별개
 
@@ -256,11 +282,11 @@ node-degree 정규화가 개선을 이끈 결과를 확보했지만, 모든 데�
 첫 batch의 task gradient와 decay 관찰값이 있다. Gate WD 제거 후 선택된 C의 변동이
 커졌다는 결과와 WD 제거가 성능을 높인다는 주장은 분리한다.
 
-다음은 [C-learning 전용 실행](../research/conductance_gat/c_learning/README.md)이다.
-기존 `node_degree` checkpoint의 C를 평균으로 바꿔 현재 의존도를 검사하는 **재학습 없는
-개입**과, 같은 정규화에서 `learned_c`/`fixed_c=1`을 처음부터 학습하는 **4개 새 학습**을
-분리한다. 두 데이터와 seed 0을 유지하고 새 learned 점수도 같은 run에서 얻는다.
-이 두 후속 분석은 구현 상태이며 GPU 결과를 아직 수령하지 않았다.
+`learned_c`/`fixed_c=1`의 네 새 학습은 완료 보고서를 수령했다. 다음
+[C-learning 전용 검사](../research/conductance_gat/c_learning/README.md)는 **그 새 run의
+learned checkpoint**에 대한 재학습 없는 평균-C 개입이다. 원 validation을 먼저 재현하고
+그래프·층별 평균 C로 바꾼 뒤 node degree도 다시 계산한다. 개입의 GPU 결과는 아직 없다.
+이전 2×2 `node_degree` 검사도 지원하지만 다른 source run의 결과로 분리한다.
 
 노드별 정규화는 기존 대칭성·보존성의 의미를 바꾸는 실험이므로 단순 속도 최적화나
 버그 수정으로 부르지 않는다. 기존 기본 benchmark는 유지한다. 다른 model seed의
@@ -274,6 +300,7 @@ node-degree 정규화가 개선을 이끈 결과를 확보했지만, 모든 데�
 | 사용자 제공 GPU 진단 stdout | 첨부 `5db2e997-c8ab-495e-b762-c32fa620c02c`; `C0E89FC76A438D1707FE90C889923390FDF8277F05780B2811FF4D444DD01A21` |
 | 사용자 제공 5e801c3 full-audit stdout | 첨부 `c4abbad1-654a-4f5e-a774-f84f7e88e4dd`; `CFA2118D4B9257CA8772FC16BE9834D1D0FB402FA375DDCB4E652D6FB37D564F` |
 | 사용자 제공 43afd63 2×2 GPU 학습·비교 stdout | 첨부 `20b4a93d-06ed-4cff-9fe5-530eacf39766`; `2C78D02BB210BF00865AB7207DF651B02B2081EE4FAE6E8A6A83665A5D331161` |
+| 사용자 제공 C-learning GPU 비교 | 2026-09-01 inline 보고서, `gat-c-learning-seed0-v1`; 별도 첨부 파일/SHA 없음, 실행 revision 미확인 |
 
 이 hash는 **제공된 텍스트 파일의 hash**이며 서버의 checkpoint/원본 데이터 hash가 아니다.
 개인 서버 계정·호스트 경로와 원본 로그 전체는 이 문서에 복제하지 않았다.

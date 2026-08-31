@@ -125,6 +125,8 @@ Gate weight decay와 정규화의 영향을 분리하는 **PPI/arxiv × 4조건 
 그 결과를 바탕으로 진행하는 **학습 C vs 고정 C=1 비교**와 기존 checkpoint의 평균-C 검사는
 [C-learning 실행 안내](research/conductance_gat/c_learning/README.md)에 있다. 새 학습은
 PPI/arxiv × 2조건 × seed 0으로 총 4개이며, 읽기 전용 검사는 재학습과 분리한다.
+이미 `gat-c-learning-seed0-v1`을 완료했다면 해당 안내의 **learned checkpoint 검사**만 실행한다.
+이번 단계는 기존 새 run을 읽으며 추가 학습하지 않는다.
 
 ### Cycle PE
 
@@ -199,7 +201,7 @@ Python patch 버전과 모든 전이 의존성을 잠근 환경은 아니며,
 서로 다른 GPU·드라이버에서 비트 단위 동일한 결과를 보장하지 않는다.
 [PyTorch 재현성 안내](https://docs.pytorch.org/docs/stable/notes/randomness.html)도 참고한다.
 
-사용자 제공 기존 benchmark 5-seed 집계, Conductance seed 0 GPU 진단과 2×2 재학습 결과는
+사용자 제공 기존 benchmark 5-seed 집계, Conductance seed 0 GPU 진단·2×2·C-learning 결과는
 [실험 상태](docs/EXPERIMENT_STATUS.md)에 기록했다. 기저벡터 v2의 GPU 학습 결과와
 실행 최적화의 가속 실측은 아직 확인하지 않았다. 구현 검증 이력과 연구상 한계는
 [hand_off.md](hand_off.md), 이 소스 버전의 코드 전체는

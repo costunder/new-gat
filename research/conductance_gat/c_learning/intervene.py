@@ -1,4 +1,8 @@
-"""Read-only validation interventions on completed factorial node-degree checkpoints.
+"""Read-only mean-C validation audits of completed learned-conductance checkpoints.
+
+The source manifest selects either the factorial suite's node_degree arm or the
+C-learning suite's learned_c arm. Fixed-C checkpoints are never substituted for a
+learned checkpoint, and both suites retain their own strict artifact validation.
 
 This does not retrain, evaluate a test split, or modify source artifacts. Replacing
 C by its arithmetic mean within each graph/layer tests reliance of this selected
@@ -31,12 +35,18 @@ from ..ablation.protocol import COMMON, CONDITIONS, DATASETS, DEFAULT_DATASETS
 from ..ablation.report import (
     _build_comparison,
     _contained,
+    _integer,
     _load_child,
     _reject_nonfinite_json,
     _same,
 )
 from ..benchmark import _binary_counts, _micro_f1_from_counts, _versions
 from ..benchmark_data import load_dataset, sha256_file
+from .model import CLearningNodeClassifier
+from .protocol import CONDITIONS as C_LEARNING_CONDITIONS
+from .protocol import SUITE as C_LEARNING_SUITE
+from .report import _load as _load_c_learning_child
+from .report import build_comparison as _build_c_learning_comparison
 
 ROOT = Path(__file__).resolve().parents[3]
 BASELINE_TOLERANCE = 1e-4
@@ -47,11 +57,39 @@ MODEL_SOURCES = (
     "research/conductance_gat/sparse.py",
     "research/conductance_gat/benchmark_data.py",
 )
-AUDIT_SOURCES = MODEL_SOURCES + (
+C_LEARNING_MODEL_SOURCES = MODEL_SOURCES + (
+    "research/conductance_gat/c_learning/model.py",
+    "research/conductance_gat/c_learning/protocol.py",
+)
+AUDIT_SOURCES = C_LEARNING_MODEL_SOURCES + (
     "research/conductance_gat/c_learning/intervene.py",
     "research/conductance_gat/ablation/report.py",
+    "research/conductance_gat/c_learning/report.py",
     "src/chartgat/cache.py",
 )
+
+
+def source_spec(suite: str) -> dict[str, Any]:
+    """Exact suite dispatch; never infer identity from an arm name or path."""
+    if suite == "conductance_factorial":
+        return {
+            "condition": "node_degree",
+            "conditions": CONDITIONS,
+            "model_sources": MODEL_SOURCES,
+            "build_comparison": _build_comparison,
+            "load_child": _load_child,
+            "model_factory": FactorialNodeClassifier,
+        }
+    if suite == C_LEARNING_SUITE:
+        return {
+            "condition": "learned_c",
+            "conditions": C_LEARNING_CONDITIONS,
+            "model_sources": C_LEARNING_MODEL_SOURCES,
+            "build_comparison": _build_c_learning_comparison,
+            "load_child": _load_c_learning_child,
+            "model_factory": CLearningNodeClassifier,
+        }
+    raise ValueError(f"Unsupported checkpoint source suite: {suite!r}")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -71,47 +109,84 @@ def _assert_unchanged(snapshot: dict[str, str], label: str) -> None:
 
 
 def validate_source(root: Path, datasets: list[str]) -> tuple[dict, dict, dict]:
-    """Validate without calling the factorial report writer or touching old results."""
+    """Validate a complete source matrix without writing or regenerating old reports."""
+    root = root.expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("Source run must be a directory containing manifest.json")
+    if (
+        not datasets
+        or any(not isinstance(dataset, str) or dataset not in DATASETS for dataset in datasets)
+        or len(set(datasets)) != len(datasets)
+    ):
+        raise ValueError("Requested datasets must be a nonempty unique supported list")
     manifest_path = _contained("manifest.json", root, "source manifest")
     manifest = _read_json(manifest_path)
+    specification = source_spec(manifest.get("suite"))
     if manifest.get("source_integrity_valid") is not True:
         raise ValueError("Source manifest must explicitly certify source_integrity_valid=true")
-    if not _same(manifest.get("conditions"), CONDITIONS):
-        raise ValueError("Source manifest condition definitions differ from the fixed factorial")
-    comparison = _build_comparison(root, manifest)
+    if not _same(manifest.get("conditions"), specification["conditions"]):
+        raise ValueError("Source manifest condition definitions differ from its declared suite")
+    comparison = specification["build_comparison"](root, manifest)
     if comparison["status"] != "passed":
-        raise ValueError("Source factorial is not complete and valid: " + str(comparison["errors"]))
+        raise ValueError("Source run is not complete and valid: " + str(comparison["errors"]))
     if any(dataset not in manifest["config"]["datasets"] for dataset in datasets):
         raise ValueError("Requested dataset is absent from the source run")
-    historical = manifest.get("sources", {}).get("sha256", {})
-    for name in MODEL_SOURCES:
+    sources = manifest.get("sources")
+    if not isinstance(sources, dict) or not isinstance(sources.get("sha256"), dict):
+        raise ValueError("Source manifest must contain executed source SHA-256 fingerprints")
+    historical = sources["sha256"]
+    for name in specification["model_sources"]:
         if historical.get(name) != sha256_file(ROOT / name):
             raise ValueError(f"Executed model/cache source differs from historical run: {name}")
     selected = {}
     paths = [manifest_path]
     for job in manifest["jobs"]:
         metrics_path = _contained(job["metrics_path"], root, "source metrics")
-        metrics = _load_child(root, job, manifest["config"])
+        metrics = specification["load_child"](root, job, manifest["config"])
         output = _contained(job["output_dir"], root, "source job")
         paths += [metrics_path]
         paths += [_contained(metrics[key], output, key) for key in ("checkpoint", "history")]
-        if job["condition"] == "node_degree" and job["dataset"] in datasets:
+        if job["condition"] == specification["condition"] and job["dataset"] in datasets:
             selected[job["dataset"]] = metrics
+    if set(selected) != set(datasets):
+        raise ValueError("Source run lacks a unique learned-conductance arm for every dataset")
     return manifest, selected, _hashes(paths)
 
 
 def validate_checkpoint(saved: dict, metrics: dict) -> None:
     if not isinstance(saved, dict):
         raise ValueError("Checkpoint must contain metadata and a state_dict")
+    if not isinstance(metrics, dict):
+        raise ValueError("Selected metrics must be an object")
+    suite = metrics.get("research_suite")
+    specification = source_spec(suite)
+    required_metrics = {
+        "condition": specification["condition"],
+        "normalization": "node_degree",
+        "gate_weight_decay": COMMON["weight_decay"],
+        "non_gate_weight_decay": COMMON["weight_decay"],
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+    }
+    if suite == C_LEARNING_SUITE:
+        required_metrics.update(gate_mode="learned", frozen_parameters=0)
+    elif "gate_mode" in metrics or "gate_mode" in saved:
+        raise ValueError("Factorial checkpoint must not contain C-learning gate_mode metadata")
+    for key, value in required_metrics.items():
+        if not _same(metrics.get(key), value):
+            raise ValueError(f"Selected checkpoint metrics {key} is not the learned source arm")
+    gate_metadata = {"gate_mode": "learned"} if suite == C_LEARNING_SUITE else {}
     expected = {
-        "research_suite": "conductance_factorial",
-        "model": "conductance_factorial",
-        "condition": "node_degree",
+        "research_suite": suite,
+        "model": suite,
+        "condition": specification["condition"],
+        **gate_metadata,
         "architecture": {
             "hidden_channels": COMMON["hidden_channels"],
             "layers": COMMON["layers"],
             "dropout": COMMON["dropout"],
             "normalization": "node_degree",
+            **gate_metadata,
         },
         **{
             key: metrics[key]
@@ -131,11 +206,44 @@ def validate_checkpoint(saved: dict, metrics: dict) -> None:
         },
         "optimizer_steps": metrics["best_checkpoint_optimizer_steps"],
     }
+    if suite == C_LEARNING_SUITE:
+        for key in ("total_parameters", "trainable_parameters", "frozen_parameters"):
+            expected[key] = _integer(
+                metrics.get(key), key, minimum=0 if key == "frozen_parameters" else 1
+            )
+        if expected["total_parameters"] != expected["trainable_parameters"]:
+            raise ValueError("Learned-C checkpoint must have zero frozen parameters")
     for key, value in expected.items():
         if not _same(saved.get(key), value):
             raise ValueError(f"Checkpoint {key} disagrees with selected source metrics")
     if not isinstance(saved.get("state_dict"), dict) or not saved["state_dict"]:
         raise ValueError("Checkpoint state_dict is missing")
+
+
+def reconstruct_model(
+    saved: dict, metrics: dict, payload: dict, device: torch.device
+) -> FactorialNodeClassifier:
+    """Restore the declared model exactly, rejecting cross-suite/frozen-gate artifacts."""
+    validate_checkpoint(saved, metrics)
+    specification = source_spec(metrics["research_suite"])
+    model = specification["model_factory"](
+        payload["graphs"][0]["x"].shape[1], payload["classes"], **saved["architecture"]
+    ).to(device)
+    model.load_state_dict(saved["state_dict"], strict=True)
+    if metrics["research_suite"] == C_LEARNING_SUITE:
+        counts = {
+            "total_parameters": sum(parameter.numel() for parameter in model.parameters()),
+            "trainable_parameters": sum(
+                parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+            ),
+            "frozen_parameters": sum(
+                parameter.numel() for parameter in model.parameters() if not parameter.requires_grad
+            ),
+        }
+        for key, value in counts.items():
+            if not _same(saved[key], value):
+                raise ValueError(f"Reconstructed learned-C model {key} differs from checkpoint")
+    return model
 
 
 @contextmanager
@@ -380,6 +488,12 @@ def _markdown(report: dict) -> str:
         "training. All-layer and individual-layer interventions are separate forwards.",
         "",
     ]
+    if "source_suite" in report and "source_condition" in report:
+        lines += [
+            f"Source: `{report['source_suite']}` / `{report['source_condition']}`; "
+            "the selected learned-conductance checkpoint from that source run.",
+            "",
+        ]
     if report.get("error"):
         lines += [f"Audit invalid: {report['error']}", "Contrasts withheld.", ""]
     for item in report["datasets"]:
@@ -412,7 +526,12 @@ def _markdown(report: dict) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-run", type=Path, required=True)
+    parser.add_argument(
+        "--source-run",
+        type=Path,
+        required=True,
+        help="Completed factorial or C-learning run; suite and learned arm come from its manifest",
+    )
     parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DEFAULT_DATASETS))
     parser.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
     parser.add_argument("--output-dir", type=Path)
@@ -453,6 +572,7 @@ def main(argv: list[str] | None = None) -> int:
     if output.exists():
         raise FileExistsError(f"Audit output already exists; choose a fresh directory: {output}")
     manifest, selected, source_hashes = validate_source(source, args.datasets)
+    specification = source_spec(manifest["suite"])
     audit_hashes = _hashes(ROOT / name for name in AUDIT_SOURCES)
     output.mkdir(parents=True, exist_ok=False)
     report = {
@@ -460,12 +580,14 @@ def main(argv: list[str] | None = None) -> int:
         "suite": "conductance_mean_c_audit",
         "status": "running",
         "source_run": str(source),
+        "source_suite": manifest["suite"],
+        "source_condition": specification["condition"],
         "source_git_revision": manifest["sources"].get("git_revision"),
         "source_manifest_sha256": source_hashes[str(source / "manifest.json")],
         "source_artifact_sha256": source_hashes,
         "executed_audit_source_sha256": audit_hashes,
         "historical_model_source_sha256": {
-            name: manifest["sources"]["sha256"][name] for name in MODEL_SOURCES
+            name: manifest["sources"]["sha256"][name] for name in specification["model_sources"]
         },
         "n_model_seeds": 1,
         "model_seed": manifest["config"]["model_seed"],
@@ -484,7 +606,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with preserved_runtime():
             for dataset in args.datasets:
-                print(f"Read-only mean-C audit: {dataset} / node_degree", flush=True)
+                print(
+                    f"Read-only mean-C audit: {dataset} / {manifest['suite']} / "
+                    f"{specification['condition']}",
+                    flush=True,
+                )
                 metrics = selected[dataset]
                 payload, protocol = load_dataset(dataset, data_root, allow_download=False)
                 if (
@@ -497,18 +623,14 @@ def main(argv: list[str] | None = None) -> int:
                     _hashes(cache / filename for filename in ("data.pt", "manifest.json"))
                 )
                 saved = torch.load(metrics["checkpoint"], map_location="cpu", weights_only=True)
-                validate_checkpoint(saved, metrics)
-                model = FactorialNodeClassifier(
-                    payload["graphs"][0]["x"].shape[1],
-                    payload["classes"],
-                    **saved["architecture"],
-                ).to(device)
-                model.load_state_dict(saved["state_dict"], strict=True)
+                model = reconstruct_model(saved, metrics, payload, device)
                 batches, indices = validation_data(payload, metrics, device)
                 result = audit_model(model, batches, indices, device, metrics["validation"])
                 report["datasets"].append(
                     {
                         "dataset": dataset,
+                        "source_suite": manifest["suite"],
+                        "source_condition": specification["condition"],
                         "metric_name": metrics["metric_name"],
                         "checkpoint_sha256": metrics["checkpoint_sha256"],
                         "cache_sha256": metrics["cache_sha256"],

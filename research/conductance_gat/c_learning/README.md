@@ -5,8 +5,14 @@
 상수인 상태에서도 점수가 높았으므로 **정규화의 효과와 C 학습의 효과를 분리**한다.
 기존 benchmark, 2×2 결과, Cycle PE와 Tree Augmentation은 변경하거나 합치지 않는다.
 
-아래 두 명령은 다른 질문에 답한다. 첫 번째는 기존 checkpoint의 읽기 전용 검사,
-두 번째는 동일 설정의 두 조건을 새로 학습하는 비교다.
+`gat-c-learning-seed0-v1`의 네 학습은 완료됐다. PPI learned/fixed는
+52.564966% / 52.705738%, arxiv는 68.317723% / 68.324435%로,
+이 seed의 validation에서는 학습 C의 이득을 확인하지 못했다.
+정확한 값·파라미터 수·진단·근거의 한계는
+[C-learning 결과](../../../docs/CONDUCTANCE_C_LEARNING_FINDINGS.md)에 기록했다.
+
+**다음 단계는 새 C-learning run의 learned checkpoint 검사이며 재학습하지 않는다.**
+새로 비교 학습을 재현하는 명령은 별도 절에 남겨뒀다.
 
 ## 준비
 
@@ -19,23 +25,25 @@
 git pull --ff-only
 ```
 
-## 1. 기존 checkpoint의 C를 평균으로 바꾸는 검사
+## 1. 완료된 C-learning의 learned checkpoint 검사
 
-이미 `gat-factorial-seed0-v1`을 완료한 서버에서 실행한다.
+이미 `gat-c-learning-seed0-v1`을 완료한 서버에서 실행한다.
 
 ```bash
-bash research/conductance_gat/c_learning/audit.sh --source-run results/conductance_gat/ablations/gat-factorial-seed0-v1
+bash research/conductance_gat/c_learning/audit.sh --source-run results/conductance_gat/c_learning/gat-c-learning-seed0-v1 --output-dir results/conductance_gat/c_learning_audits/gat-c-learning-seed0-v1
+cat results/conductance_gat/c_learning_audits/gat-c-learning-seed0-v1/report.md
 ```
 
-이 명령은 source run의 **PPI/arxiv `node_degree` best checkpoint**를 사용한다.
+이 명령은 source run의 **PPI/arxiv `learned_c` best checkpoint**를 사용한다.
 원 validation을 재현한 뒤, 각 그래프와 각 층에서 C를 해당 평균으로 바꿔 추론한다.
 전체 층 교체와 한 층씩 교체를 따로 기록하며 **교체한 C로 node degree를 다시 계산**한다.
 원래 모델의 다른 가중치는 고정한다. 재학습·optimizer step·test 평가는 하지 않는다.
 
 원본 checkpoint·결과·캐시는 수정하지 않는다. 별도 보고서 위치를 터미널에 출력하고,
-기본값은 `results/conductance_gat/c_learning_audits/<source-run-name>-<UTC timestamp>/`다.
+위 명령은 `results/conductance_gat/c_learning_audits/gat-c-learning-seed0-v1/`에 저장한다.
 그 폴더의 `report.md`는 읽기용, `audit.json`은 전체 검사 결과다.
-정확한 저장 폴더를 지정하려면 실행 명령에 `--output-dir`을 추가한다. 기존 경로는 덮어쓰지 않는다.
+기존 경로는 덮어쓰지 않으므로 재검사는 `--output-dir`의 끝을 `gat-c-learning-seed0-v2`처럼
+바꾼다. `--output-dir`을 생략하면 `<source-run-name>-<UTC timestamp>`를 자동으로 붙인다.
 
 Checkpoint/소스/cache protocol 무결성과 원 validation 재현이 맞지 않으면 실패로 처리한다.
 실패하거나 누락된 조건의 점수 차이를 성공한 대비로 제시하지 않는다.
@@ -44,10 +52,29 @@ Checkpoint/소스/cache protocol 무결성과 원 validation 재현이 맞지 �
 해석: C를 평균으로 바꿨을 때의 하락은 **현재 선택된 checkpoint가 엣지별 차이에 의존하는 정도**다.
 별도 fixed-C 모델을 학습한 성능이 아니며, 학습 중 gate의 역할까지 제거한 실험도 아니다.
 
-## 2. 학습 C와 고정 C를 동일 조건에서 새로 학습
+### 과거 2×2 checkpoint도 별도로 검사할 때
+
+검사기는 manifest의 suite를 읽어 다음 두 종류만 엄격히 구분한다.
+
+| Source suite | 선택할 condition | 의미 |
+|---|---|---|
+| `conductance_c_learning` | `learned_c` | 이번 새 학습의 learned checkpoint |
+| `conductance_factorial` | `node_degree` | 이전 2×2의 node-degree checkpoint |
+
+이전 결과를 다시 보려는 경우에만 다음 명령을 쓴다. 이번 learned/fixed 비교의 후속 검사와
+과거 checkpoint 결과를 합치지 않는다.
 
 ```bash
-bash research/conductance_gat/c_learning/reproduce.sh --run-id gat-c-learning-seed0-v1
+bash research/conductance_gat/c_learning/audit.sh --source-run results/conductance_gat/ablations/gat-factorial-seed0-v1
+```
+
+## 2. 비교 학습 자체를 새로 재현할 때만 실행
+
+이미 완료한 `gat-c-learning-seed0-v1`의 다음 검사에 이 명령은 필요 없다.
+별도 새 학습을 원할 때는 기존 run을 덮어쓰지 않도록 새 이름을 쓴다.
+
+```bash
+bash research/conductance_gat/c_learning/reproduce.sh --run-id gat-c-learning-seed0-v2
 ```
 
 **PPI/arxiv × 2조건 × model seed 0 = 총 4개 학습**을 순서대로 실행한다. 5-seed가 아니다.
@@ -74,7 +101,7 @@ optimizer에 넣지 않는다. 활성/동결/전체 파라미터 수를 구분�
 
 ## 결과 확인
 
-새 학습이 끝나면 비교표가 터미널에 자동 출력된다. 다시 확인하려면 다음을 실행한다.
+학습이 끝나면 비교표가 터미널에 자동 출력된다. 이미 완료한 첫 run은 다음으로 확인한다.
 
 ```bash
 cat results/conductance_gat/c_learning/gat-c-learning-seed0-v1/comparison.md
@@ -102,4 +129,5 @@ cat results/conductance_gat/c_learning/gat-c-learning-seed0-v1/comparison.md
 
 Model seed는 하나이므로 표준편차·CI·p-value나 SOTA를 주장하지 않는다.
 반복적인 validation 분석으로 선택 편향이 생길 수 있으며 아직 보지 않은 test 성능도 아니다.
-이번 코드의 로컬 단위 검증과 새 GPU 결과는 별개다. 새 C-learning GPU 결과는 아직 수령하지 않았다.
+학습 비교의 GPU 보고서는 수령했으며 위 결과 문서에 보존했다. 이번에 확장한
+`conductance_c_learning/learned_c` 평균-C 검사의 실제 GPU 출력은 아직 수령하지 않았다.

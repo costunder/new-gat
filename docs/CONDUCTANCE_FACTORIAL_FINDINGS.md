@@ -4,6 +4,10 @@
 서버의 원본 checkpoint·manifest·history 전체를 이 작업 공간으로 받아 독립 재검증한 것은 아니다.
 아래 측정값과 이번에 추가한 후속 코드의 실행 상태를 구분한다.
 
+2026-09-01 갱신: 후속 C-learning의 네 조건 보고서를 수령했다. 이 문서의 2×2 수치는
+그대로 보존하고, 새 결과와 새 learned checkpoint의 평균-C 검사는
+[C-learning 결과 문서](CONDUCTANCE_C_LEARNING_FINDINGS.md)에서 별도로 다룬다.
+
 ## 1. 질문이 어떻게 좁혀졌는가
 
 1. 기존 benchmark의 PPI/arxiv checkpoint에서 관측한 C가 두 층 모두 상수였고, arxiv의
@@ -118,7 +122,7 @@ novelty 또는 아직 평가하지 않은 test 성능을 주장하지 않는다.
 선택 자체가 validation에 과적합할 수 있다. arxiv는 여러 조건의 best가 200-epoch 예산 끝에
 가까우므로 학습 예산 밖에서 순위가 같다는 보장도 없다.
 
-## 6. 이번에 추가한 다음 분석: 두 질문을 분리
+## 6. 2026-08-31 당시 설계한 후속 분석: 두 질문을 분리
 
 ### A. 현재 checkpoint가 엣지별 C 차이에 의존하는가?
 
@@ -154,7 +158,8 @@ H'_i=0.05H_i+0.95\frac{1}{d_i}\sum_{j\in\mathcal N(i)}H_j.
 
 총 학습은 **2데이터 × 2조건 × 1seed = 4개**다. 이미 받은 2×2의 learned 점수를 가져와
 새 fixed 점수와 대신 짝짓지 않고 두 조건을 같은 새 실행에서 비교한다. A의 개입 효과와
-B의 재학습 차이는 별도 보고서에 남긴다. 이 새 코드의 GPU 결과는 아직 수령하지 않았다.
+B의 재학습 차이는 별도 보고서에 남긴다. 이후 B의 네 조건은 완료 보고서를 수령했으며,
+그 새 run의 learned checkpoint를 검사하는 평균-C 개입은 아직 GPU 출력이 없다.
 
 설치·실행·결과 확인은 [C 학습 기여 실험 안내](../research/conductance_gat/c_learning/README.md)를 따른다.
 
@@ -167,4 +172,4 @@ B의 재학습 차이는 별도 보고서에 남긴다. 이 새 코드의 GPU �
 4. A에서 민감하지만 B의 차이가 작으면 “현재 checkpoint의 사용”과 “재학습 시 필요성”이
    다를 수 있다. A에서 둔감하지만 B가 다르면 학습 경로의 영향 가능성이 남는다.
 5. 같은 결과를 본 뒤 새로운 WD/dropout/epochs를 동시에 바꾸지 않는다. 추가 가설은 별도 run과
-   대조 조건으로 분리한다. C-learning 결과가 나오기 전 Cycle PE/Tree를 섞어 원인을 흐리지 않는다.
+   대조 조건으로 분리한다. C-learning 결과와 후속 개입에도 Cycle PE/Tree를 섞지 않는다.

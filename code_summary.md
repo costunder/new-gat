@@ -5014,7 +5014,11 @@ exec "${environment_python}" -B -u -m research.conductance_gat.c_learning.interv
 # research/conductance_gat/c_learning/intervene.py
 
 ````python
-"""Read-only validation interventions on completed factorial node-degree checkpoints.
+"""Read-only mean-C validation audits of completed learned-conductance checkpoints.
+
+The source manifest selects either the factorial suite's node_degree arm or the
+C-learning suite's learned_c arm. Fixed-C checkpoints are never substituted for a
+learned checkpoint, and both suites retain their own strict artifact validation.
 
 This does not retrain, evaluate a test split, or modify source artifacts. Replacing
 C by its arithmetic mean within each graph/layer tests reliance of this selected
@@ -5047,12 +5051,18 @@ from ..ablation.protocol import COMMON, CONDITIONS, DATASETS, DEFAULT_DATASETS
 from ..ablation.report import (
     _build_comparison,
     _contained,
+    _integer,
     _load_child,
     _reject_nonfinite_json,
     _same,
 )
 from ..benchmark import _binary_counts, _micro_f1_from_counts, _versions
 from ..benchmark_data import load_dataset, sha256_file
+from .model import CLearningNodeClassifier
+from .protocol import CONDITIONS as C_LEARNING_CONDITIONS
+from .protocol import SUITE as C_LEARNING_SUITE
+from .report import _load as _load_c_learning_child
+from .report import build_comparison as _build_c_learning_comparison
 
 ROOT = Path(__file__).resolve().parents[3]
 BASELINE_TOLERANCE = 1e-4
@@ -5063,11 +5073,39 @@ MODEL_SOURCES = (
     "research/conductance_gat/sparse.py",
     "research/conductance_gat/benchmark_data.py",
 )
-AUDIT_SOURCES = MODEL_SOURCES + (
+C_LEARNING_MODEL_SOURCES = MODEL_SOURCES + (
+    "research/conductance_gat/c_learning/model.py",
+    "research/conductance_gat/c_learning/protocol.py",
+)
+AUDIT_SOURCES = C_LEARNING_MODEL_SOURCES + (
     "research/conductance_gat/c_learning/intervene.py",
     "research/conductance_gat/ablation/report.py",
+    "research/conductance_gat/c_learning/report.py",
     "src/chartgat/cache.py",
 )
+
+
+def source_spec(suite: str) -> dict[str, Any]:
+    """Exact suite dispatch; never infer identity from an arm name or path."""
+    if suite == "conductance_factorial":
+        return {
+            "condition": "node_degree",
+            "conditions": CONDITIONS,
+            "model_sources": MODEL_SOURCES,
+            "build_comparison": _build_comparison,
+            "load_child": _load_child,
+            "model_factory": FactorialNodeClassifier,
+        }
+    if suite == C_LEARNING_SUITE:
+        return {
+            "condition": "learned_c",
+            "conditions": C_LEARNING_CONDITIONS,
+            "model_sources": C_LEARNING_MODEL_SOURCES,
+            "build_comparison": _build_c_learning_comparison,
+            "load_child": _load_c_learning_child,
+            "model_factory": CLearningNodeClassifier,
+        }
+    raise ValueError(f"Unsupported checkpoint source suite: {suite!r}")
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -5087,47 +5125,84 @@ def _assert_unchanged(snapshot: dict[str, str], label: str) -> None:
 
 
 def validate_source(root: Path, datasets: list[str]) -> tuple[dict, dict, dict]:
-    """Validate without calling the factorial report writer or touching old results."""
+    """Validate a complete source matrix without writing or regenerating old reports."""
+    root = root.expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("Source run must be a directory containing manifest.json")
+    if (
+        not datasets
+        or any(not isinstance(dataset, str) or dataset not in DATASETS for dataset in datasets)
+        or len(set(datasets)) != len(datasets)
+    ):
+        raise ValueError("Requested datasets must be a nonempty unique supported list")
     manifest_path = _contained("manifest.json", root, "source manifest")
     manifest = _read_json(manifest_path)
+    specification = source_spec(manifest.get("suite"))
     if manifest.get("source_integrity_valid") is not True:
         raise ValueError("Source manifest must explicitly certify source_integrity_valid=true")
-    if not _same(manifest.get("conditions"), CONDITIONS):
-        raise ValueError("Source manifest condition definitions differ from the fixed factorial")
-    comparison = _build_comparison(root, manifest)
+    if not _same(manifest.get("conditions"), specification["conditions"]):
+        raise ValueError("Source manifest condition definitions differ from its declared suite")
+    comparison = specification["build_comparison"](root, manifest)
     if comparison["status"] != "passed":
-        raise ValueError("Source factorial is not complete and valid: " + str(comparison["errors"]))
+        raise ValueError("Source run is not complete and valid: " + str(comparison["errors"]))
     if any(dataset not in manifest["config"]["datasets"] for dataset in datasets):
         raise ValueError("Requested dataset is absent from the source run")
-    historical = manifest.get("sources", {}).get("sha256", {})
-    for name in MODEL_SOURCES:
+    sources = manifest.get("sources")
+    if not isinstance(sources, dict) or not isinstance(sources.get("sha256"), dict):
+        raise ValueError("Source manifest must contain executed source SHA-256 fingerprints")
+    historical = sources["sha256"]
+    for name in specification["model_sources"]:
         if historical.get(name) != sha256_file(ROOT / name):
             raise ValueError(f"Executed model/cache source differs from historical run: {name}")
     selected = {}
     paths = [manifest_path]
     for job in manifest["jobs"]:
         metrics_path = _contained(job["metrics_path"], root, "source metrics")
-        metrics = _load_child(root, job, manifest["config"])
+        metrics = specification["load_child"](root, job, manifest["config"])
         output = _contained(job["output_dir"], root, "source job")
         paths += [metrics_path]
         paths += [_contained(metrics[key], output, key) for key in ("checkpoint", "history")]
-        if job["condition"] == "node_degree" and job["dataset"] in datasets:
+        if job["condition"] == specification["condition"] and job["dataset"] in datasets:
             selected[job["dataset"]] = metrics
+    if set(selected) != set(datasets):
+        raise ValueError("Source run lacks a unique learned-conductance arm for every dataset")
     return manifest, selected, _hashes(paths)
 
 
 def validate_checkpoint(saved: dict, metrics: dict) -> None:
     if not isinstance(saved, dict):
         raise ValueError("Checkpoint must contain metadata and a state_dict")
+    if not isinstance(metrics, dict):
+        raise ValueError("Selected metrics must be an object")
+    suite = metrics.get("research_suite")
+    specification = source_spec(suite)
+    required_metrics = {
+        "condition": specification["condition"],
+        "normalization": "node_degree",
+        "gate_weight_decay": COMMON["weight_decay"],
+        "non_gate_weight_decay": COMMON["weight_decay"],
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+    }
+    if suite == C_LEARNING_SUITE:
+        required_metrics.update(gate_mode="learned", frozen_parameters=0)
+    elif "gate_mode" in metrics or "gate_mode" in saved:
+        raise ValueError("Factorial checkpoint must not contain C-learning gate_mode metadata")
+    for key, value in required_metrics.items():
+        if not _same(metrics.get(key), value):
+            raise ValueError(f"Selected checkpoint metrics {key} is not the learned source arm")
+    gate_metadata = {"gate_mode": "learned"} if suite == C_LEARNING_SUITE else {}
     expected = {
-        "research_suite": "conductance_factorial",
-        "model": "conductance_factorial",
-        "condition": "node_degree",
+        "research_suite": suite,
+        "model": suite,
+        "condition": specification["condition"],
+        **gate_metadata,
         "architecture": {
             "hidden_channels": COMMON["hidden_channels"],
             "layers": COMMON["layers"],
             "dropout": COMMON["dropout"],
             "normalization": "node_degree",
+            **gate_metadata,
         },
         **{
             key: metrics[key]
@@ -5147,11 +5222,44 @@ def validate_checkpoint(saved: dict, metrics: dict) -> None:
         },
         "optimizer_steps": metrics["best_checkpoint_optimizer_steps"],
     }
+    if suite == C_LEARNING_SUITE:
+        for key in ("total_parameters", "trainable_parameters", "frozen_parameters"):
+            expected[key] = _integer(
+                metrics.get(key), key, minimum=0 if key == "frozen_parameters" else 1
+            )
+        if expected["total_parameters"] != expected["trainable_parameters"]:
+            raise ValueError("Learned-C checkpoint must have zero frozen parameters")
     for key, value in expected.items():
         if not _same(saved.get(key), value):
             raise ValueError(f"Checkpoint {key} disagrees with selected source metrics")
     if not isinstance(saved.get("state_dict"), dict) or not saved["state_dict"]:
         raise ValueError("Checkpoint state_dict is missing")
+
+
+def reconstruct_model(
+    saved: dict, metrics: dict, payload: dict, device: torch.device
+) -> FactorialNodeClassifier:
+    """Restore the declared model exactly, rejecting cross-suite/frozen-gate artifacts."""
+    validate_checkpoint(saved, metrics)
+    specification = source_spec(metrics["research_suite"])
+    model = specification["model_factory"](
+        payload["graphs"][0]["x"].shape[1], payload["classes"], **saved["architecture"]
+    ).to(device)
+    model.load_state_dict(saved["state_dict"], strict=True)
+    if metrics["research_suite"] == C_LEARNING_SUITE:
+        counts = {
+            "total_parameters": sum(parameter.numel() for parameter in model.parameters()),
+            "trainable_parameters": sum(
+                parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+            ),
+            "frozen_parameters": sum(
+                parameter.numel() for parameter in model.parameters() if not parameter.requires_grad
+            ),
+        }
+        for key, value in counts.items():
+            if not _same(saved[key], value):
+                raise ValueError(f"Reconstructed learned-C model {key} differs from checkpoint")
+    return model
 
 
 @contextmanager
@@ -5396,6 +5504,12 @@ def _markdown(report: dict) -> str:
         "training. All-layer and individual-layer interventions are separate forwards.",
         "",
     ]
+    if "source_suite" in report and "source_condition" in report:
+        lines += [
+            f"Source: `{report['source_suite']}` / `{report['source_condition']}`; "
+            "the selected learned-conductance checkpoint from that source run.",
+            "",
+        ]
     if report.get("error"):
         lines += [f"Audit invalid: {report['error']}", "Contrasts withheld.", ""]
     for item in report["datasets"]:
@@ -5428,7 +5542,12 @@ def _markdown(report: dict) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-run", type=Path, required=True)
+    parser.add_argument(
+        "--source-run",
+        type=Path,
+        required=True,
+        help="Completed factorial or C-learning run; suite and learned arm come from its manifest",
+    )
     parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DEFAULT_DATASETS))
     parser.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
     parser.add_argument("--output-dir", type=Path)
@@ -5469,6 +5588,7 @@ def main(argv: list[str] | None = None) -> int:
     if output.exists():
         raise FileExistsError(f"Audit output already exists; choose a fresh directory: {output}")
     manifest, selected, source_hashes = validate_source(source, args.datasets)
+    specification = source_spec(manifest["suite"])
     audit_hashes = _hashes(ROOT / name for name in AUDIT_SOURCES)
     output.mkdir(parents=True, exist_ok=False)
     report = {
@@ -5476,12 +5596,14 @@ def main(argv: list[str] | None = None) -> int:
         "suite": "conductance_mean_c_audit",
         "status": "running",
         "source_run": str(source),
+        "source_suite": manifest["suite"],
+        "source_condition": specification["condition"],
         "source_git_revision": manifest["sources"].get("git_revision"),
         "source_manifest_sha256": source_hashes[str(source / "manifest.json")],
         "source_artifact_sha256": source_hashes,
         "executed_audit_source_sha256": audit_hashes,
         "historical_model_source_sha256": {
-            name: manifest["sources"]["sha256"][name] for name in MODEL_SOURCES
+            name: manifest["sources"]["sha256"][name] for name in specification["model_sources"]
         },
         "n_model_seeds": 1,
         "model_seed": manifest["config"]["model_seed"],
@@ -5500,7 +5622,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with preserved_runtime():
             for dataset in args.datasets:
-                print(f"Read-only mean-C audit: {dataset} / node_degree", flush=True)
+                print(
+                    f"Read-only mean-C audit: {dataset} / {manifest['suite']} / "
+                    f"{specification['condition']}",
+                    flush=True,
+                )
                 metrics = selected[dataset]
                 payload, protocol = load_dataset(dataset, data_root, allow_download=False)
                 if (
@@ -5513,18 +5639,14 @@ def main(argv: list[str] | None = None) -> int:
                     _hashes(cache / filename for filename in ("data.pt", "manifest.json"))
                 )
                 saved = torch.load(metrics["checkpoint"], map_location="cpu", weights_only=True)
-                validate_checkpoint(saved, metrics)
-                model = FactorialNodeClassifier(
-                    payload["graphs"][0]["x"].shape[1],
-                    payload["classes"],
-                    **saved["architecture"],
-                ).to(device)
-                model.load_state_dict(saved["state_dict"], strict=True)
+                model = reconstruct_model(saved, metrics, payload, device)
                 batches, indices = validation_data(payload, metrics, device)
                 result = audit_model(model, batches, indices, device, metrics["validation"])
                 report["datasets"].append(
                     {
                         "dataset": dataset,
+                        "source_suite": manifest["suite"],
+                        "source_condition": specification["condition"],
                         "metric_name": metrics["metric_name"],
                         "checkpoint_sha256": metrics["checkpoint_sha256"],
                         "cache_sha256": metrics["cache_sha256"],
@@ -10150,6 +10272,228 @@ def test_execution_optimization_is_opt_in_and_amp_default_is_unchanged():
     assert build_parser().parse_args(["--compile"]).compile is True
 ````
 
+# research/conductance_gat/tests/test_c_learning_checkpoint_audit_integration.py
+
+````python
+"""New-runner training artifacts through the read-only selected-checkpoint audit.
+
+This four-node UNIT fixture explicitly substitutes CUDA hardware, dependency and
+data-loading/subprocess boundaries. The actual model, optimizer, training loop,
+artifact serialization, source hashes, report validators and audit run unchanged.
+It is not a CPU research experiment and does not download public datasets.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from chartgat.cache import atomic_publish, atomic_write_json
+from research.conductance_gat.ablation import train as shared_train
+from research.conductance_gat.benchmark_data import sha256_file
+from research.conductance_gat.c_learning import intervene as audit
+from research.conductance_gat.c_learning import train
+from research.conductance_gat.c_learning.model import (
+    CLearningNodeClassifier,
+    FixedOneConductance,
+)
+from research.conductance_gat.c_learning.protocol import CONDITIONS, SUITE
+from scripts import run_conductance_c_learning as runner
+
+
+class FixtureGraph(SimpleNamespace):
+    def to(self, device, **kwargs):
+        return FixtureGraph(
+            **{
+                name: value.to(device) if isinstance(value, torch.Tensor) else value
+                for name, value in vars(self).items()
+            }
+        )
+
+
+class NoTestIndices(dict):
+    def __getitem__(self, key):
+        if key == "test":
+            raise AssertionError("This investigation must never read test indices")
+        return super().__getitem__(key)
+
+
+def test_new_training_artifacts_audit_actual_learned_checkpoint_without_input_mutation(
+    monkeypatch, tmp_path
+):
+    graph = FixtureGraph(
+        x=torch.tensor([[0.5, 1.0, 2.0], [1.0, 2.0, 0.5], [2.0, 0.5, 1.0], [3.0, 1.0, 2.0]]),
+        y=torch.tensor([0, 1, 0, 999999]),
+        incidence_edge_index=torch.tensor([[0, 0, 1], [1, 2, 3]]),
+    )
+    indices = NoTestIndices(train=torch.tensor([0, 1]), validation=torch.tensor([2]))
+    payload = {"dataset": "cora", "classes": 2, "graphs": [vars(graph)]}
+    data_root = tmp_path / "data/paper"
+    cache = data_root / "conductance_gat/matched_benchmark_v1/cora"
+    cache.mkdir(parents=True)
+    atomic_publish(cache / "data.pt", lambda path: torch.save(payload, path))
+    protocol = {"data_sha256": sha256_file(cache / "data.pt"), "unit_fixture_only": True}
+    atomic_write_json(cache / "manifest.json", protocol)
+
+    monkeypatch.setattr(shared_train, "_require_cuda", lambda device: None)
+    monkeypatch.setattr(shared_train, "_configure_fp32", lambda: None)
+    monkeypatch.setattr(shared_train, "_make_data", lambda *args: (graph, indices))
+    monkeypatch.setattr(torch.cuda, "manual_seed_all", lambda *args: None)
+    for name in ("reset_peak_memory_stats", "synchronize"):
+        monkeypatch.setattr(torch.cuda, name, lambda *args: None)
+    for name in ("max_memory_allocated", "max_memory_reserved"):
+        monkeypatch.setattr(torch.cuda, name, lambda *args: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *args: "unit_fixture_mocked_cuda")
+    monkeypatch.setattr(runner, "check_dependencies", lambda: {"unit_fixture_only": True})
+    trained, preflights = {}, []
+
+    def dispatch_fixture(command, log, environment):
+        if any(Path(argument).name == "gpu_preflight.py" for argument in command):
+            preflights.append(command)
+            return 0
+        module_index = command.index("research.conductance_gat.c_learning.train")
+        args = train.build_parser().parse_args(command[module_index + 1 :])
+        assert args.dataset == "cora" and args.model_seed == 0 and args.device == "cuda"
+        args.output_dir.mkdir(parents=True, exist_ok=False)
+        result = train.train_model(payload, protocol, args, torch.device("cpu"), args.output_dir)
+        result.update(unit_fixture_only=True, hardware_mocked=True)
+        atomic_write_json(args.output_dir / "metrics.json", result)
+        trained[args.condition] = result
+        return 0
+
+    monkeypatch.setattr(runner, "run_logged", dispatch_fixture)
+    # No source-snapshot stub: provenance must contain the real current model
+    # hashes required by audit.validate_source, not an unrelated fixture digest.
+    result = runner.main(
+        [
+            "--datasets",
+            "cora",
+            "--model-seed",
+            "0",
+            "--device",
+            "cuda",
+            "--epochs",
+            "2",
+            "--patience",
+            "2",
+            "--workers",
+            "0",
+            "--results-root",
+            str(tmp_path / "results"),
+            "--data-root",
+            str(data_root),
+            "--run-id",
+            "c-learning-to-audit-fixture",
+        ]
+    )
+    assert result == 0 and list(trained) == list(CONDITIONS) and len(preflights) == 1
+    source = tmp_path / "results/conductance_gat/c_learning/c-learning-to-audit-fixture"
+    manifest = json.loads((source / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["suite"] == SUITE and manifest["status"] == "passed"
+    for name in (
+        "research/conductance_gat/ablation/model.py",
+        "research/conductance_gat/c_learning/model.py",
+        "research/conductance_gat/c_learning/protocol.py",
+    ):
+        assert manifest["sources"]["sha256"][name] == sha256_file(runner.ROOT / name)
+    assert (
+        trained["learned_c"]["initial_state_sha256"] == trained["fixed_c"]["initial_state_sha256"]
+    )
+    saved = torch.load(trained["learned_c"]["checkpoint"], weights_only=True)
+
+    monkeypatch.setattr(audit, "_require_cuda", lambda device: None)
+    offline_reads, checkpoint_reads = [], []
+    original_load = torch.load
+
+    def read_cache(name, root, *, allow_download):
+        assert name == "cora" and root == data_root and allow_download is False
+        offline_reads.append(name)
+        return original_load(cache / "data.pt", weights_only=True), protocol
+
+    def record_checkpoint_read(path, *args, **kwargs):
+        if Path(path).name == "best.pt":
+            checkpoint_reads.append(Path(path))
+        return original_load(path, *args, **kwargs)
+
+    def validation_fixture(data, metrics, device):
+        assert metrics["research_suite"] == SUITE and metrics["condition"] == "learned_c"
+        assert data["dataset"] == "cora"
+        return [graph], indices["validation"]
+
+    monkeypatch.setattr(audit, "load_dataset", read_cache)
+    monkeypatch.setattr(audit, "validation_data", validation_fixture)
+    monkeypatch.setattr(torch, "load", record_checkpoint_read)
+    input_bytes = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    output = tmp_path / "read-only-audit"
+    result = audit.main(
+        [
+            "--source-run",
+            str(source),
+            "--datasets",
+            "cora",
+            "--device",
+            "cpu",
+            "--data-root",
+            str(data_root),
+            "--output-dir",
+            str(output),
+        ]
+    )
+    assert result == 0 and offline_reads == ["cora"]
+    assert checkpoint_reads == [Path(trained["learned_c"]["checkpoint"])]
+    for path, expected_bytes in input_bytes.items():
+        assert path.read_bytes() == expected_bytes, f"Read-only audit modified {path}"
+    audited = json.loads((output / "audit.json").read_text(encoding="utf-8"))
+    assert audited["status"] == "passed"
+    assert audited["source_suite"] == SUITE and audited["source_condition"] == "learned_c"
+    assert audited["training_performed"] is audited["test_evaluated"] is False
+    assert audited["evaluation_split"] == "validation" and audited["n_model_seeds"] == 1
+    item = audited["datasets"][0]
+    assert item["source_suite"] == SUITE and item["source_condition"] == "learned_c"
+    assert item["checkpoint_sha256"] == trained["learned_c"]["checkpoint_sha256"]
+    assert item["saved_validation"] == item["original"]["validation"]
+    assert item["saved_validation"] == trained["learned_c"]["validation"]
+    assert item["baseline_absolute_error"] == 0
+    cases = {
+        "mean_c_all_layers": (0, 1),
+        "mean_c_layer_0": (0,),
+        "mean_c_layer_1": (1,),
+    }
+    assert [row["intervention"] for row in item["interventions"]] == list(cases)
+    # Independent fixed-one replacements verify each graph/layer mean cancels
+    # with the recomputed degree. They retain the learned checkpoint's OTHER
+    # weights, unlike the separately trained fixed_c arm above.
+    original = CLearningNodeClassifier(3, 2, **saved["architecture"]).eval()
+    original.load_state_dict(saved["state_dict"], strict=True)
+    with torch.no_grad():
+        reference = original(graph).index_select(0, indices["validation"])
+        for row in item["interventions"]:
+            layers = cases[row["intervention"]]
+            model = CLearningNodeClassifier(3, 2, **saved["architecture"]).eval()
+            model.load_state_dict(saved["state_dict"], strict=True)
+            for layer in layers:
+                operator = model.operators[layer]
+                operator.estimator = FixedOneConductance(operator.estimator)
+            logits = model(graph).index_select(0, indices["validation"])
+            expected_score = float(
+                (logits.argmax(-1) == graph.y[indices["validation"]]).float().mean()
+            )
+            expected_logit_delta = float((logits.double() - reference.double()).abs().mean())
+            assert row["intervened_layers"] == list(layers)
+            assert row["validation"] == expected_score
+            assert row["percentage_points"] == 100 * (
+                expected_score - item["original"]["validation"]
+            )
+            assert row["logit_mean_absolute_delta"] == pytest.approx(
+                expected_logit_delta, abs=1e-6, rel=1e-4
+            )
+    assert (output / "report.md").is_file()
+````
+
 # research/conductance_gat/tests/test_c_learning_integration.py
 
 ````python
@@ -10289,6 +10633,384 @@ def test_two_real_arms_artifacts_pass_new_runner_and_comparison(monkeypatch, tmp
     )
     for filename in ("comparison.json", "comparison.md", "comparison.csv"):
         assert (root / filename).is_file()
+````
+
+# research/conductance_gat/tests/test_c_learning_mean_audit.py
+
+````python
+"""Metadata and reconstruction contracts on bounded, untrained unit fixtures only."""
+
+from __future__ import annotations
+
+import copy
+import json
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from chartgat.cache import atomic_publish, atomic_write_json
+from research.conductance_gat.ablation.model import state_sha256
+from research.conductance_gat.ablation.train import checkpoint_payload
+from research.conductance_gat.benchmark_data import sha256_file
+from research.conductance_gat.c_learning import intervene as audit
+from research.conductance_gat.c_learning.model import CLearningNodeClassifier
+from research.conductance_gat.c_learning.protocol import COMMON, CONDITIONS, SUITE
+from research.conductance_gat.c_learning.train import DEFINITION
+from research.conductance_gat.tests.test_c_mean_audit import graph
+
+
+def c_learning_fixture(tmp_path):
+    # The directory name is deliberately uninformative: dispatch MUST use metadata.
+    root = tmp_path / "source"
+    root.mkdir()
+    cache = tmp_path / "data/conductance_gat/matched_benchmark_v1/cora"
+    cache.mkdir(parents=True)
+    fixture_graph = graph()
+    payload = {"dataset": "cora", "classes": 2, "graphs": [vars(fixture_graph)]}
+    atomic_publish(cache / "data.pt", lambda path: torch.save(payload, path))
+    protocol = {"data_sha256": sha256_file(cache / "data.pt"), "unit_fixture_only": True}
+    atomic_write_json(cache / "manifest.json", protocol)
+    config = {
+        **COMMON,
+        "datasets": ["cora"],
+        "model_seed": 0,
+        "epochs": 2,
+        "patience": 2,
+        "batch_size": 2,
+        "workers": 0,
+        "device": "cuda",
+        "data_root": str(tmp_path / "data"),
+    }
+    model_sources = audit.MODEL_SOURCES + (
+        "research/conductance_gat/c_learning/model.py",
+        "research/conductance_gat/c_learning/protocol.py",
+    )
+    manifest = {
+        "schema_version": 1,
+        "suite": SUITE,
+        "status": "passed",
+        "source_integrity_valid": True,
+        "conditions": CONDITIONS,
+        "config": config,
+        "sources": {
+            "git_revision": "unit-fixture-not-research-training",
+            "sha256": {name: sha256_file(audit.ROOT / name) for name in model_sources},
+        },
+        "jobs": [],
+    }
+    for condition, spec in CONDITIONS.items():
+        torch.manual_seed(0)
+        model = CLearningNodeClassifier(2, 2, gate_mode=spec["gate_mode"])
+        original, _ = audit.evaluate(
+            model, [fixture_graph], torch.tensor([1, 2]), torch.device("cpu")
+        )
+        output = root / "cora" / condition
+        output.mkdir(parents=True)
+        args = SimpleNamespace(
+            **{key: value for key, value in config.items() if key not in COMMON},
+            dataset="cora",
+            condition=condition,
+        )
+        saved = checkpoint_payload(
+            model,
+            args,
+            protocol,
+            state_sha256(model),
+            1,
+            original["validation"],
+            1,
+            definition=DEFINITION,
+        )
+        atomic_publish(output / "best.pt", lambda path, value=saved: torch.save(value, path))
+        atomic_write_json(output / "history.json", [])
+        metrics = {
+            key: value
+            for key, value in saved.items()
+            if key not in {"state_dict", "architecture", "model", "optimizer_steps"}
+        }
+        metrics.update(
+            schema_version=1,
+            status="passed",
+            **spec,
+            protocol=protocol,
+            epochs_run=2,
+            best_checkpoint_optimizer_steps=1,
+            metric_name="accuracy",
+            train_loss=0.7,
+            elapsed_seconds=1.0,
+            peak_cuda_allocated_bytes=0,
+            versions={"torch": "unit-fixture"},
+            gpu="unit-fixture-no-gpu",
+            checkpoint=str(output / "best.pt"),
+            checkpoint_sha256=sha256_file(output / "best.pt"),
+            history=str(output / "history.json"),
+            history_sha256=sha256_file(output / "history.json"),
+        )
+        atomic_write_json(output / "metrics.json", metrics)
+        manifest["jobs"].append(
+            {
+                "dataset": "cora",
+                "condition": condition,
+                "status": "passed",
+                "output_dir": str(output),
+                "metrics_path": str(output / "metrics.json"),
+            }
+        )
+    atomic_write_json(root / "manifest.json", manifest)
+    return root, manifest, payload, protocol
+
+
+def _read(path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _edit_checkpoint(root, callback, condition="learned_c"):
+    folder = root / "cora" / condition
+    metrics = _read(folder / "metrics.json")
+    saved = torch.load(folder / "best.pt", weights_only=True)
+    callback(saved, metrics)
+    atomic_publish(folder / "best.pt", lambda path: torch.save(saved, path))
+    metrics["checkpoint_sha256"] = sha256_file(folder / "best.pt")
+    atomic_write_json(folder / "metrics.json", metrics)
+    return saved, metrics
+
+
+def test_source_uses_suite_metadata_not_folder_and_does_not_write(tmp_path):
+    root, _, _, _ = c_learning_fixture(tmp_path)
+    before = audit._hashes(path for path in root.rglob("*") if path.is_file())
+    manifest, selected, snapshot = audit.validate_source(root, ["cora"])
+    assert manifest["suite"] == SUITE
+    assert list(selected) == ["cora"] and selected["cora"]["condition"] == "learned_c"
+    assert selected["cora"]["gate_mode"] == "learned"
+    assert len(snapshot) == 7  # manifest + two sets of metrics/checkpoint/history
+    audit._assert_unchanged(before, "all source files")
+    assert not (root / "comparison.json").exists()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "unknown_suite",
+        "old_suite",
+        "old_conditions",
+        "fixed_missing",
+        "fixed_failed",
+        "mixed_metrics_suite",
+        "wrong_gate_mode",
+        "missing_sources",
+        "modified_model_source",
+        "modified_protocol_source",
+        "modified_checkpoint",
+        "modified_history",
+        "missing_dataset",
+    ],
+)
+def test_source_mismatch_fails_closed(tmp_path, mutation):
+    root, manifest, _, _ = c_learning_fixture(tmp_path)
+    requested = ["cora"]
+    if mutation == "unknown_suite":
+        manifest["suite"] = "unrecognized"
+    elif mutation == "old_suite":
+        manifest["suite"] = "conductance_factorial"
+    elif mutation == "old_conditions":
+        from research.conductance_gat.ablation.protocol import CONDITIONS as OLD
+
+        manifest["conditions"] = OLD
+    elif mutation == "fixed_missing":
+        manifest["jobs"].pop()
+    elif mutation == "fixed_failed":
+        manifest["jobs"][1]["status"] = "failed"
+        manifest["status"] = "failed"
+    elif mutation in {"mixed_metrics_suite", "wrong_gate_mode"}:
+        path = root / "cora/learned_c/metrics.json"
+        metrics = _read(path)
+        if mutation == "mixed_metrics_suite":
+            metrics["research_suite"] = "conductance_factorial"
+        else:
+            metrics["gate_mode"] = "fixed_one"
+        atomic_write_json(path, metrics)
+    elif mutation == "missing_sources":
+        manifest["sources"]["sha256"].pop("research/conductance_gat/c_learning/model.py")
+    elif mutation in {"modified_model_source", "modified_protocol_source"}:
+        filename = "model.py" if mutation == "modified_model_source" else "protocol.py"
+        manifest["sources"]["sha256"][f"research/conductance_gat/c_learning/{filename}"] = "f" * 64
+    elif mutation in {"modified_checkpoint", "modified_history"}:
+        filename = "best.pt" if mutation == "modified_checkpoint" else "history.json"
+        (root / "cora/learned_c" / filename).write_bytes(b"modified unit artifact")
+    else:
+        requested = ["ppi"]
+    atomic_write_json(root / "manifest.json", manifest)
+    before = audit._hashes(path for path in root.rglob("*") if path.is_file())
+    with pytest.raises(ValueError):
+        audit.validate_source(root, requested)
+    audit._assert_unchanged(before, "source after rejected validation")
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("research_suite", "conductance_factorial"),
+        ("model", "conductance_factorial"),
+        ("condition", "fixed_c"),
+        ("gate_mode", "fixed_one"),
+        ("frozen_parameters", 1),
+        ("trainable_parameters", 1),
+        ("total_parameters", 1),
+        ("optimizer_steps", 7),
+        ("model_seed", 5),
+        ("evaluation_split", "test"),
+        ("test_evaluated", True),
+    ],
+)
+def test_checkpoint_metadata_must_match_new_suite(tmp_path, key, value):
+    root, _, _, _ = c_learning_fixture(tmp_path)
+    _, selected, _ = audit.validate_source(root, ["cora"])
+    metrics = selected["cora"]
+    saved = torch.load(metrics["checkpoint"], weights_only=True)
+    audit.validate_checkpoint(saved, metrics)
+    changed = copy.deepcopy(saved)
+    changed[key] = value
+    with pytest.raises(ValueError):
+        audit.validate_checkpoint(changed, metrics)
+
+
+def test_fixed_checkpoint_cannot_be_an_audit_target(tmp_path):
+    root, _, _, _ = c_learning_fixture(tmp_path)
+    metrics = _read(root / "cora/fixed_c/metrics.json")
+    saved = torch.load(metrics["checkpoint"], weights_only=True)
+    with pytest.raises(ValueError):
+        audit.validate_checkpoint(saved, metrics)
+
+
+def test_reconstruction_has_correct_class_actual_counts_and_exact_state(tmp_path):
+    root, _, payload, _ = c_learning_fixture(tmp_path)
+    _, selected, _ = audit.validate_source(root, ["cora"])
+    metrics = selected["cora"]
+    saved = torch.load(metrics["checkpoint"], weights_only=True)
+    network = audit.reconstruct_model(saved, metrics, payload, torch.device("cpu"))
+    assert isinstance(network, CLearningNodeClassifier)
+    assert network.gate_mode == "learned" and network.normalization == "node_degree"
+    assert sum(p.numel() for p in network.parameters()) == saved["total_parameters"]
+    assert all(p.requires_grad for p in network.parameters())
+    for name, value in network.state_dict().items():
+        torch.testing.assert_close(value.cpu(), saved["state_dict"][name], atol=0, rtol=0)
+    saved["total_parameters"] += 1
+    saved["trainable_parameters"] += 1
+    metrics["total_parameters"] += 1
+    metrics["trainable_parameters"] += 1
+    with pytest.raises(ValueError):
+        audit.reconstruct_model(saved, metrics, payload, torch.device("cpu"))
+
+
+def test_old_checkpoint_metadata_cannot_masquerade_as_new_saved_state(tmp_path):
+    root, _, payload, _ = c_learning_fixture(tmp_path)
+    metrics = _read(root / "cora/learned_c/metrics.json")
+    saved = torch.load(metrics["checkpoint"], weights_only=True)
+    saved["architecture"].pop("gate_mode")
+    with pytest.raises(ValueError):
+        audit.reconstruct_model(saved, metrics, payload, torch.device("cpu"))
+
+
+def _mock_cli(monkeypatch, payload, protocol):
+    monkeypatch.setattr(audit, "_require_cuda", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "unit-fixture-no-gpu")
+
+    def offline(name, data_root, *, allow_download):
+        assert allow_download is False
+        return payload, protocol
+
+    monkeypatch.setattr(audit, "load_dataset", offline)
+    monkeypatch.setattr(audit, "validation_data", lambda *args: ([graph()], torch.tensor([1, 2])))
+
+
+def _arguments(tmp_path, root, output):
+    return [
+        "--source-run",
+        str(root),
+        "--datasets",
+        "cora",
+        "--device",
+        "cpu",
+        "--data-root",
+        str(tmp_path / "data"),
+        "--output-dir",
+        str(output),
+    ]
+
+
+def test_new_suite_baseline_mismatch_withholds_every_intervention(monkeypatch, tmp_path):
+    root, _, payload, protocol = c_learning_fixture(tmp_path)
+
+    def edit(saved, metrics):
+        saved["validation"] = metrics["validation"] = 0.123456789
+
+    _edit_checkpoint(root, edit)
+    _mock_cli(monkeypatch, payload, protocol)
+    output = tmp_path / "invalid-audit"
+    assert audit.main(_arguments(tmp_path, root, output)) == 1
+    report = _read(output / "audit.json")
+    assert report["status"] == "invalid" and report["datasets"] == []
+    assert "Original checkpoint validation mismatch" in report["error"]
+
+
+def test_new_suite_late_source_change_withholds_every_intervention(monkeypatch, tmp_path):
+    root, _, payload, protocol = c_learning_fixture(tmp_path)
+    _mock_cli(monkeypatch, payload, protocol)
+    original = audit.audit_model
+
+    def altered(*args):
+        result = original(*args)
+        (root / "cora/fixed_c/history.json").write_bytes(b"modified after audit")
+        return result
+
+    monkeypatch.setattr(audit, "audit_model", altered)
+    output = tmp_path / "invalid-audit"
+    assert audit.main(_arguments(tmp_path, root, output)) == 1
+    report = _read(output / "audit.json")
+    assert report["status"] == "invalid" and report["datasets"] == []
+    assert "changed during the audit" in report["error"]
+
+
+def test_new_suite_success_report_identifies_target_and_preserves_source(monkeypatch, tmp_path):
+    root, _, payload, protocol = c_learning_fixture(tmp_path)
+    _mock_cli(monkeypatch, payload, protocol)
+    before = audit._hashes(path for path in tmp_path.rglob("*") if path.is_file())
+    output = tmp_path / "learned-audit"
+    assert audit.main(_arguments(tmp_path, root, output)) == 0
+    report = _read(output / "audit.json")
+    assert report["source_suite"] == SUITE and report["source_condition"] == "learned_c"
+    assert report["training_performed"] is report["test_evaluated"] is False
+    item = report["datasets"][0]
+    assert item["source_suite"] == SUITE and item["source_condition"] == "learned_c"
+    assert item["baseline_absolute_error"] == 0
+    assert [r["intervened_layers"] for r in item["interventions"]] == [[0, 1], [0], [1]]
+    text = (output / "report.md").read_text(encoding="utf-8")
+    assert SUITE in text and "learned_c" in text
+    audit._assert_unchanged(before, "all original source/cache files")
+
+
+def test_new_suite_refuses_existing_output(monkeypatch, tmp_path):
+    root, _, payload, protocol = c_learning_fixture(tmp_path)
+    _mock_cli(monkeypatch, payload, protocol)
+    output = tmp_path / "existing-audit"
+    output.mkdir()
+    sentinel = output / "report.md"
+    sentinel.write_text("preserve", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        audit.main(_arguments(tmp_path, root, output))
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
+
+
+def test_execution_snapshot_includes_new_and_shared_audit_dependencies():
+    for name in (
+        "research/conductance_gat/c_learning/model.py",
+        "research/conductance_gat/c_learning/protocol.py",
+        "research/conductance_gat/c_learning/report.py",
+        "research/conductance_gat/c_learning/intervene.py",
+        "research/conductance_gat/ablation/report.py",
+    ):
+        assert name in audit.AUDIT_SOURCES
 ````
 
 # research/conductance_gat/tests/test_c_learning_model.py

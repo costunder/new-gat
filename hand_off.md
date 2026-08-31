@@ -1,6 +1,6 @@
 # NEW GAT 연구 프로젝트 Hand-off
 
-작성 기준일: 2026-08-31 (Asia/Seoul)
+작성 기준일: 2026-09-01 (Asia/Seoul)
 
 이 문서는 외부 ChatGPT 또는 연구 리뷰어가 저장소를 처음 받아도 수학적 가설, 구현 경계,
 데이터 계약, 실행법, 검증 범위와 미완료 항목을 혼동하지 않도록 만든 인수인계 문서다.
@@ -9,6 +9,51 @@
 이 문서는 실행 입문서가 아니라 연구·구현 교차검토용이다.
 
 ## 0. 리뷰어가 먼저 알아야 할 판정
+
+### 2026-09-01 C-learning 결과 수령과 같은 run의 읽기 전용 검사
+
+`gat-c-learning-seed0-v1`의 PPI/arxiv × learned/fixed C × seed 0 보고서를 수령했다.
+비교표와 네 조건은 모두 `passed`, 평가는 validation뿐이며 test는 평가하지 않았다.
+
+| 데이터 | Learned C (%) | Fixed C=1 (%) | Learned − fixed (pp) | Best / 실행 epoch (learned; fixed) |
+|---|---:|---:|---:|---|
+| PPI micro-F1 | 52.564966 | 52.705738 | −0.140772 | 64 / 114; 90 / 140 |
+| ogbn-arxiv accuracy | 68.317723 | 68.324435 | −0.006711 | 195 / 200; 195 / 200 |
+
+이 seed·설정에서는 **학습 C의 validation 이득을 관측하지 못했다.** 일반적인 동등성,
+C의 보편적 무용성, 유의성·SOTA를 입증한 것은 아니다. PPI의 learned C CV는
+0.541124 / 0.127339로 비상수지만 점수 이득이 없고, arxiv는 0 / 0.00948437로 작다.
+새 PPI learned 점수 52.564966%를 과거 2×2 node-degree의 52.465469%와 합치거나
+대체하지 않는다. 실행 간 차이의 원인은 현재 자료만으로 특정하지 않는다.
+
+활성 학습 파라미터는 PPI 36,347→11,385, arxiv 36,074→11,112로 약 69% 적다.
+Fixed 조건은 gate scaffold 24,962개를 동결 보존하므로 전체 저장 파라미터·메모리·속도
+감소를 뜻하지 않는다. Fixed 행의 gate L2는 실행하지 않는 scaffold의 norm이다.
+
+근거는 사용자 inline 비교표이며 별도 첨부 파일/SHA-256이 없다. C-learning 구현은
+`25ca328`에 게시됐지만 표에는 실제 서버 source revision이 없으므로 실행 commit으로
+단정하지 않는다. 원격 manifest·checkpoint 전체를 로컬로 받아 재검증한 것도 아니다.
+정확한 8개 진단 행과 해석은
+[C-learning 결과 문서](docs/CONDUCTANCE_C_LEARNING_FINDINGS.md)에 보존했다.
+
+다음은 **그 새 run의 learned checkpoint**를 대상으로 하는 평균-C 검사다.
+`c_learning/audit.sh`는 source manifest의 suite를 읽어
+`conductance_c_learning/learned_c`와 과거 `conductance_factorial/node_degree`를 구분한다.
+이번 검사에는 `results/conductance_gat/c_learning/gat-c-learning-seed0-v1`을 넣는다.
+원 validation·source/cache/checkpoint 무결성을 확인한 뒤 C를 그래프·층별 평균으로 바꾸고
+weighted degree를 다시 계산한다. 전체 층과 한 층씩 개입을 분리한다.
+원본 결과를 수정하지 않고 `results/conductance_gat/c_learning_audits/`의 새 폴더에
+`report.md`/`audit.json`만 기록한다. **새 학습·optimizer step·test 평가는 없다.**
+이 확장 검사의 실제 GPU 출력은 아직 수령하지 않았다. 실행은
+[C-learning README](research/conductance_gat/c_learning/README.md)의 첫 번째 명령을 따른다.
+
+이번 확장 후 로컬 전체 회귀는 **924 passed / 64 skipped** (32.11 s, exit 0),
+Ruff 통과다. 기존 890개에서 34개 검사를 추가했다. 새 run의 두 실제 단위 학습 루프에서
+만든 checkpoint를 검사기로 읽는 통합 경로, learned/fixed 및 suite 혼동 차단,
+원 validation 재현 실패 차단, 원본 바이트 보존을 확인했다. 평균-C 개입은 학습된 다른
+가중치를 그대로 둔 C=1 교체와도 독립 대조했다. 이는 작은 fixture의 CPU 단위 검증이며
+연구용 CPU 학습·공식 데이터 다운로드·실제 GPU 실행이 아니다. 생략된 검사는 Linux/Bash
+62개, 로컬 PyG 미설치 1개, Windows 실제 symlink 권한 1개다.
 
 ### 2026-08-31 2×2 GPU 결과 수령과 다음 C-learning 실험
 
@@ -48,8 +93,8 @@ NVIDIA RTX A6000, Python 3.11.16, Torch 2.7.1+cu118, PyG 2.7.0, Linux glibc 2.35
   아니다. Gate를 학습하지 않으므로 활성 parameter 수 차이는 따로 공개해야 한다.
 - 새 학습 결과는 `results/conductance_gat/c_learning/<run-id>/comparison.md/csv/json`으로
   분리한다. 기존 benchmark/2×2·Cycle PE·Tree 모델과 결과는 변경하지 않는다.
-- 두 후속 경로의 **실제 GPU 결과는 아직 수령하지 않았다.** 로컬 fixture 검증은 GPU 실험
-  결과가 아니다. 첫 번째의 개입 대비를 두 번째의 재학습 개선으로 재분류하지 않는다.
+- 이 구현 당시에는 두 후속 경로의 GPU 결과가 없었다. 이후 C-learning 학습 보고서를
+  수령하여 위 2026-09-01 절에 기록했다. 개입 대비와 재학습 차이는 계속 분리한다.
 
 실행법과 결과 경로는 [C-learning README](research/conductance_gat/c_learning/README.md)를 따른다.
 
@@ -139,7 +184,8 @@ Cycle v1 1개, Tree CSL/ZINC 2개의 총 4개 child만 실행한다. 데이터 �
 ### 현재 상태와 읽는 순서
 
 사용자가 제공한 **세 트랙의 기존 5-model-seed 집계**, **Conductance seed 0의 실제 GPU
-checkpoint 진단**과 **2×2 재학습 결과**가 있다. 결과 수치, run ID, 평가 범위, 근거 파일 hash와 미확정 원인은
+checkpoint 진단**, **2×2 및 C-learning 재학습 결과**가 있다. 결과 수치, run ID, 평가 범위,
+근거 식별자와 미확정 원인은
 [EXPERIMENT_STATUS.md](docs/EXPERIMENT_STATUS.md)에 정리했다. 이 문서의 과거 감사 기록을
 현재의 결과 미수집 상태로 해석하면 안 된다.
 
@@ -460,9 +506,9 @@ Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 
 ### 코드 스냅샷
 
 - 파일: `code_summary.md`
-- 포함 파일: 160개
-- 크기: 1,543,873 bytes, 39,396 lines (`str.splitlines()` 기준)
-- SHA-256: `AD2498D135358F72402D45BF708785860BE779CDB66C05DCA4733A653951D644`
+- 포함 파일: 162개
+- 크기: 1,574,571 bytes, 40,118 lines (`str.splitlines()` 기준)
+- SHA-256: `C38A75284506CE7CDDB32153C9A6745F24C0AC93D591C36E60AE3C2352CFF700`
 - 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`, `.gitattributes`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
 - 범위: 이 버전의 전체 source/test/config/script. 생성기는 작업본 변경도 포함하므로 게시 전
@@ -565,8 +611,9 @@ representation으로 제공하는 inductive bias다.
 
 - `README.md`: Linux NVIDIA GPU 환경의 설치부터 전체 재현까지의 실행 명령.
 - `DATASETS.md`: 사람이 읽는 데이터·split·metric 계약.
-- `docs/EXPERIMENT_STATUS.md`: 기존 5-seed 결과, 실제 seed 0 GPU 진단·2×2 재학습과 미확정 원인.
+- `docs/EXPERIMENT_STATUS.md`: 기존 5-seed 결과, 실제 seed 0 GPU 진단·2×2·C-learning과 미확정 원인.
 - `docs/CONDUCTANCE_FACTORIAL_FINDINGS.md`: 2×2의 정확한 점수·대비·층별 진단·근거와 다음 C-learning의 해석 경계.
+- `docs/CONDUCTANCE_C_LEARNING_FINDINGS.md`: 새 learned/fixed 결과·활성/동결 파라미터·진단과 같은 run의 후속 검사.
 - `docs/CONDUCTANCE_DIAGNOSTICS.md`: 기존 checkpoint의 읽기 전용 GPU 진단 실행·해석.
 - `docs/PERFORMANCE.md`: 실행 최적화 옵션과 미측정 GPU 가속의 검증 경계.
 - `pyproject.toml`: Python 3.11+, core/dev/paper dependency와 pytest/Ruff 설정.
@@ -606,8 +653,9 @@ representation으로 제공하는 inductive bias다.
   - `c_learning/model.py`, `protocol.py`, `train.py`: node-degree learned/fixed C만 바꾸는 별도 suite.
     Fixed 조건은 RNG/state 일치를 위해 gate scaffold를 동결 보존하지만 실행·optimizer에서는 제외한다.
   - `c_learning/report.py`: 같은 새 run의 initialization/cache/config/파일 hash를 확인한 learned−fixed 비교.
-  - `c_learning/intervene.py`, `audit.sh`: 기존 node-degree checkpoint의 GPU mean-C 개입,
-    원 validation·source/cache/checkpoint 무결성 확인, 별도 보고서. 재학습 없음.
+  - `c_learning/intervene.py`, `audit.sh`: suite를 구분해 기존 factorial/node_degree 또는
+    새 c_learning/learned_c checkpoint의 GPU mean-C 개입. 원 validation·source/cache/checkpoint
+    무결성 확인, 별도 보고서. 재학습 없음.
   - `sparse.py`: paper headline sparse operator와 packed variable-graph batch.
   - `paper_data.py`: S1–S4 generated protocols와 deterministic cache.
   - `public_data.py`: PascalVOC-SP와 ogbg-molhiv adapter.
@@ -1218,7 +1266,7 @@ roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사�
 
 | Track / 버전 | 기본 benchmark | 제공된 결과 |
 |---|---|---|
-| Conductance | Cora, CiteSeer, PubMed, PPI, ogbn-arxiv | 5개 데이터 5-seed 집계; seed 0 GPU/full audit; PPI/arxiv 2×2 seed 0 재학습 |
+| Conductance | Cora, CiteSeer, PubMed, PPI, ogbn-arxiv | 5개 데이터 5-seed 집계; seed 0 GPU/full audit; PPI/arxiv 2×2·C-learning seed 0 재학습 |
 | Cycle PE v1 | ZINC-12K, Peptides-struct | `cycle_set` 5-seed 집계 |
 | Cycle PE v2 | 위와 같은 공식 원본·split, 별도 기저 cache | 구현·단위 검증; GPU 결과 미수령 |
 | Tree augmentation | CSL, ZINC-12K | fixed-BFS/multi-chart 5-seed 집계 |
@@ -1238,8 +1286,9 @@ roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사�
 
 ## 8. 자동 검증 상태
 
-검증 수치는 구현 시점별로 0절에 보존한다. 현재 C-learning/평균-C 구현 후 전체 회귀는
-**890 passed / 64 skipped** (30.76 s, exit 0), Ruff 통과다. 2×2 구현 당시에는
+검증 수치는 구현 시점별로 0절에 보존한다. 현재 새 learned_c checkpoint 검사 확장 후 전체
+회귀는 **924 passed / 64 skipped** (32.11 s, exit 0), Ruff 통과다. 이전 C-learning 구현은
+**890 passed / 64 skipped** (30.76 s, exit 0)였다. 2×2 구현 당시에는
 **794 passed / 64 skipped**, 그 이전 확장 진단 구현 당시 전용 검사는 **89 passed**였다.
 로컬 단위 검증과 사용자 제공 실제 GPU 진단·재학습의 범위를 혼동하지 않는다.
 
@@ -1284,11 +1333,12 @@ Read-only protocol 교차검토에서는 CycleCount full specification/hash가 �
 
 1. 기존 run ID, source revision/dirty 상태, lock, data checksum, best checkpoint, history와
    seed별 원본 지표를 보존한다. 제공된 집계 텍스트와 서버 원본 artifact의 검증을 혼동하지 않는다.
-2. 2×2에서 개선된 node-degree checkpoint의 C를 그래프·층별 평균으로 바꿔 현재 의존도를
-   확인한다. 원 validation 재현과 source/cache/checkpoint 무결성 검사 후에만 대비를 해석한다.
-3. 같은 node-degree 아래 learned C/fixed C=1을 seed 0에서 모두 새로 학습하여 비교한다.
-   지금은 WD/dropout/epochs 등 다른 요인을 동시에 바꾸지 않는다. Gate norm·C 변동 증가를
-   곧바로 성능 개선으로 부르지 않으며, 개입 결과·재학습 차이·향후 seed 일반화는 분리한다.
+2. 완료된 **C-learning의 learned checkpoint**에서 C를 그래프·층별 평균으로 바꿔 현재
+   의존도를 확인한다. 원 validation 재현과 source/cache/checkpoint 무결성 검사 후에만
+   대비를 해석하며, 과거 factorial checkpoint와 대상 run을 혼동하지 않는다.
+3. 이미 나온 learned−fixed 차이가 PPI −0.140772pp / arxiv −0.006711pp인 사실과
+   후속 개입의 점수·logit·prediction flip을 나란히 해석한다. 현재 checkpoint의 사용과
+   재학습 이득은 다를 수 있다. 지금은 새 WD/dropout/epochs나 트랙 결합을 동시에 추가하지 않는다.
 4. v2는 별도 코드·cache·run으로 GPU 검증한다. 기존 `cycle_set` 결과를 기저벡터 실적으로
    재분류하지 않는다. 실행 최적화 역시 동등성·peak memory·GPU 속도를 별도로 측정한다.
 5. Tree의 chart-family OOD, validation 미사용, 연속 target에 부적절한 rounded 지표를
@@ -1300,8 +1350,8 @@ closed root metric/efficiency 집계, exact CUDA constraints/verification,
 cycle candidate CLI, stale S2 full-cache cardinality(112/24/48) 계약 교정을 반영했다.
 과거 shape-stress는 더미 모델 실행 제거에 맞춰 hardware/import 검사로 교체했다.
 위 코드 gate의 완료는 모든 scientific gap 해소를 의미하지 않는다. 기본 benchmark 집계와
-seed 0 진단·2×2 재학습은 있지만 C-learning 결과, 보조 suite 전체, v2 결과,
-가속 실측까지 완료된 것은 아니다.
+seed 0 진단·2×2·C-learning 재학습은 있지만 새 learned checkpoint의 평균-C 검사,
+보조 suite 전체, v2 결과, 가속 실측까지 완료된 것은 아니다.
 
 ### P1 — 강한 scientific claim 전에
 
@@ -1372,8 +1422,9 @@ seed 0 진단·2×2 재학습은 있지만 C-learning 결과, 보조 suite 전�
 ## 12. 최종 인수인계 문장
 
 현재 저장소에는 세 독립 연구의 실행·artifact pipeline이 있고 사용자 제공 기존 benchmark
-5-seed 결과, Conductance seed 0 GPU 진단과 PPI/arxiv 2×2 재학습도 있다. Node-degree의
-개선은 관측했으나 학습 C의 순수 기여·경쟁력·novelty·모든 트랙의 일관된 개선을 입증한
-상태는 아니다. 다음 작업자는 분리된 C-learning의 평균-C 개입과 fresh learned/fixed 비교를
-실행·해석하고, v2/최적화의 GPU 검증과 Tree protocol 한계를 독립적으로 다뤄야 한다.
+5-seed 결과, Conductance seed 0 GPU 진단과 PPI/arxiv 2×2·C-learning 재학습도 있다.
+Node-degree 개선은 관측했지만 같은 정규화에서 learned C의 validation 이득은 관측하지
+못했다. 이것이 보편적 동등성·novelty·경쟁력의 판정은 아니다. 다음 작업자는 같은 새 run의
+learned checkpoint 평균-C 개입으로 현재 의존도를 확인하고, v2/최적화의 GPU 검증과
+Tree protocol 한계를 독립적으로 다뤄야 한다.
 Adaptive MST나 세 트랙 결합은 이후 별도 실험이며 기존 결과를 덮어쓰지 않는다.

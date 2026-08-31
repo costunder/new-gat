@@ -3,9 +3,11 @@
 Gate weight decay와 정규화의 2×2 원인 비교는 [별도 실험 폴더](ablation/README.md)에 있다.
 PPI·ogbn-arxiv에서 seed 0 하나로 4조건을 새로 학습하며, 아래 기존 benchmark는 변경하지 않는다.
 완료된 [GPU 결과와 해석](../../docs/CONDUCTANCE_FACTORIAL_FINDINGS.md)을 바탕으로,
-다음 [C-learning 실험](c_learning/README.md)은 node-degree 아래 learned C/fixed C=1을
-4개의 fresh training으로 비교한다. 기존 node-degree checkpoint의 평균-C 개입은
-별도의 읽기 전용 검사다. 이 두 경로에도 Cycle PE/Tree나 외부 비교 모델을 섞지 않는다.
+[C-learning 실험](c_learning/README.md)은 node-degree 아래 learned C/fixed C=1을
+4개의 fresh training으로 비교하며 [완료 결과](../../docs/CONDUCTANCE_C_LEARNING_FINDINGS.md)를 수령했다.
+다음은 **그 새 run의 learned checkpoint**에 대한 평균-C 개입이며 추가 학습은 없다.
+이전 2×2 node-degree checkpoint도 별도 source로 지원한다.
+이 두 경로에도 Cycle PE/Tree나 외부 비교 모델을 섞지 않는다.
 
 This directory is a self-contained executable paper track for
 
@@ -97,9 +99,9 @@ An optional validation-only graph-bypass intervention uses the same checkpoint;
 it is not a separately trained baseline or proof of causation.
 
 The supplied five-seed benchmark aggregates, seed-0 GPU diagnostics, and completed
-single-seed factorial training results are recorded in
-[experiment status](../../docs/EXPERIMENT_STATUS.md). The new C-learning runs and
-node-degree mean-C intervention have no supplied GPU results yet.
+single-seed factorial and C-learning results are recorded in
+[experiment status](../../docs/EXPERIMENT_STATUS.md). The next read-only mean-C
+intervention uses the new C-learning learned checkpoint; its GPU output has not yet been supplied.
 
 ## Supplementary suites (not the default matched benchmark)
 
