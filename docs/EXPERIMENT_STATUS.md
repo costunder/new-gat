@@ -11,7 +11,8 @@
 후속 사용자 요청으로 현재 기본 실행은 model seed **0 하나**다. 기존 5-seed 측정값은 아래에
 그대로 보존하며, 기본값 변경이 과거 결과나 source revision을 바꾸지는 않는다.
 단일 seed의 std/CI는 null로 기록한다. 새 read-only `--full-audit`는 C 평균/셔플/전파 제거와
-train-label gradient를 검사하지만 **그 새 GPU 결과를 아직 수령한 것은 아니다.**
+train-label gradient를 검사하며 **5e801c3 실행의 새 GPU 로그를 수령했다.** 아래 확장 검사 절에
+기록했다. 후속 2×2 재학습은 구현만 완료한 별개 실험이며 아직 GPU 비교 결과가 없다.
 
 | 구분 | 확인된 상태 |
 |---|---|
@@ -20,12 +21,38 @@ train-label gradient를 검사하지만 **그 새 GPU 결과를 아직 수령한
 | 기존 학습 코드 | 위 진단 commit은 기존 benchmark의 모델·학습 수식을 변경하지 않음 |
 | Cycle PE 기저벡터 v2 | 이 소스 버전에 포함, 로컬 단위 검증 완료. 실제 GPU 결과 미수령 |
 | 실행 최적화·선택적 compile·속도 도구 | 이 소스 버전에 포함, 로컬 단위 검증 완료. GPU 가속 실측 미수령 |
-| 단일 seed 기본값·확장 checkpoint 검사 | 이 소스 버전에 포함. 새 mean/shuffle·gradient audit GPU 결과 미수령 |
+| 단일 seed 기본값·확장 checkpoint 검사 | 5e801c3 GPU full audit 수령, seed 0 다섯 데이터셋 passed |
+| Gate WD × normalization 2×2 | 별도 ablation 폴더에 구현, PPI/arxiv × 4조건 × seed 0. 실제 GPU 학습 미실행 |
 | `code_summary.md` | 이 버전의 source/test/config/script 전체를 파일별로 보존한 스냅샷 |
 
 `ebf8cd1`까지만 받은 서버에는 새 기능이 없으므로 업데이트 후 `git rev-parse HEAD`로
 실행 revision을 확인한다. 소스 업데이트가 서버에서의 실행 완료를 뜻하지는 않는다.
-아래 기존 실험을 v2·최적화·확장 진단 적용 결과로 재분류하면 안 된다.
+아래 기존 학습 결과를 v2·최적화·새 2×2 재학습 결과로 재분류하면 안 된다.
+
+### 수령한 확장 검사: 기존 checkpoint에 대한 개입
+
+학습 run `paper-20260830T150244764889Z`, model seed 0. 진단 실행 소스는 `5e801c3`이며
+보고서 폴더 suffix는 `20260831T120740120251Z`다. 사용자 첨부 로그 SHA-256:
+`CFA2118D4B9257CA8772FC16BE9834D1D0FB402FA375DDCB4E652D6FB37D564F`.
+
+| 데이터 (validation) | learned C | mean C | shuffled C | graph off |
+|---|---:|---:|---:|---:|
+| Cora accuracy | 0.658000 | 0.646000 | 0.646000 | 0.632000 |
+| CiteSeer accuracy | 0.644000 | 0.642000 | 0.642000 | 0.626000 |
+| PubMed accuracy | 0.724000 | 0.726000 | 0.726000 | 0.718000 |
+| PPI micro-F1 | 0.487508 | 0.487508 | 0.487508 | 0.452144 |
+| arxiv accuracy | 0.509279 | 0.509279 | 0.509279 | 0.508876 |
+
+다섯 dataset 모두 완료, 최종 `Diagnostic status: passed`다. Validation 재검증 오차는
+약 0~5e-8이다. 각 조건은 같은 checkpoint에 대한 개입이며 재학습한 baseline의 성능이 아니다.
+PPI/arxiv는 두 층 모두 관찰한 C가 상수이고 mean/shuffle의 prediction flip이 0이다.
+PPI에서는 graph-off 시 3.5364 percentage points 하락해 연결 구조의 기여와 C 차별화 실패가
+구분된다. arxiv에서는 0.0403 points 하락하며 rho 중앙값 약 .000433으로 전파 영향이 매우 작다.
+
+Gradient 검사는 eval/dropout-off, PPI는 첫 train batch 하나다. Gate 파라미터 norm과 task
+gradient가 극소지만 학습 당시 Adam update 이력을 복원한 것은 아니므로 WD 원인 확정은 아니다.
+기존 full audit의 극소 ratio는 분모 하한 1e-12 적용 여부를 확인해야 한다. 새 2×2의 train-mode
+관찰은 raw task/decay norm을 따로 저장하고 0분모 비율만 null로 기록한다.
 
 ## 2. 사용자가 제공한 5-seed test 집계
 
@@ -215,7 +242,10 @@ gate 상태, v2 학습 결과, GPU 속도 개선은 별도 확인이 필요하�
 당시 진단 전용은 42 passed였다. Ruff/diff 및 당시 문서 로컬 링크 34개 검사도 통과했다.
 최신 확장 검사 결과는 handoff의 최신 검증 항목을 따른다.
 단일 seed·확장 진단 구현 후 전체 회귀는 **680 passed / 63 skipped**, 진단 전용은
-**89 passed**다. 이 새 검사도 로컬 단위 검증이며 실제 GPU audit 결과는 아직 없다.
+**89 passed**다. 이는 당시 로컬 단위 검증이며, 이후 수령한 실제 GPU full-audit 로그는 위에
+별도로 기록했다. 후속 2×2 구현 후 전체 검사는 **794 passed / 64 skipped** (31.83 s, exit 0),
+Ruff 통과다. 기존 생략 사유에 Windows 실제 symlink 권한 1개가 추가됐으며 차단 로직은 별도
+mock 검사로 확인했다. 새 조건의 실제 GPU 재학습·성능 비교는 아직 실행하지 않았다.
 기존 게시 학습 코드 `a64c235`와의 진단 호환성도 메모리 로딩을 통한 42개 단위 검사로 확인했다.
 생략된 63개는 Linux/Bash 전용 62개와 로컬 PyG 미설치 1개다. 이번에도 Windows faulthandler의
 `access violation` 메시지가 있었으나 pytest는 위 결과와 exit 0까지 실행됐다.

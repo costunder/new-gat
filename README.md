@@ -118,6 +118,10 @@ glibc 등 호스트 호환성 오류는 자동 재설치하지 않고 중단한�
 bash research/conductance_gat/reproduce.sh
 ```
 
+Gate weight decay와 정규화의 영향을 분리하는 **PPI/arxiv × 4조건 × seed 0** 후속 실험은
+[독립 비교 실험 안내](research/conductance_gat/ablation/README.md)를 따른다. 기존 benchmark와
+결과를 섞지 않으며 조건별 새 학습 및 비교표 생성을 한 명령으로 실행한다.
+
 ### Cycle PE
 
 ```bash

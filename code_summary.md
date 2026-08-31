@@ -2589,19 +2589,8 @@ def test_full_block_is_orientation_invariant_and_centers_potential() -> None:
 ````python
 """Independent incidence-conductance-attention research track."""
 
-from .model import (
-    IncidenceConductanceAttention,
-    IsotropicConductanceAttention,
-    PositiveInvariantScalarConductance,
-)
-from .sparse import (
-    PackedGraphBatch,
-    SparseIncidenceConductanceLayer,
-    SparsePositiveConductance,
-    edge_divergence,
-    edge_gradient,
-    pack_graph_examples,
-)
+from importlib import import_module
+from typing import Any
 
 __all__ = [
     "IncidenceConductanceAttention",
@@ -2614,6 +2603,1509 @@ __all__ = [
     "edge_gradient",
     "pack_graph_examples",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    # Planning/reporting CLIs need only stdlib; preserve the public model API lazily.
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = ".model" if name in __all__[:3] else ".sparse"
+    value = getattr(import_module(module, __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
+````
+
+# research/conductance_gat/ablation/__init__.py
+
+````python
+"""Isolated, validation-only conductance normalization/regularization experiments."""
+````
+
+# research/conductance_gat/ablation/model.py
+
+````python
+"""One-factor operator changes without changing the benchmark architecture.
+
+``global_max`` delegates literally to the published benchmark implementation.
+``node_degree`` is H - .95 D_C^dagger B.T C B H (zero inverse on isolated nodes).
+It preserves constants/orientation invariance, but is generally not symmetric in
+the Euclidean inner product. Both choices cancel a common conductance scale;
+neither makes the absolute scale of C identifiable. No denominator is detached.
+"""
+
+from __future__ import annotations
+
+import hashlib
+
+import torch
+from torch import Tensor, nn
+
+from ..benchmark import ConductanceConv, ConductanceNodeClassifier
+from ..benchmark_data import tensor_hash
+from .protocol import COMMON, CONDITIONS
+
+
+class FactorialConductanceConv(ConductanceConv):
+    def __init__(self, channels: int, normalization: str = "global_max") -> None:
+        if normalization not in {"global_max", "node_degree"}:
+            raise ValueError(f"Unsupported normalization: {normalization}")
+        super().__init__(channels)
+        self.normalization = normalization
+
+    def forward(
+        self,
+        x: Tensor,
+        incidence: Tensor,
+        node_graph: Tensor,
+        num_graphs: int | None = None,
+    ) -> Tensor:
+        if self.normalization == "global_max":
+            return super().forward(x, incidence, node_graph, num_graphs)
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            state = x.float()
+            tail, head = incidence
+            gradient = state[head] - state[tail]
+            c = self.estimator(gradient, state.new_empty((gradient.shape[0], 0)))
+            flux = c[:, None] * gradient
+            divergence = torch.zeros_like(state)
+            divergence.index_add_(0, head, flux)
+            divergence.index_add_(0, tail, -flux)
+            degree = state.new_zeros(state.shape[0])
+            degree.index_add_(0, head, c)
+            degree.index_add_(0, tail, c)
+            # For isolated nodes division is harmless and divergence is exactly 0.
+            # For nonisolated nodes C >= 1e-5, so this branch is the exact D^dagger.
+            safe_degree = torch.where(degree > 0, degree, torch.ones_like(degree))
+            result = state - 0.95 * divergence / safe_degree[:, None]
+        return result.to(x.dtype)
+
+
+class FactorialNodeClassifier(ConductanceNodeClassifier):
+    """Identical parameter names and initialization order to the baseline."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        classes: int,
+        *,
+        normalization: str = "global_max",
+        hidden_channels: int = 64,
+        layers: int = 2,
+        dropout: float = 0.5,
+    ) -> None:
+        # Replacing initialized parent layers would consume RNG twice. Mirror
+        # precisely its four module allocations; reuse its forward unchanged.
+        nn.Module.__init__(self)
+        if hidden_channels < 1 or layers < 1 or not 0 <= dropout < 1:
+            raise ValueError("hidden width/layers must be positive and dropout in [0, 1)")
+        self.dropout = dropout
+        self.normalization = normalization
+        self.encoder = nn.Linear(in_channels, hidden_channels)
+        self.decoder = nn.Linear(hidden_channels, classes)
+        self.operators = nn.ModuleList(
+            FactorialConductanceConv(hidden_channels, normalization) for _ in range(layers)
+        )
+        self.norms = nn.ModuleList(nn.LayerNorm(hidden_channels) for _ in range(layers))
+
+
+def is_gate_parameter(name: str) -> bool:
+    return name.startswith("operators.") and ".estimator." in name
+
+
+def make_optimizer(model: nn.Module, condition: str) -> torch.optim.Adam:
+    """Coupled Adam L2 as in baseline; only estimator parameters change decay."""
+    spec = CONDITIONS[condition]
+    gate, other = [], []
+    for name, parameter in model.named_parameters():
+        (gate if is_gate_parameter(name) else other).append(parameter)
+    if not gate or not other:
+        raise ValueError("Expected nonempty, disjoint gate and non-gate parameter groups")
+    return torch.optim.Adam(
+        [
+            {"params": other, "weight_decay": COMMON["weight_decay"], "name": "non_gate"},
+            {"params": gate, "weight_decay": spec["gate_weight_decay"], "name": "gate"},
+        ],
+        lr=COMMON["lr"],
+    )
+
+
+def state_sha256(model: nn.Module) -> str:
+    """Order/name/dtype/shape/value-sensitive fingerprint, independent of torch.save."""
+    digest = hashlib.sha256()
+    for name, tensor in model.state_dict().items():
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(tensor_hash(tensor).encode("ascii"))
+    return digest.hexdigest()
+````
+
+# research/conductance_gat/ablation/protocol.py
+
+````python
+"""Dependency-free specification of the single-seed, two-factor experiment."""
+
+DATASETS = ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv")
+DEFAULT_DATASETS = ("ppi", "ogbn-arxiv")
+CONDITIONS = {
+    "baseline": {"normalization": "global_max", "gate_weight_decay": 0.0005},
+    "gate_no_wd": {"normalization": "global_max", "gate_weight_decay": 0.0},
+    "node_degree": {"normalization": "node_degree", "gate_weight_decay": 0.0005},
+    "node_degree_gate_no_wd": {"normalization": "node_degree", "gate_weight_decay": 0.0},
+}
+COMMON = {
+    "hidden_channels": 64,
+    "layers": 2,
+    "dropout": 0.5,
+    "lr": 0.005,
+    "weight_decay": 0.0005,
+    "amp": False,
+    "compile": False,
+}
+````
+
+# research/conductance_gat/ablation/report.py
+
+````python
+"""Fail-closed, validation-only comparisons for the single-seed 2x2 experiment.
+
+This module only reads child artifacts. It never trains, imports Torch, deserializes checkpoints,
+evaluates test labels, or changes a child result. The three comparison files are
+derived artifacts and can be regenerated after each completed/failed child.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import io
+import json
+import math
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from .protocol import COMMON, CONDITIONS, DATASETS
+
+REPORT_FILENAMES = ("comparison.json", "comparison.md", "comparison.csv")
+_SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
+_JOB_STATUSES = {"pending", "running", "passed", "failed"}
+_CONFIG_NOT_CHILD = {"datasets", "data_root", "results_root", "run_id", "fail_fast"}
+_FACTOR_KEYS = {"condition", "normalization", "gate_weight_decay"}
+_OUTPUT_KEYS = {"output_dir", "metrics_path", "checkpoint", "history", "log_path"}
+_EFFECTS = (
+    ("gate_effect_at_global_max", "Gate WD off at global-max normalization"),
+    ("normalization_effect_with_gate_wd", "Node-degree normalization with gate WD"),
+    ("gate_effect_at_node_degree", "Gate WD off at node-degree normalization"),
+    ("normalization_effect_without_gate_wd", "Node-degree normalization without gate WD"),
+    ("interaction", "Interaction (both - gate-only - normalization-only + baseline)"),
+)
+_CAVEATS = [
+    "One model seed (n=1): exploratory validation comparison, not a paper-level "
+    "performance claim. No seed standard deviation, confidence interval, or p-value is estimated.",
+    "Scores and contrasts remain separate for every dataset; PPI uses micro-F1, "
+    "other supported datasets use accuracy. Scores are fractions; pp means percentage points.",
+    "No test split is evaluated. Repeated validation-driven choices can overfit validation; "
+    "this report is for diagnosis, not an untouched final test estimate.",
+    "The node-degree variant changes the propagation operator, not just execution speed. "
+    "A uniform conductance rescaling still cancels under degree normalization.",
+    "Valid contrasts require shared initialization, cached data/protocol, training configuration, "
+    "and early-stopping policy. Selected epochs and actual epochs run may nevertheless differ. "
+    "Identical seeds/initialization do not guarantee bitwise-identical CUDA scatter trajectories.",
+    "The interaction is an algebraic contrast of these four runs, not a statistical "
+    "significance test. A change in validation score alone does not prove a collapse mechanism.",
+]
+
+
+class ComparisonIntegrityError(ValueError):
+    """A saved comparison is invalid and contains no effect estimates."""
+
+    def __init__(self, report: dict[str, Any]) -> None:
+        self.report = report
+        super().__init__("Factorial comparison integrity failed: " + "; ".join(report["errors"]))
+
+
+def _contained(path: Any, base: Path, label: str) -> Path:
+    if not isinstance(path, (str, Path)) or not str(path):
+        raise ValueError(f"{label}: a nonempty artifact path is required")
+    candidate = Path(path).expanduser()
+    resolved = (base / candidate if not candidate.is_absolute() else candidate).resolve()
+    if resolved == base or not resolved.is_relative_to(base):
+        raise ValueError(f"{label}: artifact path escapes its allowed directory")
+    return resolved
+
+
+def _finite_number(value: Any, label: str, *, unit_interval: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label}: expected a finite number")
+    result = float(value)
+    if not math.isfinite(result) or (unit_interval and not 0.0 <= result <= 1.0):
+        raise ValueError(
+            f"{label}: expected {'a score in [0, 1]' if unit_interval else 'finite data'}"
+        )
+    return result
+
+
+def _same(left: Any, right: Any) -> bool:
+    """Avoid Python equating False with 0 in experiment metadata."""
+    return json.dumps(left, sort_keys=True, allow_nan=False) == json.dumps(
+        right, sort_keys=True, allow_nan=False
+    )
+
+
+def _integer(value: Any, label: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{label}: expected an integer >= {minimum}")
+    return value
+
+
+def _metric_name(dataset: str) -> str:
+    return "micro_f1" if dataset == "ppi" else "accuracy"
+
+
+def _reject_nonfinite_json(value: str) -> None:
+    raise ValueError(f"nonfinite JSON value {value} is not valid experiment metadata")
+
+
+def _load_child(
+    run_dir: Path,
+    job: dict[str, Any],
+    common: dict[str, Any],
+) -> dict[str, Any]:
+    dataset, condition = job["dataset"], job["condition"]
+    label = f"{dataset}/{condition}"
+    output = _contained(job.get("output_dir"), run_dir, f"{label} output_dir")
+    metrics_path = _contained(job.get("metrics_path"), run_dir, f"{label} metrics_path")
+    if not metrics_path.is_relative_to(output):
+        raise ValueError(f"{label}: metrics_path must be inside that job's output_dir")
+    try:
+        metrics = json.loads(
+            metrics_path.read_text(encoding="utf-8"), parse_constant=_reject_nonfinite_json
+        )
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{label}: cannot read metrics.json ({exc})") from exc
+    if not isinstance(metrics, dict):
+        raise ValueError(f"{label}: metrics must be a JSON object")
+    expected = {
+        "schema_version": 1,
+        "status": "passed",
+        "research_suite": "conductance_factorial",
+        "dataset": dataset,
+        "condition": condition,
+        "model_seed": common["model_seed"],
+        "normalization": CONDITIONS[condition]["normalization"],
+        "gate_weight_decay": CONDITIONS[condition]["gate_weight_decay"],
+        "non_gate_weight_decay": common["weight_decay"],
+        "metric_name": _metric_name(dataset),
+        "test_evaluated": False,
+        "evaluation_split": "validation",
+    }
+    for key, value in expected.items():
+        if key not in metrics or not _same(metrics[key], value):
+            raise ValueError(f"{label}: {key} mismatch (expected {value!r})")
+    for key in ("cache_sha256", "initial_state_sha256"):
+        if not isinstance(metrics.get(key), str) or not _SHA256.fullmatch(metrics[key]):
+            raise ValueError(f"{label}: {key} must be a SHA-256 digest")
+    if not isinstance(metrics.get("protocol"), dict) or not metrics["protocol"]:
+        raise ValueError(f"{label}: nonempty cached-data protocol is required")
+    configuration = metrics.get("configuration")
+    if not isinstance(configuration, dict) or not configuration:
+        raise ValueError(f"{label}: configuration is missing")
+    for key, value in common.items():
+        if key not in _CONFIG_NOT_CHILD | _FACTOR_KEYS | _OUTPUT_KEYS:
+            if key not in configuration or not _same(configuration[key], value):
+                raise ValueError(f"{label}: configuration.{key} differs from manifest")
+    for key in _FACTOR_KEYS:
+        if key in configuration and not _same(configuration[key], expected[key]):
+            raise ValueError(f"{label}: configuration.{key} contradicts metric metadata")
+    if configuration.get("tf32") is not False:
+        raise ValueError(f"{label}: configuration.tf32 must explicitly be False")
+    metrics["validation"] = _finite_number(
+        metrics.get("validation"), f"{label} validation", unit_interval=True
+    )
+    for key in ("train_loss", "elapsed_seconds"):
+        value = _finite_number(metrics.get(key), f"{label} {key}")
+        if value < 0:
+            raise ValueError(f"{label}: {key} cannot be negative")
+    _integer(metrics.get("peak_cuda_allocated_bytes"), f"{label} peak_cuda_allocated_bytes")
+    best_epoch = _integer(metrics.get("best_epoch"), f"{label} best_epoch", minimum=1)
+    epochs_run = _integer(metrics.get("epochs_run"), f"{label} epochs_run", minimum=1)
+    if not best_epoch <= epochs_run <= common["epochs"]:
+        raise ValueError(f"{label}: best_epoch/epochs_run exceed the configured epoch budget")
+    for key in ("checkpoint", "history"):
+        artifact = _contained(metrics.get(key), output, f"{label} {key}")
+        expected_digest = metrics.get(f"{key}_sha256")
+        if not isinstance(expected_digest, str) or not _SHA256.fullmatch(expected_digest):
+            raise ValueError(f"{label}: {key}_sha256 must be a SHA-256 digest")
+        try:
+            with artifact.open("rb") as stream:
+                actual_digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        except OSError as exc:
+            raise ValueError(f"{label}: cannot read {key} artifact ({exc})") from exc
+        if actual_digest != expected_digest.lower():
+            raise ValueError(f"{label}: {key} SHA-256 mismatch")
+    # Diagnostics are intentionally descriptive, not part of the held-fixed configuration.
+    return metrics
+
+
+def _pair_metadata(metrics: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: metrics[key]
+        for key in (
+            "dataset",
+            "model_seed",
+            "metric_name",
+            "cache_sha256",
+            "protocol",
+            "initial_state_sha256",
+            "non_gate_weight_decay",
+            "evaluation_split",
+            "test_evaluated",
+        )
+    } | {
+        "configuration": {
+            key: value
+            for key, value in metrics["configuration"].items()
+            if key not in _FACTOR_KEYS | _OUTPUT_KEYS
+        }
+    }
+
+
+def _effects(scores: dict[str, float]) -> dict[str, dict[str, float]]:
+    baseline = scores["baseline"]
+    gate = scores["gate_no_wd"]
+    normalization = scores["node_degree"]
+    both = scores["node_degree_gate_no_wd"]
+    values = (gate - baseline, normalization - baseline, both - normalization, both - gate)
+    values += (both - normalization - gate + baseline,)
+    return {
+        key: {"score_delta": value, "percentage_points": 100.0 * value}
+        for (key, _), value in zip(_EFFECTS, values, strict=True)
+    }
+
+
+def _optional_nonnegative(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) and value >= 0 else None
+
+
+def _best_validation_summary(diagnostics: Any) -> list[dict[str, Any]]:
+    """Summarize within-graph observations, never pooled between-graph CV.
+
+    These optional descriptions do not enter score contrasts or integrity
+    matching. Missing observations remain null, not zeros. Each mean weights
+    graphs equally and carries its own number of available observations.
+    """
+    best = diagnostics.get("best_validation") if isinstance(diagnostics, dict) else None
+    if not isinstance(best, dict) or best.get("split", "validation") != "validation":
+        best = {}
+    if best.get("mode", "eval") != "eval":
+        best = {}
+    layers = best.get("layers", [])
+    if not isinstance(layers, list):
+        layers = []
+    norms = best.get("parameter_norms", {})
+    if not isinstance(norms, dict):
+        norms = {}
+    summary = []
+    for index in range(COMMON["layers"]):
+        matches = [
+            layer
+            for layer in layers
+            if isinstance(layer, dict)
+            and type(layer.get("layer")) is int
+            and layer["layer"] == index
+        ]
+        layer = matches[0] if len(matches) == 1 else {}
+        graphs = layer.get("graphs", [])
+        if not isinstance(graphs, list):
+            graphs = []
+        observed = {"conductance_cv": [], "rho_mean": [], "relative_conv_change": []}
+        for graph in graphs:
+            if not isinstance(graph, dict):
+                continue
+            for field, section, value_key in (
+                ("conductance_cv", "conductance", "cv"),
+                ("rho_mean", "rho", "mean"),
+                ("relative_conv_change", None, "relative_conv_change"),
+            ):
+                record = graph if section is None else graph.get(section, {})
+                value = (
+                    _optional_nonnegative(record.get(value_key))
+                    if isinstance(record, dict)
+                    else None
+                )
+                if value is not None:
+                    observed[field].append(value)
+        gate_norms = [
+            value
+            for name, raw_value in norms.items()
+            if isinstance(name, str)
+            and name.startswith(f"operators.{index}.estimator.")
+            and (value := _optional_nonnegative(raw_value)) is not None
+        ]
+        summary.append(
+            {
+                "layer": index,
+                "graph_count": len(graphs),
+                "aggregation": "unweighted graph mean of within-graph measurements",
+                **{
+                    field: {
+                        "mean": math.fsum(values) / len(values) if values else None,
+                        "valid_graph_count": len(values),
+                    }
+                    for field, values in observed.items()
+                },
+                "gate_parameter_l2": math.hypot(*gate_norms) if gate_norms else None,
+                "gate_parameter_tensor_count": len(gate_norms),
+            }
+        )
+    return summary
+
+
+def _build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    errors: list[str] = []
+    if manifest.get("source_integrity_valid") is False:
+        errors.append("Source integrity failed: experiment code changed during this run")
+    config = manifest.get("config", {})
+    if not isinstance(config, dict):
+        config = {}
+        errors.append("manifest.config must be an object")
+    datasets = config.get("datasets", [])
+    if (
+        not isinstance(datasets, list)
+        or not datasets
+        or any(not isinstance(value, str) or value not in DATASETS for value in datasets)
+        or len(set(datasets)) != len(datasets)
+    ):
+        errors.append("manifest.config.datasets must list unique supported datasets")
+        datasets = []
+    for key, value in (("schema_version", 1), ("suite", "conductance_factorial")):
+        if not _same(manifest.get(key), value):
+            errors.append(f"manifest.{key} mismatch (expected {value!r})")
+    if manifest.get("status") not in {"running", "passed", "failed"}:
+        errors.append("manifest.status must be running, passed, or failed")
+    try:
+        _integer(config.get("model_seed"), "manifest.config.model_seed")
+        _integer(config.get("epochs"), "manifest.config.epochs", minimum=1)
+        for key, value in COMMON.items():
+            if not _same(config.get(key), value):
+                raise ValueError(f"manifest.config.{key} must be {value!r} for this fixed 2x2")
+    except ValueError as exc:
+        errors.append(str(exc))
+    jobs = manifest.get("jobs", [])
+    if not isinstance(jobs, list):
+        jobs = []
+        errors.append("manifest.jobs must be a list")
+    indexed: dict[tuple[str, str], dict[str, Any]] = {}
+    for job in jobs:
+        if not isinstance(job, dict):
+            errors.append("manifest job must be an object")
+            continue
+        dataset, condition = job.get("dataset"), job.get("condition")
+        if not isinstance(dataset, str) or dataset not in datasets:
+            errors.append("manifest job references a dataset outside config.datasets")
+            continue
+        if not isinstance(condition, str) or condition not in CONDITIONS:
+            errors.append(f"{dataset}: manifest job references an unknown condition")
+            continue
+        key = (dataset, condition)
+        if key in indexed:
+            errors.append(f"{dataset}/{condition}: duplicate manifest job")
+            continue
+        indexed[key] = job
+        if job.get("status") not in _JOB_STATUSES:
+            errors.append(f"{dataset}/{condition}: unknown job status")
+        try:
+            output = _contained(job.get("output_dir"), run_dir, f"{key} output_dir")
+            metrics_path = _contained(job.get("metrics_path"), run_dir, f"{key} metrics_path")
+            if not metrics_path.is_relative_to(output):
+                raise ValueError(f"{key}: metrics_path is outside its job output_dir")
+        except ValueError as exc:
+            errors.append(str(exc))
+    reports = []
+    for dataset in datasets:
+        entries: list[dict[str, Any]] = []
+        loaded: dict[str, dict[str, Any]] = {}
+        for condition in CONDITIONS:
+            job = indexed.get((dataset, condition))
+            entry: dict[str, Any] = {
+                "condition": condition,
+                "status": job.get("status", "invalid") if job else "missing",
+                "normalization": CONDITIONS[condition]["normalization"],
+                "gate_weight_decay": CONDITIONS[condition]["gate_weight_decay"],
+                "validation": None,
+                "validation_percent": None,
+                "delta_from_baseline": None,
+                "best_epoch": None,
+                "epochs_run": None,
+                "best_validation_diagnostics": _best_validation_summary(None),
+            }
+            if job and job.get("error"):
+                entry["error"] = str(job["error"])
+            if job and job.get("status") == "passed":
+                try:
+                    child = _load_child(run_dir, job, config)
+                    loaded[condition] = child
+                    entry.update(
+                        validation=child["validation"],
+                        validation_percent=child["validation"] * 100.0,
+                        best_epoch=child["best_epoch"],
+                        epochs_run=child["epochs_run"],
+                        train_loss=child["train_loss"],
+                        elapsed_seconds=child["elapsed_seconds"],
+                        peak_cuda_allocated_bytes=child["peak_cuda_allocated_bytes"],
+                        diagnostics=child.get("diagnostics"),
+                        best_validation_diagnostics=_best_validation_summary(
+                            child.get("diagnostics")
+                        ),
+                    )
+                except (ValueError, KeyError, TypeError) as exc:
+                    entry["status"] = "invalid"
+                    entry["error"] = str(exc)
+                    errors.append(str(exc))
+            entries.append(entry)
+        reference = next(iter(loaded.values()), None)
+        metadata = _pair_metadata(reference) if reference is not None else None
+        for condition, child in loaded.items():
+            actual = _pair_metadata(child)
+            if metadata is not None:
+                for key, value in metadata.items():
+                    if not _same(actual[key], value):
+                        errors.append(
+                            f"{dataset}/{condition}: held-fixed {key} differs across runs"
+                        )
+        complete = len(loaded) == len(CONDITIONS)
+        reports.append(
+            {
+                "dataset": dataset,
+                "metric_name": _metric_name(dataset),
+                "model_seed": config.get("model_seed"),
+                "complete": complete,
+                "conditions": entries,
+                "held_fixed": metadata,
+                "effects": None,
+            }
+        )
+    all_complete = bool(reports) and all(item["complete"] for item in reports)
+    if manifest.get("status") == "passed" and not all_complete:
+        errors.append("manifest is passed but the complete four-condition matrix is not available")
+    if errors:
+        for item in reports:
+            item["complete"] = False
+    else:
+        for item in reports:
+            if item["complete"]:
+                scores = {row["condition"]: row["validation"] for row in item["conditions"]}
+                item["effects"] = _effects(scores)
+                for row in item["conditions"]:
+                    delta = row["validation"] - scores["baseline"]
+                    row["delta_from_baseline"] = {
+                        "score_delta": delta,
+                        "percentage_points": delta * 100.0,
+                    }
+    failed = manifest.get("status") == "failed" or any(
+        job.get("status") == "failed" for job in indexed.values()
+    )
+    complete = all_complete and not errors and manifest.get("status") == "passed" and not failed
+    return {
+        "schema_version": 1,
+        "suite": "conductance_factorial",
+        "status": "invalid"
+        if errors
+        else "passed"
+        if complete
+        else "failed"
+        if failed
+        else "running",
+        "complete": complete,
+        "source_manifest_status": manifest.get("status"),
+        "source_integrity_valid": manifest.get("source_integrity_valid", True),
+        "model_seed": config.get("model_seed"),
+        "n_model_seeds": 1,
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+        "uncertainty_status": "not_estimated_single_seed",
+        "datasets": reports,
+        "errors": errors,
+        "caveats": _CAVEATS,
+    }
+
+
+def _cell(value: Any) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
+
+def _display(value: Any, *, signed: bool = False) -> str:
+    if value is None:
+        return "—"
+    return f"{value:+.6f}" if signed else f"{value:.6f}"
+
+
+def _diagnostic_markdown(conditions: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "### Best-checkpoint validation: gate and propagation diagnostics",
+        "",
+        "Each mean below weights validation graphs equally. C CV is computed within each graph "
+        "before averaging; pooled between-graph variation is not used. Parentheses show available "
+        "graphs / observed graphs; missing values are —. Layer indices are zero-based. Gate L2 "
+        "combines that layer's gate parameter tensor norms at the selected best checkpoint.",
+        "",
+        "| Condition | Layer | Within-graph C CV mean | ρ mean | Relative Conv change mean "
+        "| Gate parameter L2 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for condition in conditions:
+        for layer in condition["best_validation_diagnostics"]:
+            cells = []
+            for key in ("conductance_cv", "rho_mean", "relative_conv_change"):
+                metric = layer[key]
+                value = metric["mean"]
+                cells.append(
+                    f"{value:.6g} ({metric['valid_graph_count']}/{layer['graph_count']})"
+                    if value is not None
+                    else "—"
+                )
+            norm = layer["gate_parameter_l2"]
+            norm_text = f"{norm:.6g}" if norm is not None else "—"
+            lines.append(
+                f"| {condition['condition']} | {layer['layer']} | "
+                + " | ".join(cells)
+                + f" | {norm_text} |"
+            )
+    return lines + [""]
+
+
+def _markdown(report: dict[str, Any]) -> str:
+    lines = [
+        "# Conductance: single-seed 2x2 validation comparison",
+        "",
+        f"Status: **{report['status']}**. Model seed: {report['model_seed']}. "
+        "Evaluation: validation only; test not evaluated.",
+        "",
+    ]
+    if report["errors"]:
+        lines += ["## Integrity errors — no contrasts are reported", ""]
+        lines += [f"- {_cell(error)}" for error in report["errors"]]
+        lines += [""]
+    for dataset in report["datasets"]:
+        lines += [
+            f"## {dataset['dataset']} ({dataset['metric_name']}, higher is better)",
+            "",
+            "| Condition | Status | Validation | Validation (%) | Δ baseline (pp) "
+            "| Best epoch | Epochs run |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for row in dataset["conditions"]:
+            delta = row["delta_from_baseline"]
+            lines.append(
+                f"| {row['condition']} | {_cell(row['status'])} | "
+                f"{_display(row['validation'])} | {_display(row['validation_percent'])} | "
+                f"{_display(delta['percentage_points'] if delta else None, signed=True)} | "
+                f"{row['best_epoch'] if row['best_epoch'] is not None else '—'} | "
+                f"{row['epochs_run'] if row['epochs_run'] is not None else '—'} |"
+            )
+        lines += [""]
+        if dataset["effects"]:
+            lines += [
+                "| Contrast | Score delta | Percentage points |",
+                "| --- | ---: | ---: |",
+            ]
+            for key, description in _EFFECTS:
+                effect = dataset["effects"][key]
+                lines.append(
+                    f"| {description} | {_display(effect['score_delta'], signed=True)} | "
+                    f"{_display(effect['percentage_points'], signed=True)} |"
+                )
+            lines += [""]
+        else:
+            lines += ["Contrasts withheld until all four conditions pass integrity checks.", ""]
+        lines += _diagnostic_markdown(dataset["conditions"])
+        for row in dataset["conditions"]:
+            if row.get("error"):
+                lines += [f"- {row['condition']}: {_cell(row['error'])}"]
+        lines += [""]
+    lines += ["## Interpretation limits", ""]
+    lines += [f"- {caveat}" for caveat in report["caveats"]]
+    lines += ["", "Full metadata and diagnostic trajectories: `comparison.json`.", ""]
+    return "\n".join(lines)
+
+
+def _csv(report: dict[str, Any]) -> str:
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=[
+            "dataset",
+            "model_seed",
+            "metric_name",
+            "report_status",
+            "row_type",
+            "condition",
+            "status",
+            "normalization",
+            "gate_weight_decay",
+            "validation",
+            "validation_percent",
+            "score_delta",
+            "percentage_points",
+            "best_epoch",
+            "epochs_run",
+        ],
+    )
+    writer.writeheader()
+    for dataset in report["datasets"]:
+        shared = {key: dataset[key] for key in ("dataset", "model_seed", "metric_name")}
+        shared["report_status"] = report["status"]
+        for condition in dataset["conditions"]:
+            row = {
+                key: condition[key]
+                for key in (
+                    "condition",
+                    "status",
+                    "normalization",
+                    "gate_weight_decay",
+                    "validation",
+                    "validation_percent",
+                    "best_epoch",
+                    "epochs_run",
+                )
+            }
+            writer.writerow(
+                shared | row | {"row_type": "condition"} | (condition["delta_from_baseline"] or {})
+            )
+        if dataset["effects"]:
+            for key, effect in dataset["effects"].items():
+                writer.writerow(
+                    shared
+                    | {"row_type": "contrast", "condition": key, "status": "complete"}
+                    | effect
+                )
+    return buffer.getvalue()
+
+
+def _atomic_write(destination: Path, text: str) -> None:
+    descriptor, name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def write_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Regenerate reports, then raise on integrity errors (never on pending jobs).
+
+    Existing derived comparison files are replaced atomically, including with an
+    explicit invalid report if child metadata were changed. Child artifacts and
+    the caller's manifest are never modified. Unsafe output symlinks are rejected
+    before any publication, so reports cannot overwrite files outside this run.
+    """
+    root = Path(run_dir).expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("run_dir must be an existing directory")
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be a JSON object")
+    destinations = [_contained(name, root, name) for name in REPORT_FILENAMES]
+    for name in REPORT_FILENAMES:
+        if (root / name).is_symlink():
+            raise ValueError(f"{name}: report destinations must not be symlinks")
+    report = _build_comparison(root, manifest)
+    contents = (
+        json.dumps(report, indent=2, sort_keys=True, ensure_ascii=False, allow_nan=False) + "\n",
+        _markdown(report),
+        _csv(report),
+    )
+    for destination, content in zip(destinations, contents, strict=True):
+        _atomic_write(destination, content)
+    if report["errors"]:
+        raise ComparisonIntegrityError(report)
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "run_dir", type=Path, help="Existing factorial run containing manifest.json"
+    )
+    args = parser.parse_args(argv)
+    try:
+        root = args.run_dir.expanduser().resolve(strict=True)
+        manifest_path = _contained("manifest.json", root, "manifest.json")
+        manifest = json.loads(
+            manifest_path.read_text(encoding="utf-8"), parse_constant=_reject_nonfinite_json
+        )
+        report = write_comparison(root, manifest)
+    except (OSError, ValueError) as exc:
+        print(f"Comparison failed: {exc}", file=sys.stderr)
+        return 1
+    print(_markdown(report))
+    print(
+        f"Reports: {root / 'comparison.md'}, {root / 'comparison.json'}, {root / 'comparison.csv'}"
+    )
+    return 0 if report["status"] == "passed" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# research/conductance_gat/ablation/reproduce.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+source "${project_root}/scripts/conda_env.sh"
+export PYTHONPATH="${project_root}/src:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
+cd "${project_root}"
+exec "${environment_python}" -B scripts/run_conductance_factorial.py "$@"
+````
+
+# research/conductance_gat/ablation/train.py
+
+````python
+"""Train ONE fresh factorial arm on verified caches, with validation-only selection.
+
+This is a causal investigation, not a benchmark test-set evaluation. Training
+requires CUDA even when this module is called directly. CPU tensors are used only
+by unit tests of the pure helpers. No downloads, test evaluation or AMP fallback.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from chartgat.cache import atomic_publish, atomic_write_json
+
+from ..benchmark import _binary_counts, _micro_f1_from_counts, _seed, _versions
+from ..benchmark_data import load_dataset, sha256_file
+from .model import FactorialNodeClassifier, is_gate_parameter, make_optimizer, state_sha256
+from .protocol import COMMON, CONDITIONS, DATASETS
+
+OBSERVATION_POLICY = {
+    "validation": "eval mode, no gradients, official validation labels only",
+    "train_trajectory": (
+        "Every epoch's FIRST actual training batch, dropout ON, before optimizer.step. "
+        "PPI is a first minibatch observation, not a full training-split gradient. "
+        "No extra backward or training-loader iteration is performed."
+    ),
+    "gradient": (
+        "Raw task-loss .grad after backward and before coupled Adam L2 is applied; "
+        "lambda*parameter norm is recorded separately, not an Adam update estimate. "
+        "Zero decay norm yields null ratio; no epsilon denominator or clamp."
+    ),
+    "statistics": (
+        "Conductance/rho scalar moments are exact over the observed edges/nodes. "
+        "Quantiles use at most 4096 deterministic evenly spaced entries PER graph. "
+        "For PPI use within-graph C CV; pooled CV also includes between-graph variation."
+    ),
+    "normalization": (
+        "Node-degree is row preconditioning, generally nonsymmetric in Euclidean space. "
+        "Both normalization choices cancel a common scale of C."
+    ),
+}
+
+
+def configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        **COMMON,
+        "model_seed": args.model_seed,
+        "epochs": args.epochs,
+        "patience": args.patience,
+        "batch_size": args.batch_size,
+        "workers": args.workers,
+        "device": args.device,
+        "tf32": False,
+        "pin_memory": True,
+    }
+
+
+def _require_cuda(device: torch.device) -> None:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("Factorial training requires a CUDA GPU; no CPU fallback is allowed.")
+    torch.cuda.get_device_properties(device)
+
+
+def _configure_fp32() -> None:
+    torch.set_default_dtype(torch.float32)
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.benchmark = False
+
+
+def _make_data(payload: dict[str, Any], args: argparse.Namespace, device: torch.device):
+    """Do not construct a test loader or even read its split index."""
+    from torch_geometric.data import Data
+    from torch_geometric.loader import DataLoader
+
+    if payload["dataset"] != "ppi":
+        graph = Data(**payload["graphs"][0]).to(device)
+        indices = {
+            key: payload["splits"][key].nonzero(as_tuple=False).flatten().to(device)
+            for key in ("train", "validation")
+        }
+        return graph, indices
+    loaders = {}
+    for split in ("train", "validation"):
+        generator = torch.Generator().manual_seed(args.model_seed)
+        loaders[split] = DataLoader(
+            [Data(**payload["graphs"][i]) for i in payload["splits"][split]],
+            batch_size=args.batch_size,
+            shuffle=split == "train",
+            num_workers=args.workers,
+            generator=generator,
+            pin_memory=True,
+            persistent_workers=args.workers > 0,
+        )
+    return loaders, None
+
+
+def training_loss(logits: Tensor, graph: Any, train_indices: Tensor | None) -> tuple[Tensor, int]:
+    if train_indices is not None:
+        return (
+            F.cross_entropy(
+                logits.index_select(0, train_indices), graph.y.index_select(0, train_indices)
+            ),
+            train_indices.numel(),
+        )
+    return F.binary_cross_entropy_with_logits(logits, graph.y), graph.y.numel()
+
+
+def _moments(value: Tensor, *, rho: bool = False) -> dict[str, Any]:
+    flat = value.detach().flatten().double()
+    if not flat.numel():
+        return {"count": 0, "mean": None, "std": None, "cv": None, "min": None, "max": None}
+    if not bool(torch.isfinite(flat).all()):
+        raise RuntimeError("Non-finite conductance/propagation observation")
+    mean = float(flat.mean())
+    std = float(flat.std(correction=0))
+    count = flat.numel()
+    selected = (
+        flat
+        if count <= 4096
+        else flat.index_select(0, torch.linspace(0, count - 1, 4096, device=flat.device).long())
+    )
+    quantiles = torch.quantile(selected, selected.new_tensor([0.1, 0.5, 0.9])).tolist()
+    result = {
+        "count": count,
+        "mean": mean,
+        "std": std,
+        "cv": std / abs(mean) if mean != 0 else None,
+        "min": float(flat.min()),
+        "max": float(flat.max()),
+        "quantiles": dict(zip(("p10", "p50", "p90"), quantiles, strict=True)),
+        "quantile_sample_count": selected.numel(),
+        "quantile_policy": "exact" if count <= 4096 else "deterministic_evenly_spaced_sample",
+    }
+    if rho:
+        result["fraction_below_0_01"] = float((flat < 0.01).double().mean())
+        result["isolated_node_count"] = int((flat == 0).sum())
+    return result
+
+
+def _pooled_moments(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Stable population-moment merging; do not invent pooled quantiles."""
+    nonempty = [record for record in records if record["count"]]
+    if not nonempty:
+        return {"count": 0, "mean": None, "std": None, "cv": None}
+    count = sum(record["count"] for record in nonempty)
+    mean = sum(record["count"] * record["mean"] for record in nonempty) / count
+    variance = (
+        sum(
+            record["count"] * (record["std"] ** 2 + (record["mean"] - mean) ** 2)
+            for record in nonempty
+        )
+        / count
+    )
+    std = math.sqrt(max(variance, 0.0))
+    result = {
+        "count": count,
+        "mean": mean,
+        "std": std,
+        "cv": std / abs(mean) if mean else None,
+        "min": min(record["min"] for record in nonempty),
+        "max": max(record["max"] for record in nonempty),
+    }
+    if "fraction_below_0_01" in nonempty[0]:
+        result["fraction_below_0_01"] = (
+            sum(record["count"] * record["fraction_below_0_01"] for record in nonempty) / count
+        )
+        result["isolated_node_count"] = sum(record["isolated_node_count"] for record in nonempty)
+    return result
+
+
+class ForwardObservation:
+    """Read-only hooks on the actual forward: no second gate evaluation or RNG use."""
+
+    def __init__(self, model: FactorialNodeClassifier) -> None:
+        self.model = model
+        self.records: dict[int, list[dict[str, Any]]] = {
+            index: [] for index in range(len(model.operators))
+        }
+        self._captured: dict[int, Tensor] = {}
+        self._handles: list[Any] = []
+
+    def __enter__(self):
+        try:
+            for index, operator in enumerate(self.model.operators):
+                self._handles.append(
+                    operator.estimator.register_forward_hook(
+                        lambda module, inputs, output, i=index: self._capture(i, output)
+                    )
+                )
+                self._handles.append(
+                    operator.register_forward_hook(
+                        lambda module, inputs, output, i=index: self._observe(i, inputs, output)
+                    )
+                )
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def _capture(self, index: int, output: Tensor) -> None:
+        self._captured[index] = output.detach()
+
+    @torch.no_grad()
+    def _observe(self, index: int, inputs: tuple, output: Tensor) -> None:
+        state, incidence, node_graph = inputs[:3]
+        state = state.detach().float()
+        output = output.detach().float()
+        c = self._captured.pop(index)
+        tail, head = incidence
+        degree = state.new_zeros(state.shape[0])
+        degree.index_add_(0, tail, c)
+        degree.index_add_(0, head, c)
+        num_graphs = int(inputs[3]) if len(inputs) > 3 else int(node_graph.max()) + 1
+        for graph_id in range(num_graphs):
+            node_mask = node_graph == graph_id
+            edge_mask = node_graph[tail] == graph_id
+            graph_degree = degree[node_mask]
+            if self.model.normalization == "global_max":
+                rho = 0.95 * graph_degree / graph_degree.max().clamp_min(1e-12)
+            else:
+                rho = (graph_degree > 0).to(state.dtype) * 0.95
+            before = state[node_mask]
+            difference = output[node_mask] - before
+            state_squared = float(before.double().square().sum())
+            delta_squared = float(difference.double().square().sum())
+            self.records[index].append(
+                {
+                    "graph_observation_index": len(self.records[index]),
+                    "conductance": _moments(c[edge_mask]),
+                    "rho": _moments(rho, rho=True),
+                    "relative_conv_change": (
+                        math.sqrt(delta_squared / state_squared) if state_squared else None
+                    ),
+                    "state_squared_norm": state_squared,
+                    "change_squared_norm": delta_squared,
+                }
+            )
+
+    def summary(self) -> list[dict[str, Any]]:
+        output = []
+        for index, records in self.records.items():
+            state_squared = sum(record["state_squared_norm"] for record in records)
+            change_squared = sum(record["change_squared_norm"] for record in records)
+            output.append(
+                {
+                    "layer": index,
+                    "conductance": _pooled_moments([r["conductance"] for r in records]),
+                    "rho": _pooled_moments([r["rho"] for r in records]),
+                    "relative_conv_change": (
+                        math.sqrt(change_squared / state_squared) if state_squared else None
+                    ),
+                    "graphs": records,
+                }
+            )
+        return output
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
+        self._captured.clear()
+
+
+def _tensor_squared_norm(value: Tensor) -> float:
+    # Avoid a second entire huge parameter tensor in float64.
+    flat = value.detach().flatten()
+    total = 0.0
+    for chunk in flat.split(1_048_576):
+        total += float(chunk.double().square().sum())
+    return total
+
+
+def parameter_norms(model: nn.Module) -> dict[str, float]:
+    return {
+        name: math.sqrt(_tensor_squared_norm(parameter))
+        for name, parameter in model.named_parameters()
+    }
+
+
+def gradient_observation(model: nn.Module, condition: str) -> dict[str, Any]:
+    groups: dict[str, list[tuple[str, nn.Parameter]]] = {"non_gate": []}
+    for name, parameter in model.named_parameters():
+        group = name.split(".estimator.")[0] if is_gate_parameter(name) else "non_gate"
+        groups.setdefault(group, []).append((name, parameter))
+    output = {}
+    for group, parameters in groups.items():
+        wd = (
+            COMMON["weight_decay"]
+            if group == "non_gate"
+            else CONDITIONS[condition]["gate_weight_decay"]
+        )
+        parameter_norm = math.sqrt(sum(_tensor_squared_norm(p) for _, p in parameters))
+        task_norm = math.sqrt(
+            sum(_tensor_squared_norm(p.grad) for _, p in parameters if p.grad is not None)
+        )
+        decay_norm = wd * parameter_norm
+        output[group] = {
+            "parameter_norm": parameter_norm,
+            "task_gradient_norm": task_norm,
+            "weight_decay": wd,
+            "decay_term_norm": decay_norm,
+            "task_to_decay_ratio": task_norm / decay_norm if decay_norm > 0 else None,
+            "ratio_policy": "exact" if decay_norm > 0 else "undefined_zero_decay_norm",
+            "parameter_count": sum(p.numel() for _, p in parameters),
+            "missing_gradient_parameters": [name for name, p in parameters if p.grad is None],
+        }
+    return output
+
+
+@contextmanager
+def _evaluation_mode(model: nn.Module):
+    modes = [(module, module.training) for module in model.modules()]
+    model.eval()
+    try:
+        with torch.no_grad():
+            yield
+    finally:
+        for module, training in modes:
+            module.training = training
+
+
+def evaluate_validation(
+    model: FactorialNodeClassifier,
+    data: Any,
+    split_indices: dict[str, Tensor] | None,
+    device: torch.device,
+) -> dict[str, Any]:
+    with _evaluation_mode(model), ForwardObservation(model) as observation:
+        if split_indices is not None:
+            logits = model(data)
+            if not bool(torch.isfinite(logits).all()):
+                raise RuntimeError("Non-finite validation logits")
+            indices = split_indices["validation"]
+            value = float(
+                (logits.index_select(0, indices).argmax(dim=-1) == data.y.index_select(0, indices))
+                .float()
+                .mean()
+            )
+        else:
+            counts = torch.zeros(3, dtype=torch.int64, device=device)
+            for graph in data["validation"]:
+                graph = graph.to(device, non_blocking=True)
+                logits = model(graph)
+                if not bool(torch.isfinite(logits).all()):
+                    raise RuntimeError("Non-finite validation logits")
+                counts.add_(_binary_counts(logits, graph.y))
+            value = _micro_f1_from_counts(counts)
+    return {
+        "metric": value,
+        "layers": observation.summary(),
+        "parameter_norms": parameter_norms(model),
+        "mode": "eval",
+        "split": "validation",
+        "observation_scope": (
+            "whole transductive graph states; validation labels only for metric"
+            if split_indices is not None
+            else "all official validation graphs"
+        ),
+    }
+
+
+def checkpoint_payload(
+    model: FactorialNodeClassifier,
+    args: argparse.Namespace,
+    protocol: dict[str, Any],
+    initial_hash: str,
+    epoch: int,
+    validation: float,
+    optimizer_steps: int = 0,
+) -> dict[str, Any]:
+    return {
+        "state_dict": {name: value.detach().cpu() for name, value in model.state_dict().items()},
+        "research_suite": "conductance_factorial",
+        # Distinct model identity makes the existing baseline diagnostics reject it.
+        "model": "conductance_factorial",
+        "dataset": args.dataset,
+        "condition": args.condition,
+        "model_seed": args.model_seed,
+        "architecture": {
+            "hidden_channels": COMMON["hidden_channels"],
+            "layers": COMMON["layers"],
+            "dropout": COMMON["dropout"],
+            "normalization": CONDITIONS[args.condition]["normalization"],
+        },
+        "configuration": configuration(args),
+        "gate_weight_decay": CONDITIONS[args.condition]["gate_weight_decay"],
+        "non_gate_weight_decay": COMMON["weight_decay"],
+        "cache_sha256": protocol["data_sha256"],
+        "initial_state_sha256": initial_hash,
+        "best_epoch": epoch,
+        "optimizer_steps": optimizer_steps,
+        "validation": validation,
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+    }
+
+
+def train_model(
+    payload: dict[str, Any],
+    protocol: dict[str, Any],
+    args: argparse.Namespace,
+    device: torch.device,
+    output: Path,
+) -> dict[str, Any]:
+    _require_cuda(device)
+    _configure_fp32()
+    _seed(args.model_seed)
+    data, split_indices = _make_data(payload, args, device)
+    train_indices = None if split_indices is None else split_indices["train"]
+    model = FactorialNodeClassifier(
+        payload["graphs"][0]["x"].shape[1],
+        payload["classes"],
+        normalization=CONDITIONS[args.condition]["normalization"],
+        hidden_channels=COMMON["hidden_channels"],
+        layers=COMMON["layers"],
+        dropout=COMMON["dropout"],
+    ).to(device)
+    initial_hash = state_sha256(model)
+    optimizer = make_optimizer(model, args.condition)
+    checkpoint = output / "best.pt"
+    history: list[dict[str, Any]] = []
+    trajectory: list[dict[str, Any]] = []
+    best_validation, best_epoch = -math.inf, 0
+    optimizer_steps, best_optimizer_steps = 0, 0
+    best_observation: dict[str, Any] | None = None
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    initial_observation = evaluate_validation(model, data, split_indices, device)
+    for epoch in range(1, args.epochs + 1):
+        torch.cuda.synchronize(device)
+        epoch_started = time.perf_counter()
+        model.train()
+        loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+        label_count = 0
+        batches = [data] if split_indices is not None else data["train"]
+        for batch_index, graph in enumerate(batches):
+            if split_indices is None:
+                graph = graph.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            if batch_index == 0:
+                with ForwardObservation(model) as training_observation:
+                    logits = model(graph)
+            else:
+                logits = model(graph)
+            loss, count = training_loss(logits, graph, train_indices)
+            if not bool(torch.isfinite(loss)):
+                raise RuntimeError(f"Non-finite train loss at epoch {epoch}, batch {batch_index}")
+            loss.backward()
+            if batch_index == 0:
+                trajectory.append(
+                    {
+                        "epoch": epoch,
+                        "batch_index": 0,
+                        "optimizer_steps_before_batch": optimizer_steps,
+                        "scope": "full_graph_train_mask"
+                        if train_indices is not None
+                        else "first_actual_training_minibatch_only",
+                        "mode": "train_dropout_on",
+                        "stage": "after_task_backward_before_optimizer_step",
+                        "label_count": count,
+                        "train_loss": float(loss.detach()),
+                        "layers": training_observation.summary(),
+                        "parameter_groups": gradient_observation(model, args.condition),
+                    }
+                )
+            optimizer.step()
+            optimizer_steps += 1
+            loss_sum.add_(loss.detach().double() * count)
+            label_count += count
+        if not label_count:
+            raise RuntimeError("Training split produced no labels")
+        validation_observation = evaluate_validation(model, data, split_indices, device)
+        validation = validation_observation["metric"]
+        train_loss = float(loss_sum / label_count)
+        torch.cuda.synchronize(device)
+        history.append(
+            {
+                "epoch": epoch,
+                "optimizer_steps": optimizer_steps,
+                "train_loss": train_loss,
+                "validation": validation,
+                "epoch_seconds": time.perf_counter() - epoch_started,
+                "validation_observation": validation_observation,
+                "training_first_batch": trajectory[-1],
+            }
+        )
+        atomic_write_json(output / "history.json", history)
+        if validation > best_validation:
+            best_validation, best_epoch = validation, epoch
+            best_optimizer_steps = optimizer_steps
+            best_observation = validation_observation
+            saved = checkpoint_payload(
+                model, args, protocol, initial_hash, epoch, validation, optimizer_steps
+            )
+            atomic_publish(checkpoint, lambda path, state=saved: torch.save(state, path))
+        if epoch == 1 or epoch % 10 == 0:
+            print(
+                f"{args.dataset}/{args.condition} epoch={epoch} train_loss={train_loss:.6f} "
+                f"val={validation:.6f} best_epoch={best_epoch}",
+                flush=True,
+            )
+        if epoch - best_epoch >= args.patience:
+            break
+    final_observation = validation_observation
+    saved = torch.load(checkpoint, map_location=device, weights_only=True)
+    model.load_state_dict(saved["state_dict"])
+    selected_observation = evaluate_validation(model, data, split_indices, device)
+    if abs(selected_observation["metric"] - best_validation) > 1e-4:
+        raise RuntimeError("Best checkpoint validation recheck disagrees with model selection")
+    torch.cuda.synchronize(device)
+    return {
+        "schema_version": 1,
+        "status": "passed",
+        "research_suite": "conductance_factorial",
+        "dataset": args.dataset,
+        "condition": args.condition,
+        "model_seed": args.model_seed,
+        **CONDITIONS[args.condition],
+        "non_gate_weight_decay": COMMON["weight_decay"],
+        "configuration": configuration(args),
+        "cache_sha256": protocol["data_sha256"],
+        "protocol": protocol,
+        "initial_state_sha256": initial_hash,
+        "best_epoch": best_epoch,
+        "epochs_run": len(history),
+        "optimizer_steps": optimizer_steps,
+        "best_checkpoint_optimizer_steps": best_optimizer_steps,
+        "validation": best_validation,
+        "metric_name": "micro_f1" if args.dataset == "ppi" else "accuracy",
+        "train_loss": history[best_epoch - 1]["train_loss"],
+        "train_loss_scope": "label-weighted epoch mean at selected best validation epoch",
+        "final_train_loss": history[-1]["train_loss"],
+        "checkpoint": str(checkpoint.resolve()),
+        "checkpoint_sha256": sha256_file(checkpoint),
+        "history": str((output / "history.json").resolve()),
+        "history_sha256": sha256_file(output / "history.json"),
+        "elapsed_seconds": time.perf_counter() - started,
+        "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
+        "trainable_parameters": sum(p.numel() for p in model.parameters()),
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+        "versions": _versions(),
+        "gpu": torch.cuda.get_device_name(device),
+        "diagnostics": {
+            "initial_validation": initial_observation,
+            "best_validation": selected_observation,
+            "best_validation_at_selection": best_observation,
+            "final_validation": final_observation,
+            "train_trajectory": trajectory,
+            "observation_policy": OBSERVATION_POLICY,
+        },
+        "reproducibility": "Same seeds/initialization; GPU scatter may remain nondeterministic.",
+        "timing_policy": "includes training, validation observations and checkpoint/history IO",
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", required=True, choices=DATASETS)
+    parser.add_argument("--condition", required=True, choices=tuple(CONDITIONS))
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--data-root", type=Path, default=Path("data/paper"))
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--model-seed", type=int, default=0)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--workers", type=int, default=0)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if min(args.epochs, args.patience, args.batch_size) < 1:
+        raise ValueError("epochs, patience and batch size must be positive")
+    if min(args.workers, args.model_seed) < 0:
+        raise ValueError("workers and model seed must be nonnegative")
+    device = torch.device(args.device)
+    _require_cuda(device)
+    output = args.output_dir.expanduser().resolve()
+    data_root = args.data_root.expanduser().resolve()
+    if output == data_root or data_root in output.parents:
+        raise ValueError("Experiment output must not be written inside the dataset cache root")
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise FileExistsError(f"Output is not an empty new arm directory: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "running",
+        "research_suite": "conductance_factorial",
+        "dataset": args.dataset,
+        "condition": args.condition,
+        "model_seed": args.model_seed,
+        **CONDITIONS[args.condition],
+        "non_gate_weight_decay": COMMON["weight_decay"],
+        "configuration": configuration(args),
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+    }
+    atomic_write_json(output / "metrics.json", record)
+    try:
+        payload, protocol = load_dataset(args.dataset, data_root, allow_download=False)
+        record.update(cache_sha256=protocol["data_sha256"], protocol=protocol)
+        result = train_model(payload, protocol, args, device, output)
+        record.update(result)
+    except BaseException as exc:
+        record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        atomic_write_json(output / "metrics.json", record)
+        raise
+    atomic_write_json(output / "metrics.json", record)
+    print(f"passed: {output}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ````
 
 # research/conductance_gat/benchmark.py
@@ -7678,6 +9170,710 @@ def test_learned_model_has_gradient_and_isotropic_baseline_is_scalar() -> None:
     metrics = evaluate_model(baseline, dataset)
     assert metrics["conductance_correlation_excited"] is None
     assert metrics["conductance_correlation_defined"] is False
+````
+
+# research/conductance_gat/tests/test_factorial_integration.py
+
+````python
+"""Four-arm artifact integration on a four-node fixture with mocked GPU hardware.
+
+This is NOT a public-dataset or CPU research experiment. Only CUDA APIs, dependency
+preflight, subprocess dispatch, and official data loading are replaced; model,
+optimizer, training loop, checkpoint serialization, runner configuration, and
+comparison integrity checks are the real implementations.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import torch
+
+from chartgat.cache import atomic_publish, atomic_write_json
+from research.conductance_gat.ablation import report, train
+from research.conductance_gat.ablation.protocol import CONDITIONS
+from research.conductance_gat.benchmark_data import sha256_file
+from scripts import run_conductance_factorial as runner
+
+
+def test_real_four_arm_training_artifacts_pass_real_runner_and_comparison(monkeypatch, tmp_path):
+    graph = SimpleNamespace(
+        x=torch.tensor([[0.5, 1.0, 2.0], [1.0, 2.0, 0.5], [2.0, 0.5, 1.0], [3.0, 1.0, 2.0]]),
+        # The held-out fixture label is intentionally outside the two-class range.
+        # A mistaken unmasked cross-entropy call would fail immediately.
+        y=torch.tensor([0, 1, 0, 999999]),
+        incidence_edge_index=torch.tensor([[0, 0, 1], [1, 2, 3]]),
+    )
+
+    class NoTestIndices(dict):
+        def __getitem__(self, key):
+            if key == "test":
+                raise AssertionError("The factorial investigation must not read test indices")
+            return super().__getitem__(key)
+
+    indices = NoTestIndices(train=torch.tensor([0, 1]), validation=torch.tensor([2]))
+    payload = {"dataset": "cora", "classes": 2, "graphs": [vars(graph)]}
+    fixture_path = tmp_path / "unit-fixture-data.pt"
+    atomic_publish(fixture_path, lambda path: torch.save(payload, path))
+    fixture_hash = sha256_file(fixture_path)
+    protocol = {
+        "data_sha256": fixture_hash,
+        "unit_fixture_only": True,
+        "description": "four-node fixture; no official dataset was loaded",
+    }
+
+    monkeypatch.setattr(train, "_require_cuda", lambda device: None)
+    monkeypatch.setattr(train, "_configure_fp32", lambda: None)
+    monkeypatch.setattr(train, "_make_data", lambda *args: (graph, indices))
+    monkeypatch.setattr(torch.cuda, "manual_seed_all", lambda *args: None)
+    for name in ("reset_peak_memory_stats", "synchronize"):
+        monkeypatch.setattr(torch.cuda, name, lambda *args: None)
+    for name in ("max_memory_allocated", "max_memory_reserved"):
+        monkeypatch.setattr(torch.cuda, name, lambda *args: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *args: "unit_fixture_mocked_cuda")
+    monkeypatch.setattr(runner, "check_dependencies", lambda: {"unit_fixture_only": True})
+    monkeypatch.setattr(
+        runner,
+        "_source_snapshot",
+        lambda: {"sha256": {"unit_fixture": fixture_hash}, "git_revision": None},
+    )
+
+    trained: dict[str, dict] = {}
+    preflights = []
+
+    def fixture_dispatch(command, log, environment):
+        if any(Path(argument).name == "gpu_preflight.py" for argument in command):
+            preflights.append(command)
+            return 0
+        module_index = command.index("research.conductance_gat.ablation.train")
+        args = train.build_parser().parse_args(command[module_index + 1 :])
+        assert args.dataset == "cora" and args.model_seed == 0
+        assert args.epochs == 2 and args.workers == 0 and args.device == "cuda"
+        args.output_dir.mkdir(parents=True, exist_ok=False)
+        metrics = train.train_model(payload, protocol, args, torch.device("cpu"), args.output_dir)
+        metrics.update(unit_fixture_only=True, hardware_mocked=True)
+        atomic_write_json(args.output_dir / "metrics.json", metrics)
+        trained[args.condition] = metrics
+        return 0
+
+    monkeypatch.setattr(runner, "run_logged", fixture_dispatch)
+    result = runner.main(
+        [
+            "--datasets",
+            "cora",
+            "--epochs",
+            "2",
+            "--patience",
+            "2",
+            "--workers",
+            "0",
+            "--model-seed",
+            "0",
+            "--device",
+            "cuda",
+            "--results-root",
+            str(tmp_path / "results"),
+            "--data-root",
+            str(tmp_path / "cache"),
+            "--run-id",
+            "integration-unit-fixture",
+        ]
+    )
+    assert result == 0
+    assert len(preflights) == 1
+    assert list(trained) == list(CONDITIONS)
+    assert len({metrics["initial_state_sha256"] for metrics in trained.values()}) == 1
+    assert {metrics["cache_sha256"] for metrics in trained.values()} == {fixture_hash}
+    for condition, metrics in trained.items():
+        assert metrics["status"] == "passed"
+        assert metrics["normalization"] == CONDITIONS[condition]["normalization"]
+        assert metrics["gate_weight_decay"] == CONDITIONS[condition]["gate_weight_decay"]
+        assert metrics["non_gate_weight_decay"] == 0.0005
+        assert metrics["test_evaluated"] is False and "test" not in metrics
+        assert metrics["evaluation_split"] == "validation"
+        assert metrics["epochs_run"] == metrics["optimizer_steps"] == 2
+        assert metrics["checkpoint_sha256"] == sha256_file(Path(metrics["checkpoint"]))
+        assert metrics["history_sha256"] == sha256_file(Path(metrics["history"]))
+        saved = torch.load(metrics["checkpoint"], weights_only=True)
+        assert saved["architecture"]["normalization"] == metrics["normalization"]
+        assert saved["research_suite"] == "conductance_factorial"
+        actual_decay = metrics["diagnostics"]["train_trajectory"][0]["parameter_groups"]
+        assert actual_decay["operators.0"]["weight_decay"] == metrics["gate_weight_decay"]
+        assert actual_decay["non_gate"]["weight_decay"] == 0.0005
+
+    root = tmp_path / "results/conductance_gat/ablations/integration-unit-fixture"
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "passed"
+    manifest["source_integrity_valid"] = True
+    # Re-read all real serialized artifacts, including actual SHA-256 checks.
+    comparison = report.write_comparison(root, manifest)
+    assert comparison["status"] == "passed" and comparison["complete"] is True
+    assert comparison["source_integrity_valid"] is True
+    assert comparison["test_evaluated"] is False
+    assert comparison["uncertainty_status"] == "not_estimated_single_seed"
+    dataset = comparison["datasets"][0]
+    assert dataset["complete"] is True and len(dataset["effects"]) == 5
+    scores = {condition: metrics["validation"] for condition, metrics in trained.items()}
+    assert dataset["effects"]["interaction"]["score_delta"] == (
+        scores["node_degree_gate_no_wd"]
+        - scores["node_degree"]
+        - scores["gate_no_wd"]
+        + scores["baseline"]
+    )
+    for name in ("comparison.json", "comparison.csv", "comparison.md"):
+        assert (root / name).is_file()
+````
+
+# research/conductance_gat/tests/test_factorial_model.py
+
+````python
+"""Pure tensor equivalence checks, not CPU research training."""
+
+from __future__ import annotations
+
+import copy
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.ablation.model import (
+    FactorialConductanceConv,
+    FactorialNodeClassifier,
+    is_gate_parameter,
+    make_optimizer,
+    state_sha256,
+)
+from research.conductance_gat.ablation.protocol import COMMON, CONDITIONS
+from research.conductance_gat.benchmark import ConductanceNodeClassifier
+
+
+def _graph():
+    return SimpleNamespace(
+        x=torch.randn(7, 3),
+        incidence_edge_index=torch.tensor([[0, 0, 1, 3, 3], [1, 2, 2, 4, 5]]),
+        batch=torch.tensor([0, 0, 0, 1, 1, 1, 1]),
+        ptr=torch.tensor([0, 3, 7]),
+    )
+
+
+@pytest.mark.parametrize("condition", CONDITIONS)
+def test_all_conditions_have_exact_baseline_initial_state_and_rng(condition):
+    torch.manual_seed(41)
+    baseline = ConductanceNodeClassifier(3, 2, hidden_channels=64, layers=2, dropout=0.5)
+    baseline_rng = torch.get_rng_state().clone()
+    torch.manual_seed(41)
+    model = FactorialNodeClassifier(3, 2, normalization=CONDITIONS[condition]["normalization"])
+    assert state_sha256(model) == state_sha256(baseline)
+    assert torch.equal(torch.get_rng_state(), baseline_rng)
+    assert list(model.state_dict()) == list(baseline.state_dict())
+    for name, expected in baseline.state_dict().items():
+        torch.testing.assert_close(model.state_dict()[name], expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("training", [False, True])
+def test_global_max_matches_baseline_forward_and_every_gradient(training):
+    torch.manual_seed(133)
+    graph = _graph()
+    baseline = ConductanceNodeClassifier(3, 2, hidden_channels=8, layers=2, dropout=0.5)
+    model = FactorialNodeClassifier(3, 2, hidden_channels=8, layers=2, dropout=0.5)
+    model.load_state_dict(baseline.state_dict())
+    baseline.train(training)
+    model.train(training)
+    torch.manual_seed(876)
+    expected = baseline(graph)
+    expected.square().sum().backward()
+    expected_rng = torch.get_rng_state().clone()
+    torch.manual_seed(876)
+    actual = model(graph)
+    actual.square().sum().backward()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.equal(expected_rng, torch.get_rng_state())
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(
+            parameter.grad, dict(baseline.named_parameters())[name].grad, rtol=0, atol=0
+        )
+
+
+def test_baseline_parameter_groups_preserve_actual_adam_step_exactly():
+    torch.manual_seed(190)
+    graph = _graph()
+    baseline = ConductanceNodeClassifier(3, 2, hidden_channels=8, layers=2, dropout=0)
+    model = FactorialNodeClassifier(3, 2, hidden_channels=8, layers=2, dropout=0)
+    model.load_state_dict(baseline.state_dict())
+    old_optimizer = torch.optim.Adam(
+        baseline.parameters(), lr=COMMON["lr"], weight_decay=COMMON["weight_decay"]
+    )
+    new_optimizer = make_optimizer(model, "baseline")
+    baseline(graph).square().mean().backward()
+    model(graph).square().mean().backward()
+    old_optimizer.step()
+    new_optimizer.step()
+    assert state_sha256(model) == state_sha256(baseline)
+
+
+@pytest.mark.parametrize("condition", CONDITIONS)
+def test_optimizer_changes_only_gate_decay_and_partitions_every_parameter(condition):
+    model = FactorialNodeClassifier(3, 2, hidden_channels=8)
+    optimizer = make_optimizer(model, condition)
+    lookup = {id(p): name for name, p in model.named_parameters()}
+    seen = []
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            seen.append(id(parameter))
+            gate = is_gate_parameter(lookup[id(parameter)])
+            expected = (
+                CONDITIONS[condition]["gate_weight_decay"] if gate else COMMON["weight_decay"]
+            )
+            assert group["weight_decay"] == expected
+            assert group["lr"] == COMMON["lr"]
+    assert len(seen) == len(set(seen)) == len(lookup)
+    assert set(seen) == set(lookup)
+
+
+def test_node_degree_matches_dense_formula_including_gate_denominator_gradients():
+    torch.manual_seed(17)
+    operator = FactorialConductanceConv(3, "node_degree")
+    reference = copy.deepcopy(operator)
+    state = torch.randn(5, 3, requires_grad=True)
+    ref_state = state.detach().clone().requires_grad_()
+    edges = torch.tensor([[0, 0, 1, 1], [1, 2, 2, 3]])
+    batch = torch.zeros(5, dtype=torch.long)
+    incidence = torch.zeros(4, 5)
+    incidence[torch.arange(4), edges[0]] = -1
+    incidence[torch.arange(4), edges[1]] = 1
+    difference = incidence @ ref_state
+    c = reference.estimator(difference, state.new_empty((4, 0)))
+    laplacian = incidence.T @ torch.diag(c) @ incidence
+    degree = laplacian.diag()
+    safe_degree = torch.where(degree > 0, degree, torch.ones_like(degree))
+    expected = ref_state - 0.95 * (laplacian @ ref_state) / safe_degree[:, None]
+    actual = operator(state, edges, batch, 1)
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+    weights = torch.randn_like(actual)
+    (actual * weights).sum().backward()
+    (expected * weights).sum().backward()
+    torch.testing.assert_close(state.grad, ref_state.grad, atol=2e-6, rtol=2e-5)
+    for parameter, ref_parameter in zip(operator.parameters(), reference.parameters(), strict=True):
+        torch.testing.assert_close(parameter.grad, ref_parameter.grad, atol=2e-6, rtol=2e-5)
+
+
+@pytest.mark.parametrize("normalization", ["global_max", "node_degree"])
+def test_orientation_constants_and_isolated_nodes(normalization):
+    torch.manual_seed(13)
+    operator = FactorialConductanceConv(3, normalization)
+    edges = torch.tensor([[0, 0, 1], [1, 2, 3]])
+    groups = torch.zeros(5, dtype=torch.long)
+    state = torch.randn(5, 3)
+    actual = operator(state, edges, groups, 1)
+    reversed_output = operator(state, edges.flip(0), groups, 1)
+    torch.testing.assert_close(actual, reversed_output, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(actual[4], state[4], rtol=0, atol=0)
+    constant = torch.ones_like(state) * 7
+    torch.testing.assert_close(operator(constant, edges, groups, 1), constant, rtol=0, atol=0)
+
+
+class _FixedConductance(torch.nn.Module):
+    def __init__(self, value):
+        super().__init__()
+        self.value = value
+
+    def forward(self, difference, features):
+        return difference.new_full((difference.shape[0],), self.value)
+
+
+@pytest.mark.parametrize("normalization", ["global_max", "node_degree"])
+def test_common_conductance_scale_still_cancels(normalization):
+    operator = FactorialConductanceConv(1, normalization)
+    state = torch.tensor([[1.0], [3.0], [7.0], [9.0]])
+    edges = torch.tensor([[0, 0], [1, 2]])
+    groups = torch.zeros(4, dtype=torch.long)
+    operator.estimator = _FixedConductance(0.5)
+    expected = operator(state, edges, groups, 1)
+    operator.estimator = _FixedConductance(2.0)
+    torch.testing.assert_close(operator(state, edges, groups, 1), expected, rtol=0, atol=0)
+
+
+def test_node_degree_is_row_normalized_not_symmetric_and_keeps_isolate():
+    operator = FactorialConductanceConv(1, "node_degree")
+    operator.estimator = _FixedConductance(1.0)
+    state = torch.tensor([[1.0], [3.0], [7.0], [9.0]])
+    edges = torch.tensor([[0, 0], [1, 2]])
+    actual = operator(state, edges, torch.zeros(4, dtype=torch.long), 1)
+    expected = torch.tensor([[0.05 + 0.95 * 5], [0.05 * 3 + 0.95], [0.05 * 7 + 0.95], [9]])
+    torch.testing.assert_close(actual, expected)
+    assert not torch.isclose(actual.sum(), state.sum())
+
+
+@pytest.mark.parametrize("normalization", ["global_max", "node_degree"])
+def test_edgeless_graph_identity(normalization):
+    operator = FactorialConductanceConv(2, normalization)
+    state = torch.randn(4, 2)
+    actual = operator(state, torch.empty((2, 0), dtype=torch.long), torch.zeros(4).long(), 1)
+    torch.testing.assert_close(actual, state, atol=0, rtol=0)
+
+
+def test_invalid_normalization_rejected():
+    with pytest.raises(ValueError, match="Unsupported normalization"):
+        FactorialConductanceConv(2, "detached_max")
+````
+
+# research/conductance_gat/tests/test_factorial_train.py
+
+````python
+"""Bounded fixture tests; never download data or run a CPU research experiment."""
+
+from __future__ import annotations
+
+import copy
+import json
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.ablation import train
+from research.conductance_gat.ablation.model import FactorialNodeClassifier, make_optimizer
+from research.conductance_gat.ablation.protocol import CONDITIONS
+
+
+class Graph(SimpleNamespace):
+    def to(self, device, **kwargs):
+        return Graph(
+            **{
+                name: value.to(device) if isinstance(value, torch.Tensor) else value
+                for name, value in vars(self).items()
+            }
+        )
+
+
+def fixture_graph():
+    return Graph(
+        x=torch.tensor([[0.5, 1.0, 2.0], [1.0, 2.0, 0.5], [2.0, 0.5, 1.0], [3.0, 1.0, 2.0]]),
+        y=torch.tensor([0, 1, 0, 999999]),
+        incidence_edge_index=torch.tensor([[0, 0, 1], [1, 2, 3]]),
+    )
+
+
+def args_for(tmp_path, condition="baseline"):
+    return train.build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            condition,
+            "--output-dir",
+            str(tmp_path / "arm"),
+            "--data-root",
+            str(tmp_path / "data"),
+        ]
+    )
+
+
+def test_parser_one_seed_gpu_fixed_architecture_no_download_flags(tmp_path):
+    args = args_for(tmp_path)
+    config = train.configuration(args)
+    assert args.model_seed == 0 and args.device == "cuda"
+    assert args.epochs == 200 and args.patience == 50 and args.batch_size == 2
+    assert config["hidden_channels"] == 64 and config["layers"] == 2
+    assert config["dropout"] == 0.5 and config["lr"] == 0.005
+    assert config["amp"] is config["compile"] is config["tf32"] is False
+    assert "allow_download" not in vars(args)
+
+
+def test_direct_training_rejects_cpu_before_loading_or_mutating(tmp_path):
+    with pytest.raises(RuntimeError, match="CUDA GPU"):
+        train.train_model({}, {}, args_for(tmp_path), torch.device("cpu"), tmp_path / "arm")
+    assert not (tmp_path / "arm").exists()
+
+
+def test_cli_rejects_cpu_without_outputs(tmp_path):
+    with pytest.raises(RuntimeError, match="CUDA GPU"):
+        train.main(
+            [
+                "--dataset",
+                "cora",
+                "--condition",
+                "baseline",
+                "--output-dir",
+                str(tmp_path / "arm"),
+                "--device",
+                "cpu",
+            ]
+        )
+    assert not (tmp_path / "arm").exists()
+
+
+@pytest.mark.parametrize("option", ["--epochs", "--patience", "--batch-size"])
+def test_nonpositive_budgets_rejected_before_cuda(tmp_path, option):
+    with pytest.raises(ValueError, match="must be positive"):
+        train.main(
+            [
+                "--dataset",
+                "cora",
+                "--condition",
+                "baseline",
+                "--output-dir",
+                str(tmp_path / "arm"),
+                option,
+                "0",
+            ]
+        )
+
+
+def test_train_loss_reads_only_mask_labels_and_backprops_only_train_logits():
+    graph = fixture_graph()
+    logits = torch.randn(4, 2, requires_grad=True)
+    indices = torch.tensor([0, 1])
+    loss, count = train.training_loss(logits, graph, indices)
+    assert count == 2 and torch.isfinite(loss)
+    loss.backward()
+    assert torch.count_nonzero(logits.grad[2:]) == 0
+    assert torch.count_nonzero(logits.grad[:2]) > 0
+
+
+def test_multilabel_loss_counts_all_node_label_elements():
+    graph = Graph(y=torch.tensor([[0.0, 1.0], [1.0, 1.0], [0.0, 0.0]]))
+    logits = torch.randn(3, 2, requires_grad=True)
+    loss, count = train.training_loss(logits, graph, None)
+    assert count == 6
+    torch.testing.assert_close(
+        loss, torch.nn.functional.binary_cross_entropy_with_logits(logits, graph.y)
+    )
+
+
+class NoTestDict(dict):
+    def __getitem__(self, key):
+        if key == "test":
+            raise AssertionError("Test labels/split must never be read")
+        return super().__getitem__(key)
+
+
+def test_validation_ignores_poison_test_targets_and_restores_modes_rng():
+    torch.manual_seed(38)
+    model = FactorialNodeClassifier(3, 2, hidden_channels=8)
+    model.train()
+    model.norms[0].eval()
+    graph = fixture_graph()
+    splits = NoTestDict(train=torch.tensor([0, 1]), validation=torch.tensor([2]))
+    modes = [module.training for module in model.modules()]
+    rng = torch.get_rng_state().clone()
+    result = train.evaluate_validation(model, graph, splits, torch.device("cpu"))
+    assert result["metric"] in (0.0, 1.0)
+    assert result["split"] == "validation"
+    assert result["layers"][0]["conductance"]["count"] == 3
+    assert [module.training for module in model.modules()] == modes
+    assert torch.equal(torch.get_rng_state(), rng)
+    assert all(p.grad is None for p in model.parameters())
+
+
+@pytest.mark.parametrize("normalization", ["global_max", "node_degree"])
+def test_telemetry_preserves_training_outputs_gradients_adam_update_and_rng(normalization):
+    torch.manual_seed(387)
+    model = FactorialNodeClassifier(3, 2, hidden_channels=8, normalization=normalization)
+    reference = copy.deepcopy(model)
+    graph = fixture_graph()
+    optimizer = make_optimizer(model, "baseline")
+    ref_optimizer = make_optimizer(reference, "baseline")
+    torch.manual_seed(200)
+    expected = reference(graph)
+    ref_loss, _ = train.training_loss(expected, graph, torch.tensor([0, 1]))
+    ref_loss.backward()
+    ref_optimizer.step()
+    reference_rng = torch.get_rng_state().clone()
+    torch.manual_seed(200)
+    with train.ForwardObservation(model) as observation:
+        actual = model(graph)
+    loss, _ = train.training_loss(actual, graph, torch.tensor([0, 1]))
+    loss.backward()
+    saved_gradients = {name: p.grad.clone() for name, p in model.named_parameters()}
+    report = train.gradient_observation(model, "baseline")
+    assert report["operators.0"]["weight_decay"] == 0.0005
+    for name, p in model.named_parameters():
+        torch.testing.assert_close(p.grad, saved_gradients[name], atol=0, rtol=0)
+    optimizer.step()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert torch.equal(torch.get_rng_state(), reference_rng)
+    assert train.state_sha256(model) == train.state_sha256(reference)
+    assert observation.summary()[0]["rho"]["count"] == 4
+    assert not any(op._forward_hooks or op.estimator._forward_hooks for op in model.operators)
+
+
+def test_observation_hooks_restore_after_exception():
+    model = FactorialNodeClassifier(3, 2, hidden_channels=8)
+    with pytest.raises(RuntimeError, match="injected"):
+        with train.ForwardObservation(model):
+            raise RuntimeError("injected")
+    assert not any(op._forward_hooks or op.estimator._forward_hooks for op in model.operators)
+
+
+def test_zero_decay_ratio_is_null_not_clamped():
+    model = FactorialNodeClassifier(3, 2, hidden_channels=8)
+    graph = fixture_graph()
+    loss, _ = train.training_loss(model(graph), graph, torch.tensor([0, 1]))
+    loss.backward()
+    result = train.gradient_observation(model, "gate_no_wd")
+    gate = result["operators.0"]
+    assert gate["task_gradient_norm"] > 0
+    assert gate["decay_term_norm"] == 0
+    assert gate["task_to_decay_ratio"] is None
+    assert gate["ratio_policy"] == "undefined_zero_decay_norm"
+    assert result["non_gate"]["weight_decay"] == 0.0005
+
+
+def test_moments_exact_values_and_quantile_sampling_policy():
+    stats = train._moments(torch.tensor([1.0, 2.0, 3.0]))
+    assert stats["mean"] == 2.0
+    assert stats["std"] == pytest.approx((2 / 3) ** 0.5)
+    assert stats["cv"] == pytest.approx((2 / 3) ** 0.5 / 2)
+    assert stats["quantiles"]["p50"] == 2.0
+    large = train._moments(torch.ones(9000))
+    assert large["cv"] == 0 and large["count"] == 9000
+    assert large["quantile_sample_count"] == 4096
+    assert large["quantile_policy"] == "deterministic_evenly_spaced_sample"
+    with pytest.raises(RuntimeError, match="Non-finite"):
+        train._moments(torch.tensor([float("nan")]))
+
+
+def test_pooled_moments_include_between_graph_variation():
+    values = [torch.tensor([1.0, 1.0]), torch.tensor([3.0, 3.0, 3.0])]
+    records = [train._moments(value) for value in values]
+    pooled = train._pooled_moments(records)
+    expected = train._moments(torch.cat(values))
+    assert pooled["mean"] == expected["mean"]
+    assert pooled["std"] == pytest.approx(expected["std"])
+    assert pooled["cv"] > 0 and all(record["cv"] == 0 for record in records)
+
+
+def _install_fake_pyg(monkeypatch):
+    modules = {
+        name: ModuleType(name)
+        for name in ("torch_geometric", "torch_geometric.data", "torch_geometric.loader")
+    }
+    modules["torch_geometric.data"].Data = Graph
+    created = []
+
+    class Loader:
+        def __init__(self, graphs, **kwargs):
+            self.graphs = graphs
+            self.kwargs = kwargs
+            created.append(self)
+
+    modules["torch_geometric.loader"].DataLoader = Loader
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return created
+
+
+def test_loaders_construct_only_train_validation_never_test(monkeypatch, tmp_path):
+    loaders = _install_fake_pyg(monkeypatch)
+    args = args_for(tmp_path)
+    payload = {
+        "dataset": "ppi",
+        "graphs": [{"graph_id": i} for i in range(5)],
+        "splits": NoTestDict(train=[0, 1], validation=[2, 3], test=[4]),
+    }
+    data, indices = train._make_data(payload, args, torch.device("cpu"))
+    assert indices is None and set(data) == {"train", "validation"}
+    assert len(loaders) == 2
+    assert [g.graph_id for loader in loaders for g in loader.graphs] == [0, 1, 2, 3]
+    assert loaders[0].kwargs["shuffle"] is True
+    assert loaders[1].kwargs["shuffle"] is False
+    assert loaders[0].kwargs["generator"] is not loaders[1].kwargs["generator"]
+
+
+@pytest.mark.parametrize("condition", CONDITIONS)
+def test_checkpoint_is_tagged_and_contains_normalization_provenance(tmp_path, condition):
+    args = args_for(tmp_path, condition)
+    model = FactorialNodeClassifier(
+        3, 2, hidden_channels=64, normalization=CONDITIONS[condition]["normalization"]
+    )
+    saved = train.checkpoint_payload(model, args, {"data_sha256": "a" * 64}, "b" * 64, 7, 0.4, 70)
+    assert saved["model"] == saved["research_suite"] == "conductance_factorial"
+    assert saved["architecture"]["normalization"] == CONDITIONS[condition]["normalization"]
+    assert saved["test_evaluated"] is False
+    assert saved["optimizer_steps"] == 70
+    assert saved["cache_sha256"] == "a" * 64
+
+
+def test_main_missing_offline_cache_records_failure_without_training(monkeypatch, tmp_path):
+    monkeypatch.setattr(train, "_require_cuda", lambda device: None)
+    seen = {}
+
+    def missing(name, root, *, allow_download):
+        seen.update(name=name, root=root, allow_download=allow_download)
+        raise FileNotFoundError("official cache missing")
+
+    monkeypatch.setattr(train, "load_dataset", missing)
+    monkeypatch.setattr(train, "train_model", lambda *a: pytest.fail("Training must not begin"))
+    args = args_for(tmp_path)
+    with pytest.raises(FileNotFoundError, match="official cache missing"):
+        train.main(
+            [
+                "--dataset",
+                "cora",
+                "--condition",
+                "baseline",
+                "--output-dir",
+                str(args.output_dir),
+                "--data-root",
+                str(args.data_root),
+            ]
+        )
+    record = json.loads((args.output_dir / "metrics.json").read_text())
+    assert record["status"] == "failed" and record["test_evaluated"] is False
+    assert seen["allow_download"] is False
+
+
+def test_nonempty_output_rejected_without_overwrite(monkeypatch, tmp_path):
+    monkeypatch.setattr(train, "_require_cuda", lambda device: None)
+    directory = tmp_path / "arm"
+    directory.mkdir()
+    keep = directory / "existing.pt"
+    keep.write_bytes(b"preserve")
+    with pytest.raises(FileExistsError):
+        train.main(["--dataset", "cora", "--condition", "baseline", "--output-dir", str(directory)])
+    assert keep.read_bytes() == b"preserve"
+
+
+def test_fixture_training_loop_writes_selected_validation_only_artifacts(monkeypatch, tmp_path):
+    # Explicit CUDA API stubs only for this four-node loop integration test.
+    # Production train_model and CLI remain strictly GPU-only (tested above).
+    monkeypatch.setattr(train, "_require_cuda", lambda device: None)
+    monkeypatch.setattr(train, "_configure_fp32", lambda: None)
+    for name in ("reset_peak_memory_stats", "synchronize"):
+        monkeypatch.setattr(torch.cuda, name, lambda *a: None)
+    for name in ("max_memory_allocated", "max_memory_reserved"):
+        monkeypatch.setattr(torch.cuda, name, lambda *a: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *a: "fixture_not_a_gpu")
+    graph = fixture_graph()
+    splits = NoTestDict(train=torch.tensor([0, 1]), validation=torch.tensor([2]))
+    monkeypatch.setattr(train, "_make_data", lambda *a: (graph, splits))
+    args = args_for(tmp_path)
+    args.epochs = 3
+    args.patience = 2
+    args.output_dir.mkdir()
+    payload = {"graphs": [vars(graph)], "classes": 2, "dataset": "cora"}
+    result = train.train_model(
+        payload, {"data_sha256": "f" * 64}, args, torch.device("cpu"), args.output_dir
+    )
+    assert result["status"] == "passed" and result["test_evaluated"] is False
+    assert "test" not in result
+    assert result["best_epoch"] >= 1
+    assert result["optimizer_steps"] == result["epochs_run"]
+    assert result["best_checkpoint_optimizer_steps"] == result["best_epoch"]
+    assert Path(result["checkpoint"]).is_file() and Path(result["history"]).is_file()
+    saved = torch.load(result["checkpoint"], weights_only=True)
+    assert saved["research_suite"] == "conductance_factorial"
+    trajectory = result["diagnostics"]["train_trajectory"]
+    assert len(trajectory) == result["epochs_run"]
+    assert [r["optimizer_steps_before_batch"] for r in trajectory] == list(range(len(trajectory)))
+    assert all(r["stage"] == "after_task_backward_before_optimizer_step" for r in trajectory)
+    assert len(result["initial_state_sha256"]) == 64
 ````
 
 # research/conductance_gat/tests/test_matched_benchmark.py
@@ -25336,6 +27532,362 @@ project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 exec bash "${project_root}/scripts/paper.sh" --suite benchmark "$@"
 ````
 
+# scripts/run_conductance_factorial.py
+
+````python
+#!/usr/bin/env python3
+"""Run four isolated Conductance conditions, one seed, on existing official data."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import math
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_json  # noqa: E402
+from research.conductance_gat.ablation.protocol import (  # noqa: E402
+    COMMON,
+    CONDITIONS,
+    DATASETS,
+    DEFAULT_DATASETS,
+)
+from scripts.check_dependencies import (  # noqa: E402
+    DependencyCheckError,
+    check_dependencies,
+    error_message,
+)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DEFAULT_DATASETS))
+    result.add_argument("--model-seed", type=int, default=0, help="One seed, not a seed list")
+    result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    result.add_argument("--results-root", type=Path, default=ROOT / "results")
+    result.add_argument("--run-id")
+    result.add_argument("--device", default="cuda")
+    result.add_argument("--epochs", type=int, default=200)
+    result.add_argument("--patience", type=int, default=50)
+    result.add_argument(
+        "--batch-size", type=int, default=2, help="PPI only; shared across conditions"
+    )
+    result.add_argument("--workers", type=int, default=0)
+    result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument(
+        "--dry-run", action="store_true", help="Print the plan without GPU or writes"
+    )
+    return result
+
+
+def _validate(args: argparse.Namespace) -> None:
+    if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
+        raise ValueError("CUDA is required; CPU training/fallback is not supported")
+    if args.model_seed < 0 or args.workers < 0:
+        raise ValueError("model seed and workers must be nonnegative")
+    if min(args.epochs, args.patience, args.batch_size) < 1:
+        raise ValueError("epochs, patience and batch size must be positive")
+    if len(set(args.datasets)) != len(args.datasets):
+        raise ValueError("duplicate datasets are not allowed")
+    if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
+        raise ValueError("minimum free GPU memory must be finite and nonnegative")
+    if args.run_id is not None and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}", args.run_id
+    ):
+        raise ValueError("run ID must be 1-120 letters, digits, underscores or hyphens")
+
+
+def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
+    jobs = []
+    for dataset in args.datasets:
+        for condition in CONDITIONS:
+            output = run_dir / dataset / condition
+            command = [
+                sys.executable,
+                "-B",
+                "-u",
+                "-m",
+                "research.conductance_gat.ablation.train",
+                "--dataset",
+                dataset,
+                "--condition",
+                condition,
+                "--output-dir",
+                str(output),
+                "--data-root",
+                str(args.data_root.expanduser().resolve()),
+                "--device",
+                args.device,
+                "--model-seed",
+                str(args.model_seed),
+                "--epochs",
+                str(args.epochs),
+                "--patience",
+                str(args.patience),
+                "--batch-size",
+                str(args.batch_size),
+                "--workers",
+                str(args.workers),
+            ]
+            jobs.append(
+                {
+                    "dataset": dataset,
+                    "condition": condition,
+                    "status": "pending",
+                    "output_dir": str(output),
+                    "metrics_path": str(output / "metrics.json"),
+                    "log_path": str(run_dir / "logs" / f"{dataset}--{condition}.log"),
+                    "command": command,
+                }
+            )
+    return jobs
+
+
+def _environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    entries = [str(ROOT / "src"), str(ROOT)]
+    if environment.get("PYTHONPATH"):
+        entries.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(entries)
+    environment["PYTHONUNBUFFERED"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return environment
+
+
+def run_logged(command: list[str], log: Path, environment: dict[str, str]) -> int:
+    """Stream child output; an interrupted parent terminates its own active child."""
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("x", encoding="utf-8", newline="\n") as stream:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                stream.write(line)
+                stream.flush()
+            return process.wait()
+        except BaseException:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+            raise
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+
+
+def _source_snapshot() -> dict[str, Any]:
+    files = sorted((ROOT / "research/conductance_gat/ablation").glob("*.py"))
+    files += [
+        ROOT / "research/conductance_gat" / name
+        for name in ("benchmark.py", "benchmark_data.py", "sparse.py")
+    ]
+    files += [
+        Path(__file__),
+        ROOT / "scripts/check_dependencies.py",
+        ROOT / "scripts/gpu_preflight.py",
+    ]
+    hashes = {
+        path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in files
+    }
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        revision = None
+    return {
+        "git_revision": revision,
+        "sha256": hashes,
+        "note": "File hashes describe executed sources, including uncommitted edits.",
+    }
+
+
+def _comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    from research.conductance_gat.ablation.report import write_comparison
+
+    return write_comparison(run_dir, manifest)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        _validate(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    run_id = args.run_id or "factorial-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    run_dir = args.results_root.expanduser().resolve() / "conductance_gat/ablations" / run_id
+    data_root = args.data_root.expanduser().resolve()
+    if run_dir == data_root or run_dir.is_relative_to(data_root):
+        print("Experiment outputs must be outside the dataset directory", file=sys.stderr)
+        return 2
+    jobs = make_jobs(args, run_dir)
+    if args.dry_run:
+        print(f"One model seed: {args.model_seed}; {len(jobs)} fresh trainings; validation only")
+        for job in jobs:
+            print(shlex.join(job["command"]))
+        print(f"Comparison: {run_dir / 'comparison.md'}")
+        return 0
+    if run_dir.exists():
+        print(f"Run already exists; use a new run ID: {run_dir}", file=sys.stderr)
+        return 2
+    try:
+        dependency_report = check_dependencies()
+    except DependencyCheckError as exc:
+        print(error_message(exc), file=sys.stderr)
+        return exc.exit_code
+    run_dir.mkdir(parents=True, exist_ok=False)
+    common_config = {
+        **COMMON,
+        **{
+            key: getattr(args, key)
+            for key in (
+                "datasets",
+                "model_seed",
+                "epochs",
+                "patience",
+                "batch_size",
+                "workers",
+                "device",
+            )
+        },
+        "data_root": str(data_root),
+    }
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "suite": "conductance_factorial",
+        "run_id": run_id,
+        "status": "running",
+        "source_integrity_valid": True,
+        "config": common_config,
+        "conditions": CONDITIONS,
+        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "jobs": jobs,
+        "dependencies": dependency_report,
+        "sources": _source_snapshot(),
+        "protocol": {
+            "selection": "best validation per condition; identical early-stopping policy",
+            "test": "not evaluated: exploratory train/validation comparison",
+            "initialization": "reset same model seed before every condition; verify state hash",
+            "data": "existing official caches only; same cache hash for each dataset's four arms",
+            "factor_order": list(CONDITIONS),
+            "normalization": (
+                "row node-degree preconditioning is a distinct operator, not a speed optimization"
+            ),
+            "uncertainty": (
+                "one seed; no seed standard deviation, CI, significance or population claim"
+            ),
+            "reproducibility": "same seeds, not guaranteed bitwise CUDA scatter determinism",
+        },
+    }
+    manifest_path = run_dir / "manifest.json"
+    atomic_write_json(manifest_path, manifest)
+    environment = _environment()
+    current_job = None
+    try:
+        _comparison(run_dir, manifest)
+        preflight = [
+            sys.executable,
+            "-B",
+            str(ROOT / "scripts/gpu_preflight.py"),
+            "--device",
+            args.device,
+            "--require-paper-deps",
+            "--min-free-gb",
+            str(args.min_free_gb),
+            "--json-out",
+            str(run_dir / "gpu-preflight.json"),
+        ]
+        status = run_logged(preflight, run_dir / "logs/preflight.log", environment)
+        if status != 0:
+            raise RuntimeError(f"GPU preflight failed with exit code {status}")
+        print(f"Run: {run_id}; seed {args.model_seed}; {len(jobs)} fresh trainings", flush=True)
+        for index, job in enumerate(jobs, start=1):
+            current_job = job
+            if _source_snapshot()["sha256"] != manifest["sources"]["sha256"]:
+                manifest["source_integrity_valid"] = False
+                raise RuntimeError(
+                    "Experiment source changed during the run; refusing mixed revisions"
+                )
+            job["status"] = "running"
+            atomic_write_json(manifest_path, manifest)
+            print(f"\n[{index}/{len(jobs)}] {job['dataset']} / {job['condition']}", flush=True)
+            started = time.monotonic()
+            status = run_logged(job["command"], Path(job["log_path"]), environment)
+            job["elapsed_seconds"] = time.monotonic() - started
+            job["exit_code"] = status
+            if status != 0:
+                raise RuntimeError(
+                    f"{job['dataset']}/{job['condition']} failed with exit code {status}"
+                )
+            if not Path(job["metrics_path"]).is_file():
+                raise RuntimeError(f"Child returned without metrics: {job['metrics_path']}")
+            job["status"] = "passed"
+            atomic_write_json(manifest_path, manifest)
+            _comparison(run_dir, manifest)
+            current_job = None
+        if _source_snapshot()["sha256"] != manifest["sources"]["sha256"]:
+            manifest["source_integrity_valid"] = False
+            raise RuntimeError("Experiment source changed during the run; refusing mixed revisions")
+        manifest["status"] = "passed"
+        manifest["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+        _comparison(run_dir, manifest)
+    except (Exception, KeyboardInterrupt) as exc:
+        manifest["status"] = "failed"
+        manifest["error"] = f"{type(exc).__name__}: {exc}"
+        manifest["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+        if current_job is not None:
+            current_job["status"] = "failed"
+            current_job["error"] = manifest["error"]
+        atomic_write_json(manifest_path, manifest)
+        try:
+            _comparison(run_dir, manifest)
+        except (ValueError, OSError) as report_error:
+            print(f"Comparison integrity error: {report_error}", file=sys.stderr)
+        print(f"Failed: {manifest['error']}\nSaved partial results: {run_dir}", file=sys.stderr)
+        return 130 if isinstance(exc, KeyboardInterrupt) else 1
+    atomic_write_json(manifest_path, manifest)
+    print((run_dir / "comparison.md").read_text(encoding="utf-8"), flush=True)
+    print(f"Comparison: {run_dir / 'comparison.md'}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # scripts/run_paper.py
 
 ````python
@@ -29236,6 +31788,753 @@ def test_training_help_and_dry_run_never_bootstrap_dependencies(
         "scripts/run_paper.py",
         *arguments,
     ]
+````
+
+# tests/test_conductance_factorial_report.py
+
+````python
+from __future__ import annotations
+
+import copy
+import csv
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+from research.conductance_gat.ablation.protocol import CONDITIONS
+from research.conductance_gat.ablation.report import (
+    ComparisonIntegrityError,
+    main,
+    write_comparison,
+)
+
+
+def _write_json(path: Path, payload: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _fixture(tmp_path: Path, datasets: tuple[str, ...] = ("ppi",)) -> tuple[Path, dict]:
+    root = tmp_path / "factorial"
+    root.mkdir()
+    common = {
+        "model_seed": 0,
+        "datasets": list(datasets),
+        "epochs": 100,
+        "patience": 20,
+        "batch_size": 2,
+        "workers": 0,
+        "device": "cuda",
+        "data_root": str(tmp_path / "data"),
+        "hidden_channels": 64,
+        "layers": 2,
+        "dropout": 0.5,
+        "lr": 0.005,
+        "weight_decay": 0.0005,
+        "amp": False,
+        "compile": False,
+    }
+    configuration = {
+        key: value for key, value in common.items() if key not in {"datasets", "data_root"}
+    } | {"tf32": False, "pin_memory": True}
+    manifest = {
+        "schema_version": 1,
+        "suite": "conductance_factorial",
+        "status": "passed",
+        "config": common,
+        "jobs": [],
+    }
+    scores = (0.5, 0.6, 0.7, 0.9)
+    for dataset_index, dataset in enumerate(datasets):
+        for index, (condition, factors) in enumerate(CONDITIONS.items()):
+            output = root / dataset / condition
+            metrics_path = output / "metrics.json"
+            metrics = {
+                "schema_version": 1,
+                "research_suite": "conductance_factorial",
+                "status": "passed",
+                "dataset": dataset,
+                "condition": condition,
+                "model_seed": 0,
+                "normalization": factors["normalization"],
+                "gate_weight_decay": factors["gate_weight_decay"],
+                "non_gate_weight_decay": 0.0005,
+                "configuration": copy.deepcopy(configuration),
+                "cache_sha256": hashlib.sha256(dataset.encode()).hexdigest(),
+                "protocol": {"dataset": dataset, "split_seed": 0, "source": "official"},
+                "initial_state_sha256": hashlib.sha256(f"init-{dataset}".encode()).hexdigest(),
+                "best_epoch": 10 + index,
+                "epochs_run": 30 + index,
+                "validation": scores[index] - dataset_index * 0.1,
+                "metric_name": "micro_f1" if dataset == "ppi" else "accuracy",
+                "train_loss": 0.7,
+                "checkpoint": str(output / "checkpoint.pt"),
+                "checkpoint_sha256": hashlib.sha256(b"unit-fixture-no-model").hexdigest(),
+                "history": str(output / "history.json"),
+                "history_sha256": hashlib.sha256(b"[]").hexdigest(),
+                "elapsed_seconds": 10.0 + index,
+                "peak_cuda_allocated_bytes": 4096,
+                "evaluation_split": "validation",
+                "test_evaluated": False,
+                "diagnostics": {"final_validation": {"mean_rho": 0.5 + 0.1 * index}},
+            }
+            _write_json(metrics_path, metrics)
+            (output / "checkpoint.pt").write_bytes(b"unit-fixture-no-model")
+            _write_json(output / "history.json", [])
+            manifest["jobs"].append(
+                {
+                    "dataset": dataset,
+                    "condition": condition,
+                    "status": "passed",
+                    "output_dir": str(output),
+                    "metrics_path": str(metrics_path),
+                }
+            )
+    _write_json(root / "manifest.json", manifest)
+    return root, manifest
+
+
+def _edit_child(manifest: dict, index: int, edit) -> None:
+    path = Path(manifest["jobs"][index]["metrics_path"])
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    edit(metrics)
+    _write_json(path, metrics)
+
+
+def test_complete_comparison_has_paired_factor_effects_and_interaction(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    report = write_comparison(root, manifest)
+    assert report["status"] == "passed"
+    assert report["complete"] is True
+    assert report["n_model_seeds"] == 1
+    assert report["uncertainty_status"] == "not_estimated_single_seed"
+    effects = report["datasets"][0]["effects"]
+    expected = {
+        "gate_effect_at_global_max": 0.1,
+        "normalization_effect_with_gate_wd": 0.2,
+        "gate_effect_at_node_degree": 0.2,
+        "normalization_effect_without_gate_wd": 0.3,
+        "interaction": 0.1,
+    }
+    for key, delta in expected.items():
+        assert effects[key]["score_delta"] == pytest.approx(delta)
+        assert effects[key]["percentage_points"] == pytest.approx(100.0 * delta)
+    baseline = report["datasets"][0]["conditions"][0]
+    assert baseline["delta_from_baseline"]["score_delta"] == 0.0
+    assert json.loads((root / "comparison.json").read_text(encoding="utf-8")) == report
+    markdown = (root / "comparison.md").read_text(encoding="utf-8")
+    assert "n=1" in markdown and "test not evaluated" in markdown
+    assert "uniform conductance rescaling still cancels" in markdown
+    assert "50.000000" in markdown and "+10.000000" in markdown
+    assert not {"sample_std", "confidence_interval", "p_value"}.intersection(effects)
+    with (root / "comparison.csv").open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 9
+    assert [row["row_type"] for row in rows].count("condition") == 4
+    assert [row["row_type"] for row in rows].count("contrast") == 5
+
+
+def test_datasets_keep_separate_metrics_and_no_cross_dataset_mean(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path, ("ppi", "ogbn-arxiv"))
+    report = write_comparison(root, manifest)
+    assert [(row["dataset"], row["metric_name"]) for row in report["datasets"]] == [
+        ("ppi", "micro_f1"),
+        ("ogbn-arxiv", "accuracy"),
+    ]
+    assert report["datasets"][0]["conditions"][0]["validation"] == 0.5
+    assert report["datasets"][1]["conditions"][0]["validation"] == 0.4
+    assert "mean" not in report and "pooled" not in report
+
+
+@pytest.mark.parametrize("job_status", ["pending", "running", "failed"])
+def test_partial_comparison_has_no_fabricated_deltas(tmp_path: Path, job_status: str) -> None:
+    root, manifest = _fixture(tmp_path)
+    manifest["status"] = "failed" if job_status == "failed" else "running"
+    manifest["jobs"][3]["status"] = job_status
+    manifest["jobs"][3]["error"] = "CUDA OOM" if job_status == "failed" else None
+    report = write_comparison(root, manifest)
+    assert report["status"] == ("failed" if job_status == "failed" else "running")
+    assert report["complete"] is False
+    assert report["datasets"][0]["effects"] is None
+    assert all(row["delta_from_baseline"] is None for row in report["datasets"][0]["conditions"])
+    assert report["datasets"][0]["conditions"][3]["validation"] is None
+    assert "Contrasts withheld" in (root / "comparison.md").read_text(encoding="utf-8")
+
+
+def test_missing_matrix_job_is_explicit_and_prevents_completion(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    manifest["status"] = "running"
+    manifest["jobs"].pop()
+    report = write_comparison(root, manifest)
+    assert report["datasets"][0]["conditions"][-1]["status"] == "missing"
+    assert report["complete"] is False and report["datasets"][0]["effects"] is None
+    manifest["status"] = "passed"
+    with pytest.raises(ComparisonIntegrityError, match="complete four-condition matrix"):
+        write_comparison(root, manifest)
+
+
+def test_source_change_invalidates_completed_contrasts(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path, ("ppi", "ogbn-arxiv"))
+    write_comparison(root, manifest)
+    manifest["status"] = "failed"
+    manifest["source_integrity_valid"] = False
+    with pytest.raises(ComparisonIntegrityError, match="Source integrity failed") as caught:
+        write_comparison(root, manifest)
+    assert caught.value.report["source_integrity_valid"] is False
+    assert all(dataset["effects"] is None for dataset in caught.value.report["datasets"])
+    assert all(
+        row["delta_from_baseline"] is None
+        for dataset in caught.value.report["datasets"]
+        for row in dataset["conditions"]
+    )
+
+
+def test_ordinary_job_failure_keeps_independent_completed_dataset_contrasts(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path, ("ppi", "ogbn-arxiv"))
+    manifest["status"] = "failed"
+    manifest["source_integrity_valid"] = True
+    manifest["jobs"][-1]["status"] = "failed"
+    report = write_comparison(root, manifest)
+    assert report["status"] == "failed" and report["complete"] is False
+    assert report["datasets"][0]["effects"] is not None
+    assert report["datasets"][1]["effects"] is None
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("dataset", "cora", "dataset mismatch"),
+        ("model_seed", 1, "model_seed mismatch"),
+        ("normalization", "global_max", "normalization mismatch"),
+        ("gate_weight_decay", 0.0005, "gate_weight_decay mismatch"),
+        ("non_gate_weight_decay", 0.0, "non_gate_weight_decay mismatch"),
+        ("metric_name", "accuracy", "metric_name mismatch"),
+        ("test_evaluated", True, "test_evaluated mismatch"),
+        ("evaluation_split", "test", "evaluation_split mismatch"),
+        ("schema_version", True, "schema_version mismatch"),
+        ("status", "running", "status mismatch"),
+        ("cache_sha256", "f" * 64, "held-fixed cache_sha256"),
+        ("initial_state_sha256", "e" * 64, "held-fixed initial_state_sha256"),
+        ("protocol", {"split_seed": 1}, "held-fixed protocol"),
+        ("cache_sha256", "not-a-digest", "must be a SHA-256 digest"),
+        ("validation", 50.0, "score in"),
+        ("validation", True, "finite number"),
+        ("best_epoch", 35, "epoch budget"),
+        ("best_epoch", 0, "integer >= 1"),
+        ("epochs_run", 101, "epoch budget"),
+        ("train_loss", -1.0, "cannot be negative"),
+    ],
+)
+def test_mismatched_child_metadata_fails_closed(
+    tmp_path: Path, key: str, value: object, message: str
+) -> None:
+    root, manifest = _fixture(tmp_path)
+    write_comparison(root, manifest)  # Ensure invalid output replaces a prior successful report.
+    _edit_child(manifest, 3, lambda child: child.update({key: value}))
+    with pytest.raises(ComparisonIntegrityError, match=message) as caught:
+        write_comparison(root, manifest)
+    report = caught.value.report
+    assert report["status"] == "invalid"
+    assert report["complete"] is False
+    assert report["datasets"][0]["effects"] is None
+    assert all(row["delta_from_baseline"] is None for row in report["datasets"][0]["conditions"])
+    saved = json.loads((root / "comparison.json").read_text(encoding="utf-8"))
+    assert saved["status"] == "invalid"
+    assert "Integrity errors" in (root / "comparison.md").read_text(encoding="utf-8")
+
+
+def test_training_configuration_must_match_manifest_and_other_children(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    _edit_child(manifest, 1, lambda child: child["configuration"].update({"lr": 0.1}))
+    with pytest.raises(ComparisonIntegrityError, match="configuration.lr differs from manifest"):
+        write_comparison(root, manifest)
+    _edit_child(manifest, 1, lambda child: child["configuration"].update({"lr": 0.005}))
+    _edit_child(manifest, 1, lambda child: child["configuration"].update({"pin_memory": False}))
+    with pytest.raises(ComparisonIntegrityError, match="held-fixed configuration"):
+        write_comparison(root, manifest)
+
+
+def test_nonfinite_score_is_rejected_and_invalid_report_is_valid_json(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    _edit_child(manifest, 2, lambda child: child.update(validation=float("nan")))
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+    saved = json.loads((root / "comparison.json").read_text(encoding="utf-8"))
+    assert saved["status"] == "invalid"
+    assert saved["datasets"][0]["conditions"][2]["validation"] is None
+
+
+def test_nonfinite_extra_metadata_fails_closed(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    _edit_child(
+        manifest,
+        2,
+        lambda child: child["configuration"].update({"extra_value": float("inf")}),
+    )
+    with pytest.raises(ComparisonIntegrityError, match="nonfinite JSON value"):
+        write_comparison(root, manifest)
+    saved = json.loads((root / "comparison.json").read_text(encoding="utf-8"))
+    assert saved["status"] == "invalid" and saved["datasets"][0]["effects"] is None
+
+
+def test_manifest_cannot_redefine_fixed_nonfactor_hyperparameters(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    manifest["config"]["hidden_channels"] = 128
+    for index in range(4):
+        _edit_child(
+            manifest,
+            index,
+            lambda child: child["configuration"].update({"hidden_channels": 128}),
+        )
+    with pytest.raises(ComparisonIntegrityError, match="hidden_channels must be 64"):
+        write_comparison(root, manifest)
+
+
+def test_duplicate_job_and_unknown_condition_are_rejected(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    manifest["jobs"].append(copy.deepcopy(manifest["jobs"][0]))
+    with pytest.raises(ComparisonIntegrityError, match="duplicate manifest job"):
+        write_comparison(root, manifest)
+    manifest["jobs"][-1]["condition"] = "undeclared-model"
+    with pytest.raises(ComparisonIntegrityError, match="unknown condition"):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize("field", ["output_dir", "metrics_path"])
+def test_manifest_artifact_paths_cannot_escape_run_root(tmp_path: Path, field: str) -> None:
+    root, manifest = _fixture(tmp_path)
+    outside = tmp_path / "outside" / "metrics.json"
+    _write_json(outside, {"untouched": True})
+    before = outside.read_bytes()
+    manifest["jobs"][1][field] = str(outside)
+    with pytest.raises(ComparisonIntegrityError, match="escapes"):
+        write_comparison(root, manifest)
+    assert outside.read_bytes() == before
+
+
+@pytest.mark.parametrize("field", ["checkpoint", "history"])
+def test_child_artifact_paths_cannot_escape_own_job(tmp_path: Path, field: str) -> None:
+    root, manifest = _fixture(tmp_path)
+    _edit_child(manifest, 1, lambda child: child.update({field: str(root / "other.bin")}))
+    with pytest.raises(ComparisonIntegrityError, match="escapes"):
+        write_comparison(root, manifest)
+
+
+def test_metrics_cannot_point_at_different_child_output(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    manifest["jobs"][1]["metrics_path"] = manifest["jobs"][0]["metrics_path"]
+    with pytest.raises(ComparisonIntegrityError, match="output_dir"):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize("field", ["checkpoint", "history"])
+def test_child_artifact_hash_must_match(tmp_path: Path, field: str) -> None:
+    root, manifest = _fixture(tmp_path)
+    metric_path = Path(manifest["jobs"][0]["metrics_path"])
+    artifact = Path(json.loads(metric_path.read_text(encoding="utf-8"))[field])
+    artifact.write_bytes(b"changed after training")
+    with pytest.raises(ComparisonIntegrityError, match=f"{field} SHA-256 mismatch"):
+        write_comparison(root, manifest)
+
+
+def test_report_destination_symlink_is_not_followed(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("unchanged", encoding="utf-8")
+    try:
+        (root / "comparison.json").symlink_to(outside)
+    except OSError:
+        pytest.skip("Creating symlinks requires OS support/Windows developer privilege")
+    with pytest.raises(ValueError, match="escapes|symlink"):
+        write_comparison(root, manifest)
+    assert outside.read_text(encoding="utf-8") == "unchanged"
+
+
+def test_report_symlink_guard_runs_before_any_writes_on_all_platforms(
+    tmp_path: Path, monkeypatch
+) -> None:
+    root, manifest = _fixture(tmp_path)
+    (root / "comparison.json").write_text("original", encoding="utf-8")
+    original = Path.is_symlink
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda path: path == root / "comparison.md" or original(path),
+    )
+    with pytest.raises(ValueError, match="report destinations must not be symlinks"):
+        write_comparison(root, manifest)
+    assert (root / "comparison.json").read_text(encoding="utf-8") == "original"
+    assert not (root / "comparison.csv").exists()
+
+
+def test_cli_regenerates_without_mutating_children_or_manifest(tmp_path: Path, capsys) -> None:
+    root, manifest = _fixture(tmp_path)
+    watched = [root / "manifest.json"] + [Path(job["metrics_path"]) for job in manifest["jobs"]]
+    before = {path: path.read_bytes() for path in watched}
+    original = copy.deepcopy(manifest)
+    assert main([str(root)]) == 0
+    assert "single-seed 2x2" in capsys.readouterr().out
+    assert {path: path.read_bytes() for path in watched} == before
+    assert manifest == original
+    assert main([str(root)]) == 0
+    assert {path: path.read_bytes() for path in watched} == before
+
+
+def test_cli_incomplete_run_returns_nonzero_not_success(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    manifest["status"] = "running"
+    manifest["jobs"][0]["status"] = "pending"
+    _write_json(root / "manifest.json", manifest)
+    assert main([str(root)]) == 2
+
+
+def test_different_early_stop_epochs_and_diagnostics_are_allowed(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    report = write_comparison(root, manifest)
+    conditions = report["datasets"][0]["conditions"]
+    assert len({condition["best_epoch"] for condition in conditions}) == 4
+    assert len({condition["epochs_run"] for condition in conditions}) == 4
+    assert conditions[1]["diagnostics"]["final_validation"]["mean_rho"] == 0.6
+
+
+def test_unknown_configuration_fields_are_not_silently_ignored(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    _edit_child(manifest, 1, lambda child: child["configuration"].update({"mystery_lr": 1.0}))
+    with pytest.raises(ComparisonIntegrityError, match="held-fixed configuration"):
+        write_comparison(root, manifest)
+
+
+def test_tf32_cannot_silently_be_enabled(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    for index in range(4):
+        _edit_child(manifest, index, lambda child: child["configuration"].update({"tf32": True}))
+    with pytest.raises(ComparisonIntegrityError, match="tf32 must explicitly be False"):
+        write_comparison(root, manifest)
+
+
+def test_diagnostics_average_within_graph_cv_not_pooled_or_edge_weighted(tmp_path: Path) -> None:
+    root, manifest = _fixture(tmp_path)
+    diagnostic = {
+        "best_validation": {
+            "split": "validation",
+            "mode": "eval",
+            "layers": [
+                {
+                    "layer": 0,
+                    "conductance": {"cv": 42.0},
+                    "rho": {"mean": 0.99},
+                    "relative_conv_change": 0.999,
+                    "graphs": [
+                        {
+                            "conductance": {"count": 1, "mean": 1.0, "cv": 0.2},
+                            "rho": {"count": 5, "mean": 0.1},
+                            "relative_conv_change": 0.2,
+                        },
+                        {
+                            "conductance": {"count": 100, "mean": 100.0, "cv": 0.8},
+                            "rho": {"count": 1000, "mean": 0.9},
+                            "relative_conv_change": 0.6,
+                        },
+                    ],
+                },
+                {
+                    "layer": 1,
+                    "conductance": {"cv": 0.95},
+                    "graphs": [
+                        {"conductance": {"mean": 1.0, "cv": 0.0}},
+                        {"conductance": {"mean": 100.0, "cv": 0.0}},
+                    ],
+                },
+            ],
+            "parameter_norms": {
+                "operators.0.estimator.network.0.weight": 3.0,
+                "operators.0.estimator.network.2.weight": 4.0,
+                "operators.1.estimator.network.0.weight": 1e-16,
+                "encoder.weight": 500.0,
+            },
+        }
+    }
+    _edit_child(manifest, 0, lambda child: child.update(diagnostics=diagnostic))
+    report = write_comparison(root, manifest)
+    summary = report["datasets"][0]["conditions"][0]["best_validation_diagnostics"]
+    assert summary[0]["conductance_cv"] == {"mean": 0.5, "valid_graph_count": 2}
+    assert summary[0]["rho_mean"]["mean"] == pytest.approx(0.5)
+    assert summary[0]["relative_conv_change"]["mean"] == pytest.approx(0.4)
+    assert summary[0]["gate_parameter_l2"] == 5.0
+    assert summary[0]["gate_parameter_tensor_count"] == 2
+    assert summary[1]["conductance_cv"]["mean"] == 0.0
+    assert summary[1]["rho_mean"]["mean"] is None
+    markdown = (root / "comparison.md").read_text(encoding="utf-8")
+    assert "within each graph before averaging" in markdown
+    assert "| baseline | 0 | 0.5 (2/2) | 0.5 (2/2) | 0.4 (2/2) | 5 |" in markdown
+    assert "1e-16" in markdown  # Small gate norms must not be rounded to an apparent zero.
+
+
+def test_missing_optional_diagnostics_are_unknown_not_zero_or_an_integrity_error(
+    tmp_path: Path,
+) -> None:
+    root, manifest = _fixture(tmp_path)
+    for index in range(4):
+        _edit_child(manifest, index, lambda child: child.pop("diagnostics"))
+    report = write_comparison(root, manifest)
+    assert report["status"] == "passed" and report["datasets"][0]["effects"] is not None
+    for condition in report["datasets"][0]["conditions"]:
+        for layer in condition["best_validation_diagnostics"]:
+            assert layer["graph_count"] == 0
+            assert layer["conductance_cv"]["mean"] is None
+            assert layer["rho_mean"]["mean"] is None
+            assert layer["relative_conv_change"]["mean"] is None
+            assert layer["gate_parameter_l2"] is None
+    assert "| baseline | 0 | — | — | — | — |" in (root / "comparison.md").read_text(
+        encoding="utf-8"
+    )
+````
+
+# tests/test_conductance_factorial_runner.py
+
+````python
+"""Orchestration contracts with stubbed subprocesses; never research training."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from scripts import run_conductance_factorial as runner
+
+
+def test_default_matrix_is_two_datasets_four_conditions_one_seed(tmp_path):
+    args = runner.parser().parse_args([])
+    jobs = runner.make_jobs(args, tmp_path)
+    assert args.datasets == ["ppi", "ogbn-arxiv"] and args.model_seed == 0
+    assert len(jobs) == 8
+    assert [job["condition"] for job in jobs[:4]] == list(runner.CONDITIONS)
+    for job in jobs:
+        command = job["command"]
+        assert command[command.index("--model-seed") + 1] == "0"
+        assert command[command.index("-m") + 1] == "research.conductance_gat.ablation.train"
+        assert "--allow-download" not in command and "--amp" not in command
+        assert Path(job["metrics_path"]).parent == Path(job["output_dir"])
+    assert len({job["output_dir"] for job in jobs}) == 8
+
+
+def test_single_seed_override_and_common_budget_apply_to_every_arm(tmp_path):
+    args = runner.parser().parse_args(
+        [
+            "--model-seed",
+            "7",
+            "--datasets",
+            "ppi",
+            "--epochs",
+            "120",
+            "--patience",
+            "30",
+            "--batch-size",
+            "3",
+            "--workers",
+            "2",
+        ]
+    )
+    jobs = runner.make_jobs(args, tmp_path)
+    assert len(jobs) == 4
+    for job in jobs:
+        command = job["command"]
+        for option, value in (
+            ("--model-seed", "7"),
+            ("--epochs", "120"),
+            ("--patience", "30"),
+            ("--batch-size", "3"),
+            ("--workers", "2"),
+        ):
+            assert command[command.index(option) + 1] == value
+
+
+@pytest.mark.parametrize("arguments", [["--help"], ["--dry-run"]])
+def test_inspection_requires_only_stdlib_and_writes_nothing(tmp_path, arguments):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            str(runner.ROOT / "scripts/run_conductance_factorial.py"),
+            "--results-root",
+            str(tmp_path),
+            *arguments,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--device", "cpu"],
+        ["--model-seed", "-1"],
+        ["--epochs", "0"],
+        ["--patience", "0"],
+        ["--workers", "-1"],
+        ["--datasets", "ppi", "ppi"],
+        ["--run-id", "../old"],
+        ["--run-id", "/tmp/old"],
+        ["--min-free-gb", "nan"],
+    ],
+)
+def test_invalid_inputs_stop_before_dependency_check(monkeypatch, options):
+    def forbidden():
+        pytest.fail("dependencies should not be checked")
+
+    monkeypatch.setattr(runner, "check_dependencies", forbidden)
+    assert runner.main(options) == 2
+
+
+def test_existing_run_is_untouched(tmp_path, monkeypatch):
+    output = tmp_path / "conductance_gat/ablations/existing"
+    output.mkdir(parents=True)
+    sentinel = output / "existing.pt"
+    sentinel.write_bytes(b"preserve")
+    monkeypatch.setattr(runner, "check_dependencies", lambda: pytest.fail("no dependency check"))
+    assert runner.main(["--results-root", str(tmp_path), "--run-id", "existing"]) == 2
+    assert sentinel.read_bytes() == b"preserve"
+
+
+def test_dataset_directory_cannot_contain_outputs(tmp_path):
+    assert (
+        runner.main(
+            [
+                "--results-root",
+                str(tmp_path),
+                "--data-root",
+                str(tmp_path),
+                "--dry-run",
+            ]
+        )
+        == 2
+    )
+
+
+def _stub_runtime(monkeypatch, tmp_path, *, failed_child=None, source_changes=False):
+    calls = []
+    comparisons = []
+    monkeypatch.setattr(runner, "check_dependencies", lambda: {"profile": "unit-stub"})
+    snapshots = 0
+
+    def snapshot():
+        nonlocal snapshots
+        snapshots += 1
+        return {"sha256": {"source.py": "changed" if source_changes and snapshots > 1 else "same"}}
+
+    def logged(command, log, environment):
+        calls.append(command)
+        assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+        if "gpu_preflight.py" in " ".join(command):
+            assert "--json-out" in command
+            return 0
+        condition = command[command.index("--condition") + 1]
+        if condition == failed_child:
+            return 9
+        output = Path(command[command.index("--output-dir") + 1])
+        output.mkdir(parents=True)
+        (output / "metrics.json").write_text("{}", encoding="utf-8")
+        return 0
+
+    def comparison(run_dir, manifest):
+        comparisons.append(json.loads(json.dumps(manifest)))
+        (run_dir / "comparison.md").write_text("unit-stub report\n", encoding="utf-8")
+        return {"status": manifest["status"]}
+
+    monkeypatch.setattr(runner, "_source_snapshot", snapshot)
+    monkeypatch.setattr(runner, "run_logged", logged)
+    monkeypatch.setattr(runner, "_comparison", comparison)
+    options = ["--results-root", str(tmp_path), "--run-id", "unit-contract", "--datasets", "ppi"]
+    return options, calls, comparisons
+
+
+def test_success_records_all_four_children_and_final_report(tmp_path, monkeypatch):
+    options, calls, comparisons = _stub_runtime(monkeypatch, tmp_path)
+    assert runner.main(options) == 0
+    assert len(calls) == 5  # One preflight, four independent processes.
+    final = comparisons[-1]
+    assert final["status"] == "passed"
+    assert all(job["status"] == "passed" for job in final["jobs"])
+    assert final["config"]["model_seed"] == 0
+    assert final["config"]["hidden_channels"] == 64
+    assert final["protocol"]["test"].startswith("not evaluated")
+
+
+def test_failed_child_stops_and_preserves_completed_arm(tmp_path, monkeypatch):
+    options, calls, comparisons = _stub_runtime(monkeypatch, tmp_path, failed_child="gate_no_wd")
+    assert runner.main(options) == 1
+    assert len(calls) == 3
+    final = comparisons[-1]
+    assert final["status"] == "failed"
+    assert [job["status"] for job in final["jobs"]] == ["passed", "failed", "pending", "pending"]
+    assert Path(final["jobs"][0]["metrics_path"]).is_file()
+    assert "exit code 9" in final["error"]
+
+
+def test_changing_sources_prevents_mixed_revision_training(tmp_path, monkeypatch):
+    options, calls, comparisons = _stub_runtime(monkeypatch, tmp_path, source_changes=True)
+    assert runner.main(options) == 1
+    assert len(calls) == 1  # Only preflight; no condition may run.
+    assert "source changed" in comparisons[-1]["error"]
+    assert comparisons[-1]["source_integrity_valid"] is False
+
+
+def test_source_change_after_last_child_marks_comparison_invalid(tmp_path, monkeypatch):
+    options, calls, comparisons = _stub_runtime(monkeypatch, tmp_path)
+    snapshots = 0
+
+    def snapshot():
+        nonlocal snapshots
+        snapshots += 1
+        return {"sha256": {"source.py": "changed" if snapshots == 6 else "same"}}
+
+    monkeypatch.setattr(runner, "_source_snapshot", snapshot)
+    assert runner.main(options) == 1
+    assert len(calls) == 5
+    assert comparisons[-1]["source_integrity_valid"] is False
+    assert comparisons[-1]["status"] == "failed"
+
+
+def test_preflight_failure_stops_all_training(tmp_path, monkeypatch):
+    options, _, comparisons = _stub_runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(runner, "run_logged", lambda *_: 3)
+    assert runner.main(options) == 1
+    assert all(job["status"] == "pending" for job in comparisons[-1]["jobs"])
+
+
+def test_integrity_error_cannot_be_marked_success(tmp_path, monkeypatch):
+    options, _, _ = _stub_runtime(monkeypatch, tmp_path)
+
+    def mismatch(run_dir, manifest):
+        if any(job["status"] == "passed" for job in manifest["jobs"]):
+            raise ValueError("initial state mismatch")
+        return {}
+
+    monkeypatch.setattr(runner, "_comparison", mismatch)
+    assert runner.main(options) == 1
+    manifest = json.loads(
+        (tmp_path / "conductance_gat/ablations/unit-contract/manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["status"] == "failed"
+    assert "initial state mismatch" in manifest["error"]
+
+
+def test_wrapper_uses_active_conda_and_independent_runner():
+    wrapper = (runner.ROOT / "research/conductance_gat/ablation/reproduce.sh").read_text()
+    assert 'source "${project_root}/scripts/conda_env.sh"' in wrapper
+    assert 'exec "${environment_python}" -B scripts/run_conductance_factorial.py "$@"' in wrapper
+    assert "setup_gpu.sh" not in wrapper and "run_paper.py" not in wrapper
 ````
 
 # tests/test_conductance_gate_audit.py

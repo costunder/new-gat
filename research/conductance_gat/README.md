@@ -1,5 +1,8 @@
 # Independent Research Track A: Sparse Incidence Conductance Attention
 
+Gate weight decay와 정규화의 2×2 원인 비교는 [별도 실험 폴더](ablation/README.md)에 있다.
+PPI·ogbn-arxiv에서 seed 0 하나로 4조건을 새로 학습하며, 아래 기존 benchmark는 변경하지 않는다.
+
 This directory is a self-contained executable paper track for
 
 \[

@@ -10,6 +10,42 @@
 
 ## 0. 리뷰어가 먼저 알아야 할 판정
 
+### 2026-08-31 후속 2×2 원인 분리 실험
+
+`research/conductance_gat/ablation/`에 기존 모델과 분리된 새 학습 경로를 추가했다.
+기본은 PPI/arxiv × baseline/gate_no_wd/node_degree/both × seed 0, 총 8개의 fresh training이다.
+실행은 `bash research/conductance_gat/ablation/reproduce.sh --run-id gat-factorial-seed0-v1`이다.
+기존 `benchmark.py` 모델·학습 함수와 기본 reproduce 경로는 변경하지 않았다.
+
+- WD 요인은 gate estimator의 weight/bias만 0.0005→0으로 바꾼다. 다른 파라미터는 기존 Adam
+  coupled decay 0.0005를 유지한다. normalization 요인은 global-max 대신 row node-degree
+  preconditioning `H-.95 D_C^dagger B^T C B H`를 쓴다. 분모 detach는 없다.
+- 변경 연산은 일반적으로 비대칭이며 보존 성질이 다르다. 두 정규화 모두 C의 공통 스케일을
+  소거한다. 변경군 rho=.95는 조작 확인값이지 gate 학습 성공의 증거가 아니다.
+- 같은 seed와 초기 state hash, cache hash, fixed config를 검증한다. 동일 early-stop 정책을
+  적용하되 실제 epoch/optimizer step 수가 다를 수 있으므로 모두 기록한다.
+- Train 정답으로 학습하고 validation으로 선택한다. Test 평가·외부 비교 모델·PE/트리 결합은 없다.
+  1-seed 차이에 CI, 표준편차, p-value 또는 seed 일반화 주장을 붙이지 않는다.
+- 각 조건을 별도 프로세스에서 순차 실행한다. 초깃값/최적/종료 validation 관찰과 실제 매 epoch의
+  첫 train batch에서 backward 후 Adam step 전 gradient·parameter·decay를 저장한다.
+  관찰용 추가 training forward/backward나 train loader iteration은 없다.
+- `scripts/run_conductance_factorial.py`는 CUDA/의존성 사전 검사, fresh path, 실행 중 소스
+  hash 변동 검사, 실패 중단·부분 보고서를 제공한다. 완료 시 `comparison.md/csv/json`에
+  4조건, 두 요인의 조건부 차이, 상호작용을 데이터셋별로 표시한다.
+- 모든 산출물은 `results/conductance_gat/ablations/<run-id>/`로 분리한다. 기존 checkpoint와
+  혼동하지 않도록 새 checkpoint model/research_suite은 `conductance_factorial`이다.
+  상세 실행·해석은 [실험 README](research/conductance_gat/ablation/README.md)를 따른다.
+
+이 2×2의 실제 GPU 학습 결과는 아직 없다. 아래에서 수령한 GPU 로그는 기존 checkpoint의
+읽기 전용 full audit이며, 새 조건의 재학습이나 개선 측정으로 재분류하지 않는다.
+
+구현 후 전체 회귀: **794 passed / 64 skipped** (31.83 s, exit 0), Ruff 통과.
+새 실험 관련 114개 검사가 포함된다. CUDA API를 모킹한 4노드 단위 fixture에서 실제 runner →
+4조건 train loop → checkpoint/history → SHA 검증 → 비교표의 연결도 확인했다. 이것은 공개
+데이터의 CPU 실험이나 GPU 학습이 아니다. 생략은 Linux/Bash 62개, 로컬 PyG 1개, Windows
+실제 symlink 권한 1개다. symlink 차단은 별도 mock 검사로 확인했다. 기존 Windows faulthandler
+`access violation` 출력은 있었으나 전체 검사는 exit 0으로 끝났다.
+
 ### 2026-08-31 단일 seed 기본값과 읽기 전용 확장 검사
 
 사용자 요청에 따라 향후 기본 model seed는 **0 하나**다. 기본 benchmark는 GAT 1개,
@@ -39,8 +75,9 @@ Cycle v1 1개, Tree CSL/ZINC 2개의 총 4개 child만 실행한다. 데이터 �
   보고하지 않는다. 명시적 여러 seed의 기존 통계는 유지한다.
 
 실행은 [진단 안내](docs/CONDUCTANCE_DIAGNOSTICS.md)를 따른다. 확장 검사와 단일 seed 변경은
-현재 소스 버전에 포함되며 이전 진단 전용 게시 commit에는 없었다. 새 확장 검사의 실제
-GPU 결과는 아직 없다.
+현재 소스 버전에 포함되며 이전 진단 전용 게시 commit에는 없었다. 이후 사용자가 제공한
+5e801c3 full-audit 로그에서 seed 0의 다섯 데이터셋 모두 passed를 확인했다. 실측값과 범위는
+[실험 상태](docs/EXPERIMENT_STATUS.md)의 확장 검사 절을 따른다.
 로컬 전체 회귀는 **680 passed / 63 skipped** (30.54 s, exit 0), 확장 진단 관련 3개 파일은
 **89 passed** (4.28 s)다. Windows faulthandler의 기존 `access violation` 경고가 출력됐으나
 검사는 위 결과와 exit 0으로 완료됐다. Linux/Bash 62개와 로컬 PyG 미설치 1개는 생략했으며,
@@ -373,9 +410,9 @@ Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 
 ### 코드 스냅샷
 
 - 파일: `code_summary.md`
-- 포함 파일: 133개
-- 크기: 1,295,476 bytes, 33,367 lines (`str.splitlines()` 기준)
-- SHA-256: `3C9515E92F2F9CC6EA01BB9A5FC063DF55EE85BA09FCBAD4CEC07352FAAD6AC8`
+- 포함 파일: 145개
+- 크기: 1,432,220 bytes, 36,666 lines (`str.splitlines()` 기준)
+- SHA-256: `ECF263C7B5DA83D028D299AC44E2601E237AF8102B057135C378E771388B14F9`
 - 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`, `.gitattributes`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
 - 범위: 이 버전의 전체 source/test/config/script. 생성기는 작업본 변경도 포함하므로 게시 전
