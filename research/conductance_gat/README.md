@@ -75,6 +75,16 @@ Changing `data_seed`, `split_seed` or `chart_seed` does not alter official fixed
 data/splits; these axes are explicitly recorded as not applicable. CUDA scatter
 operations can remain nondeterministic, so seeded runs are not a bitwise guarantee.
 
+## Diagnose a completed benchmark
+
+Use [the checkpoint diagnostic guide](../../docs/CONDUCTANCE_DIAGNOSTICS.md) to inspect
+training history, train/validation performance, learned conductance, and each node's
+neighbor mixing weight without retraining. `scripts/diagnose_conductance.sh` uses
+the active Conda environment and GPU inference on existing official caches only.
+It does not modify the model or original results, and does not re-evaluate test labels.
+An optional validation-only graph-bypass intervention uses the same checkpoint;
+it is not a separately trained baseline or proof of causation.
+
 ## Supplementary suites (not the default matched benchmark)
 
 The existing `paper.py` `core`/`all` suites remain explicitly selectable for
