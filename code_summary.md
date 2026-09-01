@@ -14066,6 +14066,1226 @@ def test_source_change_rejects_new_training_result(monkeypatch, tmp_path):
         )
 ````
 
+# research/conductance_gat/tests/test_v3_diagnostics.py
+
+````python
+"""Small mathematical fixtures, not public-data or CPU research experiments."""
+
+from copy import deepcopy
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch.nn import functional as F
+
+from research.conductance_gat.ablation.model import state_sha256
+from research.conductance_gat.v3.diagnostics import (
+    ForwardObservation,
+    Intervention,
+    best_checkpoint_interventions,
+    evaluate_validation,
+    moments,
+)
+from research.conductance_gat.v3.model import RelativeCNodeClassifier
+from research.conductance_gat.v3.train import make_optimizer
+
+
+def graph_fixture():
+    return SimpleNamespace(
+        x=torch.tensor([[0.5, 1.0, 2.0], [1.0, 2.0, 0.5], [2.0, 0.5, 1.0], [3.0, 1.0, 2.0]]),
+        y=torch.tensor([0, 1, 0, 999999]),
+        incidence_edge_index=torch.tensor([[0, 0, 1, 2], [1, 2, 2, 3]]),
+    )
+
+
+def model_fixture(mode="relative"):
+    torch.manual_seed(0)
+    return RelativeCNodeClassifier(
+        3, 2, hidden_channels=8, layers=2, dropout=0.5, gate_mode=mode, edge_chunk_size=2
+    )
+
+
+def test_observations_preserve_forward_rng_gradients_and_adamw_step():
+    graph, observed = graph_fixture(), model_fixture()
+    reference = deepcopy(observed)
+    opt_a, opt_b = make_optimizer(observed, "relative_c"), make_optimizer(reference, "relative_c")
+    rng = torch.get_rng_state()
+    with ForwardObservation(observed) as observation:
+        actual = observed(graph)
+    rng_after = torch.get_rng_state()
+    F.cross_entropy(actual[:2], graph.y[:2]).backward()
+    rows = observation.summary(gradients=True)
+    torch.set_rng_state(rng)
+    expected = reference(graph)
+    assert torch.equal(torch.get_rng_state(), rng_after)
+    F.cross_entropy(expected[:2], graph.y[:2]).backward()
+    assert torch.equal(actual, expected)
+    for left, right in zip(observed.parameters(), reference.parameters(), strict=True):
+        assert (left.grad is None) == (right.grad is None)
+        if left.grad is not None:
+            assert torch.equal(left.grad, right.grad)
+    opt_a.step()
+    opt_b.step()
+    assert state_sha256(observed) == state_sha256(reference)
+    assert len(rows) == 2
+    for row in rows:
+        assert "rho" not in row
+        assert row["alpha"] == 0.5 and row["gamma"] == 0.5 and row["tau"] == 1
+        assert row["conductance"]["mean"] == 1 and row["conductance"]["cv"] == 0
+        assert row["weighted_degree"]["quantiles"]["p50"] == 2
+        assert row["weighted_degree"]["max_over_median"] == 1.5
+        assert row["gate_gradient_norm"] is not None
+
+
+def test_interventions_recompute_normalization_restore_modes_gradients_and_rng():
+    graph, model = graph_fixture(), model_fixture()
+    with torch.no_grad():
+        for operator in model.operators:
+            operator.estimator.network[-1].weight.normal_(std=0.5)
+    model.train()
+    model.decoder.eval()
+    model.operators[0].raw_alpha.grad = torch.ones(())
+    before, modes, rng = (
+        state_sha256(model),
+        [m.training for m in model.modules()],
+        torch.get_rng_state(),
+    )
+    original, reference = evaluate_validation(model, graph, torch.tensor([0, 1, 2]))
+    result = best_checkpoint_interventions(
+        model, graph, torch.tensor([0, 1, 2]), original, reference, seed=123
+    )
+    assert result["status"] == "passed" and len(result["rows"]) == 4
+    assert state_sha256(model) == before
+    assert modes == [m.training for m in model.modules()]
+    assert torch.equal(torch.get_rng_state(), rng)
+    assert model.operators[0].raw_alpha.grad.item() == 1
+    assert all(not op._forward_hooks and not op.estimator._forward_hooks for op in model.operators)
+    rows = {row["intervention"]: row for row in result["rows"]}
+    assert rows["mean_c"]["validation"] == rows["ones_c"]["validation"]
+    assert rows["mean_c"]["logit_mean_absolute_delta"] == pytest.approx(
+        rows["ones_c"]["logit_mean_absolute_delta"], abs=1e-6
+    )
+    assert rows["ones_c"]["logit_mean_absolute_delta"] > 0
+    repeated = best_checkpoint_interventions(
+        model, graph, torch.tensor([0, 1, 2]), original, reference, seed=123
+    )
+    assert repeated == result
+    with Intervention(model, "propagation_off", 0):
+        _, off = evaluate_validation(model, graph, torch.tensor([0, 1, 2]), observe=False)
+    with torch.no_grad():
+        state = F.elu(model.encoder(graph.x))
+        for layer_norm in model.norms:
+            state = F.elu(layer_norm(state))
+        expected = model.decoder(state)[:3]
+    torch.testing.assert_close(off, expected)
+
+
+def test_graph_local_shuffle_and_mean_do_not_cross_graphs():
+    model = model_fixture()
+    c = torch.tensor([1.0, 3.0, 10.0, 20.0])
+    incidence = torch.tensor([[0, 1, 3, 4], [1, 2, 4, 5]])
+    inputs = (torch.zeros(6, 8), incidence, torch.tensor([0, 0, 0, 1, 1, 1]), 2)
+    averaged = Intervention(model, "mean_c", 0).replace(inputs, c, 0)
+    assert torch.equal(averaged, torch.tensor([2.0, 2.0, 15.0, 15.0]))
+    shuffled = Intervention(model, "shuffled_c", 8).replace(inputs, c, 0)
+    assert set(shuffled[:2].tolist()) == {1.0, 3.0}
+    assert set(shuffled[2:].tolist()) == {10.0, 20.0}
+
+
+def test_hooks_and_modes_restore_when_forward_raises(monkeypatch):
+    graph, model = graph_fixture(), model_fixture()
+    modes = [m.training for m in model.modules()]
+
+    def fail(*args):
+        raise RuntimeError("fixture failure")
+
+    monkeypatch.setattr(model.operators[1], "forward", fail)
+    with pytest.raises(RuntimeError, match="fixture failure"), Intervention(model, "mean_c", 1):
+        evaluate_validation(model, graph, torch.tensor([0]))
+    assert modes == [m.training for m in model.modules()]
+    assert all(not op._forward_hooks and not op.estimator._forward_hooks for op in model.operators)
+
+
+def test_empty_and_nonfinite_statistics():
+    assert moments(torch.empty(0))["mean"] is None
+    with pytest.raises(FloatingPointError):
+        moments(torch.tensor([float("nan")]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA RNG check needs real CUDA")
+def test_gpu_audit_preserves_cuda_rng():
+    graph, model = graph_fixture(), model_fixture().cuda()
+    graph = SimpleNamespace(**{key: value.cuda() for key, value in vars(graph).items()})
+    indices = torch.tensor([0, 1, 2], device="cuda")
+    before = torch.cuda.get_rng_state()
+    original, reference = evaluate_validation(model, graph, indices)
+    best_checkpoint_interventions(model, graph, indices, original, reference, seed=17)
+    assert torch.equal(before, torch.cuda.get_rng_state())
+````
+
+# research/conductance_gat/tests/test_v3_relative_model.py
+
+````python
+"""Tiny mathematical fixtures; no CPU research training or substitute datasets."""
+
+from __future__ import annotations
+
+import copy
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+
+from research.conductance_gat.v3.model import (
+    RelativeCNodeClassifier,
+    RelativeConductance,
+    graph_mean,
+)
+from research.conductance_gat.v3.operator import symmetric_propagation
+
+
+def fixture():
+    generator = torch.Generator().manual_seed(810)
+    state = torch.randn(8, 5, dtype=torch.float64, generator=generator)
+    c = torch.rand(7, dtype=torch.float64, generator=generator) + 0.2
+    incidence = torch.tensor([[0, 0, 1, 3, 3, 4, 5], [1, 2, 2, 4, 5, 6, 6]])
+    batch = torch.tensor([0, 0, 0, 1, 1, 1, 1, 1])
+    return state, c, incidence, batch
+
+
+def dense_reference(state, c, incidence, alpha, *, detach_degree=False):
+    b = state.new_zeros((c.numel(), state.shape[0]))
+    rows = torch.arange(c.numel())
+    b[rows, incidence[0]], b[rows, incidence[1]] = -1, 1
+    degree = b.abs().T @ c
+    active = degree > 0
+    inverse = torch.where(active, degree, torch.ones_like(degree)).rsqrt() * active
+    if detach_degree:
+        inverse = inverse.detach()
+    normalized = inverse[:, None] * state
+    return state - alpha * inverse[:, None] * (b.T @ (c[:, None] * (b @ normalized)))
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 4, 65536])
+def test_symmetric_output_and_all_gradients_match_dense(chunk):
+    state, c, incidence, _ = fixture()
+    state.requires_grad_()
+    c.requires_grad_()
+    alpha = torch.tensor(0.37, dtype=torch.float64, requires_grad=True)
+    actual = symmetric_propagation(state, c, incidence, alpha, edge_chunk_size=chunk)
+    expected = dense_reference(state, c, incidence, alpha)
+    torch.testing.assert_close(actual, expected, atol=1e-13, rtol=1e-12)
+    actual_grads = torch.autograd.grad(actual.square().sum(), (state, c, alpha))
+    expected_grads = torch.autograd.grad(expected.square().sum(), (state, c, alpha))
+    for left, right in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(left, right, atol=2e-13, rtol=1e-11)
+
+
+def test_symmetric_fp64_gradcheck():
+    state, c, incidence, _ = fixture()
+    assert torch.autograd.gradcheck(
+        lambda h, weights, a: symmetric_propagation(h, weights, incidence, a, edge_chunk_size=2),
+        (
+            state.requires_grad_(),
+            c.requires_grad_(),
+            torch.tensor(0.5, dtype=torch.float64, requires_grad=True),
+        ),
+    )
+
+
+def test_degree_terms_are_present_and_common_scale_gradient_cancels():
+    state, c, incidence, _ = fixture()
+    c.requires_grad_()
+    alpha = state.new_tensor(0.5)
+    actual = symmetric_propagation(state, c, incidence, alpha)
+    wrong = dense_reference(state, c, incidence, alpha, detach_degree=True)
+    grad_c = torch.autograd.grad(actual.square().sum(), c)[0]
+    wrong_grad = torch.autograd.grad(wrong.square().sum(), c)[0]
+    assert not torch.allclose(grad_c, wrong_grad)
+    torch.testing.assert_close((grad_c * c).sum(), c.new_zeros(()), atol=1e-12, rtol=0)
+
+
+def test_isolates_empty_edges_and_alpha_zero():
+    state = torch.randn(3, 4, dtype=torch.float64, requires_grad=True)
+    c = torch.empty(0, dtype=torch.float64, requires_grad=True)
+    incidence = torch.empty((2, 0), dtype=torch.long)
+    alpha = torch.tensor(0.5, dtype=torch.float64, requires_grad=True)
+    result = symmetric_propagation(state, c, incidence, alpha)
+    torch.testing.assert_close(result, state, rtol=0, atol=0)
+    grads = torch.autograd.grad(result.sum(), (state, c, alpha))
+    torch.testing.assert_close(grads[0], torch.ones_like(state), rtol=0, atol=0)
+    assert grads[1].numel() == 0 and grads[2] == 0
+    h, weights, edges, _ = fixture()
+    torch.testing.assert_close(
+        symmetric_propagation(h, weights, edges, h.new_tensor(0)), h, rtol=0, atol=0
+    )
+
+
+def test_symmetric_kernel_invariances_and_not_constant_preserving():
+    state, c, incidence, _ = fixture()
+    alpha = state.new_tensor(0.5)
+    expected = symmetric_propagation(state, c, incidence, alpha)
+    torch.testing.assert_close(
+        symmetric_propagation(state, 11 * c, incidence.flip(0), alpha), expected
+    )
+    order = torch.tensor([4, 6, 1, 0, 2, 5, 3])
+    torch.testing.assert_close(
+        symmetric_propagation(state, c[order], incidence[:, order], alpha), expected
+    )
+    constant = torch.ones_like(state)
+    result = symmetric_propagation(constant, c, incidence, alpha)
+    assert not torch.allclose(result, constant)
+    torch.testing.assert_close(result[-1], constant[-1], atol=0, rtol=0)
+
+
+def estimator(chunk=2, *, zero=False, mode="relative"):
+    torch.manual_seed(53)
+    gate = RelativeConductance(5, mode, chunk).double()
+    if not zero:
+        with torch.no_grad():
+            gate.network[-1].weight.copy_(torch.tensor([[0.3, -0.4, 0.5, -0.8, 0.2]]))
+    return gate
+
+
+def test_centered_relative_formula_uses_full_graph_means():
+    state, _, incidence, batch = fixture()
+    gate = estimator(chunk=2)
+    result = gate(state, incidence, batch, 2)
+    edge_graph = batch[incidence[0]]
+    scores = gate.last_scores
+    centered = scores - graph_mean(scores, edge_graph, 2)[edge_graph]
+    unnormalized = (gate.tau * centered.tanh()).exp()
+    expected = (
+        1
+        - gate.gamma
+        + gate.gamma * (unnormalized / graph_mean(unnormalized, edge_graph, 2)[edge_graph])
+    )
+    torch.testing.assert_close(result, expected)
+    torch.testing.assert_close(graph_mean(result, edge_graph, 2), torch.ones(2).double())
+    torch.testing.assert_close(
+        graph_mean(gate.last_centered_scores, edge_graph, 2),
+        torch.zeros(2).double(),
+        atol=1e-15,
+        rtol=0,
+    )
+    assert float(result.detach().std()) > 0
+
+
+@pytest.mark.parametrize("chunk", [1, 3, 65536])
+def test_gate_checkpoint_chunks_match_outputs_and_all_gradients(chunk):
+    state, _, incidence, batch = fixture()
+    state.requires_grad_()
+    gate = estimator(chunk=chunk)
+    reference = estimator(chunk=65536)
+    actual = gate(state, incidence, batch, 2)
+    expected = reference(state, incidence, batch, 2)
+    torch.testing.assert_close(actual, expected, atol=1e-14, rtol=1e-12)
+    coefficient = torch.linspace(0.2, 1.4, 7).double()
+    actual_grads = torch.autograd.grad((actual * coefficient).sum(), (state, *gate.parameters()))
+    expected_grads = torch.autograd.grad(
+        (expected * coefficient).sum(), (state, *reference.parameters())
+    )
+    for left, right in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(left, right, atol=1e-13, rtol=1e-10)
+
+
+def test_estimator_feature_orientation_permutation_and_batch_independence():
+    state, _, incidence, batch = fixture()
+    gate = estimator()
+    expected = gate(state, incidence, batch, 2)
+    flipped = incidence.clone()
+    flipped[:, ::2] = flipped.flip(0)[:, ::2]
+    torch.testing.assert_close(gate(state, flipped, batch, 2), expected)
+    order = torch.tensor([4, 6, 1, 0, 2, 5, 3])
+    torch.testing.assert_close(gate(state, incidence[:, order], batch, 2), expected[order])
+    changed = state.clone()
+    changed[batch == 1] *= 17
+    torch.testing.assert_close(gate(changed, incidence, batch, 2)[:3], expected[:3])
+    separate = gate(state[:3], incidence[:, :3], batch[:3], 1)
+    torch.testing.assert_close(separate, expected[:3])
+
+
+def classifier(mode="relative", **kwargs):
+    torch.manual_seed(79)
+    return RelativeCNodeClassifier(
+        5, 3, hidden_channels=5, layers=2, dropout=0, gate_mode=mode, edge_chunk_size=2, **kwargs
+    ).double()
+
+
+def graph():
+    state, _, incidence, batch = fixture()
+    return SimpleNamespace(x=state, incidence_edge_index=incidence, batch=batch)
+
+
+def test_fixed_relative_initial_state_and_outputs_match_and_alpha_is_active():
+    relative, fixed = classifier(), classifier("fixed_one")
+    assert relative.state_dict().keys() == fixed.state_dict().keys()
+    for name, value in relative.state_dict().items():
+        torch.testing.assert_close(value, fixed.state_dict()[name], atol=0, rtol=0)
+    torch.testing.assert_close(relative(graph()), fixed(graph()), atol=0, rtol=0)
+    for model in (relative, fixed):
+        for operator in model.operators:
+            assert operator.raw_alpha.requires_grad
+            assert operator.alpha == 0.5
+            assert operator.estimator.gamma == 0.5
+            assert operator.estimator.tau == 1
+            batch = graph()
+            c = operator.estimator(batch.x, batch.incidence_edge_index, batch.batch, 2)
+            torch.testing.assert_close(c, torch.ones_like(c), atol=0, rtol=0)
+    assert all(not p.requires_grad for op in fixed.operators for p in op.estimator.parameters())
+    assert all(p.requires_grad for op in relative.operators for p in op.estimator.parameters())
+
+
+def test_gate_final_weight_and_alpha_receive_task_gradients_at_c1_initialization():
+    relative, fixed = classifier(), classifier("fixed_one")
+    labels = torch.tensor([0, 1, 2, 1, 0, 2, 1, 0])
+    for model in (relative, fixed):
+        nn.functional.cross_entropy(model(graph()), labels).backward()
+        assert any(float(op.raw_alpha.grad.abs()) > 0 for op in model.operators)
+    for operator in relative.operators:
+        gradient = operator.estimator.network[-1].weight.grad
+        assert gradient is not None and float(gradient.abs().sum()) > 0
+        # Exact C=1 starts gamma/tau and earlier gate layers at zero task gradients,
+        # not a frozen estimator: final weights can move on the first update.
+        assert operator.estimator.raw_gamma.grad == 0
+        assert operator.estimator.raw_tau.grad == 0
+    for operator in fixed.operators:
+        assert all(p.grad is None for p in operator.estimator.parameters())
+
+
+def test_combined_c_of_h_gradient_matches_dense_reference():
+    state, _, incidence, batch = fixture()
+    state.requires_grad_()
+    gate = estimator()
+    alpha = state.new_tensor(0.4, requires_grad=True)
+    c = gate(state, incidence, batch, 2)
+    output = symmetric_propagation(state, c, incidence, alpha, edge_chunk_size=2)
+    expected = dense_reference(state, c, incidence, alpha)
+    parameters = (state, alpha, *gate.parameters())
+    actual_grads = torch.autograd.grad(output.square().sum(), parameters, retain_graph=True)
+    expected_grads = torch.autograd.grad(expected.square().sum(), parameters)
+    for left, right in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(left, right, atol=1e-12, rtol=1e-10)
+
+
+def test_shared_model_is_node_permutation_equivariant_and_accepts_new_graph():
+    model = classifier()
+    for operator in model.operators:
+        with torch.no_grad():
+            operator.estimator.network[-1].weight.fill_(0.2)
+    batch = graph()
+    original = model(batch)
+    order = torch.tensor([3, 0, 4, 1, 5, 2, 6, 7])
+    inverse = torch.argsort(order)
+    permuted = SimpleNamespace(
+        x=batch.x[order],
+        incidence_edge_index=inverse[batch.incidence_edge_index],
+        batch=batch.batch[order],
+    )
+    torch.testing.assert_close(model(permuted), original[order], atol=1e-12, rtol=1e-10)
+    other = SimpleNamespace(x=batch.x[:3], incidence_edge_index=batch.incidence_edge_index[:, :3])
+    assert model(other).shape == (3, 3)
+
+
+def test_intervention_c_hook_recomputes_weighted_degree():
+    model = classifier()
+    operator = model.operators[0]
+    state, c, incidence, batch = fixture()
+    handle = operator.estimator.register_forward_hook(lambda module, args, output: c)
+    try:
+        actual = operator(state, incidence, batch, 2)
+    finally:
+        handle.remove()
+    torch.testing.assert_close(actual, dense_reference(state, c, incidence, operator.alpha))
+
+
+def test_saved_tensors_exclude_full_edge_features_or_gate_hidden_states():
+    nodes, width = 9, 5
+    incidence = torch.combinations(torch.arange(nodes), 2).T.contiguous()
+    edges = incidence.shape[1]
+    state = torch.randn(nodes, width, dtype=torch.float64, requires_grad=True)
+    gate = estimator(chunk=3)
+    batch = torch.zeros(nodes, dtype=torch.long)
+    saved = []
+
+    def pack(tensor):
+        saved.append(tuple(tensor.shape))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda value: value):
+        c = gate(state, incidence, batch, 1)
+        result = symmetric_propagation(
+            state, c, incidence, state.new_tensor(0.5), edge_chunk_size=3
+        )
+        result.square().sum().backward()
+    assert (edges, width) not in saved
+    assert (edges, 4 * width + 2) not in saved
+    assert (nodes, nodes) not in saved
+    assert (edges, edges) not in saved
+
+
+def test_forward_diagnostics_are_detached_and_do_not_change_state_dict():
+    gate = estimator()
+    state, _, incidence, batch = fixture()
+    before = copy.deepcopy(gate.state_dict())
+    result = gate(state.requires_grad_(), incidence, batch, 2)
+    assert result.requires_grad
+    assert not gate.last_scores.requires_grad and not gate.last_centered_scores.requires_grad
+    for name, value in gate.state_dict().items():
+        torch.testing.assert_close(value, before[name], atol=0, rtol=0)
+
+
+def test_double_backward_is_unsupported():
+    state, c, incidence, _ = fixture()
+    c.requires_grad_()
+    result = symmetric_propagation(state, c, incidence, state.new_tensor(0.5))
+    grad = torch.autograd.grad(result.square().sum(), c, create_graph=True)[0]
+    with pytest.raises(RuntimeError):
+        torch.autograd.grad(grad.sum(), c)
+
+
+@pytest.mark.parametrize("alpha", [-0.1, 1.1, float("nan"), float("inf")])
+def test_invalid_alpha_rejected(alpha):
+    state, c, incidence, _ = fixture()
+    with pytest.raises(FloatingPointError, match="alpha"):
+        symmetric_propagation(state, c, incidence, state.new_tensor(alpha))
+
+
+@pytest.mark.parametrize("chunk", [0, -1, True, 0.5])
+def test_invalid_chunk_rejected(chunk):
+    with pytest.raises(ValueError, match="positive integer"):
+        RelativeConductance(5, edge_chunk_size=chunk)
+
+
+def test_cross_graph_edges_rejected():
+    batch = graph()
+    batch.incidence_edge_index[1, 0] = 3
+    with pytest.raises(ValueError, match="different graphs"):
+        classifier()(batch)
+
+
+def test_empty_graph_gate_and_node_model_remain_finite():
+    gate = estimator()
+    state = torch.randn(3, 5, dtype=torch.float64)
+    incidence = torch.empty((2, 0), dtype=torch.long)
+    assert gate(state, incidence, torch.zeros(3, dtype=torch.long), 1).shape == (0,)
+    result = classifier()(SimpleNamespace(x=state, incidence_edge_index=incidence))
+    assert bool(torch.isfinite(result).all())
+````
+
+# research/conductance_gat/tests/test_v3_report.py
+
+````python
+"""V3 artifact-integrity fixtures only; no datasets or trained models."""
+
+from __future__ import annotations
+
+import copy
+import csv
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+from research.conductance_gat.v3.protocol import COMMON, CONDITIONS, PARAMETERIZATION, SUITE
+from research.conductance_gat.v3.report import ComparisonIntegrityError, main, write_comparison
+
+
+def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
+    root = tmp_path / "relative-c-v3"
+    root.mkdir()
+    config = {
+        **COMMON,
+        "datasets": list(datasets),
+        "model_seed": 0,
+        "epochs": 100,
+        "patience": 20,
+        "batch_size": 1,
+        "workers": 0,
+        "device": "cuda",
+        "edge_chunk_size": 65536,
+    }
+    source = {"research/conductance_gat/v3/model.py": "1" * 64}
+    manifest = {
+        "schema_version": 1,
+        "suite": SUITE,
+        "status": "passed",
+        "source_integrity_valid": True,
+        "config": config,
+        "conditions": CONDITIONS,
+        "sources": {"sha256": source},
+        "jobs": [],
+    }
+    configuration = {k: v for k, v in config.items() if k != "datasets"}
+    configuration.update(tf32=False, pin_memory=True)
+    for dataset in datasets:
+        for condition, spec in CONDITIONS.items():
+            output = root / dataset / condition
+            output.mkdir(parents=True)
+            checkpoint, history = output / "best.pt", output / "history.json"
+            checkpoint.write_bytes(b"unit-fixture-not-a-trained-model")
+            history.write_text("[]", encoding="utf-8")
+            data_hash = hashlib.sha256(dataset.encode()).hexdigest()
+            relative = condition == "relative_c"
+            frozen = 0 if relative else 98
+            alpha = [f"operators.{i}.raw_alpha" for i in range(2)]
+            gamma_tau = [
+                f"operators.{i}.estimator.raw_{key}" for i in range(2) for key in ("gamma", "tau")
+            ]
+            gate = [f"operators.{i}.estimator.network.weight" for i in range(2)]
+            controls = alpha + gamma_tau if relative else alpha
+            names = ["encoder.weight"] + controls + (gate if relative else [])
+            groups = [
+                {
+                    "name": "backbone",
+                    "lr": COMMON["lr"],
+                    "weight_decay": COMMON["weight_decay"],
+                    "parameter_names": ["encoder.weight"],
+                    "parameter_count": 100,
+                },
+                {
+                    "name": "controls",
+                    "lr": COMMON["lr"],
+                    "weight_decay": 0.0,
+                    "parameter_names": controls,
+                    "parameter_count": len(controls),
+                },
+            ]
+            if relative:
+                groups.append(
+                    {
+                        "name": "gate_mlp",
+                        "lr": COMMON["lr"] * COMMON["gate_lr_multiplier"],
+                        "weight_decay": 0.0,
+                        "parameter_names": gate,
+                        "parameter_count": 94,
+                    }
+                )
+            score = 0.55 if relative else 0.50
+            layer_stats = [
+                {
+                    "layer": i,
+                    "alpha": 0.5,
+                    "gamma": 0.25,
+                    "tau": 1.0,
+                    "score": {"mean": 0.0, "std": 0.1},
+                    "conductance": {"cv": 0.05},
+                    "log_conductance": {"std": 0.08},
+                    "weighted_degree": {
+                        "quantiles": {"p50": 2.0, "p99": 3.0},
+                        "max_over_median": 1.5,
+                    },
+                    "relative_conv_change": 0.4,
+                    "gate_parameter_norm": 1.0,
+                    "gate_gradient_norm": None,
+                }
+                for i in range(COMMON["layers"])
+            ]
+            interventions = {
+                "status": "passed",
+                "scope": "validation_selected_best_checkpoint_only",
+                "original": {"validation": score, "loss": 0.7},
+                "rows": [
+                    {
+                        "intervention": name,
+                        "validation": score - 0.01,
+                        "percentage_points": -1.0,
+                        "logit_mean_absolute_delta": 0.1,
+                        "changed_prediction_fraction": 0.02,
+                    }
+                    for name in ("mean_c", "shuffled_c", "ones_c", "propagation_off")
+                ],
+            }
+            metrics = {
+                "schema_version": 1,
+                "research_suite": SUITE,
+                "status": "passed",
+                "dataset": dataset,
+                "condition": condition,
+                "model_seed": 0,
+                **spec,
+                "non_gate_weight_decay": 0.0005,
+                "configuration": copy.deepcopy(configuration),
+                "cache_sha256": data_hash,
+                "protocol": {"data_sha256": data_hash, "official": True},
+                "initial_state_sha256": "a" * 64,
+                "best_epoch": 10,
+                "epochs_run": 30,
+                "validation": 0.55 if condition == "relative_c" else 0.50,
+                "metric_name": "accuracy",
+                "train_loss": 0.7,
+                "elapsed_seconds": 2.0,
+                "peak_cuda_allocated_bytes": 100,
+                "evaluation_split": "validation",
+                "test_evaluated": False,
+                "versions": {"torch": "unit-fixture"},
+                "gpu": "unit-fixture",
+                "total_parameters": 200,
+                "trainable_parameters": 200 - frozen,
+                "frozen_parameters": frozen,
+                "optimizer": "AdamW",
+                "optimizer_groups": groups,
+                "trainable_parameter_names": names,
+                "frozen_parameter_names": [] if relative else gate + gamma_tau,
+                "diagnostics": {
+                    "best_validation": {
+                        "mode": "eval",
+                        "split": "validation",
+                        "metric": score,
+                        "loss": 0.7,
+                        "layers": layer_stats,
+                    },
+                    "best_checkpoint_interventions": interventions,
+                    "train_trajectory": [
+                        {
+                            "epoch": 10,
+                            "batch_index": 0,
+                            "optimizer_steps_before_batch": 9,
+                            "scope": "full_graph_train_mask",
+                            "mode": "train_dropout_on",
+                            "stage": "after_task_backward_before_optimizer_step",
+                            "layers": [
+                                {"layer": i, "gate_gradient_norm": 0.125 if relative else None}
+                                for i in range(COMMON["layers"])
+                            ],
+                        }
+                    ],
+                },
+                "source_sha256": source,
+                "parameterization": PARAMETERIZATION,
+                "topology": {"num_nodes": 4, "num_edges": edges, "incidence_sha256": "2" * 64},
+            }
+            for name, path in (("checkpoint", checkpoint), ("history", history)):
+                metrics[name] = str(path)
+                metrics[name + "_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+            metrics_path = output / "metrics.json"
+            metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+            manifest["jobs"].append(
+                {
+                    "dataset": dataset,
+                    "condition": condition,
+                    "status": "passed",
+                    "output_dir": str(output),
+                    "metrics_path": str(metrics_path),
+                    "metrics_sha256": hashlib.sha256(metrics_path.read_bytes()).hexdigest(),
+                }
+            )
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return root, manifest
+
+
+def _edit(manifest, callback, index=0, refresh_digest=True):
+    job = manifest["jobs"][index]
+    path = Path(job["metrics_path"])
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    callback(metrics)
+    path.write_text(json.dumps(metrics), encoding="utf-8")
+    if refresh_digest:
+        job["metrics_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_complete_report_has_units_resources_and_unchanged_children(tmp_path):
+    root, manifest = _fixture(tmp_path, ("cora", "ogbn-arxiv"))
+    before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    result = write_comparison(root, manifest)
+    assert result["status"] == "passed" and result["n_model_seeds"] == 1
+    assert result["test_evaluated"] is False
+    for dataset in result["datasets"]:
+        assert dataset["relative_minus_fixed"]["percentage_points"] == pytest.approx(5.0)
+        assert dataset["held_fixed"]["topology"]["num_edges"] == 3
+    assert all(path.read_bytes() == value for path, value in before.items())
+    text = (root / "comparison.md").read_text(encoding="utf-8")
+    assert "+5.000000 pp" in text and "Peak CUDA" in text and "Train loss" in text
+    assert "not a measured" in text and "scalability result" in text
+    with (root / "comparison.csv").open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 4 and float(rows[0]["relative_minus_fixed_pp"]) == pytest.approx(5.0)
+    assert main([str(root)]) == 0
+
+
+@pytest.mark.parametrize("status", ["pending", "running", "failed"])
+def test_partial_results_have_no_contrast(tmp_path, status):
+    root, manifest = _fixture(tmp_path)
+    manifest["status"] = "failed" if status == "failed" else "running"
+    manifest["jobs"][1]["status"] = status
+    result = write_comparison(root, manifest)
+    assert not result["complete"] and result["datasets"][0]["relative_minus_fixed"] is None
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("cache_sha256", "b" * 64),
+        ("initial_state_sha256", "b" * 64),
+        ("test_evaluated", True),
+        ("model_seed", 1),
+        ("normalization", "global_max"),
+        ("gate_mode", "fixed_one"),
+        ("gate_weight_decay", 0.0005),
+        ("non_gate_weight_decay", 0.0),
+        ("frozen_parameters", 6),
+        ("total_parameters", 300),
+        ("research_suite", "conductance_c_learning"),
+        ("validation", float("nan")),
+        ("versions", {"torch": "different"}),
+        ("gpu", "different"),
+        ("parameterization", "mlp"),
+        ("source_sha256", {"model.py": "f" * 64}),
+        ("topology", {"num_nodes": 4, "num_edges": 3, "incidence_sha256": "b" * 64}),
+        ("topology", {"num_nodes": 4, "num_edges": -1, "incidence_sha256": "2" * 64}),
+        ("topology", {"num_nodes": 4, "num_edges": 3}),
+    ],
+)
+def test_child_mismatch_invalidates_all_deltas(tmp_path, key, value):
+    root, manifest = _fixture(tmp_path)
+    _edit(manifest, lambda metrics: metrics.update({key: value}))
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+    result = json.loads((root / "comparison.json").read_text(encoding="utf-8"))
+    assert result["status"] == "invalid"
+    assert all(dataset["relative_minus_fixed"] is None for dataset in result["datasets"])
+
+
+@pytest.mark.parametrize(
+    "change", ["source", "missing_source", "duplicate", "missing", "spec", "ppi"]
+)
+def test_invalid_manifest_withholds_contrasts(tmp_path, change):
+    root, manifest = _fixture(tmp_path)
+    if change == "source":
+        manifest["source_integrity_valid"] = False
+    elif change == "missing_source":
+        manifest.pop("sources")
+    elif change == "duplicate":
+        manifest["jobs"].append(manifest["jobs"][0])
+    elif change == "missing":
+        manifest["jobs"].pop()
+    elif change == "ppi":
+        manifest["config"]["datasets"] = ["ppi"]
+    else:
+        manifest["conditions"] = {}
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize("artifact", ["checkpoint", "history"])
+def test_changed_artifacts_rejected(tmp_path, artifact):
+    root, manifest = _fixture(tmp_path)
+    child = json.loads(Path(manifest["jobs"][0]["metrics_path"]).read_text(encoding="utf-8"))
+    Path(child[artifact]).write_bytes(b"changed")
+    with pytest.raises(ComparisonIntegrityError, match="SHA-256 mismatch"):
+        write_comparison(root, manifest)
+
+
+def test_changed_metrics_rejected_even_with_valid_score(tmp_path):
+    root, manifest = _fixture(tmp_path)
+    _edit(manifest, lambda child: child.update(validation=0.9), refresh_digest=False)
+    with pytest.raises(ComparisonIntegrityError, match="metrics SHA-256 mismatch"):
+        write_comparison(root, manifest)
+
+
+def test_output_symlink_rejected_before_writes(tmp_path, monkeypatch):
+    root, manifest = _fixture(tmp_path)
+    original = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda p: p.name == "comparison.md" or original(p))
+    with pytest.raises(ValueError, match="symlinks"):
+        write_comparison(root, manifest)
+    assert not (root / "comparison.json").exists()
+
+
+def test_changed_chunk_size_or_unknown_config_rejected(tmp_path):
+    root, manifest = _fixture(tmp_path)
+    _edit(manifest, lambda child: child["configuration"].update(edge_chunk_size=1))
+    with pytest.raises(ComparisonIntegrityError, match="configuration"):
+        write_comparison(root, manifest)
+
+
+def test_fixed_frozen_count_must_match_optimizer(tmp_path):
+    root, manifest = _fixture(tmp_path)
+    _edit(
+        manifest, lambda child: child.update(frozen_parameters=5, trainable_parameters=195), index=1
+    )
+    with pytest.raises(ComparisonIntegrityError, match="parameter counts"):
+        write_comparison(root, manifest)
+
+
+def test_empty_edges_do_not_remove_shared_frozen_scaffold(tmp_path):
+    root, manifest = _fixture(tmp_path, edges=0)
+    assert write_comparison(root, manifest)["status"] == "passed"
+
+
+@pytest.mark.parametrize("key", ["optimizer_groups", "trainable_parameter_names", "diagnostics"])
+def test_required_v3_provenance_is_not_optional(tmp_path, key):
+    root, manifest = _fixture(tmp_path)
+    _edit(manifest, lambda child: child.pop(key))
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize("mutation", ["alpha", "duplicate", "group_lr", "group_decay"])
+def test_optimizer_contract_rejects_wrong_learning_policy(tmp_path, mutation):
+    root, manifest = _fixture(tmp_path)
+
+    def change(child):
+        groups = child["optimizer_groups"]
+        if mutation == "alpha":
+            groups[1]["parameter_names"] = ["operators.0.estimator.raw_gamma"]
+        elif mutation == "duplicate":
+            groups.append(copy.deepcopy(groups[0]))
+        elif mutation == "group_lr":
+            groups[-1]["lr"] = COMMON["lr"]
+        else:
+            groups[1]["weight_decay"] = 0.0005
+
+    _edit(manifest, change)
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["missing", "wrong_delta", "wrong_original", "duplicate", "wrong_scope"]
+)
+def test_intervention_integrity_rejected(tmp_path, mutation):
+    root, manifest = _fixture(tmp_path)
+
+    def change(child):
+        audit = child["diagnostics"]["best_checkpoint_interventions"]
+        if mutation == "missing":
+            audit["rows"].pop()
+        elif mutation == "wrong_delta":
+            audit["rows"][0]["percentage_points"] = 123
+        elif mutation == "wrong_original":
+            audit["original"]["validation"] = 0.4
+        elif mutation == "duplicate":
+            audit["rows"][0] = copy.deepcopy(audit["rows"][1])
+        else:
+            audit["scope"] = "test"
+
+    _edit(manifest, change)
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+def test_report_uses_relative_scalars_and_interventions_not_legacy_rho(tmp_path):
+    root, manifest = _fixture(tmp_path)
+    write_comparison(root, manifest)
+    text = (root / "comparison.md").read_text(encoding="utf-8")
+    assert "alpha" in text and "gamma" in text and "tau" in text
+    assert "shuffled_c" in text and "propagation_off" in text
+    assert "| ρ mean |" not in text
+    assert "single-factor comparison" in text
+    assert "Validation computes no gradients" in text
+    assert "Actual training gradients" in text and "0.125000" in text
+
+
+@pytest.mark.parametrize("value", ["not-a-number", False, -1.0])
+def test_malformed_optional_diagnostic_is_invalid_not_rendered(tmp_path, value):
+    root, manifest = _fixture(tmp_path)
+    _edit(
+        manifest,
+        lambda child: child["diagnostics"]["best_validation"]["layers"][0]["conductance"].update(
+            cv=value
+        ),
+    )
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "scope", "stage", "no_grad"])
+def test_actual_training_gradient_provenance_is_required(tmp_path, mutation):
+    root, manifest = _fixture(tmp_path)
+
+    def change(child):
+        records = child["diagnostics"]["train_trajectory"]
+        if mutation == "missing":
+            records.clear()
+        elif mutation == "duplicate":
+            records.append(copy.deepcopy(records[0]))
+        elif mutation == "no_grad":
+            records[0]["layers"][0]["gate_gradient_norm"] = None
+        else:
+            records[0][mutation] = "validation"
+
+    _edit(manifest, change)
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+````
+
+# research/conductance_gat/tests/test_v3_training.py
+
+````python
+"""Actual v3 training/artifacts on tiny unit fixtures with mocked CUDA hardware."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from chartgat.cache import atomic_publish
+from research.conductance_gat.ablation.model import state_sha256
+from research.conductance_gat.benchmark_data import sha256_file
+from research.conductance_gat.v3 import train
+from research.conductance_gat.v3.model import RelativeCNodeClassifier
+from research.conductance_gat.v3.protocol import CONDITIONS, SUITE
+
+
+def arguments(tmp_path, condition="relative_c"):
+    return train.build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            condition,
+            "--output-dir",
+            str(tmp_path / condition),
+            "--data-root",
+            str(tmp_path / "data"),
+            "--epochs",
+            "2",
+            "--patience",
+            "2",
+            "--edge-chunk-size",
+            "2",
+        ]
+    )
+
+
+def fixture_data():
+    graph = SimpleNamespace(
+        x=torch.tensor([[0.5, 1.0, 2.0], [1.0, 2.0, 0.5], [2.0, 0.5, 1.0], [3.0, 1.0, 2.0]]),
+        y=torch.tensor([0, 1, 0, 999999]),
+        incidence_edge_index=torch.tensor([[0, 0, 1, 2], [1, 2, 2, 3]]),
+    )
+
+    class NoTest(dict):
+        def __getitem__(self, key):
+            if key == "test":
+                raise AssertionError("No test split may be read")
+            return super().__getitem__(key)
+
+    indices = NoTest(train=torch.tensor([0, 1]), validation=torch.tensor([2]))
+    return graph, indices, {"dataset": "cora", "classes": 2, "graphs": [vars(graph)]}
+
+
+def mock_hardware(monkeypatch):
+    monkeypatch.setattr(train, "_require_cuda", lambda device: None)
+    monkeypatch.setattr(train, "_configure_fp32", lambda: None)
+    for name in ("reset_peak_memory_stats", "synchronize", "manual_seed_all"):
+        monkeypatch.setattr(torch.cuda, name, lambda *args: None)
+    for name in ("max_memory_allocated", "max_memory_reserved"):
+        monkeypatch.setattr(torch.cuda, name, lambda *args: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *args: "unit_fixture_mocked_cuda")
+    monkeypatch.setattr(train, "_source_hashes", lambda: {"unit_fixture": "a" * 64})
+
+
+@pytest.mark.parametrize("condition", CONDITIONS)
+def test_optimizer_groups_and_fixed_estimator_alpha_trainability(condition):
+    torch.manual_seed(3)
+    model = RelativeCNodeClassifier(3, 2, gate_mode=CONDITIONS[condition]["gate_mode"])
+    optimizer = train.make_optimizer(model, condition)
+    assert isinstance(optimizer, torch.optim.AdamW)
+    metadata = {group["name"]: group for group in train.optimizer_metadata(optimizer)}
+    assert metadata["backbone"]["lr"] == 0.005
+    assert metadata["backbone"]["weight_decay"] == 0.0005
+    assert metadata["controls"]["weight_decay"] == 0
+    assert all(op.raw_alpha.requires_grad for op in model.operators)
+    if condition == "fixed_c":
+        assert "gate_mlp" not in metadata
+        assert all(not p.requires_grad for op in model.operators for p in op.estimator.parameters())
+        assert all(name.endswith("raw_alpha") for name in metadata["controls"]["parameter_names"])
+    else:
+        assert metadata["gate_mlp"]["lr"] == 0.01
+        assert metadata["gate_mlp"]["weight_decay"] == 0
+
+
+def test_initial_hash_same_and_cpu_public_training_forbidden(tmp_path):
+    models = []
+    for mode in ("relative", "fixed_one"):
+        torch.manual_seed(2)
+        models.append(RelativeCNodeClassifier(3, 2, gate_mode=mode))
+    assert state_sha256(models[0]) == state_sha256(models[1])
+    args = arguments(tmp_path)
+    with pytest.raises(RuntimeError, match="CUDA GPU"):
+        train.train_model({}, {}, args, torch.device("cpu"), args.output_dir)
+    with pytest.raises(RuntimeError, match="CUDA GPU"):
+        train.main(
+            [
+                "--dataset",
+                "cora",
+                "--condition",
+                "relative_c",
+                "--device",
+                "cpu",
+                "--output-dir",
+                str(tmp_path / "forbidden"),
+            ]
+        )
+    assert not (tmp_path / "forbidden").exists()
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("batch_size", 2),
+        ("workers", 1),
+        ("epochs", 0),
+        ("patience", 0),
+        ("model_seed", -1),
+        ("edge_chunk_size", 0),
+    ],
+)
+def test_invalid_protocol_rejected(tmp_path, field, value):
+    args = arguments(tmp_path)
+    setattr(args, field, value)
+    with pytest.raises(ValueError):
+        train._validate_args(args)
+
+
+def test_real_two_arm_runner_training_checkpoint_and_report(monkeypatch, tmp_path):
+    from research.conductance_gat.v3 import report
+    from scripts import run_conductance_v3 as runner
+
+    mock_hardware(monkeypatch)
+    graph, indices, payload = fixture_data()
+    monkeypatch.setattr(train, "_make_data", lambda *args: (graph, indices))
+    fixture_file = tmp_path / "tiny_unit_fixture.pt"
+    atomic_publish(fixture_file, lambda path: torch.save(payload, path))
+    protocol = {"data_sha256": sha256_file(fixture_file), "unit_fixture_only": True}
+    monkeypatch.setattr(train, "load_dataset", lambda *args, **kwargs: (payload, protocol))
+    monkeypatch.setattr(
+        train, "_cache_snapshot", lambda args: {str(fixture_file): sha256_file(fixture_file)}
+    )
+    monkeypatch.setattr(runner, "check_dependencies", lambda: {"unit_fixture_only": True})
+    monkeypatch.setattr(
+        runner,
+        "_source_snapshot",
+        lambda: {"sha256": {"unit_fixture": "a" * 64}, "git_revision": None},
+    )
+    actual_train = train.train_model
+    monkeypatch.setattr(
+        train,
+        "train_model",
+        lambda payload, protocol, args, device, output: actual_train(
+            payload, protocol, args, torch.device("cpu"), output
+        ),
+    )
+    executions = []
+
+    def dispatch(command, log, environment):
+        if any(Path(argument).name == "gpu_preflight.py" for argument in command):
+            return 0
+        index = command.index("research.conductance_gat.v3.train")
+        args = command[index + 1 :]
+        executions.append(args)
+        return train.main(args)
+
+    monkeypatch.setattr(runner, "run_logged", dispatch)
+    result = runner.main(
+        [
+            "--datasets",
+            "cora",
+            "--epochs",
+            "2",
+            "--patience",
+            "2",
+            "--edge-chunk-size",
+            "2",
+            "--results-root",
+            str(tmp_path / "results"),
+            "--data-root",
+            str(tmp_path / "data"),
+            "--run-id",
+            "unit-fixture",
+        ]
+    )
+    assert result == 0 and len(executions) == 2
+    root = tmp_path / "results/conductance_gat/v3/unit-fixture"
+    manifest = json.loads((root / "manifest.json").read_text())
+    comparison = report.write_comparison(root, manifest)
+    assert comparison["status"] == "passed"
+    hashes = []
+    for condition in CONDITIONS:
+        folder = root / "cora" / condition
+        metrics = json.loads((folder / "metrics.json").read_text())
+        hashes.append(metrics["initial_state_sha256"])
+        assert metrics["research_suite"] == SUITE and metrics["test_evaluated"] is False
+        assert metrics["checkpoint_sha256"] == sha256_file(folder / "best.pt")
+        assert metrics["history_sha256"] == sha256_file(folder / "history.json")
+        assert len(metrics["diagnostics"]["train_trajectory"]) == 2
+        assert len(metrics["diagnostics"]["best_checkpoint_interventions"]["rows"]) == 4
+        assert len(metrics["diagnostics"]["best_validation"]["layers"]) == 2
+        assert all("rho" not in row for row in metrics["diagnostics"]["best_validation"]["layers"])
+        saved = torch.load(folder / "best.pt", weights_only=True)
+        assert saved["source_sha256"] == metrics["source_sha256"]
+        assert saved["architecture"]["normalization"] == "symmetric"
+    assert len(set(hashes)) == 1
+
+
+def test_scalar_nan_gradient_blocks_optimizer_step(monkeypatch, tmp_path):
+    mock_hardware(monkeypatch)
+    graph, indices, payload = fixture_data()
+    monkeypatch.setattr(train, "_make_data", lambda *args: (graph, indices))
+    factory = train.RelativeCNodeClassifier
+
+    def poisoned(*args, **kwargs):
+        model = factory(*args, **kwargs)
+        model.operators[0].raw_alpha.register_hook(lambda gradient: gradient * float("nan"))
+        return model
+
+    monkeypatch.setattr(train, "RelativeCNodeClassifier", poisoned)
+    steps = []
+    monkeypatch.setattr(torch.optim.AdamW, "step", lambda *args, **kwargs: steps.append(1))
+    args = arguments(tmp_path)
+    args.output_dir.mkdir()
+    with pytest.raises(FloatingPointError, match="gradient"):
+        train.train_model(
+            payload, {"data_sha256": "b" * 64}, args, torch.device("cpu"), args.output_dir
+        )
+    assert not steps
+
+
+def test_missing_cache_writes_failed_metrics_without_training(monkeypatch, tmp_path):
+    mock_hardware(monkeypatch)
+
+    def missing(*args, **kwargs):
+        assert kwargs["allow_download"] is False
+        raise FileNotFoundError("official fixture cache absent")
+
+    monkeypatch.setattr(train, "load_dataset", missing)
+    with pytest.raises(FileNotFoundError):
+        train.main(
+            [
+                "--dataset",
+                "cora",
+                "--condition",
+                "relative_c",
+                "--output-dir",
+                str(tmp_path / "failed"),
+            ]
+        )
+    record = json.loads((tmp_path / "failed/metrics.json").read_text())
+    assert record["status"] == "failed" and "absent" in record["error"]
+
+
+def test_midrun_source_change_refused(monkeypatch, tmp_path):
+    mock_hardware(monkeypatch)
+    graph, indices, payload = fixture_data()
+    monkeypatch.setattr(train, "_make_data", lambda *args: (graph, indices))
+    sources = iter([{"fixture": "a" * 64}, {"fixture": "b" * 64}])
+    monkeypatch.setattr(train, "_source_hashes", lambda: next(sources))
+    args = arguments(tmp_path)
+    args.output_dir.mkdir()
+    with pytest.raises(RuntimeError, match="sources changed"):
+        train.train_model(
+            payload, {"data_sha256": "b" * 64}, args, torch.device("cpu"), args.output_dir
+        )
+````
+
 # research/conductance_gat/v2/__init__.py
 
 ````python
@@ -15147,6 +16367,1977 @@ def main(argv: list[str] | None = None) -> int:
         if result["source_sha256"] != starting_sources:
             raise RuntimeError("Dataset preparation and training used different v2 sources")
         record.update(result)
+    except BaseException as exc:
+        record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        atomic_write_json(output / "metrics.json", record)
+        raise
+    atomic_write_json(output / "metrics.json", record)
+    print(f"passed: {output}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# research/conductance_gat/v3/__init__.py
+
+````python
+"""Relative shared conductance and symmetric propagation, separate from v1/v2."""
+````
+
+# research/conductance_gat/v3/diagnostics.py
+
+````python
+"""Read-only observations for symmetric relative-C, never the old row-normalized rho.
+
+Training observations attach to the actual forward. Interventions run only after
+validation checkpoint selection, with no optimizer or test labels involved.
+"""
+
+from __future__ import annotations
+
+import math
+from contextlib import contextmanager
+from typing import Any
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from ..ablation.model import state_sha256
+
+
+@contextmanager
+def evaluation_mode(model: nn.Module):
+    modes = [(module, module.training) for module in model.modules()]
+    try:
+        model.eval()
+        with torch.no_grad():
+            yield
+    finally:
+        for module, mode in modes:
+            module.training = mode
+
+
+def norm(parameters, *, gradient: bool = False) -> float | None:
+    total, present = 0.0, False
+    for parameter in parameters:
+        value = parameter.grad if gradient else parameter.detach()
+        if value is None:
+            continue
+        value = value.detach().double()
+        if not bool(torch.isfinite(value).all()):
+            raise FloatingPointError("Nonfinite parameter/task gradient observation")
+        total += float(value.square().sum())
+        present = True
+    return math.sqrt(total) if present else None
+
+
+def gate_parameters(operator):
+    return [
+        value
+        for name, value in operator.estimator.named_parameters()
+        if name not in {"raw_gamma", "raw_tau"}
+    ]
+
+
+@torch.no_grad()
+def moments(value: Tensor, *, quantiles: bool = False) -> dict[str, Any]:
+    flat = value.detach().flatten().double()
+    if not bool(torch.isfinite(flat).all()):
+        raise FloatingPointError("Nonfinite v3 observation")
+    result = {
+        "count": flat.numel(),
+        "mean": None,
+        "std": None,
+        "cv": None,
+        "min": None,
+        "max": None,
+    }
+    if not flat.numel():
+        return result
+    mean, std = float(flat.mean()), float(flat.std(correction=0))
+    result.update(
+        mean=mean,
+        std=std,
+        cv=std / abs(mean) if mean else None,
+        min=float(flat.min()),
+        max=float(flat.max()),
+    )
+    if quantiles:
+        # Official transductive graphs have fewer than torch.quantile's 2**24
+        # element limit. Refuse to silently label a sampled median as exact.
+        if flat.numel() > 2**24:
+            raise ValueError("Exact diagnostic quantile exceeds supported tensor size")
+        values = torch.quantile(flat, flat.new_tensor([0.1, 0.5, 0.9, 0.99])).tolist()
+        result["quantiles"] = dict(zip(("p10", "p50", "p90", "p99"), values, strict=True))
+        result["quantile_policy"] = "exact_population"
+    return result
+
+
+class ForwardObservation:
+    """Observe actual v3 score/C/state without extra forward/backward or RNG use."""
+
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self.handles = []
+        self.records: dict[int, dict[str, Any]] = {}
+        self.conductances: dict[int, Tensor] = {}
+
+    def __enter__(self):
+        try:
+            for index, operator in enumerate(self.model.operators):
+                self.handles.append(
+                    operator.estimator.register_forward_hook(
+                        lambda module, inputs, output, i=index: self._conductance(i, module, output)
+                    )
+                )
+                self.handles.append(
+                    operator.register_forward_hook(
+                        lambda module, inputs, output, i=index: self._operator(
+                            i, module, inputs, output
+                        )
+                    )
+                )
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *args):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+        self.conductances.clear()
+
+    @torch.no_grad()
+    def _conductance(self, index: int, estimator, c: Tensor):
+        value = c.detach()
+        if not bool(torch.isfinite(value).all()) or bool((value <= 0).any()):
+            raise FloatingPointError("Observed C must be finite and positive")
+        scores = estimator.last_scores
+        if scores is None or scores.shape != value.shape:
+            raise RuntimeError("V3 estimator did not expose aligned actual-forward scores")
+        self.records[index] = {
+            "layer": index,
+            "score": moments(scores),
+            "conductance": moments(value),
+            "log_conductance": moments(value.log()),
+            "gamma": float(estimator.gamma.detach()),
+            "tau": float(estimator.tau.detach()),
+            "estimator_trainable": any(p.requires_grad for p in estimator.parameters()),
+        }
+        self.conductances[index] = value
+
+    @torch.no_grad()
+    def _operator(self, index: int, operator, inputs, output: Tensor):
+        state, incidence = inputs[:2]
+        c = self.conductances.pop(index)
+        tail, head = incidence
+        degree = c.new_zeros(state.shape[0])
+        degree.index_add_(0, tail, c)
+        degree.index_add_(0, head, c)
+        positive = degree > 0
+        degree_stats = moments(degree, quantiles=True)
+        positive_stats = moments(degree[positive], quantiles=True)
+        median = degree_stats.get("quantiles", {}).get("p50")
+        degree_stats.update(
+            positive_count=int(positive.sum()),
+            positive_quantiles=positive_stats.get("quantiles", {}),
+            max_over_median=degree_stats["max"] / median if median else None,
+        )
+        inv = torch.where(positive, degree, torch.ones_like(degree)).rsqrt() * positive
+        neighbor_sum = torch.zeros_like(degree)
+        edge_weight = c * inv[tail] * inv[head]
+        neighbor_sum.index_add_(0, tail, edge_weight)
+        neighbor_sum.index_add_(0, head, edge_weight)
+        alpha = float(operator.alpha.detach())
+        before_norm = float(state.detach().double().norm())
+        change = float((output.detach().double() - state.detach().double()).norm())
+        self.records[index].update(
+            alpha=alpha,
+            weighted_degree=degree_stats,
+            neighbor_weight_row_sum=moments(alpha * neighbor_sum, quantiles=True),
+            relative_conv_change=change / before_norm if before_norm else None,
+            gate_parameter_norm=norm(gate_parameters(operator)),
+            gate_gradient_norm=None,
+        )
+
+    def summary(self, *, gradients: bool = False):
+        if set(self.records) != set(range(len(self.model.operators))):
+            raise RuntimeError("Missing actual-forward layer observation")
+        output = []
+        for index in range(len(self.model.operators)):
+            record = dict(self.records[index])
+            if gradients:
+                record["gate_gradient_norm"] = norm(
+                    gate_parameters(self.model.operators[index]), gradient=True
+                )
+            output.append(record)
+        return output
+
+
+def evaluate_validation(model, graph, indices: Tensor, *, observe: bool = True):
+    if not indices.numel():
+        raise ValueError("Validation mask is empty")
+    with evaluation_mode(model):
+        if observe:
+            with ForwardObservation(model) as observation:
+                full_logits = model(graph)
+            layers = observation.summary()
+        else:
+            full_logits, layers = model(graph), []
+        logits = full_logits.index_select(0, indices)
+        labels = graph.y.index_select(0, indices)
+        if not bool(torch.isfinite(logits).all()):
+            raise FloatingPointError("Nonfinite validation logits")
+        result = {
+            "metric": int((logits.argmax(-1) == labels).sum()) / indices.numel(),
+            "loss": float(F.cross_entropy(logits, labels)),
+            "layers": layers,
+            "mode": "eval",
+            "split": "validation",
+            "observation_scope": "whole transductive graph states; validation labels only",
+        }
+    return result, logits.detach().cpu()
+
+
+class Intervention:
+    """Temporary output hooks; the actual operator recomputes D_C after replacing C."""
+
+    def __init__(self, model, name: str, seed: int):
+        if name not in {"mean_c", "shuffled_c", "ones_c", "propagation_off"}:
+            raise ValueError("Unsupported v3 intervention")
+        self.model, self.name, self.seed, self.handles = model, name, seed, []
+
+    def __enter__(self):
+        try:
+            for index, operator in enumerate(self.model.operators):
+                if self.name == "propagation_off":
+                    self.handles.append(
+                        operator.register_forward_hook(lambda module, inputs, output: inputs[0])
+                    )
+                else:
+                    self.handles.append(
+                        operator.estimator.register_forward_hook(
+                            lambda module, inputs, output, i=index: self.replace(inputs, output, i)
+                        )
+                    )
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *args):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    def replace(self, inputs, c: Tensor, layer: int):
+        if self.name == "ones_c":
+            return torch.ones_like(c)
+        _, incidence, node_graph, num_graphs = inputs
+        edge_graph = node_graph[incidence[0]]
+        result = c.clone()
+        generator = torch.Generator(device=c.device).manual_seed(self.seed + 104729 * layer)
+        for graph_index in range(num_graphs):
+            ids = (edge_graph == graph_index).nonzero(as_tuple=False).flatten()
+            if not ids.numel():
+                continue
+            values = c.index_select(0, ids)
+            if self.name == "mean_c":
+                result[ids] = values.mean()
+            else:
+                permutation = torch.randperm(ids.numel(), device=c.device, generator=generator)
+                result[ids] = values[permutation]
+        return result
+
+
+def best_checkpoint_interventions(model, graph, indices, original, reference: Tensor, *, seed: int):
+    """All-layer read-only interventions, only on the selected best checkpoint."""
+    before = state_sha256(model)
+    modes = [module.training for module in model.modules()]
+    gradients = {
+        name: None if p.grad is None else p.grad.detach().clone()
+        for name, p in model.named_parameters()
+    }
+    rows = []
+    try:
+        for name in ("mean_c", "shuffled_c", "ones_c", "propagation_off"):
+            with Intervention(model, name, seed):
+                result, logits = evaluate_validation(model, graph, indices, observe=False)
+            difference = logits.double() - reference.double()
+            rows.append(
+                {
+                    "intervention": name,
+                    "validation": result["metric"],
+                    "loss": result["loss"],
+                    "percentage_points": 100 * (result["metric"] - original["metric"]),
+                    "score_delta": result["metric"] - original["metric"],
+                    "logit_mean_absolute_delta": float(difference.abs().mean()),
+                    "logit_max_absolute_delta": float(difference.abs().max()),
+                    "changed_prediction_fraction": float(
+                        (logits.argmax(-1) != reference.argmax(-1)).double().mean()
+                    ),
+                }
+            )
+    finally:
+        if state_sha256(model) != before or modes != [
+            module.training for module in model.modules()
+        ]:
+            raise RuntimeError("Interventions changed model state or training modes")
+        for name, parameter in model.named_parameters():
+            old = gradients[name]
+            if (old is None) != (parameter.grad is None) or (
+                old is not None and not torch.equal(old, parameter.grad)
+            ):
+                raise RuntimeError("Interventions changed a parameter gradient")
+    return {
+        "status": "passed",
+        "scope": "validation_selected_best_checkpoint_only",
+        "layers": "all_layers_simultaneously",
+        "original": {"validation": original["metric"], "loss": original["loss"]},
+        "rows": rows,
+        "shuffle_seed": seed,
+        "normalization_recomputed": True,
+        "mean_ones_note": (
+            "Graph-constant positive C cancels under symmetric normalization; "
+            "mean-C and C=1 are redundant up to rounding."
+        ),
+        "interpretation": (
+            "Checkpoint reliance, not a retrained-model benefit; "
+            "no optimizer step or test evaluation."
+        ),
+    }
+````
+
+# research/conductance_gat/v3/model.py
+
+````python
+"""Graph-centered relative C, isotropic residual and separate mixing strength.
+
+Degree features are log-degree sum/absolute difference: unlike concatenating
+ordered endpoint degrees, these are invariant to reversing incidence orientation.
+Scalar C is shared across feature channels. Checkpointed gate chunks recompute
+edge features in backward; global centering/normalization remain differentiable.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
+
+from .operator import symmetric_propagation
+
+
+def graph_mean(values: Tensor, edge_graph: Tensor, num_graphs: int) -> Tensor:
+    """Full-graph scalar edge means; empty graphs have mean zero, never NaN."""
+    sums = values.new_zeros(num_graphs).index_add(0, edge_graph, values)
+    counts = values.new_zeros(num_graphs).index_add(0, edge_graph, torch.ones_like(values))
+    return sums / counts.clamp_min(1)
+
+
+class RelativeConductance(nn.Module):
+    def __init__(self, channels: int, gate_mode: str = "relative", edge_chunk_size: int = 65536):
+        super().__init__()
+        if gate_mode not in {"relative", "fixed_one"}:
+            raise ValueError(f"Unsupported relative-C gate mode: {gate_mode}")
+        if (
+            isinstance(edge_chunk_size, bool)
+            or not isinstance(edge_chunk_size, int)
+            or edge_chunk_size < 1
+        ):
+            raise ValueError("edge_chunk_size must be a positive integer")
+        self.gate_mode = gate_mode
+        self.edge_chunk_size = edge_chunk_size
+        self.input_norm = nn.LayerNorm(4 * channels + 2)
+        self.network = nn.Sequential(
+            nn.Linear(4 * channels + 2, channels),
+            nn.SiLU(),
+            nn.Linear(channels, channels),
+            nn.SiLU(),
+            # A common final bias is removed exactly by graph centering, so omit it.
+            nn.Linear(channels, 1, bias=False),
+        )
+        nn.init.zeros_(self.network[-1].weight)
+        self.raw_gamma = nn.Parameter(torch.zeros(()))
+        self.raw_tau = nn.Parameter(torch.zeros(()))
+        self.last_scores: Tensor | None = None
+        self.last_centered_scores: Tensor | None = None
+        if gate_mode == "fixed_one":
+            self.requires_grad_(False)
+
+    @property
+    def gamma(self) -> Tensor:
+        return self.raw_gamma.sigmoid()
+
+    @property
+    def tau(self) -> Tensor:
+        return 2 * self.raw_tau.sigmoid()
+
+    def _chunk_scores(self, state: Tensor, tail: Tensor, head: Tensor, log_degree: Tensor):
+        left, right = state[tail], state[head]
+        delta = right - left
+        degree_left, degree_right = log_degree[tail], log_degree[head]
+        features = torch.cat(
+            (
+                delta.abs(),
+                delta.square(),
+                left + right,
+                left * right,
+                (degree_left + degree_right)[:, None],
+                (degree_left - degree_right).abs()[:, None],
+            ),
+            dim=1,
+        )
+        return self.network(self.input_norm(features)).squeeze(-1)
+
+    def forward(
+        self, state: Tensor, incidence: Tensor, node_graph: Tensor, num_graphs: int
+    ) -> Tensor:
+        tail, head = incidence
+        edge_graph = node_graph[tail]
+        if self.gate_mode == "fixed_one":
+            self.last_scores = state.new_zeros(tail.numel())
+            self.last_centered_scores = self.last_scores
+            return state.new_ones(tail.numel())
+        degree = state.new_zeros(state.shape[0])
+        ones = state.new_ones(tail.numel())
+        degree.index_add_(0, tail, ones)
+        degree.index_add_(0, head, ones)
+        log_degree = degree.log1p()
+        chunks = []
+        for start in range(0, tail.numel(), self.edge_chunk_size):
+            stop = start + self.edge_chunk_size
+            # Pass sliced indices explicitly. No late-bound start/stop closure is
+            # used when checkpoint recomputes this particular chunk in backward.
+            inputs = (state, tail[start:stop], head[start:stop], log_degree)
+            if torch.is_grad_enabled():
+                score = checkpoint(
+                    self._chunk_scores, *inputs, use_reentrant=False, preserve_rng_state=False
+                )
+            else:
+                score = self._chunk_scores(*inputs)
+            chunks.append(score)
+        scores = torch.cat(chunks) if chunks else state.new_empty((0,))
+        if not bool(torch.isfinite(scores.detach()).all()):
+            raise FloatingPointError("Nonfinite relative conductance scores")
+        centered = scores - graph_mean(scores, edge_graph, num_graphs)[edge_graph]
+        unnormalized = (self.tau * centered.tanh()).exp()
+        relative = unnormalized / graph_mean(unnormalized, edge_graph, num_graphs)[edge_graph]
+        c = (1 - self.gamma) + self.gamma * relative
+        self.last_scores = scores.detach()
+        self.last_centered_scores = centered.detach()
+        return c
+
+
+class RelativeCConv(nn.Module):
+    def __init__(self, channels: int, gate_mode: str, edge_chunk_size: int = 65536):
+        super().__init__()
+        self.estimator = RelativeConductance(channels, gate_mode, edge_chunk_size)
+        self.raw_alpha = nn.Parameter(torch.zeros(()))
+        self.normalization = "symmetric"
+        self.edge_chunk_size = edge_chunk_size
+
+    @property
+    def alpha(self) -> Tensor:
+        return self.raw_alpha.sigmoid()
+
+    def forward(
+        self, x: Tensor, incidence: Tensor, node_graph: Tensor, num_graphs: int | None = None
+    ) -> Tensor:
+        if num_graphs is None:
+            num_graphs = int(node_graph.max()) + 1 if node_graph.numel() else 0
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            state = x if x.dtype == torch.float64 else x.float()
+            c = self.estimator(state, incidence, node_graph, num_graphs)
+            result = symmetric_propagation(
+                state,
+                c,
+                incidence,
+                self.alpha.to(dtype=state.dtype),
+                edge_chunk_size=self.edge_chunk_size,
+            )
+        return result.to(x.dtype)
+
+
+class RelativeCNodeClassifier(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        classes: int,
+        *,
+        normalization: str = "symmetric",
+        hidden_channels: int = 64,
+        layers: int = 2,
+        dropout: float = 0.5,
+        gate_mode: str = "relative",
+        edge_chunk_size: int = 65536,
+    ):
+        super().__init__()
+        if normalization != "symmetric":
+            raise ValueError("Relative-C v3 keeps symmetric normalization fixed")
+        if hidden_channels < 1 or layers < 1 or not 0 <= dropout < 1:
+            raise ValueError("hidden width/layers must be positive and dropout in [0, 1)")
+        self.normalization = normalization
+        self.gate_mode = gate_mode
+        self.dropout = dropout
+        self.edge_chunk_size = edge_chunk_size
+        self.encoder = nn.Linear(in_channels, hidden_channels)
+        self.decoder = nn.Linear(hidden_channels, classes)
+        self.operators = nn.ModuleList(
+            RelativeCConv(hidden_channels, gate_mode, edge_chunk_size) for _ in range(layers)
+        )
+        self.norms = nn.ModuleList(nn.LayerNorm(hidden_channels) for _ in range(layers))
+
+    def forward(self, graph: Any) -> Tensor:
+        x, incidence = graph.x, graph.incidence_edge_index
+        if incidence.dtype != torch.long or incidence.ndim != 2 or incidence.shape[0] != 2:
+            raise ValueError("incidence must be a 2 x E int64 tensor")
+        if incidence.device != x.device:
+            raise ValueError("state and incidence must share a device")
+        if incidence.numel() and (
+            bool((incidence < 0).any()) or bool((incidence >= x.shape[0]).any())
+        ):
+            raise ValueError("incidence endpoint is outside the node matrix")
+        batch = getattr(graph, "batch", None)
+        if batch is None:
+            batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            num_graphs = 1
+        else:
+            if (
+                batch.dtype != torch.long
+                or batch.shape != (x.shape[0],)
+                or batch.device != x.device
+            ):
+                raise ValueError("batch must contain one same-device int64 graph index per node")
+            if batch.numel() and bool((batch < 0).any()):
+                raise ValueError("batch indices must be nonnegative")
+            num_graphs = int(batch.max()) + 1 if batch.numel() else 0
+        if incidence.numel() and not torch.equal(batch[incidence[0]], batch[incidence[1]]):
+            raise ValueError("Edges must not connect different graphs in a batch")
+        h = F.dropout(F.elu(self.encoder(x)), self.dropout, self.training)
+        for operator, norm in zip(self.operators, self.norms, strict=True):
+            h = operator(h, incidence, batch, num_graphs)
+            h = F.dropout(F.elu(norm(h)), self.dropout, self.training)
+        return self.decoder(h)
+````
+
+# research/conductance_gat/v3/operator.py
+
+````python
+"""Exact chunked symmetric normalized diffusion, including C-dependent degrees.
+
+The custom backward saves O(nd+m) values and uses O(chunk*d) edge workspace.
+It is first-order only; no dense B, C or Laplacian is materialized. The frozen-C
+linear map is symmetric, but adaptive C(H) makes the complete layer nonlinear.
+Symmetric normalization does not generally preserve the constant node vector.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor
+from torch.autograd.function import once_differentiable
+
+
+class _SymmetricPropagation(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, state, c, incidence, alpha, chunk_size):
+        degree = state.new_zeros(state.shape[0])
+        for start in range(0, c.numel(), chunk_size):
+            tail, head = incidence[:, start : start + chunk_size]
+            weights = c[start : start + chunk_size]
+            degree.index_add_(0, tail, weights)
+            degree.index_add_(0, head, weights)
+        if not bool(torch.isfinite(degree).all()):
+            raise FloatingPointError("Nonfinite symmetric conductance degree")
+        active = degree > 0
+        safe_degree = torch.where(active, degree, torch.ones_like(degree))
+        inverse = safe_degree.rsqrt() * active.to(state.dtype)
+        propagated = torch.zeros_like(state)
+        for start in range(0, c.numel(), chunk_size):
+            tail, head = incidence[:, start : start + chunk_size]
+            weights = c[start : start + chunk_size] * inverse[tail] * inverse[head]
+            propagated.index_add_(0, tail, weights[:, None] * state[head])
+            propagated.index_add_(0, head, weights[:, None] * state[tail])
+        laplacian_state = active[:, None] * state - propagated
+        result = state - alpha * laplacian_state
+        if not bool(torch.isfinite(result).all()):
+            raise FloatingPointError("Nonfinite symmetric propagation")
+        ctx.chunk_size = chunk_size
+        ctx.save_for_backward(state, c, incidence, alpha, inverse, propagated, active)
+        return result
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output):
+        state, c, incidence, alpha, inverse, propagated, active = ctx.saved_tensors
+        propagated_grad = torch.zeros_like(grad_output)
+        need_state, need_c, _, need_alpha, _ = ctx.needs_input_grad
+        if need_state or need_c:
+            for start in range(0, c.numel(), ctx.chunk_size):
+                tail, head = incidence[:, start : start + ctx.chunk_size]
+                weights = c[start : start + ctx.chunk_size] * inverse[tail] * inverse[head]
+                propagated_grad.index_add_(0, tail, weights[:, None] * grad_output[head])
+                propagated_grad.index_add_(0, head, weights[:, None] * grad_output[tail])
+        grad_state = (
+            grad_output - alpha * (active[:, None] * grad_output - propagated_grad)
+            if need_state
+            else None
+        )
+        grad_c = None
+        if need_c:
+            degree_term = (
+                -0.5
+                * (grad_output * propagated + state * propagated_grad).sum(dim=1)
+                * inverse.square()
+            )
+            grad_c = torch.empty_like(c)
+            for start in range(0, c.numel(), ctx.chunk_size):
+                tail, head = incidence[:, start : start + ctx.chunk_size]
+                direct_term = (
+                    inverse[tail]
+                    * inverse[head]
+                    * (
+                        (grad_output[tail] * state[head]).sum(dim=1)
+                        + (grad_output[head] * state[tail]).sum(dim=1)
+                    )
+                )
+                grad_c[start : start + ctx.chunk_size] = alpha * (
+                    direct_term + degree_term[tail] + degree_term[head]
+                )
+        grad_alpha = (
+            -(grad_output * (active[:, None] * state - propagated)).sum().reshape_as(alpha)
+            if need_alpha
+            else None
+        )
+        return grad_state, grad_c, None, grad_alpha, None
+
+
+def symmetric_propagation(
+    state: Tensor,
+    c: Tensor,
+    incidence: Tensor,
+    alpha: Tensor,
+    *,
+    edge_chunk_size: int = 65536,
+) -> Tensor:
+    """H-alpha D_C^-1/2 B.T C B D_C^-1/2 H, identity on isolates."""
+    if state.ndim != 2 or state.dtype not in {torch.float32, torch.float64}:
+        raise ValueError("state must be a float32/float64 node-feature matrix")
+    if incidence.dtype != torch.long or incidence.ndim != 2 or incidence.shape[0] != 2:
+        raise ValueError("incidence must be a 2 x E int64 tensor")
+    if c.ndim != 1 or c.shape[0] != incidence.shape[1] or c.dtype != state.dtype:
+        raise ValueError("C must have one same-dtype scalar per physical edge")
+    if alpha.ndim != 0 or alpha.dtype != state.dtype:
+        raise ValueError("alpha must be a same-dtype scalar tensor")
+    if any(value.device != state.device for value in (c, incidence, alpha)):
+        raise ValueError("state, C, incidence and alpha must share a device")
+    if (
+        isinstance(edge_chunk_size, bool)
+        or not isinstance(edge_chunk_size, int)
+        or edge_chunk_size < 1
+    ):
+        raise ValueError("edge_chunk_size must be a positive integer")
+    if incidence.numel() and (
+        bool((incidence < 0).any()) or bool((incidence >= state.shape[0]).any())
+    ):
+        raise ValueError("incidence endpoint is outside the node matrix")
+    if incidence.shape[1] and bool((incidence[0] == incidence[1]).any()):
+        raise ValueError("physical incidence edges must not contain self loops")
+    if not bool(torch.isfinite(c.detach()).all()) or not bool((c.detach() > 0).all()):
+        raise FloatingPointError("C must remain finite and positive")
+    if not bool(torch.isfinite(state.detach()).all()):
+        raise FloatingPointError("Nonfinite state")
+    checked_alpha = alpha.detach()
+    if not bool(torch.isfinite(checked_alpha)) or not bool(
+        (checked_alpha >= 0) & (checked_alpha <= 1)
+    ):
+        raise FloatingPointError("alpha must be finite and in [0, 1]")
+    return _SymmetricPropagation.apply(state, c, incidence, alpha, edge_chunk_size)
+````
+
+# research/conductance_gat/v3/protocol.py
+
+````python
+"""Dependency-free protocol for the first relative-conductance v3 experiment."""
+
+SUITE = "conductance_relative_c_v3"
+PARAMETERIZATION = "shared_relative_log_conductance"
+DATASETS = ("cora", "citeseer", "pubmed", "ogbn-arxiv")
+DEFAULT_DATASETS = ("ogbn-arxiv",)
+DEFAULT_EDGE_CHUNK_SIZE = 65536
+COMMON = {
+    "hidden_channels": 64,
+    "layers": 2,
+    "dropout": 0.5,
+    "lr": 0.005,
+    "weight_decay": 0.0005,
+    "amp": False,
+    "compile": False,
+    "optimizer": "AdamW",
+    "gate_lr_multiplier": 2.0,
+    "scalar_weight_decay": 0.0,
+}
+CONDITIONS = {
+    "relative_c": {
+        "normalization": "symmetric",
+        "gate_mode": "relative",
+        "gate_weight_decay": 0.0,
+    },
+    "fixed_c": {
+        "normalization": "symmetric",
+        "gate_mode": "fixed_one",
+        "gate_weight_decay": 0.0,
+    },
+}
+PROTOCOL_NOTE = (
+    "Shared graph-centered relative conductance, symmetric normalization and a separate "
+    "learnable alpha; both arms initialize C=1 and alpha=.5. Fixed C freezes the entire "
+    "estimator but keeps alpha trainable. AdamW separates backbone, gate and scalar controls. "
+    "Official train labels only; validation selects checkpoints, no test evaluation. "
+    "V1/V2 are unchanged and their historical scores are not a matched one-factor contrast. "
+    "Graph means and degrees are full graph, not chunk-local; first-order gradients only. "
+    "The kernel is sparse/chunked but training remains full graph, without neighbor sampling."
+)
+````
+
+# research/conductance_gat/v3/report.py
+
+````python
+"""Fail-closed fixed-graph relative-C comparison; stdlib only, no training or test labels."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import io
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+from ..ablation.report import (
+    REPORT_FILENAMES,
+    _atomic_write,
+    _cell,
+    _contained,
+    _display,
+    _finite_number,
+    _integer,
+    _load_child,
+    _pair_metadata,
+    _reject_nonfinite_json,
+    _same,
+)
+from .protocol import COMMON, CONDITIONS, DATASETS, PARAMETERIZATION, SUITE
+
+SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
+CAVEATS = [
+    "n=1; exploratory validation comparison; test not evaluated. No CI, p-value or seed std.",
+    "Both arms train freshly with the same initial full state, official cache, topology, "
+    "AdamW policy and early-stopping policy. No V1/V2 or historical score is reused.",
+    "V3 uses a shared relative-log-conductance generator, symmetric normalization and learned "
+    "propagation strength. The initial benchmark protocol is transductive; PPI is not included.",
+    "The contrast is relative_c minus fixed_c (percentage points), an internal V3 ablation. "
+    "V2-to-V3 changes several factors and must not be called a single-factor comparison.",
+    "Fixed C=1 freezes its unused gate MLP/gamma/tau scaffold; alpha remains trainable in both "
+    "arms. Frozen gate parameter norms do not indicate active learning.",
+    "Reported alpha/gamma/tau, C CV and log-C spread describe the selected checkpoint, not "
+    "proof of useful weighting. Propagation strength alpha is learned in V3.",
+    "Mean-C, shuffled-C, C=1 and propagation-off interventions are separate validation forwards "
+    "at the selected checkpoint, not retraining. They measure checkpoint reliance, not whether "
+    "learning C improves training; the fresh C=1 arm addresses the latter.",
+    "Elapsed time and peak CUDA allocation include diagnostics, interventions and checkpoint "
+    "overhead as recorded by the training timer. Epoch counts can differ; these are not "
+    "isolated kernel benchmarks or measured V1/V2/spectral speedups.",
+    "Sparse edge-chunked execution avoids eigendecomposition and dense incidence storage, but "
+    "still requires full-graph node states and shared-gate computation. This is not a measured "
+    "scalability result or a claim that every spectral architecture requires decomposition.",
+    "Repeated validation-guided choices can overfit validation. Identical initial states do "
+    "not guarantee bitwise-identical CUDA scatter trajectories.",
+]
+
+
+class ComparisonIntegrityError(ValueError):
+    def __init__(self, report: dict[str, Any]):
+        self.report = report
+        super().__init__(
+            "Relative-C V3 comparison integrity failed: " + "; ".join(report["errors"])
+        )
+
+
+def _source_hashes(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict) or not value:
+        raise ValueError("nonempty source_sha256 object is required")
+    for name, digest in value.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or Path(name).is_absolute()
+            or ".." in Path(name).parts
+            or not isinstance(digest, str)
+            or not SHA256.fullmatch(digest)
+        ):
+            raise ValueError("source_sha256 requires relative source paths and SHA-256 digests")
+    return value
+
+
+INTERVENTIONS = {"mean_c", "shuffled_c", "ones_c", "propagation_off"}
+
+
+def _names(value, label):
+    if not isinstance(value, list) or any(not isinstance(v, str) or not v for v in value):
+        raise ValueError(f"{label}: expected parameter-name list")
+    if len(set(value)) != len(value):
+        raise ValueError(f"{label}: duplicate parameter names")
+    return value
+
+
+def _validate_optimizer(child, config, condition):
+    if child.get("optimizer") != "AdamW":
+        raise ValueError("optimizer must be AdamW")
+    active = _names(child.get("trainable_parameter_names"), "trainable_parameter_names")
+    frozen = _names(child.get("frozen_parameter_names"), "frozen_parameter_names")
+    if not active or set(active) & set(frozen):
+        raise ValueError("active/frozen parameter names overlap or active list is empty")
+    if bool(frozen) != (condition == "fixed_c"):
+        raise ValueError("frozen parameter names disagree with condition")
+    if any(name.endswith(".raw_alpha") for name in frozen):
+        raise ValueError("alpha must remain trainable in every layer")
+    groups = child.get("optimizer_groups")
+    if not isinstance(groups, list):
+        raise ValueError("optimizer_groups must be a list")
+    expected = {"backbone", "controls"} | ({"gate_mlp"} if condition == "relative_c" else set())
+    indexed, all_names, count = {}, [], 0
+    for group in groups:
+        if not isinstance(group, dict) or group.get("name") not in expected:
+            raise ValueError("unexpected optimizer parameter group")
+        name = group["name"]
+        if name in indexed:
+            raise ValueError("duplicate optimizer parameter group")
+        indexed[name] = group
+        names = _names(group.get("parameter_names"), f"{name}.parameter_names")
+        if not names:
+            raise ValueError("optimizer groups must not be empty")
+        size = _integer(group.get("parameter_count"), f"{name}.parameter_count", minimum=1)
+        count += size
+        all_names.extend(names)
+        lr = config["lr"] * (config["gate_lr_multiplier"] if name == "gate_mlp" else 1)
+        wd = config["weight_decay"] if name == "backbone" else 0.0
+        if not _same(group.get("lr"), lr) or not _same(group.get("weight_decay"), wd):
+            raise ValueError(f"optimizer {name} lr/weight_decay mismatch")
+        if name == "controls":
+            required = {f"operators.{i}.raw_alpha" for i in range(config["layers"])}
+            if condition == "relative_c":
+                required |= {
+                    f"operators.{i}.estimator.raw_{key}"
+                    for i in range(config["layers"])
+                    for key in ("gamma", "tau")
+                }
+            if set(names) != required or size != len(names):
+                raise ValueError("scalar optimizer controls mismatch; alpha must remain active")
+        elif any(p.rsplit(".", 1)[-1] in {"raw_alpha", "raw_gamma", "raw_tau"} for p in names):
+            raise ValueError("scalar controls must use their no-decay parameter group")
+    if (
+        set(indexed) != expected
+        or len(set(all_names)) != len(all_names)
+        or set(all_names) != set(active)
+    ):
+        raise ValueError("optimizer groups do not cover exactly the trainable parameters")
+    if count != child["trainable_parameters"]:
+        raise ValueError("optimizer parameter counts disagree with trainable_parameters")
+
+
+def _validate_diagnostics(child, config):
+    diagnostics = child.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        raise ValueError("V3 diagnostics are required")
+    best = diagnostics.get("best_validation")
+    if (
+        not isinstance(best, dict)
+        or best.get("mode") != "eval"
+        or best.get("split") != "validation"
+    ):
+        raise ValueError("best_validation diagnostics must be validation/eval")
+    layers = best.get("layers")
+    if not isinstance(layers, list) or len(layers) != config["layers"]:
+        raise ValueError("best_validation layer diagnostics are incomplete")
+    indices = []
+    for layer in layers:
+        if not isinstance(layer, dict):
+            raise ValueError("invalid layer diagnostics")
+        indices.append(_integer(layer.get("layer"), "diagnostic.layer"))
+        _finite_number(layer.get("alpha"), "alpha", unit_interval=True)
+        _finite_number(layer.get("gamma"), "gamma", unit_interval=True)
+        if _finite_number(layer.get("tau"), "tau") <= 0:
+            raise ValueError("tau must be positive")
+        for path in (
+            ("score", "std"),
+            ("conductance", "cv"),
+            ("log_conductance", "std"),
+            ("weighted_degree", "quantiles", "p50"),
+            ("weighted_degree", "quantiles", "p99"),
+            ("weighted_degree", "max_over_median"),
+            ("relative_conv_change",),
+            ("gate_parameter_norm",),
+            ("gate_gradient_norm",),
+        ):
+            value = _nested(layer, *path)
+            if value is not None and _finite_number(value, ".".join(path)) < 0:
+                raise ValueError("diagnostic magnitudes must be nonnegative")
+    if sorted(indices) != list(range(config["layers"])):
+        raise ValueError("diagnostic layer indices are missing or duplicated")
+    _best_training_observation(child, config)
+    audit = diagnostics.get("best_checkpoint_interventions")
+    if (
+        not isinstance(audit, dict)
+        or audit.get("status") != "passed"
+        or audit.get("scope") != ("validation_selected_best_checkpoint_only")
+    ):
+        raise ValueError("selected-checkpoint validation interventions are required")
+    original = audit.get("original")
+    if not isinstance(original, dict):
+        raise ValueError("intervention original score is missing")
+    score = _finite_number(original.get("validation"), "intervention original", unit_interval=True)
+    if abs(score - child["validation"]) > 1.0e-7:
+        raise ValueError("intervention original differs from selected validation")
+    rows = audit.get("rows")
+    if not isinstance(rows, list) or len(rows) != len(INTERVENTIONS):
+        raise ValueError("all four selected-checkpoint interventions are required")
+    names = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("intervention") not in INTERVENTIONS:
+            raise ValueError("unknown checkpoint intervention")
+        names.append(row["intervention"])
+        value = _finite_number(row.get("validation"), "intervention validation", unit_interval=True)
+        delta = _finite_number(row.get("percentage_points"), "intervention percentage_points")
+        if abs(delta - 100.0 * (value - score)) > 1.0e-8:
+            raise ValueError("intervention percentage-points delta mismatch")
+        _finite_number(
+            row.get("changed_prediction_fraction"), "changed predictions", unit_interval=True
+        )
+        if _finite_number(row.get("logit_mean_absolute_delta"), "logit delta") < 0:
+            raise ValueError("logit delta must be nonnegative")
+    if set(names) != INTERVENTIONS or len(set(names)) != len(names):
+        raise ValueError("missing/duplicate checkpoint interventions")
+
+
+def _best_validation_summary(diagnostics):
+    if not isinstance(diagnostics, dict):
+        return []
+    best = diagnostics.get("best_validation", {})
+    return best.get("layers", []) if isinstance(best, dict) else []
+
+
+def _best_training_observation(child, config):
+    trajectory = child["diagnostics"].get("train_trajectory")
+    if not isinstance(trajectory, list) or any(not isinstance(row, dict) for row in trajectory):
+        raise ValueError("actual training trajectory must be recorded")
+    epochs = [_integer(row.get("epoch"), "training epoch", minimum=1) for row in trajectory]
+    if len(set(epochs)) != len(epochs):
+        raise ValueError("duplicate actual-training epoch observations")
+    selected = [row for row in trajectory if row["epoch"] == child["best_epoch"]]
+    if len(selected) != 1:
+        raise ValueError("selected epoch is missing from actual training observations")
+    record = selected[0]
+    expected = {
+        "scope": "full_graph_train_mask",
+        "mode": "train_dropout_on",
+        "stage": "after_task_backward_before_optimizer_step",
+        "batch_index": 0,
+        "optimizer_steps_before_batch": child["best_epoch"] - 1,
+    }
+    for key, value in expected.items():
+        if not _same(record.get(key), value):
+            raise ValueError(f"selected training observation {key} mismatch")
+    layers = record.get("layers")
+    if not isinstance(layers, list) or len(layers) != config["layers"]:
+        raise ValueError("selected training layer observations are incomplete")
+    indices = []
+    for layer in layers:
+        if not isinstance(layer, dict):
+            raise ValueError("invalid training layer observation")
+        indices.append(_integer(layer.get("layer"), "training layer"))
+        value = layer.get("gate_gradient_norm")
+        if child["condition"] == "relative_c":
+            if _finite_number(value, "actual training gate gradient") < 0:
+                raise ValueError("actual training gate gradient must be nonnegative")
+        elif value is not None:
+            raise ValueError("frozen gate must not have a training gradient")
+    if sorted(indices) != list(range(config["layers"])):
+        raise ValueError("selected training layer indices are missing or duplicated")
+    return record
+
+
+def _nested(mapping, *keys):
+    value = mapping
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _diagnostic_markdown(conditions):
+    lines = [
+        "### Selected-checkpoint layer diagnostics",
+        "",
+        "Layer indices are zero-based. Validation computes no gradients; missing values are "
+        "not evidence that training skipped backpropagation. "
+        "Fixed-arm gamma/tau and gate norms describe an unused frozen scaffold.",
+        "",
+        "| Condition | Layer | Score std | C CV | log-C std | alpha | gamma | tau |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    fields = [
+        ("score", "std"),
+        ("conductance", "cv"),
+        ("log_conductance", "std"),
+        ("alpha",),
+        ("gamma",),
+        ("tau",),
+    ]
+    for condition in conditions:
+        for layer in condition["best_validation_diagnostics"]:
+            values = [_display(_nested(layer, *path)) for path in fields]
+            lines.append(
+                "| " + " | ".join([condition["condition"], str(layer["layer"])] + values) + " |"
+            )
+    lines += [
+        "",
+        "| Condition | Layer | Degree p50 | Degree p99 | Degree max/p50 "
+        "| Relative propagation change | Gate L2 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    fields = [
+        ("weighted_degree", "quantiles", "p50"),
+        ("weighted_degree", "quantiles", "p99"),
+        ("weighted_degree", "max_over_median"),
+        ("relative_conv_change",),
+        ("gate_parameter_norm",),
+    ]
+    for condition in conditions:
+        for layer in condition["best_validation_diagnostics"]:
+            values = [_display(_nested(layer, *path)) for path in fields]
+            lines.append(
+                "| " + " | ".join([condition["condition"], str(layer["layer"])] + values) + " |"
+            )
+    return lines + [""]
+
+
+def _training_gradient_markdown(conditions):
+    lines = [
+        "### Actual training gradients at the selected epoch",
+        "",
+        "Recorded on the actual training-mask loss after backward and before that epoch's "
+        "optimizer update, with training dropout enabled. These are not gradients recomputed "
+        "at the selected post-update checkpoint. Frozen gate entries are inapplicable, not zero.",
+        "",
+        "| Condition | Epoch | Layer | Gate MLP task-gradient L2 |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for condition in conditions:
+        record = condition["best_epoch_training_observation"]
+        if not record:
+            continue
+        for layer in record["layers"]:
+            value = layer["gate_gradient_norm"]
+            label = "frozen / not trainable" if value is None else _display(value)
+            lines.append(
+                f"| {condition['condition']} | {record['epoch']} | {layer['layer']} | {label} |"
+            )
+    return lines + [""]
+
+
+def _intervention_markdown(conditions):
+    lines = [
+        "### Selected-checkpoint validation interventions (no retraining)",
+        "",
+        "| Condition | Intervention | Validation (%) | Delta original (pp) "
+        "| Changed predictions (%) | Mean absolute logit delta |",
+        "| --- | --- | ---: | ---: | ---: | ---: |",
+    ]
+    for condition in conditions:
+        audit = condition["best_checkpoint_interventions"]
+        if not audit:
+            continue
+        for row in audit["rows"]:
+            values = [
+                condition["condition"],
+                row["intervention"],
+                _display(100.0 * row["validation"]),
+                _display(row["percentage_points"], signed=True),
+                _display(100.0 * row["changed_prediction_fraction"]),
+                _display(row["logit_mean_absolute_delta"]),
+            ]
+            lines.append("| " + " | ".join(values) + " |")
+    return lines + [""]
+
+
+def _load(root, job, config, source_hashes):
+    path = _contained(job.get("metrics_path"), root, "metrics")
+    digest = job.get("metrics_sha256")
+    if not isinstance(digest, str) or not SHA256.fullmatch(digest):
+        raise ValueError("job.metrics_sha256 is required")
+    try:
+        actual_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ValueError(f"cannot read child metrics: {exc}") from exc
+    if actual_digest != digest.lower():
+        raise ValueError("metrics SHA-256 mismatch")
+    child = _load_child(root, job, config, suite=SUITE, conditions=CONDITIONS)
+    for key, expected in (
+        ("gate_mode", CONDITIONS[job["condition"]]["gate_mode"]),
+        ("parameterization", PARAMETERIZATION),
+        ("source_sha256", source_hashes),
+    ):
+        if not _same(child.get(key), expected):
+            raise ValueError(f"{key} mismatch")
+    if "gate_mode" in child["configuration"]:
+        raise ValueError("gate_mode belongs in arm metadata, not held-fixed configuration")
+    topology = child.get("topology")
+    if not isinstance(topology, dict) or set(topology) != {
+        "num_nodes",
+        "num_edges",
+        "incidence_sha256",
+    }:
+        raise ValueError("topology must contain num_nodes, num_edges and incidence_sha256")
+    _integer(topology["num_nodes"], "topology.num_nodes", minimum=1)
+    _integer(topology["num_edges"], "topology.num_edges")
+    if not isinstance(topology["incidence_sha256"], str) or not SHA256.fullmatch(
+        topology["incidence_sha256"]
+    ):
+        raise ValueError("topology.incidence_sha256 must be a SHA-256 digest")
+    total = _integer(child.get("total_parameters"), "total_parameters", minimum=1)
+    trainable = _integer(child.get("trainable_parameters"), "trainable_parameters", minimum=1)
+    frozen = _integer(child.get("frozen_parameters"), "frozen_parameters")
+    if (
+        total != trainable + frozen
+        or (job["condition"] == "relative_c" and frozen != 0)
+        or (job["condition"] == "fixed_c" and frozen == 0)
+    ):
+        raise ValueError("parameter counts disagree with relative-C/frozen-scaffold condition")
+    _validate_optimizer(child, config, job["condition"])
+    _validate_diagnostics(child, config)
+    if not isinstance(child.get("versions"), dict) or not child["versions"]:
+        raise ValueError("Missing runtime versions")
+    if not isinstance(child.get("gpu"), str) or not child["gpu"]:
+        raise ValueError("Missing GPU identity")
+    if child["protocol"].get("data_sha256") != child["cache_sha256"]:
+        raise ValueError("cache_sha256 disagrees with dataset protocol")
+    return child
+
+
+def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    errors = []
+    config = manifest.get("config", {})
+    if not isinstance(config, dict):
+        config = {}
+        errors.append("manifest.config must be an object")
+    datasets = config.get("datasets", [])
+    if (
+        not isinstance(datasets, list)
+        or not datasets
+        or any(not isinstance(d, str) or d not in DATASETS for d in datasets)
+        or len(set(datasets)) != len(datasets)
+    ):
+        datasets = []
+        errors.append("datasets must list unique supported fixed-graph datasets (PPI unsupported)")
+    for key, expected in (
+        ("schema_version", 1),
+        ("suite", SUITE),
+        ("conditions", CONDITIONS),
+        ("source_integrity_valid", True),
+    ):
+        if not _same(manifest.get(key), expected):
+            errors.append(f"manifest.{key} mismatch")
+    if manifest.get("status") not in {"running", "failed", "passed"}:
+        errors.append("invalid manifest.status")
+    sources = {}
+    try:
+        source_metadata = manifest.get("sources")
+        if not isinstance(source_metadata, dict):
+            raise ValueError("manifest.sources must be an object")
+        sources = _source_hashes(source_metadata.get("sha256"))
+        _integer(config.get("model_seed"), "model_seed")
+        for key in ("epochs", "patience", "edge_chunk_size"):
+            _integer(config.get(key), key, minimum=1)
+        if config.get("batch_size") != 1 or type(config.get("batch_size")) is not int:
+            raise ValueError("full-graph batch_size must be 1")
+        if config.get("workers") != 0 or type(config.get("workers")) is not int:
+            raise ValueError("full-graph workers must be 0")
+        if not isinstance(config.get("device"), str) or not re.fullmatch(
+            r"cuda(?::[0-9]+)?", config["device"]
+        ):
+            raise ValueError("CUDA device required")
+        for key, expected in COMMON.items():
+            if not _same(config.get(key), expected):
+                raise ValueError(f"fixed configuration.{key} mismatch")
+    except ValueError as exc:
+        errors.append(str(exc))
+    jobs = manifest.get("jobs", [])
+    if not isinstance(jobs, list):
+        jobs = []
+        errors.append("manifest.jobs must be a list")
+    indexed = {}
+    for job in jobs:
+        if not isinstance(job, dict):
+            errors.append("invalid manifest job")
+            continue
+        dataset, condition = job.get("dataset"), job.get("condition")
+        if (
+            not isinstance(dataset, str)
+            or dataset not in datasets
+            or not isinstance(condition, str)
+            or condition not in CONDITIONS
+        ):
+            errors.append("job references an unknown dataset/condition")
+            continue
+        key = dataset, condition
+        if key in indexed:
+            errors.append(f"duplicate job: {key}")
+            continue
+        indexed[key] = job
+        if job.get("status") not in {"pending", "running", "failed", "passed"}:
+            errors.append(f"{key}: invalid job status")
+        try:
+            output = _contained(job.get("output_dir"), root, f"{key} output")
+            metrics = _contained(job.get("metrics_path"), root, f"{key} metrics")
+            if (
+                output != (root / dataset / condition).resolve()
+                or metrics != output / "metrics.json"
+            ):
+                raise ValueError(f"{key}: output/metrics do not match canonical job paths")
+        except ValueError as exc:
+            errors.append(str(exc))
+    if set(indexed) != {(d, c) for d in datasets for c in CONDITIONS}:
+        errors.append("manifest must contain the complete two-arm job matrix")
+    reports = []
+    for dataset in datasets:
+        loaded, rows = {}, []
+        for condition, spec in CONDITIONS.items():
+            job = indexed.get((dataset, condition))
+            row = {
+                "condition": condition,
+                **spec,
+                "status": job.get("status") if job else "missing",
+                **{
+                    key: None
+                    for key in (
+                        "validation",
+                        "validation_percent",
+                        "best_epoch",
+                        "epochs_run",
+                        "train_loss",
+                        "total_parameters",
+                        "trainable_parameters",
+                        "frozen_parameters",
+                        "elapsed_seconds",
+                        "peak_cuda_allocated_bytes",
+                    )
+                },
+                "best_validation_diagnostics": [],
+                "best_checkpoint_interventions": None,
+                "best_epoch_training_observation": None,
+            }
+            if job and job.get("error"):
+                row["error"] = str(job["error"])
+            if job and job.get("status") == "passed":
+                try:
+                    child = _load(root, job, config, sources)
+                    loaded[condition] = child
+                    for key in (
+                        "validation",
+                        "best_epoch",
+                        "epochs_run",
+                        "train_loss",
+                        "total_parameters",
+                        "trainable_parameters",
+                        "frozen_parameters",
+                        "elapsed_seconds",
+                        "peak_cuda_allocated_bytes",
+                    ):
+                        row[key] = child[key]
+                    row["validation_percent"] = 100.0 * child["validation"]
+                    row["best_checkpoint_interventions"] = child["diagnostics"][
+                        "best_checkpoint_interventions"
+                    ]
+                    row["best_epoch_training_observation"] = _best_training_observation(
+                        child, config
+                    )
+                    row["best_validation_diagnostics"] = _best_validation_summary(
+                        child.get("diagnostics")
+                    )
+                except (ValueError, KeyError, TypeError) as exc:
+                    row.update(status="invalid", error=str(exc))
+                    errors.append(f"{dataset}/{condition}: {exc}")
+            rows.append(row)
+        reference = next(iter(loaded.values()), None)
+        metadata = _pair_metadata(reference) if reference else None
+        if reference:
+            extra = (
+                "versions",
+                "gpu",
+                "total_parameters",
+                "topology",
+                "parameterization",
+                "source_sha256",
+            )
+            metadata.update({key: reference[key] for key in extra})
+            for condition, child in loaded.items():
+                actual = _pair_metadata(child) | {key: child[key] for key in extra}
+                for key in metadata:
+                    if not _same(metadata[key], actual[key]):
+                        errors.append(f"{dataset}/{condition}: held-fixed {key} mismatch")
+        reports.append(
+            {
+                "dataset": dataset,
+                "metric_name": "accuracy",
+                "model_seed": config.get("model_seed"),
+                "conditions": rows,
+                "complete": len(loaded) == len(CONDITIONS),
+                "held_fixed": metadata,
+                "relative_minus_fixed": None,
+            }
+        )
+    all_complete = bool(reports) and all(row["complete"] for row in reports)
+    if manifest.get("status") == "passed" and not all_complete:
+        errors.append("passed manifest lacks a complete two-arm matrix")
+    for item in reports:
+        if errors:
+            item["complete"] = False
+        elif item["complete"]:
+            scores = {row["condition"]: row["validation"] for row in item["conditions"]}
+            delta = scores["relative_c"] - scores["fixed_c"]
+            item["relative_minus_fixed"] = {
+                "score_delta": delta,
+                "percentage_points": 100.0 * delta,
+            }
+    failed = manifest.get("status") == "failed" or any(
+        job.get("status") == "failed" for job in indexed.values()
+    )
+    complete = all_complete and not errors and not failed and manifest.get("status") == "passed"
+    return {
+        "schema_version": 1,
+        "suite": SUITE,
+        "status": "invalid"
+        if errors
+        else "passed"
+        if complete
+        else "failed"
+        if failed
+        else "running",
+        "complete": complete,
+        "n_model_seeds": 1,
+        "model_seed": config.get("model_seed"),
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+        "uncertainty_status": "not_estimated_single_seed",
+        "source_integrity_valid": manifest.get("source_integrity_valid"),
+        "datasets": reports,
+        "errors": errors,
+        "caveats": CAVEATS,
+    }
+
+
+def markdown(report):
+    lines = [
+        "# Shared relative C V3 vs fixed C=1",
+        "",
+        f"Status: **{report['status']}**; model seed {report['model_seed']}; validation only.",
+        "",
+    ]
+    if report["errors"]:
+        lines += ["## Integrity errors: contrasts withheld", ""]
+        lines += [f"- {_cell(error)}" for error in report["errors"]] + [""]
+    for dataset in report["datasets"]:
+        lines += [
+            f"## {dataset['dataset']} (accuracy, higher is better)",
+            "",
+            "| Condition | Status | Validation (%) | Best epoch | Epochs run "
+            "| Train loss | Trainable | Frozen |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for row in dataset["conditions"]:
+            cells = [row["condition"], row["status"], _display(row["validation_percent"])]
+            cells += [
+                str(row[k]) if row[k] is not None else "—" for k in ("best_epoch", "epochs_run")
+            ]
+            cells += [_display(row["train_loss"])]
+            cells += [
+                str(row[k]) if row[k] is not None else "—"
+                for k in ("trainable_parameters", "frozen_parameters")
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
+        contrast = dataset["relative_minus_fixed"]
+        lines += [
+            "",
+            "Relative − fixed: "
+            + (
+                _display(contrast["percentage_points"], signed=True) + " pp."
+                if contrast
+                else "withheld until both arms pass integrity checks."
+            ),
+            "",
+            "### Whole training-loop resources (including diagnostic/checkpoint overhead)",
+            "",
+            "| Condition | Elapsed seconds | Peak CUDA allocated bytes |",
+            "| --- | ---: | ---: |",
+        ]
+        for row in dataset["conditions"]:
+            peak = row["peak_cuda_allocated_bytes"]
+            lines.append(
+                f"| {row['condition']} | {_display(row['elapsed_seconds'])} "
+                f"| {peak if peak is not None else '—'} |"
+            )
+        lines += [""] + _diagnostic_markdown(dataset["conditions"])
+        lines += _training_gradient_markdown(dataset["conditions"])
+        lines += _intervention_markdown(dataset["conditions"])
+    lines += ["## Interpretation limits", ""] + [f"- {c}" for c in CAVEATS] + [""]
+    return "\n".join(lines)
+
+
+def csv_text(report):
+    buffer = io.StringIO(newline="")
+    fields = [
+        "dataset",
+        "metric_name",
+        "model_seed",
+        "condition",
+        "status",
+        "validation",
+        "validation_percent",
+        "best_epoch",
+        "epochs_run",
+        "train_loss",
+        "trainable_parameters",
+        "frozen_parameters",
+        "elapsed_seconds",
+        "peak_cuda_allocated_bytes",
+        "relative_minus_fixed_pp",
+    ]
+    writer = csv.DictWriter(buffer, fieldnames=fields)
+    writer.writeheader()
+    for dataset in report["datasets"]:
+        for row in dataset["conditions"]:
+            record = {key: row[key] for key in fields if key in row}
+            record.update({key: dataset[key] for key in ("dataset", "metric_name", "model_seed")})
+            contrast = dataset["relative_minus_fixed"]
+            record["relative_minus_fixed_pp"] = contrast["percentage_points"] if contrast else None
+            writer.writerow(record)
+    return buffer.getvalue()
+
+
+def write_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    root = Path(run_dir).expanduser().resolve(strict=True)
+    if not root.is_dir() or not isinstance(manifest, dict):
+        raise ValueError("expected an existing run directory and manifest object")
+    destinations = [_contained(name, root, name) for name in REPORT_FILENAMES]
+    if any((root / name).is_symlink() for name in REPORT_FILENAMES):
+        raise ValueError("report destinations must not be symlinks")
+    report = build_comparison(root, manifest)
+    contents = [
+        json.dumps(report, indent=2, allow_nan=False) + "\n",
+        markdown(report),
+        csv_text(report),
+    ]
+    for destination, content in zip(destinations, contents, strict=True):
+        _atomic_write(destination, content)
+    if report["errors"]:
+        raise ComparisonIntegrityError(report)
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_dir", type=Path)
+    args = parser.parse_args(argv)
+    try:
+        root = args.run_dir.expanduser().resolve(strict=True)
+        manifest = json.loads(
+            _contained("manifest.json", root, "manifest").read_text(encoding="utf-8"),
+            parse_constant=_reject_nonfinite_json,
+        )
+        report = write_comparison(root, manifest)
+    except (OSError, ValueError) as exc:
+        print(f"Comparison failed: {exc}", file=sys.stderr)
+        return 1
+    print(markdown(report))
+    print(f"Reports: {root / 'comparison.md'}")
+    return 0 if report["status"] == "passed" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# research/conductance_gat/v3/reproduce.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+source "${project_root}/scripts/conda_env.sh"
+export PYTHONPATH="${project_root}/src:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
+cd "${project_root}"
+exec "${environment_python}" -B scripts/run_conductance_v3.py "$@"
+````
+
+# research/conductance_gat/v3/train.py
+
+````python
+"""Standalone symmetric relative-C v3 training: CUDA, official cache, validation only.
+
+This does not reuse the row-normalized training observer. C interventions occur
+once, on the selected best checkpoint, never as extra training forwards.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import time
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from chartgat.cache import atomic_publish, atomic_write_json
+
+from ..ablation.model import state_sha256
+from ..ablation.train import _configure_fp32, _make_data, _require_cuda, training_loss
+from ..benchmark import _seed, _versions
+from ..benchmark_data import load_dataset, sha256_file, tensor_hash
+from .diagnostics import (
+    ForwardObservation,
+    best_checkpoint_interventions,
+    evaluate_validation,
+    norm,
+)
+from .model import RelativeCNodeClassifier
+from .protocol import COMMON, CONDITIONS, DATASETS, DEFAULT_EDGE_CHUNK_SIZE, PARAMETERIZATION, SUITE
+
+OBSERVATION_POLICY = {
+    "training": (
+        "Every epoch's actual full-graph train forward with dropout ON; raw task gradients "
+        "after backward before AdamW step. No extra training forward/backward."
+    ),
+    "validation": (
+        "Every epoch validation selects checkpoint; initial/selected/final validation "
+        "layer observations, validation labels only."
+    ),
+    "statistics": (
+        "Exact full observed graph score/C moments and degree population quantiles; "
+        "no sampled median. Fixed estimator scores/control values describe frozen "
+        "scaffold, not an active gate."
+    ),
+    "symmetric_normalization": (
+        "neighbor_weight_row_sum is alpha times symmetric off-diagonal row weight sum, "
+        "not a stochastic mixing probability and may exceed 1. No legacy fixed .95 rho."
+    ),
+    "interventions": (
+        "Only the selected best checkpoint: all-layer graph-mean C, graph-shuffled C, "
+        "C=1, propagation off. Recompute normalization; no retraining/test. "
+        "Mean-C and C=1 are algebraically redundant here."
+    ),
+}
+
+
+def configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        **COMMON,
+        "model_seed": args.model_seed,
+        "epochs": args.epochs,
+        "patience": args.patience,
+        "batch_size": args.batch_size,
+        "workers": args.workers,
+        "device": args.device,
+        "tf32": False,
+        "pin_memory": True,
+        "edge_chunk_size": args.edge_chunk_size,
+    }
+
+
+def make_optimizer(model, condition: str) -> torch.optim.AdamW:
+    specification = CONDITIONS[condition]
+    if model.gate_mode != specification["gate_mode"] or model.normalization != "symmetric":
+        raise ValueError("V3 model and condition disagree")
+    selected = {"backbone": [], "gate_mlp": [], "controls": []}
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.endswith((".raw_alpha", ".raw_gamma", ".raw_tau")):
+            group = "controls"
+        elif name.startswith("operators.") and ".estimator." in name:
+            group = "gate_mlp"
+        else:
+            group = "backbone"
+        selected[group].append((name, parameter))
+    if not selected["backbone"] or not selected["controls"]:
+        raise ValueError("V3 requires backbone and trainable alpha control groups")
+    if bool(selected["gate_mlp"]) != (model.gate_mode == "relative"):
+        raise ValueError("V3 fixed estimator must be entirely frozen")
+    groups = []
+    for name, values in selected.items():
+        if not values:
+            continue
+        groups.append(
+            {
+                "name": name,
+                "params": [value for _, value in values],
+                "parameter_names": [key for key, _ in values],
+                "lr": COMMON["lr"] * (COMMON["gate_lr_multiplier"] if name == "gate_mlp" else 1),
+                "weight_decay": COMMON["weight_decay"] if name == "backbone" else 0.0,
+            }
+        )
+    return torch.optim.AdamW(groups, lr=COMMON["lr"])
+
+
+def optimizer_metadata(optimizer):
+    return [
+        {
+            "name": group["name"],
+            "lr": group["lr"],
+            "weight_decay": group["weight_decay"],
+            "parameter_names": list(group["parameter_names"]),
+            "parameter_count": sum(p.numel() for p in group["params"]),
+        }
+        for group in optimizer.param_groups
+    ]
+
+
+def _parameter_metadata(model):
+    return {
+        "total_parameters": sum(p.numel() for p in model.parameters()),
+        "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        "frozen_parameters": sum(p.numel() for p in model.parameters() if not p.requires_grad),
+        "trainable_parameter_names": [
+            name for name, p in model.named_parameters() if p.requires_grad
+        ],
+        "frozen_parameter_names": [
+            name for name, p in model.named_parameters() if not p.requires_grad
+        ],
+    }
+
+
+def topology_metadata(payload):
+    if payload.get("dataset") not in DATASETS or len(payload.get("graphs", [])) != 1:
+        raise ValueError("V3 experiment requires one official transductive graph; PPI unsupported")
+    graph = payload["graphs"][0]
+    return {
+        "num_nodes": int(graph["x"].shape[0]),
+        "num_edges": int(graph["incidence_edge_index"].shape[1]),
+        "incidence_sha256": tensor_hash(graph["incidence_edge_index"]),
+    }
+
+
+def _source_hashes():
+    from scripts.run_conductance_v3 import _source_snapshot
+
+    return _source_snapshot()["sha256"]
+
+
+def _require_sources(expected):
+    if _source_hashes() != expected:
+        raise RuntimeError("V3 sources changed during execution; refusing mixed sources")
+
+
+def _validate_args(args):
+    if args.dataset not in DATASETS or args.condition not in CONDITIONS:
+        raise ValueError("Unsupported v3 dataset/condition")
+    if min(args.epochs, args.patience, args.edge_chunk_size) < 1 or args.model_seed < 0:
+        raise ValueError("epochs/patience/chunk size must be positive and seed nonnegative")
+    if args.batch_size != 1 or args.workers != 0:
+        raise ValueError("V3 full-graph training requires batch-size=1 and workers=0")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", required=True, choices=DATASETS)
+    parser.add_argument("--condition", required=True, choices=tuple(CONDITIONS))
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--data-root", type=Path, default=Path("data/paper"))
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--model-seed", type=int, default=0)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--edge-chunk-size", type=int, default=DEFAULT_EDGE_CHUNK_SIZE)
+    return parser
+
+
+def train_model(payload, protocol, args, device: torch.device, output: Path):
+    _require_cuda(device)
+    _validate_args(args)
+    if payload.get("dataset") != args.dataset:
+        raise ValueError("Requested dataset does not match payload")
+    topology = topology_metadata(payload)
+    sources = _source_hashes()
+    _configure_fp32()
+    _seed(args.model_seed)
+    graph, indices = _make_data(payload, args, device)
+    if indices is None or not indices["train"].numel():
+        raise ValueError("V3 requires a nonempty transductive train mask")
+    spec = CONDITIONS[args.condition]
+    model = RelativeCNodeClassifier(
+        payload["graphs"][0]["x"].shape[1],
+        payload["classes"],
+        hidden_channels=COMMON["hidden_channels"],
+        layers=COMMON["layers"],
+        dropout=COMMON["dropout"],
+        normalization="symmetric",
+        gate_mode=spec["gate_mode"],
+        edge_chunk_size=args.edge_chunk_size,
+    ).to(device)
+    initial_hash = state_sha256(model)
+    optimizer = make_optimizer(model, args.condition)
+    common = {
+        "schema_version": 1,
+        "research_suite": SUITE,
+        "model": SUITE,
+        "dataset": args.dataset,
+        "condition": args.condition,
+        "model_seed": args.model_seed,
+        **spec,
+        "non_gate_weight_decay": COMMON["weight_decay"],
+        "configuration": configuration(args),
+        "cache_sha256": protocol["data_sha256"],
+        "protocol": protocol,
+        "initial_state_sha256": initial_hash,
+        "topology": topology,
+        "parameterization": PARAMETERIZATION,
+        "source_sha256": sources,
+        "optimizer": "AdamW",
+        "optimizer_groups": optimizer_metadata(optimizer),
+        **_parameter_metadata(model),
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+    }
+    checkpoint, history_path = output / "best.pt", output / "history.json"
+    history, trajectory = [], []
+    best_validation, best_epoch = -math.inf, 0
+    checkpoint_hash = history_hash = None
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    initial_observation, _ = evaluate_validation(model, graph, indices["validation"])
+    for epoch in range(1, args.epochs + 1):
+        _require_sources(sources)
+        torch.cuda.synchronize(device)
+        epoch_started = time.perf_counter()
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        with ForwardObservation(model) as observation:
+            logits = model(graph)
+        loss, count = training_loss(logits, graph, indices["train"])
+        if not bool(torch.isfinite(loss)):
+            raise FloatingPointError(f"Nonfinite v3 training loss at epoch {epoch}")
+        loss.backward()
+        gradient_groups = [
+            {
+                **descriptor,
+                "parameter_norm": norm(group["params"]),
+                "task_gradient_norm": norm(group["params"], gradient=True),
+            }
+            for descriptor, group in zip(
+                optimizer_metadata(optimizer), optimizer.param_groups, strict=True
+            )
+        ]
+        record = {
+            "epoch": epoch,
+            "batch_index": 0,
+            "optimizer_steps_before_batch": epoch - 1,
+            "scope": "full_graph_train_mask",
+            "mode": "train_dropout_on",
+            "stage": "after_task_backward_before_optimizer_step",
+            "label_count": count,
+            "train_loss": float(loss.detach()),
+            "layers": observation.summary(gradients=True),
+            "parameter_groups": gradient_groups,
+        }
+        trajectory.append(record)
+        optimizer.step()
+        # Labels for selection are validation only. Expensive observations and
+        # interventions are not performed at every selection forward.
+        validation_observation, _ = evaluate_validation(
+            model, graph, indices["validation"], observe=False
+        )
+        validation = validation_observation["metric"]
+        torch.cuda.synchronize(device)
+        history.append(
+            {
+                "epoch": epoch,
+                "optimizer_steps": epoch,
+                "train_loss": record["train_loss"],
+                "validation": validation,
+                "epoch_seconds": time.perf_counter() - epoch_started,
+                "training_first_batch": record,
+            }
+        )
+        atomic_write_json(history_path, history)
+        history_hash = sha256_file(history_path)
+        if validation > best_validation:
+            best_validation, best_epoch = validation, epoch
+            saved = {
+                **common,
+                "state_dict": {
+                    name: tensor.detach().cpu() for name, tensor in model.state_dict().items()
+                },
+                "architecture": {
+                    "hidden_channels": COMMON["hidden_channels"],
+                    "layers": COMMON["layers"],
+                    "dropout": COMMON["dropout"],
+                    "normalization": "symmetric",
+                    "gate_mode": spec["gate_mode"],
+                    "edge_chunk_size": args.edge_chunk_size,
+                },
+                "best_epoch": epoch,
+                "optimizer_steps": epoch,
+                "validation": validation,
+            }
+            atomic_publish(checkpoint, lambda path, state=saved: torch.save(state, path))
+            checkpoint_hash = sha256_file(checkpoint)
+        if epoch == 1 or epoch % 10 == 0:
+            print(
+                f"{args.dataset}/{args.condition} epoch={epoch} "
+                f"train_loss={record['train_loss']:.6f} "
+                f"val={validation:.6f} best_epoch={best_epoch}",
+                flush=True,
+            )
+        if epoch - best_epoch >= args.patience:
+            break
+    final_observation, _ = evaluate_validation(model, graph, indices["validation"])
+    _require_sources(sources)
+    if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
+        raise RuntimeError("Checkpoint/history changed before best-checkpoint validation")
+    saved = torch.load(checkpoint, map_location=device, weights_only=True)
+    for key in (
+        "research_suite",
+        "condition",
+        "dataset",
+        "configuration",
+        "topology",
+        "source_sha256",
+        "initial_state_sha256",
+    ):
+        if saved.get(key) != common[key]:
+            raise ValueError(f"Best checkpoint metadata mismatch: {key}")
+    model.load_state_dict(saved["state_dict"])
+    optimizer.zero_grad(set_to_none=True)
+    selected_observation, reference = evaluate_validation(model, graph, indices["validation"])
+    if abs(selected_observation["metric"] - best_validation) > 1e-4:
+        raise RuntimeError("Best validation recheck disagrees with checkpoint selection")
+    interventions = best_checkpoint_interventions(
+        model, graph, indices["validation"], selected_observation, reference, seed=args.model_seed
+    )
+    _require_sources(sources)
+    if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
+        raise RuntimeError("Read-only interventions changed source checkpoint/history")
+    torch.cuda.synchronize(device)
+    return {
+        **common,
+        "status": "passed",
+        "best_epoch": best_epoch,
+        "epochs_run": len(history),
+        "optimizer_steps": len(history),
+        "best_checkpoint_optimizer_steps": best_epoch,
+        "validation": selected_observation["metric"],
+        "validation_at_selection": best_validation,
+        "metric_name": "accuracy",
+        "train_loss": history[best_epoch - 1]["train_loss"],
+        "train_loss_scope": "actual full-graph train mask loss at selected checkpoint epoch",
+        "final_train_loss": history[-1]["train_loss"],
+        "checkpoint": str(checkpoint.resolve()),
+        "checkpoint_sha256": checkpoint_hash,
+        "history": str(history_path.resolve()),
+        "history_sha256": history_hash,
+        "elapsed_seconds": time.perf_counter() - started,
+        "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
+        "versions": _versions(),
+        "gpu": torch.cuda.get_device_name(device),
+        "diagnostics": {
+            "initial_validation": initial_observation,
+            "best_validation": selected_observation,
+            "final_validation": final_observation,
+            "train_trajectory": trajectory,
+            "best_checkpoint_interventions": interventions,
+            "observation_policy": OBSERVATION_POLICY,
+        },
+        "execution": {
+            "training": "full_graph_transductive",
+            "neighbor_sampling": False,
+            "edge_chunk_size": args.edge_chunk_size,
+            "dense_incidence": False,
+            "eigendecomposition": False,
+        },
+        "reproducibility": "Same initialization/seed; CUDA scatter may remain nondeterministic.",
+        "timing_policy": (
+            "Includes training, validation, selected-checkpoint interventions, diagnostics "
+            "and artifact IO; not an isolated kernel benchmark."
+        ),
+    }
+
+
+def _cache_snapshot(args):
+    cache = (
+        args.data_root.expanduser().resolve()
+        / "conductance_gat/matched_benchmark_v1"
+        / args.dataset
+    )
+    return {str(path): sha256_file(path) for path in (cache / "data.pt", cache / "manifest.json")}
+
+
+def main(argv: list[str] | None = None):
+    args = build_parser().parse_args(argv)
+    _validate_args(args)
+    device = torch.device(args.device)
+    _require_cuda(device)
+    output, data_root = (
+        args.output_dir.expanduser().resolve(),
+        args.data_root.expanduser().resolve(),
+    )
+    if output == data_root or output.is_relative_to(data_root) or data_root.is_relative_to(output):
+        raise ValueError("V3 output and dataset cache must not overlap")
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise FileExistsError(f"Output is not a new empty arm directory: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    record = {
+        "schema_version": 1,
+        "status": "running",
+        "research_suite": SUITE,
+        "dataset": args.dataset,
+        "condition": args.condition,
+        "model_seed": args.model_seed,
+        **CONDITIONS[args.condition],
+        "configuration": configuration(args),
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+    }
+    atomic_write_json(output / "metrics.json", record)
+    try:
+        sources = _source_hashes()
+        record["source_sha256"] = sources
+        payload, protocol = load_dataset(args.dataset, data_root, allow_download=False)
+        cache_files = _cache_snapshot(args)
+        _require_sources(sources)
+        record.update(cache_sha256=protocol["data_sha256"], protocol=protocol)
+        result = train_model(payload, protocol, args, device, output)
+        if result["source_sha256"] != sources or _cache_snapshot(args) != cache_files:
+            raise RuntimeError("Cache/source changed between verification and completed training")
+        _require_sources(sources)
+        record.update(result, cache_files_sha256=cache_files)
     except BaseException as exc:
         record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
         atomic_write_json(output / "metrics.json", record)
@@ -32962,6 +36153,314 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ````
 
+# scripts/run_conductance_v3.py
+
+````python
+#!/usr/bin/env python3
+"""Train shared relative conductances vs C=1, one seed, CUDA only."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import shlex
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_json  # noqa: E402
+from research.conductance_gat.v3.protocol import (  # noqa: E402
+    COMMON,
+    CONDITIONS,
+    DATASETS,
+    DEFAULT_DATASETS,
+    SUITE,
+)
+from scripts import run_conductance_factorial as shared  # noqa: E402
+from scripts.check_dependencies import (  # noqa: E402
+    DependencyCheckError,
+    check_dependencies,
+    error_message,
+)
+
+run_logged = shared.run_logged
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument(
+        "--datasets",
+        nargs="+",
+        default=list(DEFAULT_DATASETS),
+        help="Fixed-graph datasets: " + ", ".join(DATASETS) + "; default: ogbn-arxiv",
+    )
+    result.add_argument("--model-seed", type=int, default=0, help="One seed, not a seed list")
+    result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    result.add_argument("--results-root", type=Path, default=ROOT / "results")
+    result.add_argument("--run-id")
+    result.add_argument("--device", default="cuda")
+    result.add_argument("--epochs", type=int, default=200)
+    result.add_argument("--patience", type=int, default=50)
+    result.add_argument("--batch-size", type=int, default=1, help="Must be 1: full-graph training")
+    result.add_argument("--workers", type=int, default=0)
+    result.add_argument("--edge-chunk-size", type=int, default=65536)
+    result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument("--dry-run", action="store_true", help="Print plan without GPU or writes")
+    return result
+
+
+def _validate(args: argparse.Namespace) -> None:
+    shared._validate(args)
+    if "ppi" in args.datasets:
+        raise ValueError(
+            "PPI is outside the initial V3 benchmark protocol, which uses transductive "
+            "node-classification datasets. This is a protocol limit, not a shared-gate limitation."
+        )
+    if not args.datasets or any(dataset not in DATASETS for dataset in args.datasets):
+        raise ValueError("Unsupported fixed-graph dataset; choose: " + ", ".join(DATASETS))
+    if args.edge_chunk_size < 1:
+        raise ValueError("edge chunk size must be positive")
+    if args.batch_size != 1 or args.workers != 0:
+        raise ValueError("Full-graph V3 requires batch-size=1 and workers=0")
+
+
+def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
+    jobs = []
+    for dataset in args.datasets:
+        for condition in CONDITIONS:
+            output = run_dir / dataset / condition
+            command = [
+                sys.executable,
+                "-B",
+                "-u",
+                "-m",
+                "research.conductance_gat.v3.train",
+                "--dataset",
+                dataset,
+                "--condition",
+                condition,
+                "--output-dir",
+                str(output),
+                "--data-root",
+                str(args.data_root.expanduser().resolve()),
+            ]
+            for key in (
+                "device",
+                "model_seed",
+                "epochs",
+                "patience",
+                "batch_size",
+                "workers",
+                "edge_chunk_size",
+            ):
+                command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
+            jobs.append(
+                {
+                    "dataset": dataset,
+                    "condition": condition,
+                    "status": "pending",
+                    "output_dir": str(output),
+                    "metrics_path": str(output / "metrics.json"),
+                    "log_path": str(run_dir / "logs" / f"{dataset}--{condition}.log"),
+                    "command": command,
+                }
+            )
+    return jobs
+
+
+def _source_snapshot() -> dict[str, Any]:
+    snapshot = shared._source_snapshot()
+    files = list((ROOT / "research/conductance_gat/v3").glob("*.py"))
+    files += [
+        Path(__file__),
+        ROOT / "src/chartgat/cache.py",
+        ROOT / "research/conductance_gat/v3/reproduce.sh",
+        ROOT / "scripts/conda_env.sh",
+    ]
+    for path in files:
+        snapshot["sha256"][path.relative_to(ROOT).as_posix()] = hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+    return snapshot
+
+
+def _comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    from research.conductance_gat.v3.report import write_comparison
+
+    return write_comparison(run_dir, manifest)
+
+
+def _check_sources(manifest: dict[str, Any]) -> None:
+    if _source_snapshot()["sha256"] != manifest["sources"]["sha256"]:
+        manifest["source_integrity_valid"] = False
+        raise RuntimeError("Experiment source changed during the run; refusing mixed sources")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        _validate(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    run_id = args.run_id or "relative-c-v3-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    run_dir = (args.results_root.expanduser().resolve() / "conductance_gat/v3" / run_id).resolve()
+    data_root = args.data_root.expanduser().resolve()
+    if (
+        run_dir == data_root
+        or run_dir.is_relative_to(data_root)
+        or data_root.is_relative_to(run_dir)
+    ):
+        print("Experiment outputs and dataset directories must not overlap", file=sys.stderr)
+        return 2
+    jobs = make_jobs(args, run_dir)
+    if args.dry_run:
+        print(f"One model seed: {args.model_seed}; {len(jobs)} fresh trainings; validation only")
+        for job in jobs:
+            print(shlex.join(job["command"]))
+        print(f"Comparison: {run_dir / 'comparison.md'}")
+        return 0
+    if run_dir.exists():
+        print(f"Run already exists; use a new run ID: {run_dir}", file=sys.stderr)
+        return 2
+    try:
+        dependencies = check_dependencies()
+    except DependencyCheckError as exc:
+        print(error_message(exc), file=sys.stderr)
+        return exc.exit_code
+    run_dir.mkdir(parents=True, exist_ok=False)
+    common = {
+        **COMMON,
+        **{
+            key: getattr(args, key)
+            for key in (
+                "datasets",
+                "model_seed",
+                "epochs",
+                "patience",
+                "batch_size",
+                "workers",
+                "device",
+                "edge_chunk_size",
+            )
+        },
+        "data_root": str(data_root),
+    }
+    manifest = {
+        "schema_version": 1,
+        "suite": SUITE,
+        "run_id": run_id,
+        "status": "running",
+        "source_integrity_valid": True,
+        "config": common,
+        "conditions": CONDITIONS,
+        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "jobs": jobs,
+        "dependencies": dependencies,
+        "sources": _source_snapshot(),
+        "protocol": {
+            "selection": "best validation checkpoint per arm; same early-stopping policy",
+            "test": "not evaluated; exploratory validation comparison",
+            "initialization": "same full state hash including frozen shared-gate scaffold; "
+            "alpha active in both arms",
+            "data": "same verified official cache/split and ordered topology; no downloads",
+            "contrast": "fresh relative_c minus fresh fixed_c; "
+            "never reuse any V1/V2 or older score",
+            "fixed_c": "exact C=1; gate scaffold frozen/excluded from optimizer, "
+            "alpha remains trainable",
+            "normalization": "symmetric in both arms; AdamW backbone WD=0.0005; gate/scalar WD=0",
+            "transductive": "initial protocol uses official fixed-graph train/validation masks",
+            "optimizer": "AdamW; gate MLP lr=2*base lr; alpha/gamma/tau lr=base lr; "
+            "gate/scalar WD=0",
+            "interventions": "selected checkpoint validation only: "
+            "mean C, shuffled C, C=1, propagation off",
+            "v2_comparison": "V2-to-V3 changes multiple factors; "
+            "this is not a single-factor V2 contrast",
+            "resources": "whole training-loop runtime and peak allocation include diagnostics "
+            "and checkpoint IO; no isolated kernel benchmark or V1/spectral speedup claim",
+            "uncertainty": "n=1; no CI, seed standard deviation or significance claim",
+            "reproducibility": "same seeds; CUDA scatter need not be bitwise deterministic",
+        },
+    }
+    manifest_path = run_dir / "manifest.json"
+    atomic_write_json(manifest_path, manifest)
+    current_job = None
+    environment = shared._environment()
+    try:
+        _comparison(run_dir, manifest)
+        preflight = [
+            sys.executable,
+            "-B",
+            str(ROOT / "scripts/gpu_preflight.py"),
+            "--device",
+            args.device,
+            "--require-paper-deps",
+            "--min-free-gb",
+            str(args.min_free_gb),
+            "--json-out",
+            str(run_dir / "gpu-preflight.json"),
+        ]
+        status = run_logged(preflight, run_dir / "logs/preflight.log", environment)
+        if status:
+            raise RuntimeError(f"GPU preflight failed with exit code {status}")
+        print(f"Run: {run_id}; seed {args.model_seed}; {len(jobs)} fresh trainings", flush=True)
+        for index, job in enumerate(jobs, start=1):
+            current_job = job
+            _check_sources(manifest)
+            job["status"] = "running"
+            atomic_write_json(manifest_path, manifest)
+            print(f"\n[{index}/{len(jobs)}] {job['dataset']} / {job['condition']}", flush=True)
+            started = time.monotonic()
+            status = run_logged(job["command"], Path(job["log_path"]), environment)
+            job.update(elapsed_seconds=time.monotonic() - started, exit_code=status)
+            _check_sources(manifest)
+            if status:
+                raise RuntimeError(
+                    f"{job['dataset']}/{job['condition']} failed with exit code {status}"
+                )
+            metrics = Path(job["metrics_path"])
+            if not metrics.is_file():
+                raise RuntimeError(f"Child returned without metrics: {metrics}")
+            job["metrics_sha256"] = hashlib.sha256(metrics.read_bytes()).hexdigest()
+            job["status"] = "passed"
+            atomic_write_json(manifest_path, manifest)
+            _comparison(run_dir, manifest)
+            current_job = None
+        _check_sources(manifest)
+        manifest.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+        _comparison(run_dir, manifest)
+    except (Exception, KeyboardInterrupt) as exc:
+        manifest.update(
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}",
+            finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+        )
+        if current_job is not None:
+            current_job.update(status="failed", error=manifest["error"])
+        atomic_write_json(manifest_path, manifest)
+        try:
+            _comparison(run_dir, manifest)
+        except (ValueError, OSError) as report_error:
+            print(f"Comparison integrity error: {report_error}", file=sys.stderr)
+        print(f"Failed: {manifest['error']}\nSaved partial results: {run_dir}", file=sys.stderr)
+        return 130 if isinstance(exc, KeyboardInterrupt) else 1
+    atomic_write_json(manifest_path, manifest)
+    print((run_dir / "comparison.md").read_text(encoding="utf-8"), flush=True)
+    print(f"Comparison: {run_dir / 'comparison.md'}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # scripts/run_paper.py
 
 ````python
@@ -39123,6 +42622,182 @@ def test_source_snapshot_covers_shared_and_v2_code():
         assert name in snapshot and len(snapshot[name]) == 64
 ````
 
+# tests/test_conductance_v3_runner.py
+
+````python
+"""V3 orchestration contracts; mocked subprocesses, never GPU or research training."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from scripts import run_conductance_v3 as runner
+
+
+def test_default_two_fresh_trainings():
+    args = runner.parser().parse_args([])
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert args.datasets == ["ogbn-arxiv"] and args.model_seed == 0
+    assert args.edge_chunk_size == 65536 and args.batch_size == 1 and args.workers == 0
+    assert [job["condition"] for job in jobs] == ["relative_c", "fixed_c"]
+    for job in jobs:
+        command = job["command"]
+        assert command[command.index("-m") + 1] == "research.conductance_gat.v3.train"
+        assert command[command.index("--model-seed") + 1] == "0"
+        assert command[command.index("--edge-chunk-size") + 1] == "65536"
+        assert "--amp" not in command and "--allow-download" not in command
+
+
+@pytest.mark.parametrize("option", ["--help", "--dry-run"])
+def test_stdlib_inspection_has_no_writes(tmp_path, option):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-S",
+            str(runner.ROOT / "scripts/run_conductance_v3.py"),
+            option,
+            "--results-root",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--device", "cpu"],
+        ["--model-seed", "-1"],
+        ["--epochs", "0"],
+        ["--datasets", "ppi"],
+        ["--datasets", "unknown"],
+        ["--datasets", "cora", "cora"],
+        ["--run-id", "../old"],
+        ["--min-free-gb", "nan"],
+        ["--edge-chunk-size", "0"],
+        ["--batch-size", "2"],
+        ["--workers", "1"],
+    ],
+)
+def test_invalid_inputs_do_not_check_dependencies_or_train(monkeypatch, options):
+    monkeypatch.setattr(runner, "check_dependencies", lambda: pytest.fail("no install/check"))
+    assert runner.main(options) == 2
+
+
+def test_ppi_rejection_explains_protocol_limit(capsys):
+    assert runner.main(["--datasets", "ppi"]) == 2
+    assert "protocol limit" in capsys.readouterr().err
+
+
+def _stub(tmp_path, monkeypatch, failure=None, change_after=None):
+    calls, reports, snapshots = [], [], 0
+    monkeypatch.setattr(runner, "check_dependencies", lambda: {"unit_fixture_only": True})
+
+    def snapshot():
+        nonlocal snapshots
+        snapshots += 1
+        changed = change_after is not None and snapshots >= change_after
+        return {"sha256": {"unit-source": "changed" if changed else "original"}}
+
+    def dispatch(command, log, environment):
+        calls.append(command)
+        if any(Path(part).name == "gpu_preflight.py" for part in command):
+            return 2 if failure == "preflight" else 0
+        condition = command[command.index("--condition") + 1]
+        if failure == condition:
+            return 9
+        output = Path(command[command.index("--output-dir") + 1])
+        output.mkdir(parents=True)
+        if failure != "missing_metrics":
+            (output / "metrics.json").write_text("{}", encoding="utf-8")
+        return 0
+
+    def report(root, manifest):
+        reports.append(json.loads(json.dumps(manifest)))
+        (root / "comparison.md").write_text("unit-fixture report", encoding="utf-8")
+        return {"status": manifest["status"]}
+
+    monkeypatch.setattr(runner, "_source_snapshot", snapshot)
+    monkeypatch.setattr(runner, "run_logged", dispatch)
+    monkeypatch.setattr(runner, "_comparison", report)
+    return ["--results-root", str(tmp_path), "--run-id", "unit-fixture"], calls, reports
+
+
+def test_success_records_metrics_digest_and_one_seed(tmp_path, monkeypatch):
+    options, calls, reports = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0 and len(calls) == 3
+    assert reports[-1]["status"] == "passed"
+    assert reports[-1]["config"]["model_seed"] == 0
+    assert [job["status"] for job in reports[-1]["jobs"]] == ["passed", "passed"]
+    assert all(len(job["metrics_sha256"]) == 64 for job in reports[-1]["jobs"])
+    assert "never reuse" in reports[-1]["protocol"]["contrast"]
+
+
+@pytest.mark.parametrize(
+    "failure,calls_expected",
+    [
+        ("preflight", 1),
+        ("relative_c", 2),
+        ("fixed_c", 3),
+        ("missing_metrics", 2),
+    ],
+)
+def test_failures_stop_following_trainings(tmp_path, monkeypatch, failure, calls_expected):
+    options, calls, reports = _stub(tmp_path, monkeypatch, failure=failure)
+    assert runner.main(options) == 1 and len(calls) == calls_expected
+    assert reports[-1]["status"] == "failed"
+
+
+@pytest.mark.parametrize("change_after,calls_expected", [(2, 1), (3, 2), (4, 2), (5, 3), (6, 3)])
+def test_source_checks_before_after_each_child_and_final(
+    tmp_path, monkeypatch, change_after, calls_expected
+):
+    options, calls, reports = _stub(tmp_path, monkeypatch, change_after=change_after)
+    assert runner.main(options) == 1 and len(calls) == calls_expected
+    assert reports[-1]["source_integrity_valid"] is False
+
+
+def test_existing_run_untouched(tmp_path, monkeypatch):
+    root = tmp_path / "conductance_gat/v3/existing"
+    root.mkdir(parents=True)
+    sentinel = root / "best.pt"
+    sentinel.write_bytes(b"preserve")
+    monkeypatch.setattr(runner, "check_dependencies", lambda: pytest.fail("no install"))
+    assert runner.main(["--run-id", "existing", "--results-root", str(tmp_path)]) == 2
+    assert sentinel.read_bytes() == b"preserve"
+
+
+def test_outputs_do_not_overlap_data(tmp_path):
+    assert (
+        runner.main(["--results-root", str(tmp_path), "--data-root", str(tmp_path), "--dry-run"])
+        == 2
+    )
+
+
+def test_source_snapshot_covers_shared_and_v3_code():
+    snapshot = runner._source_snapshot()["sha256"]
+    for name in (
+        "research/conductance_gat/v3/model.py",
+        "research/conductance_gat/v3/train.py",
+        "research/conductance_gat/v3/report.py",
+        "research/conductance_gat/ablation/train.py",
+        "scripts/run_conductance_v3.py",
+        "scripts/run_conductance_factorial.py",
+        "src/chartgat/cache.py",
+        "research/conductance_gat/v3/reproduce.sh",
+    ):
+        assert name in snapshot and len(snapshot[name]) == 64
+````
+
 # tests/test_cycle_v2_runner.py
 
 ````python
@@ -42341,7 +46016,7 @@ def test_paper_runner_rejects_unsafe_run_id() -> None:
 
 
 def test_readme_commands_use_full_independent_protocols() -> None:
-    from scripts import run_conductance_v2
+    from scripts import run_conductance_v2, run_conductance_v3
     from scripts.run_paper import _parser
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -42373,6 +46048,22 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert v2_args.datasets == ["ogbn-arxiv"] and v2_args.model_seed == 0
     assert len(run_conductance_v2.make_jobs(v2_args, ROOT / "results/unit-contract")) == 2
     commands = [line for line in commands if line not in v2_commands]
+    v3_commands = [
+        line
+        for line in commands
+        if shlex.split(line)[1] == "research/conductance_gat/v3/reproduce.sh"
+    ]
+    assert len(v3_commands) == 1
+    v3_command = shlex.split(v3_commands[0])
+    v3_source = (ROOT / v3_command[1]).read_text(encoding="utf-8")
+    assert "set -euo pipefail" in v3_source
+    assert 'source "${project_root}/scripts/conda_env.sh"' in v3_source
+    assert 'exec "${environment_python}" -B scripts/run_conductance_v3.py "$@"' in v3_source
+    v3_args = run_conductance_v3.parser().parse_args(v3_command[2:])
+    run_conductance_v3._validate(v3_args)
+    assert v3_args.datasets == ["ogbn-arxiv"] and v3_args.model_seed == 0
+    assert len(run_conductance_v3.make_jobs(v3_args, ROOT / "results/unit-contract")) == 2
+    commands = [line for line in commands if line not in v3_commands]
     assert len(commands) == 5  # original full protocols remain unchanged
     parsed = []
     for line in commands:

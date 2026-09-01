@@ -10,6 +10,51 @@
 
 ## 0. 리뷰어가 먼저 알아야 할 판정
 
+### 2026-09-01 추가 제안 반영: 독립 상대 C v3
+
+사용자는 기존 v2를 유지한 채 추가 제안을 v3로 구현하고 GitHub에 게시하도록 요청했다.
+제안 첨부 `0f907b27-508b-44e8-8c2e-d92605718702/pasted-text.txt`의 SHA-256은
+`BC6428F64B747079DF6EC9C615422A3D322BD37844BC1C9527F82E2E21698BED`다.
+첨부 자체는 저장소에 복사하지 않으며 구현 수식과 범위는
+[Conductance v3 README](research/conductance_gat/v3/README.md)에 보존했다.
+
+- Suite `conductance_relative_c_v3`, 폴더 `research/conductance_gat/v3/`.
+  기존 benchmark·C-learning·v2와 Cycle PE/Tree 코드는 변경하지 않는다.
+- 공유 score MLP 입력은 abs difference, squared difference, sum, product와
+  log-degree의 **합/절대차**다. 첨부의 순서 있는 degree pair는 방향 불변이 아니므로 고쳤다.
+  현재 데이터에 없는 edge attribute는 만들지 않는다.
+- 전체 그래프별 score 평균을 빼고 `tau*tanh` → exp/그래프 평균으로 상대 C를 만든다.
+  `C=(1-gamma)+gamma*relative_C`, tau=2sigmoid(raw_tau), gamma=sigmoid(raw_gamma)다.
+  초기 tau=1/gamma=0.5, 마지막 score 층을 0으로 초기화하여 C=1에서 시작한다.
+- `H'=H-alpha*D_C^-1/2 B^T C B D_C^-1/2 H`, alpha=sigmoid(raw_alpha), 초기 0.5.
+  고립 노드는 inverse degree 0으로 operator identity다. Degree와 graph mean을 미분한다.
+  Symmetric normalization은 row 평균·단순 합 보존이 아니고 실제 이웃 행 합이 alpha와
+  다를 수 있다. 고정 C 선형 안정성을 C(H) 전체 Jacobian 안정성으로 확장하지 않는다.
+- AdamW: backbone lr0.005/WD0.0005, score MLP와 입력 norm lr0.01/WD0,
+  alpha/gamma/tau raw scalar lr0.005/WD0. Fixed C는 동일 초기 estimator scaffold를
+  동결하고 alpha와 backbone만 학습한다. 두 조건 전체 state 초기 hash와 cache를 확인한다.
+- 기본 ogbn-arxiv × relative_c/fixed_c × seed0, 총 두 번의 새 GPU 학습이다.
+  Cora/CiteSeer/PubMed는 선택 가능하다. Shared generator와 별개로 이번 runner는 v2와
+  같은 transductive 규약에 한정하며 PPI는 받지 않는다. Test 평가는 없다.
+- 실제 epoch별 train forward/gradient 진단, best checkpoint의 validation 진단 및
+  평균 C·shuffled C·C=1·전파 제거 개입을 기록한다. 개입은 best에서만 시행하며 매 epoch
+  반복하지 않는다. 원래 C=1 학습 대조와 checkpoint 개입은 서로 다른 질문이다.
+- Sparse propagation의 정확한 chunked 1차 미분과 score MLP activation checkpointing을
+  사용한다. Graph 중심화는 전체 edge vector에 적용한다. MLP 작업량은 width 비례 조건에서
+  O(md²)이며 v2의 C 생성 비용과 같지 않다. Neighbor sampling, multi-head, implicit solve,
+  대규모 factorial, 외부 비교 모델, 세 연구의 결합은 이번 범위가 아니다.
+
+결과는 `results/conductance_gat/v3/<run-id>/comparison.md/csv/json`에 분리한다.
+V2↔v3는 여러 요소가 동시에 달라 단일 요인 비교가 아니다. 각 버전의 자체 C=1 대비부터 읽는다.
+첨부의 dmax/작은 rho 설명은 예전 global-max v1에 해당하며, row-normalized v2의 결함으로
+소급하지 않는다. Gamma만으로 유용성을 판정하지 않으며 상수 C 수렴 방지를 보장하지 않는다.
+V2/v3의 실제 공개 데이터 GPU 결과는 아직 없다. 이전 실측값은 아래 역사 기록으로 유지한다.
+
+V3 추가 후 전체 로컬 회귀는 **1176 passed / 65 skipped** (44.45 s, exit 0), Ruff 통과다.
+V3 전용 모델·수학·학습·진단·runner/report 검사는 **134 passed / 1 skipped**다.
+생략 1개는 실제 CUDA RNG 보존 검사이며 이 Windows 비-GPU 환경에서 실행할 수 없었다.
+작은 수학/학습 fixture의 CPU 검증을 공개 데이터 CPU 연구 실행으로 해석하지 않는다.
+
 ### 2026-09-01 평균-C GPU 검사 수령과 엣지별 직접 C v2
 
 `gat-c-learning-seed0-v1`의 seed 0 `learned_c` 평균-C 검사도 `passed` GPU 출력을
@@ -62,7 +107,7 @@ fixed 모델의 52.705738%보다 learned가 높지 않았다는 결과와 모순
 실행·정확한 수식·메모리 경계는 [Conductance v2 README](research/conductance_gat/v2/README.md)를 따른다.
 Cycle PE의 별도 기저벡터 v2와 이름이 같아도 다른 트랙이며 두 모델을 결합하지 않는다.
 
-V2 추가 후 전체 로컬 검사는 **1042 passed / 64 skipped** (47.41 s, exit 0), Ruff 통과다.
+V2 구현 시점의 전체 로컬 검사는 **1042 passed / 64 skipped** (47.41 s, exit 0), Ruff 통과다.
 새 전용 검사는 118개(모델·수학 43, runner/report 64, 학습 연결·gradient coverage 11)다.
 FP64 gradcheck, 명시적 행렬과 출력/노드/C 미분 일치, chunk 경계·고립 노드·topology 보호,
 실제 단위 학습 루프→checkpoint→무결성 비교표 연결을 확인했다. 모든 C가 gradient를 받는다는
@@ -570,9 +615,9 @@ Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 
 ### 코드 스냅샷
 
 - 파일: `code_summary.md`
-- 포함 파일: 174개
-- 크기: 1,675,532 bytes, 42,549 lines (`str.splitlines()` 기준)
-- SHA-256: `9D895174B2EAE13EA9410722F21D84B48BF2FAE3B1AD5D9EF1E75A379DAFDFAB`
+- 포함 파일: 188개
+- 크기: 1,826,929 bytes, 46,240 lines (`str.splitlines()` 기준)
+- SHA-256: `A33715FCD3F514D6C27D11D984037E7043E2D6D5D85FB0AD8B4661C54279DC06`
 - 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`, `.gitattributes`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
 - 범위: 이 버전의 전체 source/test/config/script. 생성기는 작업본 변경도 포함하므로 게시 전
@@ -1334,6 +1379,7 @@ roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사�
 |---|---|---|
 | Conductance | Cora, CiteSeer, PubMed, PPI, ogbn-arxiv | 5개 데이터 5-seed 집계; seed 0 GPU/full audit; PPI/arxiv 2×2·C-learning seed 0 재학습 |
 | Conductance 직접 C v2 (별도 실행) | 기본 ogbn-arxiv; Cora/CiteSeer/PubMed 선택, PPI 미지원 | 구현 경로 추가; GPU 결과 없음 |
+| Conductance 상대 C v3 (별도 실행) | v2와 같은 transductive 데이터 및 seed 0, 자체 C=1 대조 | 별도 구현; GPU 결과 없음 |
 | Cycle PE v1 | ZINC-12K, Peptides-struct | `cycle_set` 5-seed 집계 |
 | Cycle PE v2 | 위와 같은 공식 원본·split, 별도 기저 cache | 구현·단위 검증; GPU 결과 미수령 |
 | Tree augmentation | CSL, ZINC-12K | fixed-BFS/multi-chart 5-seed 집계 |
@@ -1353,8 +1399,11 @@ roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사�
 
 ## 8. 자동 검증 상태
 
-검증 수치는 구현 시점별로 0절에 보존한다. 현재 직접 C v2 추가 후 전체 회귀는
-**1042 passed / 64 skipped** (47.41 s, exit 0), Ruff 통과다. V2 전용은 118개다.
+검증 수치는 구현 시점별로 0절에 보존한다. 현재 상대 C v3 추가 후 전체 회귀는
+**1176 passed / 65 skipped** (44.45 s, exit 0), Ruff 통과다. V3 전용은
+134 passed / 1 skipped이고 V2 전용은 118개다. 생략 1개는 실제 CUDA RNG 검사다.
+직전 직접 C v2 시점은
+**1042 passed / 64 skipped** (47.41 s, exit 0)였다.
 직전 learned_c checkpoint 검사 확장은 **924 passed / 64 skipped** (32.11 s, exit 0)였다.
 그 이전 C-learning 구현은
 **890 passed / 64 skipped** (30.76 s, exit 0)였다. 2×2 구현 당시에는

@@ -328,7 +328,7 @@ def test_paper_runner_rejects_unsafe_run_id() -> None:
 
 
 def test_readme_commands_use_full_independent_protocols() -> None:
-    from scripts import run_conductance_v2
+    from scripts import run_conductance_v2, run_conductance_v3
     from scripts.run_paper import _parser
 
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
@@ -360,6 +360,22 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert v2_args.datasets == ["ogbn-arxiv"] and v2_args.model_seed == 0
     assert len(run_conductance_v2.make_jobs(v2_args, ROOT / "results/unit-contract")) == 2
     commands = [line for line in commands if line not in v2_commands]
+    v3_commands = [
+        line
+        for line in commands
+        if shlex.split(line)[1] == "research/conductance_gat/v3/reproduce.sh"
+    ]
+    assert len(v3_commands) == 1
+    v3_command = shlex.split(v3_commands[0])
+    v3_source = (ROOT / v3_command[1]).read_text(encoding="utf-8")
+    assert "set -euo pipefail" in v3_source
+    assert 'source "${project_root}/scripts/conda_env.sh"' in v3_source
+    assert 'exec "${environment_python}" -B scripts/run_conductance_v3.py "$@"' in v3_source
+    v3_args = run_conductance_v3.parser().parse_args(v3_command[2:])
+    run_conductance_v3._validate(v3_args)
+    assert v3_args.datasets == ["ogbn-arxiv"] and v3_args.model_seed == 0
+    assert len(run_conductance_v3.make_jobs(v3_args, ROOT / "results/unit-contract")) == 2
+    commands = [line for line in commands if line not in v3_commands]
     assert len(commands) == 5  # original full protocols remain unchanged
     parsed = []
     for line in commands:

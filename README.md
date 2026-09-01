@@ -24,7 +24,11 @@ Conductance의 **엣지별 C 자체를 직접 학습하는 v2**도
 기본 비교는 ogbn-arxiv에서 직접 C / 고정 C=1을 model seed 0으로 각각 새로 학습한다.
 그래프별 엣지 파라미터이므로 새로운 PPI 그래프로 전이하는 실험에는 사용하지 않는다.
 
-이 소스 버전에는 v2, 실행 최적화, 단일 seed 기본값과 확장 진단이 포함되어 있다.
+Conductance의 **상대 C 생성기 + 별도 전파 강도 학습 v3**는
+[독립 폴더](research/conductance_gat/v3/README.md)에 추가했다. v2를 교체하지 않으며,
+v3도 같은 ogbn-arxiv와 seed 0에서 자체 C=1 대조군과 새로 비교한다.
+
+이 소스 버전에는 독립 v2/v3, 실행 최적화, 단일 seed 기본값과 확장 진단이 포함되어 있다.
 이전 진단 전용 버전(`ebf8cd1`)과의 차이 및 실제 측정 결과는
 [실험 상태](docs/EXPERIMENT_STATUS.md)에 구분했다.
 
@@ -149,6 +153,22 @@ C는 엣지별 log 파라미터에서 양수로 변환하며, C=1 초기 상태�
 계산량과 메모리 해석은 [v2 실행 안내](research/conductance_gat/v2/README.md)를 따른다.
 같은 run ID는 덮어쓰지 않으므로 재실행할 때는 새 ID를 사용한다.
 
+### Conductance v3: 상대 C와 전파 강도 분리 학습
+
+같은 공식 ogbn-arxiv 캐시에서 **상대 C 생성기 / 고정 C=1 × seed 0**을 새로 학습한다.
+v2와는 모델·optimizer·정규화가 다르며 별도 결과 폴더에 저장한다.
+
+```bash
+bash research/conductance_gat/v3/reproduce.sh --run-id gat-relative-c-v3-seed0-v1
+cat results/conductance_gat/v3/gat-relative-c-v3-seed0-v1/comparison.md
+```
+
+공유 MLP의 score를 그래프 전체에서 중심화하고 양의 상대 C로 변환한다. 등방성 성분과의
+혼합 비율 및 전파 강도를 별도 학습하며, 대칭 정규화를 사용한다. 선택된 checkpoint의
+평균 C·섞은 C·C=1·전파 제거 검사도 validation만 사용해 기록한다.
+두 버전의 점수 차이 하나를 C 학습의 단일 요인 효과로 해석하지 않는다. 수식·진단·해석 기준은
+[v3 실행 안내](research/conductance_gat/v3/README.md)에 있다.
+
 ### Cycle PE
 
 ```bash
@@ -161,7 +181,8 @@ bash research/cycle_pe/reproduce.sh
 bash research/tree_augmentation/reproduce.sh
 ```
 
-공통 기본값은 CUDA, model seed `0`, data/split/chart seed `0`, workers `4`다.
+기본 세 트랙 benchmark의 공통 기본값은 CUDA, model seed `0`, data/split/chart seed `0`,
+workers `4`다. 별도 Conductance v2/v3는 full-graph 전용으로 workers `0`을 사용한다.
 PPI batch size는 `2`, 분자·트리 데이터는 `32`이며 인용 그래프는 full-batch다.
 각 트랙의 우리 모델 구성과 평가 규칙은 해당 트랙 문서에 있다.
 
@@ -174,8 +195,9 @@ PPI batch size는 `2`, 분자·트리 데이터는 `32`이며 인용 그래프�
 
 Conductance의 반복 GPU 동기화 제거와 Cycle PE의 연결 정보 재사용은 기본 적용된다.
 기저벡터 v2는 여러 그래프의 기저 연산을 묶는 배치 인코더를 기본 사용한다.
-선택적 `--compile`과 실제 train 데이터로 실행하는 GPU 속도 비교는
+기본 benchmark의 선택적 `--compile`과 실제 train 데이터로 실행하는 GPU 속도 비교는
 [PERFORMANCE.md](docs/PERFORMANCE.md)를 따른다. 기본 명령이나 패키지 설치를 바꿀 필요는 없다.
+별도 Conductance v2/v3는 이 compile 옵션을 받지 않는다.
 
 세 트랙을 순서대로 실행하려면 위 세 명령 **대신** 다음 명령을 사용한다.
 
