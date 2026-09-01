@@ -131,8 +131,9 @@ Full graph 학습이므로 `--batch-size 1`, `--workers 0`만 받으며 노드�
 ## 진단과 checkpoint 개입
 
 매 epoch의 실제 train forward/gradient와 선택된 best checkpoint의 validation을 기록한다.
-층별 score mean/std, C CV와 log(C) std, alpha/gamma/tau, gate parameter/gradient norm,
-weighted degree 및 전파 변화량을 함께 본다. V1/v2의 고정 rho=0.95를 v3에 적용하지 않는다.
+층별 score mean/std, C CV와 log(C) std, alpha/gamma/tau, gate MLP·입력 norm의
+parameter/gradient norm, weighted degree 및 전파 변화량을 함께 본다.
+V1/v2의 고정 rho=0.95를 v3에 적용하지 않는다.
 고정 scaffold의 norm은 활성 gate 학습량이 아니다.
 
 Best checkpoint를 고정한 추가 validation forward로 다음 네 가지 전체 층 개입을 검사한다.

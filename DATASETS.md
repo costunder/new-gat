@@ -2,9 +2,10 @@
 
 ## 기본 실행: 각 연구의 경쟁 논문과 같은 데이터셋
 
-`prepare_data.sh`, `reproduce.sh`, 트랙별 `reproduce.sh`의 기본 suite는 `benchmark`다.
+기본 세 트랙의 `prepare_data.sh`, `reproduce.sh`, 트랙별 `reproduce.sh`는
+`benchmark` suite를 사용한다. 별도 Conductance v2/v3 runner에는 `--suite` 옵션이 없다.
 기본 실행에서는 아래 공개 데이터만 사용하며 S1–S4/CycleCount를 생성하지 않는다.
-향후 기본 model seed는 사용자 요청대로 `0` 하나이며 공식 데이터·분할·전체 학습 크기는 유지한다.
+현재 기본 model seed는 사용자 요청대로 `0` 하나이며 공식 데이터·분할·전체 학습 크기는 유지한다.
 명시적 seed 목록은 선택 사항이다. 단일 seed의 std/CI는 추정하지 않으며 기존 5-seed 결과는 보존한다.
 
 | 트랙 | 기본 데이터 | 경쟁 논문과의 연결 | 이 저장소에서 실행하는 모델 | 지표 |
@@ -17,7 +18,7 @@
 | Tree augmentation | CSL, ZINC-12K | 공개 구조·분자 데이터에서 고정 tree와 다중 tree 비교 | 같은 모델의 fixed-BFS vs multi-chart | accuracy / MAE |
 
 **우리 모델만 실행**한다. 외부 비교 방법은 논문 표의 수치를 출처와 함께 인용한다.
-우리 GAT/PE는 validation으로 checkpoint를 선택한 뒤 test를 평가하고 모델 크기와 비용을
+기본 GAT/PE benchmark는 validation으로 checkpoint를 선택한 뒤 test를 평가하고 모델 크기와 비용을
 별도로 기록한다. 논문 인용 수치는 우리 seed별 실행값이나 paired 통계에 넣지 않는다.
 표를 비교할 때 데이터 버전·split·지표·추가 입력·파라미터 예산·학습 조건을 확인하고,
 다른 부분은 표 주석에 남긴다. 특히 현재 ogbn-arxiv full-batch 설정은 GATv2 논문의
@@ -28,6 +29,18 @@ GraphSAINT 설정과 다르므로 동일 학습 조건의 재실험으로 표현
 같은 공식 원본·split을 사용하되 전체 좌영공간 기저를 별도 cache에 저장한다. 기본 실행은
 여전히 통계형 `cycle_set` v1이다. v2는 이 소스 버전에 포함되지만, 제공된 5-seed 결과를 v2 결과로
 해석하면 안 된다. 실행 결과와 진단의 범위는 [실험 상태](docs/EXPERIMENT_STATUS.md)를 따른다.
+
+Conductance의 별도 [v2](research/conductance_gat/v2/README.md)와
+[v3](research/conductance_gat/v3/README.md)는 기존 matched benchmark cache의 Cora,
+CiteSeer, PubMed, ogbn-arxiv와 공식 split을 그대로 읽는다. 기본은 두 버전 모두
+ogbn-arxiv와 model seed 0을 쓰며, v2는 `direct_c`/`fixed_c`, v3는
+`relative_c`/`fixed_c`의 각 두 번을 새로 학습한다.
+V2의 C는 고정 topology의 엣지별 파라미터이고 v3는 공유 상대-C 생성기다. 둘 다 현재 별도
+runner에서는 transductive 네 데이터만 받으며 PPI를 받지 않는다. 이 제한은 v3 생성기가
+원리상 새 그래프에 적용 불가능하다는 뜻이 아니라, 이번 inductive 전이 protocol이 없다는 뜻이다.
+두 실행은 validation으로 checkpoint를 선택하고 **test를 평가하지 않으며**, 위 기본 v1
+benchmark의 test 점수나 기존 C-learning 결과를 재사용하지 않는다. V2/v3의 실제 GPU 결과는
+아직 수령하지 않았다.
 
 논문 원문: [GAT](https://arxiv.org/pdf/1710.10903),
 [GATv2](https://arxiv.org/pdf/2105.14491),
@@ -327,7 +340,9 @@ python scripts/check_datasets.py \
 값, data/manifest checksum을 검사하고 public full cache의 필수 split과 official
 cardinality를 강제한다. Network 접근이나 cache 생성은 하지 않는다. 결과는 `valid`,
 `missing`, `incomplete`, `corrupt`, `wrong_request`로 구분된다. 기본 데이터 경로는
-저장소의 `data/paper`이며 결과는 각 트랙의 `results/paper/<run-id>`에 저장된다.
+저장소의 `data/paper`이며 기본 세 트랙 결과는 각 트랙의 `results/paper/<run-id>`에 저장된다.
+별도 Conductance 결과는 `results/conductance_gat/v2/<run-id>/`와
+`results/conductance_gat/v3/<run-id>/`에 저장된다.
 Dataset checker의 `--seeds`는 `--data-seeds` 호환 alias이고 model seed가 아니다. 독립
 split cache 축은 `--split-seeds`로 검증한다.
 

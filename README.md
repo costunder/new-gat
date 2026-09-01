@@ -119,7 +119,8 @@ glibc 등 호스트 호환성 오류는 자동 재설치하지 않고 중단한�
 
 ## 실험
 
-각 연구를 독립적으로 실행한다. 아래 세 명령은 서로 다른 결과 폴더를 사용한다.
+기본 세 트랙 benchmark는 각각 독립적으로 실행하며 서로 다른 결과 폴더를 사용한다.
+중간의 Conductance v2/v3는 기본 세 트랙 명령에 자동 포함되지 않는 별도 후속 실험이다.
 
 ### Conductance GAT
 
@@ -166,6 +167,8 @@ cat results/conductance_gat/v3/gat-relative-c-v3-seed0-v1/comparison.md
 공유 MLP의 score를 그래프 전체에서 중심화하고 양의 상대 C로 변환한다. 등방성 성분과의
 혼합 비율 및 전파 강도를 별도 학습하며, 대칭 정규화를 사용한다. 선택된 checkpoint의
 평균 C·섞은 C·C=1·전파 제거 검사도 validation만 사용해 기록한다.
+대칭 정규화에서 양의 graph-constant C는 소거되므로 평균 C와 C=1은 독립 ablation이 아니라
+서로 일치해야 하는 수치 검산이다.
 두 버전의 점수 차이 하나를 C 학습의 단일 요인 효과로 해석하지 않는다. 수식·진단·해석 기준은
 [v3 실행 안내](research/conductance_gat/v3/README.md)에 있다.
 
@@ -189,6 +192,7 @@ PPI batch size는 `2`, 분자·트리 데이터는 `32`이며 인용 그래프�
 여러 model seed를 반복하려면 실행 명령 뒤에 `--model-seeds 0,1,2,3,4`처럼 명시한다.
 이 옵션은 각 트랙의 우리 benchmark에 적용된다. Cycle PE 보조 BREC official suite의 내부
 `100,200,...,1000` 10-seed search는 BREC 프로토콜 축이므로 이 기본값과 별개다.
+Conductance v2/v3는 한 번에 model seed 하나만 받아 `--model-seed 1`처럼 단수 옵션을 쓴다.
 
 기본 학습은 float32로 실행한다. GAT는 accuracy/PPI micro-F1, PE는 MAE,
 트리 증강은 CSL accuracy/ZINC MAE를 사용하며 각 트랙 안에서 비교한다.
@@ -199,7 +203,8 @@ Conductance의 반복 GPU 동기화 제거와 Cycle PE의 연결 정보 재사�
 [PERFORMANCE.md](docs/PERFORMANCE.md)를 따른다. 기본 명령이나 패키지 설치를 바꿀 필요는 없다.
 별도 Conductance v2/v3는 이 compile 옵션을 받지 않는다.
 
-세 트랙을 순서대로 실행하려면 위 세 명령 **대신** 다음 명령을 사용한다.
+기본 세 트랙을 순서대로 실행하려면 각 트랙의 기본 명령 **대신** 다음 명령을 사용한다.
+Conductance v2/v3는 이 master 명령에 포함되지 않는다.
 
 ```bash
 bash scripts/reproduce.sh
@@ -218,6 +223,8 @@ bash scripts/reproduce.sh
 | `runs/paper/<run-id>/logs/` | 트랙별 실행 로그 |
 | `runs/paper/<run-id>/aggregate/` | 우리 모델 지표·효율·실패 목록, 내부 ablation의 paired 비교 |
 | `research/<track>/results/paper/<run-id>/` | 트랙별 평가·학습 산출물 |
+| `results/conductance_gat/v2/<run-id>/` | 직접 C v2의 manifest, 조건별 checkpoint와 비교표 |
+| `results/conductance_gat/v3/<run-id>/` | 상대 C v3의 manifest, 조건별 checkpoint·개입과 비교표 |
 
 전체 성공 시 터미널에 `all requested independent paper tracks passed`와 manifest 위치가 출력된다.
 실패하면 종료 코드는 0이 아니며, 해당 run의 로그와 `aggregate/failures.csv`를 확인한다.
@@ -245,7 +252,8 @@ Python patch 버전과 모든 전이 의존성을 잠근 환경은 아니며,
 [PyTorch 재현성 안내](https://docs.pytorch.org/docs/stable/notes/randomness.html)도 참고한다.
 
 사용자 제공 기존 benchmark 5-seed 집계, Conductance seed 0 GPU 진단·2×2·C-learning 결과는
-[실험 상태](docs/EXPERIMENT_STATUS.md)에 기록했다. 기저벡터 v2의 GPU 학습 결과와
-실행 최적화의 가속 실측은 아직 확인하지 않았다. 구현 검증 이력과 연구상 한계는
+[실험 상태](docs/EXPERIMENT_STATUS.md)에 기록했다. Conductance 직접 C v2·상대 C v3와
+Cycle PE 기저벡터 v2의 GPU 학습 결과 및 실행 최적화의 가속 실측은 아직 확인하지 않았다.
+구현 검증 이력과 연구상 한계는
 [hand_off.md](hand_off.md), 이 소스 버전의 코드 전체는
 [code_summary.md](code_summary.md)에 있다.

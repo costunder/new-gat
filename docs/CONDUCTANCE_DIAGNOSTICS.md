@@ -3,6 +3,9 @@
 완료된 benchmark의 학습 기록과 `best.pt`를 읽고 **model seed 0 하나**를 검사한다.
 GPU 추론과 선택적 train-label gradient 계산을 수행하지만 재학습, optimizer update,
 파라미터 변경, 데이터 다운로드는 하지 않는다. 기존 checkpoint·학습 기록·캐시는 덮어쓰지 않는다.
+이 문서의 진단기는 기존 matched benchmark 결과를 대상으로 하며 C-learning이나 별도
+Conductance v2/v3 결과를 입력으로 받지 않는다. V3의 네 선택-checkpoint 개입은 v3 runner가
+자체 결과 폴더에 기록한다.
 
 ## 실행
 
@@ -49,7 +52,7 @@ runs/diagnostics/conductance-RUN_ID-model-seed-0-TIMESTAMP/
 확장 옵션 없는 기본 진단은 기존처럼 stdout만 출력하고 `--output-dir`을 선택할 수 있다.
 
 학습 때 사용자 지정 경로를 썼다면 `--results-root`와 필요할 경우 `--data-root`로
-실제 경로를 지정한다. 기본 결과 위치는 다음 구조다.
+실제 경로를 지정한다. 기존 benchmark의 기본 결과 위치는 다음 구조다.
 
 ```text
 research/conductance_gat/results/paper/RUN_ID/model-seed-0/benchmark/
@@ -163,5 +166,7 @@ Cora의 두 번째 층은 비상수 C이며, 모든 데이터에서 전파가 �
 정확한 train/validation 지표, 층별 통계, validation 전파 우회 차이와 해석 한계는
 [실험 상태](EXPERIMENT_STATUS.md)에 있다. 원인이 weight decay라는 설명은 아직 가설이다.
 이 결과는 전체 seed 진단·모델 수정·재학습 또는 최적화 가속 측정이 아니다.
-새 mean/shuffle·gradient 검사 결과는 아직 실제 서버에서 받지 않았다. 위 명령은 그 추가
-검사를 실행하는 코드이며 기존에 제공된 seed 0 로그에 없던 측정값을 만들어 적지 않는다.
+이후 mean/shuffle·gradient를 포함한 `5e801c3` full-audit의 실제 서버 출력을 수령했고,
+seed 0의 다섯 데이터셋이 모두 `passed`임을 확인했다. 위 초기 진단과 후속 full-audit은
+source가 다르므로 같은 실행으로 합치지 않는다. 정확한 개입·gradient 결과와 근거 범위는
+[실험 상태](EXPERIMENT_STATUS.md)에 보존한다.

@@ -3,7 +3,7 @@
 **상대 C 생성기를 학습하는 [v3](v3/README.md)**도 별도 실행한다. 공유 MLP의 score를
 그래프별 중심화·정규화하여 상대 C를 만들고, 등방성 혼합 비율과 전파 강도를 따로 학습한다.
 대칭 정규화와 AdamW 분리 그룹을 사용하며 기존 모델이나 v2를 덮어쓰지 않는다.
-기본은 v2와 같은 ogbn-arxiv × 자체 learned/fixed C × seed 0이며 validation만 평가한다.
+기본은 v2와 같은 ogbn-arxiv × `relative_c`/`fixed_c` × seed 0이며 validation만 평가한다.
 
 **엣지별 C 자체를 직접 학습하는 [v2](v2/README.md)**는 별도 폴더와 실행 경로를 쓴다.
 기존 shared-MLP 모델을 변경하지 않으며, ogbn-arxiv에서 direct C / fixed C=1을
@@ -114,7 +114,8 @@ The supplied five-seed benchmark aggregates, seed-0 GPU diagnostics, and complet
 single-seed factorial and C-learning results are recorded in
 [experiment status](../../docs/EXPERIMENT_STATUS.md). The new C-learning learned-checkpoint
 mean-C audit output has also been supplied and is preserved separately from retraining scores.
-The direct-parameter v2 is implemented separately; its GPU training results remain pending.
+The direct-parameter v2 and relative-generator v3 are implemented separately;
+their GPU training results remain pending.
 
 ## Supplementary suites (not the default matched benchmark)
 

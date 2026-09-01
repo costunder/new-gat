@@ -20,9 +20,11 @@ train-label gradient를 검사하며 **5e801c3 실행의 새 GPU 로그를 수�
 
 V3는 graph-centered score → bounded relative C → isotropic mixture와 학습 alpha의
 대칭 정규화를 사용한다. AdamW backbone/생성기/scalar 그룹을 분리했다. 기본 arxiv ×
-자체 learned/fixed C × seed 0이며 v2나 이전 MLP의 checkpoint·점수를 재사용하지 않는다.
+`relative_c`/`fixed_c` × seed 0이며 v2나 이전 MLP의 checkpoint·점수를 재사용하지 않는다.
 선택된 checkpoint에서 평균 C·셔플 C·C=1·전파 제거 validation 검사도 별도 forward로 수행한다.
+평균 C와 C=1은 대칭 정규화에서 동등하므로 서로 일치해야 하는 수치 검산이다.
 실행과 수식·비교 경계는 [v3 README](../research/conductance_gat/v3/README.md)를 따른다.
+구현 게시 revision은 `6f9d3b0981e8cfa8feb76e59fb348e26cc6909d6`이다.
 
 상대 C v3 추가 후 전체 로컬 회귀는 **1176 passed / 65 skipped** (44.45 s, exit 0),
 Ruff 통과다. V3 전용 134개가 통과했고 실제 CUDA RNG 보존 검사 1개는 로컬 GPU가 없어
@@ -47,13 +49,13 @@ graph binding과 학습 루프→checkpoint→비교표 연결 및 실제 C grad
 | Gate WD × normalization 2×2 | 43afd63 실제 GPU 결과 수령. PPI/arxiv × 4조건 × seed 0 모두 passed |
 | Node-degree의 learned C vs fixed C | `gat-c-learning-seed0-v1`, 2데이터 × 2조건 × seed 0, 모두 passed 보고서 수령 |
 | Node-degree checkpoint mean-C 개입 | 새 c_learning/learned_c의 PPI/arxiv GPU 출력 수령, passed. 기존 factorial도 별도 지원 |
-| Conductance 직접 C v2 | `conductance_direct_c_v2`, 기본 arxiv × direct/fixed × seed 0. 구현 경로 추가, 실제 GPU 결과 없음 |
-| Conductance 상대 C v3 | `conductance_relative_c_v3`, 기본 arxiv × relative/fixed × seed 0. 별도 구현, 실제 GPU 결과 없음 |
+| Conductance 직접 C v2 | `conductance_direct_c_v2`, 기본 arxiv × `direct_c`/`fixed_c` × seed 0. 구현 경로 추가, 실제 GPU 결과 없음 |
+| Conductance 상대 C v3 | `conductance_relative_c_v3`, 기본 arxiv × `relative_c`/`fixed_c` × seed 0. 별도 구현, 실제 GPU 결과 없음 |
 | `code_summary.md` | 이 버전의 source/test/config/script 전체를 파일별로 보존한 스냅샷 |
 
 `ebf8cd1`까지만 받은 서버에는 새 기능이 없으므로 업데이트 후 `git rev-parse HEAD`로
 실행 revision을 확인한다. 소스 업데이트가 서버에서의 실행 완료를 뜻하지는 않는다.
-아래 기존 학습 결과를 v2·최적화·새 2×2/C-learning 결과로 재분류하면 안 된다.
+아래 기존 학습 결과를 Conductance v2/v3·최적화·새 2×2/C-learning 결과로 재분류하면 안 된다.
 
 ### 수령한 C-learning 비교: 학습 C의 성능 이득은 관측하지 못함
 
@@ -348,14 +350,17 @@ node-degree 정규화가 개선을 이끈 결과를 확보했지만, 모든 데�
 fresh-training 이득을 관측하지 못했다는 결과를 함께 보존한다. 이전 2×2 `node_degree` 검사도
 지원하지만 다른 source run의 결과로 분리한다.
 
-다음 검증은 [직접 C v2](../research/conductance_gat/v2/README.md)의 같은 그래프에 묶인
-direct/fixed C 비교다. 이는 MLP 구현의 수학 오류 수정이 아니며 정규화·공유 함수·직접
-파라미터화 효과를 분리한다. C 공통 스케일의 비식별성, 엣지 수에 비례하는 파라미터 수와
-transductive 범위를 명시한다. 실제 v2 GPU 결과는 아직 없다.
+다음 검증은 [직접 C v2](../research/conductance_gat/v2/README.md)와
+[상대 C v3](../research/conductance_gat/v3/README.md)의 각 C=1 대조다. V2는 같은 그래프에
+묶인 direct/fixed C이고, v3는 공유 상대-C 생성기의 relative/fixed C이며 fixed v3도 alpha는
+학습한다. 둘 다 기존 MLP의 수학 오류 수정이 아니다. 각 버전 내부 비교를 먼저 보고,
+파라미터화·정규화·전파 강도·optimizer가 함께 다른 버전 간 차이를 단일 요인으로 해석하지 않는다.
+실제 v2/v3 GPU 결과는 아직 없다.
 
 노드별 정규화는 기존 대칭성·보존성의 의미를 바꾸는 실험이므로 단순 속도 최적화나
 버그 수정으로 부르지 않는다. 기존 기본 benchmark는 유지한다. 다른 model seed의
-일반화, Conductance 직접 C v2와 Cycle PE 기저벡터 v2의 학습 결과, GPU 가속 실측은
+일반화, Conductance 직접 C v2·상대 C v3와 Cycle PE 기저벡터 v2의 학습 결과,
+GPU 가속 실측은
 여전히 별도 검증 대상이다.
 
 ## 5. 근거와 검증 범위
@@ -374,7 +379,7 @@ transductive 범위를 명시한다. 실제 v2 GPU 결과는 아직 없다.
 
 확장 검사 구현 전 문서 갱신의 로컬 회귀는 619 passed / 63 skipped (21.84 s, exit 0),
 당시 진단 전용은 42 passed였다. Ruff/diff 및 당시 문서 로컬 링크 34개 검사도 통과했다.
-최신 확장 검사 결과는 handoff의 최신 검증 항목을 따른다.
+당시 확장 검사 결과는 handoff의 해당 역사 검증 항목을 따른다.
 단일 seed·확장 진단 구현 후 전체 회귀는 **680 passed / 63 skipped**, 진단 전용은
 **89 passed**다. 이는 당시 로컬 단위 검증이며, 이후 수령한 실제 GPU full-audit 로그는 위에
 별도로 기록했다. 후속 2×2 구현 후 전체 검사는 **794 passed / 64 skipped** (31.83 s, exit 0),

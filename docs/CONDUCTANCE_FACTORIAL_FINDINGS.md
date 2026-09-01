@@ -159,11 +159,14 @@ H'_i=0.05H_i+0.95\frac{1}{d_i}\sum_{j\in\mathcal N(i)}H_j.
 총 학습은 **2데이터 × 2조건 × 1seed = 4개**다. 이미 받은 2×2의 learned 점수를 가져와
 새 fixed 점수와 대신 짝짓지 않고 두 조건을 같은 새 실행에서 비교한다. A의 개입 효과와
 B의 재학습 차이는 별도 보고서에 남긴다. 이후 B의 네 조건은 완료 보고서를 수령했으며,
-그 새 run의 learned checkpoint를 검사하는 평균-C 개입은 아직 GPU 출력이 없다.
+그 새 run의 learned checkpoint를 검사하는 평균-C 개입도 이후 `passed` GPU 출력을 수령했다.
+PPI는 전체 층 평균화에서 −6.649440pp, arxiv는 −0.033558pp였지만 이는 선택 checkpoint의
+민감도이며 fresh learned/fixed 학습 이득과 같지 않다. 정확한 층별 값과 근거 한계는
+[C-learning 결과 문서](CONDUCTANCE_C_LEARNING_FINDINGS.md)를 따른다.
 
 설치·실행·결과 확인은 [C 학습 기여 실험 안내](../research/conductance_gat/c_learning/README.md)를 따른다.
 
-## 7. 결과가 나오면 판단할 순서
+## 7. 당시 정한 결과 판단 순서
 
 1. Manifest 상태와 source/cache/checkpoint 무결성, 원 validation 재현부터 확인한다.
 2. A의 all-layer 및 layer별 metric/logit/flip 차이로 현재 C 변동 의존도를 확인한다.

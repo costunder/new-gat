@@ -159,9 +159,9 @@ Layer 1/전체 층 개입도 −0.033558pp로 작다. 이를 일반적인 함수
 logit 변화와 prediction flip을 확인한다. 점수가 유지돼도 logits가 바뀔 수 있으므로 점수 하나만
 보지 않는다. 개입 민감도가 있어도 fresh-training 이득이 없을 수 있으며 두 결과는 모순이 아니다.
 
-## 7. 다음 독립 가설: MLP 없이 엣지별 C 직접 학습
+## 7. 다음 독립 가설: 직접 C v2와 상대 C 생성기 v3
 
-다음 실험은 [Conductance v2](../research/conductance_gat/v2/README.md)다.
+첫 번째 별도 실험은 [Conductance v2](../research/conductance_gat/v2/README.md)다.
 고정 그래프의 canonical 물리 엣지·층마다 alpha를 두고 `c_e=exp(alpha_e)`를 직접 학습한다.
 Alpha는 0으로 초기화해 C=1에서 시작한다. C 생성 MLP와 고유분해는 없고,
 node-degree 전파·backbone은 유지한 채 직접 C와 fixed C=1의 두 조건을 새로 비교한다.
@@ -171,3 +171,13 @@ node-degree 전파·backbone은 유지한 채 직접 C와 fixed C=1의 두 조�
 PPI의 unseen 독립 그래프에는 적용하지 않는다. 기본은 arxiv × direct/fixed × seed 0의
 2개 CUDA 학습이고 arxiv는 여전히 full-batch다. Cora/CiteSeer/PubMed는 명시적으로 선택할 수 있다.
 이 v2의 실제 GPU 결과는 아직 없으며 이전 결과를 v2 성능으로 재사용하지 않는다.
+
+추가 [Conductance v3](../research/conductance_gat/v3/README.md)는 v2를 대체하지 않는다.
+방향 불변인 노드상태·degree 특징의 공유 MLP score를 그래프별 중심화해 상대 C를 만들고,
+등방성 혼합 gamma와 bounded tau, 대칭 정규화의 전파 강도 alpha를 별도로 학습한다.
+같은 arxiv와 seed 0에서 `relative_c`/`fixed_c`를 새로 학습하며 fixed 조건도 alpha는 학습한다.
+선택된 checkpoint에는 평균 C·shuffled C·C=1·전파 제거 validation 개입을 실행한다.
+대칭 정규화에서 평균 C와 C=1은 동등하므로 둘은 독립 대비가 아니라 수치 검산이다.
+이 개입은 fresh fixed-C 재학습과 다른 질문이다. V2와 v3 사이에는 파라미터화·정규화·alpha·
+optimizer가 함께 달라 전체 점수 차이를 C 한 요인의 효과로 해석하지 않는다. 실제 v3 GPU 결과도
+아직 없으며, 단일 seed validation 결과를 유의성·test·SOTA 주장으로 확대하지 않는다.
