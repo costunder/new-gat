@@ -103,8 +103,26 @@ def _source_hashes() -> dict[str, str]:
 def _validate_args(args: argparse.Namespace) -> None:
     if args.dataset not in DATASETS:
         raise ValueError("Direct C is graph-bound; PPI's unseen graphs are not supported")
-    if min(args.epochs, args.patience, args.batch_size, args.edge_chunk_size) < 1:
-        raise ValueError("epochs, patience, batch size and edge chunk size must be positive")
+    hidden_channels = getattr(args, "hidden_channels", COMMON["hidden_channels"])
+    layers = getattr(args, "layers", COMMON["layers"])
+    dropout = getattr(args, "dropout", COMMON["dropout"])
+    if (
+        min(
+            args.epochs,
+            args.patience,
+            args.batch_size,
+            args.edge_chunk_size,
+            hidden_channels,
+            layers,
+        )
+        < 1
+    ):
+        raise ValueError(
+            "epochs, patience, batch size, edge chunk size, hidden channels and layers "
+            "must be positive"
+        )
+    if not 0 <= dropout < 1:
+        raise ValueError("dropout must be in [0, 1)")
     if min(args.workers, args.model_seed) < 0:
         raise ValueError("workers and model seed must be nonnegative")
     if args.batch_size != 1 or args.workers != 0:
@@ -121,6 +139,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--hidden-channels", type=int, default=COMMON["hidden_channels"])
+    parser.add_argument("--layers", type=int, default=COMMON["layers"])
+    parser.add_argument("--dropout", type=float, default=COMMON["dropout"])
     parser.add_argument("--batch-size", type=int, default=1, help="Full graph only: must be 1")
     parser.add_argument("--workers", type=int, default=0, help="Full graph only: must be 0")
     parser.add_argument("--edge-chunk-size", type=int, default=DEFAULT_EDGE_CHUNK_SIZE)
@@ -195,7 +216,7 @@ def train_model(
         source_sha256=sources,
         protocol_note=PROTOCOL_NOTE,
         checkpoint_sha256=sha256_file(checkpoint),
-        graph_parameter_count=topology["num_edges"] * COMMON["layers"],
+        graph_parameter_count=topology["num_edges"] * getattr(args, "layers", COMMON["layers"]),
         execution={
             "training": "full_graph_transductive",
             "propagation": "exact_edge_chunked_autograd",

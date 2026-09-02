@@ -73,9 +73,20 @@ OBSERVATION_POLICY = {
 }
 
 
+def architecture_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    """Resolve scaling overrides while preserving the historical V4 defaults."""
+
+    return {
+        "hidden_channels": getattr(args, "hidden_channels", COMMON["hidden_channels"]),
+        "layers": getattr(args, "layers", COMMON["layers"]),
+        "dropout": getattr(args, "dropout", COMMON["dropout"]),
+    }
+
+
 def configuration(args: argparse.Namespace) -> dict[str, Any]:
     return {
         **COMMON,
+        **architecture_configuration(args),
         "model_seed": args.model_seed,
         "epochs": args.epochs,
         "patience": args.patience,
@@ -286,15 +297,29 @@ def _require_sources(expected):
 def _validate_args(args):
     if args.dataset not in DATASETS or args.condition not in CONDITIONS:
         raise ValueError("Unsupported V4 dataset/condition")
-    if min(args.epochs, args.patience, args.edge_chunk_size) < 1 or args.model_seed < 0:
-        raise ValueError("epochs/patience/chunk size must be positive and seed nonnegative")
+    architecture = architecture_configuration(args)
+    if (
+        min(
+            args.epochs,
+            args.patience,
+            args.edge_chunk_size,
+            architecture["hidden_channels"],
+            architecture["layers"],
+        )
+        < 1
+        or args.model_seed < 0
+    ):
+        raise ValueError(
+            "epochs/patience/chunk size/hidden channels/layers must be positive and seed "
+            "nonnegative"
+        )
+    if not 0 <= architecture["dropout"] < 1:
+        raise ValueError("dropout must be in [0, 1)")
     expected_batch_size = BATCH_SIZE_BY_DATASET[args.dataset]
     if args.batch_size is None:
         args.batch_size = expected_batch_size
     if args.batch_size != expected_batch_size or args.workers != 0:
-        raise ValueError(
-            "V4 requires protocol batch size 2 for PPI, 1 otherwise, and workers=0"
-        )
+        raise ValueError("V4 requires protocol batch size 2 for PPI, 1 otherwise, and workers=0")
 
 
 def build_parser():
@@ -307,6 +332,9 @@ def build_parser():
     parser.add_argument("--model-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--hidden-channels", type=int, default=COMMON["hidden_channels"])
+    parser.add_argument("--layers", type=int, default=COMMON["layers"])
+    parser.add_argument("--dropout", type=float, default=COMMON["dropout"])
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--edge-chunk-size", type=int, default=DEFAULT_EDGE_CHUNK_SIZE)
@@ -331,21 +359,16 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         train_batches_per_epoch = len(data["train"])
         validation_batches = len(data["validation"])
         validation_graphs = len(payload["splits"]["validation"])
-        if (
-            train_batches_per_epoch != 10
-            or validation_batches != 1
-            or validation_graphs != 2
-        ):
+        if train_batches_per_epoch != 10 or validation_batches != 1 or validation_graphs != 2:
             raise ValueError(
                 "PPI V4 requires 20 train graphs and 2 validation graphs at batch size 2"
             )
     specification = CONDITIONS[args.condition]
+    architecture = architecture_configuration(args)
     model = RelativeCSpatialNodeClassifier(
         payload["graphs"][0]["x"].shape[1],
         payload["classes"],
-        hidden_channels=COMMON["hidden_channels"],
-        layers=COMMON["layers"],
-        dropout=COMMON["dropout"],
+        **architecture,
         normalization="symmetric",
         gate_mode=specification["gate_mode"],
         spatial_mode=specification["spatial_mode"],
@@ -388,9 +411,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     torch.cuda.synchronize(device)
     started = time.perf_counter()
     validation_indices = indices["validation"] if indices is not None else None
-    initial_observation, _ = evaluate_validation(
-        model, data, validation_indices, device=device
-    )
+    initial_observation, _ = evaluate_validation(model, data, validation_indices, device=device)
     for epoch in range(1, args.epochs + 1):
         _require_sources(sources)
         torch.cuda.synchronize(device)
@@ -476,9 +497,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
                     name: tensor.detach().cpu() for name, tensor in model.state_dict().items()
                 },
                 "architecture": {
-                    "hidden_channels": COMMON["hidden_channels"],
-                    "layers": COMMON["layers"],
-                    "dropout": COMMON["dropout"],
+                    **architecture,
                     "normalization": "symmetric",
                     "gate_mode": specification["gate_mode"],
                     "spatial_mode": specification["spatial_mode"],
@@ -503,9 +522,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     stopping_reason = "patience" if stop_epoch - best_epoch >= args.patience else "max_epochs"
     selection_loop_seconds = time.perf_counter() - started
     post_selection_started = time.perf_counter()
-    final_observation, _ = evaluate_validation(
-        model, data, validation_indices, device=device
-    )
+    final_observation, _ = evaluate_validation(model, data, validation_indices, device=device)
     _require_sources(sources)
     if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
         raise RuntimeError("Checkpoint/history changed before best-checkpoint validation")

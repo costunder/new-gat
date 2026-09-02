@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import sys
@@ -19,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import yaml
 
@@ -30,7 +32,13 @@ from .paper_data import (
     prepare_cyclecount_dataset,
     prepare_optional_pyg_dataset,
 )
-from .paper_model import build_chart_views, run_fixed_vs_multichart
+from .paper_model import (
+    FitResult,
+    VariableBetaCycleEncoder,
+    build_chart_views,
+    evaluate_downstream_model,
+    run_fixed_vs_multichart,
+)
 
 SUITES = ("core", "csl", "zinc")
 
@@ -155,6 +163,42 @@ def _load_settings() -> tuple[dict[str, Any], Path]:
     return merged, config_path
 
 
+def _apply_setting_overrides(
+    settings: dict[str, Any],
+    *,
+    hidden_dim: int | None,
+    message_layers: int | None = None,
+    optimizer_updates: int | None,
+    train_charts_per_graph: int | None,
+    eval_charts_per_graph: int | None,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Apply explicit scaling overrides while preserving config.yaml defaults."""
+
+    overrides = {
+        key: int(value)
+        for key, value in {
+            "hidden_dim": hidden_dim,
+            "message_layers": message_layers,
+            "optimizer_updates": optimizer_updates,
+            "train_charts_per_graph": train_charts_per_graph,
+            "eval_charts_per_graph": eval_charts_per_graph,
+        }.items()
+        if value is not None
+    }
+    effective = dict(settings)
+    effective.update(overrides)
+    for key in (
+        "hidden_dim",
+        "message_layers",
+        "optimizer_updates",
+        "train_charts_per_graph",
+        "eval_charts_per_graph",
+    ):
+        if int(effective[key]) < 1:
+            raise ValueError(f"{key.replace('_', ' ')} must be positive")
+    return effective, overrides
+
+
 def _prepare_dataset(
     suite: str,
     data_root: Path,
@@ -224,22 +268,95 @@ def _save_models(
     *,
     settings: dict[str, Any],
     task_type: str,
+    output_dim: int,
+    suite: str,
+    dataset_data_sha256: str,
 ) -> dict[str, str]:
     paths: dict[str, str] = {}
     for name, fitted in models.items():
         path = output_dir / f"{name}_model.pt"
         torch.save(
             {
+                "checkpoint_schema_version": 1,
+                "model_name": name,
                 "state_dict": _cpu_state_dict(fitted.model),
                 "target_mean": torch.as_tensor(fitted.target_mean),
                 "target_scale": torch.as_tensor(fitted.target_scale),
                 "settings": settings,
                 "task_type": task_type,
+                "output_dim": output_dim,
+                "suite": suite,
+                "dataset_data_sha256": dataset_data_sha256,
             },
             path,
         )
         paths[name] = str(path)
     return paths
+
+
+def _load_selected_model(
+    path: Path,
+    *,
+    expected_model_name: str,
+    expected_task_type: str,
+    expected_output_dim: int,
+    expected_suite: str,
+    expected_dataset_data_sha256: str,
+    device: torch.device,
+) -> tuple[FitResult, dict[str, Any]]:
+    """Load one selected scaling checkpoint without permitting code execution."""
+
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"selected checkpoint is missing: {resolved}")
+    payload = torch.load(resolved, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict) or payload.get("checkpoint_schema_version") != 1:
+        raise ValueError(f"unsupported selected checkpoint schema: {resolved}")
+    if payload.get("model_name") != expected_model_name:
+        raise ValueError(f"selected checkpoint arm mismatch: {resolved}")
+    if payload.get("task_type") != expected_task_type:
+        raise ValueError(f"selected checkpoint task mismatch: {resolved}")
+    if payload.get("output_dim") != expected_output_dim:
+        raise ValueError(f"selected checkpoint output dimension mismatch: {resolved}")
+    if payload.get("suite") != expected_suite:
+        raise ValueError(f"selected checkpoint suite mismatch: {resolved}")
+    if payload.get("dataset_data_sha256") != expected_dataset_data_sha256:
+        raise ValueError(f"selected checkpoint dataset mismatch: {resolved}")
+    settings = payload.get("settings")
+    state_dict = payload.get("state_dict")
+    target_mean = payload.get("target_mean")
+    target_scale = payload.get("target_scale")
+    if (
+        not isinstance(settings, dict)
+        or not isinstance(state_dict, dict)
+        or not isinstance(target_mean, torch.Tensor)
+        or not isinstance(target_scale, torch.Tensor)
+    ):
+        raise ValueError(f"selected checkpoint payload is incomplete: {resolved}")
+    hidden_dim = settings.get("hidden_dim")
+    message_layers = settings.get("message_layers")
+    if (
+        isinstance(hidden_dim, bool)
+        or not isinstance(hidden_dim, int)
+        or hidden_dim < 1
+        or isinstance(message_layers, bool)
+        or not isinstance(message_layers, int)
+        or message_layers < 1
+    ):
+        raise ValueError(f"selected checkpoint architecture is invalid: {resolved}")
+    model = VariableBetaCycleEncoder(
+        hidden_dim=hidden_dim,
+        output_dim=expected_output_dim,
+        message_layers=message_layers,
+    )
+    model.load_state_dict(state_dict, strict=True)
+    fitted = FitResult(
+        model=model.to(device),
+        target_mean=target_mean.detach().cpu().numpy().astype(np.float64, copy=False),
+        target_scale=target_scale.detach().cpu().numpy().astype(np.float64, copy=False),
+        history=(),
+    )
+    return fitted, settings
 
 
 def _split(records: tuple[Any, ...], name: str) -> list[Any]:
@@ -278,17 +395,16 @@ def _fresh_axis_overlap_stats(evaluation: dict[str, list[Any]]) -> dict[str, dic
     return result
 
 
-def _protocol_views(
+def _training_views(
     dataset: PreparedDataset,
     *,
     settings: dict[str, Any],
     chart_seed: int,
-) -> tuple[list[Any], list[Any], dict[str, list[Any]]]:
+) -> tuple[list[Any], list[Any]]:
     train_records = _split(dataset.records, "train")
     if not train_records:
         raise ValueError(f"suite {dataset.suite} contains no training graphs")
     train_charts = int(settings["train_charts_per_graph"])
-    eval_charts = int(settings["eval_charts_per_graph"])
     fixed_train = build_chart_views(
         train_records,
         chart_status="train_fixed_bfs_family",
@@ -304,6 +420,41 @@ def _protocol_views(
         methods=("bfs", "dfs"),
         seed=chart_seed + 2_000,
     )
+    return fixed_train, multi_train
+
+
+def _evaluation_views(
+    dataset: PreparedDataset,
+    *,
+    settings: dict[str, Any],
+    chart_seed: int,
+    evaluation_scope: str,
+) -> dict[str, list[Any]]:
+    if evaluation_scope not in {"validation", "test"}:
+        raise ValueError("evaluation scope must be validation or test")
+    eval_charts = int(settings["eval_charts_per_graph"])
+    if evaluation_scope == "validation":
+        validation_records = _split(dataset.records, "validation")
+        if not validation_records:
+            raise ValueError(f"suite {dataset.suite} contains no validation graphs")
+        validation_seen = build_chart_views(
+            validation_records,
+            chart_status="fresh_chart_seen_family",
+            count=eval_charts,
+            methods=("bfs",),
+            seed=chart_seed + 10_000,
+        )
+        validation_unseen = build_chart_views(
+            validation_records,
+            chart_status="fresh_chart_unseen_family",
+            count=eval_charts,
+            methods=("wilson_ust",),
+            seed=chart_seed + 20_000,
+        )
+        return {
+            "validation_graph_fresh_chart_seen_family": validation_seen,
+            "validation_graph_fresh_chart_unseen_family": validation_unseen,
+        }
     if dataset.suite == "core":
         id_records = _split(dataset.records, "id_test")
         ood_records = _split(dataset.records, "ood_test")
@@ -337,7 +488,7 @@ def _protocol_views(
             methods=("wilson_ust",),
             seed=chart_seed + 40_000,
         )
-        evaluation = {
+        return {
             "id_graph_fresh_chart_seen_family": id_seen,
             "id_graph_fresh_chart_unseen_family": id_unseen,
             "ood_graph_fresh_chart_seen_family": ood_seen,
@@ -361,18 +512,115 @@ def _protocol_views(
             methods=("wilson_ust",),
             seed=chart_seed + 20_000,
         )
-        evaluation = {
+        return {
             "test_graph_fresh_chart_seen_family": test_seen,
             "test_graph_fresh_chart_unseen_family": test_unseen,
         }
+
+
+def _protocol_views(
+    dataset: PreparedDataset,
+    *,
+    settings: dict[str, Any],
+    chart_seed: int,
+    evaluation_scope: str = "test",
+) -> tuple[list[Any], list[Any], dict[str, list[Any]]]:
+    fixed_train, multi_train = _training_views(
+        dataset,
+        settings=settings,
+        chart_seed=chart_seed,
+    )
+    evaluation = _evaluation_views(
+        dataset,
+        settings=settings,
+        chart_seed=chart_seed,
+        evaluation_scope=evaluation_scope,
+    )
     return fixed_train, multi_train, evaluation
 
 
 def _output_dim(dataset: PreparedDataset) -> int:
-    if dataset.task_type == "classification":
-        labels = [int(record.target[0]) for record in dataset.records]
-        return max(labels) + 1
-    return len(dataset.records[0].target)
+    output_dim = len(dataset.target_names)
+    if output_dim < 1:
+        raise ValueError("dataset target_names metadata must declare at least one output")
+    return output_dim
+
+
+def _dataset_cache_integrity(dataset: PreparedDataset) -> dict[str, Any]:
+    return {
+        "full_cache_loaded": True,
+        "all_declared_splits_validated": True,
+        "loaded_and_validated_splits": sorted({record.split for record in dataset.records}),
+    }
+
+
+def _model_split_usage(
+    dataset: PreparedDataset,
+    *,
+    evaluation_scope: str,
+    prepare_only: bool,
+) -> dict[str, Any]:
+    if prepare_only:
+        fit_splits: list[str] = []
+        evaluation_splits: list[str] = []
+        selection_splits: list[str] = []
+    elif evaluation_scope == "validation":
+        fit_splits = ["train"]
+        evaluation_splits = ["validation"]
+        selection_splits = ["validation"]
+    else:
+        fit_splits = [] if evaluation_scope == "selected_test" else ["train"]
+        evaluation_splits = ["id_test", "ood_test"] if dataset.suite == "core" else ["test"]
+        selection_splits = []
+    return {
+        "fit_splits": fit_splits,
+        "evaluation_splits": evaluation_splits,
+        "selection_splits": selection_splits,
+        "test_evaluated": evaluation_scope in {"test", "selected_test"} and not prepare_only,
+        "test_used_for_selection": False,
+    }
+
+
+def _evaluate_fitted_models(
+    models: dict[str, FitResult],
+    evaluation: dict[str, list[Any]],
+    *,
+    task_type: str,
+    batch_size: int,
+    device: torch.device,
+    amp: bool,
+    pin_memory: bool,
+    non_blocking: bool,
+    workers: int,
+    checkpoint_settings: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Evaluate already-selected checkpoints without an optimizer or retraining."""
+
+    metrics: dict[str, Any] = {}
+    for model_name, fitted in models.items():
+        settings = checkpoint_settings[model_name]
+        metrics[model_name] = {
+            "optimizer_updates": int(settings["optimizer_updates"]),
+            "training_performed": False,
+            "history": [],
+            "quadrants": {},
+        }
+        for quadrant, views in evaluation.items():
+            values = evaluate_downstream_model(
+                fitted,
+                views,
+                task_type=task_type,
+                batch_size=batch_size,
+                device=device,
+                amp=amp,
+                pin_memory=pin_memory,
+                non_blocking=non_blocking,
+                workers=workers,
+            )
+            if not all(math.isfinite(value) for value in values.values()):
+                raise RuntimeError(f"non-finite metric in {model_name}/{quadrant}")
+            metrics[model_name]["quadrants"][quadrant] = values
+    return metrics
 
 
 def _headline_comparison(metrics: dict[str, Any], *, suite: str) -> dict[str, Any]:
@@ -440,6 +688,13 @@ def run_suite(
     non_blocking_override: bool | None,
     workers: int = 0,
     allow_download: bool = False,
+    hidden_dim_override: int | None = None,
+    message_layers_override: int | None = None,
+    optimizer_updates_override: int | None = None,
+    train_charts_per_graph_override: int | None = None,
+    eval_charts_per_graph_override: int | None = None,
+    evaluation_scope: str = "test",
+    selected_checkpoints: dict[str, Path] | None = None,
 ) -> dict[str, Any]:
     """Prepare and optionally train exactly one independent suite."""
 
@@ -451,6 +706,14 @@ def run_suite(
         model_seed=model_seed,
     )
     settings, config_path = _load_settings()
+    settings, settings_overrides = _apply_setting_overrides(
+        settings,
+        hidden_dim=hidden_dim_override,
+        message_layers=message_layers_override,
+        optimizer_updates=optimizer_updates_override,
+        train_charts_per_graph=train_charts_per_graph_override,
+        eval_charts_per_graph=eval_charts_per_graph_override,
+    )
     output = _prepare_output_dir(output_dir)
     manifest_path = output / "manifest.json"
     manifest: dict[str, Any] = {
@@ -460,11 +723,20 @@ def run_suite(
         "seed_axes": seed_axes.to_manifest(),
         "dataset_seed_policy": _dataset_seed_policy(suite),
         "prepare_only": prepare_only,
+        "evaluation_scope": evaluation_scope,
+        "training_performed": evaluation_scope != "selected_test" and not prepare_only,
+        "dataset_cache_integrity": {
+            "full_cache_loaded": False,
+            "all_declared_splits_validated": False,
+            "loaded_and_validated_splits": [],
+        },
         "allow_download": allow_download,
         "workers": workers,
         "started_at_utc": datetime.now(UTC).isoformat(),
         "config_path": str(config_path),
         "config_sha256": _sha256(config_path),
+        "effective_settings": settings,
+        "settings_overrides": settings_overrides,
         "source_files": {
             path.name: _sha256(path)
             for path in (
@@ -487,6 +759,35 @@ def run_suite(
     }
     _write_json(manifest_path, manifest)
     try:
+        if evaluation_scope not in {"test", "validation", "selected_test"}:
+            raise ValueError("evaluation_scope must be test, validation, or selected_test")
+        if prepare_only and evaluation_scope != "test":
+            raise ValueError("prepare-only cannot be combined with a scaling evaluation scope")
+        if evaluation_scope == "selected_test":
+            if (
+                selected_checkpoints is None
+                or set(selected_checkpoints)
+                != {
+                    "fixed_bfs",
+                    "multi_chart",
+                }
+                or any(not isinstance(path, Path) for path in selected_checkpoints.values())
+            ):
+                raise ValueError("selected_test requires fixed_bfs and multi_chart checkpoints")
+            if any(
+                value is not None
+                for value in (
+                    hidden_dim_override,
+                    message_layers_override,
+                    optimizer_updates_override,
+                    train_charts_per_graph_override,
+                )
+            ):
+                raise ValueError(
+                    "selected_test architecture/training settings come from checkpoints"
+                )
+        elif selected_checkpoints is not None:
+            raise ValueError("selected checkpoints are only valid for selected_test")
         if workers < 0:
             raise ValueError("workers must be non-negative")
         dataset = _prepare_dataset(
@@ -495,6 +796,14 @@ def run_suite(
             seed_axes=seed_axes,
             allow_download=allow_download,
         )
+        dataset_cache_integrity = _dataset_cache_integrity(dataset)
+        model_split_usage = _model_split_usage(
+            dataset,
+            evaluation_scope=evaluation_scope,
+            prepare_only=prepare_only,
+        )
+        manifest["dataset_cache_integrity"] = dataset_cache_integrity
+        manifest["model_split_usage"] = model_split_usage
         manifest["dataset"] = {
             "data_path": str(dataset.data_path),
             "manifest_path": str(dataset.manifest_path),
@@ -530,8 +839,143 @@ def run_suite(
             raise ValueError("batch_size must be positive")
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
+        if evaluation_scope == "selected_test":
+            assert selected_checkpoints is not None
+            evaluation = _evaluation_views(
+                dataset,
+                settings=settings,
+                chart_seed=seed_axes.chart,
+                evaluation_scope="test",
+            )
+            output_dim = _output_dim(dataset)
+            checkpoint_paths = {
+                name: path.expanduser().resolve() for name, path in selected_checkpoints.items()
+            }
+            checkpoint_hashes = {name: _sha256(path) for name, path in checkpoint_paths.items()}
+            selected_models: dict[str, FitResult] = {}
+            selected_settings: dict[str, dict[str, Any]] = {}
+            for name in ("fixed_bfs", "multi_chart"):
+                fitted, checkpoint_settings = _load_selected_model(
+                    checkpoint_paths[name],
+                    expected_model_name=name,
+                    expected_task_type=dataset.task_type,
+                    expected_output_dim=output_dim,
+                    expected_suite=suite,
+                    expected_dataset_data_sha256=dataset.data_sha256,
+                    device=device,
+                )
+                if checkpoint_settings.get("seed_axes") != seed_axes.to_manifest():
+                    raise ValueError(f"selected {name} checkpoint seed axes mismatch")
+                if checkpoint_settings.get("eval_charts_per_graph") != settings.get(
+                    "eval_charts_per_graph"
+                ):
+                    raise ValueError(f"selected {name} checkpoint evaluation chart count mismatch")
+                selected_models[name] = fitted
+                selected_settings[name] = checkpoint_settings
+            started = time.perf_counter()
+            metrics = _evaluate_fitted_models(
+                selected_models,
+                evaluation,
+                task_type=dataset.task_type,
+                batch_size=batch_size,
+                device=device,
+                amp=amp,
+                pin_memory=pin_memory,
+                non_blocking=non_blocking,
+                workers=workers,
+                checkpoint_settings=selected_settings,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elapsed = time.perf_counter() - started
+            if {
+                name: _sha256(path) for name, path in checkpoint_paths.items()
+            } != checkpoint_hashes:
+                raise RuntimeError("a selected checkpoint changed during test evaluation")
+            parameter_counts = {
+                name: {
+                    "total": sum(parameter.numel() for parameter in fitted.model.parameters()),
+                    "trainable": sum(
+                        parameter.numel()
+                        for parameter in fitted.model.parameters()
+                        if parameter.requires_grad
+                    ),
+                }
+                for name, fitted in selected_models.items()
+            }
+            for name, counts in parameter_counts.items():
+                metrics[name]["parameters"] = counts
+            runtime = _runtime_metadata(
+                device=device,
+                amp_requested=amp,
+                pin_memory=pin_memory,
+                non_blocking=non_blocking,
+                batch_size=batch_size,
+                workers=workers,
+                elapsed_seconds=elapsed,
+            )
+            split_counts: dict[str, int] = {}
+            for record in dataset.records:
+                split_counts[record.split] = split_counts.get(record.split, 0) + 1
+            summary = {
+                "track": "tree_augmentation_scaling_selected_test",
+                "suite": suite,
+                "seed_axes": seed_axes.to_manifest(),
+                "protocol": _protocol_name(suite),
+                "evaluation_scope": "selected_test",
+                "training_performed": False,
+                "test_metrics_emitted": True,
+                "dataset_cache_integrity": dataset_cache_integrity,
+                "model_split_usage": model_split_usage,
+                "test_evaluations_per_selected_checkpoint": 1,
+                "graph_split_before_chart_sampling": True,
+                "split_counts": split_counts,
+                "view_counts": {
+                    "evaluation": {name: _view_stats(views) for name, views in evaluation.items()}
+                },
+                "settings": {
+                    "eval_charts_per_graph": int(settings["eval_charts_per_graph"]),
+                    "batch_size": batch_size,
+                    "amp": amp,
+                    "pin_memory": pin_memory,
+                    "non_blocking": non_blocking,
+                    "workers": workers,
+                    "seed_axes": seed_axes.to_manifest(),
+                },
+                "selected_checkpoint_settings": selected_settings,
+                "selected_checkpoints": {
+                    name: {"path": str(path), "sha256": checkpoint_hashes[name]}
+                    for name, path in checkpoint_paths.items()
+                },
+                "runtime": runtime,
+                "parameter_counts": parameter_counts,
+                "models": metrics,
+                "comparison": _headline_comparison(metrics, suite=suite),
+            }
+            summary_path = output / "summary.json"
+            _write_json(summary_path, summary)
+            manifest.update(
+                {
+                    "status": "passed",
+                    "device": str(device),
+                    "runtime": runtime,
+                    "selected_checkpoint_inputs": summary["selected_checkpoints"],
+                    "artifacts": {
+                        summary_path.name: {
+                            "path": str(summary_path),
+                            "sha256": _sha256(summary_path),
+                        }
+                    },
+                    "finished_at_utc": datetime.now(UTC).isoformat(),
+                }
+            )
+            _write_json(manifest_path, manifest)
+            return summary
         fixed_train, multi_train, evaluation = _protocol_views(
-            dataset, settings=settings, chart_seed=seed_axes.chart
+            dataset,
+            settings=settings,
+            chart_seed=seed_axes.chart,
+            evaluation_scope=evaluation_scope,
         )
         started = time.perf_counter()
         metrics, models = run_fixed_vs_multichart(
@@ -541,6 +985,7 @@ def run_suite(
             task_type=dataset.task_type,
             output_dim=_output_dim(dataset),
             hidden_dim=int(settings["hidden_dim"]),
+            message_layers=int(settings["message_layers"]),
             updates=int(settings["optimizer_updates"]),
             batch_size=batch_size,
             learning_rate=float(settings["learning_rate"]),
@@ -552,6 +997,19 @@ def run_suite(
             non_blocking=non_blocking,
             workers=workers,
         )
+        parameter_counts = {
+            name: {
+                "total": sum(parameter.numel() for parameter in fitted.model.parameters()),
+                "trainable": sum(
+                    parameter.numel()
+                    for parameter in fitted.model.parameters()
+                    if parameter.requires_grad
+                ),
+            }
+            for name, fitted in models.items()
+        }
+        for name, counts in parameter_counts.items():
+            metrics[name]["parameters"] = counts
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - started
@@ -577,6 +1035,9 @@ def run_suite(
                 "seed_axes": seed_axes.to_manifest(),
             },
             task_type=dataset.task_type,
+            output_dim=_output_dim(dataset),
+            suite=suite,
+            dataset_data_sha256=dataset.data_sha256,
         )
         split_counts: dict[str, int] = {}
         for record in dataset.records:
@@ -587,6 +1048,11 @@ def run_suite(
             "seed_axes": seed_axes.to_manifest(),
             "dataset_seed_policy": _dataset_seed_policy(suite),
             "protocol": _protocol_name(suite),
+            "evaluation_scope": evaluation_scope,
+            "training_performed": True,
+            "test_metrics_emitted": evaluation_scope == "test",
+            "dataset_cache_integrity": dataset_cache_integrity,
+            "model_split_usage": model_split_usage,
             "downstream_target": list(dataset.target_names),
             "target_is_independent_of_chart": True,
             "samplers": {
@@ -619,10 +1085,22 @@ def run_suite(
                 "seed_axes": seed_axes.to_manifest(),
             },
             "runtime": runtime,
+            "parameter_counts": parameter_counts,
             "models": metrics,
             "comparison": _headline_comparison(metrics, suite=suite),
             "checkpoints": model_paths,
         }
+        if evaluation_scope == "validation":
+            summary["comparison"].update(
+                {
+                    "paper_headline_eligible": False,
+                    "paper_headline_eligibility_reason": (
+                        "validation-only scaling candidate; the full cache was integrity-"
+                        "validated, but the test split was not evaluated and no test metric "
+                        "entered profile selection"
+                    ),
+                }
+            )
         summary_path = output / "summary.json"
         _write_json(summary_path, summary)
         artifacts = [summary_path, *(Path(path) for path in model_paths.values())]
@@ -694,6 +1172,54 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=None,
+        help="override paper.full.hidden_dim; omitted uses config.yaml",
+    )
+    parser.add_argument(
+        "--message-layers",
+        type=int,
+        default=None,
+        help="override paper.full.message_layers; omitted uses config.yaml",
+    )
+    parser.add_argument(
+        "--optimizer-updates",
+        type=int,
+        default=None,
+        help="override paper.full.optimizer_updates; omitted uses config.yaml",
+    )
+    parser.add_argument(
+        "--train-charts-per-graph",
+        type=int,
+        default=None,
+        help="override training chart count for the multi-chart arm",
+    )
+    parser.add_argument(
+        "--eval-charts-per-graph",
+        type=int,
+        default=None,
+        help="override fresh-chart count per evaluation family",
+    )
+    parser.add_argument(
+        "--evaluation-scope",
+        choices=("test", "validation", "selected_test"),
+        default="test",
+        help="standard test run, validation-only scaling candidate, or selected test-only run",
+    )
+    parser.add_argument(
+        "--fixed-checkpoint",
+        type=Path,
+        default=None,
+        help="selected fixed_bfs checkpoint; only valid with selected_test",
+    )
+    parser.add_argument(
+        "--multi-checkpoint",
+        type=Path,
+        default=None,
+        help="selected multi_chart checkpoint; only valid with selected_test",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=0,
@@ -710,6 +1236,12 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _run_from_args(args: argparse.Namespace, suite: str, output_dir: Path) -> dict[str, Any]:
+    selected_checkpoints = None
+    if args.fixed_checkpoint is not None or args.multi_checkpoint is not None:
+        selected_checkpoints = {
+            "fixed_bfs": args.fixed_checkpoint,
+            "multi_chart": args.multi_checkpoint,
+        }
     return run_suite(
         suite,
         data_root=args.data_root,
@@ -727,6 +1259,13 @@ def _run_from_args(args: argparse.Namespace, suite: str, output_dir: Path) -> di
         non_blocking_override=args.non_blocking,
         workers=args.workers,
         allow_download=args.allow_download,
+        hidden_dim_override=args.hidden_dim,
+        message_layers_override=args.message_layers,
+        optimizer_updates_override=args.optimizer_updates,
+        train_charts_per_graph_override=args.train_charts_per_graph,
+        eval_charts_per_graph_override=args.eval_charts_per_graph,
+        evaluation_scope=args.evaluation_scope,
+        selected_checkpoints=selected_checkpoints,
     )
 
 

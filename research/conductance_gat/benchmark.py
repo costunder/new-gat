@@ -186,12 +186,17 @@ def _make_loaders(payload: dict[str, Any], args: argparse.Namespace, device: tor
     from torch_geometric.loader import DataLoader
 
     graphs = [Data(**graph) for graph in payload["graphs"]]
+    validation_only = bool(getattr(args, "validation_only", False))
+    selected_splits = ("train", "validation") if validation_only else tuple(payload["splits"])
     if payload["dataset"] != "ppi":
         # Full graph/features are visible transductively; ONLY training-mask labels enter loss.
-        indices = _prepare_split_indices(payload["splits"], device)
+        indices = _prepare_split_indices(
+            {name: payload["splits"][name] for name in selected_splits}, device
+        )
         return graphs[0].to(device), indices
     loaders = {}
-    for split, indices in payload["splits"].items():
+    for split in selected_splits:
+        indices = payload["splits"][split]
         generator = torch.Generator().manual_seed(args.model_seed)
         loaders[split] = DataLoader(
             [graphs[index] for index in indices],
@@ -330,8 +335,10 @@ def train_model(
             break
     saved = torch.load(checkpoint, map_location=device, weights_only=True)
     model.load_state_dict(saved["state_dict"])
-    # Test is evaluated exactly once per method after validation-only model selection.
-    test_metric = evaluate("test")
+    # Scaling/model-size exploration must not repeatedly expose test labels. The
+    # historical benchmark path keeps its one post-selection test evaluation.
+    validation_only = bool(getattr(args, "validation_only", False))
+    test_metric = None if validation_only else evaluate("test")
     result = {
         "validation": best_validation,
         "test": test_metric,
@@ -351,8 +358,15 @@ def train_model(
         "execution": execution,
         "epoch_timing": "cuda_synchronized_train_and_validation_excluding_checkpoint_io",
         "model_seed": args.model_seed,
-        "test_selection": "best_validation_checkpoint_only",
+        "test_selection": (
+            "not_evaluated_scaling_selection"
+            if validation_only
+            else "best_validation_checkpoint_only"
+        ),
     }
+    if validation_only:
+        result.pop("test")
+        result.update(evaluation_split="validation", test_evaluated=False)
     atomic_write_json(output / "metrics.json", result)
     return result
 

@@ -6,6 +6,10 @@ C 자체를 self-attention이라고 정의하지 않는다. C는 incidence의 �
 양의 대각 metric이며, train loss를 줄이는 방향으로 생성 함수와 전파 강도를 학습한다.
 Cycle PE 및 Tree Augmentation은 결합하지 않는다.
 
+V1을 빼지 않고 64/128 hidden과 2/4 layers에서 V1~V4를 모두 새로 학습하는 별도 suite는
+[전체 모델 규모 확장 실험](RICH_SCALING_EXPERIMENTS.md)에 정의했다. 기존 단일 크기 결과와
+scaling 결과는 경로와 manifest를 분리한다.
+
 ## 실행
 
 [전체 인수인계](HANDOFF.md)의 Linux NVIDIA GPU·Conda 환경과 공식 데이터 캐시 계약을

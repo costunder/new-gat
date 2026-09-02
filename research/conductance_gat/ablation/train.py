@@ -75,9 +75,20 @@ OBSERVATION_POLICY = {
 }
 
 
+def architecture_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    """Return explicit architecture values, retaining legacy defaults for old callers."""
+
+    return {
+        "hidden_channels": getattr(args, "hidden_channels", COMMON["hidden_channels"]),
+        "layers": getattr(args, "layers", COMMON["layers"]),
+        "dropout": getattr(args, "dropout", COMMON["dropout"]),
+    }
+
+
 def configuration(args: argparse.Namespace) -> dict[str, Any]:
     return {
         **COMMON,
+        **architecture_configuration(args),
         "model_seed": args.model_seed,
         "epochs": args.epochs,
         "patience": args.patience,
@@ -412,6 +423,7 @@ def checkpoint_payload(
 ) -> dict[str, Any]:
     experiment = _training_definition(definition)
     spec = experiment.conditions[args.condition]
+    architecture = architecture_configuration(args)
     gate_metadata = {"gate_mode": spec["gate_mode"]} if "gate_mode" in spec else {}
     return {
         "state_dict": {name: value.detach().cpu() for name, value in model.state_dict().items()},
@@ -422,9 +434,7 @@ def checkpoint_payload(
         "condition": args.condition,
         "model_seed": args.model_seed,
         "architecture": {
-            "hidden_channels": COMMON["hidden_channels"],
-            "layers": COMMON["layers"],
-            "dropout": COMMON["dropout"],
+            **architecture,
             "normalization": spec["normalization"],
             **gate_metadata,
         },
@@ -462,13 +472,12 @@ def train_model(
     data, split_indices = _make_data(payload, args, device)
     train_indices = None if split_indices is None else split_indices["train"]
     gate_kwargs = {"gate_mode": spec["gate_mode"]} if "gate_mode" in spec else {}
+    architecture = architecture_configuration(args)
     model = experiment.model_factory(
         payload["graphs"][0]["x"].shape[1],
         payload["classes"],
         normalization=spec["normalization"],
-        hidden_channels=COMMON["hidden_channels"],
-        layers=COMMON["layers"],
-        dropout=COMMON["dropout"],
+        **architecture,
         **gate_kwargs,
     ).to(device)
     initial_hash = state_sha256(model)
@@ -634,6 +643,9 @@ def build_parser(*, definition: TrainingDefinition | None = None) -> argparse.Ar
     parser.add_argument("--model-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--hidden-channels", type=int, default=COMMON["hidden_channels"])
+    parser.add_argument("--layers", type=int, default=COMMON["layers"])
+    parser.add_argument("--dropout", type=float, default=COMMON["dropout"])
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--workers", type=int, default=0)
     return parser
@@ -642,8 +654,12 @@ def build_parser(*, definition: TrainingDefinition | None = None) -> argparse.Ar
 def main(argv: list[str] | None = None, *, definition: TrainingDefinition | None = None) -> int:
     experiment = _training_definition(definition)
     args = build_parser(definition=experiment).parse_args(argv)
-    if min(args.epochs, args.patience, args.batch_size) < 1:
-        raise ValueError("epochs, patience and batch size must be positive")
+    if min(args.epochs, args.patience, args.batch_size, args.hidden_channels, args.layers) < 1:
+        raise ValueError(
+            "epochs, patience, batch size, hidden channels and layers must be positive"
+        )
+    if not 0 <= args.dropout < 1:
+        raise ValueError("dropout must be in [0, 1)")
     if min(args.workers, args.model_seed) < 0:
         raise ValueError("workers and model seed must be nonnegative")
     device = torch.device(args.device)

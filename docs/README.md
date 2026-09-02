@@ -17,6 +17,7 @@
 | 문서 | 내용 |
 |---|---|
 | [EXPERIMENT_STATUS.md](../gpt_handoff/EXPERIMENT_STATUS.md) | 완료된 결과, 로컬 검증, 아직 실행하지 않은 실험 |
+| [RICH_SCALING_EXPERIMENTS.md](../gpt_handoff/RICH_SCALING_EXPERIMENTS.md) | V1을 포함한 전체 트랙의 큰·깊은 모델 확장 실험 |
 | [PERFORMANCE.md](PERFORMANCE.md) | 구현 최적화, 시간·메모리 측정법, 미측정 범위 |
 
 ## Conductance 연구
@@ -52,7 +53,7 @@
 
 | 문서 | 내용 |
 |---|---|
-| [README_FIRST.md](../gpt_handoff/README_FIRST.md) | GPT에 전달할 정확한 5개 파일, 읽는 순서와 요청문 |
+| [README_FIRST.md](../gpt_handoff/README_FIRST.md) | GPT에 전달할 정확한 9개 파일, 읽는 순서와 요청문 |
 | [HANDOFF.md](../gpt_handoff/HANDOFF.md) | 전체 구현 이력, 검증 근거, 남은 작업과 외부 검토 질문 |
 | [CODE_SUMMARY.md](../gpt_handoff/CODE_SUMMARY.md) | 현재 source/test/config/script의 파일별 원문 스냅샷 |
 

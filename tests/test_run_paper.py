@@ -584,6 +584,7 @@ def test_project_docs_and_gpt_handoff_are_separated() -> None:
         "CONDUCTANCE_V3.md",
         "CONDUCTANCE_V4.md",
         "CYCLE_PE_V2.md",
+        "RICH_SCALING_EXPERIMENTS.md",
         "CODE_SUMMARY.md",
     }
 

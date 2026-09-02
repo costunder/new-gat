@@ -208,6 +208,24 @@ bash research/cycle_pe/reproduce.sh
 bash research/tree_augmentation/reproduce.sh
 ```
 
+### V1을 포함한 전체 큰 모델 scaling
+
+기본 단일 크기와 별도로 Conductance V1~V4, Cycle PE V1/V2, Tree fixed/multi를 모두
+더 넓고 깊은 profile에서 실행하려면 통합 Python runner를 사용한다. 파라미터 수를 같게
+맞추는 실험이 아니라 각 방법 자체의 scaling curve이며, 기본 전체 계획은 5 seeds에서
+총 1,020 fresh model trainings이다. Cycle/Tree는 모든 크기를 validation-only로 학습한 뒤
+seed 평균 validation으로 공통 크기를 선택하고, 선택 checkpoint만 test-only로 평가한다. 먼저
+파일을 만들지 않는 계획 검사를 권장한다.
+
+```bash
+python -B scripts/run_rich_scaling.py --run-id rich-all-v1 --profiles base wide deep large --model-seeds 0 1 2 3 4 --device cuda:0 --dry-run
+```
+
+실제 전체 실행은 `--dry-run`을 제거한다. 한 트랙이 실패해도 나머지 트랙은 기본적으로
+계속 실행하고 통합 상태를 failed로 남기며, 첫 실패에서 멈추려면 `--fail-fast`를 추가한다.
+프로필별 크기, 정확한 횟수, GPU 6 실행 예시와 결과 경로는
+[전체 scaling 문서](../gpt_handoff/RICH_SCALING_EXPERIMENTS.md)에 있다.
+
 기본 세 트랙 benchmark의 공통 기본값은 CUDA, model seed `0`, data/split/chart seed `0`,
 workers `4`다. 별도 Conductance v2/v3/v4는 workers `0`을 사용한다. V2와 V3/V4의 네
 transductive 데이터는 full-graph batch 1이고, V3/V4의 PPI는 공식 graph 전체를 보존한

@@ -174,7 +174,24 @@ def _ready(root: Path, dataset: str) -> bool:
     return all((raw / name).is_file() for name in raw_names)
 
 
-def load_official_splits(data_root: Path, dataset: str, *, allow_download: bool) -> dict[str, Any]:
+def _requested_splits(splits: tuple[str, ...]) -> tuple[str, ...]:
+    if (
+        not splits
+        or len(set(splits)) != len(splits)
+        or any(split not in SPLITS for split in splits)
+    ):
+        raise ValueError("splits must be a nonempty unique subset of official splits")
+    return splits
+
+
+def load_official_splits(
+    data_root: Path,
+    dataset: str,
+    *,
+    allow_download: bool,
+    splits: tuple[str, ...] = SPLITS,
+) -> dict[str, Any]:
+    splits = _requested_splits(splits)
     if dataset not in DATASETS:
         raise ValueError(f"unknown cycle PE dataset: {dataset}")
     root = data_root / ("ZINC12K" if dataset == "zinc12k" else "LRGB")
@@ -186,18 +203,21 @@ def load_official_splits(data_root: Path, dataset: str, *, allow_download: bool)
         raise RuntimeError(
             "Cycle PE benchmarks require the project's PyG paper dependencies"
         ) from exc
+    official_names = {"train": "train", "validation": "val", "test": "test"}
+    expected_sizes = dict(zip(SPLITS, EXPECTED_SIZES[dataset], strict=True))
     datasets = {}
-    for split, official in zip(SPLITS, ("train", "val", "test"), strict=True):
+    for split in splits:
+        official = official_names[split]
         datasets[split] = (
             ZINC(str(root), subset=True, split=official)
             if dataset == "zinc12k"
             else LRGBDataset(str(root), name="Peptides-struct", split=official)
         )
-    sizes = tuple(len(datasets[split]) for split in SPLITS)
-    if sizes != EXPECTED_SIZES[dataset]:
-        raise RuntimeError(
-            f"{dataset} official split mismatch: {sizes} != {EXPECTED_SIZES[dataset]}"
-        )
+        actual = len(datasets[split])
+        if actual != expected_sizes[split]:
+            raise RuntimeError(
+                f"{dataset}/{split} official split mismatch: {actual} != {expected_sizes[split]}"
+            )
     return datasets
 
 
@@ -206,8 +226,15 @@ def load_benchmark(
     dataset: str,
     *,
     allow_download: bool,
+    splits: tuple[str, ...] = SPLITS,
 ) -> tuple[dict[str, list[Graph]], dict[str, Any]]:
-    official = load_official_splits(data_root, dataset, allow_download=allow_download)
+    splits = _requested_splits(splits)
+    official = load_official_splits(
+        data_root,
+        dataset,
+        allow_download=allow_download,
+        splits=splits,
+    )
     target_width = 1 if dataset == "zinc12k" else 11
     signature = {
         "version": CACHE_VERSION,
@@ -219,7 +246,7 @@ def load_benchmark(
     cache_dir.mkdir(parents=True, exist_ok=True)
     result: dict[str, list[Graph]] = {}
     split_hashes = {}
-    for split in SPLITS:
+    for split in splits:
         digest = hashlib.sha256()
         for data in official[split]:
             graph_fingerprint(data, digest)
@@ -272,7 +299,8 @@ def load_benchmark(
         "comparison": "ours_only_on_official_benchmark_splits",
         "source_url": SOURCES[dataset],
         "official_splits": True,
-        "split_sizes": {s: len(result[s]) for s in SPLITS},
+        "loaded_splits": list(splits),
+        "split_sizes": {s: len(result[s]) for s in splits},
         "split_content_sha256": split_hashes,
         "target_width": target_width,
         "target_scaling": "official supplied labels, unchanged; no fitted target scaling",

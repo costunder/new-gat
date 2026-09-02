@@ -8,6 +8,10 @@
 파라미터로 학습하는 가설**을 분리한다. 앞선 결과와 이 구분의 이유는
 [실험 상태와 C-learning 결과](EXPERIMENT_STATUS.md)에 있다.
 
+기본 64-hidden/2-layer만이 아니라 128-hidden 및 4-layer 모델까지 V1~V4 전체와 함께
+실행하는 별도 suite는 [전체 모델 규모 확장 실험](RICH_SCALING_EXPERIMENTS.md)을 따른다.
+이 suite도 V2/PPI를 만들지 않으며 직접 C의 원래 graph-bound 가설을 유지한다.
+
 2026-09-02 사용자 보고상 source/pull revision `7b4cd32`, run
 `gat-direct-c-v2-gpu6-seed0-v1`은 `passed`다. Preflight GPU는
 `NVIDIA A100-SXM4-80GB MIG 1g.10gb`였고 `CUDA_VISIBLE_DEVICES=6`을 프로세스 내부

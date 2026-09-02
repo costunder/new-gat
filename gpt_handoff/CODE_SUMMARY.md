@@ -3558,9 +3558,20 @@ OBSERVATION_POLICY = {
 }
 
 
+def architecture_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    """Return explicit architecture values, retaining legacy defaults for old callers."""
+
+    return {
+        "hidden_channels": getattr(args, "hidden_channels", COMMON["hidden_channels"]),
+        "layers": getattr(args, "layers", COMMON["layers"]),
+        "dropout": getattr(args, "dropout", COMMON["dropout"]),
+    }
+
+
 def configuration(args: argparse.Namespace) -> dict[str, Any]:
     return {
         **COMMON,
+        **architecture_configuration(args),
         "model_seed": args.model_seed,
         "epochs": args.epochs,
         "patience": args.patience,
@@ -3895,6 +3906,7 @@ def checkpoint_payload(
 ) -> dict[str, Any]:
     experiment = _training_definition(definition)
     spec = experiment.conditions[args.condition]
+    architecture = architecture_configuration(args)
     gate_metadata = {"gate_mode": spec["gate_mode"]} if "gate_mode" in spec else {}
     return {
         "state_dict": {name: value.detach().cpu() for name, value in model.state_dict().items()},
@@ -3905,9 +3917,7 @@ def checkpoint_payload(
         "condition": args.condition,
         "model_seed": args.model_seed,
         "architecture": {
-            "hidden_channels": COMMON["hidden_channels"],
-            "layers": COMMON["layers"],
-            "dropout": COMMON["dropout"],
+            **architecture,
             "normalization": spec["normalization"],
             **gate_metadata,
         },
@@ -3945,13 +3955,12 @@ def train_model(
     data, split_indices = _make_data(payload, args, device)
     train_indices = None if split_indices is None else split_indices["train"]
     gate_kwargs = {"gate_mode": spec["gate_mode"]} if "gate_mode" in spec else {}
+    architecture = architecture_configuration(args)
     model = experiment.model_factory(
         payload["graphs"][0]["x"].shape[1],
         payload["classes"],
         normalization=spec["normalization"],
-        hidden_channels=COMMON["hidden_channels"],
-        layers=COMMON["layers"],
-        dropout=COMMON["dropout"],
+        **architecture,
         **gate_kwargs,
     ).to(device)
     initial_hash = state_sha256(model)
@@ -4117,6 +4126,9 @@ def build_parser(*, definition: TrainingDefinition | None = None) -> argparse.Ar
     parser.add_argument("--model-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--hidden-channels", type=int, default=COMMON["hidden_channels"])
+    parser.add_argument("--layers", type=int, default=COMMON["layers"])
+    parser.add_argument("--dropout", type=float, default=COMMON["dropout"])
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--workers", type=int, default=0)
     return parser
@@ -4125,8 +4137,12 @@ def build_parser(*, definition: TrainingDefinition | None = None) -> argparse.Ar
 def main(argv: list[str] | None = None, *, definition: TrainingDefinition | None = None) -> int:
     experiment = _training_definition(definition)
     args = build_parser(definition=experiment).parse_args(argv)
-    if min(args.epochs, args.patience, args.batch_size) < 1:
-        raise ValueError("epochs, patience and batch size must be positive")
+    if min(args.epochs, args.patience, args.batch_size, args.hidden_channels, args.layers) < 1:
+        raise ValueError(
+            "epochs, patience, batch size, hidden channels and layers must be positive"
+        )
+    if not 0 <= args.dropout < 1:
+        raise ValueError("dropout must be in [0, 1)")
     if min(args.workers, args.model_seed) < 0:
         raise ValueError("workers and model seed must be nonnegative")
     device = torch.device(args.device)
@@ -4361,12 +4377,17 @@ def _make_loaders(payload: dict[str, Any], args: argparse.Namespace, device: tor
     from torch_geometric.loader import DataLoader
 
     graphs = [Data(**graph) for graph in payload["graphs"]]
+    validation_only = bool(getattr(args, "validation_only", False))
+    selected_splits = ("train", "validation") if validation_only else tuple(payload["splits"])
     if payload["dataset"] != "ppi":
         # Full graph/features are visible transductively; ONLY training-mask labels enter loss.
-        indices = _prepare_split_indices(payload["splits"], device)
+        indices = _prepare_split_indices(
+            {name: payload["splits"][name] for name in selected_splits}, device
+        )
         return graphs[0].to(device), indices
     loaders = {}
-    for split, indices in payload["splits"].items():
+    for split in selected_splits:
+        indices = payload["splits"][split]
         generator = torch.Generator().manual_seed(args.model_seed)
         loaders[split] = DataLoader(
             [graphs[index] for index in indices],
@@ -4505,8 +4526,10 @@ def train_model(
             break
     saved = torch.load(checkpoint, map_location=device, weights_only=True)
     model.load_state_dict(saved["state_dict"])
-    # Test is evaluated exactly once per method after validation-only model selection.
-    test_metric = evaluate("test")
+    # Scaling/model-size exploration must not repeatedly expose test labels. The
+    # historical benchmark path keeps its one post-selection test evaluation.
+    validation_only = bool(getattr(args, "validation_only", False))
+    test_metric = None if validation_only else evaluate("test")
     result = {
         "validation": best_validation,
         "test": test_metric,
@@ -4526,8 +4549,15 @@ def train_model(
         "execution": execution,
         "epoch_timing": "cuda_synchronized_train_and_validation_excluding_checkpoint_io",
         "model_seed": args.model_seed,
-        "test_selection": "best_validation_checkpoint_only",
+        "test_selection": (
+            "not_evaluated_scaling_selection"
+            if validation_only
+            else "best_validation_checkpoint_only"
+        ),
     }
+    if validation_only:
+        result.pop("test")
+        result.update(evaluation_split="validation", test_evaluated=False)
     atomic_write_json(output / "metrics.json", result)
     return result
 
@@ -9510,6 +9540,150 @@ set -euo pipefail
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 exec bash "${project_root}/scripts/paper.sh" --suite benchmark --tracks conductance_gat "$@"
+````
+
+# research/conductance_gat/scaling_v1.py
+
+````python
+"""Train one V1 architecture profile with validation-only checkpoint selection.
+
+This child exists specifically for model-size exploration. Unlike the historical
+V1 benchmark command, it never constructs a test loader or reports a test score.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Any
+
+from chartgat.cache import atomic_write_json
+from chartgat.execution import add_execution_arguments
+
+from .benchmark import _device, _versions, train_model
+from .benchmark_data import DATASETS, load_dataset, sha256_file
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", required=True, choices=DATASETS)
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--data-root", type=Path, default=Path("data/paper"))
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--model-seed", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--hidden-channels", type=int, default=64)
+    parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--dropout", type=float, default=0.5)
+    parser.add_argument("--lr", type=float, default=0.005)
+    parser.add_argument("--weight-decay", type=float, default=0.0005)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=True)
+    add_execution_arguments(parser)
+    return parser
+
+
+def _validate(args: argparse.Namespace) -> None:
+    if (
+        min(
+            args.batch_size,
+            args.epochs,
+            args.patience,
+            args.hidden_channels,
+            args.layers,
+        )
+        < 1
+    ):
+        raise ValueError(
+            "batch size, epochs, patience, hidden channels and layers must be positive"
+        )
+    if args.workers < 0 or args.model_seed < 0:
+        raise ValueError("workers and model seed must be nonnegative")
+    if not 0 <= args.dropout < 1 or args.lr <= 0 or args.weight_decay < 0:
+        raise ValueError("dropout/LR/weight decay configuration is invalid")
+    if args.workers != 0 or args.batch_size != 2:
+        raise ValueError("V1 scaling keeps the official PPI batch-size=2 and workers=0")
+    if args.amp or args.compile:
+        raise ValueError("V1 scaling fixes AMP and compilation off across architecture profiles")
+
+
+def _configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "hidden_channels": args.hidden_channels,
+        "layers": args.layers,
+        "dropout": args.dropout,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "model_seed": args.model_seed,
+        "epochs": args.epochs,
+        "patience": args.patience,
+        "batch_size": args.batch_size,
+        "workers": args.workers,
+        "device": args.device,
+        "amp": args.amp,
+        "compile": args.compile,
+        "pin_memory": args.pin_memory,
+        "validation_only": True,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    _validate(args)
+    # train_model and _make_loaders inspect this internal marker. It is not added
+    # to the historical benchmark parser or its default output contract.
+    args.validation_only = True
+    device = _device(args.device, prepare_only=False)
+    output = args.output_dir.expanduser().resolve()
+    data_root = args.data_root.expanduser().resolve()
+    if output == data_root or output.is_relative_to(data_root) or data_root.is_relative_to(output):
+        raise ValueError("V1 scaling output and dataset cache must not overlap")
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise FileExistsError(f"Output is not a new empty child directory: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "running",
+        "research_suite": "conductance_scaling_v1",
+        "dataset": args.dataset,
+        "condition": "conductance",
+        "model_seed": args.model_seed,
+        "configuration": _configuration(args),
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+    }
+    atomic_write_json(output / "metrics.json", record)
+    try:
+        payload, protocol = load_dataset(args.dataset, data_root, allow_download=False)
+        result = train_model(payload, args, device, output)
+        if "test" in result or result.get("test_evaluated") is not False:
+            raise RuntimeError("V1 scaling child exposed a test metric")
+        record.update(
+            result,
+            status="passed",
+            metric_name=protocol["metric"],
+            protocol=protocol,
+            cache_sha256=protocol["data_sha256"],
+            versions=_versions(),
+            source_sha256={
+                Path(__file__).name: sha256_file(Path(__file__)),
+                "benchmark.py": sha256_file(Path(__file__).with_name("benchmark.py")),
+            },
+        )
+    except BaseException as exc:
+        record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        atomic_write_json(output / "metrics.json", record)
+        raise
+    atomic_write_json(output / "metrics.json", record)
+    print(f"passed: {output}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ````
 
 # research/conductance_gat/sparse.py
@@ -16422,8 +16596,26 @@ def _source_hashes() -> dict[str, str]:
 def _validate_args(args: argparse.Namespace) -> None:
     if args.dataset not in DATASETS:
         raise ValueError("Direct C is graph-bound; PPI's unseen graphs are not supported")
-    if min(args.epochs, args.patience, args.batch_size, args.edge_chunk_size) < 1:
-        raise ValueError("epochs, patience, batch size and edge chunk size must be positive")
+    hidden_channels = getattr(args, "hidden_channels", COMMON["hidden_channels"])
+    layers = getattr(args, "layers", COMMON["layers"])
+    dropout = getattr(args, "dropout", COMMON["dropout"])
+    if (
+        min(
+            args.epochs,
+            args.patience,
+            args.batch_size,
+            args.edge_chunk_size,
+            hidden_channels,
+            layers,
+        )
+        < 1
+    ):
+        raise ValueError(
+            "epochs, patience, batch size, edge chunk size, hidden channels and layers "
+            "must be positive"
+        )
+    if not 0 <= dropout < 1:
+        raise ValueError("dropout must be in [0, 1)")
     if min(args.workers, args.model_seed) < 0:
         raise ValueError("workers and model seed must be nonnegative")
     if args.batch_size != 1 or args.workers != 0:
@@ -16440,6 +16632,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--hidden-channels", type=int, default=COMMON["hidden_channels"])
+    parser.add_argument("--layers", type=int, default=COMMON["layers"])
+    parser.add_argument("--dropout", type=float, default=COMMON["dropout"])
     parser.add_argument("--batch-size", type=int, default=1, help="Full graph only: must be 1")
     parser.add_argument("--workers", type=int, default=0, help="Full graph only: must be 0")
     parser.add_argument("--edge-chunk-size", type=int, default=DEFAULT_EDGE_CHUNK_SIZE)
@@ -16514,7 +16709,7 @@ def train_model(
         source_sha256=sources,
         protocol_note=PROTOCOL_NOTE,
         checkpoint_sha256=sha256_file(checkpoint),
-        graph_parameter_count=topology["num_edges"] * COMMON["layers"],
+        graph_parameter_count=topology["num_edges"] * getattr(args, "layers", COMMON["layers"]),
         execution={
             "training": "full_graph_transductive",
             "propagation": "exact_edge_chunked_autograd",
@@ -18351,9 +18546,20 @@ OBSERVATION_POLICY = {
 }
 
 
+def architecture_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    """Resolve scaling overrides while preserving the historical V3 defaults."""
+
+    return {
+        "hidden_channels": getattr(args, "hidden_channels", COMMON["hidden_channels"]),
+        "layers": getattr(args, "layers", COMMON["layers"]),
+        "dropout": getattr(args, "dropout", COMMON["dropout"]),
+    }
+
+
 def configuration(args: argparse.Namespace) -> dict[str, Any]:
     return {
         **COMMON,
+        **architecture_configuration(args),
         "model_seed": args.model_seed,
         "epochs": args.epochs,
         "patience": args.patience,
@@ -18491,8 +18697,24 @@ def _require_sources(expected):
 def _validate_args(args):
     if args.dataset not in DATASETS or args.condition not in CONDITIONS:
         raise ValueError("Unsupported v3 dataset/condition")
-    if min(args.epochs, args.patience, args.edge_chunk_size) < 1 or args.model_seed < 0:
-        raise ValueError("epochs/patience/chunk size must be positive and seed nonnegative")
+    architecture = architecture_configuration(args)
+    if (
+        min(
+            args.epochs,
+            args.patience,
+            args.edge_chunk_size,
+            architecture["hidden_channels"],
+            architecture["layers"],
+        )
+        < 1
+        or args.model_seed < 0
+    ):
+        raise ValueError(
+            "epochs/patience/chunk size/hidden channels/layers must be positive and seed "
+            "nonnegative"
+        )
+    if not 0 <= architecture["dropout"] < 1:
+        raise ValueError("dropout must be in [0, 1)")
     expected_batch_size = 2 if args.dataset == "ppi" else 1
     if args.batch_size is None:
         args.batch_size = expected_batch_size
@@ -18512,6 +18734,9 @@ def build_parser():
     parser.add_argument("--model-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--hidden-channels", type=int, default=COMMON["hidden_channels"])
+    parser.add_argument("--layers", type=int, default=COMMON["layers"])
+    parser.add_argument("--dropout", type=float, default=COMMON["dropout"])
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -18545,12 +18770,11 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         train_indices, validation_indices = indices["train"], indices["validation"]
         optimizer_steps_per_epoch = 1
     spec = CONDITIONS[args.condition]
+    architecture = architecture_configuration(args)
     model = RelativeCNodeClassifier(
         payload["graphs"][0]["x"].shape[1],
         payload["classes"],
-        hidden_channels=COMMON["hidden_channels"],
-        layers=COMMON["layers"],
-        dropout=COMMON["dropout"],
+        **architecture,
         normalization="symmetric",
         gate_mode=spec["gate_mode"],
         edge_chunk_size=args.edge_chunk_size,
@@ -18587,9 +18811,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
     started = time.perf_counter()
-    initial_observation, _ = evaluate_validation(
-        model, data, validation_indices, device=device
-    )
+    initial_observation, _ = evaluate_validation(model, data, validation_indices, device=device)
     optimizer_steps = 0
     best_optimizer_steps = 0
     for epoch in range(1, args.epochs + 1):
@@ -18690,9 +18912,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
                     name: tensor.detach().cpu() for name, tensor in model.state_dict().items()
                 },
                 "architecture": {
-                    "hidden_channels": COMMON["hidden_channels"],
-                    "layers": COMMON["layers"],
-                    "dropout": COMMON["dropout"],
+                    **architecture,
                     "normalization": "symmetric",
                     "gate_mode": spec["gate_mode"],
                     "edge_chunk_size": args.edge_chunk_size,
@@ -18712,9 +18932,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
             )
         if epoch - best_epoch >= args.patience:
             break
-    final_observation, _ = evaluate_validation(
-        model, data, validation_indices, device=device
-    )
+    final_observation, _ = evaluate_validation(model, data, validation_indices, device=device)
     _require_sources(sources)
     if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
         raise RuntimeError("Checkpoint/history changed before best-checkpoint validation")
@@ -21516,9 +21734,20 @@ OBSERVATION_POLICY = {
 }
 
 
+def architecture_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    """Resolve scaling overrides while preserving the historical V4 defaults."""
+
+    return {
+        "hidden_channels": getattr(args, "hidden_channels", COMMON["hidden_channels"]),
+        "layers": getattr(args, "layers", COMMON["layers"]),
+        "dropout": getattr(args, "dropout", COMMON["dropout"]),
+    }
+
+
 def configuration(args: argparse.Namespace) -> dict[str, Any]:
     return {
         **COMMON,
+        **architecture_configuration(args),
         "model_seed": args.model_seed,
         "epochs": args.epochs,
         "patience": args.patience,
@@ -21729,15 +21958,29 @@ def _require_sources(expected):
 def _validate_args(args):
     if args.dataset not in DATASETS or args.condition not in CONDITIONS:
         raise ValueError("Unsupported V4 dataset/condition")
-    if min(args.epochs, args.patience, args.edge_chunk_size) < 1 or args.model_seed < 0:
-        raise ValueError("epochs/patience/chunk size must be positive and seed nonnegative")
+    architecture = architecture_configuration(args)
+    if (
+        min(
+            args.epochs,
+            args.patience,
+            args.edge_chunk_size,
+            architecture["hidden_channels"],
+            architecture["layers"],
+        )
+        < 1
+        or args.model_seed < 0
+    ):
+        raise ValueError(
+            "epochs/patience/chunk size/hidden channels/layers must be positive and seed "
+            "nonnegative"
+        )
+    if not 0 <= architecture["dropout"] < 1:
+        raise ValueError("dropout must be in [0, 1)")
     expected_batch_size = BATCH_SIZE_BY_DATASET[args.dataset]
     if args.batch_size is None:
         args.batch_size = expected_batch_size
     if args.batch_size != expected_batch_size or args.workers != 0:
-        raise ValueError(
-            "V4 requires protocol batch size 2 for PPI, 1 otherwise, and workers=0"
-        )
+        raise ValueError("V4 requires protocol batch size 2 for PPI, 1 otherwise, and workers=0")
 
 
 def build_parser():
@@ -21750,6 +21993,9 @@ def build_parser():
     parser.add_argument("--model-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--hidden-channels", type=int, default=COMMON["hidden_channels"])
+    parser.add_argument("--layers", type=int, default=COMMON["layers"])
+    parser.add_argument("--dropout", type=float, default=COMMON["dropout"])
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--edge-chunk-size", type=int, default=DEFAULT_EDGE_CHUNK_SIZE)
@@ -21774,21 +22020,16 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         train_batches_per_epoch = len(data["train"])
         validation_batches = len(data["validation"])
         validation_graphs = len(payload["splits"]["validation"])
-        if (
-            train_batches_per_epoch != 10
-            or validation_batches != 1
-            or validation_graphs != 2
-        ):
+        if train_batches_per_epoch != 10 or validation_batches != 1 or validation_graphs != 2:
             raise ValueError(
                 "PPI V4 requires 20 train graphs and 2 validation graphs at batch size 2"
             )
     specification = CONDITIONS[args.condition]
+    architecture = architecture_configuration(args)
     model = RelativeCSpatialNodeClassifier(
         payload["graphs"][0]["x"].shape[1],
         payload["classes"],
-        hidden_channels=COMMON["hidden_channels"],
-        layers=COMMON["layers"],
-        dropout=COMMON["dropout"],
+        **architecture,
         normalization="symmetric",
         gate_mode=specification["gate_mode"],
         spatial_mode=specification["spatial_mode"],
@@ -21831,9 +22072,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     torch.cuda.synchronize(device)
     started = time.perf_counter()
     validation_indices = indices["validation"] if indices is not None else None
-    initial_observation, _ = evaluate_validation(
-        model, data, validation_indices, device=device
-    )
+    initial_observation, _ = evaluate_validation(model, data, validation_indices, device=device)
     for epoch in range(1, args.epochs + 1):
         _require_sources(sources)
         torch.cuda.synchronize(device)
@@ -21919,9 +22158,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
                     name: tensor.detach().cpu() for name, tensor in model.state_dict().items()
                 },
                 "architecture": {
-                    "hidden_channels": COMMON["hidden_channels"],
-                    "layers": COMMON["layers"],
-                    "dropout": COMMON["dropout"],
+                    **architecture,
                     "normalization": "symmetric",
                     "gate_mode": specification["gate_mode"],
                     "spatial_mode": specification["spatial_mode"],
@@ -21946,9 +22183,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     stopping_reason = "patience" if stop_epoch - best_epoch >= args.patience else "max_epochs"
     selection_loop_seconds = time.perf_counter() - started
     post_selection_started = time.perf_counter()
-    final_observation, _ = evaluate_validation(
-        model, data, validation_indices, device=device
-    )
+    final_observation, _ = evaluate_validation(model, data, validation_indices, device=device)
     _require_sources(sources)
     if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
         raise RuntimeError("Checkpoint/history changed before best-checkpoint validation")
@@ -22171,6 +22406,26 @@ from chartgat.execution import add_execution_arguments, configure_execution
 from research.cycle_pe.benchmark_data import DATASETS, Graph, collate, load_benchmark
 from research.cycle_pe.benchmark_models import MODEL_NAME, CyclePEModel, architecture_protocol
 
+TRACK_NAME = "cycle_pe"
+IMPLEMENTATION_FILES = (
+    "research/cycle_pe/benchmark.py",
+    "research/cycle_pe/benchmark_data.py",
+    "research/cycle_pe/benchmark_models.py",
+    "research/cycle_pe/features.py",
+    "research/cycle_pe/paper_model.py",
+    "src/chartgat/algebra.py",
+    "src/chartgat/cache.py",
+    "src/chartgat/execution.py",
+)
+
+
+def implementation_hashes() -> dict[str, str]:
+    root = Path(__file__).resolve().parents[2]
+    return {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+        for name in IMPLEMENTATION_FILES
+    }
+
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
@@ -22194,6 +22449,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--pe-dim", type=int, default=32)
     result.add_argument("--layers", type=int, default=3)
     result.add_argument("--max-parameters", type=int, default=500_000)
+    result.add_argument("--validation-only", action="store_true", help=argparse.SUPPRESS)
+    result.add_argument("--test-checkpoint", type=Path, help=argparse.SUPPRESS)
     add_execution_arguments(result)
     return result
 
@@ -22216,6 +22473,12 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("invalid worker count or optimizer settings")
     if len(set(args.datasets)) != len(args.datasets):
         raise ValueError("datasets must not contain duplicates")
+    if args.validation_only and args.prepare_only:
+        raise ValueError("--validation-only cannot be combined with --prepare-only")
+    if args.test_checkpoint is not None and (args.validation_only or args.prepare_only):
+        raise ValueError("--test-checkpoint is an isolated test-only mode")
+    if args.test_checkpoint is not None and len(args.datasets) != 1:
+        raise ValueError("--test-checkpoint requires exactly one dataset")
     if not args.prepare_only and (
         torch.device(args.device).type != "cuda" or not torch.cuda.is_available()
     ):
@@ -22293,7 +22556,13 @@ def _train_model(
         )
     train_loader = _loader(splits["train"], args, train=True)
     validation_loader = _loader(splits["validation"], args, train=False)
-    test_loader = _loader(splits["test"], args, train=False)
+    validation_only = bool(getattr(args, "validation_only", False))
+    expected_splits = (
+        {"train", "validation"} if validation_only else {"train", "validation", "test"}
+    )
+    if set(splits) != expected_splits:
+        raise ValueError(f"unexpected benchmark splits: {sorted(splits)}")
+    test_loader = None if validation_only else _loader(splits["test"], args, train=False)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, factor=0.5, patience=25, min_lr=1e-6
@@ -22366,24 +22635,111 @@ def _train_model(
         )
         if epoch - best_epoch >= args.patience:
             break
-    selected = torch.load(checkpoint, map_location=device, weights_only=True)
-    model.load_state_dict(selected["state_dict"])
-    # Test is touched only once, after validation selects the checkpoint.
-    test = evaluate(model, test_loader, device)
+    test = None
+    if not validation_only:
+        selected = torch.load(checkpoint, map_location=device, weights_only=True)
+        model.load_state_dict(selected["state_dict"], strict=True)
+        # Standard runner: test is touched once after validation selects the checkpoint.
+        assert test_loader is not None
+        test = evaluate(model, test_loader, device)
     torch.cuda.synchronize(device)
     elapsed = time.perf_counter() - started
-    return {
+    result = {
         "validation": best,
-        "test": test,
         "best_epoch": best_epoch,
         "trainable_parameters": parameters,
         "checkpoint": str(checkpoint),
+        "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
         "history": str(history_path),
+        "history_sha256": hashlib.sha256(history_path.read_bytes()).hexdigest(),
         "elapsed_seconds": elapsed,
         "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
         "epochs_completed": len(history),
         "execution": execution,
         "epoch_timing": "cuda_synchronized_train_and_validation_excluding_checkpoint_io",
+        "evaluation_splits": ["train", "validation"],
+        "fresh_training": True,
+    }
+    if test is not None:
+        result["test"] = test
+        result["evaluation_splits"].append("test")
+    return result
+
+
+def _evaluate_test_checkpoint(
+    dataset: str,
+    test_graphs: list[Graph],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Evaluate one validation-selected checkpoint without creating training state."""
+    if torch.device(args.device).type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("Cycle PE benchmark test evaluation requires CUDA; no CPU fallback")
+    checkpoint = args.test_checkpoint.expanduser().resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Selected checkpoint does not exist: {checkpoint}")
+    checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    device = torch.device(args.device)
+    payload = torch.load(checkpoint, map_location=device, weights_only=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get("state_dict"), dict):
+        raise ValueError("Selected checkpoint has an invalid payload schema")
+    expected_metadata = {
+        "dataset": dataset,
+        "model": MODEL_NAME,
+        "model_seed": args.model_seed,
+    }
+    for name, expected in expected_metadata.items():
+        if payload.get(name) != expected:
+            raise ValueError(f"Selected checkpoint {name} mismatch")
+    saved_arguments = payload.get("arguments")
+    if not isinstance(saved_arguments, dict) or saved_arguments.get("validation_only") is not True:
+        raise ValueError("Selected checkpoint was not produced by validation-only training")
+    for name in ("hidden_dim", "pe_dim", "layers"):
+        if saved_arguments.get(name) != getattr(args, name):
+            raise ValueError(f"Selected checkpoint architecture mismatch for {name}")
+    validation = payload.get("validation_mae")
+    epoch = payload.get("epoch")
+    if (
+        isinstance(validation, bool)
+        or not isinstance(validation, (int, float))
+        or not math.isfinite(float(validation))
+        or float(validation) < 0
+        or isinstance(epoch, bool)
+        or not isinstance(epoch, int)
+        or epoch < 1
+    ):
+        raise ValueError("Selected checkpoint validation metadata is invalid")
+    _seed(args.model_seed)
+    model = CyclePEModel(
+        dataset=dataset,
+        hidden=args.hidden_dim,
+        pe_dim=args.pe_dim,
+        layers=args.layers,
+    ).to(device)
+    parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if parameters > args.max_parameters:
+        raise ValueError(
+            f"{dataset}/{MODEL_NAME}: {parameters} parameters exceeds budget {args.max_parameters}"
+        )
+    model.load_state_dict(payload["state_dict"], strict=True)
+    execution = configure_execution(model, args, device)
+    test_loader = _loader(test_graphs, args, train=False)
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    test = evaluate(model, test_loader, device)
+    torch.cuda.synchronize(device)
+    return {
+        "test": test,
+        "selected_validation": float(validation),
+        "selected_epoch": epoch,
+        "trainable_parameters": parameters,
+        "checkpoint": str(checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
+        "evaluation_seconds": time.perf_counter() - started,
+        "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
+        "execution": execution,
+        "evaluation_splits": ["test"],
+        "fresh_training": False,
     }
 
 
@@ -22392,6 +22748,8 @@ def main(argv: list[str] | None = None) -> int:
     _validate(args)
     args.data_root = args.data_root.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
+    if args.test_checkpoint is not None:
+        args.test_checkpoint = args.test_checkpoint.expanduser().resolve()
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {args.output_dir}; choose a new run")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -22409,25 +22767,26 @@ def main(argv: list[str] | None = None) -> int:
             versions[library] = importlib.metadata.version(library)
         except importlib.metadata.PackageNotFoundError:
             versions[library] = "not_installed"
+    run_mode = (
+        "test_only"
+        if args.test_checkpoint is not None
+        else "validation_only"
+        if args.validation_only
+        else "prepare_only"
+        if args.prepare_only
+        else "standard"
+    )
     manifest = {
         "schema_version": 2,
-        "track": "cycle_pe",
+        "track": TRACK_NAME,
         "suite": "benchmark",
         "status": "running",
         "protocol": "ours_only_on_official_benchmark_splits",
+        "run_mode": run_mode,
         "arguments": arguments,
         "software": versions,
         "architecture": architecture_protocol(),
-        "implementation_sha256": {
-            name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-            for name in (
-                "benchmark.py",
-                "benchmark_data.py",
-                "benchmark_models.py",
-                "features.py",
-                "paper_model.py",
-            )
-        },
+        "implementation_sha256": implementation_hashes(),
         "seeds": {
             "model_seed": args.model_seed,
             "data_seed": "unused: fixed official graphs",
@@ -22440,25 +22799,44 @@ def main(argv: list[str] | None = None) -> int:
             "test_checkpoint_selection": False,
             "parameter_budget": args.max_parameters,
             "target_policy": "official labels unchanged",
+            "test_data_access": run_mode in {"standard", "test_only"},
+            "fresh_training": run_mode in {"standard", "validation_only"},
+            "optimizer_created": run_mode in {"standard", "validation_only"},
         },
     }
     metrics: dict[str, Any] = {
         "schema_version": 2,
-        "track": "cycle_pe",
+        "track": TRACK_NAME,
         "suite": "benchmark",
         "status": "running",
         "model_seed": args.model_seed,
+        "run_mode": run_mode,
         "datasets": {},
     }
     atomic_write_json(manifest_path, manifest)
     try:
         for dataset in args.datasets:
             started = time.perf_counter()
-            splits, protocol = load_benchmark(
-                args.data_root,
-                dataset,
-                allow_download=args.allow_download,
+            requested_splits = (
+                ("test",)
+                if args.test_checkpoint is not None
+                else ("train", "validation")
+                if args.validation_only
+                else None
             )
+            if requested_splits is None:
+                splits, protocol = load_benchmark(
+                    args.data_root,
+                    dataset,
+                    allow_download=args.allow_download,
+                )
+            else:
+                splits, protocol = load_benchmark(
+                    args.data_root,
+                    dataset,
+                    allow_download=args.allow_download,
+                    splits=requested_splits,
+                )
             dataset_metrics: dict[str, Any] = {
                 "metric": "mae",
                 "protocol": protocol,
@@ -22466,7 +22844,12 @@ def main(argv: list[str] | None = None) -> int:
                 "data_preparation_seconds": time.perf_counter() - started,
             }
             metrics["datasets"][dataset] = dataset_metrics
-            if not args.prepare_only:
+            if args.test_checkpoint is not None:
+                dataset_metrics["models"][MODEL_NAME] = _evaluate_test_checkpoint(
+                    dataset, splits["test"], args
+                )
+                atomic_write_json(args.output_dir / "metrics.json", metrics)
+            elif not args.prepare_only:
                 dataset_metrics["models"][MODEL_NAME] = _train_model(dataset, splits, args)
                 atomic_write_json(args.output_dir / "metrics.json", metrics)
             del splits
@@ -22669,7 +23052,24 @@ def _ready(root: Path, dataset: str) -> bool:
     return all((raw / name).is_file() for name in raw_names)
 
 
-def load_official_splits(data_root: Path, dataset: str, *, allow_download: bool) -> dict[str, Any]:
+def _requested_splits(splits: tuple[str, ...]) -> tuple[str, ...]:
+    if (
+        not splits
+        or len(set(splits)) != len(splits)
+        or any(split not in SPLITS for split in splits)
+    ):
+        raise ValueError("splits must be a nonempty unique subset of official splits")
+    return splits
+
+
+def load_official_splits(
+    data_root: Path,
+    dataset: str,
+    *,
+    allow_download: bool,
+    splits: tuple[str, ...] = SPLITS,
+) -> dict[str, Any]:
+    splits = _requested_splits(splits)
     if dataset not in DATASETS:
         raise ValueError(f"unknown cycle PE dataset: {dataset}")
     root = data_root / ("ZINC12K" if dataset == "zinc12k" else "LRGB")
@@ -22681,18 +23081,21 @@ def load_official_splits(data_root: Path, dataset: str, *, allow_download: bool)
         raise RuntimeError(
             "Cycle PE benchmarks require the project's PyG paper dependencies"
         ) from exc
+    official_names = {"train": "train", "validation": "val", "test": "test"}
+    expected_sizes = dict(zip(SPLITS, EXPECTED_SIZES[dataset], strict=True))
     datasets = {}
-    for split, official in zip(SPLITS, ("train", "val", "test"), strict=True):
+    for split in splits:
+        official = official_names[split]
         datasets[split] = (
             ZINC(str(root), subset=True, split=official)
             if dataset == "zinc12k"
             else LRGBDataset(str(root), name="Peptides-struct", split=official)
         )
-    sizes = tuple(len(datasets[split]) for split in SPLITS)
-    if sizes != EXPECTED_SIZES[dataset]:
-        raise RuntimeError(
-            f"{dataset} official split mismatch: {sizes} != {EXPECTED_SIZES[dataset]}"
-        )
+        actual = len(datasets[split])
+        if actual != expected_sizes[split]:
+            raise RuntimeError(
+                f"{dataset}/{split} official split mismatch: {actual} != {expected_sizes[split]}"
+            )
     return datasets
 
 
@@ -22701,8 +23104,15 @@ def load_benchmark(
     dataset: str,
     *,
     allow_download: bool,
+    splits: tuple[str, ...] = SPLITS,
 ) -> tuple[dict[str, list[Graph]], dict[str, Any]]:
-    official = load_official_splits(data_root, dataset, allow_download=allow_download)
+    splits = _requested_splits(splits)
+    official = load_official_splits(
+        data_root,
+        dataset,
+        allow_download=allow_download,
+        splits=splits,
+    )
     target_width = 1 if dataset == "zinc12k" else 11
     signature = {
         "version": CACHE_VERSION,
@@ -22714,7 +23124,7 @@ def load_benchmark(
     cache_dir.mkdir(parents=True, exist_ok=True)
     result: dict[str, list[Graph]] = {}
     split_hashes = {}
-    for split in SPLITS:
+    for split in splits:
         digest = hashlib.sha256()
         for data in official[split]:
             graph_fingerprint(data, digest)
@@ -22767,7 +23177,8 @@ def load_benchmark(
         "comparison": "ours_only_on_official_benchmark_splits",
         "source_url": SOURCES[dataset],
         "official_splits": True,
-        "split_sizes": {s: len(result[s]) for s in SPLITS},
+        "loaded_splits": list(splits),
+        "split_sizes": {s: len(result[s]) for s in splits},
         "split_content_sha256": split_hashes,
         "target_width": target_width,
         "target_scaling": "official supplied labels, unchanged; no fitted target scaling",
@@ -28666,9 +29077,9 @@ def test_preparation_failure_is_persisted_not_reported_as_success(tmp_path, monk
 def test_runner_selects_validation_checkpoint_before_single_test_evaluation() -> None:
     source = inspect.getsource(benchmark._train_model)
     assert source.count("evaluate(model, test_loader, device)") == 1
-    assert source.index('model.load_state_dict(selected["state_dict"])') < source.index(
-        "evaluate(model, test_loader, device)"
-    )
+    assert source.index(
+        'model.load_state_dict(selected["state_dict"], strict=True)'
+    ) < source.index("evaluate(model, test_loader, device)")
     assert "if validation < best:" in source
     assert "weights_only=True" in source
 ````
@@ -29659,6 +30070,8 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
     result.add_argument("--basis-pair-budget", type=int, default=32768)
+    result.add_argument("--validation-only", action="store_true", help=argparse.SUPPRESS)
+    result.add_argument("--test-checkpoint", type=Path, help=argparse.SUPPRESS)
     add_execution_arguments(result)
     return result
 
@@ -29683,6 +30096,12 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("invalid worker count or optimizer settings")
     if len(set(args.datasets)) != len(args.datasets):
         raise ValueError("datasets must not contain duplicates")
+    if args.validation_only and args.prepare_only:
+        raise ValueError("--validation-only cannot be combined with --prepare-only")
+    if args.test_checkpoint is not None and (args.validation_only or args.prepare_only):
+        raise ValueError("--test-checkpoint is an isolated test-only mode")
+    if args.test_checkpoint is not None and len(args.datasets) != 1:
+        raise ValueError("--test-checkpoint requires exactly one dataset")
     if not args.prepare_only and (
         torch.device(args.device).type != "cuda" or not torch.cuda.is_available()
     ):
@@ -29755,9 +30174,7 @@ def _train_model(
         basis_pair_budget=args.basis_pair_budget,
     ).to(device)
     execution = configure_execution(model, args, device)
-    execution.update(
-        basis_execution=args.basis_execution, basis_pair_budget=args.basis_pair_budget
-    )
+    execution.update(basis_execution=args.basis_execution, basis_pair_budget=args.basis_pair_budget)
     parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if parameters > args.max_parameters:
         raise ValueError(
@@ -29765,7 +30182,13 @@ def _train_model(
         )
     train_loader = _loader(splits["train"], args, train=True)
     validation_loader = _loader(splits["validation"], args, train=False)
-    test_loader = _loader(splits["test"], args, train=False)
+    validation_only = bool(getattr(args, "validation_only", False))
+    expected_splits = (
+        {"train", "validation"} if validation_only else {"train", "validation", "test"}
+    )
+    if set(splits) != expected_splits:
+        raise ValueError(f"unexpected benchmark splits: {sorted(splits)}")
+    test_loader = None if validation_only else _loader(splits["test"], args, train=False)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, factor=0.5, patience=25, min_lr=1e-6
@@ -29838,23 +30261,121 @@ def _train_model(
         )
         if epoch - best_epoch >= args.patience:
             break
-    selected = torch.load(checkpoint, map_location=device, weights_only=True)
-    model.load_state_dict(selected["state_dict"])
-    # Test is touched only once, after validation selects the checkpoint.
-    test = evaluate(model, test_loader, device)
+    test = None
+    if not validation_only:
+        selected = torch.load(checkpoint, map_location=device, weights_only=True)
+        model.load_state_dict(selected["state_dict"], strict=True)
+        # Standard runner: test is touched once after validation selects the checkpoint.
+        assert test_loader is not None
+        test = evaluate(model, test_loader, device)
     torch.cuda.synchronize(device)
-    return {
+    result = {
         "validation": best,
-        "test": test,
         "best_epoch": best_epoch,
         "trainable_parameters": parameters,
         "checkpoint": str(checkpoint),
+        "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
         "history": str(history_path),
+        "history_sha256": hashlib.sha256(history_path.read_bytes()).hexdigest(),
         "elapsed_seconds": time.perf_counter() - started,
         "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
         "epochs_completed": len(history),
         "execution": execution,
         "epoch_timing": "cuda_synchronized_train_and_validation_excluding_checkpoint_io",
+        "evaluation_splits": ["train", "validation"],
+        "fresh_training": True,
+    }
+    if test is not None:
+        result["test"] = test
+        result["evaluation_splits"].append("test")
+    return result
+
+
+def _evaluate_test_checkpoint(
+    dataset: str,
+    test_graphs: list[Graph],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Evaluate one validation-selected checkpoint without creating training state."""
+    if torch.device(args.device).type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("Cycle PE v2 test evaluation requires CUDA; no CPU fallback")
+    checkpoint = args.test_checkpoint.expanduser().resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Selected checkpoint does not exist: {checkpoint}")
+    checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    device = torch.device(args.device)
+    payload = torch.load(checkpoint, map_location=device, weights_only=True)
+    if not isinstance(payload, dict) or not isinstance(payload.get("state_dict"), dict):
+        raise ValueError("Selected checkpoint has an invalid payload schema")
+    expected_metadata = {
+        "dataset": dataset,
+        "model": MODEL_NAME,
+        "model_seed": args.model_seed,
+    }
+    for name, expected in expected_metadata.items():
+        if payload.get(name) != expected:
+            raise ValueError(f"Selected checkpoint {name} mismatch")
+    saved_arguments = payload.get("arguments")
+    if not isinstance(saved_arguments, dict) or saved_arguments.get("validation_only") is not True:
+        raise ValueError("Selected checkpoint was not produced by validation-only training")
+    for name in (
+        "hidden_dim",
+        "pe_dim",
+        "layers",
+        "column_chunk_size",
+        "basis_execution",
+        "basis_pair_budget",
+    ):
+        if saved_arguments.get(name) != getattr(args, name):
+            raise ValueError(f"Selected checkpoint architecture mismatch for {name}")
+    validation = payload.get("validation_mae")
+    epoch = payload.get("epoch")
+    if (
+        isinstance(validation, bool)
+        or not isinstance(validation, (int, float))
+        or not math.isfinite(float(validation))
+        or float(validation) < 0
+        or isinstance(epoch, bool)
+        or not isinstance(epoch, int)
+        or epoch < 1
+    ):
+        raise ValueError("Selected checkpoint validation metadata is invalid")
+    _seed(args.model_seed)
+    model = CycleBasisPEModel(
+        dataset=dataset,
+        hidden=args.hidden_dim,
+        pe_dim=args.pe_dim,
+        layers=args.layers,
+        column_chunk_size=args.column_chunk_size,
+        basis_execution=args.basis_execution,
+        basis_pair_budget=args.basis_pair_budget,
+    ).to(device)
+    parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if parameters > args.max_parameters:
+        raise ValueError(
+            f"{dataset}/{MODEL_NAME}: {parameters} parameters exceeds budget {args.max_parameters}"
+        )
+    model.load_state_dict(payload["state_dict"], strict=True)
+    execution = configure_execution(model, args, device)
+    execution.update(basis_execution=args.basis_execution, basis_pair_budget=args.basis_pair_budget)
+    test_loader = _loader(test_graphs, args, train=False)
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    test = evaluate(model, test_loader, device)
+    torch.cuda.synchronize(device)
+    return {
+        "test": test,
+        "selected_validation": float(validation),
+        "selected_epoch": epoch,
+        "trainable_parameters": parameters,
+        "checkpoint": str(checkpoint),
+        "checkpoint_sha256": checkpoint_sha256,
+        "evaluation_seconds": time.perf_counter() - started,
+        "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
+        "execution": execution,
+        "evaluation_splits": ["test"],
+        "fresh_training": False,
     }
 
 
@@ -29863,6 +30384,8 @@ def main(argv: list[str] | None = None) -> int:
     _validate(args)
     args.data_root = args.data_root.expanduser().resolve()
     args.output_dir = args.output_dir.expanduser().resolve()
+    if args.test_checkpoint is not None:
+        args.test_checkpoint = args.test_checkpoint.expanduser().resolve()
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {args.output_dir}; choose a new run")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -29880,6 +30403,15 @@ def main(argv: list[str] | None = None) -> int:
             versions[library] = importlib.metadata.version(library)
         except importlib.metadata.PackageNotFoundError:
             versions[library] = "not_installed"
+    run_mode = (
+        "test_only"
+        if args.test_checkpoint is not None
+        else "validation_only"
+        if args.validation_only
+        else "prepare_only"
+        if args.prepare_only
+        else "standard"
+    )
     manifest = {
         "schema_version": 2,
         "track": TRACK_NAME,
@@ -29887,6 +30419,7 @@ def main(argv: list[str] | None = None) -> int:
         "suite": "benchmark",
         "status": "running",
         "protocol": "ours_only_on_official_benchmark_splits",
+        "run_mode": run_mode,
         "arguments": arguments,
         "software": versions,
         "architecture": architecture_protocol(),
@@ -29907,6 +30440,9 @@ def main(argv: list[str] | None = None) -> int:
             "basis_rank_dependent_parameters": False,
             "column_chunk_size": args.column_chunk_size,
             "column_chunk_policy": "allocation only; every basis column is processed",
+            "test_data_access": run_mode in {"standard", "test_only"},
+            "fresh_training": run_mode in {"standard", "validation_only"},
+            "optimizer_created": run_mode in {"standard", "validation_only"},
         },
     }
     metrics: dict[str, Any] = {
@@ -29916,15 +30452,31 @@ def main(argv: list[str] | None = None) -> int:
         "suite": "benchmark",
         "status": "running",
         "model_seed": args.model_seed,
+        "run_mode": run_mode,
         "datasets": {},
     }
     atomic_write_json(manifest_path, manifest)
     try:
         for dataset in args.datasets:
             started = time.perf_counter()
-            splits, protocol = load_benchmark(
-                args.data_root, dataset, allow_download=args.allow_download
+            requested_splits = (
+                ("test",)
+                if args.test_checkpoint is not None
+                else ("train", "validation")
+                if args.validation_only
+                else None
             )
+            if requested_splits is None:
+                splits, protocol = load_benchmark(
+                    args.data_root, dataset, allow_download=args.allow_download
+                )
+            else:
+                splits, protocol = load_benchmark(
+                    args.data_root,
+                    dataset,
+                    allow_download=args.allow_download,
+                    splits=requested_splits,
+                )
             dataset_metrics: dict[str, Any] = {
                 "metric": "mae",
                 "protocol": protocol,
@@ -29932,7 +30484,12 @@ def main(argv: list[str] | None = None) -> int:
                 "data_preparation_seconds": time.perf_counter() - started,
             }
             metrics["datasets"][dataset] = dataset_metrics
-            if not args.prepare_only:
+            if args.test_checkpoint is not None:
+                dataset_metrics["models"][MODEL_NAME] = _evaluate_test_checkpoint(
+                    dataset, splits["test"], args
+                )
+                atomic_write_json(args.output_dir / "metrics.json", metrics)
+            elif not args.prepare_only:
                 dataset_metrics["models"][MODEL_NAME] = _train_model(dataset, splits, args)
                 atomic_write_json(args.output_dir / "metrics.json", metrics)
             del splits
@@ -30244,16 +30801,28 @@ def load_benchmark(
     dataset: str,
     *,
     allow_download: bool,
+    splits: tuple[str, ...] = SPLITS,
 ) -> tuple[dict[str, list[Graph]], dict[str, Any]]:
     """Load fixed official splits, validating immutable basis caches fail-closed."""
+    if (
+        not splits
+        or len(set(splits)) != len(splits)
+        or any(split not in SPLITS for split in splits)
+    ):
+        raise ValueError("splits must be a nonempty unique subset of official splits")
     signature = preparation_signature(dataset)
-    official = load_official_splits(data_root, dataset, allow_download=allow_download)
+    official = load_official_splits(
+        data_root,
+        dataset,
+        allow_download=allow_download,
+        splits=splits,
+    )
     key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:16]
     cache_dir = data_root / CACHE_NAMESPACE / dataset / key
     cache_dir.mkdir(parents=True, exist_ok=True)
     result: dict[str, list[Graph]] = {}
     split_hashes = {}
-    for split in SPLITS:
+    for split in splits:
         digest = hashlib.sha256()
         for data in official[split]:
             graph_fingerprint(data, digest)
@@ -30313,7 +30882,8 @@ def load_benchmark(
         "comparison": "ours_only_on_official_benchmark_splits",
         "source_url": SOURCES[dataset],
         "official_splits": True,
-        "split_sizes": {split: len(result[split]) for split in SPLITS},
+        "loaded_splits": list(splits),
+        "split_sizes": {split: len(result[split]) for split in splits},
         "split_content_sha256": split_hashes,
         "target_width": SCHEMAS[dataset]["targets"],
         "target_scaling": "official supplied labels, unchanged; no fitted target scaling",
@@ -31053,6 +31623,7 @@ paper:
   non_blocking: true
   full:
     hidden_dim: 64
+    message_layers: 2
     optimizer_updates: 800
     batch_size: 16
     train_charts_per_graph: 8
@@ -31154,6 +31725,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import platform
 import sys
@@ -31162,6 +31734,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import yaml
 
@@ -31173,7 +31746,13 @@ from .paper_data import (
     prepare_cyclecount_dataset,
     prepare_optional_pyg_dataset,
 )
-from .paper_model import build_chart_views, run_fixed_vs_multichart
+from .paper_model import (
+    FitResult,
+    VariableBetaCycleEncoder,
+    build_chart_views,
+    evaluate_downstream_model,
+    run_fixed_vs_multichart,
+)
 
 SUITES = ("core", "csl", "zinc")
 
@@ -31298,6 +31877,42 @@ def _load_settings() -> tuple[dict[str, Any], Path]:
     return merged, config_path
 
 
+def _apply_setting_overrides(
+    settings: dict[str, Any],
+    *,
+    hidden_dim: int | None,
+    message_layers: int | None = None,
+    optimizer_updates: int | None,
+    train_charts_per_graph: int | None,
+    eval_charts_per_graph: int | None,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Apply explicit scaling overrides while preserving config.yaml defaults."""
+
+    overrides = {
+        key: int(value)
+        for key, value in {
+            "hidden_dim": hidden_dim,
+            "message_layers": message_layers,
+            "optimizer_updates": optimizer_updates,
+            "train_charts_per_graph": train_charts_per_graph,
+            "eval_charts_per_graph": eval_charts_per_graph,
+        }.items()
+        if value is not None
+    }
+    effective = dict(settings)
+    effective.update(overrides)
+    for key in (
+        "hidden_dim",
+        "message_layers",
+        "optimizer_updates",
+        "train_charts_per_graph",
+        "eval_charts_per_graph",
+    ):
+        if int(effective[key]) < 1:
+            raise ValueError(f"{key.replace('_', ' ')} must be positive")
+    return effective, overrides
+
+
 def _prepare_dataset(
     suite: str,
     data_root: Path,
@@ -31367,22 +31982,95 @@ def _save_models(
     *,
     settings: dict[str, Any],
     task_type: str,
+    output_dim: int,
+    suite: str,
+    dataset_data_sha256: str,
 ) -> dict[str, str]:
     paths: dict[str, str] = {}
     for name, fitted in models.items():
         path = output_dir / f"{name}_model.pt"
         torch.save(
             {
+                "checkpoint_schema_version": 1,
+                "model_name": name,
                 "state_dict": _cpu_state_dict(fitted.model),
                 "target_mean": torch.as_tensor(fitted.target_mean),
                 "target_scale": torch.as_tensor(fitted.target_scale),
                 "settings": settings,
                 "task_type": task_type,
+                "output_dim": output_dim,
+                "suite": suite,
+                "dataset_data_sha256": dataset_data_sha256,
             },
             path,
         )
         paths[name] = str(path)
     return paths
+
+
+def _load_selected_model(
+    path: Path,
+    *,
+    expected_model_name: str,
+    expected_task_type: str,
+    expected_output_dim: int,
+    expected_suite: str,
+    expected_dataset_data_sha256: str,
+    device: torch.device,
+) -> tuple[FitResult, dict[str, Any]]:
+    """Load one selected scaling checkpoint without permitting code execution."""
+
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"selected checkpoint is missing: {resolved}")
+    payload = torch.load(resolved, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict) or payload.get("checkpoint_schema_version") != 1:
+        raise ValueError(f"unsupported selected checkpoint schema: {resolved}")
+    if payload.get("model_name") != expected_model_name:
+        raise ValueError(f"selected checkpoint arm mismatch: {resolved}")
+    if payload.get("task_type") != expected_task_type:
+        raise ValueError(f"selected checkpoint task mismatch: {resolved}")
+    if payload.get("output_dim") != expected_output_dim:
+        raise ValueError(f"selected checkpoint output dimension mismatch: {resolved}")
+    if payload.get("suite") != expected_suite:
+        raise ValueError(f"selected checkpoint suite mismatch: {resolved}")
+    if payload.get("dataset_data_sha256") != expected_dataset_data_sha256:
+        raise ValueError(f"selected checkpoint dataset mismatch: {resolved}")
+    settings = payload.get("settings")
+    state_dict = payload.get("state_dict")
+    target_mean = payload.get("target_mean")
+    target_scale = payload.get("target_scale")
+    if (
+        not isinstance(settings, dict)
+        or not isinstance(state_dict, dict)
+        or not isinstance(target_mean, torch.Tensor)
+        or not isinstance(target_scale, torch.Tensor)
+    ):
+        raise ValueError(f"selected checkpoint payload is incomplete: {resolved}")
+    hidden_dim = settings.get("hidden_dim")
+    message_layers = settings.get("message_layers")
+    if (
+        isinstance(hidden_dim, bool)
+        or not isinstance(hidden_dim, int)
+        or hidden_dim < 1
+        or isinstance(message_layers, bool)
+        or not isinstance(message_layers, int)
+        or message_layers < 1
+    ):
+        raise ValueError(f"selected checkpoint architecture is invalid: {resolved}")
+    model = VariableBetaCycleEncoder(
+        hidden_dim=hidden_dim,
+        output_dim=expected_output_dim,
+        message_layers=message_layers,
+    )
+    model.load_state_dict(state_dict, strict=True)
+    fitted = FitResult(
+        model=model.to(device),
+        target_mean=target_mean.detach().cpu().numpy().astype(np.float64, copy=False),
+        target_scale=target_scale.detach().cpu().numpy().astype(np.float64, copy=False),
+        history=(),
+    )
+    return fitted, settings
 
 
 def _split(records: tuple[Any, ...], name: str) -> list[Any]:
@@ -31421,17 +32109,16 @@ def _fresh_axis_overlap_stats(evaluation: dict[str, list[Any]]) -> dict[str, dic
     return result
 
 
-def _protocol_views(
+def _training_views(
     dataset: PreparedDataset,
     *,
     settings: dict[str, Any],
     chart_seed: int,
-) -> tuple[list[Any], list[Any], dict[str, list[Any]]]:
+) -> tuple[list[Any], list[Any]]:
     train_records = _split(dataset.records, "train")
     if not train_records:
         raise ValueError(f"suite {dataset.suite} contains no training graphs")
     train_charts = int(settings["train_charts_per_graph"])
-    eval_charts = int(settings["eval_charts_per_graph"])
     fixed_train = build_chart_views(
         train_records,
         chart_status="train_fixed_bfs_family",
@@ -31447,6 +32134,41 @@ def _protocol_views(
         methods=("bfs", "dfs"),
         seed=chart_seed + 2_000,
     )
+    return fixed_train, multi_train
+
+
+def _evaluation_views(
+    dataset: PreparedDataset,
+    *,
+    settings: dict[str, Any],
+    chart_seed: int,
+    evaluation_scope: str,
+) -> dict[str, list[Any]]:
+    if evaluation_scope not in {"validation", "test"}:
+        raise ValueError("evaluation scope must be validation or test")
+    eval_charts = int(settings["eval_charts_per_graph"])
+    if evaluation_scope == "validation":
+        validation_records = _split(dataset.records, "validation")
+        if not validation_records:
+            raise ValueError(f"suite {dataset.suite} contains no validation graphs")
+        validation_seen = build_chart_views(
+            validation_records,
+            chart_status="fresh_chart_seen_family",
+            count=eval_charts,
+            methods=("bfs",),
+            seed=chart_seed + 10_000,
+        )
+        validation_unseen = build_chart_views(
+            validation_records,
+            chart_status="fresh_chart_unseen_family",
+            count=eval_charts,
+            methods=("wilson_ust",),
+            seed=chart_seed + 20_000,
+        )
+        return {
+            "validation_graph_fresh_chart_seen_family": validation_seen,
+            "validation_graph_fresh_chart_unseen_family": validation_unseen,
+        }
     if dataset.suite == "core":
         id_records = _split(dataset.records, "id_test")
         ood_records = _split(dataset.records, "ood_test")
@@ -31480,7 +32202,7 @@ def _protocol_views(
             methods=("wilson_ust",),
             seed=chart_seed + 40_000,
         )
-        evaluation = {
+        return {
             "id_graph_fresh_chart_seen_family": id_seen,
             "id_graph_fresh_chart_unseen_family": id_unseen,
             "ood_graph_fresh_chart_seen_family": ood_seen,
@@ -31504,18 +32226,115 @@ def _protocol_views(
             methods=("wilson_ust",),
             seed=chart_seed + 20_000,
         )
-        evaluation = {
+        return {
             "test_graph_fresh_chart_seen_family": test_seen,
             "test_graph_fresh_chart_unseen_family": test_unseen,
         }
+
+
+def _protocol_views(
+    dataset: PreparedDataset,
+    *,
+    settings: dict[str, Any],
+    chart_seed: int,
+    evaluation_scope: str = "test",
+) -> tuple[list[Any], list[Any], dict[str, list[Any]]]:
+    fixed_train, multi_train = _training_views(
+        dataset,
+        settings=settings,
+        chart_seed=chart_seed,
+    )
+    evaluation = _evaluation_views(
+        dataset,
+        settings=settings,
+        chart_seed=chart_seed,
+        evaluation_scope=evaluation_scope,
+    )
     return fixed_train, multi_train, evaluation
 
 
 def _output_dim(dataset: PreparedDataset) -> int:
-    if dataset.task_type == "classification":
-        labels = [int(record.target[0]) for record in dataset.records]
-        return max(labels) + 1
-    return len(dataset.records[0].target)
+    output_dim = len(dataset.target_names)
+    if output_dim < 1:
+        raise ValueError("dataset target_names metadata must declare at least one output")
+    return output_dim
+
+
+def _dataset_cache_integrity(dataset: PreparedDataset) -> dict[str, Any]:
+    return {
+        "full_cache_loaded": True,
+        "all_declared_splits_validated": True,
+        "loaded_and_validated_splits": sorted({record.split for record in dataset.records}),
+    }
+
+
+def _model_split_usage(
+    dataset: PreparedDataset,
+    *,
+    evaluation_scope: str,
+    prepare_only: bool,
+) -> dict[str, Any]:
+    if prepare_only:
+        fit_splits: list[str] = []
+        evaluation_splits: list[str] = []
+        selection_splits: list[str] = []
+    elif evaluation_scope == "validation":
+        fit_splits = ["train"]
+        evaluation_splits = ["validation"]
+        selection_splits = ["validation"]
+    else:
+        fit_splits = [] if evaluation_scope == "selected_test" else ["train"]
+        evaluation_splits = ["id_test", "ood_test"] if dataset.suite == "core" else ["test"]
+        selection_splits = []
+    return {
+        "fit_splits": fit_splits,
+        "evaluation_splits": evaluation_splits,
+        "selection_splits": selection_splits,
+        "test_evaluated": evaluation_scope in {"test", "selected_test"} and not prepare_only,
+        "test_used_for_selection": False,
+    }
+
+
+def _evaluate_fitted_models(
+    models: dict[str, FitResult],
+    evaluation: dict[str, list[Any]],
+    *,
+    task_type: str,
+    batch_size: int,
+    device: torch.device,
+    amp: bool,
+    pin_memory: bool,
+    non_blocking: bool,
+    workers: int,
+    checkpoint_settings: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """Evaluate already-selected checkpoints without an optimizer or retraining."""
+
+    metrics: dict[str, Any] = {}
+    for model_name, fitted in models.items():
+        settings = checkpoint_settings[model_name]
+        metrics[model_name] = {
+            "optimizer_updates": int(settings["optimizer_updates"]),
+            "training_performed": False,
+            "history": [],
+            "quadrants": {},
+        }
+        for quadrant, views in evaluation.items():
+            values = evaluate_downstream_model(
+                fitted,
+                views,
+                task_type=task_type,
+                batch_size=batch_size,
+                device=device,
+                amp=amp,
+                pin_memory=pin_memory,
+                non_blocking=non_blocking,
+                workers=workers,
+            )
+            if not all(math.isfinite(value) for value in values.values()):
+                raise RuntimeError(f"non-finite metric in {model_name}/{quadrant}")
+            metrics[model_name]["quadrants"][quadrant] = values
+    return metrics
 
 
 def _headline_comparison(metrics: dict[str, Any], *, suite: str) -> dict[str, Any]:
@@ -31583,6 +32402,13 @@ def run_suite(
     non_blocking_override: bool | None,
     workers: int = 0,
     allow_download: bool = False,
+    hidden_dim_override: int | None = None,
+    message_layers_override: int | None = None,
+    optimizer_updates_override: int | None = None,
+    train_charts_per_graph_override: int | None = None,
+    eval_charts_per_graph_override: int | None = None,
+    evaluation_scope: str = "test",
+    selected_checkpoints: dict[str, Path] | None = None,
 ) -> dict[str, Any]:
     """Prepare and optionally train exactly one independent suite."""
 
@@ -31594,6 +32420,14 @@ def run_suite(
         model_seed=model_seed,
     )
     settings, config_path = _load_settings()
+    settings, settings_overrides = _apply_setting_overrides(
+        settings,
+        hidden_dim=hidden_dim_override,
+        message_layers=message_layers_override,
+        optimizer_updates=optimizer_updates_override,
+        train_charts_per_graph=train_charts_per_graph_override,
+        eval_charts_per_graph=eval_charts_per_graph_override,
+    )
     output = _prepare_output_dir(output_dir)
     manifest_path = output / "manifest.json"
     manifest: dict[str, Any] = {
@@ -31603,11 +32437,20 @@ def run_suite(
         "seed_axes": seed_axes.to_manifest(),
         "dataset_seed_policy": _dataset_seed_policy(suite),
         "prepare_only": prepare_only,
+        "evaluation_scope": evaluation_scope,
+        "training_performed": evaluation_scope != "selected_test" and not prepare_only,
+        "dataset_cache_integrity": {
+            "full_cache_loaded": False,
+            "all_declared_splits_validated": False,
+            "loaded_and_validated_splits": [],
+        },
         "allow_download": allow_download,
         "workers": workers,
         "started_at_utc": datetime.now(UTC).isoformat(),
         "config_path": str(config_path),
         "config_sha256": _sha256(config_path),
+        "effective_settings": settings,
+        "settings_overrides": settings_overrides,
         "source_files": {
             path.name: _sha256(path)
             for path in (
@@ -31630,6 +32473,35 @@ def run_suite(
     }
     _write_json(manifest_path, manifest)
     try:
+        if evaluation_scope not in {"test", "validation", "selected_test"}:
+            raise ValueError("evaluation_scope must be test, validation, or selected_test")
+        if prepare_only and evaluation_scope != "test":
+            raise ValueError("prepare-only cannot be combined with a scaling evaluation scope")
+        if evaluation_scope == "selected_test":
+            if (
+                selected_checkpoints is None
+                or set(selected_checkpoints)
+                != {
+                    "fixed_bfs",
+                    "multi_chart",
+                }
+                or any(not isinstance(path, Path) for path in selected_checkpoints.values())
+            ):
+                raise ValueError("selected_test requires fixed_bfs and multi_chart checkpoints")
+            if any(
+                value is not None
+                for value in (
+                    hidden_dim_override,
+                    message_layers_override,
+                    optimizer_updates_override,
+                    train_charts_per_graph_override,
+                )
+            ):
+                raise ValueError(
+                    "selected_test architecture/training settings come from checkpoints"
+                )
+        elif selected_checkpoints is not None:
+            raise ValueError("selected checkpoints are only valid for selected_test")
         if workers < 0:
             raise ValueError("workers must be non-negative")
         dataset = _prepare_dataset(
@@ -31638,6 +32510,14 @@ def run_suite(
             seed_axes=seed_axes,
             allow_download=allow_download,
         )
+        dataset_cache_integrity = _dataset_cache_integrity(dataset)
+        model_split_usage = _model_split_usage(
+            dataset,
+            evaluation_scope=evaluation_scope,
+            prepare_only=prepare_only,
+        )
+        manifest["dataset_cache_integrity"] = dataset_cache_integrity
+        manifest["model_split_usage"] = model_split_usage
         manifest["dataset"] = {
             "data_path": str(dataset.data_path),
             "manifest_path": str(dataset.manifest_path),
@@ -31673,8 +32553,143 @@ def run_suite(
             raise ValueError("batch_size must be positive")
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
+        if evaluation_scope == "selected_test":
+            assert selected_checkpoints is not None
+            evaluation = _evaluation_views(
+                dataset,
+                settings=settings,
+                chart_seed=seed_axes.chart,
+                evaluation_scope="test",
+            )
+            output_dim = _output_dim(dataset)
+            checkpoint_paths = {
+                name: path.expanduser().resolve() for name, path in selected_checkpoints.items()
+            }
+            checkpoint_hashes = {name: _sha256(path) for name, path in checkpoint_paths.items()}
+            selected_models: dict[str, FitResult] = {}
+            selected_settings: dict[str, dict[str, Any]] = {}
+            for name in ("fixed_bfs", "multi_chart"):
+                fitted, checkpoint_settings = _load_selected_model(
+                    checkpoint_paths[name],
+                    expected_model_name=name,
+                    expected_task_type=dataset.task_type,
+                    expected_output_dim=output_dim,
+                    expected_suite=suite,
+                    expected_dataset_data_sha256=dataset.data_sha256,
+                    device=device,
+                )
+                if checkpoint_settings.get("seed_axes") != seed_axes.to_manifest():
+                    raise ValueError(f"selected {name} checkpoint seed axes mismatch")
+                if checkpoint_settings.get("eval_charts_per_graph") != settings.get(
+                    "eval_charts_per_graph"
+                ):
+                    raise ValueError(f"selected {name} checkpoint evaluation chart count mismatch")
+                selected_models[name] = fitted
+                selected_settings[name] = checkpoint_settings
+            started = time.perf_counter()
+            metrics = _evaluate_fitted_models(
+                selected_models,
+                evaluation,
+                task_type=dataset.task_type,
+                batch_size=batch_size,
+                device=device,
+                amp=amp,
+                pin_memory=pin_memory,
+                non_blocking=non_blocking,
+                workers=workers,
+                checkpoint_settings=selected_settings,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elapsed = time.perf_counter() - started
+            if {
+                name: _sha256(path) for name, path in checkpoint_paths.items()
+            } != checkpoint_hashes:
+                raise RuntimeError("a selected checkpoint changed during test evaluation")
+            parameter_counts = {
+                name: {
+                    "total": sum(parameter.numel() for parameter in fitted.model.parameters()),
+                    "trainable": sum(
+                        parameter.numel()
+                        for parameter in fitted.model.parameters()
+                        if parameter.requires_grad
+                    ),
+                }
+                for name, fitted in selected_models.items()
+            }
+            for name, counts in parameter_counts.items():
+                metrics[name]["parameters"] = counts
+            runtime = _runtime_metadata(
+                device=device,
+                amp_requested=amp,
+                pin_memory=pin_memory,
+                non_blocking=non_blocking,
+                batch_size=batch_size,
+                workers=workers,
+                elapsed_seconds=elapsed,
+            )
+            split_counts: dict[str, int] = {}
+            for record in dataset.records:
+                split_counts[record.split] = split_counts.get(record.split, 0) + 1
+            summary = {
+                "track": "tree_augmentation_scaling_selected_test",
+                "suite": suite,
+                "seed_axes": seed_axes.to_manifest(),
+                "protocol": _protocol_name(suite),
+                "evaluation_scope": "selected_test",
+                "training_performed": False,
+                "test_metrics_emitted": True,
+                "dataset_cache_integrity": dataset_cache_integrity,
+                "model_split_usage": model_split_usage,
+                "test_evaluations_per_selected_checkpoint": 1,
+                "graph_split_before_chart_sampling": True,
+                "split_counts": split_counts,
+                "view_counts": {
+                    "evaluation": {name: _view_stats(views) for name, views in evaluation.items()}
+                },
+                "settings": {
+                    "eval_charts_per_graph": int(settings["eval_charts_per_graph"]),
+                    "batch_size": batch_size,
+                    "amp": amp,
+                    "pin_memory": pin_memory,
+                    "non_blocking": non_blocking,
+                    "workers": workers,
+                    "seed_axes": seed_axes.to_manifest(),
+                },
+                "selected_checkpoint_settings": selected_settings,
+                "selected_checkpoints": {
+                    name: {"path": str(path), "sha256": checkpoint_hashes[name]}
+                    for name, path in checkpoint_paths.items()
+                },
+                "runtime": runtime,
+                "parameter_counts": parameter_counts,
+                "models": metrics,
+                "comparison": _headline_comparison(metrics, suite=suite),
+            }
+            summary_path = output / "summary.json"
+            _write_json(summary_path, summary)
+            manifest.update(
+                {
+                    "status": "passed",
+                    "device": str(device),
+                    "runtime": runtime,
+                    "selected_checkpoint_inputs": summary["selected_checkpoints"],
+                    "artifacts": {
+                        summary_path.name: {
+                            "path": str(summary_path),
+                            "sha256": _sha256(summary_path),
+                        }
+                    },
+                    "finished_at_utc": datetime.now(UTC).isoformat(),
+                }
+            )
+            _write_json(manifest_path, manifest)
+            return summary
         fixed_train, multi_train, evaluation = _protocol_views(
-            dataset, settings=settings, chart_seed=seed_axes.chart
+            dataset,
+            settings=settings,
+            chart_seed=seed_axes.chart,
+            evaluation_scope=evaluation_scope,
         )
         started = time.perf_counter()
         metrics, models = run_fixed_vs_multichart(
@@ -31684,6 +32699,7 @@ def run_suite(
             task_type=dataset.task_type,
             output_dim=_output_dim(dataset),
             hidden_dim=int(settings["hidden_dim"]),
+            message_layers=int(settings["message_layers"]),
             updates=int(settings["optimizer_updates"]),
             batch_size=batch_size,
             learning_rate=float(settings["learning_rate"]),
@@ -31695,6 +32711,19 @@ def run_suite(
             non_blocking=non_blocking,
             workers=workers,
         )
+        parameter_counts = {
+            name: {
+                "total": sum(parameter.numel() for parameter in fitted.model.parameters()),
+                "trainable": sum(
+                    parameter.numel()
+                    for parameter in fitted.model.parameters()
+                    if parameter.requires_grad
+                ),
+            }
+            for name, fitted in models.items()
+        }
+        for name, counts in parameter_counts.items():
+            metrics[name]["parameters"] = counts
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - started
@@ -31720,6 +32749,9 @@ def run_suite(
                 "seed_axes": seed_axes.to_manifest(),
             },
             task_type=dataset.task_type,
+            output_dim=_output_dim(dataset),
+            suite=suite,
+            dataset_data_sha256=dataset.data_sha256,
         )
         split_counts: dict[str, int] = {}
         for record in dataset.records:
@@ -31730,6 +32762,11 @@ def run_suite(
             "seed_axes": seed_axes.to_manifest(),
             "dataset_seed_policy": _dataset_seed_policy(suite),
             "protocol": _protocol_name(suite),
+            "evaluation_scope": evaluation_scope,
+            "training_performed": True,
+            "test_metrics_emitted": evaluation_scope == "test",
+            "dataset_cache_integrity": dataset_cache_integrity,
+            "model_split_usage": model_split_usage,
             "downstream_target": list(dataset.target_names),
             "target_is_independent_of_chart": True,
             "samplers": {
@@ -31762,10 +32799,22 @@ def run_suite(
                 "seed_axes": seed_axes.to_manifest(),
             },
             "runtime": runtime,
+            "parameter_counts": parameter_counts,
             "models": metrics,
             "comparison": _headline_comparison(metrics, suite=suite),
             "checkpoints": model_paths,
         }
+        if evaluation_scope == "validation":
+            summary["comparison"].update(
+                {
+                    "paper_headline_eligible": False,
+                    "paper_headline_eligibility_reason": (
+                        "validation-only scaling candidate; the full cache was integrity-"
+                        "validated, but the test split was not evaluated and no test metric "
+                        "entered profile selection"
+                    ),
+                }
+            )
         summary_path = output / "summary.json"
         _write_json(summary_path, summary)
         artifacts = [summary_path, *(Path(path) for path in model_paths.values())]
@@ -31837,6 +32886,54 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument(
+        "--hidden-dim",
+        type=int,
+        default=None,
+        help="override paper.full.hidden_dim; omitted uses config.yaml",
+    )
+    parser.add_argument(
+        "--message-layers",
+        type=int,
+        default=None,
+        help="override paper.full.message_layers; omitted uses config.yaml",
+    )
+    parser.add_argument(
+        "--optimizer-updates",
+        type=int,
+        default=None,
+        help="override paper.full.optimizer_updates; omitted uses config.yaml",
+    )
+    parser.add_argument(
+        "--train-charts-per-graph",
+        type=int,
+        default=None,
+        help="override training chart count for the multi-chart arm",
+    )
+    parser.add_argument(
+        "--eval-charts-per-graph",
+        type=int,
+        default=None,
+        help="override fresh-chart count per evaluation family",
+    )
+    parser.add_argument(
+        "--evaluation-scope",
+        choices=("test", "validation", "selected_test"),
+        default="test",
+        help="standard test run, validation-only scaling candidate, or selected test-only run",
+    )
+    parser.add_argument(
+        "--fixed-checkpoint",
+        type=Path,
+        default=None,
+        help="selected fixed_bfs checkpoint; only valid with selected_test",
+    )
+    parser.add_argument(
+        "--multi-checkpoint",
+        type=Path,
+        default=None,
+        help="selected multi_chart checkpoint; only valid with selected_test",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=0,
@@ -31853,6 +32950,12 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _run_from_args(args: argparse.Namespace, suite: str, output_dir: Path) -> dict[str, Any]:
+    selected_checkpoints = None
+    if args.fixed_checkpoint is not None or args.multi_checkpoint is not None:
+        selected_checkpoints = {
+            "fixed_bfs": args.fixed_checkpoint,
+            "multi_chart": args.multi_checkpoint,
+        }
     return run_suite(
         suite,
         data_root=args.data_root,
@@ -31870,6 +32973,13 @@ def _run_from_args(args: argparse.Namespace, suite: str, output_dir: Path) -> di
         non_blocking_override=args.non_blocking,
         workers=args.workers,
         allow_download=args.allow_download,
+        hidden_dim_override=args.hidden_dim,
+        message_layers_override=args.message_layers,
+        optimizer_updates_override=args.optimizer_updates,
+        train_charts_per_graph_override=args.train_charts_per_graph,
+        eval_charts_per_graph_override=args.eval_charts_per_graph,
+        evaluation_scope=args.evaluation_scope,
+        selected_checkpoints=selected_checkpoints,
     )
 
 
@@ -33211,25 +34321,31 @@ class VariableBetaCycleEncoder(nn.Module):
     measured by this track.
     """
 
-    def __init__(self, *, hidden_dim: int, output_dim: int) -> None:
+    def __init__(self, *, hidden_dim: int, output_dim: int, message_layers: int = 2) -> None:
         super().__init__()
-        if hidden_dim < 4 or output_dim < 1:
-            raise ValueError("hidden_dim >= 4 and output_dim >= 1 are required")
-        self.coordinate = nn.Sequential(
-            nn.Linear(3, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-        )
+        if hidden_dim < 4 or output_dim < 1 or message_layers < 1:
+            raise ValueError(
+                "hidden_dim >= 4, output_dim >= 1, and message_layers >= 1 are required"
+            )
+        self.hidden_dim = hidden_dim
+        self.message_layers = message_layers
+
+        def hidden_stack(input_dim: int) -> nn.Sequential:
+            layers: list[nn.Module] = []
+            for index in range(message_layers):
+                layers.extend(
+                    (
+                        nn.Linear(input_dim if index == 0 else hidden_dim, hidden_dim),
+                        nn.SiLU(),
+                    )
+                )
+            return nn.Sequential(*layers)
+
+        self.coordinate = hidden_stack(3)
         chemistry_dim = max(4, hidden_dim // 4)
         self.atom_embedding = nn.Embedding(ZINC_NUM_ATOM_TYPES + 1, chemistry_dim)
         self.bond_embedding = nn.Embedding(ZINC_NUM_BOND_TYPES + 1, chemistry_dim)
-        self.edge = nn.Sequential(
-            nn.Linear(3 * hidden_dim + 4 + 3 * chemistry_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-        )
+        self.edge = hidden_stack(3 * hidden_dim + 4 + 3 * chemistry_dim)
         self.head = nn.Sequential(
             nn.Linear(3 * hidden_dim, hidden_dim),
             nn.SiLU(),
@@ -33245,7 +34361,7 @@ class VariableBetaCycleEncoder(nn.Module):
     def forward(self, batch: PaddedChartBatch) -> Tensor:
         basis = batch.basis
         batch_size, max_edges, max_beta = basis.shape
-        hidden_dim = self.coordinate[0].out_features
+        hidden_dim = self.hidden_dim
         if max_beta:
             edge_counts = batch.edge_mask.sum(dim=1).clamp_min(1)[:, None]
             normalized_cycle_support = basis.abs().sum(dim=1) / edge_counts
@@ -33365,6 +34481,7 @@ def fit_downstream_model(
     task_type: str,
     output_dim: int,
     hidden_dim: int,
+    message_layers: int = 2,
     updates: int,
     batch_size: int,
     learning_rate: float,
@@ -33388,7 +34505,11 @@ def fit_downstream_model(
     torch.manual_seed(seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
-    model = VariableBetaCycleEncoder(hidden_dim=hidden_dim, output_dim=output_dim).to(device)
+    model = VariableBetaCycleEncoder(
+        hidden_dim=hidden_dim,
+        output_dim=output_dim,
+        message_layers=message_layers,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     amp_grad_scaler = getattr(torch.amp, "GradScaler", None)
     if amp_grad_scaler is not None:
@@ -33598,6 +34719,7 @@ def run_fixed_vs_multichart(
     task_type: str,
     output_dim: int,
     hidden_dim: int,
+    message_layers: int = 2,
     updates: int,
     batch_size: int,
     learning_rate: float,
@@ -33615,6 +34737,7 @@ def run_fixed_vs_multichart(
         "task_type": task_type,
         "output_dim": output_dim,
         "hidden_dim": hidden_dim,
+        "message_layers": message_layers,
         "updates": updates,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
@@ -33790,6 +34913,46 @@ def _view(record: GraphRecord) -> GraphChartView:
         x=record.x,
         edge_attr=record.edge_attr,
     )
+
+
+def test_output_dim_comes_from_declared_target_metadata() -> None:
+    dataset = SimpleNamespace(
+        suite="csl",
+        target_names=("class_0", "class_1", "class_2"),
+        records=(SimpleNamespace(split="train", target=(0.0,)),),
+    )
+    assert tree_paper._output_dim(dataset) == 3
+    dataset.target_names = ()
+    with pytest.raises(ValueError, match="target_names metadata"):
+        tree_paper._output_dim(dataset)
+
+
+def test_cache_integrity_and_model_split_usage_are_separate() -> None:
+    dataset = SimpleNamespace(
+        suite="csl",
+        records=tuple(SimpleNamespace(split=split) for split in ("train", "validation", "test")),
+    )
+    assert tree_paper._dataset_cache_integrity(dataset) == {
+        "full_cache_loaded": True,
+        "all_declared_splits_validated": True,
+        "loaded_and_validated_splits": ["test", "train", "validation"],
+    }
+    assert tree_paper._model_split_usage(
+        dataset, evaluation_scope="validation", prepare_only=False
+    ) == {
+        "fit_splits": ["train"],
+        "evaluation_splits": ["validation"],
+        "selection_splits": ["validation"],
+        "test_evaluated": False,
+        "test_used_for_selection": False,
+    }
+    selected_test = tree_paper._model_split_usage(
+        dataset, evaluation_scope="selected_test", prepare_only=False
+    )
+    assert selected_test["fit_splits"] == []
+    assert selected_test["evaluation_splits"] == ["test"]
+    assert selected_test["test_evaluated"] is True
+    assert selected_test["test_used_for_selection"] is False
 
 
 def test_variable_beta_batch_masks_tree_cycle_and_multicycle() -> None:
@@ -39616,6 +40779,600 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ````
 
+# scripts/run_conductance_scaling.py
+
+````python
+#!/usr/bin/env python3
+"""Run validation-only architecture scaling for Conductance V1, V2, V3 and V4."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import math
+import re
+import shlex
+import statistics
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_json  # noqa: E402
+from research.conductance_gat.v2.protocol import (  # noqa: E402
+    CONDITIONS as V2_CONDITIONS,
+)
+from research.conductance_gat.v2.protocol import (  # noqa: E402
+    DATASETS as V2_DATASETS,
+)
+from research.conductance_gat.v3.protocol import (  # noqa: E402
+    CONDITIONS as V3_CONDITIONS,
+)
+from research.conductance_gat.v3.protocol import (  # noqa: E402
+    DATASETS as V3_DATASETS,
+)
+from research.conductance_gat.v4.protocol import (  # noqa: E402
+    CONDITIONS as V4_CONDITIONS,
+)
+from research.conductance_gat.v4.protocol import (  # noqa: E402
+    DATASETS as V4_DATASETS,
+)
+from scripts import run_conductance_factorial as shared  # noqa: E402
+from scripts.check_dependencies import (  # noqa: E402
+    DependencyCheckError,
+    check_dependencies,
+    error_message,
+)
+
+V1_DATASETS = ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv")
+PROFILES: dict[str, dict[str, Any]] = {
+    "base": {"hidden_channels": 64, "layers": 2, "dropout": 0.5},
+    "wide": {"hidden_channels": 128, "layers": 2, "dropout": 0.5},
+    "deep": {"hidden_channels": 64, "layers": 4, "dropout": 0.5},
+    "large": {"hidden_channels": 128, "layers": 4, "dropout": 0.5},
+}
+VERSIONS: dict[str, dict[str, Any]] = {
+    "v1": {
+        "module": "research.conductance_gat.scaling_v1",
+        "datasets": tuple(V1_DATASETS),
+        "conditions": ("conductance",),
+    },
+    "v2": {
+        "module": "research.conductance_gat.v2.train",
+        "datasets": tuple(V2_DATASETS),
+        "conditions": tuple(V2_CONDITIONS),
+    },
+    "v3": {
+        "module": "research.conductance_gat.v3.train",
+        "datasets": tuple(V3_DATASETS),
+        "conditions": tuple(V3_CONDITIONS),
+    },
+    "v4": {
+        "module": "research.conductance_gat.v4.train",
+        "datasets": tuple(V4_DATASETS),
+        "conditions": tuple(V4_CONDITIONS),
+    },
+}
+ALL_DATASETS = tuple(
+    dict.fromkeys(dataset for spec in VERSIONS.values() for dataset in spec["datasets"])
+)
+DEFAULT_MODEL_SEEDS = (0, 1, 2, 3, 4)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--versions", nargs="+", choices=tuple(VERSIONS), default=list(VERSIONS))
+    result.add_argument("--profiles", nargs="+", choices=tuple(PROFILES), default=list(PROFILES))
+    result.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=ALL_DATASETS,
+        help="Default: every dataset supported by each selected version; V2 has no PPI arm",
+    )
+    result.add_argument("--model-seeds", nargs="+", type=int, default=list(DEFAULT_MODEL_SEEDS))
+    result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    result.add_argument("--results-root", type=Path, default=ROOT / "results")
+    result.add_argument("--run-id")
+    result.add_argument("--device", default="cuda")
+    result.add_argument("--epochs", type=int, default=200)
+    result.add_argument("--patience", type=int, default=50)
+    result.add_argument("--workers", type=int, default=0)
+    result.add_argument("--edge-chunk-size", type=int, default=65536)
+    result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument("--dry-run", action="store_true", help="Print every child without writes")
+    return result
+
+
+def _validate(args: argparse.Namespace) -> None:
+    for label, values in (
+        ("versions", args.versions),
+        ("profiles", args.profiles),
+        ("model seeds", args.model_seeds),
+    ):
+        if not values or len(set(values)) != len(values):
+            raise ValueError(f"{label} must be nonempty and contain no duplicates")
+    if args.datasets is not None and len(set(args.datasets)) != len(args.datasets):
+        raise ValueError("datasets must contain no duplicates")
+    if any(seed < 0 for seed in args.model_seeds):
+        raise ValueError("model seeds must be nonnegative")
+    if min(args.epochs, args.patience, args.edge_chunk_size) < 1 or args.workers != 0:
+        raise ValueError("epochs/patience/chunk size must be positive and workers must be 0")
+    if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
+        raise ValueError("CUDA is required; CPU training/fallback is not supported")
+    if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
+        raise ValueError("minimum free GPU memory must be finite and nonnegative")
+    if args.run_id is not None and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}", args.run_id
+    ):
+        raise ValueError("run ID must be 1-120 letters, digits, underscores or hyphens")
+
+
+def _selected_datasets(args: argparse.Namespace, version: str) -> list[str]:
+    supported = VERSIONS[version]["datasets"]
+    requested = supported if args.datasets is None else args.datasets
+    return [dataset for dataset in requested if dataset in supported]
+
+
+def _exclusions(args: argparse.Namespace) -> list[dict[str, str]]:
+    if args.datasets is None:
+        return []
+    output = []
+    for version in args.versions:
+        supported = VERSIONS[version]["datasets"]
+        for dataset in args.datasets:
+            if dataset not in supported:
+                output.append(
+                    {
+                        "version": version,
+                        "dataset": dataset,
+                        "status": "not_applicable",
+                        "reason": (
+                            "V2 direct edge conductances are bound to one fixed topology and "
+                            "cannot transfer to held-out PPI graphs"
+                            if version == "v2" and dataset == "ppi"
+                            else "dataset is not supported by this version"
+                        ),
+                    }
+                )
+    return output
+
+
+def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
+    jobs: list[dict[str, Any]] = []
+    data_root = args.data_root.expanduser().resolve()
+    for version in args.versions:
+        spec = VERSIONS[version]
+        for profile_name in args.profiles:
+            profile = PROFILES[profile_name]
+            for seed in args.model_seeds:
+                for dataset in _selected_datasets(args, version):
+                    for condition in spec["conditions"]:
+                        output = (
+                            run_dir
+                            / version
+                            / profile_name
+                            / f"model-seed-{seed}"
+                            / dataset
+                            / condition
+                        )
+                        command = [
+                            sys.executable,
+                            "-B",
+                            "-u",
+                            "-m",
+                            spec["module"],
+                            "--dataset",
+                            dataset,
+                            "--output-dir",
+                            str(output),
+                            "--data-root",
+                            str(data_root),
+                            "--device",
+                            args.device,
+                            "--model-seed",
+                            str(seed),
+                            "--epochs",
+                            str(args.epochs),
+                            "--patience",
+                            str(args.patience),
+                            "--hidden-channels",
+                            str(profile["hidden_channels"]),
+                            "--layers",
+                            str(profile["layers"]),
+                            "--dropout",
+                            str(profile["dropout"]),
+                            "--workers",
+                            str(args.workers),
+                            "--batch-size",
+                            "2" if dataset == "ppi" or version == "v1" else "1",
+                        ]
+                        if version != "v1":
+                            command += ["--condition", condition]
+                        if version in {"v2", "v3", "v4"}:
+                            command += ["--edge-chunk-size", str(args.edge_chunk_size)]
+                        job_id = f"{version}/{profile_name}/model-seed-{seed}/{dataset}/{condition}"
+                        jobs.append(
+                            {
+                                "job_id": job_id,
+                                "version": version,
+                                "profile": profile_name,
+                                "architecture": dict(profile),
+                                "model_seed": seed,
+                                "dataset": dataset,
+                                "condition": condition,
+                                "status": "pending",
+                                "output_dir": str(output),
+                                "metrics_path": str(output / "metrics.json"),
+                                "log_path": str(
+                                    run_dir
+                                    / "logs"
+                                    / version
+                                    / profile_name
+                                    / f"seed-{seed}--{dataset}--{condition}.log"
+                                ),
+                                "command": command,
+                            }
+                        )
+    if not jobs:
+        raise ValueError("selection produces no supported version/dataset/profile jobs")
+    return jobs
+
+
+def _source_snapshot() -> dict[str, str]:
+    paths = [Path(__file__)]
+    paths += [
+        ROOT / "research/conductance_gat" / name
+        for name in (
+            "benchmark.py",
+            "benchmark_data.py",
+            "cache_validation.py",
+            "public_data.py",
+            "scaling_v1.py",
+            "sparse.py",
+        )
+    ]
+    paths += list((ROOT / "research/conductance_gat/ablation").glob("*.py"))
+    paths += list((ROOT / "research/conductance_gat/v2").glob("*.py"))
+    paths += list((ROOT / "research/conductance_gat/v3").glob("*.py"))
+    paths += list((ROOT / "research/conductance_gat/v4").glob("*.py"))
+    paths += [
+        ROOT / "src/chartgat/cache.py",
+        ROOT / "src/chartgat/execution.py",
+        ROOT / "scripts/check_dependencies.py",
+        ROOT / "scripts/gpu_preflight.py",
+        ROOT / "scripts/run_conductance_factorial.py",
+    ]
+    return {
+        path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(set(paths))
+    }
+
+
+def _check_sources(manifest: dict[str, Any]) -> None:
+    if _source_snapshot() != manifest["source_sha256"]:
+        manifest["source_integrity_valid"] = False
+        raise RuntimeError("Conductance scaling source changed during execution")
+
+
+def _number(value: Any, label: str, *, minimum: float | None = None) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be numeric")
+    output = float(value)
+    if not math.isfinite(output) or (minimum is not None and output < minimum):
+        raise ValueError(f"{label} is outside its valid range")
+    return output
+
+
+def _load_child(job: dict[str, Any]) -> dict[str, Any]:
+    metrics_path = Path(job["metrics_path"])
+    if not metrics_path.is_file():
+        raise RuntimeError(f"child returned without metrics: {metrics_path}")
+    raw = metrics_path.read_bytes()
+    child = json.loads(raw)
+    if not isinstance(child, dict) or child.get("status") != "passed":
+        raise RuntimeError("child metrics do not declare status=passed")
+    for key, expected in (
+        ("dataset", job["dataset"]),
+        ("condition", job["condition"]),
+        ("model_seed", job["model_seed"]),
+        ("evaluation_split", "validation"),
+        ("test_evaluated", False),
+    ):
+        if child.get(key) != expected:
+            raise RuntimeError(f"child {key} mismatch: expected {expected!r}")
+    if "test" in child:
+        raise RuntimeError("scaling child must not expose a test metric")
+    configuration = child.get("configuration")
+    if not isinstance(configuration, dict):
+        raise RuntimeError("child configuration is missing")
+    for key, expected in job["architecture"].items():
+        if configuration.get(key) != expected:
+            raise RuntimeError(f"child architecture mismatch for {key}")
+    validation = _number(child.get("validation"), "validation", minimum=0.0)
+    if validation > 1:
+        raise RuntimeError("validation metric must be at most one")
+    trainable = child.get("trainable_parameters")
+    total = child.get("total_parameters", trainable)
+    if isinstance(trainable, bool) or not isinstance(trainable, int) or trainable < 1:
+        raise RuntimeError("child trainable parameter count is invalid")
+    if isinstance(total, bool) or not isinstance(total, int) or total < trainable:
+        raise RuntimeError("child total parameter count is invalid")
+    elapsed = _number(child.get("elapsed_seconds"), "elapsed_seconds", minimum=0.0)
+    peak_memory = child.get("peak_cuda_allocated_bytes", child.get("peak_gpu_memory_bytes"))
+    if isinstance(peak_memory, bool) or not isinstance(peak_memory, int) or peak_memory < 0:
+        raise RuntimeError("child peak CUDA allocation is invalid")
+    return {
+        "metrics_sha256": hashlib.sha256(raw).hexdigest(),
+        "validation": validation,
+        "metric_name": child.get("metric_name"),
+        "best_epoch": child.get("best_epoch"),
+        "epochs_run": child.get("epochs_run"),
+        "trainable_parameters": trainable,
+        "total_parameters": total,
+        "elapsed_seconds": elapsed,
+        "peak_cuda_allocated_bytes": peak_memory,
+        "actual_configuration": {
+            key: configuration[key] for key in ("hidden_channels", "layers", "dropout")
+        },
+        "test_evaluated": False,
+    }
+
+
+def _aggregate(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for job in jobs:
+        if job.get("status") == "passed" and isinstance(job.get("result"), dict):
+            grouped[(job["version"], job["profile"], job["dataset"], job["condition"])].append(job)
+    output = []
+    for key in sorted(grouped):
+        members = grouped[key]
+        validations = [member["result"]["validation"] for member in members]
+        elapsed = [member["result"]["elapsed_seconds"] for member in members]
+        memories = [member["result"]["peak_cuda_allocated_bytes"] for member in members]
+        output.append(
+            {
+                "version": key[0],
+                "profile": key[1],
+                "dataset": key[2],
+                "condition": key[3],
+                "architecture": members[0]["architecture"],
+                "passed_seeds": sorted(member["model_seed"] for member in members),
+                "n": len(members),
+                "validation_mean": statistics.fmean(validations),
+                "validation_sample_std": (
+                    statistics.stdev(validations) if len(validations) > 1 else None
+                ),
+                "validation_min": min(validations),
+                "validation_max": max(validations),
+                "trainable_parameters": sorted(
+                    {member["result"]["trainable_parameters"] for member in members}
+                ),
+                "total_parameters": sorted(
+                    {member["result"]["total_parameters"] for member in members}
+                ),
+                "elapsed_seconds_mean": statistics.fmean(elapsed),
+                "peak_cuda_allocated_bytes_max": max(memories),
+            }
+        )
+    return output
+
+
+def _summary(manifest: dict[str, Any]) -> dict[str, Any]:
+    jobs = manifest["jobs"]
+    counts = {
+        status: sum(job["status"] == status for job in jobs)
+        for status in (
+            "pending",
+            "running",
+            "passed",
+            "failed",
+        )
+    }
+    complete = manifest.get("status") == "passed" and counts == {
+        "pending": 0,
+        "running": 0,
+        "passed": len(jobs),
+        "failed": 0,
+    }
+    return {
+        "schema_version": 1,
+        "suite": "conductance_architecture_scaling_v1_v4",
+        "run_id": manifest["run_id"],
+        "status": manifest["status"],
+        "valid_for_validation_comparison": complete
+        and manifest.get("source_integrity_valid") is True,
+        "test_evaluated": False,
+        "selection_scope": "validation only; no profile is selected on test",
+        "job_counts": counts,
+        "expected_model_seeds": manifest["config"]["model_seeds"],
+        "exclusions": manifest["exclusions"],
+        "rows": _aggregate(jobs),
+    }
+
+
+def _write_summary(run_dir: Path, manifest: dict[str, Any]) -> None:
+    summary = _summary(manifest)
+    atomic_write_json(run_dir / "summary.json", summary)
+    lines = [
+        "# Conductance V1-V4 architecture scaling",
+        "",
+        f"- Status: `{summary['status']}`",
+        f"- Validation comparison released: `{summary['valid_for_validation_comparison']}`",
+        "- Test evaluated: `false`",
+        "- Profiles: base 64x2, wide 128x2, deep 64x4, large 128x4; dropout 0.5",
+        "- The table is descriptive validation scaling across independent model seeds.",
+        "",
+        "| Version | Profile | Dataset | Condition | n | Validation mean | Sample SD | "
+        "Trainable parameters |",
+        "|---|---|---|---|---:|---:|---:|---:|",
+    ]
+    for row in summary["rows"]:
+        deviation = (
+            "N/A" if row["validation_sample_std"] is None else f"{row['validation_sample_std']:.6f}"
+        )
+        parameters = ", ".join(str(value) for value in row["trainable_parameters"])
+        lines.append(
+            f"| {row['version']} | {row['profile']} | {row['dataset']} | "
+            f"{row['condition']} | {row['n']} | {row['validation_mean']:.6f} | "
+            f"{deviation} | {parameters} |"
+        )
+    (run_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        _validate(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    run_id = args.run_id or "scaling-v1-v4-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    results_root = args.results_root.expanduser().resolve()
+    run_dir = (results_root / "conductance_gat/scaling" / run_id).resolve()
+    data_root = args.data_root.expanduser().resolve()
+    if (
+        run_dir == data_root
+        or run_dir.is_relative_to(data_root)
+        or data_root.is_relative_to(run_dir)
+    ):
+        print("Scaling outputs and dataset cache must not overlap", file=sys.stderr)
+        return 2
+    try:
+        jobs = make_jobs(args, run_dir)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    exclusions = _exclusions(args)
+    if args.dry_run:
+        print(
+            f"{len(jobs)} validation-only fresh trainings; versions={args.versions}; "
+            f"profiles={args.profiles}; seeds={args.model_seeds}"
+        )
+        for exclusion in exclusions:
+            print(f"N/A: {exclusion['version']}/{exclusion['dataset']}: {exclusion['reason']}")
+        for job in jobs:
+            print(shlex.join(job["command"]))
+        print(f"Manifest: {run_dir / 'manifest.json'}")
+        return 0
+    if run_dir.exists():
+        print(f"Run already exists; use a new run ID: {run_dir}", file=sys.stderr)
+        return 2
+    try:
+        dependencies = check_dependencies()
+    except DependencyCheckError as exc:
+        print(error_message(exc), file=sys.stderr)
+        return exc.exit_code
+    run_dir.mkdir(parents=True, exist_ok=False)
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "suite": "conductance_architecture_scaling_v1_v4",
+        "run_id": run_id,
+        "status": "running",
+        "source_integrity_valid": True,
+        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "config": {
+            "versions": args.versions,
+            "profiles": {name: PROFILES[name] for name in args.profiles},
+            "datasets": args.datasets,
+            "datasets_by_version": {
+                version: _selected_datasets(args, version) for version in args.versions
+            },
+            "model_seeds": args.model_seeds,
+            "epochs": args.epochs,
+            "patience": args.patience,
+            "workers": args.workers,
+            "device": args.device,
+            "edge_chunk_size": args.edge_chunk_size,
+            "data_root": str(data_root),
+        },
+        "protocol": {
+            "purpose": "architecture scale response, not parameter matching",
+            "profiles": "base/wide/deep/large all run for every selected version",
+            "selection": "best validation checkpoint within each independent child",
+            "test": "never loaded into a V1 scaling loader and never evaluated by any child",
+            "aggregation": "validation mean and sample standard deviation across model seeds",
+            "release": "comparison valid only after every planned child and source check passes",
+        },
+        "exclusions": exclusions,
+        "jobs": jobs,
+        "dependencies": dependencies,
+        "source_sha256": _source_snapshot(),
+    }
+    manifest_path = run_dir / "manifest.json"
+    atomic_write_json(manifest_path, manifest)
+    _write_summary(run_dir, manifest)
+    current: dict[str, Any] | None = None
+    environment = shared._environment()
+    environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+    try:
+        preflight = [
+            sys.executable,
+            "-B",
+            str(ROOT / "scripts/gpu_preflight.py"),
+            "--device",
+            args.device,
+            "--require-paper-deps",
+            "--min-free-gb",
+            str(args.min_free_gb),
+            "--json-out",
+            str(run_dir / "gpu-preflight.json"),
+        ]
+        status = shared.run_logged(preflight, run_dir / "logs/preflight.log", environment)
+        if status:
+            raise RuntimeError(f"GPU preflight failed with exit code {status}")
+        print(f"Run: {run_id}; {len(jobs)} validation-only fresh trainings", flush=True)
+        for index, job in enumerate(jobs, start=1):
+            current = job
+            _check_sources(manifest)
+            job["status"] = "running"
+            atomic_write_json(manifest_path, manifest)
+            _write_summary(run_dir, manifest)
+            print(f"\n[{index}/{len(jobs)}] {job['job_id']}", flush=True)
+            started = time.monotonic()
+            status = shared.run_logged(job["command"], Path(job["log_path"]), environment)
+            job.update(exit_code=status, elapsed_wall_seconds=time.monotonic() - started)
+            _check_sources(manifest)
+            if status:
+                raise RuntimeError(f"{job['job_id']} failed with exit code {status}")
+            job["result"] = _load_child(job)
+            job["metrics_sha256"] = job["result"]["metrics_sha256"]
+            job["status"] = "passed"
+            current = None
+            atomic_write_json(manifest_path, manifest)
+            _write_summary(run_dir, manifest)
+        _check_sources(manifest)
+        manifest.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+    except (Exception, KeyboardInterrupt) as exc:
+        manifest.update(
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}",
+            finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+        )
+        if current is not None:
+            current.update(status="failed", error=manifest["error"])
+        atomic_write_json(manifest_path, manifest)
+        _write_summary(run_dir, manifest)
+        print(f"Failed: {manifest['error']}\nSaved partial results: {run_dir}", file=sys.stderr)
+        return 130 if isinstance(exc, KeyboardInterrupt) else 1
+    atomic_write_json(manifest_path, manifest)
+    _write_summary(run_dir, manifest)
+    print((run_dir / "summary.md").read_text(encoding="utf-8"), flush=True)
+    print(f"Summary: {run_dir / 'summary.md'}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # scripts/run_conductance_v2.py
 
 ````python
@@ -40550,6 +42307,1163 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ````
 
+# scripts/run_cycle_scaling.py
+
+````python
+#!/usr/bin/env python3
+"""Run larger-model scaling experiments for both Cycle PE V1 and V2.
+
+Every candidate uses only the official train/validation splits.  One common
+profile per version and dataset is selected by mean validation MAE across all
+requested model seeds; each seed's checkpoint at that profile is then evaluated
+once on test without retraining.  Candidate artifacts and final test evaluations
+are kept in disjoint result sections.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import statistics
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_json  # noqa: E402
+from scripts.check_dependencies import (  # noqa: E402
+    DependencyCheckError,
+    check_dependencies,
+    error_message,
+)
+
+DATASETS = ("zinc12k", "peptides_struct")
+VERSIONS = ("v1", "v2")
+PROFILE_ORDER = ("base", "wide", "deep", "large")
+PROFILES: dict[str, dict[str, int]] = {
+    "base": {"hidden_dim": 64, "pe_dim": 32, "layers": 3},
+    "wide": {"hidden_dim": 128, "pe_dim": 64, "layers": 3},
+    "deep": {"hidden_dim": 64, "pe_dim": 32, "layers": 6},
+    "large": {"hidden_dim": 128, "pe_dim": 64, "layers": 6},
+}
+MODEL_NAMES = {"v1": "cycle_set", "v2": "cycle_basis_v2"}
+MODULES = {
+    "v1": "research.cycle_pe.benchmark",
+    "v2": "research.cycle_pe.v2.benchmark",
+}
+RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+SOURCE_FILES = (
+    "scripts/run_cycle_scaling.py",
+    "scripts/check_dependencies.py",
+    "scripts/gpu_preflight.py",
+    "research/cycle_pe/benchmark.py",
+    "research/cycle_pe/benchmark_data.py",
+    "research/cycle_pe/benchmark_models.py",
+    "research/cycle_pe/paper_model.py",
+    "research/cycle_pe/features.py",
+    "research/cycle_pe/v2/benchmark.py",
+    "research/cycle_pe/v2/basis.py",
+    "research/cycle_pe/v2/data.py",
+    "research/cycle_pe/v2/model.py",
+    "src/chartgat/algebra.py",
+    "src/chartgat/cache.py",
+    "src/chartgat/execution.py",
+)
+
+
+def _run_id(value: str) -> str:
+    if not RUN_ID_PATTERN.fullmatch(value):
+        raise argparse.ArgumentTypeError(
+            "run id must contain only letters, digits, dot, underscore, or hyphen"
+        )
+    return value
+
+
+def _seeds(value: str) -> tuple[int, ...]:
+    try:
+        seeds = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("model seeds must be comma-separated integers") from exc
+    if not seeds or len(set(seeds)) != len(seeds) or any(seed < 0 for seed in seeds):
+        raise argparse.ArgumentTypeError("model seeds must be nonnegative, unique, and nonempty")
+    return seeds
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--versions", nargs="+", choices=VERSIONS, default=list(VERSIONS))
+    result.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    result.add_argument("--profiles", nargs="+", choices=PROFILE_ORDER, default=list(PROFILE_ORDER))
+    result.add_argument(
+        "--model-seeds",
+        type=_seeds,
+        default=(0, 1, 2, 3, 4),
+        help="comma-separated model/minibatch seeds (default: 0,1,2,3,4)",
+    )
+    result.add_argument("--run-id", type=_run_id)
+    result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    result.add_argument("--results-root", type=Path, default=ROOT / "results")
+    result.add_argument("--device", default="cuda")
+    result.add_argument("--batch-size", type=int, default=32)
+    result.add_argument("--workers", type=int, default=4)
+    result.add_argument("--epochs", type=int, default=300)
+    result.add_argument("--patience", type=int, default=50)
+    result.add_argument("--lr", type=float, default=1e-3)
+    result.add_argument("--weight-decay", type=float, default=0.0)
+    result.add_argument(
+        "--max-parameters",
+        type=int,
+        default=5_000_000,
+        help="fail-closed ceiling per model; large profile needs more than the legacy 500k cap",
+    )
+    result.add_argument("--allow-download", action="store_true")
+    result.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
+    result.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
+    result.add_argument("--column-chunk-size", type=int, default=16)
+    result.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
+    result.add_argument("--basis-pair-budget", type=int, default=32768)
+    result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument("--fail-fast", action="store_true")
+    result.add_argument("--dry-run", action="store_true")
+    return result
+
+
+def _validate(args: argparse.Namespace) -> None:
+    for name in ("versions", "datasets", "profiles"):
+        values = getattr(args, name)
+        if not values or len(set(values)) != len(values):
+            raise ValueError(f"--{name} must be nonempty and contain no duplicates")
+    for name in (
+        "batch_size",
+        "epochs",
+        "patience",
+        "max_parameters",
+        "column_chunk_size",
+        "basis_pair_budget",
+    ):
+        if getattr(args, name) < 1:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
+    if args.workers < 0 or args.lr <= 0 or args.weight_decay < 0 or args.min_free_gb < 0:
+        raise ValueError("invalid worker, optimizer, or GPU-memory setting")
+    if not args.device.lower().startswith("cuda"):
+        raise ValueError("Cycle PE scaling training requires CUDA; no CPU fallback")
+
+
+def _default_run_id() -> str:
+    return "cycle-scaling-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def _run_dir(args: argparse.Namespace, run_id: str) -> Path:
+    return (args.results_root.expanduser().resolve() / "cycle_pe/scaling" / run_id).resolve()
+
+
+def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
+    jobs: list[dict[str, Any]] = []
+    data_root = args.data_root.expanduser().resolve()
+    for version in args.versions:
+        for profile in args.profiles:
+            config = PROFILES[profile]
+            for seed in args.model_seeds:
+                output = run_dir / "results" / version / profile / f"model-seed-{seed}"
+                job_id = f"{version}:{profile}:model-seed-{seed}"
+                command = [
+                    sys.executable,
+                    "-B",
+                    "-u",
+                    "-m",
+                    MODULES[version],
+                    "--suite",
+                    "benchmark",
+                    "--datasets",
+                    *args.datasets,
+                    "--data-root",
+                    str(data_root),
+                    "--output-dir",
+                    str(output),
+                    "--device",
+                    args.device,
+                    "--model-seed",
+                    str(seed),
+                    "--batch-size",
+                    str(args.batch_size),
+                    "--workers",
+                    str(args.workers),
+                    "--epochs",
+                    str(args.epochs),
+                    "--patience",
+                    str(args.patience),
+                    "--lr",
+                    str(args.lr),
+                    "--weight-decay",
+                    str(args.weight_decay),
+                    "--hidden-dim",
+                    str(config["hidden_dim"]),
+                    "--pe-dim",
+                    str(config["pe_dim"]),
+                    "--layers",
+                    str(config["layers"]),
+                    "--max-parameters",
+                    str(args.max_parameters),
+                    "--validation-only",
+                    "--amp" if args.amp else "--no-amp",
+                    "--compile" if args.compile else "--no-compile",
+                ]
+                if args.allow_download:
+                    command.append("--allow-download")
+                if version == "v2":
+                    command += [
+                        "--column-chunk-size",
+                        str(args.column_chunk_size),
+                        "--basis-execution",
+                        args.basis_execution,
+                        "--basis-pair-budget",
+                        str(args.basis_pair_budget),
+                    ]
+                jobs.append(
+                    {
+                        "job_id": job_id,
+                        "version": version,
+                        "profile": profile,
+                        "model_seed": seed,
+                        "datasets": list(args.datasets),
+                        "config": dict(config),
+                        "status": "pending",
+                        "command": command,
+                        "output_dir": str(output),
+                        "log_path": str(
+                            run_dir / "logs" / f"{version}--{profile}--seed-{seed}.log"
+                        ),
+                        "returncode": None,
+                        "artifact_errors": [],
+                    }
+                )
+    return jobs
+
+
+def _source_snapshot() -> dict[str, str]:
+    return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in SOURCE_FILES}
+
+
+def _environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+    entries = [str(ROOT / "src"), str(ROOT)]
+    if environment.get("PYTHONPATH"):
+        entries.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(entries)
+    environment["PYTHONUNBUFFERED"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    return environment
+
+
+def run_logged(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
+    """Run and stream one child, terminating it if the scaling runner is interrupted."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("x", encoding="utf-8", newline="\n") as stream:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                stream.write(line)
+                stream.flush()
+            return process.wait()
+        except BaseException:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+            raise
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+
+
+def _json_object(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON root must be an object: {path}")
+    return payload
+
+
+def _finite_number(value: Any, label: str, *, minimum: float = 0.0) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be numeric")
+    result = float(value)
+    if not math.isfinite(result) or result < minimum:
+        raise ValueError(f"{label} must be finite and >= {minimum}")
+    return result
+
+
+def _artifact(
+    value: Any,
+    digest: Any,
+    *,
+    expected: Path,
+    label: str,
+) -> tuple[str, str]:
+    if not isinstance(value, str) or not isinstance(digest, str):
+        raise ValueError(f"{label} path/hash metadata is missing")
+    path = Path(value).expanduser().resolve()
+    expected = expected.resolve()
+    if path != expected or not path.is_file():
+        raise ValueError(f"{label} is missing or outside its exact expected location")
+    actual = hashlib.sha256(path.read_bytes()).hexdigest()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest) or digest != actual:
+        raise ValueError(f"{label} SHA-256 mismatch")
+    return str(path), actual
+
+
+def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
+    """Admit validation-only candidates only after fail-closed artifact checks."""
+    output = Path(job["output_dir"])
+    manifest = _json_object(output / "manifest.json")
+    metrics = _json_object(output / "metrics.json")
+    if manifest.get("status") != "passed" or metrics.get("status") != "passed":
+        raise ValueError("child manifest and metrics must both have status=passed")
+    if (
+        manifest.get("run_mode") != "validation_only"
+        or metrics.get("run_mode") != "validation_only"
+    ):
+        raise ValueError("candidate child must identify as validation_only")
+    expected_version = job["version"]
+    if expected_version == "v2" and manifest.get("version") != "v2":
+        raise ValueError("V2 child did not identify itself as version v2")
+    if expected_version == "v1" and manifest.get("version") not in (None, "v1"):
+        raise ValueError("V1 child has an unexpected version marker")
+    arguments = manifest.get("arguments")
+    if not isinstance(arguments, dict):
+        raise ValueError("child manifest arguments are missing")
+    expected_arguments = {
+        "model_seed": job["model_seed"],
+        "hidden_dim": job["config"]["hidden_dim"],
+        "pe_dim": job["config"]["pe_dim"],
+        "layers": job["config"]["layers"],
+        "validation_only": True,
+        "test_checkpoint": None,
+    }
+    for name, expected in expected_arguments.items():
+        if arguments.get(name) != expected:
+            actual = arguments.get(name)
+            raise ValueError(f"child argument mismatch for {name}: {actual} != {expected}")
+    if expected_version == "v2":
+        expected_v2 = {
+            "column_chunk_size": 16,
+            "basis_execution": "batched",
+            "basis_pair_budget": 32768,
+        }
+        command = job.get("command", [])
+        for flag, name in (
+            ("--column-chunk-size", "column_chunk_size"),
+            ("--basis-execution", "basis_execution"),
+            ("--basis-pair-budget", "basis_pair_budget"),
+        ):
+            if flag in command:
+                value = command[command.index(flag) + 1]
+                expected_v2[name] = int(value) if name != "basis_execution" else value
+        for name, expected in expected_v2.items():
+            if arguments.get(name) != expected:
+                raise ValueError(f"child argument mismatch for {name}")
+    if arguments.get("datasets") != job["datasets"]:
+        raise ValueError("child dataset selection differs from the requested official datasets")
+    if metrics.get("model_seed") != job["model_seed"]:
+        raise ValueError("child metrics model seed mismatch")
+    controls = manifest.get("controls")
+    if (
+        not isinstance(controls, dict)
+        or controls.get("test_data_access") is not False
+        or controls.get("fresh_training") is not True
+        or controls.get("optimizer_created") is not True
+    ):
+        raise ValueError("candidate child test/training controls are invalid")
+    datasets = metrics.get("datasets")
+    if not isinstance(datasets, dict) or set(datasets) != set(job["datasets"]):
+        raise ValueError("child metrics do not contain exactly the requested datasets")
+    rows: list[dict[str, Any]] = []
+    for dataset in job["datasets"]:
+        dataset_metrics = datasets[dataset]
+        if dataset_metrics.get("metric") != "mae":
+            raise ValueError(f"{dataset}: expected official MAE metric")
+        protocol = dataset_metrics.get("protocol")
+        if (
+            not isinstance(protocol, dict)
+            or protocol.get("loaded_splits") != ["train", "validation"]
+            or set(protocol.get("split_sizes", {})) != {"train", "validation"}
+            or set(protocol.get("split_content_sha256", {})) != {"train", "validation"}
+        ):
+            raise ValueError(f"{dataset}: candidate protocol exposed or loaded a test split")
+        models = dataset_metrics.get("models")
+        model_name = MODEL_NAMES[expected_version]
+        if not isinstance(models, dict) or set(models) != {model_name}:
+            raise ValueError(f"{dataset}: expected only model {model_name}")
+        result = models[model_name]
+        if not isinstance(result, dict) or "test" in result:
+            raise ValueError(f"{dataset}: candidate result leaked a test metric")
+        if result.get("evaluation_splits") != ["train", "validation"]:
+            raise ValueError(f"{dataset}: candidate evaluated an unexpected split")
+        if result.get("fresh_training") is not True:
+            raise ValueError(f"{dataset}: candidate fresh-training marker is invalid")
+        validation = _finite_number(result.get("validation"), f"{dataset}/validation")
+        parameters = int(
+            _finite_number(result.get("trainable_parameters"), f"{dataset}/parameters", minimum=1)
+        )
+        elapsed = _finite_number(
+            result.get("elapsed_seconds"), f"{dataset}/elapsed_seconds", minimum=0
+        )
+        peak_memory = int(
+            _finite_number(result.get("peak_gpu_memory_bytes"), f"{dataset}/peak_gpu_memory_bytes")
+        )
+        best_epoch = int(
+            _finite_number(result.get("best_epoch"), f"{dataset}/best_epoch", minimum=1)
+        )
+        epochs_completed = int(
+            _finite_number(result.get("epochs_completed"), f"{dataset}/epochs_completed", minimum=1)
+        )
+        expected_run = output / dataset / model_name
+        checkpoint, checkpoint_sha256 = _artifact(
+            result.get("checkpoint"),
+            result.get("checkpoint_sha256"),
+            expected=expected_run / "best.pt",
+            label=f"{dataset}/checkpoint",
+        )
+        history, history_sha256 = _artifact(
+            result.get("history"),
+            result.get("history_sha256"),
+            expected=expected_run / "history.json",
+            label=f"{dataset}/history",
+        )
+        history_payload = json.loads(Path(history).read_text(encoding="utf-8"))
+        if (
+            not isinstance(history_payload, list)
+            or not history_payload
+            or len(history_payload) != epochs_completed
+            or not isinstance(history_payload[-1], dict)
+            or history_payload[-1].get("epoch") != epochs_completed
+        ):
+            raise ValueError(f"{dataset}: history length/epoch metadata mismatch")
+        rows.append(
+            {
+                "version": expected_version,
+                "profile": job["profile"],
+                "dataset": dataset,
+                "model_seed": job["model_seed"],
+                "config": dict(job["config"]),
+                "validation_mae": validation,
+                "trainable_parameters": parameters,
+                "elapsed_seconds": elapsed,
+                "peak_gpu_memory_bytes": peak_memory,
+                "best_epoch": best_epoch,
+                "epochs_completed": epochs_completed,
+                "checkpoint": checkpoint,
+                "checkpoint_sha256": checkpoint_sha256,
+                "history": history,
+                "history_sha256": history_sha256,
+                "output_dir": str(output),
+            }
+        )
+    return rows
+
+
+def _stats(values: list[float]) -> dict[str, float | int | None]:
+    if not values:
+        raise ValueError("cannot aggregate an empty metric")
+    return {
+        "n": len(values),
+        "mean": statistics.fmean(values),
+        "sample_std": statistics.stdev(values) if len(values) > 1 else None,
+        "min": min(values),
+        "max": max(values),
+    }
+
+
+def build_summary(
+    rows: list[dict[str, Any]],
+    *,
+    versions: list[str],
+    datasets: list[str],
+    profiles: list[str],
+    model_seeds: tuple[int, ...],
+    complete: bool,
+) -> dict[str, Any]:
+    """Select one common profile per version/dataset without any test input."""
+    summary: dict[str, Any] = {
+        "schema_version": 2,
+        "status": "pending_test_evaluation" if complete else "failed",
+        "scope": "cycle_pe_v1_v2_larger_model_scaling",
+        "metric": "mae_lower_is_better",
+        "selection_policy": {
+            "profile_selection_input": "mean validation MAE across requested model seeds",
+            "selection_unit": "version x dataset",
+            "test_used_for_profile_selection": False,
+            "checkpoint_selection": "validation MAE only inside each candidate training",
+            "final_test_report": "separate test_evaluations rows after selection",
+        },
+        "profiles": {name: dict(PROFILES[name]) for name in profiles},
+        "requested_model_seeds": list(model_seeds),
+        "runs": rows,
+        "profile_aggregates": [],
+        "profile_selections": [],
+        "selected_checkpoints": [],
+        "test_evaluations": [],
+        "fresh_dataset_trainings": len(rows),
+    }
+    expected_keys = {
+        (version, dataset, profile, seed)
+        for version in versions
+        for dataset in datasets
+        for profile in profiles
+        for seed in model_seeds
+    }
+    actual_keys = [
+        (row["version"], row["dataset"], row["profile"], row["model_seed"]) for row in rows
+    ]
+    if len(actual_keys) != len(set(actual_keys)) or set(actual_keys) != expected_keys:
+        complete = False
+        summary["status"] = "failed"
+    aggregates: list[dict[str, Any]] = []
+    for version in versions:
+        for dataset in datasets:
+            for profile in profiles:
+                group = [
+                    row
+                    for row in rows
+                    if row["version"] == version
+                    and row["dataset"] == dataset
+                    and row["profile"] == profile
+                ]
+                if not group:
+                    continue
+                seeds = [row["model_seed"] for row in group]
+                if len(group) != len(model_seeds) or set(seeds) != set(model_seeds):
+                    complete = False
+                    summary["status"] = "failed"
+                aggregates.append(
+                    {
+                        "version": version,
+                        "dataset": dataset,
+                        "profile": profile,
+                        "config": dict(PROFILES[profile]),
+                        "model_seeds": sorted(seeds),
+                        "validation_mae": _stats([row["validation_mae"] for row in group]),
+                        "trainable_parameters": sorted(
+                            {row["trainable_parameters"] for row in group}
+                        ),
+                        "elapsed_seconds": _stats([row["elapsed_seconds"] for row in group]),
+                        "peak_gpu_memory_bytes": _stats(
+                            [float(row["peak_gpu_memory_bytes"]) for row in group]
+                        ),
+                        "epochs_completed": _stats(
+                            [float(row["epochs_completed"]) for row in group]
+                        ),
+                    }
+                )
+    summary["profile_aggregates"] = aggregates
+    if not complete:
+        summary["selection_withheld"] = (
+            "At least one requested child/result is missing or invalid; "
+            "no checkpoint is selected and test remains untouched."
+        )
+        return summary
+    for version in versions:
+        for dataset in datasets:
+            candidates = [
+                item
+                for item in aggregates
+                if item["version"] == version and item["dataset"] == dataset
+            ]
+            if len(candidates) != len(profiles):
+                summary["status"] = "failed"
+                summary["selection_withheld"] = "A requested profile aggregate is missing."
+                summary["profile_selections"] = []
+                summary["selected_checkpoints"] = []
+                return summary
+            selected_profile = min(
+                candidates,
+                key=lambda item: (
+                    item["validation_mae"]["mean"],
+                    profiles.index(item["profile"]),
+                ),
+            )
+            profile_selection_id = f"{version}:{dataset}"
+            summary["profile_selections"].append(
+                {
+                    "profile_selection_id": profile_selection_id,
+                    "version": version,
+                    "dataset": dataset,
+                    "selected_profile": selected_profile["profile"],
+                    "config": dict(selected_profile["config"]),
+                    "selection_metric": "validation_mae.mean_across_requested_model_seeds",
+                    "selected_validation_mae": selected_profile["validation_mae"],
+                    "model_seeds": list(model_seeds),
+                    "test_used_for_selection": False,
+                }
+            )
+            selected_rows = [
+                row
+                for row in rows
+                if row["version"] == version
+                and row["dataset"] == dataset
+                and row["profile"] == selected_profile["profile"]
+            ]
+            selected_by_seed = {row["model_seed"]: row for row in selected_rows}
+            if set(selected_by_seed) != set(model_seeds) or len(selected_rows) != len(model_seeds):
+                summary["status"] = "failed"
+                summary["selection_withheld"] = "Selected profile checkpoints are incomplete."
+                summary["profile_selections"] = []
+                summary["selected_checkpoints"] = []
+                return summary
+            for seed in model_seeds:
+                selected = selected_by_seed[seed]
+                summary["selected_checkpoints"].append(
+                    {
+                        "checkpoint_id": f"{version}:{dataset}:model-seed-{seed}",
+                        "profile_selection_id": profile_selection_id,
+                        "version": version,
+                        "dataset": dataset,
+                        "model_seed": seed,
+                        "selected_profile": selected["profile"],
+                        "config": dict(selected["config"]),
+                        "selected_validation_mae": selected["validation_mae"],
+                        "trainable_parameters": selected["trainable_parameters"],
+                        "checkpoint": selected["checkpoint"],
+                        "checkpoint_sha256": selected["checkpoint_sha256"],
+                        "history": selected["history"],
+                        "history_sha256": selected["history_sha256"],
+                    }
+                )
+    return summary
+
+
+def make_test_jobs(
+    args: argparse.Namespace,
+    run_dir: Path,
+    selections: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Create test-only jobs after validation has irreversibly fixed each checkpoint."""
+    jobs: list[dict[str, Any]] = []
+    data_root = args.data_root.expanduser().resolve()
+    for selection in selections:
+        version = selection["version"]
+        dataset = selection["dataset"]
+        seed = selection["model_seed"]
+        profile = selection["selected_profile"]
+        config = PROFILES[profile]
+        output = run_dir / "test-evaluations" / version / dataset / f"model-seed-{seed}"
+        job_id = f"test:{version}:{dataset}:model-seed-{seed}"
+        command = [
+            sys.executable,
+            "-B",
+            "-u",
+            "-m",
+            MODULES[version],
+            "--suite",
+            "benchmark",
+            "--datasets",
+            dataset,
+            "--data-root",
+            str(data_root),
+            "--output-dir",
+            str(output),
+            "--device",
+            args.device,
+            "--model-seed",
+            str(seed),
+            "--batch-size",
+            str(args.batch_size),
+            "--workers",
+            str(args.workers),
+            "--hidden-dim",
+            str(config["hidden_dim"]),
+            "--pe-dim",
+            str(config["pe_dim"]),
+            "--layers",
+            str(config["layers"]),
+            "--max-parameters",
+            str(args.max_parameters),
+            "--test-checkpoint",
+            selection["checkpoint"],
+            "--compile" if args.compile else "--no-compile",
+        ]
+        if args.allow_download:
+            command.append("--allow-download")
+        if version == "v2":
+            command += [
+                "--column-chunk-size",
+                str(args.column_chunk_size),
+                "--basis-execution",
+                args.basis_execution,
+                "--basis-pair-budget",
+                str(args.basis_pair_budget),
+            ]
+        jobs.append(
+            {
+                "job_id": job_id,
+                "checkpoint_id": selection["checkpoint_id"],
+                "profile_selection_id": selection["profile_selection_id"],
+                "version": version,
+                "dataset": dataset,
+                "model_seed": seed,
+                "selected_profile": profile,
+                "config": dict(config),
+                "checkpoint": selection["checkpoint"],
+                "checkpoint_sha256": selection["checkpoint_sha256"],
+                "selected_validation_mae": selection["selected_validation_mae"],
+                "trainable_parameters": selection["trainable_parameters"],
+                "status": "pending",
+                "command": command,
+                "output_dir": str(output),
+                "log_path": str(
+                    run_dir / "logs" / "test" / f"{version}--{dataset}--seed-{seed}.log"
+                ),
+                "returncode": None,
+                "artifact_errors": [],
+            }
+        )
+    return jobs
+
+
+def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
+    """Validate one test-only evaluation and bind it to the selected checkpoint."""
+    output = Path(job["output_dir"])
+    manifest_path = output / "manifest.json"
+    metrics_path = output / "metrics.json"
+    manifest = _json_object(manifest_path)
+    metrics = _json_object(metrics_path)
+    if manifest.get("status") != "passed" or metrics.get("status") != "passed":
+        raise ValueError("test-only manifest and metrics must both have status=passed")
+    if manifest.get("run_mode") != "test_only" or metrics.get("run_mode") != "test_only":
+        raise ValueError("selected checkpoint evaluation must identify as test_only")
+    version = job["version"]
+    if version == "v2" and manifest.get("version") != "v2":
+        raise ValueError("V2 test-only child did not identify itself as version v2")
+    if version == "v1" and manifest.get("version") not in (None, "v1"):
+        raise ValueError("V1 test-only child has an unexpected version marker")
+    arguments = manifest.get("arguments")
+    expected_arguments = {
+        "datasets": [job["dataset"]],
+        "model_seed": job["model_seed"],
+        "hidden_dim": job["config"]["hidden_dim"],
+        "pe_dim": job["config"]["pe_dim"],
+        "layers": job["config"]["layers"],
+        "validation_only": False,
+        "test_checkpoint": str(Path(job["checkpoint"]).resolve()),
+    }
+    if not isinstance(arguments, dict):
+        raise ValueError("test-only manifest arguments are missing")
+    for name, expected in expected_arguments.items():
+        if arguments.get(name) != expected:
+            raise ValueError(f"test-only argument mismatch for {name}")
+    controls = manifest.get("controls")
+    if (
+        not isinstance(controls, dict)
+        or controls.get("test_data_access") is not True
+        or controls.get("fresh_training") is not False
+        or controls.get("optimizer_created") is not False
+    ):
+        raise ValueError("test-only controls do not prove evaluation without retraining")
+    datasets = metrics.get("datasets")
+    if not isinstance(datasets, dict) or set(datasets) != {job["dataset"]}:
+        raise ValueError("test-only metrics must contain exactly the selected dataset")
+    dataset_metrics = datasets[job["dataset"]]
+    if dataset_metrics.get("metric") != "mae":
+        raise ValueError("test-only result must use official MAE")
+    protocol = dataset_metrics.get("protocol")
+    if (
+        not isinstance(protocol, dict)
+        or protocol.get("loaded_splits") != ["test"]
+        or set(protocol.get("split_sizes", {})) != {"test"}
+        or set(protocol.get("split_content_sha256", {})) != {"test"}
+    ):
+        raise ValueError("test-only child must load exactly the official test split")
+    model_name = MODEL_NAMES[version]
+    models = dataset_metrics.get("models")
+    if not isinstance(models, dict) or set(models) != {model_name}:
+        raise ValueError(f"test-only child must contain only model {model_name}")
+    result = models[model_name]
+    if not isinstance(result, dict):
+        raise ValueError("test-only model result is invalid")
+    forbidden = {"validation", "history", "epochs_completed", "best_epoch"}
+    if forbidden & set(result):
+        raise ValueError("test-only result contains training or candidate metrics")
+    if result.get("evaluation_splits") != ["test"] or result.get("fresh_training") is not False:
+        raise ValueError("test-only result has invalid split/training markers")
+    checkpoint = str(Path(job["checkpoint"]).resolve())
+    if (
+        result.get("checkpoint") != checkpoint
+        or result.get("checkpoint_sha256") != job["checkpoint_sha256"]
+    ):
+        raise ValueError("test-only result is not bound to the selected checkpoint")
+    if not Path(checkpoint).is_file():
+        raise ValueError("selected checkpoint disappeared before test result admission")
+    if hashlib.sha256(Path(checkpoint).read_bytes()).hexdigest() != job["checkpoint_sha256"]:
+        raise ValueError("selected checkpoint changed before/during test evaluation")
+    selected_validation = _finite_number(result.get("selected_validation"), "selected_validation")
+    if selected_validation != job["selected_validation_mae"]:
+        raise ValueError("test-only checkpoint validation metadata mismatch")
+    parameters = int(
+        _finite_number(result.get("trainable_parameters"), "test/trainable_parameters", minimum=1)
+    )
+    if parameters != job["trainable_parameters"]:
+        raise ValueError("test-only model parameter count differs from selected candidate")
+    return {
+        "test_evaluation_id": job["job_id"],
+        "checkpoint_id": job["checkpoint_id"],
+        "profile_selection_id": job["profile_selection_id"],
+        "version": version,
+        "dataset": job["dataset"],
+        "model_seed": job["model_seed"],
+        "selected_profile": job["selected_profile"],
+        "checkpoint": checkpoint,
+        "checkpoint_sha256": job["checkpoint_sha256"],
+        "test_mae": _finite_number(result.get("test"), "test_mae"),
+        "evaluation_seconds": _finite_number(
+            result.get("evaluation_seconds"), "test/evaluation_seconds"
+        ),
+        "peak_gpu_memory_bytes": int(
+            _finite_number(result.get("peak_gpu_memory_bytes"), "test/peak_gpu_memory_bytes")
+        ),
+        "fresh_training": False,
+        "output_dir": str(output.resolve()),
+        "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+        "metrics_sha256": hashlib.sha256(metrics_path.read_bytes()).hexdigest(),
+    }
+
+
+def attach_test_results(
+    summary: dict[str, Any],
+    test_rows: list[dict[str, Any]],
+    *,
+    complete: bool,
+) -> dict[str, Any]:
+    expected = {item["checkpoint_id"]: item for item in summary["selected_checkpoints"]}
+    actual_ids = [row["checkpoint_id"] for row in test_rows]
+    if not complete or len(actual_ids) != len(set(actual_ids)) or set(actual_ids) != set(expected):
+        summary["status"] = "failed"
+        summary["test_evaluations"] = []
+        summary["test_results_withheld"] = (
+            "Every validation-selected checkpoint must have exactly one valid test-only result."
+        )
+        return summary
+    for row in test_rows:
+        selected = expected[row["checkpoint_id"]]
+        if (
+            row["profile_selection_id"] != selected["profile_selection_id"]
+            or row["selected_profile"] != selected["selected_profile"]
+            or row["checkpoint"] != selected["checkpoint"]
+            or row["checkpoint_sha256"] != selected["checkpoint_sha256"]
+        ):
+            summary["status"] = "failed"
+            summary["test_evaluations"] = []
+            summary["test_results_withheld"] = "A test result is detached from its selection."
+            return summary
+        selected["test_evaluation_id"] = row["test_evaluation_id"]
+    summary["test_evaluations"] = test_rows
+    summary["selected_test_evaluations"] = len(test_rows)
+    ordered_versions = list(
+        dict.fromkeys(item["version"] for item in summary["profile_selections"])
+    )
+    ordered_datasets = list(
+        dict.fromkeys(item["dataset"] for item in summary["profile_selections"])
+    )
+    summary["final_test_aggregates"] = [
+        {
+            "version": version,
+            "dataset": dataset,
+            "model_seeds": list(summary["requested_model_seeds"]),
+            "selected_profiles": [
+                row["selected_profile"]
+                for row in test_rows
+                if row["version"] == version and row["dataset"] == dataset
+            ],
+            "test_mae": _stats(
+                [
+                    row["test_mae"]
+                    for row in test_rows
+                    if row["version"] == version and row["dataset"] == dataset
+                ]
+            ),
+        }
+        for version in ordered_versions
+        for dataset in ordered_datasets
+    ]
+    summary["status"] = "passed"
+    return summary
+
+
+def _manifest_base(
+    args: argparse.Namespace,
+    run_id: str,
+    run_dir: Path,
+    jobs: list[dict[str, Any]],
+    dependencies: dict[str, Any],
+    sources: dict[str, str],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "scope": "cycle_pe_v1_v2_larger_model_scaling",
+        "run_id": run_id,
+        "status": "running",
+        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "output_dir": str(run_dir),
+        "versions": list(args.versions),
+        "datasets": list(args.datasets),
+        "profiles": {name: dict(PROFILES[name]) for name in args.profiles},
+        "model_seeds": list(args.model_seeds),
+        "fresh_child_runs": len(jobs),
+        "fresh_dataset_trainings": len(jobs) * len(args.datasets),
+        "selected_test_evaluations_planned": len(args.versions)
+        * len(args.datasets)
+        * len(args.model_seeds),
+        "selection_protocol": {
+            "profile_selection": (
+                "one common profile per version/dataset by mean validation MAE "
+                "across all requested model seeds"
+            ),
+            "checkpoint_selection": "validation only inside each candidate child",
+            "candidate_loaded_splits": ["train", "validation"],
+            "test_role": "one test-only evaluation of each selected checkpoint; no retraining",
+            "official_splits": True,
+        },
+        "resource_reporting": (
+            "per-dataset trainable parameters, CUDA-synchronized training runtime, "
+            "peak allocated GPU memory, epochs and best epoch"
+        ),
+        "dependencies": dependencies,
+        "source_sha256": sources,
+        "source_integrity_valid": True,
+        "preflight": {"status": "pending"},
+        "jobs": jobs,
+        "test_evaluation_jobs": [],
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        _validate(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    run_id = args.run_id or _default_run_id()
+    run_dir = _run_dir(args, run_id)
+    data_root = args.data_root.expanduser().resolve()
+    paths_overlap = (
+        run_dir == data_root
+        or run_dir.is_relative_to(data_root)
+        or data_root.is_relative_to(run_dir)
+    )
+    if paths_overlap:
+        print("Experiment outputs and dataset directories must not overlap", file=sys.stderr)
+        return 2
+    jobs = make_jobs(args, run_dir)
+    if args.dry_run:
+        print(
+            f"{len(jobs)} fresh child runs; {len(jobs) * len(args.datasets)} fresh dataset "
+            "trainings (train+validation only); "
+            f"{len(args.versions) * len(args.datasets) * len(args.model_seeds)} "
+            "selected-checkpoint test evaluations are deferred until validation selection"
+        )
+        for job in jobs:
+            print(f"[{job['job_id']}] {shlex.join(job['command'])}")
+            print(f"  output: {job['output_dir']}")
+        print(f"manifest: {run_dir / 'manifest.json'}")
+        print(f"summary: {run_dir / 'summary.json'}")
+        return 0
+    if run_dir.exists():
+        print(f"Run already exists; choose a new run ID: {run_dir}", file=sys.stderr)
+        return 2
+    try:
+        dependencies = check_dependencies()
+    except DependencyCheckError as exc:
+        print(error_message(exc), file=sys.stderr)
+        return exc.exit_code
+    sources = _source_snapshot()
+    run_dir.mkdir(parents=True, exist_ok=False)
+    manifest_path = run_dir / "manifest.json"
+    summary_path = run_dir / "summary.json"
+    manifest = _manifest_base(args, run_id, run_dir, jobs, dependencies, sources)
+    atomic_write_json(manifest_path, manifest, sort_keys=False)
+    environment = _environment()
+    rows: list[dict[str, Any]] = []
+    test_rows: list[dict[str, Any]] = []
+    validation_summary: dict[str, Any] | None = None
+    failed = False
+    try:
+        preflight_output = run_dir / "gpu-preflight.json"
+        preflight_command = [
+            sys.executable,
+            "-B",
+            str(ROOT / "scripts/gpu_preflight.py"),
+            "--device",
+            args.device,
+            "--require-paper-deps",
+            "--min-free-gb",
+            str(args.min_free_gb),
+            "--json-out",
+            str(preflight_output),
+        ]
+        preflight_code = run_logged(
+            preflight_command, run_dir / "logs/gpu-preflight.log", environment
+        )
+        preflight_errors: list[str] = []
+        if preflight_code == 0:
+            try:
+                preflight_payload = _json_object(preflight_output)
+                if preflight_payload.get("status") != "passed":
+                    preflight_errors.append("GPU preflight JSON does not have status=passed")
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                preflight_errors.append(f"{type(exc).__name__}: {exc}")
+        manifest["preflight"] = {
+            "status": "passed" if preflight_code == 0 and not preflight_errors else "failed",
+            "returncode": preflight_code,
+            "command": preflight_command,
+            "output": str(preflight_output),
+            "artifact_errors": preflight_errors,
+        }
+        if manifest["preflight"]["status"] != "passed":
+            failed = True
+        atomic_write_json(manifest_path, manifest, sort_keys=False)
+        if not failed:
+            for job in jobs:
+                job["status"] = "running"
+                job["started_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+                atomic_write_json(manifest_path, manifest, sort_keys=False)
+                code = run_logged(job["command"], Path(job["log_path"]), environment)
+                job["returncode"] = code
+                job["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+                if code == 0:
+                    try:
+                        job_rows = read_job_rows(job)
+                    except (OSError, ValueError, json.JSONDecodeError) as exc:
+                        job["artifact_errors"] = [f"{type(exc).__name__}: {exc}"]
+                    else:
+                        rows.extend(job_rows)
+                job["status"] = "passed" if code == 0 and not job["artifact_errors"] else "failed"
+                failed = failed or job["status"] == "failed"
+                atomic_write_json(manifest_path, manifest, sort_keys=False)
+                if failed and args.fail_fast:
+                    break
+        candidate_complete = (
+            not failed
+            and len(rows) == len(jobs) * len(args.datasets)
+            and all(job["status"] == "passed" for job in jobs)
+        )
+        validation_summary = build_summary(
+            rows,
+            versions=list(args.versions),
+            datasets=list(args.datasets),
+            profiles=list(args.profiles),
+            model_seeds=args.model_seeds,
+            complete=candidate_complete,
+        )
+        if validation_summary["status"] != "pending_test_evaluation":
+            failed = True
+        if _source_snapshot() != sources:
+            failed = True
+            manifest["source_integrity_valid"] = False
+            manifest["source_integrity_error"] = "experiment source changed during the run"
+        test_jobs = (
+            make_test_jobs(args, run_dir, validation_summary["selected_checkpoints"])
+            if not failed
+            else []
+        )
+        manifest["test_evaluation_jobs"] = test_jobs
+        atomic_write_json(manifest_path, manifest, sort_keys=False)
+        if not failed:
+            for test_job in test_jobs:
+                test_job["status"] = "running"
+                test_job["started_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+                atomic_write_json(manifest_path, manifest, sort_keys=False)
+                code = run_logged(test_job["command"], Path(test_job["log_path"]), environment)
+                test_job["returncode"] = code
+                test_job["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+                if code == 0:
+                    try:
+                        test_row = read_test_result(test_job)
+                    except (OSError, ValueError, json.JSONDecodeError) as exc:
+                        test_job["artifact_errors"] = [f"{type(exc).__name__}: {exc}"]
+                    else:
+                        test_rows.append(test_row)
+                test_job["status"] = (
+                    "passed" if code == 0 and not test_job["artifact_errors"] else "failed"
+                )
+                failed = failed or test_job["status"] == "failed"
+                atomic_write_json(manifest_path, manifest, sort_keys=False)
+                if failed and args.fail_fast:
+                    break
+        if _source_snapshot() != sources:
+            failed = True
+            manifest["source_integrity_valid"] = False
+            manifest["source_integrity_error"] = "experiment source changed during the run"
+    except BaseException as exc:
+        manifest["status"] = "failed"
+        manifest["error"] = f"{type(exc).__name__}: {exc}"
+        manifest["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+        atomic_write_json(manifest_path, manifest, sort_keys=False)
+        summary = build_summary(
+            rows,
+            versions=list(args.versions),
+            datasets=list(args.datasets),
+            profiles=list(args.profiles),
+            model_seeds=args.model_seeds,
+            complete=False,
+        )
+        summary["error"] = manifest["error"]
+        atomic_write_json(summary_path, summary, sort_keys=False)
+        raise
+    assert validation_summary is not None
+    test_jobs = manifest["test_evaluation_jobs"]
+    test_complete = (
+        not failed
+        and len(test_rows) == len(test_jobs)
+        and len(test_jobs) == len(args.versions) * len(args.datasets) * len(args.model_seeds)
+        and all(job["status"] == "passed" for job in test_jobs)
+    )
+    summary = attach_test_results(validation_summary, test_rows, complete=test_complete)
+    if summary["status"] != "passed":
+        failed = True
+    manifest["status"] = "failed" if failed else "passed"
+    manifest["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+    manifest["summary"] = str(summary_path)
+    manifest["completed_child_runs"] = sum(job["status"] == "passed" for job in jobs)
+    manifest["completed_dataset_trainings"] = len(rows)
+    manifest["completed_selected_test_evaluations"] = len(test_rows)
+    atomic_write_json(summary_path, summary, sort_keys=False)
+    atomic_write_json(manifest_path, manifest, sort_keys=False)
+    if failed:
+        print(f"Cycle scaling run failed; inspect {manifest_path}", file=sys.stderr)
+        return 1
+    print(f"Cycle scaling run passed; summary: {summary_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # scripts/run_paper.py
 
 ````python
@@ -41317,6 +44231,1998 @@ def main() -> int:
         print(f"paper run failed; inspect {manifest_path}", file=sys.stderr)
         return 1
     print(f"all requested independent paper tracks passed; manifest: {manifest_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# scripts/run_rich_scaling.py
+
+````python
+#!/usr/bin/env python3
+"""Run the complete Conductance, Cycle PE, and Tree larger-model scaling suites."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+
+TRACKS = ("conductance", "cycle", "tree")
+PROFILES = ("base", "wide", "deep", "large")
+DEFAULT_MODEL_SEEDS = (0, 1, 2, 3, 4)
+RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
+
+# Keep the complete public matrices here instead of trusting child row counts.  The
+# central runner passes these selections explicitly and verifies the same Cartesian
+# products in every returned summary.
+CONDUCTANCE_MATRIX = {
+    "v1": {
+        "datasets": ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"),
+        "conditions": ("conductance",),
+    },
+    "v2": {
+        "datasets": ("cora", "citeseer", "pubmed", "ogbn-arxiv"),
+        "conditions": ("direct_c", "fixed_c"),
+    },
+    "v3": {
+        "datasets": ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"),
+        "conditions": ("relative_c", "fixed_c"),
+    },
+    "v4": {
+        "datasets": ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"),
+        "conditions": (
+            "fixed_c_identity_w",
+            "relative_c_identity_w",
+            "fixed_c_spatial_w",
+            "relative_c_spatial_w",
+        ),
+    },
+}
+CYCLE_VERSIONS = ("v1", "v2")
+CYCLE_DATASETS = ("zinc12k", "peptides_struct")
+TREE_SUITES = ("csl", "zinc")
+TREE_MODELS = ("fixed_bfs", "multi_chart")
+TRACK_SPECS = {
+    "conductance": {
+        "script": "run_conductance_scaling.py",
+        "results_subdir": "conductance_gat/scaling",
+    },
+    "cycle": {
+        "script": "run_cycle_scaling.py",
+        "results_subdir": "cycle_pe/scaling",
+    },
+    "tree": {
+        "script": "run_tree_scaling.py",
+        "results_subdir": "tree_augmentation/scaling",
+    },
+}
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--tracks", nargs="+", choices=TRACKS, default=list(TRACKS))
+    result.add_argument("--profiles", nargs="+", choices=PROFILES, default=list(PROFILES))
+    result.add_argument("--model-seeds", nargs="+", type=int, default=list(DEFAULT_MODEL_SEEDS))
+    result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    result.add_argument("--results-root", type=Path, default=ROOT / "results")
+    result.add_argument("--run-id")
+    result.add_argument("--device", default="cuda")
+    result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument("--allow-download", action="store_true")
+    result.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Stop before later tracks after the first failed or unverifiable child",
+    )
+    result.add_argument("--dry-run", action="store_true", help="Print the plan without writes")
+    return result
+
+
+def _validate(args: argparse.Namespace) -> None:
+    for label, values in (
+        ("tracks", args.tracks),
+        ("profiles", args.profiles),
+        ("model seeds", args.model_seeds),
+    ):
+        if not values or len(set(values)) != len(values):
+            raise ValueError(f"{label} must be nonempty and contain no duplicates")
+    if any(seed < 0 for seed in args.model_seeds):
+        raise ValueError("model seeds must be nonnegative")
+    if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
+        raise ValueError("rich scaling requires CUDA; CPU fallback is not supported")
+    if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
+        raise ValueError("minimum free GPU memory must be finite and nonnegative")
+    if args.run_id is not None and RUN_ID_PATTERN.fullmatch(args.run_id) is None:
+        raise ValueError("run ID must be 1-120 letters, digits, underscores, or hyphens")
+
+
+def _default_run_id() -> str:
+    return "rich-scaling-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def _child_run_id(run_id: str, track: str) -> str:
+    candidate = f"{run_id}-{track}"
+    if len(candidate) <= 120:
+        return candidate
+    digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:8]
+    prefix_length = 120 - len(track) - len(digest) - 2
+    return f"{run_id[:prefix_length]}-{track}-{digest}"
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return first == second or first.is_relative_to(second) or second.is_relative_to(first)
+
+
+def _requested_matrix(track: str, profiles: list[str], model_seeds: list[int]) -> dict[str, Any]:
+    common = {"profiles": list(profiles), "model_seeds": list(model_seeds)}
+    if track == "conductance":
+        requested_datasets = list(
+            dict.fromkeys(
+                dataset for spec in CONDUCTANCE_MATRIX.values() for dataset in spec["datasets"]
+            )
+        )
+        return {
+            **common,
+            "versions": list(CONDUCTANCE_MATRIX),
+            "requested_datasets": requested_datasets,
+            "datasets_by_version": {
+                version: list(spec["datasets"]) for version, spec in CONDUCTANCE_MATRIX.items()
+            },
+            "conditions_by_version": {
+                version: list(spec["conditions"]) for version, spec in CONDUCTANCE_MATRIX.items()
+            },
+        }
+    if track == "cycle":
+        return {
+            **common,
+            "versions": list(CYCLE_VERSIONS),
+            "datasets": list(CYCLE_DATASETS),
+        }
+    return {
+        **common,
+        "suites": list(TREE_SUITES),
+        "models": list(TREE_MODELS),
+    }
+
+
+def _expected_counts(track: str, profiles: list[str], model_seeds: list[int]) -> dict[str, int]:
+    combinations = len(profiles) * len(model_seeds)
+    if track == "conductance":
+        trainings_per_combination = sum(
+            len(spec["datasets"]) * len(spec["conditions"]) for spec in CONDUCTANCE_MATRIX.values()
+        )
+        return {
+            "child_runs": combinations * trainings_per_combination,
+            "model_trainings": combinations * trainings_per_combination,
+        }
+    if track == "cycle":
+        child_runs = combinations * len(CYCLE_VERSIONS)
+        return {
+            "child_runs": child_runs,
+            "model_trainings": child_runs * len(CYCLE_DATASETS),
+        }
+    child_runs = combinations * len(TREE_SUITES)
+    return {
+        "child_runs": child_runs,
+        "model_trainings": child_runs * len(TREE_MODELS),
+    }
+
+
+def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
+    """Build one sequential child-process job per selected research track."""
+    results_root = args.results_root.expanduser().resolve()
+    data_root = args.data_root.expanduser().resolve()
+    jobs: list[dict[str, Any]] = []
+    for track in args.tracks:
+        spec = TRACK_SPECS[track]
+        child_run_id = _child_run_id(run_id, track)
+        child_dir = (results_root / spec["results_subdir"] / child_run_id).resolve()
+        profiles = list(args.profiles)
+        requested_matrix = _requested_matrix(track, profiles, list(args.model_seeds))
+        command = [
+            sys.executable,
+            "-B",
+            str(ROOT / "scripts" / spec["script"]),
+        ]
+        if track == "tree":
+            command += [
+                "--suites",
+                ",".join(requested_matrix["suites"]),
+                "--profiles",
+                ",".join(profiles),
+                "--model-seeds",
+                ",".join(str(seed) for seed in args.model_seeds),
+            ]
+        elif track == "cycle":
+            command += ["--versions", *requested_matrix["versions"]]
+            command += ["--datasets", *requested_matrix["datasets"]]
+            command += ["--profiles", *profiles]
+            command += ["--model-seeds", ",".join(str(seed) for seed in args.model_seeds)]
+        else:
+            command += ["--versions", *requested_matrix["versions"]]
+            command += ["--datasets", *requested_matrix["requested_datasets"]]
+            command += ["--profiles", *profiles]
+            command += ["--model-seeds", *(str(seed) for seed in args.model_seeds)]
+        command += [
+            "--data-root",
+            str(data_root),
+            "--results-root",
+            str(results_root),
+            "--run-id",
+            child_run_id,
+            "--device",
+            args.device,
+            "--min-free-gb",
+            str(args.min_free_gb),
+        ]
+        # Conductance scaling intentionally consumes only pre-verified offline caches and its
+        # child CLI therefore has no --allow-download option.
+        download_forwarded = args.allow_download and track in {"cycle", "tree"}
+        if download_forwarded:
+            command.append("--allow-download")
+        if args.dry_run:
+            command.append("--dry-run")
+        jobs.append(
+            {
+                "track": track,
+                "child_run_id": child_run_id,
+                "status": "pending",
+                "profiles": profiles,
+                "shared_profiles": list(args.profiles),
+                "model_seeds": list(args.model_seeds),
+                "command": command,
+                "output_dir": str(child_dir),
+                "summary_path": str(child_dir / "summary.json"),
+                "log_path": str(results_root / "rich_scaling" / run_id / "logs" / f"{track}.log"),
+                "allow_download_forwarded": download_forwarded,
+                "requested_matrix": requested_matrix,
+                "expected_counts": _expected_counts(track, profiles, list(args.model_seeds)),
+            }
+        )
+    return jobs
+
+
+def _source_snapshot() -> dict[str, str]:
+    paths = [Path(__file__).resolve()]
+    paths.extend(ROOT / "scripts" / TRACK_SPECS[track]["script"] for track in TRACKS)
+    return {
+        path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in paths
+    }
+
+
+def _check_central_sources(manifest: dict[str, Any]) -> None:
+    try:
+        current = _source_snapshot()
+    except Exception as error:
+        manifest["source_integrity_valid"] = False
+        raise RuntimeError(f"could not re-hash central scaling sources: {error}") from error
+    manifest["source_sha256_final"] = current
+    if current != manifest["source_sha256"]:
+        manifest["source_integrity_valid"] = False
+        raise RuntimeError("central scaling source changed while child experiments were running")
+    manifest["source_integrity_valid"] = True
+
+
+def _environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    entries = [str(ROOT / "src"), str(ROOT)]
+    if environment.get("PYTHONPATH"):
+        entries.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(entries)
+    environment["PYTHONUNBUFFERED"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+    return environment
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(payload, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _run_logged(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("x", encoding="utf-8", newline="\n") as log:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            shell=False,
+        )
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                log.write(line)
+                log.flush()
+            return process.wait()
+        except BaseException:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+            raise
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+
+
+def _integer(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError(f"child summary {label} must be a nonnegative integer")
+    return value
+
+
+def _exact_key_matrix(
+    rows: Any,
+    *,
+    fields: tuple[str, ...],
+    integer_fields: frozenset[str],
+    expected: set[tuple[Any, ...]],
+    label: str,
+) -> dict[tuple[Any, ...], dict[str, Any]]:
+    if not isinstance(rows, list):
+        raise RuntimeError(f"{label} must be a list")
+    observed: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise RuntimeError(f"{label}[{index}] must be an object")
+        values: list[Any] = []
+        for field in fields:
+            value = row.get(field)
+            if field in integer_fields:
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise RuntimeError(f"{label}[{index}].{field} must be a nonnegative integer")
+            elif not isinstance(value, str):
+                raise RuntimeError(f"{label}[{index}].{field} must be a string")
+            values.append(value)
+        key = tuple(values)
+        if key in observed:
+            raise RuntimeError(f"{label} contains duplicate key {key!r}")
+        observed[key] = row
+    observed_keys = set(observed)
+    if observed_keys != expected:
+        missing = sorted(expected - observed_keys, key=repr)
+        unexpected = sorted(observed_keys - expected, key=repr)
+        raise RuntimeError(
+            f"{label} matrix mismatch; missing={missing[:3]!r}, unexpected={unexpected[:3]!r}"
+        )
+    return observed
+
+
+def _exact_string_mapping_keys(value: Any, expected: list[str], label: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != set(expected):
+        raise RuntimeError(f"{label} keys do not exactly match the requested profiles")
+    return value
+
+
+def _validate_conductance_summary(payload: dict[str, Any], job: dict[str, Any]) -> dict[str, int]:
+    if payload.get("suite") != "conductance_architecture_scaling_v1_v4":
+        raise RuntimeError("Conductance child summary suite mismatch")
+    if payload.get("run_id") != job["child_run_id"]:
+        raise RuntimeError("Conductance child summary run ID mismatch")
+    if payload.get("valid_for_validation_comparison") is not True:
+        raise RuntimeError("Conductance child did not release a valid validation comparison")
+    if payload.get("test_evaluated") is not False:
+        raise RuntimeError("Conductance child summary does not certify test_evaluated=false")
+
+    expected = job["expected_counts"]
+    counts = payload.get("job_counts")
+    if not isinstance(counts, dict):
+        raise RuntimeError("Conductance child summary has no job counts")
+    checked = {
+        status: _integer(counts.get(status), f"job_counts.{status}")
+        for status in ("pending", "running", "passed", "failed")
+    }
+    if checked != {
+        "pending": 0,
+        "running": 0,
+        "passed": expected["model_trainings"],
+        "failed": 0,
+    }:
+        raise RuntimeError("Conductance child summary job counts are incomplete")
+
+    matrix = job["requested_matrix"]
+    seeds = matrix["model_seeds"]
+    if payload.get("expected_model_seeds") != seeds:
+        raise RuntimeError("Conductance child summary model seeds mismatch")
+    expected_rows = {
+        (version, profile, dataset, condition)
+        for version in matrix["versions"]
+        for profile in matrix["profiles"]
+        for dataset in matrix["datasets_by_version"][version]
+        for condition in matrix["conditions_by_version"][version]
+    }
+    rows = _exact_key_matrix(
+        payload.get("rows"),
+        fields=("version", "profile", "dataset", "condition"),
+        integer_fields=frozenset(),
+        expected=expected_rows,
+        label="Conductance summary rows",
+    )
+    expected_seeds = sorted(seeds)
+    for key, row in rows.items():
+        passed_seeds = row.get("passed_seeds")
+        if (
+            not isinstance(passed_seeds, list)
+            or any(isinstance(seed, bool) or not isinstance(seed, int) for seed in passed_seeds)
+            or passed_seeds != expected_seeds
+        ):
+            raise RuntimeError(f"Conductance summary row {key!r} has the wrong seed set")
+        if _integer(row.get("n"), f"rows[{key!r}].n") != len(expected_seeds):
+            raise RuntimeError(f"Conductance summary row {key!r} has the wrong seed count")
+
+    expected_exclusions = {
+        (version, dataset)
+        for version in matrix["versions"]
+        for dataset in matrix["requested_datasets"]
+        if dataset not in matrix["datasets_by_version"][version]
+    }
+    exclusions = _exact_key_matrix(
+        payload.get("exclusions"),
+        fields=("version", "dataset"),
+        integer_fields=frozenset(),
+        expected=expected_exclusions,
+        label="Conductance exclusions",
+    )
+    if any(row.get("status") != "not_applicable" for row in exclusions.values()):
+        raise RuntimeError("Conductance exclusion rows must declare not_applicable")
+    return {"child_runs": checked["passed"], "model_trainings": checked["passed"]}
+
+
+def _validate_cycle_summary(payload: dict[str, Any], job: dict[str, Any]) -> dict[str, int]:
+    if payload.get("scope") != "cycle_pe_v1_v2_larger_model_scaling":
+        raise RuntimeError("Cycle child summary scope mismatch")
+    matrix = job["requested_matrix"]
+    if payload.get("requested_model_seeds") != matrix["model_seeds"]:
+        raise RuntimeError("Cycle child summary model seeds mismatch")
+    _exact_string_mapping_keys(payload.get("profiles"), matrix["profiles"], "Cycle profiles")
+
+    expected_runs = {
+        (version, profile, seed, dataset)
+        for version in matrix["versions"]
+        for profile in matrix["profiles"]
+        for seed in matrix["model_seeds"]
+        for dataset in matrix["datasets"]
+    }
+    runs = _exact_key_matrix(
+        payload.get("runs"),
+        fields=("version", "profile", "model_seed", "dataset"),
+        integer_fields=frozenset({"model_seed"}),
+        expected=expected_runs,
+        label="Cycle training rows",
+    )
+    expected_children = {
+        (version, profile, seed)
+        for version in matrix["versions"]
+        for profile in matrix["profiles"]
+        for seed in matrix["model_seeds"]
+    }
+    observed_children = {(key[0], key[1], key[2]) for key in runs}
+    if observed_children != expected_children:
+        raise RuntimeError("Cycle child-run matrix is incomplete")
+    if any("test" in key.lower() for row in runs.values() for key in row):
+        raise RuntimeError("Cycle candidate training rows must not contain test metrics")
+
+    expected_aggregates = {
+        (version, dataset, profile)
+        for version in matrix["versions"]
+        for dataset in matrix["datasets"]
+        for profile in matrix["profiles"]
+    }
+    aggregates = _exact_key_matrix(
+        payload.get("profile_aggregates"),
+        fields=("version", "dataset", "profile"),
+        integer_fields=frozenset(),
+        expected=expected_aggregates,
+        label="Cycle profile aggregates",
+    )
+    expected_seeds = sorted(matrix["model_seeds"])
+    for key, row in aggregates.items():
+        if row.get("model_seeds") != expected_seeds:
+            raise RuntimeError(f"Cycle profile aggregate {key!r} has the wrong seed set")
+        if any("test" in field.lower() for field in row):
+            raise RuntimeError("Cycle validation aggregates must not contain test metrics")
+
+    expected_profile_selections = {
+        (version, dataset) for version in matrix["versions"] for dataset in matrix["datasets"]
+    }
+    profile_selections = _exact_key_matrix(
+        payload.get("profile_selections"),
+        fields=("version", "dataset"),
+        integer_fields=frozenset(),
+        expected=expected_profile_selections,
+        label="Cycle validation profile selections",
+    )
+    for key, row in profile_selections.items():
+        if (
+            row.get("selected_profile") not in matrix["profiles"]
+            or row.get("model_seeds") != matrix["model_seeds"]
+            or row.get("test_used_for_selection") is not False
+        ):
+            raise RuntimeError(f"Cycle validation profile selection {key!r} is invalid")
+
+    expected_checkpoints = {
+        (version, dataset, seed)
+        for version in matrix["versions"]
+        for dataset in matrix["datasets"]
+        for seed in matrix["model_seeds"]
+    }
+    selected_checkpoints = _exact_key_matrix(
+        payload.get("selected_checkpoints"),
+        fields=("version", "dataset", "model_seed"),
+        integer_fields=frozenset({"model_seed"}),
+        expected=expected_checkpoints,
+        label="Cycle selected validation checkpoints",
+    )
+    for key, row in selected_checkpoints.items():
+        profile_selection = profile_selections[(key[0], key[1])]
+        if row.get("selected_profile") != profile_selection.get("selected_profile"):
+            raise RuntimeError(f"Cycle selected checkpoint {key!r} uses the wrong profile")
+
+    test_rows = _exact_key_matrix(
+        payload.get("test_evaluations"),
+        fields=("version", "dataset", "model_seed"),
+        integer_fields=frozenset({"model_seed"}),
+        expected=expected_checkpoints,
+        label="Cycle selected-checkpoint test evaluations",
+    )
+    for key, row in test_rows.items():
+        if (
+            row.get("selected_profile") != selected_checkpoints[key].get("selected_profile")
+            or row.get("checkpoint") != selected_checkpoints[key].get("checkpoint")
+            or row.get("checkpoint_sha256") != selected_checkpoints[key].get("checkpoint_sha256")
+            or row.get("fresh_training") is not False
+        ):
+            raise RuntimeError(f"Cycle selected-checkpoint test evaluation {key!r} is invalid")
+    if _integer(payload.get("fresh_dataset_trainings"), "fresh_dataset_trainings") != len(runs):
+        raise RuntimeError("Cycle fresh training count disagrees with its exact candidate matrix")
+    if _integer(payload.get("selected_test_evaluations"), "selected_test_evaluations") != len(
+        test_rows
+    ):
+        raise RuntimeError("Cycle selected-checkpoint test count is incomplete")
+
+    expected_final_aggregates = {
+        (version, dataset) for version in matrix["versions"] for dataset in matrix["datasets"]
+    }
+    final_aggregates = _exact_key_matrix(
+        payload.get("final_test_aggregates"),
+        fields=("version", "dataset"),
+        integer_fields=frozenset(),
+        expected=expected_final_aggregates,
+        label="Cycle final test aggregates",
+    )
+    for key, row in final_aggregates.items():
+        selected_profiles = row.get("selected_profiles")
+        if (
+            row.get("model_seeds") != matrix["model_seeds"]
+            or not isinstance(selected_profiles, list)
+            or len(selected_profiles) != len(matrix["model_seeds"])
+            or any(profile not in matrix["profiles"] for profile in selected_profiles)
+        ):
+            raise RuntimeError(f"Cycle final test aggregate {key!r} is incomplete")
+    return {"child_runs": len(expected_children), "model_trainings": len(runs)}
+
+
+def _validate_tree_summary(payload: dict[str, Any], job: dict[str, Any]) -> dict[str, int]:
+    if payload.get("suite") != "tree_scaling":
+        raise RuntimeError("Tree child summary suite mismatch")
+    if payload.get("run_id") != job["child_run_id"]:
+        raise RuntimeError("Tree child summary run ID mismatch")
+    matrix = job["requested_matrix"]
+    if payload.get("models_per_child") != matrix["models"]:
+        raise RuntimeError("Tree child summary model list mismatch")
+    _exact_string_mapping_keys(
+        payload.get("profile_configs"), matrix["profiles"], "Tree profile configs"
+    )
+
+    expected_rows = {
+        (suite, profile, seed)
+        for suite in matrix["suites"]
+        for profile in matrix["profiles"]
+        for seed in matrix["model_seeds"]
+    }
+    results = _exact_key_matrix(
+        payload.get("results"),
+        fields=("suite", "profile", "model_seed"),
+        integer_fields=frozenset({"model_seed"}),
+        expected=expected_rows,
+        label="Tree candidate results",
+    )
+    for key, row in results.items():
+        if (
+            row.get("trained_models") != matrix["models"]
+            or row.get("test_evaluated") is not False
+            or row.get("test_used_for_selection") is not False
+            or row.get("dataset_cache_integrity")
+            != {
+                "full_cache_loaded": True,
+                "all_declared_splits_validated": True,
+                "loaded_and_validated_splits": ["test", "train", "validation"],
+            }
+        ):
+            raise RuntimeError(f"Tree candidate result {key!r} has the wrong trained models")
+
+    expected_selection_rows = {(suite,) for suite in matrix["suites"]}
+    selections = _exact_key_matrix(
+        payload.get("selections"),
+        fields=("suite",),
+        integer_fields=frozenset(),
+        expected=expected_selection_rows,
+        label="Tree validation profile selections",
+    )
+    expected_seed_keys = {str(seed) for seed in matrix["model_seeds"]}
+    for key, selection in selections.items():
+        conditions = selection.get("conditions")
+        if (
+            selection.get("selection_split") != "validation"
+            or selection.get("aggregation_axis") != "mean_across_requested_model_seeds"
+            or selection.get("model_seeds") != matrix["model_seeds"]
+            or selection.get("test_metrics_used_for_selection") is not False
+            or not isinstance(conditions, dict)
+            or set(conditions) != set(matrix["models"])
+        ):
+            raise RuntimeError(f"Tree validation profile selection {key!r} is invalid")
+        for model, condition in conditions.items():
+            checkpoints = condition.get("selected_checkpoints_by_model_seed")
+            if (
+                condition.get("selected_profile") not in matrix["profiles"]
+                or not isinstance(checkpoints, dict)
+                or set(checkpoints) != expected_seed_keys
+            ):
+                raise RuntimeError(
+                    f"Tree validation selection {key!r}/{model} has an incomplete seed matrix"
+                )
+
+    expected_test_rows = {
+        (suite, seed) for suite in matrix["suites"] for seed in matrix["model_seeds"]
+    }
+    test_results = _exact_key_matrix(
+        payload.get("selected_test_results"),
+        fields=("suite", "model_seed"),
+        integer_fields=frozenset({"model_seed"}),
+        expected=expected_test_rows,
+        label="Tree selected-checkpoint test results",
+    )
+    for key, row in test_results.items():
+        selected_profiles = row.get("selected_profiles")
+        selected_checkpoints = row.get("selected_checkpoints")
+        selection = selections[(key[0],)]
+        if (
+            row.get("evaluation_scope") != "selected_test"
+            or row.get("training_performed") is not False
+            or row.get("test_evaluated") is not True
+            or row.get("test_used_for_selection") is not False
+            or row.get("test_evaluations_per_selected_checkpoint") != 1
+            or not isinstance(selected_profiles, dict)
+            or set(selected_profiles) != set(matrix["models"])
+            or not isinstance(selected_checkpoints, dict)
+            or set(selected_checkpoints) != set(matrix["models"])
+            or any(
+                selected_profiles[model] != selection["conditions"][model]["selected_profile"]
+                for model in matrix["models"]
+            )
+        ):
+            raise RuntimeError(f"Tree selected-checkpoint test result {key!r} is invalid")
+
+    planned_children = _integer(payload.get("planned_child_runs"), "planned_child_runs")
+    planned_trainings = _integer(payload.get("planned_model_trainings"), "planned_model_trainings")
+    completed_children = _integer(payload.get("completed_child_runs"), "completed_child_runs")
+    completed_trainings = _integer(
+        payload.get("completed_model_trainings"), "completed_model_trainings"
+    )
+    failed_children = _integer(payload.get("failed_child_runs"), "failed_child_runs")
+    expected_profile_selections = len(matrix["suites"]) * len(matrix["models"])
+    planned_profile_selections = _integer(
+        payload.get("planned_profile_selections"), "planned_profile_selections"
+    )
+    completed_profile_selections = _integer(
+        payload.get("completed_profile_selections"), "completed_profile_selections"
+    )
+    expected_test_runs = len(matrix["suites"]) * len(matrix["model_seeds"])
+    planned_test_runs = _integer(
+        payload.get("planned_selected_test_runs"), "planned_selected_test_runs"
+    )
+    completed_test_runs = _integer(
+        payload.get("completed_selected_test_runs"), "completed_selected_test_runs"
+    )
+    failed_test_runs = _integer(
+        payload.get("failed_selected_test_runs"), "failed_selected_test_runs"
+    )
+    expected_test_evaluations = expected_test_runs * len(matrix["models"])
+    planned_test_evaluations = _integer(
+        payload.get("planned_selected_checkpoint_test_evaluations"),
+        "planned_selected_checkpoint_test_evaluations",
+    )
+    completed_test_evaluations = _integer(
+        payload.get("completed_selected_checkpoint_test_evaluations"),
+        "completed_selected_checkpoint_test_evaluations",
+    )
+    observed = {
+        "child_runs": len(results),
+        "model_trainings": sum(len(row["trained_models"]) for row in results.values()),
+    }
+    expected = job["expected_counts"]
+    if (
+        {"child_runs": planned_children, "model_trainings": planned_trainings} != expected
+        or {"child_runs": completed_children, "model_trainings": completed_trainings} != observed
+        or observed != expected
+        or failed_children != 0
+        or planned_profile_selections != expected_profile_selections
+        or completed_profile_selections != expected_profile_selections
+        or planned_test_runs != expected_test_runs
+        or completed_test_runs != len(test_results)
+        or completed_test_runs != expected_test_runs
+        or failed_test_runs != 0
+        or planned_test_evaluations != expected_test_evaluations
+        or completed_test_evaluations != expected_test_evaluations
+    ):
+        raise RuntimeError("Tree child summary counts are incomplete")
+    return observed
+
+
+def _validate_child_summary(job: dict[str, Any]) -> dict[str, Any]:
+    path = Path(job["summary_path"])
+    if not path.is_file():
+        raise RuntimeError(f"child returned without its exact summary path: {path}")
+    if path.resolve(strict=True) != path:
+        raise RuntimeError(f"child summary resolves outside its exact output path: {path}")
+    raw = path.read_bytes()
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid child summary JSON at {path}: {error}") from error
+    if not isinstance(payload, dict) or payload.get("status") != "passed":
+        raise RuntimeError("child summary does not certify status=passed")
+
+    track = job["track"]
+    validators = {
+        "conductance": _validate_conductance_summary,
+        "cycle": _validate_cycle_summary,
+        "tree": _validate_tree_summary,
+    }
+    observed = validators[track](payload, job)
+    if observed != job["expected_counts"]:
+        raise RuntimeError(f"{track} observed matrix counts do not match the requested plan")
+    return {
+        "summary_path": str(path),
+        "summary_sha256": hashlib.sha256(raw).hexdigest(),
+        "status": "passed",
+        "observed_counts": observed,
+    }
+
+
+def _totals(jobs: list[dict[str, Any]]) -> dict[str, int]:
+    return {
+        "track_runs": len(jobs),
+        "child_runs": sum(job["expected_counts"]["child_runs"] for job in jobs),
+        "model_trainings": sum(job["expected_counts"]["model_trainings"] for job in jobs),
+    }
+
+
+def _print_plan(args: argparse.Namespace, run_id: str, jobs: list[dict[str, Any]]) -> None:
+    totals = _totals(jobs)
+    print(
+        f"{totals['track_runs']} track runs; {totals['child_runs']} child runs; "
+        f"{totals['model_trainings']} fresh model trainings"
+    )
+    print(f"profiles={list(args.profiles)}; model_seeds={list(args.model_seeds)}")
+    for job in jobs:
+        expected = job["expected_counts"]
+        print(
+            f"[{job['track']}] {expected['child_runs']} child runs; "
+            f"{expected['model_trainings']} fresh model trainings; "
+            f"child profiles={job['profiles']}"
+        )
+        print(shlex.join(job["command"]))
+        print(f"  summary: {job['summary_path']}")
+    results_root = args.results_root.expanduser().resolve()
+    print(f"central manifest: {results_root / 'rich_scaling' / run_id / 'manifest.json'}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        _validate(args)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    run_id = args.run_id or _default_run_id()
+    results_root = args.results_root.expanduser().resolve()
+    data_root = args.data_root.expanduser().resolve()
+    run_dir = (results_root / "rich_scaling" / run_id).resolve()
+    jobs = make_jobs(args, run_id)
+    relevant_outputs = [run_dir, *(Path(job["output_dir"]) for job in jobs)]
+    if any(_paths_overlap(output, data_root) for output in relevant_outputs):
+        print("experiment outputs and dataset directories must not overlap", file=sys.stderr)
+        return 2
+    missing = [
+        ROOT / "scripts" / TRACK_SPECS[track]["script"]
+        for track in args.tracks
+        if not (ROOT / "scripts" / TRACK_SPECS[track]["script"]).is_file()
+    ]
+    if missing:
+        print(f"missing child runner: {missing[0]}", file=sys.stderr)
+        return 2
+    if args.dry_run:
+        _print_plan(args, run_id, jobs)
+        print("dry run only; no files or directories were written")
+        return 0
+    if run_dir.exists():
+        print(f"run already exists; use a new run ID: {run_dir}", file=sys.stderr)
+        return 2
+
+    run_dir.mkdir(parents=True, exist_ok=False)
+    (run_dir / "logs").mkdir(exist_ok=False)
+    totals = _totals(jobs)
+    manifest: dict[str, Any] = {
+        "schema_version": 1,
+        "suite": "rich_scaling",
+        "run_id": run_id,
+        "status": "running",
+        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "config": {
+            "tracks": list(args.tracks),
+            "shared_profiles": list(args.profiles),
+            "tree_profiles": list(args.profiles),
+            "model_seeds": list(args.model_seeds),
+            "device": args.device,
+            "min_free_gb": args.min_free_gb,
+            "allow_download": args.allow_download,
+            "data_root": str(data_root),
+            "results_root": str(results_root),
+            "fail_fast": args.fail_fast,
+        },
+        "protocol": {
+            "purpose": "larger-model scaling for every selected V1/V2/V3/V4 track",
+            "execution": "selected track runners execute sequentially without a shell",
+            "failure_policy": (
+                "stop after first failed track" if args.fail_fast else "continue remaining tracks"
+            ),
+            "tree_profiles": "base/wide/deep/large are forwarded without renaming",
+            "download_policy": (
+                "allow-download is forwarded to Cycle and Tree; Conductance remains "
+                "verified-cache-only because its child contract exposes no download flag"
+            ),
+            "immutability": "a run ID is create-once; existing central runs are never overwritten",
+            "verification": "nonzero return code, missing/wrong summary path, or an incomplete "
+            "non-passed summary fails its track",
+        },
+        "planned_counts": totals,
+        "jobs": jobs,
+        "source_integrity_valid": True,
+        "source_sha256": _source_snapshot(),
+    }
+    manifest_path = run_dir / "manifest.json"
+    _atomic_write_json(manifest_path, manifest)
+    environment = _environment()
+    failed = False
+    interrupted = False
+    print(
+        f"Run: {run_id}; {totals['track_runs']} tracks; "
+        f"{totals['model_trainings']} fresh model trainings",
+        flush=True,
+    )
+    for index, job in enumerate(jobs, start=1):
+        if failed and args.fail_fast:
+            break
+        job["status"] = "running"
+        job["started_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+        _atomic_write_json(manifest_path, manifest)
+        print(f"\n[{index}/{len(jobs)}] {job['track']}", flush=True)
+        started = time.monotonic()
+        try:
+            returncode = _run_logged(job["command"], Path(job["log_path"]), environment)
+            job["returncode"] = returncode
+            if returncode != 0:
+                raise RuntimeError(f"{job['track']} child failed with exit code {returncode}")
+            job["result"] = _validate_child_summary(job)
+            job["status"] = "passed"
+        except KeyboardInterrupt as error:
+            interrupted = True
+            failed = True
+            job["status"] = "failed"
+            job["error"] = f"{type(error).__name__}: {error}"
+        except Exception as error:
+            failed = True
+            job["status"] = "failed"
+            job["error"] = f"{type(error).__name__}: {error}"
+            print(f"Failed {job['track']}: {job['error']}", file=sys.stderr)
+        finally:
+            job["elapsed_seconds"] = time.monotonic() - started
+            job["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+            _atomic_write_json(manifest_path, manifest)
+        if interrupted:
+            break
+
+    try:
+        _check_central_sources(manifest)
+    except Exception as error:
+        failed = True
+        manifest["source_integrity_error"] = f"{type(error).__name__}: {error}"
+        print(f"Failed source integrity: {manifest['source_integrity_error']}", file=sys.stderr)
+
+    manifest["status"] = "failed" if failed else "passed"
+    manifest["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+    manifest["completed_counts"] = {
+        "passed_tracks": sum(job["status"] == "passed" for job in jobs),
+        "failed_tracks": sum(job["status"] == "failed" for job in jobs),
+        "pending_tracks": sum(job["status"] == "pending" for job in jobs),
+        "verified_child_runs": sum(
+            job["expected_counts"]["child_runs"]
+            for job in jobs
+            if job["status"] == "passed" and manifest["source_integrity_valid"] is True
+        ),
+        "verified_model_trainings": sum(
+            job["expected_counts"]["model_trainings"]
+            for job in jobs
+            if job["status"] == "passed" and manifest["source_integrity_valid"] is True
+        ),
+    }
+    _atomic_write_json(manifest_path, manifest)
+    if failed:
+        print(f"Rich scaling failed; inspect {manifest_path}", file=sys.stderr)
+        return 130 if interrupted else 1
+    print(f"Rich scaling passed; manifest: {manifest_path}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# scripts/run_tree_scaling.py
+
+````python
+#!/usr/bin/env python3
+"""Run larger Tree V1/V2 fixed-vs-multi experiments on CSL and ZINC.
+
+Each candidate child trains ``fixed_bfs`` (V1) and ``multi_chart`` (V2) from
+scratch and evaluates only the official validation split.  Profiles are selected
+separately for the two conditions after aggregation across requested model seeds,
+then one test-only child per seed evaluates the selected checkpoints without retraining.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_json  # noqa: E402
+from scripts.check_dependencies import (  # noqa: E402
+    DependencyCheckError,
+    check_dependencies,
+    error_message,
+)
+
+SUITES = ("csl", "zinc")
+MODELS = ("fixed_bfs", "multi_chart")
+PROFILE_CONFIGS: dict[str, dict[str, int]] = {
+    "base": {
+        "hidden_dim": 64,
+        "message_layers": 2,
+        "optimizer_updates": 800,
+        "train_charts_per_graph": 8,
+        "eval_charts_per_graph": 8,
+    },
+    "wide": {
+        "hidden_dim": 128,
+        "message_layers": 2,
+        "optimizer_updates": 800,
+        "train_charts_per_graph": 8,
+        "eval_charts_per_graph": 8,
+    },
+    "deep": {
+        "hidden_dim": 64,
+        "message_layers": 4,
+        "optimizer_updates": 800,
+        "train_charts_per_graph": 8,
+        "eval_charts_per_graph": 8,
+    },
+    "large": {
+        "hidden_dim": 128,
+        "message_layers": 4,
+        "optimizer_updates": 800,
+        "train_charts_per_graph": 8,
+        "eval_charts_per_graph": 8,
+    },
+}
+PROFILES = tuple(PROFILE_CONFIGS)
+DEFAULT_MODEL_SEEDS = (0, 1, 2, 3, 4)
+RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
+
+
+def _csv_subset(value: str, *, choices: tuple[str, ...], option: str) -> tuple[str, ...]:
+    selected = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not selected or len(set(selected)) != len(selected):
+        raise argparse.ArgumentTypeError(f"{option} must be non-empty and unique")
+    unknown = sorted(set(selected) - set(choices))
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"{option} contains unsupported values {unknown}; choose from {list(choices)}"
+        )
+    return selected
+
+
+def _suites(value: str) -> tuple[str, ...]:
+    return _csv_subset(value, choices=SUITES, option="--suites")
+
+
+def _profiles(value: str) -> tuple[str, ...]:
+    return _csv_subset(value, choices=PROFILES, option="--profiles")
+
+
+def _model_seeds(value: str) -> tuple[int, ...]:
+    try:
+        seeds = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "--model-seeds must contain comma-separated integers"
+        ) from error
+    if not seeds or len(set(seeds)) != len(seeds) or any(seed < 0 for seed in seeds):
+        raise argparse.ArgumentTypeError(
+            "--model-seeds must be non-empty, unique, and non-negative"
+        )
+    return seeds
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--suites", type=_suites, default=SUITES)
+    result.add_argument("--profiles", type=_profiles, default=PROFILES)
+    result.add_argument(
+        "--model-seeds",
+        type=_model_seeds,
+        default=DEFAULT_MODEL_SEEDS,
+        help="comma-separated model/minibatch seeds (default: 0,1,2,3,4)",
+    )
+    result.add_argument("--data-seed", type=int, default=0)
+    result.add_argument("--split-seed", type=int, default=0)
+    result.add_argument("--chart-seed", type=int, default=0)
+    result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    result.add_argument("--results-root", type=Path, default=ROOT / "results")
+    result.add_argument("--run-id")
+    result.add_argument("--device", default="cuda")
+    result.add_argument("--batch-size", type=int, default=16)
+    result.add_argument("--workers", type=int, default=0)
+    result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument("--allow-download", action="store_true")
+    result.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
+    result.add_argument("--dry-run", action="store_true", help="print the full plan; no writes")
+    return result
+
+
+def _validate(args: argparse.Namespace) -> None:
+    if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
+        raise ValueError("Tree scaling requires an explicit CUDA device; no CPU fallback")
+    if min(args.data_seed, args.split_seed, args.chart_seed, *args.model_seeds) < 0:
+        raise ValueError("all seed axes must be non-negative")
+    if args.batch_size < 1 or args.workers < 0:
+        raise ValueError("batch size must be positive and workers must be non-negative")
+    if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
+        raise ValueError("minimum free GPU memory must be finite and non-negative")
+    if args.run_id is not None and RUN_ID_PATTERN.fullmatch(args.run_id) is None:
+        raise ValueError("run ID must be 1-120 letters, digits, underscores, or hyphens")
+
+
+def _default_run_id() -> str:
+    return "tree-scaling-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
+    jobs: list[dict[str, Any]] = []
+    data_root = args.data_root.expanduser().resolve()
+    for suite in args.suites:
+        for model_seed in args.model_seeds:
+            for profile in args.profiles:
+                profile_config = dict(PROFILE_CONFIGS[profile])
+                output = run_dir / suite / profile / f"model-seed-{model_seed}"
+                command = [
+                    sys.executable,
+                    "-B",
+                    "-u",
+                    "-m",
+                    "research.tree_augmentation.paper",
+                    "--suite",
+                    suite,
+                    "--data-root",
+                    str(data_root),
+                    "--output-dir",
+                    str(output),
+                    "--device",
+                    args.device,
+                    "--seed",
+                    str(args.data_seed),
+                    "--data-seed",
+                    str(args.data_seed),
+                    "--split-seed",
+                    str(args.split_seed),
+                    "--chart-seed",
+                    str(args.chart_seed),
+                    "--model-seed",
+                    str(model_seed),
+                    "--batch-size",
+                    str(args.batch_size),
+                    "--workers",
+                    str(args.workers),
+                    "--evaluation-scope",
+                    "validation",
+                ]
+                for key, value in profile_config.items():
+                    command.extend(("--" + key.replace("_", "-"), str(value)))
+                if args.allow_download:
+                    command.append("--allow-download")
+                if args.amp is not None:
+                    command.append("--amp" if args.amp else "--no-amp")
+                jobs.append(
+                    {
+                        "suite": suite,
+                        "profile": profile,
+                        "profile_config": profile_config,
+                        "model_seed": model_seed,
+                        "trained_models": list(MODELS),
+                        "status": "pending",
+                        "output_dir": str(output),
+                        "summary_path": str(output / "summary.json"),
+                        "manifest_path": str(output / "manifest.json"),
+                        "log_path": str(
+                            run_dir / "logs" / f"{suite}--{profile}--seed-{model_seed}.log"
+                        ),
+                        "command": command,
+                    }
+                )
+    return jobs
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_snapshot() -> dict[str, Any]:
+    files = sorted((ROOT / "research/tree_augmentation").glob("*.py"))
+    files += sorted((ROOT / "research/tree_augmentation").glob("*.yaml"))
+    files += [
+        Path(__file__).resolve(),
+        ROOT / "scripts/check_dependencies.py",
+        ROOT / "scripts/gpu_preflight.py",
+        ROOT / "src/chartgat/algebra.py",
+        ROOT / "src/chartgat/cache.py",
+        ROOT / "src/chartgat/graphs.py",
+        ROOT / "src/chartgat/seeds.py",
+    ]
+    hashes = {path.relative_to(ROOT).as_posix(): _sha256(path) for path in sorted(set(files))}
+    revision = "unknown"
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            capture_output=True,
+            check=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    return {"git_revision": revision, "sha256": hashes}
+
+
+def _check_sources(manifest: dict[str, Any]) -> None:
+    if _source_snapshot() != manifest["sources"]:
+        manifest["source_integrity_valid"] = False
+        raise RuntimeError("experiment source changed during the run; refusing mixed sources")
+
+
+def _environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    entries = [str(ROOT / "src"), str(ROOT)]
+    if environment.get("PYTHONPATH"):
+        entries.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(entries)
+    environment["PYTHONUNBUFFERED"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    # A stale NVML-based visibility probe can disagree with a MIG allocation.
+    environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+    return environment
+
+
+def _run_logged(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("x", encoding="utf-8", newline="\n") as log:
+        process = subprocess.Popen(
+            command,
+            cwd=ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                log.write(line)
+                log.flush()
+            return process.wait()
+        except BaseException:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+            raise
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+
+
+def _read_mapping(path: Path, label: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise RuntimeError(f"child returned without {label}: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid child {label}: {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"child {label} must contain a JSON object: {path}")
+    return payload
+
+
+def _finite_metric_mapping(values: Any, label: str) -> dict[str, float]:
+    if not isinstance(values, dict) or not values:
+        raise RuntimeError(f"missing child metrics for {label}")
+    result: dict[str, float] = {}
+    for key, value in values.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RuntimeError(f"non-numeric child metric in {label}/{key}")
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            raise RuntimeError(f"non-finite child metric in {label}/{key}")
+        result[str(key)] = numeric
+    return result
+
+
+def _validate_child(job: dict[str, Any]) -> dict[str, Any]:
+    output = Path(job["output_dir"]).resolve()
+    summary_path = Path(job["summary_path"])
+    manifest_path = Path(job["manifest_path"])
+    child_summary = _read_mapping(summary_path, "summary.json")
+    child_manifest = _read_mapping(manifest_path, "manifest.json")
+    if child_manifest.get("status") != "passed" or child_manifest.get("suite") != job["suite"]:
+        raise RuntimeError("child manifest does not certify the requested passed suite")
+    if child_summary.get("suite") != job["suite"]:
+        raise RuntimeError("child summary suite does not match its job")
+    expected_cache_integrity = {
+        "full_cache_loaded": True,
+        "all_declared_splits_validated": True,
+        "loaded_and_validated_splits": ["test", "train", "validation"],
+    }
+    expected_model_split_usage = {
+        "fit_splits": ["train"],
+        "evaluation_splits": ["validation"],
+        "selection_splits": ["validation"],
+        "test_evaluated": False,
+        "test_used_for_selection": False,
+    }
+    if (
+        child_manifest.get("evaluation_scope") != "validation"
+        or child_manifest.get("training_performed") is not True
+        or child_manifest.get("dataset_cache_integrity") != expected_cache_integrity
+        or child_manifest.get("model_split_usage") != expected_model_split_usage
+        or child_summary.get("evaluation_scope") != "validation"
+        or child_summary.get("training_performed") is not True
+        or child_summary.get("test_metrics_emitted") is not False
+        or child_summary.get("dataset_cache_integrity") != expected_cache_integrity
+        or child_summary.get("model_split_usage") != expected_model_split_usage
+    ):
+        raise RuntimeError("candidate child does not certify validation-only profile selection")
+    expected_axes = {
+        "data": int(job["command"][job["command"].index("--data-seed") + 1]),
+        "split": int(job["command"][job["command"].index("--split-seed") + 1]),
+        "chart": int(job["command"][job["command"].index("--chart-seed") + 1]),
+        "model": job["model_seed"],
+    }
+    if (
+        child_summary.get("seed_axes") != expected_axes
+        or child_manifest.get("seed_axes") != expected_axes
+    ):
+        raise RuntimeError("child seed axes do not match the requested job")
+    for payload_name, payload in (("summary", child_summary), ("manifest", child_manifest)):
+        settings = (
+            payload.get("settings")
+            if payload_name == "summary"
+            else payload.get("effective_settings")
+        )
+        if not isinstance(settings, dict) or any(
+            settings.get(key) != value for key, value in job["profile_config"].items()
+        ):
+            raise RuntimeError(f"child {payload_name} does not record the requested profile")
+    if child_manifest.get("settings_overrides") != job["profile_config"]:
+        raise RuntimeError("child manifest does not record the exact scaling overrides")
+    models = child_summary.get("models")
+    if not isinstance(models, dict) or set(models) != set(MODELS):
+        raise RuntimeError("child summary must contain exactly fixed_bfs and multi_chart")
+    expected_quadrants = {
+        "validation_graph_fresh_chart_seen_family",
+        "validation_graph_fresh_chart_unseen_family",
+    }
+    checked_metrics: dict[str, Any] = {}
+    checked_parameters: dict[str, Any] = {}
+    selection_objectives: dict[str, Any] = {}
+    for model_name in MODELS:
+        model = models[model_name]
+        if (
+            not isinstance(model, dict)
+            or model.get("optimizer_updates") != job["profile_config"]["optimizer_updates"]
+        ):
+            raise RuntimeError(f"child {model_name} update count does not match its profile")
+        quadrants = model.get("quadrants")
+        if not isinstance(quadrants, dict) or set(quadrants) != expected_quadrants:
+            raise RuntimeError(f"child {model_name} evaluation quadrants are incomplete")
+        checked_metrics[model_name] = {
+            quadrant: _finite_metric_mapping(values, f"{model_name}/{quadrant}")
+            for quadrant, values in quadrants.items()
+        }
+        parameters = model.get("parameters")
+        if not isinstance(parameters, dict) or set(parameters) != {"total", "trainable"}:
+            raise RuntimeError(f"child {model_name} parameter counts are missing")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in parameters.values()
+        ):
+            raise RuntimeError(f"child {model_name} parameter counts are invalid")
+        if child_summary.get("parameter_counts", {}).get(model_name) != parameters:
+            raise RuntimeError(f"child {model_name} parameter count records disagree")
+        checked_parameters[model_name] = parameters
+        metric_name = "graph_macro_accuracy" if job["suite"] == "csl" else "graph_macro_mae"
+        direction = "maximize" if job["suite"] == "csl" else "minimize"
+        values = [checked_metrics[model_name][quadrant][metric_name] for quadrant in quadrants]
+        objective_value = sum(values) / len(values)
+        selection_objectives[model_name] = {
+            "metric": f"mean_validation_{metric_name}_across_seen_and_unseen_chart_families",
+            "direction": direction,
+            "value": objective_value,
+            "components": {
+                quadrant: checked_metrics[model_name][quadrant][metric_name]
+                for quadrant in quadrants
+            },
+            "rank_score": objective_value if direction == "maximize" else -objective_value,
+        }
+    comparison = child_summary.get("comparison")
+    if not isinstance(comparison, dict) or comparison.get("paper_headline_eligible") is not False:
+        raise RuntimeError("validation candidate must not claim test headline eligibility")
+    if comparison.get("fixed_and_multi_optimizer_updates_matched") is not True:
+        raise RuntimeError("child did not match fixed/multi optimizer updates")
+    checkpoints = child_summary.get("checkpoints")
+    if not isinstance(checkpoints, dict) or set(checkpoints) != set(MODELS):
+        raise RuntimeError("child checkpoints are incomplete")
+    required_artifacts = {"summary.json": summary_path}
+    checked_checkpoints: dict[str, Any] = {}
+    for model_name, raw_path in checkpoints.items():
+        checkpoint = Path(raw_path).expanduser().resolve()
+        if not checkpoint.is_relative_to(output) or not checkpoint.is_file():
+            raise RuntimeError(f"child checkpoint is missing or outside its output: {checkpoint}")
+        required_artifacts[checkpoint.name] = checkpoint
+        checked_checkpoints[model_name] = {"path": str(checkpoint)}
+    artifacts = child_manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise RuntimeError("child manifest artifact table is missing")
+    artifact_hashes: dict[str, str] = {}
+    for name, path in required_artifacts.items():
+        record = artifacts.get(name)
+        digest = _sha256(path)
+        if not isinstance(record, dict) or record.get("sha256") != digest:
+            raise RuntimeError(f"child artifact hash mismatch: {name}")
+        artifact_hashes[name] = digest
+    for model_name in MODELS:
+        checked_checkpoints[model_name]["sha256"] = artifact_hashes[
+            Path(checked_checkpoints[model_name]["path"]).name
+        ]
+    return {
+        "suite": job["suite"],
+        "profile": job["profile"],
+        "profile_config": job["profile_config"],
+        "model_seed": job["model_seed"],
+        "seed_axes": expected_axes,
+        "trained_models": list(MODELS),
+        "parameter_counts": checked_parameters,
+        "quadrant_metrics": checked_metrics,
+        "selection_objectives": selection_objectives,
+        "checkpoints": checked_checkpoints,
+        "child_manifest_sha256": _sha256(manifest_path),
+        "child_summary_sha256": _sha256(summary_path),
+        "artifact_sha256": artifact_hashes,
+        "child_metrics_checked": True,
+        "dataset_cache_integrity": expected_cache_integrity,
+        "model_split_usage": expected_model_split_usage,
+        "test_evaluated": False,
+        "test_used_for_selection": False,
+    }
+
+
+def _select_profiles(
+    candidate_jobs: list[dict[str, Any]],
+    *,
+    suite: str,
+    model_seeds: tuple[int, ...],
+    profiles: tuple[str, ...],
+) -> dict[str, Any]:
+    candidates = {
+        (job["profile"], job["model_seed"]): job for job in candidate_jobs if job["suite"] == suite
+    }
+    expected = {(profile, seed) for profile in profiles for seed in model_seeds}
+    if set(candidates) != expected or any(
+        candidates[key].get("status") != "passed" for key in expected
+    ):
+        raise RuntimeError(f"incomplete validation candidates for {suite}")
+    conditions: dict[str, Any] = {}
+    for model_name in MODELS:
+        profile_aggregates: dict[str, Any] = {}
+        for profile in profiles:
+            components = [
+                {
+                    "model_seed": seed,
+                    **candidates[(profile, seed)]["result"]["selection_objectives"][model_name],
+                }
+                for seed in model_seeds
+            ]
+            direction = components[0]["direction"]
+            value = sum(component["value"] for component in components) / len(components)
+            profile_aggregates[profile] = {
+                "metric": components[0]["metric"],
+                "direction": direction,
+                "value": value,
+                "rank_score": value if direction == "maximize" else -value,
+                "seed_components": components,
+            }
+        selected_profile = max(
+            profiles,
+            key=lambda profile: profile_aggregates[profile]["rank_score"],
+        )
+        selected_by_seed: dict[str, Any] = {}
+        for seed in model_seeds:
+            result = candidates[(selected_profile, seed)]["result"]
+            selected_by_seed[str(seed)] = {
+                "checkpoint": result["checkpoints"][model_name],
+                "parameter_counts": result["parameter_counts"][model_name],
+                "validation_metrics": result["quadrant_metrics"][model_name],
+                "candidate_summary_sha256": result["child_summary_sha256"],
+            }
+        conditions[model_name] = {
+            "selected_profile": selected_profile,
+            "profile_config": dict(PROFILE_CONFIGS[selected_profile]),
+            "aggregate_validation_objective": profile_aggregates[selected_profile],
+            "all_profile_aggregate_objectives": profile_aggregates,
+            "selected_checkpoints_by_model_seed": selected_by_seed,
+            "tie_break_order": list(profiles),
+        }
+    return {
+        "suite": suite,
+        "selection_split": "validation",
+        "aggregation_axis": "mean_across_requested_model_seeds",
+        "model_seeds": list(model_seeds),
+        "conditions_selected_independently": True,
+        "test_metrics_used_for_selection": False,
+        "conditions": conditions,
+    }
+
+
+def _make_selected_test_job(
+    args: argparse.Namespace,
+    run_dir: Path,
+    selection: dict[str, Any],
+    model_seed: int,
+) -> dict[str, Any]:
+    suite = selection["suite"]
+    selected_inputs = {
+        name: {
+            "selected_profile": selection["conditions"][name]["selected_profile"],
+            "profile_config": selection["conditions"][name]["profile_config"],
+            **selection["conditions"][name]["selected_checkpoints_by_model_seed"][str(model_seed)],
+        }
+        for name in MODELS
+    }
+    output = run_dir / "selected-test" / suite / f"model-seed-{model_seed}"
+    command = [
+        sys.executable,
+        "-B",
+        "-u",
+        "-m",
+        "research.tree_augmentation.paper",
+        "--suite",
+        suite,
+        "--data-root",
+        str(args.data_root.expanduser().resolve()),
+        "--output-dir",
+        str(output),
+        "--device",
+        args.device,
+        "--seed",
+        str(args.data_seed),
+        "--data-seed",
+        str(args.data_seed),
+        "--split-seed",
+        str(args.split_seed),
+        "--chart-seed",
+        str(args.chart_seed),
+        "--model-seed",
+        str(model_seed),
+        "--batch-size",
+        str(args.batch_size),
+        "--workers",
+        str(args.workers),
+        "--eval-charts-per-graph",
+        str(PROFILE_CONFIGS["base"]["eval_charts_per_graph"]),
+        "--evaluation-scope",
+        "selected_test",
+        "--fixed-checkpoint",
+        selected_inputs["fixed_bfs"]["checkpoint"]["path"],
+        "--multi-checkpoint",
+        selected_inputs["multi_chart"]["checkpoint"]["path"],
+    ]
+    if args.allow_download:
+        command.append("--allow-download")
+    if args.amp is not None:
+        command.append("--amp" if args.amp else "--no-amp")
+    return {
+        "suite": suite,
+        "model_seed": model_seed,
+        "selection": selection,
+        "selected_inputs": selected_inputs,
+        "evaluated_models": list(MODELS),
+        "status": "pending",
+        "output_dir": str(output),
+        "summary_path": str(output / "summary.json"),
+        "manifest_path": str(output / "manifest.json"),
+        "log_path": str(run_dir / "logs" / f"{suite}--selected-test--seed-{model_seed}.log"),
+        "command": command,
+    }
+
+
+def _validate_selected_test(job: dict[str, Any]) -> dict[str, Any]:
+    summary_path = Path(job["summary_path"])
+    manifest_path = Path(job["manifest_path"])
+    child_summary = _read_mapping(summary_path, "selected-test summary.json")
+    child_manifest = _read_mapping(manifest_path, "selected-test manifest.json")
+    expected_axes = {
+        "data": int(job["command"][job["command"].index("--data-seed") + 1]),
+        "split": int(job["command"][job["command"].index("--split-seed") + 1]),
+        "chart": int(job["command"][job["command"].index("--chart-seed") + 1]),
+        "model": job["model_seed"],
+    }
+    expected_cache_integrity = {
+        "full_cache_loaded": True,
+        "all_declared_splits_validated": True,
+        "loaded_and_validated_splits": ["test", "train", "validation"],
+    }
+    expected_model_split_usage = {
+        "fit_splits": [],
+        "evaluation_splits": ["test"],
+        "selection_splits": [],
+        "test_evaluated": True,
+        "test_used_for_selection": False,
+    }
+    if (
+        child_manifest.get("status") != "passed"
+        or child_manifest.get("suite") != job["suite"]
+        or child_manifest.get("seed_axes") != expected_axes
+        or child_manifest.get("evaluation_scope") != "selected_test"
+        or child_manifest.get("training_performed") is not False
+        or child_manifest.get("dataset_cache_integrity") != expected_cache_integrity
+        or child_manifest.get("model_split_usage") != expected_model_split_usage
+    ):
+        raise RuntimeError(
+            "selected-test manifest does not certify test-only checkpoint evaluation"
+        )
+    if (
+        child_summary.get("suite") != job["suite"]
+        or child_summary.get("seed_axes") != expected_axes
+        or child_summary.get("evaluation_scope") != "selected_test"
+        or child_summary.get("training_performed") is not False
+        or child_summary.get("test_metrics_emitted") is not True
+        or child_summary.get("test_evaluations_per_selected_checkpoint") != 1
+        or child_summary.get("dataset_cache_integrity") != expected_cache_integrity
+        or child_summary.get("model_split_usage") != expected_model_split_usage
+    ):
+        raise RuntimeError("selected-test summary does not certify exactly one test phase")
+    selection = job["selection"]
+    selected_inputs = job["selected_inputs"]
+    expected_inputs = {name: selected_inputs[name]["checkpoint"] for name in MODELS}
+    if (
+        child_summary.get("selected_checkpoints") != expected_inputs
+        or child_manifest.get("selected_checkpoint_inputs") != expected_inputs
+    ):
+        raise RuntimeError("selected-test child did not use the selected checkpoint hashes")
+    for record in expected_inputs.values():
+        path = Path(record["path"])
+        if not path.is_file() or _sha256(path) != record["sha256"]:
+            raise RuntimeError("a selected checkpoint changed before result acceptance")
+    expected_quadrants = {
+        "test_graph_fresh_chart_seen_family",
+        "test_graph_fresh_chart_unseen_family",
+    }
+    models = child_summary.get("models")
+    if not isinstance(models, dict) or set(models) != set(MODELS):
+        raise RuntimeError("selected-test summary arms are incomplete")
+    checked_metrics: dict[str, Any] = {}
+    checked_parameters: dict[str, Any] = {}
+    for model_name in MODELS:
+        model = models[model_name]
+        if (
+            not isinstance(model, dict)
+            or model.get("training_performed") is not False
+            or model.get("history") != []
+        ):
+            raise RuntimeError(f"selected-test {model_name} appears to have been retrained")
+        quadrants = model.get("quadrants")
+        if not isinstance(quadrants, dict) or set(quadrants) != expected_quadrants:
+            raise RuntimeError(f"selected-test {model_name} quadrants are incomplete")
+        checked_metrics[model_name] = {
+            quadrant: _finite_metric_mapping(values, f"selected-test/{model_name}/{quadrant}")
+            for quadrant, values in quadrants.items()
+        }
+        parameters = model.get("parameters")
+        expected_profile = selected_inputs[model_name]["profile_config"]
+        expected_parameters = selected_inputs[model_name]["parameter_counts"]
+        if (
+            not isinstance(parameters, dict)
+            or parameters != child_summary.get("parameter_counts", {}).get(model_name)
+            or parameters != expected_parameters
+        ):
+            raise RuntimeError(f"selected-test {model_name} parameter counts are inconsistent")
+        checkpoint_settings = child_summary.get("selected_checkpoint_settings", {}).get(model_name)
+        if not isinstance(checkpoint_settings, dict) or any(
+            checkpoint_settings.get(key) != value for key, value in expected_profile.items()
+        ):
+            raise RuntimeError(f"selected-test {model_name} architecture/profile mismatch")
+        checked_parameters[model_name] = parameters
+    artifacts = child_manifest.get("artifacts")
+    summary_digest = _sha256(summary_path)
+    if (
+        not isinstance(artifacts, dict)
+        or set(artifacts) != {"summary.json"}
+        or not isinstance(artifacts["summary.json"], dict)
+        or artifacts["summary.json"].get("sha256") != summary_digest
+    ):
+        raise RuntimeError("selected-test summary artifact hash is invalid")
+    return {
+        "suite": job["suite"],
+        "model_seed": job["model_seed"],
+        "evaluation_scope": "selected_test",
+        "training_performed": False,
+        "selected_profiles": {
+            name: selection["conditions"][name]["selected_profile"] for name in MODELS
+        },
+        "selected_checkpoints": expected_inputs,
+        "test_metrics": checked_metrics,
+        "parameter_counts": checked_parameters,
+        "dataset_cache_integrity": expected_cache_integrity,
+        "model_split_usage": expected_model_split_usage,
+        "test_evaluated": True,
+        "test_used_for_selection": False,
+        "test_evaluations_per_selected_checkpoint": 1,
+        "child_manifest_sha256": _sha256(manifest_path),
+        "child_summary_sha256": summary_digest,
+    }
+
+
+def _aggregate_summary(manifest: dict[str, Any]) -> dict[str, Any]:
+    completed = [job for job in manifest["jobs"] if job["status"] == "passed"]
+    failed = [job for job in manifest["jobs"] if job["status"] == "failed"]
+    selected_jobs = manifest.get("selected_test_jobs", [])
+    completed_selected = [job for job in selected_jobs if job["status"] == "passed"]
+    failed_selected = [job for job in selected_jobs if job["status"] == "failed"]
+    return {
+        "schema_version": 2,
+        "suite": "tree_scaling",
+        "run_id": manifest["run_id"],
+        "status": manifest["status"],
+        "planned_child_runs": len(manifest["jobs"]),
+        "planned_model_trainings": len(manifest["jobs"]) * len(MODELS),
+        "completed_child_runs": len(completed),
+        "completed_model_trainings": len(completed) * len(MODELS),
+        "failed_child_runs": len(failed),
+        "planned_profile_selections": manifest["planned_profile_selections"],
+        "completed_profile_selections": len(manifest.get("selections", [])) * len(MODELS),
+        "planned_selected_test_runs": manifest["planned_selected_test_runs"],
+        "completed_selected_test_runs": len(completed_selected),
+        "failed_selected_test_runs": len(failed_selected),
+        "planned_selected_checkpoint_test_evaluations": manifest["planned_selected_test_runs"]
+        * len(MODELS),
+        "completed_selected_checkpoint_test_evaluations": len(completed_selected) * len(MODELS),
+        "models_per_child": list(MODELS),
+        "profile_configs": manifest["config"]["profile_configs"],
+        "chart_family_isolation": manifest["protocol"]["chart_family_isolation"],
+        "results": [job["result"] for job in completed],
+        "selections": manifest.get("selections", []),
+        "selected_test_results": [job["result"] for job in completed_selected],
+        **({"error": manifest["error"]} if "error" in manifest else {}),
+    }
+
+
+def _write_state(run_dir: Path, manifest: dict[str, Any]) -> None:
+    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(run_dir / "summary.json", _aggregate_summary(manifest))
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        _validate(args)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    run_id = args.run_id or _default_run_id()
+    run_dir = (
+        args.results_root.expanduser().resolve() / "tree_augmentation/scaling" / run_id
+    ).resolve()
+    data_root = args.data_root.expanduser().resolve()
+    if (
+        run_dir == data_root
+        or run_dir.is_relative_to(data_root)
+        or data_root.is_relative_to(run_dir)
+    ):
+        print("experiment outputs and dataset directories must not overlap", file=sys.stderr)
+        return 2
+    jobs = make_jobs(args, run_dir)
+    planned_selected_test_runs = len(args.suites) * len(args.model_seeds)
+    if args.dry_run:
+        print(
+            f"{len(jobs)} validation-candidate child runs; "
+            f"{len(jobs) * len(MODELS)} fresh model trainings; "
+            f"{len(args.suites) * len(MODELS)} aggregate profile selections; "
+            f"{planned_selected_test_runs * len(MODELS)} selected-checkpoint test evaluations"
+        )
+        for job in jobs:
+            print(shlex.join(job["command"]))
+        print(f"Aggregate: {run_dir / 'summary.json'}")
+        return 0
+    if run_dir.exists():
+        print(f"run already exists; use a new run ID: {run_dir}", file=sys.stderr)
+        return 2
+    try:
+        dependencies = check_dependencies()
+    except DependencyCheckError as error:
+        print(error_message(error), file=sys.stderr)
+        return error.exit_code
+    run_dir.mkdir(parents=True, exist_ok=False)
+    manifest: dict[str, Any] = {
+        "schema_version": 2,
+        "suite": "tree_scaling",
+        "run_id": run_id,
+        "status": "running",
+        "source_integrity_valid": True,
+        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "config": {
+            "suites": list(args.suites),
+            "profiles": list(args.profiles),
+            "profile_configs": {profile: PROFILE_CONFIGS[profile] for profile in args.profiles},
+            "model_seeds": list(args.model_seeds),
+            "data_seed": args.data_seed,
+            "split_seed": args.split_seed,
+            "chart_seed": args.chart_seed,
+            "device": args.device,
+            "batch_size": args.batch_size,
+            "workers": args.workers,
+            "amp_override": args.amp,
+            "allow_download": args.allow_download,
+            "data_root": str(data_root),
+        },
+        "models_per_child": list(MODELS),
+        "planned_child_runs": len(jobs),
+        "planned_model_trainings": len(jobs) * len(MODELS),
+        "planned_selected_test_runs": planned_selected_test_runs,
+        "planned_profile_selections": len(args.suites) * len(MODELS),
+        "jobs": jobs,
+        "selections": [],
+        "selected_test_jobs": [],
+        "dependencies": dependencies,
+        "sources": _source_snapshot(),
+        "protocol": {
+            "fresh_training": "every profile/seed/suite child trains V1 fixed_bfs and V2 "
+            "multi_chart independently; no checkpoint or score reuse",
+            "scaling_axes": "model width and real encoder message-layer depth",
+            "controlled_budget": "all profiles use 800 optimizer updates, 8 multi-chart "
+            "training views per graph, and 8 evaluation charts per family",
+            "paired_comparison": "within each child both arms use the same model width, update "
+            "count, initialization seed, batch size, dataset split, and evaluation charts",
+            "chart_family_isolation": {
+                "fixed_train": "one bfs chart rooted at node 0 per graph",
+                "multi_train": "8 charts per graph split across random-root bfs/dfs",
+                "seen_evaluation": "fresh random-root bfs charts",
+                "unseen_evaluation": "fresh Wilson uniform spanning-tree charts",
+                "evaluation_charts_per_family": 8,
+            },
+            "selection": {
+                "split": "official validation only; full caches are integrity-validated, but "
+                "candidate model paths do not evaluate test data or use test metrics",
+                "by": "suite x condition (fixed_bfs and multi_chart separately), using the "
+                "mean preregistered scalar across all requested model seeds",
+                "csl_objective": "maximize mean graph_macro_accuracy across fresh BFS and "
+                "fresh Wilson validation chart families",
+                "zinc_objective": "minimize mean graph_macro_mae across fresh BFS and fresh "
+                "Wilson validation chart families",
+                "tie_break": "first profile in the preregistered --profiles order",
+                "test": "one test-only phase per selected checkpoint; no optimizer or retraining",
+            },
+            "failure_policy": "stop at first failed or unverifiable child; leave pending jobs "
+            "unclaimed and publish failed aggregate state",
+            "uncertainty": "default five model seeds; report per-seed metrics without "
+            "pretending child models are independent datasets",
+            "device": "CUDA required; no CPU fallback",
+        },
+    }
+    _write_state(run_dir, manifest)
+    environment = _environment()
+    current_job: dict[str, Any] | None = None
+    try:
+        preflight_path = run_dir / "gpu-preflight.json"
+        preflight = [
+            sys.executable,
+            "-B",
+            str(ROOT / "scripts/gpu_preflight.py"),
+            "--device",
+            args.device,
+            "--require-paper-deps",
+            "--min-free-gb",
+            str(args.min_free_gb),
+            "--json-out",
+            str(preflight_path),
+        ]
+        status = _run_logged(preflight, run_dir / "logs/preflight.log", environment)
+        if status:
+            raise RuntimeError(f"GPU preflight failed with exit code {status}")
+        preflight_result = _read_mapping(preflight_path, "gpu-preflight.json")
+        if preflight_result.get("status") != "passed":
+            raise RuntimeError("GPU preflight returned without a passed certificate")
+        manifest["gpu_preflight"] = {
+            "path": str(preflight_path),
+            "sha256": _sha256(preflight_path),
+        }
+        _write_state(run_dir, manifest)
+        print(
+            f"Run: {run_id}; {len(jobs)} child runs; "
+            f"{len(jobs) * len(MODELS)} fresh model trainings",
+            flush=True,
+        )
+        for index, job in enumerate(jobs, start=1):
+            current_job = job
+            _check_sources(manifest)
+            job["status"] = "running"
+            _write_state(run_dir, manifest)
+            print(
+                f"\n[{index}/{len(jobs)}] {job['suite']} / {job['profile']} / "
+                f"model seed {job['model_seed']} (fixed_bfs + multi_chart)",
+                flush=True,
+            )
+            started = time.monotonic()
+            status = _run_logged(job["command"], Path(job["log_path"]), environment)
+            job.update(exit_code=status, elapsed_seconds=time.monotonic() - started)
+            _check_sources(manifest)
+            if status:
+                raise RuntimeError(
+                    f"{job['suite']}/{job['profile']}/seed-{job['model_seed']} failed "
+                    f"with exit code {status}"
+                )
+            job["result"] = _validate_child(job)
+            job["status"] = "passed"
+            _write_state(run_dir, manifest)
+            current_job = None
+        for suite in args.suites:
+            _check_sources(manifest)
+            selection = _select_profiles(
+                jobs,
+                suite=suite,
+                model_seeds=args.model_seeds,
+                profiles=args.profiles,
+            )
+            manifest["selections"].append(selection)
+            _write_state(run_dir, manifest)
+            for model_seed in args.model_seeds:
+                selected_job = _make_selected_test_job(args, run_dir, selection, model_seed)
+                manifest["selected_test_jobs"].append(selected_job)
+                current_job = selected_job
+                selected_job["status"] = "running"
+                _write_state(run_dir, manifest)
+                print(
+                    f"\n[selected test] {suite} / model seed {model_seed}: "
+                    f"fixed={selection['conditions']['fixed_bfs']['selected_profile']}, "
+                    f"multi={selection['conditions']['multi_chart']['selected_profile']}",
+                    flush=True,
+                )
+                started = time.monotonic()
+                status = _run_logged(
+                    selected_job["command"], Path(selected_job["log_path"]), environment
+                )
+                selected_job.update(
+                    exit_code=status,
+                    elapsed_seconds=time.monotonic() - started,
+                )
+                _check_sources(manifest)
+                if status:
+                    raise RuntimeError(
+                        f"{suite}/seed-{model_seed} selected test failed with exit code {status}"
+                    )
+                selected_job["result"] = _validate_selected_test(selected_job)
+                selected_job["status"] = "passed"
+                _write_state(run_dir, manifest)
+                current_job = None
+        _check_sources(manifest)
+        manifest.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+    except (Exception, KeyboardInterrupt) as error:
+        manifest.update(
+            status="failed",
+            error=f"{type(error).__name__}: {error}",
+            finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+        )
+        if current_job is not None:
+            current_job.update(status="failed", error=manifest["error"])
+        _write_state(run_dir, manifest)
+        print(
+            f"Failed: {manifest['error']}\nSaved partial results: {run_dir}",
+            file=sys.stderr,
+        )
+        return 130 if isinstance(error, KeyboardInterrupt) else 1
+    _write_state(run_dir, manifest)
+    print(f"Passed aggregate: {run_dir / 'summary.json'}", flush=True)
     return 0
 
 
@@ -46291,6 +51197,349 @@ def test_no_edges_and_nonfinite_c_are_explicit(interventions, torch):
     assert all(not operator._forward_hooks for operator in model.operators)
 ````
 
+# tests/test_conductance_scaling_runner.py
+
+````python
+"""Architecture-scaling orchestration contracts; subprocesses are always mocked."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+
+import pytest
+
+from research.conductance_gat import benchmark
+from research.conductance_gat.ablation import train as ablation_train
+from research.conductance_gat.v2 import train as v2_train
+from research.conductance_gat.v3 import train as v3_train
+from research.conductance_gat.v4 import train as v4_train
+from scripts import run_conductance_scaling as runner
+
+
+def _argument(command: list[str], name: str) -> str:
+    return command[command.index(name) + 1]
+
+
+def test_default_plan_covers_all_versions_profiles_five_seeds_and_supported_datasets():
+    args = runner.parser().parse_args([])
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert args.versions == ["v1", "v2", "v3", "v4"]
+    assert args.profiles == ["base", "wide", "deep", "large"]
+    assert args.model_seeds == [0, 1, 2, 3, 4]
+    assert len(jobs) == 860
+    assert {job["profile"] for job in jobs} == set(runner.PROFILES)
+    assert {job["model_seed"] for job in jobs} == set(runner.DEFAULT_MODEL_SEEDS)
+    assert not any(job["version"] == "v2" and job["dataset"] == "ppi" for job in jobs)
+    assert any(job["version"] == "v1" and job["dataset"] == "ppi" for job in jobs)
+    assert any(job["version"] == "v4" and job["dataset"] == "ppi" for job in jobs)
+
+
+@pytest.mark.parametrize(
+    "mutated_relative_path",
+    ["scripts/run_conductance_factorial.py", "scripts/check_dependencies.py"],
+)
+def test_source_inventory_covers_imported_scripts_and_rejects_mutation(
+    monkeypatch, mutated_relative_path
+):
+    snapshot = runner._source_snapshot()
+    imported_scripts = {
+        "scripts/run_conductance_factorial.py",
+        "scripts/check_dependencies.py",
+    }
+    assert imported_scripts <= snapshot.keys()
+
+    target = (runner.ROOT / mutated_relative_path).resolve()
+    original_read_bytes = Path.read_bytes
+
+    def read_bytes_with_mutation(path):
+        contents = original_read_bytes(path)
+        if path.resolve() == target:
+            return contents + b"\n# simulated source mutation\n"
+        return contents
+
+    manifest = {"source_sha256": snapshot, "source_integrity_valid": True}
+    monkeypatch.setattr(Path, "read_bytes", read_bytes_with_mutation)
+    with pytest.raises(RuntimeError, match="source changed during execution"):
+        runner._check_sources(manifest)
+    assert manifest["source_integrity_valid"] is False
+
+
+def test_large_profile_is_forwarded_to_every_child_and_outputs_are_unique():
+    args = runner.parser().parse_args(
+        [
+            "--profiles",
+            "large",
+            "--datasets",
+            "cora",
+            "--model-seeds",
+            "3",
+            "4",
+        ]
+    )
+    runner._validate(args)
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert len(jobs) == 18
+    assert len({job["output_dir"] for job in jobs}) == len(jobs)
+    for job in jobs:
+        assert _argument(job["command"], "--hidden-channels") == "128"
+        assert _argument(job["command"], "--layers") == "4"
+        assert _argument(job["command"], "--dropout") == "0.5"
+        assert job["architecture"] == runner.PROFILES["large"]
+        module = _argument(job["command"], "-m")
+        if job["version"] == "v1":
+            assert module == "research.conductance_gat.scaling_v1"
+            assert "--condition" not in job["command"]
+        else:
+            assert _argument(job["command"], "--condition") == job["condition"]
+
+
+def test_explicit_ppi_records_v2_as_not_applicable_instead_of_inventing_transfer():
+    args = runner.parser().parse_args(["--datasets", "ppi"])
+    jobs = runner.make_jobs(args, Path("fixture"))
+    exclusions = runner._exclusions(args)
+    assert {job["version"] for job in jobs} == {"v1", "v3", "v4"}
+    assert exclusions == [
+        {
+            "version": "v2",
+            "dataset": "ppi",
+            "status": "not_applicable",
+            "reason": (
+                "V2 direct edge conductances are bound to one fixed topology and cannot "
+                "transfer to held-out PPI graphs"
+            ),
+        }
+    ]
+
+
+@pytest.mark.parametrize("option", ["--help", "--dry-run"])
+def test_stdlib_inspection_has_no_writes(tmp_path, option):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-S",
+            str(runner.ROOT / "scripts/run_conductance_scaling.py"),
+            option,
+            "--results-root",
+            str(tmp_path),
+            "--versions",
+            "v1",
+            "--profiles",
+            "base",
+            "--datasets",
+            "cora",
+            "--model-seeds",
+            "0",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_v2_v3_v4_children_accept_and_record_real_architecture_overrides():
+    v2_args = v2_train.build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            "direct_c",
+            "--output-dir",
+            "unused",
+            "--hidden-channels",
+            "128",
+            "--layers",
+            "4",
+            "--dropout",
+            "0.25",
+        ]
+    )
+    v3_args = v3_train.build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            "relative_c",
+            "--output-dir",
+            "unused",
+            "--hidden-channels",
+            "128",
+            "--layers",
+            "4",
+            "--dropout",
+            "0.25",
+        ]
+    )
+    v4_args = v4_train.build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            "relative_c_spatial_w",
+            "--output-dir",
+            "unused",
+            "--hidden-channels",
+            "128",
+            "--layers",
+            "4",
+            "--dropout",
+            "0.25",
+        ]
+    )
+    for args, validate, configuration in (
+        (v2_args, v2_train._validate_args, v2_train.configuration),
+        (v3_args, v3_train._validate_args, v3_train.configuration),
+        (v4_args, v4_train._validate_args, v4_train.configuration),
+    ):
+        validate(args)
+        actual = configuration(args)
+        assert {key: actual[key] for key in ("hidden_channels", "layers", "dropout")} == {
+            "hidden_channels": 128,
+            "layers": 4,
+            "dropout": 0.25,
+        }
+
+    defaults = ablation_train.build_parser().parse_args(
+        ["--dataset", "cora", "--condition", "baseline", "--output-dir", "unused"]
+    )
+    assert ablation_train.architecture_configuration(defaults) == {
+        "hidden_channels": 64,
+        "layers": 2,
+        "dropout": 0.5,
+    }
+
+
+def test_v1_validation_only_path_does_not_construct_a_test_loader(monkeypatch):
+    class FakeData:
+        def __init__(self, **values):
+            self.values = values
+
+    class FakeLoader:
+        def __init__(self, graphs, **kwargs):
+            self.graphs = graphs
+            self.kwargs = kwargs
+
+    geometric = ModuleType("torch_geometric")
+    data_module = ModuleType("torch_geometric.data")
+    loader_module = ModuleType("torch_geometric.loader")
+    data_module.Data = FakeData
+    loader_module.DataLoader = FakeLoader
+    monkeypatch.setitem(sys.modules, "torch_geometric", geometric)
+    monkeypatch.setitem(sys.modules, "torch_geometric.data", data_module)
+    monkeypatch.setitem(sys.modules, "torch_geometric.loader", loader_module)
+    payload = {
+        "dataset": "ppi",
+        "graphs": [{"identifier": index} for index in range(4)],
+        "splits": {"train": [0, 1], "validation": [2], "test": [3]},
+    }
+    args = SimpleNamespace(
+        validation_only=True,
+        model_seed=0,
+        batch_size=2,
+        workers=0,
+        pin_memory=True,
+    )
+    loaders, indices = benchmark._make_loaders(payload, args, benchmark.torch.device("cpu"))
+    assert indices is None
+    assert set(loaders) == {"train", "validation"}
+    observed = [
+        graph.values["identifier"] for loader in loaders.values() for graph in loader.graphs
+    ]
+    assert observed == [0, 1, 2]
+    assert 3 not in observed
+
+
+def _stub(tmp_path, monkeypatch, *, expose_test: bool = False):
+    calls: list[list[str]] = []
+    monkeypatch.setattr(runner, "check_dependencies", lambda: {"unit_fixture_only": True})
+    monkeypatch.setattr(runner, "_source_snapshot", lambda: {"unit-source": "stable"})
+
+    def dispatch(command, log, environment):
+        calls.append(command)
+        if any(Path(part).name == "gpu_preflight.py" for part in command):
+            return 0
+        output = Path(_argument(command, "--output-dir"))
+        output.mkdir(parents=True)
+        architecture = {
+            "hidden_channels": int(_argument(command, "--hidden-channels")),
+            "layers": int(_argument(command, "--layers")),
+            "dropout": float(_argument(command, "--dropout")),
+        }
+        record = {
+            "status": "passed",
+            "dataset": _argument(command, "--dataset"),
+            "condition": (
+                _argument(command, "--condition") if "--condition" in command else "conductance"
+            ),
+            "model_seed": int(_argument(command, "--model-seed")),
+            "configuration": architecture,
+            "evaluation_split": "validation",
+            "test_evaluated": False,
+            "validation": 0.75,
+            "metric_name": "accuracy",
+            "best_epoch": 3,
+            "epochs_run": 5,
+            "trainable_parameters": 1234,
+            "total_parameters": 1300,
+            "elapsed_seconds": 1.5,
+            "peak_cuda_allocated_bytes": 2048,
+        }
+        if expose_test:
+            record["test"] = 0.9
+        (output / "metrics.json").write_text(json.dumps(record), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(runner.shared, "run_logged", dispatch)
+    options = [
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        "unit-fixture",
+        "--versions",
+        "v1",
+        "v4",
+        "--profiles",
+        "base",
+        "--datasets",
+        "cora",
+        "--model-seeds",
+        "0",
+        "1",
+    ]
+    return options, calls
+
+
+def test_success_is_released_only_after_every_child_metric_is_valid(tmp_path, monkeypatch):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    assert len(calls) == 11  # preflight + (V1 1 + V4 4) x two seeds
+    root = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "passed"
+    assert all(job["status"] == "passed" for job in manifest["jobs"])
+    assert summary["valid_for_validation_comparison"] is True
+    assert summary["test_evaluated"] is False
+    assert {row["n"] for row in summary["rows"]} == {2}
+    assert all(row["validation_mean"] == 0.75 for row in summary["rows"])
+
+
+def test_any_test_metric_fails_closed_and_stops_following_children(tmp_path, monkeypatch):
+    options, calls = _stub(tmp_path, monkeypatch, expose_test=True)
+    assert runner.main(options) == 1
+    assert len(calls) == 2
+    summary = json.loads(
+        (tmp_path / "conductance_gat/scaling/unit-fixture/summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["status"] == "failed"
+    assert summary["valid_for_validation_comparison"] is False
+````
+
 # tests/test_conductance_v2_report.py
 
 ````python
@@ -48538,6 +53787,405 @@ def test_source_snapshot_covers_all_v4_and_shared_execution_code():
         "research/conductance_gat/v4/reproduce.sh",
     ):
         assert name in snapshot and len(snapshot[name]) == 64
+````
+
+# tests/test_cycle_scaling_runner.py
+
+````python
+"""Contracts for the V1+V2 Cycle PE larger-model scaling runner."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+import json
+from pathlib import Path
+
+import pytest
+
+from scripts import run_cycle_scaling as scaling
+
+
+def _args(*extra: str):
+    return scaling.parser().parse_args(list(extra))
+
+
+def test_default_matrix_runs_both_versions_all_profiles_and_five_seeds(tmp_path):
+    args = _args("--results-root", str(tmp_path))
+    scaling._validate(args)
+    jobs = scaling.make_jobs(args, scaling._run_dir(args, "matrix"))
+    assert args.model_seeds == (0, 1, 2, 3, 4)
+    assert len(jobs) == 2 * 4 * 5
+    assert len(jobs) * len(args.datasets) == 80
+    assert {(job["version"], job["profile"]) for job in jobs} == {
+        (version, profile) for version in scaling.VERSIONS for profile in scaling.PROFILE_ORDER
+    }
+    assert all(job["datasets"] == ["zinc12k", "peptides_struct"] for job in jobs)
+    assert len({job["output_dir"] for job in jobs}) == len(jobs)
+
+
+@pytest.mark.parametrize("version", scaling.VERSIONS)
+@pytest.mark.parametrize("profile", scaling.PROFILE_ORDER)
+def test_child_commands_use_real_version_cli_and_exact_profile(version, profile, tmp_path):
+    args = _args(
+        "--versions",
+        version,
+        "--profiles",
+        profile,
+        "--model-seeds",
+        "7",
+        "--device",
+        "cuda:0",
+        "--results-root",
+        str(tmp_path),
+    )
+    job = scaling.make_jobs(args, scaling._run_dir(args, "commands"))[0]
+    command = job["command"]
+    assert command[3:5] == ["-m", scaling.MODULES[version]]
+    child_parser = (
+        __import__("research.cycle_pe.benchmark", fromlist=["parser"]).parser
+        if version == "v1"
+        else __import__("research.cycle_pe.v2.benchmark", fromlist=["parser"]).parser
+    )
+    child = child_parser().parse_args(command[5:])
+    expected = scaling.PROFILES[profile]
+    assert (child.hidden_dim, child.pe_dim, child.layers) == (
+        expected["hidden_dim"],
+        expected["pe_dim"],
+        expected["layers"],
+    )
+    assert child.datasets == ["zinc12k", "peptides_struct"]
+    assert child.model_seed == 7 and child.device == "cuda:0"
+    assert child.max_parameters == 5_000_000
+    assert child.validation_only is True
+    assert child.test_checkpoint is None
+    if version == "v2":
+        assert child.basis_execution == "batched" and child.basis_pair_budget == 32768
+
+
+def test_profiles_include_independent_width_depth_and_combined_growth():
+    assert scaling.PROFILES == {
+        "base": {"hidden_dim": 64, "pe_dim": 32, "layers": 3},
+        "wide": {"hidden_dim": 128, "pe_dim": 64, "layers": 3},
+        "deep": {"hidden_dim": 64, "pe_dim": 32, "layers": 6},
+        "large": {"hidden_dim": 128, "pe_dim": 64, "layers": 6},
+    }
+
+
+def test_direct_runner_environment_explicitly_unsets_nvml_cuda_check(monkeypatch):
+    monkeypatch.setenv("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
+    assert "PYTORCH_NVML_BASED_CUDA_CHECK" not in scaling._environment()
+    assert "src/chartgat/algebra.py" in scaling.SOURCE_FILES
+
+
+def _row(version: str, dataset: str, profile: str, seed: int, validation: float):
+    prefix = f"/{version}/{dataset}/{profile}/{seed}"
+    return {
+        "version": version,
+        "profile": profile,
+        "dataset": dataset,
+        "model_seed": seed,
+        "config": dict(scaling.PROFILES[profile]),
+        "validation_mae": validation,
+        "trainable_parameters": 100 if profile == "base" else 200,
+        "elapsed_seconds": 10.0,
+        "peak_gpu_memory_bytes": 1024,
+        "best_epoch": 3,
+        "epochs_completed": 5,
+        "checkpoint": f"{prefix}/best.pt",
+        "checkpoint_sha256": "a" * 64,
+        "history": f"{prefix}/history.json",
+        "history_sha256": "b" * 64,
+        "output_dir": prefix,
+    }
+
+
+def test_profile_selection_uses_mean_validation_and_one_common_profile():
+    rows = [
+        _row("v1", "zinc12k", "base", 0, 0.10),
+        _row("v1", "zinc12k", "large", 0, 0.20),
+        _row("v1", "zinc12k", "base", 1, 0.30),
+        _row("v1", "zinc12k", "large", 1, 0.30),
+    ]
+    summary = scaling.build_summary(
+        rows,
+        versions=["v1"],
+        datasets=["zinc12k"],
+        profiles=["base", "large"],
+        model_seeds=(0, 1),
+        complete=True,
+    )
+    assert summary["status"] == "pending_test_evaluation"
+    assert [row["selected_profile"] for row in summary["profile_selections"]] == ["base"]
+    assert len(summary["selected_checkpoints"]) == 2
+    assert {row["selected_profile"] for row in summary["selected_checkpoints"]} == {"base"}
+    assert summary["profile_selections"][0]["test_used_for_selection"] is False
+    assert summary["test_evaluations"] == []
+    assert all("test" not in key for row in summary["runs"] for key in row)
+
+
+def test_incomplete_seed_matrix_withholds_selection_fail_closed():
+    summary = scaling.build_summary(
+        [_row("v2", "peptides_struct", "base", 0, 0.2)],
+        versions=["v2"],
+        datasets=["peptides_struct"],
+        profiles=["base"],
+        model_seeds=(0, 1),
+        complete=True,
+    )
+    assert summary["status"] == "failed"
+    assert summary["profile_selections"] == []
+    assert summary["selected_checkpoints"] == []
+    assert "selection_withheld" in summary
+
+
+def test_selected_profile_creates_one_test_only_job_per_seed_and_attaches_separately(tmp_path):
+    rows = [
+        _row("v1", "zinc12k", profile, seed, value)
+        for profile, values in (("base", (0.1, 0.2)), ("large", (0.4, 0.3)))
+        for seed, value in enumerate(values)
+    ]
+    summary = scaling.build_summary(
+        rows,
+        versions=["v1"],
+        datasets=["zinc12k"],
+        profiles=["base", "large"],
+        model_seeds=(0, 1),
+        complete=True,
+    )
+    args = _args(
+        "--versions",
+        "v1",
+        "--datasets",
+        "zinc12k",
+        "--profiles",
+        "base",
+        "large",
+        "--model-seeds",
+        "0,1",
+    )
+    jobs = scaling.make_test_jobs(args, tmp_path, summary["selected_checkpoints"])
+    assert len(jobs) == 2
+    assert all("--test-checkpoint" in job["command"] for job in jobs)
+    assert all("--validation-only" not in job["command"] for job in jobs)
+    test_rows = [
+        {
+            "test_evaluation_id": job["job_id"],
+            "checkpoint_id": job["checkpoint_id"],
+            "profile_selection_id": job["profile_selection_id"],
+            "version": job["version"],
+            "dataset": job["dataset"],
+            "model_seed": job["model_seed"],
+            "selected_profile": job["selected_profile"],
+            "checkpoint": job["checkpoint"],
+            "checkpoint_sha256": job["checkpoint_sha256"],
+            "test_mae": 0.5 + job["model_seed"],
+            "fresh_training": False,
+        }
+        for job in jobs
+    ]
+    final = scaling.attach_test_results(summary, test_rows, complete=True)
+    assert final["status"] == "passed"
+    assert len(final["profile_selections"]) == 1
+    assert len(final["selected_checkpoints"]) == len(final["test_evaluations"]) == 2
+    assert all("test_mae" not in row for row in final["selected_checkpoints"])
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    ["research.cycle_pe.benchmark", "research.cycle_pe.v2.benchmark"],
+)
+def test_validation_only_child_loads_no_test_split(module_name, tmp_path, monkeypatch):
+    benchmark = importlib.import_module(module_name)
+    loaded = []
+
+    def fake_load(_root, _dataset, **kwargs):
+        loaded.append(kwargs["splits"])
+        return {"train": [], "validation": []}, {
+            "loaded_splits": ["train", "validation"],
+            "split_sizes": {"train": 1, "validation": 1},
+            "split_content_sha256": {"train": "a", "validation": "b"},
+        }
+
+    monkeypatch.setattr(benchmark, "_validate", lambda _args: None)
+    monkeypatch.setattr(benchmark, "load_benchmark", fake_load)
+    monkeypatch.setattr(benchmark, "_train_model", lambda *_args: {"validation": 0.2})
+    output = tmp_path / module_name.replace(".", "-")
+    assert (
+        benchmark.main(
+            [
+                "--datasets",
+                "zinc12k",
+                "--validation-only",
+                "--output-dir",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    assert loaded == [("train", "validation")]
+    metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
+    assert "test" not in metrics["datasets"]["zinc12k"]["models"][benchmark.MODEL_NAME]
+
+
+def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakage(tmp_path):
+    output = tmp_path / "child"
+    output.mkdir()
+    job = {
+        "version": "v2",
+        "profile": "wide",
+        "model_seed": 3,
+        "datasets": ["zinc12k"],
+        "config": dict(scaling.PROFILES["wide"]),
+        "output_dir": str(output),
+        "command": [
+            "python",
+            "-m",
+            "research.cycle_pe.v2.benchmark",
+            "--column-chunk-size",
+            "16",
+            "--basis-execution",
+            "batched",
+            "--basis-pair-budget",
+            "32768",
+        ],
+    }
+    run = output / "zinc12k/cycle_basis_v2"
+    run.mkdir(parents=True)
+    checkpoint = run / "best.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    history = run / "history.json"
+    history.write_text(json.dumps([{"epoch": epoch} for epoch in range(1, 5)]), encoding="utf-8")
+    manifest = {
+        "status": "passed",
+        "run_mode": "validation_only",
+        "version": "v2",
+        "arguments": {
+            "model_seed": 3,
+            "hidden_dim": 128,
+            "pe_dim": 64,
+            "layers": 3,
+            "datasets": ["zinc12k"],
+            "validation_only": True,
+            "test_checkpoint": None,
+            "column_chunk_size": 16,
+            "basis_execution": "batched",
+            "basis_pair_budget": 32768,
+        },
+        "controls": {
+            "test_data_access": False,
+            "fresh_training": True,
+            "optimizer_created": True,
+        },
+    }
+    metrics = {
+        "status": "passed",
+        "run_mode": "validation_only",
+        "model_seed": 3,
+        "datasets": {
+            "zinc12k": {
+                "metric": "mae",
+                "protocol": {
+                    "loaded_splits": ["train", "validation"],
+                    "split_sizes": {"train": 10, "validation": 2},
+                    "split_content_sha256": {"train": "a", "validation": "b"},
+                },
+                "models": {
+                    "cycle_basis_v2": {
+                        "validation": 0.2,
+                        "trainable_parameters": 1234,
+                        "elapsed_seconds": 5.0,
+                        "peak_gpu_memory_bytes": 2048,
+                        "best_epoch": 2,
+                        "epochs_completed": 4,
+                        "checkpoint": str(checkpoint.resolve()),
+                        "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+                        "history": str(history.resolve()),
+                        "history_sha256": hashlib.sha256(history.read_bytes()).hexdigest(),
+                        "evaluation_splits": ["train", "validation"],
+                        "fresh_training": True,
+                    }
+                },
+            }
+        },
+    }
+    (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (output / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+    row = scaling.read_job_rows(job)[0]
+    assert row["validation_mae"] == 0.2 and "test_mae" not in row
+    assert row["trainable_parameters"] == 1234
+    metrics["datasets"]["zinc12k"]["models"]["cycle_basis_v2"]["test"] = 0.3
+    (output / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+    with pytest.raises(ValueError, match="leaked a test metric"):
+        scaling.read_job_rows(job)
+
+
+def test_dry_run_prints_full_plan_without_dependency_or_gpu_checks(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        scaling,
+        "check_dependencies",
+        lambda: (_ for _ in ()).throw(AssertionError("dry run must not check dependencies")),
+    )
+    code = scaling.main(
+        [
+            "--versions",
+            "v1",
+            "v2",
+            "--profiles",
+            "base",
+            "large",
+            "--model-seeds",
+            "0,2",
+            "--datasets",
+            "zinc12k",
+            "--results-root",
+            str(tmp_path),
+            "--dry-run",
+        ]
+    )
+    output = capsys.readouterr().out
+    assert code == 0 and "8 fresh child runs" in output and "8 fresh dataset trainings" in output
+    assert "train+validation only" in output
+    assert "4 selected-checkpoint test evaluations" in output
+    assert not (tmp_path / "cycle_pe/scaling").exists()
+
+
+def test_failed_child_leaves_failed_manifest_and_withholds_selection(tmp_path, monkeypatch):
+    monkeypatch.setattr(scaling, "check_dependencies", lambda: {"status": "passed"})
+    monkeypatch.setattr(scaling, "_source_snapshot", lambda: {"source": "stable"})
+
+    def fake_run(command, _log_path: Path, _environment):
+        if "gpu_preflight.py" in " ".join(command):
+            output = Path(command[command.index("--json-out") + 1])
+            output.write_text('{"status":"passed"}', encoding="utf-8")
+            return 0
+        return 9
+
+    monkeypatch.setattr(scaling, "run_logged", fake_run)
+    code = scaling.main(
+        [
+            "--versions",
+            "v1",
+            "--profiles",
+            "base",
+            "--model-seeds",
+            "0",
+            "--datasets",
+            "zinc12k",
+            "--data-root",
+            str(tmp_path / "data"),
+            "--results-root",
+            str(tmp_path),
+            "--run-id",
+            "failed-child",
+        ]
+    )
+    run = tmp_path / "cycle_pe/scaling/failed-child"
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    assert code == 1 and manifest["status"] == "failed"
+    assert manifest["jobs"][0]["returncode"] == 9
+    assert summary["status"] == "failed" and "selection_withheld" in summary
 ````
 
 # tests/test_cycle_v2_runner.py
@@ -51425,6 +57073,579 @@ def test_tree_augmentation_depends_on_neither_conductance_nor_combined_track() -
     )
 ````
 
+# tests/test_rich_scaling_runner.py
+
+````python
+"""Contracts for the unified larger-model scaling runner; no research training."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from scripts import run_rich_scaling as runner
+
+
+def _option(command: list[str], name: str) -> str:
+    return command[command.index(name) + 1]
+
+
+def _options(command: list[str], name: str) -> list[str]:
+    start = command.index(name) + 1
+    values: list[str] = []
+    for value in command[start:]:
+        if value.startswith("--"):
+            break
+        values.append(value)
+    return values
+
+
+def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_path: Path):
+    args = runner.parser().parse_args(["--results-root", str(tmp_path)])
+    runner._validate(args)
+    jobs = runner.make_jobs(args, "matrix")
+    assert args.tracks == list(runner.TRACKS)
+    assert args.profiles == list(runner.PROFILES)
+    assert args.model_seeds == list(runner.DEFAULT_MODEL_SEEDS)
+    assert [job["track"] for job in jobs] == ["conductance", "cycle", "tree"]
+    assert runner._totals(jobs) == {
+        "track_runs": 3,
+        "child_runs": 940,
+        "model_trainings": 1020,
+    }
+
+    conductance, cycle, tree = jobs
+    assert conductance["profiles"] == ["base", "wide", "deep", "large"]
+    assert conductance["command"][conductance["command"].index("--profiles") + 1 :][:4] == [
+        "base",
+        "wide",
+        "deep",
+        "large",
+    ]
+    assert _option(cycle["command"], "--model-seeds") == "0,1,2,3,4"
+    assert _option(tree["command"], "--profiles") == "base,wide,deep,large"
+    assert _option(tree["command"], "--model-seeds") == "0,1,2,3,4"
+    assert _option(tree["command"], "--suites") == "csl,zinc"
+    assert conductance["requested_matrix"]["versions"] == ["v1", "v2", "v3", "v4"]
+    assert cycle["requested_matrix"]["datasets"] == ["zinc12k", "peptides_struct"]
+    assert Path(conductance["summary_path"]).relative_to(tmp_path) == Path(
+        "conductance_gat/scaling/matrix-conductance/summary.json"
+    )
+    assert Path(cycle["summary_path"]).relative_to(tmp_path) == Path(
+        "cycle_pe/scaling/matrix-cycle/summary.json"
+    )
+    assert Path(tree["summary_path"]).relative_to(tmp_path) == Path(
+        "tree_augmentation/scaling/matrix-tree/summary.json"
+    )
+
+
+def test_selection_and_download_flag_are_mapped_only_to_supported_child_clis(tmp_path: Path):
+    args = runner.parser().parse_args(
+        [
+            "--tracks",
+            "conductance",
+            "cycle",
+            "tree",
+            "--profiles",
+            "deep",
+            "large",
+            "--model-seeds",
+            "2",
+            "7",
+            "--allow-download",
+            "--results-root",
+            str(tmp_path),
+        ]
+    )
+    runner._validate(args)
+    jobs = runner.make_jobs(args, "selected")
+    assert runner._totals(jobs)["model_trainings"] == (43 + 4 + 4) * 2 * 2
+    assert "--allow-download" not in jobs[0]["command"]
+    assert "--allow-download" in jobs[1]["command"]
+    assert "--allow-download" in jobs[2]["command"]
+    assert _option(jobs[2]["command"], "--profiles") == "deep,large"
+
+
+def test_dry_run_prints_complete_plan_without_writes_or_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    monkeypatch.setattr(
+        runner,
+        "_run_logged",
+        lambda *_args: pytest.fail("dry run must not launch child processes"),
+    )
+    code = runner.main(
+        [
+            "--tracks",
+            "cycle",
+            "tree",
+            "--profiles",
+            "base",
+            "deep",
+            "--model-seeds",
+            "0",
+            "--results-root",
+            str(tmp_path),
+            "--run-id",
+            "dry",
+            "--dry-run",
+        ]
+    )
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "2 track runs; 8 child runs; 16 fresh model trainings" in output
+    assert "child profiles=['base', 'deep']" in output
+    assert "--profiles base,deep" in output
+    assert "no files or directories were written" in output
+    assert list(tmp_path.iterdir()) == []
+
+
+def _write_summary(command: list[str], *, malformed: str | None = None) -> None:
+    script = Path(command[2]).name
+    results_root = Path(_option(command, "--results-root"))
+    run_id = _option(command, "--run-id")
+    if script == "run_conductance_scaling.py":
+        versions = _options(command, "--versions")
+        requested_datasets = _options(command, "--datasets")
+        profiles = _options(command, "--profiles")
+        seeds = [int(value) for value in _options(command, "--model-seeds")]
+        rows = []
+        exclusions = []
+        for version in versions:
+            spec = runner.CONDUCTANCE_MATRIX[version]
+            for dataset in requested_datasets:
+                if dataset not in spec["datasets"]:
+                    exclusions.append(
+                        {
+                            "version": version,
+                            "dataset": dataset,
+                            "status": "not_applicable",
+                        }
+                    )
+            for profile in profiles:
+                for dataset in spec["datasets"]:
+                    for condition in spec["conditions"]:
+                        rows.append(
+                            {
+                                "version": version,
+                                "profile": profile,
+                                "dataset": dataset,
+                                "condition": condition,
+                                "passed_seeds": sorted(seeds),
+                                "n": len(seeds),
+                            }
+                        )
+        count = len(rows) * len(seeds)
+        output = results_root / "conductance_gat/scaling" / run_id
+        payload = {
+            "status": "failed" if malformed == "status" else "passed",
+            "suite": "conductance_architecture_scaling_v1_v4",
+            "run_id": run_id,
+            "valid_for_validation_comparison": malformed != "status",
+            "test_evaluated": False,
+            "job_counts": {"pending": 0, "running": 0, "passed": count, "failed": 0},
+            "expected_model_seeds": seeds,
+            "exclusions": exclusions,
+            "rows": rows,
+        }
+    elif script == "run_cycle_scaling.py":
+        versions = _options(command, "--versions")
+        datasets = _options(command, "--datasets")
+        profiles = _options(command, "--profiles")
+        seeds = [int(value) for value in _option(command, "--model-seeds").split(",")]
+        rows = [
+            {
+                "version": version,
+                "profile": profile,
+                "model_seed": seed,
+                "dataset": dataset,
+            }
+            for version in versions
+            for profile in profiles
+            for seed in seeds
+            for dataset in datasets
+        ]
+        aggregates = [
+            {
+                "version": version,
+                "dataset": dataset,
+                "profile": profile,
+                "model_seeds": sorted(seeds),
+            }
+            for version in versions
+            for dataset in datasets
+            for profile in profiles
+        ]
+        selections = [
+            {
+                "version": version,
+                "dataset": dataset,
+                "selected_profile": profiles[0],
+                "model_seeds": seeds,
+                "test_used_for_selection": False,
+            }
+            for version in versions
+            for dataset in datasets
+        ]
+        selected_checkpoints = [
+            {
+                "version": selection["version"],
+                "dataset": selection["dataset"],
+                "model_seed": seed,
+                "selected_profile": selection["selected_profile"],
+                "checkpoint": f"{selection['version']}-{selection['dataset']}-{seed}.pt",
+                "checkpoint_sha256": f"hash-{seed}",
+            }
+            for selection in selections
+            for seed in seeds
+        ]
+        test_evaluations = [
+            {**checkpoint, "fresh_training": False} for checkpoint in selected_checkpoints
+        ]
+        output = results_root / "cycle_pe/scaling" / run_id
+        payload = {
+            "status": "failed" if malformed == "status" else "passed",
+            "scope": "cycle_pe_v1_v2_larger_model_scaling",
+            "requested_model_seeds": seeds,
+            "profiles": {profile: {} for profile in profiles},
+            "runs": rows,
+            "profile_aggregates": aggregates,
+            "profile_selections": selections,
+            "selected_checkpoints": selected_checkpoints,
+            "test_evaluations": test_evaluations,
+            "fresh_dataset_trainings": len(rows),
+            "selected_test_evaluations": len(test_evaluations),
+            "final_test_aggregates": [
+                {
+                    "version": version,
+                    "dataset": dataset,
+                    "model_seeds": seeds,
+                    "selected_profiles": [profiles[0] for _seed in seeds],
+                }
+                for version in versions
+                for dataset in datasets
+            ],
+        }
+    else:
+        suites = _option(command, "--suites").split(",")
+        profiles = _option(command, "--profiles").split(",")
+        seeds = [int(value) for value in _option(command, "--model-seeds").split(",")]
+        children = 2 * len(profiles) * len(seeds)
+        trainings = children * 2
+        results = [
+            {
+                "suite": suite,
+                "profile": profile,
+                "model_seed": seed,
+                "trained_models": list(runner.TREE_MODELS),
+                "dataset_cache_integrity": {
+                    "full_cache_loaded": True,
+                    "all_declared_splits_validated": True,
+                    "loaded_and_validated_splits": ["test", "train", "validation"],
+                },
+                "test_evaluated": False,
+                "test_used_for_selection": False,
+            }
+            for suite in suites
+            for profile in profiles
+            for seed in seeds
+        ]
+        output = results_root / "tree_augmentation/scaling" / run_id
+        payload = {
+            "status": "failed" if malformed == "status" else "passed",
+            "suite": "tree_scaling",
+            "run_id": run_id,
+            "planned_child_runs": children,
+            "planned_model_trainings": trainings,
+            "completed_child_runs": children,
+            "completed_model_trainings": trainings,
+            "failed_child_runs": 0,
+            "models_per_child": list(runner.TREE_MODELS),
+            "profile_configs": {profile: {} for profile in profiles},
+            "results": results,
+            "planned_profile_selections": len(suites) * len(runner.TREE_MODELS),
+            "completed_profile_selections": len(suites) * len(runner.TREE_MODELS),
+            "planned_selected_test_runs": len(suites) * len(seeds),
+            "completed_selected_test_runs": len(suites) * len(seeds),
+            "failed_selected_test_runs": 0,
+            "planned_selected_checkpoint_test_evaluations": (
+                len(suites) * len(seeds) * len(runner.TREE_MODELS)
+            ),
+            "completed_selected_checkpoint_test_evaluations": (
+                len(suites) * len(seeds) * len(runner.TREE_MODELS)
+            ),
+            "selections": [
+                {
+                    "suite": suite,
+                    "selection_split": "validation",
+                    "aggregation_axis": "mean_across_requested_model_seeds",
+                    "model_seeds": seeds,
+                    "test_metrics_used_for_selection": False,
+                    "conditions": {
+                        model: {
+                            "selected_profile": profiles[0],
+                            "selected_checkpoints_by_model_seed": {
+                                str(seed): {"checkpoint": f"{suite}-{model}-{seed}.pt"}
+                                for seed in seeds
+                            },
+                        }
+                        for model in runner.TREE_MODELS
+                    },
+                }
+                for suite in suites
+            ],
+            "selected_test_results": [
+                {
+                    "suite": suite,
+                    "model_seed": seed,
+                    "evaluation_scope": "selected_test",
+                    "training_performed": False,
+                    "test_evaluated": True,
+                    "test_used_for_selection": False,
+                    "selected_profiles": {model: profiles[0] for model in runner.TREE_MODELS},
+                    "selected_checkpoints": {
+                        model: {"path": f"{suite}-{model}-{seed}.pt"}
+                        for model in runner.TREE_MODELS
+                    },
+                    "test_evaluations_per_selected_checkpoint": 1,
+                }
+                for suite in suites
+                for seed in seeds
+            ],
+        }
+
+    if malformed == "duplicate":
+        key = "runs" if script == "run_cycle_scaling.py" else "results"
+        if script == "run_conductance_scaling.py":
+            key = "rows"
+        payload[key][-1] = dict(payload[key][0])
+    elif malformed is not None and malformed.startswith("matrix:"):
+        field = malformed.split(":", 1)[1]
+        key = "runs" if script == "run_cycle_scaling.py" else "results"
+        if script == "run_conductance_scaling.py":
+            key = "rows"
+        row = payload[key][0]
+        if field == "seed_set":
+            row["passed_seeds"] = [999]
+        elif field == "trained_models":
+            row["trained_models"] = ["fixed_bfs"]
+        else:
+            row[field] = 999 if field == "model_seed" else "unexpected"
+    output.mkdir(parents=True)
+    if malformed != "missing":
+        (output / "summary.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _base_options(tmp_path: Path) -> list[str]:
+    return [
+        "--profiles",
+        "base",
+        "--model-seeds",
+        "0",
+        "--data-root",
+        str(tmp_path / "data"),
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        "unit",
+    ]
+
+
+def test_success_runs_tracks_sequentially_and_certifies_all_summaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    calls: list[str] = []
+
+    def dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        calls.append(Path(command[2]).name)
+        _write_summary(command)
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    assert runner.main(_base_options(tmp_path)) == 0
+    assert calls == [
+        "run_conductance_scaling.py",
+        "run_cycle_scaling.py",
+        "run_tree_scaling.py",
+    ]
+    manifest_path = tmp_path / "rich_scaling/unit/manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "passed"
+    assert manifest["planned_counts"] == {
+        "track_runs": 3,
+        "child_runs": 47,
+        "model_trainings": 51,
+    }
+    assert manifest["completed_counts"]["verified_model_trainings"] == 51
+    assert all(job["status"] == "passed" for job in manifest["jobs"])
+    assert all(len(job["result"]["summary_sha256"]) == 64 for job in manifest["jobs"])
+
+
+@pytest.mark.parametrize("track", ["conductance", "cycle", "tree"])
+def test_equal_count_duplicate_child_matrix_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, track: str
+):
+    def dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        _write_summary(command, malformed="duplicate")
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    assert runner.main(["--tracks", track, *_base_options(tmp_path)]) == 1
+    manifest = json.loads(
+        (tmp_path / "rich_scaling/unit/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["jobs"][0]["status"] == "failed"
+    assert "duplicate key" in manifest["jobs"][0]["error"]
+
+
+@pytest.mark.parametrize(
+    ("track", "field"),
+    [
+        ("conductance", "version"),
+        ("conductance", "dataset"),
+        ("conductance", "profile"),
+        ("conductance", "condition"),
+        ("conductance", "seed_set"),
+        ("cycle", "version"),
+        ("cycle", "dataset"),
+        ("cycle", "profile"),
+        ("cycle", "model_seed"),
+        ("tree", "suite"),
+        ("tree", "profile"),
+        ("tree", "model_seed"),
+        ("tree", "trained_models"),
+    ],
+)
+def test_child_summary_must_match_every_requested_matrix_axis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, track: str, field: str
+):
+    def dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        _write_summary(command, malformed=f"matrix:{field}")
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    assert runner.main(["--tracks", track, *_base_options(tmp_path)]) == 1
+    manifest = json.loads(
+        (tmp_path / "rich_scaling/unit/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["jobs"][0]["status"] == "failed"
+    assert any(
+        phrase in manifest["jobs"][0]["error"]
+        for phrase in ("matrix mismatch", "wrong seed set", "wrong trained models")
+    )
+
+
+def test_central_sources_are_rehashed_after_children_and_change_fails_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    def dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        _write_summary(command)
+        return 0
+
+    snapshots = iter([{"scripts/run_rich_scaling.py": "before"}, {"changed.py": "after"}])
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    monkeypatch.setattr(runner, "_source_snapshot", lambda: next(snapshots))
+    assert runner.main(["--tracks", "cycle", *_base_options(tmp_path)]) == 1
+    manifest = json.loads(
+        (tmp_path / "rich_scaling/unit/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["jobs"][0]["status"] == "passed"
+    assert manifest["status"] == "failed"
+    assert manifest["source_integrity_valid"] is False
+    assert "source changed" in manifest["source_integrity_error"]
+    assert manifest["completed_counts"]["verified_model_trainings"] == 0
+
+
+def test_default_failure_policy_continues_later_tracks_and_marks_overall_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    calls: list[str] = []
+
+    def dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        script = Path(command[2]).name
+        calls.append(script)
+        if script == "run_conductance_scaling.py":
+            return 9
+        _write_summary(command)
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    assert runner.main(_base_options(tmp_path)) == 1
+    assert calls == [
+        "run_conductance_scaling.py",
+        "run_cycle_scaling.py",
+        "run_tree_scaling.py",
+    ]
+    manifest = json.loads(
+        (tmp_path / "rich_scaling/unit/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "failed"
+    assert [job["status"] for job in manifest["jobs"]] == ["failed", "passed", "passed"]
+    assert manifest["jobs"][0]["returncode"] == 9
+
+
+def test_fail_fast_leaves_later_tracks_pending(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    calls: list[str] = []
+
+    def dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        calls.append(Path(command[2]).name)
+        return 7
+
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    assert runner.main([*_base_options(tmp_path), "--fail-fast"]) == 1
+    assert calls == ["run_conductance_scaling.py"]
+    manifest = json.loads(
+        (tmp_path / "rich_scaling/unit/manifest.json").read_text(encoding="utf-8")
+    )
+    assert [job["status"] for job in manifest["jobs"]] == ["failed", "pending", "pending"]
+
+
+@pytest.mark.parametrize("malformed", ["missing", "status"])
+def test_zero_return_code_without_exact_passed_summary_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, malformed: str
+):
+    def dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        _write_summary(command, malformed=malformed)
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    options = [
+        "--tracks",
+        "conductance",
+        *_base_options(tmp_path),
+    ]
+    assert runner.main(options) == 1
+    manifest = json.loads(
+        (tmp_path / "rich_scaling/unit/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["jobs"][0]["status"] == "failed"
+    assert "summary" in manifest["jobs"][0]["error"]
+
+
+def test_existing_central_run_is_never_overwritten(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    run = tmp_path / "rich_scaling/existing"
+    run.mkdir(parents=True)
+    sentinel = run / "manifest.json"
+    sentinel.write_text("preserve", encoding="utf-8")
+    monkeypatch.setattr(runner, "_run_logged", lambda *_args: pytest.fail("must not launch"))
+    assert (
+        runner.main(
+            [
+                "--results-root",
+                str(tmp_path),
+                "--data-root",
+                str(tmp_path / "data"),
+                "--run-id",
+                "existing",
+            ]
+        )
+        == 2
+    )
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
+````
+
 # tests/test_run_paper.py
 
 ````python
@@ -52014,6 +58235,7 @@ def test_project_docs_and_gpt_handoff_are_separated() -> None:
         "CONDUCTANCE_V3.md",
         "CONDUCTANCE_V4.md",
         "CYCLE_PE_V2.md",
+        "RICH_SCALING_EXPERIMENTS.md",
         "CODE_SUMMARY.md",
     }
 
@@ -52117,4 +58339,476 @@ def test_negative_seed_axis_is_rejected(field: str) -> None:
     values[field] = -1
     with pytest.raises(ValueError, match=f"{field} seed"):
         SeedAxes(**values)
+````
+
+# tests/test_tree_scaling_runner.py
+
+````python
+"""Tree scaling orchestration contracts; no GPU or research training."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from research.tree_augmentation import paper as tree_paper
+from scripts import run_tree_scaling as runner
+
+
+def _digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_default_matrix_trains_both_versions_across_larger_profiles() -> None:
+    args = runner.parser().parse_args([])
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert args.suites == ("csl", "zinc")
+    assert args.profiles == ("base", "wide", "deep", "large")
+    assert args.model_seeds == (0, 1, 2, 3, 4)
+    assert len(jobs) == 40
+    assert sum(len(job["trained_models"]) for job in jobs) == 80
+    assert len({job["output_dir"] for job in jobs}) == len(jobs)
+    assert runner.PROFILE_CONFIGS == {
+        "base": {
+            "hidden_dim": 64,
+            "message_layers": 2,
+            "optimizer_updates": 800,
+            "train_charts_per_graph": 8,
+            "eval_charts_per_graph": 8,
+        },
+        "wide": {
+            "hidden_dim": 128,
+            "message_layers": 2,
+            "optimizer_updates": 800,
+            "train_charts_per_graph": 8,
+            "eval_charts_per_graph": 8,
+        },
+        "deep": {
+            "hidden_dim": 64,
+            "message_layers": 4,
+            "optimizer_updates": 800,
+            "train_charts_per_graph": 8,
+            "eval_charts_per_graph": 8,
+        },
+        "large": {
+            "hidden_dim": 128,
+            "message_layers": 4,
+            "optimizer_updates": 800,
+            "train_charts_per_graph": 8,
+            "eval_charts_per_graph": 8,
+        },
+    }
+    for job in jobs:
+        assert job["trained_models"] == ["fixed_bfs", "multi_chart"]
+        command = job["command"]
+        assert command[command.index("-m") + 1] == "research.tree_augmentation.paper"
+        for key, value in job["profile_config"].items():
+            assert command[command.index("--" + key.replace("_", "-")) + 1] == str(value)
+
+
+def test_paper_scaling_overrides_are_opt_in_and_validated() -> None:
+    args = tree_paper._parser().parse_args([])
+    assert args.hidden_dim is None
+    assert args.message_layers is None
+    assert args.optimizer_updates is None
+    assert args.train_charts_per_graph is None
+    assert args.eval_charts_per_graph is None
+    defaults = {
+        "hidden_dim": 64,
+        "message_layers": 2,
+        "optimizer_updates": 800,
+        "train_charts_per_graph": 8,
+        "eval_charts_per_graph": 8,
+    }
+    effective, overrides = tree_paper._apply_setting_overrides(
+        defaults,
+        hidden_dim=128,
+        message_layers=4,
+        optimizer_updates=800,
+        train_charts_per_graph=8,
+        eval_charts_per_graph=8,
+    )
+    assert effective == runner.PROFILE_CONFIGS["large"]
+    assert overrides == runner.PROFILE_CONFIGS["large"]
+    unchanged, no_overrides = tree_paper._apply_setting_overrides(
+        defaults,
+        hidden_dim=None,
+        message_layers=None,
+        optimizer_updates=None,
+        train_charts_per_graph=None,
+        eval_charts_per_graph=None,
+    )
+    assert unchanged == defaults and no_overrides == {}
+    with pytest.raises(ValueError, match="hidden dim must be positive"):
+        tree_paper._apply_setting_overrides(
+            defaults,
+            hidden_dim=0,
+            message_layers=None,
+            optimizer_updates=None,
+            train_charts_per_graph=None,
+            eval_charts_per_graph=None,
+        )
+
+
+@pytest.mark.parametrize("option", ["--help", "--dry-run"])
+def test_stdlib_inspection_has_no_writes(tmp_path: Path, option: str) -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-S",
+            str(runner.ROOT / "scripts/run_tree_scaling.py"),
+            option,
+            "--results-root",
+            str(tmp_path),
+            "--suites",
+            "csl",
+            "--profiles",
+            "large",
+            "--model-seeds",
+            "0,1",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert list(tmp_path.iterdir()) == []
+    if option == "--dry-run":
+        assert "2 validation-candidate child runs; 4 fresh model trainings" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--device", "cpu"],
+        ["--batch-size", "0"],
+        ["--workers", "-1"],
+        ["--data-seed", "-1"],
+        ["--min-free-gb", "nan"],
+        ["--run-id", "../old"],
+    ],
+)
+def test_invalid_inputs_do_not_check_dependencies(monkeypatch, options: list[str]) -> None:
+    monkeypatch.setattr(runner, "check_dependencies", lambda: pytest.fail("dependency check"))
+    assert runner.main(options) == 2
+
+
+def _write_child(job: dict[str, object], *, malformed: str | None = None) -> None:
+    command = job["command"]
+    assert isinstance(command, list)
+    output = Path(job["output_dir"])
+    output.mkdir(parents=True)
+    axes = {
+        "data": int(command[command.index("--data-seed") + 1]),
+        "split": int(command[command.index("--split-seed") + 1]),
+        "chart": int(command[command.index("--chart-seed") + 1]),
+        "model": int(job["model_seed"]),
+    }
+    profile = dict(job["profile_config"])
+    parameter_count = 1000 + profile["hidden_dim"]
+    parameters = {"total": parameter_count, "trainable": parameter_count}
+    quadrants = {
+        "validation_graph_fresh_chart_seen_family": {
+            "accuracy": 0.7,
+            "graph_macro_accuracy": 0.7,
+            "mae": 0.2,
+            "graph_macro_mae": 0.2,
+        },
+        "validation_graph_fresh_chart_unseen_family": {
+            "accuracy": 0.6,
+            "graph_macro_accuracy": 0.6,
+            "mae": 0.3,
+            "graph_macro_mae": 0.3,
+        },
+    }
+    models = {
+        name: {
+            "optimizer_updates": profile["optimizer_updates"],
+            "parameters": dict(parameters),
+            "quadrants": json.loads(json.dumps(quadrants)),
+        }
+        for name in runner.MODELS
+    }
+    if malformed == "metric":
+        models["multi_chart"]["quadrants"]["validation_graph_fresh_chart_seen_family"][
+            "graph_macro_accuracy"
+        ] = float("nan")
+    checkpoints = {}
+    for name in runner.MODELS:
+        path = output / f"{name}_model.pt"
+        path.write_bytes(f"unit-{name}".encode())
+        checkpoints[name] = str(path.resolve())
+    summary = {
+        "suite": job["suite"],
+        "seed_axes": axes,
+        "evaluation_scope": "validation",
+        "training_performed": True,
+        "test_metrics_emitted": False,
+        "dataset_cache_integrity": {
+            "full_cache_loaded": True,
+            "all_declared_splits_validated": True,
+            "loaded_and_validated_splits": ["test", "train", "validation"],
+        },
+        "model_split_usage": {
+            "fit_splits": ["train"],
+            "evaluation_splits": ["validation"],
+            "selection_splits": ["validation"],
+            "test_evaluated": False,
+            "test_used_for_selection": False,
+        },
+        "settings": profile,
+        "parameter_counts": {name: dict(parameters) for name in runner.MODELS},
+        "models": models,
+        "comparison": {
+            "paper_headline_eligible": False,
+            "fixed_and_multi_optimizer_updates_matched": True,
+        },
+        "checkpoints": checkpoints,
+    }
+    summary_path = output / "summary.json"
+    summary_path.write_text(json.dumps(summary, allow_nan=True), encoding="utf-8")
+    artifacts = {"summary.json": {"path": str(summary_path), "sha256": _digest(summary_path)}}
+    for path in map(Path, checkpoints.values()):
+        artifacts[path.name] = {"path": str(path), "sha256": _digest(path)}
+    child_manifest = {
+        "status": "passed",
+        "suite": job["suite"],
+        "seed_axes": axes,
+        "evaluation_scope": "validation",
+        "training_performed": True,
+        "dataset_cache_integrity": summary["dataset_cache_integrity"],
+        "model_split_usage": summary["model_split_usage"],
+        "effective_settings": profile,
+        "settings_overrides": profile,
+        "artifacts": artifacts,
+    }
+    (output / "manifest.json").write_text(json.dumps(child_manifest), encoding="utf-8")
+
+
+def _write_selected_child(job: dict[str, object]) -> None:
+    command = job["command"]
+    assert isinstance(command, list)
+    output = Path(job["output_dir"])
+    output.mkdir(parents=True)
+    axes = {
+        "data": int(command[command.index("--data-seed") + 1]),
+        "split": int(command[command.index("--split-seed") + 1]),
+        "chart": int(command[command.index("--chart-seed") + 1]),
+        "model": int(job["model_seed"]),
+    }
+    selected_inputs = job["selected_inputs"]
+    expected_checkpoints = {name: selected_inputs[name]["checkpoint"] for name in runner.MODELS}
+    quadrants = {
+        "test_graph_fresh_chart_seen_family": {"accuracy": 0.7, "mae": 0.2},
+        "test_graph_fresh_chart_unseen_family": {"accuracy": 0.6, "mae": 0.3},
+    }
+    models = {
+        name: {
+            "optimizer_updates": 800,
+            "training_performed": False,
+            "history": [],
+            "parameters": selected_inputs[name]["parameter_counts"],
+            "quadrants": quadrants,
+        }
+        for name in runner.MODELS
+    }
+    summary = {
+        "suite": job["suite"],
+        "seed_axes": axes,
+        "evaluation_scope": "selected_test",
+        "training_performed": False,
+        "test_metrics_emitted": True,
+        "dataset_cache_integrity": {
+            "full_cache_loaded": True,
+            "all_declared_splits_validated": True,
+            "loaded_and_validated_splits": ["test", "train", "validation"],
+        },
+        "model_split_usage": {
+            "fit_splits": [],
+            "evaluation_splits": ["test"],
+            "selection_splits": [],
+            "test_evaluated": True,
+            "test_used_for_selection": False,
+        },
+        "test_evaluations_per_selected_checkpoint": 1,
+        "selected_checkpoints": expected_checkpoints,
+        "selected_checkpoint_settings": {
+            name: selected_inputs[name]["profile_config"] for name in runner.MODELS
+        },
+        "parameter_counts": {
+            name: selected_inputs[name]["parameter_counts"] for name in runner.MODELS
+        },
+        "models": models,
+    }
+    summary_path = output / "summary.json"
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    child_manifest = {
+        "status": "passed",
+        "suite": job["suite"],
+        "seed_axes": axes,
+        "evaluation_scope": "selected_test",
+        "training_performed": False,
+        "dataset_cache_integrity": summary["dataset_cache_integrity"],
+        "model_split_usage": summary["model_split_usage"],
+        "selected_checkpoint_inputs": expected_checkpoints,
+        "artifacts": {"summary.json": {"path": str(summary_path), "sha256": _digest(summary_path)}},
+    }
+    (output / "manifest.json").write_text(json.dumps(child_manifest), encoding="utf-8")
+
+
+def _stub(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failure: str | None = None,
+) -> tuple[list[str], list[list[str]]]:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(runner, "check_dependencies", lambda: {"unit_fixture_only": True})
+    monkeypatch.setattr(
+        runner,
+        "_source_snapshot",
+        lambda: {"git_revision": "unit", "sha256": {"unit-source": "stable"}},
+    )
+
+    def dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        calls.append(command)
+        if any(Path(part).name == "gpu_preflight.py" for part in command):
+            if failure == "preflight_exit":
+                return 7
+            preflight = Path(command[command.index("--json-out") + 1])
+            if failure != "preflight_missing":
+                preflight.write_text(
+                    json.dumps({"status": "failed" if failure == "preflight_status" else "passed"}),
+                    encoding="utf-8",
+                )
+            return 0
+        if failure == "child_exit":
+            return 9
+        output = Path(command[command.index("--output-dir") + 1])
+        manifest = json.loads(
+            (tmp_path / "tree_augmentation/scaling/unit/manifest.json").read_text("utf-8")
+        )
+        candidate = next(
+            (job for job in manifest["jobs"] if Path(job["output_dir"]) == output), None
+        )
+        if candidate is not None:
+            if failure != "child_missing":
+                _write_child(candidate, malformed="metric" if failure == "child_metric" else None)
+        else:
+            selected = next(
+                job for job in manifest["selected_test_jobs"] if Path(job["output_dir"]) == output
+            )
+            _write_selected_child(selected)
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    options = [
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        "unit",
+        "--suites",
+        "csl",
+        "--profiles",
+        "wide",
+        "--model-seeds",
+        "3,4",
+    ]
+    return options, calls
+
+
+def test_success_checks_metrics_parameters_artifacts_and_records_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    assert len(calls) == 5
+    root = tmp_path / "tree_augmentation/scaling/unit"
+    manifest = json.loads((root / "manifest.json").read_text("utf-8"))
+    summary = json.loads((root / "summary.json").read_text("utf-8"))
+    assert manifest["status"] == summary["status"] == "passed"
+    assert manifest["planned_child_runs"] == 2
+    assert manifest["planned_model_trainings"] == 4
+    assert summary["completed_child_runs"] == 2
+    assert summary["completed_model_trainings"] == 4
+    assert summary["completed_profile_selections"] == 2
+    assert summary["completed_selected_test_runs"] == 2
+    assert summary["completed_selected_checkpoint_test_evaluations"] == 4
+    assert len(summary["selections"]) == 1
+    assert len(summary["selected_test_results"]) == 2
+    assert all(job["status"] == "passed" for job in manifest["jobs"])
+    assert all(job["result"]["child_metrics_checked"] for job in manifest["jobs"])
+    assert all(job["result"]["test_evaluated"] is False for job in manifest["jobs"])
+    assert all(
+        job["result"]["dataset_cache_integrity"]["full_cache_loaded"] is True
+        for job in manifest["jobs"]
+    )
+    assert all(row["test_evaluated"] is True for row in summary["selected_test_results"])
+    assert all(row["test_used_for_selection"] is False for row in summary["selected_test_results"])
+    assert all(
+        job["result"]["profile_config"] == runner.PROFILE_CONFIGS["wide"]
+        for job in manifest["jobs"]
+    )
+    assert all(
+        set(job["result"]["parameter_counts"]) == set(runner.MODELS) for job in manifest["jobs"]
+    )
+    assert "chart_family_isolation" in summary
+
+
+@pytest.mark.parametrize(
+    "failure,calls_expected",
+    [
+        ("preflight_exit", 1),
+        ("preflight_missing", 1),
+        ("preflight_status", 1),
+        ("child_exit", 2),
+        ("child_missing", 2),
+        ("child_metric", 2),
+    ],
+)
+def test_fail_closed_stops_after_first_unverified_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    calls_expected: int,
+) -> None:
+    options, calls = _stub(tmp_path, monkeypatch, failure=failure)
+    assert runner.main(options) == 1
+    assert len(calls) == calls_expected
+    root = tmp_path / "tree_augmentation/scaling/unit"
+    manifest = json.loads((root / "manifest.json").read_text("utf-8"))
+    summary = json.loads((root / "summary.json").read_text("utf-8"))
+    assert manifest["status"] == summary["status"] == "failed"
+    assert summary["completed_child_runs"] == 0
+    assert manifest["jobs"][1]["status"] == "pending"
+
+
+def test_existing_run_is_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "tree_augmentation/scaling/existing"
+    root.mkdir(parents=True)
+    sentinel = root / "model.pt"
+    sentinel.write_bytes(b"preserve")
+    monkeypatch.setattr(runner, "check_dependencies", lambda: pytest.fail("dependency check"))
+    assert runner.main(["--results-root", str(tmp_path), "--run-id", "existing"]) == 2
+    assert sentinel.read_bytes() == b"preserve"
+
+
+def test_source_snapshot_covers_tree_model_runner_and_shared_math() -> None:
+    snapshot = runner._source_snapshot()["sha256"]
+    for name in (
+        "scripts/run_tree_scaling.py",
+        "research/tree_augmentation/paper.py",
+        "research/tree_augmentation/paper_model.py",
+        "research/tree_augmentation/paper_data.py",
+        "research/tree_augmentation/config.yaml",
+        "src/chartgat/algebra.py",
+        "src/chartgat/graphs.py",
+        "src/chartgat/seeds.py",
+    ):
+        assert name in snapshot and len(snapshot[name]) == 64
 ````

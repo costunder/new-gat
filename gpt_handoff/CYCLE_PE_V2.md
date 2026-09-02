@@ -11,6 +11,10 @@ revision `7b4cd32`, run `cycle-pe-v2-gpu6-seed0-v1`은 `passed`다. Preflight GP
 `cuda:0`으로 사용했다. v2 성능 수치와 전체 원본 artifact는 수령하지 않았으며, 이를 기존
 v1 점수와 합치지 않는다. 게시·실험 범위는 [실험 상태](EXPERIMENT_STATUS.md)에 기록한다.
 
+V1과 V2를 모두 hidden 64/128, PE 32/64, message layer 3/6에서 실행하는 큰 모델 suite는
+[전체 모델 규모 확장 실험](RICH_SCALING_EXPERIMENTS.md)을 따른다. 기존 v1을 제외하지 않고
+같은 공식 ZINC-12K/Peptides-struct에서 별도 fresh run으로 실행한다.
+
 ## 실행
 
 저장소 최상위 폴더에서 실행한다. [전체 인수인계](HANDOFF.md)의 환경 계약에 따라 GPU 의존성

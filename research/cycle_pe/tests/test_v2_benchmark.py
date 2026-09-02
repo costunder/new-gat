@@ -140,8 +140,8 @@ def test_preparation_failure_is_persisted_not_reported_as_success(tmp_path, monk
 def test_runner_selects_validation_checkpoint_before_single_test_evaluation() -> None:
     source = inspect.getsource(benchmark._train_model)
     assert source.count("evaluate(model, test_loader, device)") == 1
-    assert source.index('model.load_state_dict(selected["state_dict"])') < source.index(
-        "evaluate(model, test_loader, device)"
-    )
+    assert source.index(
+        'model.load_state_dict(selected["state_dict"], strict=True)'
+    ) < source.index("evaluate(model, test_loader, device)")
     assert "if validation < best:" in source
     assert "weights_only=True" in source

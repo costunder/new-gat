@@ -283,16 +283,28 @@ def load_benchmark(
     dataset: str,
     *,
     allow_download: bool,
+    splits: tuple[str, ...] = SPLITS,
 ) -> tuple[dict[str, list[Graph]], dict[str, Any]]:
     """Load fixed official splits, validating immutable basis caches fail-closed."""
+    if (
+        not splits
+        or len(set(splits)) != len(splits)
+        or any(split not in SPLITS for split in splits)
+    ):
+        raise ValueError("splits must be a nonempty unique subset of official splits")
     signature = preparation_signature(dataset)
-    official = load_official_splits(data_root, dataset, allow_download=allow_download)
+    official = load_official_splits(
+        data_root,
+        dataset,
+        allow_download=allow_download,
+        splits=splits,
+    )
     key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:16]
     cache_dir = data_root / CACHE_NAMESPACE / dataset / key
     cache_dir.mkdir(parents=True, exist_ok=True)
     result: dict[str, list[Graph]] = {}
     split_hashes = {}
-    for split in SPLITS:
+    for split in splits:
         digest = hashlib.sha256()
         for data in official[split]:
             graph_fingerprint(data, digest)
@@ -352,7 +364,8 @@ def load_benchmark(
         "comparison": "ours_only_on_official_benchmark_splits",
         "source_url": SOURCES[dataset],
         "official_splits": True,
-        "split_sizes": {split: len(result[split]) for split in SPLITS},
+        "loaded_splits": list(splits),
+        "split_sizes": {split: len(result[split]) for split in splits},
         "split_content_sha256": split_hashes,
         "target_width": SCHEMAS[dataset]["targets"],
         "target_scaling": "official supplied labels, unchanged; no fitted target scaling",

@@ -4,13 +4,17 @@
 > V4만이 아니라 다른 모든 트랙과 전체 실험 상태는 같은 전달 폴더의 `HANDOFF.md`와
 > `EXPERIMENT_STATUS.md`에서 함께 검토한다.
 
+> V1~V4를 모두 포함해 더 넓고 깊은 모델을 실행하는 별도 계약은
+> [RICH_SCALING_EXPERIMENTS.md](RICH_SCALING_EXPERIMENTS.md)를 따른다. 아래 20-job 기본
+> 실험을 큰 모델 결과로 재분류하지 않는다.
+
 ## 현재 상태
 
 | 항목 | 상태 |
 |---|---|
 | 구현 | 완료 |
 | 로컬 V4 전용 검사 | **131 passed** |
-| 저장소 전체 회귀 | **1317 passed / 66 skipped** (74.10 s, exit 0) |
+| 저장소 전체 회귀 | **1394 passed / 66 skipped** (86.72 s, exit 0) |
 | Ruff·compileall·코드 스냅샷 검사 | 통과 |
 | 공식 데이터 CUDA 학습 | **정식 결과 없음** — 과거 arxiv-only 4-arm run에서 첫 arm만 200 epochs·child exit 0 후 구 report gate 중단, 나머지 3개 pending |
 | 기본 실행 대상 | Cora/CiteSeer/PubMed/PPI/ogbn-arxiv, model seed 0, 20번의 fresh training |

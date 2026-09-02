@@ -22,6 +22,16 @@ runner는 각각 `passed`다. 성능 수치와 전체 원본 artifact는 수령�
 넣지 않는다. 과거 arxiv-only V4는 첫 arm의 200 epochs·child exit 0 뒤 구 report gate에서
 중단되어 정식 결과가 아니다. 현재 확대된 V2/V3/V4 8/10/20-job 전체 결과는 수령하지 않았다.
 
+이후 단일 `hidden/layer` 설정만으로는 큰 모델에서의 적합도를 확인할 수 없다는 사용자 요청에
+따라 [전체 모델 규모 확장 실험](RICH_SCALING_EXPERIMENTS.md)을 추가했다. Conductance
+V1/V2/V3/V4, Cycle PE V1/V2, Tree fixed/multi를 모두 포함하고, 각 트랙에서 `base`, `wide`,
+`deep`, `large` 프로필과 model seed 0--4를 별도 fresh run으로 실행한다. 기본 전체 계획은
+Conductance 860회, Cycle 80회, Tree 80회로 총 1,020 model trainings이다. Cycle/Tree 후보는
+validation-only로 비교한 뒤 선택 checkpoint에 대해서만 각각 20회의 test-only 평가를 추가한다.
+Tree의 네 profile은 800 updates와 chart 8/8을 고정하고 실제 hidden/message-layer만 바꾼다.
+현재 확인된 것은 runner·manifest·무결성 검사와 로컬 테스트이며 **이 1,020개 GPU 학습 결과는
+아직 실행·수령하지 않았다.** 기존 단일 크기 결과를 scaling 결과로 재분류하지 않는다.
+
 ### 2026-09-02 사용자 서버 실행 보고
 
 사용자 terminal 보고의 공통 source/pull revision은 `7b4cd32`다. GPU preflight에는
@@ -35,6 +45,7 @@ runner는 각각 `passed`다. 성능 수치와 전체 원본 artifact는 수령�
 | Conductance v3 | `gat-relative-c-v3-gpu6-seed0-v1` | 과거 arxiv-only 2-job run `passed`; 현재 10-job 결과 아님 |
 | Conductance v4 | `gat-hybrid-c-spatial-v4-gpu6-seed0-v1` | 과거 arxiv-only 4-arm run의 `fixed_c_identity_w`만 200 epochs·child exit 0 뒤 구 report gate 중단; 나머지 3개 pending; 현재 20-job 결과 아님 |
 | Cycle PE v2 | `cycle-pe-v2-gpu6-seed0-v1` | `passed` |
+| 전체 scaling | 미실행 | V1 포함 1,020-training 실행 코드만 추가; GPU 결과 없음 |
 
 V3는 graph-centered score → bounded relative C → isotropic mixture와 학습 alpha의
 대칭 정규화를 사용한다. AdamW backbone/생성기/scalar 그룹을 분리했다. 현재 기본은
@@ -67,8 +78,8 @@ child exit 0까지 완료됐지만 구 numeric hard gate에서 중단되어 나�
 성능 수치는 수령하지 않았고 이 partial arm은 재사용하지 않으므로, 정식 V4 결과에는 새
 run의 5개 데이터 × 네 fresh arm, 총 20 jobs가 모두 필요하다.
 
-현재 5-dataset/PPI 확장 구현은 `PYTHONUTF8=1` 전체 로컬 회귀에서
-**1317 passed / 66 skipped** (74.10 s, exit 0)를 통과했다. V2/V3/V4 전용 결과는 각각
+현재 전체 scaling runner까지 포함한 구현은 `PYTHONUTF8=1` 전체 로컬 회귀에서
+**1394 passed / 66 skipped** (86.72 s, exit 0)를 통과했다. V2/V3/V4 전용 결과는 각각
 **118 passed**, **141 passed / 2 skipped**, **131 passed**다. Ruff·compileall과 재생성한
 `code_summary --check`도 통과했다. 생략은 Linux/Bash·Windows symlink 권한·로컬 PyG 미설치·
 실제 CUDA RNG처럼 이 호스트에서 충족되지 않은 환경 조건이다. 이 검증은 공개 데이터 GPU 학습
@@ -106,6 +117,7 @@ graph binding과 학습 루프→checkpoint→비교표 연결 및 실제 C grad
 | Conductance 직접 C v2 | 과거 arxiv-only `gat-direct-c-v2-gpu6-seed0-v1` 사용자 보고상 `passed`; 현재 4-dataset 기본 결과는 미수령 |
 | Conductance 상대 C v3 | 과거 arxiv-only `gat-relative-c-v3-gpu6-seed0-v1` 사용자 보고상 `passed`; 현재 5-dataset 기본 결과는 미수령 |
 | [Conductance C × spatial W v4](CONDUCTANCE_V4.md) | 과거 arxiv run은 첫 arm 뒤 구 report gate에서 중단. 현재 5-dataset × 4-condition = 20-arm 정식 결과 없음; 새 전체 run 필요 |
+| [전체 큰 모델 scaling](RICH_SCALING_EXPERIMENTS.md) | Conductance V1~V4 860 + Cycle V1/V2 80 + Tree fixed/multi 80의 코드·로컬 계약 검증만 완료; GPU 결과 미수령 |
 | [CODE_SUMMARY.md](CODE_SUMMARY.md) | 이 버전의 source/test/config/script 전체를 파일별로 보존한 스냅샷 |
 
 `ebf8cd1`까지만 받은 서버에는 새 기능이 없으므로 업데이트 후 `git rev-parse HEAD`로

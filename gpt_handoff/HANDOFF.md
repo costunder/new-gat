@@ -2,7 +2,7 @@
 
 작성 기준일: 2026-09-02 (Asia/Seoul)
 
-이 문서는 `gpt_handoff/`의 여덟 파일 중 전체 프로젝트 인수인계를 담당한다. 외부 ChatGPT 또는
+이 문서는 `gpt_handoff/`의 아홉 파일 중 전체 프로젝트 인수인계를 담당한다. 외부 ChatGPT 또는
 연구 리뷰어가 저장소를 처음 받아도 수학적 가설, 구현 경계,
 데이터 계약, 실행법, 검증 범위와 미완료 항목을 혼동하지 않도록 만든 인수인계 문서다.
 원문 코드는 같은 폴더의 `CODE_SUMMARY.md`에 파일별로 들어 있다.
@@ -692,11 +692,11 @@ Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 
 ### 코드 스냅샷
 
 - 파일: `gpt_handoff/CODE_SUMMARY.md`
-- 스냅샷 생성 기준 parent Git HEAD: `070b191bfdc02c19c78cb95617e78befbdc017c1`
-  (현재 V1-dataset 확장 작업본 포함)
-- 포함 파일: 201개
-- 크기: 2,064,441 bytes, 52,120 lines (`str.splitlines()` 기준)
-- SHA-256: `7F40C471371C1DC8DA6B214EF70A9D0DA0B5A23CE3B11C27483433D1ED19DD69`
+- 스냅샷 생성 기준 parent Git HEAD: `b26aec8e5a6fbb88829ad3a9bd6335ad3a20654c`
+  (현재 전체 scaling 작업본 포함)
+- 포함 파일: 210개
+- 크기: 2,334,863 bytes, 58,814 lines (`str.splitlines()` 기준)
+- SHA-256: `D999B6FAAB1DA7048A56159CD54DAC3EC8E965A2FB818D347D3FABFB233814DE`
 - 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`, `.gitattributes`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
 - 범위: 이 버전의 전체 source/test/config/script. 생성기는 작업본 변경도 포함하므로 게시 전
@@ -1518,8 +1518,8 @@ roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사�
 
 ## 8. 자동 검증 상태
 
-현재 5-dataset/PPI 확장 구현은 `PYTHONUTF8=1` 전체 로컬 회귀에서
-**1317 passed / 66 skipped** (74.10 s, exit 0)를 통과했다. 버전별 전용 결과는 V2
+현재 전체 scaling runner까지 포함한 구현은 `PYTHONUTF8=1` 전체 로컬 회귀에서
+**1394 passed / 66 skipped** (86.72 s, exit 0)를 통과했다. 버전별 전용 결과는 V2
 **118 passed**, V3 **141 passed / 2 skipped**, V4 **131 passed**다. Ruff·compileall과
 재생성한 `code_summary --check`도 통과했다. 생략은 Linux/Bash 계약, Windows symlink 권한,
 로컬 PyG 미설치와 실제 CUDA RNG처럼 이 호스트에서 충족되지 않은 환경 조건이다. 공개 데이터
@@ -1579,6 +1579,24 @@ Read-only protocol 교차검토에서는 CycleCount full specification/hash가 �
 
 ## 9. 논문 claim 전 우선순위
 
+### 전체 모델 규모 확장 suite
+
+단일 기본 크기만으로 큰 모델의 적합도를 놓치지 않도록 `scripts/run_rich_scaling.py`와 세
+트랙별 scaling runner를 추가했다. 이것은 파라미터 수를 맞추는 실험이 아니라 각 원래 방법을
+더 넓고 깊게 만드는 사전 정의 scaling curve다. Conductance는 V1~V4를 모두 포함해
+`64×2`, `128×2`, `64×4`, `128×4`를 실행한다. Cycle V1/V2는 hidden/PE/layer를
+`64/32/3`, `128/64/3`, `64/32/6`, `128/64/6`으로 확장한다. Tree는 hidden 64/128과
+실제 message layer 2/4를 조합하고, 모든 profile에서 800 updates와 chart 8/8을 고정한 채
+fixed/multi를 모두 새로 학습한다.
+
+기본 5 seeds 전체는 Conductance 860, Cycle 80, Tree 80으로 총 1,020 fresh trainings다.
+Cycle과 Tree는 seed 평균 validation으로 공통 profile을 선택한 뒤 선택된 checkpoint 20개씩만
+test-only로 평가하며, 이 40회는 재학습이 아니므로 1,020 학습 횟수에 포함하지 않는다.
+트랙별 결과와 통합 manifest는 기존 기본 결과와 별도 경로에 create-once로 저장한다. 한 트랙
+실패 뒤에도 기본 통합 runner는 가능한 다음 트랙을 실행하되 전체 상태는 failed로 남긴다.
+자세한 profile, 명령, 결과 경계는 [RICH_SCALING_EXPERIMENTS.md](RICH_SCALING_EXPERIMENTS.md)를
+따른다. 현재는 코드와 로컬 계약 검증만 완료됐고 GPU scaling 결과는 없다.
+
 ### P0 — 이미 나온 결과의 검증과 Conductance 실패 원인 분리
 
 1. 기존 run ID, source revision/dirty 상태, lock, data checksum, best checkpoint, history와
@@ -1601,8 +1619,9 @@ Read-only protocol 교차검토에서는 CycleCount full specification/hash가 �
    fresh 실행한다. PPI는 V3와 같은 계약을 사용하고 과거 arxiv partial arm을 재사용하지 않는다.
 6. Cycle PE v2는 별도 코드·cache·run으로 GPU 검증한다. 기존 `cycle_set` 결과를 기저벡터 실적으로
    재분류하지 않는다. 실행 최적화 역시 동등성·peak memory·GPU 속도를 별도로 측정한다.
-7. Tree의 chart-family OOD, validation 미사용, 연속 target에 부적절한 rounded 지표를
-   반영해 claim을 제한한다. 지표/학습 변경은 문서 수정과 별도 작업으로 다룬다.
+7. 과거 Tree 기본 결과의 validation 미사용과 연속 target에 부적절한 rounded 지표를
+   반영해 claim을 제한한다. 새 scaling suite는 공식 validation의 graph-macro 목적값으로
+   profile을 선택하고 CSL accuracy/ZINC MAE를 분리하지만, 과거 결과를 소급 재해석하지 않는다.
 
 코드 수준 P0 교정은 완료됐다: semantic strict cache와 atomic publish, BREC official/custom
 분리와 global reliability gate, Wilson train-family 제거, tree orientation gauge test, 네 seed 축,
@@ -1640,8 +1659,8 @@ Cycle PE 기저벡터 v2의 결과와 가속 실측까지
 ## 10. 외부 ChatGPT에게 권장하는 교차검증 질문
 
 `README_FIRST.md`, 이 파일, `EXPERIMENT_STATUS.md`, `CONDUCTANCE_V2.md`,
-`CONDUCTANCE_V3.md`, `CONDUCTANCE_V4.md`, `CYCLE_PE_V2.md`, `CODE_SUMMARY.md`의
-여덟 파일을 함께 주고 다음을 요청한다.
+`CONDUCTANCE_V3.md`, `CONDUCTANCE_V4.md`, `CYCLE_PE_V2.md`,
+`RICH_SCALING_EXPERIMENTS.md`, `CODE_SUMMARY.md`의 아홉 파일을 함께 주고 다음을 요청한다.
 먼저 기본 benchmark/기저벡터 v2/보조 `core/all` 범위를 구분한다.
 
 1. `B∈R^{m×n}` convention에서 `ker(B^T)`, `L=B^TB`, fundamental basis와 pseudoinverse 설명이
@@ -1706,5 +1725,7 @@ Node-degree 개선은 관측했지만 같은 정규화에서 learned C의 valida
 성능 수치와 전체 artifact를 수령하지 않아 효과를 판정하지 않는다. 다음 작업자는 이 세 run의
 원본 artifact를 확보·검증하고, V2/V3/V4의 확대된 8/10/20개 학습을 새 run으로 완료하며,
 최적화의 GPU 검증과
-Tree protocol 한계를 독립적으로 다뤄야 한다.
+Tree protocol 한계를 독립적으로 다뤄야 한다. V1을 포함한 전체 큰 모델 scaling suite도
+코드만 준비됐으므로 1,020개 결과가 있는 것처럼 주장하지 말고 서버 manifest를 별도로
+확보·검증해야 한다.
 Adaptive MST나 세 트랙 결합은 이후 별도 실험이며 기존 결과를 덮어쓰지 않는다.

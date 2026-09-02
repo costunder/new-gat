@@ -107,6 +107,46 @@ def _view(record: GraphRecord) -> GraphChartView:
     )
 
 
+def test_output_dim_comes_from_declared_target_metadata() -> None:
+    dataset = SimpleNamespace(
+        suite="csl",
+        target_names=("class_0", "class_1", "class_2"),
+        records=(SimpleNamespace(split="train", target=(0.0,)),),
+    )
+    assert tree_paper._output_dim(dataset) == 3
+    dataset.target_names = ()
+    with pytest.raises(ValueError, match="target_names metadata"):
+        tree_paper._output_dim(dataset)
+
+
+def test_cache_integrity_and_model_split_usage_are_separate() -> None:
+    dataset = SimpleNamespace(
+        suite="csl",
+        records=tuple(SimpleNamespace(split=split) for split in ("train", "validation", "test")),
+    )
+    assert tree_paper._dataset_cache_integrity(dataset) == {
+        "full_cache_loaded": True,
+        "all_declared_splits_validated": True,
+        "loaded_and_validated_splits": ["test", "train", "validation"],
+    }
+    assert tree_paper._model_split_usage(
+        dataset, evaluation_scope="validation", prepare_only=False
+    ) == {
+        "fit_splits": ["train"],
+        "evaluation_splits": ["validation"],
+        "selection_splits": ["validation"],
+        "test_evaluated": False,
+        "test_used_for_selection": False,
+    }
+    selected_test = tree_paper._model_split_usage(
+        dataset, evaluation_scope="selected_test", prepare_only=False
+    )
+    assert selected_test["fit_splits"] == []
+    assert selected_test["evaluation_splits"] == ["test"]
+    assert selected_test["test_evaluated"] is True
+    assert selected_test["test_used_for_selection"] is False
+
+
 def test_variable_beta_batch_masks_tree_cycle_and_multicycle() -> None:
     records = (
         GraphRecord("tree", "fixture", "train", 4, ((0, 1), (1, 2), (2, 3)), (0.0,)),

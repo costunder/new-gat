@@ -227,25 +227,31 @@ class VariableBetaCycleEncoder(nn.Module):
     measured by this track.
     """
 
-    def __init__(self, *, hidden_dim: int, output_dim: int) -> None:
+    def __init__(self, *, hidden_dim: int, output_dim: int, message_layers: int = 2) -> None:
         super().__init__()
-        if hidden_dim < 4 or output_dim < 1:
-            raise ValueError("hidden_dim >= 4 and output_dim >= 1 are required")
-        self.coordinate = nn.Sequential(
-            nn.Linear(3, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-        )
+        if hidden_dim < 4 or output_dim < 1 or message_layers < 1:
+            raise ValueError(
+                "hidden_dim >= 4, output_dim >= 1, and message_layers >= 1 are required"
+            )
+        self.hidden_dim = hidden_dim
+        self.message_layers = message_layers
+
+        def hidden_stack(input_dim: int) -> nn.Sequential:
+            layers: list[nn.Module] = []
+            for index in range(message_layers):
+                layers.extend(
+                    (
+                        nn.Linear(input_dim if index == 0 else hidden_dim, hidden_dim),
+                        nn.SiLU(),
+                    )
+                )
+            return nn.Sequential(*layers)
+
+        self.coordinate = hidden_stack(3)
         chemistry_dim = max(4, hidden_dim // 4)
         self.atom_embedding = nn.Embedding(ZINC_NUM_ATOM_TYPES + 1, chemistry_dim)
         self.bond_embedding = nn.Embedding(ZINC_NUM_BOND_TYPES + 1, chemistry_dim)
-        self.edge = nn.Sequential(
-            nn.Linear(3 * hidden_dim + 4 + 3 * chemistry_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-        )
+        self.edge = hidden_stack(3 * hidden_dim + 4 + 3 * chemistry_dim)
         self.head = nn.Sequential(
             nn.Linear(3 * hidden_dim, hidden_dim),
             nn.SiLU(),
@@ -261,7 +267,7 @@ class VariableBetaCycleEncoder(nn.Module):
     def forward(self, batch: PaddedChartBatch) -> Tensor:
         basis = batch.basis
         batch_size, max_edges, max_beta = basis.shape
-        hidden_dim = self.coordinate[0].out_features
+        hidden_dim = self.hidden_dim
         if max_beta:
             edge_counts = batch.edge_mask.sum(dim=1).clamp_min(1)[:, None]
             normalized_cycle_support = basis.abs().sum(dim=1) / edge_counts
@@ -381,6 +387,7 @@ def fit_downstream_model(
     task_type: str,
     output_dim: int,
     hidden_dim: int,
+    message_layers: int = 2,
     updates: int,
     batch_size: int,
     learning_rate: float,
@@ -404,7 +411,11 @@ def fit_downstream_model(
     torch.manual_seed(seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
-    model = VariableBetaCycleEncoder(hidden_dim=hidden_dim, output_dim=output_dim).to(device)
+    model = VariableBetaCycleEncoder(
+        hidden_dim=hidden_dim,
+        output_dim=output_dim,
+        message_layers=message_layers,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     amp_grad_scaler = getattr(torch.amp, "GradScaler", None)
     if amp_grad_scaler is not None:
@@ -614,6 +625,7 @@ def run_fixed_vs_multichart(
     task_type: str,
     output_dim: int,
     hidden_dim: int,
+    message_layers: int = 2,
     updates: int,
     batch_size: int,
     learning_rate: float,
@@ -631,6 +643,7 @@ def run_fixed_vs_multichart(
         "task_type": task_type,
         "output_dim": output_dim,
         "hidden_dim": hidden_dim,
+        "message_layers": message_layers,
         "updates": updates,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
