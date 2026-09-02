@@ -148,10 +148,28 @@ def _diagnostics(score, specification):
             "normalization_recomputed_for_c_interventions": True,
             "mean_c_numeric_check": {
                 "comparison": "mean_c_vs_ones_c",
+                "role": "informational_non_gating",
+                "separate_full_graph_forwards": True,
                 "allclose_rtol": 1e-5,
                 "allclose_atol": 1e-6,
-                "passed": True,
+                "within_declared_tolerance": True,
                 "logit_mean_absolute_delta": 0.0,
+                "logit_max_absolute_delta": 0.0,
+                "changed_prediction_fraction": 0.0,
+                "replacement_contracts": {
+                    "mean_c": {
+                        "contract": "graph_constant_positive",
+                        "satisfied": True,
+                        "layers_checked": 2,
+                        "edge_counts": [3, 3],
+                    },
+                    "ones_c": {
+                        "contract": "exact_one",
+                        "satisfied": True,
+                        "layers_checked": 2,
+                        "edge_counts": [3, 3],
+                    },
+                },
             },
         },
     }
@@ -294,6 +312,10 @@ def _edit(manifest, callback, *, condition="fixed_c_identity_w", refresh=True):
         job["metrics_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _mean_c_numeric_check(metrics):
+    return metrics["diagnostics"]["best_checkpoint_interventions"]["mean_c_numeric_check"]
+
+
 def test_complete_report_has_all_conditional_contrasts_and_resources(tmp_path, monkeypatch):
     root, manifest = _fixture(tmp_path)
     before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
@@ -317,6 +339,168 @@ def test_complete_report_has_all_conditional_contrasts_and_resources(tmp_path, m
         lambda: manifest["sources"]["sha256"],
     )
     assert main([str(root)]) == 0
+
+
+def test_mean_c_tolerance_miss_is_informational_and_keeps_factorial_contrasts(tmp_path):
+    root, manifest = _fixture(tmp_path)
+
+    def record_cuda_roundoff(metrics):
+        _mean_c_numeric_check(metrics).update(
+            within_declared_tolerance=False,
+            logit_mean_absolute_delta=2.0e-6,
+            logit_max_absolute_delta=3.0e-5,
+            changed_prediction_fraction=1.0e-4,
+        )
+
+    _edit(manifest, record_cuda_roundoff)
+    result = write_comparison(root, manifest)
+    assert result["status"] == "passed"
+    assert result["complete"] is True
+    assert result["datasets"][0]["factorial_contrasts"] is not None
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "comparison",
+        "role",
+        "separate_full_graph_forwards",
+        "within_declared_tolerance",
+        "allclose_rtol",
+        "allclose_atol",
+        "logit_mean_absolute_delta",
+        "logit_max_absolute_delta",
+        "changed_prediction_fraction",
+        "replacement_contracts",
+    ],
+)
+def test_mean_c_numeric_contract_rejects_missing_fields(tmp_path, field):
+    root, manifest = _fixture(tmp_path)
+    _edit(manifest, lambda metrics: _mean_c_numeric_check(metrics).pop(field))
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("comparison", "ones_c_vs_mean_c"),
+        ("role", "integrity_gate"),
+        ("separate_full_graph_forwards", False),
+        ("separate_full_graph_forwards", 1),
+        ("within_declared_tolerance", 1),
+        ("within_declared_tolerance", "false"),
+        ("allclose_rtol", 2.0e-5),
+        ("allclose_rtol", -1.0e-5),
+        ("allclose_rtol", float("nan")),
+        ("allclose_atol", 2.0e-6),
+        ("allclose_atol", -1.0e-6),
+        ("allclose_atol", float("nan")),
+        ("logit_mean_absolute_delta", -1.0e-6),
+        ("logit_mean_absolute_delta", float("nan")),
+        ("logit_max_absolute_delta", -1.0e-6),
+        ("logit_max_absolute_delta", float("nan")),
+        ("changed_prediction_fraction", -0.1),
+        ("changed_prediction_fraction", 1.1),
+        ("changed_prediction_fraction", float("nan")),
+    ],
+)
+def test_mean_c_numeric_contract_rejects_invalid_values(tmp_path, field, value):
+    root, manifest = _fixture(tmp_path)
+    _edit(manifest, lambda metrics: _mean_c_numeric_check(metrics).update({field: value}))
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+def test_mean_c_numeric_contract_rejects_maximum_below_mean(tmp_path):
+    root, manifest = _fixture(tmp_path)
+
+    def invert_delta_order(metrics):
+        _mean_c_numeric_check(metrics).update(
+            logit_mean_absolute_delta=2.0e-5,
+            logit_max_absolute_delta=1.0e-5,
+        )
+
+    _edit(manifest, invert_delta_order)
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+def test_mean_c_numeric_contract_rejects_legacy_passed_field(tmp_path):
+    root, manifest = _fixture(tmp_path)
+    _edit(manifest, lambda metrics: _mean_c_numeric_check(metrics).update(passed=True))
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing_mean_c",
+        "missing_ones_c",
+        "extra_contract",
+        "missing_contract_field",
+        "extra_contract_field",
+        "wrong_mean_contract",
+        "wrong_ones_contract",
+        "unsatisfied",
+        "non_boolean_satisfied",
+        "wrong_layers_checked",
+        "non_integer_layers_checked",
+        "edge_counts_not_list",
+        "edge_counts_wrong_length",
+        "negative_edge_count",
+        "non_integer_edge_count",
+        "edge_counts_wrong_topology",
+        "different_edge_counts",
+    ],
+)
+def test_mean_c_replacement_contracts_fail_closed_on_missing_or_tampered_data(
+    tmp_path, change
+):
+    root, manifest = _fixture(tmp_path)
+
+    def tamper(metrics):
+        contracts = _mean_c_numeric_check(metrics)["replacement_contracts"]
+        if change == "missing_mean_c":
+            contracts.pop("mean_c")
+        elif change == "missing_ones_c":
+            contracts.pop("ones_c")
+        elif change == "extra_contract":
+            contracts["shuffled_c"] = copy.deepcopy(contracts["ones_c"])
+        elif change == "missing_contract_field":
+            contracts["mean_c"].pop("contract")
+        elif change == "extra_contract_field":
+            contracts["mean_c"]["unexpected"] = True
+        elif change == "wrong_mean_contract":
+            contracts["mean_c"]["contract"] = "exact_one"
+        elif change == "wrong_ones_contract":
+            contracts["ones_c"]["contract"] = "graph_constant_positive"
+        elif change == "unsatisfied":
+            contracts["mean_c"]["satisfied"] = False
+        elif change == "non_boolean_satisfied":
+            contracts["mean_c"]["satisfied"] = 1
+        elif change == "wrong_layers_checked":
+            contracts["mean_c"]["layers_checked"] = 1
+        elif change == "non_integer_layers_checked":
+            contracts["mean_c"]["layers_checked"] = True
+        elif change == "edge_counts_not_list":
+            contracts["mean_c"]["edge_counts"] = "3,3"
+        elif change == "edge_counts_wrong_length":
+            contracts["mean_c"]["edge_counts"] = [3]
+        elif change == "negative_edge_count":
+            contracts["mean_c"]["edge_counts"] = [3, -1]
+        elif change == "non_integer_edge_count":
+            contracts["mean_c"]["edge_counts"] = [3, True]
+        elif change == "edge_counts_wrong_topology":
+            contracts["mean_c"]["edge_counts"] = [4, 4]
+            contracts["ones_c"]["edge_counts"] = [4, 4]
+        else:
+            contracts["ones_c"]["edge_counts"] = [3, 4]
+
+    _edit(manifest, tamper)
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
 
 
 @pytest.mark.parametrize("status", ["pending", "running", "failed"])

@@ -8,6 +8,11 @@
 파라미터로 학습하는 가설**을 분리한다. 앞선 결과와 이 구분의 이유는
 [실험 상태와 C-learning 결과](EXPERIMENT_STATUS.md)에 있다.
 
+2026-09-02 사용자 보고상 source/pull revision `7b4cd32`, run
+`gat-direct-c-v2-gpu6-seed0-v1`은 `passed`다. Preflight GPU는
+`NVIDIA A100-SXM4-80GB MIG 1g.10gb`였고 `CUDA_VISIBLE_DEVICES=6`을 프로세스 내부
+`cuda:0`으로 사용했다. 성능 수치와 전체 원본 artifact는 수령하지 않아 별도로 주장하지 않는다.
+
 ## 실행
 
 [전체 인수인계](HANDOFF.md)의 Linux NVIDIA GPU·Conda 환경과 공식 데이터 캐시 계약을 사용한다.
@@ -151,6 +156,7 @@ Suite ID는 `conductance_direct_c_v2`다. 결과는
 | `<dataset>/<condition>/metrics.json` | 설정·graph binding·지표·파일 hash·파라미터 수 |
 
 비교할 때 원본 graph binding과 설정 일치부터 확인하고 direct−fixed accuracy 차이,
-선택/종료 epoch, train loss, C 분포와 파라미터 수를 함께 읽는다. 현재 실제 v2 GPU 결과는
-없으므로 개선·효율·novelty를 미리 주장하지 않는다. Model seed는 하나이고 validation만
-사용하므로 CI·p-value·SOTA 또는 일반적 최적 조건을 주장하지 않는다.
+선택/종료 epoch, train loss, C 분포와 파라미터 수를 함께 읽는다. 사용자 보고상 runner는
+`passed`지만 성능 수치와 전체 artifact를 수령하지 않았으므로 개선·효율·novelty를 주장하지
+않는다. Model seed는 하나이고 validation만 사용하므로 CI·p-value·SOTA 또는 일반적 최적
+조건을 주장하지 않는다.

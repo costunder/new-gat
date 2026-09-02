@@ -18672,6 +18672,7 @@ class Intervention:
         if name not in self.NAMES:
             raise ValueError("Unsupported V4 intervention")
         self.model, self.name, self.seed, self.handles = model, name, seed, []
+        self.c_contract_checks: list[dict[str, Any]] = []
 
     def __enter__(self):
         try:
@@ -18707,26 +18708,89 @@ class Intervention:
 
     def replace_c(self, inputs, c: Tensor, layer: int):
         if self.name in {"ones_c", "ones_c_identity_w"}:
-            return torch.ones_like(c)
+            result = torch.ones_like(c)
+            exact_one = bool((result == 1).all())
+            if not exact_one:
+                raise RuntimeError("C=1 intervention did not produce exact unit conductance")
+            self.c_contract_checks.append(
+                {
+                    "layer": layer,
+                    "edge_count": c.numel(),
+                    "contract": "exact_one",
+                    "satisfied": True,
+                }
+            )
+            return result
         _, incidence, node_graph, num_graphs = inputs
         edge_graph = node_graph[incidence[0]]
         result = c.clone()
         generator = torch.Generator(device=c.device).manual_seed(self.seed + 104729 * layer)
+        nonempty_graphs = 0
         for graph_index in range(num_graphs):
             ids = (edge_graph == graph_index).nonzero(as_tuple=False).flatten()
             if not ids.numel():
                 continue
+            nonempty_graphs += 1
             values = c.index_select(0, ids)
             if self.name == "mean_c":
-                result[ids] = values.mean()
+                mean = values.mean()
+                if not bool(torch.isfinite(mean)) or not bool(mean > 0):
+                    raise FloatingPointError(
+                        "Mean-C intervention requires a finite positive graph mean"
+                    )
+                result[ids] = mean
+                if not bool((result.index_select(0, ids) == mean).all()):
+                    raise RuntimeError("Mean-C intervention is not graph-constant")
             else:
                 permutation = torch.randperm(ids.numel(), device=c.device, generator=generator)
                 result[ids] = values[permutation]
+        if self.name == "mean_c":
+            if not bool(torch.isfinite(result).all()) or not bool((result > 0).all()):
+                raise FloatingPointError(
+                    "Mean-C intervention did not remain finite and positive"
+                )
+            self.c_contract_checks.append(
+                {
+                    "layer": layer,
+                    "edge_count": c.numel(),
+                    "nonempty_graph_count": nonempty_graphs,
+                    "contract": "graph_constant_positive",
+                    "satisfied": True,
+                }
+            )
         return result
+
+    def contract_summary(self, expected_layers: int) -> dict[str, Any]:
+        """Summarize the directly checked C-replacement contract."""
+
+        if self.name not in {"mean_c", "ones_c", "ones_c_identity_w"}:
+            raise ValueError("This intervention has no C-replacement contract")
+        expected = list(range(expected_layers))
+        observed = [record["layer"] for record in self.c_contract_checks]
+        satisfied = all(record["satisfied"] for record in self.c_contract_checks)
+        if observed != expected or not satisfied:
+            raise RuntimeError("C intervention contract checks are missing or unsatisfied")
+        return {
+            "contract": self.c_contract_checks[0]["contract"] if expected else None,
+            "satisfied": True,
+            "layers_checked": len(self.c_contract_checks),
+            "edge_counts": [record["edge_count"] for record in self.c_contract_checks],
+        }
+
+
+def _logit_difference(left: Tensor, right: Tensor, label: str) -> Tensor:
+    if not isinstance(left, Tensor) or not isinstance(right, Tensor) or left.shape != right.shape:
+        raise ValueError(f"{label} logits must be aligned tensors")
+    if not left.numel():
+        raise ValueError(f"{label} logits must be nonempty")
+    left, right = left.detach().double(), right.detach().double()
+    if not bool(torch.isfinite(left).all()) or not bool(torch.isfinite(right).all()):
+        raise FloatingPointError(f"Nonfinite {label} logits")
+    return left - right
 
 
 def _intervention_row(name, result, logits, original, reference):
-    difference = logits.double() - reference.double()
+    difference = _logit_difference(logits, reference, name)
     return {
         "intervention": name,
         "intervention_kind": "read_only_selected_checkpoint",
@@ -18760,11 +18824,13 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
         "ones_c_identity_w",
         "propagation_off",
     )
-    rows, intervention_logits = [], {}
+    rows, intervention_logits, replacement_contracts = [], {}, {}
     try:
         for name in names:
-            with Intervention(model, name, seed):
+            with Intervention(model, name, seed) as intervention:
                 result, logits = evaluate_validation(model, graph, indices, observe=False)
+            if name in {"mean_c", "ones_c"}:
+                replacement_contracts[name] = intervention.contract_summary(len(model.operators))
             intervention_logits[name] = logits
             rows.append(_intervention_row(name, result, logits, original, reference))
     finally:
@@ -18782,17 +18848,28 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
                 raise RuntimeError("Interventions changed a parameter gradient")
     mean_logits = intervention_logits["mean_c"].double()
     ones_logits = intervention_logits["ones_c"].double()
-    numeric_difference = mean_logits - ones_logits
+    numeric_difference = _logit_difference(mean_logits, ones_logits, "mean-C/C=1")
+    mean_absolute_delta = float(numeric_difference.abs().mean())
+    max_absolute_delta = float(numeric_difference.abs().max())
+    if not math.isfinite(mean_absolute_delta) or not math.isfinite(max_absolute_delta):
+        raise FloatingPointError("Nonfinite mean-C/C=1 numerical delta")
+    if max_absolute_delta < mean_absolute_delta:
+        raise RuntimeError("Mean-C/C=1 maximum numerical delta is smaller than its mean")
     numeric_check = {
         "comparison": "mean_c_vs_ones_c",
+        "role": "informational_non_gating",
+        "separate_full_graph_forwards": True,
         "allclose_rtol": 1e-5,
         "allclose_atol": 1e-6,
-        "passed": bool(torch.allclose(mean_logits, ones_logits, rtol=1e-5, atol=1e-6)),
-        "logit_mean_absolute_delta": float(numeric_difference.abs().mean()),
-        "logit_max_absolute_delta": float(numeric_difference.abs().max()),
+        "within_declared_tolerance": bool(
+            torch.allclose(mean_logits, ones_logits, rtol=1e-5, atol=1e-6)
+        ),
+        "logit_mean_absolute_delta": mean_absolute_delta,
+        "logit_max_absolute_delta": max_absolute_delta,
         "changed_prediction_fraction": float(
             (mean_logits.argmax(-1) != ones_logits.argmax(-1)).double().mean()
         ),
+        "replacement_contracts": replacement_contracts,
     }
     return {
         "status": "passed",
@@ -18804,9 +18881,10 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
         "normalization_recomputed_for_c_interventions": True,
         "mean_c_numeric_check": numeric_check,
         "mean_ones_note": (
-            "Graph-constant positive C cancels under symmetric normalization; mean-C and "
-            "C=1 should agree up to floating-point rounding. This is a numerical check, "
-            "not an independent causal intervention."
+            "Graph-constant positive C cancellation and the replacement contracts are enforced "
+            "directly. Mean-C and C=1 logits come from separate full-graph forwards, so their "
+            "allclose result is informational and non-gating because CUDA scatter rounding need "
+            "not be bitwise repeatable. This is not an independent causal intervention."
         ),
         "interpretation": (
             "Checkpoint reliance, not a retrained-model benefit; no optimizer step or test "
@@ -19537,7 +19615,8 @@ CAVEATS = [
     "C and W can compensate across layers. C spread, gamma/tau, W-I distance, singular values "
     "or gradient norms alone do not prove that either mechanism is useful.",
     "Mean-C and C=1 are algebraically redundant under symmetric weighted-degree normalization. "
-    "Their checkpoint interventions are a numerical consistency check, not two effects.",
+    "Their separate CUDA-forward logit allclose is informational and non-gating because scatter "
+    "is not bitwise deterministic; these interventions are not two effects.",
     "Checkpoint interventions use separate validation forwards without retraining. They measure "
     "selected-checkpoint reliance; the four fresh arms provide the training contrasts.",
     "Elapsed time and peak CUDA memory include diagnostics, interventions, checkpoint/history IO "
@@ -19897,9 +19976,86 @@ def _validate_diagnostics(child: dict[str, Any], config: dict[str, Any]) -> None
     numeric = audit.get("mean_c_numeric_check")
     if not isinstance(numeric, dict) or numeric.get("comparison") != "mean_c_vs_ones_c":
         raise ValueError("mean-C/C=1 numerical check is required")
-    if numeric.get("passed") is not True:
-        raise ValueError("mean-C and C=1 numerical consistency check failed")
-    _nonnegative_optional(numeric.get("logit_mean_absolute_delta"), "mean-C numeric delta")
+    if "passed" in numeric:
+        raise ValueError("legacy mean-C numeric passed field is not allowed")
+    if numeric.get("role") != "informational_non_gating":
+        raise ValueError("mean-C numerical check must be informational and non-gating")
+    if numeric.get("separate_full_graph_forwards") is not True:
+        raise ValueError("mean-C numerical check must identify separate full-graph forwards")
+    if not isinstance(numeric.get("within_declared_tolerance"), bool):
+        raise ValueError("mean-C within-tolerance observation must be boolean")
+    _require_close(
+        numeric.get("allclose_rtol"),
+        1.0e-5,
+        "mean-C numerical relative tolerance",
+        atol=0.0,
+    )
+    _require_close(
+        numeric.get("allclose_atol"),
+        1.0e-6,
+        "mean-C numerical absolute tolerance",
+        atol=0.0,
+    )
+    mean_delta = _finite_number(
+        numeric.get("logit_mean_absolute_delta"), "mean-C mean absolute logit delta"
+    )
+    maximum_delta = _finite_number(
+        numeric.get("logit_max_absolute_delta"), "mean-C maximum absolute logit delta"
+    )
+    if mean_delta < 0 or maximum_delta < 0:
+        raise ValueError("mean-C numerical deltas must be nonnegative")
+    if maximum_delta < mean_delta:
+        raise ValueError("mean-C maximum absolute delta must not be below its mean")
+    _finite_number(
+        numeric.get("changed_prediction_fraction"),
+        "mean-C changed predictions",
+        unit_interval=True,
+    )
+    replacement_contracts = numeric.get("replacement_contracts")
+    expected_contracts = {
+        "mean_c": "graph_constant_positive",
+        "ones_c": "exact_one",
+    }
+    if not isinstance(replacement_contracts, dict) or set(replacement_contracts) != set(
+        expected_contracts
+    ):
+        raise ValueError("mean-C numerical check requires exactly mean_c/ones_c contracts")
+    topology = child.get("topology")
+    topology_edge_count = _integer(
+        topology.get("num_edges") if isinstance(topology, dict) else None,
+        "topology.num_edges",
+    )
+    expected_edge_counts = None
+    for name, expected_contract in expected_contracts.items():
+        replacement = replacement_contracts[name]
+        if not isinstance(replacement, dict) or set(replacement) != {
+            "contract",
+            "satisfied",
+            "layers_checked",
+            "edge_counts",
+        }:
+            raise ValueError(f"{name} replacement contract metadata is incomplete")
+        if replacement.get("contract") != expected_contract:
+            raise ValueError(f"{name} replacement contract kind is invalid")
+        if replacement.get("satisfied") is not True:
+            raise ValueError(f"{name} replacement contract must be satisfied")
+        layers_checked = _integer(
+            replacement.get("layers_checked"), f"{name} replacement layers_checked"
+        )
+        if layers_checked != config["layers"]:
+            raise ValueError(f"{name} replacement must check every configured layer")
+        edge_counts = replacement.get("edge_counts")
+        if not isinstance(edge_counts, list) or len(edge_counts) != layers_checked:
+            raise ValueError(f"{name} replacement requires one edge count per layer")
+        checked_edge_counts = [
+            _integer(value, f"{name} replacement edge count") for value in edge_counts
+        ]
+        if any(value != topology_edge_count for value in checked_edge_counts):
+            raise ValueError(f"{name} replacement edge counts must match the bound topology")
+        if expected_edge_counts is None:
+            expected_edge_counts = checked_edge_counts
+        elif checked_edge_counts != expected_edge_counts:
+            raise ValueError("mean-C and C=1 replacements must cover identical layer edges")
 
 
 def _load(
@@ -46103,6 +46259,180 @@ def test_invalid_v4_modes_and_chunk_are_rejected(kwargs):
         RelativeCSpatialConv(2, **kwargs)
 ````
 
+# tests/test_conductance_v4_diagnostics.py
+
+````python
+"""CPU fixtures for V4 selected-checkpoint diagnostic contracts."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from research.conductance_gat.ablation.model import state_sha256  # noqa: E402
+from research.conductance_gat.v4 import diagnostics  # noqa: E402
+from research.conductance_gat.v4.diagnostics import (  # noqa: E402
+    Intervention,
+    best_checkpoint_interventions,
+    evaluate_validation,
+)
+from research.conductance_gat.v4.model import RelativeCSpatialNodeClassifier  # noqa: E402
+from research.conductance_gat.v4.operator import symmetric_spatial_propagation  # noqa: E402
+
+
+def _graph():
+    return SimpleNamespace(
+        x=torch.tensor(
+            [[0.5, 1.0, 2.0], [1.0, 2.0, 0.5], [2.0, 0.5, 1.0], [3.0, 1.0, 2.0]]
+        ),
+        y=torch.tensor([0, 1, 0, 1]),
+        incidence_edge_index=torch.tensor([[0, 0, 1, 2], [1, 2, 2, 3]]),
+    )
+
+
+def _model(*, gate_mode="relative"):
+    torch.manual_seed(17)
+    model = RelativeCSpatialNodeClassifier(
+        3,
+        2,
+        hidden_channels=8,
+        layers=2,
+        dropout=0.5,
+        gate_mode=gate_mode,
+        spatial_mode="fixed_identity",
+        edge_chunk_size=2,
+    )
+    if gate_mode == "relative":
+        with torch.no_grad():
+            for operator in model.operators:
+                operator.estimator.network[-1].weight.normal_(std=0.2)
+    return model
+
+
+def test_graphwise_positive_constant_c_is_algebraically_equivalent_to_ones():
+    residual = torch.tensor(
+        [
+            [0.2, -1.1],
+            [1.7, 0.4],
+            [-0.6, 2.2],
+            [3.0, -0.5],
+            [0.8, 1.3],
+            [-1.4, 0.6],
+        ],
+        dtype=torch.float64,
+    )
+    message = residual.flip(0).clone()
+    incidence = torch.tensor([[0, 1, 3, 4], [1, 2, 4, 5]], dtype=torch.long)
+    alpha = torch.tensor(0.37, dtype=torch.float64)
+    graph_constant_c = torch.tensor([2.0, 2.0, 7.0, 7.0], dtype=torch.float64)
+    actual = symmetric_spatial_propagation(
+        residual,
+        message,
+        graph_constant_c,
+        incidence,
+        alpha,
+        edge_chunk_size=2,
+    )
+    expected = symmetric_spatial_propagation(
+        residual,
+        message,
+        torch.ones_like(graph_constant_c),
+        incidence,
+        alpha,
+        edge_chunk_size=2,
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-14, atol=1e-14)
+
+
+def test_separate_forward_jitter_is_informational_and_preserves_model(monkeypatch):
+    graph, model = _graph(), _model()
+    indices = torch.tensor([0, 1, 2])
+    model.train()
+    model.decoder.eval()
+    model.operators[0].raw_alpha.grad = torch.ones(())
+    original, reference = evaluate_validation(model, graph, indices)
+    before_state = state_sha256(model)
+    before_modes = [module.training for module in model.modules()]
+    before_rng = torch.random.get_rng_state().clone()
+    real_evaluate = diagnostics.evaluate_validation
+    calls = 0
+
+    def jittered_evaluate(*args, **kwargs):
+        nonlocal calls
+        result, logits = real_evaluate(*args, **kwargs)
+        calls += 1
+        if calls == 1:  # mean-C; emulate harmless separate-forward CUDA scatter drift.
+            logits = logits.clone()
+            logits[0, 0] += 0.01
+        return result, logits
+
+    monkeypatch.setattr(diagnostics, "evaluate_validation", jittered_evaluate)
+    audit = best_checkpoint_interventions(
+        model, graph, indices, original, reference, seed=17
+    )
+
+    numeric = audit["mean_c_numeric_check"]
+    assert audit["status"] == "passed"
+    assert numeric["within_declared_tolerance"] is False
+    assert numeric["role"] == "informational_non_gating"
+    assert numeric["separate_full_graph_forwards"] is True
+    assert "passed" not in numeric
+    assert 0 <= numeric["logit_mean_absolute_delta"] <= numeric["logit_max_absolute_delta"]
+    assert numeric["replacement_contracts"]["mean_c"]["satisfied"] is True
+    assert numeric["replacement_contracts"]["ones_c"]["satisfied"] is True
+    assert state_sha256(model) == before_state
+    assert [module.training for module in model.modules()] == before_modes
+    assert torch.equal(torch.random.get_rng_state(), before_rng)
+    assert model.operators[0].raw_alpha.grad.item() == 1
+    assert all(
+        not operator._forward_hooks
+        and not operator.estimator._forward_hooks
+        and not operator.message_transform._forward_hooks
+        for operator in model.operators
+    )
+
+
+def test_nonfinite_reference_logits_are_rejected():
+    graph, model = _graph(), _model()
+    indices = torch.tensor([0, 1, 2])
+    original, reference = evaluate_validation(model, graph, indices)
+    reference[0, 0] = float("nan")
+    with pytest.raises(FloatingPointError, match="Nonfinite mean_c logits"):
+        best_checkpoint_interventions(model, graph, indices, original, reference, seed=0)
+
+
+@pytest.mark.parametrize("name", ["mean_c", "ones_c"])
+def test_fixed_c_hooks_produce_exact_ones_and_record_contract(name):
+    graph, model = _graph(), _model(gate_mode="fixed_one")
+    observed = []
+    handles = []
+    intervention = Intervention(model, name, seed=0)
+    try:
+        with intervention:
+            handles = [
+                operator.estimator.register_forward_hook(
+                    lambda module, inputs, output: observed.append(output.detach().clone())
+                )
+                for operator in model.operators
+            ]
+            with torch.no_grad():
+                model.eval()(graph)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert len(observed) == len(model.operators)
+    assert all(torch.equal(value, torch.ones_like(value)) for value in observed)
+    summary = intervention.contract_summary(len(model.operators))
+    assert summary["satisfied"] is True and summary["layers_checked"] == len(model.operators)
+    assert summary["contract"] == (
+        "graph_constant_positive" if name == "mean_c" else "exact_one"
+    )
+````
+
 # tests/test_conductance_v4_report.py
 
 ````python
@@ -46256,10 +46586,28 @@ def _diagnostics(score, specification):
             "normalization_recomputed_for_c_interventions": True,
             "mean_c_numeric_check": {
                 "comparison": "mean_c_vs_ones_c",
+                "role": "informational_non_gating",
+                "separate_full_graph_forwards": True,
                 "allclose_rtol": 1e-5,
                 "allclose_atol": 1e-6,
-                "passed": True,
+                "within_declared_tolerance": True,
                 "logit_mean_absolute_delta": 0.0,
+                "logit_max_absolute_delta": 0.0,
+                "changed_prediction_fraction": 0.0,
+                "replacement_contracts": {
+                    "mean_c": {
+                        "contract": "graph_constant_positive",
+                        "satisfied": True,
+                        "layers_checked": 2,
+                        "edge_counts": [3, 3],
+                    },
+                    "ones_c": {
+                        "contract": "exact_one",
+                        "satisfied": True,
+                        "layers_checked": 2,
+                        "edge_counts": [3, 3],
+                    },
+                },
             },
         },
     }
@@ -46402,6 +46750,10 @@ def _edit(manifest, callback, *, condition="fixed_c_identity_w", refresh=True):
         job["metrics_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _mean_c_numeric_check(metrics):
+    return metrics["diagnostics"]["best_checkpoint_interventions"]["mean_c_numeric_check"]
+
+
 def test_complete_report_has_all_conditional_contrasts_and_resources(tmp_path, monkeypatch):
     root, manifest = _fixture(tmp_path)
     before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
@@ -46425,6 +46777,168 @@ def test_complete_report_has_all_conditional_contrasts_and_resources(tmp_path, m
         lambda: manifest["sources"]["sha256"],
     )
     assert main([str(root)]) == 0
+
+
+def test_mean_c_tolerance_miss_is_informational_and_keeps_factorial_contrasts(tmp_path):
+    root, manifest = _fixture(tmp_path)
+
+    def record_cuda_roundoff(metrics):
+        _mean_c_numeric_check(metrics).update(
+            within_declared_tolerance=False,
+            logit_mean_absolute_delta=2.0e-6,
+            logit_max_absolute_delta=3.0e-5,
+            changed_prediction_fraction=1.0e-4,
+        )
+
+    _edit(manifest, record_cuda_roundoff)
+    result = write_comparison(root, manifest)
+    assert result["status"] == "passed"
+    assert result["complete"] is True
+    assert result["datasets"][0]["factorial_contrasts"] is not None
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "comparison",
+        "role",
+        "separate_full_graph_forwards",
+        "within_declared_tolerance",
+        "allclose_rtol",
+        "allclose_atol",
+        "logit_mean_absolute_delta",
+        "logit_max_absolute_delta",
+        "changed_prediction_fraction",
+        "replacement_contracts",
+    ],
+)
+def test_mean_c_numeric_contract_rejects_missing_fields(tmp_path, field):
+    root, manifest = _fixture(tmp_path)
+    _edit(manifest, lambda metrics: _mean_c_numeric_check(metrics).pop(field))
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("comparison", "ones_c_vs_mean_c"),
+        ("role", "integrity_gate"),
+        ("separate_full_graph_forwards", False),
+        ("separate_full_graph_forwards", 1),
+        ("within_declared_tolerance", 1),
+        ("within_declared_tolerance", "false"),
+        ("allclose_rtol", 2.0e-5),
+        ("allclose_rtol", -1.0e-5),
+        ("allclose_rtol", float("nan")),
+        ("allclose_atol", 2.0e-6),
+        ("allclose_atol", -1.0e-6),
+        ("allclose_atol", float("nan")),
+        ("logit_mean_absolute_delta", -1.0e-6),
+        ("logit_mean_absolute_delta", float("nan")),
+        ("logit_max_absolute_delta", -1.0e-6),
+        ("logit_max_absolute_delta", float("nan")),
+        ("changed_prediction_fraction", -0.1),
+        ("changed_prediction_fraction", 1.1),
+        ("changed_prediction_fraction", float("nan")),
+    ],
+)
+def test_mean_c_numeric_contract_rejects_invalid_values(tmp_path, field, value):
+    root, manifest = _fixture(tmp_path)
+    _edit(manifest, lambda metrics: _mean_c_numeric_check(metrics).update({field: value}))
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+def test_mean_c_numeric_contract_rejects_maximum_below_mean(tmp_path):
+    root, manifest = _fixture(tmp_path)
+
+    def invert_delta_order(metrics):
+        _mean_c_numeric_check(metrics).update(
+            logit_mean_absolute_delta=2.0e-5,
+            logit_max_absolute_delta=1.0e-5,
+        )
+
+    _edit(manifest, invert_delta_order)
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+def test_mean_c_numeric_contract_rejects_legacy_passed_field(tmp_path):
+    root, manifest = _fixture(tmp_path)
+    _edit(manifest, lambda metrics: _mean_c_numeric_check(metrics).update(passed=True))
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing_mean_c",
+        "missing_ones_c",
+        "extra_contract",
+        "missing_contract_field",
+        "extra_contract_field",
+        "wrong_mean_contract",
+        "wrong_ones_contract",
+        "unsatisfied",
+        "non_boolean_satisfied",
+        "wrong_layers_checked",
+        "non_integer_layers_checked",
+        "edge_counts_not_list",
+        "edge_counts_wrong_length",
+        "negative_edge_count",
+        "non_integer_edge_count",
+        "edge_counts_wrong_topology",
+        "different_edge_counts",
+    ],
+)
+def test_mean_c_replacement_contracts_fail_closed_on_missing_or_tampered_data(
+    tmp_path, change
+):
+    root, manifest = _fixture(tmp_path)
+
+    def tamper(metrics):
+        contracts = _mean_c_numeric_check(metrics)["replacement_contracts"]
+        if change == "missing_mean_c":
+            contracts.pop("mean_c")
+        elif change == "missing_ones_c":
+            contracts.pop("ones_c")
+        elif change == "extra_contract":
+            contracts["shuffled_c"] = copy.deepcopy(contracts["ones_c"])
+        elif change == "missing_contract_field":
+            contracts["mean_c"].pop("contract")
+        elif change == "extra_contract_field":
+            contracts["mean_c"]["unexpected"] = True
+        elif change == "wrong_mean_contract":
+            contracts["mean_c"]["contract"] = "exact_one"
+        elif change == "wrong_ones_contract":
+            contracts["ones_c"]["contract"] = "graph_constant_positive"
+        elif change == "unsatisfied":
+            contracts["mean_c"]["satisfied"] = False
+        elif change == "non_boolean_satisfied":
+            contracts["mean_c"]["satisfied"] = 1
+        elif change == "wrong_layers_checked":
+            contracts["mean_c"]["layers_checked"] = 1
+        elif change == "non_integer_layers_checked":
+            contracts["mean_c"]["layers_checked"] = True
+        elif change == "edge_counts_not_list":
+            contracts["mean_c"]["edge_counts"] = "3,3"
+        elif change == "edge_counts_wrong_length":
+            contracts["mean_c"]["edge_counts"] = [3]
+        elif change == "negative_edge_count":
+            contracts["mean_c"]["edge_counts"] = [3, -1]
+        elif change == "non_integer_edge_count":
+            contracts["mean_c"]["edge_counts"] = [3, True]
+        elif change == "edge_counts_wrong_topology":
+            contracts["mean_c"]["edge_counts"] = [4, 4]
+            contracts["ones_c"]["edge_counts"] = [4, 4]
+        else:
+            contracts["ones_c"]["edge_counts"] = [3, 4]
+
+    _edit(manifest, tamper)
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
 
 
 @pytest.mark.parametrize("status", ["pending", "running", "failed"])

@@ -23,6 +23,11 @@ Test label은 학습·선택·진단에 사용하지 않으며 test 성능을 �
 GPU가 없거나 공식 캐시가 누락·손상되면 중단한다. CPU 학습·대체 데이터·자동 설치는 없다.
 기존 run을 덮어쓰거나 자동 재개하지 않으므로 재실행에는 새 run ID를 사용한다.
 
+2026-09-02 사용자 보고상 source/pull revision `7b4cd32`, run
+`gat-relative-c-v3-gpu6-seed0-v1`은 `passed`다. Preflight GPU는
+`NVIDIA A100-SXM4-80GB MIG 1g.10gb`였고 `CUDA_VISIBLE_DEVICES=6`을 프로세스 내부
+`cuda:0`으로 사용했다. 성능 수치와 전체 원본 artifact는 수령하지 않아 별도로 주장하지 않는다.
+
 결과 확인:
 
 ```bash
@@ -204,5 +209,6 @@ Suite ID는 `conductance_relative_c_v3`이며 `results/conductance_gat/v3/<run-i
 | `<dataset>/<condition>/metrics.json` | 결과·설정·무결성 hash·개입 |
 
 두 조건의 초기 state, 데이터 계약, 소스와 설정을 검사한다. 누락·혼합·변조된 산출물을
-성공 비교로 표시하지 않는다. 아직 실제 v2/v3 GPU 결과는 수령하지 않았으며 로컬 검증 범위는
+성공 비교로 표시하지 않는다. 사용자 보고상 v3 runner는 `passed`지만 성능 수치와 전체
+artifact는 수령하지 않았다. 로컬 검증과 서버 보고의 근거 범위는
 [실험 상태](EXPERIMENT_STATUS.md)에 별도로 기록한다.

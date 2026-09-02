@@ -5,8 +5,11 @@
 외부 비교 모델도 실행하지 않는다.
 
 이 소스 버전에는 v2 구현·단위 검사가 포함되어 있다. 이전 진단 전용 commit `ebf8cd1`에는
-없었다. 기존 `cycle_set` 5-seed 결과는 v1 결과이고 v2의 GPU 학습 결과는 아직 없다.
-게시·실험 범위는 [실험 상태](EXPERIMENT_STATUS.md)에 기록한다.
+없었다. 기존 `cycle_set` 5-seed 결과는 v1 결과다. 2026-09-02 사용자 보고상 source/pull
+revision `7b4cd32`, run `cycle-pe-v2-gpu6-seed0-v1`은 `passed`다. Preflight GPU는
+`NVIDIA A100-SXM4-80GB MIG 1g.10gb`였고 `CUDA_VISIBLE_DEVICES=6`을 프로세스 내부
+`cuda:0`으로 사용했다. v2 성능 수치와 전체 원본 artifact는 수령하지 않았으며, 이를 기존
+v1 점수와 합치지 않는다. 게시·실험 범위는 [실험 상태](EXPERIMENT_STATUS.md)에 기록한다.
 
 ## 실행
 
@@ -122,5 +125,6 @@ Dense SVD는 그래프별 CPU 전처리 비용이 있고 큰 그래프용 확장
 v2 데이터 준비/로딩 경로 자체가 캐시 checksum·공식 내용·기저 수학 조건을 검증한다.
 
 검사는 작은 수학/배치 fixture를 사용하는 개발 단위 검사다. 실험 CLI에는 가짜 데이터나
-CPU 학습 fallback이 없다. 실제 공식 데이터의 전체 GPU 학습 성공 여부는 별도로 확인해야 한다.
-구버전 Torch의 체크포인트 보안 제약은 [전체 인수인계](HANDOFF.md)의 환경 절을 따른다.
+CPU 학습 fallback이 없다. 사용자 보고상 공식 v2 runner는 `passed`지만, 성능 수치와 전체
+artifact의 독립 검증은 아직 필요하다. 구버전 Torch의 체크포인트 보안 제약은
+[전체 인수인계](HANDOFF.md)의 환경 절을 따른다.

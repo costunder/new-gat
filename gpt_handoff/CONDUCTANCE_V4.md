@@ -9,14 +9,20 @@
 | 항목 | 상태 |
 |---|---|
 | 구현 | 완료 |
-| 로컬 V4 전용 검사 | **68 passed** |
-| 저장소 전체 회귀 | **1247 passed / 65 skipped** |
+| 로컬 V4 전용 검사 | **122 passed** |
+| 저장소 전체 회귀 | **1301 passed / 65 skipped** |
 | Ruff·compileall·코드 스냅샷 검사 | 통과 |
-| 공식 데이터 CUDA 학습 | **아직 실행하지 않음** |
+| 공식 데이터 CUDA 학습 | **정식 결과 없음** — 사용자 보고상 첫 arm만 200 epochs·child exit 0 후 구 report gate에서 중단, 나머지 3개 pending |
 | 기본 실행 대상 | ogbn-arxiv, model seed 0, 네 번의 fresh training |
 
-로컬 검사는 작은 CPU fixture로 수학·미분·runner·report 무결성을 확인한 것이다. 실제 GPU
-성능이나 validation 점수는 아래 CUDA 실행이 끝난 뒤에만 기록한다.
+로컬 검사는 작은 CPU fixture로 수학·미분·runner·report 무결성을 확인한 것이다. 2026-09-02
+사용자 보고의 source/pull revision은 `7b4cd32`, run은
+`gat-hybrid-c-spatial-v4-gpu6-seed0-v1`이다. Preflight GPU는
+`NVIDIA A100-SXM4-80GB MIG 1g.10gb`였고 `CUDA_VISIBLE_DEVICES=6`을 프로세스 내부
+`cuda:0`으로 사용했다. 이 partial run에서 `fixed_c_identity_w`가 200 epochs를 마치고 child
+exit 0을 반환했지만, 당시 mean-C/C=1 수치 검사를 hard gate로 쓰던 report가 실행을 중단해
+나머지 세 arm은 pending으로 남았다. 점수와 전체 artifact는 수령하지 않았으며, 이 한 arm을
+정식 V4 결과로 보지 않는다. 실제 성능은 새 run에서 네 CUDA 학습이 모두 끝난 뒤에만 기록한다.
 
 ## 정확한 V4 아이디어
 
@@ -143,9 +149,10 @@ cat results/conductance_gat/v4/gat-hybrid-c-spatial-v4-seed0-v1/comparison.md
 | `<dataset>/<condition>/history.json` | epoch별 train/validation과 실제 task-gradient 진단 |
 | `<dataset>/<condition>/metrics.json` | 설정·graph binding·지표·hash·시간·메모리 |
 
-네 학습이 모두 통과하고 source/cache/topology/configuration/초기-state/metrics hash가 일치하기
-전에는 최종 factorial 대조를 공개하지 않는다. standalone report 재생성도 현재 source hash를
-다시 확인한다.
+네 fresh 학습이 모두 통과하고 source/cache/topology/configuration/초기-state/metrics hash가
+일치하기 전에는 최종 factorial 대조를 공개하지 않는다. checkpoint 개입의 informational
+mean-C/C=1 수치 차이는 이 성공 조건에 포함하지 않는다. standalone report 재생성도 현재
+source hash를 다시 확인한다.
 
 ## 비교값 해석
 
@@ -185,9 +192,13 @@ interaction&=y11-y10-y01+y00.
 - conductance propagation off
 
 C를 바꾸는 개입은 바뀐 C로 weighted degree를 다시 계산한다. 대칭 정규화에서는 양의
-graph-constant C가 소거되므로 mean-C와 C=1 비교는 독립 효과가 아니라 수치 일치 검산이다.
-이 개입들은 선택 checkpoint가 각 메커니즘에 얼마나 의존하는지 볼 뿐, 네 fresh-training
-조건의 차이를 대신하지 않는다.
+graph-constant C가 정확히 소거되므로 mean-C와 C=1은 **대수적으로 중복된 같은 개입**이며,
+독립 효과나 별도 성공 조건이 아니다. 구현은 두 개입을 CUDA에서 각각 forward하여 logit 차이와
+`allclose_rtol=1e-5`, `allclose_atol=1e-6`, `within_declared_tolerance`를 기록하지만, 이는
+CUDA scatter·부동소수점 합산 차이를 관찰하기 위한 **informational, non-gating** 진단이다.
+허용오차 초과만으로 arm·report·run을 실패시키지 않는다. 이 개입들은 선택 checkpoint가 각
+메커니즘에 얼마나 의존하는지 볼 뿐, 반드시 모두 완료해야 하는 네 fresh-training 조건의
+차이를 대신하지 않는다.
 
 ## 구현 파일
 
@@ -207,6 +218,7 @@ graph-constant C가 소거되므로 mean-C와 C=1 비교는 독립 효과가 아
 
 ## 현재 남은 한 가지 작업
 
-지원되는 Linux NVIDIA GPU 환경에서 위 기본 명령을 실행하고 생성된
+지원되는 Linux NVIDIA GPU 환경에서 **새 run ID로 네 조건을 모두 fresh 실행**하고 생성된
 `comparison.md/csv/json`, `manifest.json`, 네 조건의 `metrics.json`을 보존하는 것이다.
-그 전까지 이 저장소에는 V4 구현과 로컬 검증 결과만 있으며 실제 V4 성능 수치는 없다.
+구 report gate에서 끝난 partial run의 첫 arm은 새 2×2 대조에 재사용하지 않는다. 네 arm이
+모두 완료되기 전까지 정식 V4 성능 수치는 없다.

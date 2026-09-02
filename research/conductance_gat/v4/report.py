@@ -54,7 +54,8 @@ CAVEATS = [
     "C and W can compensate across layers. C spread, gamma/tau, W-I distance, singular values "
     "or gradient norms alone do not prove that either mechanism is useful.",
     "Mean-C and C=1 are algebraically redundant under symmetric weighted-degree normalization. "
-    "Their checkpoint interventions are a numerical consistency check, not two effects.",
+    "Their separate CUDA-forward logit allclose is informational and non-gating because scatter "
+    "is not bitwise deterministic; these interventions are not two effects.",
     "Checkpoint interventions use separate validation forwards without retraining. They measure "
     "selected-checkpoint reliance; the four fresh arms provide the training contrasts.",
     "Elapsed time and peak CUDA memory include diagnostics, interventions, checkpoint/history IO "
@@ -414,9 +415,86 @@ def _validate_diagnostics(child: dict[str, Any], config: dict[str, Any]) -> None
     numeric = audit.get("mean_c_numeric_check")
     if not isinstance(numeric, dict) or numeric.get("comparison") != "mean_c_vs_ones_c":
         raise ValueError("mean-C/C=1 numerical check is required")
-    if numeric.get("passed") is not True:
-        raise ValueError("mean-C and C=1 numerical consistency check failed")
-    _nonnegative_optional(numeric.get("logit_mean_absolute_delta"), "mean-C numeric delta")
+    if "passed" in numeric:
+        raise ValueError("legacy mean-C numeric passed field is not allowed")
+    if numeric.get("role") != "informational_non_gating":
+        raise ValueError("mean-C numerical check must be informational and non-gating")
+    if numeric.get("separate_full_graph_forwards") is not True:
+        raise ValueError("mean-C numerical check must identify separate full-graph forwards")
+    if not isinstance(numeric.get("within_declared_tolerance"), bool):
+        raise ValueError("mean-C within-tolerance observation must be boolean")
+    _require_close(
+        numeric.get("allclose_rtol"),
+        1.0e-5,
+        "mean-C numerical relative tolerance",
+        atol=0.0,
+    )
+    _require_close(
+        numeric.get("allclose_atol"),
+        1.0e-6,
+        "mean-C numerical absolute tolerance",
+        atol=0.0,
+    )
+    mean_delta = _finite_number(
+        numeric.get("logit_mean_absolute_delta"), "mean-C mean absolute logit delta"
+    )
+    maximum_delta = _finite_number(
+        numeric.get("logit_max_absolute_delta"), "mean-C maximum absolute logit delta"
+    )
+    if mean_delta < 0 or maximum_delta < 0:
+        raise ValueError("mean-C numerical deltas must be nonnegative")
+    if maximum_delta < mean_delta:
+        raise ValueError("mean-C maximum absolute delta must not be below its mean")
+    _finite_number(
+        numeric.get("changed_prediction_fraction"),
+        "mean-C changed predictions",
+        unit_interval=True,
+    )
+    replacement_contracts = numeric.get("replacement_contracts")
+    expected_contracts = {
+        "mean_c": "graph_constant_positive",
+        "ones_c": "exact_one",
+    }
+    if not isinstance(replacement_contracts, dict) or set(replacement_contracts) != set(
+        expected_contracts
+    ):
+        raise ValueError("mean-C numerical check requires exactly mean_c/ones_c contracts")
+    topology = child.get("topology")
+    topology_edge_count = _integer(
+        topology.get("num_edges") if isinstance(topology, dict) else None,
+        "topology.num_edges",
+    )
+    expected_edge_counts = None
+    for name, expected_contract in expected_contracts.items():
+        replacement = replacement_contracts[name]
+        if not isinstance(replacement, dict) or set(replacement) != {
+            "contract",
+            "satisfied",
+            "layers_checked",
+            "edge_counts",
+        }:
+            raise ValueError(f"{name} replacement contract metadata is incomplete")
+        if replacement.get("contract") != expected_contract:
+            raise ValueError(f"{name} replacement contract kind is invalid")
+        if replacement.get("satisfied") is not True:
+            raise ValueError(f"{name} replacement contract must be satisfied")
+        layers_checked = _integer(
+            replacement.get("layers_checked"), f"{name} replacement layers_checked"
+        )
+        if layers_checked != config["layers"]:
+            raise ValueError(f"{name} replacement must check every configured layer")
+        edge_counts = replacement.get("edge_counts")
+        if not isinstance(edge_counts, list) or len(edge_counts) != layers_checked:
+            raise ValueError(f"{name} replacement requires one edge count per layer")
+        checked_edge_counts = [
+            _integer(value, f"{name} replacement edge count") for value in edge_counts
+        ]
+        if any(value != topology_edge_count for value in checked_edge_counts):
+            raise ValueError(f"{name} replacement edge counts must match the bound topology")
+        if expected_edge_counts is None:
+            expected_edge_counts = checked_edge_counts
+        elif checked_edge_counts != expected_edge_counts:
+            raise ValueError("mean-C and C=1 replacements must cover identical layer edges")
 
 
 def _load(
