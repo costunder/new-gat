@@ -22,13 +22,13 @@ def _argument(command: list[str], name: str) -> str:
     return command[command.index(name) + 1]
 
 
-def test_default_plan_covers_all_versions_profiles_five_seeds_and_supported_datasets():
+def test_default_plan_covers_all_versions_profiles_seed_zero_and_supported_datasets():
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
     assert args.versions == ["v1", "v2", "v3", "v4"]
     assert args.profiles == ["base", "wide", "deep", "large"]
-    assert args.model_seeds == [0, 1, 2, 3, 4]
-    assert len(jobs) == 860
+    assert args.model_seeds == [0]
+    assert len(jobs) == 172
     assert {job["profile"] for job in jobs} == set(runner.PROFILES)
     assert {job["model_seed"] for job in jobs} == set(runner.DEFAULT_MODEL_SEEDS)
     assert not any(job["version"] == "v2" and job["dataset"] == "ppi" for job in jobs)
@@ -325,6 +325,187 @@ def test_success_is_released_only_after_every_child_metric_is_valid(tmp_path, mo
     assert summary["test_evaluated"] is False
     assert {row["n"] for row in summary["rows"]} == {2}
     assert all(row["validation_mean"] == 0.75 for row in summary["rows"])
+
+
+def test_completed_run_is_verified_and_reused_without_any_execution(tmp_path, monkeypatch):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    calls.clear()
+
+    assert runner.main(options) == 0
+    assert calls == []
+
+
+def test_retry_logs_use_new_paths_inside_the_run_directory(tmp_path):
+    run_dir = tmp_path / "run"
+    preferred = run_dir / "logs/job.log"
+    preferred.parent.mkdir(parents=True)
+    preferred.write_text("first", encoding="utf-8")
+    retry_one = runner._next_attempt_log(preferred, run_dir, "v1/cora")
+    assert retry_one != preferred.resolve()
+    assert retry_one.is_relative_to(run_dir.resolve())
+    retry_one.parent.mkdir(parents=True)
+    retry_one.write_text("second", encoding="utf-8")
+    retry_two = runner._next_attempt_log(preferred, run_dir, "v1/cora")
+    assert retry_two != retry_one
+    assert retry_two.is_relative_to(run_dir.resolve())
+
+
+def test_incomplete_child_symlink_cannot_delete_a_passed_sibling(tmp_path):
+    run_dir = tmp_path / "run"
+    passed = run_dir / "passed"
+    passed.mkdir(parents=True)
+    marker = passed / "metrics.json"
+    marker.write_text("preserve", encoding="utf-8")
+    indirect = run_dir / "incomplete"
+    try:
+        indirect.symlink_to(passed, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+    with pytest.raises(RuntimeError, match="indirect child output"):
+        runner._discard_incomplete_child({"output_dir": str(indirect)}, run_dir)
+    assert marker.read_text(encoding="utf-8") == "preserve"
+
+
+def test_resume_rejects_passed_output_symlink_alias_before_preflight(tmp_path, monkeypatch):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    run_dir = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    aliased_output = Path(manifest["jobs"][0]["output_dir"])
+    sibling_output = Path(manifest["jobs"][1]["output_dir"])
+    sibling_sentinel = sibling_output / "preserve-sibling.txt"
+    sibling_sentinel.write_text("preserve", encoding="utf-8")
+    (aliased_output / "metrics.json").unlink()
+    aliased_output.rmdir()
+    try:
+        aliased_output.symlink_to(sibling_output, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+    calls.clear()
+
+    assert runner.main(options) == 1
+    assert calls == []
+    assert sibling_sentinel.read_text(encoding="utf-8") == "preserve"
+
+
+def test_interrupted_resume_rejects_external_preflight_symlink_before_execution(
+    tmp_path, monkeypatch
+):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    run_dir = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "running"
+    manifest["jobs"][0]["status"] = "running"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    outside_sentinel = tmp_path / "outside-preflight-sentinel.txt"
+    outside_sentinel.write_text("preserve", encoding="utf-8")
+    (run_dir / "gpu-preflight.json").unlink(missing_ok=True)
+    try:
+        (run_dir / "gpu-preflight.json").symlink_to(outside_sentinel)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    calls.clear()
+
+    assert runner.main(options) == 1
+    assert calls == []
+    assert outside_sentinel.read_text(encoding="utf-8") == "preserve"
+
+
+@pytest.mark.parametrize("summary_name", ["summary.json", "summary.md"])
+def test_interrupted_resume_rejects_external_summary_symlink_before_execution(
+    tmp_path, monkeypatch, summary_name
+):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    run_dir = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "running"
+    manifest["jobs"][0]["status"] = "running"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    outside_sentinel = tmp_path / f"outside-{summary_name}-sentinel.txt"
+    outside_sentinel.write_text("preserve", encoding="utf-8")
+    summary_path = run_dir / summary_name
+    summary_path.unlink()
+    try:
+        summary_path.symlink_to(outside_sentinel)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    calls.clear()
+
+    assert runner.main(options) == 1
+    assert calls == []
+    assert outside_sentinel.read_text(encoding="utf-8") == "preserve"
+
+
+def test_resume_binds_minimum_free_gpu_memory(tmp_path, monkeypatch):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    calls.clear()
+    assert runner.main([*options, "--min-free-gb", "9.0"]) == 1
+    assert calls == []
+
+
+@pytest.mark.parametrize("interrupted_status", ["pending", "running", "failed"])
+def test_resume_skips_passed_jobs_and_reruns_only_nonpassed_job(
+    tmp_path, monkeypatch, interrupted_status
+):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    root = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    retried = manifest["jobs"][0]
+    retried["status"] = interrupted_status
+    manifest["status"] = "failed" if interrupted_status == "failed" else "running"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    calls.clear()
+
+    assert runner.main(options) == 0
+    assert len(calls) == 2  # preflight plus exactly one retried child
+    assert calls[1] == retried["command"]
+    resumed = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert resumed["status"] == "passed"
+    assert resumed["resume_count"] == 1
+    assert all(job["status"] == "passed" for job in resumed["jobs"])
+
+
+def test_corrupted_passed_artifact_fails_closed_before_any_execution(tmp_path, monkeypatch):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    root = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    metrics_path = Path(manifest["jobs"][0]["metrics_path"])
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["validation"] = 0.5
+    metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+    calls.clear()
+
+    assert runner.main(options) == 1
+    assert calls == []
+
+
+@pytest.mark.parametrize("mismatch", ["config", "source", "job_plan"])
+def test_resume_requires_exact_config_source_and_job_plan(tmp_path, monkeypatch, mismatch):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    manifest_path = tmp_path / "conductance_gat/scaling/unit-fixture/manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if mismatch == "config":
+        manifest["config"]["epochs"] += 1
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif mismatch == "source":
+        monkeypatch.setattr(runner, "_source_snapshot", lambda: {"unit-source": "changed"})
+    else:
+        manifest["jobs"][0]["command"].append("--unexpected")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    calls.clear()
+
+    assert runner.main(options) == 1
+    assert calls == []
 
 
 def test_any_test_metric_fails_closed_and_stops_following_children(tmp_path, monkeypatch):

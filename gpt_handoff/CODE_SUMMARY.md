@@ -40792,8 +40792,10 @@ import datetime as dt
 import hashlib
 import json
 import math
+import os
 import re
 import shlex
+import shutil
 import statistics
 import sys
 import time
@@ -40864,7 +40866,7 @@ VERSIONS: dict[str, dict[str, Any]] = {
 ALL_DATASETS = tuple(
     dict.fromkeys(dataset for spec in VERSIONS.values() for dataset in spec["datasets"])
 )
-DEFAULT_MODEL_SEEDS = (0, 1, 2, 3, 4)
+DEFAULT_MODEL_SEEDS = (0,)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -41027,7 +41029,12 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
 
 
 def _source_snapshot() -> dict[str, str]:
-    paths = [Path(__file__)]
+    paths = [
+        Path(__file__),
+        ROOT / "research/__init__.py",
+        ROOT / "research/conductance_gat/__init__.py",
+        ROOT / "src/chartgat/__init__.py",
+    ]
     paths += [
         ROOT / "research/conductance_gat" / name
         for name in (
@@ -41047,8 +41054,10 @@ def _source_snapshot() -> dict[str, str]:
         ROOT / "src/chartgat/cache.py",
         ROOT / "src/chartgat/execution.py",
         ROOT / "scripts/check_dependencies.py",
+        ROOT / "scripts/gpu_profiles.py",
         ROOT / "scripts/gpu_preflight.py",
         ROOT / "scripts/run_conductance_factorial.py",
+        ROOT / "scripts/verify_gpu_lock.py",
     ]
     return {
         path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -41060,6 +41069,154 @@ def _check_sources(manifest: dict[str, Any]) -> None:
     if _source_snapshot() != manifest["source_sha256"]:
         manifest["source_integrity_valid"] = False
         raise RuntimeError("Conductance scaling source changed during execution")
+
+
+_JOB_IDENTITY_KEYS = (
+    "job_id",
+    "version",
+    "profile",
+    "architecture",
+    "model_seed",
+    "dataset",
+    "condition",
+    "output_dir",
+    "metrics_path",
+    "log_path",
+    "command",
+)
+
+
+def _job_identity(job: dict[str, Any]) -> dict[str, Any]:
+    return {key: job.get(key) for key in _JOB_IDENTITY_KEYS}
+
+
+def _verify_passed_job(job: dict[str, Any]) -> None:
+    actual = _load_child(job)
+    if job.get("metrics_sha256") != actual["metrics_sha256"]:
+        raise RuntimeError(f"passed job artifact hash mismatch: {job['job_id']}")
+    if job.get("result") != actual:
+        raise RuntimeError(f"passed job manifest result mismatch: {job['job_id']}")
+
+
+def _load_resume_manifest(
+    manifest_path: Path,
+    *,
+    run_id: str,
+    config: dict[str, Any],
+    exclusions: list[dict[str, str]],
+    jobs: list[dict[str, Any]],
+    source_sha256: dict[str, str],
+    dependencies: dict[str, Any],
+) -> dict[str, Any]:
+    if not manifest_path.is_file():
+        raise RuntimeError("existing run directory has no manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"existing manifest is unreadable: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("existing manifest must be a JSON object")
+    for key, expected in (
+        ("schema_version", 1),
+        ("suite", "conductance_architecture_scaling_v1_v4"),
+        ("run_id", run_id),
+        ("config", config),
+        ("exclusions", exclusions),
+        ("source_sha256", source_sha256),
+        ("source_integrity_valid", True),
+        ("dependencies", dependencies),
+    ):
+        if manifest.get(key) != expected:
+            raise RuntimeError(f"existing manifest {key} does not match this invocation")
+    existing_jobs = manifest.get("jobs")
+    if not isinstance(existing_jobs, list) or not all(
+        isinstance(job, dict) for job in existing_jobs
+    ):
+        raise RuntimeError("existing manifest jobs are invalid")
+    if [_job_identity(job) for job in existing_jobs] != [_job_identity(job) for job in jobs]:
+        raise RuntimeError("existing manifest job plan does not match this invocation")
+    if manifest.get("status") not in {"running", "failed", "passed"}:
+        raise RuntimeError("existing manifest status is not resumable")
+    run_dir = manifest_path.parent.resolve()
+    for job in existing_jobs:
+        if job.get("status") not in {"pending", "running", "failed", "passed"}:
+            raise RuntimeError(f"existing job status is invalid: {job.get('job_id')}")
+        lexical_output = Path(os.path.abspath(Path(job.get("output_dir", "")).expanduser()))
+        lexical_metrics = Path(os.path.abspath(Path(job.get("metrics_path", "")).expanduser()))
+        lexical_log = Path(os.path.abspath(Path(job.get("log_path", "")).expanduser()))
+        output = lexical_output.resolve()
+        metrics = lexical_metrics.resolve()
+        log = lexical_log.resolve()
+        if (
+            output != lexical_output
+            or metrics != lexical_metrics
+            or log != lexical_log
+            or not output.is_relative_to(run_dir)
+            or metrics != output / "metrics.json"
+            or not log.is_relative_to(run_dir / "logs")
+        ):
+            raise RuntimeError(
+                f"existing job paths escape or indirectly alias the run: {job.get('job_id')}"
+            )
+        if job["status"] == "passed":
+            _verify_passed_job(job)
+    if manifest["status"] == "passed" and any(job["status"] != "passed" for job in existing_jobs):
+        raise RuntimeError("passed manifest contains a non-passed job")
+    return manifest
+
+
+def _discard_incomplete_child(job: dict[str, Any], run_dir: Path) -> None:
+    lexical_output = Path(os.path.abspath(Path(job["output_dir"]).expanduser()))
+    output = lexical_output.resolve()
+    run_dir = run_dir.resolve()
+    if output != lexical_output:
+        raise RuntimeError(f"refusing to clear an indirect child output path: {lexical_output}")
+    if output == run_dir or not output.is_relative_to(run_dir):
+        raise RuntimeError(f"refusing to clear child output outside run directory: {output}")
+    if lexical_output.exists():
+        if not lexical_output.is_dir():
+            raise RuntimeError(f"child output path is not a directory: {lexical_output}")
+        shutil.rmtree(lexical_output)
+    for key in ("result", "metrics_sha256", "exit_code", "elapsed_wall_seconds", "error"):
+        job.pop(key, None)
+
+
+def _next_attempt_log(preferred: Path, run_dir: Path, label: str) -> Path:
+    """Return a new in-run log path without overwriting an earlier attempt."""
+    run_dir = run_dir.resolve()
+    preferred = preferred.resolve()
+    if not preferred.is_relative_to(run_dir):
+        raise RuntimeError(f"log path resolves outside the run directory: {preferred}")
+    if not preferred.exists():
+        return preferred
+    root = (run_dir / "logs/resume").resolve()
+    if not root.is_relative_to(run_dir):
+        raise RuntimeError("resume log directory resolves outside the run directory")
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "--", label)
+    attempt = 1
+    while True:
+        candidate = (root / f"{safe_label}.attempt-{attempt}.log").resolve()
+        if not candidate.is_relative_to(run_dir):
+            raise RuntimeError("resume log path resolves outside the run directory")
+        if not candidate.exists():
+            return candidate
+        attempt += 1
+
+
+def _validated_write_path(path: Path, run_dir: Path, *, label: str) -> Path:
+    """Validate a direct regular-file path before any runner or child write."""
+    lexical = Path(os.path.abspath(path.expanduser()))
+    resolved = lexical.resolve()
+    run_dir = run_dir.resolve()
+    if (
+        resolved != lexical
+        or resolved == run_dir
+        or resolved.is_dir()
+        or (lexical.exists() and not lexical.is_file())
+        or not resolved.is_relative_to(run_dir)
+    ):
+        raise RuntimeError(f"refusing to write an indirect or out-of-run {label}: {lexical}")
+    return lexical
 
 
 def _number(value: Any, label: str, *, minimum: float | None = None) -> float:
@@ -41200,7 +41357,11 @@ def _summary(manifest: dict[str, Any]) -> dict[str, Any]:
 
 def _write_summary(run_dir: Path, manifest: dict[str, Any]) -> None:
     summary = _summary(manifest)
-    atomic_write_json(run_dir / "summary.json", summary)
+    summary_json = _validated_write_path(run_dir / "summary.json", run_dir, label="summary JSON")
+    summary_markdown = _validated_write_path(
+        run_dir / "summary.md", run_dir, label="summary Markdown"
+    )
+    atomic_write_json(summary_json, summary)
     lines = [
         "# Conductance V1-V4 architecture scaling",
         "",
@@ -41224,7 +41385,7 @@ def _write_summary(run_dir: Path, manifest: dict[str, Any]) -> None:
             f"{row['condition']} | {row['n']} | {row['validation_mean']:.6f} | "
             f"{deviation} | {parameters} |"
         )
-    (run_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    summary_markdown.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -41238,6 +41399,9 @@ def main(argv: list[str] | None = None) -> int:
     results_root = args.results_root.expanduser().resolve()
     run_dir = (results_root / "conductance_gat/scaling" / run_id).resolve()
     data_root = args.data_root.expanduser().resolve()
+    if not run_dir.is_relative_to(results_root):
+        print("Scaling outputs must stay within the results root", file=sys.stderr)
+        return 2
     if (
         run_dir == data_root
         or run_dir.is_relative_to(data_root)
@@ -41251,6 +41415,22 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     exclusions = _exclusions(args)
+    config = {
+        "versions": args.versions,
+        "profiles": {name: PROFILES[name] for name in args.profiles},
+        "datasets": args.datasets,
+        "datasets_by_version": {
+            version: _selected_datasets(args, version) for version in args.versions
+        },
+        "model_seeds": args.model_seeds,
+        "epochs": args.epochs,
+        "patience": args.patience,
+        "workers": args.workers,
+        "device": args.device,
+        "min_free_gb": args.min_free_gb,
+        "edge_chunk_size": args.edge_chunk_size,
+        "data_root": str(data_root),
+    }
     if args.dry_run:
         print(
             f"{len(jobs)} validation-only fresh trainings; versions={args.versions}; "
@@ -41262,57 +41442,89 @@ def main(argv: list[str] | None = None) -> int:
             print(shlex.join(job["command"]))
         print(f"Manifest: {run_dir / 'manifest.json'}")
         return 0
-    if run_dir.exists():
-        print(f"Run already exists; use a new run ID: {run_dir}", file=sys.stderr)
-        return 2
+    manifest_path = run_dir / "manifest.json"
+    try:
+        manifest_path = _validated_write_path(manifest_path, run_dir, label="runner manifest")
+        _validated_write_path(run_dir / "summary.json", run_dir, label="summary JSON")
+        _validated_write_path(run_dir / "summary.md", run_dir, label="summary Markdown")
+    except RuntimeError as exc:
+        print(f"Refusing unsafe run state: {exc}", file=sys.stderr)
+        return 1
+    source_sha256 = _source_snapshot()
     try:
         dependencies = check_dependencies()
     except DependencyCheckError as exc:
         print(error_message(exc), file=sys.stderr)
         return exc.exit_code
-    run_dir.mkdir(parents=True, exist_ok=False)
-    manifest: dict[str, Any] = {
-        "schema_version": 1,
-        "suite": "conductance_architecture_scaling_v1_v4",
-        "run_id": run_id,
-        "status": "running",
-        "source_integrity_valid": True,
-        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
-        "config": {
-            "versions": args.versions,
-            "profiles": {name: PROFILES[name] for name in args.profiles},
-            "datasets": args.datasets,
-            "datasets_by_version": {
-                version: _selected_datasets(args, version) for version in args.versions
+    resuming = run_dir.exists()
+    if resuming:
+        try:
+            manifest = _load_resume_manifest(
+                manifest_path,
+                run_id=run_id,
+                config=config,
+                exclusions=exclusions,
+                jobs=jobs,
+                source_sha256=source_sha256,
+                dependencies=dependencies,
+            )
+        except Exception as exc:
+            print(f"Refusing to resume: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        jobs = manifest["jobs"]
+        if all(job["status"] == "passed" for job in jobs):
+            manifest.update(status="passed", source_integrity_valid=True)
+            manifest.pop("error", None)
+            manifest.setdefault("finished_at_utc", dt.datetime.now(dt.UTC).isoformat())
+            atomic_write_json(manifest_path, manifest)
+            _write_summary(run_dir, manifest)
+            print(f"Run already complete; verified {len(jobs)} passed child artifacts", flush=True)
+            print((run_dir / "summary.md").read_text(encoding="utf-8"), flush=True)
+            print(f"Summary: {run_dir / 'summary.md'}", flush=True)
+            return 0
+    if resuming:
+        manifest.update(
+            status="running",
+            source_integrity_valid=True,
+            resumed_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+            resume_count=int(manifest.get("resume_count", 0)) + 1,
+        )
+        manifest.pop("error", None)
+        manifest.pop("finished_at_utc", None)
+    else:
+        run_dir.mkdir(parents=True, exist_ok=False)
+        manifest = {
+            "schema_version": 1,
+            "suite": "conductance_architecture_scaling_v1_v4",
+            "run_id": run_id,
+            "status": "running",
+            "source_integrity_valid": True,
+            "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+            "config": config,
+            "protocol": {
+                "purpose": "architecture scale response, not parameter matching",
+                "profiles": "base/wide/deep/large all run for every selected version",
+                "selection": "best validation checkpoint within each independent child",
+                "test": "never loaded into a V1 scaling loader and never evaluated by any child",
+                "aggregation": "validation mean and sample standard deviation across model seeds",
+                "release": (
+                    "comparison valid only after every planned child and source check passes"
+                ),
             },
-            "model_seeds": args.model_seeds,
-            "epochs": args.epochs,
-            "patience": args.patience,
-            "workers": args.workers,
-            "device": args.device,
-            "edge_chunk_size": args.edge_chunk_size,
-            "data_root": str(data_root),
-        },
-        "protocol": {
-            "purpose": "architecture scale response, not parameter matching",
-            "profiles": "base/wide/deep/large all run for every selected version",
-            "selection": "best validation checkpoint within each independent child",
-            "test": "never loaded into a V1 scaling loader and never evaluated by any child",
-            "aggregation": "validation mean and sample standard deviation across model seeds",
-            "release": "comparison valid only after every planned child and source check passes",
-        },
-        "exclusions": exclusions,
-        "jobs": jobs,
-        "dependencies": dependencies,
-        "source_sha256": _source_snapshot(),
-    }
-    manifest_path = run_dir / "manifest.json"
+            "exclusions": exclusions,
+            "jobs": jobs,
+            "dependencies": dependencies,
+            "source_sha256": source_sha256,
+        }
     atomic_write_json(manifest_path, manifest)
     _write_summary(run_dir, manifest)
     current: dict[str, Any] | None = None
     environment = shared._environment()
     environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
     try:
+        preflight_output = _validated_write_path(
+            run_dir / "gpu-preflight.json", run_dir, label="GPU preflight output"
+        )
         preflight = [
             sys.executable,
             "-B",
@@ -41323,21 +41535,33 @@ def main(argv: list[str] | None = None) -> int:
             "--min-free-gb",
             str(args.min_free_gb),
             "--json-out",
-            str(run_dir / "gpu-preflight.json"),
+            str(preflight_output),
         ]
-        status = shared.run_logged(preflight, run_dir / "logs/preflight.log", environment)
+        preflight_log = _next_attempt_log(run_dir / "logs/preflight.log", run_dir, "preflight")
+        manifest["preflight_log_path"] = str(preflight_log)
+        status = shared.run_logged(preflight, preflight_log, environment)
         if status:
             raise RuntimeError(f"GPU preflight failed with exit code {status}")
-        print(f"Run: {run_id}; {len(jobs)} validation-only fresh trainings", flush=True)
+        remaining = sum(job["status"] != "passed" for job in jobs)
+        print(
+            f"Run: {run_id}; {remaining}/{len(jobs)} validation-only fresh trainings remaining",
+            flush=True,
+        )
         for index, job in enumerate(jobs, start=1):
+            if job["status"] == "passed":
+                print(f"\n[{index}/{len(jobs)}] verified, skipping {job['job_id']}", flush=True)
+                continue
             current = job
             _check_sources(manifest)
+            _discard_incomplete_child(job, run_dir)
             job["status"] = "running"
             atomic_write_json(manifest_path, manifest)
             _write_summary(run_dir, manifest)
             print(f"\n[{index}/{len(jobs)}] {job['job_id']}", flush=True)
             started = time.monotonic()
-            status = shared.run_logged(job["command"], Path(job["log_path"]), environment)
+            attempt_log = _next_attempt_log(Path(job["log_path"]), run_dir, str(job["job_id"]))
+            job["attempt_log_path"] = str(attempt_log)
+            status = shared.run_logged(job["command"], attempt_log, environment)
             job.update(exit_code=status, elapsed_wall_seconds=time.monotonic() - started)
             _check_sources(manifest)
             if status:
@@ -42366,19 +42590,27 @@ RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SOURCE_FILES = (
     "scripts/run_cycle_scaling.py",
     "scripts/check_dependencies.py",
+    "scripts/gpu_profiles.py",
     "scripts/gpu_preflight.py",
+    "scripts/verify_gpu_lock.py",
+    "research/__init__.py",
+    "research/cycle_pe/__init__.py",
     "research/cycle_pe/benchmark.py",
     "research/cycle_pe/benchmark_data.py",
     "research/cycle_pe/benchmark_models.py",
     "research/cycle_pe/paper_model.py",
+    "research/cycle_pe/paper_data.py",
     "research/cycle_pe/features.py",
     "research/cycle_pe/v2/benchmark.py",
+    "research/cycle_pe/v2/__init__.py",
     "research/cycle_pe/v2/basis.py",
     "research/cycle_pe/v2/data.py",
     "research/cycle_pe/v2/model.py",
     "src/chartgat/algebra.py",
+    "src/chartgat/__init__.py",
     "src/chartgat/cache.py",
     "src/chartgat/execution.py",
+    "src/chartgat/graphs.py",
 )
 
 
@@ -42408,8 +42640,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--model-seeds",
         type=_seeds,
-        default=(0, 1, 2, 3, 4),
-        help="comma-separated model/minibatch seeds (default: 0,1,2,3,4)",
+        default=(0,),
+        help="comma-separated model/minibatch seeds (default: 0)",
     )
     result.add_argument("--run-id", type=_run_id)
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
@@ -42570,7 +42802,7 @@ def _environment() -> dict[str, str]:
 def run_logged(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
     """Run and stream one child, terminating it if the scaling runner is interrupted."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("x", encoding="utf-8", newline="\n") as stream:
+    with log_path.open("a", encoding="utf-8", newline="\n") as stream:
         process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -43213,6 +43445,322 @@ def attach_test_results(
     return summary
 
 
+_JOB_STATE_FIELDS = {
+    "accepted_result",
+    "accepted_rows",
+    "artifact_errors",
+    "error",
+    "finished_at_utc",
+    "previous_attempts",
+    "quarantined_outputs",
+    "recovered_at_utc",
+    "resume_artifact_errors",
+    "resume_attempts",
+    "returncode",
+    "selection_rebinds",
+    "started_at_utc",
+    "status",
+}
+
+_TEST_JOB_STABLE_FIELDS = (
+    "job_id",
+    "checkpoint_id",
+    "profile_selection_id",
+    "version",
+    "dataset",
+    "model_seed",
+    "output_dir",
+    "log_path",
+)
+
+
+def _run_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    """Return the complete execution contract that must match on resume."""
+    return {
+        "versions": list(args.versions),
+        "datasets": list(args.datasets),
+        "profiles": list(args.profiles),
+        "model_seeds": list(args.model_seeds),
+        "data_root": str(args.data_root.expanduser().resolve()),
+        "device": args.device,
+        "batch_size": args.batch_size,
+        "workers": args.workers,
+        "epochs": args.epochs,
+        "patience": args.patience,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "max_parameters": args.max_parameters,
+        "allow_download": args.allow_download,
+        "amp": args.amp,
+        "compile": args.compile,
+        "column_chunk_size": args.column_chunk_size,
+        "basis_execution": args.basis_execution,
+        "basis_pair_budget": args.basis_pair_budget,
+        "min_free_gb": args.min_free_gb,
+    }
+
+
+def _restore_job_state(
+    generated: list[dict[str, Any]],
+    stored: Any,
+    *,
+    label: str,
+) -> None:
+    """Bind persisted state to an identical regenerated plan, failing closed."""
+    if not isinstance(stored, list):
+        raise ValueError(f"stored {label} job plan is not a list")
+    stored_by_id: dict[str, dict[str, Any]] = {}
+    for item in stored:
+        if not isinstance(item, dict) or not isinstance(item.get("job_id"), str):
+            raise ValueError(f"stored {label} job is malformed")
+        job_id = item["job_id"]
+        if job_id in stored_by_id:
+            raise ValueError(f"stored {label} job IDs are not unique")
+        stored_by_id[job_id] = item
+    generated_ids = {job["job_id"] for job in generated}
+    if set(stored_by_id) != generated_ids:
+        raise ValueError(f"stored {label} job matrix differs from this invocation")
+    for job in generated:
+        previous = stored_by_id[job["job_id"]]
+        binding = {key: value for key, value in job.items() if key not in _JOB_STATE_FIELDS}
+        for key, expected in binding.items():
+            if previous.get(key) != expected:
+                raise ValueError(f"stored {label} job binding differs for {job['job_id']}/{key}")
+        status = previous.get("status")
+        if status not in {"pending", "running", "passed", "failed"}:
+            raise ValueError(f"stored {label} job has invalid status: {job['job_id']}")
+        for key in _JOB_STATE_FIELDS:
+            if key in previous:
+                job[key] = previous[key]
+
+
+def _restore_or_rebind_test_job_state(
+    generated: list[dict[str, Any]],
+    stored: Any,
+    run_dir: Path,
+) -> None:
+    """Restore identical test jobs or preserve and replace a superseded selection."""
+    if not isinstance(stored, list):
+        raise ValueError("stored test-evaluation job plan is not a list")
+    stored_by_id: dict[str, dict[str, Any]] = {}
+    for item in stored:
+        if not isinstance(item, dict) or not isinstance(item.get("job_id"), str):
+            raise ValueError("stored test-evaluation job is malformed")
+        if item["job_id"] in stored_by_id:
+            raise ValueError("stored test-evaluation job IDs are not unique")
+        stored_by_id[item["job_id"]] = item
+    if set(stored_by_id) != {job["job_id"] for job in generated}:
+        raise ValueError("stored test-evaluation job matrix differs from this invocation")
+    for job in generated:
+        previous = stored_by_id[job["job_id"]]
+        if any(previous.get(key) != job[key] for key in _TEST_JOB_STABLE_FIELDS):
+            raise ValueError(f"stored test-evaluation identity differs for {job['job_id']}")
+        previous_binding = {
+            key: value for key, value in previous.items() if key not in _JOB_STATE_FIELDS
+        }
+        generated_binding = {
+            key: value for key, value in job.items() if key not in _JOB_STATE_FIELDS
+        }
+        if previous_binding == generated_binding:
+            status = previous.get("status")
+            if status not in {"pending", "running", "passed", "failed"}:
+                raise ValueError(f"stored test-evaluation job has invalid status: {job['job_id']}")
+            for key in _JOB_STATE_FIELDS:
+                if key in previous:
+                    job[key] = previous[key]
+            continue
+
+        _validate_job_paths([previous], run_dir)
+        _quarantine_incomplete_output(previous, run_dir)
+        history = list(previous.get("previous_attempts", []))
+        history.append(
+            {
+                "status": previous.get("status"),
+                "selected_profile": previous.get("selected_profile"),
+                "checkpoint": previous.get("checkpoint"),
+                "checkpoint_sha256": previous.get("checkpoint_sha256"),
+                "selected_validation_mae": previous.get("selected_validation_mae"),
+                "accepted_result": previous.get("accepted_result"),
+                "output_dir": previous.get("output_dir"),
+                "quarantined_output": (
+                    previous.get("quarantined_outputs", [])[-1]
+                    if previous.get("quarantined_outputs")
+                    else None
+                ),
+            }
+        )
+        job["previous_attempts"] = history
+        job["selection_rebinds"] = int(previous.get("selection_rebinds", 0)) + 1
+        for key in ("resume_attempts", "quarantined_outputs"):
+            if key in previous:
+                job[key] = previous[key]
+
+
+def _resume_manifest(
+    args: argparse.Namespace,
+    run_id: str,
+    run_dir: Path,
+    jobs: list[dict[str, Any]],
+    dependencies: dict[str, Any],
+    sources: dict[str, str],
+) -> tuple[dict[str, Any], str]:
+    """Load a same-run continuation only when every immutable binding still matches."""
+    manifest = _json_object(run_dir / "manifest.json")
+    expected_identity = {
+        "schema_version": 2,
+        "scope": "cycle_pe_v1_v2_larger_model_scaling",
+        "run_id": run_id,
+        "output_dir": str(run_dir),
+        "run_configuration": _run_configuration(args),
+        "dependencies": dependencies,
+        "source_sha256": sources,
+    }
+    for key, expected in expected_identity.items():
+        if manifest.get(key) != expected:
+            raise ValueError(f"existing run cannot be resumed: {key} differs")
+    previous_status = manifest.get("status")
+    if previous_status not in {"running", "failed", "passed"}:
+        raise ValueError("existing run cannot be resumed: status is invalid")
+    if manifest.get("source_integrity_valid") is not True:
+        raise ValueError("existing run cannot be resumed after a source-integrity failure")
+    _restore_job_state(jobs, manifest.get("jobs"), label="candidate")
+    manifest["jobs"] = jobs
+    manifest["status"] = "running"
+    manifest.pop("error", None)
+    manifest.pop("finished_at_utc", None)
+    manifest["resume_count"] = int(manifest.get("resume_count", 0)) + 1
+    manifest["resumed_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+    return manifest, previous_status
+
+
+def _recover_candidate_rows(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Re-admit complete candidates from disk, including a child finished before interruption."""
+    rows: list[dict[str, Any]] = []
+    for job in jobs:
+        previous_status = job.get("status")
+        if job.get("status") == "failed" and job.get("returncode") not in (None, 0):
+            job["status"] = "pending"
+            job["returncode"] = None
+            job["artifact_errors"] = []
+            continue
+        output_exists = Path(job["output_dir"]).exists()
+        try:
+            recovered = read_job_rows(job)
+            if previous_status == "passed" and job.get("accepted_rows") != recovered:
+                raise ValueError("passed candidate artifacts differ from their accepted rows")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            if output_exists or job.get("status") in {"running", "passed"}:
+                job.setdefault("resume_artifact_errors", []).append(f"{type(exc).__name__}: {exc}")
+            job["status"] = "pending"
+            job["returncode"] = None
+            job["artifact_errors"] = []
+        else:
+            rows.extend(recovered)
+            job["status"] = "passed"
+            job["returncode"] = 0
+            job["artifact_errors"] = []
+            if previous_status != "passed":
+                job["accepted_rows"] = recovered
+            job["recovered_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+    return rows
+
+
+def _recover_test_rows(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Re-admit test-only artifacts while rechecking their selected-checkpoint binding."""
+    rows: list[dict[str, Any]] = []
+    for job in jobs:
+        previous_status = job.get("status")
+        if job.get("status") == "failed" and job.get("returncode") not in (None, 0):
+            job["status"] = "pending"
+            job["returncode"] = None
+            job["artifact_errors"] = []
+            continue
+        output_exists = Path(job["output_dir"]).exists()
+        try:
+            recovered = read_test_result(job)
+            if previous_status == "passed" and job.get("accepted_result") != recovered:
+                raise ValueError("passed test artifact differs from its accepted result")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            if output_exists or job.get("status") in {"running", "passed"}:
+                job.setdefault("resume_artifact_errors", []).append(f"{type(exc).__name__}: {exc}")
+            job["status"] = "pending"
+            job["returncode"] = None
+            job["artifact_errors"] = []
+        else:
+            rows.append(recovered)
+            job["status"] = "passed"
+            job["returncode"] = 0
+            job["artifact_errors"] = []
+            if previous_status != "passed":
+                job["accepted_result"] = recovered
+            job["recovered_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+    return rows
+
+
+def _quarantine_incomplete_output(job: dict[str, Any], run_dir: Path) -> None:
+    """Preserve an incomplete child directory before retrying its exact output binding."""
+    lexical_output = Path(os.path.abspath(Path(job["output_dir"]).expanduser()))
+    output = lexical_output.resolve()
+    run_dir = run_dir.resolve()
+    if output != lexical_output:
+        raise ValueError(f"refusing to move an indirect retry output: {lexical_output}")
+    if not output.exists():
+        return
+    if output == run_dir or not output.is_relative_to(run_dir):
+        raise ValueError(f"refusing to move unsafe retry output: {output}")
+    root = (run_dir / "resume-orphans" / re.sub(r"[^A-Za-z0-9_.-]+", "--", job["job_id"])).resolve()
+    if not root.is_relative_to(run_dir):
+        raise ValueError("refusing to use a retry archive outside the run directory")
+    root.mkdir(parents=True, exist_ok=True)
+    attempt = int(job.get("resume_attempts", 0)) + 1
+    target = (root / f"attempt-{attempt}").resolve()
+    while target.exists():
+        attempt += 1
+        target = (root / f"attempt-{attempt}").resolve()
+    if not target.is_relative_to(run_dir):
+        raise ValueError("refusing to move retry output outside the run directory")
+    lexical_output.rename(target)
+    job["resume_attempts"] = attempt
+    job.setdefault("quarantined_outputs", []).append(str(target))
+
+
+def _validated_log_path(log_path: Path, run_dir: Path) -> Path:
+    """Reject indirect or out-of-run log targets before opening them for append."""
+    lexical = Path(os.path.abspath(log_path.expanduser()))
+    resolved = lexical.resolve()
+    log_root = (run_dir.resolve() / "logs").resolve()
+    if resolved != lexical or not resolved.is_relative_to(log_root):
+        raise ValueError(f"refusing to write an indirect or out-of-run log: {lexical}")
+    return lexical
+
+
+def _validated_write_path(path: Path, run_dir: Path, *, label: str) -> Path:
+    """Validate a direct in-run file path before passing it to a child writer."""
+    lexical = Path(os.path.abspath(path.expanduser()))
+    resolved = lexical.resolve()
+    run_dir = run_dir.resolve()
+    if (
+        resolved != lexical
+        or resolved == run_dir
+        or resolved.is_dir()
+        or (lexical.exists() and not lexical.is_file())
+        or not resolved.is_relative_to(run_dir)
+    ):
+        raise ValueError(f"refusing to write an indirect or out-of-run {label}: {lexical}")
+    return lexical
+
+
+def _validate_job_paths(jobs: list[dict[str, Any]], run_dir: Path) -> None:
+    """Require every mutable child output and log to be a direct in-run path."""
+    run_dir = run_dir.resolve()
+    for job in jobs:
+        lexical_output = Path(os.path.abspath(Path(job["output_dir"]).expanduser()))
+        output = lexical_output.resolve()
+        if output != lexical_output or output == run_dir or not output.is_relative_to(run_dir):
+            raise ValueError(f"unsafe output path for {job['job_id']}: {lexical_output}")
+        _validated_log_path(Path(job["log_path"]), run_dir)
+
+
 def _manifest_base(
     args: argparse.Namespace,
     run_id: str,
@@ -43254,6 +43802,7 @@ def _manifest_base(
         "dependencies": dependencies,
         "source_sha256": sources,
         "source_integrity_valid": True,
+        "run_configuration": _run_configuration(args),
         "preflight": {"status": "pending"},
         "jobs": jobs,
         "test_evaluation_jobs": [],
@@ -43268,8 +43817,12 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     run_id = args.run_id or _default_run_id()
+    results_root = args.results_root.expanduser().resolve()
     run_dir = _run_dir(args, run_id)
     data_root = args.data_root.expanduser().resolve()
+    if not run_dir.is_relative_to(results_root):
+        print("Experiment outputs must stay within the results root", file=sys.stderr)
+        return 2
     paths_overlap = (
         run_dir == data_root
         or run_dir.is_relative_to(data_root)
@@ -43292,8 +43845,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"manifest: {run_dir / 'manifest.json'}")
         print(f"summary: {run_dir / 'summary.json'}")
         return 0
-    if run_dir.exists():
-        print(f"Run already exists; choose a new run ID: {run_dir}", file=sys.stderr)
+    try:
+        manifest_path = _validated_write_path(
+            run_dir / "manifest.json", run_dir, label="runner manifest"
+        )
+        summary_path = _validated_write_path(
+            run_dir / "summary.json", run_dir, label="aggregate summary"
+        )
+    except ValueError as exc:
+        print(f"Existing run cannot be resumed: {exc}", file=sys.stderr)
         return 2
     try:
         dependencies = check_dependencies()
@@ -43301,18 +43861,82 @@ def main(argv: list[str] | None = None) -> int:
         print(error_message(exc), file=sys.stderr)
         return exc.exit_code
     sources = _source_snapshot()
-    run_dir.mkdir(parents=True, exist_ok=False)
-    manifest_path = run_dir / "manifest.json"
-    summary_path = run_dir / "summary.json"
-    manifest = _manifest_base(args, run_id, run_dir, jobs, dependencies, sources)
+    is_resume = run_dir.exists()
+    resume_previous_status: str | None = None
+    if is_resume:
+        try:
+            manifest, resume_previous_status = _resume_manifest(
+                args,
+                run_id,
+                run_dir,
+                jobs,
+                dependencies,
+                sources,
+            )
+            _validate_job_paths(jobs, run_dir)
+            rows = _recover_candidate_rows(jobs)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"Existing run cannot be resumed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+    else:
+        run_dir.mkdir(parents=True, exist_ok=False)
+        manifest = _manifest_base(args, run_id, run_dir, jobs, dependencies, sources)
+        rows = []
+    if (
+        is_resume
+        and resume_previous_status == "passed"
+        and all(job["status"] == "passed" for job in jobs)
+    ):
+        try:
+            verified_validation = build_summary(
+                rows,
+                versions=list(args.versions),
+                datasets=list(args.datasets),
+                profiles=list(args.profiles),
+                model_seeds=args.model_seeds,
+                complete=len(rows) == len(jobs) * len(args.datasets),
+            )
+            if verified_validation["status"] != "pending_test_evaluation":
+                raise ValueError("completed candidate matrix no longer validates")
+            verified_test_jobs = make_test_jobs(
+                args, run_dir, verified_validation["selected_checkpoints"]
+            )
+            _restore_or_rebind_test_job_state(
+                verified_test_jobs,
+                manifest.get("test_evaluation_jobs"),
+                run_dir,
+            )
+            _validate_job_paths(verified_test_jobs, run_dir)
+            verified_test_rows = _recover_test_rows(verified_test_jobs)
+            verified_complete = (
+                len(verified_test_rows) == len(verified_test_jobs)
+                and len(verified_test_jobs)
+                == len(args.versions) * len(args.datasets) * len(args.model_seeds)
+                and all(job["status"] == "passed" for job in verified_test_jobs)
+            )
+            verified_summary = attach_test_results(
+                verified_validation, verified_test_rows, complete=verified_complete
+            )
+            if verified_summary["status"] == "passed":
+                if _json_object(summary_path) != verified_summary:
+                    raise ValueError("stored aggregate summary differs from verified artifacts")
+                print(
+                    f"Cycle scaling run already complete; verified {len(jobs)} candidates and "
+                    f"{len(verified_test_jobs)} selected-checkpoint evaluations"
+                )
+                return 0
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"Existing run cannot be resumed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
     atomic_write_json(manifest_path, manifest, sort_keys=False)
     environment = _environment()
-    rows: list[dict[str, Any]] = []
     test_rows: list[dict[str, Any]] = []
     validation_summary: dict[str, Any] | None = None
     failed = False
     try:
-        preflight_output = run_dir / "gpu-preflight.json"
+        preflight_output = _validated_write_path(
+            run_dir / "gpu-preflight.json", run_dir, label="GPU preflight output"
+        )
         preflight_command = [
             sys.executable,
             "-B",
@@ -43325,9 +43949,8 @@ def main(argv: list[str] | None = None) -> int:
             "--json-out",
             str(preflight_output),
         ]
-        preflight_code = run_logged(
-            preflight_command, run_dir / "logs/gpu-preflight.log", environment
-        )
+        preflight_log = _validated_log_path(run_dir / "logs/gpu-preflight.log", run_dir)
+        preflight_code = run_logged(preflight_command, preflight_log, environment)
         preflight_errors: list[str] = []
         if preflight_code == 0:
             try:
@@ -43348,10 +43971,15 @@ def main(argv: list[str] | None = None) -> int:
         atomic_write_json(manifest_path, manifest, sort_keys=False)
         if not failed:
             for job in jobs:
+                if job["status"] == "passed":
+                    continue
+                _quarantine_incomplete_output(job, run_dir)
+                job["artifact_errors"] = []
                 job["status"] = "running"
                 job["started_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
                 atomic_write_json(manifest_path, manifest, sort_keys=False)
-                code = run_logged(job["command"], Path(job["log_path"]), environment)
+                log_path = _validated_log_path(Path(job["log_path"]), run_dir)
+                code = run_logged(job["command"], log_path, environment)
                 job["returncode"] = code
                 job["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
                 if code == 0:
@@ -43361,6 +43989,7 @@ def main(argv: list[str] | None = None) -> int:
                         job["artifact_errors"] = [f"{type(exc).__name__}: {exc}"]
                     else:
                         rows.extend(job_rows)
+                        job["accepted_rows"] = job_rows
                 job["status"] = "passed" if code == 0 and not job["artifact_errors"] else "failed"
                 failed = failed or job["status"] == "failed"
                 atomic_write_json(manifest_path, manifest, sort_keys=False)
@@ -43385,19 +44014,31 @@ def main(argv: list[str] | None = None) -> int:
             failed = True
             manifest["source_integrity_valid"] = False
             manifest["source_integrity_error"] = "experiment source changed during the run"
+        stored_test_jobs = manifest.get("test_evaluation_jobs", [])
         test_jobs = (
             make_test_jobs(args, run_dir, validation_summary["selected_checkpoints"])
             if not failed
+            else list(stored_test_jobs)
+            if is_resume and isinstance(stored_test_jobs, list)
             else []
         )
+        if not failed and is_resume and stored_test_jobs:
+            _restore_or_rebind_test_job_state(test_jobs, stored_test_jobs, run_dir)
+            _validate_job_paths(test_jobs, run_dir)
+            test_rows = _recover_test_rows(test_jobs)
         manifest["test_evaluation_jobs"] = test_jobs
         atomic_write_json(manifest_path, manifest, sort_keys=False)
         if not failed:
             for test_job in test_jobs:
+                if test_job["status"] == "passed":
+                    continue
+                _quarantine_incomplete_output(test_job, run_dir)
+                test_job["artifact_errors"] = []
                 test_job["status"] = "running"
                 test_job["started_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
                 atomic_write_json(manifest_path, manifest, sort_keys=False)
-                code = run_logged(test_job["command"], Path(test_job["log_path"]), environment)
+                log_path = _validated_log_path(Path(test_job["log_path"]), run_dir)
+                code = run_logged(test_job["command"], log_path, environment)
                 test_job["returncode"] = code
                 test_job["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
                 if code == 0:
@@ -43407,6 +44048,7 @@ def main(argv: list[str] | None = None) -> int:
                         test_job["artifact_errors"] = [f"{type(exc).__name__}: {exc}"]
                     else:
                         test_rows.append(test_row)
+                        test_job["accepted_result"] = test_row
                 test_job["status"] = (
                     "passed" if code == 0 and not test_job["artifact_errors"] else "failed"
                 )
@@ -44265,7 +44907,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 TRACKS = ("conductance", "cycle", "tree")
 PROFILES = ("base", "wide", "deep", "large")
-DEFAULT_MODEL_SEEDS = (0, 1, 2, 3, 4)
+DEFAULT_MODEL_SEEDS = (0,)
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
 
 # Keep the complete public matrices here instead of trusting child row counts.  The
@@ -44499,11 +45141,32 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
 
 
 def _source_snapshot() -> dict[str, str]:
-    paths = [Path(__file__).resolve()]
+    paths = [
+        Path(__file__).resolve(),
+        ROOT / "research/__init__.py",
+        ROOT / "scripts/check_dependencies.py",
+        ROOT / "scripts/gpu_profiles.py",
+        ROOT / "scripts/gpu_preflight.py",
+        ROOT / "scripts/run_conductance_factorial.py",
+        ROOT / "scripts/verify_gpu_lock.py",
+        ROOT / "research/tree_augmentation/config.yaml",
+    ]
     paths.extend(ROOT / "scripts" / TRACK_SPECS[track]["script"] for track in TRACKS)
+    for source_root in (
+        ROOT / "research/conductance_gat",
+        ROOT / "research/cycle_pe",
+        ROOT / "research/tree_augmentation",
+        ROOT / "src/chartgat",
+    ):
+        for pattern in ("*.py", "*.yaml", "*.yml"):
+            paths.extend(
+                path
+                for path in source_root.rglob(pattern)
+                if "tests" not in path.relative_to(source_root).parts
+            )
     return {
         path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in paths
+        for path in sorted(set(paths))
     }
 
 
@@ -44550,7 +45213,11 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def _run_logged(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("x", encoding="utf-8", newline="\n") as log:
+    mode = "a" if log_path.exists() else "x"
+    with log_path.open(mode, encoding="utf-8", newline="\n") as log:
+        if mode == "a":
+            log.write(f"\n=== resumed {dt.datetime.now(dt.UTC).isoformat()} ===\n")
+            log.flush()
         process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -45028,6 +45695,124 @@ def _validate_child_summary(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_RESUME_JOB_FIELDS = (
+    "track",
+    "child_run_id",
+    "profiles",
+    "shared_profiles",
+    "model_seeds",
+    "command",
+    "output_dir",
+    "summary_path",
+    "log_path",
+    "allow_download_forwarded",
+    "requested_matrix",
+    "expected_counts",
+)
+
+
+def _config_payload(
+    args: argparse.Namespace, *, data_root: Path, results_root: Path
+) -> dict[str, Any]:
+    return {
+        "tracks": list(args.tracks),
+        "shared_profiles": list(args.profiles),
+        "tree_profiles": list(args.profiles),
+        "model_seeds": list(args.model_seeds),
+        "device": args.device,
+        "min_free_gb": args.min_free_gb,
+        "allow_download": args.allow_download,
+        "data_root": str(data_root),
+        "results_root": str(results_root),
+        "fail_fast": args.fail_fast,
+    }
+
+
+def _resume_manifest(
+    manifest_path: Path,
+    *,
+    run_id: str,
+    expected_config: dict[str, Any],
+    expected_jobs: list[dict[str, Any]],
+    expected_totals: dict[str, int],
+    expected_sources: dict[str, str],
+) -> dict[str, Any]:
+    """Load an interrupted run without trusting stale status or artifacts."""
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"existing run manifest is unreadable: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("existing run manifest must be a JSON object")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("suite") != "rich_scaling"
+        or payload.get("run_id") != run_id
+    ):
+        raise ValueError("existing run manifest identity does not match this runner")
+    if payload.get("config") != expected_config:
+        raise ValueError("existing run configuration differs; use its original arguments")
+    if payload.get("planned_counts") != expected_totals:
+        raise ValueError("existing run count contract differs from the requested plan")
+    if payload.get("source_sha256") != expected_sources:
+        raise ValueError("experiment source changed since this run started; use a new run ID")
+    if payload.get("source_integrity_valid") is not True:
+        raise ValueError("existing run failed source integrity and cannot be resumed")
+    stored_jobs = payload.get("jobs")
+    if not isinstance(stored_jobs, list) or len(stored_jobs) != len(expected_jobs):
+        raise ValueError("existing run job matrix is incomplete")
+    for stored, expected in zip(stored_jobs, expected_jobs, strict=True):
+        if not isinstance(stored, dict) or any(
+            stored.get(field) != expected[field] for field in _RESUME_JOB_FIELDS
+        ):
+            raise ValueError("existing run job contract differs from the requested plan")
+        previous_status = stored.get("status")
+        if previous_status == "passed":
+            try:
+                validated = _validate_child_summary(stored)
+                if stored.get("result") != validated:
+                    raise RuntimeError("passed track summary hash or certificate changed")
+                stored["result"] = validated
+            except Exception as error:
+                stored["status"] = "pending"
+                stored["resume_validation_error"] = f"{type(error).__name__}: {error}"
+                stored.pop("result", None)
+            else:
+                stored.pop("resume_validation_error", None)
+                continue
+        else:
+            stored["status"] = "pending"
+            stored["previous_status"] = previous_status
+        for field in (
+            "returncode",
+            "error",
+            "elapsed_seconds",
+            "started_at_utc",
+            "finished_at_utc",
+            "result",
+        ):
+            stored.pop(field, None)
+    payload["status"] = "running"
+    payload["source_integrity_valid"] = True
+    resume_count = payload.get("resume_count", 0)
+    if isinstance(resume_count, bool) or not isinstance(resume_count, int) or resume_count < 0:
+        raise ValueError("existing run resume_count is invalid")
+    resumed_at = payload.get("resumed_at_utc", [])
+    if not isinstance(resumed_at, list) or any(not isinstance(value, str) for value in resumed_at):
+        raise ValueError("existing run resumed_at_utc history is invalid")
+    payload["resume_count"] = resume_count + 1
+    payload["resumed_at_utc"] = [*resumed_at, dt.datetime.now(dt.UTC).isoformat()]
+    for field in (
+        "error",
+        "finished_at_utc",
+        "completed_counts",
+        "source_integrity_error",
+        "source_sha256_final",
+    ):
+        payload.pop(field, None)
+    return payload
+
+
 def _totals(jobs: list[dict[str, Any]]) -> dict[str, int]:
     return {
         "track_runs": len(jobs),
@@ -45069,6 +45854,9 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = (results_root / "rich_scaling" / run_id).resolve()
     jobs = make_jobs(args, run_id)
     relevant_outputs = [run_dir, *(Path(job["output_dir"]) for job in jobs)]
+    if any(not output.is_relative_to(results_root) for output in relevant_outputs):
+        print("experiment outputs must resolve within the results root", file=sys.stderr)
+        return 2
     if any(_paths_overlap(output, data_root) for output in relevant_outputs):
         print("experiment outputs and dataset directories must not overlap", file=sys.stderr)
         return 2
@@ -45084,71 +45872,84 @@ def main(argv: list[str] | None = None) -> int:
         _print_plan(args, run_id, jobs)
         print("dry run only; no files or directories were written")
         return 0
-    if run_dir.exists():
-        print(f"run already exists; use a new run ID: {run_dir}", file=sys.stderr)
-        return 2
-
-    run_dir.mkdir(parents=True, exist_ok=False)
-    (run_dir / "logs").mkdir(exist_ok=False)
     totals = _totals(jobs)
-    manifest: dict[str, Any] = {
-        "schema_version": 1,
-        "suite": "rich_scaling",
-        "run_id": run_id,
-        "status": "running",
-        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
-        "config": {
-            "tracks": list(args.tracks),
-            "shared_profiles": list(args.profiles),
-            "tree_profiles": list(args.profiles),
-            "model_seeds": list(args.model_seeds),
-            "device": args.device,
-            "min_free_gb": args.min_free_gb,
-            "allow_download": args.allow_download,
-            "data_root": str(data_root),
-            "results_root": str(results_root),
-            "fail_fast": args.fail_fast,
-        },
-        "protocol": {
-            "purpose": "larger-model scaling for every selected V1/V2/V3/V4 track",
-            "execution": "selected track runners execute sequentially without a shell",
-            "failure_policy": (
-                "stop after first failed track" if args.fail_fast else "continue remaining tracks"
-            ),
-            "tree_profiles": "base/wide/deep/large are forwarded without renaming",
-            "download_policy": (
-                "allow-download is forwarded to Cycle and Tree; Conductance remains "
-                "verified-cache-only because its child contract exposes no download flag"
-            ),
-            "immutability": "a run ID is create-once; existing central runs are never overwritten",
-            "verification": "nonzero return code, missing/wrong summary path, or an incomplete "
-            "non-passed summary fails its track",
-        },
-        "planned_counts": totals,
-        "jobs": jobs,
-        "source_integrity_valid": True,
-        "source_sha256": _source_snapshot(),
-    }
     manifest_path = run_dir / "manifest.json"
+    sources = _source_snapshot()
+    config = _config_payload(args, data_root=data_root, results_root=results_root)
+    resumed = run_dir.exists()
+    if resumed:
+        try:
+            manifest = _resume_manifest(
+                manifest_path,
+                run_id=run_id,
+                expected_config=config,
+                expected_jobs=jobs,
+                expected_totals=totals,
+                expected_sources=sources,
+            )
+        except (ValueError, RuntimeError) as error:
+            print(f"cannot resume existing run: {error}", file=sys.stderr)
+            return 2
+        (run_dir / "logs").mkdir(exist_ok=True)
+    else:
+        run_dir.mkdir(parents=True, exist_ok=False)
+        (run_dir / "logs").mkdir(exist_ok=False)
+        manifest = {
+            "schema_version": 1,
+            "suite": "rich_scaling",
+            "run_id": run_id,
+            "status": "running",
+            "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+            "config": config,
+            "protocol": {
+                "purpose": "larger-model scaling for every selected V1/V2/V3/V4 track",
+                "execution": "selected track runners execute sequentially without a shell",
+                "failure_policy": (
+                    "stop after first failed track"
+                    if args.fail_fast
+                    else "continue remaining tracks"
+                ),
+                "tree_profiles": "base/wide/deep/large are forwarded without renaming",
+                "download_policy": (
+                    "allow-download is forwarded to Cycle and Tree; Conductance remains "
+                    "verified-cache-only because its child contract exposes no download flag"
+                ),
+                "resume": "the same run ID verifies immutable config/source/job contracts, "
+                "skips valid passed tracks, and reruns only incomplete or invalid tracks",
+                "verification": "nonzero return code, missing/wrong summary path, or an "
+                "incomplete non-passed summary fails its track",
+            },
+            "planned_counts": totals,
+            "jobs": jobs,
+            "source_integrity_valid": True,
+            "source_sha256": sources,
+        }
+    jobs = manifest["jobs"]
     _atomic_write_json(manifest_path, manifest)
     environment = _environment()
     failed = False
     interrupted = False
     print(
         f"Run: {run_id}; {totals['track_runs']} tracks; "
-        f"{totals['model_trainings']} fresh model trainings",
+        f"{totals['model_trainings']} planned model trainings; "
+        f"resume={'yes' if resumed else 'no'}",
         flush=True,
     )
     for index, job in enumerate(jobs, start=1):
         if failed and args.fail_fast:
             break
+        previously_passed = job["status"] == "passed"
         job["status"] = "running"
         job["started_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
         _atomic_write_json(manifest_path, manifest)
-        print(f"\n[{index}/{len(jobs)}] {job['track']}", flush=True)
+        action = "verify completed child state" if previously_passed else "resume incomplete child"
+        print(f"\n[{index}/{len(jobs)}] {job['track']} — {action}", flush=True)
         started = time.monotonic()
         try:
-            returncode = _run_logged(job["command"], Path(job["log_path"]), environment)
+            log_path = Path(job["log_path"])
+            if not log_path.resolve().is_relative_to(run_dir):
+                raise RuntimeError("track log path resolves outside the central run directory")
+            returncode = _run_logged(job["command"], log_path, environment)
             job["returncode"] = returncode
             if returncode != 0:
                 raise RuntimeError(f"{job['track']} child failed with exit code {returncode}")
@@ -45280,7 +46081,7 @@ PROFILE_CONFIGS: dict[str, dict[str, int]] = {
     },
 }
 PROFILES = tuple(PROFILE_CONFIGS)
-DEFAULT_MODEL_SEEDS = (0, 1, 2, 3, 4)
+DEFAULT_MODEL_SEEDS = (0,)
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
 
 
@@ -45326,7 +46127,7 @@ def parser() -> argparse.ArgumentParser:
         "--model-seeds",
         type=_model_seeds,
         default=DEFAULT_MODEL_SEEDS,
-        help="comma-separated model/minibatch seeds (default: 0,1,2,3,4)",
+        help="comma-separated model/minibatch seeds (default: 0)",
     )
     result.add_argument("--data-seed", type=int, default=0)
     result.add_argument("--split-seed", type=int, default=0)
@@ -45414,6 +46215,7 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                         "model_seed": model_seed,
                         "trained_models": list(MODELS),
                         "status": "pending",
+                        "attempt": 1,
                         "output_dir": str(output),
                         "summary_path": str(output / "summary.json"),
                         "manifest_path": str(output / "manifest.json"),
@@ -45439,9 +46241,13 @@ def _source_snapshot() -> dict[str, Any]:
     files += sorted((ROOT / "research/tree_augmentation").glob("*.yaml"))
     files += [
         Path(__file__).resolve(),
+        ROOT / "research/__init__.py",
         ROOT / "scripts/check_dependencies.py",
+        ROOT / "scripts/gpu_profiles.py",
         ROOT / "scripts/gpu_preflight.py",
+        ROOT / "scripts/verify_gpu_lock.py",
         ROOT / "src/chartgat/algebra.py",
+        ROOT / "src/chartgat/__init__.py",
         ROOT / "src/chartgat/cache.py",
         ROOT / "src/chartgat/graphs.py",
         ROOT / "src/chartgat/seeds.py",
@@ -45829,6 +46635,7 @@ def _make_selected_test_job(
         "selected_inputs": selected_inputs,
         "evaluated_models": list(MODELS),
         "status": "pending",
+        "attempt": 1,
         "output_dir": str(output),
         "summary_path": str(output / "summary.json"),
         "manifest_path": str(output / "manifest.json"),
@@ -45998,9 +46805,368 @@ def _aggregate_summary(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validated_write_path(path: Path, run_dir: Path, *, label: str) -> Path:
+    """Validate a direct regular-file path before any runner or child write."""
+    lexical = Path(os.path.abspath(path.expanduser()))
+    resolved = lexical.resolve()
+    run_dir = run_dir.resolve()
+    if (
+        resolved != lexical
+        or resolved == run_dir
+        or resolved.is_dir()
+        or (lexical.exists() and not lexical.is_file())
+        or not resolved.is_relative_to(run_dir)
+    ):
+        raise ValueError(f"refusing to write an indirect or out-of-run {label}: {lexical}")
+    return lexical
+
+
 def _write_state(run_dir: Path, manifest: dict[str, Any]) -> None:
-    atomic_write_json(run_dir / "manifest.json", manifest)
-    atomic_write_json(run_dir / "summary.json", _aggregate_summary(manifest))
+    manifest_path = _validated_write_path(
+        run_dir / "manifest.json", run_dir, label="runner manifest"
+    )
+    summary_path = _validated_write_path(
+        run_dir / "summary.json", run_dir, label="aggregate summary"
+    )
+    atomic_write_json(manifest_path, manifest)
+    atomic_write_json(summary_path, _aggregate_summary(manifest))
+
+
+def _run_config(args: argparse.Namespace, data_root: Path) -> dict[str, Any]:
+    return {
+        "suites": list(args.suites),
+        "profiles": list(args.profiles),
+        "profile_configs": {profile: PROFILE_CONFIGS[profile] for profile in args.profiles},
+        "model_seeds": list(args.model_seeds),
+        "data_seed": args.data_seed,
+        "split_seed": args.split_seed,
+        "chart_seed": args.chart_seed,
+        "device": args.device,
+        "batch_size": args.batch_size,
+        "workers": args.workers,
+        "min_free_gb": args.min_free_gb,
+        "amp_override": args.amp,
+        "allow_download": args.allow_download,
+        "data_root": str(data_root),
+    }
+
+
+def _candidate_key(job: dict[str, Any]) -> tuple[str, str, int]:
+    return job["suite"], job["profile"], job["model_seed"]
+
+
+def _selected_key(job: dict[str, Any]) -> tuple[str, int]:
+    return job["suite"], job["model_seed"]
+
+
+def _normalized_output_command(command: Any) -> list[str]:
+    if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+        raise ValueError("stored child command is invalid")
+    normalized = list(command)
+    try:
+        normalized[normalized.index("--output-dir") + 1] = "<OUTPUT>"
+    except (ValueError, IndexError) as error:
+        raise ValueError("stored child command has no output directory") from error
+    return normalized
+
+
+def _replace_output(command: list[str], output: Path) -> list[str]:
+    updated = list(command)
+    updated[updated.index("--output-dir") + 1] = str(output)
+    return updated
+
+
+def _validate_record_paths(job: dict[str, Any], run_dir: Path) -> None:
+    lexical_output = Path(os.path.abspath(Path(job.get("output_dir", "")).expanduser()))
+    lexical_summary = Path(os.path.abspath(Path(job.get("summary_path", "")).expanduser()))
+    lexical_manifest = Path(os.path.abspath(Path(job.get("manifest_path", "")).expanduser()))
+    lexical_log = Path(os.path.abspath(Path(job.get("log_path", "")).expanduser()))
+    output = lexical_output.resolve()
+    summary = lexical_summary.resolve()
+    child_manifest = lexical_manifest.resolve()
+    log = lexical_log.resolve()
+    if (
+        output != lexical_output
+        or summary != lexical_summary
+        or child_manifest != lexical_manifest
+        or log != lexical_log
+        or not output.is_relative_to(run_dir)
+        or summary != output / "summary.json"
+        or child_manifest != output / "manifest.json"
+        or not log.is_relative_to(run_dir / "logs")
+    ):
+        raise ValueError("stored child paths escape or disagree with the run directory")
+    command = job.get("command")
+    if not isinstance(command, list):
+        raise ValueError("stored child command is invalid")
+    try:
+        command_output = Path(command[command.index("--output-dir") + 1]).resolve()
+    except (ValueError, IndexError) as error:
+        raise ValueError("stored child command has no output directory") from error
+    if command_output != output:
+        raise ValueError("stored child command/output path mismatch")
+
+
+def _attempt_record(job: dict[str, Any], validation_error: str | None) -> dict[str, Any]:
+    return {
+        "attempt": job.get("attempt", 1),
+        "status": job.get("status"),
+        "output_dir": job.get("output_dir"),
+        "log_path": job.get("log_path"),
+        **({"exit_code": job["exit_code"]} if "exit_code" in job else {}),
+        **({"error": job["error"]} if "error" in job else {}),
+        **({"validation_error": validation_error} if validation_error else {}),
+    }
+
+
+def _retry_record(
+    job: dict[str, Any],
+    expected: dict[str, Any],
+    run_dir: Path,
+    *,
+    kind: str,
+    validation_error: str,
+) -> None:
+    history = list(job.get("attempt_history", []))
+    history.append(_attempt_record(job, validation_error))
+    attempt = max(1, int(job.get("attempt", 1))) + 1
+    if kind == "candidate":
+        suffix = Path(job["suite"]) / job["profile"] / f"model-seed-{job['model_seed']}"
+    else:
+        suffix = Path(job["suite"]) / f"model-seed-{job['model_seed']}"
+    while True:
+        output = (run_dir / "resume-attempts" / f"attempt-{attempt}" / kind / suffix).resolve()
+        log = (
+            run_dir / "logs" / "resume" / f"attempt-{attempt}" / kind / suffix.with_suffix(".log")
+        ).resolve()
+        if not output.is_relative_to(run_dir) or not log.is_relative_to(run_dir):
+            raise ValueError("retry output or log resolves outside the run directory")
+        if not output.exists() and not log.exists():
+            break
+        attempt += 1
+    replacement = dict(expected)
+    replacement.update(
+        {
+            "attempt": attempt,
+            "attempt_history": history,
+            "status": "pending",
+            "output_dir": str(output),
+            "summary_path": str(output / "summary.json"),
+            "manifest_path": str(output / "manifest.json"),
+            "log_path": str(log),
+            "command": _replace_output(expected["command"], output),
+        }
+    )
+    job.clear()
+    job.update(replacement)
+
+
+def _reconcile_candidate(job: dict[str, Any], expected: dict[str, Any], run_dir: Path) -> None:
+    _validate_record_paths(job, run_dir)
+    if (
+        _candidate_key(job) != _candidate_key(expected)
+        or job.get("profile_config") != expected["profile_config"]
+        or job.get("trained_models") != expected["trained_models"]
+        or _normalized_output_command(job.get("command"))
+        != _normalized_output_command(expected["command"])
+    ):
+        raise ValueError("stored candidate job does not match the requested matrix")
+    if job.get("exit_code") not in (None, 0):
+        _retry_record(
+            job,
+            expected,
+            run_dir,
+            kind="candidate",
+            validation_error="previous candidate attempt returned a nonzero exit code",
+        )
+        return
+    try:
+        result = _validate_child(job)
+    except Exception as error:
+        output = Path(job["output_dir"])
+        log = Path(job["log_path"])
+        if job.get("status") == "pending" and not output.exists() and not log.exists():
+            job.pop("error", None)
+            return
+        _retry_record(
+            job,
+            expected,
+            run_dir,
+            kind="candidate",
+            validation_error=f"{type(error).__name__}: {error}",
+        )
+        return
+    previous_status = job.get("status")
+    if previous_status == "passed" and job.get("result") != result:
+        _retry_record(
+            job,
+            expected,
+            run_dir,
+            kind="candidate",
+            validation_error="passed candidate differs from its accepted result",
+        )
+        return
+    job["result"] = result
+    job["status"] = "passed"
+    job.pop("error", None)
+    if previous_status != "passed":
+        job["recovered_completed_artifact"] = True
+
+
+def _reconcile_selected(job: dict[str, Any], expected: dict[str, Any], run_dir: Path) -> None:
+    _validate_record_paths(job, run_dir)
+    if job.get("exit_code") not in (None, 0):
+        _retry_record(
+            job,
+            expected,
+            run_dir,
+            kind="selected-test",
+            validation_error="previous selected-test attempt returned a nonzero exit code",
+        )
+        return
+    matching_inputs = (
+        _selected_key(job) == _selected_key(expected)
+        and job.get("evaluated_models") == expected["evaluated_models"]
+        and job.get("selected_inputs") == expected["selected_inputs"]
+        and _normalized_output_command(job.get("command"))
+        == _normalized_output_command(expected["command"])
+    )
+    if matching_inputs:
+        try:
+            result = _validate_selected_test(job)
+        except Exception as error:
+            validation_error = f"{type(error).__name__}: {error}"
+        else:
+            previous_status = job.get("status")
+            if previous_status == "passed" and job.get("result") != result:
+                _retry_record(
+                    job,
+                    expected,
+                    run_dir,
+                    kind="selected-test",
+                    validation_error="passed selected-test differs from its accepted result",
+                )
+                return
+            job["selection"] = expected["selection"]
+            job["result"] = result
+            job["status"] = "passed"
+            job.pop("error", None)
+            if previous_status != "passed":
+                job["recovered_completed_artifact"] = True
+            return
+    else:
+        validation_error = "selected inputs no longer match the validation selection"
+    output = Path(job["output_dir"])
+    log = Path(job["log_path"])
+    if (
+        matching_inputs
+        and job.get("status") == "pending"
+        and not output.exists()
+        and not log.exists()
+    ):
+        job["selection"] = expected["selection"]
+        job.pop("error", None)
+        return
+    _retry_record(
+        job,
+        expected,
+        run_dir,
+        kind="selected-test",
+        validation_error=validation_error,
+    )
+
+
+def _load_resume_manifest(
+    manifest_path: Path,
+    *,
+    run_id: str,
+    run_dir: Path,
+    expected_jobs: list[dict[str, Any]],
+    expected_config: dict[str, Any],
+    expected_sources: dict[str, Any],
+    planned_selected_test_runs: int,
+) -> dict[str, Any]:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"existing run has no valid manifest: {error}") from error
+    if not isinstance(manifest, dict):
+        raise ValueError("existing run manifest must contain an object")
+    if (
+        manifest.get("schema_version") != 2
+        or manifest.get("suite") != "tree_scaling"
+        or manifest.get("run_id") != run_id
+        or manifest.get("config") != expected_config
+        or manifest.get("models_per_child") != list(MODELS)
+        or manifest.get("planned_child_runs") != len(expected_jobs)
+        or manifest.get("planned_model_trainings") != len(expected_jobs) * len(MODELS)
+        or manifest.get("planned_selected_test_runs") != planned_selected_test_runs
+        or manifest.get("planned_profile_selections")
+        != len(expected_config["suites"]) * len(MODELS)
+        or manifest.get("sources") != expected_sources
+        or manifest.get("source_integrity_valid") is not True
+    ):
+        raise ValueError("existing run manifest does not match this exact experiment request")
+    stored_jobs = manifest.get("jobs")
+    if not isinstance(stored_jobs, list) or len(stored_jobs) != len(expected_jobs):
+        raise ValueError("existing run candidate matrix is incomplete")
+    if [_candidate_key(job) for job in stored_jobs] != [
+        _candidate_key(job) for job in expected_jobs
+    ]:
+        raise ValueError("existing run candidate matrix differs from the requested matrix")
+    for stored, expected in zip(stored_jobs, expected_jobs, strict=True):
+        _reconcile_candidate(stored, expected, run_dir)
+    selected_jobs = manifest.get("selected_test_jobs", [])
+    if not isinstance(selected_jobs, list):
+        raise ValueError("existing selected-test job table is invalid")
+    for job in selected_jobs:
+        if not isinstance(job, dict):
+            raise ValueError("existing selected-test job table contains a non-object")
+        _validate_record_paths(job, run_dir)
+    selected_keys = [_selected_key(job) for job in selected_jobs]
+    if len(selected_keys) != len(set(selected_keys)):
+        raise ValueError("existing selected-test job table contains duplicates")
+    expected_selected_keys = {
+        (suite, seed)
+        for suite in expected_config["suites"]
+        for seed in expected_config["model_seeds"]
+    }
+    if not set(selected_keys).issubset(expected_selected_keys):
+        raise ValueError("existing selected-test job table is outside the requested matrix")
+    manifest["jobs"] = stored_jobs
+    return manifest
+
+
+def _prepare_selected_jobs(
+    args: argparse.Namespace,
+    run_dir: Path,
+    candidate_jobs: list[dict[str, Any]],
+    stored_jobs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Rebuild validation selections and reconcile their test-only jobs."""
+    previous_selected = {_selected_key(job): job for job in stored_jobs}
+    selections: list[dict[str, Any]] = []
+    expected_selected_jobs: list[dict[str, Any]] = []
+    for suite in args.suites:
+        selection = _select_profiles(
+            candidate_jobs,
+            suite=suite,
+            model_seeds=args.model_seeds,
+            profiles=args.profiles,
+        )
+        selections.append(selection)
+        for model_seed in args.model_seeds:
+            expected_selected_jobs.append(
+                _make_selected_test_job(args, run_dir, selection, model_seed)
+            )
+    selected_jobs: list[dict[str, Any]] = []
+    for expected_selected in expected_selected_jobs:
+        key = _selected_key(expected_selected)
+        selected_job = previous_selected.get(key, expected_selected)
+        if selected_job is not expected_selected:
+            _reconcile_selected(selected_job, expected_selected, run_dir)
+        selected_jobs.append(selected_job)
+    return selections, selected_jobs
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -46011,10 +47177,12 @@ def main(argv: list[str] | None = None) -> int:
         print(str(error), file=sys.stderr)
         return 2
     run_id = args.run_id or _default_run_id()
-    run_dir = (
-        args.results_root.expanduser().resolve() / "tree_augmentation/scaling" / run_id
-    ).resolve()
+    results_root = args.results_root.expanduser().resolve()
+    run_dir = (results_root / "tree_augmentation/scaling" / run_id).resolve()
     data_root = args.data_root.expanduser().resolve()
+    if not run_dir.is_relative_to(results_root):
+        print("experiment outputs must stay within the results root", file=sys.stderr)
+        return 2
     if (
         run_dir == data_root
         or run_dir.is_relative_to(data_root)
@@ -46035,86 +47203,145 @@ def main(argv: list[str] | None = None) -> int:
             print(shlex.join(job["command"]))
         print(f"Aggregate: {run_dir / 'summary.json'}")
         return 0
-    if run_dir.exists():
-        print(f"run already exists; use a new run ID: {run_dir}", file=sys.stderr)
+    try:
+        manifest_path = _validated_write_path(
+            run_dir / "manifest.json", run_dir, label="runner manifest"
+        )
+        _validated_write_path(run_dir / "summary.json", run_dir, label="aggregate summary")
+    except ValueError as error:
+        print(f"cannot resume existing run: {error}", file=sys.stderr)
         return 2
+    expected_config = _run_config(args, data_root)
+    sources = _source_snapshot()
+    resuming = run_dir.exists()
+    if resuming:
+        try:
+            manifest = _load_resume_manifest(
+                manifest_path,
+                run_id=run_id,
+                run_dir=run_dir,
+                expected_jobs=jobs,
+                expected_config=expected_config,
+                expected_sources=sources,
+                planned_selected_test_runs=planned_selected_test_runs,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            print(f"cannot resume existing run: {error}", file=sys.stderr)
+            return 2
+        jobs = manifest["jobs"]
     try:
         dependencies = check_dependencies()
     except DependencyCheckError as error:
         print(error_message(error), file=sys.stderr)
         return error.exit_code
-    run_dir.mkdir(parents=True, exist_ok=False)
-    manifest: dict[str, Any] = {
-        "schema_version": 2,
-        "suite": "tree_scaling",
-        "run_id": run_id,
-        "status": "running",
-        "source_integrity_valid": True,
-        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
-        "config": {
-            "suites": list(args.suites),
-            "profiles": list(args.profiles),
-            "profile_configs": {profile: PROFILE_CONFIGS[profile] for profile in args.profiles},
-            "model_seeds": list(args.model_seeds),
-            "data_seed": args.data_seed,
-            "split_seed": args.split_seed,
-            "chart_seed": args.chart_seed,
-            "device": args.device,
-            "batch_size": args.batch_size,
-            "workers": args.workers,
-            "amp_override": args.amp,
-            "allow_download": args.allow_download,
-            "data_root": str(data_root),
-        },
-        "models_per_child": list(MODELS),
-        "planned_child_runs": len(jobs),
-        "planned_model_trainings": len(jobs) * len(MODELS),
-        "planned_selected_test_runs": planned_selected_test_runs,
-        "planned_profile_selections": len(args.suites) * len(MODELS),
-        "jobs": jobs,
-        "selections": [],
-        "selected_test_jobs": [],
-        "dependencies": dependencies,
-        "sources": _source_snapshot(),
-        "protocol": {
-            "fresh_training": "every profile/seed/suite child trains V1 fixed_bfs and V2 "
-            "multi_chart independently; no checkpoint or score reuse",
-            "scaling_axes": "model width and real encoder message-layer depth",
-            "controlled_budget": "all profiles use 800 optimizer updates, 8 multi-chart "
-            "training views per graph, and 8 evaluation charts per family",
-            "paired_comparison": "within each child both arms use the same model width, update "
-            "count, initialization seed, batch size, dataset split, and evaluation charts",
-            "chart_family_isolation": {
-                "fixed_train": "one bfs chart rooted at node 0 per graph",
-                "multi_train": "8 charts per graph split across random-root bfs/dfs",
-                "seen_evaluation": "fresh random-root bfs charts",
-                "unseen_evaluation": "fresh Wilson uniform spanning-tree charts",
-                "evaluation_charts_per_family": 8,
+    if resuming and manifest.get("dependencies") != dependencies:
+        print("cannot resume existing run: dependency inventory differs", file=sys.stderr)
+        return 2
+    if (
+        resuming
+        and manifest.get("status") == "passed"
+        and all(job["status"] == "passed" for job in jobs)
+    ):
+        try:
+            verified_selections, verified_selected_jobs = _prepare_selected_jobs(
+                args,
+                run_dir,
+                jobs,
+                manifest.get("selected_test_jobs", []),
+            )
+            if len(verified_selected_jobs) == planned_selected_test_runs and all(
+                job["status"] == "passed" for job in verified_selected_jobs
+            ):
+                manifest["selections"] = verified_selections
+                manifest["selected_test_jobs"] = verified_selected_jobs
+                stored_summary = _read_mapping(run_dir / "summary.json", "tree scaling summary")
+                if stored_summary != _aggregate_summary(manifest):
+                    raise RuntimeError("stored aggregate summary differs from verified artifacts")
+                print(
+                    f"Tree scaling run already complete; verified {len(jobs)} candidates and "
+                    f"{len(verified_selected_jobs)} selected-checkpoint evaluations",
+                    flush=True,
+                )
+                return 0
+        except Exception as error:
+            print(f"cannot resume existing run: {error}", file=sys.stderr)
+            return 2
+    if not resuming:
+        run_dir.mkdir(parents=True, exist_ok=False)
+        manifest = {
+            "schema_version": 2,
+            "suite": "tree_scaling",
+            "run_id": run_id,
+            "status": "running",
+            "source_integrity_valid": True,
+            "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+            "config": expected_config,
+            "models_per_child": list(MODELS),
+            "planned_child_runs": len(jobs),
+            "planned_model_trainings": len(jobs) * len(MODELS),
+            "planned_selected_test_runs": planned_selected_test_runs,
+            "planned_profile_selections": len(args.suites) * len(MODELS),
+            "jobs": jobs,
+            "selections": [],
+            "selected_test_jobs": [],
+            "dependencies": dependencies,
+            "sources": sources,
+            "invocation_count": 1,
+            "protocol": {
+                "fresh_training": "every profile/seed/suite candidate child trains V1 fixed_bfs "
+                "and V2 multi_chart independently; verified completed attempts are reused only "
+                "when resuming the exact same run",
+                "resume": "same-run continuation revalidates completed artifacts, skips valid "
+                "candidate/checkpoint evaluations, and uses new attempt paths for incomplete work",
+                "scaling_axes": "model width and real encoder message-layer depth",
+                "controlled_budget": "all profiles use 800 optimizer updates, 8 multi-chart "
+                "training views per graph, and 8 evaluation charts per family",
+                "paired_comparison": "within each child both arms use the same model width, update "
+                "count, initialization seed, batch size, dataset split, and evaluation charts",
+                "chart_family_isolation": {
+                    "fixed_train": "one bfs chart rooted at node 0 per graph",
+                    "multi_train": "8 charts per graph split across random-root bfs/dfs",
+                    "seen_evaluation": "fresh random-root bfs charts",
+                    "unseen_evaluation": "fresh Wilson uniform spanning-tree charts",
+                    "evaluation_charts_per_family": 8,
+                },
+                "selection": {
+                    "split": "official validation only; full caches are integrity-validated, but "
+                    "candidate model paths do not evaluate test data or use test metrics",
+                    "by": "suite x condition (fixed_bfs and multi_chart separately), using the "
+                    "mean preregistered scalar across all requested model seeds",
+                    "csl_objective": "maximize mean graph_macro_accuracy across fresh BFS and "
+                    "fresh Wilson validation chart families",
+                    "zinc_objective": "minimize mean graph_macro_mae across fresh BFS and fresh "
+                    "Wilson validation chart families",
+                    "tie_break": "first profile in the preregistered --profiles order",
+                    "test": "one test-only phase per selected checkpoint; no optimizer or "
+                    "retraining",
+                },
+                "failure_policy": "stop at first failed or unverifiable child; preserve completed "
+                "artifacts for exact-request continuation",
+                "uncertainty": "default model seed is 0; explicit comma-separated multiple seeds "
+                "remain supported and are aggregated without treating child models as datasets",
+                "device": "CUDA required; no CPU fallback",
             },
-            "selection": {
-                "split": "official validation only; full caches are integrity-validated, but "
-                "candidate model paths do not evaluate test data or use test metrics",
-                "by": "suite x condition (fixed_bfs and multi_chart separately), using the "
-                "mean preregistered scalar across all requested model seeds",
-                "csl_objective": "maximize mean graph_macro_accuracy across fresh BFS and "
-                "fresh Wilson validation chart families",
-                "zinc_objective": "minimize mean graph_macro_mae across fresh BFS and fresh "
-                "Wilson validation chart families",
-                "tie_break": "first profile in the preregistered --profiles order",
-                "test": "one test-only phase per selected checkpoint; no optimizer or retraining",
-            },
-            "failure_policy": "stop at first failed or unverifiable child; leave pending jobs "
-            "unclaimed and publish failed aggregate state",
-            "uncertainty": "default five model seeds; report per-seed metrics without "
-            "pretending child models are independent datasets",
-            "device": "CUDA required; no CPU fallback",
-        },
-    }
+        }
+    else:
+        manifest["invocation_count"] = int(manifest.get("invocation_count", 1)) + 1
+        manifest["last_resumed_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+        manifest["status"] = "running"
+        manifest["source_integrity_valid"] = True
+        manifest.pop("error", None)
+        manifest.pop("finished_at_utc", None)
     _write_state(run_dir, manifest)
     environment = _environment()
     current_job: dict[str, Any] | None = None
     try:
-        preflight_path = run_dir / "gpu-preflight.json"
+        invocation = manifest["invocation_count"]
+        preflight_path = _validated_write_path(
+            run_dir / f"gpu-preflight.attempt-{invocation}.json",
+            run_dir,
+            label="GPU preflight output",
+        )
         preflight = [
             sys.executable,
             "-B",
@@ -46127,16 +47354,22 @@ def main(argv: list[str] | None = None) -> int:
             "--json-out",
             str(preflight_path),
         ]
-        status = _run_logged(preflight, run_dir / "logs/preflight.log", environment)
+        status = _run_logged(
+            preflight,
+            run_dir / "logs" / f"preflight.attempt-{invocation}.log",
+            environment,
+        )
         if status:
             raise RuntimeError(f"GPU preflight failed with exit code {status}")
         preflight_result = _read_mapping(preflight_path, "gpu-preflight.json")
         if preflight_result.get("status") != "passed":
             raise RuntimeError("GPU preflight returned without a passed certificate")
-        manifest["gpu_preflight"] = {
+        preflight_record = {
             "path": str(preflight_path),
             "sha256": _sha256(preflight_path),
         }
+        manifest["gpu_preflight"] = preflight_record
+        manifest.setdefault("gpu_preflights", []).append(preflight_record)
         _write_state(run_dir, manifest)
         print(
             f"Run: {run_id}; {len(jobs)} child runs; "
@@ -46144,6 +47377,13 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
         for index, job in enumerate(jobs, start=1):
+            if job["status"] == "passed":
+                print(
+                    f"[{index}/{len(jobs)}] skip verified {job['suite']} / {job['profile']} / "
+                    f"model seed {job['model_seed']}",
+                    flush=True,
+                )
+                continue
             current_job = job
             _check_sources(manifest)
             job["status"] = "running"
@@ -46164,49 +47404,63 @@ def main(argv: list[str] | None = None) -> int:
                 )
             job["result"] = _validate_child(job)
             job["status"] = "passed"
+            job.pop("error", None)
             _write_state(run_dir, manifest)
             current_job = None
-        for suite in args.suites:
-            _check_sources(manifest)
-            selection = _select_profiles(
-                jobs,
-                suite=suite,
-                model_seeds=args.model_seeds,
-                profiles=args.profiles,
-            )
-            manifest["selections"].append(selection)
-            _write_state(run_dir, manifest)
-            for model_seed in args.model_seeds:
-                selected_job = _make_selected_test_job(args, run_dir, selection, model_seed)
-                manifest["selected_test_jobs"].append(selected_job)
-                current_job = selected_job
-                selected_job["status"] = "running"
-                _write_state(run_dir, manifest)
+        _check_sources(manifest)
+        selections, selected_jobs = _prepare_selected_jobs(
+            args,
+            run_dir,
+            jobs,
+            manifest.get("selected_test_jobs", []),
+        )
+        manifest["selections"] = selections
+        manifest["selected_test_jobs"] = selected_jobs
+        _write_state(run_dir, manifest)
+        for selected_job in selected_jobs:
+            if selected_job["status"] == "passed":
                 print(
-                    f"\n[selected test] {suite} / model seed {model_seed}: "
-                    f"fixed={selection['conditions']['fixed_bfs']['selected_profile']}, "
-                    f"multi={selection['conditions']['multi_chart']['selected_profile']}",
+                    f"[selected test] skip verified {selected_job['suite']} / "
+                    f"model seed {selected_job['model_seed']}",
                     flush=True,
                 )
-                started = time.monotonic()
-                status = _run_logged(
-                    selected_job["command"], Path(selected_job["log_path"]), environment
+                continue
+            current_job = selected_job
+            selection = selected_job["selection"]
+            model_seed = selected_job["model_seed"]
+            suite = selected_job["suite"]
+            selected_job["status"] = "running"
+            _write_state(run_dir, manifest)
+            print(
+                f"\n[selected test] {suite} / model seed {model_seed}: "
+                f"fixed={selection['conditions']['fixed_bfs']['selected_profile']}, "
+                f"multi={selection['conditions']['multi_chart']['selected_profile']}",
+                flush=True,
+            )
+            started = time.monotonic()
+            status = _run_logged(
+                selected_job["command"], Path(selected_job["log_path"]), environment
+            )
+            selected_job.update(
+                exit_code=status,
+                elapsed_seconds=time.monotonic() - started,
+            )
+            _check_sources(manifest)
+            if status:
+                raise RuntimeError(
+                    f"{suite}/seed-{model_seed} selected test failed with exit code {status}"
                 )
-                selected_job.update(
-                    exit_code=status,
-                    elapsed_seconds=time.monotonic() - started,
-                )
-                _check_sources(manifest)
-                if status:
-                    raise RuntimeError(
-                        f"{suite}/seed-{model_seed} selected test failed with exit code {status}"
-                    )
-                selected_job["result"] = _validate_selected_test(selected_job)
-                selected_job["status"] = "passed"
-                _write_state(run_dir, manifest)
-                current_job = None
+            selected_job["result"] = _validate_selected_test(selected_job)
+            selected_job["status"] = "passed"
+            selected_job.pop("error", None)
+            _write_state(run_dir, manifest)
+            current_job = None
         _check_sources(manifest)
-        manifest.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+        manifest.update(
+            status="passed",
+            source_integrity_valid=True,
+            finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+        )
     except (Exception, KeyboardInterrupt) as error:
         manifest.update(
             status="failed",
@@ -51224,13 +52478,13 @@ def _argument(command: list[str], name: str) -> str:
     return command[command.index(name) + 1]
 
 
-def test_default_plan_covers_all_versions_profiles_five_seeds_and_supported_datasets():
+def test_default_plan_covers_all_versions_profiles_seed_zero_and_supported_datasets():
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
     assert args.versions == ["v1", "v2", "v3", "v4"]
     assert args.profiles == ["base", "wide", "deep", "large"]
-    assert args.model_seeds == [0, 1, 2, 3, 4]
-    assert len(jobs) == 860
+    assert args.model_seeds == [0]
+    assert len(jobs) == 172
     assert {job["profile"] for job in jobs} == set(runner.PROFILES)
     assert {job["model_seed"] for job in jobs} == set(runner.DEFAULT_MODEL_SEEDS)
     assert not any(job["version"] == "v2" and job["dataset"] == "ppi" for job in jobs)
@@ -51527,6 +52781,187 @@ def test_success_is_released_only_after_every_child_metric_is_valid(tmp_path, mo
     assert summary["test_evaluated"] is False
     assert {row["n"] for row in summary["rows"]} == {2}
     assert all(row["validation_mean"] == 0.75 for row in summary["rows"])
+
+
+def test_completed_run_is_verified_and_reused_without_any_execution(tmp_path, monkeypatch):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    calls.clear()
+
+    assert runner.main(options) == 0
+    assert calls == []
+
+
+def test_retry_logs_use_new_paths_inside_the_run_directory(tmp_path):
+    run_dir = tmp_path / "run"
+    preferred = run_dir / "logs/job.log"
+    preferred.parent.mkdir(parents=True)
+    preferred.write_text("first", encoding="utf-8")
+    retry_one = runner._next_attempt_log(preferred, run_dir, "v1/cora")
+    assert retry_one != preferred.resolve()
+    assert retry_one.is_relative_to(run_dir.resolve())
+    retry_one.parent.mkdir(parents=True)
+    retry_one.write_text("second", encoding="utf-8")
+    retry_two = runner._next_attempt_log(preferred, run_dir, "v1/cora")
+    assert retry_two != retry_one
+    assert retry_two.is_relative_to(run_dir.resolve())
+
+
+def test_incomplete_child_symlink_cannot_delete_a_passed_sibling(tmp_path):
+    run_dir = tmp_path / "run"
+    passed = run_dir / "passed"
+    passed.mkdir(parents=True)
+    marker = passed / "metrics.json"
+    marker.write_text("preserve", encoding="utf-8")
+    indirect = run_dir / "incomplete"
+    try:
+        indirect.symlink_to(passed, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+    with pytest.raises(RuntimeError, match="indirect child output"):
+        runner._discard_incomplete_child({"output_dir": str(indirect)}, run_dir)
+    assert marker.read_text(encoding="utf-8") == "preserve"
+
+
+def test_resume_rejects_passed_output_symlink_alias_before_preflight(tmp_path, monkeypatch):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    run_dir = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    aliased_output = Path(manifest["jobs"][0]["output_dir"])
+    sibling_output = Path(manifest["jobs"][1]["output_dir"])
+    sibling_sentinel = sibling_output / "preserve-sibling.txt"
+    sibling_sentinel.write_text("preserve", encoding="utf-8")
+    (aliased_output / "metrics.json").unlink()
+    aliased_output.rmdir()
+    try:
+        aliased_output.symlink_to(sibling_output, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+    calls.clear()
+
+    assert runner.main(options) == 1
+    assert calls == []
+    assert sibling_sentinel.read_text(encoding="utf-8") == "preserve"
+
+
+def test_interrupted_resume_rejects_external_preflight_symlink_before_execution(
+    tmp_path, monkeypatch
+):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    run_dir = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "running"
+    manifest["jobs"][0]["status"] = "running"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    outside_sentinel = tmp_path / "outside-preflight-sentinel.txt"
+    outside_sentinel.write_text("preserve", encoding="utf-8")
+    (run_dir / "gpu-preflight.json").unlink(missing_ok=True)
+    try:
+        (run_dir / "gpu-preflight.json").symlink_to(outside_sentinel)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    calls.clear()
+
+    assert runner.main(options) == 1
+    assert calls == []
+    assert outside_sentinel.read_text(encoding="utf-8") == "preserve"
+
+
+@pytest.mark.parametrize("summary_name", ["summary.json", "summary.md"])
+def test_interrupted_resume_rejects_external_summary_symlink_before_execution(
+    tmp_path, monkeypatch, summary_name
+):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    run_dir = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest_path = run_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "running"
+    manifest["jobs"][0]["status"] = "running"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    outside_sentinel = tmp_path / f"outside-{summary_name}-sentinel.txt"
+    outside_sentinel.write_text("preserve", encoding="utf-8")
+    summary_path = run_dir / summary_name
+    summary_path.unlink()
+    try:
+        summary_path.symlink_to(outside_sentinel)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    calls.clear()
+
+    assert runner.main(options) == 1
+    assert calls == []
+    assert outside_sentinel.read_text(encoding="utf-8") == "preserve"
+
+
+def test_resume_binds_minimum_free_gpu_memory(tmp_path, monkeypatch):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    calls.clear()
+    assert runner.main([*options, "--min-free-gb", "9.0"]) == 1
+    assert calls == []
+
+
+@pytest.mark.parametrize("interrupted_status", ["pending", "running", "failed"])
+def test_resume_skips_passed_jobs_and_reruns_only_nonpassed_job(
+    tmp_path, monkeypatch, interrupted_status
+):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    root = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    retried = manifest["jobs"][0]
+    retried["status"] = interrupted_status
+    manifest["status"] = "failed" if interrupted_status == "failed" else "running"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    calls.clear()
+
+    assert runner.main(options) == 0
+    assert len(calls) == 2  # preflight plus exactly one retried child
+    assert calls[1] == retried["command"]
+    resumed = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert resumed["status"] == "passed"
+    assert resumed["resume_count"] == 1
+    assert all(job["status"] == "passed" for job in resumed["jobs"])
+
+
+def test_corrupted_passed_artifact_fails_closed_before_any_execution(tmp_path, monkeypatch):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    root = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    metrics_path = Path(manifest["jobs"][0]["metrics_path"])
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["validation"] = 0.5
+    metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+    calls.clear()
+
+    assert runner.main(options) == 1
+    assert calls == []
+
+
+@pytest.mark.parametrize("mismatch", ["config", "source", "job_plan"])
+def test_resume_requires_exact_config_source_and_job_plan(tmp_path, monkeypatch, mismatch):
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    manifest_path = tmp_path / "conductance_gat/scaling/unit-fixture/manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if mismatch == "config":
+        manifest["config"]["epochs"] += 1
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    elif mismatch == "source":
+        monkeypatch.setattr(runner, "_source_snapshot", lambda: {"unit-source": "changed"})
+    else:
+        manifest["jobs"][0]["command"].append("--unexpected")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    calls.clear()
+
+    assert runner.main(options) == 1
+    assert calls == []
 
 
 def test_any_test_metric_fails_closed_and_stops_following_children(tmp_path, monkeypatch):
@@ -53810,13 +55245,24 @@ def _args(*extra: str):
     return scaling.parser().parse_args(list(extra))
 
 
-def test_default_matrix_runs_both_versions_all_profiles_and_five_seeds(tmp_path):
+def test_default_matrix_runs_both_versions_all_profiles_and_seed_zero(tmp_path):
     args = _args("--results-root", str(tmp_path))
     scaling._validate(args)
     jobs = scaling.make_jobs(args, scaling._run_dir(args, "matrix"))
-    assert args.model_seeds == (0, 1, 2, 3, 4)
-    assert len(jobs) == 2 * 4 * 5
-    assert len(jobs) * len(args.datasets) == 80
+    assert args.model_seeds == (0,)
+    assert len(jobs) == 8
+    assert len(jobs) * len(args.datasets) == 16
+    manifest = scaling._manifest_base(
+        args,
+        "matrix",
+        scaling._run_dir(args, "matrix"),
+        jobs,
+        {"status": "passed"},
+        {"source": "stable"},
+    )
+    assert manifest["fresh_child_runs"] == 8
+    assert manifest["fresh_dataset_trainings"] == 16
+    assert manifest["selected_test_evaluations_planned"] == 4
     assert {(job["version"], job["profile"]) for job in jobs} == {
         (version, profile) for version in scaling.VERSIONS for profile in scaling.PROFILE_ORDER
     }
@@ -53876,6 +55322,14 @@ def test_direct_runner_environment_explicitly_unsets_nvml_cuda_check(monkeypatch
     monkeypatch.setenv("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
     assert "PYTORCH_NVML_BASED_CUDA_CHECK" not in scaling._environment()
     assert "src/chartgat/algebra.py" in scaling.SOURCE_FILES
+    assert "src/chartgat/graphs.py" in scaling.SOURCE_FILES
+    assert "research/__init__.py" in scaling.SOURCE_FILES
+    assert "research/cycle_pe/__init__.py" in scaling.SOURCE_FILES
+    assert "research/cycle_pe/v2/__init__.py" in scaling.SOURCE_FILES
+    assert "research/cycle_pe/paper_data.py" in scaling.SOURCE_FILES
+    assert "src/chartgat/__init__.py" in scaling.SOURCE_FILES
+    assert "scripts/gpu_profiles.py" in scaling.SOURCE_FILES
+    assert "scripts/verify_gpu_lock.py" in scaling.SOURCE_FILES
 
 
 def _row(version: str, dataset: str, profile: str, seed: int, validation: float):
@@ -54186,6 +55640,500 @@ def test_failed_child_leaves_failed_manifest_and_withholds_selection(tmp_path, m
     assert code == 1 and manifest["status"] == "failed"
     assert manifest["jobs"][0]["returncode"] == 9
     assert summary["status"] == "failed" and "selection_withheld" in summary
+
+
+def _start_interrupted_cycle_run(tmp_path, monkeypatch, run_id):
+    monkeypatch.setattr(scaling, "check_dependencies", lambda: {"status": "passed"})
+    monkeypatch.setattr(scaling, "_source_snapshot", lambda: {"source": "stable"})
+    calls: list[list[str]] = []
+
+    def interrupt_after_preflight(command, _log_path: Path, _environment):
+        calls.append(command)
+        if "gpu_preflight.py" in " ".join(command):
+            output = Path(command[command.index("--json-out") + 1])
+            output.write_text('{"status":"passed"}', encoding="utf-8")
+            return 0
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(scaling, "run_logged", interrupt_after_preflight)
+    arguments = [
+        "--versions",
+        "v1",
+        "--profiles",
+        "base",
+        "--model-seeds",
+        "0",
+        "--datasets",
+        "zinc12k",
+        "--data-root",
+        str(tmp_path / "data"),
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        run_id,
+    ]
+    with pytest.raises(KeyboardInterrupt):
+        scaling.main(arguments)
+    assert len(calls) == 2
+    return arguments, tmp_path / "cycle_pe/scaling" / run_id
+
+
+def test_interrupted_resume_rejects_preflight_symlink_before_child_launch(tmp_path, monkeypatch):
+    arguments, run = _start_interrupted_cycle_run(tmp_path, monkeypatch, "preflight-symlink")
+    preflight = run / "gpu-preflight.json"
+    preflight.unlink()
+    sentinel = tmp_path / "outside-preflight.json"
+    sentinel.write_text("preserve-preflight", encoding="utf-8")
+    try:
+        preflight.symlink_to(sentinel)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    resume_calls: list[list[str]] = []
+
+    def unexpected_launch(command, _log_path: Path, _environment):
+        resume_calls.append(command)
+        pytest.fail("resume launched a subprocess before rejecting the preflight symlink")
+
+    monkeypatch.setattr(scaling, "run_logged", unexpected_launch)
+    with pytest.raises(ValueError, match="indirect.*GPU preflight output"):
+        scaling.main(arguments)
+    assert resume_calls == []
+    assert sentinel.read_text(encoding="utf-8") == "preserve-preflight"
+
+
+def test_interrupted_resume_rejects_summary_symlink_before_writes_or_launch(tmp_path, monkeypatch):
+    arguments, run = _start_interrupted_cycle_run(tmp_path, monkeypatch, "summary-symlink")
+    summary = run / "summary.json"
+    summary.unlink()
+    sentinel = tmp_path / "outside-summary.json"
+    sentinel.write_text("preserve-summary", encoding="utf-8")
+    try:
+        summary.symlink_to(sentinel)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    manifest = run / "manifest.json"
+    manifest_before = manifest.read_bytes()
+    launches: list[list[str]] = []
+    writes: list[Path] = []
+
+    def unexpected_launch(command, _log_path: Path, _environment):
+        launches.append(command)
+        pytest.fail("resume launched a subprocess before rejecting the summary symlink")
+
+    def unexpected_write(path, *_args, **_kwargs):
+        writes.append(Path(path))
+        pytest.fail("resume wrote state before rejecting the summary symlink")
+
+    monkeypatch.setattr(scaling, "run_logged", unexpected_launch)
+    monkeypatch.setattr(scaling, "atomic_write_json", unexpected_write)
+    assert scaling.main(arguments) == 2
+    assert launches == [] and writes == []
+    assert manifest.read_bytes() == manifest_before
+    assert sentinel.read_text(encoding="utf-8") == "preserve-summary"
+
+
+def test_same_run_id_resumes_valid_children_and_test_checkpoints(tmp_path, monkeypatch):
+    monkeypatch.setattr(scaling, "check_dependencies", lambda: {"status": "passed"})
+    monkeypatch.setattr(scaling, "_source_snapshot", lambda: {"source": "stable"})
+    candidate_launches: list[int] = []
+    test_launches: list[int] = []
+    interrupt_second_test = True
+
+    def completed_marker(job):
+        return Path(job["output_dir"]) / "completed.marker"
+
+    def fake_candidate_rows(job):
+        if not completed_marker(job).is_file():
+            raise OSError("candidate is incomplete")
+        checkpoint = Path(job["output_dir"]) / "zinc12k/cycle_set/best.pt"
+        history = checkpoint.with_name("history.json")
+        return [
+            {
+                "version": job["version"],
+                "profile": job["profile"],
+                "dataset": "zinc12k",
+                "model_seed": job["model_seed"],
+                "config": dict(job["config"]),
+                "validation_mae": 0.1 + job["model_seed"] / 100,
+                "trainable_parameters": 123,
+                "elapsed_seconds": 1.0,
+                "peak_gpu_memory_bytes": 1024,
+                "best_epoch": 2,
+                "epochs_completed": 3,
+                "checkpoint": str(checkpoint.resolve()),
+                "checkpoint_sha256": "a" * 64,
+                "history": str(history.resolve()),
+                "history_sha256": "b" * 64,
+                "output_dir": job["output_dir"],
+            }
+        ]
+
+    def fake_test_result(job):
+        if not completed_marker(job).is_file():
+            raise OSError("test evaluation is incomplete")
+        return {
+            "test_evaluation_id": job["job_id"],
+            "checkpoint_id": job["checkpoint_id"],
+            "profile_selection_id": job["profile_selection_id"],
+            "version": job["version"],
+            "dataset": job["dataset"],
+            "model_seed": job["model_seed"],
+            "selected_profile": job["selected_profile"],
+            "checkpoint": job["checkpoint"],
+            "checkpoint_sha256": job["checkpoint_sha256"],
+            "test_mae": 0.2 + job["model_seed"] / 100,
+            "fresh_training": False,
+        }
+
+    def fake_run(command, _log_path: Path, _environment):
+        nonlocal interrupt_second_test
+        if "gpu_preflight.py" in " ".join(command):
+            output = Path(command[command.index("--json-out") + 1])
+            output.write_text('{"status":"passed"}', encoding="utf-8")
+            return 0
+        output = Path(command[command.index("--output-dir") + 1])
+        seed = int(command[command.index("--model-seed") + 1])
+        if "--validation-only" in command:
+            candidate_launches.append(seed)
+        else:
+            test_launches.append(seed)
+            if interrupt_second_test and len(test_launches) == 2:
+                output.mkdir(parents=True)
+                (output / "partial.tmp").write_text("interrupted", encoding="utf-8")
+                interrupt_second_test = False
+                raise KeyboardInterrupt
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "completed.marker").write_text("passed", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(scaling, "run_logged", fake_run)
+    monkeypatch.setattr(scaling, "read_job_rows", fake_candidate_rows)
+    monkeypatch.setattr(scaling, "read_test_result", fake_test_result)
+    arguments = [
+        "--versions",
+        "v1",
+        "--profiles",
+        "base",
+        "--model-seeds",
+        "0,1",
+        "--datasets",
+        "zinc12k",
+        "--data-root",
+        str(tmp_path / "data"),
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        "resume-cycle",
+    ]
+
+    with pytest.raises(KeyboardInterrupt):
+        scaling.main(arguments)
+    mismatched = list(arguments)
+    mismatched[mismatched.index("0,1")] = "0"
+    assert scaling.main(mismatched) == 2
+    assert candidate_launches == [0, 1]
+    assert test_launches == [0, 1]
+    assert scaling.main(arguments) == 0
+
+    run = tmp_path / "cycle_pe/scaling/resume-cycle"
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    assert candidate_launches == [0, 1]
+    assert test_launches == [0, 1, 1]
+    assert manifest["resume_count"] == 1
+    assert manifest["completed_child_runs"] == 2
+    assert manifest["completed_selected_test_evaluations"] == 2
+    assert manifest["test_evaluation_jobs"][1]["quarantined_outputs"]
+    assert summary["status"] == "passed"
+    assert len(summary["test_evaluations"]) == 2
+
+
+def test_retrained_selected_candidate_rebinds_and_reruns_test_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(scaling, "check_dependencies", lambda: {"status": "passed"})
+    monkeypatch.setattr(scaling, "_source_snapshot", lambda: {"source": "stable"})
+    candidate_launches: list[int] = []
+    test_launches: list[str] = []
+
+    def fake_candidate_rows(job):
+        output = Path(job["output_dir"])
+        state = json.loads((output / "candidate-state.json").read_text(encoding="utf-8"))
+        generation = state["generation"]
+        run = output / "zinc12k/cycle_set"
+        checkpoint = run / "best.pt"
+        history = run / "history.json"
+        return [
+            {
+                "version": job["version"],
+                "profile": job["profile"],
+                "dataset": "zinc12k",
+                "model_seed": job["model_seed"],
+                "config": dict(job["config"]),
+                "validation_mae": 0.3 - generation / 10,
+                "trainable_parameters": 123,
+                "elapsed_seconds": 1.0,
+                "peak_gpu_memory_bytes": 1024,
+                "best_epoch": 2,
+                "epochs_completed": 3,
+                "checkpoint": str(checkpoint.resolve()),
+                "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+                "history": str(history.resolve()),
+                "history_sha256": hashlib.sha256(history.read_bytes()).hexdigest(),
+                "output_dir": job["output_dir"],
+            }
+        ]
+
+    def fake_test_result(job):
+        marker = json.loads(
+            (Path(job["output_dir"]) / "test-result.json").read_text(encoding="utf-8")
+        )
+        if marker["checkpoint_sha256"] != job["checkpoint_sha256"]:
+            raise ValueError("test result is bound to a stale checkpoint")
+        return {
+            "test_evaluation_id": job["job_id"],
+            "checkpoint_id": job["checkpoint_id"],
+            "profile_selection_id": job["profile_selection_id"],
+            "version": job["version"],
+            "dataset": job["dataset"],
+            "model_seed": job["model_seed"],
+            "selected_profile": job["selected_profile"],
+            "checkpoint": job["checkpoint"],
+            "checkpoint_sha256": job["checkpoint_sha256"],
+            "test_mae": 0.2 + marker["launch"] / 100,
+            "fresh_training": False,
+        }
+
+    def fake_run(command, _log_path: Path, _environment):
+        if "gpu_preflight.py" in " ".join(command):
+            output = Path(command[command.index("--json-out") + 1])
+            output.write_text('{"status":"passed"}', encoding="utf-8")
+            return 0
+        output = Path(command[command.index("--output-dir") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        if "--validation-only" in command:
+            generation = len(candidate_launches) + 1
+            candidate_launches.append(generation)
+            run = output / "zinc12k/cycle_set"
+            run.mkdir(parents=True, exist_ok=True)
+            (run / "best.pt").write_bytes(f"checkpoint-{generation}".encode())
+            (run / "history.json").write_text(
+                json.dumps([{"generation": generation}]), encoding="utf-8"
+            )
+            (output / "candidate-state.json").write_text(
+                json.dumps({"generation": generation}), encoding="utf-8"
+            )
+            return 0
+        checkpoint = Path(command[command.index("--test-checkpoint") + 1])
+        checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+        launch = len(test_launches) + 1
+        test_launches.append(checkpoint_sha256)
+        (output / "test-result.json").write_text(
+            json.dumps({"launch": launch, "checkpoint_sha256": checkpoint_sha256}),
+            encoding="utf-8",
+        )
+        if launch == 1:
+            (output / "old-test-sentinel.txt").write_text("preserve-old-test", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(scaling, "run_logged", fake_run)
+    monkeypatch.setattr(scaling, "read_job_rows", fake_candidate_rows)
+    monkeypatch.setattr(scaling, "read_test_result", fake_test_result)
+    arguments = [
+        "--versions",
+        "v1",
+        "--profiles",
+        "base",
+        "--model-seeds",
+        "0",
+        "--datasets",
+        "zinc12k",
+        "--data-root",
+        str(tmp_path / "data"),
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        "candidate-rebind",
+    ]
+    assert scaling.main(arguments) == 0
+    run = tmp_path / "cycle_pe/scaling/candidate-rebind"
+    initial = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    old_test = initial["test_evaluation_jobs"][0]
+    old_accepted_result = old_test["accepted_result"]
+    old_test_output = Path(old_test["output_dir"])
+    assert (old_test_output / "old-test-sentinel.txt").is_file()
+
+    candidate_output = Path(initial["jobs"][0]["output_dir"])
+    (candidate_output / "candidate-state.json").write_text("{corrupt", encoding="utf-8")
+    test_launches_before_resume = len(test_launches)
+    assert scaling.main(arguments) == 0
+
+    final = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    summary = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    rebound = final["test_evaluation_jobs"][0]
+    assert final["status"] == summary["status"] == "passed"
+    assert candidate_launches == [1, 2]
+    assert len(test_launches) == test_launches_before_resume + 1
+    assert test_launches[0] != test_launches[1]
+    assert rebound["selection_rebinds"] == 1
+    assert rebound["accepted_result"] != old_accepted_result
+    assert rebound["accepted_result"]["checkpoint_sha256"] == test_launches[1]
+    previous = rebound["previous_attempts"][0]
+    assert previous["accepted_result"] == old_accepted_result
+    quarantined = Path(previous["quarantined_output"])
+    assert quarantined != Path(rebound["output_dir"])
+    assert (quarantined / "old-test-sentinel.txt").read_text(encoding="utf-8") == (
+        "preserve-old-test"
+    )
+    assert not (Path(rebound["output_dir"]) / "old-test-sentinel.txt").exists()
+
+
+def test_completed_run_returns_without_relaunching_preflight_or_children(tmp_path, monkeypatch):
+    monkeypatch.setattr(scaling, "check_dependencies", lambda: {"status": "passed"})
+    monkeypatch.setattr(scaling, "_source_snapshot", lambda: {"source": "stable"})
+    calls: list[list[str]] = []
+
+    def completed_marker(job):
+        return Path(job["output_dir"]) / "completed.marker"
+
+    def fake_candidate_rows(job):
+        if not completed_marker(job).is_file():
+            raise OSError("candidate is incomplete")
+        checkpoint = Path(job["output_dir"]) / "zinc12k/cycle_set/best.pt"
+        history = checkpoint.with_name("history.json")
+        return [
+            {
+                "version": job["version"],
+                "profile": job["profile"],
+                "dataset": "zinc12k",
+                "model_seed": job["model_seed"],
+                "config": dict(job["config"]),
+                "validation_mae": 0.1,
+                "trainable_parameters": 123,
+                "elapsed_seconds": 1.0,
+                "peak_gpu_memory_bytes": 1024,
+                "best_epoch": 2,
+                "epochs_completed": 3,
+                "checkpoint": str(checkpoint.resolve()),
+                "checkpoint_sha256": "a" * 64,
+                "history": str(history.resolve()),
+                "history_sha256": "b" * 64,
+                "output_dir": job["output_dir"],
+            }
+        ]
+
+    def fake_test_result(job):
+        if not completed_marker(job).is_file():
+            raise OSError("test evaluation is incomplete")
+        return {
+            "test_evaluation_id": job["job_id"],
+            "checkpoint_id": job["checkpoint_id"],
+            "profile_selection_id": job["profile_selection_id"],
+            "version": job["version"],
+            "dataset": job["dataset"],
+            "model_seed": job["model_seed"],
+            "selected_profile": job["selected_profile"],
+            "checkpoint": job["checkpoint"],
+            "checkpoint_sha256": job["checkpoint_sha256"],
+            "test_mae": 0.2,
+            "fresh_training": False,
+        }
+
+    def complete_run(command, _log_path: Path, _environment):
+        calls.append(command)
+        if "gpu_preflight.py" in " ".join(command):
+            output = Path(command[command.index("--json-out") + 1])
+            output.write_text('{"status":"passed"}', encoding="utf-8")
+            return 0
+        output = Path(command[command.index("--output-dir") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "completed.marker").write_text("passed", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(scaling, "run_logged", complete_run)
+    monkeypatch.setattr(scaling, "read_job_rows", fake_candidate_rows)
+    monkeypatch.setattr(scaling, "read_test_result", fake_test_result)
+    arguments = [
+        "--versions",
+        "v1",
+        "--profiles",
+        "base",
+        "--model-seeds",
+        "0",
+        "--datasets",
+        "zinc12k",
+        "--data-root",
+        str(tmp_path / "data"),
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        "completed-cycle",
+    ]
+    assert scaling.main(arguments) == 0
+    assert len(calls) == 3  # preflight, one candidate, and one selected-checkpoint test
+
+    run = tmp_path / "cycle_pe/scaling/completed-cycle"
+    before = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    accepted_rows = before["jobs"][0]["accepted_rows"]
+    accepted_result = before["test_evaluation_jobs"][0]["accepted_result"]
+    unexpected_calls: list[list[str]] = []
+
+    def failing_if_relaunched(command, _log_path: Path, _environment):
+        unexpected_calls.append(command)
+        return 97
+
+    monkeypatch.setattr(scaling, "run_logged", failing_if_relaunched)
+    assert scaling.main(arguments) == 0
+    assert unexpected_calls == []
+
+    after = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    assert after["status"] == "passed"
+    assert after["jobs"][0]["status"] == "passed"
+    assert after["test_evaluation_jobs"][0]["status"] == "passed"
+    assert after["jobs"][0]["accepted_rows"] == accepted_rows
+    assert after["test_evaluation_jobs"][0]["accepted_result"] == accepted_result
+
+
+def test_recovered_nonpassed_cycle_jobs_store_acceptance_anchors(tmp_path, monkeypatch):
+    candidate_rows = [{"candidate": "verified"}]
+    candidate = {
+        "status": "running",
+        "returncode": None,
+        "output_dir": str(tmp_path / "candidate"),
+        "artifact_errors": ["old"],
+    }
+    Path(candidate["output_dir"]).mkdir()
+    monkeypatch.setattr(scaling, "read_job_rows", lambda _job: candidate_rows)
+    assert scaling._recover_candidate_rows([candidate]) == candidate_rows
+    assert candidate["status"] == "passed"
+    assert candidate["accepted_rows"] == candidate_rows
+
+    test_result = {"test": "verified"}
+    test_job = {
+        "status": "failed",
+        "returncode": 0,
+        "output_dir": str(tmp_path / "selected-test"),
+        "artifact_errors": ["old"],
+    }
+    Path(test_job["output_dir"]).mkdir()
+    monkeypatch.setattr(scaling, "read_test_result", lambda _job: test_result)
+    assert scaling._recover_test_rows([test_job]) == [test_result]
+    assert test_job["status"] == "passed"
+    assert test_job["accepted_result"] == test_result
+
+
+def test_quarantine_rejects_resume_orphans_symlink_outside_run(tmp_path):
+    run_dir = tmp_path / "run"
+    output = run_dir / "candidate"
+    output.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (run_dir / "resume-orphans").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+    job = {"job_id": "v1/base/seed-0", "output_dir": str(output)}
+    with pytest.raises(ValueError, match="indirect|outside the run directory"):
+        scaling._quarantine_incomplete_output(job, run_dir)
+    assert output.is_dir()
 ````
 
 # tests/test_cycle_v2_runner.py
@@ -57081,6 +59029,7 @@ def test_tree_augmentation_depends_on_neither_conductance_nor_combined_track() -
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -57112,8 +59061,8 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
     assert [job["track"] for job in jobs] == ["conductance", "cycle", "tree"]
     assert runner._totals(jobs) == {
         "track_runs": 3,
-        "child_runs": 940,
-        "model_trainings": 1020,
+        "child_runs": 188,
+        "model_trainings": 204,
     }
 
     conductance, cycle, tree = jobs
@@ -57124,9 +59073,9 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
         "deep",
         "large",
     ]
-    assert _option(cycle["command"], "--model-seeds") == "0,1,2,3,4"
+    assert _option(cycle["command"], "--model-seeds") == "0"
     assert _option(tree["command"], "--profiles") == "base,wide,deep,large"
-    assert _option(tree["command"], "--model-seeds") == "0,1,2,3,4"
+    assert _option(tree["command"], "--model-seeds") == "0"
     assert _option(tree["command"], "--suites") == "csl,zinc"
     assert conductance["requested_matrix"]["versions"] == ["v1", "v2", "v3", "v4"]
     assert cycle["requested_matrix"]["datasets"] == ["zinc12k", "peptides_struct"]
@@ -57166,6 +59115,30 @@ def test_selection_and_download_flag_are_mapped_only_to_supported_child_clis(tmp
     assert "--allow-download" in jobs[1]["command"]
     assert "--allow-download" in jobs[2]["command"]
     assert _option(jobs[2]["command"], "--profiles") == "deep,large"
+
+
+def test_central_source_inventory_covers_imported_child_code_and_tree_config():
+    snapshot = runner._source_snapshot()
+    assert "research/__init__.py" in snapshot
+    assert "src/chartgat/graphs.py" in snapshot
+    assert "research/cycle_pe/benchmark_data.py" in snapshot
+    assert "research/conductance_gat/v4/train.py" in snapshot
+    assert "research/tree_augmentation/paper.py" in snapshot
+    assert "research/tree_augmentation/config.yaml" in snapshot
+    assert "research/tree_augmentation/datasets.yaml" in snapshot
+    assert "scripts/gpu_profiles.py" in snapshot
+    assert "scripts/verify_gpu_lock.py" in snapshot
+
+
+def test_run_logged_appends_a_resume_attempt_to_an_existing_log(tmp_path: Path):
+    log = tmp_path / "track.log"
+    log.write_text("first attempt\n", encoding="utf-8")
+    command = [sys.executable, "-c", "print('second attempt')"]
+    assert runner._run_logged(command, log, runner._environment()) == 0
+    content = log.read_text(encoding="utf-8")
+    assert "first attempt" in content
+    assert "=== resumed " in content
+    assert "second attempt" in content
 
 
 def test_dry_run_prints_complete_plan_without_writes_or_processes(
@@ -57624,7 +59597,7 @@ def test_zero_return_code_without_exact_passed_summary_fails_closed(
     assert "summary" in manifest["jobs"][0]["error"]
 
 
-def test_existing_central_run_is_never_overwritten(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_invalid_existing_central_run_is_preserved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     run = tmp_path / "rich_scaling/existing"
     run.mkdir(parents=True)
     sentinel = run / "manifest.json"
@@ -57644,6 +59617,78 @@ def test_existing_central_run_is_never_overwritten(tmp_path: Path, monkeypatch: 
         == 2
     )
     assert sentinel.read_text(encoding="utf-8") == "preserve"
+
+
+def test_same_run_id_revalidates_passed_track_and_resumes_failed_track(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    first_calls: list[str] = []
+
+    def first_dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        script = Path(command[2]).name
+        first_calls.append(script)
+        if script == "run_cycle_scaling.py":
+            return 9
+        _write_summary(command)
+        return 0
+
+    options = ["--tracks", "conductance", "cycle", *_base_options(tmp_path)]
+    monkeypatch.setattr(runner, "_run_logged", first_dispatch)
+    assert runner.main(options) == 1
+    assert first_calls == ["run_conductance_scaling.py", "run_cycle_scaling.py"]
+
+    resumed_calls: list[str] = []
+
+    def resumed_dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        script = Path(command[2]).name
+        resumed_calls.append(script)
+        if script == "run_cycle_scaling.py":
+            _write_summary(command)
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", resumed_dispatch)
+    assert runner.main(options) == 0
+    assert resumed_calls == ["run_conductance_scaling.py", "run_cycle_scaling.py"]
+    manifest = json.loads(
+        (tmp_path / "rich_scaling/unit/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "passed"
+    assert manifest["resume_count"] == 1
+    assert [job["status"] for job in manifest["jobs"]] == ["passed", "passed"]
+
+
+def test_resume_rejects_changed_config_and_source_without_launching_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    def dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        _write_summary(command)
+        return 0
+
+    options = ["--tracks", "conductance", *_base_options(tmp_path)]
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    assert runner.main(options) == 0
+    manifest_path = tmp_path / "rich_scaling/unit/manifest.json"
+    original = manifest_path.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(
+        runner,
+        "_run_logged",
+        lambda *_args: pytest.fail("rejected resume must not launch a child"),
+    )
+    changed = list(options)
+    changed[changed.index("--profiles") + 1] = "large"
+    assert runner.main(changed) == 2
+    assert manifest_path.read_text(encoding="utf-8") == original
+
+    payload = json.loads(original)
+    payload["source_sha256"]["scripts/run_rich_scaling.py"] = "tampered"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert runner.main(options) == 2
+
+    payload = json.loads(original)
+    payload["source_integrity_valid"] = False
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert runner.main(options) == 2
 ````
 
 # tests/test_run_paper.py
@@ -58369,9 +60414,11 @@ def test_default_matrix_trains_both_versions_across_larger_profiles() -> None:
     jobs = runner.make_jobs(args, Path("fixture"))
     assert args.suites == ("csl", "zinc")
     assert args.profiles == ("base", "wide", "deep", "large")
-    assert args.model_seeds == (0, 1, 2, 3, 4)
-    assert len(jobs) == 40
-    assert sum(len(job["trained_models"]) for job in jobs) == 80
+    assert args.model_seeds == (0,)
+    assert len(jobs) == 8
+    assert sum(len(job["trained_models"]) for job in jobs) == 16
+    assert len(args.suites) * len(runner.MODELS) == 4
+    assert len(args.suites) * len(args.model_seeds) * len(runner.MODELS) == 4
     assert len({job["output_dir"] for job in jobs}) == len(jobs)
     assert runner.PROFILE_CONFIGS == {
         "base": {
@@ -58409,6 +60456,18 @@ def test_default_matrix_trains_both_versions_across_larger_profiles() -> None:
         assert command[command.index("-m") + 1] == "research.tree_augmentation.paper"
         for key, value in job["profile_config"].items():
             assert command[command.index("--" + key.replace("_", "-")) + 1] == str(value)
+
+
+def test_default_dry_run_reports_seed_zero_plan_without_writes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert runner.main(["--results-root", str(tmp_path), "--dry-run"]) == 0
+    output = capsys.readouterr().out
+    assert "8 validation-candidate child runs" in output
+    assert "16 fresh model trainings" in output
+    assert "4 aggregate profile selections" in output
+    assert "4 selected-checkpoint test evaluations" in output
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_paper_scaling_overrides_are_opt_in_and_validated() -> None:
@@ -58697,12 +60756,31 @@ def _stub(
             (job for job in manifest["jobs"] if Path(job["output_dir"]) == output), None
         )
         if candidate is not None:
+            candidate_call_count = sum(
+                "--evaluation-scope" in call
+                and call[call.index("--evaluation-scope") + 1] == "validation"
+                for call in calls
+            )
+            if failure == "second_child_exit" and candidate_call_count == 2:
+                return 9
+            if failure == "second_child_interrupt" and candidate_call_count == 2:
+                raise KeyboardInterrupt
+            if failure == "child_exit_with_artifact":
+                _write_child(candidate)
+                return 9
             if failure != "child_missing":
                 _write_child(candidate, malformed="metric" if failure == "child_metric" else None)
         else:
             selected = next(
                 job for job in manifest["selected_test_jobs"] if Path(job["output_dir"]) == output
             )
+            selected_call_count = sum(
+                "--evaluation-scope" in call
+                and call[call.index("--evaluation-scope") + 1] == "selected_test"
+                for call in calls
+            )
+            if failure == "second_selected_exit" and selected_call_count == 2:
+                return 9
             _write_selected_child(selected)
         return 0
 
@@ -58758,6 +60836,253 @@ def test_success_checks_metrics_parameters_artifacts_and_records_profile(
         set(job["result"]["parameter_counts"]) == set(runner.MODELS) for job in manifest["jobs"]
     )
     assert "chart_family_isolation" in summary
+
+
+def test_completed_run_returns_without_relaunching_preflight_or_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    assert len(calls) == 5
+    root = tmp_path / "tree_augmentation/scaling/unit"
+    before = json.loads((root / "manifest.json").read_text("utf-8"))
+    candidate_results = [job["result"] for job in before["jobs"]]
+    selected_results = [job["result"] for job in before["selected_test_jobs"]]
+    unexpected_calls: list[list[str]] = []
+
+    def failing_if_relaunched(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        unexpected_calls.append(command)
+        return 97
+
+    monkeypatch.setattr(runner, "_run_logged", failing_if_relaunched)
+    assert runner.main(options) == 0
+    assert unexpected_calls == []
+
+    after = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert after["status"] == "passed"
+    assert all(job["status"] == "passed" for job in after["jobs"])
+    assert all(job["status"] == "passed" for job in after["selected_test_jobs"])
+    assert [job["result"] for job in after["jobs"]] == candidate_results
+    assert [job["result"] for job in after["selected_test_jobs"]] == selected_results
+
+
+def test_resume_skips_verified_candidate_and_retries_incomplete_child_on_new_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, first_calls = _stub(tmp_path, monkeypatch, failure="second_child_interrupt")
+    assert runner.main(options) == 130
+    assert len(first_calls) == 3
+    root = tmp_path / "tree_augmentation/scaling/unit"
+    failed_manifest = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert [job["status"] for job in failed_manifest["jobs"]] == ["passed", "failed"]
+    first_output = Path(failed_manifest["jobs"][0]["output_dir"])
+    first_summary_digest = _digest(first_output / "summary.json")
+
+    resume_options, resume_calls = _stub(tmp_path, monkeypatch)
+    assert resume_options == options
+    assert runner.main(resume_options) == 0
+    assert len(resume_calls) == 4  # preflight + one candidate retry + two selected tests
+    candidate_calls = [
+        call
+        for call in resume_calls
+        if "--evaluation-scope" in call
+        and call[call.index("--evaluation-scope") + 1] == "validation"
+    ]
+    assert len(candidate_calls) == 1
+    assert Path(candidate_calls[0][candidate_calls[0].index("--output-dir") + 1]) != first_output
+    assert _digest(first_output / "summary.json") == first_summary_digest
+
+    resumed = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert resumed["status"] == "passed"
+    assert resumed["invocation_count"] == 2
+    assert resumed["jobs"][0]["attempt"] == 1
+    assert resumed["jobs"][1]["attempt"] == 2
+    assert len(resumed["jobs"][1]["attempt_history"]) == 1
+    assert all(job["status"] == "passed" for job in resumed["jobs"])
+
+
+def test_resume_skips_candidates_and_verified_selected_checkpoint_evaluation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, first_calls = _stub(tmp_path, monkeypatch, failure="second_selected_exit")
+    assert runner.main(options) == 1
+    assert len(first_calls) == 5
+    root = tmp_path / "tree_augmentation/scaling/unit"
+    failed_manifest = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert [job["status"] for job in failed_manifest["jobs"]] == ["passed", "passed"]
+    assert [job["status"] for job in failed_manifest["selected_test_jobs"]] == [
+        "passed",
+        "failed",
+    ]
+    completed_test_output = Path(failed_manifest["selected_test_jobs"][0]["output_dir"])
+    completed_test_digest = _digest(completed_test_output / "summary.json")
+
+    resume_options, resume_calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(resume_options) == 0
+    assert len(resume_calls) == 2  # preflight + only the incomplete selected test
+    scoped = [call for call in resume_calls if "--evaluation-scope" in call]
+    assert len(scoped) == 1
+    assert scoped[0][scoped[0].index("--evaluation-scope") + 1] == "selected_test"
+    assert _digest(completed_test_output / "summary.json") == completed_test_digest
+
+    resumed = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert resumed["status"] == "passed"
+    assert [job["attempt"] for job in resumed["selected_test_jobs"]] == [1, 2]
+    assert all(job["status"] == "passed" for job in resumed["selected_test_jobs"])
+    summary = json.loads((root / "summary.json").read_text("utf-8"))
+    assert summary["completed_selected_checkpoint_test_evaluations"] == 4
+
+
+def test_nonzero_candidate_with_complete_artifacts_is_retried_on_a_new_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, _calls = _stub(tmp_path, monkeypatch, failure="child_exit_with_artifact")
+    assert runner.main(options) == 1
+    root = tmp_path / "tree_augmentation/scaling/unit"
+    failed = json.loads((root / "manifest.json").read_text("utf-8"))
+    failed_output = Path(failed["jobs"][0]["output_dir"])
+    assert (failed_output / "summary.json").is_file()
+
+    resume_options, resume_calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(resume_options) == 0
+    candidate_calls = [
+        call
+        for call in resume_calls
+        if "--evaluation-scope" in call
+        and call[call.index("--evaluation-scope") + 1] == "validation"
+    ]
+    assert candidate_calls
+    assert Path(candidate_calls[0][candidate_calls[0].index("--output-dir") + 1]) != failed_output
+
+
+def test_passed_candidate_result_mismatch_schedules_a_new_attempt(tmp_path: Path) -> None:
+    args = runner.parser().parse_args(
+        [
+            "--results-root",
+            str(tmp_path),
+            "--run-id",
+            "result-mismatch",
+            "--suites",
+            "csl",
+            "--profiles",
+            "wide",
+            "--model-seeds",
+            "3",
+        ]
+    )
+    run_dir = (tmp_path / "tree_augmentation/scaling/result-mismatch").resolve()
+    expected = runner.make_jobs(args, run_dir)[0]
+    job = json.loads(json.dumps(expected))
+    _write_child(job)
+    accepted = runner._validate_child(job)
+    job["status"] = "passed"
+    job["result"] = json.loads(json.dumps(accepted))
+    job["result"]["child_metrics_checked"] = False
+    original_output = Path(job["output_dir"])
+
+    runner._reconcile_candidate(job, expected, run_dir)
+
+    assert job["status"] == "pending"
+    assert job["attempt"] == 2
+    assert Path(job["output_dir"]) != original_output
+    assert original_output.is_dir()
+    assert job["attempt_history"][-1]["validation_error"] == (
+        "passed candidate differs from its accepted result"
+    )
+
+
+def test_interrupted_resume_rejects_preflight_symlink_before_child_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, first_calls = _stub(tmp_path, monkeypatch, failure="second_child_interrupt")
+    assert runner.main(options) == 130
+    assert len(first_calls) == 3
+    run = tmp_path / "tree_augmentation/scaling/unit"
+    preflight = run / "gpu-preflight.attempt-2.json"
+    sentinel = tmp_path / "outside-preflight.json"
+    sentinel.write_text("preserve-preflight", encoding="utf-8")
+    try:
+        preflight.symlink_to(sentinel)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    resume_calls: list[list[str]] = []
+
+    def unexpected_launch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        resume_calls.append(command)
+        pytest.fail("resume launched a subprocess before rejecting the preflight symlink")
+
+    monkeypatch.setattr(runner, "_run_logged", unexpected_launch)
+    assert runner.main(options) == 1
+    assert resume_calls == []
+    assert sentinel.read_text(encoding="utf-8") == "preserve-preflight"
+
+
+def test_interrupted_resume_rejects_summary_symlink_before_writes_or_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, first_calls = _stub(tmp_path, monkeypatch, failure="second_child_interrupt")
+    assert runner.main(options) == 130
+    assert len(first_calls) == 3
+    run = tmp_path / "tree_augmentation/scaling/unit"
+    summary = run / "summary.json"
+    summary.unlink()
+    sentinel = tmp_path / "outside-summary.json"
+    sentinel.write_text("preserve-summary", encoding="utf-8")
+    try:
+        summary.symlink_to(sentinel)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    manifest = run / "manifest.json"
+    manifest_before = manifest.read_bytes()
+    launches: list[list[str]] = []
+    writes: list[Path] = []
+
+    def unexpected_launch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        launches.append(command)
+        pytest.fail("resume launched a subprocess before rejecting the summary symlink")
+
+    def unexpected_write(path: Path, *_args, **_kwargs) -> None:
+        writes.append(Path(path))
+        pytest.fail("resume wrote state before rejecting the summary symlink")
+
+    monkeypatch.setattr(runner, "_run_logged", unexpected_launch)
+    monkeypatch.setattr(runner, "atomic_write_json", unexpected_write)
+    assert runner.main(options) == 2
+    assert launches == [] and writes == []
+    assert manifest.read_bytes() == manifest_before
+    assert sentinel.read_text(encoding="utf-8") == "preserve-summary"
+
+
+def test_retry_path_rejects_resume_attempts_symlink_outside_run(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (run_dir / "resume-attempts").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+    original_output = run_dir / "candidate"
+    command = ["python", "child.py", "--output-dir", str(original_output)]
+    expected = {
+        "suite": "csl",
+        "profile": "base",
+        "model_seed": 0,
+        "command": command,
+        "output_dir": str(original_output),
+        "log_path": str(run_dir / "logs/candidate.log"),
+    }
+    job = {**expected, "attempt": 1, "status": "failed", "exit_code": 9}
+    with pytest.raises(ValueError, match="outside the run directory"):
+        runner._retry_record(
+            job,
+            expected,
+            run_dir,
+            kind="candidate",
+            validation_error="interrupted",
+        )
 
 
 @pytest.mark.parametrize(

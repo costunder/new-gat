@@ -14,7 +14,7 @@
 |---|---|
 | 구현 | 완료 |
 | 로컬 V4 전용 검사 | **131 passed** |
-| 저장소 전체 회귀 | **1394 passed / 66 skipped** (86.72 s, exit 0) |
+| 저장소 전체 회귀 | **1418 passed / 77 skipped** (80.24 s, exit 0) |
 | Ruff·compileall·코드 스냅샷 검사 | 통과 |
 | 공식 데이터 CUDA 학습 | **정식 결과 없음** — 과거 arxiv-only 4-arm run에서 첫 arm만 200 epochs·child exit 0 후 구 report gate 중단, 나머지 3개 pending |
 | 기본 실행 대상 | Cora/CiteSeer/PubMed/PPI/ogbn-arxiv, model seed 0, 20번의 fresh training |

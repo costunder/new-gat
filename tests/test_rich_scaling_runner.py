@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -34,8 +35,8 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
     assert [job["track"] for job in jobs] == ["conductance", "cycle", "tree"]
     assert runner._totals(jobs) == {
         "track_runs": 3,
-        "child_runs": 940,
-        "model_trainings": 1020,
+        "child_runs": 188,
+        "model_trainings": 204,
     }
 
     conductance, cycle, tree = jobs
@@ -46,9 +47,9 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
         "deep",
         "large",
     ]
-    assert _option(cycle["command"], "--model-seeds") == "0,1,2,3,4"
+    assert _option(cycle["command"], "--model-seeds") == "0"
     assert _option(tree["command"], "--profiles") == "base,wide,deep,large"
-    assert _option(tree["command"], "--model-seeds") == "0,1,2,3,4"
+    assert _option(tree["command"], "--model-seeds") == "0"
     assert _option(tree["command"], "--suites") == "csl,zinc"
     assert conductance["requested_matrix"]["versions"] == ["v1", "v2", "v3", "v4"]
     assert cycle["requested_matrix"]["datasets"] == ["zinc12k", "peptides_struct"]
@@ -88,6 +89,30 @@ def test_selection_and_download_flag_are_mapped_only_to_supported_child_clis(tmp
     assert "--allow-download" in jobs[1]["command"]
     assert "--allow-download" in jobs[2]["command"]
     assert _option(jobs[2]["command"], "--profiles") == "deep,large"
+
+
+def test_central_source_inventory_covers_imported_child_code_and_tree_config():
+    snapshot = runner._source_snapshot()
+    assert "research/__init__.py" in snapshot
+    assert "src/chartgat/graphs.py" in snapshot
+    assert "research/cycle_pe/benchmark_data.py" in snapshot
+    assert "research/conductance_gat/v4/train.py" in snapshot
+    assert "research/tree_augmentation/paper.py" in snapshot
+    assert "research/tree_augmentation/config.yaml" in snapshot
+    assert "research/tree_augmentation/datasets.yaml" in snapshot
+    assert "scripts/gpu_profiles.py" in snapshot
+    assert "scripts/verify_gpu_lock.py" in snapshot
+
+
+def test_run_logged_appends_a_resume_attempt_to_an_existing_log(tmp_path: Path):
+    log = tmp_path / "track.log"
+    log.write_text("first attempt\n", encoding="utf-8")
+    command = [sys.executable, "-c", "print('second attempt')"]
+    assert runner._run_logged(command, log, runner._environment()) == 0
+    content = log.read_text(encoding="utf-8")
+    assert "first attempt" in content
+    assert "=== resumed " in content
+    assert "second attempt" in content
 
 
 def test_dry_run_prints_complete_plan_without_writes_or_processes(
@@ -546,7 +571,7 @@ def test_zero_return_code_without_exact_passed_summary_fails_closed(
     assert "summary" in manifest["jobs"][0]["error"]
 
 
-def test_existing_central_run_is_never_overwritten(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_invalid_existing_central_run_is_preserved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     run = tmp_path / "rich_scaling/existing"
     run.mkdir(parents=True)
     sentinel = run / "manifest.json"
@@ -566,3 +591,75 @@ def test_existing_central_run_is_never_overwritten(tmp_path: Path, monkeypatch: 
         == 2
     )
     assert sentinel.read_text(encoding="utf-8") == "preserve"
+
+
+def test_same_run_id_revalidates_passed_track_and_resumes_failed_track(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    first_calls: list[str] = []
+
+    def first_dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        script = Path(command[2]).name
+        first_calls.append(script)
+        if script == "run_cycle_scaling.py":
+            return 9
+        _write_summary(command)
+        return 0
+
+    options = ["--tracks", "conductance", "cycle", *_base_options(tmp_path)]
+    monkeypatch.setattr(runner, "_run_logged", first_dispatch)
+    assert runner.main(options) == 1
+    assert first_calls == ["run_conductance_scaling.py", "run_cycle_scaling.py"]
+
+    resumed_calls: list[str] = []
+
+    def resumed_dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        script = Path(command[2]).name
+        resumed_calls.append(script)
+        if script == "run_cycle_scaling.py":
+            _write_summary(command)
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", resumed_dispatch)
+    assert runner.main(options) == 0
+    assert resumed_calls == ["run_conductance_scaling.py", "run_cycle_scaling.py"]
+    manifest = json.loads(
+        (tmp_path / "rich_scaling/unit/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "passed"
+    assert manifest["resume_count"] == 1
+    assert [job["status"] for job in manifest["jobs"]] == ["passed", "passed"]
+
+
+def test_resume_rejects_changed_config_and_source_without_launching_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    def dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        _write_summary(command)
+        return 0
+
+    options = ["--tracks", "conductance", *_base_options(tmp_path)]
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    assert runner.main(options) == 0
+    manifest_path = tmp_path / "rich_scaling/unit/manifest.json"
+    original = manifest_path.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(
+        runner,
+        "_run_logged",
+        lambda *_args: pytest.fail("rejected resume must not launch a child"),
+    )
+    changed = list(options)
+    changed[changed.index("--profiles") + 1] = "large"
+    assert runner.main(changed) == 2
+    assert manifest_path.read_text(encoding="utf-8") == original
+
+    payload = json.loads(original)
+    payload["source_sha256"]["scripts/run_rich_scaling.py"] = "tampered"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert runner.main(options) == 2
+
+    payload = json.loads(original)
+    payload["source_integrity_valid"] = False
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    assert runner.main(options) == 2

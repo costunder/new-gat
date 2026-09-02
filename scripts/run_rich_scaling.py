@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 TRACKS = ("conductance", "cycle", "tree")
 PROFILES = ("base", "wide", "deep", "large")
-DEFAULT_MODEL_SEEDS = (0, 1, 2, 3, 4)
+DEFAULT_MODEL_SEEDS = (0,)
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
 
 # Keep the complete public matrices here instead of trusting child row counts.  The
@@ -256,11 +256,32 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
 
 
 def _source_snapshot() -> dict[str, str]:
-    paths = [Path(__file__).resolve()]
+    paths = [
+        Path(__file__).resolve(),
+        ROOT / "research/__init__.py",
+        ROOT / "scripts/check_dependencies.py",
+        ROOT / "scripts/gpu_profiles.py",
+        ROOT / "scripts/gpu_preflight.py",
+        ROOT / "scripts/run_conductance_factorial.py",
+        ROOT / "scripts/verify_gpu_lock.py",
+        ROOT / "research/tree_augmentation/config.yaml",
+    ]
     paths.extend(ROOT / "scripts" / TRACK_SPECS[track]["script"] for track in TRACKS)
+    for source_root in (
+        ROOT / "research/conductance_gat",
+        ROOT / "research/cycle_pe",
+        ROOT / "research/tree_augmentation",
+        ROOT / "src/chartgat",
+    ):
+        for pattern in ("*.py", "*.yaml", "*.yml"):
+            paths.extend(
+                path
+                for path in source_root.rglob(pattern)
+                if "tests" not in path.relative_to(source_root).parts
+            )
     return {
         path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
-        for path in paths
+        for path in sorted(set(paths))
     }
 
 
@@ -307,7 +328,11 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def _run_logged(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("x", encoding="utf-8", newline="\n") as log:
+    mode = "a" if log_path.exists() else "x"
+    with log_path.open(mode, encoding="utf-8", newline="\n") as log:
+        if mode == "a":
+            log.write(f"\n=== resumed {dt.datetime.now(dt.UTC).isoformat()} ===\n")
+            log.flush()
         process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -785,6 +810,124 @@ def _validate_child_summary(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_RESUME_JOB_FIELDS = (
+    "track",
+    "child_run_id",
+    "profiles",
+    "shared_profiles",
+    "model_seeds",
+    "command",
+    "output_dir",
+    "summary_path",
+    "log_path",
+    "allow_download_forwarded",
+    "requested_matrix",
+    "expected_counts",
+)
+
+
+def _config_payload(
+    args: argparse.Namespace, *, data_root: Path, results_root: Path
+) -> dict[str, Any]:
+    return {
+        "tracks": list(args.tracks),
+        "shared_profiles": list(args.profiles),
+        "tree_profiles": list(args.profiles),
+        "model_seeds": list(args.model_seeds),
+        "device": args.device,
+        "min_free_gb": args.min_free_gb,
+        "allow_download": args.allow_download,
+        "data_root": str(data_root),
+        "results_root": str(results_root),
+        "fail_fast": args.fail_fast,
+    }
+
+
+def _resume_manifest(
+    manifest_path: Path,
+    *,
+    run_id: str,
+    expected_config: dict[str, Any],
+    expected_jobs: list[dict[str, Any]],
+    expected_totals: dict[str, int],
+    expected_sources: dict[str, str],
+) -> dict[str, Any]:
+    """Load an interrupted run without trusting stale status or artifacts."""
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"existing run manifest is unreadable: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("existing run manifest must be a JSON object")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("suite") != "rich_scaling"
+        or payload.get("run_id") != run_id
+    ):
+        raise ValueError("existing run manifest identity does not match this runner")
+    if payload.get("config") != expected_config:
+        raise ValueError("existing run configuration differs; use its original arguments")
+    if payload.get("planned_counts") != expected_totals:
+        raise ValueError("existing run count contract differs from the requested plan")
+    if payload.get("source_sha256") != expected_sources:
+        raise ValueError("experiment source changed since this run started; use a new run ID")
+    if payload.get("source_integrity_valid") is not True:
+        raise ValueError("existing run failed source integrity and cannot be resumed")
+    stored_jobs = payload.get("jobs")
+    if not isinstance(stored_jobs, list) or len(stored_jobs) != len(expected_jobs):
+        raise ValueError("existing run job matrix is incomplete")
+    for stored, expected in zip(stored_jobs, expected_jobs, strict=True):
+        if not isinstance(stored, dict) or any(
+            stored.get(field) != expected[field] for field in _RESUME_JOB_FIELDS
+        ):
+            raise ValueError("existing run job contract differs from the requested plan")
+        previous_status = stored.get("status")
+        if previous_status == "passed":
+            try:
+                validated = _validate_child_summary(stored)
+                if stored.get("result") != validated:
+                    raise RuntimeError("passed track summary hash or certificate changed")
+                stored["result"] = validated
+            except Exception as error:
+                stored["status"] = "pending"
+                stored["resume_validation_error"] = f"{type(error).__name__}: {error}"
+                stored.pop("result", None)
+            else:
+                stored.pop("resume_validation_error", None)
+                continue
+        else:
+            stored["status"] = "pending"
+            stored["previous_status"] = previous_status
+        for field in (
+            "returncode",
+            "error",
+            "elapsed_seconds",
+            "started_at_utc",
+            "finished_at_utc",
+            "result",
+        ):
+            stored.pop(field, None)
+    payload["status"] = "running"
+    payload["source_integrity_valid"] = True
+    resume_count = payload.get("resume_count", 0)
+    if isinstance(resume_count, bool) or not isinstance(resume_count, int) or resume_count < 0:
+        raise ValueError("existing run resume_count is invalid")
+    resumed_at = payload.get("resumed_at_utc", [])
+    if not isinstance(resumed_at, list) or any(not isinstance(value, str) for value in resumed_at):
+        raise ValueError("existing run resumed_at_utc history is invalid")
+    payload["resume_count"] = resume_count + 1
+    payload["resumed_at_utc"] = [*resumed_at, dt.datetime.now(dt.UTC).isoformat()]
+    for field in (
+        "error",
+        "finished_at_utc",
+        "completed_counts",
+        "source_integrity_error",
+        "source_sha256_final",
+    ):
+        payload.pop(field, None)
+    return payload
+
+
 def _totals(jobs: list[dict[str, Any]]) -> dict[str, int]:
     return {
         "track_runs": len(jobs),
@@ -826,6 +969,9 @@ def main(argv: list[str] | None = None) -> int:
     run_dir = (results_root / "rich_scaling" / run_id).resolve()
     jobs = make_jobs(args, run_id)
     relevant_outputs = [run_dir, *(Path(job["output_dir"]) for job in jobs)]
+    if any(not output.is_relative_to(results_root) for output in relevant_outputs):
+        print("experiment outputs must resolve within the results root", file=sys.stderr)
+        return 2
     if any(_paths_overlap(output, data_root) for output in relevant_outputs):
         print("experiment outputs and dataset directories must not overlap", file=sys.stderr)
         return 2
@@ -841,71 +987,84 @@ def main(argv: list[str] | None = None) -> int:
         _print_plan(args, run_id, jobs)
         print("dry run only; no files or directories were written")
         return 0
-    if run_dir.exists():
-        print(f"run already exists; use a new run ID: {run_dir}", file=sys.stderr)
-        return 2
-
-    run_dir.mkdir(parents=True, exist_ok=False)
-    (run_dir / "logs").mkdir(exist_ok=False)
     totals = _totals(jobs)
-    manifest: dict[str, Any] = {
-        "schema_version": 1,
-        "suite": "rich_scaling",
-        "run_id": run_id,
-        "status": "running",
-        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
-        "config": {
-            "tracks": list(args.tracks),
-            "shared_profiles": list(args.profiles),
-            "tree_profiles": list(args.profiles),
-            "model_seeds": list(args.model_seeds),
-            "device": args.device,
-            "min_free_gb": args.min_free_gb,
-            "allow_download": args.allow_download,
-            "data_root": str(data_root),
-            "results_root": str(results_root),
-            "fail_fast": args.fail_fast,
-        },
-        "protocol": {
-            "purpose": "larger-model scaling for every selected V1/V2/V3/V4 track",
-            "execution": "selected track runners execute sequentially without a shell",
-            "failure_policy": (
-                "stop after first failed track" if args.fail_fast else "continue remaining tracks"
-            ),
-            "tree_profiles": "base/wide/deep/large are forwarded without renaming",
-            "download_policy": (
-                "allow-download is forwarded to Cycle and Tree; Conductance remains "
-                "verified-cache-only because its child contract exposes no download flag"
-            ),
-            "immutability": "a run ID is create-once; existing central runs are never overwritten",
-            "verification": "nonzero return code, missing/wrong summary path, or an incomplete "
-            "non-passed summary fails its track",
-        },
-        "planned_counts": totals,
-        "jobs": jobs,
-        "source_integrity_valid": True,
-        "source_sha256": _source_snapshot(),
-    }
     manifest_path = run_dir / "manifest.json"
+    sources = _source_snapshot()
+    config = _config_payload(args, data_root=data_root, results_root=results_root)
+    resumed = run_dir.exists()
+    if resumed:
+        try:
+            manifest = _resume_manifest(
+                manifest_path,
+                run_id=run_id,
+                expected_config=config,
+                expected_jobs=jobs,
+                expected_totals=totals,
+                expected_sources=sources,
+            )
+        except (ValueError, RuntimeError) as error:
+            print(f"cannot resume existing run: {error}", file=sys.stderr)
+            return 2
+        (run_dir / "logs").mkdir(exist_ok=True)
+    else:
+        run_dir.mkdir(parents=True, exist_ok=False)
+        (run_dir / "logs").mkdir(exist_ok=False)
+        manifest = {
+            "schema_version": 1,
+            "suite": "rich_scaling",
+            "run_id": run_id,
+            "status": "running",
+            "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+            "config": config,
+            "protocol": {
+                "purpose": "larger-model scaling for every selected V1/V2/V3/V4 track",
+                "execution": "selected track runners execute sequentially without a shell",
+                "failure_policy": (
+                    "stop after first failed track"
+                    if args.fail_fast
+                    else "continue remaining tracks"
+                ),
+                "tree_profiles": "base/wide/deep/large are forwarded without renaming",
+                "download_policy": (
+                    "allow-download is forwarded to Cycle and Tree; Conductance remains "
+                    "verified-cache-only because its child contract exposes no download flag"
+                ),
+                "resume": "the same run ID verifies immutable config/source/job contracts, "
+                "skips valid passed tracks, and reruns only incomplete or invalid tracks",
+                "verification": "nonzero return code, missing/wrong summary path, or an "
+                "incomplete non-passed summary fails its track",
+            },
+            "planned_counts": totals,
+            "jobs": jobs,
+            "source_integrity_valid": True,
+            "source_sha256": sources,
+        }
+    jobs = manifest["jobs"]
     _atomic_write_json(manifest_path, manifest)
     environment = _environment()
     failed = False
     interrupted = False
     print(
         f"Run: {run_id}; {totals['track_runs']} tracks; "
-        f"{totals['model_trainings']} fresh model trainings",
+        f"{totals['model_trainings']} planned model trainings; "
+        f"resume={'yes' if resumed else 'no'}",
         flush=True,
     )
     for index, job in enumerate(jobs, start=1):
         if failed and args.fail_fast:
             break
+        previously_passed = job["status"] == "passed"
         job["status"] = "running"
         job["started_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
         _atomic_write_json(manifest_path, manifest)
-        print(f"\n[{index}/{len(jobs)}] {job['track']}", flush=True)
+        action = "verify completed child state" if previously_passed else "resume incomplete child"
+        print(f"\n[{index}/{len(jobs)}] {job['track']} — {action}", flush=True)
         started = time.monotonic()
         try:
-            returncode = _run_logged(job["command"], Path(job["log_path"]), environment)
+            log_path = Path(job["log_path"])
+            if not log_path.resolve().is_relative_to(run_dir):
+                raise RuntimeError("track log path resolves outside the central run directory")
+            returncode = _run_logged(job["command"], log_path, environment)
             job["returncode"] = returncode
             if returncode != 0:
                 raise RuntimeError(f"{job['track']} child failed with exit code {returncode}")

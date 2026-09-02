@@ -68,7 +68,7 @@ PROFILE_CONFIGS: dict[str, dict[str, int]] = {
     },
 }
 PROFILES = tuple(PROFILE_CONFIGS)
-DEFAULT_MODEL_SEEDS = (0, 1, 2, 3, 4)
+DEFAULT_MODEL_SEEDS = (0,)
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
 
 
@@ -114,7 +114,7 @@ def parser() -> argparse.ArgumentParser:
         "--model-seeds",
         type=_model_seeds,
         default=DEFAULT_MODEL_SEEDS,
-        help="comma-separated model/minibatch seeds (default: 0,1,2,3,4)",
+        help="comma-separated model/minibatch seeds (default: 0)",
     )
     result.add_argument("--data-seed", type=int, default=0)
     result.add_argument("--split-seed", type=int, default=0)
@@ -202,6 +202,7 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                         "model_seed": model_seed,
                         "trained_models": list(MODELS),
                         "status": "pending",
+                        "attempt": 1,
                         "output_dir": str(output),
                         "summary_path": str(output / "summary.json"),
                         "manifest_path": str(output / "manifest.json"),
@@ -227,9 +228,13 @@ def _source_snapshot() -> dict[str, Any]:
     files += sorted((ROOT / "research/tree_augmentation").glob("*.yaml"))
     files += [
         Path(__file__).resolve(),
+        ROOT / "research/__init__.py",
         ROOT / "scripts/check_dependencies.py",
+        ROOT / "scripts/gpu_profiles.py",
         ROOT / "scripts/gpu_preflight.py",
+        ROOT / "scripts/verify_gpu_lock.py",
         ROOT / "src/chartgat/algebra.py",
+        ROOT / "src/chartgat/__init__.py",
         ROOT / "src/chartgat/cache.py",
         ROOT / "src/chartgat/graphs.py",
         ROOT / "src/chartgat/seeds.py",
@@ -617,6 +622,7 @@ def _make_selected_test_job(
         "selected_inputs": selected_inputs,
         "evaluated_models": list(MODELS),
         "status": "pending",
+        "attempt": 1,
         "output_dir": str(output),
         "summary_path": str(output / "summary.json"),
         "manifest_path": str(output / "manifest.json"),
@@ -786,9 +792,368 @@ def _aggregate_summary(manifest: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validated_write_path(path: Path, run_dir: Path, *, label: str) -> Path:
+    """Validate a direct regular-file path before any runner or child write."""
+    lexical = Path(os.path.abspath(path.expanduser()))
+    resolved = lexical.resolve()
+    run_dir = run_dir.resolve()
+    if (
+        resolved != lexical
+        or resolved == run_dir
+        or resolved.is_dir()
+        or (lexical.exists() and not lexical.is_file())
+        or not resolved.is_relative_to(run_dir)
+    ):
+        raise ValueError(f"refusing to write an indirect or out-of-run {label}: {lexical}")
+    return lexical
+
+
 def _write_state(run_dir: Path, manifest: dict[str, Any]) -> None:
-    atomic_write_json(run_dir / "manifest.json", manifest)
-    atomic_write_json(run_dir / "summary.json", _aggregate_summary(manifest))
+    manifest_path = _validated_write_path(
+        run_dir / "manifest.json", run_dir, label="runner manifest"
+    )
+    summary_path = _validated_write_path(
+        run_dir / "summary.json", run_dir, label="aggregate summary"
+    )
+    atomic_write_json(manifest_path, manifest)
+    atomic_write_json(summary_path, _aggregate_summary(manifest))
+
+
+def _run_config(args: argparse.Namespace, data_root: Path) -> dict[str, Any]:
+    return {
+        "suites": list(args.suites),
+        "profiles": list(args.profiles),
+        "profile_configs": {profile: PROFILE_CONFIGS[profile] for profile in args.profiles},
+        "model_seeds": list(args.model_seeds),
+        "data_seed": args.data_seed,
+        "split_seed": args.split_seed,
+        "chart_seed": args.chart_seed,
+        "device": args.device,
+        "batch_size": args.batch_size,
+        "workers": args.workers,
+        "min_free_gb": args.min_free_gb,
+        "amp_override": args.amp,
+        "allow_download": args.allow_download,
+        "data_root": str(data_root),
+    }
+
+
+def _candidate_key(job: dict[str, Any]) -> tuple[str, str, int]:
+    return job["suite"], job["profile"], job["model_seed"]
+
+
+def _selected_key(job: dict[str, Any]) -> tuple[str, int]:
+    return job["suite"], job["model_seed"]
+
+
+def _normalized_output_command(command: Any) -> list[str]:
+    if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+        raise ValueError("stored child command is invalid")
+    normalized = list(command)
+    try:
+        normalized[normalized.index("--output-dir") + 1] = "<OUTPUT>"
+    except (ValueError, IndexError) as error:
+        raise ValueError("stored child command has no output directory") from error
+    return normalized
+
+
+def _replace_output(command: list[str], output: Path) -> list[str]:
+    updated = list(command)
+    updated[updated.index("--output-dir") + 1] = str(output)
+    return updated
+
+
+def _validate_record_paths(job: dict[str, Any], run_dir: Path) -> None:
+    lexical_output = Path(os.path.abspath(Path(job.get("output_dir", "")).expanduser()))
+    lexical_summary = Path(os.path.abspath(Path(job.get("summary_path", "")).expanduser()))
+    lexical_manifest = Path(os.path.abspath(Path(job.get("manifest_path", "")).expanduser()))
+    lexical_log = Path(os.path.abspath(Path(job.get("log_path", "")).expanduser()))
+    output = lexical_output.resolve()
+    summary = lexical_summary.resolve()
+    child_manifest = lexical_manifest.resolve()
+    log = lexical_log.resolve()
+    if (
+        output != lexical_output
+        or summary != lexical_summary
+        or child_manifest != lexical_manifest
+        or log != lexical_log
+        or not output.is_relative_to(run_dir)
+        or summary != output / "summary.json"
+        or child_manifest != output / "manifest.json"
+        or not log.is_relative_to(run_dir / "logs")
+    ):
+        raise ValueError("stored child paths escape or disagree with the run directory")
+    command = job.get("command")
+    if not isinstance(command, list):
+        raise ValueError("stored child command is invalid")
+    try:
+        command_output = Path(command[command.index("--output-dir") + 1]).resolve()
+    except (ValueError, IndexError) as error:
+        raise ValueError("stored child command has no output directory") from error
+    if command_output != output:
+        raise ValueError("stored child command/output path mismatch")
+
+
+def _attempt_record(job: dict[str, Any], validation_error: str | None) -> dict[str, Any]:
+    return {
+        "attempt": job.get("attempt", 1),
+        "status": job.get("status"),
+        "output_dir": job.get("output_dir"),
+        "log_path": job.get("log_path"),
+        **({"exit_code": job["exit_code"]} if "exit_code" in job else {}),
+        **({"error": job["error"]} if "error" in job else {}),
+        **({"validation_error": validation_error} if validation_error else {}),
+    }
+
+
+def _retry_record(
+    job: dict[str, Any],
+    expected: dict[str, Any],
+    run_dir: Path,
+    *,
+    kind: str,
+    validation_error: str,
+) -> None:
+    history = list(job.get("attempt_history", []))
+    history.append(_attempt_record(job, validation_error))
+    attempt = max(1, int(job.get("attempt", 1))) + 1
+    if kind == "candidate":
+        suffix = Path(job["suite"]) / job["profile"] / f"model-seed-{job['model_seed']}"
+    else:
+        suffix = Path(job["suite"]) / f"model-seed-{job['model_seed']}"
+    while True:
+        output = (run_dir / "resume-attempts" / f"attempt-{attempt}" / kind / suffix).resolve()
+        log = (
+            run_dir / "logs" / "resume" / f"attempt-{attempt}" / kind / suffix.with_suffix(".log")
+        ).resolve()
+        if not output.is_relative_to(run_dir) or not log.is_relative_to(run_dir):
+            raise ValueError("retry output or log resolves outside the run directory")
+        if not output.exists() and not log.exists():
+            break
+        attempt += 1
+    replacement = dict(expected)
+    replacement.update(
+        {
+            "attempt": attempt,
+            "attempt_history": history,
+            "status": "pending",
+            "output_dir": str(output),
+            "summary_path": str(output / "summary.json"),
+            "manifest_path": str(output / "manifest.json"),
+            "log_path": str(log),
+            "command": _replace_output(expected["command"], output),
+        }
+    )
+    job.clear()
+    job.update(replacement)
+
+
+def _reconcile_candidate(job: dict[str, Any], expected: dict[str, Any], run_dir: Path) -> None:
+    _validate_record_paths(job, run_dir)
+    if (
+        _candidate_key(job) != _candidate_key(expected)
+        or job.get("profile_config") != expected["profile_config"]
+        or job.get("trained_models") != expected["trained_models"]
+        or _normalized_output_command(job.get("command"))
+        != _normalized_output_command(expected["command"])
+    ):
+        raise ValueError("stored candidate job does not match the requested matrix")
+    if job.get("exit_code") not in (None, 0):
+        _retry_record(
+            job,
+            expected,
+            run_dir,
+            kind="candidate",
+            validation_error="previous candidate attempt returned a nonzero exit code",
+        )
+        return
+    try:
+        result = _validate_child(job)
+    except Exception as error:
+        output = Path(job["output_dir"])
+        log = Path(job["log_path"])
+        if job.get("status") == "pending" and not output.exists() and not log.exists():
+            job.pop("error", None)
+            return
+        _retry_record(
+            job,
+            expected,
+            run_dir,
+            kind="candidate",
+            validation_error=f"{type(error).__name__}: {error}",
+        )
+        return
+    previous_status = job.get("status")
+    if previous_status == "passed" and job.get("result") != result:
+        _retry_record(
+            job,
+            expected,
+            run_dir,
+            kind="candidate",
+            validation_error="passed candidate differs from its accepted result",
+        )
+        return
+    job["result"] = result
+    job["status"] = "passed"
+    job.pop("error", None)
+    if previous_status != "passed":
+        job["recovered_completed_artifact"] = True
+
+
+def _reconcile_selected(job: dict[str, Any], expected: dict[str, Any], run_dir: Path) -> None:
+    _validate_record_paths(job, run_dir)
+    if job.get("exit_code") not in (None, 0):
+        _retry_record(
+            job,
+            expected,
+            run_dir,
+            kind="selected-test",
+            validation_error="previous selected-test attempt returned a nonzero exit code",
+        )
+        return
+    matching_inputs = (
+        _selected_key(job) == _selected_key(expected)
+        and job.get("evaluated_models") == expected["evaluated_models"]
+        and job.get("selected_inputs") == expected["selected_inputs"]
+        and _normalized_output_command(job.get("command"))
+        == _normalized_output_command(expected["command"])
+    )
+    if matching_inputs:
+        try:
+            result = _validate_selected_test(job)
+        except Exception as error:
+            validation_error = f"{type(error).__name__}: {error}"
+        else:
+            previous_status = job.get("status")
+            if previous_status == "passed" and job.get("result") != result:
+                _retry_record(
+                    job,
+                    expected,
+                    run_dir,
+                    kind="selected-test",
+                    validation_error="passed selected-test differs from its accepted result",
+                )
+                return
+            job["selection"] = expected["selection"]
+            job["result"] = result
+            job["status"] = "passed"
+            job.pop("error", None)
+            if previous_status != "passed":
+                job["recovered_completed_artifact"] = True
+            return
+    else:
+        validation_error = "selected inputs no longer match the validation selection"
+    output = Path(job["output_dir"])
+    log = Path(job["log_path"])
+    if (
+        matching_inputs
+        and job.get("status") == "pending"
+        and not output.exists()
+        and not log.exists()
+    ):
+        job["selection"] = expected["selection"]
+        job.pop("error", None)
+        return
+    _retry_record(
+        job,
+        expected,
+        run_dir,
+        kind="selected-test",
+        validation_error=validation_error,
+    )
+
+
+def _load_resume_manifest(
+    manifest_path: Path,
+    *,
+    run_id: str,
+    run_dir: Path,
+    expected_jobs: list[dict[str, Any]],
+    expected_config: dict[str, Any],
+    expected_sources: dict[str, Any],
+    planned_selected_test_runs: int,
+) -> dict[str, Any]:
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"existing run has no valid manifest: {error}") from error
+    if not isinstance(manifest, dict):
+        raise ValueError("existing run manifest must contain an object")
+    if (
+        manifest.get("schema_version") != 2
+        or manifest.get("suite") != "tree_scaling"
+        or manifest.get("run_id") != run_id
+        or manifest.get("config") != expected_config
+        or manifest.get("models_per_child") != list(MODELS)
+        or manifest.get("planned_child_runs") != len(expected_jobs)
+        or manifest.get("planned_model_trainings") != len(expected_jobs) * len(MODELS)
+        or manifest.get("planned_selected_test_runs") != planned_selected_test_runs
+        or manifest.get("planned_profile_selections")
+        != len(expected_config["suites"]) * len(MODELS)
+        or manifest.get("sources") != expected_sources
+        or manifest.get("source_integrity_valid") is not True
+    ):
+        raise ValueError("existing run manifest does not match this exact experiment request")
+    stored_jobs = manifest.get("jobs")
+    if not isinstance(stored_jobs, list) or len(stored_jobs) != len(expected_jobs):
+        raise ValueError("existing run candidate matrix is incomplete")
+    if [_candidate_key(job) for job in stored_jobs] != [
+        _candidate_key(job) for job in expected_jobs
+    ]:
+        raise ValueError("existing run candidate matrix differs from the requested matrix")
+    for stored, expected in zip(stored_jobs, expected_jobs, strict=True):
+        _reconcile_candidate(stored, expected, run_dir)
+    selected_jobs = manifest.get("selected_test_jobs", [])
+    if not isinstance(selected_jobs, list):
+        raise ValueError("existing selected-test job table is invalid")
+    for job in selected_jobs:
+        if not isinstance(job, dict):
+            raise ValueError("existing selected-test job table contains a non-object")
+        _validate_record_paths(job, run_dir)
+    selected_keys = [_selected_key(job) for job in selected_jobs]
+    if len(selected_keys) != len(set(selected_keys)):
+        raise ValueError("existing selected-test job table contains duplicates")
+    expected_selected_keys = {
+        (suite, seed)
+        for suite in expected_config["suites"]
+        for seed in expected_config["model_seeds"]
+    }
+    if not set(selected_keys).issubset(expected_selected_keys):
+        raise ValueError("existing selected-test job table is outside the requested matrix")
+    manifest["jobs"] = stored_jobs
+    return manifest
+
+
+def _prepare_selected_jobs(
+    args: argparse.Namespace,
+    run_dir: Path,
+    candidate_jobs: list[dict[str, Any]],
+    stored_jobs: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Rebuild validation selections and reconcile their test-only jobs."""
+    previous_selected = {_selected_key(job): job for job in stored_jobs}
+    selections: list[dict[str, Any]] = []
+    expected_selected_jobs: list[dict[str, Any]] = []
+    for suite in args.suites:
+        selection = _select_profiles(
+            candidate_jobs,
+            suite=suite,
+            model_seeds=args.model_seeds,
+            profiles=args.profiles,
+        )
+        selections.append(selection)
+        for model_seed in args.model_seeds:
+            expected_selected_jobs.append(
+                _make_selected_test_job(args, run_dir, selection, model_seed)
+            )
+    selected_jobs: list[dict[str, Any]] = []
+    for expected_selected in expected_selected_jobs:
+        key = _selected_key(expected_selected)
+        selected_job = previous_selected.get(key, expected_selected)
+        if selected_job is not expected_selected:
+            _reconcile_selected(selected_job, expected_selected, run_dir)
+        selected_jobs.append(selected_job)
+    return selections, selected_jobs
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -799,10 +1164,12 @@ def main(argv: list[str] | None = None) -> int:
         print(str(error), file=sys.stderr)
         return 2
     run_id = args.run_id or _default_run_id()
-    run_dir = (
-        args.results_root.expanduser().resolve() / "tree_augmentation/scaling" / run_id
-    ).resolve()
+    results_root = args.results_root.expanduser().resolve()
+    run_dir = (results_root / "tree_augmentation/scaling" / run_id).resolve()
     data_root = args.data_root.expanduser().resolve()
+    if not run_dir.is_relative_to(results_root):
+        print("experiment outputs must stay within the results root", file=sys.stderr)
+        return 2
     if (
         run_dir == data_root
         or run_dir.is_relative_to(data_root)
@@ -823,86 +1190,145 @@ def main(argv: list[str] | None = None) -> int:
             print(shlex.join(job["command"]))
         print(f"Aggregate: {run_dir / 'summary.json'}")
         return 0
-    if run_dir.exists():
-        print(f"run already exists; use a new run ID: {run_dir}", file=sys.stderr)
+    try:
+        manifest_path = _validated_write_path(
+            run_dir / "manifest.json", run_dir, label="runner manifest"
+        )
+        _validated_write_path(run_dir / "summary.json", run_dir, label="aggregate summary")
+    except ValueError as error:
+        print(f"cannot resume existing run: {error}", file=sys.stderr)
         return 2
+    expected_config = _run_config(args, data_root)
+    sources = _source_snapshot()
+    resuming = run_dir.exists()
+    if resuming:
+        try:
+            manifest = _load_resume_manifest(
+                manifest_path,
+                run_id=run_id,
+                run_dir=run_dir,
+                expected_jobs=jobs,
+                expected_config=expected_config,
+                expected_sources=sources,
+                planned_selected_test_runs=planned_selected_test_runs,
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            print(f"cannot resume existing run: {error}", file=sys.stderr)
+            return 2
+        jobs = manifest["jobs"]
     try:
         dependencies = check_dependencies()
     except DependencyCheckError as error:
         print(error_message(error), file=sys.stderr)
         return error.exit_code
-    run_dir.mkdir(parents=True, exist_ok=False)
-    manifest: dict[str, Any] = {
-        "schema_version": 2,
-        "suite": "tree_scaling",
-        "run_id": run_id,
-        "status": "running",
-        "source_integrity_valid": True,
-        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
-        "config": {
-            "suites": list(args.suites),
-            "profiles": list(args.profiles),
-            "profile_configs": {profile: PROFILE_CONFIGS[profile] for profile in args.profiles},
-            "model_seeds": list(args.model_seeds),
-            "data_seed": args.data_seed,
-            "split_seed": args.split_seed,
-            "chart_seed": args.chart_seed,
-            "device": args.device,
-            "batch_size": args.batch_size,
-            "workers": args.workers,
-            "amp_override": args.amp,
-            "allow_download": args.allow_download,
-            "data_root": str(data_root),
-        },
-        "models_per_child": list(MODELS),
-        "planned_child_runs": len(jobs),
-        "planned_model_trainings": len(jobs) * len(MODELS),
-        "planned_selected_test_runs": planned_selected_test_runs,
-        "planned_profile_selections": len(args.suites) * len(MODELS),
-        "jobs": jobs,
-        "selections": [],
-        "selected_test_jobs": [],
-        "dependencies": dependencies,
-        "sources": _source_snapshot(),
-        "protocol": {
-            "fresh_training": "every profile/seed/suite child trains V1 fixed_bfs and V2 "
-            "multi_chart independently; no checkpoint or score reuse",
-            "scaling_axes": "model width and real encoder message-layer depth",
-            "controlled_budget": "all profiles use 800 optimizer updates, 8 multi-chart "
-            "training views per graph, and 8 evaluation charts per family",
-            "paired_comparison": "within each child both arms use the same model width, update "
-            "count, initialization seed, batch size, dataset split, and evaluation charts",
-            "chart_family_isolation": {
-                "fixed_train": "one bfs chart rooted at node 0 per graph",
-                "multi_train": "8 charts per graph split across random-root bfs/dfs",
-                "seen_evaluation": "fresh random-root bfs charts",
-                "unseen_evaluation": "fresh Wilson uniform spanning-tree charts",
-                "evaluation_charts_per_family": 8,
+    if resuming and manifest.get("dependencies") != dependencies:
+        print("cannot resume existing run: dependency inventory differs", file=sys.stderr)
+        return 2
+    if (
+        resuming
+        and manifest.get("status") == "passed"
+        and all(job["status"] == "passed" for job in jobs)
+    ):
+        try:
+            verified_selections, verified_selected_jobs = _prepare_selected_jobs(
+                args,
+                run_dir,
+                jobs,
+                manifest.get("selected_test_jobs", []),
+            )
+            if len(verified_selected_jobs) == planned_selected_test_runs and all(
+                job["status"] == "passed" for job in verified_selected_jobs
+            ):
+                manifest["selections"] = verified_selections
+                manifest["selected_test_jobs"] = verified_selected_jobs
+                stored_summary = _read_mapping(run_dir / "summary.json", "tree scaling summary")
+                if stored_summary != _aggregate_summary(manifest):
+                    raise RuntimeError("stored aggregate summary differs from verified artifacts")
+                print(
+                    f"Tree scaling run already complete; verified {len(jobs)} candidates and "
+                    f"{len(verified_selected_jobs)} selected-checkpoint evaluations",
+                    flush=True,
+                )
+                return 0
+        except Exception as error:
+            print(f"cannot resume existing run: {error}", file=sys.stderr)
+            return 2
+    if not resuming:
+        run_dir.mkdir(parents=True, exist_ok=False)
+        manifest = {
+            "schema_version": 2,
+            "suite": "tree_scaling",
+            "run_id": run_id,
+            "status": "running",
+            "source_integrity_valid": True,
+            "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+            "config": expected_config,
+            "models_per_child": list(MODELS),
+            "planned_child_runs": len(jobs),
+            "planned_model_trainings": len(jobs) * len(MODELS),
+            "planned_selected_test_runs": planned_selected_test_runs,
+            "planned_profile_selections": len(args.suites) * len(MODELS),
+            "jobs": jobs,
+            "selections": [],
+            "selected_test_jobs": [],
+            "dependencies": dependencies,
+            "sources": sources,
+            "invocation_count": 1,
+            "protocol": {
+                "fresh_training": "every profile/seed/suite candidate child trains V1 fixed_bfs "
+                "and V2 multi_chart independently; verified completed attempts are reused only "
+                "when resuming the exact same run",
+                "resume": "same-run continuation revalidates completed artifacts, skips valid "
+                "candidate/checkpoint evaluations, and uses new attempt paths for incomplete work",
+                "scaling_axes": "model width and real encoder message-layer depth",
+                "controlled_budget": "all profiles use 800 optimizer updates, 8 multi-chart "
+                "training views per graph, and 8 evaluation charts per family",
+                "paired_comparison": "within each child both arms use the same model width, update "
+                "count, initialization seed, batch size, dataset split, and evaluation charts",
+                "chart_family_isolation": {
+                    "fixed_train": "one bfs chart rooted at node 0 per graph",
+                    "multi_train": "8 charts per graph split across random-root bfs/dfs",
+                    "seen_evaluation": "fresh random-root bfs charts",
+                    "unseen_evaluation": "fresh Wilson uniform spanning-tree charts",
+                    "evaluation_charts_per_family": 8,
+                },
+                "selection": {
+                    "split": "official validation only; full caches are integrity-validated, but "
+                    "candidate model paths do not evaluate test data or use test metrics",
+                    "by": "suite x condition (fixed_bfs and multi_chart separately), using the "
+                    "mean preregistered scalar across all requested model seeds",
+                    "csl_objective": "maximize mean graph_macro_accuracy across fresh BFS and "
+                    "fresh Wilson validation chart families",
+                    "zinc_objective": "minimize mean graph_macro_mae across fresh BFS and fresh "
+                    "Wilson validation chart families",
+                    "tie_break": "first profile in the preregistered --profiles order",
+                    "test": "one test-only phase per selected checkpoint; no optimizer or "
+                    "retraining",
+                },
+                "failure_policy": "stop at first failed or unverifiable child; preserve completed "
+                "artifacts for exact-request continuation",
+                "uncertainty": "default model seed is 0; explicit comma-separated multiple seeds "
+                "remain supported and are aggregated without treating child models as datasets",
+                "device": "CUDA required; no CPU fallback",
             },
-            "selection": {
-                "split": "official validation only; full caches are integrity-validated, but "
-                "candidate model paths do not evaluate test data or use test metrics",
-                "by": "suite x condition (fixed_bfs and multi_chart separately), using the "
-                "mean preregistered scalar across all requested model seeds",
-                "csl_objective": "maximize mean graph_macro_accuracy across fresh BFS and "
-                "fresh Wilson validation chart families",
-                "zinc_objective": "minimize mean graph_macro_mae across fresh BFS and fresh "
-                "Wilson validation chart families",
-                "tie_break": "first profile in the preregistered --profiles order",
-                "test": "one test-only phase per selected checkpoint; no optimizer or retraining",
-            },
-            "failure_policy": "stop at first failed or unverifiable child; leave pending jobs "
-            "unclaimed and publish failed aggregate state",
-            "uncertainty": "default five model seeds; report per-seed metrics without "
-            "pretending child models are independent datasets",
-            "device": "CUDA required; no CPU fallback",
-        },
-    }
+        }
+    else:
+        manifest["invocation_count"] = int(manifest.get("invocation_count", 1)) + 1
+        manifest["last_resumed_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+        manifest["status"] = "running"
+        manifest["source_integrity_valid"] = True
+        manifest.pop("error", None)
+        manifest.pop("finished_at_utc", None)
     _write_state(run_dir, manifest)
     environment = _environment()
     current_job: dict[str, Any] | None = None
     try:
-        preflight_path = run_dir / "gpu-preflight.json"
+        invocation = manifest["invocation_count"]
+        preflight_path = _validated_write_path(
+            run_dir / f"gpu-preflight.attempt-{invocation}.json",
+            run_dir,
+            label="GPU preflight output",
+        )
         preflight = [
             sys.executable,
             "-B",
@@ -915,16 +1341,22 @@ def main(argv: list[str] | None = None) -> int:
             "--json-out",
             str(preflight_path),
         ]
-        status = _run_logged(preflight, run_dir / "logs/preflight.log", environment)
+        status = _run_logged(
+            preflight,
+            run_dir / "logs" / f"preflight.attempt-{invocation}.log",
+            environment,
+        )
         if status:
             raise RuntimeError(f"GPU preflight failed with exit code {status}")
         preflight_result = _read_mapping(preflight_path, "gpu-preflight.json")
         if preflight_result.get("status") != "passed":
             raise RuntimeError("GPU preflight returned without a passed certificate")
-        manifest["gpu_preflight"] = {
+        preflight_record = {
             "path": str(preflight_path),
             "sha256": _sha256(preflight_path),
         }
+        manifest["gpu_preflight"] = preflight_record
+        manifest.setdefault("gpu_preflights", []).append(preflight_record)
         _write_state(run_dir, manifest)
         print(
             f"Run: {run_id}; {len(jobs)} child runs; "
@@ -932,6 +1364,13 @@ def main(argv: list[str] | None = None) -> int:
             flush=True,
         )
         for index, job in enumerate(jobs, start=1):
+            if job["status"] == "passed":
+                print(
+                    f"[{index}/{len(jobs)}] skip verified {job['suite']} / {job['profile']} / "
+                    f"model seed {job['model_seed']}",
+                    flush=True,
+                )
+                continue
             current_job = job
             _check_sources(manifest)
             job["status"] = "running"
@@ -952,49 +1391,63 @@ def main(argv: list[str] | None = None) -> int:
                 )
             job["result"] = _validate_child(job)
             job["status"] = "passed"
+            job.pop("error", None)
             _write_state(run_dir, manifest)
             current_job = None
-        for suite in args.suites:
-            _check_sources(manifest)
-            selection = _select_profiles(
-                jobs,
-                suite=suite,
-                model_seeds=args.model_seeds,
-                profiles=args.profiles,
-            )
-            manifest["selections"].append(selection)
-            _write_state(run_dir, manifest)
-            for model_seed in args.model_seeds:
-                selected_job = _make_selected_test_job(args, run_dir, selection, model_seed)
-                manifest["selected_test_jobs"].append(selected_job)
-                current_job = selected_job
-                selected_job["status"] = "running"
-                _write_state(run_dir, manifest)
+        _check_sources(manifest)
+        selections, selected_jobs = _prepare_selected_jobs(
+            args,
+            run_dir,
+            jobs,
+            manifest.get("selected_test_jobs", []),
+        )
+        manifest["selections"] = selections
+        manifest["selected_test_jobs"] = selected_jobs
+        _write_state(run_dir, manifest)
+        for selected_job in selected_jobs:
+            if selected_job["status"] == "passed":
                 print(
-                    f"\n[selected test] {suite} / model seed {model_seed}: "
-                    f"fixed={selection['conditions']['fixed_bfs']['selected_profile']}, "
-                    f"multi={selection['conditions']['multi_chart']['selected_profile']}",
+                    f"[selected test] skip verified {selected_job['suite']} / "
+                    f"model seed {selected_job['model_seed']}",
                     flush=True,
                 )
-                started = time.monotonic()
-                status = _run_logged(
-                    selected_job["command"], Path(selected_job["log_path"]), environment
+                continue
+            current_job = selected_job
+            selection = selected_job["selection"]
+            model_seed = selected_job["model_seed"]
+            suite = selected_job["suite"]
+            selected_job["status"] = "running"
+            _write_state(run_dir, manifest)
+            print(
+                f"\n[selected test] {suite} / model seed {model_seed}: "
+                f"fixed={selection['conditions']['fixed_bfs']['selected_profile']}, "
+                f"multi={selection['conditions']['multi_chart']['selected_profile']}",
+                flush=True,
+            )
+            started = time.monotonic()
+            status = _run_logged(
+                selected_job["command"], Path(selected_job["log_path"]), environment
+            )
+            selected_job.update(
+                exit_code=status,
+                elapsed_seconds=time.monotonic() - started,
+            )
+            _check_sources(manifest)
+            if status:
+                raise RuntimeError(
+                    f"{suite}/seed-{model_seed} selected test failed with exit code {status}"
                 )
-                selected_job.update(
-                    exit_code=status,
-                    elapsed_seconds=time.monotonic() - started,
-                )
-                _check_sources(manifest)
-                if status:
-                    raise RuntimeError(
-                        f"{suite}/seed-{model_seed} selected test failed with exit code {status}"
-                    )
-                selected_job["result"] = _validate_selected_test(selected_job)
-                selected_job["status"] = "passed"
-                _write_state(run_dir, manifest)
-                current_job = None
+            selected_job["result"] = _validate_selected_test(selected_job)
+            selected_job["status"] = "passed"
+            selected_job.pop("error", None)
+            _write_state(run_dir, manifest)
+            current_job = None
         _check_sources(manifest)
-        manifest.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+        manifest.update(
+            status="passed",
+            source_integrity_valid=True,
+            finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+        )
     except (Exception, KeyboardInterrupt) as error:
         manifest.update(
             status="failed",

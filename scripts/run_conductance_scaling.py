@@ -8,8 +8,10 @@ import datetime as dt
 import hashlib
 import json
 import math
+import os
 import re
 import shlex
+import shutil
 import statistics
 import sys
 import time
@@ -80,7 +82,7 @@ VERSIONS: dict[str, dict[str, Any]] = {
 ALL_DATASETS = tuple(
     dict.fromkeys(dataset for spec in VERSIONS.values() for dataset in spec["datasets"])
 )
-DEFAULT_MODEL_SEEDS = (0, 1, 2, 3, 4)
+DEFAULT_MODEL_SEEDS = (0,)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -243,7 +245,12 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
 
 
 def _source_snapshot() -> dict[str, str]:
-    paths = [Path(__file__)]
+    paths = [
+        Path(__file__),
+        ROOT / "research/__init__.py",
+        ROOT / "research/conductance_gat/__init__.py",
+        ROOT / "src/chartgat/__init__.py",
+    ]
     paths += [
         ROOT / "research/conductance_gat" / name
         for name in (
@@ -263,8 +270,10 @@ def _source_snapshot() -> dict[str, str]:
         ROOT / "src/chartgat/cache.py",
         ROOT / "src/chartgat/execution.py",
         ROOT / "scripts/check_dependencies.py",
+        ROOT / "scripts/gpu_profiles.py",
         ROOT / "scripts/gpu_preflight.py",
         ROOT / "scripts/run_conductance_factorial.py",
+        ROOT / "scripts/verify_gpu_lock.py",
     ]
     return {
         path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -276,6 +285,154 @@ def _check_sources(manifest: dict[str, Any]) -> None:
     if _source_snapshot() != manifest["source_sha256"]:
         manifest["source_integrity_valid"] = False
         raise RuntimeError("Conductance scaling source changed during execution")
+
+
+_JOB_IDENTITY_KEYS = (
+    "job_id",
+    "version",
+    "profile",
+    "architecture",
+    "model_seed",
+    "dataset",
+    "condition",
+    "output_dir",
+    "metrics_path",
+    "log_path",
+    "command",
+)
+
+
+def _job_identity(job: dict[str, Any]) -> dict[str, Any]:
+    return {key: job.get(key) for key in _JOB_IDENTITY_KEYS}
+
+
+def _verify_passed_job(job: dict[str, Any]) -> None:
+    actual = _load_child(job)
+    if job.get("metrics_sha256") != actual["metrics_sha256"]:
+        raise RuntimeError(f"passed job artifact hash mismatch: {job['job_id']}")
+    if job.get("result") != actual:
+        raise RuntimeError(f"passed job manifest result mismatch: {job['job_id']}")
+
+
+def _load_resume_manifest(
+    manifest_path: Path,
+    *,
+    run_id: str,
+    config: dict[str, Any],
+    exclusions: list[dict[str, str]],
+    jobs: list[dict[str, Any]],
+    source_sha256: dict[str, str],
+    dependencies: dict[str, Any],
+) -> dict[str, Any]:
+    if not manifest_path.is_file():
+        raise RuntimeError("existing run directory has no manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"existing manifest is unreadable: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("existing manifest must be a JSON object")
+    for key, expected in (
+        ("schema_version", 1),
+        ("suite", "conductance_architecture_scaling_v1_v4"),
+        ("run_id", run_id),
+        ("config", config),
+        ("exclusions", exclusions),
+        ("source_sha256", source_sha256),
+        ("source_integrity_valid", True),
+        ("dependencies", dependencies),
+    ):
+        if manifest.get(key) != expected:
+            raise RuntimeError(f"existing manifest {key} does not match this invocation")
+    existing_jobs = manifest.get("jobs")
+    if not isinstance(existing_jobs, list) or not all(
+        isinstance(job, dict) for job in existing_jobs
+    ):
+        raise RuntimeError("existing manifest jobs are invalid")
+    if [_job_identity(job) for job in existing_jobs] != [_job_identity(job) for job in jobs]:
+        raise RuntimeError("existing manifest job plan does not match this invocation")
+    if manifest.get("status") not in {"running", "failed", "passed"}:
+        raise RuntimeError("existing manifest status is not resumable")
+    run_dir = manifest_path.parent.resolve()
+    for job in existing_jobs:
+        if job.get("status") not in {"pending", "running", "failed", "passed"}:
+            raise RuntimeError(f"existing job status is invalid: {job.get('job_id')}")
+        lexical_output = Path(os.path.abspath(Path(job.get("output_dir", "")).expanduser()))
+        lexical_metrics = Path(os.path.abspath(Path(job.get("metrics_path", "")).expanduser()))
+        lexical_log = Path(os.path.abspath(Path(job.get("log_path", "")).expanduser()))
+        output = lexical_output.resolve()
+        metrics = lexical_metrics.resolve()
+        log = lexical_log.resolve()
+        if (
+            output != lexical_output
+            or metrics != lexical_metrics
+            or log != lexical_log
+            or not output.is_relative_to(run_dir)
+            or metrics != output / "metrics.json"
+            or not log.is_relative_to(run_dir / "logs")
+        ):
+            raise RuntimeError(
+                f"existing job paths escape or indirectly alias the run: {job.get('job_id')}"
+            )
+        if job["status"] == "passed":
+            _verify_passed_job(job)
+    if manifest["status"] == "passed" and any(job["status"] != "passed" for job in existing_jobs):
+        raise RuntimeError("passed manifest contains a non-passed job")
+    return manifest
+
+
+def _discard_incomplete_child(job: dict[str, Any], run_dir: Path) -> None:
+    lexical_output = Path(os.path.abspath(Path(job["output_dir"]).expanduser()))
+    output = lexical_output.resolve()
+    run_dir = run_dir.resolve()
+    if output != lexical_output:
+        raise RuntimeError(f"refusing to clear an indirect child output path: {lexical_output}")
+    if output == run_dir or not output.is_relative_to(run_dir):
+        raise RuntimeError(f"refusing to clear child output outside run directory: {output}")
+    if lexical_output.exists():
+        if not lexical_output.is_dir():
+            raise RuntimeError(f"child output path is not a directory: {lexical_output}")
+        shutil.rmtree(lexical_output)
+    for key in ("result", "metrics_sha256", "exit_code", "elapsed_wall_seconds", "error"):
+        job.pop(key, None)
+
+
+def _next_attempt_log(preferred: Path, run_dir: Path, label: str) -> Path:
+    """Return a new in-run log path without overwriting an earlier attempt."""
+    run_dir = run_dir.resolve()
+    preferred = preferred.resolve()
+    if not preferred.is_relative_to(run_dir):
+        raise RuntimeError(f"log path resolves outside the run directory: {preferred}")
+    if not preferred.exists():
+        return preferred
+    root = (run_dir / "logs/resume").resolve()
+    if not root.is_relative_to(run_dir):
+        raise RuntimeError("resume log directory resolves outside the run directory")
+    safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "--", label)
+    attempt = 1
+    while True:
+        candidate = (root / f"{safe_label}.attempt-{attempt}.log").resolve()
+        if not candidate.is_relative_to(run_dir):
+            raise RuntimeError("resume log path resolves outside the run directory")
+        if not candidate.exists():
+            return candidate
+        attempt += 1
+
+
+def _validated_write_path(path: Path, run_dir: Path, *, label: str) -> Path:
+    """Validate a direct regular-file path before any runner or child write."""
+    lexical = Path(os.path.abspath(path.expanduser()))
+    resolved = lexical.resolve()
+    run_dir = run_dir.resolve()
+    if (
+        resolved != lexical
+        or resolved == run_dir
+        or resolved.is_dir()
+        or (lexical.exists() and not lexical.is_file())
+        or not resolved.is_relative_to(run_dir)
+    ):
+        raise RuntimeError(f"refusing to write an indirect or out-of-run {label}: {lexical}")
+    return lexical
 
 
 def _number(value: Any, label: str, *, minimum: float | None = None) -> float:
@@ -416,7 +573,11 @@ def _summary(manifest: dict[str, Any]) -> dict[str, Any]:
 
 def _write_summary(run_dir: Path, manifest: dict[str, Any]) -> None:
     summary = _summary(manifest)
-    atomic_write_json(run_dir / "summary.json", summary)
+    summary_json = _validated_write_path(run_dir / "summary.json", run_dir, label="summary JSON")
+    summary_markdown = _validated_write_path(
+        run_dir / "summary.md", run_dir, label="summary Markdown"
+    )
+    atomic_write_json(summary_json, summary)
     lines = [
         "# Conductance V1-V4 architecture scaling",
         "",
@@ -440,7 +601,7 @@ def _write_summary(run_dir: Path, manifest: dict[str, Any]) -> None:
             f"{row['condition']} | {row['n']} | {row['validation_mean']:.6f} | "
             f"{deviation} | {parameters} |"
         )
-    (run_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    summary_markdown.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -454,6 +615,9 @@ def main(argv: list[str] | None = None) -> int:
     results_root = args.results_root.expanduser().resolve()
     run_dir = (results_root / "conductance_gat/scaling" / run_id).resolve()
     data_root = args.data_root.expanduser().resolve()
+    if not run_dir.is_relative_to(results_root):
+        print("Scaling outputs must stay within the results root", file=sys.stderr)
+        return 2
     if (
         run_dir == data_root
         or run_dir.is_relative_to(data_root)
@@ -467,6 +631,22 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     exclusions = _exclusions(args)
+    config = {
+        "versions": args.versions,
+        "profiles": {name: PROFILES[name] for name in args.profiles},
+        "datasets": args.datasets,
+        "datasets_by_version": {
+            version: _selected_datasets(args, version) for version in args.versions
+        },
+        "model_seeds": args.model_seeds,
+        "epochs": args.epochs,
+        "patience": args.patience,
+        "workers": args.workers,
+        "device": args.device,
+        "min_free_gb": args.min_free_gb,
+        "edge_chunk_size": args.edge_chunk_size,
+        "data_root": str(data_root),
+    }
     if args.dry_run:
         print(
             f"{len(jobs)} validation-only fresh trainings; versions={args.versions}; "
@@ -478,57 +658,89 @@ def main(argv: list[str] | None = None) -> int:
             print(shlex.join(job["command"]))
         print(f"Manifest: {run_dir / 'manifest.json'}")
         return 0
-    if run_dir.exists():
-        print(f"Run already exists; use a new run ID: {run_dir}", file=sys.stderr)
-        return 2
+    manifest_path = run_dir / "manifest.json"
+    try:
+        manifest_path = _validated_write_path(manifest_path, run_dir, label="runner manifest")
+        _validated_write_path(run_dir / "summary.json", run_dir, label="summary JSON")
+        _validated_write_path(run_dir / "summary.md", run_dir, label="summary Markdown")
+    except RuntimeError as exc:
+        print(f"Refusing unsafe run state: {exc}", file=sys.stderr)
+        return 1
+    source_sha256 = _source_snapshot()
     try:
         dependencies = check_dependencies()
     except DependencyCheckError as exc:
         print(error_message(exc), file=sys.stderr)
         return exc.exit_code
-    run_dir.mkdir(parents=True, exist_ok=False)
-    manifest: dict[str, Any] = {
-        "schema_version": 1,
-        "suite": "conductance_architecture_scaling_v1_v4",
-        "run_id": run_id,
-        "status": "running",
-        "source_integrity_valid": True,
-        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
-        "config": {
-            "versions": args.versions,
-            "profiles": {name: PROFILES[name] for name in args.profiles},
-            "datasets": args.datasets,
-            "datasets_by_version": {
-                version: _selected_datasets(args, version) for version in args.versions
+    resuming = run_dir.exists()
+    if resuming:
+        try:
+            manifest = _load_resume_manifest(
+                manifest_path,
+                run_id=run_id,
+                config=config,
+                exclusions=exclusions,
+                jobs=jobs,
+                source_sha256=source_sha256,
+                dependencies=dependencies,
+            )
+        except Exception as exc:
+            print(f"Refusing to resume: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+        jobs = manifest["jobs"]
+        if all(job["status"] == "passed" for job in jobs):
+            manifest.update(status="passed", source_integrity_valid=True)
+            manifest.pop("error", None)
+            manifest.setdefault("finished_at_utc", dt.datetime.now(dt.UTC).isoformat())
+            atomic_write_json(manifest_path, manifest)
+            _write_summary(run_dir, manifest)
+            print(f"Run already complete; verified {len(jobs)} passed child artifacts", flush=True)
+            print((run_dir / "summary.md").read_text(encoding="utf-8"), flush=True)
+            print(f"Summary: {run_dir / 'summary.md'}", flush=True)
+            return 0
+    if resuming:
+        manifest.update(
+            status="running",
+            source_integrity_valid=True,
+            resumed_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+            resume_count=int(manifest.get("resume_count", 0)) + 1,
+        )
+        manifest.pop("error", None)
+        manifest.pop("finished_at_utc", None)
+    else:
+        run_dir.mkdir(parents=True, exist_ok=False)
+        manifest = {
+            "schema_version": 1,
+            "suite": "conductance_architecture_scaling_v1_v4",
+            "run_id": run_id,
+            "status": "running",
+            "source_integrity_valid": True,
+            "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+            "config": config,
+            "protocol": {
+                "purpose": "architecture scale response, not parameter matching",
+                "profiles": "base/wide/deep/large all run for every selected version",
+                "selection": "best validation checkpoint within each independent child",
+                "test": "never loaded into a V1 scaling loader and never evaluated by any child",
+                "aggregation": "validation mean and sample standard deviation across model seeds",
+                "release": (
+                    "comparison valid only after every planned child and source check passes"
+                ),
             },
-            "model_seeds": args.model_seeds,
-            "epochs": args.epochs,
-            "patience": args.patience,
-            "workers": args.workers,
-            "device": args.device,
-            "edge_chunk_size": args.edge_chunk_size,
-            "data_root": str(data_root),
-        },
-        "protocol": {
-            "purpose": "architecture scale response, not parameter matching",
-            "profiles": "base/wide/deep/large all run for every selected version",
-            "selection": "best validation checkpoint within each independent child",
-            "test": "never loaded into a V1 scaling loader and never evaluated by any child",
-            "aggregation": "validation mean and sample standard deviation across model seeds",
-            "release": "comparison valid only after every planned child and source check passes",
-        },
-        "exclusions": exclusions,
-        "jobs": jobs,
-        "dependencies": dependencies,
-        "source_sha256": _source_snapshot(),
-    }
-    manifest_path = run_dir / "manifest.json"
+            "exclusions": exclusions,
+            "jobs": jobs,
+            "dependencies": dependencies,
+            "source_sha256": source_sha256,
+        }
     atomic_write_json(manifest_path, manifest)
     _write_summary(run_dir, manifest)
     current: dict[str, Any] | None = None
     environment = shared._environment()
     environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
     try:
+        preflight_output = _validated_write_path(
+            run_dir / "gpu-preflight.json", run_dir, label="GPU preflight output"
+        )
         preflight = [
             sys.executable,
             "-B",
@@ -539,21 +751,33 @@ def main(argv: list[str] | None = None) -> int:
             "--min-free-gb",
             str(args.min_free_gb),
             "--json-out",
-            str(run_dir / "gpu-preflight.json"),
+            str(preflight_output),
         ]
-        status = shared.run_logged(preflight, run_dir / "logs/preflight.log", environment)
+        preflight_log = _next_attempt_log(run_dir / "logs/preflight.log", run_dir, "preflight")
+        manifest["preflight_log_path"] = str(preflight_log)
+        status = shared.run_logged(preflight, preflight_log, environment)
         if status:
             raise RuntimeError(f"GPU preflight failed with exit code {status}")
-        print(f"Run: {run_id}; {len(jobs)} validation-only fresh trainings", flush=True)
+        remaining = sum(job["status"] != "passed" for job in jobs)
+        print(
+            f"Run: {run_id}; {remaining}/{len(jobs)} validation-only fresh trainings remaining",
+            flush=True,
+        )
         for index, job in enumerate(jobs, start=1):
+            if job["status"] == "passed":
+                print(f"\n[{index}/{len(jobs)}] verified, skipping {job['job_id']}", flush=True)
+                continue
             current = job
             _check_sources(manifest)
+            _discard_incomplete_child(job, run_dir)
             job["status"] = "running"
             atomic_write_json(manifest_path, manifest)
             _write_summary(run_dir, manifest)
             print(f"\n[{index}/{len(jobs)}] {job['job_id']}", flush=True)
             started = time.monotonic()
-            status = shared.run_logged(job["command"], Path(job["log_path"]), environment)
+            attempt_log = _next_attempt_log(Path(job["log_path"]), run_dir, str(job["job_id"]))
+            job["attempt_log_path"] = str(attempt_log)
+            status = shared.run_logged(job["command"], attempt_log, environment)
             job.update(exit_code=status, elapsed_wall_seconds=time.monotonic() - started)
             _check_sources(manifest)
             if status:

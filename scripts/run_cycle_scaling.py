@@ -54,19 +54,27 @@ RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SOURCE_FILES = (
     "scripts/run_cycle_scaling.py",
     "scripts/check_dependencies.py",
+    "scripts/gpu_profiles.py",
     "scripts/gpu_preflight.py",
+    "scripts/verify_gpu_lock.py",
+    "research/__init__.py",
+    "research/cycle_pe/__init__.py",
     "research/cycle_pe/benchmark.py",
     "research/cycle_pe/benchmark_data.py",
     "research/cycle_pe/benchmark_models.py",
     "research/cycle_pe/paper_model.py",
+    "research/cycle_pe/paper_data.py",
     "research/cycle_pe/features.py",
     "research/cycle_pe/v2/benchmark.py",
+    "research/cycle_pe/v2/__init__.py",
     "research/cycle_pe/v2/basis.py",
     "research/cycle_pe/v2/data.py",
     "research/cycle_pe/v2/model.py",
     "src/chartgat/algebra.py",
+    "src/chartgat/__init__.py",
     "src/chartgat/cache.py",
     "src/chartgat/execution.py",
+    "src/chartgat/graphs.py",
 )
 
 
@@ -96,8 +104,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--model-seeds",
         type=_seeds,
-        default=(0, 1, 2, 3, 4),
-        help="comma-separated model/minibatch seeds (default: 0,1,2,3,4)",
+        default=(0,),
+        help="comma-separated model/minibatch seeds (default: 0)",
     )
     result.add_argument("--run-id", type=_run_id)
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
@@ -258,7 +266,7 @@ def _environment() -> dict[str, str]:
 def run_logged(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
     """Run and stream one child, terminating it if the scaling runner is interrupted."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("x", encoding="utf-8", newline="\n") as stream:
+    with log_path.open("a", encoding="utf-8", newline="\n") as stream:
         process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -901,6 +909,322 @@ def attach_test_results(
     return summary
 
 
+_JOB_STATE_FIELDS = {
+    "accepted_result",
+    "accepted_rows",
+    "artifact_errors",
+    "error",
+    "finished_at_utc",
+    "previous_attempts",
+    "quarantined_outputs",
+    "recovered_at_utc",
+    "resume_artifact_errors",
+    "resume_attempts",
+    "returncode",
+    "selection_rebinds",
+    "started_at_utc",
+    "status",
+}
+
+_TEST_JOB_STABLE_FIELDS = (
+    "job_id",
+    "checkpoint_id",
+    "profile_selection_id",
+    "version",
+    "dataset",
+    "model_seed",
+    "output_dir",
+    "log_path",
+)
+
+
+def _run_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    """Return the complete execution contract that must match on resume."""
+    return {
+        "versions": list(args.versions),
+        "datasets": list(args.datasets),
+        "profiles": list(args.profiles),
+        "model_seeds": list(args.model_seeds),
+        "data_root": str(args.data_root.expanduser().resolve()),
+        "device": args.device,
+        "batch_size": args.batch_size,
+        "workers": args.workers,
+        "epochs": args.epochs,
+        "patience": args.patience,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "max_parameters": args.max_parameters,
+        "allow_download": args.allow_download,
+        "amp": args.amp,
+        "compile": args.compile,
+        "column_chunk_size": args.column_chunk_size,
+        "basis_execution": args.basis_execution,
+        "basis_pair_budget": args.basis_pair_budget,
+        "min_free_gb": args.min_free_gb,
+    }
+
+
+def _restore_job_state(
+    generated: list[dict[str, Any]],
+    stored: Any,
+    *,
+    label: str,
+) -> None:
+    """Bind persisted state to an identical regenerated plan, failing closed."""
+    if not isinstance(stored, list):
+        raise ValueError(f"stored {label} job plan is not a list")
+    stored_by_id: dict[str, dict[str, Any]] = {}
+    for item in stored:
+        if not isinstance(item, dict) or not isinstance(item.get("job_id"), str):
+            raise ValueError(f"stored {label} job is malformed")
+        job_id = item["job_id"]
+        if job_id in stored_by_id:
+            raise ValueError(f"stored {label} job IDs are not unique")
+        stored_by_id[job_id] = item
+    generated_ids = {job["job_id"] for job in generated}
+    if set(stored_by_id) != generated_ids:
+        raise ValueError(f"stored {label} job matrix differs from this invocation")
+    for job in generated:
+        previous = stored_by_id[job["job_id"]]
+        binding = {key: value for key, value in job.items() if key not in _JOB_STATE_FIELDS}
+        for key, expected in binding.items():
+            if previous.get(key) != expected:
+                raise ValueError(f"stored {label} job binding differs for {job['job_id']}/{key}")
+        status = previous.get("status")
+        if status not in {"pending", "running", "passed", "failed"}:
+            raise ValueError(f"stored {label} job has invalid status: {job['job_id']}")
+        for key in _JOB_STATE_FIELDS:
+            if key in previous:
+                job[key] = previous[key]
+
+
+def _restore_or_rebind_test_job_state(
+    generated: list[dict[str, Any]],
+    stored: Any,
+    run_dir: Path,
+) -> None:
+    """Restore identical test jobs or preserve and replace a superseded selection."""
+    if not isinstance(stored, list):
+        raise ValueError("stored test-evaluation job plan is not a list")
+    stored_by_id: dict[str, dict[str, Any]] = {}
+    for item in stored:
+        if not isinstance(item, dict) or not isinstance(item.get("job_id"), str):
+            raise ValueError("stored test-evaluation job is malformed")
+        if item["job_id"] in stored_by_id:
+            raise ValueError("stored test-evaluation job IDs are not unique")
+        stored_by_id[item["job_id"]] = item
+    if set(stored_by_id) != {job["job_id"] for job in generated}:
+        raise ValueError("stored test-evaluation job matrix differs from this invocation")
+    for job in generated:
+        previous = stored_by_id[job["job_id"]]
+        if any(previous.get(key) != job[key] for key in _TEST_JOB_STABLE_FIELDS):
+            raise ValueError(f"stored test-evaluation identity differs for {job['job_id']}")
+        previous_binding = {
+            key: value for key, value in previous.items() if key not in _JOB_STATE_FIELDS
+        }
+        generated_binding = {
+            key: value for key, value in job.items() if key not in _JOB_STATE_FIELDS
+        }
+        if previous_binding == generated_binding:
+            status = previous.get("status")
+            if status not in {"pending", "running", "passed", "failed"}:
+                raise ValueError(f"stored test-evaluation job has invalid status: {job['job_id']}")
+            for key in _JOB_STATE_FIELDS:
+                if key in previous:
+                    job[key] = previous[key]
+            continue
+
+        _validate_job_paths([previous], run_dir)
+        _quarantine_incomplete_output(previous, run_dir)
+        history = list(previous.get("previous_attempts", []))
+        history.append(
+            {
+                "status": previous.get("status"),
+                "selected_profile": previous.get("selected_profile"),
+                "checkpoint": previous.get("checkpoint"),
+                "checkpoint_sha256": previous.get("checkpoint_sha256"),
+                "selected_validation_mae": previous.get("selected_validation_mae"),
+                "accepted_result": previous.get("accepted_result"),
+                "output_dir": previous.get("output_dir"),
+                "quarantined_output": (
+                    previous.get("quarantined_outputs", [])[-1]
+                    if previous.get("quarantined_outputs")
+                    else None
+                ),
+            }
+        )
+        job["previous_attempts"] = history
+        job["selection_rebinds"] = int(previous.get("selection_rebinds", 0)) + 1
+        for key in ("resume_attempts", "quarantined_outputs"):
+            if key in previous:
+                job[key] = previous[key]
+
+
+def _resume_manifest(
+    args: argparse.Namespace,
+    run_id: str,
+    run_dir: Path,
+    jobs: list[dict[str, Any]],
+    dependencies: dict[str, Any],
+    sources: dict[str, str],
+) -> tuple[dict[str, Any], str]:
+    """Load a same-run continuation only when every immutable binding still matches."""
+    manifest = _json_object(run_dir / "manifest.json")
+    expected_identity = {
+        "schema_version": 2,
+        "scope": "cycle_pe_v1_v2_larger_model_scaling",
+        "run_id": run_id,
+        "output_dir": str(run_dir),
+        "run_configuration": _run_configuration(args),
+        "dependencies": dependencies,
+        "source_sha256": sources,
+    }
+    for key, expected in expected_identity.items():
+        if manifest.get(key) != expected:
+            raise ValueError(f"existing run cannot be resumed: {key} differs")
+    previous_status = manifest.get("status")
+    if previous_status not in {"running", "failed", "passed"}:
+        raise ValueError("existing run cannot be resumed: status is invalid")
+    if manifest.get("source_integrity_valid") is not True:
+        raise ValueError("existing run cannot be resumed after a source-integrity failure")
+    _restore_job_state(jobs, manifest.get("jobs"), label="candidate")
+    manifest["jobs"] = jobs
+    manifest["status"] = "running"
+    manifest.pop("error", None)
+    manifest.pop("finished_at_utc", None)
+    manifest["resume_count"] = int(manifest.get("resume_count", 0)) + 1
+    manifest["resumed_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+    return manifest, previous_status
+
+
+def _recover_candidate_rows(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Re-admit complete candidates from disk, including a child finished before interruption."""
+    rows: list[dict[str, Any]] = []
+    for job in jobs:
+        previous_status = job.get("status")
+        if job.get("status") == "failed" and job.get("returncode") not in (None, 0):
+            job["status"] = "pending"
+            job["returncode"] = None
+            job["artifact_errors"] = []
+            continue
+        output_exists = Path(job["output_dir"]).exists()
+        try:
+            recovered = read_job_rows(job)
+            if previous_status == "passed" and job.get("accepted_rows") != recovered:
+                raise ValueError("passed candidate artifacts differ from their accepted rows")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            if output_exists or job.get("status") in {"running", "passed"}:
+                job.setdefault("resume_artifact_errors", []).append(f"{type(exc).__name__}: {exc}")
+            job["status"] = "pending"
+            job["returncode"] = None
+            job["artifact_errors"] = []
+        else:
+            rows.extend(recovered)
+            job["status"] = "passed"
+            job["returncode"] = 0
+            job["artifact_errors"] = []
+            if previous_status != "passed":
+                job["accepted_rows"] = recovered
+            job["recovered_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+    return rows
+
+
+def _recover_test_rows(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Re-admit test-only artifacts while rechecking their selected-checkpoint binding."""
+    rows: list[dict[str, Any]] = []
+    for job in jobs:
+        previous_status = job.get("status")
+        if job.get("status") == "failed" and job.get("returncode") not in (None, 0):
+            job["status"] = "pending"
+            job["returncode"] = None
+            job["artifact_errors"] = []
+            continue
+        output_exists = Path(job["output_dir"]).exists()
+        try:
+            recovered = read_test_result(job)
+            if previous_status == "passed" and job.get("accepted_result") != recovered:
+                raise ValueError("passed test artifact differs from its accepted result")
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            if output_exists or job.get("status") in {"running", "passed"}:
+                job.setdefault("resume_artifact_errors", []).append(f"{type(exc).__name__}: {exc}")
+            job["status"] = "pending"
+            job["returncode"] = None
+            job["artifact_errors"] = []
+        else:
+            rows.append(recovered)
+            job["status"] = "passed"
+            job["returncode"] = 0
+            job["artifact_errors"] = []
+            if previous_status != "passed":
+                job["accepted_result"] = recovered
+            job["recovered_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+    return rows
+
+
+def _quarantine_incomplete_output(job: dict[str, Any], run_dir: Path) -> None:
+    """Preserve an incomplete child directory before retrying its exact output binding."""
+    lexical_output = Path(os.path.abspath(Path(job["output_dir"]).expanduser()))
+    output = lexical_output.resolve()
+    run_dir = run_dir.resolve()
+    if output != lexical_output:
+        raise ValueError(f"refusing to move an indirect retry output: {lexical_output}")
+    if not output.exists():
+        return
+    if output == run_dir or not output.is_relative_to(run_dir):
+        raise ValueError(f"refusing to move unsafe retry output: {output}")
+    root = (run_dir / "resume-orphans" / re.sub(r"[^A-Za-z0-9_.-]+", "--", job["job_id"])).resolve()
+    if not root.is_relative_to(run_dir):
+        raise ValueError("refusing to use a retry archive outside the run directory")
+    root.mkdir(parents=True, exist_ok=True)
+    attempt = int(job.get("resume_attempts", 0)) + 1
+    target = (root / f"attempt-{attempt}").resolve()
+    while target.exists():
+        attempt += 1
+        target = (root / f"attempt-{attempt}").resolve()
+    if not target.is_relative_to(run_dir):
+        raise ValueError("refusing to move retry output outside the run directory")
+    lexical_output.rename(target)
+    job["resume_attempts"] = attempt
+    job.setdefault("quarantined_outputs", []).append(str(target))
+
+
+def _validated_log_path(log_path: Path, run_dir: Path) -> Path:
+    """Reject indirect or out-of-run log targets before opening them for append."""
+    lexical = Path(os.path.abspath(log_path.expanduser()))
+    resolved = lexical.resolve()
+    log_root = (run_dir.resolve() / "logs").resolve()
+    if resolved != lexical or not resolved.is_relative_to(log_root):
+        raise ValueError(f"refusing to write an indirect or out-of-run log: {lexical}")
+    return lexical
+
+
+def _validated_write_path(path: Path, run_dir: Path, *, label: str) -> Path:
+    """Validate a direct in-run file path before passing it to a child writer."""
+    lexical = Path(os.path.abspath(path.expanduser()))
+    resolved = lexical.resolve()
+    run_dir = run_dir.resolve()
+    if (
+        resolved != lexical
+        or resolved == run_dir
+        or resolved.is_dir()
+        or (lexical.exists() and not lexical.is_file())
+        or not resolved.is_relative_to(run_dir)
+    ):
+        raise ValueError(f"refusing to write an indirect or out-of-run {label}: {lexical}")
+    return lexical
+
+
+def _validate_job_paths(jobs: list[dict[str, Any]], run_dir: Path) -> None:
+    """Require every mutable child output and log to be a direct in-run path."""
+    run_dir = run_dir.resolve()
+    for job in jobs:
+        lexical_output = Path(os.path.abspath(Path(job["output_dir"]).expanduser()))
+        output = lexical_output.resolve()
+        if output != lexical_output or output == run_dir or not output.is_relative_to(run_dir):
+            raise ValueError(f"unsafe output path for {job['job_id']}: {lexical_output}")
+        _validated_log_path(Path(job["log_path"]), run_dir)
+
+
 def _manifest_base(
     args: argparse.Namespace,
     run_id: str,
@@ -942,6 +1266,7 @@ def _manifest_base(
         "dependencies": dependencies,
         "source_sha256": sources,
         "source_integrity_valid": True,
+        "run_configuration": _run_configuration(args),
         "preflight": {"status": "pending"},
         "jobs": jobs,
         "test_evaluation_jobs": [],
@@ -956,8 +1281,12 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 2
     run_id = args.run_id or _default_run_id()
+    results_root = args.results_root.expanduser().resolve()
     run_dir = _run_dir(args, run_id)
     data_root = args.data_root.expanduser().resolve()
+    if not run_dir.is_relative_to(results_root):
+        print("Experiment outputs must stay within the results root", file=sys.stderr)
+        return 2
     paths_overlap = (
         run_dir == data_root
         or run_dir.is_relative_to(data_root)
@@ -980,8 +1309,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"manifest: {run_dir / 'manifest.json'}")
         print(f"summary: {run_dir / 'summary.json'}")
         return 0
-    if run_dir.exists():
-        print(f"Run already exists; choose a new run ID: {run_dir}", file=sys.stderr)
+    try:
+        manifest_path = _validated_write_path(
+            run_dir / "manifest.json", run_dir, label="runner manifest"
+        )
+        summary_path = _validated_write_path(
+            run_dir / "summary.json", run_dir, label="aggregate summary"
+        )
+    except ValueError as exc:
+        print(f"Existing run cannot be resumed: {exc}", file=sys.stderr)
         return 2
     try:
         dependencies = check_dependencies()
@@ -989,18 +1325,82 @@ def main(argv: list[str] | None = None) -> int:
         print(error_message(exc), file=sys.stderr)
         return exc.exit_code
     sources = _source_snapshot()
-    run_dir.mkdir(parents=True, exist_ok=False)
-    manifest_path = run_dir / "manifest.json"
-    summary_path = run_dir / "summary.json"
-    manifest = _manifest_base(args, run_id, run_dir, jobs, dependencies, sources)
+    is_resume = run_dir.exists()
+    resume_previous_status: str | None = None
+    if is_resume:
+        try:
+            manifest, resume_previous_status = _resume_manifest(
+                args,
+                run_id,
+                run_dir,
+                jobs,
+                dependencies,
+                sources,
+            )
+            _validate_job_paths(jobs, run_dir)
+            rows = _recover_candidate_rows(jobs)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"Existing run cannot be resumed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+    else:
+        run_dir.mkdir(parents=True, exist_ok=False)
+        manifest = _manifest_base(args, run_id, run_dir, jobs, dependencies, sources)
+        rows = []
+    if (
+        is_resume
+        and resume_previous_status == "passed"
+        and all(job["status"] == "passed" for job in jobs)
+    ):
+        try:
+            verified_validation = build_summary(
+                rows,
+                versions=list(args.versions),
+                datasets=list(args.datasets),
+                profiles=list(args.profiles),
+                model_seeds=args.model_seeds,
+                complete=len(rows) == len(jobs) * len(args.datasets),
+            )
+            if verified_validation["status"] != "pending_test_evaluation":
+                raise ValueError("completed candidate matrix no longer validates")
+            verified_test_jobs = make_test_jobs(
+                args, run_dir, verified_validation["selected_checkpoints"]
+            )
+            _restore_or_rebind_test_job_state(
+                verified_test_jobs,
+                manifest.get("test_evaluation_jobs"),
+                run_dir,
+            )
+            _validate_job_paths(verified_test_jobs, run_dir)
+            verified_test_rows = _recover_test_rows(verified_test_jobs)
+            verified_complete = (
+                len(verified_test_rows) == len(verified_test_jobs)
+                and len(verified_test_jobs)
+                == len(args.versions) * len(args.datasets) * len(args.model_seeds)
+                and all(job["status"] == "passed" for job in verified_test_jobs)
+            )
+            verified_summary = attach_test_results(
+                verified_validation, verified_test_rows, complete=verified_complete
+            )
+            if verified_summary["status"] == "passed":
+                if _json_object(summary_path) != verified_summary:
+                    raise ValueError("stored aggregate summary differs from verified artifacts")
+                print(
+                    f"Cycle scaling run already complete; verified {len(jobs)} candidates and "
+                    f"{len(verified_test_jobs)} selected-checkpoint evaluations"
+                )
+                return 0
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"Existing run cannot be resumed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
     atomic_write_json(manifest_path, manifest, sort_keys=False)
     environment = _environment()
-    rows: list[dict[str, Any]] = []
     test_rows: list[dict[str, Any]] = []
     validation_summary: dict[str, Any] | None = None
     failed = False
     try:
-        preflight_output = run_dir / "gpu-preflight.json"
+        preflight_output = _validated_write_path(
+            run_dir / "gpu-preflight.json", run_dir, label="GPU preflight output"
+        )
         preflight_command = [
             sys.executable,
             "-B",
@@ -1013,9 +1413,8 @@ def main(argv: list[str] | None = None) -> int:
             "--json-out",
             str(preflight_output),
         ]
-        preflight_code = run_logged(
-            preflight_command, run_dir / "logs/gpu-preflight.log", environment
-        )
+        preflight_log = _validated_log_path(run_dir / "logs/gpu-preflight.log", run_dir)
+        preflight_code = run_logged(preflight_command, preflight_log, environment)
         preflight_errors: list[str] = []
         if preflight_code == 0:
             try:
@@ -1036,10 +1435,15 @@ def main(argv: list[str] | None = None) -> int:
         atomic_write_json(manifest_path, manifest, sort_keys=False)
         if not failed:
             for job in jobs:
+                if job["status"] == "passed":
+                    continue
+                _quarantine_incomplete_output(job, run_dir)
+                job["artifact_errors"] = []
                 job["status"] = "running"
                 job["started_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
                 atomic_write_json(manifest_path, manifest, sort_keys=False)
-                code = run_logged(job["command"], Path(job["log_path"]), environment)
+                log_path = _validated_log_path(Path(job["log_path"]), run_dir)
+                code = run_logged(job["command"], log_path, environment)
                 job["returncode"] = code
                 job["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
                 if code == 0:
@@ -1049,6 +1453,7 @@ def main(argv: list[str] | None = None) -> int:
                         job["artifact_errors"] = [f"{type(exc).__name__}: {exc}"]
                     else:
                         rows.extend(job_rows)
+                        job["accepted_rows"] = job_rows
                 job["status"] = "passed" if code == 0 and not job["artifact_errors"] else "failed"
                 failed = failed or job["status"] == "failed"
                 atomic_write_json(manifest_path, manifest, sort_keys=False)
@@ -1073,19 +1478,31 @@ def main(argv: list[str] | None = None) -> int:
             failed = True
             manifest["source_integrity_valid"] = False
             manifest["source_integrity_error"] = "experiment source changed during the run"
+        stored_test_jobs = manifest.get("test_evaluation_jobs", [])
         test_jobs = (
             make_test_jobs(args, run_dir, validation_summary["selected_checkpoints"])
             if not failed
+            else list(stored_test_jobs)
+            if is_resume and isinstance(stored_test_jobs, list)
             else []
         )
+        if not failed and is_resume and stored_test_jobs:
+            _restore_or_rebind_test_job_state(test_jobs, stored_test_jobs, run_dir)
+            _validate_job_paths(test_jobs, run_dir)
+            test_rows = _recover_test_rows(test_jobs)
         manifest["test_evaluation_jobs"] = test_jobs
         atomic_write_json(manifest_path, manifest, sort_keys=False)
         if not failed:
             for test_job in test_jobs:
+                if test_job["status"] == "passed":
+                    continue
+                _quarantine_incomplete_output(test_job, run_dir)
+                test_job["artifact_errors"] = []
                 test_job["status"] = "running"
                 test_job["started_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
                 atomic_write_json(manifest_path, manifest, sort_keys=False)
-                code = run_logged(test_job["command"], Path(test_job["log_path"]), environment)
+                log_path = _validated_log_path(Path(test_job["log_path"]), run_dir)
+                code = run_logged(test_job["command"], log_path, environment)
                 test_job["returncode"] = code
                 test_job["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
                 if code == 0:
@@ -1095,6 +1512,7 @@ def main(argv: list[str] | None = None) -> int:
                         test_job["artifact_errors"] = [f"{type(exc).__name__}: {exc}"]
                     else:
                         test_rows.append(test_row)
+                        test_job["accepted_result"] = test_row
                 test_job["status"] = (
                     "passed" if code == 0 and not test_job["artifact_errors"] else "failed"
                 )

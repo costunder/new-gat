@@ -692,11 +692,11 @@ Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 
 ### 코드 스냅샷
 
 - 파일: `gpt_handoff/CODE_SUMMARY.md`
-- 스냅샷 생성 기준 parent Git HEAD: `b26aec8e5a6fbb88829ad3a9bd6335ad3a20654c`
+- 스냅샷 생성 기준 parent Git HEAD: `8541166ee679ba70138a6efffd31989b03dd1d81`
   (현재 전체 scaling 작업본 포함)
 - 포함 파일: 210개
-- 크기: 2,334,863 bytes, 58,814 lines (`str.splitlines()` 기준)
-- SHA-256: `D999B6FAAB1DA7048A56159CD54DAC3EC8E965A2FB818D347D3FABFB233814DE`
+- 크기: 2,431,924 bytes, 61,139 lines (`str.splitlines()` 기준)
+- SHA-256: `7D4D023C4C1CAA982BD8A782E28D687E20C1FADC29B716D107879C30FCDF918C`
 - 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`, `.gitattributes`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
 - 범위: 이 버전의 전체 source/test/config/script. 생성기는 작업본 변경도 포함하므로 게시 전
@@ -1519,7 +1519,7 @@ roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사�
 ## 8. 자동 검증 상태
 
 현재 전체 scaling runner까지 포함한 구현은 `PYTHONUTF8=1` 전체 로컬 회귀에서
-**1394 passed / 66 skipped** (86.72 s, exit 0)를 통과했다. 버전별 전용 결과는 V2
+**1418 passed / 77 skipped** (80.24 s, exit 0)를 통과했다. 버전별 전용 결과는 V2
 **118 passed**, V3 **141 passed / 2 skipped**, V4 **131 passed**다. Ruff·compileall과
 재생성한 `code_summary --check`도 통과했다. 생략은 Linux/Bash 계약, Windows symlink 권한,
 로컬 PyG 미설치와 실제 CUDA RNG처럼 이 호스트에서 충족되지 않은 환경 조건이다. 공개 데이터
@@ -1589,11 +1589,14 @@ Read-only protocol 교차검토에서는 CycleCount full specification/hash가 �
 실제 message layer 2/4를 조합하고, 모든 profile에서 800 updates와 chart 8/8을 고정한 채
 fixed/multi를 모두 새로 학습한다.
 
-기본 5 seeds 전체는 Conductance 860, Cycle 80, Tree 80으로 총 1,020 fresh trainings다.
-Cycle과 Tree는 seed 평균 validation으로 공통 profile을 선택한 뒤 선택된 checkpoint 20개씩만
-test-only로 평가하며, 이 40회는 재학습이 아니므로 1,020 학습 횟수에 포함하지 않는다.
-트랙별 결과와 통합 manifest는 기존 기본 결과와 별도 경로에 create-once로 저장한다. 한 트랙
-실패 뒤에도 기본 통합 runner는 가능한 다음 트랙을 실행하되 전체 상태는 failed로 남긴다.
+기본 model seed 0 전체는 Conductance 172, Cycle 16, Tree 16으로 총 204 fresh trainings다.
+Cycle과 Tree는 요청된 seed의 평균 validation으로 공통 profile을 선택한 뒤 선택된 checkpoint
+4개씩만 test-only로 평가하며, 이 8회는 재학습이 아니므로 204 학습 횟수에 포함하지 않는다.
+트랙별 결과와 통합 manifest는 기존 기본 결과와 별도 경로에 저장한다. 같은 인수와 run ID로
+재실행하면 설정·소스·artifact를 검증하고 완료 child는 건너뛰며 미완료 child만 재실행한다.
+완료된 하위 run은 GPU preflight 없이 전체 artifact와 집계를 검증해 반환한다. 진행 중이던
+단일 child의 epoch 상태는 이어받지 않고 그 child만 처음부터 다시 시작한다.
+한 트랙 실패 뒤에도 기본 통합 runner는 가능한 다음 트랙을 실행하되 전체 상태는 failed로 남긴다.
 자세한 profile, 명령, 결과 경계는 [RICH_SCALING_EXPERIMENTS.md](RICH_SCALING_EXPERIMENTS.md)를
 따른다. 현재는 코드와 로컬 계약 검증만 완료됐고 GPU scaling 결과는 없다.
 
@@ -1726,6 +1729,6 @@ Node-degree 개선은 관측했지만 같은 정규화에서 learned C의 valida
 원본 artifact를 확보·검증하고, V2/V3/V4의 확대된 8/10/20개 학습을 새 run으로 완료하며,
 최적화의 GPU 검증과
 Tree protocol 한계를 독립적으로 다뤄야 한다. V1을 포함한 전체 큰 모델 scaling suite도
-코드만 준비됐으므로 1,020개 결과가 있는 것처럼 주장하지 말고 서버 manifest를 별도로
+코드만 준비됐으므로 204개 결과가 있는 것처럼 주장하지 말고 서버 manifest를 별도로
 확보·검증해야 한다.
 Adaptive MST나 세 트랙 결합은 이후 별도 실험이며 기존 결과를 덮어쓰지 않는다.

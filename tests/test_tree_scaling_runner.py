@@ -23,9 +23,11 @@ def test_default_matrix_trains_both_versions_across_larger_profiles() -> None:
     jobs = runner.make_jobs(args, Path("fixture"))
     assert args.suites == ("csl", "zinc")
     assert args.profiles == ("base", "wide", "deep", "large")
-    assert args.model_seeds == (0, 1, 2, 3, 4)
-    assert len(jobs) == 40
-    assert sum(len(job["trained_models"]) for job in jobs) == 80
+    assert args.model_seeds == (0,)
+    assert len(jobs) == 8
+    assert sum(len(job["trained_models"]) for job in jobs) == 16
+    assert len(args.suites) * len(runner.MODELS) == 4
+    assert len(args.suites) * len(args.model_seeds) * len(runner.MODELS) == 4
     assert len({job["output_dir"] for job in jobs}) == len(jobs)
     assert runner.PROFILE_CONFIGS == {
         "base": {
@@ -63,6 +65,18 @@ def test_default_matrix_trains_both_versions_across_larger_profiles() -> None:
         assert command[command.index("-m") + 1] == "research.tree_augmentation.paper"
         for key, value in job["profile_config"].items():
             assert command[command.index("--" + key.replace("_", "-")) + 1] == str(value)
+
+
+def test_default_dry_run_reports_seed_zero_plan_without_writes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert runner.main(["--results-root", str(tmp_path), "--dry-run"]) == 0
+    output = capsys.readouterr().out
+    assert "8 validation-candidate child runs" in output
+    assert "16 fresh model trainings" in output
+    assert "4 aggregate profile selections" in output
+    assert "4 selected-checkpoint test evaluations" in output
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_paper_scaling_overrides_are_opt_in_and_validated() -> None:
@@ -351,12 +365,31 @@ def _stub(
             (job for job in manifest["jobs"] if Path(job["output_dir"]) == output), None
         )
         if candidate is not None:
+            candidate_call_count = sum(
+                "--evaluation-scope" in call
+                and call[call.index("--evaluation-scope") + 1] == "validation"
+                for call in calls
+            )
+            if failure == "second_child_exit" and candidate_call_count == 2:
+                return 9
+            if failure == "second_child_interrupt" and candidate_call_count == 2:
+                raise KeyboardInterrupt
+            if failure == "child_exit_with_artifact":
+                _write_child(candidate)
+                return 9
             if failure != "child_missing":
                 _write_child(candidate, malformed="metric" if failure == "child_metric" else None)
         else:
             selected = next(
                 job for job in manifest["selected_test_jobs"] if Path(job["output_dir"]) == output
             )
+            selected_call_count = sum(
+                "--evaluation-scope" in call
+                and call[call.index("--evaluation-scope") + 1] == "selected_test"
+                for call in calls
+            )
+            if failure == "second_selected_exit" and selected_call_count == 2:
+                return 9
             _write_selected_child(selected)
         return 0
 
@@ -412,6 +445,253 @@ def test_success_checks_metrics_parameters_artifacts_and_records_profile(
         set(job["result"]["parameter_counts"]) == set(runner.MODELS) for job in manifest["jobs"]
     )
     assert "chart_family_isolation" in summary
+
+
+def test_completed_run_returns_without_relaunching_preflight_or_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    assert len(calls) == 5
+    root = tmp_path / "tree_augmentation/scaling/unit"
+    before = json.loads((root / "manifest.json").read_text("utf-8"))
+    candidate_results = [job["result"] for job in before["jobs"]]
+    selected_results = [job["result"] for job in before["selected_test_jobs"]]
+    unexpected_calls: list[list[str]] = []
+
+    def failing_if_relaunched(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        unexpected_calls.append(command)
+        return 97
+
+    monkeypatch.setattr(runner, "_run_logged", failing_if_relaunched)
+    assert runner.main(options) == 0
+    assert unexpected_calls == []
+
+    after = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert after["status"] == "passed"
+    assert all(job["status"] == "passed" for job in after["jobs"])
+    assert all(job["status"] == "passed" for job in after["selected_test_jobs"])
+    assert [job["result"] for job in after["jobs"]] == candidate_results
+    assert [job["result"] for job in after["selected_test_jobs"]] == selected_results
+
+
+def test_resume_skips_verified_candidate_and_retries_incomplete_child_on_new_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, first_calls = _stub(tmp_path, monkeypatch, failure="second_child_interrupt")
+    assert runner.main(options) == 130
+    assert len(first_calls) == 3
+    root = tmp_path / "tree_augmentation/scaling/unit"
+    failed_manifest = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert [job["status"] for job in failed_manifest["jobs"]] == ["passed", "failed"]
+    first_output = Path(failed_manifest["jobs"][0]["output_dir"])
+    first_summary_digest = _digest(first_output / "summary.json")
+
+    resume_options, resume_calls = _stub(tmp_path, monkeypatch)
+    assert resume_options == options
+    assert runner.main(resume_options) == 0
+    assert len(resume_calls) == 4  # preflight + one candidate retry + two selected tests
+    candidate_calls = [
+        call
+        for call in resume_calls
+        if "--evaluation-scope" in call
+        and call[call.index("--evaluation-scope") + 1] == "validation"
+    ]
+    assert len(candidate_calls) == 1
+    assert Path(candidate_calls[0][candidate_calls[0].index("--output-dir") + 1]) != first_output
+    assert _digest(first_output / "summary.json") == first_summary_digest
+
+    resumed = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert resumed["status"] == "passed"
+    assert resumed["invocation_count"] == 2
+    assert resumed["jobs"][0]["attempt"] == 1
+    assert resumed["jobs"][1]["attempt"] == 2
+    assert len(resumed["jobs"][1]["attempt_history"]) == 1
+    assert all(job["status"] == "passed" for job in resumed["jobs"])
+
+
+def test_resume_skips_candidates_and_verified_selected_checkpoint_evaluation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, first_calls = _stub(tmp_path, monkeypatch, failure="second_selected_exit")
+    assert runner.main(options) == 1
+    assert len(first_calls) == 5
+    root = tmp_path / "tree_augmentation/scaling/unit"
+    failed_manifest = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert [job["status"] for job in failed_manifest["jobs"]] == ["passed", "passed"]
+    assert [job["status"] for job in failed_manifest["selected_test_jobs"]] == [
+        "passed",
+        "failed",
+    ]
+    completed_test_output = Path(failed_manifest["selected_test_jobs"][0]["output_dir"])
+    completed_test_digest = _digest(completed_test_output / "summary.json")
+
+    resume_options, resume_calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(resume_options) == 0
+    assert len(resume_calls) == 2  # preflight + only the incomplete selected test
+    scoped = [call for call in resume_calls if "--evaluation-scope" in call]
+    assert len(scoped) == 1
+    assert scoped[0][scoped[0].index("--evaluation-scope") + 1] == "selected_test"
+    assert _digest(completed_test_output / "summary.json") == completed_test_digest
+
+    resumed = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert resumed["status"] == "passed"
+    assert [job["attempt"] for job in resumed["selected_test_jobs"]] == [1, 2]
+    assert all(job["status"] == "passed" for job in resumed["selected_test_jobs"])
+    summary = json.loads((root / "summary.json").read_text("utf-8"))
+    assert summary["completed_selected_checkpoint_test_evaluations"] == 4
+
+
+def test_nonzero_candidate_with_complete_artifacts_is_retried_on_a_new_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, _calls = _stub(tmp_path, monkeypatch, failure="child_exit_with_artifact")
+    assert runner.main(options) == 1
+    root = tmp_path / "tree_augmentation/scaling/unit"
+    failed = json.loads((root / "manifest.json").read_text("utf-8"))
+    failed_output = Path(failed["jobs"][0]["output_dir"])
+    assert (failed_output / "summary.json").is_file()
+
+    resume_options, resume_calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(resume_options) == 0
+    candidate_calls = [
+        call
+        for call in resume_calls
+        if "--evaluation-scope" in call
+        and call[call.index("--evaluation-scope") + 1] == "validation"
+    ]
+    assert candidate_calls
+    assert Path(candidate_calls[0][candidate_calls[0].index("--output-dir") + 1]) != failed_output
+
+
+def test_passed_candidate_result_mismatch_schedules_a_new_attempt(tmp_path: Path) -> None:
+    args = runner.parser().parse_args(
+        [
+            "--results-root",
+            str(tmp_path),
+            "--run-id",
+            "result-mismatch",
+            "--suites",
+            "csl",
+            "--profiles",
+            "wide",
+            "--model-seeds",
+            "3",
+        ]
+    )
+    run_dir = (tmp_path / "tree_augmentation/scaling/result-mismatch").resolve()
+    expected = runner.make_jobs(args, run_dir)[0]
+    job = json.loads(json.dumps(expected))
+    _write_child(job)
+    accepted = runner._validate_child(job)
+    job["status"] = "passed"
+    job["result"] = json.loads(json.dumps(accepted))
+    job["result"]["child_metrics_checked"] = False
+    original_output = Path(job["output_dir"])
+
+    runner._reconcile_candidate(job, expected, run_dir)
+
+    assert job["status"] == "pending"
+    assert job["attempt"] == 2
+    assert Path(job["output_dir"]) != original_output
+    assert original_output.is_dir()
+    assert job["attempt_history"][-1]["validation_error"] == (
+        "passed candidate differs from its accepted result"
+    )
+
+
+def test_interrupted_resume_rejects_preflight_symlink_before_child_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, first_calls = _stub(tmp_path, monkeypatch, failure="second_child_interrupt")
+    assert runner.main(options) == 130
+    assert len(first_calls) == 3
+    run = tmp_path / "tree_augmentation/scaling/unit"
+    preflight = run / "gpu-preflight.attempt-2.json"
+    sentinel = tmp_path / "outside-preflight.json"
+    sentinel.write_text("preserve-preflight", encoding="utf-8")
+    try:
+        preflight.symlink_to(sentinel)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    resume_calls: list[list[str]] = []
+
+    def unexpected_launch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        resume_calls.append(command)
+        pytest.fail("resume launched a subprocess before rejecting the preflight symlink")
+
+    monkeypatch.setattr(runner, "_run_logged", unexpected_launch)
+    assert runner.main(options) == 1
+    assert resume_calls == []
+    assert sentinel.read_text(encoding="utf-8") == "preserve-preflight"
+
+
+def test_interrupted_resume_rejects_summary_symlink_before_writes_or_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, first_calls = _stub(tmp_path, monkeypatch, failure="second_child_interrupt")
+    assert runner.main(options) == 130
+    assert len(first_calls) == 3
+    run = tmp_path / "tree_augmentation/scaling/unit"
+    summary = run / "summary.json"
+    summary.unlink()
+    sentinel = tmp_path / "outside-summary.json"
+    sentinel.write_text("preserve-summary", encoding="utf-8")
+    try:
+        summary.symlink_to(sentinel)
+    except OSError as error:
+        pytest.skip(f"file symlinks are unavailable: {error}")
+    manifest = run / "manifest.json"
+    manifest_before = manifest.read_bytes()
+    launches: list[list[str]] = []
+    writes: list[Path] = []
+
+    def unexpected_launch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        launches.append(command)
+        pytest.fail("resume launched a subprocess before rejecting the summary symlink")
+
+    def unexpected_write(path: Path, *_args, **_kwargs) -> None:
+        writes.append(Path(path))
+        pytest.fail("resume wrote state before rejecting the summary symlink")
+
+    monkeypatch.setattr(runner, "_run_logged", unexpected_launch)
+    monkeypatch.setattr(runner, "atomic_write_json", unexpected_write)
+    assert runner.main(options) == 2
+    assert launches == [] and writes == []
+    assert manifest.read_bytes() == manifest_before
+    assert sentinel.read_text(encoding="utf-8") == "preserve-summary"
+
+
+def test_retry_path_rejects_resume_attempts_symlink_outside_run(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (run_dir / "resume-attempts").symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+    original_output = run_dir / "candidate"
+    command = ["python", "child.py", "--output-dir", str(original_output)]
+    expected = {
+        "suite": "csl",
+        "profile": "base",
+        "model_seed": 0,
+        "command": command,
+        "output_dir": str(original_output),
+        "log_path": str(run_dir / "logs/candidate.log"),
+    }
+    job = {**expected, "attempt": 1, "status": "failed", "exit_code": 9}
+    with pytest.raises(ValueError, match="outside the run directory"):
+        runner._retry_record(
+            job,
+            expected,
+            run_dir,
+            kind="candidate",
+            validation_error="interrupted",
+        )
 
 
 @pytest.mark.parametrize(
