@@ -41,7 +41,12 @@ def parser() -> argparse.ArgumentParser:
         "--datasets",
         nargs="+",
         default=list(DEFAULT_DATASETS),
-        help="Fixed-graph datasets: " + ", ".join(DATASETS) + "; default: ogbn-arxiv",
+        help=(
+            "Fixed-graph datasets: "
+            + ", ".join(DATASETS)
+            + "; default: "
+            + ", ".join(DEFAULT_DATASETS)
+        ),
     )
     result.add_argument("--model-seed", type=int, default=0, help="One seed, not a seed list")
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
@@ -62,8 +67,9 @@ def _validate(args: argparse.Namespace) -> None:
     shared._validate(args)
     if "ppi" in args.datasets:
         raise ValueError(
-            "PPI is unsupported in direct-C V2: graph-specific edge parameters cannot transfer "
-            "to held-out PPI graphs. Use the separate shared-generator V1 experiment."
+            "Direct-C V2 is N/A for PPI: graph-specific edge parameters are bound to one "
+            "fixed topology and cannot be defined for held-out PPI graphs without changing "
+            "the method. Use the separate shared-generator V1 experiment for PPI."
         )
     if not args.datasets or any(dataset not in DATASETS for dataset in args.datasets):
         raise ValueError("Unsupported fixed-graph dataset; choose: " + ", ".join(DATASETS))

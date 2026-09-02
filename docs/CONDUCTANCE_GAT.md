@@ -2,19 +2,20 @@
 
 **상대 C graph operator와 spatial message `W`를 함께 학습하는 [V4 통합 문서](../gpt_handoff/CONDUCTANCE_V4.md)**는
 v2/v3를 바꾸지 않는 별도 2×2 실행이다. V3의 `C(H)`와 대칭 정규화를 유지하면서 각 층의
-이웃 메시지에 identity-initialized bias-free `W`를 적용한다. 기본은 ogbn-arxiv ×
-고정/상대 C × identity/학습 W × seed 0이며 validation만 평가한다.
+이웃 메시지에 identity-initialized bias-free `W`를 적용한다. 기본은 v1의 5개 데이터 ×
+고정/상대 C × identity/학습 W × seed 0의 20회 학습이며 validation만 평가한다.
 
 **상대 C 생성기를 학습하는 [v3](../gpt_handoff/CONDUCTANCE_V3.md)**도 별도 실행한다. 공유 MLP의 score를
 그래프별 중심화·정규화하여 상대 C를 만들고, 등방성 혼합 비율과 전파 강도를 따로 학습한다.
 대칭 정규화와 AdamW 분리 그룹을 사용하며 기존 모델이나 v2를 덮어쓰지 않는다.
-기본은 v2와 같은 ogbn-arxiv × `relative_c`/`fixed_c` × seed 0이며 validation만 평가한다.
+기본은 v1의 Cora/CiteSeer/PubMed/PPI/ogbn-arxiv × `relative_c`/`fixed_c` × seed 0의
+10회 학습이며 validation만 평가한다. PPI는 공식 20/2/2 inductive split과 global micro-F1을 쓴다.
 
 **엣지별 C 자체를 직접 학습하는 [v2](../gpt_handoff/CONDUCTANCE_V2.md)**는 `research/conductance_gat/v2/`의 별도 실행 경로를 쓴다.
-기존 shared-MLP 모델을 변경하지 않으며, ogbn-arxiv에서 direct C / fixed C=1을
-model seed 0 하나로 새로 비교한다. MLP나 고유분해 없이 `c_e=exp(alpha_e)`를 학습하고,
+기존 shared-MLP 모델을 변경하지 않으며, Cora/CiteSeer/PubMed/ogbn-arxiv에서
+direct C / fixed C=1을 model seed 0 하나로 각각 새로 비교한다(총 8회). MLP나 고유분해 없이 `c_e=exp(alpha_e)`를 학습하고,
 정확한 chunked backward로 엣지 중간값 메모리를 제한한다. 그래프별 파라미터를 사용하므로
-PPI의 미관측 그래프 전이와 합치지 않으며, 기본 benchmark나 전체 실행에 자동 추가하지 않는다.
+PPI의 미관측 그래프에는 정의되지 않아 PPI만 V2에서 N/A로 기록한다.
 
 Gate weight decay와 정규화의 2×2 원인 비교는 [별도 실험 문서](CONDUCTANCE_FACTORIAL.md)에 있다.
 PPI·ogbn-arxiv에서 seed 0 하나로 4조건을 새로 학습하며, 아래 기존 benchmark는 변경하지 않는다.

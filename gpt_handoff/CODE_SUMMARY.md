@@ -14083,6 +14083,7 @@ from research.conductance_gat.v3.diagnostics import (
     ForwardObservation,
     Intervention,
     best_checkpoint_interventions,
+    changed_prediction_fraction,
     evaluate_validation,
     moments,
 )
@@ -14210,6 +14211,13 @@ def test_empty_and_nonfinite_statistics():
     assert moments(torch.empty(0))["mean"] is None
     with pytest.raises(FloatingPointError):
         moments(torch.tensor([float("nan")]))
+
+
+def test_ppi_changed_predictions_are_labelwise_threshold_decisions():
+    reference = torch.tensor([[2.0, 0.1], [1.0, -1.0]])
+    logits = torch.tensor([[2.0, -0.1], [1.0, -1.0]])
+    assert changed_prediction_fraction(logits, reference, "accuracy") == 0.0
+    assert changed_prediction_fraction(logits, reference, "micro_f1") == 0.25
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA RNG check needs real CUDA")
@@ -14602,7 +14610,7 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
         "model_seed": 0,
         "epochs": 100,
         "patience": 20,
-        "batch_size": 1,
+        "batch_size": 2,
         "workers": 0,
         "device": "cuda",
         "edge_chunk_size": 65536,
@@ -14621,6 +14629,42 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
     configuration = {k: v for k, v in config.items() if k != "datasets"}
     configuration.update(tf32=False, pin_memory=True)
     for dataset in datasets:
+        is_ppi = dataset == "ppi"
+        child_batch_size = 2 if is_ppi else 1
+        metric_name = "micro_f1" if is_ppi else "accuracy"
+        prediction_unit = "node_label_decision" if is_ppi else "node"
+        validation_graph_count = 2 if is_ppi else 1
+        optimizer_steps_per_epoch = 10 if is_ppi else 1
+        child_configuration = copy.deepcopy(configuration)
+        child_configuration["batch_size"] = child_batch_size
+        protocol = {
+            "data_sha256": hashlib.sha256(dataset.encode()).hexdigest(),
+            "dataset": dataset,
+            "split": (
+                "official_inductive_graph_split"
+                if is_ppi
+                else "official_time_split"
+                if dataset == "ogbn-arxiv"
+                else "official_public_masks"
+            ),
+            "task": "multi_label_node_classification" if is_ppi else "node_classification",
+            "metric": metric_name,
+        }
+        if is_ppi:
+            protocol.update(
+                split_counts={"train": 20, "validation": 2, "test": 2},
+            )
+        topology = (
+            {
+                "scope": "official_train_and_validation_graphs",
+                "split_graph_counts": {"train": 20, "validation": 2},
+                "split_num_nodes": {"train": 40, "validation": 4},
+                "split_num_edges": {"train": 30, "validation": 3},
+                "split_incidence_sha256": {"train": "2" * 64, "validation": "3" * 64},
+            }
+            if is_ppi
+            else {"num_nodes": 4, "num_edges": edges, "incidence_sha256": "2" * 64}
+        )
         for condition, spec in CONDITIONS.items():
             output = root / dataset / condition
             output.mkdir(parents=True)
@@ -14687,6 +14731,11 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                 "status": "passed",
                 "scope": "validation_selected_best_checkpoint_only",
                 "original": {"validation": score, "loss": 0.7},
+                "validation_graph_count": validation_graph_count,
+                "prediction_unit": prediction_unit,
+                "prediction_rule": (
+                    "logit_gt_zero_node_label" if is_ppi else "argmax_node_class"
+                ),
                 "rows": [
                     {
                         "intervention": name,
@@ -14694,6 +14743,10 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                         "percentage_points": -1.0,
                         "logit_mean_absolute_delta": 0.1,
                         "changed_prediction_fraction": 0.02,
+                        "prediction_unit": prediction_unit,
+                        "prediction_rule": (
+                            "logit_gt_zero_node_label" if is_ppi else "argmax_node_class"
+                        ),
                     }
                     for name in ("mean_c", "shuffled_c", "ones_c", "propagation_off")
                 ],
@@ -14707,14 +14760,17 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                 "model_seed": 0,
                 **spec,
                 "non_gate_weight_decay": 0.0005,
-                "configuration": copy.deepcopy(configuration),
+                "configuration": child_configuration,
                 "cache_sha256": data_hash,
-                "protocol": {"data_sha256": data_hash, "official": True},
+                "protocol": protocol,
                 "initial_state_sha256": "a" * 64,
                 "best_epoch": 10,
                 "epochs_run": 30,
                 "validation": 0.55 if condition == "relative_c" else 0.50,
-                "metric_name": "accuracy",
+                "metric_name": metric_name,
+                "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+                "optimizer_steps": 30 * optimizer_steps_per_epoch,
+                "best_checkpoint_optimizer_steps": 10 * optimizer_steps_per_epoch,
                 "train_loss": 0.7,
                 "elapsed_seconds": 2.0,
                 "peak_cuda_allocated_bytes": 100,
@@ -14734,7 +14790,13 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                         "mode": "eval",
                         "split": "validation",
                         "metric": score,
+                        "metric_name": metric_name,
+                        "prediction_rule": (
+                            "logit_gt_zero_node_label" if is_ppi else "argmax_node_class"
+                        ),
                         "loss": 0.7,
+                        "validation_graph_count": validation_graph_count,
+                        "prediction_unit": prediction_unit,
                         "layers": layer_stats,
                     },
                     "best_checkpoint_interventions": interventions,
@@ -14742,8 +14804,12 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                         {
                             "epoch": 10,
                             "batch_index": 0,
-                            "optimizer_steps_before_batch": 9,
-                            "scope": "full_graph_train_mask",
+                            "optimizer_steps_before_batch": 9 * optimizer_steps_per_epoch,
+                            "scope": (
+                                "first_actual_training_minibatch_only"
+                                if is_ppi
+                                else "full_graph_train_mask"
+                            ),
                             "mode": "train_dropout_on",
                             "stage": "after_task_backward_before_optimizer_step",
                             "layers": [
@@ -14755,7 +14821,7 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                 },
                 "source_sha256": source,
                 "parameterization": PARAMETERIZATION,
-                "topology": {"num_nodes": 4, "num_edges": edges, "incidence_sha256": "2" * 64},
+                "topology": topology,
             }
             for name, path in (("checkpoint", checkpoint), ("history", history)):
                 metrics[name] = str(path)
@@ -14766,6 +14832,7 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                 {
                     "dataset": dataset,
                     "condition": condition,
+                    "batch_size": child_batch_size,
                     "status": "passed",
                     "output_dir": str(output),
                     "metrics_path": str(metrics_path),
@@ -14849,7 +14916,7 @@ def test_child_mismatch_invalidates_all_deltas(tmp_path, key, value):
 
 
 @pytest.mark.parametrize(
-    "change", ["source", "missing_source", "duplicate", "missing", "spec", "ppi"]
+    "change", ["source", "missing_source", "duplicate", "missing", "spec", "unknown"]
 )
 def test_invalid_manifest_withholds_contrasts(tmp_path, change):
     root, manifest = _fixture(tmp_path)
@@ -14861,8 +14928,8 @@ def test_invalid_manifest_withholds_contrasts(tmp_path, change):
         manifest["jobs"].append(manifest["jobs"][0])
     elif change == "missing":
         manifest["jobs"].pop()
-    elif change == "ppi":
-        manifest["config"]["datasets"] = ["ppi"]
+    elif change == "unknown":
+        manifest["config"]["datasets"] = ["unknown"]
     else:
         manifest["conditions"] = {}
     with pytest.raises(ComparisonIntegrityError):
@@ -14977,6 +15044,41 @@ def test_report_uses_relative_scalars_and_interventions_not_legacy_rho(tmp_path)
     assert "single-factor comparison" in text
     assert "Validation computes no gradients" in text
     assert "Actual training gradients" in text and "0.125000" in text
+
+
+def test_ppi_report_uses_micro_f1_and_official_inductive_contract(tmp_path):
+    root, manifest = _fixture(tmp_path, ("ppi",))
+    report = write_comparison(root, manifest)
+    assert report["status"] == "passed"
+    assert report["datasets"][0]["metric_name"] == "micro_f1"
+    assert report["datasets"][0]["held_fixed"]["topology"]["split_graph_counts"] == {
+        "train": 20,
+        "validation": 2,
+    }
+    assert "ppi (micro_f1" in (root / "comparison.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("dataset", "cora"), ("task", "node_classification"), ("metric", "accuracy")],
+)
+def test_ppi_report_rejects_wrong_cached_task_contract(tmp_path, field, value):
+    root, manifest = _fixture(tmp_path, ("ppi",))
+    _edit(manifest, lambda child: child["protocol"].update({field: value}))
+    with pytest.raises(ComparisonIntegrityError, match="official V1 dataset contract"):
+        write_comparison(root, manifest)
+
+
+def test_ppi_report_rejects_wrong_prediction_threshold_contract(tmp_path):
+    root, manifest = _fixture(tmp_path, ("ppi",))
+    _edit(
+        manifest,
+        lambda child: child["diagnostics"]["best_validation"].update(
+            prediction_rule="argmax_node_class"
+        ),
+    )
+    with pytest.raises(ComparisonIntegrityError, match="prediction scope mismatch"):
+        write_comparison(root, manifest)
 
 
 @pytest.mark.parametrize("value", ["not-a-number", False, -1.0])
@@ -15146,6 +15248,106 @@ def test_invalid_protocol_rejected(tmp_path, field, value):
         train._validate_args(args)
 
 
+def test_child_batch_size_defaults_resolve_by_dataset(tmp_path):
+    cora = arguments(tmp_path)
+    assert cora.batch_size is None
+    train._validate_args(cora)
+    assert cora.batch_size == 1
+    ppi = train.build_parser().parse_args(
+        [
+            "--dataset",
+            "ppi",
+            "--condition",
+            "relative_c",
+            "--output-dir",
+            str(tmp_path / "ppi"),
+        ]
+    )
+    train._validate_args(ppi)
+    assert ppi.batch_size == 2 and ppi.workers == 0
+
+
+def test_ppi_uses_all_train_minibatches_and_all_validation_graphs(monkeypatch, tmp_path):
+    pytest.importorskip("torch_geometric")
+    from torch_geometric.data import Data
+    from torch_geometric.loader import DataLoader
+
+    mock_hardware(monkeypatch)
+    graphs = []
+    for graph_index in range(6):
+        graphs.append(
+            Data(
+                x=torch.tensor(
+                    [[0.5 + graph_index, 1.0, 2.0], [1.0, 2.0, 0.5], [2.0, 0.5, 1.0]]
+                ),
+                y=torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+                incidence_edge_index=torch.tensor([[0, 1], [1, 2]]),
+            )
+        )
+
+    class NoTest(dict):
+        def __getitem__(self, key):
+            if key == "test":
+                raise AssertionError("PPI test graphs must not be read")
+            return super().__getitem__(key)
+
+    splits = NoTest(train=[0, 1, 2, 3], validation=[4, 5])
+    payload = {
+        "dataset": "ppi",
+        "classes": 2,
+        "graphs": [
+            {
+                "x": graph.x,
+                "y": graph.y,
+                "incidence_edge_index": graph.incidence_edge_index,
+            }
+            for graph in graphs
+        ],
+        "splits": splits,
+    }
+    loaders = {
+        "train": DataLoader(graphs[:4], batch_size=2, shuffle=False),
+        "validation": DataLoader(graphs[4:], batch_size=2, shuffle=False),
+    }
+    monkeypatch.setattr(train, "_make_data", lambda *args: (loaders, None))
+    args = train.build_parser().parse_args(
+        [
+            "--dataset",
+            "ppi",
+            "--condition",
+            "relative_c",
+            "--output-dir",
+            str(tmp_path / "ppi-train"),
+            "--epochs",
+            "2",
+            "--patience",
+            "2",
+            "--edge-chunk-size",
+            "2",
+        ]
+    )
+    args.output_dir.mkdir()
+    result = train.train_model(
+        payload, {"data_sha256": "b" * 64}, args, torch.device("cpu"), args.output_dir
+    )
+    assert result["optimizer_steps_per_epoch"] == 2
+    assert result["optimizer_steps"] == 2 * result["epochs_run"]
+    assert result["best_checkpoint_optimizer_steps"] == 2 * result["best_epoch"]
+    assert result["metric_name"] == "micro_f1"
+    best = result["diagnostics"]["best_validation"]
+    assert best["validation_graph_count"] == 2
+    assert best["label_decision_count"] == 12
+    assert best["prediction_unit"] == "node_label_decision"
+    assert all(
+        row["prediction_unit"] == "node_label_decision"
+        for row in result["diagnostics"]["best_checkpoint_interventions"]["rows"]
+    )
+    assert result["diagnostics"]["train_trajectory"][0]["scope"] == (
+        "first_actual_training_minibatch_only"
+    )
+    assert result["topology"]["split_graph_counts"] == {"train": 4, "validation": 2}
+
+
 def test_real_two_arm_runner_training_checkpoint_and_report(monkeypatch, tmp_path):
     from research.conductance_gat.v3 import report
     from scripts import run_conductance_v3 as runner
@@ -15155,7 +15357,14 @@ def test_real_two_arm_runner_training_checkpoint_and_report(monkeypatch, tmp_pat
     monkeypatch.setattr(train, "_make_data", lambda *args: (graph, indices))
     fixture_file = tmp_path / "tiny_unit_fixture.pt"
     atomic_publish(fixture_file, lambda path: torch.save(payload, path))
-    protocol = {"data_sha256": sha256_file(fixture_file), "unit_fixture_only": True}
+    protocol = {
+        "data_sha256": sha256_file(fixture_file),
+        "dataset": "cora",
+        "split": "official_public_masks",
+        "task": "node_classification",
+        "metric": "accuracy",
+        "unit_fixture_only": True,
+    }
     monkeypatch.setattr(train, "load_dataset", lambda *args, **kwargs: (payload, protocol))
     monkeypatch.setattr(
         train, "_cache_snapshot", lambda args: {str(fixture_file): sha256_file(fixture_file)}
@@ -15205,13 +15414,13 @@ def test_real_two_arm_runner_training_checkpoint_and_report(monkeypatch, tmp_pat
     )
     assert result == 0 and len(executions) == 2
     root = tmp_path / "results/conductance_gat/v3/unit-fixture"
-    manifest = json.loads((root / "manifest.json").read_text())
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     comparison = report.write_comparison(root, manifest)
     assert comparison["status"] == "passed"
     hashes = []
     for condition in CONDITIONS:
         folder = root / "cora" / condition
-        metrics = json.loads((folder / "metrics.json").read_text())
+        metrics = json.loads((folder / "metrics.json").read_text(encoding="utf-8"))
         hashes.append(metrics["initial_state_sha256"])
         assert metrics["research_suite"] == SUITE and metrics["test_evaluated"] is False
         assert metrics["checkpoint_sha256"] == sha256_file(folder / "best.pt")
@@ -15268,7 +15477,7 @@ def test_missing_cache_writes_failed_metrics_without_training(monkeypatch, tmp_p
                 str(tmp_path / "failed"),
             ]
         )
-    record = json.loads((tmp_path / "failed/metrics.json").read_text())
+    record = json.loads((tmp_path / "failed/metrics.json").read_text(encoding="utf-8"))
     assert record["status"] == "failed" and "absent" in record["error"]
 
 
@@ -15596,7 +15805,7 @@ from ..ablation.protocol import COMMON
 SUITE = "conductance_direct_c_v2"
 PARAMETERIZATION = "direct_log_edge_conductance"
 DATASETS = ("cora", "citeseer", "pubmed", "ogbn-arxiv")
-DEFAULT_DATASETS = ("ogbn-arxiv",)
+DEFAULT_DATASETS = DATASETS
 DEFAULT_EDGE_CHUNK_SIZE = 65_536
 CONDITIONS = {
     "direct_c": {
@@ -16392,7 +16601,7 @@ if __name__ == "__main__":
 """Read-only observations for symmetric relative-C, never the old row-normalized rho.
 
 Training observations attach to the actual forward. Interventions run only after
-validation checkpoint selection, with no optimizer or test labels involved.
+validation checkpoint selection, with no optimizer step or test-label metric involved.
 """
 
 from __future__ import annotations
@@ -16406,6 +16615,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from ..ablation.model import state_sha256
+from ..benchmark import _binary_counts, _micro_f1_from_counts
 
 
 @contextmanager
@@ -16578,7 +16788,54 @@ class ForwardObservation:
         return output
 
 
-def evaluate_validation(model, graph, indices: Tensor, *, observe: bool = True):
+def evaluate_validation(
+    model,
+    data,
+    indices: Tensor | None,
+    *,
+    observe: bool = True,
+    device: torch.device | None = None,
+):
+    """Evaluate one fixed graph or the complete official two-graph PPI validation split."""
+    if indices is None:
+        if not isinstance(data, dict) or "validation" not in data:
+            raise ValueError("PPI validation loader is missing")
+        loader = data["validation"]
+        if len(loader) != 1:
+            raise ValueError("PPI validation must be its two official graphs in one batch")
+        if device is None:
+            device = next(model.parameters()).device
+        graph = next(iter(loader)).to(device, non_blocking=True)
+        if int(getattr(graph, "num_graphs", 0)) != 2:
+            raise ValueError("PPI validation must contain both official validation graphs")
+        with evaluation_mode(model):
+            if observe:
+                with ForwardObservation(model) as observation:
+                    logits = model(graph)
+                layers = observation.summary()
+            else:
+                logits, layers = model(graph), []
+            if not bool(torch.isfinite(logits).all()):
+                raise FloatingPointError("Nonfinite validation logits")
+            labels = graph.y
+            counts = _binary_counts(logits, labels)
+            result = {
+                "metric": _micro_f1_from_counts(counts),
+                "metric_name": "micro_f1",
+                "prediction_rule": "logit_gt_zero_node_label",
+                "loss": float(F.binary_cross_entropy_with_logits(logits, labels)),
+                "layers": layers,
+                "mode": "eval",
+                "split": "validation",
+                "validation_graph_count": 2,
+                "label_decision_count": labels.numel(),
+                "prediction_unit": "node_label_decision",
+                "observation_scope": (
+                    "all official PPI validation graphs; global node-label micro-F1"
+                ),
+            }
+        return result, logits.detach().cpu()
+    graph = data
     if not indices.numel():
         raise ValueError("Validation mask is empty")
     with evaluation_mode(model):
@@ -16594,13 +16851,30 @@ def evaluate_validation(model, graph, indices: Tensor, *, observe: bool = True):
             raise FloatingPointError("Nonfinite validation logits")
         result = {
             "metric": int((logits.argmax(-1) == labels).sum()) / indices.numel(),
+            "metric_name": "accuracy",
+            "prediction_rule": "argmax_node_class",
             "loss": float(F.cross_entropy(logits, labels)),
             "layers": layers,
             "mode": "eval",
             "split": "validation",
+            "validation_graph_count": 1,
+            "label_decision_count": indices.numel(),
+            "prediction_unit": "node",
             "observation_scope": "whole transductive graph states; validation labels only",
         }
     return result, logits.detach().cpu()
+
+
+def changed_prediction_fraction(logits: Tensor, reference: Tensor, metric_name: str) -> float:
+    if logits.shape != reference.shape or not logits.numel():
+        raise ValueError("Intervention/reference logits must be nonempty and aligned")
+    if metric_name == "micro_f1":
+        changed = (logits > 0) != (reference > 0)
+    elif metric_name == "accuracy":
+        changed = logits.argmax(-1) != reference.argmax(-1)
+    else:
+        raise ValueError("Unsupported intervention prediction metric")
+    return float(changed.double().mean())
 
 
 class Intervention:
@@ -16654,7 +16928,16 @@ class Intervention:
         return result
 
 
-def best_checkpoint_interventions(model, graph, indices, original, reference: Tensor, *, seed: int):
+def best_checkpoint_interventions(
+    model,
+    data,
+    indices,
+    original,
+    reference: Tensor,
+    *,
+    seed: int,
+    device: torch.device | None = None,
+):
     """All-layer read-only interventions, only on the selected best checkpoint."""
     before = state_sha256(model)
     modes = [module.training for module in model.modules()]
@@ -16666,7 +16949,9 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
     try:
         for name in ("mean_c", "shuffled_c", "ones_c", "propagation_off"):
             with Intervention(model, name, seed):
-                result, logits = evaluate_validation(model, graph, indices, observe=False)
+                result, logits = evaluate_validation(
+                    model, data, indices, observe=False, device=device
+                )
             difference = logits.double() - reference.double()
             rows.append(
                 {
@@ -16677,9 +16962,11 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
                     "score_delta": result["metric"] - original["metric"],
                     "logit_mean_absolute_delta": float(difference.abs().mean()),
                     "logit_max_absolute_delta": float(difference.abs().max()),
-                    "changed_prediction_fraction": float(
-                        (logits.argmax(-1) != reference.argmax(-1)).double().mean()
+                    "changed_prediction_fraction": changed_prediction_fraction(
+                        logits, reference, original["metric_name"]
                     ),
+                    "prediction_unit": original["prediction_unit"],
+                    "prediction_rule": original["prediction_rule"],
                 }
             )
     finally:
@@ -16698,6 +16985,9 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
         "scope": "validation_selected_best_checkpoint_only",
         "layers": "all_layers_simultaneously",
         "original": {"validation": original["metric"], "loss": original["loss"]},
+        "validation_graph_count": original["validation_graph_count"],
+        "prediction_unit": original["prediction_unit"],
+        "prediction_rule": original["prediction_rule"],
         "rows": rows,
         "shuffle_seed": seed,
         "normalization_recomputed": True,
@@ -17070,8 +17360,8 @@ def symmetric_propagation(
 
 SUITE = "conductance_relative_c_v3"
 PARAMETERIZATION = "shared_relative_log_conductance"
-DATASETS = ("cora", "citeseer", "pubmed", "ogbn-arxiv")
-DEFAULT_DATASETS = ("ogbn-arxiv",)
+DATASETS = ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv")
+DEFAULT_DATASETS = DATASETS
 DEFAULT_EDGE_CHUNK_SIZE = 65536
 COMMON = {
     "hidden_channels": 64,
@@ -17101,17 +17391,22 @@ PROTOCOL_NOTE = (
     "Shared graph-centered relative conductance, symmetric normalization and a separate "
     "learnable alpha; both arms initialize C=1 and alpha=.5. Fixed C freezes the entire "
     "estimator but keeps alpha trainable. AdamW separates backbone, gate and scalar controls. "
-    "Official train labels only; validation selects checkpoints, no test evaluation. "
+    "Optimization uses official train labels only; validation labels select checkpoints, "
+    "with no test evaluation. "
+    "PPI uses the official 20/2/2 split: train 20 and validation 2 run in whole-graph "
+    "minibatches of 2 with BCEWithLogits and global logit>0 node-label micro-F1; test 2 is "
+    "not scored. "
     "V1/V2 are unchanged and their historical scores are not a matched one-factor contrast. "
     "Graph means and degrees are full graph, not chunk-local; first-order gradients only. "
-    "The kernel is sparse/chunked but training remains full graph, without neighbor sampling."
+    "The kernel is sparse/chunked; citation/arxiv training remains full graph while PPI uses "
+    "whole-graph minibatches without neighbor sampling."
 )
 ````
 
 # research/conductance_gat/v3/report.py
 
 ````python
-"""Fail-closed fixed-graph relative-C comparison; stdlib only, no training or test labels."""
+"""Fail-closed relative-C comparison; stdlib only, no training or test labels."""
 
 from __future__ import annotations
 
@@ -17146,7 +17441,9 @@ CAVEATS = [
     "Both arms train freshly with the same initial full state, official cache, topology, "
     "AdamW policy and early-stopping policy. No V1/V2 or historical score is reused.",
     "V3 uses a shared relative-log-conductance generator, symmetric normalization and learned "
-    "propagation strength. The initial benchmark protocol is transductive; PPI is not included.",
+    "propagation strength. PPI uses the official 20/2/2 graph split: train 20 and validation "
+    "2 run at batch 2 with BCEWithLogits and global logit>0 node-label micro-F1; test 2 is not "
+    "scored. The other four datasets retain full-graph node splits.",
     "The contrast is relative_c minus fixed_c (percentage points), an internal V3 ablation. "
     "V2-to-V3 changes several factors and must not be called a single-factor comparison.",
     "Fixed C=1 freezes its unused gate MLP/gamma/tau scaffold; alpha remains trainable in both "
@@ -17257,7 +17554,7 @@ def _validate_optimizer(child, config, condition):
         raise ValueError("optimizer parameter counts disagree with trainable_parameters")
 
 
-def _validate_diagnostics(child, config):
+def _validate_diagnostics(child, config, dataset):
     diagnostics = child.get("diagnostics")
     if not isinstance(diagnostics, dict):
         raise ValueError("V3 diagnostics are required")
@@ -17268,6 +17565,17 @@ def _validate_diagnostics(child, config):
         or best.get("split") != "validation"
     ):
         raise ValueError("best_validation diagnostics must be validation/eval")
+    expected_metric = "micro_f1" if dataset == "ppi" else "accuracy"
+    expected_graphs = 2 if dataset == "ppi" else 1
+    expected_unit = "node_label_decision" if dataset == "ppi" else "node"
+    expected_rule = "logit_gt_zero_node_label" if dataset == "ppi" else "argmax_node_class"
+    if (
+        best.get("metric_name") != expected_metric
+        or best.get("validation_graph_count") != expected_graphs
+        or best.get("prediction_unit") != expected_unit
+        or best.get("prediction_rule") != expected_rule
+    ):
+        raise ValueError("best_validation dataset metric/graph/prediction scope mismatch")
     layers = best.get("layers")
     if not isinstance(layers, list) or len(layers) != config["layers"]:
         raise ValueError("best_validation layer diagnostics are incomplete")
@@ -17296,7 +17604,7 @@ def _validate_diagnostics(child, config):
                 raise ValueError("diagnostic magnitudes must be nonnegative")
     if sorted(indices) != list(range(config["layers"])):
         raise ValueError("diagnostic layer indices are missing or duplicated")
-    _best_training_observation(child, config)
+    _best_training_observation(child, config, dataset)
     audit = diagnostics.get("best_checkpoint_interventions")
     if (
         not isinstance(audit, dict)
@@ -17310,6 +17618,12 @@ def _validate_diagnostics(child, config):
     score = _finite_number(original.get("validation"), "intervention original", unit_interval=True)
     if abs(score - child["validation"]) > 1.0e-7:
         raise ValueError("intervention original differs from selected validation")
+    if (
+        audit.get("validation_graph_count") != expected_graphs
+        or audit.get("prediction_unit") != expected_unit
+        or audit.get("prediction_rule") != expected_rule
+    ):
+        raise ValueError("intervention graph/prediction scope mismatch")
     rows = audit.get("rows")
     if not isinstance(rows, list) or len(rows) != len(INTERVENTIONS):
         raise ValueError("all four selected-checkpoint interventions are required")
@@ -17325,6 +17639,11 @@ def _validate_diagnostics(child, config):
         _finite_number(
             row.get("changed_prediction_fraction"), "changed predictions", unit_interval=True
         )
+        if (
+            row.get("prediction_unit") != expected_unit
+            or row.get("prediction_rule") != expected_rule
+        ):
+            raise ValueError("intervention changed-prediction unit mismatch")
         if _finite_number(row.get("logit_mean_absolute_delta"), "logit delta") < 0:
             raise ValueError("logit delta must be nonnegative")
     if set(names) != INTERVENTIONS or len(set(names)) != len(names):
@@ -17338,7 +17657,7 @@ def _best_validation_summary(diagnostics):
     return best.get("layers", []) if isinstance(best, dict) else []
 
 
-def _best_training_observation(child, config):
+def _best_training_observation(child, config, dataset):
     trajectory = child["diagnostics"].get("train_trajectory")
     if not isinstance(trajectory, list) or any(not isinstance(row, dict) for row in trajectory):
         raise ValueError("actual training trajectory must be recorded")
@@ -17349,12 +17668,27 @@ def _best_training_observation(child, config):
     if len(selected) != 1:
         raise ValueError("selected epoch is missing from actual training observations")
     record = selected[0]
+    steps = _integer(
+        child.get("optimizer_steps_per_epoch"), "optimizer_steps_per_epoch", minimum=1
+    )
+    expected_steps = 10 if dataset == "ppi" else 1
+    if steps != expected_steps:
+        raise ValueError("optimizer_steps_per_epoch disagrees with official data protocol")
+    if (
+        child.get("optimizer_steps") != child["epochs_run"] * steps
+        or child.get("best_checkpoint_optimizer_steps") != child["best_epoch"] * steps
+    ):
+        raise ValueError("optimizer step counts disagree with actual minibatch count")
     expected = {
-        "scope": "full_graph_train_mask",
+        "scope": (
+            "first_actual_training_minibatch_only"
+            if dataset == "ppi"
+            else "full_graph_train_mask"
+        ),
         "mode": "train_dropout_on",
         "stage": "after_task_backward_before_optimizer_step",
         "batch_index": 0,
-        "optimizer_steps_before_batch": child["best_epoch"] - 1,
+        "optimizer_steps_before_batch": (child["best_epoch"] - 1) * steps,
     }
     for key, value in expected.items():
         if not _same(record.get(key), value):
@@ -17438,8 +17772,9 @@ def _training_gradient_markdown(conditions):
     lines = [
         "### Actual training gradients at the selected epoch",
         "",
-        "Recorded on the actual training-mask loss after backward and before that epoch's "
-        "optimizer update, with training dropout enabled. These are not gradients recomputed "
+        "Recorded on the actual transductive full-graph loss or PPI first minibatch after "
+        "backward and before its optimizer update, with training dropout enabled. These are "
+        "not gradients recomputed "
         "at the selected post-update checkpoint. Frozen gate entries are inapplicable, not zero.",
         "",
         "| Condition | Epoch | Layer | Gate MLP task-gradient L2 |",
@@ -17494,7 +17829,10 @@ def _load(root, job, config, source_hashes):
         raise ValueError(f"cannot read child metrics: {exc}") from exc
     if actual_digest != digest.lower():
         raise ValueError("metrics SHA-256 mismatch")
-    child = _load_child(root, job, config, suite=SUITE, conditions=CONDITIONS)
+    dataset = job["dataset"]
+    child_config = dict(config)
+    child_config["batch_size"] = 2 if dataset == "ppi" else 1
+    child = _load_child(root, job, child_config, suite=SUITE, conditions=CONDITIONS)
     for key, expected in (
         ("gate_mode", CONDITIONS[job["condition"]]["gate_mode"]),
         ("parameterization", PARAMETERIZATION),
@@ -17505,18 +17843,71 @@ def _load(root, job, config, source_hashes):
     if "gate_mode" in child["configuration"]:
         raise ValueError("gate_mode belongs in arm metadata, not held-fixed configuration")
     topology = child.get("topology")
-    if not isinstance(topology, dict) or set(topology) != {
-        "num_nodes",
-        "num_edges",
-        "incidence_sha256",
-    }:
-        raise ValueError("topology must contain num_nodes, num_edges and incidence_sha256")
-    _integer(topology["num_nodes"], "topology.num_nodes", minimum=1)
-    _integer(topology["num_edges"], "topology.num_edges")
-    if not isinstance(topology["incidence_sha256"], str) or not SHA256.fullmatch(
-        topology["incidence_sha256"]
+    expected_split = (
+        "official_inductive_graph_split"
+        if dataset == "ppi"
+        else "official_time_split"
+        if dataset == "ogbn-arxiv"
+        else "official_public_masks"
+    )
+    expected_task = (
+        "multi_label_node_classification" if dataset == "ppi" else "node_classification"
+    )
+    expected_metric = "micro_f1" if dataset == "ppi" else "accuracy"
+    protocol = child.get("protocol")
+    if (
+        not isinstance(protocol, dict)
+        or protocol.get("dataset") != dataset
+        or protocol.get("split") != expected_split
+        or protocol.get("task") != expected_task
+        or protocol.get("metric") != expected_metric
     ):
-        raise ValueError("topology.incidence_sha256 must be a SHA-256 digest")
+        raise ValueError("cached protocol does not match the official V1 dataset contract")
+    if dataset == "ppi":
+        expected_keys = {
+            "scope",
+            "split_graph_counts",
+            "split_num_nodes",
+            "split_num_edges",
+            "split_incidence_sha256",
+        }
+        if not isinstance(topology, dict) or set(topology) != expected_keys:
+            raise ValueError("PPI topology must fingerprint official train/validation graphs")
+        if topology["scope"] != "official_train_and_validation_graphs":
+            raise ValueError("PPI topology scope mismatch")
+        if topology["split_graph_counts"] != {"train": 20, "validation": 2}:
+            raise ValueError("PPI topology must contain the official 20/2 graph split")
+        for key in ("split_num_nodes", "split_num_edges"):
+            value = topology[key]
+            if not isinstance(value, dict) or set(value) != {"train", "validation"}:
+                raise ValueError(f"PPI topology {key} split metadata is incomplete")
+            for split, count in value.items():
+                _integer(count, f"topology.{key}.{split}", minimum=1)
+        digests = topology["split_incidence_sha256"]
+        if (
+            not isinstance(digests, dict)
+            or set(digests) != {"train", "validation"}
+            or any(
+                not isinstance(value, str) or not SHA256.fullmatch(value)
+                for value in digests.values()
+            )
+        ):
+            raise ValueError("PPI split incidence fingerprints are invalid")
+        if protocol.get("split_counts") != {"train": 20, "validation": 2, "test": 2}:
+            raise ValueError("PPI cached protocol is not the official 20/2/2 graph split")
+    else:
+        if not isinstance(topology, dict) or set(topology) != {
+            "num_nodes",
+            "num_edges",
+            "incidence_sha256",
+        }:
+            raise ValueError("topology must contain num_nodes, num_edges and incidence_sha256")
+        _integer(topology["num_nodes"], "topology.num_nodes", minimum=1)
+        _integer(topology["num_edges"], "topology.num_edges")
+        if not isinstance(topology["incidence_sha256"], str) or not SHA256.fullmatch(
+            topology["incidence_sha256"]
+        ):
+            raise ValueError("topology.incidence_sha256 must be a SHA-256 digest")
     total = _integer(child.get("total_parameters"), "total_parameters", minimum=1)
     trainable = _integer(child.get("trainable_parameters"), "trainable_parameters", minimum=1)
     frozen = _integer(child.get("frozen_parameters"), "frozen_parameters")
@@ -17526,8 +17917,8 @@ def _load(root, job, config, source_hashes):
         or (job["condition"] == "fixed_c" and frozen == 0)
     ):
         raise ValueError("parameter counts disagree with relative-C/frozen-scaffold condition")
-    _validate_optimizer(child, config, job["condition"])
-    _validate_diagnostics(child, config)
+    _validate_optimizer(child, child_config, job["condition"])
+    _validate_diagnostics(child, child_config, dataset)
     if not isinstance(child.get("versions"), dict) or not child["versions"]:
         raise ValueError("Missing runtime versions")
     if not isinstance(child.get("gpu"), str) or not child["gpu"]:
@@ -17551,7 +17942,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         or len(set(datasets)) != len(datasets)
     ):
         datasets = []
-        errors.append("datasets must list unique supported fixed-graph datasets (PPI unsupported)")
+        errors.append("datasets must list unique supported V3 datasets")
     for key, expected in (
         ("schema_version", 1),
         ("suite", SUITE),
@@ -17571,8 +17962,8 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         _integer(config.get("model_seed"), "model_seed")
         for key in ("epochs", "patience", "edge_chunk_size"):
             _integer(config.get(key), key, minimum=1)
-        if config.get("batch_size") != 1 or type(config.get("batch_size")) is not int:
-            raise ValueError("full-graph batch_size must be 1")
+        if config.get("batch_size") != 2 or type(config.get("batch_size")) is not int:
+            raise ValueError("manifest PPI batch_size must be 2")
         if config.get("workers") != 0 or type(config.get("workers")) is not int:
             raise ValueError("full-graph workers must be 0")
         if not isinstance(config.get("device"), str) or not re.fullmatch(
@@ -17607,6 +17998,9 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             errors.append(f"duplicate job: {key}")
             continue
         indexed[key] = job
+        expected_batch_size = 2 if dataset == "ppi" else 1
+        if job.get("batch_size") != expected_batch_size:
+            errors.append(f"{key}: job batch_size must be {expected_batch_size}")
         if job.get("status") not in {"pending", "running", "failed", "passed"}:
             errors.append(f"{key}: invalid job status")
         try:
@@ -17672,7 +18066,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                         "best_checkpoint_interventions"
                     ]
                     row["best_epoch_training_observation"] = _best_training_observation(
-                        child, config
+                        child, {**config, "batch_size": 2 if dataset == "ppi" else 1}, dataset
                     )
                     row["best_validation_diagnostics"] = _best_validation_summary(
                         child.get("diagnostics")
@@ -17701,7 +18095,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         reports.append(
             {
                 "dataset": dataset,
-                "metric_name": "accuracy",
+                "metric_name": "micro_f1" if dataset == "ppi" else "accuracy",
                 "model_seed": config.get("model_seed"),
                 "conditions": rows,
                 "complete": len(loaded) == len(CONDITIONS),
@@ -17761,7 +18155,7 @@ def markdown(report):
         lines += [f"- {_cell(error)}" for error in report["errors"]] + [""]
     for dataset in report["datasets"]:
         lines += [
-            f"## {dataset['dataset']} (accuracy, higher is better)",
+            f"## {dataset['dataset']} ({dataset['metric_name']}, higher is better)",
             "",
             "| Condition | Status | Validation (%) | Best epoch | Epochs run "
             "| Train loss | Trainable | Frozen |",
@@ -17896,15 +18290,18 @@ exec "${environment_python}" -B scripts/run_conductance_v3.py "$@"
 # research/conductance_gat/v3/train.py
 
 ````python
-"""Standalone symmetric relative-C v3 training: CUDA, official cache, validation only.
+"""Standalone symmetric relative-C v3 CUDA training on the official V1 cache.
 
 This does not reuse the row-normalized training observer. C interventions occur
-once, on the selected best checkpoint, never as extra training forwards.
+once on the validation-selected best checkpoint, never as extra training forwards;
+no test score is computed.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
 import time
 from pathlib import Path
@@ -17929,8 +18326,9 @@ from .protocol import COMMON, CONDITIONS, DATASETS, DEFAULT_EDGE_CHUNK_SIZE, PAR
 
 OBSERVATION_POLICY = {
     "training": (
-        "Every epoch's actual full-graph train forward with dropout ON; raw task gradients "
-        "after backward before AdamW step. No extra training forward/backward."
+        "Every epoch's first actual train minibatch with dropout ON; raw task gradients "
+        "after backward before AdamW step. Transductive data has one full-graph batch; PPI "
+        "continues through every official train-graph minibatch without extra forwards."
     ),
     "validation": (
         "Every epoch validation selects checkpoint; initial/selected/final validation "
@@ -18031,8 +18429,46 @@ def _parameter_metadata(model):
 
 
 def topology_metadata(payload):
-    if payload.get("dataset") not in DATASETS or len(payload.get("graphs", [])) != 1:
-        raise ValueError("V3 experiment requires one official transductive graph; PPI unsupported")
+    if payload.get("dataset") not in DATASETS:
+        raise ValueError("Unsupported V3 topology payload")
+    if payload["dataset"] == "ppi":
+        splits = payload.get("splits")
+        graphs = payload.get("graphs")
+        if not isinstance(splits, dict) or not isinstance(graphs, list):
+            raise ValueError("PPI topology requires official graph splits")
+        metadata = {
+            "scope": "official_train_and_validation_graphs",
+            "split_graph_counts": {},
+            "split_num_nodes": {},
+            "split_num_edges": {},
+            "split_incidence_sha256": {},
+        }
+        for split in ("train", "validation"):
+            indices = splits[split]
+            descriptors = []
+            nodes = edges = 0
+            for graph_index in indices:
+                graph = graphs[int(graph_index)]
+                incidence = graph["incidence_edge_index"]
+                nodes += int(graph["x"].shape[0])
+                edges += int(incidence.shape[1])
+                descriptors.append(
+                    {
+                        "graph_index": int(graph_index),
+                        "num_nodes": int(graph["x"].shape[0]),
+                        "num_edges": int(incidence.shape[1]),
+                        "incidence_sha256": tensor_hash(incidence),
+                    }
+                )
+            metadata["split_graph_counts"][split] = len(indices)
+            metadata["split_num_nodes"][split] = nodes
+            metadata["split_num_edges"][split] = edges
+            metadata["split_incidence_sha256"][split] = hashlib.sha256(
+                json.dumps(descriptors, sort_keys=True).encode()
+            ).hexdigest()
+        return metadata
+    if len(payload.get("graphs", [])) != 1:
+        raise ValueError("Transductive V3 requires exactly one official graph")
     graph = payload["graphs"][0]
     return {
         "num_nodes": int(graph["x"].shape[0]),
@@ -18057,8 +18493,13 @@ def _validate_args(args):
         raise ValueError("Unsupported v3 dataset/condition")
     if min(args.epochs, args.patience, args.edge_chunk_size) < 1 or args.model_seed < 0:
         raise ValueError("epochs/patience/chunk size must be positive and seed nonnegative")
-    if args.batch_size != 1 or args.workers != 0:
-        raise ValueError("V3 full-graph training requires batch-size=1 and workers=0")
+    expected_batch_size = 2 if args.dataset == "ppi" else 1
+    if args.batch_size is None:
+        args.batch_size = expected_batch_size
+    if args.batch_size != expected_batch_size or args.workers != 0:
+        raise ValueError(
+            f"V3 {args.dataset} requires batch-size={expected_batch_size} and workers=0"
+        )
 
 
 def build_parser():
@@ -18071,7 +18512,12 @@ def build_parser():
     parser.add_argument("--model-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Defaults by dataset: 2 for PPI, 1 for fixed-graph datasets",
+    )
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--edge-chunk-size", type=int, default=DEFAULT_EDGE_CHUNK_SIZE)
     return parser
@@ -18086,9 +18532,18 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     sources = _source_hashes()
     _configure_fp32()
     _seed(args.model_seed)
-    graph, indices = _make_data(payload, args, device)
-    if indices is None or not indices["train"].numel():
-        raise ValueError("V3 requires a nonempty transductive train mask")
+    data, indices = _make_data(payload, args, device)
+    is_ppi = args.dataset == "ppi"
+    if is_ppi:
+        if indices is not None or not isinstance(data, dict) or not len(data["train"]):
+            raise ValueError("V3 PPI requires nonempty official train/validation graph loaders")
+        train_indices = validation_indices = None
+        optimizer_steps_per_epoch = len(data["train"])
+    else:
+        if indices is None or not indices["train"].numel():
+            raise ValueError("V3 requires a nonempty transductive train mask")
+        train_indices, validation_indices = indices["train"], indices["validation"]
+        optimizer_steps_per_epoch = 1
     spec = CONDITIONS[args.condition]
     model = RelativeCNodeClassifier(
         payload["graphs"][0]["x"].shape[1],
@@ -18123,6 +18578,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         **_parameter_metadata(model),
         "evaluation_split": "validation",
         "test_evaluated": False,
+        "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
     }
     checkpoint, history_path = output / "best.pt", output / "history.json"
     history, trajectory = [], []
@@ -18131,55 +18587,93 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
     started = time.perf_counter()
-    initial_observation, _ = evaluate_validation(model, graph, indices["validation"])
+    initial_observation, _ = evaluate_validation(
+        model, data, validation_indices, device=device
+    )
+    optimizer_steps = 0
+    best_optimizer_steps = 0
     for epoch in range(1, args.epochs + 1):
         _require_sources(sources)
         torch.cuda.synchronize(device)
         epoch_started = time.perf_counter()
         model.train()
-        optimizer.zero_grad(set_to_none=True)
-        with ForwardObservation(model) as observation:
-            logits = model(graph)
-        loss, count = training_loss(logits, graph, indices["train"])
-        if not bool(torch.isfinite(loss)):
-            raise FloatingPointError(f"Nonfinite v3 training loss at epoch {epoch}")
-        loss.backward()
-        gradient_groups = [
-            {
-                **descriptor,
-                "parameter_norm": norm(group["params"]),
-                "task_gradient_norm": norm(group["params"], gradient=True),
-            }
+        loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+        label_count = 0
+        batches = data["train"] if is_ppi else [data]
+        record = None
+        for batch_index, graph in enumerate(batches):
+            if is_ppi:
+                graph = graph.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            if batch_index == 0:
+                with ForwardObservation(model) as observation:
+                    logits = model(graph)
+            else:
+                logits = model(graph)
+            loss, count = training_loss(logits, graph, train_indices)
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError(
+                    f"Nonfinite v3 training loss at epoch {epoch}, batch {batch_index}"
+                )
+            loss.backward()
+            gradient_groups = []
             for descriptor, group in zip(
                 optimizer_metadata(optimizer), optimizer.param_groups, strict=True
-            )
-        ]
-        record = {
-            "epoch": epoch,
-            "batch_index": 0,
-            "optimizer_steps_before_batch": epoch - 1,
-            "scope": "full_graph_train_mask",
-            "mode": "train_dropout_on",
-            "stage": "after_task_backward_before_optimizer_step",
-            "label_count": count,
-            "train_loss": float(loss.detach()),
-            "layers": observation.summary(gradients=True),
-            "parameter_groups": gradient_groups,
-        }
-        trajectory.append(record)
-        optimizer.step()
+            ):
+                if batch_index == 0:
+                    task_gradient_norm = norm(group["params"], gradient=True)
+                    gradient_groups.append(
+                        {
+                            **descriptor,
+                            "parameter_norm": norm(group["params"]),
+                            "task_gradient_norm": task_gradient_norm,
+                        }
+                    )
+                else:
+                    for parameter in group["params"]:
+                        if parameter.grad is not None and not bool(
+                            torch.isfinite(parameter.grad.detach()).all()
+                        ):
+                            raise FloatingPointError(
+                                "Nonfinite parameter/task gradient observation"
+                            )
+            if batch_index == 0:
+                record = {
+                    "epoch": epoch,
+                    "batch_index": 0,
+                    "optimizer_steps_before_batch": optimizer_steps,
+                    "scope": (
+                        "first_actual_training_minibatch_only"
+                        if is_ppi
+                        else "full_graph_train_mask"
+                    ),
+                    "mode": "train_dropout_on",
+                    "stage": "after_task_backward_before_optimizer_step",
+                    "label_count": count,
+                    "train_loss": float(loss.detach()),
+                    "layers": observation.summary(gradients=True),
+                    "parameter_groups": gradient_groups,
+                }
+                trajectory.append(record)
+            optimizer.step()
+            optimizer_steps += 1
+            loss_sum.add_(loss.detach().double() * count)
+            label_count += count
+        if record is None or not label_count:
+            raise RuntimeError("V3 training split produced no labels")
+        train_loss = float(loss_sum / label_count)
         # Labels for selection are validation only. Expensive observations and
         # interventions are not performed at every selection forward.
         validation_observation, _ = evaluate_validation(
-            model, graph, indices["validation"], observe=False
+            model, data, validation_indices, observe=False, device=device
         )
         validation = validation_observation["metric"]
         torch.cuda.synchronize(device)
         history.append(
             {
                 "epoch": epoch,
-                "optimizer_steps": epoch,
-                "train_loss": record["train_loss"],
+                "optimizer_steps": optimizer_steps,
+                "train_loss": train_loss,
                 "validation": validation,
                 "epoch_seconds": time.perf_counter() - epoch_started,
                 "training_first_batch": record,
@@ -18189,6 +18683,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         history_hash = sha256_file(history_path)
         if validation > best_validation:
             best_validation, best_epoch = validation, epoch
+            best_optimizer_steps = optimizer_steps
             saved = {
                 **common,
                 "state_dict": {
@@ -18203,7 +18698,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
                     "edge_chunk_size": args.edge_chunk_size,
                 },
                 "best_epoch": epoch,
-                "optimizer_steps": epoch,
+                "optimizer_steps": optimizer_steps,
                 "validation": validation,
             }
             atomic_publish(checkpoint, lambda path, state=saved: torch.save(state, path))
@@ -18211,13 +18706,15 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         if epoch == 1 or epoch % 10 == 0:
             print(
                 f"{args.dataset}/{args.condition} epoch={epoch} "
-                f"train_loss={record['train_loss']:.6f} "
+                f"train_loss={train_loss:.6f} "
                 f"val={validation:.6f} best_epoch={best_epoch}",
                 flush=True,
             )
         if epoch - best_epoch >= args.patience:
             break
-    final_observation, _ = evaluate_validation(model, graph, indices["validation"])
+    final_observation, _ = evaluate_validation(
+        model, data, validation_indices, device=device
+    )
     _require_sources(sources)
     if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
         raise RuntimeError("Checkpoint/history changed before best-checkpoint validation")
@@ -18235,11 +18732,19 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
             raise ValueError(f"Best checkpoint metadata mismatch: {key}")
     model.load_state_dict(saved["state_dict"])
     optimizer.zero_grad(set_to_none=True)
-    selected_observation, reference = evaluate_validation(model, graph, indices["validation"])
+    selected_observation, reference = evaluate_validation(
+        model, data, validation_indices, device=device
+    )
     if abs(selected_observation["metric"] - best_validation) > 1e-4:
         raise RuntimeError("Best validation recheck disagrees with checkpoint selection")
     interventions = best_checkpoint_interventions(
-        model, graph, indices["validation"], selected_observation, reference, seed=args.model_seed
+        model,
+        data,
+        validation_indices,
+        selected_observation,
+        reference,
+        seed=args.model_seed,
+        device=device,
     )
     _require_sources(sources)
     if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
@@ -18250,13 +18755,17 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         "status": "passed",
         "best_epoch": best_epoch,
         "epochs_run": len(history),
-        "optimizer_steps": len(history),
-        "best_checkpoint_optimizer_steps": best_epoch,
+        "optimizer_steps": optimizer_steps,
+        "best_checkpoint_optimizer_steps": best_optimizer_steps,
         "validation": selected_observation["metric"],
         "validation_at_selection": best_validation,
-        "metric_name": "accuracy",
+        "metric_name": "micro_f1" if is_ppi else "accuracy",
         "train_loss": history[best_epoch - 1]["train_loss"],
-        "train_loss_scope": "actual full-graph train mask loss at selected checkpoint epoch",
+        "train_loss_scope": (
+            "label-weighted mean over all official PPI train-graph minibatches at selected epoch"
+            if is_ppi
+            else "actual full-graph train mask loss at selected checkpoint epoch"
+        ),
         "final_train_loss": history[-1]["train_loss"],
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_sha256": checkpoint_hash,
@@ -18276,7 +18785,11 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
             "observation_policy": OBSERVATION_POLICY,
         },
         "execution": {
-            "training": "full_graph_transductive",
+            "training": (
+                "official_inductive_graph_minibatch" if is_ppi else "full_graph_transductive"
+            ),
+            "batch_size": args.batch_size,
+            "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
             "neighbor_sampling": False,
             "edge_chunk_size": args.edge_chunk_size,
             "dense_incidence": False,
@@ -18362,16 +18875,17 @@ if __name__ == "__main__":
 ````python
 """Read-only observations for the V4 conductance/spatial factorial.
 
-Training observations attach to the actual full-graph forward.  Interventions
-run only after validation checkpoint selection and never update parameters or
-inspect test labels.  Replacing estimator output means that the operator's
-normal symmetric-normalization path recomputes the C-dependent degrees.
+Training observations attach to the actual transductive full-graph forward or
+PPI whole-graph minibatch. Interventions run only after validation checkpoint
+selection and never update parameters or compute a test-label metric. Replacing
+estimator output means that the operator's normal symmetric-normalization path
+recomputes the C-dependent degrees.
 """
 
 from __future__ import annotations
 
 import math
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -18379,6 +18893,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from ..ablation.model import state_sha256
+from ..benchmark import _binary_counts, _micro_f1_from_counts
 
 
 @contextmanager
@@ -18631,27 +19146,99 @@ class ForwardObservation:
         return output
 
 
-def evaluate_validation(model, graph, indices: Tensor, *, observe: bool = True):
-    if not indices.numel():
+def _prediction_tensor(logits: Tensor, prediction_rule: str) -> Tensor:
+    if prediction_rule == "argmax_node_class":
+        return logits.argmax(-1)
+    if prediction_rule == "logit_gt_zero_node_label":
+        return logits > 0
+    raise ValueError("Unknown V4 prediction rule")
+
+
+def _ppi_graph_count(graph) -> int:
+    value = getattr(graph, "num_graphs", None)
+    if value is not None:
+        return int(value)
+    batch = getattr(graph, "batch", None)
+    return int(batch.max()) + 1 if isinstance(batch, Tensor) and batch.numel() else 1
+
+
+def evaluate_validation(
+    model,
+    graph,
+    indices: Tensor | None,
+    *,
+    observe: bool = True,
+    device: torch.device | None = None,
+):
+    if indices is not None and not indices.numel():
         raise ValueError("Validation mask is empty")
     with evaluation_mode(model):
-        if observe:
-            with ForwardObservation(model) as observation:
+        context = ForwardObservation(model) if observe else nullcontext(None)
+        with context as observation:
+            if indices is not None:
                 full_logits = model(graph)
-            layers = observation.summary()
-        else:
-            full_logits, layers = model(graph), []
-        logits = full_logits.index_select(0, indices)
-        labels = graph.y.index_select(0, indices)
-        if not bool(torch.isfinite(logits).all()):
-            raise FloatingPointError("Nonfinite validation logits")
+                logits = full_logits.index_select(0, indices)
+                labels = graph.y.index_select(0, indices)
+                if not bool(torch.isfinite(logits).all()):
+                    raise FloatingPointError("Nonfinite validation logits")
+                metric = int((logits.argmax(-1) == labels).sum()) / indices.numel()
+                loss = float(F.cross_entropy(logits, labels))
+                graph_count = 1
+                metric_name = "accuracy"
+                prediction_rule = "argmax_node_class"
+                observation_scope = (
+                    "whole transductive graph states; validation labels only"
+                )
+            else:
+                if not isinstance(graph, dict) or "validation" not in graph:
+                    raise ValueError("PPI validation requires the official validation loader")
+                batches = graph["validation"]
+                if len(batches) != 1:
+                    raise ValueError(
+                        "PPI validation must pack its two official graphs into one batch"
+                    )
+                if device is None:
+                    device = next(model.parameters()).device
+                counts = torch.zeros(3, dtype=torch.int64, device=device)
+                loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+                label_count = 0
+                graph_count = 0
+                parts = []
+                for batch in batches:
+                    batch = batch.to(device, non_blocking=True)
+                    batch_logits = model(batch)
+                    if batch_logits.shape != batch.y.shape or not bool(
+                        torch.isfinite(batch_logits).all()
+                    ):
+                        raise FloatingPointError("Invalid or nonfinite PPI validation logits")
+                    counts.add_(_binary_counts(batch_logits, batch.y))
+                    loss_sum.add_(
+                        F.binary_cross_entropy_with_logits(
+                            batch_logits, batch.y, reduction="sum"
+                        ).double()
+                    )
+                    label_count += batch.y.numel()
+                    graph_count += _ppi_graph_count(batch)
+                    parts.append(batch_logits.detach().cpu())
+                if graph_count != 2 or not label_count:
+                    raise ValueError("PPI validation must cover both official validation graphs")
+                logits = torch.cat(parts, dim=0)
+                metric = _micro_f1_from_counts(counts)
+                loss = float(loss_sum / label_count)
+                metric_name = "micro_f1"
+                prediction_rule = "logit_gt_zero_node_label"
+                observation_scope = "all two official inductive validation graphs"
+        layers = observation.summary() if observation is not None else []
         result = {
-            "metric": int((logits.argmax(-1) == labels).sum()) / indices.numel(),
-            "loss": float(F.cross_entropy(logits, labels)),
+            "metric": metric,
+            "metric_name": metric_name,
+            "prediction_rule": prediction_rule,
+            "loss": loss,
             "layers": layers,
             "mode": "eval",
             "split": "validation",
-            "observation_scope": "whole transductive graph states; validation labels only",
+            "validation_graph_count": graph_count,
+            "observation_scope": observation_scope,
         }
     return result, logits.detach().cpu()
 
@@ -18791,6 +19378,7 @@ def _logit_difference(left: Tensor, right: Tensor, label: str) -> Tensor:
 
 def _intervention_row(name, result, logits, original, reference):
     difference = _logit_difference(logits, reference, name)
+    prediction_rule = result["prediction_rule"]
     return {
         "intervention": name,
         "intervention_kind": "read_only_selected_checkpoint",
@@ -18802,12 +19390,26 @@ def _intervention_row(name, result, logits, original, reference):
         "logit_mean_absolute_delta": float(difference.abs().mean()),
         "logit_max_absolute_delta": float(difference.abs().max()),
         "changed_prediction_fraction": float(
-            (logits.argmax(-1) != reference.argmax(-1)).double().mean()
+            (
+                _prediction_tensor(logits, prediction_rule)
+                != _prediction_tensor(reference, prediction_rule)
+            )
+            .double()
+            .mean()
         ),
     }
 
 
-def best_checkpoint_interventions(model, graph, indices, original, reference: Tensor, *, seed: int):
+def best_checkpoint_interventions(
+    model,
+    graph,
+    indices,
+    original,
+    reference: Tensor,
+    *,
+    seed: int,
+    device: torch.device | None = None,
+):
     """All-layer read-only interventions, only on the selected best checkpoint."""
     before = state_sha256(model)
     modes = [module.training for module in model.modules()]
@@ -18828,7 +19430,9 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
     try:
         for name in names:
             with Intervention(model, name, seed) as intervention:
-                result, logits = evaluate_validation(model, graph, indices, observe=False)
+                result, logits = evaluate_validation(
+                    model, graph, indices, observe=False, device=device
+                )
             if name in {"mean_c", "ones_c"}:
                 replacement_contracts[name] = intervention.contract_summary(len(model.operators))
             intervention_logits[name] = logits
@@ -18867,7 +19471,12 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
         "logit_mean_absolute_delta": mean_absolute_delta,
         "logit_max_absolute_delta": max_absolute_delta,
         "changed_prediction_fraction": float(
-            (mean_logits.argmax(-1) != ones_logits.argmax(-1)).double().mean()
+            (
+                _prediction_tensor(mean_logits, original["prediction_rule"])
+                != _prediction_tensor(ones_logits, original["prediction_rule"])
+            )
+            .double()
+            .mean()
         ),
         "replacement_contracts": replacement_contracts,
     }
@@ -18876,13 +19485,17 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
         "scope": "validation_selected_best_checkpoint_only",
         "layers": "all_layers_simultaneously",
         "original": {"validation": original["metric"], "loss": original["loss"]},
+        "metric_name": original["metric_name"],
+        "prediction_rule": original["prediction_rule"],
+        "validation_graph_count": original["validation_graph_count"],
         "rows": rows,
         "shuffle_seed": seed,
         "normalization_recomputed_for_c_interventions": True,
         "mean_c_numeric_check": numeric_check,
         "mean_ones_note": (
             "Graph-constant positive C cancellation and the replacement contracts are enforced "
-            "directly. Mean-C and C=1 logits come from separate full-graph forwards, so their "
+            "directly. Mean-C and C=1 logits come from separate full-graph validation forwards, "
+            "so their "
             "allclose result is informational and non-gating because CUDA scatter rounding need "
             "not be bitwise repeatable. This is not an independent causal intervention."
         ),
@@ -19500,8 +20113,12 @@ def symmetric_spatial_propagation(
 
 SUITE = "conductance_hybrid_c_spatial_v4"
 PARAMETERIZATION = "shared_relative_log_conductance_x_spatial_message_transform"
-DATASETS = ("cora", "citeseer", "pubmed", "ogbn-arxiv")
-DEFAULT_DATASETS = ("ogbn-arxiv",)
+DATASETS = ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv")
+DEFAULT_DATASETS = DATASETS
+BATCH_SIZE_BY_DATASET = {dataset: 2 if dataset == "ppi" else 1 for dataset in DATASETS}
+METRIC_BY_DATASET = {
+    dataset: "micro_f1" if dataset == "ppi" else "accuracy" for dataset in DATASETS
+}
 DEFAULT_EDGE_CHUNK_SIZE = 65536
 COMMON = {
     "hidden_channels": 64,
@@ -19548,8 +20165,11 @@ PROTOCOL_NOTE = (
     "groups are frozen and excluded from AdamW; active W uses the ordinary backbone learning "
     "rate and weight decay. C is computed from the pre-W state, while symmetric propagation "
     "aggregates H W. Graph means and C-dependent weighted degrees are exact full-graph "
-    "quantities; edge computation is chunked and first-order only. Official train labels "
-    "only; validation selects checkpoints, with no test evaluation. V3 is unchanged and "
+    "quantities; edge computation is chunked and first-order only. Cora, CiteSeer, PubMed and "
+    "ogbn-arxiv use their original transductive full graph and official node masks. PPI uses the "
+    "official 20/2/2 inductive graph split, batch size 2, binary cross entropy and global "
+    "node-label micro-F1. Optimization uses official train labels only; validation labels "
+    "select checkpoints, with no test evaluation. The V3 model definition is unchanged and "
     "cross-version score differences are not a matched single-factor causal contrast. The "
     "report releases five within-V4 factorial contrasts only after all four fresh arms and "
     "source integrity pass; selected-checkpoint C/W interventions are read-only diagnostics."
@@ -19586,7 +20206,15 @@ from ..ablation.report import (
     _reject_nonfinite_json,
     _same,
 )
-from .protocol import COMMON, CONDITIONS, DATASETS, PARAMETERIZATION, SUITE
+from .protocol import (
+    BATCH_SIZE_BY_DATASET,
+    COMMON,
+    CONDITIONS,
+    DATASETS,
+    METRIC_BY_DATASET,
+    PARAMETERIZATION,
+    SUITE,
+)
 
 SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
 INTERVENTIONS = {
@@ -19606,7 +20234,10 @@ FACTORIAL_ORDER = (
 CAVEATS = [
     "n=1; exploratory validation-only factorial. Test is not evaluated; no CI, p-value, "
     "seed standard deviation, SOTA or general optimality claim.",
-    "All four arms train freshly from a matched full initial state. No V3 checkpoint or score "
+    "All four arms train freshly from a matched full initial state. PPI uses the official "
+    "20/2/2 inductive graph split: train 20 and validation 2 run at batch 2 with "
+    "BCEWithLogits and global logit>0 node-label micro-F1; test 2 is not scored. Other "
+    "datasets use their official transductive masks and accuracy. No V3 checkpoint or score "
     "is reused, and a V3-to-V4 score difference is not a one-factor causal contrast.",
     "V3/V4 do not implement a conventional eigendecomposition-based spectral GNN. Relative C "
     "adapts the weighted graph operator; W is a shared spatial message-channel transform.",
@@ -19623,8 +20254,9 @@ CAVEATS = [
     "as defined by the trainer; they are not isolated kernel benchmarks.",
     "W-on arms have more active parameters and optimizer state than W-off arms. This factorial "
     "does not parameter-budget-match unrelated architectures.",
-    "Sparse exact edge chunking remains full-graph training. Identical seeds and initial hashes "
-    "do not make CUDA scatter trajectories bitwise deterministic.",
+    "Sparse exact edge chunking processes every selected graph in full; only PPI batches whole "
+    "inductive graphs. Identical seeds and initial hashes do not make CUDA scatter trajectories "
+    "bitwise deterministic.",
 ]
 
 
@@ -19785,12 +20417,28 @@ def _best_training_observation(child: dict[str, Any], config: dict[str, Any]) ->
     if len(selected) != 1:
         raise ValueError("selected epoch is missing from actual training observations")
     record = selected[0]
+    batches_per_epoch = _integer(
+        child.get("train_batches_per_epoch"), "train_batches_per_epoch", minimum=1
+    )
+    expected_batches = 10 if child["dataset"] == "ppi" else 1
+    if batches_per_epoch != expected_batches:
+        raise ValueError("train_batches_per_epoch disagrees with official data protocol")
+    if (
+        child.get("optimizer_steps") != child["epochs_run"] * batches_per_epoch
+        or child.get("best_checkpoint_optimizer_steps")
+        != child["best_epoch"] * batches_per_epoch
+    ):
+        raise ValueError("optimizer step counts disagree with actual minibatch count")
     expected = {
-        "scope": "full_graph_train_mask",
+        "scope": (
+            "first_actual_training_minibatch_only"
+            if child["dataset"] == "ppi"
+            else "full_graph_train_mask"
+        ),
         "mode": "train_dropout_on",
         "stage": "after_task_backward_before_optimizer_step",
         "batch_index": 0,
-        "optimizer_steps_before_batch": child["best_epoch"] - 1,
+        "optimizer_steps_before_batch": (child["best_epoch"] - 1) * batches_per_epoch,
     }
     for key, value in expected.items():
         if not _same(record.get(key), value):
@@ -19828,14 +20476,22 @@ def _validate_diagnostics(child: dict[str, Any], config: dict[str, Any]) -> None
     if not isinstance(diagnostics, dict):
         raise ValueError("V4 diagnostics are required")
     observations = {}
+    expected_metric = METRIC_BY_DATASET[child["dataset"]]
+    expected_prediction_rule = (
+        "logit_gt_zero_node_label" if child["dataset"] == "ppi" else "argmax_node_class"
+    )
+    expected_validation_graphs = 2 if child["dataset"] == "ppi" else 1
     for name in ("initial_validation", "best_validation", "final_validation"):
         observation = diagnostics.get(name)
         if (
             not isinstance(observation, dict)
             or observation.get("mode") != "eval"
             or observation.get("split") != "validation"
+            or observation.get("metric_name") != expected_metric
+            or observation.get("prediction_rule") != expected_prediction_rule
+            or observation.get("validation_graph_count") != expected_validation_graphs
         ):
-            raise ValueError(f"{name} diagnostics must be validation/eval")
+            raise ValueError(f"{name} diagnostics task/split contract mismatch")
         observations[name] = observation
     best = observations["best_validation"]
     layers = best.get("layers")
@@ -19943,6 +20599,12 @@ def _validate_diagnostics(child: dict[str, Any], config: dict[str, Any]) -> None
         raise ValueError("checkpoint interventions must apply to all layers simultaneously")
     if audit.get("normalization_recomputed_for_c_interventions") is not True:
         raise ValueError("C interventions must recompute symmetric normalization")
+    if (
+        audit.get("metric_name") != expected_metric
+        or audit.get("prediction_rule") != expected_prediction_rule
+        or audit.get("validation_graph_count") != expected_validation_graphs
+    ):
+        raise ValueError("checkpoint intervention task contract mismatch")
     if _integer(audit.get("shuffle_seed"), "intervention shuffle_seed") != child["model_seed"]:
         raise ValueError("intervention shuffle_seed must equal model_seed")
     original = audit.get("original")
@@ -20022,8 +20684,12 @@ def _validate_diagnostics(child: dict[str, Any], config: dict[str, Any]) -> None
         raise ValueError("mean-C numerical check requires exactly mean_c/ones_c contracts")
     topology = child.get("topology")
     topology_edge_count = _integer(
-        topology.get("num_edges") if isinstance(topology, dict) else None,
-        "topology.num_edges",
+        (
+            topology.get("split_num_edges", {}).get("validation")
+            if child["dataset"] == "ppi" and isinstance(topology, dict)
+            else topology.get("num_edges") if isinstance(topology, dict) else None
+        ),
+        "topology validation edge count",
     )
     expected_edge_counts = None
     for name, expected_contract in expected_contracts.items():
@@ -20074,7 +20740,12 @@ def _load(
         raise ValueError(f"cannot read child metrics: {exc}") from exc
     if actual_digest != digest.lower():
         raise ValueError("metrics SHA-256 mismatch")
-    child = _load_child(root, job, config, suite=SUITE, conditions=CONDITIONS)
+    dataset = job["dataset"]
+    child_config = {
+        key: value for key, value in config.items() if key != "batch_size_by_dataset"
+    }
+    child_config["batch_size"] = BATCH_SIZE_BY_DATASET[dataset]
+    child = _load_child(root, job, child_config, suite=SUITE, conditions=CONDITIONS)
     spec = CONDITIONS[job["condition"]]
     for key, expected in (
         ("gate_mode", spec["gate_mode"]),
@@ -20087,18 +20758,71 @@ def _load(
     if "gate_mode" in child["configuration"] or "spatial_mode" in child["configuration"]:
         raise ValueError("factor modes belong in arm metadata, not held-fixed configuration")
     topology = child.get("topology")
-    if not isinstance(topology, dict) or set(topology) != {
-        "num_nodes",
-        "num_edges",
-        "incidence_sha256",
-    }:
-        raise ValueError("topology must contain num_nodes, num_edges and incidence_sha256")
-    _integer(topology["num_nodes"], "topology.num_nodes", minimum=1)
-    _integer(topology["num_edges"], "topology.num_edges")
-    if not isinstance(topology["incidence_sha256"], str) or not SHA256.fullmatch(
-        topology["incidence_sha256"]
+    expected_split = (
+        "official_inductive_graph_split"
+        if dataset == "ppi"
+        else "official_time_split"
+        if dataset == "ogbn-arxiv"
+        else "official_public_masks"
+    )
+    expected_task = (
+        "multi_label_node_classification" if dataset == "ppi" else "node_classification"
+    )
+    expected_metric = METRIC_BY_DATASET[dataset]
+    protocol = child.get("protocol")
+    if (
+        not isinstance(protocol, dict)
+        or protocol.get("dataset") != dataset
+        or protocol.get("split") != expected_split
+        or protocol.get("task") != expected_task
+        or protocol.get("metric") != expected_metric
     ):
-        raise ValueError("topology.incidence_sha256 must be a SHA-256 digest")
+        raise ValueError("cached protocol does not match the official V1 dataset contract")
+    if dataset == "ppi":
+        expected_keys = {
+            "scope",
+            "split_graph_counts",
+            "split_num_nodes",
+            "split_num_edges",
+            "split_incidence_sha256",
+        }
+        if not isinstance(topology, dict) or set(topology) != expected_keys:
+            raise ValueError("PPI topology must fingerprint official train/validation graphs")
+        if topology["scope"] != "official_train_and_validation_graphs":
+            raise ValueError("PPI topology scope mismatch")
+        if topology["split_graph_counts"] != {"train": 20, "validation": 2}:
+            raise ValueError("PPI topology must contain the official 20/2 graph split")
+        for key in ("split_num_nodes", "split_num_edges"):
+            value = topology[key]
+            if not isinstance(value, dict) or set(value) != {"train", "validation"}:
+                raise ValueError(f"PPI topology {key} split metadata is incomplete")
+            for split, count in value.items():
+                _integer(count, f"topology.{key}.{split}", minimum=1)
+        digests = topology["split_incidence_sha256"]
+        if (
+            not isinstance(digests, dict)
+            or set(digests) != {"train", "validation"}
+            or any(
+                not isinstance(value, str) or not SHA256.fullmatch(value)
+                for value in digests.values()
+            )
+        ):
+            raise ValueError("PPI split incidence fingerprints are invalid")
+        if protocol.get("split_counts") != {"train": 20, "validation": 2, "test": 2}:
+            raise ValueError("PPI cached protocol is not the official 20/2/2 graph split")
+    else:
+        if not isinstance(topology, dict) or set(topology) != {
+            "num_nodes",
+            "num_edges",
+            "incidence_sha256",
+        }:
+            raise ValueError("topology must contain num_nodes, num_edges and incidence_sha256")
+        _integer(topology["num_nodes"], "topology.num_nodes", minimum=1)
+        _integer(topology["num_edges"], "topology.num_edges")
+        if not isinstance(topology["incidence_sha256"], str) or not SHA256.fullmatch(
+            topology["incidence_sha256"]
+        ):
+            raise ValueError("topology.incidence_sha256 must be a SHA-256 digest")
     total = _integer(child.get("total_parameters"), "total_parameters", minimum=1)
     trainable = _integer(child.get("trainable_parameters"), "trainable_parameters", minimum=1)
     frozen = _integer(child.get("frozen_parameters"), "frozen_parameters")
@@ -20107,14 +20831,19 @@ def _load(
     expected_frozen = not (spec["gate_mode"] == "relative" and spec["spatial_mode"] == "learned")
     if bool(frozen) != expected_frozen:
         raise ValueError("frozen parameter count disagrees with V4 condition")
-    _validate_optimizer(child, config, job["condition"])
-    _validate_diagnostics(child, config)
+    _validate_optimizer(child, child_config, job["condition"])
+    _validate_diagnostics(child, child_config)
     best_epoch = _integer(child.get("best_epoch"), "best_epoch", minimum=1)
     stop_epoch = _integer(child.get("stop_epoch"), "stop_epoch", minimum=best_epoch)
     if stop_epoch != child.get("epochs_run"):
         raise ValueError("stop_epoch must equal epochs_run")
     if child.get("stopping_reason") not in {"patience", "max_epochs"}:
         raise ValueError("unknown stopping_reason")
+    if (
+        child.get("validation_batches") != 1
+        or child.get("validation_graphs") != (2 if dataset == "ppi" else 1)
+    ):
+        raise ValueError("validation coverage disagrees with official data protocol")
     for key in (
         "selection_loop_seconds",
         "post_selection_diagnostics_seconds",
@@ -20202,7 +20931,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         or len(set(datasets)) != len(datasets)
     ):
         datasets = []
-        errors.append("datasets must list unique supported fixed-graph datasets")
+        errors.append("datasets must list unique supported V4 datasets")
     for key, expected in (
         ("schema_version", 1),
         ("suite", SUITE),
@@ -20222,8 +20951,12 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         _integer(config.get("model_seed"), "model_seed")
         for key in ("epochs", "patience", "edge_chunk_size"):
             _integer(config.get(key), key, minimum=1)
-        if config.get("batch_size") != 1 or type(config.get("batch_size")) is not int:
-            raise ValueError("full-graph batch_size must be 1")
+        batch_sizes = config.get("batch_size_by_dataset")
+        expected_batch_sizes = {
+            dataset: BATCH_SIZE_BY_DATASET[dataset] for dataset in datasets
+        }
+        if not _same(batch_sizes, expected_batch_sizes):
+            raise ValueError("manifest batch_size_by_dataset violates the V4 protocol")
         if config.get("workers") != 0 or type(config.get("workers")) is not int:
             raise ValueError("full-graph workers must be 0")
         if not isinstance(config.get("device"), str) or not re.fullmatch(
@@ -20254,6 +20987,9 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             errors.append(f"duplicate job: {key}")
             continue
         indexed[key] = job
+        expected_batch_size = BATCH_SIZE_BY_DATASET[dataset]
+        if job.get("batch_size") != expected_batch_size:
+            errors.append(f"{key}: job batch_size must be {expected_batch_size}")
         if job.get("status") not in {"pending", "running", "failed", "passed"}:
             errors.append(f"{key}: invalid job status")
         try:
@@ -20332,7 +21068,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                     row["validation_percent"] = 100.0 * child["validation"]
                     row["best_validation_diagnostics"] = _best_layers(child["diagnostics"])
                     row["best_epoch_training_observation"] = _best_training_observation(
-                        child, config
+                        child, child["configuration"]
                     )
                     row["best_checkpoint_interventions"] = child["diagnostics"][
                         "best_checkpoint_interventions"
@@ -20362,7 +21098,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         dataset_reports.append(
             {
                 "dataset": dataset,
-                "metric_name": "accuracy",
+                "metric_name": METRIC_BY_DATASET[dataset],
                 "model_seed": config.get("model_seed"),
                 "conditions": rows,
                 "complete": len(loaded) == len(CONDITIONS),
@@ -20458,7 +21194,8 @@ def _gradient_markdown(rows: list[dict[str, Any]]) -> list[str]:
     lines = [
         "### Actual training gradients at the selected epoch",
         "",
-        "Actual train-mask backward, before that epoch's optimizer update; frozen entries are N/A.",
+        "Actual transductive full-graph or PPI first-minibatch backward, before that batch's "
+        "optimizer update; frozen entries are N/A.",
         "",
         "| Condition | Epoch | Layer | C-gate gradient L2 | Spatial-W gradient L2 |",
         "| --- | ---: | ---: | ---: | ---: |",
@@ -20523,7 +21260,7 @@ def markdown(report: dict[str, Any]) -> str:
         lines += [f"- {_cell(error)}" for error in report["errors"]] + [""]
     for dataset in report["datasets"]:
         lines += [
-            f"## {dataset['dataset']} (accuracy, higher is better)",
+            f"## {dataset['dataset']} ({dataset['metric_name']}, higher is better)",
             "",
             "| Condition | C mode | W mode | Status | Validation (%) | Best epoch | Stop epoch "
             "| Stop reason | Train loss | Trainable | Frozen |",
@@ -20706,14 +21443,18 @@ exec "${environment_python}" -B scripts/run_conductance_v4.py "$@"
 ````python
 """Standalone four-arm conductance x spatial-message V4 training.
 
-Every arm is trained freshly on CUDA with the same official full-graph cache.
+Every arm is trained freshly on CUDA with the same official V1 dataset cache.
+Transductive datasets use one full graph; PPI uses whole-graph minibatches.
 Validation alone selects a checkpoint.  Selected-checkpoint interventions are
-read-only diagnostic forwards and are never counted as additional training.
+read-only diagnostic forwards and are never counted as additional training. No
+test score is computed.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
 import time
 from pathlib import Path
@@ -20734,19 +21475,29 @@ from .diagnostics import (
     norm,
 )
 from .model import RelativeCSpatialNodeClassifier
-from .protocol import COMMON, CONDITIONS, DATASETS, DEFAULT_EDGE_CHUNK_SIZE, PARAMETERIZATION, SUITE
+from .protocol import (
+    BATCH_SIZE_BY_DATASET,
+    COMMON,
+    CONDITIONS,
+    DATASETS,
+    DEFAULT_EDGE_CHUNK_SIZE,
+    METRIC_BY_DATASET,
+    PARAMETERIZATION,
+    SUITE,
+)
 
 OBSERVATION_POLICY = {
     "training": (
-        "Every epoch's actual full-graph train forward with dropout ON; raw task gradients "
-        "after backward before AdamW step. No extra training forward/backward."
+        "Every epoch's actual transductive full-graph forward or PPI first actual minibatch with "
+        "dropout ON; raw task gradients after backward before AdamW step. No extra training "
+        "forward/backward."
     ),
     "validation": (
         "Every epoch validation selects checkpoint; initial/selected/final validation layer "
         "observations use validation labels only."
     ),
     "statistics": (
-        "Exact full observed graph score/C moments and degree population quantiles; per-layer "
+        "Exact full observed batch score/C moments and degree population quantiles; per-layer "
         "alpha and W parameter, identity-distance, gradient, and singular-value summaries."
     ),
     "factorial_training": (
@@ -20907,9 +21658,56 @@ def _parameter_metadata(model):
 
 
 def topology_metadata(payload):
-    if payload.get("dataset") not in DATASETS or len(payload.get("graphs", [])) != 1:
-        raise ValueError("V4 experiment requires one official transductive graph; PPI unsupported")
-    graph = payload["graphs"][0]
+    dataset = payload.get("dataset")
+    graphs = payload.get("graphs", [])
+    if dataset not in DATASETS or not graphs:
+        raise ValueError("V4 requires a supported official dataset payload")
+    if dataset == "ppi":
+        train_indices = list(payload.get("splits", {}).get("train", []))
+        validation_indices = list(payload.get("splits", {}).get("validation", []))
+        if (
+            len(train_indices) != 20
+            or len(validation_indices) != 2
+            or set(train_indices) & set(validation_indices)
+        ):
+            raise ValueError("PPI requires disjoint official 20-train/2-validation graph splits")
+        metadata = {
+            "scope": "official_train_and_validation_graphs",
+            "split_graph_counts": {},
+            "split_num_nodes": {},
+            "split_num_edges": {},
+            "split_incidence_sha256": {},
+        }
+        for split, split_indices in (
+            ("train", train_indices),
+            ("validation", validation_indices),
+        ):
+            descriptors = []
+            nodes = edges = 0
+            for graph_index in split_indices:
+                graph = graphs[int(graph_index)]
+                incidence = graph["incidence_edge_index"]
+                nodes += int(graph["x"].shape[0])
+                edges += int(incidence.shape[1])
+                descriptors.append(
+                    {
+                        "graph_index": int(graph_index),
+                        "num_nodes": int(graph["x"].shape[0]),
+                        "num_edges": int(incidence.shape[1]),
+                        "incidence_sha256": tensor_hash(incidence),
+                    }
+                )
+            metadata["split_graph_counts"][split] = len(split_indices)
+            metadata["split_num_nodes"][split] = nodes
+            metadata["split_num_edges"][split] = edges
+            metadata["split_incidence_sha256"][split] = hashlib.sha256(
+                json.dumps(descriptors, sort_keys=True).encode()
+            ).hexdigest()
+        return metadata
+    else:
+        if len(graphs) != 1:
+            raise ValueError("Transductive V4 datasets require exactly one official graph")
+        graph = graphs[0]
     return {
         "num_nodes": int(graph["x"].shape[0]),
         "num_edges": int(graph["incidence_edge_index"].shape[1]),
@@ -20933,8 +21731,13 @@ def _validate_args(args):
         raise ValueError("Unsupported V4 dataset/condition")
     if min(args.epochs, args.patience, args.edge_chunk_size) < 1 or args.model_seed < 0:
         raise ValueError("epochs/patience/chunk size must be positive and seed nonnegative")
-    if args.batch_size != 1 or args.workers != 0:
-        raise ValueError("V4 full-graph training requires batch-size=1 and workers=0")
+    expected_batch_size = BATCH_SIZE_BY_DATASET[args.dataset]
+    if args.batch_size is None:
+        args.batch_size = expected_batch_size
+    if args.batch_size != expected_batch_size or args.workers != 0:
+        raise ValueError(
+            "V4 requires protocol batch size 2 for PPI, 1 otherwise, and workers=0"
+        )
 
 
 def build_parser():
@@ -20947,7 +21750,7 @@ def build_parser():
     parser.add_argument("--model-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--edge-chunk-size", type=int, default=DEFAULT_EDGE_CHUNK_SIZE)
     return parser
@@ -20962,9 +21765,23 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     sources = _source_hashes()
     _configure_fp32()
     _seed(args.model_seed)
-    graph, indices = _make_data(payload, args, device)
-    if indices is None or not indices["train"].numel():
-        raise ValueError("V4 requires a nonempty transductive train mask")
+    data, indices = _make_data(payload, args, device)
+    if indices is not None:
+        if not indices["train"].numel():
+            raise ValueError("V4 requires a nonempty transductive train mask")
+        train_batches_per_epoch = validation_batches = validation_graphs = 1
+    else:
+        train_batches_per_epoch = len(data["train"])
+        validation_batches = len(data["validation"])
+        validation_graphs = len(payload["splits"]["validation"])
+        if (
+            train_batches_per_epoch != 10
+            or validation_batches != 1
+            or validation_graphs != 2
+        ):
+            raise ValueError(
+                "PPI V4 requires 20 train graphs and 2 validation graphs at batch size 2"
+            )
     specification = CONDITIONS[args.condition]
     model = RelativeCSpatialNodeClassifier(
         payload["graphs"][0]["x"].shape[1],
@@ -21008,57 +21825,84 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     checkpoint, history_path = output / "best.pt", output / "history.json"
     history, trajectory = [], []
     best_validation, best_epoch = -math.inf, 0
+    optimizer_steps = best_optimizer_steps = 0
     checkpoint_hash = history_hash = None
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
     started = time.perf_counter()
-    initial_observation, _ = evaluate_validation(model, graph, indices["validation"])
+    validation_indices = indices["validation"] if indices is not None else None
+    initial_observation, _ = evaluate_validation(
+        model, data, validation_indices, device=device
+    )
     for epoch in range(1, args.epochs + 1):
         _require_sources(sources)
         torch.cuda.synchronize(device)
         epoch_started = time.perf_counter()
         model.train()
-        optimizer.zero_grad(set_to_none=True)
-        with ForwardObservation(model) as observation:
-            logits = model(graph)
-        loss, count = training_loss(logits, graph, indices["train"])
-        if not bool(torch.isfinite(loss)):
-            raise FloatingPointError(f"Nonfinite V4 training loss at epoch {epoch}")
-        loss.backward()
-        gradient_groups = [
-            {
-                **descriptor,
-                "parameter_norm": norm(group["params"]),
-                "task_gradient_norm": norm(group["params"], gradient=True),
-            }
-            for descriptor, group in zip(
-                optimizer_metadata(optimizer), optimizer.param_groups, strict=True
-            )
-        ]
-        record = {
-            "epoch": epoch,
-            "batch_index": 0,
-            "optimizer_steps_before_batch": epoch - 1,
-            "scope": "full_graph_train_mask",
-            "mode": "train_dropout_on",
-            "stage": "after_task_backward_before_optimizer_step",
-            "label_count": count,
-            "train_loss": float(loss.detach()),
-            "layers": observation.summary(gradients=True),
-            "parameter_groups": gradient_groups,
-        }
-        trajectory.append(record)
-        optimizer.step()
+        loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+        label_count = 0
+        batches = [data] if indices is not None else data["train"]
+        for batch_index, batch in enumerate(batches):
+            if indices is None:
+                batch = batch.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            if batch_index == 0:
+                with ForwardObservation(model) as observation:
+                    logits = model(batch)
+            else:
+                logits = model(batch)
+            train_indices = indices["train"] if indices is not None else None
+            loss, count = training_loss(logits, batch, train_indices)
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError(
+                    f"Nonfinite V4 training loss at epoch {epoch}, batch {batch_index}"
+                )
+            loss.backward()
+            if batch_index == 0:
+                gradient_groups = [
+                    {
+                        **descriptor,
+                        "parameter_norm": norm(group["params"]),
+                        "task_gradient_norm": norm(group["params"], gradient=True),
+                    }
+                    for descriptor, group in zip(
+                        optimizer_metadata(optimizer), optimizer.param_groups, strict=True
+                    )
+                ]
+                record = {
+                    "epoch": epoch,
+                    "batch_index": 0,
+                    "optimizer_steps_before_batch": optimizer_steps,
+                    "scope": (
+                        "full_graph_train_mask"
+                        if indices is not None
+                        else "first_actual_training_minibatch_only"
+                    ),
+                    "mode": "train_dropout_on",
+                    "stage": "after_task_backward_before_optimizer_step",
+                    "label_count": count,
+                    "train_loss": float(loss.detach()),
+                    "layers": observation.summary(gradients=True),
+                    "parameter_groups": gradient_groups,
+                }
+                trajectory.append(record)
+            optimizer.step()
+            optimizer_steps += 1
+            loss_sum.add_(loss.detach().double() * count)
+            label_count += count
+        if not label_count:
+            raise RuntimeError("V4 training split produced no labels")
+        train_loss = float(loss_sum / label_count)
         validation_observation, _ = evaluate_validation(
-            model, graph, indices["validation"], observe=False
+            model, data, validation_indices, observe=False, device=device
         )
         validation = validation_observation["metric"]
         torch.cuda.synchronize(device)
         history.append(
             {
                 "epoch": epoch,
-                "optimizer_steps": epoch,
-                "train_loss": record["train_loss"],
+                "optimizer_steps": optimizer_steps,
+                "train_loss": train_loss,
                 "validation": validation,
                 "epoch_seconds": time.perf_counter() - epoch_started,
                 "training_first_batch": record,
@@ -21068,6 +21912,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         history_hash = sha256_file(history_path)
         if validation > best_validation:
             best_validation, best_epoch = validation, epoch
+            best_optimizer_steps = optimizer_steps
             saved = {
                 **common,
                 "state_dict": {
@@ -21083,7 +21928,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
                     "edge_chunk_size": args.edge_chunk_size,
                 },
                 "best_epoch": epoch,
-                "optimizer_steps": epoch,
+                "optimizer_steps": optimizer_steps,
                 "validation": validation,
             }
             atomic_publish(checkpoint, lambda path, state=saved: torch.save(state, path))
@@ -21091,7 +21936,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         if epoch == 1 or epoch % 10 == 0:
             print(
                 f"{args.dataset}/{args.condition} epoch={epoch} "
-                f"train_loss={record['train_loss']:.6f} "
+                f"train_loss={train_loss:.6f} "
                 f"val={validation:.6f} best_epoch={best_epoch}",
                 flush=True,
             )
@@ -21101,7 +21946,9 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     stopping_reason = "patience" if stop_epoch - best_epoch >= args.patience else "max_epochs"
     selection_loop_seconds = time.perf_counter() - started
     post_selection_started = time.perf_counter()
-    final_observation, _ = evaluate_validation(model, graph, indices["validation"])
+    final_observation, _ = evaluate_validation(
+        model, data, validation_indices, device=device
+    )
     _require_sources(sources)
     if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
         raise RuntimeError("Checkpoint/history changed before best-checkpoint validation")
@@ -21121,16 +21968,19 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
             raise ValueError(f"Best checkpoint metadata mismatch: {key}")
     model.load_state_dict(saved["state_dict"])
     optimizer.zero_grad(set_to_none=True)
-    selected_observation, reference = evaluate_validation(model, graph, indices["validation"])
+    selected_observation, reference = evaluate_validation(
+        model, data, validation_indices, device=device
+    )
     if abs(selected_observation["metric"] - best_validation) > 1e-4:
         raise RuntimeError("Best validation recheck disagrees with checkpoint selection")
     interventions = best_checkpoint_interventions(
         model,
-        graph,
-        indices["validation"],
+        data,
+        validation_indices,
         selected_observation,
         reference,
         seed=args.model_seed,
+        device=device,
     )
     _require_sources(sources)
     if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
@@ -21144,13 +21994,21 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         "stop_epoch": stop_epoch,
         "stopping_reason": stopping_reason,
         "epochs_run": len(history),
-        "optimizer_steps": len(history),
-        "best_checkpoint_optimizer_steps": best_epoch,
+        "optimizer_steps": optimizer_steps,
+        "best_checkpoint_optimizer_steps": best_optimizer_steps,
+        "train_batches_per_epoch": train_batches_per_epoch,
+        "validation_batches": validation_batches,
+        "validation_graphs": validation_graphs,
         "validation": selected_observation["metric"],
         "validation_at_selection": best_validation,
-        "metric_name": "accuracy",
+        "metric_name": METRIC_BY_DATASET[args.dataset],
         "train_loss": history[best_epoch - 1]["train_loss"],
-        "train_loss_scope": "actual full-graph train mask loss at selected checkpoint epoch",
+        "train_loss_scope": (
+            "actual full-graph train mask loss at selected checkpoint epoch"
+            if indices is not None
+            else "node-label-weighted mean across all 20 official PPI train graphs at the "
+            "selected checkpoint epoch"
+        ),
         "final_train_loss": history[-1]["train_loss"],
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_sha256": checkpoint_hash,
@@ -21173,7 +22031,11 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
             "observation_policy": OBSERVATION_POLICY,
         },
         "execution": {
-            "training": "full_graph_transductive",
+            "training": (
+                "full_graph_transductive"
+                if indices is not None
+                else "official_inductive_graph_minibatch"
+            ),
             "neighbor_sampling": False,
             "edge_chunk_size": args.edge_chunk_size,
             "dense_incidence": False,
@@ -38800,7 +39662,12 @@ def parser() -> argparse.ArgumentParser:
         "--datasets",
         nargs="+",
         default=list(DEFAULT_DATASETS),
-        help="Fixed-graph datasets: " + ", ".join(DATASETS) + "; default: ogbn-arxiv",
+        help=(
+            "Fixed-graph datasets: "
+            + ", ".join(DATASETS)
+            + "; default: "
+            + ", ".join(DEFAULT_DATASETS)
+        ),
     )
     result.add_argument("--model-seed", type=int, default=0, help="One seed, not a seed list")
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
@@ -38821,8 +39688,9 @@ def _validate(args: argparse.Namespace) -> None:
     shared._validate(args)
     if "ppi" in args.datasets:
         raise ValueError(
-            "PPI is unsupported in direct-C V2: graph-specific edge parameters cannot transfer "
-            "to held-out PPI graphs. Use the separate shared-generator V1 experiment."
+            "Direct-C V2 is N/A for PPI: graph-specific edge parameters are bound to one "
+            "fixed topology and cannot be defined for held-out PPI graphs without changing "
+            "the method. Use the separate shared-generator V1 experiment for PPI."
         )
     if not args.datasets or any(dataset not in DATASETS for dataset in args.datasets):
         raise ValueError("Unsupported fixed-graph dataset; choose: " + ", ".join(DATASETS))
@@ -39099,7 +39967,7 @@ def parser() -> argparse.ArgumentParser:
         "--datasets",
         nargs="+",
         default=list(DEFAULT_DATASETS),
-        help="Fixed-graph datasets: " + ", ".join(DATASETS) + "; default: ogbn-arxiv",
+        help="Official V1 datasets: " + ", ".join(DATASETS) + "; default: all five",
     )
     result.add_argument("--model-seed", type=int, default=0, help="One seed, not a seed list")
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
@@ -39108,7 +39976,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--device", default="cuda")
     result.add_argument("--epochs", type=int, default=200)
     result.add_argument("--patience", type=int, default=50)
-    result.add_argument("--batch-size", type=int, default=1, help="Must be 1: full-graph training")
+    result.add_argument(
+        "--batch-size",
+        type=int,
+        default=2,
+        help="PPI graph minibatch size (must be 2); fixed-graph children always use 1",
+    )
     result.add_argument("--workers", type=int, default=0)
     result.add_argument("--edge-chunk-size", type=int, default=65536)
     result.add_argument("--min-free-gb", type=float, default=8.0)
@@ -39118,22 +39991,18 @@ def parser() -> argparse.ArgumentParser:
 
 def _validate(args: argparse.Namespace) -> None:
     shared._validate(args)
-    if "ppi" in args.datasets:
-        raise ValueError(
-            "PPI is outside the initial V3 benchmark protocol, which uses transductive "
-            "node-classification datasets. This is a protocol limit, not a shared-gate limitation."
-        )
     if not args.datasets or any(dataset not in DATASETS for dataset in args.datasets):
-        raise ValueError("Unsupported fixed-graph dataset; choose: " + ", ".join(DATASETS))
+        raise ValueError("Unsupported V3 dataset; choose: " + ", ".join(DATASETS))
     if args.edge_chunk_size < 1:
         raise ValueError("edge chunk size must be positive")
-    if args.batch_size != 1 or args.workers != 0:
-        raise ValueError("Full-graph V3 requires batch-size=1 and workers=0")
+    if args.batch_size != 2 or args.workers != 0:
+        raise ValueError("V3 requires PPI batch-size=2 and workers=0")
 
 
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     jobs = []
     for dataset in args.datasets:
+        child_batch_size = args.batch_size if dataset == "ppi" else 1
         for condition in CONDITIONS:
             output = run_dir / dataset / condition
             command = [
@@ -39156,15 +40025,16 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "model_seed",
                 "epochs",
                 "patience",
-                "batch_size",
                 "workers",
                 "edge_chunk_size",
             ):
                 command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
+            command += ["--batch-size", str(child_batch_size)]
             jobs.append(
                 {
                     "dataset": dataset,
                     "condition": condition,
+                    "batch_size": child_batch_size,
                     "status": "pending",
                     "output_dir": str(output),
                     "metrics_path": str(output / "metrics.json"),
@@ -39270,13 +40140,15 @@ def main(argv: list[str] | None = None) -> int:
             "test": "not evaluated; exploratory validation comparison",
             "initialization": "same full state hash including frozen shared-gate scaffold; "
             "alpha active in both arms",
-            "data": "same verified official cache/split and ordered topology; no downloads",
+            "data": "same verified official V1 cache/split and ordered topology; no downloads",
             "contrast": "fresh relative_c minus fresh fixed_c; "
             "never reuse any V1/V2 or older score",
             "fixed_c": "exact C=1; gate scaffold frozen/excluded from optimizer, "
             "alpha remains trainable",
             "normalization": "symmetric in both arms; AdamW backbone WD=0.0005; gate/scalar WD=0",
-            "transductive": "initial protocol uses official fixed-graph train/validation masks",
+            "data_modes": "Cora/CiteSeer/PubMed/arxiv use fixed-graph train/validation masks; "
+            "PPI uses the official 20/2/2 split: train 20 and validation 2 run at batch 2 "
+            "with BCEWithLogits and global logit>0 node-label micro-F1; test 2 is not scored",
             "optimizer": "AdamW; gate MLP lr=2*base lr; alpha/gamma/tau lr=base lr; "
             "gate/scalar WD=0",
             "interventions": "selected checkpoint validation only: "
@@ -39385,6 +40257,7 @@ for directory in (ROOT, ROOT / "src"):
 
 from chartgat.cache import atomic_write_json  # noqa: E402
 from research.conductance_gat.v4.protocol import (  # noqa: E402
+    BATCH_SIZE_BY_DATASET,
     COMMON,
     CONDITIONS,
     DATASETS,
@@ -39407,7 +40280,7 @@ def parser() -> argparse.ArgumentParser:
         "--datasets",
         nargs="+",
         default=list(DEFAULT_DATASETS),
-        help="Fixed-graph datasets: " + ", ".join(DATASETS) + "; default: ogbn-arxiv",
+        help="Official V1 datasets; default: " + ", ".join(DEFAULT_DATASETS),
     )
     result.add_argument("--model-seed", type=int, default=0, help="One seed, not a seed list")
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
@@ -39416,7 +40289,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--device", default="cuda")
     result.add_argument("--epochs", type=int, default=200)
     result.add_argument("--patience", type=int, default=50)
-    result.add_argument("--batch-size", type=int, default=1, help="Must be 1: full-graph training")
+    result.add_argument("--batch-size", type=int, default=1, help=argparse.SUPPRESS)
     result.add_argument("--workers", type=int, default=0)
     result.add_argument("--edge-chunk-size", type=int, default=65536)
     result.add_argument("--min-free-gb", type=float, default=8.0)
@@ -39426,22 +40299,22 @@ def parser() -> argparse.ArgumentParser:
 
 def _validate(args: argparse.Namespace) -> None:
     shared._validate(args)
-    if "ppi" in args.datasets:
-        raise ValueError(
-            "PPI is outside the initial V4 protocol, which uses one fixed transductive graph. "
-            "This is a protocol limit, not a claim about the shared modules."
-        )
     if not args.datasets or any(dataset not in DATASETS for dataset in args.datasets):
-        raise ValueError("Unsupported fixed-graph dataset; choose: " + ", ".join(DATASETS))
+        raise ValueError("Unsupported V4 dataset; choose: " + ", ".join(DATASETS))
     if args.edge_chunk_size < 1:
         raise ValueError("edge chunk size must be positive")
-    if args.batch_size != 1 or args.workers != 0:
-        raise ValueError("Full-graph V4 requires batch-size=1 and workers=0")
+    if args.batch_size != 1:
+        raise ValueError(
+            "V4 batch size is protocol-locked per dataset: PPI=2, transductive datasets=1"
+        )
+    if args.workers != 0:
+        raise ValueError("V4 requires workers=0")
 
 
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     jobs = []
     for dataset in args.datasets:
+        batch_size = BATCH_SIZE_BY_DATASET[dataset]
         for condition in CONDITIONS:
             output = run_dir / dataset / condition
             command = [
@@ -39464,15 +40337,16 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "model_seed",
                 "epochs",
                 "patience",
-                "batch_size",
                 "workers",
                 "edge_chunk_size",
             ):
                 command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
+            command += ["--batch-size", str(batch_size)]
             jobs.append(
                 {
                     "dataset": dataset,
                     "condition": condition,
+                    "batch_size": batch_size,
                     "status": "pending",
                     "output_dir": str(output),
                     "metrics_path": str(output / "metrics.json"),
@@ -39560,11 +40434,13 @@ def main(argv: list[str] | None = None) -> int:
                 "model_seed",
                 "epochs",
                 "patience",
-                "batch_size",
                 "workers",
                 "device",
                 "edge_chunk_size",
             )
+        },
+        "batch_size_by_dataset": {
+            dataset: BATCH_SIZE_BY_DATASET[dataset] for dataset in args.datasets
         },
         "data_root": str(data_root),
     }
@@ -39584,14 +40460,17 @@ def main(argv: list[str] | None = None) -> int:
             "selection": "best validation checkpoint per arm; same early-stopping policy",
             "test": "not evaluated; exploratory validation comparison",
             "initialization": "same full state hash across all four arms; C=1, W=I, alpha=.5",
-            "data": "same verified official cache/split and ordered topology; no downloads",
+            "data": "same verified official V1 cache/split and ordered topology; no downloads",
             "contrast": "four fresh V4 trainings; never reuse V3 checkpoints or scores",
             "factorial": "relative C on/off crossed with learned spatial W on/off",
             "fixed_c": "exact C=1; estimator scaffold frozen and excluded from optimizer",
             "identity_w": "exact W=I; message-transform scaffold frozen and excluded",
             "normalization": "symmetric weighted-degree in every arm; alpha remains trainable",
-            "transductive": "initial protocol uses official fixed-graph train/validation masks",
-            "interventions": "selected-checkpoint validation only; no retraining or test labels",
+            "task_protocol": "Cora/CiteSeer/PubMed/ogbn-arxiv use transductive full graphs; "
+            "PPI uses the official 20/2/2 inductive graph split, batch size 2, BCEWithLogits "
+            "and global node-label micro-F1",
+            "interventions": "selected-checkpoint validation only; no retraining, test-label "
+            "metric or checkpoint selection; cache test metadata remains integrity-checked",
             "v3_comparison": "V3 is not reused and V3-to-V4 is not a one-factor score contrast",
             "resources": "whole-loop time and peak allocation include diagnostics and IO",
             "uncertainty": "n=1; no CI, seed standard deviation or significance claim",
@@ -45673,12 +46552,18 @@ import pytest
 from scripts import run_conductance_v2 as runner
 
 
-def test_default_two_fresh_trainings():
+def test_default_eight_fresh_trainings_cover_all_supported_transductive_datasets():
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
-    assert args.datasets == ["ogbn-arxiv"] and args.model_seed == 0
+    assert args.datasets == ["cora", "citeseer", "pubmed", "ogbn-arxiv"]
+    assert args.model_seed == 0
     assert args.edge_chunk_size == 65536 and args.batch_size == 1 and args.workers == 0
-    assert [job["condition"] for job in jobs] == ["direct_c", "fixed_c"]
+    assert [(job["dataset"], job["condition"]) for job in jobs] == [
+        (dataset, condition)
+        for dataset in args.datasets
+        for condition in ("direct_c", "fixed_c")
+    ]
+    assert len(jobs) == 8
     for job in jobs:
         command = job["command"]
         assert command[command.index("-m") + 1] == "research.conductance_gat.v2.train"
@@ -45763,7 +46648,14 @@ def _stub(tmp_path, monkeypatch, failure=None, change_after=None):
     monkeypatch.setattr(runner, "_source_snapshot", snapshot)
     monkeypatch.setattr(runner, "run_logged", dispatch)
     monkeypatch.setattr(runner, "_comparison", report)
-    return ["--results-root", str(tmp_path), "--run-id", "unit-fixture"], calls, reports
+    return [
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        "unit-fixture",
+        "--datasets",
+        "ogbn-arxiv",
+    ], calls, reports
 
 
 def test_success_records_metrics_digest_and_one_seed(tmp_path, monkeypatch):
@@ -45849,17 +46741,22 @@ import pytest
 from scripts import run_conductance_v3 as runner
 
 
-def test_default_two_fresh_trainings():
+def test_default_ten_fresh_trainings_with_dataset_specific_batch_sizes():
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
-    assert args.datasets == ["ogbn-arxiv"] and args.model_seed == 0
-    assert args.edge_chunk_size == 65536 and args.batch_size == 1 and args.workers == 0
-    assert [job["condition"] for job in jobs] == ["relative_c", "fixed_c"]
+    assert args.datasets == ["cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"]
+    assert args.model_seed == 0
+    assert args.edge_chunk_size == 65536 and args.batch_size == 2 and args.workers == 0
+    assert len(jobs) == 10
+    assert [job["condition"] for job in jobs] == ["relative_c", "fixed_c"] * 5
     for job in jobs:
         command = job["command"]
         assert command[command.index("-m") + 1] == "research.conductance_gat.v3.train"
         assert command[command.index("--model-seed") + 1] == "0"
         assert command[command.index("--edge-chunk-size") + 1] == "65536"
+        expected_batch_size = 2 if job["dataset"] == "ppi" else 1
+        assert job["batch_size"] == expected_batch_size
+        assert command[command.index("--batch-size") + 1] == str(expected_batch_size)
         assert "--amp" not in command and "--allow-download" not in command
 
 
@@ -45888,13 +46785,13 @@ def test_stdlib_inspection_has_no_writes(tmp_path, option):
         ["--device", "cpu"],
         ["--model-seed", "-1"],
         ["--epochs", "0"],
-        ["--datasets", "ppi"],
         ["--datasets", "unknown"],
         ["--datasets", "cora", "cora"],
         ["--run-id", "../old"],
         ["--min-free-gb", "nan"],
         ["--edge-chunk-size", "0"],
-        ["--batch-size", "2"],
+        ["--batch-size", "1"],
+        ["--batch-size", "3"],
         ["--workers", "1"],
     ],
 )
@@ -45903,9 +46800,11 @@ def test_invalid_inputs_do_not_check_dependencies_or_train(monkeypatch, options)
     assert runner.main(options) == 2
 
 
-def test_ppi_rejection_explains_protocol_limit(capsys):
-    assert runner.main(["--datasets", "ppi"]) == 2
-    assert "protocol limit" in capsys.readouterr().err
+def test_ppi_is_a_supported_two_arm_batch_two_plan():
+    args = runner.parser().parse_args(["--datasets", "ppi"])
+    runner._validate(args)
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert len(jobs) == 2 and all(job["batch_size"] == 2 for job in jobs)
 
 
 def _stub(tmp_path, monkeypatch, failure=None, change_after=None):
@@ -45939,7 +46838,14 @@ def _stub(tmp_path, monkeypatch, failure=None, change_after=None):
     monkeypatch.setattr(runner, "_source_snapshot", snapshot)
     monkeypatch.setattr(runner, "run_logged", dispatch)
     monkeypatch.setattr(runner, "_comparison", report)
-    return ["--results-root", str(tmp_path), "--run-id", "unit-fixture"], calls, reports
+    return [
+        "--datasets",
+        "cora",
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        "unit-fixture",
+    ], calls, reports
 
 
 def test_success_records_metrics_digest_and_one_seed(tmp_path, monkeypatch):
@@ -46023,12 +46929,14 @@ torch = pytest.importorskip("torch")
 
 from research.conductance_gat.ablation.model import state_sha256  # noqa: E402
 from research.conductance_gat.v3.model import RelativeCNodeClassifier  # noqa: E402
+from research.conductance_gat.v4 import train as train_module  # noqa: E402
 from research.conductance_gat.v4.model import (  # noqa: E402
     RelativeCSpatialConv,
     RelativeCSpatialNodeClassifier,
 )
 from research.conductance_gat.v4.operator import symmetric_spatial_propagation  # noqa: E402
 from research.conductance_gat.v4.protocol import CONDITIONS  # noqa: E402
+from research.conductance_gat.v4.train import _validate_args, topology_metadata  # noqa: E402
 
 
 def _dense_reference(residual, message, c, incidence, alpha):
@@ -46215,6 +47123,169 @@ def test_identity_w_path_is_exact_v3_forward():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_packed_inductive_graphs_match_separate_graph_forwards():
+    torch.manual_seed(43)
+    model = RelativeCSpatialNodeClassifier(
+        3,
+        2,
+        hidden_channels=4,
+        layers=2,
+        dropout=0.0,
+        gate_mode="relative",
+        spatial_mode="learned",
+        edge_chunk_size=1,
+    ).eval()
+    first = SimpleNamespace(
+        x=torch.tensor([[0.2, 1.0, -0.4], [1.2, -0.7, 0.5], [-0.3, 0.8, 2.0]]),
+        incidence_edge_index=torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+    )
+    second = SimpleNamespace(
+        x=torch.tensor([[0.9, 0.1, -1.0], [0.4, -0.2, 0.7], [1.1, 0.3, -0.5]]),
+        incidence_edge_index=torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+    )
+    packed = SimpleNamespace(
+        x=torch.cat((first.x, second.x)),
+        incidence_edge_index=torch.tensor([[0, 1, 3, 4], [1, 2, 4, 5]], dtype=torch.long),
+        batch=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long),
+    )
+    with torch.no_grad():
+        expected = torch.cat((model(first), model(second)))
+        actual = model(packed)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_ppi_topology_and_child_batch_defaults_bind_official_protocol():
+    graphs = [
+        {
+            "x": torch.ones(3, 2),
+            "incidence_edge_index": torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        }
+        for _ in range(24)
+    ]
+    payload = {
+        "dataset": "ppi",
+        "graphs": graphs,
+        "splits": {
+            "train": list(range(20)),
+            "validation": [20, 21],
+            "test": [22, 23],
+        },
+    }
+    topology = topology_metadata(payload)
+    assert topology["scope"] == "official_train_and_validation_graphs"
+    assert topology["split_graph_counts"] == {"train": 20, "validation": 2}
+    assert topology["split_num_nodes"] == {"train": 60, "validation": 6}
+    assert topology["split_num_edges"] == {"train": 40, "validation": 4}
+    assert all(len(value) == 64 for value in topology["split_incidence_sha256"].values())
+
+    args = SimpleNamespace(
+        dataset="ppi",
+        condition="fixed_c_identity_w",
+        epochs=1,
+        patience=1,
+        edge_chunk_size=1,
+        model_seed=0,
+        batch_size=None,
+        workers=0,
+    )
+    _validate_args(args)
+    assert args.batch_size == 2
+
+
+class _PackedBatch(SimpleNamespace):
+    def to(self, device, non_blocking=False):
+        del non_blocking
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                setattr(self, name, value.to(device))
+        return self
+
+
+class _NoTestSplits(dict):
+    def __getitem__(self, key):
+        if key == "test":
+            pytest.fail("V4 training must not read the PPI test split")
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        if key == "test":
+            pytest.fail("V4 training must not read the PPI test split")
+        return super().get(key, default)
+
+
+def test_ppi_training_uses_ten_minibatch_steps_and_never_reads_test(
+    tmp_path, monkeypatch
+):
+    individual = {
+        "x": torch.ones(3, 2),
+        "y": torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+        "incidence_edge_index": torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+    }
+    payload = {
+        "dataset": "ppi",
+        "classes": 2,
+        "graphs": [
+            {name: value.clone() for name, value in individual.items()} for _ in range(24)
+        ],
+        "splits": _NoTestSplits(
+            train=list(range(20)),
+            validation=[20, 21],
+        ),
+    }
+    packed = _PackedBatch(
+        x=torch.cat((individual["x"], individual["x"])),
+        y=torch.cat((individual["y"], individual["y"])),
+        incidence_edge_index=torch.tensor([[0, 1, 3, 4], [1, 2, 4, 5]], dtype=torch.long),
+        batch=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long),
+        num_graphs=2,
+    )
+    loaders = {"train": [packed] * 10, "validation": [packed]}
+    monkeypatch.setattr(train_module, "_require_cuda", lambda device: None)
+    monkeypatch.setattr(train_module, "_make_data", lambda payload, args, device: (loaders, None))
+    monkeypatch.setattr(train_module, "_source_hashes", lambda: {"unit.py": "a" * 64})
+    monkeypatch.setattr(train_module, "_versions", lambda: {"torch": "unit"})
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "unit-cpu")
+    steps = 0
+    real_step = torch.optim.AdamW.step
+
+    def counted_step(optimizer, *args, **kwargs):
+        nonlocal steps
+        steps += 1
+        return real_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", counted_step)
+    output = tmp_path / "ppi-arm"
+    output.mkdir()
+    args = SimpleNamespace(
+        dataset="ppi",
+        condition="fixed_c_identity_w",
+        model_seed=0,
+        epochs=1,
+        patience=1,
+        batch_size=2,
+        workers=0,
+        device="cpu",
+        edge_chunk_size=16,
+    )
+    protocol = {
+        "data_sha256": "b" * 64,
+        "split": "official_inductive_graph_split",
+        "split_counts": {"train": 20, "validation": 2, "test": 2},
+    }
+    result = train_module.train_model(payload, protocol, args, torch.device("cpu"), output)
+    assert steps == 10
+    assert result["optimizer_steps"] == 10
+    assert result["best_checkpoint_optimizer_steps"] == 10
+    assert result["train_batches_per_epoch"] == 10
+    assert result["validation_batches"] == 1 and result["validation_graphs"] == 2
+    assert result["metric_name"] == "micro_f1"
+    assert result["execution"]["training"] == "official_inductive_graph_minibatch"
+
+
 def test_conductance_reads_pre_w_state_and_learned_w_receives_task_gradient():
     operator = RelativeCSpatialConv(
         2,
@@ -46312,6 +47383,36 @@ def _model(*, gate_mode="relative"):
     return model
 
 
+class _MovableGraph(SimpleNamespace):
+    def to(self, device, non_blocking=False):
+        del non_blocking
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                setattr(self, name, value.to(device))
+        return self
+
+
+def _packed_ppi_graph():
+    return _MovableGraph(
+        x=torch.tensor(
+            [
+                [0.5, 1.0, 2.0],
+                [1.0, 2.0, 0.5],
+                [2.0, 0.5, 1.0],
+                [3.0, 1.0, 2.0],
+                [0.2, 0.7, 1.3],
+                [1.1, 0.1, 0.4],
+            ]
+        ),
+        y=torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+        ),
+        incidence_edge_index=torch.tensor([[0, 1, 3, 4], [1, 2, 4, 5]]),
+        batch=torch.tensor([0, 0, 0, 1, 1, 1]),
+        num_graphs=2,
+    )
+
+
 def test_graphwise_positive_constant_c_is_algebraically_equivalent_to_ones():
     residual = torch.tensor(
         [
@@ -46345,6 +47446,46 @@ def test_graphwise_positive_constant_c_is_algebraically_equivalent_to_ones():
         edge_chunk_size=2,
     )
     torch.testing.assert_close(actual, expected, rtol=1e-14, atol=1e-14)
+
+
+def test_ppi_validation_uses_both_graphs_global_micro_f1_and_labelwise_predictions():
+    graph, model = _packed_ppi_graph(), _model()
+    data = {"validation": [graph]}
+    result, logits = evaluate_validation(model, data, None, device=torch.device("cpu"))
+    predicted, truth = logits > 0, graph.y > 0
+    true_positive = int((predicted & truth).sum())
+    denominator = int(predicted.sum() + truth.sum())
+    expected = 2 * true_positive / denominator if denominator else 0.0
+    assert result["metric"] == pytest.approx(expected)
+    assert result["metric_name"] == "micro_f1"
+    assert result["prediction_rule"] == "logit_gt_zero_node_label"
+    assert result["validation_graph_count"] == 2
+    assert len(result["layers"]) == len(model.operators)
+
+    audit = best_checkpoint_interventions(
+        model,
+        data,
+        None,
+        result,
+        logits,
+        seed=17,
+        device=torch.device("cpu"),
+    )
+    assert audit["metric_name"] == "micro_f1"
+    assert audit["prediction_rule"] == "logit_gt_zero_node_label"
+    assert audit["validation_graph_count"] == 2
+    for contract in audit["mean_c_numeric_check"]["replacement_contracts"].values():
+        assert contract["edge_counts"] == [4, 4]
+
+
+def test_ppi_prediction_change_is_labelwise_not_argmax():
+    left = torch.tensor([[2.0, 1.0], [-1.0, 3.0]])
+    right = torch.tensor([[1.0, 2.0], [-2.0, 4.0]])
+    assert not torch.equal(left.argmax(-1), right.argmax(-1))
+    assert torch.equal(
+        diagnostics._prediction_tensor(left, "logit_gt_zero_node_label"),
+        diagnostics._prediction_tensor(right, "logit_gt_zero_node_label"),
+    )
 
 
 def test_separate_forward_jitter_is_informational_and_preserves_model(monkeypatch):
@@ -46454,8 +47595,10 @@ torch = pytest.importorskip("torch")
 from research.conductance_gat.v4 import report as report_module  # noqa: E402
 from research.conductance_gat.v4.model import RelativeCSpatialNodeClassifier  # noqa: E402
 from research.conductance_gat.v4.protocol import (  # noqa: E402
+    BATCH_SIZE_BY_DATASET,
     COMMON,
     CONDITIONS,
+    METRIC_BY_DATASET,
     PARAMETERIZATION,
     SUITE,
 )
@@ -46537,20 +47680,38 @@ def _layer(index, specification, *, gradients=False):
     }
 
 
-def _training_record(epoch, specification):
+def _training_record(epoch, specification, dataset="ogbn-arxiv"):
+    steps = 10 if dataset == "ppi" else 1
     return {
         "epoch": epoch,
         "batch_index": 0,
-        "optimizer_steps_before_batch": epoch - 1,
-        "scope": "full_graph_train_mask",
+        "optimizer_steps_before_batch": (epoch - 1) * steps,
+        "scope": (
+            "first_actual_training_minibatch_only"
+            if dataset == "ppi"
+            else "full_graph_train_mask"
+        ),
         "mode": "train_dropout_on",
         "stage": "after_task_backward_before_optimizer_step",
         "layers": [_layer(index, specification, gradients=True) for index in range(2)],
     }
 
 
-def _diagnostics(score, specification):
+def _diagnostics(score, specification, dataset="ogbn-arxiv", edge_count=3):
     layers = [_layer(index, specification) for index in range(2)]
+    metric_name = METRIC_BY_DATASET[dataset]
+    prediction_rule = (
+        "logit_gt_zero_node_label" if dataset == "ppi" else "argmax_node_class"
+    )
+    graph_count = 2 if dataset == "ppi" else 1
+    observation = {
+        "mode": "eval",
+        "split": "validation",
+        "metric_name": metric_name,
+        "prediction_rule": prediction_rule,
+        "validation_graph_count": graph_count,
+        "layers": layers,
+    }
     intervention_rows = [
         {
             "intervention": name,
@@ -46564,17 +47725,15 @@ def _diagnostics(score, specification):
         for name in INTERVENTIONS
     ]
     return {
-        "initial_validation": {"mode": "eval", "split": "validation", "layers": layers},
+        "initial_validation": dict(observation),
         "best_validation": {
-            "mode": "eval",
-            "split": "validation",
+            **observation,
             "metric": score,
-            "layers": layers,
         },
-        "final_validation": {"mode": "eval", "split": "validation", "layers": layers},
+        "final_validation": dict(observation),
         "train_trajectory": [
-            _training_record(1, specification),
-            _training_record(2, specification),
+            _training_record(1, specification, dataset),
+            _training_record(2, specification, dataset),
         ],
         "best_checkpoint_interventions": {
             "status": "passed",
@@ -46584,6 +47743,9 @@ def _diagnostics(score, specification):
             "rows": intervention_rows,
             "shuffle_seed": 0,
             "normalization_recomputed_for_c_interventions": True,
+            "metric_name": metric_name,
+            "prediction_rule": prediction_rule,
+            "validation_graph_count": graph_count,
             "mean_c_numeric_check": {
                 "comparison": "mean_c_vs_ones_c",
                 "role": "informational_non_gating",
@@ -46599,13 +47761,13 @@ def _diagnostics(score, specification):
                         "contract": "graph_constant_positive",
                         "satisfied": True,
                         "layers_checked": 2,
-                        "edge_counts": [3, 3],
+                        "edge_counts": [edge_count, edge_count],
                     },
                     "ones_c": {
                         "contract": "exact_one",
                         "satisfied": True,
                         "layers_checked": 2,
-                        "edge_counts": [3, 3],
+                        "edge_counts": [edge_count, edge_count],
                     },
                 },
             },
@@ -46613,25 +47775,30 @@ def _diagnostics(score, specification):
     }
 
 
-def _fixture(tmp_path):
+def _fixture(tmp_path, dataset="ogbn-arxiv"):
     root = tmp_path / "hybrid-c-spatial-v4"
     root.mkdir()
+    batch_size = BATCH_SIZE_BY_DATASET[dataset]
+    metric_name = METRIC_BY_DATASET[dataset]
+    train_batches = 10 if dataset == "ppi" else 1
+    validation_graphs = 2 if dataset == "ppi" else 1
+    validation_edges = 4 if dataset == "ppi" else 3
     args = SimpleNamespace(
         model_seed=0,
         epochs=2,
         patience=1,
-        batch_size=1,
+        batch_size=batch_size,
         workers=0,
         device="cuda",
         edge_chunk_size=65536,
     )
     config = {
         **COMMON,
-        "datasets": ["ogbn-arxiv"],
+        "datasets": [dataset],
         "model_seed": 0,
         "epochs": 2,
         "patience": 1,
-        "batch_size": 1,
+        "batch_size_by_dataset": {dataset: batch_size},
         "workers": 0,
         "device": "cuda",
         "edge_chunk_size": 65536,
@@ -46661,7 +47828,7 @@ def _fixture(tmp_path):
             spatial_mode=specification["spatial_mode"],
         )
         optimizer = make_optimizer(model, condition)
-        output = root / "ogbn-arxiv" / condition
+        output = root / dataset / condition
         output.mkdir(parents=True)
         checkpoint, history = output / "best.pt", output / "history.json"
         checkpoint.write_bytes(b"unit-fixture-not-a-model")
@@ -46672,20 +47839,54 @@ def _fixture(tmp_path):
             "research_suite": SUITE,
             "status": "passed",
             "model": SUITE,
-            "dataset": "ogbn-arxiv",
+            "dataset": dataset,
             "condition": condition,
             "model_seed": 0,
             **specification,
             "non_gate_weight_decay": COMMON["weight_decay"],
             "configuration": configuration(args),
             "cache_sha256": data_hash,
-            "protocol": {"data_sha256": data_hash, "official": True},
+            "protocol": (
+                {
+                    "data_sha256": data_hash,
+                    "dataset": dataset,
+                    "split": "official_inductive_graph_split",
+                    "task": "multi_label_node_classification",
+                    "metric": "micro_f1",
+                    "split_counts": {"train": 20, "validation": 2, "test": 2},
+                }
+                if dataset == "ppi"
+                else {
+                    "data_sha256": data_hash,
+                    "dataset": dataset,
+                    "split": (
+                        "official_time_split"
+                        if dataset == "ogbn-arxiv"
+                        else "official_public_masks"
+                    ),
+                    "task": "node_classification",
+                    "metric": "accuracy",
+                }
+            ),
             "initial_state_sha256": "a" * 64,
-            "topology": {
-                "num_nodes": 4,
-                "num_edges": 3,
-                "incidence_sha256": "3" * 64,
-            },
+            "topology": (
+                {
+                    "scope": "official_train_and_validation_graphs",
+                    "split_graph_counts": {"train": 20, "validation": 2},
+                    "split_num_nodes": {"train": 60, "validation": 6},
+                    "split_num_edges": {"train": 40, "validation": validation_edges},
+                    "split_incidence_sha256": {
+                        "train": "3" * 64,
+                        "validation": "4" * 64,
+                    },
+                }
+                if dataset == "ppi"
+                else {
+                    "num_nodes": 4,
+                    "num_edges": validation_edges,
+                    "incidence_sha256": "3" * 64,
+                }
+            ),
             "parameterization": PARAMETERIZATION,
             "source_sha256": source,
             "optimizer": "AdamW",
@@ -46697,8 +47898,13 @@ def _fixture(tmp_path):
             "stop_epoch": 2,
             "stopping_reason": "patience",
             "epochs_run": 2,
+            "optimizer_steps": 2 * train_batches,
+            "best_checkpoint_optimizer_steps": train_batches,
+            "train_batches_per_epoch": train_batches,
+            "validation_batches": 1,
+            "validation_graphs": validation_graphs,
             "validation": score,
-            "metric_name": "accuracy",
+            "metric_name": metric_name,
             "train_loss": 0.7,
             "selection_loop_seconds": 0.7,
             "post_selection_diagnostics_seconds": 0.2,
@@ -46718,7 +47924,9 @@ def _fixture(tmp_path):
             "peak_cuda_reserved_bytes": 200,
             "versions": {"torch": "unit-fixture"},
             "gpu": "unit-fixture",
-            "diagnostics": _diagnostics(score, specification),
+            "diagnostics": _diagnostics(
+                score, specification, dataset=dataset, edge_count=validation_edges
+            ),
             "checkpoint": str(checkpoint.resolve()),
             "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
             "history": str(history.resolve()),
@@ -46728,8 +47936,9 @@ def _fixture(tmp_path):
         metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
         manifest["jobs"].append(
             {
-                "dataset": "ogbn-arxiv",
+                "dataset": dataset,
                 "condition": condition,
+                "batch_size": batch_size,
                 "status": "passed",
                 "output_dir": str(output),
                 "metrics_path": str(metrics_path),
@@ -46777,6 +47986,44 @@ def test_complete_report_has_all_conditional_contrasts_and_resources(tmp_path, m
         lambda: manifest["sources"]["sha256"],
     )
     assert main([str(root)]) == 0
+
+
+def test_ppi_report_enforces_micro_f1_batch_two_and_actual_optimizer_steps(tmp_path):
+    root, manifest = _fixture(tmp_path, dataset="ppi")
+    result = write_comparison(root, manifest)
+    dataset = result["datasets"][0]
+    assert result["status"] == "passed"
+    assert dataset["dataset"] == "ppi" and dataset["metric_name"] == "micro_f1"
+    assert dataset["held_fixed"]["configuration"]["batch_size"] == 2
+    assert all(
+        row["best_epoch_training_observation"]["scope"]
+        == "first_actual_training_minibatch_only"
+        for row in dataset["conditions"]
+    )
+    assert "ppi (micro_f1" in (root / "comparison.md").read_text(encoding="utf-8")
+
+
+def test_ppi_report_rejects_wrong_job_batch_or_optimizer_step_count(tmp_path):
+    root, manifest = _fixture(tmp_path, dataset="ppi")
+    manifest["jobs"][0]["batch_size"] = 1
+    with pytest.raises(ComparisonIntegrityError, match="job batch_size must be 2"):
+        write_comparison(root, manifest)
+
+    manifest["jobs"][0]["batch_size"] = 2
+    _edit(manifest, lambda metrics: metrics.update(optimizer_steps=2))
+    with pytest.raises(ComparisonIntegrityError, match="optimizer step counts"):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("dataset", "cora"), ("task", "node_classification"), ("metric", "accuracy")],
+)
+def test_ppi_report_rejects_wrong_cached_task_contract(tmp_path, field, value):
+    root, manifest = _fixture(tmp_path, dataset="ppi")
+    _edit(manifest, lambda metrics: metrics["protocol"].update({field: value}))
+    with pytest.raises(ComparisonIntegrityError, match="official V1 dataset contract"):
+        write_comparison(root, manifest)
 
 
 def test_mean_c_tolerance_miss_is_informational_and_keeps_factorial_contrasts(tmp_path):
@@ -47101,22 +48348,27 @@ from pathlib import Path
 
 import pytest
 
-from research.conductance_gat.v4.protocol import CONDITIONS
+from research.conductance_gat.v4.protocol import BATCH_SIZE_BY_DATASET, CONDITIONS, DATASETS
 from scripts import run_conductance_v4 as runner
 
 
-def test_default_four_fresh_factorial_trainings():
+def test_default_twenty_fresh_factorial_trainings_cover_all_v1_datasets():
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
-    assert args.datasets == ["ogbn-arxiv"] and args.model_seed == 0
+    assert args.datasets == list(DATASETS) and args.model_seed == 0
     assert args.edge_chunk_size == 65536 and args.batch_size == 1 and args.workers == 0
-    assert [job["condition"] for job in jobs] == list(CONDITIONS)
-    assert len(jobs) == 4
+    assert len(jobs) == len(DATASETS) * len(CONDITIONS) == 20
+    assert {(job["dataset"], job["condition"]) for job in jobs} == {
+        (dataset, condition) for dataset in DATASETS for condition in CONDITIONS
+    }
     for job in jobs:
         command = job["command"]
         assert command[command.index("-m") + 1] == "research.conductance_gat.v4.train"
         assert command[command.index("--model-seed") + 1] == "0"
         assert command[command.index("--edge-chunk-size") + 1] == "65536"
+        expected_batch_size = BATCH_SIZE_BY_DATASET[job["dataset"]]
+        assert job["batch_size"] == expected_batch_size
+        assert command[command.index("--batch-size") + 1] == str(expected_batch_size)
         assert "--amp" not in command and "--allow-download" not in command
 
 
@@ -47136,6 +48388,7 @@ def test_stdlib_inspection_has_no_writes(tmp_path, option):
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     assert result.returncode == 0, result.stderr
     assert list(tmp_path.iterdir()) == []
@@ -47147,7 +48400,6 @@ def test_stdlib_inspection_has_no_writes(tmp_path, option):
         ["--device", "cpu"],
         ["--model-seed", "-1"],
         ["--epochs", "0"],
-        ["--datasets", "ppi"],
         ["--datasets", "unknown"],
         ["--datasets", "cora", "cora"],
         ["--run-id", "../old"],
@@ -47162,9 +48414,12 @@ def test_invalid_inputs_do_not_check_dependencies_or_train(monkeypatch, options)
     assert runner.main(options) == 2
 
 
-def test_ppi_rejection_explains_protocol_limit(capsys):
-    assert runner.main(["--datasets", "ppi"]) == 2
-    assert "protocol limit" in capsys.readouterr().err
+def test_ppi_jobs_are_protocol_locked_to_batch_two():
+    args = runner.parser().parse_args(["--datasets", "ppi"])
+    runner._validate(args)
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert len(jobs) == 4
+    assert {job["batch_size"] for job in jobs} == {2}
 
 
 def _stub(tmp_path, monkeypatch, failure=None, change_after=None):
@@ -47198,7 +48453,14 @@ def _stub(tmp_path, monkeypatch, failure=None, change_after=None):
     monkeypatch.setattr(runner, "_source_snapshot", snapshot)
     monkeypatch.setattr(runner, "run_logged", dispatch)
     monkeypatch.setattr(runner, "_comparison", report)
-    return ["--results-root", str(tmp_path), "--run-id", "unit-fixture"], calls, reports
+    return [
+        "--datasets",
+        "ogbn-arxiv",
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        "unit-fixture",
+    ], calls, reports
 
 
 def test_success_records_metrics_digest_one_seed_and_four_jobs(tmp_path, monkeypatch):
@@ -50525,8 +51787,9 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert 'exec "${environment_python}" -B scripts/run_conductance_v2.py "$@"' in v2_source
     v2_args = run_conductance_v2.parser().parse_args(v2_command[2:])
     run_conductance_v2._validate(v2_args)
-    assert v2_args.datasets == ["ogbn-arxiv"] and v2_args.model_seed == 0
-    assert len(run_conductance_v2.make_jobs(v2_args, ROOT / "results/unit-contract")) == 2
+    assert v2_args.datasets == ["cora", "citeseer", "pubmed", "ogbn-arxiv"]
+    assert v2_args.model_seed == 0
+    assert len(run_conductance_v2.make_jobs(v2_args, ROOT / "results/unit-contract")) == 8
     commands = [line for line in commands if line not in v2_commands]
     v3_commands = [
         line
@@ -50541,8 +51804,17 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert 'exec "${environment_python}" -B scripts/run_conductance_v3.py "$@"' in v3_source
     v3_args = run_conductance_v3.parser().parse_args(v3_command[2:])
     run_conductance_v3._validate(v3_args)
-    assert v3_args.datasets == ["ogbn-arxiv"] and v3_args.model_seed == 0
-    assert len(run_conductance_v3.make_jobs(v3_args, ROOT / "results/unit-contract")) == 2
+    assert v3_args.datasets == ["cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"]
+    assert v3_args.model_seed == 0
+    v3_jobs = run_conductance_v3.make_jobs(v3_args, ROOT / "results/unit-contract")
+    assert len(v3_jobs) == 10
+    assert {job["dataset"]: job["batch_size"] for job in v3_jobs} == {
+        "cora": 1,
+        "citeseer": 1,
+        "pubmed": 1,
+        "ppi": 2,
+        "ogbn-arxiv": 1,
+    }
     commands = [line for line in commands if line not in v3_commands]
     v4_commands = [
         line
@@ -50557,8 +51829,17 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert 'exec "${environment_python}" -B scripts/run_conductance_v4.py "$@"' in v4_source
     v4_args = run_conductance_v4.parser().parse_args(v4_command[2:])
     run_conductance_v4._validate(v4_args)
-    assert v4_args.datasets == ["ogbn-arxiv"] and v4_args.model_seed == 0
-    assert len(run_conductance_v4.make_jobs(v4_args, ROOT / "results/unit-contract")) == 4
+    assert v4_args.datasets == ["cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"]
+    assert v4_args.model_seed == 0
+    v4_jobs = run_conductance_v4.make_jobs(v4_args, ROOT / "results/unit-contract")
+    assert len(v4_jobs) == 20
+    assert {job["dataset"]: job["batch_size"] for job in v4_jobs} == {
+        "cora": 1,
+        "citeseer": 1,
+        "pubmed": 1,
+        "ppi": 2,
+        "ogbn-arxiv": 1,
+    }
     commands = [line for line in commands if line not in v4_commands]
     assert len(commands) == 5  # original full protocols remain unchanged
     parsed = []

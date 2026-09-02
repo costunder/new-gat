@@ -12,6 +12,7 @@ from research.conductance_gat.v3.diagnostics import (
     ForwardObservation,
     Intervention,
     best_checkpoint_interventions,
+    changed_prediction_fraction,
     evaluate_validation,
     moments,
 )
@@ -139,6 +140,13 @@ def test_empty_and_nonfinite_statistics():
     assert moments(torch.empty(0))["mean"] is None
     with pytest.raises(FloatingPointError):
         moments(torch.tensor([float("nan")]))
+
+
+def test_ppi_changed_predictions_are_labelwise_threshold_decisions():
+    reference = torch.tensor([[2.0, 0.1], [1.0, -1.0]])
+    logits = torch.tensor([[2.0, -0.1], [1.0, -1.0]])
+    assert changed_prediction_fraction(logits, reference, "accuracy") == 0.0
+    assert changed_prediction_fraction(logits, reference, "micro_f1") == 0.25
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA RNG check needs real CUDA")

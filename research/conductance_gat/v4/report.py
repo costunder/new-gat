@@ -25,7 +25,15 @@ from ..ablation.report import (
     _reject_nonfinite_json,
     _same,
 )
-from .protocol import COMMON, CONDITIONS, DATASETS, PARAMETERIZATION, SUITE
+from .protocol import (
+    BATCH_SIZE_BY_DATASET,
+    COMMON,
+    CONDITIONS,
+    DATASETS,
+    METRIC_BY_DATASET,
+    PARAMETERIZATION,
+    SUITE,
+)
 
 SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
 INTERVENTIONS = {
@@ -45,7 +53,10 @@ FACTORIAL_ORDER = (
 CAVEATS = [
     "n=1; exploratory validation-only factorial. Test is not evaluated; no CI, p-value, "
     "seed standard deviation, SOTA or general optimality claim.",
-    "All four arms train freshly from a matched full initial state. No V3 checkpoint or score "
+    "All four arms train freshly from a matched full initial state. PPI uses the official "
+    "20/2/2 inductive graph split: train 20 and validation 2 run at batch 2 with "
+    "BCEWithLogits and global logit>0 node-label micro-F1; test 2 is not scored. Other "
+    "datasets use their official transductive masks and accuracy. No V3 checkpoint or score "
     "is reused, and a V3-to-V4 score difference is not a one-factor causal contrast.",
     "V3/V4 do not implement a conventional eigendecomposition-based spectral GNN. Relative C "
     "adapts the weighted graph operator; W is a shared spatial message-channel transform.",
@@ -62,8 +73,9 @@ CAVEATS = [
     "as defined by the trainer; they are not isolated kernel benchmarks.",
     "W-on arms have more active parameters and optimizer state than W-off arms. This factorial "
     "does not parameter-budget-match unrelated architectures.",
-    "Sparse exact edge chunking remains full-graph training. Identical seeds and initial hashes "
-    "do not make CUDA scatter trajectories bitwise deterministic.",
+    "Sparse exact edge chunking processes every selected graph in full; only PPI batches whole "
+    "inductive graphs. Identical seeds and initial hashes do not make CUDA scatter trajectories "
+    "bitwise deterministic.",
 ]
 
 
@@ -224,12 +236,28 @@ def _best_training_observation(child: dict[str, Any], config: dict[str, Any]) ->
     if len(selected) != 1:
         raise ValueError("selected epoch is missing from actual training observations")
     record = selected[0]
+    batches_per_epoch = _integer(
+        child.get("train_batches_per_epoch"), "train_batches_per_epoch", minimum=1
+    )
+    expected_batches = 10 if child["dataset"] == "ppi" else 1
+    if batches_per_epoch != expected_batches:
+        raise ValueError("train_batches_per_epoch disagrees with official data protocol")
+    if (
+        child.get("optimizer_steps") != child["epochs_run"] * batches_per_epoch
+        or child.get("best_checkpoint_optimizer_steps")
+        != child["best_epoch"] * batches_per_epoch
+    ):
+        raise ValueError("optimizer step counts disagree with actual minibatch count")
     expected = {
-        "scope": "full_graph_train_mask",
+        "scope": (
+            "first_actual_training_minibatch_only"
+            if child["dataset"] == "ppi"
+            else "full_graph_train_mask"
+        ),
         "mode": "train_dropout_on",
         "stage": "after_task_backward_before_optimizer_step",
         "batch_index": 0,
-        "optimizer_steps_before_batch": child["best_epoch"] - 1,
+        "optimizer_steps_before_batch": (child["best_epoch"] - 1) * batches_per_epoch,
     }
     for key, value in expected.items():
         if not _same(record.get(key), value):
@@ -267,14 +295,22 @@ def _validate_diagnostics(child: dict[str, Any], config: dict[str, Any]) -> None
     if not isinstance(diagnostics, dict):
         raise ValueError("V4 diagnostics are required")
     observations = {}
+    expected_metric = METRIC_BY_DATASET[child["dataset"]]
+    expected_prediction_rule = (
+        "logit_gt_zero_node_label" if child["dataset"] == "ppi" else "argmax_node_class"
+    )
+    expected_validation_graphs = 2 if child["dataset"] == "ppi" else 1
     for name in ("initial_validation", "best_validation", "final_validation"):
         observation = diagnostics.get(name)
         if (
             not isinstance(observation, dict)
             or observation.get("mode") != "eval"
             or observation.get("split") != "validation"
+            or observation.get("metric_name") != expected_metric
+            or observation.get("prediction_rule") != expected_prediction_rule
+            or observation.get("validation_graph_count") != expected_validation_graphs
         ):
-            raise ValueError(f"{name} diagnostics must be validation/eval")
+            raise ValueError(f"{name} diagnostics task/split contract mismatch")
         observations[name] = observation
     best = observations["best_validation"]
     layers = best.get("layers")
@@ -382,6 +418,12 @@ def _validate_diagnostics(child: dict[str, Any], config: dict[str, Any]) -> None
         raise ValueError("checkpoint interventions must apply to all layers simultaneously")
     if audit.get("normalization_recomputed_for_c_interventions") is not True:
         raise ValueError("C interventions must recompute symmetric normalization")
+    if (
+        audit.get("metric_name") != expected_metric
+        or audit.get("prediction_rule") != expected_prediction_rule
+        or audit.get("validation_graph_count") != expected_validation_graphs
+    ):
+        raise ValueError("checkpoint intervention task contract mismatch")
     if _integer(audit.get("shuffle_seed"), "intervention shuffle_seed") != child["model_seed"]:
         raise ValueError("intervention shuffle_seed must equal model_seed")
     original = audit.get("original")
@@ -461,8 +503,12 @@ def _validate_diagnostics(child: dict[str, Any], config: dict[str, Any]) -> None
         raise ValueError("mean-C numerical check requires exactly mean_c/ones_c contracts")
     topology = child.get("topology")
     topology_edge_count = _integer(
-        topology.get("num_edges") if isinstance(topology, dict) else None,
-        "topology.num_edges",
+        (
+            topology.get("split_num_edges", {}).get("validation")
+            if child["dataset"] == "ppi" and isinstance(topology, dict)
+            else topology.get("num_edges") if isinstance(topology, dict) else None
+        ),
+        "topology validation edge count",
     )
     expected_edge_counts = None
     for name, expected_contract in expected_contracts.items():
@@ -513,7 +559,12 @@ def _load(
         raise ValueError(f"cannot read child metrics: {exc}") from exc
     if actual_digest != digest.lower():
         raise ValueError("metrics SHA-256 mismatch")
-    child = _load_child(root, job, config, suite=SUITE, conditions=CONDITIONS)
+    dataset = job["dataset"]
+    child_config = {
+        key: value for key, value in config.items() if key != "batch_size_by_dataset"
+    }
+    child_config["batch_size"] = BATCH_SIZE_BY_DATASET[dataset]
+    child = _load_child(root, job, child_config, suite=SUITE, conditions=CONDITIONS)
     spec = CONDITIONS[job["condition"]]
     for key, expected in (
         ("gate_mode", spec["gate_mode"]),
@@ -526,18 +577,71 @@ def _load(
     if "gate_mode" in child["configuration"] or "spatial_mode" in child["configuration"]:
         raise ValueError("factor modes belong in arm metadata, not held-fixed configuration")
     topology = child.get("topology")
-    if not isinstance(topology, dict) or set(topology) != {
-        "num_nodes",
-        "num_edges",
-        "incidence_sha256",
-    }:
-        raise ValueError("topology must contain num_nodes, num_edges and incidence_sha256")
-    _integer(topology["num_nodes"], "topology.num_nodes", minimum=1)
-    _integer(topology["num_edges"], "topology.num_edges")
-    if not isinstance(topology["incidence_sha256"], str) or not SHA256.fullmatch(
-        topology["incidence_sha256"]
+    expected_split = (
+        "official_inductive_graph_split"
+        if dataset == "ppi"
+        else "official_time_split"
+        if dataset == "ogbn-arxiv"
+        else "official_public_masks"
+    )
+    expected_task = (
+        "multi_label_node_classification" if dataset == "ppi" else "node_classification"
+    )
+    expected_metric = METRIC_BY_DATASET[dataset]
+    protocol = child.get("protocol")
+    if (
+        not isinstance(protocol, dict)
+        or protocol.get("dataset") != dataset
+        or protocol.get("split") != expected_split
+        or protocol.get("task") != expected_task
+        or protocol.get("metric") != expected_metric
     ):
-        raise ValueError("topology.incidence_sha256 must be a SHA-256 digest")
+        raise ValueError("cached protocol does not match the official V1 dataset contract")
+    if dataset == "ppi":
+        expected_keys = {
+            "scope",
+            "split_graph_counts",
+            "split_num_nodes",
+            "split_num_edges",
+            "split_incidence_sha256",
+        }
+        if not isinstance(topology, dict) or set(topology) != expected_keys:
+            raise ValueError("PPI topology must fingerprint official train/validation graphs")
+        if topology["scope"] != "official_train_and_validation_graphs":
+            raise ValueError("PPI topology scope mismatch")
+        if topology["split_graph_counts"] != {"train": 20, "validation": 2}:
+            raise ValueError("PPI topology must contain the official 20/2 graph split")
+        for key in ("split_num_nodes", "split_num_edges"):
+            value = topology[key]
+            if not isinstance(value, dict) or set(value) != {"train", "validation"}:
+                raise ValueError(f"PPI topology {key} split metadata is incomplete")
+            for split, count in value.items():
+                _integer(count, f"topology.{key}.{split}", minimum=1)
+        digests = topology["split_incidence_sha256"]
+        if (
+            not isinstance(digests, dict)
+            or set(digests) != {"train", "validation"}
+            or any(
+                not isinstance(value, str) or not SHA256.fullmatch(value)
+                for value in digests.values()
+            )
+        ):
+            raise ValueError("PPI split incidence fingerprints are invalid")
+        if protocol.get("split_counts") != {"train": 20, "validation": 2, "test": 2}:
+            raise ValueError("PPI cached protocol is not the official 20/2/2 graph split")
+    else:
+        if not isinstance(topology, dict) or set(topology) != {
+            "num_nodes",
+            "num_edges",
+            "incidence_sha256",
+        }:
+            raise ValueError("topology must contain num_nodes, num_edges and incidence_sha256")
+        _integer(topology["num_nodes"], "topology.num_nodes", minimum=1)
+        _integer(topology["num_edges"], "topology.num_edges")
+        if not isinstance(topology["incidence_sha256"], str) or not SHA256.fullmatch(
+            topology["incidence_sha256"]
+        ):
+            raise ValueError("topology.incidence_sha256 must be a SHA-256 digest")
     total = _integer(child.get("total_parameters"), "total_parameters", minimum=1)
     trainable = _integer(child.get("trainable_parameters"), "trainable_parameters", minimum=1)
     frozen = _integer(child.get("frozen_parameters"), "frozen_parameters")
@@ -546,14 +650,19 @@ def _load(
     expected_frozen = not (spec["gate_mode"] == "relative" and spec["spatial_mode"] == "learned")
     if bool(frozen) != expected_frozen:
         raise ValueError("frozen parameter count disagrees with V4 condition")
-    _validate_optimizer(child, config, job["condition"])
-    _validate_diagnostics(child, config)
+    _validate_optimizer(child, child_config, job["condition"])
+    _validate_diagnostics(child, child_config)
     best_epoch = _integer(child.get("best_epoch"), "best_epoch", minimum=1)
     stop_epoch = _integer(child.get("stop_epoch"), "stop_epoch", minimum=best_epoch)
     if stop_epoch != child.get("epochs_run"):
         raise ValueError("stop_epoch must equal epochs_run")
     if child.get("stopping_reason") not in {"patience", "max_epochs"}:
         raise ValueError("unknown stopping_reason")
+    if (
+        child.get("validation_batches") != 1
+        or child.get("validation_graphs") != (2 if dataset == "ppi" else 1)
+    ):
+        raise ValueError("validation coverage disagrees with official data protocol")
     for key in (
         "selection_loop_seconds",
         "post_selection_diagnostics_seconds",
@@ -641,7 +750,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         or len(set(datasets)) != len(datasets)
     ):
         datasets = []
-        errors.append("datasets must list unique supported fixed-graph datasets")
+        errors.append("datasets must list unique supported V4 datasets")
     for key, expected in (
         ("schema_version", 1),
         ("suite", SUITE),
@@ -661,8 +770,12 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         _integer(config.get("model_seed"), "model_seed")
         for key in ("epochs", "patience", "edge_chunk_size"):
             _integer(config.get(key), key, minimum=1)
-        if config.get("batch_size") != 1 or type(config.get("batch_size")) is not int:
-            raise ValueError("full-graph batch_size must be 1")
+        batch_sizes = config.get("batch_size_by_dataset")
+        expected_batch_sizes = {
+            dataset: BATCH_SIZE_BY_DATASET[dataset] for dataset in datasets
+        }
+        if not _same(batch_sizes, expected_batch_sizes):
+            raise ValueError("manifest batch_size_by_dataset violates the V4 protocol")
         if config.get("workers") != 0 or type(config.get("workers")) is not int:
             raise ValueError("full-graph workers must be 0")
         if not isinstance(config.get("device"), str) or not re.fullmatch(
@@ -693,6 +806,9 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             errors.append(f"duplicate job: {key}")
             continue
         indexed[key] = job
+        expected_batch_size = BATCH_SIZE_BY_DATASET[dataset]
+        if job.get("batch_size") != expected_batch_size:
+            errors.append(f"{key}: job batch_size must be {expected_batch_size}")
         if job.get("status") not in {"pending", "running", "failed", "passed"}:
             errors.append(f"{key}: invalid job status")
         try:
@@ -771,7 +887,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                     row["validation_percent"] = 100.0 * child["validation"]
                     row["best_validation_diagnostics"] = _best_layers(child["diagnostics"])
                     row["best_epoch_training_observation"] = _best_training_observation(
-                        child, config
+                        child, child["configuration"]
                     )
                     row["best_checkpoint_interventions"] = child["diagnostics"][
                         "best_checkpoint_interventions"
@@ -801,7 +917,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         dataset_reports.append(
             {
                 "dataset": dataset,
-                "metric_name": "accuracy",
+                "metric_name": METRIC_BY_DATASET[dataset],
                 "model_seed": config.get("model_seed"),
                 "conditions": rows,
                 "complete": len(loaded) == len(CONDITIONS),
@@ -897,7 +1013,8 @@ def _gradient_markdown(rows: list[dict[str, Any]]) -> list[str]:
     lines = [
         "### Actual training gradients at the selected epoch",
         "",
-        "Actual train-mask backward, before that epoch's optimizer update; frozen entries are N/A.",
+        "Actual transductive full-graph or PPI first-minibatch backward, before that batch's "
+        "optimizer update; frozen entries are N/A.",
         "",
         "| Condition | Epoch | Layer | C-gate gradient L2 | Spatial-W gradient L2 |",
         "| --- | ---: | ---: | ---: | ---: |",
@@ -962,7 +1079,7 @@ def markdown(report: dict[str, Any]) -> str:
         lines += [f"- {_cell(error)}" for error in report["errors"]] + [""]
     for dataset in report["datasets"]:
         lines += [
-            f"## {dataset['dataset']} (accuracy, higher is better)",
+            f"## {dataset['dataset']} ({dataset['metric_name']}, higher is better)",
             "",
             "| Condition | C mode | W mode | Status | Validation (%) | Best epoch | Stop epoch "
             "| Stop reason | Train loss | Trainable | Frozen |",

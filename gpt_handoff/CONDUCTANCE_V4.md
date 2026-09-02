@@ -9,20 +9,23 @@
 | 항목 | 상태 |
 |---|---|
 | 구현 | 완료 |
-| 로컬 V4 전용 검사 | **122 passed** |
-| 저장소 전체 회귀 | **1301 passed / 65 skipped** |
+| 로컬 V4 전용 검사 | **131 passed** |
+| 저장소 전체 회귀 | **1317 passed / 66 skipped** (74.10 s, exit 0) |
 | Ruff·compileall·코드 스냅샷 검사 | 통과 |
-| 공식 데이터 CUDA 학습 | **정식 결과 없음** — 사용자 보고상 첫 arm만 200 epochs·child exit 0 후 구 report gate에서 중단, 나머지 3개 pending |
-| 기본 실행 대상 | ogbn-arxiv, model seed 0, 네 번의 fresh training |
+| 공식 데이터 CUDA 학습 | **정식 결과 없음** — 과거 arxiv-only 4-arm run에서 첫 arm만 200 epochs·child exit 0 후 구 report gate 중단, 나머지 3개 pending |
+| 기본 실행 대상 | Cora/CiteSeer/PubMed/PPI/ogbn-arxiv, model seed 0, 20번의 fresh training |
 
-로컬 검사는 작은 CPU fixture로 수학·미분·runner·report 무결성을 확인한 것이다. 2026-09-02
-사용자 보고의 source/pull revision은 `7b4cd32`, run은
+로컬 검사는 작은 CPU fixture로 수학·미분·runner·report 무결성을 확인한 것이다. V2 전용은
+118 passed, V3 전용은 141 passed / 2 skipped이며 전체 검사는 `PYTHONUTF8=1`에서 실행했다.
+이는 공식 데이터 GPU 학습 결과가 아니다. 2026-09-02
+사용자 보고의 source/pull revision은 `7b4cd32`, 과거 arxiv-only run은
 `gat-hybrid-c-spatial-v4-gpu6-seed0-v1`이다. Preflight GPU는
 `NVIDIA A100-SXM4-80GB MIG 1g.10gb`였고 `CUDA_VISIBLE_DEVICES=6`을 프로세스 내부
 `cuda:0`으로 사용했다. 이 partial run에서 `fixed_c_identity_w`가 200 epochs를 마치고 child
 exit 0을 반환했지만, 당시 mean-C/C=1 수치 검사를 hard gate로 쓰던 report가 실행을 중단해
 나머지 세 arm은 pending으로 남았다. 점수와 전체 artifact는 수령하지 않았으며, 이 한 arm을
-정식 V4 결과로 보지 않는다. 실제 성능은 새 run에서 네 CUDA 학습이 모두 끝난 뒤에만 기록한다.
+정식 V4 결과로 보지 않는다. 확대된 기본 실험의 실제 성능은 새 run에서 20개 CUDA 학습이
+모두 끝난 뒤에만 기록한다.
 
 ## 정확한 V4 아이디어
 
@@ -104,7 +107,8 @@ bash scripts/prepare_data.sh
 bash research/conductance_gat/v4/reproduce.sh --run-id gat-hybrid-c-spatial-v4-seed0-v1
 ```
 
-이 명령은 **ogbn-arxiv × 네 조건 × seed 0 = 네 번의 새 CUDA 학습**을 순서대로 수행한다.
+이 명령은 **Cora/CiteSeer/PubMed/PPI/ogbn-arxiv × 네 조건 × seed 0 = 20번의 새 CUDA 학습**을
+순서대로 수행한다.
 학습 중 패키지를 설치하거나 데이터를 다운로드하지 않는다. CUDA가 없거나 cache가 검증되지
 않으면 결과를 만들기 전에 중단한다. 같은 run ID를 덮어쓰거나 자동 재개하지 않는다.
 
@@ -116,7 +120,7 @@ python -B scripts/run_conductance_v4.py \
   --run-id gat-hybrid-c-spatial-v4-seed0-v1
 ```
 
-Cora, CiteSeer, PubMed도 명시적으로 선택할 수 있다.
+기본 범위 중 Cora, CiteSeer, PubMed만 명시적으로 선택할 수도 있다.
 
 ```bash
 bash research/conductance_gat/v4/reproduce.sh \
@@ -124,9 +128,14 @@ bash research/conductance_gat/v4/reproduce.sh \
   --run-id gat-hybrid-c-spatial-v4-citations-seed0-v1
 ```
 
-초기 V4 규약은 하나의 고정 그래프에서 train/validation 노드를 나누는 transductive 실험이다.
-PPI는 이 실행기에서 지원하지 않는다. `--batch-size 1`, `--workers 0`은 전체 그래프 하나를
-처리한다는 뜻이며 노드를 하나씩 학습한다는 뜻이 아니다.
+Cora/CiteSeer/PubMed/ogbn-arxiv는 하나의 고정 그래프에서 train/validation 노드를 나누는
+transductive full-graph 실험이다. PPI는 v1과 같은 공식 20/2/2 inductive graph split,
+batch size 2와 BCEWithLogitsLoss를 사용한다. `logit > 0`을 양성 예측으로 하여 validation graph
+두 개 전체의 node-label 결정을 합친 global micro-F1로 checkpoint를 선택한다. 모든 dataset의
+workers는 0이며 PPI도 neighbor sampling이 아니라 각 minibatch의 graph 전체를 처리한다.
+Test graph는 train/validation loader, forward, loss, metric, checkpoint 선택과 진단에 들어가지
+않는다. 다만 full cache의 test tensor와 metadata는 공식 20/2/2 분할·shape·checksum 무결성
+검사를 위해 load/validate된다.
 
 ## 결과 확인
 
@@ -143,20 +152,22 @@ cat results/conductance_gat/v4/gat-hybrid-c-spatial-v4-seed0-v1/comparison.md
 | `comparison.md` | 사람이 읽는 최종 네 조건 비교·진단·개입 보고서 |
 | `comparison.csv` | 네 조건과 factorial 대조의 표 형식 결과 |
 | `comparison.json` | 검증 가능한 전체 구조화 결과 |
-| `manifest.json` | source hash, 실행 설정, 네 job 상태 |
+| `manifest.json` | source hash, 실행 설정, 선택 dataset × 네 조건의 job 상태; 기본은 20 jobs |
 | `logs/` | GPU 사전검사와 조건별 학습 로그 |
 | `<dataset>/<condition>/best.pt` | validation-best checkpoint |
 | `<dataset>/<condition>/history.json` | epoch별 train/validation과 실제 task-gradient 진단 |
 | `<dataset>/<condition>/metrics.json` | 설정·graph binding·지표·hash·시간·메모리 |
 
-네 fresh 학습이 모두 통과하고 source/cache/topology/configuration/초기-state/metrics hash가
+선택한 모든 dataset의 네 fresh 학습, 즉 기본 20 jobs가 모두 통과하고
+source/cache/topology/configuration/초기-state/metrics hash가
 일치하기 전에는 최종 factorial 대조를 공개하지 않는다. checkpoint 개입의 informational
 mean-C/C=1 수치 차이는 이 성공 조건에 포함하지 않는다. standalone report 재생성도 현재
 source hash를 다시 확인한다.
 
 ## 비교값 해석
 
-위 표 순서의 validation accuracy를 `y00`, `y10`, `y01`, `y11`이라 두면 V4 내부에서만
+위 표 순서의 dataset별 validation 지표(일반 데이터 accuracy, PPI global micro-F1)를
+`y00`, `y10`, `y01`, `y11`이라 두면 V4 내부에서만
 다음 다섯 값을 계산한다.
 
 \[
@@ -210,15 +221,15 @@ CUDA scatter·부동소수점 합산 차이를 관찰하기 위한 **information
 | [`research/conductance_gat/v4/diagnostics.py`](CODE_SUMMARY.md) | 실제 task-gradient 진단과 checkpoint 개입 |
 | [`research/conductance_gat/v4/report.py`](CODE_SUMMARY.md) | fail-closed 네 조건 비교 보고서 |
 | [`research/conductance_gat/v4/protocol.py`](CODE_SUMMARY.md) | 고정 프로토콜과 네 조건 정의 |
-| [`scripts/run_conductance_v4.py`](CODE_SUMMARY.md) | GPU 사전검사와 네 학습 orchestration |
+| [`scripts/run_conductance_v4.py`](CODE_SUMMARY.md) | GPU 사전검사와 dataset별 네 조건, 기본 20-job orchestration |
 | [`research/conductance_gat/v4/reproduce.sh`](CODE_SUMMARY.md) | 최상위 재현 명령 |
 | [`tests/test_conductance_v4_core.py`](CODE_SUMMARY.md) | 수식·미분·W=I 동치 검사 |
-| [`tests/test_conductance_v4_runner.py`](CODE_SUMMARY.md) | 네 job·source·실행 무결성 검사 |
+| [`tests/test_conductance_v4_runner.py`](CODE_SUMMARY.md) | dataset별 네 조건·기본 20-job·source·실행 무결성 검사 |
 | [`tests/test_conductance_v4_report.py`](CODE_SUMMARY.md) | report·contrast·개입 fail-closed 검사 |
 
 ## 현재 남은 한 가지 작업
 
-지원되는 Linux NVIDIA GPU 환경에서 **새 run ID로 네 조건을 모두 fresh 실행**하고 생성된
-`comparison.md/csv/json`, `manifest.json`, 네 조건의 `metrics.json`을 보존하는 것이다.
-구 report gate에서 끝난 partial run의 첫 arm은 새 2×2 대조에 재사용하지 않는다. 네 arm이
-모두 완료되기 전까지 정식 V4 성능 수치는 없다.
+지원되는 Linux NVIDIA GPU 환경에서 **새 run ID로 5개 데이터의 네 조건, 총 20개 arm을 모두
+fresh 실행**하고 생성된 `comparison.md/csv/json`, `manifest.json`, 각 조건의 `metrics.json`을
+보존하는 것이다. 구 report gate에서 끝난 arxiv partial run의 첫 arm은 새 2×2 대조에 재사용하지
+않는다. 전체 20개 arm이 모두 완료되기 전까지 확대된 기본 V4의 정식 성능 수치는 없다.

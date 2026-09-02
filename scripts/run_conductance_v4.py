@@ -19,6 +19,7 @@ for directory in (ROOT, ROOT / "src"):
 
 from chartgat.cache import atomic_write_json  # noqa: E402
 from research.conductance_gat.v4.protocol import (  # noqa: E402
+    BATCH_SIZE_BY_DATASET,
     COMMON,
     CONDITIONS,
     DATASETS,
@@ -41,7 +42,7 @@ def parser() -> argparse.ArgumentParser:
         "--datasets",
         nargs="+",
         default=list(DEFAULT_DATASETS),
-        help="Fixed-graph datasets: " + ", ".join(DATASETS) + "; default: ogbn-arxiv",
+        help="Official V1 datasets; default: " + ", ".join(DEFAULT_DATASETS),
     )
     result.add_argument("--model-seed", type=int, default=0, help="One seed, not a seed list")
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
@@ -50,7 +51,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--device", default="cuda")
     result.add_argument("--epochs", type=int, default=200)
     result.add_argument("--patience", type=int, default=50)
-    result.add_argument("--batch-size", type=int, default=1, help="Must be 1: full-graph training")
+    result.add_argument("--batch-size", type=int, default=1, help=argparse.SUPPRESS)
     result.add_argument("--workers", type=int, default=0)
     result.add_argument("--edge-chunk-size", type=int, default=65536)
     result.add_argument("--min-free-gb", type=float, default=8.0)
@@ -60,22 +61,22 @@ def parser() -> argparse.ArgumentParser:
 
 def _validate(args: argparse.Namespace) -> None:
     shared._validate(args)
-    if "ppi" in args.datasets:
-        raise ValueError(
-            "PPI is outside the initial V4 protocol, which uses one fixed transductive graph. "
-            "This is a protocol limit, not a claim about the shared modules."
-        )
     if not args.datasets or any(dataset not in DATASETS for dataset in args.datasets):
-        raise ValueError("Unsupported fixed-graph dataset; choose: " + ", ".join(DATASETS))
+        raise ValueError("Unsupported V4 dataset; choose: " + ", ".join(DATASETS))
     if args.edge_chunk_size < 1:
         raise ValueError("edge chunk size must be positive")
-    if args.batch_size != 1 or args.workers != 0:
-        raise ValueError("Full-graph V4 requires batch-size=1 and workers=0")
+    if args.batch_size != 1:
+        raise ValueError(
+            "V4 batch size is protocol-locked per dataset: PPI=2, transductive datasets=1"
+        )
+    if args.workers != 0:
+        raise ValueError("V4 requires workers=0")
 
 
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     jobs = []
     for dataset in args.datasets:
+        batch_size = BATCH_SIZE_BY_DATASET[dataset]
         for condition in CONDITIONS:
             output = run_dir / dataset / condition
             command = [
@@ -98,15 +99,16 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "model_seed",
                 "epochs",
                 "patience",
-                "batch_size",
                 "workers",
                 "edge_chunk_size",
             ):
                 command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
+            command += ["--batch-size", str(batch_size)]
             jobs.append(
                 {
                     "dataset": dataset,
                     "condition": condition,
+                    "batch_size": batch_size,
                     "status": "pending",
                     "output_dir": str(output),
                     "metrics_path": str(output / "metrics.json"),
@@ -194,11 +196,13 @@ def main(argv: list[str] | None = None) -> int:
                 "model_seed",
                 "epochs",
                 "patience",
-                "batch_size",
                 "workers",
                 "device",
                 "edge_chunk_size",
             )
+        },
+        "batch_size_by_dataset": {
+            dataset: BATCH_SIZE_BY_DATASET[dataset] for dataset in args.datasets
         },
         "data_root": str(data_root),
     }
@@ -218,14 +222,17 @@ def main(argv: list[str] | None = None) -> int:
             "selection": "best validation checkpoint per arm; same early-stopping policy",
             "test": "not evaluated; exploratory validation comparison",
             "initialization": "same full state hash across all four arms; C=1, W=I, alpha=.5",
-            "data": "same verified official cache/split and ordered topology; no downloads",
+            "data": "same verified official V1 cache/split and ordered topology; no downloads",
             "contrast": "four fresh V4 trainings; never reuse V3 checkpoints or scores",
             "factorial": "relative C on/off crossed with learned spatial W on/off",
             "fixed_c": "exact C=1; estimator scaffold frozen and excluded from optimizer",
             "identity_w": "exact W=I; message-transform scaffold frozen and excluded",
             "normalization": "symmetric weighted-degree in every arm; alpha remains trainable",
-            "transductive": "initial protocol uses official fixed-graph train/validation masks",
-            "interventions": "selected-checkpoint validation only; no retraining or test labels",
+            "task_protocol": "Cora/CiteSeer/PubMed/ogbn-arxiv use transductive full graphs; "
+            "PPI uses the official 20/2/2 inductive graph split, batch size 2, BCEWithLogits "
+            "and global node-label micro-F1",
+            "interventions": "selected-checkpoint validation only; no retraining, test-label "
+            "metric or checkpoint selection; cache test metadata remains integrity-checked",
             "v3_comparison": "V3 is not reused and V3-to-V4 is not a one-factor score contrast",
             "resources": "whole-loop time and peak allocation include diagnostics and IO",
             "uncertainty": "n=1; no CI, seed standard deviation or significance claim",

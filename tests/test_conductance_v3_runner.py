@@ -12,17 +12,22 @@ import pytest
 from scripts import run_conductance_v3 as runner
 
 
-def test_default_two_fresh_trainings():
+def test_default_ten_fresh_trainings_with_dataset_specific_batch_sizes():
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
-    assert args.datasets == ["ogbn-arxiv"] and args.model_seed == 0
-    assert args.edge_chunk_size == 65536 and args.batch_size == 1 and args.workers == 0
-    assert [job["condition"] for job in jobs] == ["relative_c", "fixed_c"]
+    assert args.datasets == ["cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"]
+    assert args.model_seed == 0
+    assert args.edge_chunk_size == 65536 and args.batch_size == 2 and args.workers == 0
+    assert len(jobs) == 10
+    assert [job["condition"] for job in jobs] == ["relative_c", "fixed_c"] * 5
     for job in jobs:
         command = job["command"]
         assert command[command.index("-m") + 1] == "research.conductance_gat.v3.train"
         assert command[command.index("--model-seed") + 1] == "0"
         assert command[command.index("--edge-chunk-size") + 1] == "65536"
+        expected_batch_size = 2 if job["dataset"] == "ppi" else 1
+        assert job["batch_size"] == expected_batch_size
+        assert command[command.index("--batch-size") + 1] == str(expected_batch_size)
         assert "--amp" not in command and "--allow-download" not in command
 
 
@@ -51,13 +56,13 @@ def test_stdlib_inspection_has_no_writes(tmp_path, option):
         ["--device", "cpu"],
         ["--model-seed", "-1"],
         ["--epochs", "0"],
-        ["--datasets", "ppi"],
         ["--datasets", "unknown"],
         ["--datasets", "cora", "cora"],
         ["--run-id", "../old"],
         ["--min-free-gb", "nan"],
         ["--edge-chunk-size", "0"],
-        ["--batch-size", "2"],
+        ["--batch-size", "1"],
+        ["--batch-size", "3"],
         ["--workers", "1"],
     ],
 )
@@ -66,9 +71,11 @@ def test_invalid_inputs_do_not_check_dependencies_or_train(monkeypatch, options)
     assert runner.main(options) == 2
 
 
-def test_ppi_rejection_explains_protocol_limit(capsys):
-    assert runner.main(["--datasets", "ppi"]) == 2
-    assert "protocol limit" in capsys.readouterr().err
+def test_ppi_is_a_supported_two_arm_batch_two_plan():
+    args = runner.parser().parse_args(["--datasets", "ppi"])
+    runner._validate(args)
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert len(jobs) == 2 and all(job["batch_size"] == 2 for job in jobs)
 
 
 def _stub(tmp_path, monkeypatch, failure=None, change_after=None):
@@ -102,7 +109,14 @@ def _stub(tmp_path, monkeypatch, failure=None, change_after=None):
     monkeypatch.setattr(runner, "_source_snapshot", snapshot)
     monkeypatch.setattr(runner, "run_logged", dispatch)
     monkeypatch.setattr(runner, "_comparison", report)
-    return ["--results-root", str(tmp_path), "--run-id", "unit-fixture"], calls, reports
+    return [
+        "--datasets",
+        "cora",
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        "unit-fixture",
+    ], calls, reports
 
 
 def test_success_records_metrics_digest_and_one_seed(tmp_path, monkeypatch):

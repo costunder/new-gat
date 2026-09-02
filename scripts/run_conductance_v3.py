@@ -41,7 +41,7 @@ def parser() -> argparse.ArgumentParser:
         "--datasets",
         nargs="+",
         default=list(DEFAULT_DATASETS),
-        help="Fixed-graph datasets: " + ", ".join(DATASETS) + "; default: ogbn-arxiv",
+        help="Official V1 datasets: " + ", ".join(DATASETS) + "; default: all five",
     )
     result.add_argument("--model-seed", type=int, default=0, help="One seed, not a seed list")
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
@@ -50,7 +50,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--device", default="cuda")
     result.add_argument("--epochs", type=int, default=200)
     result.add_argument("--patience", type=int, default=50)
-    result.add_argument("--batch-size", type=int, default=1, help="Must be 1: full-graph training")
+    result.add_argument(
+        "--batch-size",
+        type=int,
+        default=2,
+        help="PPI graph minibatch size (must be 2); fixed-graph children always use 1",
+    )
     result.add_argument("--workers", type=int, default=0)
     result.add_argument("--edge-chunk-size", type=int, default=65536)
     result.add_argument("--min-free-gb", type=float, default=8.0)
@@ -60,22 +65,18 @@ def parser() -> argparse.ArgumentParser:
 
 def _validate(args: argparse.Namespace) -> None:
     shared._validate(args)
-    if "ppi" in args.datasets:
-        raise ValueError(
-            "PPI is outside the initial V3 benchmark protocol, which uses transductive "
-            "node-classification datasets. This is a protocol limit, not a shared-gate limitation."
-        )
     if not args.datasets or any(dataset not in DATASETS for dataset in args.datasets):
-        raise ValueError("Unsupported fixed-graph dataset; choose: " + ", ".join(DATASETS))
+        raise ValueError("Unsupported V3 dataset; choose: " + ", ".join(DATASETS))
     if args.edge_chunk_size < 1:
         raise ValueError("edge chunk size must be positive")
-    if args.batch_size != 1 or args.workers != 0:
-        raise ValueError("Full-graph V3 requires batch-size=1 and workers=0")
+    if args.batch_size != 2 or args.workers != 0:
+        raise ValueError("V3 requires PPI batch-size=2 and workers=0")
 
 
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     jobs = []
     for dataset in args.datasets:
+        child_batch_size = args.batch_size if dataset == "ppi" else 1
         for condition in CONDITIONS:
             output = run_dir / dataset / condition
             command = [
@@ -98,15 +99,16 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "model_seed",
                 "epochs",
                 "patience",
-                "batch_size",
                 "workers",
                 "edge_chunk_size",
             ):
                 command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
+            command += ["--batch-size", str(child_batch_size)]
             jobs.append(
                 {
                     "dataset": dataset,
                     "condition": condition,
+                    "batch_size": child_batch_size,
                     "status": "pending",
                     "output_dir": str(output),
                     "metrics_path": str(output / "metrics.json"),
@@ -212,13 +214,15 @@ def main(argv: list[str] | None = None) -> int:
             "test": "not evaluated; exploratory validation comparison",
             "initialization": "same full state hash including frozen shared-gate scaffold; "
             "alpha active in both arms",
-            "data": "same verified official cache/split and ordered topology; no downloads",
+            "data": "same verified official V1 cache/split and ordered topology; no downloads",
             "contrast": "fresh relative_c minus fresh fixed_c; "
             "never reuse any V1/V2 or older score",
             "fixed_c": "exact C=1; gate scaffold frozen/excluded from optimizer, "
             "alpha remains trainable",
             "normalization": "symmetric in both arms; AdamW backbone WD=0.0005; gate/scalar WD=0",
-            "transductive": "initial protocol uses official fixed-graph train/validation masks",
+            "data_modes": "Cora/CiteSeer/PubMed/arxiv use fixed-graph train/validation masks; "
+            "PPI uses the official 20/2/2 split: train 20 and validation 2 run at batch 2 "
+            "with BCEWithLogits and global logit>0 node-label micro-F1; test 2 is not scored",
             "optimizer": "AdamW; gate MLP lr=2*base lr; alpha/gamma/tau lr=base lr; "
             "gate/scalar WD=0",
             "interventions": "selected checkpoint validation only: "

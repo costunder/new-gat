@@ -1,7 +1,7 @@
 """Read-only observations for symmetric relative-C, never the old row-normalized rho.
 
 Training observations attach to the actual forward. Interventions run only after
-validation checkpoint selection, with no optimizer or test labels involved.
+validation checkpoint selection, with no optimizer step or test-label metric involved.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from ..ablation.model import state_sha256
+from ..benchmark import _binary_counts, _micro_f1_from_counts
 
 
 @contextmanager
@@ -187,7 +188,54 @@ class ForwardObservation:
         return output
 
 
-def evaluate_validation(model, graph, indices: Tensor, *, observe: bool = True):
+def evaluate_validation(
+    model,
+    data,
+    indices: Tensor | None,
+    *,
+    observe: bool = True,
+    device: torch.device | None = None,
+):
+    """Evaluate one fixed graph or the complete official two-graph PPI validation split."""
+    if indices is None:
+        if not isinstance(data, dict) or "validation" not in data:
+            raise ValueError("PPI validation loader is missing")
+        loader = data["validation"]
+        if len(loader) != 1:
+            raise ValueError("PPI validation must be its two official graphs in one batch")
+        if device is None:
+            device = next(model.parameters()).device
+        graph = next(iter(loader)).to(device, non_blocking=True)
+        if int(getattr(graph, "num_graphs", 0)) != 2:
+            raise ValueError("PPI validation must contain both official validation graphs")
+        with evaluation_mode(model):
+            if observe:
+                with ForwardObservation(model) as observation:
+                    logits = model(graph)
+                layers = observation.summary()
+            else:
+                logits, layers = model(graph), []
+            if not bool(torch.isfinite(logits).all()):
+                raise FloatingPointError("Nonfinite validation logits")
+            labels = graph.y
+            counts = _binary_counts(logits, labels)
+            result = {
+                "metric": _micro_f1_from_counts(counts),
+                "metric_name": "micro_f1",
+                "prediction_rule": "logit_gt_zero_node_label",
+                "loss": float(F.binary_cross_entropy_with_logits(logits, labels)),
+                "layers": layers,
+                "mode": "eval",
+                "split": "validation",
+                "validation_graph_count": 2,
+                "label_decision_count": labels.numel(),
+                "prediction_unit": "node_label_decision",
+                "observation_scope": (
+                    "all official PPI validation graphs; global node-label micro-F1"
+                ),
+            }
+        return result, logits.detach().cpu()
+    graph = data
     if not indices.numel():
         raise ValueError("Validation mask is empty")
     with evaluation_mode(model):
@@ -203,13 +251,30 @@ def evaluate_validation(model, graph, indices: Tensor, *, observe: bool = True):
             raise FloatingPointError("Nonfinite validation logits")
         result = {
             "metric": int((logits.argmax(-1) == labels).sum()) / indices.numel(),
+            "metric_name": "accuracy",
+            "prediction_rule": "argmax_node_class",
             "loss": float(F.cross_entropy(logits, labels)),
             "layers": layers,
             "mode": "eval",
             "split": "validation",
+            "validation_graph_count": 1,
+            "label_decision_count": indices.numel(),
+            "prediction_unit": "node",
             "observation_scope": "whole transductive graph states; validation labels only",
         }
     return result, logits.detach().cpu()
+
+
+def changed_prediction_fraction(logits: Tensor, reference: Tensor, metric_name: str) -> float:
+    if logits.shape != reference.shape or not logits.numel():
+        raise ValueError("Intervention/reference logits must be nonempty and aligned")
+    if metric_name == "micro_f1":
+        changed = (logits > 0) != (reference > 0)
+    elif metric_name == "accuracy":
+        changed = logits.argmax(-1) != reference.argmax(-1)
+    else:
+        raise ValueError("Unsupported intervention prediction metric")
+    return float(changed.double().mean())
 
 
 class Intervention:
@@ -263,7 +328,16 @@ class Intervention:
         return result
 
 
-def best_checkpoint_interventions(model, graph, indices, original, reference: Tensor, *, seed: int):
+def best_checkpoint_interventions(
+    model,
+    data,
+    indices,
+    original,
+    reference: Tensor,
+    *,
+    seed: int,
+    device: torch.device | None = None,
+):
     """All-layer read-only interventions, only on the selected best checkpoint."""
     before = state_sha256(model)
     modes = [module.training for module in model.modules()]
@@ -275,7 +349,9 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
     try:
         for name in ("mean_c", "shuffled_c", "ones_c", "propagation_off"):
             with Intervention(model, name, seed):
-                result, logits = evaluate_validation(model, graph, indices, observe=False)
+                result, logits = evaluate_validation(
+                    model, data, indices, observe=False, device=device
+                )
             difference = logits.double() - reference.double()
             rows.append(
                 {
@@ -286,9 +362,11 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
                     "score_delta": result["metric"] - original["metric"],
                     "logit_mean_absolute_delta": float(difference.abs().mean()),
                     "logit_max_absolute_delta": float(difference.abs().max()),
-                    "changed_prediction_fraction": float(
-                        (logits.argmax(-1) != reference.argmax(-1)).double().mean()
+                    "changed_prediction_fraction": changed_prediction_fraction(
+                        logits, reference, original["metric_name"]
                     ),
+                    "prediction_unit": original["prediction_unit"],
+                    "prediction_rule": original["prediction_rule"],
                 }
             )
     finally:
@@ -307,6 +385,9 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
         "scope": "validation_selected_best_checkpoint_only",
         "layers": "all_layers_simultaneously",
         "original": {"validation": original["metric"], "loss": original["loss"]},
+        "validation_graph_count": original["validation_graph_count"],
+        "prediction_unit": original["prediction_unit"],
+        "prediction_rule": original["prediction_rule"],
         "rows": rows,
         "shuffle_seed": seed,
         "normalization_recomputed": True,

@@ -10,12 +10,14 @@ torch = pytest.importorskip("torch")
 
 from research.conductance_gat.ablation.model import state_sha256  # noqa: E402
 from research.conductance_gat.v3.model import RelativeCNodeClassifier  # noqa: E402
+from research.conductance_gat.v4 import train as train_module  # noqa: E402
 from research.conductance_gat.v4.model import (  # noqa: E402
     RelativeCSpatialConv,
     RelativeCSpatialNodeClassifier,
 )
 from research.conductance_gat.v4.operator import symmetric_spatial_propagation  # noqa: E402
 from research.conductance_gat.v4.protocol import CONDITIONS  # noqa: E402
+from research.conductance_gat.v4.train import _validate_args, topology_metadata  # noqa: E402
 
 
 def _dense_reference(residual, message, c, incidence, alpha):
@@ -200,6 +202,169 @@ def test_identity_w_path_is_exact_v3_forward():
         expected = v3(graph)
         actual = v4(graph)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_packed_inductive_graphs_match_separate_graph_forwards():
+    torch.manual_seed(43)
+    model = RelativeCSpatialNodeClassifier(
+        3,
+        2,
+        hidden_channels=4,
+        layers=2,
+        dropout=0.0,
+        gate_mode="relative",
+        spatial_mode="learned",
+        edge_chunk_size=1,
+    ).eval()
+    first = SimpleNamespace(
+        x=torch.tensor([[0.2, 1.0, -0.4], [1.2, -0.7, 0.5], [-0.3, 0.8, 2.0]]),
+        incidence_edge_index=torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+    )
+    second = SimpleNamespace(
+        x=torch.tensor([[0.9, 0.1, -1.0], [0.4, -0.2, 0.7], [1.1, 0.3, -0.5]]),
+        incidence_edge_index=torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+    )
+    packed = SimpleNamespace(
+        x=torch.cat((first.x, second.x)),
+        incidence_edge_index=torch.tensor([[0, 1, 3, 4], [1, 2, 4, 5]], dtype=torch.long),
+        batch=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long),
+    )
+    with torch.no_grad():
+        expected = torch.cat((model(first), model(second)))
+        actual = model(packed)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+
+
+def test_ppi_topology_and_child_batch_defaults_bind_official_protocol():
+    graphs = [
+        {
+            "x": torch.ones(3, 2),
+            "incidence_edge_index": torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        }
+        for _ in range(24)
+    ]
+    payload = {
+        "dataset": "ppi",
+        "graphs": graphs,
+        "splits": {
+            "train": list(range(20)),
+            "validation": [20, 21],
+            "test": [22, 23],
+        },
+    }
+    topology = topology_metadata(payload)
+    assert topology["scope"] == "official_train_and_validation_graphs"
+    assert topology["split_graph_counts"] == {"train": 20, "validation": 2}
+    assert topology["split_num_nodes"] == {"train": 60, "validation": 6}
+    assert topology["split_num_edges"] == {"train": 40, "validation": 4}
+    assert all(len(value) == 64 for value in topology["split_incidence_sha256"].values())
+
+    args = SimpleNamespace(
+        dataset="ppi",
+        condition="fixed_c_identity_w",
+        epochs=1,
+        patience=1,
+        edge_chunk_size=1,
+        model_seed=0,
+        batch_size=None,
+        workers=0,
+    )
+    _validate_args(args)
+    assert args.batch_size == 2
+
+
+class _PackedBatch(SimpleNamespace):
+    def to(self, device, non_blocking=False):
+        del non_blocking
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                setattr(self, name, value.to(device))
+        return self
+
+
+class _NoTestSplits(dict):
+    def __getitem__(self, key):
+        if key == "test":
+            pytest.fail("V4 training must not read the PPI test split")
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        if key == "test":
+            pytest.fail("V4 training must not read the PPI test split")
+        return super().get(key, default)
+
+
+def test_ppi_training_uses_ten_minibatch_steps_and_never_reads_test(
+    tmp_path, monkeypatch
+):
+    individual = {
+        "x": torch.ones(3, 2),
+        "y": torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+        "incidence_edge_index": torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+    }
+    payload = {
+        "dataset": "ppi",
+        "classes": 2,
+        "graphs": [
+            {name: value.clone() for name, value in individual.items()} for _ in range(24)
+        ],
+        "splits": _NoTestSplits(
+            train=list(range(20)),
+            validation=[20, 21],
+        ),
+    }
+    packed = _PackedBatch(
+        x=torch.cat((individual["x"], individual["x"])),
+        y=torch.cat((individual["y"], individual["y"])),
+        incidence_edge_index=torch.tensor([[0, 1, 3, 4], [1, 2, 4, 5]], dtype=torch.long),
+        batch=torch.tensor([0, 0, 0, 1, 1, 1], dtype=torch.long),
+        num_graphs=2,
+    )
+    loaders = {"train": [packed] * 10, "validation": [packed]}
+    monkeypatch.setattr(train_module, "_require_cuda", lambda device: None)
+    monkeypatch.setattr(train_module, "_make_data", lambda payload, args, device: (loaders, None))
+    monkeypatch.setattr(train_module, "_source_hashes", lambda: {"unit.py": "a" * 64})
+    monkeypatch.setattr(train_module, "_versions", lambda: {"torch": "unit"})
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "unit-cpu")
+    steps = 0
+    real_step = torch.optim.AdamW.step
+
+    def counted_step(optimizer, *args, **kwargs):
+        nonlocal steps
+        steps += 1
+        return real_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", counted_step)
+    output = tmp_path / "ppi-arm"
+    output.mkdir()
+    args = SimpleNamespace(
+        dataset="ppi",
+        condition="fixed_c_identity_w",
+        model_seed=0,
+        epochs=1,
+        patience=1,
+        batch_size=2,
+        workers=0,
+        device="cpu",
+        edge_chunk_size=16,
+    )
+    protocol = {
+        "data_sha256": "b" * 64,
+        "split": "official_inductive_graph_split",
+        "split_counts": {"train": 20, "validation": 2, "test": 2},
+    }
+    result = train_module.train_model(payload, protocol, args, torch.device("cpu"), output)
+    assert steps == 10
+    assert result["optimizer_steps"] == 10
+    assert result["best_checkpoint_optimizer_steps"] == 10
+    assert result["train_batches_per_epoch"] == 10
+    assert result["validation_batches"] == 1 and result["validation_graphs"] == 2
+    assert result["metric_name"] == "micro_f1"
+    assert result["execution"]["training"] == "official_inductive_graph_minibatch"
 
 
 def test_conductance_reads_pre_w_state_and_learned_w_receives_task_gradient():

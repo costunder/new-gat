@@ -23,7 +23,7 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
         "model_seed": 0,
         "epochs": 100,
         "patience": 20,
-        "batch_size": 1,
+        "batch_size": 2,
         "workers": 0,
         "device": "cuda",
         "edge_chunk_size": 65536,
@@ -42,6 +42,42 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
     configuration = {k: v for k, v in config.items() if k != "datasets"}
     configuration.update(tf32=False, pin_memory=True)
     for dataset in datasets:
+        is_ppi = dataset == "ppi"
+        child_batch_size = 2 if is_ppi else 1
+        metric_name = "micro_f1" if is_ppi else "accuracy"
+        prediction_unit = "node_label_decision" if is_ppi else "node"
+        validation_graph_count = 2 if is_ppi else 1
+        optimizer_steps_per_epoch = 10 if is_ppi else 1
+        child_configuration = copy.deepcopy(configuration)
+        child_configuration["batch_size"] = child_batch_size
+        protocol = {
+            "data_sha256": hashlib.sha256(dataset.encode()).hexdigest(),
+            "dataset": dataset,
+            "split": (
+                "official_inductive_graph_split"
+                if is_ppi
+                else "official_time_split"
+                if dataset == "ogbn-arxiv"
+                else "official_public_masks"
+            ),
+            "task": "multi_label_node_classification" if is_ppi else "node_classification",
+            "metric": metric_name,
+        }
+        if is_ppi:
+            protocol.update(
+                split_counts={"train": 20, "validation": 2, "test": 2},
+            )
+        topology = (
+            {
+                "scope": "official_train_and_validation_graphs",
+                "split_graph_counts": {"train": 20, "validation": 2},
+                "split_num_nodes": {"train": 40, "validation": 4},
+                "split_num_edges": {"train": 30, "validation": 3},
+                "split_incidence_sha256": {"train": "2" * 64, "validation": "3" * 64},
+            }
+            if is_ppi
+            else {"num_nodes": 4, "num_edges": edges, "incidence_sha256": "2" * 64}
+        )
         for condition, spec in CONDITIONS.items():
             output = root / dataset / condition
             output.mkdir(parents=True)
@@ -108,6 +144,11 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                 "status": "passed",
                 "scope": "validation_selected_best_checkpoint_only",
                 "original": {"validation": score, "loss": 0.7},
+                "validation_graph_count": validation_graph_count,
+                "prediction_unit": prediction_unit,
+                "prediction_rule": (
+                    "logit_gt_zero_node_label" if is_ppi else "argmax_node_class"
+                ),
                 "rows": [
                     {
                         "intervention": name,
@@ -115,6 +156,10 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                         "percentage_points": -1.0,
                         "logit_mean_absolute_delta": 0.1,
                         "changed_prediction_fraction": 0.02,
+                        "prediction_unit": prediction_unit,
+                        "prediction_rule": (
+                            "logit_gt_zero_node_label" if is_ppi else "argmax_node_class"
+                        ),
                     }
                     for name in ("mean_c", "shuffled_c", "ones_c", "propagation_off")
                 ],
@@ -128,14 +173,17 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                 "model_seed": 0,
                 **spec,
                 "non_gate_weight_decay": 0.0005,
-                "configuration": copy.deepcopy(configuration),
+                "configuration": child_configuration,
                 "cache_sha256": data_hash,
-                "protocol": {"data_sha256": data_hash, "official": True},
+                "protocol": protocol,
                 "initial_state_sha256": "a" * 64,
                 "best_epoch": 10,
                 "epochs_run": 30,
                 "validation": 0.55 if condition == "relative_c" else 0.50,
-                "metric_name": "accuracy",
+                "metric_name": metric_name,
+                "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+                "optimizer_steps": 30 * optimizer_steps_per_epoch,
+                "best_checkpoint_optimizer_steps": 10 * optimizer_steps_per_epoch,
                 "train_loss": 0.7,
                 "elapsed_seconds": 2.0,
                 "peak_cuda_allocated_bytes": 100,
@@ -155,7 +203,13 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                         "mode": "eval",
                         "split": "validation",
                         "metric": score,
+                        "metric_name": metric_name,
+                        "prediction_rule": (
+                            "logit_gt_zero_node_label" if is_ppi else "argmax_node_class"
+                        ),
                         "loss": 0.7,
+                        "validation_graph_count": validation_graph_count,
+                        "prediction_unit": prediction_unit,
                         "layers": layer_stats,
                     },
                     "best_checkpoint_interventions": interventions,
@@ -163,8 +217,12 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                         {
                             "epoch": 10,
                             "batch_index": 0,
-                            "optimizer_steps_before_batch": 9,
-                            "scope": "full_graph_train_mask",
+                            "optimizer_steps_before_batch": 9 * optimizer_steps_per_epoch,
+                            "scope": (
+                                "first_actual_training_minibatch_only"
+                                if is_ppi
+                                else "full_graph_train_mask"
+                            ),
                             "mode": "train_dropout_on",
                             "stage": "after_task_backward_before_optimizer_step",
                             "layers": [
@@ -176,7 +234,7 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                 },
                 "source_sha256": source,
                 "parameterization": PARAMETERIZATION,
-                "topology": {"num_nodes": 4, "num_edges": edges, "incidence_sha256": "2" * 64},
+                "topology": topology,
             }
             for name, path in (("checkpoint", checkpoint), ("history", history)):
                 metrics[name] = str(path)
@@ -187,6 +245,7 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                 {
                     "dataset": dataset,
                     "condition": condition,
+                    "batch_size": child_batch_size,
                     "status": "passed",
                     "output_dir": str(output),
                     "metrics_path": str(metrics_path),
@@ -270,7 +329,7 @@ def test_child_mismatch_invalidates_all_deltas(tmp_path, key, value):
 
 
 @pytest.mark.parametrize(
-    "change", ["source", "missing_source", "duplicate", "missing", "spec", "ppi"]
+    "change", ["source", "missing_source", "duplicate", "missing", "spec", "unknown"]
 )
 def test_invalid_manifest_withholds_contrasts(tmp_path, change):
     root, manifest = _fixture(tmp_path)
@@ -282,8 +341,8 @@ def test_invalid_manifest_withholds_contrasts(tmp_path, change):
         manifest["jobs"].append(manifest["jobs"][0])
     elif change == "missing":
         manifest["jobs"].pop()
-    elif change == "ppi":
-        manifest["config"]["datasets"] = ["ppi"]
+    elif change == "unknown":
+        manifest["config"]["datasets"] = ["unknown"]
     else:
         manifest["conditions"] = {}
     with pytest.raises(ComparisonIntegrityError):
@@ -398,6 +457,41 @@ def test_report_uses_relative_scalars_and_interventions_not_legacy_rho(tmp_path)
     assert "single-factor comparison" in text
     assert "Validation computes no gradients" in text
     assert "Actual training gradients" in text and "0.125000" in text
+
+
+def test_ppi_report_uses_micro_f1_and_official_inductive_contract(tmp_path):
+    root, manifest = _fixture(tmp_path, ("ppi",))
+    report = write_comparison(root, manifest)
+    assert report["status"] == "passed"
+    assert report["datasets"][0]["metric_name"] == "micro_f1"
+    assert report["datasets"][0]["held_fixed"]["topology"]["split_graph_counts"] == {
+        "train": 20,
+        "validation": 2,
+    }
+    assert "ppi (micro_f1" in (root / "comparison.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("dataset", "cora"), ("task", "node_classification"), ("metric", "accuracy")],
+)
+def test_ppi_report_rejects_wrong_cached_task_contract(tmp_path, field, value):
+    root, manifest = _fixture(tmp_path, ("ppi",))
+    _edit(manifest, lambda child: child["protocol"].update({field: value}))
+    with pytest.raises(ComparisonIntegrityError, match="official V1 dataset contract"):
+        write_comparison(root, manifest)
+
+
+def test_ppi_report_rejects_wrong_prediction_threshold_contract(tmp_path):
+    root, manifest = _fixture(tmp_path, ("ppi",))
+    _edit(
+        manifest,
+        lambda child: child["diagnostics"]["best_validation"].update(
+            prediction_rule="argmax_node_class"
+        ),
+    )
+    with pytest.raises(ComparisonIntegrityError, match="prediction scope mismatch"):
+        write_comparison(root, manifest)
 
 
 @pytest.mark.parametrize("value", ["not-a-number", False, -1.0])

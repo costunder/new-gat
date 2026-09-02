@@ -14,10 +14,14 @@ GPU 가속 실측은 아직 받지 않았다. 기존 benchmark 결과·checkpoin
 정확한 chunked 1차 backward와 공유 MLP activation checkpointing을 자체 실행 경로에서 쓴다.
 V4는 잔차 상태와 `HW` 메시지를 분리한 대칭 전파의 정확한 chunked 1차 backward를 사용하고,
 상대 C 조건에서는 v3와 같은 shared generator checkpointing을 사용한다.
-두 경로 모두 full-graph이며 neighbor sampling이나 `torch.compile` 옵션을 제공하지 않는다.
+세 경로 모두 neighbor sampling이나 `torch.compile` 옵션을 제공하지 않는다. V2와 V3/V4의
+transductive 데이터는 full-graph batch 1이며, V3/V4의 PPI는 graph를 자르지 않는 whole-graph
+minibatch 2를 사용한다.
 특히 v3의 전파 자체는 O((n+m)d)이지만 width가 d에 비례하는 C 생성 MLP는 O(md²) 작업을
 요구한다. Chunking/checkpointing을 전체 모델 메모리 상수화나 실측 가속으로 표현하지 않는다.
-V2/v3/v4 GPU 시간·peak memory는 각각의 `comparison.md`에 기록되기 전까지 미측정이다.
+현재 확대된 V2/V3/V4 8/10/20개 기본 실행의 GPU 시간·peak memory는 수령하지 않았다.
+과거 arxiv-only runner 상태를 전체 비교의 실측으로 재사용하지 않으며, 각각의 완전한
+`comparison.md`가 보존되기 전에는 확정값으로 기록하지 않는다.
 
 ## 기본 적용
 

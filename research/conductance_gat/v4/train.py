@@ -1,13 +1,17 @@
 """Standalone four-arm conductance x spatial-message V4 training.
 
-Every arm is trained freshly on CUDA with the same official full-graph cache.
+Every arm is trained freshly on CUDA with the same official V1 dataset cache.
+Transductive datasets use one full graph; PPI uses whole-graph minibatches.
 Validation alone selects a checkpoint.  Selected-checkpoint interventions are
-read-only diagnostic forwards and are never counted as additional training.
+read-only diagnostic forwards and are never counted as additional training. No
+test score is computed.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
 import time
 from pathlib import Path
@@ -28,19 +32,29 @@ from .diagnostics import (
     norm,
 )
 from .model import RelativeCSpatialNodeClassifier
-from .protocol import COMMON, CONDITIONS, DATASETS, DEFAULT_EDGE_CHUNK_SIZE, PARAMETERIZATION, SUITE
+from .protocol import (
+    BATCH_SIZE_BY_DATASET,
+    COMMON,
+    CONDITIONS,
+    DATASETS,
+    DEFAULT_EDGE_CHUNK_SIZE,
+    METRIC_BY_DATASET,
+    PARAMETERIZATION,
+    SUITE,
+)
 
 OBSERVATION_POLICY = {
     "training": (
-        "Every epoch's actual full-graph train forward with dropout ON; raw task gradients "
-        "after backward before AdamW step. No extra training forward/backward."
+        "Every epoch's actual transductive full-graph forward or PPI first actual minibatch with "
+        "dropout ON; raw task gradients after backward before AdamW step. No extra training "
+        "forward/backward."
     ),
     "validation": (
         "Every epoch validation selects checkpoint; initial/selected/final validation layer "
         "observations use validation labels only."
     ),
     "statistics": (
-        "Exact full observed graph score/C moments and degree population quantiles; per-layer "
+        "Exact full observed batch score/C moments and degree population quantiles; per-layer "
         "alpha and W parameter, identity-distance, gradient, and singular-value summaries."
     ),
     "factorial_training": (
@@ -201,9 +215,56 @@ def _parameter_metadata(model):
 
 
 def topology_metadata(payload):
-    if payload.get("dataset") not in DATASETS or len(payload.get("graphs", [])) != 1:
-        raise ValueError("V4 experiment requires one official transductive graph; PPI unsupported")
-    graph = payload["graphs"][0]
+    dataset = payload.get("dataset")
+    graphs = payload.get("graphs", [])
+    if dataset not in DATASETS or not graphs:
+        raise ValueError("V4 requires a supported official dataset payload")
+    if dataset == "ppi":
+        train_indices = list(payload.get("splits", {}).get("train", []))
+        validation_indices = list(payload.get("splits", {}).get("validation", []))
+        if (
+            len(train_indices) != 20
+            or len(validation_indices) != 2
+            or set(train_indices) & set(validation_indices)
+        ):
+            raise ValueError("PPI requires disjoint official 20-train/2-validation graph splits")
+        metadata = {
+            "scope": "official_train_and_validation_graphs",
+            "split_graph_counts": {},
+            "split_num_nodes": {},
+            "split_num_edges": {},
+            "split_incidence_sha256": {},
+        }
+        for split, split_indices in (
+            ("train", train_indices),
+            ("validation", validation_indices),
+        ):
+            descriptors = []
+            nodes = edges = 0
+            for graph_index in split_indices:
+                graph = graphs[int(graph_index)]
+                incidence = graph["incidence_edge_index"]
+                nodes += int(graph["x"].shape[0])
+                edges += int(incidence.shape[1])
+                descriptors.append(
+                    {
+                        "graph_index": int(graph_index),
+                        "num_nodes": int(graph["x"].shape[0]),
+                        "num_edges": int(incidence.shape[1]),
+                        "incidence_sha256": tensor_hash(incidence),
+                    }
+                )
+            metadata["split_graph_counts"][split] = len(split_indices)
+            metadata["split_num_nodes"][split] = nodes
+            metadata["split_num_edges"][split] = edges
+            metadata["split_incidence_sha256"][split] = hashlib.sha256(
+                json.dumps(descriptors, sort_keys=True).encode()
+            ).hexdigest()
+        return metadata
+    else:
+        if len(graphs) != 1:
+            raise ValueError("Transductive V4 datasets require exactly one official graph")
+        graph = graphs[0]
     return {
         "num_nodes": int(graph["x"].shape[0]),
         "num_edges": int(graph["incidence_edge_index"].shape[1]),
@@ -227,8 +288,13 @@ def _validate_args(args):
         raise ValueError("Unsupported V4 dataset/condition")
     if min(args.epochs, args.patience, args.edge_chunk_size) < 1 or args.model_seed < 0:
         raise ValueError("epochs/patience/chunk size must be positive and seed nonnegative")
-    if args.batch_size != 1 or args.workers != 0:
-        raise ValueError("V4 full-graph training requires batch-size=1 and workers=0")
+    expected_batch_size = BATCH_SIZE_BY_DATASET[args.dataset]
+    if args.batch_size is None:
+        args.batch_size = expected_batch_size
+    if args.batch_size != expected_batch_size or args.workers != 0:
+        raise ValueError(
+            "V4 requires protocol batch size 2 for PPI, 1 otherwise, and workers=0"
+        )
 
 
 def build_parser():
@@ -241,7 +307,7 @@ def build_parser():
     parser.add_argument("--model-seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=50)
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--edge-chunk-size", type=int, default=DEFAULT_EDGE_CHUNK_SIZE)
     return parser
@@ -256,9 +322,23 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     sources = _source_hashes()
     _configure_fp32()
     _seed(args.model_seed)
-    graph, indices = _make_data(payload, args, device)
-    if indices is None or not indices["train"].numel():
-        raise ValueError("V4 requires a nonempty transductive train mask")
+    data, indices = _make_data(payload, args, device)
+    if indices is not None:
+        if not indices["train"].numel():
+            raise ValueError("V4 requires a nonempty transductive train mask")
+        train_batches_per_epoch = validation_batches = validation_graphs = 1
+    else:
+        train_batches_per_epoch = len(data["train"])
+        validation_batches = len(data["validation"])
+        validation_graphs = len(payload["splits"]["validation"])
+        if (
+            train_batches_per_epoch != 10
+            or validation_batches != 1
+            or validation_graphs != 2
+        ):
+            raise ValueError(
+                "PPI V4 requires 20 train graphs and 2 validation graphs at batch size 2"
+            )
     specification = CONDITIONS[args.condition]
     model = RelativeCSpatialNodeClassifier(
         payload["graphs"][0]["x"].shape[1],
@@ -302,57 +382,84 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     checkpoint, history_path = output / "best.pt", output / "history.json"
     history, trajectory = [], []
     best_validation, best_epoch = -math.inf, 0
+    optimizer_steps = best_optimizer_steps = 0
     checkpoint_hash = history_hash = None
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
     started = time.perf_counter()
-    initial_observation, _ = evaluate_validation(model, graph, indices["validation"])
+    validation_indices = indices["validation"] if indices is not None else None
+    initial_observation, _ = evaluate_validation(
+        model, data, validation_indices, device=device
+    )
     for epoch in range(1, args.epochs + 1):
         _require_sources(sources)
         torch.cuda.synchronize(device)
         epoch_started = time.perf_counter()
         model.train()
-        optimizer.zero_grad(set_to_none=True)
-        with ForwardObservation(model) as observation:
-            logits = model(graph)
-        loss, count = training_loss(logits, graph, indices["train"])
-        if not bool(torch.isfinite(loss)):
-            raise FloatingPointError(f"Nonfinite V4 training loss at epoch {epoch}")
-        loss.backward()
-        gradient_groups = [
-            {
-                **descriptor,
-                "parameter_norm": norm(group["params"]),
-                "task_gradient_norm": norm(group["params"], gradient=True),
-            }
-            for descriptor, group in zip(
-                optimizer_metadata(optimizer), optimizer.param_groups, strict=True
-            )
-        ]
-        record = {
-            "epoch": epoch,
-            "batch_index": 0,
-            "optimizer_steps_before_batch": epoch - 1,
-            "scope": "full_graph_train_mask",
-            "mode": "train_dropout_on",
-            "stage": "after_task_backward_before_optimizer_step",
-            "label_count": count,
-            "train_loss": float(loss.detach()),
-            "layers": observation.summary(gradients=True),
-            "parameter_groups": gradient_groups,
-        }
-        trajectory.append(record)
-        optimizer.step()
+        loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+        label_count = 0
+        batches = [data] if indices is not None else data["train"]
+        for batch_index, batch in enumerate(batches):
+            if indices is None:
+                batch = batch.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            if batch_index == 0:
+                with ForwardObservation(model) as observation:
+                    logits = model(batch)
+            else:
+                logits = model(batch)
+            train_indices = indices["train"] if indices is not None else None
+            loss, count = training_loss(logits, batch, train_indices)
+            if not bool(torch.isfinite(loss)):
+                raise FloatingPointError(
+                    f"Nonfinite V4 training loss at epoch {epoch}, batch {batch_index}"
+                )
+            loss.backward()
+            if batch_index == 0:
+                gradient_groups = [
+                    {
+                        **descriptor,
+                        "parameter_norm": norm(group["params"]),
+                        "task_gradient_norm": norm(group["params"], gradient=True),
+                    }
+                    for descriptor, group in zip(
+                        optimizer_metadata(optimizer), optimizer.param_groups, strict=True
+                    )
+                ]
+                record = {
+                    "epoch": epoch,
+                    "batch_index": 0,
+                    "optimizer_steps_before_batch": optimizer_steps,
+                    "scope": (
+                        "full_graph_train_mask"
+                        if indices is not None
+                        else "first_actual_training_minibatch_only"
+                    ),
+                    "mode": "train_dropout_on",
+                    "stage": "after_task_backward_before_optimizer_step",
+                    "label_count": count,
+                    "train_loss": float(loss.detach()),
+                    "layers": observation.summary(gradients=True),
+                    "parameter_groups": gradient_groups,
+                }
+                trajectory.append(record)
+            optimizer.step()
+            optimizer_steps += 1
+            loss_sum.add_(loss.detach().double() * count)
+            label_count += count
+        if not label_count:
+            raise RuntimeError("V4 training split produced no labels")
+        train_loss = float(loss_sum / label_count)
         validation_observation, _ = evaluate_validation(
-            model, graph, indices["validation"], observe=False
+            model, data, validation_indices, observe=False, device=device
         )
         validation = validation_observation["metric"]
         torch.cuda.synchronize(device)
         history.append(
             {
                 "epoch": epoch,
-                "optimizer_steps": epoch,
-                "train_loss": record["train_loss"],
+                "optimizer_steps": optimizer_steps,
+                "train_loss": train_loss,
                 "validation": validation,
                 "epoch_seconds": time.perf_counter() - epoch_started,
                 "training_first_batch": record,
@@ -362,6 +469,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         history_hash = sha256_file(history_path)
         if validation > best_validation:
             best_validation, best_epoch = validation, epoch
+            best_optimizer_steps = optimizer_steps
             saved = {
                 **common,
                 "state_dict": {
@@ -377,7 +485,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
                     "edge_chunk_size": args.edge_chunk_size,
                 },
                 "best_epoch": epoch,
-                "optimizer_steps": epoch,
+                "optimizer_steps": optimizer_steps,
                 "validation": validation,
             }
             atomic_publish(checkpoint, lambda path, state=saved: torch.save(state, path))
@@ -385,7 +493,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         if epoch == 1 or epoch % 10 == 0:
             print(
                 f"{args.dataset}/{args.condition} epoch={epoch} "
-                f"train_loss={record['train_loss']:.6f} "
+                f"train_loss={train_loss:.6f} "
                 f"val={validation:.6f} best_epoch={best_epoch}",
                 flush=True,
             )
@@ -395,7 +503,9 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     stopping_reason = "patience" if stop_epoch - best_epoch >= args.patience else "max_epochs"
     selection_loop_seconds = time.perf_counter() - started
     post_selection_started = time.perf_counter()
-    final_observation, _ = evaluate_validation(model, graph, indices["validation"])
+    final_observation, _ = evaluate_validation(
+        model, data, validation_indices, device=device
+    )
     _require_sources(sources)
     if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
         raise RuntimeError("Checkpoint/history changed before best-checkpoint validation")
@@ -415,16 +525,19 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
             raise ValueError(f"Best checkpoint metadata mismatch: {key}")
     model.load_state_dict(saved["state_dict"])
     optimizer.zero_grad(set_to_none=True)
-    selected_observation, reference = evaluate_validation(model, graph, indices["validation"])
+    selected_observation, reference = evaluate_validation(
+        model, data, validation_indices, device=device
+    )
     if abs(selected_observation["metric"] - best_validation) > 1e-4:
         raise RuntimeError("Best validation recheck disagrees with checkpoint selection")
     interventions = best_checkpoint_interventions(
         model,
-        graph,
-        indices["validation"],
+        data,
+        validation_indices,
         selected_observation,
         reference,
         seed=args.model_seed,
+        device=device,
     )
     _require_sources(sources)
     if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
@@ -438,13 +551,21 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         "stop_epoch": stop_epoch,
         "stopping_reason": stopping_reason,
         "epochs_run": len(history),
-        "optimizer_steps": len(history),
-        "best_checkpoint_optimizer_steps": best_epoch,
+        "optimizer_steps": optimizer_steps,
+        "best_checkpoint_optimizer_steps": best_optimizer_steps,
+        "train_batches_per_epoch": train_batches_per_epoch,
+        "validation_batches": validation_batches,
+        "validation_graphs": validation_graphs,
         "validation": selected_observation["metric"],
         "validation_at_selection": best_validation,
-        "metric_name": "accuracy",
+        "metric_name": METRIC_BY_DATASET[args.dataset],
         "train_loss": history[best_epoch - 1]["train_loss"],
-        "train_loss_scope": "actual full-graph train mask loss at selected checkpoint epoch",
+        "train_loss_scope": (
+            "actual full-graph train mask loss at selected checkpoint epoch"
+            if indices is not None
+            else "node-label-weighted mean across all 20 official PPI train graphs at the "
+            "selected checkpoint epoch"
+        ),
         "final_train_loss": history[-1]["train_loss"],
         "checkpoint": str(checkpoint.resolve()),
         "checkpoint_sha256": checkpoint_hash,
@@ -467,7 +588,11 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
             "observation_policy": OBSERVATION_POLICY,
         },
         "execution": {
-            "training": "full_graph_transductive",
+            "training": (
+                "full_graph_transductive"
+                if indices is not None
+                else "official_inductive_graph_minibatch"
+            ),
             "neighbor_sampling": False,
             "edge_chunk_size": args.edge_chunk_size,
             "dense_incidence": False,

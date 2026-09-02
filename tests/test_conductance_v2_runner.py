@@ -12,12 +12,18 @@ import pytest
 from scripts import run_conductance_v2 as runner
 
 
-def test_default_two_fresh_trainings():
+def test_default_eight_fresh_trainings_cover_all_supported_transductive_datasets():
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
-    assert args.datasets == ["ogbn-arxiv"] and args.model_seed == 0
+    assert args.datasets == ["cora", "citeseer", "pubmed", "ogbn-arxiv"]
+    assert args.model_seed == 0
     assert args.edge_chunk_size == 65536 and args.batch_size == 1 and args.workers == 0
-    assert [job["condition"] for job in jobs] == ["direct_c", "fixed_c"]
+    assert [(job["dataset"], job["condition"]) for job in jobs] == [
+        (dataset, condition)
+        for dataset in args.datasets
+        for condition in ("direct_c", "fixed_c")
+    ]
+    assert len(jobs) == 8
     for job in jobs:
         command = job["command"]
         assert command[command.index("-m") + 1] == "research.conductance_gat.v2.train"
@@ -102,7 +108,14 @@ def _stub(tmp_path, monkeypatch, failure=None, change_after=None):
     monkeypatch.setattr(runner, "_source_snapshot", snapshot)
     monkeypatch.setattr(runner, "run_logged", dispatch)
     monkeypatch.setattr(runner, "_comparison", report)
-    return ["--results-root", str(tmp_path), "--run-id", "unit-fixture"], calls, reports
+    return [
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        "unit-fixture",
+        "--datasets",
+        "ogbn-arxiv",
+    ], calls, reports
 
 
 def test_success_records_metrics_digest_and_one_seed(tmp_path, monkeypatch):

@@ -16,8 +16,10 @@ torch = pytest.importorskip("torch")
 from research.conductance_gat.v4 import report as report_module  # noqa: E402
 from research.conductance_gat.v4.model import RelativeCSpatialNodeClassifier  # noqa: E402
 from research.conductance_gat.v4.protocol import (  # noqa: E402
+    BATCH_SIZE_BY_DATASET,
     COMMON,
     CONDITIONS,
+    METRIC_BY_DATASET,
     PARAMETERIZATION,
     SUITE,
 )
@@ -99,20 +101,38 @@ def _layer(index, specification, *, gradients=False):
     }
 
 
-def _training_record(epoch, specification):
+def _training_record(epoch, specification, dataset="ogbn-arxiv"):
+    steps = 10 if dataset == "ppi" else 1
     return {
         "epoch": epoch,
         "batch_index": 0,
-        "optimizer_steps_before_batch": epoch - 1,
-        "scope": "full_graph_train_mask",
+        "optimizer_steps_before_batch": (epoch - 1) * steps,
+        "scope": (
+            "first_actual_training_minibatch_only"
+            if dataset == "ppi"
+            else "full_graph_train_mask"
+        ),
         "mode": "train_dropout_on",
         "stage": "after_task_backward_before_optimizer_step",
         "layers": [_layer(index, specification, gradients=True) for index in range(2)],
     }
 
 
-def _diagnostics(score, specification):
+def _diagnostics(score, specification, dataset="ogbn-arxiv", edge_count=3):
     layers = [_layer(index, specification) for index in range(2)]
+    metric_name = METRIC_BY_DATASET[dataset]
+    prediction_rule = (
+        "logit_gt_zero_node_label" if dataset == "ppi" else "argmax_node_class"
+    )
+    graph_count = 2 if dataset == "ppi" else 1
+    observation = {
+        "mode": "eval",
+        "split": "validation",
+        "metric_name": metric_name,
+        "prediction_rule": prediction_rule,
+        "validation_graph_count": graph_count,
+        "layers": layers,
+    }
     intervention_rows = [
         {
             "intervention": name,
@@ -126,17 +146,15 @@ def _diagnostics(score, specification):
         for name in INTERVENTIONS
     ]
     return {
-        "initial_validation": {"mode": "eval", "split": "validation", "layers": layers},
+        "initial_validation": dict(observation),
         "best_validation": {
-            "mode": "eval",
-            "split": "validation",
+            **observation,
             "metric": score,
-            "layers": layers,
         },
-        "final_validation": {"mode": "eval", "split": "validation", "layers": layers},
+        "final_validation": dict(observation),
         "train_trajectory": [
-            _training_record(1, specification),
-            _training_record(2, specification),
+            _training_record(1, specification, dataset),
+            _training_record(2, specification, dataset),
         ],
         "best_checkpoint_interventions": {
             "status": "passed",
@@ -146,6 +164,9 @@ def _diagnostics(score, specification):
             "rows": intervention_rows,
             "shuffle_seed": 0,
             "normalization_recomputed_for_c_interventions": True,
+            "metric_name": metric_name,
+            "prediction_rule": prediction_rule,
+            "validation_graph_count": graph_count,
             "mean_c_numeric_check": {
                 "comparison": "mean_c_vs_ones_c",
                 "role": "informational_non_gating",
@@ -161,13 +182,13 @@ def _diagnostics(score, specification):
                         "contract": "graph_constant_positive",
                         "satisfied": True,
                         "layers_checked": 2,
-                        "edge_counts": [3, 3],
+                        "edge_counts": [edge_count, edge_count],
                     },
                     "ones_c": {
                         "contract": "exact_one",
                         "satisfied": True,
                         "layers_checked": 2,
-                        "edge_counts": [3, 3],
+                        "edge_counts": [edge_count, edge_count],
                     },
                 },
             },
@@ -175,25 +196,30 @@ def _diagnostics(score, specification):
     }
 
 
-def _fixture(tmp_path):
+def _fixture(tmp_path, dataset="ogbn-arxiv"):
     root = tmp_path / "hybrid-c-spatial-v4"
     root.mkdir()
+    batch_size = BATCH_SIZE_BY_DATASET[dataset]
+    metric_name = METRIC_BY_DATASET[dataset]
+    train_batches = 10 if dataset == "ppi" else 1
+    validation_graphs = 2 if dataset == "ppi" else 1
+    validation_edges = 4 if dataset == "ppi" else 3
     args = SimpleNamespace(
         model_seed=0,
         epochs=2,
         patience=1,
-        batch_size=1,
+        batch_size=batch_size,
         workers=0,
         device="cuda",
         edge_chunk_size=65536,
     )
     config = {
         **COMMON,
-        "datasets": ["ogbn-arxiv"],
+        "datasets": [dataset],
         "model_seed": 0,
         "epochs": 2,
         "patience": 1,
-        "batch_size": 1,
+        "batch_size_by_dataset": {dataset: batch_size},
         "workers": 0,
         "device": "cuda",
         "edge_chunk_size": 65536,
@@ -223,7 +249,7 @@ def _fixture(tmp_path):
             spatial_mode=specification["spatial_mode"],
         )
         optimizer = make_optimizer(model, condition)
-        output = root / "ogbn-arxiv" / condition
+        output = root / dataset / condition
         output.mkdir(parents=True)
         checkpoint, history = output / "best.pt", output / "history.json"
         checkpoint.write_bytes(b"unit-fixture-not-a-model")
@@ -234,20 +260,54 @@ def _fixture(tmp_path):
             "research_suite": SUITE,
             "status": "passed",
             "model": SUITE,
-            "dataset": "ogbn-arxiv",
+            "dataset": dataset,
             "condition": condition,
             "model_seed": 0,
             **specification,
             "non_gate_weight_decay": COMMON["weight_decay"],
             "configuration": configuration(args),
             "cache_sha256": data_hash,
-            "protocol": {"data_sha256": data_hash, "official": True},
+            "protocol": (
+                {
+                    "data_sha256": data_hash,
+                    "dataset": dataset,
+                    "split": "official_inductive_graph_split",
+                    "task": "multi_label_node_classification",
+                    "metric": "micro_f1",
+                    "split_counts": {"train": 20, "validation": 2, "test": 2},
+                }
+                if dataset == "ppi"
+                else {
+                    "data_sha256": data_hash,
+                    "dataset": dataset,
+                    "split": (
+                        "official_time_split"
+                        if dataset == "ogbn-arxiv"
+                        else "official_public_masks"
+                    ),
+                    "task": "node_classification",
+                    "metric": "accuracy",
+                }
+            ),
             "initial_state_sha256": "a" * 64,
-            "topology": {
-                "num_nodes": 4,
-                "num_edges": 3,
-                "incidence_sha256": "3" * 64,
-            },
+            "topology": (
+                {
+                    "scope": "official_train_and_validation_graphs",
+                    "split_graph_counts": {"train": 20, "validation": 2},
+                    "split_num_nodes": {"train": 60, "validation": 6},
+                    "split_num_edges": {"train": 40, "validation": validation_edges},
+                    "split_incidence_sha256": {
+                        "train": "3" * 64,
+                        "validation": "4" * 64,
+                    },
+                }
+                if dataset == "ppi"
+                else {
+                    "num_nodes": 4,
+                    "num_edges": validation_edges,
+                    "incidence_sha256": "3" * 64,
+                }
+            ),
             "parameterization": PARAMETERIZATION,
             "source_sha256": source,
             "optimizer": "AdamW",
@@ -259,8 +319,13 @@ def _fixture(tmp_path):
             "stop_epoch": 2,
             "stopping_reason": "patience",
             "epochs_run": 2,
+            "optimizer_steps": 2 * train_batches,
+            "best_checkpoint_optimizer_steps": train_batches,
+            "train_batches_per_epoch": train_batches,
+            "validation_batches": 1,
+            "validation_graphs": validation_graphs,
             "validation": score,
-            "metric_name": "accuracy",
+            "metric_name": metric_name,
             "train_loss": 0.7,
             "selection_loop_seconds": 0.7,
             "post_selection_diagnostics_seconds": 0.2,
@@ -280,7 +345,9 @@ def _fixture(tmp_path):
             "peak_cuda_reserved_bytes": 200,
             "versions": {"torch": "unit-fixture"},
             "gpu": "unit-fixture",
-            "diagnostics": _diagnostics(score, specification),
+            "diagnostics": _diagnostics(
+                score, specification, dataset=dataset, edge_count=validation_edges
+            ),
             "checkpoint": str(checkpoint.resolve()),
             "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
             "history": str(history.resolve()),
@@ -290,8 +357,9 @@ def _fixture(tmp_path):
         metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
         manifest["jobs"].append(
             {
-                "dataset": "ogbn-arxiv",
+                "dataset": dataset,
                 "condition": condition,
+                "batch_size": batch_size,
                 "status": "passed",
                 "output_dir": str(output),
                 "metrics_path": str(metrics_path),
@@ -339,6 +407,44 @@ def test_complete_report_has_all_conditional_contrasts_and_resources(tmp_path, m
         lambda: manifest["sources"]["sha256"],
     )
     assert main([str(root)]) == 0
+
+
+def test_ppi_report_enforces_micro_f1_batch_two_and_actual_optimizer_steps(tmp_path):
+    root, manifest = _fixture(tmp_path, dataset="ppi")
+    result = write_comparison(root, manifest)
+    dataset = result["datasets"][0]
+    assert result["status"] == "passed"
+    assert dataset["dataset"] == "ppi" and dataset["metric_name"] == "micro_f1"
+    assert dataset["held_fixed"]["configuration"]["batch_size"] == 2
+    assert all(
+        row["best_epoch_training_observation"]["scope"]
+        == "first_actual_training_minibatch_only"
+        for row in dataset["conditions"]
+    )
+    assert "ppi (micro_f1" in (root / "comparison.md").read_text(encoding="utf-8")
+
+
+def test_ppi_report_rejects_wrong_job_batch_or_optimizer_step_count(tmp_path):
+    root, manifest = _fixture(tmp_path, dataset="ppi")
+    manifest["jobs"][0]["batch_size"] = 1
+    with pytest.raises(ComparisonIntegrityError, match="job batch_size must be 2"):
+        write_comparison(root, manifest)
+
+    manifest["jobs"][0]["batch_size"] = 2
+    _edit(manifest, lambda metrics: metrics.update(optimizer_steps=2))
+    with pytest.raises(ComparisonIntegrityError, match="optimizer step counts"):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("dataset", "cora"), ("task", "node_classification"), ("metric", "accuracy")],
+)
+def test_ppi_report_rejects_wrong_cached_task_contract(tmp_path, field, value):
+    root, manifest = _fixture(tmp_path, dataset="ppi")
+    _edit(manifest, lambda metrics: metrics["protocol"].update({field: value}))
+    with pytest.raises(ComparisonIntegrityError, match="official V1 dataset contract"):
+        write_comparison(root, manifest)
 
 
 def test_mean_c_tolerance_miss_is_informational_and_keeps_factorial_contrasts(tmp_path):

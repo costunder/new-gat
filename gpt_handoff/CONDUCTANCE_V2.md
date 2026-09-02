@@ -23,7 +23,8 @@ git pull --ff-only
 bash research/conductance_gat/v2/reproduce.sh --run-id gat-direct-c-v2-seed0-v1
 ```
 
-기본 실행은 **ogbn-arxiv × `direct_c`/`fixed_c` × model seed 0 = 총 2개 새 GPU 학습**이다.
+기본 실행은 **Cora/CiteSeer/PubMed/ogbn-arxiv × `direct_c`/`fixed_c` × model seed 0 =
+총 8개 새 GPU 학습**이다.
 과거 MLP/fixed 점수나 checkpoint를 재사용하지 않고 두 조건을 같은 새 run에서 학습한다.
 학습 중 데이터 다운로드나 패키지 변경은 하지 않으며 GPU를 사용할 수 없으면 중단한다.
 기존 결과 디렉터리는 덮어쓰거나 자동 재개하지 않는다. 재실행에는 새 run ID를 사용한다.
@@ -103,7 +104,7 @@ C의 각 값은 특정 물리 엣지에 대응한다. 정렬된 topology와 cano
 다른 그래프나 재정렬된 엣지 목록에 같은 파라미터를 조용히 적용하지 않는다.
 엣지 m이 같다는 사실만으로 호환되는 checkpoint가 아니다.
 
-기본 arxiv와 선택 가능한 Cora/CiteSeer/PubMed는 하나의 고정 그래프에서 train/validation
+기본 Cora/CiteSeer/PubMed/ogbn-arxiv는 각각 하나의 고정 그래프에서 train/validation
 노드가 나뉘는 transductive 실험이다. PPI는 train/validation/test에 독립 그래프가 있으므로
 이 버전에서 **지원하지 않는다**. 학습에서 없던 그래프의 엣지에 alpha를 전달하는 규칙을
 임의로 만들거나 test graph의 alpha를 학습하지 않는다.
@@ -112,7 +113,7 @@ C의 각 값은 특정 물리 엣지에 대응한다. 정렬된 topology와 cano
 영향을 주지 못하는 엣지의 alpha는 task gradient가 0인 채 C=1에 머물 수 있다.
 전체 그래프를 forward에 넣었다고 모든 엣지 파라미터가 감독 신호를 받는 것은 아니다.
 
-다른 지원 데이터셋을 실행하려면 다음처럼 명시한다. 선택한 데이터셋마다 두 조건을 새로 학습한다.
+기본 범위 중 일부만 실행하려면 다음처럼 명시한다. 선택한 데이터셋마다 두 조건을 새로 학습한다.
 
 ```bash
 bash research/conductance_gat/v2/reproduce.sh --datasets cora citeseer pubmed --run-id gat-direct-c-v2-citations-seed0-v1

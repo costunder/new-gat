@@ -32,16 +32,20 @@ GraphSAINT 설정과 다르므로 동일 학습 조건의 재실험으로 표현
 
 Conductance의 별도 [v2](../gpt_handoff/CONDUCTANCE_V2.md),
 [v3](../gpt_handoff/CONDUCTANCE_V3.md), [V4 통합 문서](../gpt_handoff/CONDUCTANCE_V4.md)는 기존 matched benchmark cache의 Cora,
-CiteSeer, PubMed, ogbn-arxiv와 공식 split을 그대로 읽는다. 기본은 세 버전 모두
-ogbn-arxiv와 model seed 0을 쓰며, v2는 `direct_c`/`fixed_c`, v3는
-`relative_c`/`fixed_c`의 각 두 번, v4는 C × spatial W의 2×2 네 번을 새로 학습한다.
-V2의 C는 고정 topology의 엣지별 파라미터이고 v3는 공유 상대-C 생성기다. 둘 다 현재 별도
-runner에서는 transductive 네 데이터만 받으며 PPI를 받지 않는다. 이 제한은 v3 생성기가
-원리상 새 그래프에 적용 불가능하다는 뜻이 아니라, 이번 inductive 전이 protocol이 없다는 뜻이다.
-두 실행은 validation으로 checkpoint를 선택하고 **test를 평가하지 않으며**, 위 기본 v1
-benchmark의 test 점수나 기존 C-learning 결과를 재사용하지 않는다. V4는 같은 기본 데이터와
-seed에서 고정/상대 C × identity/학습 spatial W의 네 조건을 새로 학습하며 test를 평가하지 않는다.
-V2/v3/v4의 실제 GPU 결과는 아직 수령하지 않았다.
+CiteSeer, PubMed, PPI, ogbn-arxiv와 공식 split을 그대로 읽는다. model seed 0에서 v2는
+**Cora/CiteSeer/PubMed/ogbn-arxiv × `direct_c`/`fixed_c` = 8회**, v3는 **v1의 5개 데이터 ×
+`relative_c`/`fixed_c` = 10회**, v4는 **v1의 5개 데이터 × C × spatial W 2×2 = 20회**를
+기본으로 새로 학습한다. PPI는 v1과 같은 공식 20/2/2 독립 그래프 split, batch size 2,
+BCEWithLogits와 global node-label micro-F1을 v3/v4에 사용한다. 나머지 네 데이터는 공식
+transductive mask와 full-graph cross-entropy/accuracy를 그대로 사용한다.
+
+V2의 C는 고정 topology의 엣지별 파라미터라 학습에서 보지 못한 PPI validation graph에
+대응하는 C가 존재하지 않는다. 따라서 PPI만 V2에서 명시적 N/A이며, 임의의 edge 재매핑이나
+validation C 최적화로 다른 가설을 만들지 않는다. V3/V4의 공유 생성기는 새 PPI graph에
+적용되므로 공식 inductive split을 지원한다. 세 실행 모두 validation으로 checkpoint를 선택하고
+**test를 평가하지 않으며**, v1 benchmark의 test 점수나 과거 결과를 재사용하지 않는다.
+2026-09-02에 수령한 arxiv-only v2/v3 실행과 V4 partial 실행은 이 확대된 기본 전체 실행의
+결과가 아니므로 새 run ID로 다시 실행해야 한다.
 
 논문 원문: [GAT](https://arxiv.org/pdf/1710.10903),
 [GATv2](https://arxiv.org/pdf/2105.14491),
@@ -342,8 +346,8 @@ python scripts/check_datasets.py \
 cardinality를 강제한다. Network 접근이나 cache 생성은 하지 않는다. 결과는 `valid`,
 `missing`, `incomplete`, `corrupt`, `wrong_request`로 구분된다. 기본 데이터 경로는
 저장소의 `data/paper`이며 기본 세 트랙 결과는 각 트랙의 `results/paper/<run-id>`에 저장된다.
-별도 Conductance 결과는 `results/conductance_gat/v2/<run-id>/`와
-`results/conductance_gat/v3/<run-id>/`에 저장된다.
+별도 Conductance 결과는 `results/conductance_gat/v2/<run-id>/`,
+`results/conductance_gat/v3/<run-id>/`, `results/conductance_gat/v4/<run-id>/`에 저장된다.
 Dataset checker의 `--seeds`는 `--data-seeds` 호환 alias이고 model seed가 아니다. 독립
 split cache 축은 `--split-seeds`로 검증한다.
 

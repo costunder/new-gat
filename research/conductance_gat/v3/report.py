@@ -1,4 +1,4 @@
-"""Fail-closed fixed-graph relative-C comparison; stdlib only, no training or test labels."""
+"""Fail-closed relative-C comparison; stdlib only, no training or test labels."""
 
 from __future__ import annotations
 
@@ -33,7 +33,9 @@ CAVEATS = [
     "Both arms train freshly with the same initial full state, official cache, topology, "
     "AdamW policy and early-stopping policy. No V1/V2 or historical score is reused.",
     "V3 uses a shared relative-log-conductance generator, symmetric normalization and learned "
-    "propagation strength. The initial benchmark protocol is transductive; PPI is not included.",
+    "propagation strength. PPI uses the official 20/2/2 graph split: train 20 and validation "
+    "2 run at batch 2 with BCEWithLogits and global logit>0 node-label micro-F1; test 2 is not "
+    "scored. The other four datasets retain full-graph node splits.",
     "The contrast is relative_c minus fixed_c (percentage points), an internal V3 ablation. "
     "V2-to-V3 changes several factors and must not be called a single-factor comparison.",
     "Fixed C=1 freezes its unused gate MLP/gamma/tau scaffold; alpha remains trainable in both "
@@ -144,7 +146,7 @@ def _validate_optimizer(child, config, condition):
         raise ValueError("optimizer parameter counts disagree with trainable_parameters")
 
 
-def _validate_diagnostics(child, config):
+def _validate_diagnostics(child, config, dataset):
     diagnostics = child.get("diagnostics")
     if not isinstance(diagnostics, dict):
         raise ValueError("V3 diagnostics are required")
@@ -155,6 +157,17 @@ def _validate_diagnostics(child, config):
         or best.get("split") != "validation"
     ):
         raise ValueError("best_validation diagnostics must be validation/eval")
+    expected_metric = "micro_f1" if dataset == "ppi" else "accuracy"
+    expected_graphs = 2 if dataset == "ppi" else 1
+    expected_unit = "node_label_decision" if dataset == "ppi" else "node"
+    expected_rule = "logit_gt_zero_node_label" if dataset == "ppi" else "argmax_node_class"
+    if (
+        best.get("metric_name") != expected_metric
+        or best.get("validation_graph_count") != expected_graphs
+        or best.get("prediction_unit") != expected_unit
+        or best.get("prediction_rule") != expected_rule
+    ):
+        raise ValueError("best_validation dataset metric/graph/prediction scope mismatch")
     layers = best.get("layers")
     if not isinstance(layers, list) or len(layers) != config["layers"]:
         raise ValueError("best_validation layer diagnostics are incomplete")
@@ -183,7 +196,7 @@ def _validate_diagnostics(child, config):
                 raise ValueError("diagnostic magnitudes must be nonnegative")
     if sorted(indices) != list(range(config["layers"])):
         raise ValueError("diagnostic layer indices are missing or duplicated")
-    _best_training_observation(child, config)
+    _best_training_observation(child, config, dataset)
     audit = diagnostics.get("best_checkpoint_interventions")
     if (
         not isinstance(audit, dict)
@@ -197,6 +210,12 @@ def _validate_diagnostics(child, config):
     score = _finite_number(original.get("validation"), "intervention original", unit_interval=True)
     if abs(score - child["validation"]) > 1.0e-7:
         raise ValueError("intervention original differs from selected validation")
+    if (
+        audit.get("validation_graph_count") != expected_graphs
+        or audit.get("prediction_unit") != expected_unit
+        or audit.get("prediction_rule") != expected_rule
+    ):
+        raise ValueError("intervention graph/prediction scope mismatch")
     rows = audit.get("rows")
     if not isinstance(rows, list) or len(rows) != len(INTERVENTIONS):
         raise ValueError("all four selected-checkpoint interventions are required")
@@ -212,6 +231,11 @@ def _validate_diagnostics(child, config):
         _finite_number(
             row.get("changed_prediction_fraction"), "changed predictions", unit_interval=True
         )
+        if (
+            row.get("prediction_unit") != expected_unit
+            or row.get("prediction_rule") != expected_rule
+        ):
+            raise ValueError("intervention changed-prediction unit mismatch")
         if _finite_number(row.get("logit_mean_absolute_delta"), "logit delta") < 0:
             raise ValueError("logit delta must be nonnegative")
     if set(names) != INTERVENTIONS or len(set(names)) != len(names):
@@ -225,7 +249,7 @@ def _best_validation_summary(diagnostics):
     return best.get("layers", []) if isinstance(best, dict) else []
 
 
-def _best_training_observation(child, config):
+def _best_training_observation(child, config, dataset):
     trajectory = child["diagnostics"].get("train_trajectory")
     if not isinstance(trajectory, list) or any(not isinstance(row, dict) for row in trajectory):
         raise ValueError("actual training trajectory must be recorded")
@@ -236,12 +260,27 @@ def _best_training_observation(child, config):
     if len(selected) != 1:
         raise ValueError("selected epoch is missing from actual training observations")
     record = selected[0]
+    steps = _integer(
+        child.get("optimizer_steps_per_epoch"), "optimizer_steps_per_epoch", minimum=1
+    )
+    expected_steps = 10 if dataset == "ppi" else 1
+    if steps != expected_steps:
+        raise ValueError("optimizer_steps_per_epoch disagrees with official data protocol")
+    if (
+        child.get("optimizer_steps") != child["epochs_run"] * steps
+        or child.get("best_checkpoint_optimizer_steps") != child["best_epoch"] * steps
+    ):
+        raise ValueError("optimizer step counts disagree with actual minibatch count")
     expected = {
-        "scope": "full_graph_train_mask",
+        "scope": (
+            "first_actual_training_minibatch_only"
+            if dataset == "ppi"
+            else "full_graph_train_mask"
+        ),
         "mode": "train_dropout_on",
         "stage": "after_task_backward_before_optimizer_step",
         "batch_index": 0,
-        "optimizer_steps_before_batch": child["best_epoch"] - 1,
+        "optimizer_steps_before_batch": (child["best_epoch"] - 1) * steps,
     }
     for key, value in expected.items():
         if not _same(record.get(key), value):
@@ -325,8 +364,9 @@ def _training_gradient_markdown(conditions):
     lines = [
         "### Actual training gradients at the selected epoch",
         "",
-        "Recorded on the actual training-mask loss after backward and before that epoch's "
-        "optimizer update, with training dropout enabled. These are not gradients recomputed "
+        "Recorded on the actual transductive full-graph loss or PPI first minibatch after "
+        "backward and before its optimizer update, with training dropout enabled. These are "
+        "not gradients recomputed "
         "at the selected post-update checkpoint. Frozen gate entries are inapplicable, not zero.",
         "",
         "| Condition | Epoch | Layer | Gate MLP task-gradient L2 |",
@@ -381,7 +421,10 @@ def _load(root, job, config, source_hashes):
         raise ValueError(f"cannot read child metrics: {exc}") from exc
     if actual_digest != digest.lower():
         raise ValueError("metrics SHA-256 mismatch")
-    child = _load_child(root, job, config, suite=SUITE, conditions=CONDITIONS)
+    dataset = job["dataset"]
+    child_config = dict(config)
+    child_config["batch_size"] = 2 if dataset == "ppi" else 1
+    child = _load_child(root, job, child_config, suite=SUITE, conditions=CONDITIONS)
     for key, expected in (
         ("gate_mode", CONDITIONS[job["condition"]]["gate_mode"]),
         ("parameterization", PARAMETERIZATION),
@@ -392,18 +435,71 @@ def _load(root, job, config, source_hashes):
     if "gate_mode" in child["configuration"]:
         raise ValueError("gate_mode belongs in arm metadata, not held-fixed configuration")
     topology = child.get("topology")
-    if not isinstance(topology, dict) or set(topology) != {
-        "num_nodes",
-        "num_edges",
-        "incidence_sha256",
-    }:
-        raise ValueError("topology must contain num_nodes, num_edges and incidence_sha256")
-    _integer(topology["num_nodes"], "topology.num_nodes", minimum=1)
-    _integer(topology["num_edges"], "topology.num_edges")
-    if not isinstance(topology["incidence_sha256"], str) or not SHA256.fullmatch(
-        topology["incidence_sha256"]
+    expected_split = (
+        "official_inductive_graph_split"
+        if dataset == "ppi"
+        else "official_time_split"
+        if dataset == "ogbn-arxiv"
+        else "official_public_masks"
+    )
+    expected_task = (
+        "multi_label_node_classification" if dataset == "ppi" else "node_classification"
+    )
+    expected_metric = "micro_f1" if dataset == "ppi" else "accuracy"
+    protocol = child.get("protocol")
+    if (
+        not isinstance(protocol, dict)
+        or protocol.get("dataset") != dataset
+        or protocol.get("split") != expected_split
+        or protocol.get("task") != expected_task
+        or protocol.get("metric") != expected_metric
     ):
-        raise ValueError("topology.incidence_sha256 must be a SHA-256 digest")
+        raise ValueError("cached protocol does not match the official V1 dataset contract")
+    if dataset == "ppi":
+        expected_keys = {
+            "scope",
+            "split_graph_counts",
+            "split_num_nodes",
+            "split_num_edges",
+            "split_incidence_sha256",
+        }
+        if not isinstance(topology, dict) or set(topology) != expected_keys:
+            raise ValueError("PPI topology must fingerprint official train/validation graphs")
+        if topology["scope"] != "official_train_and_validation_graphs":
+            raise ValueError("PPI topology scope mismatch")
+        if topology["split_graph_counts"] != {"train": 20, "validation": 2}:
+            raise ValueError("PPI topology must contain the official 20/2 graph split")
+        for key in ("split_num_nodes", "split_num_edges"):
+            value = topology[key]
+            if not isinstance(value, dict) or set(value) != {"train", "validation"}:
+                raise ValueError(f"PPI topology {key} split metadata is incomplete")
+            for split, count in value.items():
+                _integer(count, f"topology.{key}.{split}", minimum=1)
+        digests = topology["split_incidence_sha256"]
+        if (
+            not isinstance(digests, dict)
+            or set(digests) != {"train", "validation"}
+            or any(
+                not isinstance(value, str) or not SHA256.fullmatch(value)
+                for value in digests.values()
+            )
+        ):
+            raise ValueError("PPI split incidence fingerprints are invalid")
+        if protocol.get("split_counts") != {"train": 20, "validation": 2, "test": 2}:
+            raise ValueError("PPI cached protocol is not the official 20/2/2 graph split")
+    else:
+        if not isinstance(topology, dict) or set(topology) != {
+            "num_nodes",
+            "num_edges",
+            "incidence_sha256",
+        }:
+            raise ValueError("topology must contain num_nodes, num_edges and incidence_sha256")
+        _integer(topology["num_nodes"], "topology.num_nodes", minimum=1)
+        _integer(topology["num_edges"], "topology.num_edges")
+        if not isinstance(topology["incidence_sha256"], str) or not SHA256.fullmatch(
+            topology["incidence_sha256"]
+        ):
+            raise ValueError("topology.incidence_sha256 must be a SHA-256 digest")
     total = _integer(child.get("total_parameters"), "total_parameters", minimum=1)
     trainable = _integer(child.get("trainable_parameters"), "trainable_parameters", minimum=1)
     frozen = _integer(child.get("frozen_parameters"), "frozen_parameters")
@@ -413,8 +509,8 @@ def _load(root, job, config, source_hashes):
         or (job["condition"] == "fixed_c" and frozen == 0)
     ):
         raise ValueError("parameter counts disagree with relative-C/frozen-scaffold condition")
-    _validate_optimizer(child, config, job["condition"])
-    _validate_diagnostics(child, config)
+    _validate_optimizer(child, child_config, job["condition"])
+    _validate_diagnostics(child, child_config, dataset)
     if not isinstance(child.get("versions"), dict) or not child["versions"]:
         raise ValueError("Missing runtime versions")
     if not isinstance(child.get("gpu"), str) or not child["gpu"]:
@@ -438,7 +534,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         or len(set(datasets)) != len(datasets)
     ):
         datasets = []
-        errors.append("datasets must list unique supported fixed-graph datasets (PPI unsupported)")
+        errors.append("datasets must list unique supported V3 datasets")
     for key, expected in (
         ("schema_version", 1),
         ("suite", SUITE),
@@ -458,8 +554,8 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         _integer(config.get("model_seed"), "model_seed")
         for key in ("epochs", "patience", "edge_chunk_size"):
             _integer(config.get(key), key, minimum=1)
-        if config.get("batch_size") != 1 or type(config.get("batch_size")) is not int:
-            raise ValueError("full-graph batch_size must be 1")
+        if config.get("batch_size") != 2 or type(config.get("batch_size")) is not int:
+            raise ValueError("manifest PPI batch_size must be 2")
         if config.get("workers") != 0 or type(config.get("workers")) is not int:
             raise ValueError("full-graph workers must be 0")
         if not isinstance(config.get("device"), str) or not re.fullmatch(
@@ -494,6 +590,9 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             errors.append(f"duplicate job: {key}")
             continue
         indexed[key] = job
+        expected_batch_size = 2 if dataset == "ppi" else 1
+        if job.get("batch_size") != expected_batch_size:
+            errors.append(f"{key}: job batch_size must be {expected_batch_size}")
         if job.get("status") not in {"pending", "running", "failed", "passed"}:
             errors.append(f"{key}: invalid job status")
         try:
@@ -559,7 +658,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                         "best_checkpoint_interventions"
                     ]
                     row["best_epoch_training_observation"] = _best_training_observation(
-                        child, config
+                        child, {**config, "batch_size": 2 if dataset == "ppi" else 1}, dataset
                     )
                     row["best_validation_diagnostics"] = _best_validation_summary(
                         child.get("diagnostics")
@@ -588,7 +687,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         reports.append(
             {
                 "dataset": dataset,
-                "metric_name": "accuracy",
+                "metric_name": "micro_f1" if dataset == "ppi" else "accuracy",
                 "model_seed": config.get("model_seed"),
                 "conditions": rows,
                 "complete": len(loaded) == len(CONDITIONS),
@@ -648,7 +747,7 @@ def markdown(report):
         lines += [f"- {_cell(error)}" for error in report["errors"]] + [""]
     for dataset in report["datasets"]:
         lines += [
-            f"## {dataset['dataset']} (accuracy, higher is better)",
+            f"## {dataset['dataset']} ({dataset['metric_name']}, higher is better)",
             "",
             "| Condition | Status | Validation (%) | Best epoch | Epochs run "
             "| Train loss | Trainable | Frozen |",

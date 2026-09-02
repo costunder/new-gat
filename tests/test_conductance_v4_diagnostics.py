@@ -48,6 +48,36 @@ def _model(*, gate_mode="relative"):
     return model
 
 
+class _MovableGraph(SimpleNamespace):
+    def to(self, device, non_blocking=False):
+        del non_blocking
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                setattr(self, name, value.to(device))
+        return self
+
+
+def _packed_ppi_graph():
+    return _MovableGraph(
+        x=torch.tensor(
+            [
+                [0.5, 1.0, 2.0],
+                [1.0, 2.0, 0.5],
+                [2.0, 0.5, 1.0],
+                [3.0, 1.0, 2.0],
+                [0.2, 0.7, 1.3],
+                [1.1, 0.1, 0.4],
+            ]
+        ),
+        y=torch.tensor(
+            [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+        ),
+        incidence_edge_index=torch.tensor([[0, 1, 3, 4], [1, 2, 4, 5]]),
+        batch=torch.tensor([0, 0, 0, 1, 1, 1]),
+        num_graphs=2,
+    )
+
+
 def test_graphwise_positive_constant_c_is_algebraically_equivalent_to_ones():
     residual = torch.tensor(
         [
@@ -81,6 +111,46 @@ def test_graphwise_positive_constant_c_is_algebraically_equivalent_to_ones():
         edge_chunk_size=2,
     )
     torch.testing.assert_close(actual, expected, rtol=1e-14, atol=1e-14)
+
+
+def test_ppi_validation_uses_both_graphs_global_micro_f1_and_labelwise_predictions():
+    graph, model = _packed_ppi_graph(), _model()
+    data = {"validation": [graph]}
+    result, logits = evaluate_validation(model, data, None, device=torch.device("cpu"))
+    predicted, truth = logits > 0, graph.y > 0
+    true_positive = int((predicted & truth).sum())
+    denominator = int(predicted.sum() + truth.sum())
+    expected = 2 * true_positive / denominator if denominator else 0.0
+    assert result["metric"] == pytest.approx(expected)
+    assert result["metric_name"] == "micro_f1"
+    assert result["prediction_rule"] == "logit_gt_zero_node_label"
+    assert result["validation_graph_count"] == 2
+    assert len(result["layers"]) == len(model.operators)
+
+    audit = best_checkpoint_interventions(
+        model,
+        data,
+        None,
+        result,
+        logits,
+        seed=17,
+        device=torch.device("cpu"),
+    )
+    assert audit["metric_name"] == "micro_f1"
+    assert audit["prediction_rule"] == "logit_gt_zero_node_label"
+    assert audit["validation_graph_count"] == 2
+    for contract in audit["mean_c_numeric_check"]["replacement_contracts"].values():
+        assert contract["edge_counts"] == [4, 4]
+
+
+def test_ppi_prediction_change_is_labelwise_not_argmax():
+    left = torch.tensor([[2.0, 1.0], [-1.0, 3.0]])
+    right = torch.tensor([[1.0, 2.0], [-2.0, 4.0]])
+    assert not torch.equal(left.argmax(-1), right.argmax(-1))
+    assert torch.equal(
+        diagnostics._prediction_tensor(left, "logit_gt_zero_node_label"),
+        diagnostics._prediction_tensor(right, "logit_gt_zero_node_label"),
+    )
 
 
 def test_separate_forward_jitter_is_informational_and_preserves_model(monkeypatch):

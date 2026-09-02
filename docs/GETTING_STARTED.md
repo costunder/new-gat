@@ -23,12 +23,12 @@ Cycle PE의 좌영공간 **기저벡터 전체를 입력하는 v2**는
 
 Conductance의 **엣지별 C 자체를 직접 학습하는 v2**도
 [별도 폴더](../gpt_handoff/CONDUCTANCE_V2.md)에 있다. 기존 MLP 생성 방식과 섞지 않으며,
-기본 비교는 ogbn-arxiv에서 직접 C / 고정 C=1을 model seed 0으로 각각 새로 학습한다.
-그래프별 엣지 파라미터이므로 새로운 PPI 그래프로 전이하는 실험에는 사용하지 않는다.
+기본 비교는 Cora/CiteSeer/PubMed/ogbn-arxiv에서 직접 C / 고정 C=1을 model seed 0으로
+각각 새로 학습한다(총 8회). 그래프별 엣지 파라미터이므로 새로운 PPI 그래프에는 정의되지 않는다.
 
 Conductance의 **상대 C 생성기 + 별도 전파 강도 학습 v3**는
 [독립 폴더](../gpt_handoff/CONDUCTANCE_V3.md)에 추가했다. v2를 교체하지 않으며,
-v3도 같은 ogbn-arxiv와 seed 0에서 자체 C=1 대조군과 새로 비교한다.
+v3는 v1의 5개 데이터와 seed 0에서 자체 C=1 대조군과 새로 비교한다(총 10회).
 
 Conductance의 **상대 C graph operator + spatial message transform v4**에 필요한 내용은
 **[V4 통합 문서](../gpt_handoff/CONDUCTANCE_V4.md)** 한 곳에 모았다. 정확한 의도, 수식, 네 조건, 실행 명령, 결과 위치,
@@ -146,8 +146,10 @@ PPI/arxiv × 2조건 × seed 0으로 총 4개이며, 읽기 전용 검사는 재
 
 ### Conductance v2: 엣지별 C 직접 학습
 
-기존 공식 데이터 캐시와 Conda 환경을 사용한다. 아래 명령은 **ogbn-arxiv × 두 조건 × seed 0**을
-별도로 학습한다. 기존 모델·결과를 바꾸거나 checkpoint를 재사용하지 않는다.
+기존 공식 데이터 캐시와 Conda 환경을 사용한다. 아래 명령은
+**Cora/CiteSeer/PubMed/ogbn-arxiv × 두 조건 × seed 0 = 8회**를 별도로 학습한다.
+PPI는 미관측 graph의 edge별 C가 정의되지 않아 V2에서 N/A다. 기존 모델·결과를 바꾸거나
+checkpoint를 재사용하지 않는다.
 
 ```bash
 bash research/conductance_gat/v2/reproduce.sh --run-id gat-direct-c-v2-seed0-v1
@@ -162,7 +164,9 @@ C는 엣지별 log 파라미터에서 양수로 변환하며, C=1 초기 상태�
 
 ### Conductance v3: 상대 C와 전파 강도 분리 학습
 
-같은 공식 ogbn-arxiv 캐시에서 **상대 C 생성기 / 고정 C=1 × seed 0**을 새로 학습한다.
+v1과 같은 공식 Cora/CiteSeer/PubMed/PPI/ogbn-arxiv 캐시에서
+**상대 C 생성기 / 고정 C=1 × seed 0 = 10회**를 새로 학습한다. PPI는 공식 20/2/2
+inductive graph split, batch size 2, BCEWithLogits와 global micro-F1을 사용한다.
 v2와는 모델·optimizer·정규화가 다르며 별도 결과 폴더에 저장한다.
 
 ```bash
@@ -189,6 +193,8 @@ cat results/conductance_gat/v4/gat-hybrid-c-spatial-v4-seed0-v1/comparison.md
 ```
 
 수식, 네 조건, 다섯 대조, checkpoint 개입과 해석 제한도 모두 [CONDUCTANCE_V4.md](../gpt_handoff/CONDUCTANCE_V4.md)에 있다.
+기본 실행은 v1의 5개 데이터 × 네 조건 × seed 0 = 20회다. PPI는 v3와 같은 공식
+inductive 계약을 사용하며, 나머지 네 데이터는 full-graph transductive 학습이다.
 
 ### Cycle PE
 
@@ -203,8 +209,10 @@ bash research/tree_augmentation/reproduce.sh
 ```
 
 기본 세 트랙 benchmark의 공통 기본값은 CUDA, model seed `0`, data/split/chart seed `0`,
-workers `4`다. 별도 Conductance v2/v3/v4는 full-graph 전용으로 workers `0`을 사용한다.
-PPI batch size는 `2`, 분자·트리 데이터는 `32`이며 인용 그래프는 full-batch다.
+workers `4`다. 별도 Conductance v2/v3/v4는 workers `0`을 사용한다. V2와 V3/V4의 네
+transductive 데이터는 full-graph batch 1이고, V3/V4의 PPI는 공식 graph 전체를 보존한
+minibatch 2다. 어느 경로도 neighbor sampling을 사용하지 않는다. 기본 benchmark의 PPI batch
+size도 `2`, 분자·트리 데이터는 `32`이며 인용 그래프는 full-batch다.
 각 트랙의 우리 모델 구성과 평가 규칙은 해당 트랙 문서에 있다.
 
 여러 model seed를 반복하려면 실행 명령 뒤에 `--model-seeds 0,1,2,3,4`처럼 명시한다.
@@ -271,8 +279,10 @@ Python patch 버전과 모든 전이 의존성을 잠근 환경은 아니며,
 [PyTorch 재현성 안내](https://docs.pytorch.org/docs/stable/notes/randomness.html)도 참고한다.
 
 사용자 제공 기존 benchmark 5-seed 집계, Conductance seed 0 GPU 진단·2×2·C-learning 결과는
-[실험 상태](../gpt_handoff/EXPERIMENT_STATUS.md)에 기록했다. Conductance 직접 C v2·상대 C v3·hybrid v4와
-Cycle PE 기저벡터 v2의 GPU 학습 결과 및 실행 최적화의 가속 실측은 아직 확인하지 않았다.
+[실험 상태](../gpt_handoff/EXPERIMENT_STATUS.md)에 기록했다. 같은 문서에는 2026-09-02의 과거
+arxiv-only Conductance v2/v3 runner `passed` 보고와 V4 partial 중단도 별도로 보존한다. 이들은
+현재 확대된 V2/V3/V4 8/10/20개 전체 실행 결과가 아니다. 확대 실행의 성능 수치·전체 artifact,
+Cycle PE 기저벡터 v2의 성능 수치·전체 artifact와 실행 최적화의 가속 실측은 아직 확인하지 않았다.
 구현 검증 이력과 연구상 한계는
 [HANDOFF.md](../gpt_handoff/HANDOFF.md), 이 소스 버전의 코드 전체는
 [CODE_SUMMARY.md](../gpt_handoff/CODE_SUMMARY.md)에 있다.

@@ -357,8 +357,9 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert 'exec "${environment_python}" -B scripts/run_conductance_v2.py "$@"' in v2_source
     v2_args = run_conductance_v2.parser().parse_args(v2_command[2:])
     run_conductance_v2._validate(v2_args)
-    assert v2_args.datasets == ["ogbn-arxiv"] and v2_args.model_seed == 0
-    assert len(run_conductance_v2.make_jobs(v2_args, ROOT / "results/unit-contract")) == 2
+    assert v2_args.datasets == ["cora", "citeseer", "pubmed", "ogbn-arxiv"]
+    assert v2_args.model_seed == 0
+    assert len(run_conductance_v2.make_jobs(v2_args, ROOT / "results/unit-contract")) == 8
     commands = [line for line in commands if line not in v2_commands]
     v3_commands = [
         line
@@ -373,8 +374,17 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert 'exec "${environment_python}" -B scripts/run_conductance_v3.py "$@"' in v3_source
     v3_args = run_conductance_v3.parser().parse_args(v3_command[2:])
     run_conductance_v3._validate(v3_args)
-    assert v3_args.datasets == ["ogbn-arxiv"] and v3_args.model_seed == 0
-    assert len(run_conductance_v3.make_jobs(v3_args, ROOT / "results/unit-contract")) == 2
+    assert v3_args.datasets == ["cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"]
+    assert v3_args.model_seed == 0
+    v3_jobs = run_conductance_v3.make_jobs(v3_args, ROOT / "results/unit-contract")
+    assert len(v3_jobs) == 10
+    assert {job["dataset"]: job["batch_size"] for job in v3_jobs} == {
+        "cora": 1,
+        "citeseer": 1,
+        "pubmed": 1,
+        "ppi": 2,
+        "ogbn-arxiv": 1,
+    }
     commands = [line for line in commands if line not in v3_commands]
     v4_commands = [
         line
@@ -389,8 +399,17 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert 'exec "${environment_python}" -B scripts/run_conductance_v4.py "$@"' in v4_source
     v4_args = run_conductance_v4.parser().parse_args(v4_command[2:])
     run_conductance_v4._validate(v4_args)
-    assert v4_args.datasets == ["ogbn-arxiv"] and v4_args.model_seed == 0
-    assert len(run_conductance_v4.make_jobs(v4_args, ROOT / "results/unit-contract")) == 4
+    assert v4_args.datasets == ["cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"]
+    assert v4_args.model_seed == 0
+    v4_jobs = run_conductance_v4.make_jobs(v4_args, ROOT / "results/unit-contract")
+    assert len(v4_jobs) == 20
+    assert {job["dataset"]: job["batch_size"] for job in v4_jobs} == {
+        "cora": 1,
+        "citeseer": 1,
+        "pubmed": 1,
+        "ppi": 2,
+        "ogbn-arxiv": 1,
+    }
     commands = [line for line in commands if line not in v4_commands]
     assert len(commands) == 5  # original full protocols remain unchanged
     parsed = []

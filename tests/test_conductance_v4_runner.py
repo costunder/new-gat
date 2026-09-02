@@ -9,22 +9,27 @@ from pathlib import Path
 
 import pytest
 
-from research.conductance_gat.v4.protocol import CONDITIONS
+from research.conductance_gat.v4.protocol import BATCH_SIZE_BY_DATASET, CONDITIONS, DATASETS
 from scripts import run_conductance_v4 as runner
 
 
-def test_default_four_fresh_factorial_trainings():
+def test_default_twenty_fresh_factorial_trainings_cover_all_v1_datasets():
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
-    assert args.datasets == ["ogbn-arxiv"] and args.model_seed == 0
+    assert args.datasets == list(DATASETS) and args.model_seed == 0
     assert args.edge_chunk_size == 65536 and args.batch_size == 1 and args.workers == 0
-    assert [job["condition"] for job in jobs] == list(CONDITIONS)
-    assert len(jobs) == 4
+    assert len(jobs) == len(DATASETS) * len(CONDITIONS) == 20
+    assert {(job["dataset"], job["condition"]) for job in jobs} == {
+        (dataset, condition) for dataset in DATASETS for condition in CONDITIONS
+    }
     for job in jobs:
         command = job["command"]
         assert command[command.index("-m") + 1] == "research.conductance_gat.v4.train"
         assert command[command.index("--model-seed") + 1] == "0"
         assert command[command.index("--edge-chunk-size") + 1] == "65536"
+        expected_batch_size = BATCH_SIZE_BY_DATASET[job["dataset"]]
+        assert job["batch_size"] == expected_batch_size
+        assert command[command.index("--batch-size") + 1] == str(expected_batch_size)
         assert "--amp" not in command and "--allow-download" not in command
 
 
@@ -44,6 +49,7 @@ def test_stdlib_inspection_has_no_writes(tmp_path, option):
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
     )
     assert result.returncode == 0, result.stderr
     assert list(tmp_path.iterdir()) == []
@@ -55,7 +61,6 @@ def test_stdlib_inspection_has_no_writes(tmp_path, option):
         ["--device", "cpu"],
         ["--model-seed", "-1"],
         ["--epochs", "0"],
-        ["--datasets", "ppi"],
         ["--datasets", "unknown"],
         ["--datasets", "cora", "cora"],
         ["--run-id", "../old"],
@@ -70,9 +75,12 @@ def test_invalid_inputs_do_not_check_dependencies_or_train(monkeypatch, options)
     assert runner.main(options) == 2
 
 
-def test_ppi_rejection_explains_protocol_limit(capsys):
-    assert runner.main(["--datasets", "ppi"]) == 2
-    assert "protocol limit" in capsys.readouterr().err
+def test_ppi_jobs_are_protocol_locked_to_batch_two():
+    args = runner.parser().parse_args(["--datasets", "ppi"])
+    runner._validate(args)
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert len(jobs) == 4
+    assert {job["batch_size"] for job in jobs} == {2}
 
 
 def _stub(tmp_path, monkeypatch, failure=None, change_after=None):
@@ -106,7 +114,14 @@ def _stub(tmp_path, monkeypatch, failure=None, change_after=None):
     monkeypatch.setattr(runner, "_source_snapshot", snapshot)
     monkeypatch.setattr(runner, "run_logged", dispatch)
     monkeypatch.setattr(runner, "_comparison", report)
-    return ["--results-root", str(tmp_path), "--run-id", "unit-fixture"], calls, reports
+    return [
+        "--datasets",
+        "ogbn-arxiv",
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        "unit-fixture",
+    ], calls, reports
 
 
 def test_success_records_metrics_digest_one_seed_and_four_jobs(tmp_path, monkeypatch):

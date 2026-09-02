@@ -2,8 +2,12 @@
 
 SUITE = "conductance_hybrid_c_spatial_v4"
 PARAMETERIZATION = "shared_relative_log_conductance_x_spatial_message_transform"
-DATASETS = ("cora", "citeseer", "pubmed", "ogbn-arxiv")
-DEFAULT_DATASETS = ("ogbn-arxiv",)
+DATASETS = ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv")
+DEFAULT_DATASETS = DATASETS
+BATCH_SIZE_BY_DATASET = {dataset: 2 if dataset == "ppi" else 1 for dataset in DATASETS}
+METRIC_BY_DATASET = {
+    dataset: "micro_f1" if dataset == "ppi" else "accuracy" for dataset in DATASETS
+}
 DEFAULT_EDGE_CHUNK_SIZE = 65536
 COMMON = {
     "hidden_channels": 64,
@@ -50,8 +54,11 @@ PROTOCOL_NOTE = (
     "groups are frozen and excluded from AdamW; active W uses the ordinary backbone learning "
     "rate and weight decay. C is computed from the pre-W state, while symmetric propagation "
     "aggregates H W. Graph means and C-dependent weighted degrees are exact full-graph "
-    "quantities; edge computation is chunked and first-order only. Official train labels "
-    "only; validation selects checkpoints, with no test evaluation. V3 is unchanged and "
+    "quantities; edge computation is chunked and first-order only. Cora, CiteSeer, PubMed and "
+    "ogbn-arxiv use their original transductive full graph and official node masks. PPI uses the "
+    "official 20/2/2 inductive graph split, batch size 2, binary cross entropy and global "
+    "node-label micro-F1. Optimization uses official train labels only; validation labels "
+    "select checkpoints, with no test evaluation. The V3 model definition is unchanged and "
     "cross-version score differences are not a matched single-factor causal contrast. The "
     "report releases five within-V4 factorial contrasts only after all four fresh arms and "
     "source integrity pass; selected-checkpoint C/W interventions are read-only diagnostics."

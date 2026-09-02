@@ -5,7 +5,7 @@ from ..ablation.protocol import COMMON
 SUITE = "conductance_direct_c_v2"
 PARAMETERIZATION = "direct_log_edge_conductance"
 DATASETS = ("cora", "citeseer", "pubmed", "ogbn-arxiv")
-DEFAULT_DATASETS = ("ogbn-arxiv",)
+DEFAULT_DATASETS = DATASETS
 DEFAULT_EDGE_CHUNK_SIZE = 65_536
 CONDITIONS = {
     "direct_c": {

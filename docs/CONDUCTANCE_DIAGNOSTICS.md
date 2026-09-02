@@ -4,8 +4,8 @@
 GPU 추론과 선택적 train-label gradient 계산을 수행하지만 재학습, optimizer update,
 파라미터 변경, 데이터 다운로드는 하지 않는다. 기존 checkpoint·학습 기록·캐시는 덮어쓰지 않는다.
 이 문서의 진단기는 기존 matched benchmark 결과를 대상으로 하며 C-learning이나 별도
-Conductance v2/v3 결과를 입력으로 받지 않는다. V3의 네 선택-checkpoint 개입은 v3 runner가
-자체 결과 폴더에 기록한다.
+Conductance v2/v3/v4 결과를 입력으로 받지 않는다. 후속 세 버전의 진단·비교는 각각의 runner와
+결과 폴더에 기록하며, V3/V4의 선택-checkpoint 개입도 해당 runner가 자체 수행한다.
 
 ## 실행
 

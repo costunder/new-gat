@@ -17,16 +17,21 @@ git pull --ff-only
 bash research/conductance_gat/v3/reproduce.sh --run-id gat-relative-c-v3-seed0-v1
 ```
 
-기본은 **ogbn-arxiv × `relative_c`/`fixed_c` × model seed 0 = 두 번의 새 GPU 학습**이다.
-두 조건 모두 train mask의 cross-entropy로 학습하고 validation으로 checkpoint를 선택한다.
-Test label은 학습·선택·진단에 사용하지 않으며 test 성능을 평가하지 않는다.
+기본은 **Cora/CiteSeer/PubMed/PPI/ogbn-arxiv × `relative_c`/`fixed_c` × model seed 0 =
+10번의 새 GPU 학습**이다. 네 transductive 데이터는 train mask의 cross-entropy로 학습한다.
+PPI는 v1과 같은 공식 20/2/2 독립 graph split에서 batch size 2와 BCEWithLogitsLoss를 사용한다.
+`logit > 0`을 양성 예측으로 하여 validation graph 두 개의 모든 node-label 결정을 합친 global
+micro-F1로 checkpoint를 선택한다. Test graph는 train/validation loader, forward, loss, metric,
+checkpoint 선택과 진단에 들어가지 않고 test 성능도 평가하지 않는다. 다만 full cache의 test
+tensor와 metadata는 공식 20/2/2 분할·shape·checksum 무결성 검사를 위해 load/validate된다.
 GPU가 없거나 공식 캐시가 누락·손상되면 중단한다. CPU 학습·대체 데이터·자동 설치는 없다.
 기존 run을 덮어쓰거나 자동 재개하지 않으므로 재실행에는 새 run ID를 사용한다.
 
-2026-09-02 사용자 보고상 source/pull revision `7b4cd32`, run
+2026-09-02 사용자 보고상 source/pull revision `7b4cd32`의 **과거 arxiv-only 2-job run**
 `gat-relative-c-v3-gpu6-seed0-v1`은 `passed`다. Preflight GPU는
 `NVIDIA A100-SXM4-80GB MIG 1g.10gb`였고 `CUDA_VISIBLE_DEVICES=6`을 프로세스 내부
-`cuda:0`으로 사용했다. 성능 수치와 전체 원본 artifact는 수령하지 않아 별도로 주장하지 않는다.
+`cuda:0`으로 사용했다. 성능 수치와 전체 원본 artifact는 수령하지 않았으며, 이 보고를 현재
+10-job 전체 기본 실행의 결과로 재사용하지 않는다.
 
 결과 확인:
 
@@ -34,15 +39,16 @@ GPU가 없거나 공식 캐시가 누락·손상되면 중단한다. CPU 학습�
 cat results/conductance_gat/v3/gat-relative-c-v3-seed0-v1/comparison.md
 ```
 
-다른 인용 그래프를 명시적으로 선택할 수 있다.
+기본 범위 중 인용 그래프만 명시적으로 선택할 수 있다.
 
 ```bash
 bash research/conductance_gat/v3/reproduce.sh --datasets cora citeseer pubmed --run-id gat-relative-c-v3-citations-seed0-v1
 ```
 
-각 데이터마다 두 조건을 학습한다. 이번 실행 규약은 v2와 같은 transductive 데이터로 한정한다.
-공유 생성기는 엣지 ID에 묶이지 않지만, **이 실행 파일에는 PPI 전이 학습을 추가하지 않았다.**
-새 그래프로 전이할 수 있는 파라미터화와 실제 inductive 성능 검증을 구분한다.
+각 데이터마다 두 조건을 학습한다. 공유 생성기는 엣지 ID에 묶이지 않으므로 PPI에서는 train
+graph에서 학습한 동일 파라미터를 미관측 validation graph에 적용한다. Validation graph의 C나
+모델 파라미터를 따로 최적화하지 않는다. Test graph는 train/validation DataLoader로 만들거나
+forward하지 않지만, full cache를 읽을 때 test tensor와 metadata의 무결성은 함께 검증한다.
 
 ## C를 어떻게 학습하는가
 
@@ -131,7 +137,8 @@ Fixed 조건도 alpha를 학습하므로 이 대조는 **v3 안에서 적응적 
 
 Train loss 외에 C를 일정하게 만들거나 다양성을 강제하는 보조 손실은 없다.
 최대 200 epochs, validation patience 50, FP32, AMP/compile/TF32 비활성이다.
-Full graph 학습이므로 `--batch-size 1`, `--workers 0`만 받으며 노드를 하나씩 학습하는 뜻은 아니다.
+Cora/CiteSeer/PubMed/ogbn-arxiv는 full graph batch 1, PPI는 graph minibatch 2이며 workers는 0이다.
+PPI의 optimizer step 수는 epoch가 아니라 실제 train minibatch 수를 따른다.
 
 ## 진단과 checkpoint 개입
 
@@ -155,8 +162,10 @@ Best checkpoint를 고정한 추가 validation forward로 다음 네 가지 전�
 독립 효과나 fresh training 이득과 같지 않다.
 
 이 개입들은 **선택된 checkpoint에서 한 번씩** 실행하며 매 epoch 반복하지 않는다.
-재학습·optimizer step·test 평가는 없다. Validation accuracy 변화(pp), 바뀐 노드 예측 비율,
-평균 절대 logit 변화량을 기록한다. 단일 shuffled-C 표본은 shuffle 불확실성 추정이 아니다.
+재학습·optimizer step·test 평가는 없다. Validation 지표 변화(pp), 바뀐 예측 비율과
+평균 절대 logit 변화량을 기록한다. 단일-label 데이터의 flip은 nodewise, PPI는 labelwise이며
+PPI 점수와 개입은 validation graph 두 개 전체를 global count로 합산한다. 단일 shuffled-C
+표본은 shuffle 불확실성 추정이 아니다.
 
 ## 계산량과 확장성의 경계
 
@@ -171,7 +180,8 @@ backbone·optimizer·진단 상태도 필요하다. Chunking은 전체 메모리
 checkpoint 재계산은 추가 작업을 요구한다. 1차 미분을 검증하며 고차 미분은 지원하지 않는다.
 
 Dense 고유분해가 없다는 것은 구현 사실이고, spectral GNN 전부보다 빠르다는 결론은 아니다.
-여전히 full-graph 실행으로 GraphSAGE/GraphSAINT sampling은 구현하지 않았다.
+네 transductive 데이터는 full-graph batch 1이고 PPI는 graph를 자르지 않는 whole-graph
+minibatch 2다. 어느 쪽도 GraphSAGE/GraphSAINT sampling을 구현하지 않았다.
 실제 GPU 시간·peak memory·가속률은 서버 측 측정 전까지 미확인이다.
 
 ## v2와 어떻게 비교할 것인가
@@ -183,7 +193,7 @@ Dense 고유분해가 없다는 것은 구현 사실이고, spectral GNN 전부�
 | 전파 강도 | 고정 0.95 | 층별 학습, 초기 0.5 |
 | Optimizer | Adam | 그룹별 AdamW |
 | 자체 대조군 | 직접 C vs C=1 | 상대 C vs C=1, 둘 다 alpha 학습 |
-| 기본 데이터/seed | ogbn-arxiv / 0 | ogbn-arxiv / 0 |
+| 기본 데이터/seed | Cora/CiteSeer/PubMed/ogbn-arxiv / 0 | Cora/CiteSeer/PubMed/PPI/ogbn-arxiv / 0 |
 
 같은 데이터·seed라는 이유로 v2↔v3 전체 차이를 한 요인의 효과로 읽지 않는다.
 먼저 각각의 learned−fixed를 비교하고, 점수와 C 분포·개입·epoch/시간/메모리를 함께 확인한다.
@@ -209,6 +219,6 @@ Suite ID는 `conductance_relative_c_v3`이며 `results/conductance_gat/v3/<run-i
 | `<dataset>/<condition>/metrics.json` | 결과·설정·무결성 hash·개입 |
 
 두 조건의 초기 state, 데이터 계약, 소스와 설정을 검사한다. 누락·혼합·변조된 산출물을
-성공 비교로 표시하지 않는다. 사용자 보고상 v3 runner는 `passed`지만 성능 수치와 전체
-artifact는 수령하지 않았다. 로컬 검증과 서버 보고의 근거 범위는
+성공 비교로 표시하지 않는다. 사용자 보고상 과거 arxiv-only v3 runner는 `passed`지만 성능
+수치와 전체 artifact는 수령하지 않았고 현재 10-job 전체 기본 결과도 없다. 로컬 검증과 서버 보고의 근거 범위는
 [실험 상태](EXPERIMENT_STATUS.md)에 별도로 기록한다.

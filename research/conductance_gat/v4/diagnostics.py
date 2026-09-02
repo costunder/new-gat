@@ -1,15 +1,16 @@
 """Read-only observations for the V4 conductance/spatial factorial.
 
-Training observations attach to the actual full-graph forward.  Interventions
-run only after validation checkpoint selection and never update parameters or
-inspect test labels.  Replacing estimator output means that the operator's
-normal symmetric-normalization path recomputes the C-dependent degrees.
+Training observations attach to the actual transductive full-graph forward or
+PPI whole-graph minibatch. Interventions run only after validation checkpoint
+selection and never update parameters or compute a test-label metric. Replacing
+estimator output means that the operator's normal symmetric-normalization path
+recomputes the C-dependent degrees.
 """
 
 from __future__ import annotations
 
 import math
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
 
 import torch
@@ -17,6 +18,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from ..ablation.model import state_sha256
+from ..benchmark import _binary_counts, _micro_f1_from_counts
 
 
 @contextmanager
@@ -269,27 +271,99 @@ class ForwardObservation:
         return output
 
 
-def evaluate_validation(model, graph, indices: Tensor, *, observe: bool = True):
-    if not indices.numel():
+def _prediction_tensor(logits: Tensor, prediction_rule: str) -> Tensor:
+    if prediction_rule == "argmax_node_class":
+        return logits.argmax(-1)
+    if prediction_rule == "logit_gt_zero_node_label":
+        return logits > 0
+    raise ValueError("Unknown V4 prediction rule")
+
+
+def _ppi_graph_count(graph) -> int:
+    value = getattr(graph, "num_graphs", None)
+    if value is not None:
+        return int(value)
+    batch = getattr(graph, "batch", None)
+    return int(batch.max()) + 1 if isinstance(batch, Tensor) and batch.numel() else 1
+
+
+def evaluate_validation(
+    model,
+    graph,
+    indices: Tensor | None,
+    *,
+    observe: bool = True,
+    device: torch.device | None = None,
+):
+    if indices is not None and not indices.numel():
         raise ValueError("Validation mask is empty")
     with evaluation_mode(model):
-        if observe:
-            with ForwardObservation(model) as observation:
+        context = ForwardObservation(model) if observe else nullcontext(None)
+        with context as observation:
+            if indices is not None:
                 full_logits = model(graph)
-            layers = observation.summary()
-        else:
-            full_logits, layers = model(graph), []
-        logits = full_logits.index_select(0, indices)
-        labels = graph.y.index_select(0, indices)
-        if not bool(torch.isfinite(logits).all()):
-            raise FloatingPointError("Nonfinite validation logits")
+                logits = full_logits.index_select(0, indices)
+                labels = graph.y.index_select(0, indices)
+                if not bool(torch.isfinite(logits).all()):
+                    raise FloatingPointError("Nonfinite validation logits")
+                metric = int((logits.argmax(-1) == labels).sum()) / indices.numel()
+                loss = float(F.cross_entropy(logits, labels))
+                graph_count = 1
+                metric_name = "accuracy"
+                prediction_rule = "argmax_node_class"
+                observation_scope = (
+                    "whole transductive graph states; validation labels only"
+                )
+            else:
+                if not isinstance(graph, dict) or "validation" not in graph:
+                    raise ValueError("PPI validation requires the official validation loader")
+                batches = graph["validation"]
+                if len(batches) != 1:
+                    raise ValueError(
+                        "PPI validation must pack its two official graphs into one batch"
+                    )
+                if device is None:
+                    device = next(model.parameters()).device
+                counts = torch.zeros(3, dtype=torch.int64, device=device)
+                loss_sum = torch.zeros((), dtype=torch.float64, device=device)
+                label_count = 0
+                graph_count = 0
+                parts = []
+                for batch in batches:
+                    batch = batch.to(device, non_blocking=True)
+                    batch_logits = model(batch)
+                    if batch_logits.shape != batch.y.shape or not bool(
+                        torch.isfinite(batch_logits).all()
+                    ):
+                        raise FloatingPointError("Invalid or nonfinite PPI validation logits")
+                    counts.add_(_binary_counts(batch_logits, batch.y))
+                    loss_sum.add_(
+                        F.binary_cross_entropy_with_logits(
+                            batch_logits, batch.y, reduction="sum"
+                        ).double()
+                    )
+                    label_count += batch.y.numel()
+                    graph_count += _ppi_graph_count(batch)
+                    parts.append(batch_logits.detach().cpu())
+                if graph_count != 2 or not label_count:
+                    raise ValueError("PPI validation must cover both official validation graphs")
+                logits = torch.cat(parts, dim=0)
+                metric = _micro_f1_from_counts(counts)
+                loss = float(loss_sum / label_count)
+                metric_name = "micro_f1"
+                prediction_rule = "logit_gt_zero_node_label"
+                observation_scope = "all two official inductive validation graphs"
+        layers = observation.summary() if observation is not None else []
         result = {
-            "metric": int((logits.argmax(-1) == labels).sum()) / indices.numel(),
-            "loss": float(F.cross_entropy(logits, labels)),
+            "metric": metric,
+            "metric_name": metric_name,
+            "prediction_rule": prediction_rule,
+            "loss": loss,
             "layers": layers,
             "mode": "eval",
             "split": "validation",
-            "observation_scope": "whole transductive graph states; validation labels only",
+            "validation_graph_count": graph_count,
+            "observation_scope": observation_scope,
         }
     return result, logits.detach().cpu()
 
@@ -429,6 +503,7 @@ def _logit_difference(left: Tensor, right: Tensor, label: str) -> Tensor:
 
 def _intervention_row(name, result, logits, original, reference):
     difference = _logit_difference(logits, reference, name)
+    prediction_rule = result["prediction_rule"]
     return {
         "intervention": name,
         "intervention_kind": "read_only_selected_checkpoint",
@@ -440,12 +515,26 @@ def _intervention_row(name, result, logits, original, reference):
         "logit_mean_absolute_delta": float(difference.abs().mean()),
         "logit_max_absolute_delta": float(difference.abs().max()),
         "changed_prediction_fraction": float(
-            (logits.argmax(-1) != reference.argmax(-1)).double().mean()
+            (
+                _prediction_tensor(logits, prediction_rule)
+                != _prediction_tensor(reference, prediction_rule)
+            )
+            .double()
+            .mean()
         ),
     }
 
 
-def best_checkpoint_interventions(model, graph, indices, original, reference: Tensor, *, seed: int):
+def best_checkpoint_interventions(
+    model,
+    graph,
+    indices,
+    original,
+    reference: Tensor,
+    *,
+    seed: int,
+    device: torch.device | None = None,
+):
     """All-layer read-only interventions, only on the selected best checkpoint."""
     before = state_sha256(model)
     modes = [module.training for module in model.modules()]
@@ -466,7 +555,9 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
     try:
         for name in names:
             with Intervention(model, name, seed) as intervention:
-                result, logits = evaluate_validation(model, graph, indices, observe=False)
+                result, logits = evaluate_validation(
+                    model, graph, indices, observe=False, device=device
+                )
             if name in {"mean_c", "ones_c"}:
                 replacement_contracts[name] = intervention.contract_summary(len(model.operators))
             intervention_logits[name] = logits
@@ -505,7 +596,12 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
         "logit_mean_absolute_delta": mean_absolute_delta,
         "logit_max_absolute_delta": max_absolute_delta,
         "changed_prediction_fraction": float(
-            (mean_logits.argmax(-1) != ones_logits.argmax(-1)).double().mean()
+            (
+                _prediction_tensor(mean_logits, original["prediction_rule"])
+                != _prediction_tensor(ones_logits, original["prediction_rule"])
+            )
+            .double()
+            .mean()
         ),
         "replacement_contracts": replacement_contracts,
     }
@@ -514,13 +610,17 @@ def best_checkpoint_interventions(model, graph, indices, original, reference: Te
         "scope": "validation_selected_best_checkpoint_only",
         "layers": "all_layers_simultaneously",
         "original": {"validation": original["metric"], "loss": original["loss"]},
+        "metric_name": original["metric_name"],
+        "prediction_rule": original["prediction_rule"],
+        "validation_graph_count": original["validation_graph_count"],
         "rows": rows,
         "shuffle_seed": seed,
         "normalization_recomputed_for_c_interventions": True,
         "mean_c_numeric_check": numeric_check,
         "mean_ones_note": (
             "Graph-constant positive C cancellation and the replacement contracts are enforced "
-            "directly. Mean-C and C=1 logits come from separate full-graph forwards, so their "
+            "directly. Mean-C and C=1 logits come from separate full-graph validation forwards, "
+            "so their "
             "allclose result is informational and non-gating because CUDA scatter rounding need "
             "not be bitwise repeatable. This is not an independent causal intervention."
         ),

@@ -129,6 +129,106 @@ def test_invalid_protocol_rejected(tmp_path, field, value):
         train._validate_args(args)
 
 
+def test_child_batch_size_defaults_resolve_by_dataset(tmp_path):
+    cora = arguments(tmp_path)
+    assert cora.batch_size is None
+    train._validate_args(cora)
+    assert cora.batch_size == 1
+    ppi = train.build_parser().parse_args(
+        [
+            "--dataset",
+            "ppi",
+            "--condition",
+            "relative_c",
+            "--output-dir",
+            str(tmp_path / "ppi"),
+        ]
+    )
+    train._validate_args(ppi)
+    assert ppi.batch_size == 2 and ppi.workers == 0
+
+
+def test_ppi_uses_all_train_minibatches_and_all_validation_graphs(monkeypatch, tmp_path):
+    pytest.importorskip("torch_geometric")
+    from torch_geometric.data import Data
+    from torch_geometric.loader import DataLoader
+
+    mock_hardware(monkeypatch)
+    graphs = []
+    for graph_index in range(6):
+        graphs.append(
+            Data(
+                x=torch.tensor(
+                    [[0.5 + graph_index, 1.0, 2.0], [1.0, 2.0, 0.5], [2.0, 0.5, 1.0]]
+                ),
+                y=torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]),
+                incidence_edge_index=torch.tensor([[0, 1], [1, 2]]),
+            )
+        )
+
+    class NoTest(dict):
+        def __getitem__(self, key):
+            if key == "test":
+                raise AssertionError("PPI test graphs must not be read")
+            return super().__getitem__(key)
+
+    splits = NoTest(train=[0, 1, 2, 3], validation=[4, 5])
+    payload = {
+        "dataset": "ppi",
+        "classes": 2,
+        "graphs": [
+            {
+                "x": graph.x,
+                "y": graph.y,
+                "incidence_edge_index": graph.incidence_edge_index,
+            }
+            for graph in graphs
+        ],
+        "splits": splits,
+    }
+    loaders = {
+        "train": DataLoader(graphs[:4], batch_size=2, shuffle=False),
+        "validation": DataLoader(graphs[4:], batch_size=2, shuffle=False),
+    }
+    monkeypatch.setattr(train, "_make_data", lambda *args: (loaders, None))
+    args = train.build_parser().parse_args(
+        [
+            "--dataset",
+            "ppi",
+            "--condition",
+            "relative_c",
+            "--output-dir",
+            str(tmp_path / "ppi-train"),
+            "--epochs",
+            "2",
+            "--patience",
+            "2",
+            "--edge-chunk-size",
+            "2",
+        ]
+    )
+    args.output_dir.mkdir()
+    result = train.train_model(
+        payload, {"data_sha256": "b" * 64}, args, torch.device("cpu"), args.output_dir
+    )
+    assert result["optimizer_steps_per_epoch"] == 2
+    assert result["optimizer_steps"] == 2 * result["epochs_run"]
+    assert result["best_checkpoint_optimizer_steps"] == 2 * result["best_epoch"]
+    assert result["metric_name"] == "micro_f1"
+    best = result["diagnostics"]["best_validation"]
+    assert best["validation_graph_count"] == 2
+    assert best["label_decision_count"] == 12
+    assert best["prediction_unit"] == "node_label_decision"
+    assert all(
+        row["prediction_unit"] == "node_label_decision"
+        for row in result["diagnostics"]["best_checkpoint_interventions"]["rows"]
+    )
+    assert result["diagnostics"]["train_trajectory"][0]["scope"] == (
+        "first_actual_training_minibatch_only"
+    )
+    assert result["topology"]["split_graph_counts"] == {"train": 4, "validation": 2}
+
+
 def test_real_two_arm_runner_training_checkpoint_and_report(monkeypatch, tmp_path):
     from research.conductance_gat.v3 import report
     from scripts import run_conductance_v3 as runner
@@ -138,7 +238,14 @@ def test_real_two_arm_runner_training_checkpoint_and_report(monkeypatch, tmp_pat
     monkeypatch.setattr(train, "_make_data", lambda *args: (graph, indices))
     fixture_file = tmp_path / "tiny_unit_fixture.pt"
     atomic_publish(fixture_file, lambda path: torch.save(payload, path))
-    protocol = {"data_sha256": sha256_file(fixture_file), "unit_fixture_only": True}
+    protocol = {
+        "data_sha256": sha256_file(fixture_file),
+        "dataset": "cora",
+        "split": "official_public_masks",
+        "task": "node_classification",
+        "metric": "accuracy",
+        "unit_fixture_only": True,
+    }
     monkeypatch.setattr(train, "load_dataset", lambda *args, **kwargs: (payload, protocol))
     monkeypatch.setattr(
         train, "_cache_snapshot", lambda args: {str(fixture_file): sha256_file(fixture_file)}
@@ -188,13 +295,13 @@ def test_real_two_arm_runner_training_checkpoint_and_report(monkeypatch, tmp_pat
     )
     assert result == 0 and len(executions) == 2
     root = tmp_path / "results/conductance_gat/v3/unit-fixture"
-    manifest = json.loads((root / "manifest.json").read_text())
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     comparison = report.write_comparison(root, manifest)
     assert comparison["status"] == "passed"
     hashes = []
     for condition in CONDITIONS:
         folder = root / "cora" / condition
-        metrics = json.loads((folder / "metrics.json").read_text())
+        metrics = json.loads((folder / "metrics.json").read_text(encoding="utf-8"))
         hashes.append(metrics["initial_state_sha256"])
         assert metrics["research_suite"] == SUITE and metrics["test_evaluated"] is False
         assert metrics["checkpoint_sha256"] == sha256_file(folder / "best.pt")
@@ -251,7 +358,7 @@ def test_missing_cache_writes_failed_metrics_without_training(monkeypatch, tmp_p
                 str(tmp_path / "failed"),
             ]
         )
-    record = json.loads((tmp_path / "failed/metrics.json").read_text())
+    record = json.loads((tmp_path / "failed/metrics.json").read_text(encoding="utf-8"))
     assert record["status"] == "failed" and "absent" in record["error"]
 
 
