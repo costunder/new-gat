@@ -2,13 +2,57 @@
 
 작성 기준일: 2026-09-01 (Asia/Seoul)
 
-이 문서는 외부 ChatGPT 또는 연구 리뷰어가 저장소를 처음 받아도 수학적 가설, 구현 경계,
+이 문서는 `gpt_handoff/`의 여덟 파일 중 전체 프로젝트 인수인계를 담당한다. 외부 ChatGPT 또는
+연구 리뷰어가 저장소를 처음 받아도 수학적 가설, 구현 경계,
 데이터 계약, 실행법, 검증 범위와 미완료 항목을 혼동하지 않도록 만든 인수인계 문서다.
-원문 코드는 같은 폴더의 `code_summary.md`에 파일별로 들어 있다.
-처음 설치·실행하는 사용자는 [README.md](README.md)의 순서를 따른다.
+원문 코드는 같은 폴더의 `CODE_SUMMARY.md`에 파일별로 들어 있다.
+처음 설치·실행하는 사용자는 저장소의 `docs/GETTING_STARTED.md` 순서를 따른다. 이 사용자용
+설치 문서는 GPT 기본 전달 묶음에는 필요하지 않다.
 이 문서는 실행 입문서가 아니라 연구·구현 교차검토용이다.
 
 ## 0. 리뷰어가 먼저 알아야 할 판정
+
+### 2026-09-01 추가 요청 반영: 상대 C graph operator × spatial W v4
+
+V4 정보는 같은 문서 폴더의 **[CONDUCTANCE_V4.md](CONDUCTANCE_V4.md)**를 기준으로 한다.
+
+사용자가 말한 두 학습 경로는 v3 전체를 spectral GNN으로 분류한다는 뜻이 아니다. V3의
+상대 `C(H)`를 spectral 관점으로 해석 가능한 학습 graph operator/metric으로 유지하면서,
+spatial GNN의 공유 feature-message 행렬 `W`도 같은 층에서 학습하는 별도 v4를 추가했다.
+V2/v3와 Cycle PE/Tree Augmentation은 변경하거나 결합하지 않는다.
+
+- Suite `conductance_hybrid_c_spatial_v4`, 폴더 `research/conductance_gat/v4/`, runner
+  `scripts/run_conductance_v4.py`, 결과 `results/conductance_gat/v4/<run-id>/`다.
+- 각 층은 pre-W 상태에서 v3와 같은 graph-centered 상대 `C(H)`를 만든다. 이후
+  `P_C=D_C^-1/2 A_C D_C^-1/2`와 bias 없는 identity-initialized `W`를 사용해 비고립 노드에서
+  `H'=(1-alpha)H+alpha P_C(HW)`를 계산하고, 고립 노드는 `H`를 그대로 둔다.
+- C-dependent degree의 양쪽 정규화까지 미분하는 정확한 chunked first-order backward를
+  구현했다. Residual `H`와 message `HW`의 gradient를 분리하며 dense B/C/A/L이나 고유분해를
+  만들지 않는다. `W=I`이면 v3 전파와 bit-exact하게 일치하도록 고정 identity 경로를 둔다.
+- 기본은 ogbn-arxiv × `fixed_c_identity_w`/`relative_c_identity_w`/
+  `fixed_c_spatial_w`/`relative_c_spatial_w` × model seed 0의 네 fresh CUDA 학습이다.
+  네 조건은 전체 state의 이름·shape·초기값 hash가 같고 C=1, W=I, alpha=0.5에서 시작한다.
+  Inactive C/W scaffold는 동결·optimizer 제외, alpha는 모든 조건에서 학습한다.
+- 보고서는 `C|W off`, `C|W on`, `W|C fixed`, `W|C relative`, 2×2 interaction을 계산한다.
+  네 cell이 source/cache/topology/initial-state/artifact 무결성 검사를 모두 통과하기 전에는
+  대조값을 성공 결과로 표시하지 않는다. V3 checkpoint나 점수는 재사용하지 않는다.
+- 선택 checkpoint에서 mean/shuffled/C=1, W=I, C=1+W=I, propagation-off validation 개입을
+  수행한다. Mean-C와 C=1은 대칭 정규화에서 같은 수치 검산이며 독립 효과가 아니다.
+  C/W 분포·gradient, `||W-I||`, singular value, epoch/사후진단 시간과 peak CUDA memory를 기록한다.
+- 단일 seed validation 실험이며 CI·p-value·SOTA나 일반적 우월성을 주장하지 않는다.
+  V3↔V4 전체 점수 차이와 checkpoint 개입을 단일 요인의 fresh-training 인과효과로 읽지 않는다.
+
+실행과 결과 확인:
+
+```bash
+bash research/conductance_gat/v4/reproduce.sh --run-id gat-hybrid-c-spatial-v4-seed0-v1
+cat results/conductance_gat/v4/gat-hybrid-c-spatial-v4-seed0-v1/comparison.md
+```
+
+실제 공개 데이터 GPU 학습 결과는 아직 수령하지 않았다. 로컬에서는 dense 기준 forward/backward,
+네 arm 초기 hash, W=I v3 동치, runner/report 무결성 fixture를 검사했으며 GPU 연구 학습은 실행하지 않았다.
+V4 구현 및 GPT 전달 묶음 정리 후 전체 회귀는 **1247 passed / 65 skipped** (68.99 s, exit 0), V4 전용은
+**68 passed**, Ruff·compileall·`code_summary --check`도 통과했다.
 
 ### 2026-09-01 추가 제안 반영: 독립 상대 C v3
 
@@ -17,7 +61,7 @@
 제안 첨부 `0f907b27-508b-44e8-8c2e-d92605718702/pasted-text.txt`의 SHA-256은
 `BC6428F64B747079DF6EC9C615422A3D322BD37844BC1C9527F82E2E21698BED`다.
 첨부 자체는 저장소에 복사하지 않으며 구현 수식과 범위는
-[Conductance v3 README](research/conductance_gat/v3/README.md)에 보존했다.
+이 문서의 v3 절과 [전체 코드 스냅샷](CODE_SUMMARY.md)에 보존했다.
 
 - Suite `conductance_relative_c_v3`, 폴더 `research/conductance_gat/v3/`.
   기존 benchmark·C-learning·v2와 Cycle PE/Tree 코드는 변경하지 않는다.
@@ -75,7 +119,7 @@ Arxiv의 저장 값은 68.317723%이며 위 재계산 값과 구분한다. PPI l
 −6.198266pp, layer 1만 평균화하면 −0.238916pp다. Arxiv layer 0은 prediction flip이
 0이고 layer 1 개입이 전체 층 개입과 같은 작은 점수 차이를 냈다.
 전체/층별 정확한 점수·logit 변화·flip 단위는
-[C-learning 결과](docs/CONDUCTANCE_C_LEARNING_FINDINGS.md)에 보존했다.
+[실험 상태와 결과](EXPERIMENT_STATUS.md)에 보존했다.
 
 PPI의 **선택된 learned checkpoint는 엣지별 C 변동에 의존한다**. 하지만 처음부터 학습한
 fixed 모델의 52.705738%보다 learned가 높지 않았다는 결과와 모순되지 않는다. 다른 파라미터를
@@ -109,7 +153,7 @@ fixed 모델의 52.705738%보다 learned가 높지 않았다는 결과와 모순
   결과는 `results/conductance_gat/v2/<run-id>/comparison.md/csv/json`에 분리하며
   기존 MLP/fixed 점수를 재사용하지 않는다. **실제 v2 GPU 결과는 아직 없다.**
 
-실행·정확한 수식·메모리 경계는 [Conductance v2 README](research/conductance_gat/v2/README.md)를 따른다.
+실행·정확한 수식·메모리 경계는 이 문서의 v2 절과 [전체 코드 스냅샷](CODE_SUMMARY.md)을 따른다.
 Cycle PE의 별도 기저벡터 v2와 이름이 같아도 다른 트랙이며 두 모델을 결합하지 않는다.
 
 V2 구현 시점의 전체 로컬 검사는 **1042 passed / 64 skipped** (47.41 s, exit 0), Ruff 통과다.
@@ -147,7 +191,7 @@ Fixed 조건은 gate scaffold 24,962개를 동결 보존하므로 전체 저장 
 `25ca328`에 게시됐지만 표에는 실제 서버 source revision이 없으므로 실행 commit으로
 단정하지 않는다. 원격 manifest·checkpoint 전체를 로컬로 받아 재검증한 것도 아니다.
 정확한 8개 진단 행과 해석은
-[C-learning 결과 문서](docs/CONDUCTANCE_C_LEARNING_FINDINGS.md)에 보존했다.
+[실험 상태와 결과](EXPERIMENT_STATUS.md)에 보존했다.
 
 당시 후속으로 **그 새 run의 learned checkpoint**를 대상으로 평균-C 검사를 추가했다.
 `c_learning/audit.sh`는 source manifest의 suite를 읽어
@@ -158,7 +202,7 @@ weighted degree를 다시 계산한다. 전체 층과 한 층씩 개입을 분�
 원본 결과를 수정하지 않고 `results/conductance_gat/c_learning_audits/`의 새 폴더에
 `report.md`/`audit.json`만 기록한다. **새 학습·optimizer step·test 평가는 없다.**
 이후 실제 GPU 출력도 수령하여 위 절에 기록했다. 재검사 명령은
-[C-learning README](research/conductance_gat/c_learning/README.md)를 따른다.
+[실험 상태와 결과](EXPERIMENT_STATUS.md)를 따른다.
 
 이번 확장 후 로컬 전체 회귀는 **924 passed / 64 skipped** (32.11 s, exit 0),
 Ruff 통과다. 기존 890개에서 34개 검사를 추가했다. 새 run의 두 실제 단위 학습 루프에서
@@ -189,7 +233,7 @@ NVIDIA RTX A6000, Python 3.11.16, Torch 2.7.1+cu118, PyG 2.7.0, Linux glibc 2.35
 그 자체가 성능 개선은 아니었다. arxiv 최고 조건의 C CV가 0 / 0.00948423이므로
 학습 C의 순수 기여는 여전히 미확정이다. PPI 최고 조건에는 비상수 C가 남아 있다.
 정확한 epoch, 대비, 층별 진단과 해석은
-[CONDUCTANCE_FACTORIAL_FINDINGS.md](docs/CONDUCTANCE_FACTORIAL_FINDINGS.md)에 보존했다.
+[실험 상태와 결과](EXPERIMENT_STATUS.md)에 보존했다.
 단일 seed의 validation 탐색이며 test·CI·p-value·SOTA·일반적 최적값을 보고하지 않는다.
 
 이번 후속 코드는 `research/conductance_gat/c_learning/`에 분리했다.
@@ -209,7 +253,7 @@ NVIDIA RTX A6000, Python 3.11.16, Torch 2.7.1+cu118, PyG 2.7.0, Linux glibc 2.35
 - 이 구현 당시에는 두 후속 경로의 GPU 결과가 없었다. 이후 C-learning 학습 보고서를
   수령하여 위 2026-09-01 절에 기록했다. 개입 대비와 재학습 차이는 계속 분리한다.
 
-실행법과 결과 경로는 [C-learning README](research/conductance_gat/c_learning/README.md)를 따른다.
+실행법과 결과 경로는 [전체 코드 스냅샷](CODE_SUMMARY.md)과 [실험 상태](EXPERIMENT_STATUS.md)를 따른다.
 
 이번 후속 구현의 전체 로컬 회귀는 **890 passed / 64 skipped** (30.76 s, exit 0),
 Ruff 전체 검사 통과다. 기존 794개에서 96개 검사가 추가됐다. 새 두 조건의 실제 학습 루프→
@@ -242,7 +286,7 @@ checkpoint/history→runner/report 연결은 작은 단위 fixture와 모킹한 
   4조건, 두 요인의 조건부 차이, 상호작용을 데이터셋별로 표시한다.
 - 모든 산출물은 `results/conductance_gat/ablations/<run-id>/`로 분리한다. 기존 checkpoint와
   혼동하지 않도록 새 checkpoint model/research_suite은 `conductance_factorial`이다.
-  상세 실행·해석은 [실험 README](research/conductance_gat/ablation/README.md)를 따른다.
+  상세 실행·해석은 [전체 코드 스냅샷](CODE_SUMMARY.md)과 [실험 상태](EXPERIMENT_STATUS.md)를 따른다.
 
 이 2×2의 실제 GPU 학습 결과는 위 절에 별도 기록했다. 아래의 5e801c3 full-audit 로그는
 기존 checkpoint의 읽기 전용 검사이므로 43afd63의 재학습 결과와 합치지 않는다.
@@ -282,10 +326,10 @@ Cycle v1 1개, Tree CSL/ZINC 2개의 총 4개 child만 실행한다. 데이터 �
   `null`(CSV 빈칸)과 `uncertainty_status=insufficient_samples`로 표시한다. 숫자 0의 불확실성으로
   보고하지 않는다. 명시적 여러 seed의 기존 통계는 유지한다.
 
-실행은 [진단 안내](docs/CONDUCTANCE_DIAGNOSTICS.md)를 따른다. 확장 검사와 단일 seed 변경은
+실행 구현은 [전체 코드 스냅샷](CODE_SUMMARY.md)을 따른다. 확장 검사와 단일 seed 변경은
 현재 소스 버전에 포함되며 이전 진단 전용 게시 commit에는 없었다. 이후 사용자가 제공한
 5e801c3 full-audit 로그에서 seed 0의 다섯 데이터셋 모두 passed를 확인했다. 실측값과 범위는
-[실험 상태](docs/EXPERIMENT_STATUS.md)의 확장 검사 절을 따른다.
+[실험 상태](EXPERIMENT_STATUS.md)의 확장 검사 절을 따른다.
 로컬 전체 회귀는 **680 passed / 63 skipped** (30.54 s, exit 0), 확장 진단 관련 3개 파일은
 **89 passed** (4.28 s)다. Windows faulthandler의 기존 `access violation` 경고가 출력됐으나
 검사는 위 결과와 exit 0으로 완료됐다. Linux/Bash 62개와 로컬 PyG 미설치 1개는 생략했으며,
@@ -299,14 +343,14 @@ Cycle v1 1개, Tree CSL/ZINC 2개의 총 4개 child만 실행한다. 데이터 �
 사용자가 제공한 **세 트랙의 기존 5-model-seed 집계**, **Conductance seed 0의 실제 GPU
 checkpoint 진단**, **2×2 및 C-learning 재학습 결과**가 있다. 결과 수치, run ID, 평가 범위,
 근거 식별자와 미확정 원인은
-[EXPERIMENT_STATUS.md](docs/EXPERIMENT_STATUS.md)에 정리했다. 이 문서의 과거 감사 기록을
+[EXPERIMENT_STATUS.md](EXPERIMENT_STATUS.md)에 정리했다. 이 문서의 과거 감사 기록을
 현재의 결과 미수집 상태로 해석하면 안 된다.
 
 - 이전 진단 전용 게시 commit은 `ebf8cd19b80e6cd6c742b132e2bb1dadb97b019c`다.
   해당 commit은 진단 Python/Bash, 테스트, 안내, 트랙 README의 **5개 파일만** 추가·갱신했다.
 - 이번 소스 버전에는 기저벡터 Cycle PE v2, 실행 최적화·속도 도구, 단일 seed 기본값,
   확장 진단·2×2·C-learning 및 별도 Conductance 직접 C v2·상대 C v3 코드가 포함된다.
-  `code_summary.md`는 이 버전의 스냅샷이다.
+  `CODE_SUMMARY.md`는 이 버전의 스냅샷이다.
 - 제공된 Cycle 결과는 `cycle_set` v1이다. 이를 `cycle_basis_v2`의 학습 결과로 쓰지 않는다.
   기존 benchmark 결과와 당시 진단은 이번 최적화의 가속 실측도 아니다.
 - 원격 서버의 전체 checkpoint/manifest를 직접 내려받아 검사한 것은 아니다. 사용자 로그로
@@ -321,7 +365,7 @@ code summary를 읽는다. 세 연구는 계속 독립이며 결합 모델을 �
 `scripts/diagnose_conductance.py`와 active-Conda wrapper를 추가했다. 완료된 공식 benchmark의
 기록과 checkpoint를 읽어 GPU에서 train/validation 추론만 수행하며 재학습·다운로드·optimizer
 update·원래 산출물 덮어쓰기는 없다. 기본 출력은 터미널이고 새 별도 경로의 보고서는 선택 사항이다.
-사용법과 해석은 [CONDUCTANCE_DIAGNOSTICS.md](docs/CONDUCTANCE_DIAGNOSTICS.md)에 있다.
+사용법과 해석은 [전체 코드 스냅샷](CODE_SUMMARY.md)과 [실험 상태](EXPERIMENT_STATUS.md)에 있다.
 
 - 층별 C 분포, 가중 차수, `rho_i = .95 d_i^C / d_max^C`, 전파 전후 상대 변화량을 확인한다.
   최대 차수는 각 그래프 안에서 계산하며 PPI 그래프를 합친 최대값으로 대체하지 않는다.
@@ -368,7 +412,7 @@ Ruff/diff 검사와 갱신 문서의 로컬 링크 34개 검사 통과다.
   warmup·steady-state·동등성 검사·peak memory를 `runs/performance/`에 분리 기록한다.
   optimizer update 및 전체 학습 속도/정확도 실험과 구분한다.
 - GPU 실측·전체 학습 완료·가속 배수는 확인하지 않았다. 사용법과 측정 경계는
-  [PERFORMANCE.md](docs/PERFORMANCE.md)에 있다. 구형 Singularity에서 opt-in compiler
+  [실험 상태](EXPERIMENT_STATUS.md)에 있다. 구형 Singularity에서 opt-in compiler
   호환성을 보장하지 않으며 환경/드라이버/공용 라이브러리를 자동 변경하지 않는다.
 
 이후의 과거 감사 수치와 한계는 해당 시점의 기록이며, 현재 최적화의 GPU 검증 결과가 아니다.
@@ -411,7 +455,7 @@ Ruff 및 diff 검사 통과다. 생략은 Linux/Bash 전용 62개와 로컬 PyG 
 - `v2/datasets.yaml`은 v2 run에 보존하는 데이터/표현 계약이다. 기존 일반 `check_datasets.py`의
   v1 registry 검증이 v2 기저를 검증했다고 해석하지 않는다. v2 로더 자체가 수학·내용을 검사한다.
 
-설치 완료 후 실행 명령은 [v2 README](research/cycle_pe/v2/README.md)에 있다. 이번 작업에서
+설치 완료 후 실행 명령은 [전체 코드 스냅샷](CODE_SUMMARY.md)에 있다. 이번 작업에서
 공식 데이터 다운로드나 CPU/GPU 연구 학습은 실행하지 않았다. 작은 개발 fixture의 수학·배치·미분
 검사는 실제 공개 데이터의 학습 완료나 성능/novelty 입증과 구분한다.
 
@@ -452,7 +496,8 @@ Conda는 `/tools/anaconda3`의 공용 설치본이다. 이미지 선택 옵션�
 - 구버전 Torch에는 공개된 체크포인트 로딩 취약점이 있다. Torch 2.6뿐 아니라 2.7도 해당하며
   `weights_only=True`를 보안 보장으로 취급하지 않는다. 공식 출처가 확인된 데이터와 직접 만든
   체크포인트만 사용한다. 별도 Conda 환경은 보안 sandbox가 아니다. 최신 보안 패치가 필요하면
-  더 새 컨테이너가 필요하다. [환경 안내](docs/ENVIRONMENT.md)에 설치 절차와 제약을 정리했다.
+  더 새 컨테이너가 필요하다. 설치 절차와 제약은 저장소의 사용자용 `docs/ENVIRONMENT.md`에
+  있으며 GPT 기본 전달 묶음의 구현 감사에는 필요하지 않다.
 
 근거: [PyTorch Linux wheel 플랫폼 공지](https://dev-discuss.pytorch.org/t/pytorch-linux-wheels-switching-to-new-wheel-build-platform-manylinux-2-28-on-november-12-2024/2581),
 [공식 cu118 wheel 목록](https://download.pytorch.org/whl/cu118/torch/),
@@ -462,7 +507,7 @@ Conda는 `/tools/anaconda3`의 공용 설치본이다. 이미지 선택 옵션�
 전체 pytest **387 passed, 63 skipped**, Ruff 및 diff 검사 통과. 생략은 Linux/Bash 동적
 검사 62개와 로컬 PyG 미설치에 따른 batching 검사 1개다. profile 선택/정확한 pin/CUDA
 runtime, glibc 경계, 기존 환경 보호, 의존성 보완 시 profile 유지, manifest, README 실행
-계약을 검증했다. `code_summary.md`도 현재 105개 소스/설정 파일에서 다시 생성했다.
+계약을 검증했다. `CODE_SUMMARY.md`도 당시 105개 소스/설정 파일에서 다시 생성했다.
 이 호스트에서 실제 Ubuntu 18.04 설치·CUDA 학습은 실행하지 않았다. 아래 이전 날짜의
 pytest 수치는 해당 시점의 이력이며 최신 회귀 결과와 구분한다.
 
@@ -619,11 +664,11 @@ Alchemy는 upstream index의 중복·split 겹침 때문에 기본 데이터에 
 
 ### 코드 스냅샷
 
-- 파일: `code_summary.md`
-- 기준 source revision: `6f9d3b0981e8cfa8feb76e59fb348e26cc6909d6`
-- 포함 파일: 188개
-- 크기: 1,826,929 bytes, 46,240 lines (`str.splitlines()` 기준)
-- SHA-256: `A33715FCD3F514D6C27D11D984037E7043E2D6D5D85FB0AD8B4661C54279DC06`
+- 파일: `gpt_handoff/CODE_SUMMARY.md`
+- 기준 Git HEAD: `af8d9dca5eafa1c1203e9a5c850a7c6685a300c3` (현재 미커밋 작업본 포함)
+- 포함 파일: 200개
+- 크기: 1,991,649 bytes, 50,325 lines (`str.splitlines()` 기준)
+- SHA-256: `0261D384532AFBF3C2B63E4810453806877508ECE833054DFC7826BB81C1190E`
 - 포함: 모든 Python source/test, TOML/YAML, Bash/PowerShell script, requirements, `.gitignore`, `.gitattributes`
 - 제외: `.venv*`, data/cache, run artifact, `egg-info`, README류 설명 문서
 - 범위: 이 버전의 전체 source/test/config/script. 생성기는 작업본 변경도 포함하므로 게시 전
@@ -725,9 +770,9 @@ representation으로 제공하는 inductive bias다.
 
 ### Root와 공통 계층
 
-- `README.md`: Linux NVIDIA GPU 환경의 설치부터 전체 재현까지의 실행 명령.
-- `DATASETS.md`: 사람이 읽는 데이터·split·metric 계약.
-- `docs/EXPERIMENT_STATUS.md`: 기존 5-seed 결과, 실제 seed 0 GPU 진단·2×2·C-learning,
+- `docs/GETTING_STARTED.md`: Linux NVIDIA GPU 환경의 설치부터 전체 재현까지의 실행 명령.
+- `docs/DATASETS.md`: 사람이 읽는 데이터·split·metric 계약.
+- `gpt_handoff/EXPERIMENT_STATUS.md`: 기존 5-seed 결과, 실제 seed 0 GPU 진단·2×2·C-learning,
   Conductance v2/v3 구현·GPU 미실행 상태와 미확정 원인.
 - `docs/CONDUCTANCE_FACTORIAL_FINDINGS.md`: 2×2의 정확한 점수·대비·층별 진단·근거와 다음 C-learning의 해석 경계.
 - `docs/CONDUCTANCE_C_LEARNING_FINDINGS.md`: learned/fixed 결과·활성/동결 파라미터·평균-C GPU 개입과 다음 직접 C 가설.
@@ -816,8 +861,8 @@ Cluster의 login node에 GPU가 없다면 해당 cluster의 scheduler로 GPU all
 
 ### 3.1 설치
 
-일반 사용자용 실행 순서는 [README.md](README.md), 환경별 조정은
-[docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)에 있다. 저장소 root에서 실행한다.
+일반 사용자용 실행 순서는 저장소의 `docs/GETTING_STARTED.md`, 환경별 조정은
+`docs/ENVIRONMENT.md`에 있다. 두 파일은 GPT 기본 전달 대상이 아니며 저장소 root에서 실행한다.
 
 ```bash
 conda env create -f environment.yml
@@ -1431,8 +1476,11 @@ roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사�
 
 ## 8. 자동 검증 상태
 
-검증 수치는 구현 시점별로 0절에 보존한다. 현재 상대 C v3 추가 후 전체 회귀는
-**1176 passed / 65 skipped** (44.45 s, exit 0), Ruff 통과다. V3 전용은
+검증 수치는 구현 시점별로 0절에 보존한다. 현재 V4 추가 후 전체 회귀는
+**1245 passed / 65 skipped** (65.58 s, exit 0), Ruff 통과다. V4 전용은
+68개이며 dense 기준 미분, W=I 동치, 네 조건 초기화·동결·optimizer, runner/report 무결성을
+검사한다. 실제 공개 데이터 또는 GPU 연구 학습은 실행하지 않았다. 직전 V3 추가 시점은
+**1176 passed / 65 skipped** (44.45 s, exit 0)였고, V3 전용은
 134 passed / 1 skipped이고 V2 전용은 118개다. V3 전용 생략 1개는 실제 CUDA RNG
 검사이며, 전체 65개는 기존 환경별 생략 64개와 이 검사 1개를 합친 수다.
 직전 직접 C v2 시점은
@@ -1534,7 +1582,9 @@ Conductance 직접 C v2·상대 C v3·Cycle PE 기저벡터 v2의 결과와 가�
 
 ## 10. 외부 ChatGPT에게 권장하는 교차검증 질문
 
-`code_summary.md`, 이 파일과 `docs/EXPERIMENT_STATUS.md`를 함께 주고 다음을 요청한다.
+`README_FIRST.md`, 이 파일, `EXPERIMENT_STATUS.md`, `CONDUCTANCE_V2.md`,
+`CONDUCTANCE_V3.md`, `CONDUCTANCE_V4.md`, `CYCLE_PE_V2.md`, `CODE_SUMMARY.md`의
+여덟 파일을 함께 주고 다음을 요청한다.
 먼저 기본 benchmark/기저벡터 v2/보조 `core/all` 범위를 구분한다.
 
 1. `B∈R^{m×n}` convention에서 `ker(B^T)`, `L=B^TB`, fundamental basis와 pseudoinverse 설명이
@@ -1564,6 +1614,11 @@ Conductance 직접 C v2·상대 C v3·Cycle PE 기저벡터 v2의 결과와 가�
 18. 2×2의 node-degree 개선과 learned C의 순수 효과를 혼동하지 않는가? Mean-C 추론 개입과
     fresh learned/fixed 학습 비교를 구분하고, 초기 backbone·학습 예산·parameter 수 차이를
     정확히 공개하는가? 1-seed 대비를 통계적 유의성이나 최종 test 성능으로 과장하지 않는가?
+19. V4가 `C(H_pre-W)`로 graph operator를 정한 뒤 `P_C(HW)`로 spatial message를 전달하는가?
+    `W=I`일 때 v3 전파와 정확히 같고, 2×2의 비활성 C/W가 동결·optimizer 제외됐는가?
+20. V4의 네 fresh-training cell, 조건부 주효과·interaction과 checkpoint C/W 개입을 서로
+    다른 근거로 해석하는가? Validation-only 단일 seed 결과를 test 성능이나 일반적 인과효과로
+    과장하지 않으며, 실제 GPU 결과가 아직 없다는 상태와 일치하는가?
 19. 직접 C v2의 exp(alpha), degree 미분, graph binding, 0 초기 fixed 대조와 C 공통 스케일
     비식별성이 일관되는가? Chunking을 neighbor sampling이나 전체 GPU 가속 실측으로
     과장하거나 기존 shared MLP를 수학 오류로 오해하지 않는가?

@@ -6,11 +6,11 @@
 
 이 소스 버전에는 v2 구현·단위 검사가 포함되어 있다. 이전 진단 전용 commit `ebf8cd1`에는
 없었다. 기존 `cycle_set` 5-seed 결과는 v1 결과이고 v2의 GPU 학습 결과는 아직 없다.
-게시·실험 범위는 [실험 상태](../../../docs/EXPERIMENT_STATUS.md)에 기록한다.
+게시·실험 범위는 [실험 상태](EXPERIMENT_STATUS.md)에 기록한다.
 
 ## 실행
 
-저장소 최상위 폴더에서 실행한다. [공통 설치 안내](../../../README.md)에 따라 GPU 의존성
+저장소 최상위 폴더에서 실행한다. [전체 인수인계](HANDOFF.md)의 환경 계약에 따라 GPU 의존성
 설치를 끝내고 해당 Conda 환경을 활성화해야 한다. Ubuntu 18.04/glibc 2.27에서는
 전용 `new-gat-legacy` 환경과 `setup_gpu.sh --profile legacy-cu118`을 사용한다.
 환경 생성·활성화만으로 연구 패키지 설치가 완료되는 것은 아니다.
@@ -91,7 +91,7 @@ B^\top U_c=0,\quad U_c^\top U_c=I_\beta.
 각 `(graph, column)`의 context는 서로 분리하며 모든 signed 계수를 보존한다.
 `--basis-pair-budget 32768`은 MLP 호출당 pair 수이며 기저 열 개수 제한이 아니다.
 `--basis-execution reference`로 같은 파라미터를 쓰는 기존 그래프별 경로를 선택할 수 있다.
-선택적 컴파일 및 실제 train 데이터의 속도 비교는 [PERFORMANCE.md](../../../docs/PERFORMANCE.md)를 따른다.
+선택적 컴파일 및 실제 train 데이터의 속도 비교 범위는 [실험 상태](EXPERIMENT_STATUS.md)를 따른다.
 
 ## 보장하지 않는 것
 
@@ -123,4 +123,4 @@ v2 데이터 준비/로딩 경로 자체가 캐시 checksum·공식 내용·기�
 
 검사는 작은 수학/배치 fixture를 사용하는 개발 단위 검사다. 실험 CLI에는 가짜 데이터나
 CPU 학습 fallback이 없다. 실제 공식 데이터의 전체 GPU 학습 성공 여부는 별도로 확인해야 한다.
-구버전 Torch의 체크포인트 보안 제약은 [환경 안내](../../../docs/ENVIRONMENT.md)를 따른다.
+구버전 Torch의 체크포인트 보안 제약은 [전체 인수인계](HANDOFF.md)의 환경 절을 따른다.

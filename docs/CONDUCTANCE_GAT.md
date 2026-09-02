@@ -1,27 +1,32 @@
 # Independent Research Track A: Sparse Incidence Conductance
 
-**상대 C 생성기를 학습하는 [v3](v3/README.md)**도 별도 실행한다. 공유 MLP의 score를
+**상대 C graph operator와 spatial message `W`를 함께 학습하는 [V4 통합 문서](../gpt_handoff/CONDUCTANCE_V4.md)**는
+v2/v3를 바꾸지 않는 별도 2×2 실행이다. V3의 `C(H)`와 대칭 정규화를 유지하면서 각 층의
+이웃 메시지에 identity-initialized bias-free `W`를 적용한다. 기본은 ogbn-arxiv ×
+고정/상대 C × identity/학습 W × seed 0이며 validation만 평가한다.
+
+**상대 C 생성기를 학습하는 [v3](../gpt_handoff/CONDUCTANCE_V3.md)**도 별도 실행한다. 공유 MLP의 score를
 그래프별 중심화·정규화하여 상대 C를 만들고, 등방성 혼합 비율과 전파 강도를 따로 학습한다.
 대칭 정규화와 AdamW 분리 그룹을 사용하며 기존 모델이나 v2를 덮어쓰지 않는다.
 기본은 v2와 같은 ogbn-arxiv × `relative_c`/`fixed_c` × seed 0이며 validation만 평가한다.
 
-**엣지별 C 자체를 직접 학습하는 [v2](v2/README.md)**는 별도 폴더와 실행 경로를 쓴다.
+**엣지별 C 자체를 직접 학습하는 [v2](../gpt_handoff/CONDUCTANCE_V2.md)**는 `research/conductance_gat/v2/`의 별도 실행 경로를 쓴다.
 기존 shared-MLP 모델을 변경하지 않으며, ogbn-arxiv에서 direct C / fixed C=1을
 model seed 0 하나로 새로 비교한다. MLP나 고유분해 없이 `c_e=exp(alpha_e)`를 학습하고,
 정확한 chunked backward로 엣지 중간값 메모리를 제한한다. 그래프별 파라미터를 사용하므로
 PPI의 미관측 그래프 전이와 합치지 않으며, 기본 benchmark나 전체 실행에 자동 추가하지 않는다.
 
-Gate weight decay와 정규화의 2×2 원인 비교는 [별도 실험 폴더](ablation/README.md)에 있다.
+Gate weight decay와 정규화의 2×2 원인 비교는 [별도 실험 문서](CONDUCTANCE_FACTORIAL.md)에 있다.
 PPI·ogbn-arxiv에서 seed 0 하나로 4조건을 새로 학습하며, 아래 기존 benchmark는 변경하지 않는다.
-완료된 [GPU 결과와 해석](../../docs/CONDUCTANCE_FACTORIAL_FINDINGS.md)을 바탕으로,
-[C-learning 실험](c_learning/README.md)은 node-degree 아래 learned C/fixed C=1을
-4개의 fresh training으로 비교하며 [완료 결과](../../docs/CONDUCTANCE_C_LEARNING_FINDINGS.md)를 수령했다.
+완료된 [GPU 결과와 해석](CONDUCTANCE_FACTORIAL_FINDINGS.md)을 바탕으로,
+[C-learning 실험](CONDUCTANCE_C_LEARNING.md)은 node-degree 아래 learned C/fixed C=1을
+4개의 fresh training으로 비교하며 [완료 결과](CONDUCTANCE_C_LEARNING_FINDINGS.md)를 수령했다.
 그 새 run의 learned checkpoint 평균-C 검사도 완료 보고서를 수령했다. PPI는 현재
 checkpoint의 C 의존성이 컸고 arxiv는 작았지만, 이것이 fresh training의 성능 이득은 아니다.
 이전 2×2 node-degree checkpoint도 별도 source로 지원한다.
 이 두 경로에도 Cycle PE/Tree나 외부 비교 모델을 섞지 않는다.
 
-The existing shared-generator v1 in this directory implements
+The existing shared-generator v1 under `research/conductance_gat/` implements
 
 \[
 H \xrightarrow{B} BH
@@ -40,7 +45,7 @@ benchmark training requires CUDA and never silently falls back to CPU.
 ## Reproduce this track
 
 Complete the environment installation and dataset preparation in the
-[root README](../../README.md). With the project's Conda environment active,
+[getting-started guide](GETTING_STARTED.md). With the project's Conda environment active,
 run this script from the repository root:
 
 ```bash
@@ -53,7 +58,7 @@ It uses CUDA and model seed `0` by default, with data/split/chart seeds fixed to
 Pass `--model-seeds 0,1,2,3,4` to the reproduction script when an explicit
 five-seed sweep is required.
 It executes only this track, through its own `benchmark.py` entry point. Dataset and
-result locations, run identifiers, and shared overrides follow the root README.
+result locations, run identifiers, and shared overrides follow the getting-started guide.
 Missing or damaged public data is an error; training does not download a substitute.
 
 ## Our model on original-paper datasets
@@ -100,7 +105,7 @@ operations can remain nondeterministic, so seeded runs are not a bitwise guarant
 
 ## Diagnose a completed benchmark
 
-Use [the checkpoint diagnostic guide](../../docs/CONDUCTANCE_DIAGNOSTICS.md) to inspect
+Use [the checkpoint diagnostic guide](CONDUCTANCE_DIAGNOSTICS.md) to inspect
 training history, train/validation performance, learned conductance, and each node's
 neighbor mixing weight without retraining. `scripts/diagnose_conductance.sh` uses
 the active Conda environment and GPU inference on existing official caches only.
@@ -112,10 +117,10 @@ it is not a separately trained baseline or proof of causation.
 
 The supplied five-seed benchmark aggregates, seed-0 GPU diagnostics, and completed
 single-seed factorial and C-learning results are recorded in
-[experiment status](../../docs/EXPERIMENT_STATUS.md). The new C-learning learned-checkpoint
+[experiment status](../gpt_handoff/EXPERIMENT_STATUS.md). The new C-learning learned-checkpoint
 mean-C audit output has also been supplied and is preserved separately from retraining scores.
-The direct-parameter v2 and relative-generator v3 are implemented separately;
-their GPU training results remain pending.
+The direct-parameter v2, relative-generator v3, and hybrid C × spatial-W v4 are implemented
+separately; their GPU training results remain pending.
 
 ## Supplementary suites (not the default matched benchmark)
 
@@ -205,7 +210,7 @@ every factorial cell.
 
 These public benchmarks belong only to the explicit legacy `all` suite. Preparation is
 network-opt-in: no official dataset class is instantiated for a download unless
-`--allow-download` is supplied during the root README's data-preparation step.
+`--allow-download` is supplied during the getting-started guide's data-preparation step.
 
 - [LRGB PascalVOC-SP](https://github.com/vijaydwivedi75/lrgb): official
   train/validation/test split and node macro-F1.

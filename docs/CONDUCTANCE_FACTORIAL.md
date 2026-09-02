@@ -5,13 +5,13 @@
 외부 비교 모델을 추가하는 실험도 아니다.
 
 `43afd63`으로 실행한 `gat-factorial-seed0-v1`의 8개 GPU 학습과 비교표는 모두 완료됐다.
-정확한 결과와 제한은 [실험 정리](../../../docs/CONDUCTANCE_FACTORIAL_FINDINGS.md)에 있다.
+정확한 결과와 제한은 [실험 정리](CONDUCTANCE_FACTORIAL_FINDINGS.md)에 있다.
 다음 단계인 node-degree 아래의 learned/fixed C 비교와 읽기 전용 평균-C 검사는
-[별도 C-learning 폴더](../c_learning/README.md)를 사용한다. 이미 완료한 run을 덮어쓰지 않는다.
+[별도 C-learning 문서](CONDUCTANCE_C_LEARNING.md)를 사용한다. 이미 완료한 run을 덮어쓰지 않는다.
 
 ## 실행
 
-저장소 README에 따라 GPU Conda 환경과 공식 데이터 캐시를 준비한 뒤 저장소 루트에서 실행한다.
+[시작 안내](GETTING_STARTED.md)에 따라 GPU Conda 환경과 공식 데이터 캐시를 준비한 뒤 저장소 루트에서 실행한다.
 기존 `bash scripts/prepare_data.sh`로 받은 데이터를 그대로 사용한다. 새 다운로드나 더미 데이터는 없다.
 
 ```bash

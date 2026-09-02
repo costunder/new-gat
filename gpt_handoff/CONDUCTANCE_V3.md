@@ -8,7 +8,7 @@ Cycle PE 및 Tree Augmentation은 결합하지 않는다.
 
 ## 실행
 
-루트 [README](../../../README.md)의 Linux NVIDIA GPU·Conda 환경과 공식 데이터 캐시를
+[전체 인수인계](HANDOFF.md)의 Linux NVIDIA GPU·Conda 환경과 공식 데이터 캐시 계약을
 사용한다. 이미 데이터 준비를 끝냈다면 패키지 설치나 다운로드를 반복할 필요 없다.
 저장소 루트에서 실행한다.
 
@@ -205,4 +205,4 @@ Suite ID는 `conductance_relative_c_v3`이며 `results/conductance_gat/v3/<run-i
 
 두 조건의 초기 state, 데이터 계약, 소스와 설정을 검사한다. 누락·혼합·변조된 산출물을
 성공 비교로 표시하지 않는다. 아직 실제 v2/v3 GPU 결과는 수령하지 않았으며 로컬 검증 범위는
-[실험 상태](../../../docs/EXPERIMENT_STATUS.md)에 별도로 기록한다.
+[실험 상태](EXPERIMENT_STATUS.md)에 별도로 기록한다.

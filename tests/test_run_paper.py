@@ -328,10 +328,10 @@ def test_paper_runner_rejects_unsafe_run_id() -> None:
 
 
 def test_readme_commands_use_full_independent_protocols() -> None:
-    from scripts import run_conductance_v2, run_conductance_v3
+    from scripts import run_conductance_v2, run_conductance_v3, run_conductance_v4
     from scripts.run_paper import _parser
 
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = (ROOT / "docs/GETTING_STARTED.md").read_text(encoding="utf-8")
     blocks = re.findall(r"```bash\n(.*?)```", readme, flags=re.DOTALL)
     bash_commands = [
         line for block in blocks for line in block.splitlines() if line.startswith("bash ")
@@ -376,6 +376,22 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert v3_args.datasets == ["ogbn-arxiv"] and v3_args.model_seed == 0
     assert len(run_conductance_v3.make_jobs(v3_args, ROOT / "results/unit-contract")) == 2
     commands = [line for line in commands if line not in v3_commands]
+    v4_commands = [
+        line
+        for line in commands
+        if shlex.split(line)[1] == "research/conductance_gat/v4/reproduce.sh"
+    ]
+    assert len(v4_commands) == 1
+    v4_command = shlex.split(v4_commands[0])
+    v4_source = (ROOT / v4_command[1]).read_text(encoding="utf-8")
+    assert "set -euo pipefail" in v4_source
+    assert 'source "${project_root}/scripts/conda_env.sh"' in v4_source
+    assert 'exec "${environment_python}" -B scripts/run_conductance_v4.py "$@"' in v4_source
+    v4_args = run_conductance_v4.parser().parse_args(v4_command[2:])
+    run_conductance_v4._validate(v4_args)
+    assert v4_args.datasets == ["ogbn-arxiv"] and v4_args.model_seed == 0
+    assert len(run_conductance_v4.make_jobs(v4_args, ROOT / "results/unit-contract")) == 4
+    commands = [line for line in commands if line not in v4_commands]
     assert len(commands) == 5  # original full protocols remain unchanged
     parsed = []
     for line in commands:
@@ -516,3 +532,106 @@ def test_legacy_demo_entrypoints_are_removed() -> None:
         "research/tree_augmentation/run.py",
     ]
     assert all(not (ROOT / path).exists() for path in paths)
+
+
+def test_project_docs_and_gpt_handoff_are_separated() -> None:
+    ignored = {
+        ".git",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        ".venv-gpu",
+        "data",
+        "results",
+    }
+    markdown = [
+        path
+        for path in ROOT.rglob("*.md")
+        if not any(part in ignored or part.startswith(".venv") for part in path.parts)
+    ]
+    outside_document_folders = {
+        path.relative_to(ROOT).as_posix()
+        for path in markdown
+        if path.parent not in {ROOT / "docs", ROOT / "gpt_handoff"}
+    }
+    assert outside_document_folders == {"README.md"}
+
+    handoff_files = {path.name for path in (ROOT / "gpt_handoff").glob("*.md")}
+    assert handoff_files == {
+        "README_FIRST.md",
+        "HANDOFF.md",
+        "EXPERIMENT_STATUS.md",
+        "CONDUCTANCE_V2.md",
+        "CONDUCTANCE_V3.md",
+        "CONDUCTANCE_V4.md",
+        "CYCLE_PE_V2.md",
+        "CODE_SUMMARY.md",
+    }
+
+    root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert len(root_readme) < 1000
+    assert "docs/README.md" in root_readme
+    assert "docs/GETTING_STARTED.md" in root_readme
+    assert "gpt_handoff/README_FIRST.md" in root_readme
+
+    index = (ROOT / "docs/README.md").read_text(encoding="utf-8")
+    for document in (ROOT / "docs").glob("*.md"):
+        if document.name != "README.md":
+            assert f"({document.name})" in index, document.name
+
+    package_readme = (ROOT / "gpt_handoff/README_FIRST.md").read_text(encoding="utf-8")
+    for document in handoff_files:
+        assert document in package_readme
+    assert "V4만이 아니라 NEW GAT 전체 프로젝트" in package_readme
+
+    hub = (ROOT / "gpt_handoff/CONDUCTANCE_V4.md").read_text(encoding="utf-8")
+    for required in (
+        "V3 자체를 spectral GNN이라고 분류하는 실험이 아니다",
+        "C(H_pre-W)",
+        "P_C(HW)",
+        "fixed_c_identity_w",
+        "relative_c_spatial_w",
+        "research/conductance_gat/v4/reproduce.sh",
+        "results/conductance_gat/v4/<run-id>/",
+        "현재 상태",
+    ):
+        assert required in hub
+
+
+def test_all_local_document_links_resolve() -> None:
+    links = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+    documents = [
+        ROOT / "README.md",
+        *(ROOT / "docs").glob("*.md"),
+        *(ROOT / "gpt_handoff").glob("*.md"),
+    ]
+    for document in documents:
+        if document.name == "CODE_SUMMARY.md":
+            continue
+        contents = document.read_text(encoding="utf-8")
+        for destination in links.findall(contents):
+            destination = destination.strip()
+            if destination.startswith(("#", "http://", "https://", "mailto:")):
+                continue
+            assert not any(char.isspace() for char in destination), (
+                document,
+                destination,
+            )
+            local = destination.partition("#")[0]
+            assert (document.parent / local).resolve().exists(), (document, destination)
+
+
+def test_gpt_handoff_markdown_links_are_self_contained() -> None:
+    links = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+    package = (ROOT / "gpt_handoff").resolve()
+    for document in (ROOT / "gpt_handoff").glob("*.md"):
+        if document.name == "CODE_SUMMARY.md":
+            continue
+        contents = document.read_text(encoding="utf-8")
+        for destination in links.findall(contents):
+            destination = destination.strip()
+            if destination.startswith(("#", "http://", "https://", "mailto:")):
+                continue
+            local = destination.partition("#")[0]
+            resolved = (document.parent / local).resolve()
+            assert resolved.parent == package, (document, destination)

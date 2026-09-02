@@ -3,7 +3,7 @@
 ## 기본 실행: 각 연구의 경쟁 논문과 같은 데이터셋
 
 기본 세 트랙의 `prepare_data.sh`, `reproduce.sh`, 트랙별 `reproduce.sh`는
-`benchmark` suite를 사용한다. 별도 Conductance v2/v3 runner에는 `--suite` 옵션이 없다.
+`benchmark` suite를 사용한다. 별도 Conductance v2/v3/v4 runner에는 `--suite` 옵션이 없다.
 기본 실행에서는 아래 공개 데이터만 사용하며 S1–S4/CycleCount를 생성하지 않는다.
 현재 기본 model seed는 사용자 요청대로 `0` 하나이며 공식 데이터·분할·전체 학습 크기는 유지한다.
 명시적 seed 목록은 선택 사항이다. 단일 seed의 std/CI는 추정하지 않으며 기존 5-seed 결과는 보존한다.
@@ -25,22 +25,23 @@
 GraphSAINT 설정과 다르므로 동일 학습 조건의 재실험으로 표현하지 않는다.
 트랙 간 모델을 결합하거나 GAT 트랙에 새 cycle PE를 주입하지 않는다.
 
-기저벡터 입력 [Cycle PE v2](research/cycle_pe/v2/README.md)는 ZINC-12K와 Peptides-struct의
+기저벡터 입력 [Cycle PE v2](../gpt_handoff/CYCLE_PE_V2.md)는 ZINC-12K와 Peptides-struct의
 같은 공식 원본·split을 사용하되 전체 좌영공간 기저를 별도 cache에 저장한다. 기본 실행은
 여전히 통계형 `cycle_set` v1이다. v2는 이 소스 버전에 포함되지만, 제공된 5-seed 결과를 v2 결과로
-해석하면 안 된다. 실행 결과와 진단의 범위는 [실험 상태](docs/EXPERIMENT_STATUS.md)를 따른다.
+해석하면 안 된다. 실행 결과와 진단의 범위는 [실험 상태](../gpt_handoff/EXPERIMENT_STATUS.md)를 따른다.
 
-Conductance의 별도 [v2](research/conductance_gat/v2/README.md)와
-[v3](research/conductance_gat/v3/README.md)는 기존 matched benchmark cache의 Cora,
-CiteSeer, PubMed, ogbn-arxiv와 공식 split을 그대로 읽는다. 기본은 두 버전 모두
+Conductance의 별도 [v2](../gpt_handoff/CONDUCTANCE_V2.md),
+[v3](../gpt_handoff/CONDUCTANCE_V3.md), [V4 통합 문서](../gpt_handoff/CONDUCTANCE_V4.md)는 기존 matched benchmark cache의 Cora,
+CiteSeer, PubMed, ogbn-arxiv와 공식 split을 그대로 읽는다. 기본은 세 버전 모두
 ogbn-arxiv와 model seed 0을 쓰며, v2는 `direct_c`/`fixed_c`, v3는
-`relative_c`/`fixed_c`의 각 두 번을 새로 학습한다.
+`relative_c`/`fixed_c`의 각 두 번, v4는 C × spatial W의 2×2 네 번을 새로 학습한다.
 V2의 C는 고정 topology의 엣지별 파라미터이고 v3는 공유 상대-C 생성기다. 둘 다 현재 별도
 runner에서는 transductive 네 데이터만 받으며 PPI를 받지 않는다. 이 제한은 v3 생성기가
 원리상 새 그래프에 적용 불가능하다는 뜻이 아니라, 이번 inductive 전이 protocol이 없다는 뜻이다.
 두 실행은 validation으로 checkpoint를 선택하고 **test를 평가하지 않으며**, 위 기본 v1
-benchmark의 test 점수나 기존 C-learning 결과를 재사용하지 않는다. V2/v3의 실제 GPU 결과는
-아직 수령하지 않았다.
+benchmark의 test 점수나 기존 C-learning 결과를 재사용하지 않는다. V4는 같은 기본 데이터와
+seed에서 고정/상대 C × identity/학습 spatial W의 네 조건을 새로 학습하며 test를 평가하지 않는다.
+V2/v3/v4의 실제 GPU 결과는 아직 수령하지 않았다.
 
 논문 원문: [GAT](https://arxiv.org/pdf/1710.10903),
 [GATv2](https://arxiv.org/pdf/2105.14491),

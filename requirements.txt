@@ -1,4 +1,4 @@
-# Reference research packages; see README.md for Conda and CUDA installation.
+# Reference research packages; see docs/GETTING_STARTED.md for Conda and CUDA installation.
 # setup_gpu.sh applies the matching CUDA constraints before this stack is used.
 -r requirements-lock.txt
 -e .

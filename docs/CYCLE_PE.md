@@ -1,9 +1,9 @@
 # Static Cycle PE 연구 트랙
 
-좌영공간 기저벡터 자체를 입력하는 새 버전은 [Cycle PE v2](v2/README.md)에 있다.
+좌영공간 기저벡터 자체를 입력하는 새 버전은 [Cycle PE v2](../gpt_handoff/CYCLE_PE_V2.md)에 있다.
 아래 기본 실행은 기존 6개 통계형 v1이며, v2와 캐시·모델·결과를 공유하지 않는다.
 
-이 폴더는 그래프 topology에서 계산하는 **우리 Cycle PE 모델만** 학습·평가한다.
+`research/cycle_pe/`의 코드는 그래프 topology에서 계산하는 **우리 Cycle PE 모델만** 학습·평가한다.
 기본 실행 경로는 `research.cycle_pe.benchmark`다. SignNet·PEARL이 사용한 ZINC-12K와
 PEARL이 사용한 Peptides-struct의 공식 데이터·split을 쓰되, **해당 논문 모델을
 재구현하거나 같이 실행하지 않는다.** 다른 논문의 성능은 출처를 명시한 외부 비교표에서 다룬다.
@@ -11,7 +11,7 @@ PEARL이 사용한 Peptides-struct의 공식 데이터·split을 쓰되, **해�
 
 ## 이 트랙 재현
 
-[루트 README](../../README.md)의 환경 설치와 데이터 준비를 완료한 뒤,
+[시작 안내](GETTING_STARTED.md)의 환경 설치와 데이터 준비를 완료한 뒤,
 프로젝트 Conda 환경이 활성화된 저장소 최상위 폴더에서 실행한다.
 
 ```bash
@@ -22,7 +22,7 @@ ZINC-12K와 Peptides-struct에서 우리 `cycle_set` 모델을 CUDA model seed `
 여러 seed 반복은 `--model-seeds 0,1,2,3,4`처럼 명시한다. 학습/검증/시험은 공식 split
 그대로이며 seed로 다시 나누지 않는다.
 학습에 필요한 공개 데이터가 없거나 손상되면 자동 다운로드나 대체 없이 오류로 종료한다.
-데이터·결과 경로, run ID와 공통 옵션은 루트 README를 따른다.
+데이터·결과 경로, run ID와 공통 옵션은 시작 안내를 따른다.
 
 ## 기본 데이터와 우리 모델
 

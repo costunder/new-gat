@@ -170,7 +170,7 @@ build-backend = "setuptools.build_meta"
 name = "chartgat"
 version = "0.1.0"
 description = "Independent incidence-conductance, cycle-PE, and tree-augmentation experiments"
-readme = "README.md"
+readme = "docs/GETTING_STARTED.md"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26",
@@ -309,7 +309,7 @@ tqdm==4.70.0
 # requirements.txt
 
 ````text
-# Reference research packages; see README.md for Conda and CUDA installation.
+# Reference research packages; see docs/GETTING_STARTED.md for Conda and CUDA installation.
 # setup_gpu.sh applies the matching CUDA constraints before this stack is used.
 -r requirements-lock.txt
 -e .
@@ -18351,6 +18351,2750 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ````
 
+# research/conductance_gat/v4/__init__.py
+
+````python
+"""Conductance-by-spatial v4, kept import-light for dependency-free protocol use."""
+````
+
+# research/conductance_gat/v4/diagnostics.py
+
+````python
+"""Read-only observations for the V4 conductance/spatial factorial.
+
+Training observations attach to the actual full-graph forward.  Interventions
+run only after validation checkpoint selection and never update parameters or
+inspect test labels.  Replacing estimator output means that the operator's
+normal symmetric-normalization path recomputes the C-dependent degrees.
+"""
+
+from __future__ import annotations
+
+import math
+from contextlib import contextmanager
+from typing import Any
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from ..ablation.model import state_sha256
+
+
+@contextmanager
+def evaluation_mode(model: nn.Module):
+    modes = [(module, module.training) for module in model.modules()]
+    try:
+        model.eval()
+        with torch.no_grad():
+            yield
+    finally:
+        for module, mode in modes:
+            module.training = mode
+
+
+def norm(parameters, *, gradient: bool = False) -> float | None:
+    total, present = 0.0, False
+    for parameter in parameters:
+        value = parameter.grad if gradient else parameter.detach()
+        if value is None:
+            continue
+        value = value.detach().double()
+        if not bool(torch.isfinite(value).all()):
+            raise FloatingPointError("Nonfinite parameter/task gradient observation")
+        total += float(value.square().sum())
+        present = True
+    return math.sqrt(total) if present else None
+
+
+def _rng_snapshot():
+    return {
+        "cpu": torch.random.get_rng_state().clone(),
+        "cuda": (
+            [state.clone() for state in torch.cuda.get_rng_state_all()]
+            if torch.cuda.is_available()
+            else []
+        ),
+    }
+
+
+def _same_rng_state(before) -> bool:
+    if not torch.equal(before["cpu"], torch.random.get_rng_state()):
+        return False
+    current_cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+    return len(before["cuda"]) == len(current_cuda) and all(
+        torch.equal(old, current) for old, current in zip(before["cuda"], current_cuda, strict=True)
+    )
+
+
+def gate_parameters(operator):
+    return [
+        value
+        for name, value in operator.estimator.named_parameters()
+        if name not in {"raw_gamma", "raw_tau"}
+    ]
+
+
+def spatial_parameters(operator):
+    return list(operator.message_transform.parameters())
+
+
+@torch.no_grad()
+def moments(value: Tensor, *, quantiles: bool = False) -> dict[str, Any]:
+    flat = value.detach().flatten().double()
+    if not bool(torch.isfinite(flat).all()):
+        raise FloatingPointError("Nonfinite V4 observation")
+    result = {
+        "count": flat.numel(),
+        "mean": None,
+        "std": None,
+        "cv": None,
+        "min": None,
+        "max": None,
+    }
+    if not flat.numel():
+        return result
+    mean, std = float(flat.mean()), float(flat.std(correction=0))
+    result.update(
+        mean=mean,
+        std=std,
+        cv=std / abs(mean) if mean else None,
+        min=float(flat.min()),
+        max=float(flat.max()),
+    )
+    if quantiles:
+        if flat.numel() > 2**24:
+            raise ValueError("Exact diagnostic quantile exceeds supported tensor size")
+        values = torch.quantile(flat, flat.new_tensor([0.1, 0.5, 0.9, 0.99])).tolist()
+        result["quantiles"] = dict(zip(("p10", "p50", "p90", "p99"), values, strict=True))
+        result["quantile_policy"] = "exact_population"
+    return result
+
+
+@torch.no_grad()
+def spatial_weight_statistics(operator) -> dict[str, Any]:
+    weight = operator.message_transform.weight.detach().double()
+    if weight.ndim != 2 or weight.shape[0] != weight.shape[1]:
+        raise ValueError("V4 message transform must be a square matrix")
+    if not bool(torch.isfinite(weight).all()):
+        raise FloatingPointError("Nonfinite V4 spatial message transform")
+    identity = torch.eye(weight.shape[0], dtype=weight.dtype, device=weight.device)
+    distance = float((weight - identity).norm())
+    singular = torch.linalg.svdvals(weight)
+    minimum, maximum = float(singular.min()), float(singular.max())
+    return {
+        "spatial_mode": operator.spatial_mode,
+        "trainable": any(p.requires_grad for p in operator.message_transform.parameters()),
+        "parameter_norm": norm(spatial_parameters(operator)),
+        "identity_distance_frobenius": distance,
+        "identity_relative_distance": distance / math.sqrt(weight.shape[0]),
+        "singular_values": {
+            "count": singular.numel(),
+            "min": minimum,
+            "max": maximum,
+            "mean": float(singular.mean()),
+            "std": float(singular.std(correction=0)),
+            "condition_number": maximum / minimum if minimum else None,
+        },
+    }
+
+
+class ForwardObservation:
+    """Observe actual V4 C, message transform, and propagation without extra RNG use."""
+
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self.handles = []
+        self.records: dict[int, dict[str, Any]] = {}
+        self.conductances: dict[int, Tensor] = {}
+        self.messages: dict[int, Tensor] = {}
+
+    def __enter__(self):
+        try:
+            for index, operator in enumerate(self.model.operators):
+                self.handles.append(
+                    operator.estimator.register_forward_hook(
+                        lambda module, inputs, output, i=index: self._conductance(i, module, output)
+                    )
+                )
+                self.handles.append(
+                    operator.message_transform.register_forward_hook(
+                        lambda module, inputs, output, i=index: self._message(i, inputs, output)
+                    )
+                )
+                self.handles.append(
+                    operator.register_forward_hook(
+                        lambda module, inputs, output, i=index: self._operator(
+                            i, module, inputs, output
+                        )
+                    )
+                )
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *args):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+        self.conductances.clear()
+        self.messages.clear()
+
+    @torch.no_grad()
+    def _conductance(self, index: int, estimator, c: Tensor):
+        value = c.detach()
+        if not bool(torch.isfinite(value).all()) or bool((value <= 0).any()):
+            raise FloatingPointError("Observed C must be finite and positive")
+        scores = estimator.last_scores
+        if scores is None or scores.shape != value.shape:
+            raise RuntimeError("V4 estimator did not expose aligned actual-forward scores")
+        self.records[index] = {
+            "layer": index,
+            "score": moments(scores),
+            "conductance": moments(value),
+            "log_conductance": moments(value.log()),
+            "gamma": float(estimator.gamma.detach()),
+            "tau": float(estimator.tau.detach()),
+            "estimator_trainable": any(p.requires_grad for p in estimator.parameters()),
+        }
+        self.conductances[index] = value
+
+    @torch.no_grad()
+    def _message(self, index: int, inputs, output: Tensor):
+        state = inputs[0]
+        if output.shape != state.shape:
+            raise RuntimeError("V4 spatial transform changed the node-state shape")
+        if not bool(torch.isfinite(output.detach()).all()):
+            raise FloatingPointError("Nonfinite V4 spatial message")
+        self.messages[index] = output.detach()
+
+    @torch.no_grad()
+    def _operator(self, index: int, operator, inputs, output: Tensor):
+        state, incidence = inputs[:2]
+        if index not in self.records or index not in self.conductances:
+            raise RuntimeError("V4 operator ran without an aligned conductance observation")
+        if index not in self.messages:
+            raise RuntimeError("V4 operator ran without an aligned spatial-message observation")
+        c = self.conductances.pop(index)
+        message = self.messages.pop(index)
+        tail, head = incidence
+        degree = c.new_zeros(state.shape[0])
+        degree.index_add_(0, tail, c)
+        degree.index_add_(0, head, c)
+        positive = degree > 0
+        degree_stats = moments(degree, quantiles=True)
+        positive_stats = moments(degree[positive], quantiles=True)
+        median = degree_stats.get("quantiles", {}).get("p50")
+        degree_stats.update(
+            positive_count=int(positive.sum()),
+            positive_quantiles=positive_stats.get("quantiles", {}),
+            max_over_median=degree_stats["max"] / median if median else None,
+        )
+        inv = torch.where(positive, degree, torch.ones_like(degree)).rsqrt() * positive
+        neighbor_sum = torch.zeros_like(degree)
+        edge_weight = c * inv[tail] * inv[head]
+        neighbor_sum.index_add_(0, tail, edge_weight)
+        neighbor_sum.index_add_(0, head, edge_weight)
+        alpha = float(operator.alpha.detach())
+        before_norm = float(state.detach().double().norm())
+        message_norm = float(message.double().norm())
+        change = float((output.detach().double() - state.detach().double()).norm())
+        message_change = float((message.double() - state.detach().double()).norm())
+        self.records[index].update(
+            alpha=alpha,
+            weighted_degree=degree_stats,
+            neighbor_weight_row_sum=moments(alpha * neighbor_sum, quantiles=True),
+            state_norm=before_norm,
+            message_norm=message_norm,
+            relative_message_transform_change=(
+                message_change / before_norm if before_norm else None
+            ),
+            relative_conv_change=change / before_norm if before_norm else None,
+            gate_parameter_norm=norm(gate_parameters(operator)),
+            gate_gradient_norm=None,
+            spatial_weight=spatial_weight_statistics(operator),
+            spatial_gradient_norm=None,
+        )
+
+    def summary(self, *, gradients: bool = False):
+        if set(self.records) != set(range(len(self.model.operators))):
+            raise RuntimeError("Missing actual-forward V4 layer observation")
+        output = []
+        for index in range(len(self.model.operators)):
+            record = dict(self.records[index])
+            if gradients:
+                operator = self.model.operators[index]
+                record["gate_gradient_norm"] = norm(gate_parameters(operator), gradient=True)
+                record["spatial_gradient_norm"] = norm(spatial_parameters(operator), gradient=True)
+            output.append(record)
+        return output
+
+
+def evaluate_validation(model, graph, indices: Tensor, *, observe: bool = True):
+    if not indices.numel():
+        raise ValueError("Validation mask is empty")
+    with evaluation_mode(model):
+        if observe:
+            with ForwardObservation(model) as observation:
+                full_logits = model(graph)
+            layers = observation.summary()
+        else:
+            full_logits, layers = model(graph), []
+        logits = full_logits.index_select(0, indices)
+        labels = graph.y.index_select(0, indices)
+        if not bool(torch.isfinite(logits).all()):
+            raise FloatingPointError("Nonfinite validation logits")
+        result = {
+            "metric": int((logits.argmax(-1) == labels).sum()) / indices.numel(),
+            "loss": float(F.cross_entropy(logits, labels)),
+            "layers": layers,
+            "mode": "eval",
+            "split": "validation",
+            "observation_scope": "whole transductive graph states; validation labels only",
+        }
+    return result, logits.detach().cpu()
+
+
+class Intervention:
+    """Temporary output hooks for selected-checkpoint read-only interventions."""
+
+    NAMES = {
+        "mean_c",
+        "shuffled_c",
+        "ones_c",
+        "identity_w",
+        "ones_c_identity_w",
+        "propagation_off",
+    }
+
+    def __init__(self, model, name: str, seed: int):
+        if name not in self.NAMES:
+            raise ValueError("Unsupported V4 intervention")
+        self.model, self.name, self.seed, self.handles = model, name, seed, []
+
+    def __enter__(self):
+        try:
+            for index, operator in enumerate(self.model.operators):
+                if self.name == "propagation_off":
+                    self.handles.append(
+                        operator.register_forward_hook(lambda module, inputs, output: inputs[0])
+                    )
+                    continue
+                if self.name in {"mean_c", "shuffled_c", "ones_c", "ones_c_identity_w"}:
+                    self.handles.append(
+                        operator.estimator.register_forward_hook(
+                            lambda module, inputs, output, i=index: self.replace_c(
+                                inputs, output, i
+                            )
+                        )
+                    )
+                if self.name in {"identity_w", "ones_c_identity_w"}:
+                    self.handles.append(
+                        operator.message_transform.register_forward_hook(
+                            lambda module, inputs, output: inputs[0]
+                        )
+                    )
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    def __exit__(self, *args):
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
+    def replace_c(self, inputs, c: Tensor, layer: int):
+        if self.name in {"ones_c", "ones_c_identity_w"}:
+            return torch.ones_like(c)
+        _, incidence, node_graph, num_graphs = inputs
+        edge_graph = node_graph[incidence[0]]
+        result = c.clone()
+        generator = torch.Generator(device=c.device).manual_seed(self.seed + 104729 * layer)
+        for graph_index in range(num_graphs):
+            ids = (edge_graph == graph_index).nonzero(as_tuple=False).flatten()
+            if not ids.numel():
+                continue
+            values = c.index_select(0, ids)
+            if self.name == "mean_c":
+                result[ids] = values.mean()
+            else:
+                permutation = torch.randperm(ids.numel(), device=c.device, generator=generator)
+                result[ids] = values[permutation]
+        return result
+
+
+def _intervention_row(name, result, logits, original, reference):
+    difference = logits.double() - reference.double()
+    return {
+        "intervention": name,
+        "intervention_kind": "read_only_selected_checkpoint",
+        "fresh_training": False,
+        "validation": result["metric"],
+        "loss": result["loss"],
+        "percentage_points": 100 * (result["metric"] - original["metric"]),
+        "score_delta": result["metric"] - original["metric"],
+        "logit_mean_absolute_delta": float(difference.abs().mean()),
+        "logit_max_absolute_delta": float(difference.abs().max()),
+        "changed_prediction_fraction": float(
+            (logits.argmax(-1) != reference.argmax(-1)).double().mean()
+        ),
+    }
+
+
+def best_checkpoint_interventions(model, graph, indices, original, reference: Tensor, *, seed: int):
+    """All-layer read-only interventions, only on the selected best checkpoint."""
+    before = state_sha256(model)
+    modes = [module.training for module in model.modules()]
+    gradients = {
+        name: None if parameter.grad is None else parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+    }
+    rng = _rng_snapshot()
+    names = (
+        "mean_c",
+        "shuffled_c",
+        "ones_c",
+        "identity_w",
+        "ones_c_identity_w",
+        "propagation_off",
+    )
+    rows, intervention_logits = [], {}
+    try:
+        for name in names:
+            with Intervention(model, name, seed):
+                result, logits = evaluate_validation(model, graph, indices, observe=False)
+            intervention_logits[name] = logits
+            rows.append(_intervention_row(name, result, logits, original, reference))
+    finally:
+        if state_sha256(model) != before or modes != [
+            module.training for module in model.modules()
+        ]:
+            raise RuntimeError("Interventions changed model state or training modes")
+        if not _same_rng_state(rng):
+            raise RuntimeError("Interventions changed a global CPU/CUDA RNG state")
+        for name, parameter in model.named_parameters():
+            old = gradients[name]
+            if (old is None) != (parameter.grad is None) or (
+                old is not None and not torch.equal(old, parameter.grad)
+            ):
+                raise RuntimeError("Interventions changed a parameter gradient")
+    mean_logits = intervention_logits["mean_c"].double()
+    ones_logits = intervention_logits["ones_c"].double()
+    numeric_difference = mean_logits - ones_logits
+    numeric_check = {
+        "comparison": "mean_c_vs_ones_c",
+        "allclose_rtol": 1e-5,
+        "allclose_atol": 1e-6,
+        "passed": bool(torch.allclose(mean_logits, ones_logits, rtol=1e-5, atol=1e-6)),
+        "logit_mean_absolute_delta": float(numeric_difference.abs().mean()),
+        "logit_max_absolute_delta": float(numeric_difference.abs().max()),
+        "changed_prediction_fraction": float(
+            (mean_logits.argmax(-1) != ones_logits.argmax(-1)).double().mean()
+        ),
+    }
+    return {
+        "status": "passed",
+        "scope": "validation_selected_best_checkpoint_only",
+        "layers": "all_layers_simultaneously",
+        "original": {"validation": original["metric"], "loss": original["loss"]},
+        "rows": rows,
+        "shuffle_seed": seed,
+        "normalization_recomputed_for_c_interventions": True,
+        "mean_c_numeric_check": numeric_check,
+        "mean_ones_note": (
+            "Graph-constant positive C cancels under symmetric normalization; mean-C and "
+            "C=1 should agree up to floating-point rounding. This is a numerical check, "
+            "not an independent causal intervention."
+        ),
+        "interpretation": (
+            "Checkpoint reliance, not a retrained-model benefit; no optimizer step or test "
+            "evaluation. Fresh factorial arms, not these rows, estimate learned-component "
+            "contrasts."
+        ),
+    }
+````
+
+# research/conductance_gat/v4/model.py
+
+````python
+"""Relative graph-operator learning plus a standard spatial feature transform.
+
+Each layer first estimates relative physical-edge conductance ``C(H)`` from the
+pre-transform state. It then applies a bias-free per-layer matrix ``W`` to form
+messages and evaluates symmetric conductance propagation:
+
+    H' = (1 - alpha) H + alpha P_C(H W)
+
+on nonisolated nodes, while isolates remain ``H``. Thus C changes the learned
+graph metric/operator and W changes feature channels carried by spatial messages.
+They are separately switchable in a matched 2x2 scaffold; no second edge scalar
+is multiplied into C.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
+
+from .operator import symmetric_spatial_propagation
+
+
+def graph_mean(values: Tensor, edge_graph: Tensor, num_graphs: int) -> Tensor:
+    """Return full-graph scalar edge means; empty graphs have mean zero."""
+
+    if values.ndim != 1 or edge_graph.shape != values.shape or edge_graph.dtype != torch.long:
+        raise ValueError("values and edge_graph must be aligned one-dimensional tensors")
+    if edge_graph.device != values.device:
+        raise ValueError("values and edge_graph must share a device")
+    if isinstance(num_graphs, bool) or not isinstance(num_graphs, int) or num_graphs < 0:
+        raise ValueError("num_graphs must be a nonnegative integer")
+    if edge_graph.numel() and (
+        bool((edge_graph < 0).any()) or bool((edge_graph >= num_graphs).any())
+    ):
+        raise ValueError("edge graph index is outside num_graphs")
+    sums = values.new_zeros(num_graphs).index_add(0, edge_graph, values)
+    counts = values.new_zeros(num_graphs).index_add(0, edge_graph, torch.ones_like(values))
+    return sums / counts.clamp_min(1)
+
+
+class RelativeConductance(nn.Module):
+    """Shared orientation-invariant relative-C estimator copied from the v3 design."""
+
+    def __init__(
+        self,
+        channels: int,
+        gate_mode: str = "relative",
+        edge_chunk_size: int = 65536,
+    ) -> None:
+        super().__init__()
+        if isinstance(channels, bool) or not isinstance(channels, int) or channels < 1:
+            raise ValueError("channels must be a positive integer")
+        if gate_mode not in {"relative", "fixed_one"}:
+            raise ValueError(f"Unsupported relative-C gate mode: {gate_mode}")
+        if (
+            isinstance(edge_chunk_size, bool)
+            or not isinstance(edge_chunk_size, int)
+            or edge_chunk_size < 1
+        ):
+            raise ValueError("edge_chunk_size must be a positive integer")
+        self.channels = channels
+        self.gate_mode = gate_mode
+        self.edge_chunk_size = edge_chunk_size
+        self.input_norm = nn.LayerNorm(4 * channels + 2)
+        self.network = nn.Sequential(
+            nn.Linear(4 * channels + 2, channels),
+            nn.SiLU(),
+            nn.Linear(channels, channels),
+            nn.SiLU(),
+            # A common final bias is removed exactly by graph centering.
+            nn.Linear(channels, 1, bias=False),
+        )
+        nn.init.zeros_(self.network[-1].weight)
+        self.raw_gamma = nn.Parameter(torch.zeros(()))
+        self.raw_tau = nn.Parameter(torch.zeros(()))
+        self.last_scores: Tensor | None = None
+        self.last_centered_scores: Tensor | None = None
+        if gate_mode == "fixed_one":
+            self.requires_grad_(False)
+
+    @property
+    def gamma(self) -> Tensor:
+        return self.raw_gamma.sigmoid()
+
+    @property
+    def tau(self) -> Tensor:
+        return 2 * self.raw_tau.sigmoid()
+
+    def _chunk_scores(
+        self,
+        state: Tensor,
+        tail: Tensor,
+        head: Tensor,
+        log_degree: Tensor,
+    ) -> Tensor:
+        left, right = state[tail], state[head]
+        delta = right - left
+        degree_left, degree_right = log_degree[tail], log_degree[head]
+        features = torch.cat(
+            (
+                delta.abs(),
+                delta.square(),
+                left + right,
+                left * right,
+                (degree_left + degree_right)[:, None],
+                (degree_left - degree_right).abs()[:, None],
+            ),
+            dim=1,
+        )
+        return self.network(self.input_norm(features)).squeeze(-1)
+
+    def forward(
+        self,
+        state: Tensor,
+        incidence: Tensor,
+        node_graph: Tensor,
+        num_graphs: int,
+    ) -> Tensor:
+        if state.ndim != 2 or state.shape[1] != self.channels:
+            raise ValueError("state width does not match the conductance estimator")
+        if incidence.dtype != torch.long or incidence.ndim != 2 or incidence.shape[0] != 2:
+            raise ValueError("incidence must be a 2 x E int64 tensor")
+        if node_graph.dtype != torch.long or node_graph.shape != (state.shape[0],):
+            raise ValueError("node_graph must contain one int64 graph index per node")
+        if any(value.device != state.device for value in (incidence, node_graph)):
+            raise ValueError("state, incidence and node_graph must share a device")
+        if isinstance(num_graphs, bool) or not isinstance(num_graphs, int) or num_graphs < 0:
+            raise ValueError("num_graphs must be a nonnegative integer")
+        if node_graph.numel() and (
+            bool((node_graph < 0).any()) or bool((node_graph >= num_graphs).any())
+        ):
+            raise ValueError("node graph index is outside num_graphs")
+        if incidence.numel() and (
+            bool((incidence < 0).any()) or bool((incidence >= state.shape[0]).any())
+        ):
+            raise ValueError("incidence endpoint is outside the node matrix")
+        if incidence.shape[1] and bool((incidence[0] == incidence[1]).any()):
+            raise ValueError("physical incidence edges must not contain self loops")
+
+        tail, head = incidence
+        if tail.numel() and not torch.equal(node_graph[tail], node_graph[head]):
+            raise ValueError("Edges must not connect different graphs in a batch")
+        edge_graph = node_graph[tail]
+        if self.gate_mode == "fixed_one":
+            self.last_scores = state.new_zeros(tail.numel())
+            self.last_centered_scores = self.last_scores
+            return state.new_ones(tail.numel())
+
+        degree = state.new_zeros(state.shape[0])
+        ones = state.new_ones(tail.numel())
+        degree.index_add_(0, tail, ones)
+        degree.index_add_(0, head, ones)
+        log_degree = degree.log1p()
+        chunks = []
+        for start in range(0, tail.numel(), self.edge_chunk_size):
+            stop = start + self.edge_chunk_size
+            inputs = (state, tail[start:stop], head[start:stop], log_degree)
+            if torch.is_grad_enabled():
+                score = checkpoint(
+                    self._chunk_scores,
+                    *inputs,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                score = self._chunk_scores(*inputs)
+            chunks.append(score)
+        scores = torch.cat(chunks) if chunks else state.new_empty((0,))
+        if not bool(torch.isfinite(scores.detach()).all()):
+            raise FloatingPointError("Nonfinite relative conductance scores")
+        centered = scores - graph_mean(scores, edge_graph, num_graphs)[edge_graph]
+        unnormalized = (self.tau * centered.tanh()).exp()
+        relative = unnormalized / graph_mean(unnormalized, edge_graph, num_graphs)[edge_graph]
+        c = (1 - self.gamma) + self.gamma * relative
+        if not bool(torch.isfinite(c.detach()).all()) or not bool((c.detach() > 0).all()):
+            raise FloatingPointError("Relative conductance must remain finite and positive")
+        self.last_scores = scores.detach()
+        self.last_centered_scores = centered.detach()
+        return c
+
+
+class SpatialMessageTransform(nn.Module):
+    """Bias-free square W, identity initialized without consuming model RNG.
+
+    In ``fixed_identity`` mode the allocated weight is frozen and the exact
+    identity path is used. In ``learned`` mode the forward is evaluated as
+    ``H + H(W-I)``. This is algebraically the ordinary ``H W`` map, gives W the
+    standard linear-map gradient, and makes W=I reduce bit-for-bit to the v3
+    message state rather than depending on a matrix-multiply implementation.
+    """
+
+    def __init__(self, channels: int, spatial_mode: str = "learned") -> None:
+        super().__init__()
+        if isinstance(channels, bool) or not isinstance(channels, int) or channels < 1:
+            raise ValueError("channels must be a positive integer")
+        if spatial_mode not in {"learned", "fixed_identity"}:
+            raise ValueError(f"Unsupported spatial mode: {spatial_mode}")
+        self.in_features = channels
+        self.out_features = channels
+        self.spatial_mode = spatial_mode
+        identity = torch.eye(channels)
+        self.weight = nn.Parameter(identity.clone(), requires_grad=spatial_mode == "learned")
+        self.register_buffer("_identity", identity, persistent=False)
+
+    def forward(self, state: Tensor) -> Tensor:
+        if state.ndim != 2 or state.shape[1] != self.in_features:
+            raise ValueError("state width does not match the spatial transform")
+        if self.spatial_mode == "fixed_identity":
+            return state
+        # The residual form is exactly F.linear(state, weight) algebraically.
+        return state + F.linear(state, self.weight - self._identity)
+
+
+class RelativeCSpatialConv(nn.Module):
+    """One v4 layer: estimate C from H, then propagate the spatial message H W."""
+
+    def __init__(
+        self,
+        channels: int,
+        gate_mode: str,
+        spatial_mode: str,
+        edge_chunk_size: int = 65536,
+    ) -> None:
+        super().__init__()
+        if (
+            isinstance(edge_chunk_size, bool)
+            or not isinstance(edge_chunk_size, int)
+            or edge_chunk_size < 1
+        ):
+            raise ValueError("edge_chunk_size must be a positive integer")
+        # Keep the v3 allocation order. SpatialMessageTransform uses a
+        # deterministic torch.eye and therefore does not advance model RNG.
+        self.estimator = RelativeConductance(channels, gate_mode, edge_chunk_size)
+        self.raw_alpha = nn.Parameter(torch.zeros(()))
+        self.message_transform = SpatialMessageTransform(channels, spatial_mode)
+        self.gate_mode = gate_mode
+        self.spatial_mode = spatial_mode
+        self.normalization = "symmetric"
+        self.edge_chunk_size = edge_chunk_size
+
+    @property
+    def alpha(self) -> Tensor:
+        return self.raw_alpha.sigmoid()
+
+    def forward(
+        self,
+        x: Tensor,
+        incidence: Tensor,
+        node_graph: Tensor,
+        num_graphs: int | None = None,
+    ) -> Tensor:
+        if num_graphs is None:
+            num_graphs = int(node_graph.max()) + 1 if node_graph.numel() else 0
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            state = x if x.dtype == torch.float64 else x.float()
+            # C must be a function of the pre-W state. Do not move this call
+            # below message_transform: that would confound the two mechanisms.
+            c = self.estimator(state, incidence, node_graph, num_graphs)
+            message = self.message_transform(state)
+            result = symmetric_spatial_propagation(
+                state,
+                message,
+                c,
+                incidence,
+                self.alpha.to(dtype=state.dtype),
+                edge_chunk_size=self.edge_chunk_size,
+            )
+        return result.to(x.dtype)
+
+
+class RelativeCSpatialNodeClassifier(nn.Module):
+    """V3-compatible node scaffold with factorial relative-C and spatial-W controls."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        classes: int,
+        *,
+        normalization: str = "symmetric",
+        hidden_channels: int = 64,
+        layers: int = 2,
+        dropout: float = 0.5,
+        gate_mode: str = "relative",
+        spatial_mode: str = "learned",
+        edge_chunk_size: int = 65536,
+    ) -> None:
+        super().__init__()
+        if normalization != "symmetric":
+            raise ValueError("Relative-C spatial v4 keeps symmetric normalization fixed")
+        for name, value in (
+            ("in_channels", in_channels),
+            ("classes", classes),
+            ("hidden_channels", hidden_channels),
+            ("layers", layers),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            not isinstance(dropout, (int, float))
+            or isinstance(dropout, bool)
+            or not 0 <= dropout < 1
+        ):
+            raise ValueError("dropout must be in [0, 1)")
+        if gate_mode not in {"relative", "fixed_one"}:
+            raise ValueError(f"Unsupported relative-C gate mode: {gate_mode}")
+        if spatial_mode not in {"learned", "fixed_identity"}:
+            raise ValueError(f"Unsupported spatial mode: {spatial_mode}")
+        if (
+            isinstance(edge_chunk_size, bool)
+            or not isinstance(edge_chunk_size, int)
+            or edge_chunk_size < 1
+        ):
+            raise ValueError("edge_chunk_size must be a positive integer")
+
+        self.in_channels = in_channels
+        self.classes = classes
+        self.normalization = normalization
+        self.gate_mode = gate_mode
+        self.spatial_mode = spatial_mode
+        self.dropout = float(dropout)
+        self.edge_chunk_size = edge_chunk_size
+        self.encoder = nn.Linear(in_channels, hidden_channels)
+        self.decoder = nn.Linear(hidden_channels, classes)
+        self.operators = nn.ModuleList(
+            RelativeCSpatialConv(
+                hidden_channels,
+                gate_mode,
+                spatial_mode,
+                edge_chunk_size,
+            )
+            for _ in range(layers)
+        )
+        self.norms = nn.ModuleList(nn.LayerNorm(hidden_channels) for _ in range(layers))
+
+    def forward(self, graph: Any) -> Tensor:
+        x, incidence = graph.x, graph.incidence_edge_index
+        if x.ndim != 2 or x.shape[1] != self.in_channels or not x.is_floating_point():
+            raise ValueError("graph.x must be a floating node matrix with the configured width")
+        if incidence.dtype != torch.long or incidence.ndim != 2 or incidence.shape[0] != 2:
+            raise ValueError("incidence must be a 2 x E int64 tensor")
+        if incidence.device != x.device:
+            raise ValueError("state and incidence must share a device")
+        if incidence.numel() and (
+            bool((incidence < 0).any()) or bool((incidence >= x.shape[0]).any())
+        ):
+            raise ValueError("incidence endpoint is outside the node matrix")
+        if incidence.shape[1] and bool((incidence[0] == incidence[1]).any()):
+            raise ValueError("physical incidence edges must not contain self loops")
+
+        batch = getattr(graph, "batch", None)
+        if batch is None:
+            batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            num_graphs = 1
+        else:
+            if (
+                batch.dtype != torch.long
+                or batch.shape != (x.shape[0],)
+                or batch.device != x.device
+            ):
+                raise ValueError("batch must contain one same-device int64 graph index per node")
+            if batch.numel() and bool((batch < 0).any()):
+                raise ValueError("batch indices must be nonnegative")
+            num_graphs = int(batch.max()) + 1 if batch.numel() else 0
+        if incidence.numel() and not torch.equal(batch[incidence[0]], batch[incidence[1]]):
+            raise ValueError("Edges must not connect different graphs in a batch")
+
+        h = F.dropout(F.elu(self.encoder(x)), self.dropout, self.training)
+        for operator, norm in zip(self.operators, self.norms, strict=True):
+            h = operator(h, incidence, batch, num_graphs)
+            h = F.dropout(F.elu(norm(h)), self.dropout, self.training)
+        return self.decoder(h)
+
+
+# Concise aliases for callers that describe this design as the v4 hybrid model.
+HybridCSpatialConv = RelativeCSpatialConv
+HybridCSpatialNodeClassifier = RelativeCSpatialNodeClassifier
+````
+
+# research/conductance_gat/v4/operator.py
+
+````python
+"""Exact chunked symmetric propagation for distinct residual and message states.
+
+For nonisolated nodes this computes
+
+    (1 - alpha) H + alpha D_C^-1/2 A_C D_C^-1/2 M,
+
+where ``H`` is the residual state and ``M`` is the message state (``H W`` in
+the v4 model). Isolates remain exactly ``H``. The custom backward differentiates
+the direct edge weights and both C-dependent symmetric degree factors. It saves
+O(nd + m) values, uses O(chunk*d) edge workspace, and intentionally supports
+first-order gradients only. No dense adjacency, incidence, C, or Laplacian is
+materialized.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor
+from torch.autograd.function import once_differentiable
+
+
+class _SymmetricSpatialPropagation(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        residual_state: Tensor,
+        message_state: Tensor,
+        c: Tensor,
+        incidence: Tensor,
+        alpha: Tensor,
+        chunk_size: int,
+    ) -> Tensor:
+        degree = residual_state.new_zeros(residual_state.shape[0])
+        for start in range(0, c.numel(), chunk_size):
+            stop = start + chunk_size
+            tail, head = incidence[:, start:stop]
+            weights = c[start:stop]
+            degree.index_add_(0, tail, weights)
+            degree.index_add_(0, head, weights)
+        if not bool(torch.isfinite(degree).all()):
+            raise FloatingPointError("Nonfinite symmetric conductance degree")
+
+        active = degree > 0
+        safe_degree = torch.where(active, degree, torch.ones_like(degree))
+        inverse = safe_degree.rsqrt() * active.to(residual_state.dtype)
+        propagated = torch.zeros_like(message_state)
+        for start in range(0, c.numel(), chunk_size):
+            stop = start + chunk_size
+            tail, head = incidence[:, start:stop]
+            weights = c[start:stop] * inverse[tail] * inverse[head]
+            propagated.index_add_(0, tail, weights[:, None] * message_state[head])
+            propagated.index_add_(0, head, weights[:, None] * message_state[tail])
+
+        result = residual_state - alpha * (active[:, None] * residual_state - propagated)
+        if not bool(torch.isfinite(result).all()):
+            raise FloatingPointError("Nonfinite symmetric spatial propagation")
+
+        ctx.chunk_size = chunk_size
+        ctx.save_for_backward(
+            residual_state,
+            message_state,
+            c,
+            incidence,
+            alpha,
+            inverse,
+            propagated,
+            active,
+        )
+        return result
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output: Tensor):
+        (
+            residual_state,
+            message_state,
+            c,
+            incidence,
+            alpha,
+            inverse,
+            propagated,
+            active,
+        ) = ctx.saved_tensors
+        (
+            need_residual,
+            need_message,
+            need_c,
+            _,
+            need_alpha,
+            _,
+        ) = ctx.needs_input_grad
+
+        # P_C is symmetric. P_C grad_output is needed both for the message
+        # gradient and for the degree-factor part of dL/dC.
+        propagated_grad = None
+        if need_message or need_c:
+            propagated_grad = torch.zeros_like(grad_output)
+            for start in range(0, c.numel(), ctx.chunk_size):
+                stop = start + ctx.chunk_size
+                tail, head = incidence[:, start:stop]
+                weights = c[start:stop] * inverse[tail] * inverse[head]
+                propagated_grad.index_add_(0, tail, weights[:, None] * grad_output[head])
+                propagated_grad.index_add_(0, head, weights[:, None] * grad_output[tail])
+
+        grad_residual = (
+            grad_output - alpha * active[:, None] * grad_output if need_residual else None
+        )
+        grad_message = alpha * propagated_grad if need_message else None
+
+        grad_c = None
+        if need_c:
+            # The first inner product is the derivative of the row inverse
+            # degree; the second is the derivative of the column inverse
+            # degree. Each incident C_e contributes to both endpoint degrees.
+            degree_term = (
+                -0.5
+                * (
+                    (grad_output * propagated).sum(dim=1)
+                    + (message_state * propagated_grad).sum(dim=1)
+                )
+                * inverse.square()
+            )
+            grad_c = torch.empty_like(c)
+            for start in range(0, c.numel(), ctx.chunk_size):
+                stop = start + ctx.chunk_size
+                tail, head = incidence[:, start:stop]
+                direct_term = (
+                    inverse[tail]
+                    * inverse[head]
+                    * (
+                        (grad_output[tail] * message_state[head]).sum(dim=1)
+                        + (grad_output[head] * message_state[tail]).sum(dim=1)
+                    )
+                )
+                grad_c[start:stop] = alpha * (direct_term + degree_term[tail] + degree_term[head])
+
+        grad_alpha = (
+            -(grad_output * (active[:, None] * residual_state - propagated)).sum().reshape_as(alpha)
+            if need_alpha
+            else None
+        )
+        return grad_residual, grad_message, grad_c, None, grad_alpha, None
+
+
+def symmetric_spatial_propagation(
+    residual_state: Tensor,
+    message_state: Tensor,
+    c: Tensor,
+    incidence: Tensor,
+    alpha: Tensor,
+    *,
+    edge_chunk_size: int = 65536,
+) -> Tensor:
+    """Apply the v4 symmetric operator with identity behavior on isolates.
+
+    ``residual_state`` and ``message_state`` must have the same node/feature
+    shape. Passing the same tensor for both exactly recovers the v3 equation.
+    Physical edges are undirected and must appear exactly once; either endpoint
+    orientation and any edge ordering are accepted.
+    """
+
+    allowed_dtypes = {torch.float32, torch.float64}
+    if residual_state.ndim != 2 or residual_state.dtype not in allowed_dtypes:
+        raise ValueError("residual_state must be a float32/float64 node-feature matrix")
+    if (
+        message_state.ndim != 2
+        or message_state.shape != residual_state.shape
+        or message_state.dtype != residual_state.dtype
+    ):
+        raise ValueError("message_state must match residual_state shape and dtype")
+    if incidence.dtype != torch.long or incidence.ndim != 2 or incidence.shape[0] != 2:
+        raise ValueError("incidence must be a 2 x E int64 tensor")
+    if c.ndim != 1 or c.shape[0] != incidence.shape[1] or c.dtype != residual_state.dtype:
+        raise ValueError("C must have one residual-state-dtype scalar per physical edge")
+    if alpha.ndim != 0 or alpha.dtype != residual_state.dtype:
+        raise ValueError("alpha must be a residual-state-dtype scalar tensor")
+    if any(value.device != residual_state.device for value in (message_state, c, incidence, alpha)):
+        raise ValueError("all propagation inputs must share a device")
+    if (
+        isinstance(edge_chunk_size, bool)
+        or not isinstance(edge_chunk_size, int)
+        or edge_chunk_size < 1
+    ):
+        raise ValueError("edge_chunk_size must be a positive integer")
+    if incidence.numel() and (
+        bool((incidence < 0).any()) or bool((incidence >= residual_state.shape[0]).any())
+    ):
+        raise ValueError("incidence endpoint is outside the node matrix")
+    if incidence.shape[1] and bool((incidence[0] == incidence[1]).any()):
+        raise ValueError("physical incidence edges must not contain self loops")
+    if not bool(torch.isfinite(c.detach()).all()) or not bool((c.detach() > 0).all()):
+        raise FloatingPointError("C must remain finite and positive")
+    if not bool(torch.isfinite(residual_state.detach()).all()):
+        raise FloatingPointError("Nonfinite residual state")
+    if not bool(torch.isfinite(message_state.detach()).all()):
+        raise FloatingPointError("Nonfinite message state")
+    checked_alpha = alpha.detach()
+    if not bool(torch.isfinite(checked_alpha)) or not bool(
+        (checked_alpha >= 0) & (checked_alpha <= 1)
+    ):
+        raise FloatingPointError("alpha must be finite and in [0, 1]")
+    return _SymmetricSpatialPropagation.apply(
+        residual_state,
+        message_state,
+        c,
+        incidence,
+        alpha,
+        edge_chunk_size,
+    )
+````
+
+# research/conductance_gat/v4/protocol.py
+
+````python
+"""Dependency-free protocol for the matched conductance-by-spatial v4 experiment."""
+
+SUITE = "conductance_hybrid_c_spatial_v4"
+PARAMETERIZATION = "shared_relative_log_conductance_x_spatial_message_transform"
+DATASETS = ("cora", "citeseer", "pubmed", "ogbn-arxiv")
+DEFAULT_DATASETS = ("ogbn-arxiv",)
+DEFAULT_EDGE_CHUNK_SIZE = 65536
+COMMON = {
+    "hidden_channels": 64,
+    "layers": 2,
+    "dropout": 0.5,
+    "lr": 0.005,
+    "weight_decay": 0.0005,
+    "amp": False,
+    "compile": False,
+    "optimizer": "AdamW",
+    "gate_lr_multiplier": 2.0,
+    "scalar_weight_decay": 0.0,
+}
+CONDITIONS = {
+    "fixed_c_identity_w": {
+        "normalization": "symmetric",
+        "gate_mode": "fixed_one",
+        "spatial_mode": "fixed_identity",
+        "gate_weight_decay": 0.0,
+    },
+    "relative_c_identity_w": {
+        "normalization": "symmetric",
+        "gate_mode": "relative",
+        "spatial_mode": "fixed_identity",
+        "gate_weight_decay": 0.0,
+    },
+    "fixed_c_spatial_w": {
+        "normalization": "symmetric",
+        "gate_mode": "fixed_one",
+        "spatial_mode": "learned",
+        "gate_weight_decay": 0.0,
+    },
+    "relative_c_spatial_w": {
+        "normalization": "symmetric",
+        "gate_mode": "relative",
+        "spatial_mode": "learned",
+        "gate_weight_decay": 0.0,
+    },
+}
+PROTOCOL_NOTE = (
+    "A matched 2x2 factorial separates graph-operator adaptation by relative C from a "
+    "bias-free spatial feature transform W. Every arm allocates the same estimator and W "
+    "state, starts at C=1, W=I and alpha=.5, and trains alpha. Inactive estimator or W "
+    "groups are frozen and excluded from AdamW; active W uses the ordinary backbone learning "
+    "rate and weight decay. C is computed from the pre-W state, while symmetric propagation "
+    "aggregates H W. Graph means and C-dependent weighted degrees are exact full-graph "
+    "quantities; edge computation is chunked and first-order only. Official train labels "
+    "only; validation selects checkpoints, with no test evaluation. V3 is unchanged and "
+    "cross-version score differences are not a matched single-factor causal contrast. The "
+    "report releases five within-V4 factorial contrasts only after all four fresh arms and "
+    "source integrity pass; selected-checkpoint C/W interventions are read-only diagnostics."
+)
+````
+
+# research/conductance_gat/v4/report.py
+
+````python
+"""Fail-closed report for the V4 relative-C x spatial-W factorial."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import io
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+from ..ablation.report import (
+    REPORT_FILENAMES,
+    _atomic_write,
+    _cell,
+    _contained,
+    _display,
+    _finite_number,
+    _integer,
+    _load_child,
+    _pair_metadata,
+    _reject_nonfinite_json,
+    _same,
+)
+from .protocol import COMMON, CONDITIONS, DATASETS, PARAMETERIZATION, SUITE
+
+SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
+INTERVENTIONS = {
+    "mean_c",
+    "shuffled_c",
+    "ones_c",
+    "identity_w",
+    "ones_c_identity_w",
+    "propagation_off",
+}
+FACTORIAL_ORDER = (
+    "fixed_c_identity_w",
+    "relative_c_identity_w",
+    "fixed_c_spatial_w",
+    "relative_c_spatial_w",
+)
+CAVEATS = [
+    "n=1; exploratory validation-only factorial. Test is not evaluated; no CI, p-value, "
+    "seed standard deviation, SOTA or general optimality claim.",
+    "All four arms train freshly from a matched full initial state. No V3 checkpoint or score "
+    "is reused, and a V3-to-V4 score difference is not a one-factor causal contrast.",
+    "V3/V4 do not implement a conventional eigendecomposition-based spectral GNN. Relative C "
+    "adapts the weighted graph operator; W is a shared spatial message-channel transform.",
+    "The five factorial contrasts are descriptive configuration differences within V4. Early "
+    "stopping epochs can differ and single-seed validation does not establish population effects.",
+    "C and W can compensate across layers. C spread, gamma/tau, W-I distance, singular values "
+    "or gradient norms alone do not prove that either mechanism is useful.",
+    "Mean-C and C=1 are algebraically redundant under symmetric weighted-degree normalization. "
+    "Their checkpoint interventions are a numerical consistency check, not two effects.",
+    "Checkpoint interventions use separate validation forwards without retraining. They measure "
+    "selected-checkpoint reliance; the four fresh arms provide the training contrasts.",
+    "Elapsed time and peak CUDA memory include diagnostics, interventions, checkpoint/history IO "
+    "as defined by the trainer; they are not isolated kernel benchmarks.",
+    "W-on arms have more active parameters and optimizer state than W-off arms. This factorial "
+    "does not parameter-budget-match unrelated architectures.",
+    "Sparse exact edge chunking remains full-graph training. Identical seeds and initial hashes "
+    "do not make CUDA scatter trajectories bitwise deterministic.",
+]
+
+
+class ComparisonIntegrityError(ValueError):
+    def __init__(self, report: dict[str, Any]):
+        self.report = report
+        super().__init__("Conductance/spatial V4 integrity failed: " + "; ".join(report["errors"]))
+
+
+def _source_hashes(value: Any) -> dict[str, str]:
+    if not isinstance(value, dict) or not value:
+        raise ValueError("nonempty source_sha256 object is required")
+    for name, digest in value.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or Path(name).is_absolute()
+            or ".." in Path(name).parts
+            or not isinstance(digest, str)
+            or not SHA256.fullmatch(digest)
+        ):
+            raise ValueError("source_sha256 requires relative paths and SHA-256 digests")
+    return value
+
+
+def _current_source_hashes() -> dict[str, str]:
+    """Recompute the runner's exact source inventory for standalone reports."""
+
+    from scripts.run_conductance_v4 import _source_snapshot
+
+    return _source_hashes(_source_snapshot().get("sha256"))
+
+
+def _names(value: Any, label: str) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        raise ValueError(f"{label}: expected parameter-name list")
+    if len(set(value)) != len(value):
+        raise ValueError(f"{label}: duplicate parameter names")
+    return value
+
+
+def _nested(mapping: Any, *keys: str) -> Any:
+    value = mapping
+    for key in keys:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _nonnegative_optional(value: Any, label: str) -> float | None:
+    if value is None:
+        return None
+    result = _finite_number(value, label)
+    if result < 0:
+        raise ValueError(f"{label} must be nonnegative")
+    return result
+
+
+def _require_close(value: Any, expected: float, label: str, *, atol: float = 1.0e-9) -> None:
+    actual = _finite_number(value, label)
+    if abs(actual - expected) > atol:
+        raise ValueError(f"{label} must equal {expected}")
+
+
+def _validate_optimizer(child: dict[str, Any], config: dict[str, Any], condition: str) -> None:
+    if child.get("optimizer") != "AdamW":
+        raise ValueError("optimizer must be AdamW")
+    spec = CONDITIONS[condition]
+    c_active = spec["gate_mode"] == "relative"
+    w_active = spec["spatial_mode"] == "learned"
+    active = _names(child.get("trainable_parameter_names"), "trainable_parameter_names")
+    frozen = _names(child.get("frozen_parameter_names"), "frozen_parameter_names")
+    active_set, frozen_set = set(active), set(frozen)
+    if not active or active_set & frozen_set:
+        raise ValueError("active/frozen parameter names overlap or active list is empty")
+    layers = config["layers"]
+    alpha = {f"operators.{index}.raw_alpha" for index in range(layers)}
+    spatial = {f"operators.{index}.message_transform.weight" for index in range(layers)}
+    estimator = {name for name in active_set | frozen_set if ".estimator." in name}
+    if not estimator or not alpha <= active_set:
+        raise ValueError("every layer requires an estimator scaffold and active alpha")
+    if (estimator <= active_set) != c_active or (estimator <= frozen_set) == c_active:
+        raise ValueError("conductance estimator active/frozen state disagrees with condition")
+    if (spatial <= active_set) != w_active or (spatial <= frozen_set) == w_active:
+        raise ValueError("spatial W active/frozen state disagrees with condition")
+    if any(name.endswith(".raw_alpha") for name in frozen_set):
+        raise ValueError("alpha must remain trainable in all four arms")
+
+    expected_groups = {"backbone", "raw_scalars"}
+    if c_active:
+        expected_groups.add("conductance_gate")
+    if w_active:
+        expected_groups.add("spatial_w")
+    groups = child.get("optimizer_groups")
+    if not isinstance(groups, list):
+        raise ValueError("optimizer_groups must be a list")
+    indexed: dict[str, dict[str, Any]] = {}
+    all_names: list[str] = []
+    parameter_count = 0
+    for group in groups:
+        if not isinstance(group, dict) or group.get("name") not in expected_groups:
+            raise ValueError("unexpected V4 optimizer parameter group")
+        name = group["name"]
+        if name in indexed:
+            raise ValueError("duplicate optimizer parameter group")
+        indexed[name] = group
+        names = _names(group.get("parameter_names"), f"{name}.parameter_names")
+        if not names:
+            raise ValueError("optimizer groups must not be empty")
+        size = _integer(group.get("parameter_count"), f"{name}.parameter_count", minimum=1)
+        all_names.extend(names)
+        parameter_count += size
+        lr = config["lr"] * (config["gate_lr_multiplier"] if name == "conductance_gate" else 1.0)
+        wd = config["weight_decay"] if name in {"backbone", "spatial_w"} else 0.0
+        if not _same(group.get("lr"), lr) or not _same(group.get("weight_decay"), wd):
+            raise ValueError(f"optimizer {name} lr/weight_decay mismatch")
+        if name == "raw_scalars":
+            required = set(alpha)
+            if c_active:
+                required |= {
+                    f"operators.{index}.estimator.raw_{control}"
+                    for index in range(layers)
+                    for control in ("gamma", "tau")
+                }
+            if set(names) != required or size != len(names):
+                raise ValueError("raw scalar controls mismatch")
+        elif name == "spatial_w":
+            if set(names) != spatial:
+                raise ValueError("spatial_w group does not contain exactly the layer W matrices")
+        elif name == "conductance_gate":
+            controls = {n for n in estimator if n.endswith((".raw_gamma", ".raw_tau"))}
+            if set(names) != estimator - controls:
+                raise ValueError("conductance_gate group does not cover the non-scalar estimator")
+        elif name == "backbone" and any(
+            name.endswith((".raw_alpha", ".raw_gamma", ".raw_tau")) or ".message_transform." in name
+            for name in names
+        ):
+            raise ValueError("backbone group contains V4 factor parameters")
+    if (
+        set(indexed) != expected_groups
+        or len(set(all_names)) != len(all_names)
+        or set(all_names) != active_set
+    ):
+        raise ValueError("optimizer groups do not cover exactly the trainable parameters")
+    if parameter_count != child["trainable_parameters"]:
+        raise ValueError("optimizer parameter counts disagree with trainable_parameters")
+
+
+def _best_training_observation(child: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    trajectory = child["diagnostics"].get("train_trajectory")
+    if not isinstance(trajectory, list) or any(not isinstance(row, dict) for row in trajectory):
+        raise ValueError("actual training trajectory must be recorded")
+    epochs = [_integer(row.get("epoch"), "training epoch", minimum=1) for row in trajectory]
+    if len(set(epochs)) != len(epochs):
+        raise ValueError("duplicate actual-training epoch observations")
+    selected = [row for row in trajectory if row["epoch"] == child["best_epoch"]]
+    if len(selected) != 1:
+        raise ValueError("selected epoch is missing from actual training observations")
+    record = selected[0]
+    expected = {
+        "scope": "full_graph_train_mask",
+        "mode": "train_dropout_on",
+        "stage": "after_task_backward_before_optimizer_step",
+        "batch_index": 0,
+        "optimizer_steps_before_batch": child["best_epoch"] - 1,
+    }
+    for key, value in expected.items():
+        if not _same(record.get(key), value):
+            raise ValueError(f"selected training observation {key} mismatch")
+    layers = record.get("layers")
+    if not isinstance(layers, list) or len(layers) != config["layers"]:
+        raise ValueError("selected training layer observations are incomplete")
+    spec = CONDITIONS[child["condition"]]
+    indices = []
+    for layer in layers:
+        if not isinstance(layer, dict):
+            raise ValueError("invalid training layer observation")
+        indices.append(_integer(layer.get("layer"), "training layer"))
+        gate = layer.get("gate_gradient_norm")
+        spatial = layer.get("spatial_gradient_norm")
+        if spec["gate_mode"] == "relative":
+            _nonnegative_optional(gate, "actual gate task gradient")
+            if gate is None:
+                raise ValueError("active conductance gate lacks a task gradient")
+        elif gate is not None:
+            raise ValueError("frozen conductance gate has a task gradient")
+        if spec["spatial_mode"] == "learned":
+            _nonnegative_optional(spatial, "actual spatial-W task gradient")
+            if spatial is None:
+                raise ValueError("active spatial W lacks a task gradient")
+        elif spatial is not None:
+            raise ValueError("frozen identity W has a task gradient")
+    if sorted(indices) != list(range(config["layers"])):
+        raise ValueError("selected training layer indices are missing or duplicated")
+    return record
+
+
+def _validate_diagnostics(child: dict[str, Any], config: dict[str, Any]) -> None:
+    diagnostics = child.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        raise ValueError("V4 diagnostics are required")
+    observations = {}
+    for name in ("initial_validation", "best_validation", "final_validation"):
+        observation = diagnostics.get(name)
+        if (
+            not isinstance(observation, dict)
+            or observation.get("mode") != "eval"
+            or observation.get("split") != "validation"
+        ):
+            raise ValueError(f"{name} diagnostics must be validation/eval")
+        observations[name] = observation
+    best = observations["best_validation"]
+    layers = best.get("layers")
+    if not isinstance(layers, list) or len(layers) != config["layers"]:
+        raise ValueError("best_validation layer diagnostics are incomplete")
+    spec = CONDITIONS[child["condition"]]
+    indices = []
+    for layer in layers:
+        if not isinstance(layer, dict):
+            raise ValueError("invalid selected-checkpoint layer diagnostics")
+        indices.append(_integer(layer.get("layer"), "diagnostic.layer"))
+        _finite_number(layer.get("alpha"), "alpha", unit_interval=True)
+        _finite_number(layer.get("gamma"), "gamma", unit_interval=True)
+        if _finite_number(layer.get("tau"), "tau") <= 0:
+            raise ValueError("tau must be positive")
+        for path in (
+            ("score", "std"),
+            ("conductance", "cv"),
+            ("log_conductance", "std"),
+            ("weighted_degree", "quantiles", "p50"),
+            ("weighted_degree", "quantiles", "p99"),
+            ("weighted_degree", "max_over_median"),
+            ("relative_message_transform_change",),
+            ("relative_conv_change",),
+            ("gate_parameter_norm",),
+        ):
+            _nonnegative_optional(_nested(layer, *path), ".".join(path))
+        spatial = layer.get("spatial_weight")
+        if not isinstance(spatial, dict):
+            raise ValueError("spatial_weight diagnostics are required")
+        c_active = spec["gate_mode"] == "relative"
+        if layer.get("estimator_trainable") is not c_active:
+            raise ValueError("conductance estimator trainable metadata mismatch")
+        if not c_active:
+            conductance = layer.get("conductance")
+            log_conductance = layer.get("log_conductance")
+            if not isinstance(conductance, dict) or not isinstance(log_conductance, dict):
+                raise ValueError("fixed-C value diagnostics are required")
+            for key, expected in (
+                ("mean", 1.0),
+                ("std", 0.0),
+                ("cv", 0.0),
+                ("min", 1.0),
+                ("max", 1.0),
+            ):
+                _require_close(conductance.get(key), expected, f"fixed conductance.{key}")
+            for key in ("mean", "std", "min", "max"):
+                _require_close(log_conductance.get(key), 0.0, f"fixed log-conductance.{key}")
+        if spatial.get("spatial_mode") != spec["spatial_mode"] or spatial.get("trainable") is not (
+            spec["spatial_mode"] == "learned"
+        ):
+            raise ValueError("spatial_weight mode/trainable metadata mismatch")
+        for key in (
+            "parameter_norm",
+            "identity_distance_frobenius",
+            "identity_relative_distance",
+        ):
+            _nonnegative_optional(spatial.get(key), f"spatial_weight.{key}")
+        singular = spatial.get("singular_values")
+        if not isinstance(singular, dict):
+            raise ValueError("spatial singular-value diagnostics are required")
+        if (
+            _integer(singular.get("count"), "singular count", minimum=1)
+            != config["hidden_channels"]
+        ):
+            raise ValueError("spatial singular-value count differs from hidden width")
+        for key in ("min", "max", "mean", "std", "condition_number"):
+            _nonnegative_optional(singular.get(key), f"singular_values.{key}")
+        if spec["spatial_mode"] == "fixed_identity":
+            _require_close(
+                layer.get("relative_message_transform_change"),
+                0.0,
+                "fixed identity message change",
+            )
+            _require_close(
+                spatial.get("identity_distance_frobenius"),
+                0.0,
+                "fixed identity W distance",
+            )
+            _require_close(
+                spatial.get("identity_relative_distance"),
+                0.0,
+                "fixed relative identity W distance",
+            )
+            for key, expected in (
+                ("min", 1.0),
+                ("max", 1.0),
+                ("mean", 1.0),
+                ("std", 0.0),
+                ("condition_number", 1.0),
+            ):
+                _require_close(singular.get(key), expected, f"fixed identity singular {key}")
+    if sorted(indices) != list(range(config["layers"])):
+        raise ValueError("diagnostic layer indices are missing or duplicated")
+    _best_training_observation(child, config)
+
+    audit = diagnostics.get("best_checkpoint_interventions")
+    if (
+        not isinstance(audit, dict)
+        or audit.get("status") != "passed"
+        or audit.get("scope") != "validation_selected_best_checkpoint_only"
+    ):
+        raise ValueError("selected-checkpoint validation interventions are required")
+    if audit.get("layers") != "all_layers_simultaneously":
+        raise ValueError("checkpoint interventions must apply to all layers simultaneously")
+    if audit.get("normalization_recomputed_for_c_interventions") is not True:
+        raise ValueError("C interventions must recompute symmetric normalization")
+    if _integer(audit.get("shuffle_seed"), "intervention shuffle_seed") != child["model_seed"]:
+        raise ValueError("intervention shuffle_seed must equal model_seed")
+    original = audit.get("original")
+    if not isinstance(original, dict):
+        raise ValueError("intervention original score is missing")
+    score = _finite_number(original.get("validation"), "intervention original", unit_interval=True)
+    if abs(score - child["validation"]) > 1.0e-7:
+        raise ValueError("intervention original differs from selected validation")
+    rows = audit.get("rows")
+    if not isinstance(rows, list) or len(rows) != len(INTERVENTIONS):
+        raise ValueError("all six selected-checkpoint interventions are required")
+    names = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("intervention") not in INTERVENTIONS:
+            raise ValueError("unknown V4 checkpoint intervention")
+        names.append(row["intervention"])
+        value = _finite_number(row.get("validation"), "intervention validation", unit_interval=True)
+        delta = _finite_number(row.get("percentage_points"), "intervention delta")
+        if abs(delta - 100.0 * (value - score)) > 1.0e-8:
+            raise ValueError("intervention percentage-points delta mismatch")
+        _finite_number(
+            row.get("changed_prediction_fraction"), "changed predictions", unit_interval=True
+        )
+        _nonnegative_optional(row.get("logit_mean_absolute_delta"), "logit delta")
+        if row.get("fresh_training") is not False:
+            raise ValueError("checkpoint interventions must not be labeled fresh training")
+        if row.get("intervention_kind") != "read_only_selected_checkpoint":
+            raise ValueError("checkpoint intervention kind mismatch")
+    if set(names) != INTERVENTIONS or len(set(names)) != len(names):
+        raise ValueError("missing/duplicate V4 checkpoint interventions")
+    numeric = audit.get("mean_c_numeric_check")
+    if not isinstance(numeric, dict) or numeric.get("comparison") != "mean_c_vs_ones_c":
+        raise ValueError("mean-C/C=1 numerical check is required")
+    if numeric.get("passed") is not True:
+        raise ValueError("mean-C and C=1 numerical consistency check failed")
+    _nonnegative_optional(numeric.get("logit_mean_absolute_delta"), "mean-C numeric delta")
+
+
+def _load(
+    root: Path,
+    job: dict[str, Any],
+    config: dict[str, Any],
+    source_hashes: dict[str, str],
+) -> dict[str, Any]:
+    path = _contained(job.get("metrics_path"), root, "metrics")
+    digest = job.get("metrics_sha256")
+    if not isinstance(digest, str) or not SHA256.fullmatch(digest):
+        raise ValueError("job.metrics_sha256 is required")
+    try:
+        actual_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise ValueError(f"cannot read child metrics: {exc}") from exc
+    if actual_digest != digest.lower():
+        raise ValueError("metrics SHA-256 mismatch")
+    child = _load_child(root, job, config, suite=SUITE, conditions=CONDITIONS)
+    spec = CONDITIONS[job["condition"]]
+    for key, expected in (
+        ("gate_mode", spec["gate_mode"]),
+        ("spatial_mode", spec["spatial_mode"]),
+        ("parameterization", PARAMETERIZATION),
+        ("source_sha256", source_hashes),
+    ):
+        if not _same(child.get(key), expected):
+            raise ValueError(f"{key} mismatch")
+    if "gate_mode" in child["configuration"] or "spatial_mode" in child["configuration"]:
+        raise ValueError("factor modes belong in arm metadata, not held-fixed configuration")
+    topology = child.get("topology")
+    if not isinstance(topology, dict) or set(topology) != {
+        "num_nodes",
+        "num_edges",
+        "incidence_sha256",
+    }:
+        raise ValueError("topology must contain num_nodes, num_edges and incidence_sha256")
+    _integer(topology["num_nodes"], "topology.num_nodes", minimum=1)
+    _integer(topology["num_edges"], "topology.num_edges")
+    if not isinstance(topology["incidence_sha256"], str) or not SHA256.fullmatch(
+        topology["incidence_sha256"]
+    ):
+        raise ValueError("topology.incidence_sha256 must be a SHA-256 digest")
+    total = _integer(child.get("total_parameters"), "total_parameters", minimum=1)
+    trainable = _integer(child.get("trainable_parameters"), "trainable_parameters", minimum=1)
+    frozen = _integer(child.get("frozen_parameters"), "frozen_parameters")
+    if total != trainable + frozen:
+        raise ValueError("total parameter count differs from trainable+frozen")
+    expected_frozen = not (spec["gate_mode"] == "relative" and spec["spatial_mode"] == "learned")
+    if bool(frozen) != expected_frozen:
+        raise ValueError("frozen parameter count disagrees with V4 condition")
+    _validate_optimizer(child, config, job["condition"])
+    _validate_diagnostics(child, config)
+    best_epoch = _integer(child.get("best_epoch"), "best_epoch", minimum=1)
+    stop_epoch = _integer(child.get("stop_epoch"), "stop_epoch", minimum=best_epoch)
+    if stop_epoch != child.get("epochs_run"):
+        raise ValueError("stop_epoch must equal epochs_run")
+    if child.get("stopping_reason") not in {"patience", "max_epochs"}:
+        raise ValueError("unknown stopping_reason")
+    for key in (
+        "selection_loop_seconds",
+        "post_selection_diagnostics_seconds",
+        "elapsed_seconds",
+    ):
+        if _finite_number(child.get(key), key) < 0:
+            raise ValueError(f"{key} must be nonnegative")
+    if child["elapsed_seconds"] + 1.0e-9 < (
+        child["selection_loop_seconds"] + child["post_selection_diagnostics_seconds"]
+    ):
+        raise ValueError("elapsed_seconds is shorter than its recorded timing components")
+    timing = child.get("epoch_timing")
+    if not isinstance(timing, dict):
+        raise ValueError("epoch_timing summary is required")
+    if _integer(timing.get("count"), "epoch_timing.count", minimum=1) != child["epochs_run"]:
+        raise ValueError("epoch_timing.count must equal epochs_run")
+    for key in (
+        "total_seconds",
+        "mean_seconds",
+        "median_seconds",
+        "p90_seconds",
+        "min_seconds",
+        "max_seconds",
+    ):
+        if _finite_number(timing.get(key), f"epoch_timing.{key}") < 0:
+            raise ValueError(f"epoch_timing.{key} must be nonnegative")
+    if not (
+        timing["min_seconds"]
+        <= timing["median_seconds"]
+        <= timing["p90_seconds"]
+        <= timing["max_seconds"]
+    ):
+        raise ValueError("epoch_timing quantiles are not ordered")
+    if timing.get("quantile_method") != "linear_order_statistic" or not isinstance(
+        timing.get("scope"), str
+    ):
+        raise ValueError("epoch_timing policy metadata mismatch")
+    for key in ("peak_cuda_allocated_bytes", "peak_cuda_reserved_bytes"):
+        _integer(child.get(key), key)
+    if not isinstance(child.get("versions"), dict) or not child["versions"]:
+        raise ValueError("missing runtime versions")
+    if not isinstance(child.get("gpu"), str) or not child["gpu"]:
+        raise ValueError("missing GPU identity")
+    if child["protocol"].get("data_sha256") != child["cache_sha256"]:
+        raise ValueError("cache_sha256 disagrees with dataset protocol")
+    return child
+
+
+def _factorial(scores: dict[str, float]) -> dict[str, dict[str, float]]:
+    y00 = scores["fixed_c_identity_w"]
+    y10 = scores["relative_c_identity_w"]
+    y01 = scores["fixed_c_spatial_w"]
+    y11 = scores["relative_c_spatial_w"]
+    values = {
+        "c_given_w_off": ("C | W off", y10 - y00),
+        "c_given_w_on": ("C | W on", y11 - y01),
+        "w_given_c_fixed": ("W | C fixed", y01 - y00),
+        "w_given_c_relative": ("W | C relative", y11 - y10),
+        "interaction": ("interaction", y11 - y10 - y01 + y00),
+    }
+    return {
+        key: {"label": label, "score_delta": delta, "percentage_points": 100.0 * delta}
+        for key, (label, delta) in values.items()
+    }
+
+
+def _best_layers(diagnostics: Any) -> list[dict[str, Any]]:
+    if not isinstance(diagnostics, dict):
+        return []
+    best = diagnostics.get("best_validation")
+    return best.get("layers", []) if isinstance(best, dict) else []
+
+
+def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    errors: list[str] = []
+    config = manifest.get("config", {})
+    if not isinstance(config, dict):
+        config = {}
+        errors.append("manifest.config must be an object")
+    datasets = config.get("datasets", [])
+    if (
+        not isinstance(datasets, list)
+        or not datasets
+        or any(not isinstance(dataset, str) or dataset not in DATASETS for dataset in datasets)
+        or len(set(datasets)) != len(datasets)
+    ):
+        datasets = []
+        errors.append("datasets must list unique supported fixed-graph datasets")
+    for key, expected in (
+        ("schema_version", 1),
+        ("suite", SUITE),
+        ("conditions", CONDITIONS),
+        ("source_integrity_valid", True),
+    ):
+        if not _same(manifest.get(key), expected):
+            errors.append(f"manifest.{key} mismatch")
+    if manifest.get("status") not in {"running", "failed", "passed"}:
+        errors.append("invalid manifest.status")
+    sources: dict[str, str] = {}
+    try:
+        source_metadata = manifest.get("sources")
+        if not isinstance(source_metadata, dict):
+            raise ValueError("manifest.sources must be an object")
+        sources = _source_hashes(source_metadata.get("sha256"))
+        _integer(config.get("model_seed"), "model_seed")
+        for key in ("epochs", "patience", "edge_chunk_size"):
+            _integer(config.get(key), key, minimum=1)
+        if config.get("batch_size") != 1 or type(config.get("batch_size")) is not int:
+            raise ValueError("full-graph batch_size must be 1")
+        if config.get("workers") != 0 or type(config.get("workers")) is not int:
+            raise ValueError("full-graph workers must be 0")
+        if not isinstance(config.get("device"), str) or not re.fullmatch(
+            r"cuda(?::[0-9]+)?", config["device"]
+        ):
+            raise ValueError("CUDA device required")
+        for key, expected in COMMON.items():
+            if not _same(config.get(key), expected):
+                raise ValueError(f"fixed configuration.{key} mismatch")
+    except ValueError as exc:
+        errors.append(str(exc))
+
+    jobs = manifest.get("jobs", [])
+    if not isinstance(jobs, list):
+        jobs = []
+        errors.append("manifest.jobs must be a list")
+    indexed: dict[tuple[str, str], dict[str, Any]] = {}
+    for job in jobs:
+        if not isinstance(job, dict):
+            errors.append("invalid manifest job")
+            continue
+        dataset, condition = job.get("dataset"), job.get("condition")
+        if dataset not in datasets or condition not in CONDITIONS:
+            errors.append("job references an unknown dataset/condition")
+            continue
+        key = dataset, condition
+        if key in indexed:
+            errors.append(f"duplicate job: {key}")
+            continue
+        indexed[key] = job
+        if job.get("status") not in {"pending", "running", "failed", "passed"}:
+            errors.append(f"{key}: invalid job status")
+        try:
+            output = _contained(job.get("output_dir"), root, f"{key} output")
+            metrics = _contained(job.get("metrics_path"), root, f"{key} metrics")
+            if (
+                output != (root / dataset / condition).resolve()
+                or metrics != output / "metrics.json"
+            ):
+                raise ValueError(f"{key}: output/metrics do not match canonical paths")
+        except ValueError as exc:
+            errors.append(str(exc))
+    if set(indexed) != {(dataset, condition) for dataset in datasets for condition in CONDITIONS}:
+        errors.append("manifest must contain the complete four-arm job matrix")
+
+    dataset_reports = []
+    for dataset in datasets:
+        loaded: dict[str, dict[str, Any]] = {}
+        rows = []
+        for condition in FACTORIAL_ORDER:
+            spec = CONDITIONS[condition]
+            job = indexed.get((dataset, condition))
+            row = {
+                "condition": condition,
+                **spec,
+                "status": job.get("status") if job else "missing",
+                **{
+                    key: None
+                    for key in (
+                        "validation",
+                        "validation_percent",
+                        "best_epoch",
+                        "stop_epoch",
+                        "stopping_reason",
+                        "epochs_run",
+                        "train_loss",
+                        "total_parameters",
+                        "trainable_parameters",
+                        "frozen_parameters",
+                        "elapsed_seconds",
+                        "selection_loop_seconds",
+                        "post_selection_diagnostics_seconds",
+                        "peak_cuda_allocated_bytes",
+                        "peak_cuda_reserved_bytes",
+                    )
+                },
+                "best_validation_diagnostics": [],
+                "best_epoch_training_observation": None,
+                "best_checkpoint_interventions": None,
+                "epoch_timing": None,
+            }
+            if job and job.get("error"):
+                row["error"] = str(job["error"])
+            if job and job.get("status") == "passed":
+                try:
+                    child = _load(root, job, config, sources)
+                    loaded[condition] = child
+                    for key in (
+                        "validation",
+                        "best_epoch",
+                        "stop_epoch",
+                        "stopping_reason",
+                        "epochs_run",
+                        "train_loss",
+                        "total_parameters",
+                        "trainable_parameters",
+                        "frozen_parameters",
+                        "elapsed_seconds",
+                        "selection_loop_seconds",
+                        "post_selection_diagnostics_seconds",
+                        "peak_cuda_allocated_bytes",
+                        "peak_cuda_reserved_bytes",
+                    ):
+                        row[key] = child[key]
+                    row["epoch_timing"] = child["epoch_timing"]
+                    row["validation_percent"] = 100.0 * child["validation"]
+                    row["best_validation_diagnostics"] = _best_layers(child["diagnostics"])
+                    row["best_epoch_training_observation"] = _best_training_observation(
+                        child, config
+                    )
+                    row["best_checkpoint_interventions"] = child["diagnostics"][
+                        "best_checkpoint_interventions"
+                    ]
+                except (ValueError, KeyError, TypeError) as exc:
+                    row.update(status="invalid", error=str(exc))
+                    errors.append(f"{dataset}/{condition}: {exc}")
+            rows.append(row)
+
+        reference = next(iter(loaded.values()), None)
+        held_fixed = _pair_metadata(reference) if reference else None
+        if reference:
+            extra = (
+                "versions",
+                "gpu",
+                "total_parameters",
+                "topology",
+                "parameterization",
+                "source_sha256",
+            )
+            held_fixed.update({key: reference[key] for key in extra})
+            for condition, child in loaded.items():
+                actual = _pair_metadata(child) | {key: child[key] for key in extra}
+                for key, expected in held_fixed.items():
+                    if not _same(expected, actual[key]):
+                        errors.append(f"{dataset}/{condition}: held-fixed {key} mismatch")
+        dataset_reports.append(
+            {
+                "dataset": dataset,
+                "metric_name": "accuracy",
+                "model_seed": config.get("model_seed"),
+                "conditions": rows,
+                "complete": len(loaded) == len(CONDITIONS),
+                "held_fixed": held_fixed,
+                "factorial_contrasts": None,
+            }
+        )
+
+    manifest_passed = manifest.get("status") == "passed"
+    all_complete = bool(dataset_reports) and all(item["complete"] for item in dataset_reports)
+    if manifest_passed and not all_complete:
+        errors.append("passed manifest lacks a complete four-arm matrix")
+    for item in dataset_reports:
+        if errors:
+            item["complete"] = False
+        elif manifest_passed and item["complete"]:
+            item["factorial_contrasts"] = _factorial(
+                {row["condition"]: row["validation"] for row in item["conditions"]}
+            )
+    failed = manifest.get("status") == "failed" or any(
+        job.get("status") == "failed" for job in indexed.values()
+    )
+    complete = all_complete and not errors and not failed and manifest_passed
+    return {
+        "schema_version": 1,
+        "suite": SUITE,
+        "status": "invalid"
+        if errors
+        else "passed"
+        if complete
+        else "failed"
+        if failed
+        else "running",
+        "complete": complete,
+        "n_model_seeds": 1,
+        "model_seed": config.get("model_seed"),
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+        "uncertainty_status": "not_estimated_single_seed",
+        "source_integrity_valid": manifest.get("source_integrity_valid"),
+        "datasets": dataset_reports,
+        "errors": errors,
+        "caveats": CAVEATS,
+    }
+
+
+def _diagnostic_markdown(rows: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "### Selected-checkpoint C and propagation diagnostics",
+        "",
+        "Layer indices are zero-based. Frozen scaffold values are not evidence of active learning.",
+        "",
+        "| Condition | Layer | Score std | C CV | log-C std | alpha | gamma | tau | Conv change |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    paths = (
+        ("score", "std"),
+        ("conductance", "cv"),
+        ("log_conductance", "std"),
+        ("alpha",),
+        ("gamma",),
+        ("tau",),
+        ("relative_conv_change",),
+    )
+    for row in rows:
+        for layer in row["best_validation_diagnostics"]:
+            values = [_display(_nested(layer, *path)) for path in paths]
+            lines.append("| " + " | ".join([row["condition"], str(layer["layer"])] + values) + " |")
+    lines += [
+        "",
+        "### Selected-checkpoint spatial-W diagnostics",
+        "",
+        "| Condition | Layer | W-I Frobenius | W-I relative | singular min | singular max "
+        "| condition number | message change |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    paths = (
+        ("spatial_weight", "identity_distance_frobenius"),
+        ("spatial_weight", "identity_relative_distance"),
+        ("spatial_weight", "singular_values", "min"),
+        ("spatial_weight", "singular_values", "max"),
+        ("spatial_weight", "singular_values", "condition_number"),
+        ("relative_message_transform_change",),
+    )
+    for row in rows:
+        for layer in row["best_validation_diagnostics"]:
+            values = [_display(_nested(layer, *path)) for path in paths]
+            lines.append("| " + " | ".join([row["condition"], str(layer["layer"])] + values) + " |")
+    return lines + [""]
+
+
+def _gradient_markdown(rows: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "### Actual training gradients at the selected epoch",
+        "",
+        "Actual train-mask backward, before that epoch's optimizer update; frozen entries are N/A.",
+        "",
+        "| Condition | Epoch | Layer | C-gate gradient L2 | Spatial-W gradient L2 |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
+    for row in rows:
+        record = row["best_epoch_training_observation"]
+        if not record:
+            continue
+        for layer in record["layers"]:
+            gate = layer.get("gate_gradient_norm")
+            spatial = layer.get("spatial_gradient_norm")
+            lines.append(
+                "| "
+                + " | ".join(
+                    (
+                        row["condition"],
+                        str(record["epoch"]),
+                        str(layer["layer"]),
+                        "frozen / N/A" if gate is None else _display(gate),
+                        "frozen / N/A" if spatial is None else _display(spatial),
+                    )
+                )
+                + " |"
+            )
+    return lines + [""]
+
+
+def _intervention_markdown(rows: list[dict[str, Any]]) -> list[str]:
+    lines = [
+        "### Selected-checkpoint validation interventions (no retraining)",
+        "",
+        "| Condition | Intervention | Validation (%) | Delta original (pp) "
+        "| Changed predictions (%) | Mean absolute logit delta |",
+        "| --- | --- | ---: | ---: | ---: | ---: |",
+    ]
+    for row in rows:
+        audit = row["best_checkpoint_interventions"]
+        if not audit:
+            continue
+        for item in audit["rows"]:
+            values = (
+                row["condition"],
+                item["intervention"],
+                _display(100.0 * item["validation"]),
+                _display(item["percentage_points"], signed=True),
+                _display(100.0 * item["changed_prediction_fraction"]),
+                _display(item["logit_mean_absolute_delta"]),
+            )
+            lines.append("| " + " | ".join(values) + " |")
+    return lines + [""]
+
+
+def markdown(report: dict[str, Any]) -> str:
+    lines = [
+        "# Conductance C x spatial W V4 factorial",
+        "",
+        f"Status: **{report['status']}**; model seed {report['model_seed']}; validation only.",
+        "",
+    ]
+    if report["errors"]:
+        lines += ["## Integrity errors: factorial contrasts withheld", ""]
+        lines += [f"- {_cell(error)}" for error in report["errors"]] + [""]
+    for dataset in report["datasets"]:
+        lines += [
+            f"## {dataset['dataset']} (accuracy, higher is better)",
+            "",
+            "| Condition | C mode | W mode | Status | Validation (%) | Best epoch | Stop epoch "
+            "| Stop reason | Train loss | Trainable | Frozen |",
+            "| --- | --- | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: |",
+        ]
+        for row in dataset["conditions"]:
+            values = [
+                row["condition"],
+                row["gate_mode"],
+                row["spatial_mode"],
+                row["status"],
+                _display(row["validation_percent"]),
+                str(row["best_epoch"]) if row["best_epoch"] is not None else "—",
+                str(row["stop_epoch"]) if row["stop_epoch"] is not None else "—",
+                row["stopping_reason"] if row["stopping_reason"] is not None else "—",
+                _display(row["train_loss"]),
+                str(row["trainable_parameters"])
+                if row["trainable_parameters"] is not None
+                else "—",
+                str(row["frozen_parameters"]) if row["frozen_parameters"] is not None else "—",
+            ]
+            lines.append("| " + " | ".join(values) + " |")
+        lines += ["", "### Conditional factorial contrasts", ""]
+        contrasts = dataset["factorial_contrasts"]
+        if contrasts:
+            lines += [
+                "| Contrast | Validation delta (pp) |",
+                "| --- | ---: |",
+            ]
+            for item in contrasts.values():
+                lines.append(
+                    f"| {item['label']} | {_display(item['percentage_points'], signed=True)} |"
+                )
+        else:
+            lines.append("Withheld until all four arms pass integrity checks.")
+        lines += [
+            "",
+            "### Whole-loop resources",
+            "",
+            "| Condition | Epoch median (s) | Epoch p90 (s) | Selection loop (s) "
+            "| Post-selection (s) | Total elapsed (s) | Peak allocated bytes "
+            "| Peak reserved bytes |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+        for row in dataset["conditions"]:
+            values = [
+                row["condition"],
+                _display(_nested(row, "epoch_timing", "median_seconds")),
+                _display(_nested(row, "epoch_timing", "p90_seconds")),
+                _display(row["selection_loop_seconds"]),
+                _display(row["post_selection_diagnostics_seconds"]),
+                _display(row["elapsed_seconds"]),
+                str(row["peak_cuda_allocated_bytes"])
+                if row["peak_cuda_allocated_bytes"] is not None
+                else "—",
+                str(row["peak_cuda_reserved_bytes"])
+                if row["peak_cuda_reserved_bytes"] is not None
+                else "—",
+            ]
+            lines.append("| " + " | ".join(values) + " |")
+        lines += [""] + _diagnostic_markdown(dataset["conditions"])
+        lines += _gradient_markdown(dataset["conditions"])
+        lines += _intervention_markdown(dataset["conditions"])
+    lines += ["## Interpretation limits", ""] + [f"- {item}" for item in CAVEATS] + [""]
+    return "\n".join(lines)
+
+
+def csv_text(report: dict[str, Any]) -> str:
+    buffer = io.StringIO(newline="")
+    fields = [
+        "dataset",
+        "metric_name",
+        "model_seed",
+        "condition",
+        "gate_mode",
+        "spatial_mode",
+        "status",
+        "validation",
+        "validation_percent",
+        "best_epoch",
+        "stop_epoch",
+        "stopping_reason",
+        "epochs_run",
+        "train_loss",
+        "total_parameters",
+        "trainable_parameters",
+        "frozen_parameters",
+        "selection_loop_seconds",
+        "post_selection_diagnostics_seconds",
+        "elapsed_seconds",
+        "epoch_median_seconds",
+        "epoch_p90_seconds",
+        "peak_cuda_allocated_bytes",
+        "peak_cuda_reserved_bytes",
+        "c_given_w_off_pp",
+        "c_given_w_on_pp",
+        "w_given_c_fixed_pp",
+        "w_given_c_relative_pp",
+        "interaction_pp",
+    ]
+    writer = csv.DictWriter(buffer, fieldnames=fields)
+    writer.writeheader()
+    for dataset in report["datasets"]:
+        contrasts = dataset["factorial_contrasts"] or {}
+        additions = {f"{key}_pp": item["percentage_points"] for key, item in contrasts.items()}
+        for row in dataset["conditions"]:
+            record = {key: row[key] for key in fields if key in row}
+            record["epoch_median_seconds"] = _nested(row, "epoch_timing", "median_seconds")
+            record["epoch_p90_seconds"] = _nested(row, "epoch_timing", "p90_seconds")
+            record.update({key: dataset[key] for key in ("dataset", "metric_name", "model_seed")})
+            record.update(additions)
+            writer.writerow(record)
+    return buffer.getvalue()
+
+
+def write_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    root = Path(run_dir).expanduser().resolve(strict=True)
+    if not root.is_dir() or not isinstance(manifest, dict):
+        raise ValueError("expected an existing run directory and manifest object")
+    destinations = [_contained(name, root, name) for name in REPORT_FILENAMES]
+    if any((root / name).is_symlink() for name in REPORT_FILENAMES):
+        raise ValueError("report destinations must not be symlinks")
+    report = build_comparison(root, manifest)
+    contents = [
+        json.dumps(report, indent=2, allow_nan=False) + "\n",
+        markdown(report),
+        csv_text(report),
+    ]
+    for destination, content in zip(destinations, contents, strict=True):
+        _atomic_write(destination, content)
+    if report["errors"]:
+        raise ComparisonIntegrityError(report)
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_dir", type=Path)
+    args = parser.parse_args(argv)
+    try:
+        root = args.run_dir.expanduser().resolve(strict=True)
+        manifest = json.loads(
+            _contained("manifest.json", root, "manifest").read_text(encoding="utf-8"),
+            parse_constant=_reject_nonfinite_json,
+        )
+        source_metadata = manifest.get("sources")
+        if not isinstance(source_metadata, dict):
+            raise ValueError("manifest.sources must be an object")
+        recorded_sources = _source_hashes(source_metadata.get("sha256"))
+        if _current_source_hashes() != recorded_sources:
+            manifest["source_integrity_valid"] = False
+        report = write_comparison(root, manifest)
+    except (OSError, ValueError) as exc:
+        print(f"Comparison failed: {exc}", file=sys.stderr)
+        return 1
+    print(markdown(report))
+    print(f"Reports: {root / 'comparison.md'}")
+    return 0 if report["status"] == "passed" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# research/conductance_gat/v4/reproduce.sh
+
+````bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+source "${project_root}/scripts/conda_env.sh"
+export PYTHONPATH="${project_root}/src:${project_root}${PYTHONPATH:+:${PYTHONPATH}}"
+cd "${project_root}"
+exec "${environment_python}" -B scripts/run_conductance_v4.py "$@"
+````
+
+# research/conductance_gat/v4/train.py
+
+````python
+"""Standalone four-arm conductance x spatial-message V4 training.
+
+Every arm is trained freshly on CUDA with the same official full-graph cache.
+Validation alone selects a checkpoint.  Selected-checkpoint interventions are
+read-only diagnostic forwards and are never counted as additional training.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import time
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from chartgat.cache import atomic_publish, atomic_write_json
+
+from ..ablation.model import state_sha256
+from ..ablation.train import _configure_fp32, _make_data, _require_cuda, training_loss
+from ..benchmark import _seed, _versions
+from ..benchmark_data import load_dataset, sha256_file, tensor_hash
+from .diagnostics import (
+    ForwardObservation,
+    best_checkpoint_interventions,
+    evaluate_validation,
+    norm,
+)
+from .model import RelativeCSpatialNodeClassifier
+from .protocol import COMMON, CONDITIONS, DATASETS, DEFAULT_EDGE_CHUNK_SIZE, PARAMETERIZATION, SUITE
+
+OBSERVATION_POLICY = {
+    "training": (
+        "Every epoch's actual full-graph train forward with dropout ON; raw task gradients "
+        "after backward before AdamW step. No extra training forward/backward."
+    ),
+    "validation": (
+        "Every epoch validation selects checkpoint; initial/selected/final validation layer "
+        "observations use validation labels only."
+    ),
+    "statistics": (
+        "Exact full observed graph score/C moments and degree population quantiles; per-layer "
+        "alpha and W parameter, identity-distance, gradient, and singular-value summaries."
+    ),
+    "factorial_training": (
+        "Four independently trained arms cross fixed/relative C with fixed-identity/learned W. "
+        "Inactive scaffolds are frozen and excluded from AdamW; alpha is active in every arm."
+    ),
+    "symmetric_normalization": (
+        "neighbor_weight_row_sum is alpha times symmetric off-diagonal row weight sum, not a "
+        "stochastic mixing probability and may exceed 1."
+    ),
+    "interventions": (
+        "Only the selected best checkpoint: all-layer graph-mean C, graph-shuffled C, C=1, "
+        "W=I, C=1 plus W=I, and propagation off. C replacements recompute normalization. "
+        "Mean-C versus C=1 is a numerical cancellation check, not an independent effect."
+    ),
+}
+
+
+def configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        **COMMON,
+        "model_seed": args.model_seed,
+        "epochs": args.epochs,
+        "patience": args.patience,
+        "batch_size": args.batch_size,
+        "workers": args.workers,
+        "device": args.device,
+        "tf32": False,
+        "pin_memory": True,
+        "edge_chunk_size": args.edge_chunk_size,
+    }
+
+
+def make_optimizer(model, condition: str) -> torch.optim.AdamW:
+    specification = CONDITIONS[condition]
+    if (
+        model.gate_mode != specification["gate_mode"]
+        or model.spatial_mode != specification["spatial_mode"]
+        or model.normalization != "symmetric"
+    ):
+        raise ValueError("V4 model and factorial condition disagree")
+    selected = {
+        "backbone": [],
+        "conductance_gate": [],
+        "spatial_w": [],
+        "raw_scalars": [],
+    }
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.endswith((".raw_alpha", ".raw_gamma", ".raw_tau")):
+            group = "raw_scalars"
+        elif name.startswith("operators.") and ".estimator." in name:
+            group = "conductance_gate"
+        elif name.startswith("operators.") and ".message_transform." in name:
+            group = "spatial_w"
+        else:
+            group = "backbone"
+        selected[group].append((name, parameter))
+    if not selected["backbone"] or not selected["raw_scalars"]:
+        raise ValueError("V4 requires backbone and trainable alpha/scalar groups")
+    if bool(selected["conductance_gate"]) != (model.gate_mode == "relative"):
+        raise ValueError("V4 fixed estimator must be entirely frozen and excluded")
+    if bool(selected["spatial_w"]) != (model.spatial_mode == "learned"):
+        raise ValueError("V4 fixed identity W must be entirely frozen and excluded")
+    groups = []
+    for name, values in selected.items():
+        if not values:
+            continue
+        if name == "conductance_gate":
+            learning_rate = COMMON["lr"] * COMMON["gate_lr_multiplier"]
+            weight_decay = specification["gate_weight_decay"]
+        elif name == "raw_scalars":
+            learning_rate = COMMON["lr"]
+            weight_decay = COMMON["scalar_weight_decay"]
+        elif name in {"backbone", "spatial_w"}:
+            learning_rate = COMMON["lr"]
+            weight_decay = COMMON["weight_decay"]
+        else:  # pragma: no cover - fail closed if the grouping table changes.
+            raise AssertionError(name)
+        groups.append(
+            {
+                "name": name,
+                "params": [value for _, value in values],
+                "parameter_names": [key for key, _ in values],
+                "lr": learning_rate,
+                "weight_decay": weight_decay,
+            }
+        )
+    optimizer = torch.optim.AdamW(groups, lr=COMMON["lr"])
+    optimized = {name for group in optimizer.param_groups for name in group["parameter_names"]}
+    trainable = {name for name, value in model.named_parameters() if value.requires_grad}
+    if optimized != trainable:
+        raise RuntimeError("V4 optimizer does not contain each trainable parameter exactly once")
+    return optimizer
+
+
+def optimizer_metadata(optimizer):
+    return [
+        {
+            "name": group["name"],
+            "lr": group["lr"],
+            "weight_decay": group["weight_decay"],
+            "parameter_names": list(group["parameter_names"]),
+            "parameter_count": sum(parameter.numel() for parameter in group["params"]),
+        }
+        for group in optimizer.param_groups
+    ]
+
+
+def epoch_timing_summary(history):
+    values = [float(row["epoch_seconds"]) for row in history]
+    if not values or not all(math.isfinite(value) and value >= 0 for value in values):
+        raise ValueError("V4 epoch timing history must be nonempty, finite, and nonnegative")
+    ordered = sorted(values)
+
+    def quantile(fraction: float) -> float:
+        position = (len(ordered) - 1) * fraction
+        lower, upper = math.floor(position), math.ceil(position)
+        if lower == upper:
+            return ordered[lower]
+        weight = position - lower
+        return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+    return {
+        "count": len(values),
+        "total_seconds": sum(values),
+        "mean_seconds": sum(values) / len(values),
+        "median_seconds": quantile(0.5),
+        "p90_seconds": quantile(0.9),
+        "min_seconds": ordered[0],
+        "max_seconds": ordered[-1],
+        "quantile_method": "linear_order_statistic",
+        "scope": (
+            "Per epoch: actual train forward/backward/step, diagnostic summaries, validation "
+            "selection, and CUDA synchronization; subsequent history/checkpoint IO is "
+            "excluded from epoch_seconds and included in selection_loop_seconds."
+        ),
+    }
+
+
+def _parameter_metadata(model):
+    return {
+        "total_parameters": sum(parameter.numel() for parameter in model.parameters()),
+        "trainable_parameters": sum(
+            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+        ),
+        "frozen_parameters": sum(
+            parameter.numel() for parameter in model.parameters() if not parameter.requires_grad
+        ),
+        "trainable_parameter_names": [
+            name for name, parameter in model.named_parameters() if parameter.requires_grad
+        ],
+        "frozen_parameter_names": [
+            name for name, parameter in model.named_parameters() if not parameter.requires_grad
+        ],
+    }
+
+
+def topology_metadata(payload):
+    if payload.get("dataset") not in DATASETS or len(payload.get("graphs", [])) != 1:
+        raise ValueError("V4 experiment requires one official transductive graph; PPI unsupported")
+    graph = payload["graphs"][0]
+    return {
+        "num_nodes": int(graph["x"].shape[0]),
+        "num_edges": int(graph["incidence_edge_index"].shape[1]),
+        "incidence_sha256": tensor_hash(graph["incidence_edge_index"]),
+    }
+
+
+def _source_hashes():
+    from scripts.run_conductance_v4 import _source_snapshot
+
+    return _source_snapshot()["sha256"]
+
+
+def _require_sources(expected):
+    if _source_hashes() != expected:
+        raise RuntimeError("V4 sources changed during execution; refusing mixed sources")
+
+
+def _validate_args(args):
+    if args.dataset not in DATASETS or args.condition not in CONDITIONS:
+        raise ValueError("Unsupported V4 dataset/condition")
+    if min(args.epochs, args.patience, args.edge_chunk_size) < 1 or args.model_seed < 0:
+        raise ValueError("epochs/patience/chunk size must be positive and seed nonnegative")
+    if args.batch_size != 1 or args.workers != 0:
+        raise ValueError("V4 full-graph training requires batch-size=1 and workers=0")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", required=True, choices=DATASETS)
+    parser.add_argument("--condition", required=True, choices=tuple(CONDITIONS))
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--data-root", type=Path, default=Path("data/paper"))
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--model-seed", type=int, default=0)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--edge-chunk-size", type=int, default=DEFAULT_EDGE_CHUNK_SIZE)
+    return parser
+
+
+def train_model(payload, protocol, args, device: torch.device, output: Path):
+    _require_cuda(device)
+    _validate_args(args)
+    if payload.get("dataset") != args.dataset:
+        raise ValueError("Requested dataset does not match payload")
+    topology = topology_metadata(payload)
+    sources = _source_hashes()
+    _configure_fp32()
+    _seed(args.model_seed)
+    graph, indices = _make_data(payload, args, device)
+    if indices is None or not indices["train"].numel():
+        raise ValueError("V4 requires a nonempty transductive train mask")
+    specification = CONDITIONS[args.condition]
+    model = RelativeCSpatialNodeClassifier(
+        payload["graphs"][0]["x"].shape[1],
+        payload["classes"],
+        hidden_channels=COMMON["hidden_channels"],
+        layers=COMMON["layers"],
+        dropout=COMMON["dropout"],
+        normalization="symmetric",
+        gate_mode=specification["gate_mode"],
+        spatial_mode=specification["spatial_mode"],
+        edge_chunk_size=args.edge_chunk_size,
+    ).to(device)
+    initial_hash = state_sha256(model)
+    optimizer = make_optimizer(model, args.condition)
+    common = {
+        "schema_version": 1,
+        "research_suite": SUITE,
+        "model": SUITE,
+        "dataset": args.dataset,
+        "condition": args.condition,
+        "model_seed": args.model_seed,
+        **specification,
+        "factorial_axes": {
+            "conductance": specification["gate_mode"],
+            "spatial_message": specification["spatial_mode"],
+        },
+        "non_gate_weight_decay": COMMON["weight_decay"],
+        "configuration": configuration(args),
+        "cache_sha256": protocol["data_sha256"],
+        "protocol": protocol,
+        "initial_state_sha256": initial_hash,
+        "topology": topology,
+        "parameterization": PARAMETERIZATION,
+        "source_sha256": sources,
+        "optimizer": "AdamW",
+        "optimizer_groups": optimizer_metadata(optimizer),
+        **_parameter_metadata(model),
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+    }
+    checkpoint, history_path = output / "best.pt", output / "history.json"
+    history, trajectory = [], []
+    best_validation, best_epoch = -math.inf, 0
+    checkpoint_hash = history_hash = None
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    initial_observation, _ = evaluate_validation(model, graph, indices["validation"])
+    for epoch in range(1, args.epochs + 1):
+        _require_sources(sources)
+        torch.cuda.synchronize(device)
+        epoch_started = time.perf_counter()
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        with ForwardObservation(model) as observation:
+            logits = model(graph)
+        loss, count = training_loss(logits, graph, indices["train"])
+        if not bool(torch.isfinite(loss)):
+            raise FloatingPointError(f"Nonfinite V4 training loss at epoch {epoch}")
+        loss.backward()
+        gradient_groups = [
+            {
+                **descriptor,
+                "parameter_norm": norm(group["params"]),
+                "task_gradient_norm": norm(group["params"], gradient=True),
+            }
+            for descriptor, group in zip(
+                optimizer_metadata(optimizer), optimizer.param_groups, strict=True
+            )
+        ]
+        record = {
+            "epoch": epoch,
+            "batch_index": 0,
+            "optimizer_steps_before_batch": epoch - 1,
+            "scope": "full_graph_train_mask",
+            "mode": "train_dropout_on",
+            "stage": "after_task_backward_before_optimizer_step",
+            "label_count": count,
+            "train_loss": float(loss.detach()),
+            "layers": observation.summary(gradients=True),
+            "parameter_groups": gradient_groups,
+        }
+        trajectory.append(record)
+        optimizer.step()
+        validation_observation, _ = evaluate_validation(
+            model, graph, indices["validation"], observe=False
+        )
+        validation = validation_observation["metric"]
+        torch.cuda.synchronize(device)
+        history.append(
+            {
+                "epoch": epoch,
+                "optimizer_steps": epoch,
+                "train_loss": record["train_loss"],
+                "validation": validation,
+                "epoch_seconds": time.perf_counter() - epoch_started,
+                "training_first_batch": record,
+            }
+        )
+        atomic_write_json(history_path, history)
+        history_hash = sha256_file(history_path)
+        if validation > best_validation:
+            best_validation, best_epoch = validation, epoch
+            saved = {
+                **common,
+                "state_dict": {
+                    name: tensor.detach().cpu() for name, tensor in model.state_dict().items()
+                },
+                "architecture": {
+                    "hidden_channels": COMMON["hidden_channels"],
+                    "layers": COMMON["layers"],
+                    "dropout": COMMON["dropout"],
+                    "normalization": "symmetric",
+                    "gate_mode": specification["gate_mode"],
+                    "spatial_mode": specification["spatial_mode"],
+                    "edge_chunk_size": args.edge_chunk_size,
+                },
+                "best_epoch": epoch,
+                "optimizer_steps": epoch,
+                "validation": validation,
+            }
+            atomic_publish(checkpoint, lambda path, state=saved: torch.save(state, path))
+            checkpoint_hash = sha256_file(checkpoint)
+        if epoch == 1 or epoch % 10 == 0:
+            print(
+                f"{args.dataset}/{args.condition} epoch={epoch} "
+                f"train_loss={record['train_loss']:.6f} "
+                f"val={validation:.6f} best_epoch={best_epoch}",
+                flush=True,
+            )
+        if epoch - best_epoch >= args.patience:
+            break
+    stop_epoch = len(history)
+    stopping_reason = "patience" if stop_epoch - best_epoch >= args.patience else "max_epochs"
+    selection_loop_seconds = time.perf_counter() - started
+    post_selection_started = time.perf_counter()
+    final_observation, _ = evaluate_validation(model, graph, indices["validation"])
+    _require_sources(sources)
+    if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
+        raise RuntimeError("Checkpoint/history changed before best-checkpoint validation")
+    saved = torch.load(checkpoint, map_location=device, weights_only=True)
+    for key in (
+        "research_suite",
+        "condition",
+        "dataset",
+        "configuration",
+        "topology",
+        "source_sha256",
+        "initial_state_sha256",
+        "gate_mode",
+        "spatial_mode",
+    ):
+        if saved.get(key) != common[key]:
+            raise ValueError(f"Best checkpoint metadata mismatch: {key}")
+    model.load_state_dict(saved["state_dict"])
+    optimizer.zero_grad(set_to_none=True)
+    selected_observation, reference = evaluate_validation(model, graph, indices["validation"])
+    if abs(selected_observation["metric"] - best_validation) > 1e-4:
+        raise RuntimeError("Best validation recheck disagrees with checkpoint selection")
+    interventions = best_checkpoint_interventions(
+        model,
+        graph,
+        indices["validation"],
+        selected_observation,
+        reference,
+        seed=args.model_seed,
+    )
+    _require_sources(sources)
+    if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
+        raise RuntimeError("Read-only interventions changed source checkpoint/history")
+    torch.cuda.synchronize(device)
+    post_selection_diagnostics_seconds = time.perf_counter() - post_selection_started
+    return {
+        **common,
+        "status": "passed",
+        "best_epoch": best_epoch,
+        "stop_epoch": stop_epoch,
+        "stopping_reason": stopping_reason,
+        "epochs_run": len(history),
+        "optimizer_steps": len(history),
+        "best_checkpoint_optimizer_steps": best_epoch,
+        "validation": selected_observation["metric"],
+        "validation_at_selection": best_validation,
+        "metric_name": "accuracy",
+        "train_loss": history[best_epoch - 1]["train_loss"],
+        "train_loss_scope": "actual full-graph train mask loss at selected checkpoint epoch",
+        "final_train_loss": history[-1]["train_loss"],
+        "checkpoint": str(checkpoint.resolve()),
+        "checkpoint_sha256": checkpoint_hash,
+        "history": str(history_path.resolve()),
+        "history_sha256": history_hash,
+        "selection_loop_seconds": selection_loop_seconds,
+        "post_selection_diagnostics_seconds": post_selection_diagnostics_seconds,
+        "epoch_timing": epoch_timing_summary(history),
+        "elapsed_seconds": time.perf_counter() - started,
+        "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
+        "versions": _versions(),
+        "gpu": torch.cuda.get_device_name(device),
+        "diagnostics": {
+            "initial_validation": initial_observation,
+            "best_validation": selected_observation,
+            "final_validation": final_observation,
+            "train_trajectory": trajectory,
+            "best_checkpoint_interventions": interventions,
+            "observation_policy": OBSERVATION_POLICY,
+        },
+        "execution": {
+            "training": "full_graph_transductive",
+            "neighbor_sampling": False,
+            "edge_chunk_size": args.edge_chunk_size,
+            "dense_incidence": False,
+            "eigendecomposition": False,
+            "spatial_message_transform": specification["spatial_mode"],
+        },
+        "reproducibility": "Same initialization/seed; CUDA scatter may remain nondeterministic.",
+        "timing_policy": (
+            "selection_loop_seconds includes initial validation, training, validation selection "
+            "and history/checkpoint IO. post_selection_diagnostics_seconds includes final and "
+            "selected-checkpoint observations/interventions plus integrity checks and checkpoint "
+            "loading. elapsed_seconds includes both."
+        ),
+    }
+
+
+def _cache_snapshot(args):
+    cache = (
+        args.data_root.expanduser().resolve()
+        / "conductance_gat/matched_benchmark_v1"
+        / args.dataset
+    )
+    return {str(path): sha256_file(path) for path in (cache / "data.pt", cache / "manifest.json")}
+
+
+def main(argv: list[str] | None = None):
+    args = build_parser().parse_args(argv)
+    _validate_args(args)
+    device = torch.device(args.device)
+    _require_cuda(device)
+    output, data_root = (
+        args.output_dir.expanduser().resolve(),
+        args.data_root.expanduser().resolve(),
+    )
+    if output == data_root or output.is_relative_to(data_root) or data_root.is_relative_to(output):
+        raise ValueError("V4 output and dataset cache must not overlap")
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise FileExistsError(f"Output is not a new empty arm directory: {output}")
+    output.mkdir(parents=True, exist_ok=True)
+    record = {
+        "schema_version": 1,
+        "status": "running",
+        "research_suite": SUITE,
+        "dataset": args.dataset,
+        "condition": args.condition,
+        "model_seed": args.model_seed,
+        **CONDITIONS[args.condition],
+        "configuration": configuration(args),
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+    }
+    atomic_write_json(output / "metrics.json", record)
+    try:
+        sources = _source_hashes()
+        record["source_sha256"] = sources
+        payload, protocol = load_dataset(args.dataset, data_root, allow_download=False)
+        cache_files = _cache_snapshot(args)
+        _require_sources(sources)
+        record.update(cache_sha256=protocol["data_sha256"], protocol=protocol)
+        result = train_model(payload, protocol, args, device, output)
+        if result["source_sha256"] != sources or _cache_snapshot(args) != cache_files:
+            raise RuntimeError("Cache/source changed between verification and completed training")
+        _require_sources(sources)
+        record.update(result, cache_files_sha256=cache_files)
+    except BaseException as exc:
+        record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        atomic_write_json(output / "metrics.json", record)
+        raise
+    atomic_write_json(output / "metrics.json", record)
+    print(f"passed: {output}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # research/cycle_pe/__init__.py
 
 ````python
@@ -34621,7 +37365,7 @@ exec "${environment_python}" -B scripts/diagnose_conductance.py "$@"
 
 ````python
 #!/usr/bin/env python3
-"""Generate the reviewable ``# path`` + exact source ``code_summary.md`` snapshot."""
+"""Generate the reviewable ``# path`` + exact source GPT handoff snapshot."""
 
 from __future__ import annotations
 
@@ -34633,7 +37377,7 @@ import tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-OUTPUT_PATH = PROJECT_ROOT / "code_summary.md"
+OUTPUT_PATH = PROJECT_ROOT / "gpt_handoff/CODE_SUMMARY.md"
 
 SOURCE_SUFFIXES = {".py", ".toml", ".yaml", ".yml", ".sh", ".ps1"}
 EXCLUDED_PARTS = {
@@ -34733,7 +37477,7 @@ def main() -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="fail if code_summary.md does not exactly match the current selected sources",
+        help="fail if gpt_handoff/CODE_SUMMARY.md does not match the selected sources",
     )
     parser.add_argument("--json", action="store_true", help="include the selected source list")
     args = parser.parse_args()
@@ -36461,6 +39205,316 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ````
 
+# scripts/run_conductance_v4.py
+
+````python
+#!/usr/bin/env python3
+"""Run the four-arm relative-conductance x spatial-message V4 experiment."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import shlex
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_json  # noqa: E402
+from research.conductance_gat.v4.protocol import (  # noqa: E402
+    COMMON,
+    CONDITIONS,
+    DATASETS,
+    DEFAULT_DATASETS,
+    SUITE,
+)
+from scripts import run_conductance_factorial as shared  # noqa: E402
+from scripts.check_dependencies import (  # noqa: E402
+    DependencyCheckError,
+    check_dependencies,
+    error_message,
+)
+
+run_logged = shared.run_logged
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument(
+        "--datasets",
+        nargs="+",
+        default=list(DEFAULT_DATASETS),
+        help="Fixed-graph datasets: " + ", ".join(DATASETS) + "; default: ogbn-arxiv",
+    )
+    result.add_argument("--model-seed", type=int, default=0, help="One seed, not a seed list")
+    result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    result.add_argument("--results-root", type=Path, default=ROOT / "results")
+    result.add_argument("--run-id")
+    result.add_argument("--device", default="cuda")
+    result.add_argument("--epochs", type=int, default=200)
+    result.add_argument("--patience", type=int, default=50)
+    result.add_argument("--batch-size", type=int, default=1, help="Must be 1: full-graph training")
+    result.add_argument("--workers", type=int, default=0)
+    result.add_argument("--edge-chunk-size", type=int, default=65536)
+    result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument("--dry-run", action="store_true", help="Print plan without GPU or writes")
+    return result
+
+
+def _validate(args: argparse.Namespace) -> None:
+    shared._validate(args)
+    if "ppi" in args.datasets:
+        raise ValueError(
+            "PPI is outside the initial V4 protocol, which uses one fixed transductive graph. "
+            "This is a protocol limit, not a claim about the shared modules."
+        )
+    if not args.datasets or any(dataset not in DATASETS for dataset in args.datasets):
+        raise ValueError("Unsupported fixed-graph dataset; choose: " + ", ".join(DATASETS))
+    if args.edge_chunk_size < 1:
+        raise ValueError("edge chunk size must be positive")
+    if args.batch_size != 1 or args.workers != 0:
+        raise ValueError("Full-graph V4 requires batch-size=1 and workers=0")
+
+
+def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
+    jobs = []
+    for dataset in args.datasets:
+        for condition in CONDITIONS:
+            output = run_dir / dataset / condition
+            command = [
+                sys.executable,
+                "-B",
+                "-u",
+                "-m",
+                "research.conductance_gat.v4.train",
+                "--dataset",
+                dataset,
+                "--condition",
+                condition,
+                "--output-dir",
+                str(output),
+                "--data-root",
+                str(args.data_root.expanduser().resolve()),
+            ]
+            for key in (
+                "device",
+                "model_seed",
+                "epochs",
+                "patience",
+                "batch_size",
+                "workers",
+                "edge_chunk_size",
+            ):
+                command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
+            jobs.append(
+                {
+                    "dataset": dataset,
+                    "condition": condition,
+                    "status": "pending",
+                    "output_dir": str(output),
+                    "metrics_path": str(output / "metrics.json"),
+                    "log_path": str(run_dir / "logs" / f"{dataset}--{condition}.log"),
+                    "command": command,
+                }
+            )
+    return jobs
+
+
+def _source_snapshot() -> dict[str, Any]:
+    """Hash V4 plus every shared execution dependency used by its training jobs."""
+    snapshot = shared._source_snapshot()
+    files = list((ROOT / "research/conductance_gat/v4").glob("*.py"))
+    files += [
+        Path(__file__),
+        ROOT / "src/chartgat/cache.py",
+        ROOT / "src/chartgat/execution.py",
+        ROOT / "research/conductance_gat/v4/reproduce.sh",
+        ROOT / "scripts/conda_env.sh",
+        ROOT / "scripts/gpu_profiles.py",
+        ROOT / "scripts/verify_conda_env.py",
+        ROOT / "scripts/verify_gpu_lock.py",
+    ]
+    for path in files:
+        snapshot["sha256"][path.relative_to(ROOT).as_posix()] = hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+    return snapshot
+
+
+def _comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    from research.conductance_gat.v4.report import write_comparison
+
+    return write_comparison(run_dir, manifest)
+
+
+def _check_sources(manifest: dict[str, Any]) -> None:
+    if _source_snapshot()["sha256"] != manifest["sources"]["sha256"]:
+        manifest["source_integrity_valid"] = False
+        raise RuntimeError("Experiment source changed during the run; refusing mixed sources")
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        _validate(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    run_id = args.run_id or "hybrid-c-spatial-v4-" + dt.datetime.now(dt.UTC).strftime(
+        "%Y%m%dT%H%M%S%fZ"
+    )
+    run_dir = (args.results_root.expanduser().resolve() / "conductance_gat/v4" / run_id).resolve()
+    data_root = args.data_root.expanduser().resolve()
+    if (
+        run_dir == data_root
+        or run_dir.is_relative_to(data_root)
+        or data_root.is_relative_to(run_dir)
+    ):
+        print("Experiment outputs and dataset directories must not overlap", file=sys.stderr)
+        return 2
+    jobs = make_jobs(args, run_dir)
+    if args.dry_run:
+        print(f"One model seed: {args.model_seed}; {len(jobs)} fresh trainings; validation only")
+        for job in jobs:
+            print(shlex.join(job["command"]))
+        print(f"Comparison: {run_dir / 'comparison.md'}")
+        return 0
+    if run_dir.exists():
+        print(f"Run already exists; use a new run ID: {run_dir}", file=sys.stderr)
+        return 2
+    try:
+        dependencies = check_dependencies()
+    except DependencyCheckError as exc:
+        print(error_message(exc), file=sys.stderr)
+        return exc.exit_code
+    run_dir.mkdir(parents=True, exist_ok=False)
+    common = {
+        **COMMON,
+        **{
+            key: getattr(args, key)
+            for key in (
+                "datasets",
+                "model_seed",
+                "epochs",
+                "patience",
+                "batch_size",
+                "workers",
+                "device",
+                "edge_chunk_size",
+            )
+        },
+        "data_root": str(data_root),
+    }
+    manifest = {
+        "schema_version": 1,
+        "suite": SUITE,
+        "run_id": run_id,
+        "status": "running",
+        "source_integrity_valid": True,
+        "config": common,
+        "conditions": CONDITIONS,
+        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "jobs": jobs,
+        "dependencies": dependencies,
+        "sources": _source_snapshot(),
+        "protocol": {
+            "selection": "best validation checkpoint per arm; same early-stopping policy",
+            "test": "not evaluated; exploratory validation comparison",
+            "initialization": "same full state hash across all four arms; C=1, W=I, alpha=.5",
+            "data": "same verified official cache/split and ordered topology; no downloads",
+            "contrast": "four fresh V4 trainings; never reuse V3 checkpoints or scores",
+            "factorial": "relative C on/off crossed with learned spatial W on/off",
+            "fixed_c": "exact C=1; estimator scaffold frozen and excluded from optimizer",
+            "identity_w": "exact W=I; message-transform scaffold frozen and excluded",
+            "normalization": "symmetric weighted-degree in every arm; alpha remains trainable",
+            "transductive": "initial protocol uses official fixed-graph train/validation masks",
+            "interventions": "selected-checkpoint validation only; no retraining or test labels",
+            "v3_comparison": "V3 is not reused and V3-to-V4 is not a one-factor score contrast",
+            "resources": "whole-loop time and peak allocation include diagnostics and IO",
+            "uncertainty": "n=1; no CI, seed standard deviation or significance claim",
+            "reproducibility": "same seeds; CUDA scatter need not be bitwise deterministic",
+        },
+    }
+    manifest_path = run_dir / "manifest.json"
+    atomic_write_json(manifest_path, manifest)
+    current_job = None
+    environment = shared._environment()
+    try:
+        _comparison(run_dir, manifest)
+        preflight = [
+            sys.executable,
+            "-B",
+            str(ROOT / "scripts/gpu_preflight.py"),
+            "--device",
+            args.device,
+            "--require-paper-deps",
+            "--min-free-gb",
+            str(args.min_free_gb),
+            "--json-out",
+            str(run_dir / "gpu-preflight.json"),
+        ]
+        status = run_logged(preflight, run_dir / "logs/preflight.log", environment)
+        if status:
+            raise RuntimeError(f"GPU preflight failed with exit code {status}")
+        print(f"Run: {run_id}; seed {args.model_seed}; {len(jobs)} fresh trainings", flush=True)
+        for index, job in enumerate(jobs, start=1):
+            current_job = job
+            _check_sources(manifest)
+            job["status"] = "running"
+            atomic_write_json(manifest_path, manifest)
+            print(f"\n[{index}/{len(jobs)}] {job['dataset']} / {job['condition']}", flush=True)
+            started = time.monotonic()
+            status = run_logged(job["command"], Path(job["log_path"]), environment)
+            job.update(elapsed_seconds=time.monotonic() - started, exit_code=status)
+            _check_sources(manifest)
+            if status:
+                raise RuntimeError(
+                    f"{job['dataset']}/{job['condition']} failed with exit code {status}"
+                )
+            metrics = Path(job["metrics_path"])
+            if not metrics.is_file():
+                raise RuntimeError(f"Child returned without metrics: {metrics}")
+            job["metrics_sha256"] = hashlib.sha256(metrics.read_bytes()).hexdigest()
+            job["status"] = "passed"
+            atomic_write_json(manifest_path, manifest)
+            _comparison(run_dir, manifest)
+            current_job = None
+        _check_sources(manifest)
+        manifest.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+        _comparison(run_dir, manifest)
+        _check_sources(manifest)
+    except (Exception, KeyboardInterrupt) as exc:
+        manifest.update(
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}",
+            finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+        )
+        if current_job is not None:
+            current_job.update(status="failed", error=manifest["error"])
+        atomic_write_json(manifest_path, manifest)
+        try:
+            _comparison(run_dir, manifest)
+        except (ValueError, OSError) as report_error:
+            print(f"Comparison integrity error: {report_error}", file=sys.stderr)
+        print(f"Failed: {manifest['error']}\nSaved partial results: {run_dir}", file=sys.stderr)
+        return 130 if isinstance(exc, KeyboardInterrupt) else 1
+    atomic_write_json(manifest_path, manifest)
+    print((run_dir / "comparison.md").read_text(encoding="utf-8"), flush=True)
+    print(f"Comparison: {run_dir / 'comparison.md'}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # scripts/run_paper.py
 
 ````python
@@ -37381,7 +40435,7 @@ fi
 
 echo "Exact environment report: ${lock_report}"
 echo "Resolved transitive snapshot: ${freeze_report}"
-echo "GPU environment ready. Follow README.md for dataset preparation and experiments."
+echo "GPU environment ready. Follow docs/GETTING_STARTED.md for data and experiments."
 ````
 
 # scripts/verify_conda_env.py
@@ -42798,6 +45852,918 @@ def test_source_snapshot_covers_shared_and_v3_code():
         assert name in snapshot and len(snapshot[name]) == 64
 ````
 
+# tests/test_conductance_v4_core.py
+
+````python
+"""CPU-only mathematical contracts for Conductance V4; no dataset or training run."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from research.conductance_gat.ablation.model import state_sha256  # noqa: E402
+from research.conductance_gat.v3.model import RelativeCNodeClassifier  # noqa: E402
+from research.conductance_gat.v4.model import (  # noqa: E402
+    RelativeCSpatialConv,
+    RelativeCSpatialNodeClassifier,
+)
+from research.conductance_gat.v4.operator import symmetric_spatial_propagation  # noqa: E402
+from research.conductance_gat.v4.protocol import CONDITIONS  # noqa: E402
+
+
+def _dense_reference(residual, message, c, incidence, alpha):
+    nodes = residual.shape[0]
+    tail, head = incidence
+    adjacency = c.new_zeros(nodes, nodes)
+    adjacency = adjacency.index_put((tail, head), c, accumulate=True)
+    adjacency = adjacency.index_put((head, tail), c, accumulate=True)
+    degree = adjacency.sum(dim=1)
+    active = degree > 0
+    inverse = torch.where(active, degree, torch.ones_like(degree)).rsqrt()
+    inverse = inverse * active.to(c.dtype)
+    propagation = inverse[:, None] * adjacency * inverse[None, :]
+    return residual - alpha * (active[:, None] * residual - propagation @ message)
+
+
+def _operator_inputs():
+    residual = torch.tensor(
+        [[0.2, -1.1], [1.7, 0.4], [-0.6, 2.2], [3.0, -0.5]],
+        dtype=torch.float64,
+    )
+    message = torch.tensor(
+        [[1.1, 0.3], [-0.7, 2.4], [0.8, -1.6], [-2.0, 0.9]],
+        dtype=torch.float64,
+    )
+    conductance = torch.tensor([0.4, 1.3], dtype=torch.float64)
+    incidence = torch.tensor([[0, 1], [1, 2]], dtype=torch.long)
+    alpha = torch.tensor(0.37, dtype=torch.float64)
+    return residual, message, conductance, incidence, alpha
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 17])
+def test_chunked_operator_matches_dense_reference_and_preserves_isolate(chunk_size):
+    residual, message, conductance, incidence, alpha = _operator_inputs()
+    actual = symmetric_spatial_propagation(
+        residual,
+        message,
+        conductance,
+        incidence,
+        alpha,
+        edge_chunk_size=chunk_size,
+    )
+    expected = _dense_reference(residual, message, conductance, incidence, alpha)
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(actual[3], residual[3], rtol=0, atol=0)
+
+
+def test_custom_backward_matches_dense_autograd_for_both_states_c_and_alpha():
+    values = _operator_inputs()
+    actual_inputs = [value.clone().requires_grad_(True) for value in values[:3]]
+    actual_alpha = values[4].clone().requires_grad_(True)
+    actual = symmetric_spatial_propagation(
+        *actual_inputs,
+        values[3],
+        actual_alpha,
+        edge_chunk_size=1,
+    )
+
+    reference_inputs = [value.clone().requires_grad_(True) for value in values[:3]]
+    reference_alpha = values[4].clone().requires_grad_(True)
+    expected = _dense_reference(
+        *reference_inputs,
+        values[3],
+        reference_alpha,
+    )
+    upstream = torch.tensor(
+        [[0.3, -0.9], [1.1, 0.2], [-0.5, 0.8], [0.7, -1.4]],
+        dtype=torch.float64,
+    )
+    actual_gradients = torch.autograd.grad(
+        actual,
+        (*actual_inputs, actual_alpha),
+        grad_outputs=upstream,
+    )
+    expected_gradients = torch.autograd.grad(
+        expected,
+        (*reference_inputs, reference_alpha),
+        grad_outputs=upstream,
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(
+            actual_gradient,
+            expected_gradient,
+            rtol=2e-10,
+            atol=2e-10,
+        )
+
+
+def test_custom_operator_passes_first_order_gradcheck():
+    residual, message, conductance, incidence, alpha = _operator_inputs()
+    differentiable = tuple(
+        value.clone().requires_grad_(True) for value in (residual, message, conductance, alpha)
+    )
+
+    def function(residual_state, message_state, c, mixing):
+        return symmetric_spatial_propagation(
+            residual_state,
+            message_state,
+            c,
+            incidence,
+            mixing,
+            edge_chunk_size=1,
+        )
+
+    assert torch.autograd.gradcheck(function, differentiable, eps=1e-6, atol=1e-5, rtol=1e-4)
+
+
+def _model(condition):
+    specification = CONDITIONS[condition]
+    return RelativeCSpatialNodeClassifier(
+        3,
+        2,
+        hidden_channels=4,
+        layers=2,
+        dropout=0.0,
+        gate_mode=specification["gate_mode"],
+        spatial_mode=specification["spatial_mode"],
+        edge_chunk_size=1,
+    )
+
+
+def test_all_factorial_arms_have_identical_initial_state_and_expected_freezing():
+    models = {}
+    for condition in CONDITIONS:
+        torch.manual_seed(71)
+        models[condition] = _model(condition)
+    assert len({state_sha256(model) for model in models.values()}) == 1
+    for condition, model in models.items():
+        specification = CONDITIONS[condition]
+        for operator in model.operators:
+            assert operator.raw_alpha.requires_grad
+            estimator_active = any(
+                parameter.requires_grad for parameter in operator.estimator.parameters()
+            )
+            assert estimator_active == (specification["gate_mode"] == "relative")
+            assert operator.message_transform.weight.requires_grad == (
+                specification["spatial_mode"] == "learned"
+            )
+            torch.testing.assert_close(
+                operator.message_transform.weight,
+                torch.eye(4),
+                rtol=0,
+                atol=0,
+            )
+
+
+def test_identity_w_path_is_exact_v3_forward():
+    torch.manual_seed(29)
+    v3 = RelativeCNodeClassifier(
+        3,
+        2,
+        hidden_channels=4,
+        layers=2,
+        dropout=0.0,
+        gate_mode="relative",
+        edge_chunk_size=1,
+    )
+    torch.manual_seed(29)
+    v4 = RelativeCSpatialNodeClassifier(
+        3,
+        2,
+        hidden_channels=4,
+        layers=2,
+        dropout=0.0,
+        gate_mode="relative",
+        spatial_mode="fixed_identity",
+        edge_chunk_size=1,
+    )
+    v4_state = v4.state_dict()
+    for name, value in v3.state_dict().items():
+        torch.testing.assert_close(v4_state[name], value, rtol=0, atol=0)
+    graph = SimpleNamespace(
+        x=torch.tensor([[0.2, 1.0, -0.4], [1.2, -0.7, 0.5], [-0.3, 0.8, 2.0], [0.9, 0.1, -1.0]]),
+        incidence_edge_index=torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+    )
+    v3.eval()
+    v4.eval()
+    with torch.no_grad():
+        expected = v3(graph)
+        actual = v4(graph)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_conductance_reads_pre_w_state_and_learned_w_receives_task_gradient():
+    operator = RelativeCSpatialConv(
+        2,
+        gate_mode="fixed_one",
+        spatial_mode="learned",
+        edge_chunk_size=1,
+    ).double()
+    state = torch.tensor(
+        [[1.0, -2.0], [0.5, 3.0], [-1.5, 0.7]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    incidence = torch.tensor([[0], [1]], dtype=torch.long)
+    node_graph = torch.zeros(3, dtype=torch.long)
+    observed = []
+    handle = operator.estimator.register_forward_pre_hook(
+        lambda module, inputs: observed.append(inputs[0].detach().clone())
+    )
+    with torch.no_grad():
+        operator.message_transform.weight.copy_(2 * torch.eye(2, dtype=torch.float64))
+    try:
+        output = operator(state, incidence, node_graph, 1)
+    finally:
+        handle.remove()
+    torch.testing.assert_close(observed[0], state.detach(), rtol=0, atol=0)
+    torch.testing.assert_close(output[2], state[2], rtol=0, atol=0)
+    output.square().sum().backward()
+    gradient = operator.message_transform.weight.grad
+    assert gradient is not None and bool((gradient.abs() > 0).any())
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"gate_mode": "unknown", "spatial_mode": "learned"},
+        {"gate_mode": "relative", "spatial_mode": "unknown"},
+        {"gate_mode": "relative", "spatial_mode": "learned", "edge_chunk_size": 0},
+    ],
+)
+def test_invalid_v4_modes_and_chunk_are_rejected(kwargs):
+    with pytest.raises(ValueError):
+        RelativeCSpatialConv(2, **kwargs)
+````
+
+# tests/test_conductance_v4_report.py
+
+````python
+"""Artifact-only integrity tests for the Conductance V4 factorial report."""
+
+from __future__ import annotations
+
+import copy
+import csv
+import hashlib
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from research.conductance_gat.v4 import report as report_module  # noqa: E402
+from research.conductance_gat.v4.model import RelativeCSpatialNodeClassifier  # noqa: E402
+from research.conductance_gat.v4.protocol import (  # noqa: E402
+    COMMON,
+    CONDITIONS,
+    PARAMETERIZATION,
+    SUITE,
+)
+from research.conductance_gat.v4.report import (  # noqa: E402
+    ComparisonIntegrityError,
+    main,
+    write_comparison,
+)
+from research.conductance_gat.v4.train import (  # noqa: E402
+    _parameter_metadata,
+    configuration,
+    make_optimizer,
+    optimizer_metadata,
+)
+
+SCORES = {
+    "fixed_c_identity_w": 0.50,
+    "relative_c_identity_w": 0.52,
+    "fixed_c_spatial_w": 0.55,
+    "relative_c_spatial_w": 0.60,
+}
+INTERVENTIONS = (
+    "mean_c",
+    "shuffled_c",
+    "ones_c",
+    "identity_w",
+    "ones_c_identity_w",
+    "propagation_off",
+)
+
+
+def _layer(index, specification, *, gradients=False):
+    c_active = specification["gate_mode"] == "relative"
+    w_active = specification["spatial_mode"] == "learned"
+    return {
+        "layer": index,
+        "score": {"std": 0.1 if c_active else 0.0},
+        "conductance": {
+            "mean": 1.0,
+            "std": 0.02 if c_active else 0.0,
+            "cv": 0.02 if c_active else 0.0,
+            "min": 0.9 if c_active else 1.0,
+            "max": 1.1 if c_active else 1.0,
+        },
+        "log_conductance": {
+            "mean": 0.0,
+            "std": 0.02 if c_active else 0.0,
+            "min": -0.1 if c_active else 0.0,
+            "max": 0.1 if c_active else 0.0,
+        },
+        "alpha": 0.5,
+        "gamma": 0.5,
+        "tau": 1.0,
+        "estimator_trainable": c_active,
+        "weighted_degree": {
+            "quantiles": {"p50": 2.0, "p99": 4.0},
+            "max_over_median": 2.0,
+        },
+        "relative_message_transform_change": 0.03 if w_active else 0.0,
+        "relative_conv_change": 0.2,
+        "gate_parameter_norm": 1.0,
+        "gate_gradient_norm": 0.1 if gradients and c_active else None,
+        "spatial_gradient_norm": 0.2 if gradients and w_active else None,
+        "spatial_weight": {
+            "spatial_mode": specification["spatial_mode"],
+            "trainable": w_active,
+            "parameter_norm": 8.0,
+            "identity_distance_frobenius": 0.1 if w_active else 0.0,
+            "identity_relative_distance": 0.0125 if w_active else 0.0,
+            "singular_values": {
+                "count": 64,
+                "min": 0.9 if w_active else 1.0,
+                "max": 1.1 if w_active else 1.0,
+                "mean": 1.0,
+                "std": 0.01 if w_active else 0.0,
+                "condition_number": 1.1 / 0.9 if w_active else 1.0,
+            },
+        },
+    }
+
+
+def _training_record(epoch, specification):
+    return {
+        "epoch": epoch,
+        "batch_index": 0,
+        "optimizer_steps_before_batch": epoch - 1,
+        "scope": "full_graph_train_mask",
+        "mode": "train_dropout_on",
+        "stage": "after_task_backward_before_optimizer_step",
+        "layers": [_layer(index, specification, gradients=True) for index in range(2)],
+    }
+
+
+def _diagnostics(score, specification):
+    layers = [_layer(index, specification) for index in range(2)]
+    intervention_rows = [
+        {
+            "intervention": name,
+            "intervention_kind": "read_only_selected_checkpoint",
+            "fresh_training": False,
+            "validation": score,
+            "percentage_points": 0.0,
+            "changed_prediction_fraction": 0.0,
+            "logit_mean_absolute_delta": 0.0,
+        }
+        for name in INTERVENTIONS
+    ]
+    return {
+        "initial_validation": {"mode": "eval", "split": "validation", "layers": layers},
+        "best_validation": {
+            "mode": "eval",
+            "split": "validation",
+            "metric": score,
+            "layers": layers,
+        },
+        "final_validation": {"mode": "eval", "split": "validation", "layers": layers},
+        "train_trajectory": [
+            _training_record(1, specification),
+            _training_record(2, specification),
+        ],
+        "best_checkpoint_interventions": {
+            "status": "passed",
+            "scope": "validation_selected_best_checkpoint_only",
+            "layers": "all_layers_simultaneously",
+            "original": {"validation": score, "loss": 1.0},
+            "rows": intervention_rows,
+            "shuffle_seed": 0,
+            "normalization_recomputed_for_c_interventions": True,
+            "mean_c_numeric_check": {
+                "comparison": "mean_c_vs_ones_c",
+                "allclose_rtol": 1e-5,
+                "allclose_atol": 1e-6,
+                "passed": True,
+                "logit_mean_absolute_delta": 0.0,
+            },
+        },
+    }
+
+
+def _fixture(tmp_path):
+    root = tmp_path / "hybrid-c-spatial-v4"
+    root.mkdir()
+    args = SimpleNamespace(
+        model_seed=0,
+        epochs=2,
+        patience=1,
+        batch_size=1,
+        workers=0,
+        device="cuda",
+        edge_chunk_size=65536,
+    )
+    config = {
+        **COMMON,
+        "datasets": ["ogbn-arxiv"],
+        "model_seed": 0,
+        "epochs": 2,
+        "patience": 1,
+        "batch_size": 1,
+        "workers": 0,
+        "device": "cuda",
+        "edge_chunk_size": 65536,
+        "data_root": str(tmp_path / "data"),
+    }
+    source = {"research/conductance_gat/v4/model.py": "1" * 64}
+    manifest = {
+        "schema_version": 1,
+        "suite": SUITE,
+        "status": "passed",
+        "source_integrity_valid": True,
+        "config": config,
+        "conditions": CONDITIONS,
+        "sources": {"sha256": source},
+        "jobs": [],
+    }
+    data_hash = "2" * 64
+    for condition, specification in CONDITIONS.items():
+        torch.manual_seed(19)
+        model = RelativeCSpatialNodeClassifier(
+            3,
+            2,
+            hidden_channels=64,
+            layers=2,
+            dropout=0.5,
+            gate_mode=specification["gate_mode"],
+            spatial_mode=specification["spatial_mode"],
+        )
+        optimizer = make_optimizer(model, condition)
+        output = root / "ogbn-arxiv" / condition
+        output.mkdir(parents=True)
+        checkpoint, history = output / "best.pt", output / "history.json"
+        checkpoint.write_bytes(b"unit-fixture-not-a-model")
+        history.write_text("[]", encoding="utf-8")
+        score = SCORES[condition]
+        metrics = {
+            "schema_version": 1,
+            "research_suite": SUITE,
+            "status": "passed",
+            "model": SUITE,
+            "dataset": "ogbn-arxiv",
+            "condition": condition,
+            "model_seed": 0,
+            **specification,
+            "non_gate_weight_decay": COMMON["weight_decay"],
+            "configuration": configuration(args),
+            "cache_sha256": data_hash,
+            "protocol": {"data_sha256": data_hash, "official": True},
+            "initial_state_sha256": "a" * 64,
+            "topology": {
+                "num_nodes": 4,
+                "num_edges": 3,
+                "incidence_sha256": "3" * 64,
+            },
+            "parameterization": PARAMETERIZATION,
+            "source_sha256": source,
+            "optimizer": "AdamW",
+            "optimizer_groups": optimizer_metadata(optimizer),
+            **_parameter_metadata(model),
+            "evaluation_split": "validation",
+            "test_evaluated": False,
+            "best_epoch": 1,
+            "stop_epoch": 2,
+            "stopping_reason": "patience",
+            "epochs_run": 2,
+            "validation": score,
+            "metric_name": "accuracy",
+            "train_loss": 0.7,
+            "selection_loop_seconds": 0.7,
+            "post_selection_diagnostics_seconds": 0.2,
+            "epoch_timing": {
+                "count": 2,
+                "total_seconds": 0.6,
+                "mean_seconds": 0.3,
+                "median_seconds": 0.3,
+                "p90_seconds": 0.38,
+                "min_seconds": 0.2,
+                "max_seconds": 0.4,
+                "quantile_method": "linear_order_statistic",
+                "scope": "unit fixture",
+            },
+            "elapsed_seconds": 1.0,
+            "peak_cuda_allocated_bytes": 100,
+            "peak_cuda_reserved_bytes": 200,
+            "versions": {"torch": "unit-fixture"},
+            "gpu": "unit-fixture",
+            "diagnostics": _diagnostics(score, specification),
+            "checkpoint": str(checkpoint.resolve()),
+            "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+            "history": str(history.resolve()),
+            "history_sha256": hashlib.sha256(history.read_bytes()).hexdigest(),
+        }
+        metrics_path = output / "metrics.json"
+        metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+        manifest["jobs"].append(
+            {
+                "dataset": "ogbn-arxiv",
+                "condition": condition,
+                "status": "passed",
+                "output_dir": str(output),
+                "metrics_path": str(metrics_path),
+                "metrics_sha256": hashlib.sha256(metrics_path.read_bytes()).hexdigest(),
+            }
+        )
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return root, manifest
+
+
+def _edit(manifest, callback, *, condition="fixed_c_identity_w", refresh=True):
+    job = next(job for job in manifest["jobs"] if job["condition"] == condition)
+    path = Path(job["metrics_path"])
+    metrics = json.loads(path.read_text(encoding="utf-8"))
+    callback(metrics)
+    path.write_text(json.dumps(metrics), encoding="utf-8")
+    if refresh:
+        job["metrics_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_complete_report_has_all_conditional_contrasts_and_resources(tmp_path, monkeypatch):
+    root, manifest = _fixture(tmp_path)
+    before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    result = write_comparison(root, manifest)
+    assert result["status"] == "passed" and result["test_evaluated"] is False
+    contrasts = result["datasets"][0]["factorial_contrasts"]
+    assert contrasts["c_given_w_off"]["percentage_points"] == pytest.approx(2.0)
+    assert contrasts["c_given_w_on"]["percentage_points"] == pytest.approx(5.0)
+    assert contrasts["w_given_c_fixed"]["percentage_points"] == pytest.approx(5.0)
+    assert contrasts["w_given_c_relative"]["percentage_points"] == pytest.approx(8.0)
+    assert contrasts["interaction"]["percentage_points"] == pytest.approx(3.0)
+    assert all(path.read_bytes() == value for path, value in before.items())
+    markdown = (root / "comparison.md").read_text(encoding="utf-8")
+    assert "C | W off" in markdown and "Epoch p90" in markdown and "W-I Frobenius" in markdown
+    with (root / "comparison.csv").open(encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 4 and float(rows[0]["interaction_pp"]) == pytest.approx(3.0)
+    monkeypatch.setattr(
+        report_module,
+        "_current_source_hashes",
+        lambda: manifest["sources"]["sha256"],
+    )
+    assert main([str(root)]) == 0
+
+
+@pytest.mark.parametrize("status", ["pending", "running", "failed"])
+def test_partial_matrix_withholds_all_contrasts(tmp_path, status):
+    root, manifest = _fixture(tmp_path)
+    manifest["status"] = "failed" if status == "failed" else "running"
+    manifest["jobs"][-1]["status"] = status
+    result = write_comparison(root, manifest)
+    assert not result["complete"]
+    assert result["datasets"][0]["factorial_contrasts"] is None
+
+
+@pytest.mark.parametrize("status", ["running", "failed"])
+def test_complete_children_withhold_contrasts_until_manifest_passes(tmp_path, status):
+    root, manifest = _fixture(tmp_path)
+    manifest["status"] = status
+    result = write_comparison(root, manifest)
+    assert not result["complete"]
+    assert result["status"] == status
+    assert result["datasets"][0]["factorial_contrasts"] is None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "metric_digest",
+        "initial_hash",
+        "gate_mode",
+        "spatial_mode",
+        "test",
+        "source",
+        "numeric_check",
+        "initial_test_split",
+        "final_test_split",
+        "intervention_layers",
+        "intervention_kind",
+        "normalization_recomputed",
+        "fixed_c_value",
+        "fixed_w_value",
+    ],
+)
+def test_tampering_or_mismatched_factor_metadata_withholds_contrasts(tmp_path, change):
+    root, manifest = _fixture(tmp_path)
+    if change == "metric_digest":
+        _edit(manifest, lambda metrics: metrics.update(validation=0.9), refresh=False)
+    elif change == "initial_hash":
+        _edit(manifest, lambda metrics: metrics.update(initial_state_sha256="b" * 64))
+    elif change == "gate_mode":
+        _edit(manifest, lambda metrics: metrics.update(gate_mode="relative"))
+    elif change == "spatial_mode":
+        _edit(manifest, lambda metrics: metrics.update(spatial_mode="learned"))
+    elif change == "test":
+        _edit(manifest, lambda metrics: metrics.update(test_evaluated=True))
+    elif change == "source":
+        _edit(manifest, lambda metrics: metrics.update(source_sha256={"x.py": "f" * 64}))
+    elif change == "numeric_check":
+        _edit(
+            manifest,
+            lambda metrics: metrics["diagnostics"]["best_checkpoint_interventions"][
+                "mean_c_numeric_check"
+            ].update(passed=False),
+        )
+    elif change == "initial_test_split":
+        _edit(
+            manifest,
+            lambda metrics: metrics["diagnostics"]["initial_validation"].update(split="test"),
+        )
+    elif change == "final_test_split":
+        _edit(
+            manifest,
+            lambda metrics: metrics["diagnostics"]["final_validation"].update(split="test"),
+        )
+    elif change == "intervention_layers":
+        _edit(
+            manifest,
+            lambda metrics: metrics["diagnostics"]["best_checkpoint_interventions"].update(
+                layers="one_layer_only"
+            ),
+        )
+    elif change == "intervention_kind":
+        _edit(
+            manifest,
+            lambda metrics: metrics["diagnostics"]["best_checkpoint_interventions"]["rows"][
+                0
+            ].update(intervention_kind="retrained"),
+        )
+    elif change == "normalization_recomputed":
+        _edit(
+            manifest,
+            lambda metrics: metrics["diagnostics"]["best_checkpoint_interventions"].update(
+                normalization_recomputed_for_c_interventions=False
+            ),
+        )
+    elif change == "fixed_c_value":
+        _edit(
+            manifest,
+            lambda metrics: metrics["diagnostics"]["best_validation"]["layers"][0][
+                "conductance"
+            ].update(mean=0.9),
+        )
+    else:
+        _edit(
+            manifest,
+            lambda metrics: metrics["diagnostics"]["best_validation"]["layers"][0][
+                "spatial_weight"
+            ].update(identity_distance_frobenius=0.1),
+        )
+    with pytest.raises(ComparisonIntegrityError):
+        write_comparison(root, manifest)
+    report = json.loads((root / "comparison.json").read_text(encoding="utf-8"))
+    assert report["status"] == "invalid"
+    assert report["datasets"][0]["factorial_contrasts"] is None
+
+
+def test_standalone_report_rejects_changed_current_sources(tmp_path, monkeypatch):
+    root, _ = _fixture(tmp_path)
+    monkeypatch.setattr(
+        report_module,
+        "_current_source_hashes",
+        lambda: {"changed.py": "f" * 64},
+    )
+    assert main([str(root)]) == 1
+    report = json.loads((root / "comparison.json").read_text(encoding="utf-8"))
+    assert report["status"] == "invalid"
+    assert report["datasets"][0]["factorial_contrasts"] is None
+
+
+def test_manifest_requires_every_unique_factorial_cell(tmp_path):
+    root, manifest = _fixture(tmp_path)
+    broken = copy.deepcopy(manifest)
+    broken["jobs"].pop()
+    with pytest.raises(ComparisonIntegrityError, match="four-arm"):
+        write_comparison(root, broken)
+
+
+def test_report_destinations_reject_symlinks_before_writing(tmp_path, monkeypatch):
+    root, manifest = _fixture(tmp_path)
+    original = Path.is_symlink
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda path: path.name == "comparison.md" or original(path),
+    )
+    with pytest.raises(ValueError, match="symlinks"):
+        write_comparison(root, manifest)
+    assert not (root / "comparison.json").exists()
+````
+
+# tests/test_conductance_v4_runner.py
+
+````python
+"""V4 orchestration contracts; subprocesses are mocked and never train a model."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from research.conductance_gat.v4.protocol import CONDITIONS
+from scripts import run_conductance_v4 as runner
+
+
+def test_default_four_fresh_factorial_trainings():
+    args = runner.parser().parse_args([])
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert args.datasets == ["ogbn-arxiv"] and args.model_seed == 0
+    assert args.edge_chunk_size == 65536 and args.batch_size == 1 and args.workers == 0
+    assert [job["condition"] for job in jobs] == list(CONDITIONS)
+    assert len(jobs) == 4
+    for job in jobs:
+        command = job["command"]
+        assert command[command.index("-m") + 1] == "research.conductance_gat.v4.train"
+        assert command[command.index("--model-seed") + 1] == "0"
+        assert command[command.index("--edge-chunk-size") + 1] == "65536"
+        assert "--amp" not in command and "--allow-download" not in command
+
+
+@pytest.mark.parametrize("option", ["--help", "--dry-run"])
+def test_stdlib_inspection_has_no_writes(tmp_path, option):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-X",
+            "utf8",
+            "-B",
+            "-S",
+            str(runner.ROOT / "scripts/run_conductance_v4.py"),
+            option,
+            "--results-root",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--device", "cpu"],
+        ["--model-seed", "-1"],
+        ["--epochs", "0"],
+        ["--datasets", "ppi"],
+        ["--datasets", "unknown"],
+        ["--datasets", "cora", "cora"],
+        ["--run-id", "../old"],
+        ["--min-free-gb", "nan"],
+        ["--edge-chunk-size", "0"],
+        ["--batch-size", "2"],
+        ["--workers", "1"],
+    ],
+)
+def test_invalid_inputs_do_not_check_dependencies_or_train(monkeypatch, options):
+    monkeypatch.setattr(runner, "check_dependencies", lambda: pytest.fail("no install/check"))
+    assert runner.main(options) == 2
+
+
+def test_ppi_rejection_explains_protocol_limit(capsys):
+    assert runner.main(["--datasets", "ppi"]) == 2
+    assert "protocol limit" in capsys.readouterr().err
+
+
+def _stub(tmp_path, monkeypatch, failure=None, change_after=None):
+    calls, reports, snapshots = [], [], 0
+    monkeypatch.setattr(runner, "check_dependencies", lambda: {"unit_fixture_only": True})
+
+    def snapshot():
+        nonlocal snapshots
+        snapshots += 1
+        changed = change_after is not None and snapshots >= change_after
+        return {"sha256": {"unit-source": "changed" if changed else "original"}}
+
+    def dispatch(command, log, environment):
+        calls.append(command)
+        if any(Path(part).name == "gpu_preflight.py" for part in command):
+            return 2 if failure == "preflight" else 0
+        condition = command[command.index("--condition") + 1]
+        if failure == condition:
+            return 9
+        output = Path(command[command.index("--output-dir") + 1])
+        output.mkdir(parents=True)
+        if failure != "missing_metrics":
+            (output / "metrics.json").write_text("{}", encoding="utf-8")
+        return 0
+
+    def report(root, manifest):
+        reports.append(json.loads(json.dumps(manifest)))
+        (root / "comparison.md").write_text("unit-fixture report", encoding="utf-8")
+        return {"status": manifest["status"]}
+
+    monkeypatch.setattr(runner, "_source_snapshot", snapshot)
+    monkeypatch.setattr(runner, "run_logged", dispatch)
+    monkeypatch.setattr(runner, "_comparison", report)
+    return ["--results-root", str(tmp_path), "--run-id", "unit-fixture"], calls, reports
+
+
+def test_success_records_metrics_digest_one_seed_and_four_jobs(tmp_path, monkeypatch):
+    options, calls, reports = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0 and len(calls) == 5
+    final = reports[-1]
+    assert final["status"] == "passed" and final["config"]["model_seed"] == 0
+    assert [job["status"] for job in final["jobs"]] == ["passed"] * 4
+    assert all(len(job["metrics_sha256"]) == 64 for job in final["jobs"])
+    assert "never reuse V3" in final["protocol"]["contrast"]
+
+
+@pytest.mark.parametrize(
+    "failure,calls_expected",
+    [
+        ("preflight", 1),
+        ("fixed_c_identity_w", 2),
+        ("relative_c_identity_w", 3),
+        ("fixed_c_spatial_w", 4),
+        ("relative_c_spatial_w", 5),
+        ("missing_metrics", 2),
+    ],
+)
+def test_failures_stop_following_trainings(tmp_path, monkeypatch, failure, calls_expected):
+    options, calls, reports = _stub(tmp_path, monkeypatch, failure=failure)
+    assert runner.main(options) == 1 and len(calls) == calls_expected
+    assert reports[-1]["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "change_after,calls_expected",
+    [(2, 1), (3, 2), (4, 2), (5, 3), (6, 3), (7, 4), (8, 4), (9, 5), (10, 5)],
+)
+def test_source_checks_before_after_every_child_and_final(
+    tmp_path, monkeypatch, change_after, calls_expected
+):
+    options, calls, reports = _stub(tmp_path, monkeypatch, change_after=change_after)
+    assert runner.main(options) == 1 and len(calls) == calls_expected
+    assert reports[-1]["source_integrity_valid"] is False
+
+
+def test_existing_run_is_untouched(tmp_path, monkeypatch):
+    root = tmp_path / "conductance_gat/v4/existing"
+    root.mkdir(parents=True)
+    sentinel = root / "best.pt"
+    sentinel.write_bytes(b"preserve")
+    monkeypatch.setattr(runner, "check_dependencies", lambda: pytest.fail("no install"))
+    assert runner.main(["--run-id", "existing", "--results-root", str(tmp_path)]) == 2
+    assert sentinel.read_bytes() == b"preserve"
+
+
+def test_outputs_do_not_overlap_data(tmp_path):
+    assert (
+        runner.main(["--results-root", str(tmp_path), "--data-root", str(tmp_path), "--dry-run"])
+        == 2
+    )
+
+
+def test_source_snapshot_covers_all_v4_and_shared_execution_code():
+    snapshot = runner._source_snapshot()["sha256"]
+    for name in (
+        "research/conductance_gat/v4/model.py",
+        "research/conductance_gat/v4/operator.py",
+        "research/conductance_gat/v4/train.py",
+        "research/conductance_gat/v4/diagnostics.py",
+        "research/conductance_gat/v4/report.py",
+        "research/conductance_gat/ablation/train.py",
+        "scripts/run_conductance_v4.py",
+        "scripts/run_conductance_factorial.py",
+        "src/chartgat/cache.py",
+        "src/chartgat/execution.py",
+        "scripts/gpu_profiles.py",
+        "scripts/verify_conda_env.py",
+        "scripts/verify_gpu_lock.py",
+        "research/conductance_gat/v4/reproduce.sh",
+    ):
+        assert name in snapshot and len(snapshot[name]) == 64
+````
+
 # tests/test_cycle_v2_runner.py
 
 ````python
@@ -46016,10 +49982,10 @@ def test_paper_runner_rejects_unsafe_run_id() -> None:
 
 
 def test_readme_commands_use_full_independent_protocols() -> None:
-    from scripts import run_conductance_v2, run_conductance_v3
+    from scripts import run_conductance_v2, run_conductance_v3, run_conductance_v4
     from scripts.run_paper import _parser
 
-    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme = (ROOT / "docs/GETTING_STARTED.md").read_text(encoding="utf-8")
     blocks = re.findall(r"```bash\n(.*?)```", readme, flags=re.DOTALL)
     bash_commands = [
         line for block in blocks for line in block.splitlines() if line.startswith("bash ")
@@ -46064,6 +50030,22 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert v3_args.datasets == ["ogbn-arxiv"] and v3_args.model_seed == 0
     assert len(run_conductance_v3.make_jobs(v3_args, ROOT / "results/unit-contract")) == 2
     commands = [line for line in commands if line not in v3_commands]
+    v4_commands = [
+        line
+        for line in commands
+        if shlex.split(line)[1] == "research/conductance_gat/v4/reproduce.sh"
+    ]
+    assert len(v4_commands) == 1
+    v4_command = shlex.split(v4_commands[0])
+    v4_source = (ROOT / v4_command[1]).read_text(encoding="utf-8")
+    assert "set -euo pipefail" in v4_source
+    assert 'source "${project_root}/scripts/conda_env.sh"' in v4_source
+    assert 'exec "${environment_python}" -B scripts/run_conductance_v4.py "$@"' in v4_source
+    v4_args = run_conductance_v4.parser().parse_args(v4_command[2:])
+    run_conductance_v4._validate(v4_args)
+    assert v4_args.datasets == ["ogbn-arxiv"] and v4_args.model_seed == 0
+    assert len(run_conductance_v4.make_jobs(v4_args, ROOT / "results/unit-contract")) == 4
+    commands = [line for line in commands if line not in v4_commands]
     assert len(commands) == 5  # original full protocols remain unchanged
     parsed = []
     for line in commands:
@@ -46204,6 +50186,109 @@ def test_legacy_demo_entrypoints_are_removed() -> None:
         "research/tree_augmentation/run.py",
     ]
     assert all(not (ROOT / path).exists() for path in paths)
+
+
+def test_project_docs_and_gpt_handoff_are_separated() -> None:
+    ignored = {
+        ".git",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        ".venv-gpu",
+        "data",
+        "results",
+    }
+    markdown = [
+        path
+        for path in ROOT.rglob("*.md")
+        if not any(part in ignored or part.startswith(".venv") for part in path.parts)
+    ]
+    outside_document_folders = {
+        path.relative_to(ROOT).as_posix()
+        for path in markdown
+        if path.parent not in {ROOT / "docs", ROOT / "gpt_handoff"}
+    }
+    assert outside_document_folders == {"README.md"}
+
+    handoff_files = {path.name for path in (ROOT / "gpt_handoff").glob("*.md")}
+    assert handoff_files == {
+        "README_FIRST.md",
+        "HANDOFF.md",
+        "EXPERIMENT_STATUS.md",
+        "CONDUCTANCE_V2.md",
+        "CONDUCTANCE_V3.md",
+        "CONDUCTANCE_V4.md",
+        "CYCLE_PE_V2.md",
+        "CODE_SUMMARY.md",
+    }
+
+    root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert len(root_readme) < 1000
+    assert "docs/README.md" in root_readme
+    assert "docs/GETTING_STARTED.md" in root_readme
+    assert "gpt_handoff/README_FIRST.md" in root_readme
+
+    index = (ROOT / "docs/README.md").read_text(encoding="utf-8")
+    for document in (ROOT / "docs").glob("*.md"):
+        if document.name != "README.md":
+            assert f"({document.name})" in index, document.name
+
+    package_readme = (ROOT / "gpt_handoff/README_FIRST.md").read_text(encoding="utf-8")
+    for document in handoff_files:
+        assert document in package_readme
+    assert "V4만이 아니라 NEW GAT 전체 프로젝트" in package_readme
+
+    hub = (ROOT / "gpt_handoff/CONDUCTANCE_V4.md").read_text(encoding="utf-8")
+    for required in (
+        "V3 자체를 spectral GNN이라고 분류하는 실험이 아니다",
+        "C(H_pre-W)",
+        "P_C(HW)",
+        "fixed_c_identity_w",
+        "relative_c_spatial_w",
+        "research/conductance_gat/v4/reproduce.sh",
+        "results/conductance_gat/v4/<run-id>/",
+        "현재 상태",
+    ):
+        assert required in hub
+
+
+def test_all_local_document_links_resolve() -> None:
+    links = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+    documents = [
+        ROOT / "README.md",
+        *(ROOT / "docs").glob("*.md"),
+        *(ROOT / "gpt_handoff").glob("*.md"),
+    ]
+    for document in documents:
+        if document.name == "CODE_SUMMARY.md":
+            continue
+        contents = document.read_text(encoding="utf-8")
+        for destination in links.findall(contents):
+            destination = destination.strip()
+            if destination.startswith(("#", "http://", "https://", "mailto:")):
+                continue
+            assert not any(char.isspace() for char in destination), (
+                document,
+                destination,
+            )
+            local = destination.partition("#")[0]
+            assert (document.parent / local).resolve().exists(), (document, destination)
+
+
+def test_gpt_handoff_markdown_links_are_self_contained() -> None:
+    links = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+    package = (ROOT / "gpt_handoff").resolve()
+    for document in (ROOT / "gpt_handoff").glob("*.md"):
+        if document.name == "CODE_SUMMARY.md":
+            continue
+        contents = document.read_text(encoding="utf-8")
+        for destination in links.findall(contents):
+            destination = destination.strip()
+            if destination.startswith(("#", "http://", "https://", "mailto:")):
+                continue
+            local = destination.partition("#")[0]
+            resolved = (document.parent / local).resolve()
+            assert resolved.parent == package, (document, destination)
 ````
 
 # tests/test_seed_protocol.py

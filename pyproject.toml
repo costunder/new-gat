@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "chartgat"
 version = "0.1.0"
 description = "Independent incidence-conductance, cycle-PE, and tree-augmentation experiments"
-readme = "README.md"
+readme = "docs/GETTING_STARTED.md"
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=1.26",

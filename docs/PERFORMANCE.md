@@ -6,16 +6,18 @@ PyTorch의 사전 빌드된 C++/CUDA 연산을 사용한다. 프로젝트 전용
 
 이 최적화는 현재 소스 버전에 포함된다. 이전 진단 전용 commit `ebf8cd1`에는 없었으며,
 GPU 가속 실측은 아직 받지 않았다. 기존 benchmark 결과·checkpoint 진단과의
-구분은 [실험 상태](EXPERIMENT_STATUS.md)를 따른다.
+구분은 [실험 상태](../gpt_handoff/EXPERIMENT_STATUS.md)를 따른다.
 
-별도 Conductance [v2](../research/conductance_gat/v2/README.md)와
-[v3](../research/conductance_gat/v3/README.md)는 아래 기존 benchmark compile/속도 도구의
+별도 Conductance [v2](../gpt_handoff/CONDUCTANCE_V2.md),
+[v3](../gpt_handoff/CONDUCTANCE_V3.md), [V4 통합 문서](../gpt_handoff/CONDUCTANCE_V4.md)는 아래 기존 benchmark compile/속도 도구의
 대상이 아니다. V2는 직접 C 전파의 정확한 chunked 1차 backward를, v3는 대칭 전파의
 정확한 chunked 1차 backward와 공유 MLP activation checkpointing을 자체 실행 경로에서 쓴다.
+V4는 잔차 상태와 `HW` 메시지를 분리한 대칭 전파의 정확한 chunked 1차 backward를 사용하고,
+상대 C 조건에서는 v3와 같은 shared generator checkpointing을 사용한다.
 두 경로 모두 full-graph이며 neighbor sampling이나 `torch.compile` 옵션을 제공하지 않는다.
 특히 v3의 전파 자체는 O((n+m)d)이지만 width가 d에 비례하는 C 생성 MLP는 O(md²) 작업을
 요구한다. Chunking/checkpointing을 전체 모델 메모리 상수화나 실측 가속으로 표현하지 않는다.
-V2/v3 GPU 시간·peak memory는 각각의 `comparison.md`에 기록되기 전까지 미측정이다.
+V2/v3/v4 GPU 시간·peak memory는 각각의 `comparison.md`에 기록되기 전까지 미측정이다.
 
 ## 기본 적용
 

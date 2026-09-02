@@ -141,4 +141,4 @@ fi
 
 echo "Exact environment report: ${lock_report}"
 echo "Resolved transitive snapshot: ${freeze_report}"
-echo "GPU environment ready. Follow README.md for dataset preparation and experiments."
+echo "GPU environment ready. Follow docs/GETTING_STARTED.md for data and experiments."

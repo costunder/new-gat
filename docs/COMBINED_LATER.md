@@ -1,6 +1,6 @@
 # Combined prototype — postponed
 
-This directory contains the earlier prototype that combined:
+The code directory `research/combined_later/` contains the earlier prototype that combined:
 
 - learned incidence conductance;
 - persistent cycle coordinates;
@@ -21,4 +21,3 @@ Optional historical checks can be run explicitly:
 .\.venv\Scripts\python.exe -m research.combined_later.run_identifiability
 .\.venv\Scripts\python.exe -m research.combined_later.run_fixed_c --epochs 40
 ```
-

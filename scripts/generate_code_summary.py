@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the reviewable ``# path`` + exact source ``code_summary.md`` snapshot."""
+"""Generate the reviewable ``# path`` + exact source GPT handoff snapshot."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-OUTPUT_PATH = PROJECT_ROOT / "code_summary.md"
+OUTPUT_PATH = PROJECT_ROOT / "gpt_handoff/CODE_SUMMARY.md"
 
 SOURCE_SUFFIXES = {".py", ".toml", ".yaml", ".yml", ".sh", ".ps1"}
 EXCLUDED_PARTS = {
@@ -111,7 +111,7 @@ def main() -> int:
     parser.add_argument(
         "--check",
         action="store_true",
-        help="fail if code_summary.md does not exactly match the current selected sources",
+        help="fail if gpt_handoff/CODE_SUMMARY.md does not match the selected sources",
     )
     parser.add_argument("--json", action="store_true", help="include the selected source list")
     args = parser.parse_args()

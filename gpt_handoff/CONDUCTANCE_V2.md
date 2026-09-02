@@ -6,11 +6,11 @@
 기존 MLP는 `C=f_theta(abs(BH),(BH)^2)`라는 유효한 공유 함수 설계다. 수학적으로 틀린
 구현이라서 고치는 것이 아니라, **공유 함수로 C를 만드는 가설**과 **고정 그래프의 C 자체를
 파라미터로 학습하는 가설**을 분리한다. 앞선 결과와 이 구분의 이유는
-[C-learning 결과 기록](../../../docs/CONDUCTANCE_C_LEARNING_FINDINGS.md)에 있다.
+[실험 상태와 C-learning 결과](EXPERIMENT_STATUS.md)에 있다.
 
 ## 실행
 
-루트 [README](../../../README.md)의 Linux NVIDIA GPU·Conda 환경과 공식 데이터 캐시를 사용한다.
+[전체 인수인계](HANDOFF.md)의 Linux NVIDIA GPU·Conda 환경과 공식 데이터 캐시 계약을 사용한다.
 기존 `bash scripts/prepare_data.sh`로 받은 데이터면 된다. 저장소 루트에서 실행한다.
 
 ```bash

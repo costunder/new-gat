@@ -1,6 +1,6 @@
 # Node-degree 정규화에서 C 학습의 기여
 
-앞선 [2×2 GPU 실험](../../../docs/CONDUCTANCE_FACTORIAL_FINDINGS.md)에서는
+앞선 [2×2 GPU 실험](CONDUCTANCE_FACTORIAL_FINDINGS.md)에서는
 `node_degree + gate WD 0.0005`가 PPI/arxiv 모두 최고였다. 하지만 arxiv의 C가 거의
 상수인 상태에서도 점수가 높았으므로 **정규화의 효과와 C 학습의 효과를 분리**한다.
 기존 benchmark, 2×2 결과, Cycle PE와 Tree Augmentation은 변경하거나 합치지 않는다.
@@ -9,18 +9,18 @@
 52.564966% / 52.705738%, arxiv는 68.317723% / 68.324435%로,
 이 seed의 validation에서는 학습 C의 이득을 확인하지 못했다.
 정확한 값·파라미터 수·진단·근거의 한계는
-[C-learning 결과](../../../docs/CONDUCTANCE_C_LEARNING_FINDINGS.md)에 기록했다.
+[C-learning 결과](CONDUCTANCE_C_LEARNING_FINDINGS.md)에 기록했다.
 
 **새 C-learning run의 learned checkpoint 검사도 완료 보고서를 수령했다.**
 PPI의 전체 층 평균-C 교체는 -6.649440 pp, arxiv는 -0.033558 pp였다.
 선택된 checkpoint의 의존성과 fresh training의 이득은 별개다.
-이 폴더는 기존 MLP 실험과 검사 재현용으로 유지한다. 다음 직접 엣지 C 학습은
-[v2](../v2/README.md), 공유 상대-C 생성기 학습은 [v3](../v3/README.md)의 별도 명령으로
+`research/conductance_gat/c_learning/`의 코드는 기존 MLP 실험과 검사 재현용으로 유지한다. 다음 직접 엣지 C 학습은
+[v2](../gpt_handoff/CONDUCTANCE_V2.md), 공유 상대-C 생성기 학습은 [v3](../gpt_handoff/CONDUCTANCE_V3.md)의 별도 명령으로
 실행하며 과거 결과에 덮어쓰지 않는다. 두 버전은 서로도 별도 가설이다.
 
 ## 준비
 
-루트 [README](../../../README.md)에 따라 Linux/NVIDIA GPU와 Conda 환경을 준비한다.
+[시작 안내](GETTING_STARTED.md)에 따라 Linux/NVIDIA GPU와 Conda 환경을 준비한다.
 기존 `bash scripts/prepare_data.sh`의 PPI·ogbn-arxiv 공식 캐시를 그대로 사용한다.
 학습·검사 중 다운로드, 더미 데이터 생성, 자동 패키지 교체나 CPU fallback은 없다.
 모든 명령은 저장소 루트에서 실행한다.

@@ -15,20 +15,34 @@ train-label gradient를 검사하며 **5e801c3 실행의 새 GPU 로그를 수�
 기록했다. 이후 **43afd63의 2×2 GPU 재학습 결과도 수령했으며 여덟 조건 모두 passed**다.
 이어 **C-learning의 네 조건 비교도 모두 passed인 보고서를 수령했다.** 새 run의
 `learned_c` checkpoint의 평균-C 검사도 이후 `passed` GPU 출력을 수령했다.
-다음은 엣지별 직접 C의 Conductance v2와 공유 상대 C 생성기의 v3다.
-두 버전은 별도 구현·실행 경로를 사용하며 실제 GPU 결과는 아직 없다.
+다음은 엣지별 직접 C의 Conductance v2, 공유 상대 C 생성기의 v3, 그리고 상대 C graph
+operator와 spatial message transform을 함께 학습하는 v4다. 세 버전은 별도 구현·실행 경로를
+사용하며 실제 GPU 결과는 아직 없다.
 
 V3는 graph-centered score → bounded relative C → isotropic mixture와 학습 alpha의
 대칭 정규화를 사용한다. AdamW backbone/생성기/scalar 그룹을 분리했다. 기본 arxiv ×
 `relative_c`/`fixed_c` × seed 0이며 v2나 이전 MLP의 checkpoint·점수를 재사용하지 않는다.
 선택된 checkpoint에서 평균 C·셔플 C·C=1·전파 제거 validation 검사도 별도 forward로 수행한다.
 평균 C와 C=1은 대칭 정규화에서 동등하므로 서로 일치해야 하는 수치 검산이다.
-실행과 수식·비교 경계는 [v3 README](../research/conductance_gat/v3/README.md)를 따른다.
+실행과 수식·비교 경계는 [전체 인수인계](HANDOFF.md)와 [코드 스냅샷](CODE_SUMMARY.md)을 따른다.
 구현 게시 revision은 `6f9d3b0981e8cfa8feb76e59fb348e26cc6909d6`이다.
 
-상대 C v3 추가 후 전체 로컬 회귀는 **1176 passed / 65 skipped** (44.45 s, exit 0),
-Ruff 통과다. V3 전용 134개가 통과했고 실제 CUDA RNG 보존 검사 1개는 로컬 GPU가 없어
-생략됐다. 공개 데이터 학습이나 GPU 성능 측정은 실행하지 않았다.
+V4는 v3의 상대 C 생성기와 대칭 weighted-degree 정규화를 유지하고, 각 층에 bias 없는
+identity-initialized `W`를 추가한다. 한 층은 `C(H)`를 먼저 만들고 비고립 노드에서
+`(1-alpha)H + alpha P_C(HW)`를 계산한다. `W=I`이면 v3 전파와 일치한다. 기본은
+ogbn-arxiv × 고정/상대 C × identity/학습 W × seed 0의 4개 새 CUDA 학습이다. Alpha는
+모든 조건에서 학습하고, inactive C/W scaffold는 동결하여 optimizer에서 제외한다. V3 결과를
+재사용하지 않으며 네 cell의 조건부 주효과와 interaction만 V4 내부의 기술적 대조로 보고한다.
+선택 checkpoint의 C/W 개입은 재학습 효과와 구분한다. 실제 GPU 결과는 아직 없다.
+
+V4 구현 및 GPT 전달 묶음 정리 후 전체 로컬 회귀는 **1247 passed / 65 skipped** (68.99 s, exit 0),
+V4 전용 **68개**와 Ruff·compileall·`code_summary --check`가 모두 통과했다. 생략은 기존
+환경별 검사이며 공개 데이터 학습이나 GPU 성능 측정은 실행하지 않았다. Windows의 한국어
+작업 경로에서 기존 stdlib-only 자식 프로세스 출력을 읽는 4개 검사는 decode thread 경고를
+남겼지만 pytest는 exit 0으로 완료됐다.
+
+직전 상대 C v3 추가 시점의 전체 로컬 회귀는 **1176 passed / 65 skipped** (44.45 s, exit 0)였다.
+V3 전용 134개가 통과했고 실제 CUDA RNG 보존 검사 1개는 로컬 GPU가 없어 생략됐다.
 
 직전 직접 C v2 구현 시점의 로컬 회귀는 **1042 passed / 64 skipped** (47.41 s, exit 0)였다.
 직전 평균-C 검사 확장의 924개에 v2 전용 118개를 추가했다. 직접 C의 FP64 미분·chunk 연산,
@@ -51,11 +65,12 @@ graph binding과 학습 루프→checkpoint→비교표 연결 및 실제 C grad
 | Node-degree checkpoint mean-C 개입 | 새 c_learning/learned_c의 PPI/arxiv GPU 출력 수령, passed. 기존 factorial도 별도 지원 |
 | Conductance 직접 C v2 | `conductance_direct_c_v2`, 기본 arxiv × `direct_c`/`fixed_c` × seed 0. 구현 경로 추가, 실제 GPU 결과 없음 |
 | Conductance 상대 C v3 | `conductance_relative_c_v3`, 기본 arxiv × `relative_c`/`fixed_c` × seed 0. 별도 구현, 실제 GPU 결과 없음 |
-| `code_summary.md` | 이 버전의 source/test/config/script 전체를 파일별로 보존한 스냅샷 |
+| [Conductance C × spatial W v4](CONDUCTANCE_V4.md) | `conductance_hybrid_c_spatial_v4`, 기본 arxiv × 4조건 × seed 0. 별도 구현, 실제 GPU 결과 없음 |
+| [CODE_SUMMARY.md](CODE_SUMMARY.md) | 이 버전의 source/test/config/script 전체를 파일별로 보존한 스냅샷 |
 
 `ebf8cd1`까지만 받은 서버에는 새 기능이 없으므로 업데이트 후 `git rev-parse HEAD`로
 실행 revision을 확인한다. 소스 업데이트가 서버에서의 실행 완료를 뜻하지는 않는다.
-아래 기존 학습 결과를 Conductance v2/v3·최적화·새 2×2/C-learning 결과로 재분류하면 안 된다.
+아래 기존 학습 결과를 Conductance v2/v3/v4·최적화·새 2×2/C-learning 결과로 재분류하면 안 된다.
 
 ### 수령한 C-learning 비교: 학습 C의 성능 이득은 관측하지 못함
 
@@ -75,7 +90,7 @@ PPI learned에는 비상수 C가 남아 있지만 성능 이득은 없었고, ar
 C-learning 구현 게시본은 `25ca328`이지만 제공된 비교표에는 실제 서버 source revision이
 없다. 해당 manifest revision을 독립 확인하지 않았으므로 실행 commit으로 단정하지 않는다.
 이번 근거는 inline 붙여넣기라 별도 첨부 파일/SHA-256도 없다. 정확한 파라미터 수·층별
-진단과 이전 PPI 점수와의 구분은 [C-learning 결과](CONDUCTANCE_C_LEARNING_FINDINGS.md)를 따른다.
+진단과 이전 PPI 점수와의 구분은 아래 C-learning 결과 절과 [전체 인수인계](HANDOFF.md)를 따른다.
 
 이어 **같은 새 C-learning run의 learned checkpoint**에 대한 읽기 전용 평균-C 검사도
 수령했다. 원 validation 및 원본 무결성 확인 후 그래프·층별 C 변동에 대한 현재 의존도를
@@ -97,14 +112,14 @@ PPI에서 layer 0만 평균화한 차이는 −6.198266pp, layer 1만 평균화�
 모델은 52.705738%였다. **고정된 checkpoint의 개입 민감도와 다른 모델을 새로 학습한
 성능 차이는 다른 질문**이다. 층별 효과도 더해서 전체 효과로 만들지 않는다.
 arxiv는 layer 0 prediction flip이 0이며 layer 1 개입이 전체 개입과 같은 작은 점수 차이를 냈다.
-6개 개입의 정확한 점수·flip 단위·logit 변화는 [C-learning 결과](CONDUCTANCE_C_LEARNING_FINDINGS.md)에 있다.
+6개 개입의 정확한 점수·flip 단위·logit 변화는 이 문서의 C-learning 결과 절에 있다.
 
 이 근거는 사용자 출력이며 서버의 원본 artifact 전체를 독립 검사한 것은 아니다.
 단일 model seed의 validation 결과이므로 test·유의성·보편적 동등성 주장은 하지 않는다.
 
-### 다음 실험: 독립 v2/v3와 각 버전의 C=1 대조
+### 다음 실험: 독립 v2/v3/v4와 각 버전 내부 대조
 
-[Conductance v2](../research/conductance_gat/v2/README.md)는 canonical 물리 엣지마다
+[Conductance v2](CONDUCTANCE_V2.md)는 canonical 물리 엣지마다
 층별 alpha를 두고 `c_e=exp(alpha_e)`를 직접 학습한다. Alpha=0에서 C=1로 시작하며
 C 생성 MLP·고유분해 없이 implicit diagonal C와 기존 node-degree 전파를 사용한다.
 직접 alpha의 WD는 0, 나머지 파라미터의 WD는 0.0005다. 같은 초기 상태의 direct/fixed를
@@ -116,7 +131,7 @@ Cora/CiteSeer/PubMed는 명시적으로 선택할 수 있고, unseen 독립 그�
 Chunk 연산은 전체 엣지의 forward/backward를 처리하는 메모리 제어이며 GraphSAGE식 sampling이 아니다.
 기존 공유 MLP 설계도 유효하다. V2는 별도 직접 파라미터화 가설이며 아직 GPU 성능·가속 결과는 없다.
 
-[Conductance v3](../research/conductance_gat/v3/README.md)는 공유 MLP가 방향 불변인 엣지
+[Conductance v3](CONDUCTANCE_V3.md)는 공유 MLP가 방향 불변인 엣지
 특징에서 score를 생성한다. 그래프별 중심화 및 mean(C)=1 상대화, 학습 gamma/tau,
 학습 alpha와 symmetric normalization을 조합한다. V2와 같은 arxiv/seed 0을 사용하되
 각 버전 내부의 C=1 모델을 새로 학습한다. V3의 fixed C도 alpha는 학습한다.
@@ -124,6 +139,15 @@ Chunk 연산은 전체 엣지의 forward/backward를 처리하는 메모리 제�
 제안의 dmax/작은 rho 지적은 과거 global-max v1에 해당하며 현재 v2의 오류라고 기록하지 않는다.
 Gamma 값만으로 C의 중요도를 판정하거나 full-graph chunking을 neighbor sampling으로
 설명하지 않는다. Multi-head·implicit solve·PPI 전이 실험은 이번 v3 실행 범위에 없다.
+
+[V4 통합 문서](CONDUCTANCE_V4.md)의 실험은 v3의 `C(H)`를 학습 가능한
+graph operator/metric 경로로 유지하면서, 이웃 feature message에 층별 `W`를 적용한다.
+비고립 노드의 식은 `(1-alpha)H + alpha P_C(HW)`이고 고립 노드는 `H`를 유지한다.
+`W=I` 조건은 v3 전파와 일치한다. 기본은 arxiv/seed 0에서 고정/상대 C × identity/학습 W의
+네 fresh training이며 모든 cell에서 alpha를 학습한다. 보고서는 `C|W off`, `C|W on`,
+`W|C fixed`, `W|C relative`, interaction을 V4 내부에서만 계산한다. V3 checkpoint/점수는
+재사용하지 않고, 선택 checkpoint의 C/W 제거 개입을 fresh-training 차이로 해석하지 않는다.
+실제 GPU 결과는 아직 없다.
 
 ### 수령한 2×2 GPU 재학습: 정규화 효과와 C 학습은 별개
 
@@ -146,7 +170,7 @@ Train 정답으로 학습하고 validation으로 선택했으며 **test는 평�
 반대로 C가 항상 불필요하다는 결론도 성립하지 않는다.
 
 정확한 epoch·5개 대비·층별 C/rho/전파량·해석 경계와 다음 분석은
-[Conductance 실험 정리](CONDUCTANCE_FACTORIAL_FINDINGS.md)에 보존했다.
+아래 Conductance 실험 정리 절과 [전체 인수인계](HANDOFF.md)에 보존했다.
 단일 seed의 탐색적 validation 결과이며 유의성·일반적 최적값·SOTA 주장은 하지 않는다.
 
 ### 수령한 확장 검사: 기존 checkpoint에 대한 개입
@@ -350,16 +374,16 @@ node-degree 정규화가 개선을 이끈 결과를 확보했지만, 모든 데�
 fresh-training 이득을 관측하지 못했다는 결과를 함께 보존한다. 이전 2×2 `node_degree` 검사도
 지원하지만 다른 source run의 결과로 분리한다.
 
-다음 검증은 [직접 C v2](../research/conductance_gat/v2/README.md)와
-[상대 C v3](../research/conductance_gat/v3/README.md)의 각 C=1 대조다. V2는 같은 그래프에
+다음 검증은 [직접 C v2](CONDUCTANCE_V2.md)와
+[상대 C v3](CONDUCTANCE_V3.md)의 각 C=1 대조다. V2는 같은 그래프에
 묶인 direct/fixed C이고, v3는 공유 상대-C 생성기의 relative/fixed C이며 fixed v3도 alpha는
 학습한다. 둘 다 기존 MLP의 수학 오류 수정이 아니다. 각 버전 내부 비교를 먼저 보고,
 파라미터화·정규화·전파 강도·optimizer가 함께 다른 버전 간 차이를 단일 요인으로 해석하지 않는다.
-실제 v2/v3 GPU 결과는 아직 없다.
+실제 v2/v3/v4 GPU 결과는 아직 없다.
 
 노드별 정규화는 기존 대칭성·보존성의 의미를 바꾸는 실험이므로 단순 속도 최적화나
 버그 수정으로 부르지 않는다. 기존 기본 benchmark는 유지한다. 다른 model seed의
-일반화, Conductance 직접 C v2·상대 C v3와 Cycle PE 기저벡터 v2의 학습 결과,
+일반화, Conductance 직접 C v2·상대 C v3·C×spatial-W v4와 Cycle PE 기저벡터 v2의 학습 결과,
 GPU 가속 실측은
 여전히 별도 검증 대상이다.
 
@@ -391,4 +415,4 @@ mock 검사로 확인했다. 이 수치는 2×2 코드 구현 당시의 로컬 �
 `access violation` 메시지가 있었으나 pytest는 위 결과와 exit 0까지 실행됐다.
 이 호스트 경고를 Linux 성공의 근거로 해석하지 않는다. 로컬 단위 검사는 GPU 학습
 또는 가속 배수의 검증을 대신하지 않는다. 현재 소스 스냅샷 checksum은
-[hand_off.md](../hand_off.md)의 코드 스냅샷 항목을 따른다.
+[HANDOFF.md](HANDOFF.md)의 코드 스냅샷 항목을 따른다.

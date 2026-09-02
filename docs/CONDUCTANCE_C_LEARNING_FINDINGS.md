@@ -161,7 +161,7 @@ logit 변화와 prediction flip을 확인한다. 점수가 유지돼도 logits�
 
 ## 7. 다음 독립 가설: 직접 C v2와 상대 C 생성기 v3
 
-첫 번째 별도 실험은 [Conductance v2](../research/conductance_gat/v2/README.md)다.
+첫 번째 별도 실험은 [Conductance v2](../gpt_handoff/CONDUCTANCE_V2.md)다.
 고정 그래프의 canonical 물리 엣지·층마다 alpha를 두고 `c_e=exp(alpha_e)`를 직접 학습한다.
 Alpha는 0으로 초기화해 C=1에서 시작한다. C 생성 MLP와 고유분해는 없고,
 node-degree 전파·backbone은 유지한 채 직접 C와 fixed C=1의 두 조건을 새로 비교한다.
@@ -172,7 +172,7 @@ PPI의 unseen 독립 그래프에는 적용하지 않는다. 기본은 arxiv × 
 2개 CUDA 학습이고 arxiv는 여전히 full-batch다. Cora/CiteSeer/PubMed는 명시적으로 선택할 수 있다.
 이 v2의 실제 GPU 결과는 아직 없으며 이전 결과를 v2 성능으로 재사용하지 않는다.
 
-추가 [Conductance v3](../research/conductance_gat/v3/README.md)는 v2를 대체하지 않는다.
+추가 [Conductance v3](../gpt_handoff/CONDUCTANCE_V3.md)는 v2를 대체하지 않는다.
 방향 불변인 노드상태·degree 특징의 공유 MLP score를 그래프별 중심화해 상대 C를 만들고,
 등방성 혼합 gamma와 bounded tau, 대칭 정규화의 전파 강도 alpha를 별도로 학습한다.
 같은 arxiv와 seed 0에서 `relative_c`/`fixed_c`를 새로 학습하며 fixed 조건도 alpha는 학습한다.

@@ -18,7 +18,7 @@
 3. 이에 gate weight decay와 정규화를 한 번에 바꾸지 않고 2×2로 분리하여 새로 학습했다.
    이번 결과는 이 세 번째 단계다. 이전 5-seed test 표나 checkpoint 개입 값과 합치지 않는다.
 
-이전 결과와 full audit의 수치·근거는 [실험 상태](EXPERIMENT_STATUS.md)에 보존되어 있다.
+이전 결과와 full audit의 수치·근거는 [실험 상태](../gpt_handoff/EXPERIMENT_STATUS.md)에 보존되어 있다.
 
 ## 2. 실행과 근거
 
@@ -164,7 +164,7 @@ PPI는 전체 층 평균화에서 −6.649440pp, arxiv는 −0.033558pp였지만
 민감도이며 fresh learned/fixed 학습 이득과 같지 않다. 정확한 층별 값과 근거 한계는
 [C-learning 결과 문서](CONDUCTANCE_C_LEARNING_FINDINGS.md)를 따른다.
 
-설치·실행·결과 확인은 [C 학습 기여 실험 안내](../research/conductance_gat/c_learning/README.md)를 따른다.
+설치·실행·결과 확인은 [C 학습 기여 실험 안내](CONDUCTANCE_C_LEARNING.md)를 따른다.
 
 ## 7. 당시 정한 결과 판단 순서
 

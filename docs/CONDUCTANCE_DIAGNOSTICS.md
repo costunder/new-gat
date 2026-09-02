@@ -164,9 +164,9 @@ Cora/PPI/ogbn-arxiv 진단이 `passed`로 종료됨을 확인했다. PPI/arxiv�
 Cora의 두 번째 층은 비상수 C이며, 모든 데이터에서 전파가 무효인 것은 아니다.
 
 정확한 train/validation 지표, 층별 통계, validation 전파 우회 차이와 해석 한계는
-[실험 상태](EXPERIMENT_STATUS.md)에 있다. 원인이 weight decay라는 설명은 아직 가설이다.
+[실험 상태](../gpt_handoff/EXPERIMENT_STATUS.md)에 있다. 원인이 weight decay라는 설명은 아직 가설이다.
 이 결과는 전체 seed 진단·모델 수정·재학습 또는 최적화 가속 측정이 아니다.
 이후 mean/shuffle·gradient를 포함한 `5e801c3` full-audit의 실제 서버 출력을 수령했고,
 seed 0의 다섯 데이터셋이 모두 `passed`임을 확인했다. 위 초기 진단과 후속 full-audit은
 source가 다르므로 같은 실행으로 합치지 않는다. 정확한 개입·gradient 결과와 근거 범위는
-[실험 상태](EXPERIMENT_STATUS.md)에 보존한다.
+[실험 상태](../gpt_handoff/EXPERIMENT_STATUS.md)에 보존한다.
