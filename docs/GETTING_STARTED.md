@@ -17,9 +17,12 @@ GAT 트랙은 GAT/GATv2 논문의 데이터셋을, PE 트랙은 SignNet/PEARL �
 데이터 버전·split·지표·학습 조건이 다른 경우 차이를 명시한다. 데이터셋 이름이 같다는 것만으로
 조건이 모두 일치하는 비교라고 주장하지 않는다.
 
-Cycle PE의 좌영공간 **기저벡터 전체를 입력하는 v2**는
-[별도 폴더와 실행 안내](../gpt_handoff/CYCLE_PE_V2.md)에 있다. 아래 기본 전체 실행은
-기존 통계형 v1을 유지하며, v2는 자체 명령·기저 캐시·결과 폴더로 독립 실행한다.
+Cycle PE V2는 실패한 구 `cycle_basis_v2`를 폐기하고, cycle space의 projector
+`P = Z(Z^T Z)^{-1}Z^T = QQ^T`와 방향 불변 edge kernel `P⊙P`를 사용하는
+`cycle_projector_pe_v2`로 교체했다. [새 V2 계약과 실행법](../gpt_handoff/CYCLE_PE_V2.md)을
+기준으로 하며, 구 V2 artifact와 새 결과를 혼합하지 않는다. 기본 `thin_q` 외에 iterative
+DFS spanning forest와 non-tree edge parent-path 역추적으로 raw fundamental cycle basis를 만드는
+`--basis-backend dfs_fundamental`을 선택할 수 있다. 이는 all-simple-cycle 열거가 아니다.
 
 Conductance의 **엣지별 C 자체를 직접 학습하는 v2**도
 [별도 폴더](../gpt_handoff/CONDUCTANCE_V2.md)에 있다. 기존 MLP 생성 방식과 섞지 않으며,
@@ -34,7 +37,15 @@ Conductance의 **상대 C graph operator + spatial message transform v4**에 필
 **[V4 통합 문서](../gpt_handoff/CONDUCTANCE_V4.md)** 한 곳에 모았다. 정확한 의도, 수식, 네 조건, 실행 명령, 결과 위치,
 진단과 현재 검증 상태를 다른 문서에서 찾을 필요 없이 여기서 확인한다.
 
-이 소스 버전에는 독립 v2/v3/v4, 실행 최적화, 단일 seed 기본값과 확장 진단이 포함되어 있다.
+Conductance V5는 graph-conditioned **shared dynamic C**와 multi-head spatial W·head별
+전파 강도 beta를 분리해 학습한다. fixed-C와 dynamic-C는 같은 architecture·초기화를 쓰지만
+phase별 optimizer update 배분이 다른 strong-recipe 비교이며, sampling과 10GB MIG용 activation
+checkpoint를 지원한다. beta 기본값은 hard margin 없는 sigmoid와 nominal 초기값 0.1이고,
+과거 `0.05+0.90*sigmoid`는 명시적으로 선택하는 ablation으로만 남는다. 수식과 계약은
+[V5 통합 문서](../gpt_handoff/CONDUCTANCE_V5.md)를 기준으로 한다.
+
+이 소스 버전에는 독립 v2/v3/v4/v5, 새 Cycle V2, 실행 최적화, 단일 seed 기본값과
+확장 진단이 포함되어 있다.
 이전 진단 전용 버전(`ebf8cd1`)과의 차이 및 실제 측정 결과는
 [실험 상태](../gpt_handoff/EXPERIMENT_STATUS.md)에 구분했다.
 
@@ -126,7 +137,7 @@ glibc 등 호스트 호환성 오류는 자동 재설치하지 않고 중단한�
 ## 실험
 
 기본 세 트랙 benchmark는 각각 독립적으로 실행하며 서로 다른 결과 폴더를 사용한다.
-중간의 Conductance v2/v3/v4는 기본 세 트랙 명령에 자동 포함되지 않는 별도 후속 실험이다.
+Conductance v2/v3/v4/v5는 기본 세 트랙 명령에 자동 포함되지 않는 별도 후속 실험이다.
 
 ### Conductance GAT
 
@@ -196,10 +207,41 @@ cat results/conductance_gat/v4/gat-hybrid-c-spatial-v4-seed0-v1/comparison.md
 기본 실행은 v1의 5개 데이터 × 네 조건 × seed 0 = 20회다. PPI는 v3와 같은 공식
 inductive 계약을 사용하며, 나머지 네 데이터는 full-graph transductive 학습이다.
 
+### Conductance v5: graph-conditioned shared dynamic C
+
+V5의 핵심 비교는 동일 architecture·seed·초기화에서 `fixed_c` strong spatial recipe와
+`shared_dynamic_c` coordinate recipe를 학습하는 두 조건이다. phase별 update allocation이 달라
+C 하나의 인과효과로 해석하지 않는다. `reference`는 hidden 256, 8 layers, 8 heads,
+FFN multiplier 4이고, `large`는 384, 12 layers, 8 heads다. 아래는 FP32, PPI batch 2,
+ogbn-arxiv seed-node batch 1024와 activation checkpoint를 쓰는 `portable` 실행이다.
+
+```bash
+python -B scripts/run_conductance_v5.py --datasets cora citeseer pubmed ppi ogbn-arxiv --profile reference --sampling auto --sample-seed-batch-size 1024 --model-seed 0 --device cuda:0 --hardware-profile portable --run-id conductance-v5-portable-reference-seed0
+```
+
+물리 GPU 3의 RTX A6000을 쓰는 직접 V5 실행은 다음과 같다. 프로세스 안에서는 이 장치가
+`cuda:0`이다. 이 profile은 dense BF16/TF32, FP32 conductance geometry, PPI batch 8,
+arxiv seed-node batch 2048, 더 큰 edge chunk와 prefetch를 쓰고 activation checkpoint를 끈다.
+
+```bash
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 python -B scripts/run_conductance_v5.py --datasets cora citeseer pubmed ppi ogbn-arxiv --profile reference --model-seed 0 --device cuda:0 --sampling auto --hardware-profile a6000-48gb --min-free-gb 40 --run-id conductance-v5-a6000-gpu3-reference-seed0
+```
+
+같은 명령과 run ID를 다시 실행하면 완료 조건은 검증 후 건너뛰고, V5의 `last.pt`가 있는
+미완료 조건은 epoch·optimizer·RNG 상태부터 재개한다. 자세한 식, sampling 의미와 결과 계약은
+[CONDUCTANCE_V5.md](../gpt_handoff/CONDUCTANCE_V5.md)에 있다.
+
 ### Cycle PE
 
 ```bash
 bash research/cycle_pe/reproduce.sh
+```
+
+새 projector V2를 dataset-aware reference 크기로 실행하려면 다음 명령을 사용한다. 동일한
+run ID 재실행 시 `<child>/<dataset>/cycle_projector_pe_v2/last.pt`부터 이어진다.
+
+```bash
+python -B scripts/run_cycle_scaling.py --versions v2 --profiles reference --datasets zinc12k peptides_struct --model-seeds 0 --device cuda:0 --hardware-profile portable --run-id cycle-projector-v2-portable-reference-seed0
 ```
 
 ### Tree Augmentation
@@ -210,50 +252,76 @@ bash research/tree_augmentation/reproduce.sh
 
 ### V1을 포함한 전체 큰 모델 scaling
 
-기본 단일 크기와 별도로 Conductance V1~V4, Cycle PE V1/V2, Tree fixed/multi를 모두
-더 넓고 깊은 profile에서 실행하려면 통합 Python runner를 사용한다. 파라미터 수를 같게
-맞추는 실험이 아니라 각 방법 자체의 scaling curve이며, 시간 제약을 반영한 기본 전체 계획은
-model seed 0 하나에서 총 204 fresh model trainings이다. Cycle/Tree는 모든 크기를
+기본 단일 크기와 별도로 Conductance V1~V5, Cycle PE V1/새 V2, Tree fixed/multi를 모두
+dataset-aware `reference`와 `large` profile에서 실행하려면 통합 Python runner를 사용한다.
+파라미터 수를 억지로 같게 맞추는 실험이 아니라 각 방법 자체의 scaling curve이며, 시간 제약을
+반영한 기본 전체 계획은 model seed 0 하나에서 **118 child runs / 122 model trainings**다.
+Cycle/Tree는 두 크기를
 validation-only로 학습한 뒤 요청된 seed의 평균 validation으로 공통 크기를 선택하고, 선택
 checkpoint만 test-only로 평가한다. 먼저
-파일을 만들지 않는 계획 검사를 권장한다.
+파일을 만들지 않는 계획 검사를 권장한다. 다음은 물리 GPU 3을 프로세스의 `cuda:0`으로
+매핑하는 RTX A6000 48GB용 전체 계획이다.
 
 ```bash
-python -B scripts/run_rich_scaling.py --run-id rich-all-v1 --profiles base wide deep large --model-seeds 0 --device cuda:0 --dry-run
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 python -B scripts/run_rich_scaling.py --run-id rich-a6000-gpu3-seed0-v1 --profiles reference large --model-seeds 0 --device cuda:0 --hardware-profile a6000-48gb --min-free-gb 40 --cycle-v2-basis-backend thin_q --dry-run
 ```
 
 실제 전체 실행은 `--dry-run`을 제거한다. 한 트랙이 실패해도 나머지 트랙은 기본적으로
 계속 실행하고 통합 상태를 failed로 남기며, 첫 실패에서 멈추려면 `--fail-fast`를 추가한다.
+`--cycle-v2-basis-backend thin_q`가 전체 학습용 기본값이며, DFS/역추적 기저를 별도 진단하려면
+새 run ID에서 `dfs_fundamental`로 바꾼다.
 중단 후에는 인수와 `--run-id`를 그대로 두고 같은 명령을 재실행한다. 완료 artifact를 다시
 검증해 통과한 child는 건너뛰고 미완료 child만 다시 실행한다. 실행 중이던 child 하나는
-epoch 중간부터가 아니라 처음부터 다시 시작한다. 이미 전체가 완료된 run은 source·artifact·
-집계 결과만 검증하고 GPU preflight나 학습 child를 다시 실행하지 않는다.
-프로필별 크기, 정확한 횟수, GPU 6 실행 예시와 결과 경로는
+V5와 새 Cycle V2라면 `last.pt`부터 이어지고, checkpoint 계약이 없는 legacy child만 처음부터
+다시 시작한다. 이미 전체가 완료된 run은 source·artifact·
+집계 결과만 검증하고 GPU preflight나 학습 child를 다시 실행하지 않는다. 중단 후 재개할 때도
+`--dry-run`을 제거한 실제 명령과 run ID를 한 글자도 바꾸지 않고 다시 실행한다.
+프로필별 크기, 정확한 횟수, portable/10GB MIG와 GPU 3/A6000 실행 예시 및 결과 경로는
 [전체 scaling 문서](../gpt_handoff/RICH_SCALING_EXPERIMENTS.md)에 있다.
 
-기본 세 트랙 benchmark의 공통 기본값은 CUDA, model seed `0`, data/split/chart seed `0`,
-workers `4`다. 별도 Conductance v2/v3/v4는 workers `0`을 사용한다. V2와 V3/V4의 네
+기본 세 트랙 benchmark와 `portable` scaling의 공통 기본값은 CUDA, model seed `0`,
+data/split/chart seed `0`이다. 기본 benchmark의 workers는 `4`다. 별도 Conductance
+v2/v3/v4/v5는 workers `0`을 사용한다. V2와 V3/V4의 네
 transductive 데이터는 full-graph batch 1이고, V3/V4의 PPI는 공식 graph 전체를 보존한
-minibatch 2다. 어느 경로도 neighbor sampling을 사용하지 않는다. 기본 benchmark의 PPI batch
+minibatch 2다. V5만 명시적으로 full/neighbor/cluster sampling을 지원하고 PPI는 full graph를
+유지한다. 기본 benchmark의 PPI batch
 size도 `2`, 분자·트리 데이터는 `32`이며 인용 그래프는 full-batch다.
 각 트랙의 우리 모델 구성과 평가 규칙은 해당 트랙 문서에 있다.
 
-여러 model seed를 반복하려면 실행 명령 뒤에 `--model-seeds 0,1,2,3,4`처럼 명시한다.
+`a6000-48gb`는 architecture 크기가 아니라 별도의 optimization/execution profile이다.
+Conductance V5의 real sample/PPI batch와 BF16 실행, Cycle V1/V2의 dataset별 batch와 FP16
+AMP, Tree V1/V2의 batch와 동시 child 수가 portable과 달라진다. 따라서 같은 hardware profile
+안의 arm/version만 주 비교로 해석하고, portable와 A6000 사이의 점수 또는 wall time 차이를
+모델 효과나 GPU 하나의 효과로 직접 해석하지 않는다. 정확한 자원값과 비교 경계는 전체 scaling
+문서의 표를 따른다.
+
+통합 scaling에서 여러 model seed를 반복하려면 실행 명령 뒤에
+`--model-seeds 0 1 2 3 4`처럼 공백으로 나열한다.
 이 옵션은 각 트랙의 우리 benchmark에 적용된다. Cycle PE 보조 BREC official suite의 내부
 `100,200,...,1000` 10-seed search는 BREC 프로토콜 축이므로 이 기본값과 별개다.
-Conductance v2/v3/v4는 한 번에 model seed 하나만 받아 `--model-seed 1`처럼 단수 옵션을 쓴다.
+Conductance v2/v3/v4/v5는 한 번에 model seed 하나만 받아 `--model-seed 1`처럼 단수 옵션을 쓴다.
 
-기본 학습은 float32로 실행한다. GAT는 accuracy/PPI micro-F1, PE는 MAE,
-트리 증강은 CSL accuracy/ZINC MAE를 사용하며 각 트랙 안에서 비교한다.
+기본 `scripts/run_paper.py --suite benchmark`는 float32로 실행한다. Scaling의 `portable`은
+Conductance와 Cycle에 FP32를 쓰고 Tree에는 기존 suite config의 FP16 AMP를 유지한다. A6000
+profile은 Conductance V5 dense 연산에 BF16, Cycle backbone에 FP16 AMP를 쓰며 Tree의 FP16
+AMP를 명시적으로 고정한다. Conductance geometry와 Cycle projector contraction은 float32를
+유지한다. GAT는 accuracy/PPI micro-F1, PE는 MAE, 트리 증강은 CSL accuracy/ZINC MAE를
+사용하며 각 트랙 안에서 비교한다.
 
 Conductance의 반복 GPU 동기화 제거와 Cycle PE의 연결 정보 재사용은 기본 적용된다.
-기저벡터 v2는 여러 그래프의 기저 연산을 묶는 배치 인코더를 기본 사용한다.
+새 projector V2는 fundamental basis로부터 만든 방향 불변 `P⊙P`의 작용을 pair-free
+low-rank contraction으로 계산한다. 시간 복잡도는 cycle rank를 `r`, PE value 폭을 `d`라 할 때
+`O(m r² d)`이며 production forward에서 `m×m` projector/kernel을 만들거나 cache하지 않는다.
+`--basis-pair-budget`는 임시 feature×rank×rank core allocation을 제한한다.
+선택적 `dfs_fundamental` backend에서 DFS forest 탐색 자체는 `O(V+E)`, 명시적 basis 복원은
+`O(V+E+nnz(Z))`이지만, projector의 기저 불변성을 지키기 위한 graph별 runtime QR은 선형 시간이
+아니므로 이 backend를 전체 학습 가속으로 해석하지 않는다.
 기본 benchmark의 선택적 `--compile`과 실제 train 데이터로 실행하는 GPU 속도 비교는
 [PERFORMANCE.md](PERFORMANCE.md)를 따른다. 기본 명령이나 패키지 설치를 바꿀 필요는 없다.
-별도 Conductance v2/v3/v4는 이 compile 옵션을 받지 않는다.
+별도 Conductance v2/v3/v4/v5는 이 compile 옵션을 받지 않는다.
 
 기본 세 트랙을 순서대로 실행하려면 각 트랙의 기본 명령 **대신** 다음 명령을 사용한다.
-Conductance v2/v3/v4는 이 master 명령에 포함되지 않는다.
+Conductance v2/v3/v4/v5는 이 master 명령에 포함되지 않는다.
 
 ```bash
 bash scripts/reproduce.sh
@@ -275,6 +343,9 @@ bash scripts/reproduce.sh
 | `results/conductance_gat/v2/<run-id>/` | 직접 C v2의 manifest, 조건별 checkpoint와 비교표 |
 | `results/conductance_gat/v3/<run-id>/` | 상대 C v3의 manifest, 조건별 checkpoint·개입과 비교표 |
 | `results/conductance_gat/v4/<run-id>/` | [V4 통합 문서](../gpt_handoff/CONDUCTANCE_V4.md#결과-확인)의 2×2 checkpoint·진단·비교표 |
+| `results/conductance_gat/v5/<run-id>/` | graph-conditioned V5의 fixed/dynamic C checkpoint·manifest·비교표 |
+| `results/cycle_pe/scaling/<run-id>/` | V1/새 projector V2의 dataset-aware profile 선택·최종 평가 |
+| `results/rich_scaling/<run-id>/` | V1–V5, Cycle V1/V2, Tree 통합 상태와 118/122 실행 검증 |
 
 전체 성공 시 터미널에 `all requested independent paper tracks passed`와 manifest 위치가 출력된다.
 실패하면 종료 코드는 0이 아니며, 해당 run의 로그와 `aggregate/failures.csv`를 확인한다.
@@ -304,8 +375,10 @@ Python patch 버전과 모든 전이 의존성을 잠근 환경은 아니며,
 사용자 제공 기존 benchmark 5-seed 집계, Conductance seed 0 GPU 진단·2×2·C-learning 결과는
 [실험 상태](../gpt_handoff/EXPERIMENT_STATUS.md)에 기록했다. 같은 문서에는 2026-09-02의 과거
 arxiv-only Conductance v2/v3 runner `passed` 보고와 V4 partial 중단도 별도로 보존한다. 이들은
-현재 확대된 V2/V3/V4 8/10/20개 전체 실행 결과가 아니다. 확대 실행의 성능 수치·전체 artifact,
-Cycle PE 기저벡터 v2의 성능 수치·전체 artifact와 실행 최적화의 가속 실측은 아직 확인하지 않았다.
+현재 확대된 V2/V3/V4 8/10/20개 전체 실행 결과가 아니다. V5와 새
+`cycle_projector_pe_v2`는 구현·계약·CPU 회귀 검증 단계이며 GPU 성능 결과가 아니다.
+V1–V5 reference/large 122-training 계획의 성능 수치·전체 artifact와 실행 최적화의 가속 실측도
+아직 확인하지 않았다.
 구현 검증 이력과 연구상 한계는
 [HANDOFF.md](../gpt_handoff/HANDOFF.md), 이 소스 버전의 코드 전체는
 [CODE_SUMMARY.md](../gpt_handoff/CODE_SUMMARY.md)에 있다.

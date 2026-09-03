@@ -1,7 +1,7 @@
 # GPT 전달용 전체 프로젝트 묶음
 
-이 폴더는 **V4만이 아니라 NEW GAT 전체 프로젝트를 외부 GPT에게 검토시키기 위한 전달 묶음**이다.
-GPT에는 파일을 따로 고르지 말고 이 폴더의 **9개 파일을 전부** 전달한다.
+이 폴더는 **V5만이 아니라 NEW GAT 전체 프로젝트를 외부 GPT에게 검토시키기 위한 전달 묶음**이다.
+GPT에는 파일을 따로 고르지 말고 이 폴더의 **10개 파일을 전부** 전달한다.
 
 ## 읽는 순서
 
@@ -11,19 +11,21 @@ GPT에는 파일을 따로 고르지 말고 이 폴더의 **9개 파일을 전�
 4. `CONDUCTANCE_V2.md`: 고정 그래프의 엣지별 C 직접 학습 계약
 5. `CONDUCTANCE_V3.md`: 공유 상대 C graph operator 학습 계약
 6. `CONDUCTANCE_V4.md`: C graph operator × spatial W 2×2 실험의 정확한 계약
-7. `CYCLE_PE_V2.md`: 좌영공간 기저벡터 전체를 입력하는 Cycle PE v2 계약
-8. `RICH_SCALING_EXPERIMENTS.md`: V1을 포함한 전체 트랙의 큰·깊은 모델 scaling 계약
-9. `CODE_SUMMARY.md`: 현재 Python·test·config·script 전체의 원문 스냅샷
+7. `CONDUCTANCE_V5.md`: graph-conditioned shared dynamic C와 연구급 규모 계약
+8. `CYCLE_PE_V2.md`: 폐기된 구 V2를 대체한 좌영공간 projector PE 계약
+9. `RICH_SCALING_EXPERIMENTS.md`: Conductance V1–V5, Cycle PE V1/V2, Tree의
+   reference/large 전체 scaling 계약(118 child / 122 model trainings)
+10. `CODE_SUMMARY.md`: 현재 Python·test·config·script 전체의 원문 스냅샷
 
-Conductance v2/v3/v4와 Cycle PE v2는 각각의 원문 문서를 직접 제공한다. 이 네 문서만 보는
+Conductance v2/v3/v4/v5와 Cycle PE v2는 각각의 원문 문서를 직접 제공한다. 이 문서만 보는
 것도 아니며 Conductance v1, Cycle PE v1, Tree Augmentation, 전체 scaling 실험, 데이터·평가
 계약과 과거 GPU 결과는 `RICH_SCALING_EXPERIMENTS.md`, `HANDOFF.md`,
 `EXPERIMENT_STATUS.md`에서 함께 검토한다.
 
 ## GPT에 그대로 줄 요청문
 
-> 첨부한 `gpt_handoff` 폴더의 9개 파일을 모두 읽고 NEW GAT 전체 프로젝트를 교차검증해 줘.
-> V4만 검토하지 말고 Conductance v1/v2/v3/v4, Cycle PE v1/v2, Tree Augmentation과 공통
+> 첨부한 `gpt_handoff` 폴더의 10개 파일을 모두 읽고 NEW GAT 전체 프로젝트를 교차검증해 줘.
+> V5만 검토하지 말고 Conductance v1/v2/v3/v4/v5, Cycle PE v1/v2, Tree Augmentation과 공통
 > scaling profile, 데이터·평가·실행 계약을 모두 범위에 포함해라. 문서의 주장과
 > `CODE_SUMMARY.md`의 실제 구현이
 > 일치하는지 확인하고, 수학 오류·데이터 누수·비교 불공정·재현성·artifact 무결성·검증 누락을

@@ -17,7 +17,7 @@
 | 문서 | 내용 |
 |---|---|
 | [EXPERIMENT_STATUS.md](../gpt_handoff/EXPERIMENT_STATUS.md) | 완료된 결과, 로컬 검증, 아직 실행하지 않은 실험 |
-| [RICH_SCALING_EXPERIMENTS.md](../gpt_handoff/RICH_SCALING_EXPERIMENTS.md) | V1을 포함한 전체 트랙의 큰·깊은 모델 확장 실험 |
+| [RICH_SCALING_EXPERIMENTS.md](../gpt_handoff/RICH_SCALING_EXPERIMENTS.md) | Conductance V1–V5, Cycle PE V1/V2, Tree의 reference/large 전체 실험(118 child / 122 model trainings) |
 | [PERFORMANCE.md](PERFORMANCE.md) | 구현 최적화, 시간·메모리 측정법, 미측정 범위 |
 
 ## Conductance 연구
@@ -33,13 +33,14 @@
 | [CONDUCTANCE_V2.md](../gpt_handoff/CONDUCTANCE_V2.md) | 엣지별 C 직접 학습 |
 | [CONDUCTANCE_V3.md](../gpt_handoff/CONDUCTANCE_V3.md) | 상대 C graph operator 학습 |
 | [CONDUCTANCE_V4.md](../gpt_handoff/CONDUCTANCE_V4.md) | 상대 C graph operator × spatial W 2×2 통합 문서 |
+| [CONDUCTANCE_V5.md](../gpt_handoff/CONDUCTANCE_V5.md) | graph-conditioned shared dynamic C와 multi-head W의 V5 계약·실행법 |
 
 ## Cycle PE와 Tree Augmentation
 
 | 문서 | 내용 |
 |---|---|
 | [CYCLE_PE.md](CYCLE_PE.md) | 기본 Cycle PE 모델과 benchmark |
-| [CYCLE_PE_V2.md](../gpt_handoff/CYCLE_PE_V2.md) | 좌영공간 기저벡터 전체를 입력하는 별도 v2 |
+| [CYCLE_PE_V2.md](../gpt_handoff/CYCLE_PE_V2.md) | 구 V2를 폐기하고 교체한 cycle-space projector PE V2 |
 | [TREE_AUGMENTATION.md](TREE_AUGMENTATION.md) | 고정 tree·다중 tree augmentation 실험 |
 
 ## 연구 구조와 후속 아이디어
@@ -53,7 +54,7 @@
 
 | 문서 | 내용 |
 |---|---|
-| [README_FIRST.md](../gpt_handoff/README_FIRST.md) | GPT에 전달할 정확한 9개 파일, 읽는 순서와 요청문 |
+| [README_FIRST.md](../gpt_handoff/README_FIRST.md) | GPT에 전달할 정확한 10개 파일, 읽는 순서와 요청문 |
 | [HANDOFF.md](../gpt_handoff/HANDOFF.md) | 전체 구현 이력, 검증 근거, 남은 작업과 외부 검토 질문 |
 | [CODE_SUMMARY.md](../gpt_handoff/CODE_SUMMARY.md) | 현재 source/test/config/script의 파일별 원문 스냅샷 |
 

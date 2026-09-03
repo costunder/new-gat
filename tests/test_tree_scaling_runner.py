@@ -6,6 +6,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -21,39 +22,31 @@ def _digest(path: Path) -> str:
 def test_default_matrix_trains_both_versions_across_larger_profiles() -> None:
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
+    assert [(job["suite"], job["profile"]) for job in jobs] == [
+        ("csl", "reference"),
+        ("csl", "large"),
+        ("zinc", "reference"),
+        ("zinc", "large"),
+    ]
     assert args.suites == ("csl", "zinc")
-    assert args.profiles == ("base", "wide", "deep", "large")
+    assert args.profiles == ("reference", "large")
     assert args.model_seeds == (0,)
-    assert len(jobs) == 8
-    assert sum(len(job["trained_models"]) for job in jobs) == 16
+    assert len(jobs) == 4
+    assert sum(len(job["trained_models"]) for job in jobs) == 8
     assert len(args.suites) * len(runner.MODELS) == 4
     assert len(args.suites) * len(args.model_seeds) * len(runner.MODELS) == 4
     assert len({job["output_dir"] for job in jobs}) == len(jobs)
     assert runner.PROFILE_CONFIGS == {
-        "base": {
-            "hidden_dim": 64,
-            "message_layers": 2,
-            "optimizer_updates": 800,
-            "train_charts_per_graph": 8,
-            "eval_charts_per_graph": 8,
-        },
-        "wide": {
+        "reference": {
             "hidden_dim": 128,
-            "message_layers": 2,
-            "optimizer_updates": 800,
-            "train_charts_per_graph": 8,
-            "eval_charts_per_graph": 8,
-        },
-        "deep": {
-            "hidden_dim": 64,
-            "message_layers": 4,
+            "message_layers": 8,
             "optimizer_updates": 800,
             "train_charts_per_graph": 8,
             "eval_charts_per_graph": 8,
         },
         "large": {
-            "hidden_dim": 128,
-            "message_layers": 4,
+            "hidden_dim": 256,
+            "message_layers": 12,
             "optimizer_updates": 800,
             "train_charts_per_graph": 8,
             "eval_charts_per_graph": 8,
@@ -67,13 +60,200 @@ def test_default_matrix_trains_both_versions_across_larger_profiles() -> None:
             assert command[command.index("--" + key.replace("_", "-")) + 1] == str(value)
 
 
+def test_a6000_profile_resolves_recorded_high_throughput_settings() -> None:
+    args = runner.parser().parse_args(["--hardware-profile", "a6000-48gb"])
+    runner._validate(args)
+    assert (args.batch_size, args.workers, args.amp, args.job_concurrency) == (64, 4, True, 2)
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert [(job["suite"], job["profile"]) for job in jobs] == [
+        ("zinc", "large"),
+        ("zinc", "reference"),
+        ("csl", "large"),
+        ("csl", "reference"),
+    ]
+    assert all(job["command"][job["command"].index("--batch-size") + 1] == "64" for job in jobs)
+    assert all(job["command"][job["command"].index("--workers") + 1] == "4" for job in jobs)
+    assert all("--amp" in job["command"] for job in jobs)
+    config = runner._run_config(args, Path("data").resolve())
+    assert config["hardware_profile"] == "a6000-48gb"
+    assert config["job_concurrency"] == 2
+
+
+def test_profile_selection_is_independent_of_a6000_heavy_first_job_order() -> None:
+    args = runner.parser().parse_args(["--hardware-profile", "a6000-48gb"])
+    runner._validate(args)
+    jobs = [job for job in runner.make_jobs(args, Path("fixture")) if job["suite"] == "csl"]
+    for job in jobs:
+        score = 0.8 if job["profile"] == "large" else 0.7
+        job["status"] = "passed"
+        job["result"] = {
+            "selection_objectives": {
+                model: {
+                    "metric": "unit",
+                    "direction": "maximize",
+                    "value": score,
+                }
+                for model in runner.MODELS
+            },
+            "checkpoints": {
+                model: {"path": f"{job['profile']}-{model}.pt", "sha256": "unit"}
+                for model in runner.MODELS
+            },
+            "parameter_counts": {model: {"total": 1, "trainable": 1} for model in runner.MODELS},
+            "quadrant_metrics": {model: {"unit": {"accuracy": score}} for model in runner.MODELS},
+            "child_summary_sha256": "unit",
+        }
+    forward = runner._select_profiles(
+        jobs, suite="csl", model_seeds=(0,), profiles=("reference", "large")
+    )
+    reverse = runner._select_profiles(
+        list(reversed(jobs)),
+        suite="csl",
+        model_seeds=(0,),
+        profiles=("reference", "large"),
+    )
+    assert forward == reverse
+    assert all(
+        condition["selected_profile"] == "large" for condition in forward["conditions"].values()
+    )
+
+
+def test_a6000_preflight_rejects_mig_and_old_compute_capability() -> None:
+    base = {
+        "status": "passed",
+        "gpu": {
+            "free_bytes": 47 * 1024**3,
+            "total_bytes": 48 * 1024**3,
+            "compute_capability": [8, 6],
+        },
+    }
+    runner._validate_hardware_preflight(base, "a6000-48gb")
+    mig = json.loads(json.dumps(base))
+    mig["gpu"]["total_bytes"] = 10 * 1024**3
+    with pytest.raises(RuntimeError, match="40 GiB"):
+        runner._validate_hardware_preflight(mig, "a6000-48gb")
+    busy = json.loads(json.dumps(base))
+    busy["gpu"]["free_bytes"] = 31 * 1024**3
+    with pytest.raises(RuntimeError, match="32 GiB free"):
+        runner._validate_hardware_preflight(busy, "a6000-48gb")
+    old = json.loads(json.dumps(base))
+    old["gpu"]["compute_capability"] = [7, 5]
+    with pytest.raises(RuntimeError, match="capability 8.0"):
+        runner._validate_hardware_preflight(old, "a6000-48gb")
+
+
+def test_bounded_wave_runs_independent_jobs_concurrently_with_single_manifest_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    barrier = threading.Barrier(2)
+    worker_threads: list[int] = []
+    writer_threads: list[int] = []
+    main_thread = threading.get_ident()
+    jobs = [
+        {
+            "status": "pending",
+            "command": [f"job-{index}"],
+            "log_path": str(tmp_path / f"job-{index}.log"),
+        }
+        for index in range(2)
+    ]
+    manifest = {"jobs": jobs, "sources": {}}
+
+    def dispatch(_command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        worker_threads.append(threading.get_ident())
+        barrier.wait(timeout=5)
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    monkeypatch.setattr(runner, "_check_sources", lambda _manifest: None)
+    monkeypatch.setattr(
+        runner,
+        "_write_state",
+        lambda _run_dir, _manifest: writer_threads.append(threading.get_ident()),
+    )
+    runner._execute_job_matrix(
+        jobs,
+        concurrency=2,
+        environment={},
+        manifest=manifest,
+        run_dir=tmp_path,
+        validator=lambda job: {"accepted": job["command"][0]},
+        describe=lambda job: job["command"][0],
+    )
+    assert len(set(worker_threads)) == 2
+    assert set(worker_threads) == set(worker_threads) - {main_thread}
+    assert writer_threads and set(writer_threads) == {main_thread}
+    assert [job["status"] for job in jobs] == ["passed", "passed"]
+
+
+@pytest.mark.parametrize("failure_mode", ["nonzero", "exception"])
+def test_concurrent_wave_preserves_successful_peer_and_retries_only_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_mode: str
+) -> None:
+    barrier = threading.Barrier(2)
+    jobs = [
+        {
+            "status": "pending",
+            "command": [f"job-{index}"],
+            "log_path": str(tmp_path / f"job-{index}.log"),
+        }
+        for index in range(2)
+    ]
+    manifest = {"jobs": jobs, "sources": {}}
+
+    def first_dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        barrier.wait(timeout=5)
+        if command[0] == "job-1":
+            if failure_mode == "exception":
+                raise RuntimeError("worker failure")
+            return 7
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", first_dispatch)
+    monkeypatch.setattr(runner, "_check_sources", lambda _manifest: None)
+    monkeypatch.setattr(runner, "_write_state", lambda *_args: None)
+    with pytest.raises(RuntimeError):
+        runner._execute_job_matrix(
+            jobs,
+            concurrency=2,
+            environment={},
+            manifest=manifest,
+            run_dir=tmp_path,
+            validator=lambda job: {"accepted": job["command"][0]},
+            describe=lambda job: job["command"][0],
+        )
+    assert jobs[0]["status"] == "passed"
+    assert jobs[0]["result"] == {"accepted": "job-0"}
+    assert jobs[1]["status"] == "failed"
+
+    jobs[1]["status"] = "pending"
+    resumed_calls: list[str] = []
+
+    def resumed_dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        resumed_calls.append(command[0])
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", resumed_dispatch)
+    runner._execute_job_matrix(
+        jobs,
+        concurrency=2,
+        environment={},
+        manifest=manifest,
+        run_dir=tmp_path,
+        validator=lambda job: {"accepted": job["command"][0]},
+        describe=lambda job: job["command"][0],
+    )
+    assert resumed_calls == ["job-1"]
+    assert [job["status"] for job in jobs] == ["passed", "passed"]
+
+
 def test_default_dry_run_reports_seed_zero_plan_without_writes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert runner.main(["--results-root", str(tmp_path), "--dry-run"]) == 0
     output = capsys.readouterr().out
-    assert "8 validation-candidate child runs" in output
-    assert "16 fresh model trainings" in output
+    assert "4 validation-candidate child runs" in output
+    assert "8 fresh model trainings" in output
     assert "4 aggregate profile selections" in output
     assert "4 selected-checkpoint test evaluations" in output
     assert list(tmp_path.iterdir()) == []
@@ -95,8 +275,8 @@ def test_paper_scaling_overrides_are_opt_in_and_validated() -> None:
     }
     effective, overrides = tree_paper._apply_setting_overrides(
         defaults,
-        hidden_dim=128,
-        message_layers=4,
+        hidden_dim=256,
+        message_layers=12,
         optimizer_updates=800,
         train_charts_per_graph=8,
         eval_charts_per_graph=8,
@@ -211,6 +391,16 @@ def _write_child(job: dict[str, object], *, malformed: str | None = None) -> Non
         path = output / f"{name}_model.pt"
         path.write_bytes(f"unit-{name}".encode())
         checkpoints[name] = str(path.resolve())
+    amp = "--no-amp" not in command
+    runtime = {
+        "batch_size": int(command[command.index("--batch-size") + 1]),
+        "workers": int(command[command.index("--workers") + 1]),
+        "amp_requested": amp,
+        "amp_effective": amp,
+        "elapsed_seconds": 1.25,
+        "peak_gpu_allocated_bytes": 1_000_000,
+        "peak_gpu_reserved_bytes": 2_000_000,
+    }
     summary = {
         "suite": job["suite"],
         "seed_axes": axes,
@@ -237,6 +427,7 @@ def _write_child(job: dict[str, object], *, malformed: str | None = None) -> Non
             "fixed_and_multi_optimizer_updates_matched": True,
         },
         "checkpoints": checkpoints,
+        "runtime": runtime,
     }
     summary_path = output / "summary.json"
     summary_path.write_text(json.dumps(summary, allow_nan=True), encoding="utf-8")
@@ -253,6 +444,7 @@ def _write_child(job: dict[str, object], *, malformed: str | None = None) -> Non
         "model_split_usage": summary["model_split_usage"],
         "effective_settings": profile,
         "settings_overrides": profile,
+        "runtime": runtime,
         "artifacts": artifacts,
     }
     (output / "manifest.json").write_text(json.dumps(child_manifest), encoding="utf-8")
@@ -285,6 +477,16 @@ def _write_selected_child(job: dict[str, object]) -> None:
         }
         for name in runner.MODELS
     }
+    amp = "--no-amp" not in command
+    runtime = {
+        "batch_size": int(command[command.index("--batch-size") + 1]),
+        "workers": int(command[command.index("--workers") + 1]),
+        "amp_requested": amp,
+        "amp_effective": amp,
+        "elapsed_seconds": 0.5,
+        "peak_gpu_allocated_bytes": 750_000,
+        "peak_gpu_reserved_bytes": 1_500_000,
+    }
     summary = {
         "suite": job["suite"],
         "seed_axes": axes,
@@ -312,6 +514,7 @@ def _write_selected_child(job: dict[str, object]) -> None:
             name: selected_inputs[name]["parameter_counts"] for name in runner.MODELS
         },
         "models": models,
+        "runtime": runtime,
     }
     summary_path = output / "summary.json"
     summary_path.write_text(json.dumps(summary), encoding="utf-8")
@@ -324,6 +527,7 @@ def _write_selected_child(job: dict[str, object]) -> None:
         "dataset_cache_integrity": summary["dataset_cache_integrity"],
         "model_split_usage": summary["model_split_usage"],
         "selected_checkpoint_inputs": expected_checkpoints,
+        "runtime": runtime,
         "artifacts": {"summary.json": {"path": str(summary_path), "sha256": _digest(summary_path)}},
     }
     (output / "manifest.json").write_text(json.dumps(child_manifest), encoding="utf-8")
@@ -351,7 +555,17 @@ def _stub(
             preflight = Path(command[command.index("--json-out") + 1])
             if failure != "preflight_missing":
                 preflight.write_text(
-                    json.dumps({"status": "failed" if failure == "preflight_status" else "passed"}),
+                    json.dumps(
+                        {
+                            "status": "failed" if failure == "preflight_status" else "passed",
+                            "gpu": {
+                                "name": "unit A6000",
+                                "free_bytes": 47 * 1024**3,
+                                "total_bytes": 48 * 1024**3,
+                                "compute_capability": [8, 6],
+                            },
+                        }
+                    ),
                     encoding="utf-8",
                 )
             return 0
@@ -371,6 +585,8 @@ def _stub(
                 for call in calls
             )
             if failure == "second_child_exit" and candidate_call_count == 2:
+                return 9
+            if failure == "seed4_exit" and candidate["model_seed"] == 4:
                 return 9
             if failure == "second_child_interrupt" and candidate_call_count == 2:
                 raise KeyboardInterrupt
@@ -402,7 +618,7 @@ def _stub(
         "--suites",
         "csl",
         "--profiles",
-        "wide",
+        "large",
         "--model-seeds",
         "3,4",
     ]
@@ -438,7 +654,7 @@ def test_success_checks_metrics_parameters_artifacts_and_records_profile(
     assert all(row["test_evaluated"] is True for row in summary["selected_test_results"])
     assert all(row["test_used_for_selection"] is False for row in summary["selected_test_results"])
     assert all(
-        job["result"]["profile_config"] == runner.PROFILE_CONFIGS["wide"]
+        job["result"]["profile_config"] == runner.PROFILE_CONFIGS["large"]
         for job in manifest["jobs"]
     )
     assert all(
@@ -510,6 +726,60 @@ def test_resume_skips_verified_candidate_and_retries_incomplete_child_on_new_pat
     assert all(job["status"] == "passed" for job in resumed["jobs"])
 
 
+def test_a6000_failed_concurrent_peer_preserves_passed_artifact_for_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, first_calls = _stub(tmp_path, monkeypatch, failure="seed4_exit")
+    options += ["--hardware-profile", "a6000-48gb"]
+    assert runner.main(options) == 1
+    root = tmp_path / "tree_augmentation/scaling/unit"
+    failed = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert failed["config"]["job_concurrency"] == 2
+    assert failed["config"]["batch_size"] == 64
+    assert [job["status"] for job in failed["jobs"]] == ["passed", "failed"]
+    passed_output = Path(failed["jobs"][0]["output_dir"])
+    passed_digest = _digest(passed_output / "summary.json")
+
+    resume_options, resume_calls = _stub(tmp_path, monkeypatch)
+    resume_options += ["--hardware-profile", "a6000-48gb"]
+    assert runner.main(resume_options) == 0
+    candidate_calls = [
+        call
+        for call in resume_calls
+        if "--evaluation-scope" in call
+        and call[call.index("--evaluation-scope") + 1] == "validation"
+    ]
+    assert len(candidate_calls) == 1
+    assert "--amp" in candidate_calls[0]
+    assert candidate_calls[0][candidate_calls[0].index("--batch-size") + 1] == "64"
+    assert _digest(passed_output / "summary.json") == passed_digest
+    resumed = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert [job["status"] for job in resumed["jobs"]] == ["passed", "passed"]
+    assert all("runtime" in job["result"] for job in resumed["jobs"])
+    summary = json.loads((root / "summary.json").read_text("utf-8"))
+    assert all(result["runtime"]["peak_gpu_allocated_bytes"] > 0 for result in summary["results"])
+
+
+def test_a6000_concurrent_wave_fails_closed_if_source_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, calls = _stub(tmp_path, monkeypatch)
+    options += ["--hardware-profile", "a6000-48gb"]
+    stable = {"git_revision": "unit", "sha256": {"unit-source": "stable"}}
+    changed = {"git_revision": "unit", "sha256": {"unit-source": "changed"}}
+    snapshots = iter((stable, stable, changed))
+    monkeypatch.setattr(runner, "_source_snapshot", lambda: next(snapshots, changed))
+    assert runner.main(options) == 1
+    manifest = json.loads(
+        (tmp_path / "tree_augmentation/scaling/unit/manifest.json").read_text("utf-8")
+    )
+    assert manifest["source_integrity_valid"] is False
+    assert manifest["status"] == "failed"
+    candidate_calls = [call for call in calls if "--evaluation-scope" in call]
+    assert len(candidate_calls) == 2
+    assert manifest["selected_test_jobs"] == []
+
+
 def test_resume_skips_candidates_and_verified_selected_checkpoint_evaluation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -574,7 +844,7 @@ def test_passed_candidate_result_mismatch_schedules_a_new_attempt(tmp_path: Path
             "--suites",
             "csl",
             "--profiles",
-            "wide",
+            "large",
             "--model-seeds",
             "3",
         ]
@@ -677,7 +947,7 @@ def test_retry_path_rejects_resume_attempts_symlink_outside_run(
     command = ["python", "child.py", "--output-dir", str(original_output)]
     expected = {
         "suite": "csl",
-        "profile": "base",
+        "profile": "reference",
         "model_seed": 0,
         "command": command,
         "output_dir": str(original_output),

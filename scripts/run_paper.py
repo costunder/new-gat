@@ -42,6 +42,7 @@ CYCLE_BREC_OFFICIAL_SEEDS = (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
 CYCLE_VARIANTS = ("no_pe", "raw", "set", "projector")
 DEFAULT_CYCLE_VARIANTS = ("raw", "set", "projector")
 CYCLE_CORE_TARGETS = ("edge", "node", "graph")
+CYCLE_BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
@@ -239,10 +240,16 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
                     label = "benchmark-v2" if cycle_v2 else suite
                     overrides: list[str] = []
                     if cycle_v2:
-                        overrides.extend((
-                            "--basis-execution", args.basis_execution,
-                            "--basis-pair-budget", str(args.basis_pair_budget),
-                        ))
+                        overrides.extend(
+                            (
+                                "--basis-backend",
+                                args.basis_backend,
+                                "--basis-execution",
+                                args.basis_execution,
+                                "--basis-pair-budget",
+                                str(args.basis_pair_budget),
+                            )
+                        )
                         if args.cycle_epochs is not None:
                             overrides.extend(("--epochs", str(args.cycle_epochs)))
                         if args.cycle_learning_rate is not None:
@@ -515,6 +522,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cycle-epochs", type=int)
     parser.add_argument("--cycle-learning-rate", type=float)
+    parser.add_argument("--basis-backend", choices=CYCLE_BASIS_BACKENDS, default="thin_q")
     parser.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
     parser.add_argument("--basis-pair-budget", type=int, default=32768)
     parser.add_argument(
@@ -562,6 +570,9 @@ def main() -> int:
         return 2
     if args.basis_pair_budget < 1:
         print("--basis-pair-budget must be positive", file=sys.stderr)
+        return 2
+    if args.basis_backend != "thin_q" and args.cycle_pe_version != "v2":
+        print("nondefault --basis-backend requires --cycle-pe-version v2", file=sys.stderr)
         return 2
     if args.cycle_pe_version == "v2" and (
         args.suite != "benchmark" or _selected_tracks(args.tracks) != ("cycle_pe",)
@@ -644,6 +655,7 @@ def main() -> int:
         "executed_model_seeds": ([] if args.prepare_only else list(args.model_seeds)),
         "execution_protocol": {
             "torch_compile": args.compile and not args.prepare_only,
+            "basis_backend": args.basis_backend if args.cycle_pe_version == "v2" else None,
             "basis_execution": args.basis_execution if args.cycle_pe_version == "v2" else None,
             "basis_pair_budget": args.basis_pair_budget if args.cycle_pe_version == "v2" else None,
             "cycle_pe_version": args.cycle_pe_version if "cycle_pe" in tracks else None,

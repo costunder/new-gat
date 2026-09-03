@@ -38,14 +38,53 @@ from scripts.check_dependencies import (  # noqa: E402
 
 DATASETS = ("zinc12k", "peptides_struct")
 VERSIONS = ("v1", "v2")
-PROFILE_ORDER = ("base", "wide", "deep", "large")
-PROFILES: dict[str, dict[str, int]] = {
-    "base": {"hidden_dim": 64, "pe_dim": 32, "layers": 3},
-    "wide": {"hidden_dim": 128, "pe_dim": 64, "layers": 3},
-    "deep": {"hidden_dim": 64, "pe_dim": 32, "layers": 6},
-    "large": {"hidden_dim": 128, "pe_dim": 64, "layers": 6},
+PROFILE_ORDER = ("reference", "large")
+HARDWARE_PROFILES = ("portable", "a6000-48gb")
+BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
+A6000_MIN_TOTAL_BYTES = 40 * 1024**3
+A6000_BATCH_SIZE = {
+    "reference": {"zinc12k": 512, "peptides_struct": 128},
+    "large": {"zinc12k": 256, "peptides_struct": 64},
 }
-MODEL_NAMES = {"v1": "cycle_set", "v2": "cycle_basis_v2"}
+PROFILES: dict[str, dict[str, dict[str, float | int]]] = {
+    "reference": {
+        "zinc12k": {
+            "hidden_dim": 128,
+            "pe_dim": 64,
+            "layers": 10,
+            "ffn_multiplier": 4,
+            "dropout": 0.1,
+            "layer_scale": 0.1,
+        },
+        "peptides_struct": {
+            "hidden_dim": 256,
+            "pe_dim": 64,
+            "layers": 6,
+            "ffn_multiplier": 4,
+            "dropout": 0.1,
+            "layer_scale": 0.1,
+        },
+    },
+    "large": {
+        "zinc12k": {
+            "hidden_dim": 192,
+            "pe_dim": 96,
+            "layers": 12,
+            "ffn_multiplier": 4,
+            "dropout": 0.1,
+            "layer_scale": 0.1,
+        },
+        "peptides_struct": {
+            "hidden_dim": 320,
+            "pe_dim": 96,
+            "layers": 8,
+            "ffn_multiplier": 4,
+            "dropout": 0.1,
+            "layer_scale": 0.1,
+        },
+    },
+}
+MODEL_NAMES = {"v1": "cycle_set", "v2": "cycle_projector_pe_v2"}
 MODULES = {
     "v1": "research.cycle_pe.benchmark",
     "v2": "research.cycle_pe.v2.benchmark",
@@ -111,8 +150,22 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
     result.add_argument("--device", default="cuda")
-    result.add_argument("--batch-size", type=int, default=32)
-    result.add_argument("--workers", type=int, default=4)
+    result.add_argument("--hardware-profile", choices=HARDWARE_PROFILES, default="portable")
+    result.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="explicit fixed override; 0 uses the preregistered hardware/dataset/profile value",
+    )
+    result.add_argument(
+        "--workers", type=int, default=-1, help="explicit override; -1 selects by hardware profile"
+    )
+    result.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=0,
+        help="explicit override; 0 selects by hardware profile",
+    )
     result.add_argument("--epochs", type=int, default=300)
     result.add_argument("--patience", type=int, default=50)
     result.add_argument("--lr", type=float, default=1e-3)
@@ -120,15 +173,16 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--max-parameters",
         type=int,
-        default=5_000_000,
-        help="fail-closed ceiling per model; large profile needs more than the legacy 500k cap",
+        default=50_000_000,
+        help="fail-closed ceiling per model for the reference-scale profiles",
     )
     result.add_argument("--allow-download", action="store_true")
-    result.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
+    result.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     result.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
-    result.add_argument("--column-chunk-size", type=int, default=16)
+    result.add_argument("--column-chunk-size", type=int, default=0)
+    result.add_argument("--basis-backend", choices=BASIS_BACKENDS, default="thin_q")
     result.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
-    result.add_argument("--basis-pair-budget", type=int, default=32768)
+    result.add_argument("--basis-pair-budget", type=int, default=0)
     result.add_argument("--min-free-gb", type=float, default=8.0)
     result.add_argument("--fail-fast", action="store_true")
     result.add_argument("--dry-run", action="store_true")
@@ -140,17 +194,25 @@ def _validate(args: argparse.Namespace) -> None:
         values = getattr(args, name)
         if not values or len(set(values)) != len(values):
             raise ValueError(f"--{name} must be nonempty and contain no duplicates")
+    if args.basis_backend != "thin_q" and "v2" not in args.versions:
+        raise ValueError("nondefault --basis-backend requires v2 in --versions")
     for name in (
-        "batch_size",
         "epochs",
         "patience",
         "max_parameters",
-        "column_chunk_size",
-        "basis_pair_budget",
     ):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    if args.workers < 0 or args.lr <= 0 or args.weight_decay < 0 or args.min_free_gb < 0:
+    if (
+        args.batch_size < 0
+        or args.workers < -1
+        or args.prefetch_factor < 0
+        or args.column_chunk_size < 0
+        or args.basis_pair_budget < 0
+        or args.lr <= 0
+        or args.weight_decay < 0
+        or args.min_free_gb < 0
+    ):
         raise ValueError("invalid worker, optimizer, or GPU-memory setting")
     if not args.device.lower().startswith("cuda"):
         raise ValueError("Cycle PE scaling training requires CUDA; no CPU fallback")
@@ -164,86 +226,153 @@ def _run_dir(args: argparse.Namespace, run_id: str) -> Path:
     return (args.results_root.expanduser().resolve() / "cycle_pe/scaling" / run_id).resolve()
 
 
+def _profile_config(profile: str, dataset: str, version: str) -> dict[str, float | int]:
+    config = dict(PROFILES[profile][dataset])
+    if version == "v1":
+        return {key: config[key] for key in ("hidden_dim", "pe_dim", "layers")}
+    return config
+
+
+def _job_resources(
+    args: argparse.Namespace, version: str, profile: str, dataset: str
+) -> dict[str, Any]:
+    accelerated = args.hardware_profile == "a6000-48gb"
+    is_v2 = version == "v2"
+    return {
+        "hardware_profile": args.hardware_profile,
+        "batch_size": args.batch_size
+        or (A6000_BATCH_SIZE[profile][dataset] if accelerated else 32),
+        "workers": args.workers if args.workers >= 0 else (8 if accelerated else 4),
+        # V1's frozen loader exposes no prefetch CLI and therefore uses the
+        # DataLoader default (2); never claim the V2-only override for V1.
+        "prefetch_factor": (args.prefetch_factor or (4 if accelerated else 2) if is_v2 else 2),
+        "amp": accelerated if args.amp is None else args.amp,
+        "column_chunk_size": (
+            args.column_chunk_size or (32 if accelerated else 16) if is_v2 else None
+        ),
+        "basis_pair_budget": (
+            args.basis_pair_budget or (4_194_304 if accelerated else 32768) if is_v2 else None
+        ),
+        "basis_execution": args.basis_execution if is_v2 else None,
+        "basis_backend": args.basis_backend if is_v2 else None,
+        "precision_scope": (
+            "projector_fp32_backbone_amp" if version == "v2" else "legacy_v1_partial_amp"
+        ),
+        "version": version,
+    }
+
+
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     data_root = args.data_root.expanduser().resolve()
     for version in args.versions:
         for profile in args.profiles:
-            config = PROFILES[profile]
             for seed in args.model_seeds:
-                output = run_dir / "results" / version / profile / f"model-seed-{seed}"
-                job_id = f"{version}:{profile}:model-seed-{seed}"
-                command = [
-                    sys.executable,
-                    "-B",
-                    "-u",
-                    "-m",
-                    MODULES[version],
-                    "--suite",
-                    "benchmark",
-                    "--datasets",
-                    *args.datasets,
-                    "--data-root",
-                    str(data_root),
-                    "--output-dir",
-                    str(output),
-                    "--device",
-                    args.device,
-                    "--model-seed",
-                    str(seed),
-                    "--batch-size",
-                    str(args.batch_size),
-                    "--workers",
-                    str(args.workers),
-                    "--epochs",
-                    str(args.epochs),
-                    "--patience",
-                    str(args.patience),
-                    "--lr",
-                    str(args.lr),
-                    "--weight-decay",
-                    str(args.weight_decay),
-                    "--hidden-dim",
-                    str(config["hidden_dim"]),
-                    "--pe-dim",
-                    str(config["pe_dim"]),
-                    "--layers",
-                    str(config["layers"]),
-                    "--max-parameters",
-                    str(args.max_parameters),
-                    "--validation-only",
-                    "--amp" if args.amp else "--no-amp",
-                    "--compile" if args.compile else "--no-compile",
-                ]
-                if args.allow_download:
-                    command.append("--allow-download")
-                if version == "v2":
-                    command += [
-                        "--column-chunk-size",
-                        str(args.column_chunk_size),
-                        "--basis-execution",
-                        args.basis_execution,
-                        "--basis-pair-budget",
-                        str(args.basis_pair_budget),
+                for dataset in args.datasets:
+                    config = _profile_config(profile, dataset, version)
+                    resources = _job_resources(args, version, profile, dataset)
+                    output = (
+                        run_dir / "results" / version / profile / dataset / f"model-seed-{seed}"
+                    )
+                    job_id = f"{version}:{profile}:{dataset}:model-seed-{seed}"
+                    command = [
+                        sys.executable,
+                        "-B",
+                        "-u",
+                        "-m",
+                        MODULES[version],
+                        "--suite",
+                        "benchmark",
+                        "--datasets",
+                        dataset,
+                        "--data-root",
+                        str(data_root),
+                        "--output-dir",
+                        str(output),
+                        "--device",
+                        args.device,
+                        "--model-seed",
+                        str(seed),
+                        "--batch-size",
+                        str(resources["batch_size"]),
+                        "--workers",
+                        str(resources["workers"]),
+                        "--epochs",
+                        str(args.epochs),
+                        "--patience",
+                        str(args.patience),
+                        "--lr",
+                        str(args.lr),
+                        "--weight-decay",
+                        str(args.weight_decay),
+                        "--hidden-dim",
+                        str(config["hidden_dim"]),
+                        "--pe-dim",
+                        str(config["pe_dim"]),
+                        "--layers",
+                        str(config["layers"]),
+                        "--max-parameters",
+                        str(args.max_parameters),
+                        "--validation-only",
+                        "--amp" if resources["amp"] else "--no-amp",
+                        "--compile" if args.compile else "--no-compile",
                     ]
-                jobs.append(
-                    {
-                        "job_id": job_id,
-                        "version": version,
-                        "profile": profile,
-                        "model_seed": seed,
-                        "datasets": list(args.datasets),
-                        "config": dict(config),
-                        "status": "pending",
-                        "command": command,
-                        "output_dir": str(output),
-                        "log_path": str(
-                            run_dir / "logs" / f"{version}--{profile}--seed-{seed}.log"
-                        ),
-                        "returncode": None,
-                        "artifact_errors": [],
-                    }
-                )
+                    if args.allow_download:
+                        command.append("--allow-download")
+                    if version == "v2":
+                        command += [
+                            "--ffn-multiplier",
+                            str(config["ffn_multiplier"]),
+                            "--dropout",
+                            str(config["dropout"]),
+                            "--layer-scale",
+                            str(config["layer_scale"]),
+                            "--column-chunk-size",
+                            str(resources["column_chunk_size"]),
+                            "--basis-backend",
+                            args.basis_backend,
+                            "--basis-execution",
+                            args.basis_execution,
+                            "--basis-pair-budget",
+                            str(resources["basis_pair_budget"]),
+                            "--prefetch-factor",
+                            str(resources["prefetch_factor"]),
+                            "--hardware-profile",
+                            args.hardware_profile,
+                        ]
+                    jobs.append(
+                        {
+                            "job_id": job_id,
+                            "version": version,
+                            "profile": profile,
+                            "model_seed": seed,
+                            "datasets": [dataset],
+                            "config": dict(config),
+                            "resources": resources,
+                            "status": "pending",
+                            "command": command,
+                            "output_dir": str(output),
+                            "log_path": str(
+                                run_dir
+                                / "logs"
+                                / f"{version}--{profile}--{dataset}--seed-{seed}.log"
+                            ),
+                            "returncode": None,
+                            "artifact_errors": [],
+                        }
+                    )
+    if args.hardware_profile == "a6000-48gb":
+        # Put the genuinely heavy candidate first so capacity/utilization is
+        # exercised immediately instead of spending the first hours on V1/ZINC.
+        # This deterministic order is persisted as part of the manifest plan.
+        jobs.sort(
+            key=lambda job: (
+                job["version"] != "v2",
+                job["profile"] != "large",
+                job["datasets"] != ["peptides_struct"],
+                job["model_seed"],
+            )
+        )
     return jobs
 
 
@@ -261,6 +390,24 @@ def _environment() -> dict[str, str]:
     environment["PYTHONUNBUFFERED"] = "1"
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
+
+
+def _validate_preflight_hardware(profile: str, report: dict[str, Any]) -> None:
+    if profile != "a6000-48gb":
+        return
+    gpu = report.get("gpu")
+    if (
+        not isinstance(gpu, dict)
+        or not isinstance(gpu.get("total_bytes"), int)
+        or gpu["total_bytes"] < A6000_MIN_TOTAL_BYTES
+        or not isinstance(gpu.get("compute_capability"), list)
+        or not gpu["compute_capability"]
+        or gpu["compute_capability"][0] < 8
+    ):
+        raise ValueError(
+            "a6000-48gb requires >=40 GiB total memory and compute capability >=8.0; "
+            "MIG/small-device fallback is forbidden"
+        )
 
 
 def run_logged(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
@@ -358,6 +505,9 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
         "hidden_dim": job["config"]["hidden_dim"],
         "pe_dim": job["config"]["pe_dim"],
         "layers": job["config"]["layers"],
+        "batch_size": job["resources"]["batch_size"],
+        "workers": job["resources"]["workers"],
+        "amp": job["resources"]["amp"],
         "validation_only": True,
         "test_checkpoint": None,
     }
@@ -367,19 +517,28 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
             raise ValueError(f"child argument mismatch for {name}: {actual} != {expected}")
     if expected_version == "v2":
         expected_v2 = {
+            "ffn_multiplier": job["config"]["ffn_multiplier"],
+            "dropout": job["config"]["dropout"],
+            "layer_scale": job["config"]["layer_scale"],
             "column_chunk_size": 16,
+            "basis_backend": job["resources"]["basis_backend"],
             "basis_execution": "batched",
             "basis_pair_budget": 32768,
+            "prefetch_factor": job["resources"]["prefetch_factor"],
+            "hardware_profile": job["resources"]["hardware_profile"],
         }
         command = job.get("command", [])
         for flag, name in (
             ("--column-chunk-size", "column_chunk_size"),
+            ("--basis-backend", "basis_backend"),
             ("--basis-execution", "basis_execution"),
             ("--basis-pair-budget", "basis_pair_budget"),
         ):
             if flag in command:
                 value = command[command.index(flag) + 1]
-                expected_v2[name] = int(value) if name != "basis_execution" else value
+                expected_v2[name] = (
+                    int(value) if name not in {"basis_backend", "basis_execution"} else value
+                )
         for name, expected in expected_v2.items():
             if arguments.get(name) != expected:
                 raise ValueError(f"child argument mismatch for {name}")
@@ -432,6 +591,37 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
         peak_memory = int(
             _finite_number(result.get("peak_gpu_memory_bytes"), f"{dataset}/peak_gpu_memory_bytes")
         )
+        reserved_memory = (
+            int(
+                _finite_number(
+                    result.get("peak_gpu_reserved_bytes"),
+                    f"{dataset}/peak_gpu_reserved_bytes",
+                )
+            )
+            if expected_version == "v2"
+            else None
+        )
+        if expected_version == "v2":
+            execution = result.get("execution")
+            pipeline = execution.get("data_pipeline") if isinstance(execution, dict) else None
+            precision = execution.get("precision") if isinstance(execution, dict) else None
+            hardware = execution.get("hardware") if isinstance(execution, dict) else None
+            if (
+                result.get("effective_batch_size") != job["resources"]["batch_size"]
+                or not isinstance(pipeline, dict)
+                or pipeline.get("effective_batch_size") != job["resources"]["batch_size"]
+                or pipeline.get("workers") != job["resources"]["workers"]
+                or pipeline.get("prefetch_factor") != job["resources"]["prefetch_factor"]
+                or pipeline.get("packed_cycle_basis_h2d_tensors_per_batch") != 1
+                or not isinstance(precision, dict)
+                or precision.get("amp") is not job["resources"]["amp"]
+                or precision.get("projector_contraction") != "float32"
+                or not isinstance(hardware, dict)
+                or hardware.get("profile") != job["resources"]["hardware_profile"]
+                or reserved_memory is None
+                or reserved_memory < peak_memory
+            ):
+                raise ValueError(f"{dataset}: V2 runtime/resource evidence mismatch")
         best_epoch = int(
             _finite_number(result.get("best_epoch"), f"{dataset}/best_epoch", minimum=1)
         )
@@ -460,6 +650,24 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
             or history_payload[-1].get("epoch") != epochs_completed
         ):
             raise ValueError(f"{dataset}: history length/epoch metadata mismatch")
+        if expected_version == "v2" and any(
+            not isinstance(epoch_row.get("train_graphs"), int)
+            or epoch_row["train_graphs"] < 1
+            or _finite_number(
+                epoch_row.get("train_cuda_synchronized_seconds"),
+                f"{dataset}/train_seconds",
+                minimum=0,
+            )
+            <= 0
+            or _finite_number(
+                epoch_row.get("train_graphs_per_second"),
+                f"{dataset}/train_graphs_per_second",
+                minimum=0,
+            )
+            <= 0
+            for epoch_row in history_payload
+        ):
+            raise ValueError(f"{dataset}: V2 throughput history is invalid")
         rows.append(
             {
                 "version": expected_version,
@@ -467,10 +675,14 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
                 "dataset": dataset,
                 "model_seed": job["model_seed"],
                 "config": dict(job["config"]),
+                "resources": dict(job["resources"]),
                 "validation_mae": validation,
                 "trainable_parameters": parameters,
                 "elapsed_seconds": elapsed,
                 "peak_gpu_memory_bytes": peak_memory,
+                "peak_gpu_reserved_bytes": reserved_memory,
+                "effective_batch_size": result.get("effective_batch_size"),
+                "execution": result.get("execution"),
                 "best_epoch": best_epoch,
                 "epochs_completed": epochs_completed,
                 "checkpoint": checkpoint,
@@ -517,7 +729,7 @@ def build_summary(
             "checkpoint_selection": "validation MAE only inside each candidate training",
             "final_test_report": "separate test_evaluations rows after selection",
         },
-        "profiles": {name: dict(PROFILES[name]) for name in profiles},
+        "profiles": {name: PROFILES[name] for name in profiles},
         "requested_model_seeds": list(model_seeds),
         "runs": rows,
         "profile_aggregates": [],
@@ -561,7 +773,7 @@ def build_summary(
                         "version": version,
                         "dataset": dataset,
                         "profile": profile,
-                        "config": dict(PROFILES[profile]),
+                        "config": dict(group[0]["config"]),
                         "model_seeds": sorted(seeds),
                         "validation_mae": _stats([row["validation_mae"] for row in group]),
                         "trainable_parameters": sorted(
@@ -666,7 +878,8 @@ def make_test_jobs(
         dataset = selection["dataset"]
         seed = selection["model_seed"]
         profile = selection["selected_profile"]
-        config = PROFILES[profile]
+        config = _profile_config(profile, dataset, version)
+        resources = _job_resources(args, version, profile, dataset)
         output = run_dir / "test-evaluations" / version / dataset / f"model-seed-{seed}"
         job_id = f"test:{version}:{dataset}:model-seed-{seed}"
         command = [
@@ -688,9 +901,9 @@ def make_test_jobs(
             "--model-seed",
             str(seed),
             "--batch-size",
-            str(args.batch_size),
+            str(resources["batch_size"]),
             "--workers",
-            str(args.workers),
+            str(resources["workers"]),
             "--hidden-dim",
             str(config["hidden_dim"]),
             "--pe-dim",
@@ -701,18 +914,31 @@ def make_test_jobs(
             str(args.max_parameters),
             "--test-checkpoint",
             selection["checkpoint"],
+            "--amp" if resources["amp"] else "--no-amp",
             "--compile" if args.compile else "--no-compile",
         ]
         if args.allow_download:
             command.append("--allow-download")
         if version == "v2":
             command += [
+                "--ffn-multiplier",
+                str(config["ffn_multiplier"]),
+                "--dropout",
+                str(config["dropout"]),
+                "--layer-scale",
+                str(config["layer_scale"]),
                 "--column-chunk-size",
-                str(args.column_chunk_size),
+                str(resources["column_chunk_size"]),
+                "--basis-backend",
+                args.basis_backend,
                 "--basis-execution",
                 args.basis_execution,
                 "--basis-pair-budget",
-                str(args.basis_pair_budget),
+                str(resources["basis_pair_budget"]),
+                "--prefetch-factor",
+                str(resources["prefetch_factor"]),
+                "--hardware-profile",
+                args.hardware_profile,
             ]
         jobs.append(
             {
@@ -724,6 +950,7 @@ def make_test_jobs(
                 "model_seed": seed,
                 "selected_profile": profile,
                 "config": dict(config),
+                "resources": resources,
                 "checkpoint": selection["checkpoint"],
                 "checkpoint_sha256": selection["checkpoint_sha256"],
                 "selected_validation_mae": selection["selected_validation_mae"],
@@ -764,6 +991,9 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
         "hidden_dim": job["config"]["hidden_dim"],
         "pe_dim": job["config"]["pe_dim"],
         "layers": job["config"]["layers"],
+        "batch_size": job["resources"]["batch_size"],
+        "workers": job["resources"]["workers"],
+        "amp": job["resources"]["amp"],
         "validation_only": False,
         "test_checkpoint": str(Path(job["checkpoint"]).resolve()),
     }
@@ -772,6 +1002,21 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
     for name, expected in expected_arguments.items():
         if arguments.get(name) != expected:
             raise ValueError(f"test-only argument mismatch for {name}")
+    if version == "v2":
+        expected_v2_arguments = {
+            "ffn_multiplier": job["config"]["ffn_multiplier"],
+            "dropout": job["config"]["dropout"],
+            "layer_scale": job["config"]["layer_scale"],
+            "column_chunk_size": job["resources"]["column_chunk_size"],
+            "basis_backend": job["resources"]["basis_backend"],
+            "basis_execution": job["resources"]["basis_execution"],
+            "basis_pair_budget": job["resources"]["basis_pair_budget"],
+            "prefetch_factor": job["resources"]["prefetch_factor"],
+            "hardware_profile": job["resources"]["hardware_profile"],
+        }
+        for name, expected in expected_v2_arguments.items():
+            if arguments.get(name) != expected:
+                raise ValueError(f"V2 test-only argument mismatch for {name}")
     controls = manifest.get("controls")
     if (
         not isinstance(controls, dict)
@@ -806,6 +1051,32 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("test-only result contains training or candidate metrics")
     if result.get("evaluation_splits") != ["test"] or result.get("fresh_training") is not False:
         raise ValueError("test-only result has invalid split/training markers")
+    if version == "v2":
+        execution = result.get("execution")
+        pipeline = execution.get("data_pipeline") if isinstance(execution, dict) else None
+        precision = execution.get("precision") if isinstance(execution, dict) else None
+        hardware = execution.get("hardware") if isinstance(execution, dict) else None
+        allocated = _finite_number(
+            result.get("peak_gpu_memory_bytes"), "test/peak_gpu_memory_bytes"
+        )
+        reserved = _finite_number(
+            result.get("peak_gpu_reserved_bytes"), "test/peak_gpu_reserved_bytes"
+        )
+        if (
+            result.get("effective_batch_size") != job["resources"]["batch_size"]
+            or not isinstance(pipeline, dict)
+            or pipeline.get("effective_batch_size") != job["resources"]["batch_size"]
+            or pipeline.get("workers") != job["resources"]["workers"]
+            or pipeline.get("prefetch_factor") != job["resources"]["prefetch_factor"]
+            or pipeline.get("packed_cycle_basis_h2d_tensors_per_batch") != 1
+            or not isinstance(precision, dict)
+            or precision.get("amp") is not job["resources"]["amp"]
+            or precision.get("projector_contraction") != "float32"
+            or not isinstance(hardware, dict)
+            or hardware.get("profile") != job["resources"]["hardware_profile"]
+            or reserved < allocated
+        ):
+            raise ValueError("V2 test-only runtime/resource evidence mismatch")
     checkpoint = str(Path(job["checkpoint"]).resolve())
     if (
         result.get("checkpoint") != checkpoint
@@ -841,6 +1112,18 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
         "peak_gpu_memory_bytes": int(
             _finite_number(result.get("peak_gpu_memory_bytes"), "test/peak_gpu_memory_bytes")
         ),
+        "peak_gpu_reserved_bytes": (
+            int(
+                _finite_number(
+                    result.get("peak_gpu_reserved_bytes"),
+                    "test/peak_gpu_reserved_bytes",
+                )
+            )
+            if version == "v2"
+            else None
+        ),
+        "effective_batch_size": result.get("effective_batch_size"),
+        "execution": result.get("execution"),
         "fresh_training": False,
         "output_dir": str(output.resolve()),
         "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
@@ -947,8 +1230,10 @@ def _run_configuration(args: argparse.Namespace) -> dict[str, Any]:
         "model_seeds": list(args.model_seeds),
         "data_root": str(args.data_root.expanduser().resolve()),
         "device": args.device,
+        "hardware_profile": args.hardware_profile,
         "batch_size": args.batch_size,
         "workers": args.workers,
+        "prefetch_factor": args.prefetch_factor,
         "epochs": args.epochs,
         "patience": args.patience,
         "lr": args.lr,
@@ -958,6 +1243,7 @@ def _run_configuration(args: argparse.Namespace) -> dict[str, Any]:
         "amp": args.amp,
         "compile": args.compile,
         "column_chunk_size": args.column_chunk_size,
+        "basis_backend": args.basis_backend,
         "basis_execution": args.basis_execution,
         "basis_pair_budget": args.basis_pair_budget,
         "min_free_gb": args.min_free_gb,
@@ -1188,6 +1474,18 @@ def _quarantine_incomplete_output(job: dict[str, Any], run_dir: Path) -> None:
     job.setdefault("quarantined_outputs", []).append(str(target))
 
 
+def _candidate_attempt_command(job: dict[str, Any], run_dir: Path) -> list[str]:
+    """Keep a resumable projector checkpoint; quarantine every other partial child."""
+    command = list(job["command"])
+    dataset = job["datasets"][0]
+    checkpoint = Path(job["output_dir"]) / dataset / MODEL_NAMES[job["version"]] / "last.pt"
+    if job["version"] == "v2" and checkpoint.is_file():
+        command.append("--resume")
+    else:
+        _quarantine_incomplete_output(job, run_dir)
+    return command
+
+
 def _validated_log_path(log_path: Path, run_dir: Path) -> Path:
     """Reject indirect or out-of-run log targets before opening them for append."""
     lexical = Path(os.path.abspath(log_path.expanduser()))
@@ -1242,10 +1540,10 @@ def _manifest_base(
         "output_dir": str(run_dir),
         "versions": list(args.versions),
         "datasets": list(args.datasets),
-        "profiles": {name: dict(PROFILES[name]) for name in args.profiles},
+        "profiles": {name: PROFILES[name] for name in args.profiles},
         "model_seeds": list(args.model_seeds),
         "fresh_child_runs": len(jobs),
-        "fresh_dataset_trainings": len(jobs) * len(args.datasets),
+        "fresh_dataset_trainings": len(jobs),
         "selected_test_evaluations_planned": len(args.versions)
         * len(args.datasets)
         * len(args.model_seeds),
@@ -1258,7 +1556,17 @@ def _manifest_base(
             "candidate_loaded_splits": ["train", "validation"],
             "test_role": "one test-only evaluation of each selected checkpoint; no retraining",
             "official_splits": True,
+            "hardware_profile_identity": (
+                "batch size changes optimizer-step count and trajectory; hardware_profile and "
+                "resolved resources are immutable optimization identity"
+            ),
+            "cross_profile_comparison": (
+                "portable and a6000-48gb scores are not direct paired comparisons; compare V1/V2 "
+                "only within the same hardware profile and resolved batch policy"
+            ),
         },
+        "hardware_profile": args.hardware_profile,
+        "resolved_resource_matrix": {job["job_id"]: job["resources"] for job in jobs},
         "resource_reporting": (
             "per-dataset trainable parameters, CUDA-synchronized training runtime, "
             "peak allocated GPU memory, epochs and best epoch"
@@ -1298,7 +1606,7 @@ def main(argv: list[str] | None = None) -> int:
     jobs = make_jobs(args, run_dir)
     if args.dry_run:
         print(
-            f"{len(jobs)} fresh child runs; {len(jobs) * len(args.datasets)} fresh dataset "
+            f"{len(jobs)} fresh child runs; {len(jobs)} fresh dataset "
             "trainings (train+validation only); "
             f"{len(args.versions) * len(args.datasets) * len(args.model_seeds)} "
             "selected-checkpoint test evaluations are deferred until validation selection"
@@ -1358,7 +1666,7 @@ def main(argv: list[str] | None = None) -> int:
                 datasets=list(args.datasets),
                 profiles=list(args.profiles),
                 model_seeds=args.model_seeds,
-                complete=len(rows) == len(jobs) * len(args.datasets),
+                complete=len(rows) == len(jobs),
             )
             if verified_validation["status"] != "pending_test_evaluation":
                 raise ValueError("completed candidate matrix no longer validates")
@@ -1416,11 +1724,13 @@ def main(argv: list[str] | None = None) -> int:
         preflight_log = _validated_log_path(run_dir / "logs/gpu-preflight.log", run_dir)
         preflight_code = run_logged(preflight_command, preflight_log, environment)
         preflight_errors: list[str] = []
+        preflight_payload: dict[str, Any] | None = None
         if preflight_code == 0:
             try:
                 preflight_payload = _json_object(preflight_output)
                 if preflight_payload.get("status") != "passed":
                     preflight_errors.append("GPU preflight JSON does not have status=passed")
+                _validate_preflight_hardware(args.hardware_profile, preflight_payload)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 preflight_errors.append(f"{type(exc).__name__}: {exc}")
         manifest["preflight"] = {
@@ -1429,6 +1739,8 @@ def main(argv: list[str] | None = None) -> int:
             "command": preflight_command,
             "output": str(preflight_output),
             "artifact_errors": preflight_errors,
+            "gpu": preflight_payload.get("gpu") if preflight_payload else None,
+            "hardware_profile": args.hardware_profile,
         }
         if manifest["preflight"]["status"] != "passed":
             failed = True
@@ -1437,13 +1749,14 @@ def main(argv: list[str] | None = None) -> int:
             for job in jobs:
                 if job["status"] == "passed":
                     continue
-                _quarantine_incomplete_output(job, run_dir)
+                attempt_command = _candidate_attempt_command(job, run_dir)
+                job["attempt_command"] = attempt_command
                 job["artifact_errors"] = []
                 job["status"] = "running"
                 job["started_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
                 atomic_write_json(manifest_path, manifest, sort_keys=False)
                 log_path = _validated_log_path(Path(job["log_path"]), run_dir)
-                code = run_logged(job["command"], log_path, environment)
+                code = run_logged(attempt_command, log_path, environment)
                 job["returncode"] = code
                 job["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
                 if code == 0:
@@ -1460,9 +1773,7 @@ def main(argv: list[str] | None = None) -> int:
                 if failed and args.fail_fast:
                     break
         candidate_complete = (
-            not failed
-            and len(rows) == len(jobs) * len(args.datasets)
-            and all(job["status"] == "passed" for job in jobs)
+            not failed and len(rows) == len(jobs) and all(job["status"] == "passed" for job in jobs)
         )
         validation_summary = build_summary(
             rows,

@@ -10,6 +10,7 @@ then one test-only child per seed evaluates the selected checkpoints without ret
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import hashlib
 import json
@@ -19,7 +20,9 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -38,38 +41,44 @@ from scripts.check_dependencies import (  # noqa: E402
 SUITES = ("csl", "zinc")
 MODELS = ("fixed_bfs", "multi_chart")
 PROFILE_CONFIGS: dict[str, dict[str, int]] = {
-    "base": {
-        "hidden_dim": 64,
-        "message_layers": 2,
-        "optimizer_updates": 800,
-        "train_charts_per_graph": 8,
-        "eval_charts_per_graph": 8,
-    },
-    "wide": {
+    "reference": {
         "hidden_dim": 128,
-        "message_layers": 2,
-        "optimizer_updates": 800,
-        "train_charts_per_graph": 8,
-        "eval_charts_per_graph": 8,
-    },
-    "deep": {
-        "hidden_dim": 64,
-        "message_layers": 4,
+        "message_layers": 8,
         "optimizer_updates": 800,
         "train_charts_per_graph": 8,
         "eval_charts_per_graph": 8,
     },
     "large": {
-        "hidden_dim": 128,
-        "message_layers": 4,
+        "hidden_dim": 256,
+        "message_layers": 12,
         "optimizer_updates": 800,
         "train_charts_per_graph": 8,
         "eval_charts_per_graph": 8,
     },
 }
 PROFILES = tuple(PROFILE_CONFIGS)
+HARDWARE_PROFILES = ("portable", "a6000-48gb")
+HARDWARE_PROFILE_DEFAULTS: dict[str, dict[str, int | bool | None]] = {
+    "portable": {
+        "batch_size": 16,
+        "workers": 0,
+        "amp": None,
+        "job_concurrency": 1,
+    },
+    "a6000-48gb": {
+        "batch_size": 64,
+        "workers": 4,
+        "amp": True,
+        "job_concurrency": 2,
+    },
+}
+A6000_MIN_VISIBLE_BYTES = 40 * 1024**3
+A6000_MIN_FREE_BYTES = 32 * 1024**3
+A6000_MIN_COMPUTE_CAPABILITY = (8, 0)
 DEFAULT_MODEL_SEEDS = (0,)
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
+_ACTIVE_PROCESS_LOCK = threading.Lock()
+_ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
 
 
 def _csv_subset(value: str, *, choices: tuple[str, ...], option: str) -> tuple[str, ...]:
@@ -123,8 +132,30 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
     result.add_argument("--run-id")
     result.add_argument("--device", default="cuda")
-    result.add_argument("--batch-size", type=int, default=16)
-    result.add_argument("--workers", type=int, default=0)
+    result.add_argument(
+        "--hardware-profile",
+        choices=HARDWARE_PROFILES,
+        default="portable",
+        help="portable defaults or an RTX A6000-class 48 GB throughput contract",
+    )
+    result.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="override the hardware-profile graph minibatch size",
+    )
+    result.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="override the hardware-profile DataLoader worker count",
+    )
+    result.add_argument(
+        "--job-concurrency",
+        type=int,
+        default=None,
+        help="override concurrent independent candidate/test child processes",
+    )
     result.add_argument("--min-free-gb", type=float, default=8.0)
     result.add_argument("--allow-download", action="store_true")
     result.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
@@ -132,13 +163,26 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
+def _resolve_hardware_profile(args: argparse.Namespace) -> None:
+    if getattr(args, "_hardware_profile_resolved", False):
+        return
+    defaults = HARDWARE_PROFILE_DEFAULTS[args.hardware_profile]
+    for field in ("batch_size", "workers", "amp", "job_concurrency"):
+        if getattr(args, field) is None:
+            setattr(args, field, defaults[field])
+    args._hardware_profile_resolved = True
+
+
 def _validate(args: argparse.Namespace) -> None:
+    _resolve_hardware_profile(args)
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
         raise ValueError("Tree scaling requires an explicit CUDA device; no CPU fallback")
     if min(args.data_seed, args.split_seed, args.chart_seed, *args.model_seeds) < 0:
         raise ValueError("all seed axes must be non-negative")
-    if args.batch_size < 1 or args.workers < 0:
-        raise ValueError("batch size must be positive and workers must be non-negative")
+    if args.batch_size < 1 or args.workers < 0 or args.job_concurrency < 1:
+        raise ValueError(
+            "batch size and job concurrency must be positive; workers must be non-negative"
+        )
     if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
         raise ValueError("minimum free GPU memory must be finite and non-negative")
     if args.run_id is not None and RUN_ID_PATTERN.fullmatch(args.run_id) is None:
@@ -150,6 +194,7 @@ def _default_run_id() -> str:
 
 
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
+    _resolve_hardware_profile(args)
     jobs: list[dict[str, Any]] = []
     data_root = args.data_root.expanduser().resolve()
     for suite in args.suites:
@@ -212,6 +257,18 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                         "command": command,
                     }
                 )
+    if args.hardware_profile == "a6000-48gb":
+        # Exercise the highest expected memory/compute demand first.  If the declared
+        # concurrency is unsafe, the run fails before spending time on all light candidates.
+        suite_priority = {"zinc": 0, "csl": 1}
+        profile_priority = {"large": 0, "reference": 1}
+        jobs.sort(
+            key=lambda job: (
+                suite_priority[job["suite"]],
+                profile_priority[job["profile"]],
+                job["model_seed"],
+            )
+        )
     return jobs
 
 
@@ -273,6 +330,62 @@ def _environment() -> dict[str, str]:
     return environment
 
 
+def _validate_hardware_preflight(payload: dict[str, Any], hardware_profile: str) -> None:
+    if payload.get("status") != "passed":
+        raise RuntimeError("GPU preflight returned without a passed certificate")
+    if hardware_profile != "a6000-48gb":
+        return
+    gpu = payload.get("gpu")
+    if not isinstance(gpu, dict):
+        raise RuntimeError("a6000-48gb preflight is missing the visible GPU record")
+    total_bytes = gpu.get("total_bytes")
+    free_bytes = gpu.get("free_bytes")
+    capability = gpu.get("compute_capability")
+    if (
+        isinstance(total_bytes, bool)
+        or not isinstance(total_bytes, int)
+        or total_bytes < A6000_MIN_VISIBLE_BYTES
+    ):
+        raise RuntimeError(
+            "a6000-48gb requires at least 40 GiB of visible GPU memory; "
+            "a 10 GiB MIG slice must use the portable profile"
+        )
+    if (
+        isinstance(free_bytes, bool)
+        or not isinstance(free_bytes, int)
+        or free_bytes < A6000_MIN_FREE_BYTES
+    ):
+        raise RuntimeError(
+            "a6000-48gb concurrency requires at least 32 GiB free at preflight; "
+            "wait for other GPU jobs or use the portable profile"
+        )
+    if (
+        not isinstance(capability, list)
+        or len(capability) != 2
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in capability)
+        or tuple(capability) < A6000_MIN_COMPUTE_CAPABILITY
+    ):
+        raise RuntimeError("a6000-48gb requires CUDA compute capability 8.0 or newer")
+
+
+def _stop_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def _stop_active_processes() -> None:
+    with _ACTIVE_PROCESS_LOCK:
+        active = tuple(_ACTIVE_PROCESSES)
+    for process in active:
+        _stop_process(process)
+
+
 def _run_logged(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("x", encoding="utf-8", newline="\n") as log:
@@ -287,6 +400,8 @@ def _run_logged(command: list[str], log_path: Path, environment: dict[str, str])
             errors="replace",
             bufsize=1,
         )
+        with _ACTIVE_PROCESS_LOCK:
+            _ACTIVE_PROCESSES.add(process)
         try:
             assert process.stdout is not None
             for line in process.stdout:
@@ -295,16 +410,117 @@ def _run_logged(command: list[str], log_path: Path, environment: dict[str, str])
                 log.flush()
             return process.wait()
         except BaseException:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
+            _stop_process(process)
             raise
         finally:
+            with _ACTIVE_PROCESS_LOCK:
+                _ACTIVE_PROCESSES.discard(process)
             if process.stdout is not None:
                 process.stdout.close()
+
+
+def _run_wave(
+    jobs: list[dict[str, Any]],
+    environment: dict[str, str],
+) -> list[tuple[dict[str, Any], int | None, float, BaseException | None]]:
+    """Run one bounded wave; workers never mutate the shared manifest."""
+
+    def invoke(
+        job: dict[str, Any],
+    ) -> tuple[dict[str, Any], int | None, float, BaseException | None]:
+        started = time.monotonic()
+        try:
+            status = _run_logged(job["command"], Path(job["log_path"]), environment)
+        except BaseException as error:
+            return job, None, time.monotonic() - started, error
+        return job, status, time.monotonic() - started, None
+
+    if len(jobs) == 1:
+        return [invoke(jobs[0])]
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs))
+    futures = [executor.submit(invoke, job) for job in jobs]
+    try:
+        # Wait in completion order so an early failure is observed promptly, but return in input
+        # order so coordinator-owned manifest updates and failure messages stay deterministic.
+        by_future = {future: index for index, future in enumerate(futures)}
+        results: list[tuple[dict[str, Any], int | None, float, BaseException | None] | None] = [
+            None
+        ] * len(futures)
+        for future in concurrent.futures.as_completed(futures):
+            results[by_future[future]] = future.result()
+        if any(result is None for result in results):
+            raise RuntimeError("concurrent job wave returned an incomplete result set")
+        return [result for result in results if result is not None]
+    except BaseException:
+        _stop_active_processes()
+        for future in futures:
+            future.cancel()
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _execute_job_matrix(
+    jobs: list[dict[str, Any]],
+    *,
+    concurrency: int,
+    environment: dict[str, str],
+    manifest: dict[str, Any],
+    run_dir: Path,
+    validator: Callable[[dict[str, Any]], dict[str, Any]],
+    describe: Callable[[dict[str, Any]], str],
+) -> None:
+    """Execute independent jobs in bounded waves with coordinator-only state writes."""
+    pending = [job for job in jobs if job["status"] != "passed"]
+    for job in jobs:
+        if job["status"] == "passed":
+            print(f"skip verified {describe(job)}", flush=True)
+    for offset in range(0, len(pending), concurrency):
+        wave = pending[offset : offset + concurrency]
+        _check_sources(manifest)
+        started_at = dt.datetime.now(dt.UTC).isoformat()
+        for job in wave:
+            job.update(status="running", started_at_utc=started_at)
+            print(f"\n{describe(job)}", flush=True)
+        _write_state(run_dir, manifest)
+        try:
+            outcomes = _run_wave(wave, environment)
+            _check_sources(manifest)
+        except BaseException as error:
+            detail = f"{type(error).__name__}: {error}"
+            for job in wave:
+                if job.get("status") == "running":
+                    job.update(status="failed", error=detail)
+            _write_state(run_dir, manifest)
+            raise
+        errors: list[str] = []
+        interruption: BaseException | None = None
+        for job, status, elapsed, invocation_error in outcomes:
+            job.update(
+                exit_code=status,
+                elapsed_seconds=elapsed,
+                finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+            )
+            try:
+                if invocation_error is not None:
+                    raise invocation_error
+                if status:
+                    raise RuntimeError(f"child exited with code {status}")
+                job["result"] = validator(job)
+            except BaseException as error:
+                detail = f"{type(error).__name__}: {error}"
+                job.update(status="failed", error=detail)
+                errors.append(f"{describe(job)}: {detail}")
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    interruption = error
+            else:
+                job["status"] = "passed"
+                job.pop("error", None)
+        _write_state(run_dir, manifest)
+        if interruption is not None:
+            raise interruption
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
 
 def _read_mapping(path: Path, label: str) -> dict[str, Any]:
@@ -331,6 +547,38 @@ def _finite_metric_mapping(values: Any, label: str) -> dict[str, float]:
             raise RuntimeError(f"non-finite child metric in {label}/{key}")
         result[str(key)] = numeric
     return result
+
+
+def _validated_runtime(
+    child_summary: dict[str, Any],
+    child_manifest: dict[str, Any],
+    command: list[str],
+    label: str,
+) -> dict[str, Any]:
+    runtime = child_summary.get("runtime")
+    if not isinstance(runtime, dict) or runtime != child_manifest.get("runtime"):
+        raise RuntimeError(f"{label} runtime metadata is missing or disagrees")
+    expected_batch = int(command[command.index("--batch-size") + 1])
+    expected_workers = int(command[command.index("--workers") + 1])
+    if runtime.get("batch_size") != expected_batch or runtime.get("workers") != expected_workers:
+        raise RuntimeError(f"{label} runtime does not record the requested input pipeline")
+    for field in ("elapsed_seconds", "peak_gpu_allocated_bytes", "peak_gpu_reserved_bytes"):
+        value = runtime.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RuntimeError(f"{label} runtime {field} must be numeric")
+        if not math.isfinite(float(value)) or value < 0:
+            raise RuntimeError(f"{label} runtime {field} must be finite and non-negative")
+    if not isinstance(runtime.get("amp_requested"), bool) or not isinstance(
+        runtime.get("amp_effective"), bool
+    ):
+        raise RuntimeError(f"{label} runtime AMP state is missing")
+    if "--amp" in command and (
+        runtime["amp_requested"] is not True or runtime["amp_effective"] is not True
+    ):
+        raise RuntimeError(f"{label} did not apply the requested CUDA AMP setting")
+    if "--no-amp" in command and runtime["amp_requested"] is not False:
+        raise RuntimeError(f"{label} did not apply the requested no-AMP setting")
+    return dict(runtime)
 
 
 def _validate_child(job: dict[str, Any]) -> dict[str, Any]:
@@ -390,6 +638,9 @@ def _validate_child(job: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError(f"child {payload_name} does not record the requested profile")
     if child_manifest.get("settings_overrides") != job["profile_config"]:
         raise RuntimeError("child manifest does not record the exact scaling overrides")
+    checked_runtime = _validated_runtime(
+        child_summary, child_manifest, job["command"], "candidate child"
+    )
     models = child_summary.get("models")
     if not isinstance(models, dict) or set(models) != set(MODELS):
         raise RuntimeError("child summary must contain exactly fixed_bfs and multi_chart")
@@ -479,6 +730,7 @@ def _validate_child(job: dict[str, Any]) -> dict[str, Any]:
         "parameter_counts": checked_parameters,
         "quadrant_metrics": checked_metrics,
         "selection_objectives": selection_objectives,
+        "runtime": checked_runtime,
         "checkpoints": checked_checkpoints,
         "child_manifest_sha256": _sha256(manifest_path),
         "child_summary_sha256": _sha256(summary_path),
@@ -603,7 +855,7 @@ def _make_selected_test_job(
         "--workers",
         str(args.workers),
         "--eval-charts-per-graph",
-        str(PROFILE_CONFIGS["base"]["eval_charts_per_graph"]),
+        str(PROFILE_CONFIGS["reference"]["eval_charts_per_graph"]),
         "--evaluation-scope",
         "selected_test",
         "--fixed-checkpoint",
@@ -677,6 +929,9 @@ def _validate_selected_test(job: dict[str, Any]) -> dict[str, Any]:
         or child_summary.get("model_split_usage") != expected_model_split_usage
     ):
         raise RuntimeError("selected-test summary does not certify exactly one test phase")
+    checked_runtime = _validated_runtime(
+        child_summary, child_manifest, job["command"], "selected-test child"
+    )
     selection = job["selection"]
     selected_inputs = job["selected_inputs"]
     expected_inputs = {name: selected_inputs[name]["checkpoint"] for name in MODELS}
@@ -748,6 +1003,7 @@ def _validate_selected_test(job: dict[str, Any]) -> dict[str, Any]:
         "selected_checkpoints": expected_inputs,
         "test_metrics": checked_metrics,
         "parameter_counts": checked_parameters,
+        "runtime": checked_runtime,
         "dataset_cache_integrity": expected_cache_integrity,
         "model_split_usage": expected_model_split_usage,
         "test_evaluated": True,
@@ -829,8 +1085,10 @@ def _run_config(args: argparse.Namespace, data_root: Path) -> dict[str, Any]:
         "split_seed": args.split_seed,
         "chart_seed": args.chart_seed,
         "device": args.device,
+        "hardware_profile": args.hardware_profile,
         "batch_size": args.batch_size,
         "workers": args.workers,
+        "job_concurrency": args.job_concurrency,
         "min_free_gb": args.min_free_gb,
         "amp_override": args.amp,
         "allow_download": args.allow_download,
@@ -1306,10 +1564,32 @@ def main(argv: list[str] | None = None) -> int:
                     "retraining",
                 },
                 "failure_policy": "stop at first failed or unverifiable child; preserve completed "
-                "artifacts for exact-request continuation",
+                "artifacts for exact-request continuation; with concurrency greater than one, "
+                "already-running peers in the same bounded wave are allowed to finish and are "
+                "validated independently",
                 "uncertainty": "default model seed is 0; explicit comma-separated multiple seeds "
                 "remain supported and are aggregated without treating child models as datasets",
                 "device": "CUDA required; no CPU fallback",
+                "hardware_profile": {
+                    "name": args.hardware_profile,
+                    "effective_batch_size": args.batch_size,
+                    "effective_workers": args.workers,
+                    "effective_amp_override": args.amp,
+                    "independent_job_concurrency": args.job_concurrency,
+                    "a6000_requirements": {
+                        "minimum_visible_gpu_bytes": A6000_MIN_VISIBLE_BYTES,
+                        "minimum_free_gpu_bytes": A6000_MIN_FREE_BYTES,
+                        "minimum_compute_capability": list(A6000_MIN_COMPUTE_CAPABILITY),
+                    },
+                    "parallel_safety": "candidate and selected-test children have disjoint "
+                    "output directories and logs; only the coordinator atomically writes the "
+                    "shared manifest",
+                    "scientific_scope": "batch size is part of the immutable optimization "
+                    "protocol: a6000-48gb batch 64 exposes four times as many graph samples per "
+                    "800 optimizer updates as portable batch 16. Compare fixed_bfs against "
+                    "multi_chart within one hardware profile; do not attribute differences "
+                    "between hardware profiles to GPU speed alone",
+                },
             },
         }
     else:
@@ -1321,7 +1601,6 @@ def main(argv: list[str] | None = None) -> int:
         manifest.pop("finished_at_utc", None)
     _write_state(run_dir, manifest)
     environment = _environment()
-    current_job: dict[str, Any] | None = None
     try:
         invocation = manifest["invocation_count"]
         preflight_path = _validated_write_path(
@@ -1349,8 +1628,7 @@ def main(argv: list[str] | None = None) -> int:
         if status:
             raise RuntimeError(f"GPU preflight failed with exit code {status}")
         preflight_result = _read_mapping(preflight_path, "gpu-preflight.json")
-        if preflight_result.get("status") != "passed":
-            raise RuntimeError("GPU preflight returned without a passed certificate")
+        _validate_hardware_preflight(preflight_result, args.hardware_profile)
         preflight_record = {
             "path": str(preflight_path),
             "sha256": _sha256(preflight_path),
@@ -1360,40 +1638,25 @@ def main(argv: list[str] | None = None) -> int:
         _write_state(run_dir, manifest)
         print(
             f"Run: {run_id}; {len(jobs)} child runs; "
-            f"{len(jobs) * len(MODELS)} fresh model trainings",
+            f"{len(jobs) * len(MODELS)} fresh model trainings; "
+            f"hardware={args.hardware_profile}; concurrency={args.job_concurrency}; "
+            f"batch={args.batch_size}; workers={args.workers}; amp={args.amp}",
             flush=True,
         )
-        for index, job in enumerate(jobs, start=1):
-            if job["status"] == "passed":
-                print(
-                    f"[{index}/{len(jobs)}] skip verified {job['suite']} / {job['profile']} / "
-                    f"model seed {job['model_seed']}",
-                    flush=True,
-                )
-                continue
-            current_job = job
-            _check_sources(manifest)
-            job["status"] = "running"
-            _write_state(run_dir, manifest)
-            print(
-                f"\n[{index}/{len(jobs)}] {job['suite']} / {job['profile']} / "
-                f"model seed {job['model_seed']} (fixed_bfs + multi_chart)",
-                flush=True,
-            )
-            started = time.monotonic()
-            status = _run_logged(job["command"], Path(job["log_path"]), environment)
-            job.update(exit_code=status, elapsed_seconds=time.monotonic() - started)
-            _check_sources(manifest)
-            if status:
-                raise RuntimeError(
-                    f"{job['suite']}/{job['profile']}/seed-{job['model_seed']} failed "
-                    f"with exit code {status}"
-                )
-            job["result"] = _validate_child(job)
-            job["status"] = "passed"
-            job.pop("error", None)
-            _write_state(run_dir, manifest)
-            current_job = None
+        candidate_positions = {id(job): index for index, job in enumerate(jobs, start=1)}
+        _execute_job_matrix(
+            jobs,
+            concurrency=args.job_concurrency,
+            environment=environment,
+            manifest=manifest,
+            run_dir=run_dir,
+            validator=_validate_child,
+            describe=lambda job: (
+                f"[{candidate_positions[id(job)]}/{len(jobs)}] {job['suite']} / "
+                f"{job['profile']} / model seed {job['model_seed']} "
+                "(fixed_bfs + multi_chart)"
+            ),
+        )
         _check_sources(manifest)
         selections, selected_jobs = _prepare_selected_jobs(
             args,
@@ -1404,44 +1667,24 @@ def main(argv: list[str] | None = None) -> int:
         manifest["selections"] = selections
         manifest["selected_test_jobs"] = selected_jobs
         _write_state(run_dir, manifest)
-        for selected_job in selected_jobs:
-            if selected_job["status"] == "passed":
-                print(
-                    f"[selected test] skip verified {selected_job['suite']} / "
-                    f"model seed {selected_job['model_seed']}",
-                    flush=True,
-                )
-                continue
-            current_job = selected_job
-            selection = selected_job["selection"]
-            model_seed = selected_job["model_seed"]
-            suite = selected_job["suite"]
-            selected_job["status"] = "running"
-            _write_state(run_dir, manifest)
-            print(
-                f"\n[selected test] {suite} / model seed {model_seed}: "
+
+        def selected_description(job: dict[str, Any]) -> str:
+            selection = job["selection"]
+            return (
+                f"[selected test] {job['suite']} / model seed {job['model_seed']}: "
                 f"fixed={selection['conditions']['fixed_bfs']['selected_profile']}, "
-                f"multi={selection['conditions']['multi_chart']['selected_profile']}",
-                flush=True,
+                f"multi={selection['conditions']['multi_chart']['selected_profile']}"
             )
-            started = time.monotonic()
-            status = _run_logged(
-                selected_job["command"], Path(selected_job["log_path"]), environment
-            )
-            selected_job.update(
-                exit_code=status,
-                elapsed_seconds=time.monotonic() - started,
-            )
-            _check_sources(manifest)
-            if status:
-                raise RuntimeError(
-                    f"{suite}/seed-{model_seed} selected test failed with exit code {status}"
-                )
-            selected_job["result"] = _validate_selected_test(selected_job)
-            selected_job["status"] = "passed"
-            selected_job.pop("error", None)
-            _write_state(run_dir, manifest)
-            current_job = None
+
+        _execute_job_matrix(
+            selected_jobs,
+            concurrency=args.job_concurrency,
+            environment=environment,
+            manifest=manifest,
+            run_dir=run_dir,
+            validator=_validate_selected_test,
+            describe=selected_description,
+        )
         _check_sources(manifest)
         manifest.update(
             status="passed",
@@ -1454,8 +1697,7 @@ def main(argv: list[str] | None = None) -> int:
             error=f"{type(error).__name__}: {error}",
             finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
         )
-        if current_job is not None:
-            current_job.update(status="failed", error=manifest["error"])
+        _stop_active_processes()
         _write_state(run_dir, manifest)
         print(
             f"Failed: {manifest['error']}\nSaved partial results: {run_dir}",

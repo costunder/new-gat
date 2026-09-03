@@ -19,9 +19,20 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    BETA_PARAMETERIZATIONS,
+    DEFAULT_BETA_INITIAL,
+    DEFAULT_BETA_PARAMETERIZATION,
+    beta_configuration,
+)
 
 TRACKS = ("conductance", "cycle", "tree")
-PROFILES = ("base", "wide", "deep", "large")
+PROFILES = ("reference", "large")
+HARDWARE_PROFILES = ("portable", "a6000-48gb")
+CYCLE_V2_BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
 DEFAULT_MODEL_SEEDS = (0,)
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
 
@@ -49,6 +60,10 @@ CONDUCTANCE_MATRIX = {
             "fixed_c_spatial_w",
             "relative_c_spatial_w",
         ),
+    },
+    "v5": {
+        "datasets": ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"),
+        "conditions": ("fixed_c", "shared_dynamic_c"),
     },
 }
 CYCLE_VERSIONS = ("v1", "v2")
@@ -80,7 +95,31 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
     result.add_argument("--run-id")
     result.add_argument("--device", default="cuda")
+    result.add_argument(
+        "--hardware-profile",
+        choices=HARDWARE_PROFILES,
+        default="portable",
+        help=(
+            "portable keeps conservative child settings; a6000-48gb enables each track's "
+            "recorded high-throughput settings and fails closed below 40 GiB visible VRAM or "
+            "compute capability 8.0"
+        ),
+    )
     result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument(
+        "--v5-beta-parameterization",
+        choices=BETA_PARAMETERIZATIONS,
+        default=DEFAULT_BETA_PARAMETERIZATION,
+    )
+    result.add_argument("--v5-beta-initial", type=float, default=DEFAULT_BETA_INITIAL)
+    result.add_argument("--v5-beta-min", type=float)
+    result.add_argument("--v5-beta-max", type=float)
+    result.add_argument(
+        "--cycle-v2-basis-backend",
+        choices=CYCLE_V2_BASIS_BACKENDS,
+        default="thin_q",
+        help="Cycle V2 basis construction; thin_q is the production default",
+    )
     result.add_argument("--allow-download", action="store_true")
     result.add_argument(
         "--fail-fast",
@@ -107,6 +146,7 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("minimum free GPU memory must be finite and nonnegative")
     if args.run_id is not None and RUN_ID_PATTERN.fullmatch(args.run_id) is None:
         raise ValueError("run ID must be 1-120 letters, digits, underscores, or hyphens")
+    _v5_beta_configuration(args)
 
 
 def _default_run_id() -> str:
@@ -169,16 +209,25 @@ def _expected_counts(track: str, profiles: list[str], model_seeds: list[int]) ->
             "model_trainings": combinations * trainings_per_combination,
         }
     if track == "cycle":
-        child_runs = combinations * len(CYCLE_VERSIONS)
+        child_runs = combinations * len(CYCLE_VERSIONS) * len(CYCLE_DATASETS)
         return {
             "child_runs": child_runs,
-            "model_trainings": child_runs * len(CYCLE_DATASETS),
+            "model_trainings": child_runs,
         }
     child_runs = combinations * len(TREE_SUITES)
     return {
         "child_runs": child_runs,
         "model_trainings": child_runs * len(TREE_MODELS),
     }
+
+
+def _v5_beta_configuration(args: argparse.Namespace) -> dict[str, float | str]:
+    return beta_configuration(
+        args.v5_beta_parameterization,
+        args.v5_beta_initial,
+        args.v5_beta_min,
+        args.v5_beta_max,
+    )
 
 
 def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
@@ -211,11 +260,14 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             command += ["--datasets", *requested_matrix["datasets"]]
             command += ["--profiles", *profiles]
             command += ["--model-seeds", ",".join(str(seed) for seed in args.model_seeds)]
+            command += ["--basis-backend", args.cycle_v2_basis_backend]
         else:
             command += ["--versions", *requested_matrix["versions"]]
             command += ["--datasets", *requested_matrix["requested_datasets"]]
             command += ["--profiles", *profiles]
             command += ["--model-seeds", *(str(seed) for seed in args.model_seeds)]
+            for name, value in _v5_beta_configuration(args).items():
+                command += ["--v5-" + name.replace("_", "-"), str(value)]
         command += [
             "--data-root",
             str(data_root),
@@ -225,6 +277,8 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             child_run_id,
             "--device",
             args.device,
+            "--hardware-profile",
+            args.hardware_profile,
             "--min-free-gb",
             str(args.min_free_gb),
         ]
@@ -415,7 +469,7 @@ def _exact_string_mapping_keys(value: Any, expected: list[str], label: str) -> d
 
 
 def _validate_conductance_summary(payload: dict[str, Any], job: dict[str, Any]) -> dict[str, int]:
-    if payload.get("suite") != "conductance_architecture_scaling_v1_v4":
+    if payload.get("suite") != "conductance_architecture_scaling_v1_v5":
         raise RuntimeError("Conductance child summary suite mismatch")
     if payload.get("run_id") != job["child_run_id"]:
         raise RuntimeError("Conductance child summary run ID mismatch")
@@ -511,12 +565,13 @@ def _validate_cycle_summary(payload: dict[str, Any], job: dict[str, Any]) -> dic
         label="Cycle training rows",
     )
     expected_children = {
-        (version, profile, seed)
+        (version, profile, seed, dataset)
         for version in matrix["versions"]
         for profile in matrix["profiles"]
         for seed in matrix["model_seeds"]
+        for dataset in matrix["datasets"]
     }
-    observed_children = {(key[0], key[1], key[2]) for key in runs}
+    observed_children = set(runs)
     if observed_children != expected_children:
         raise RuntimeError("Cycle child-run matrix is incomplete")
     if any("test" in key.lower() for row in runs.values() for key in row):
@@ -835,7 +890,10 @@ def _config_payload(
         "tree_profiles": list(args.profiles),
         "model_seeds": list(args.model_seeds),
         "device": args.device,
+        "hardware_profile": args.hardware_profile,
         "min_free_gb": args.min_free_gb,
+        "v5_beta": _v5_beta_configuration(args),
+        "cycle_v2_basis_backend": args.cycle_v2_basis_backend,
         "allow_download": args.allow_download,
         "data_root": str(data_root),
         "results_root": str(results_root),
@@ -943,6 +1001,10 @@ def _print_plan(args: argparse.Namespace, run_id: str, jobs: list[dict[str, Any]
         f"{totals['model_trainings']} fresh model trainings"
     )
     print(f"profiles={list(args.profiles)}; model_seeds={list(args.model_seeds)}")
+    print(
+        f"hardware_profile={args.hardware_profile}; track_concurrency=1 "
+        "(independent-job concurrency is owned by each child runner)"
+    )
     for job in jobs:
         expected = job["expected_counts"]
         print(
@@ -1017,14 +1079,25 @@ def main(argv: list[str] | None = None) -> int:
             "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
             "config": config,
             "protocol": {
-                "purpose": "larger-model scaling for every selected V1/V2/V3/V4 track",
+                "purpose": "reference-scale training for every selected V1/V2/V3/V4/V5 track",
                 "execution": "selected track runners execute sequentially without a shell",
+                "hardware_profile": {
+                    "name": args.hardware_profile,
+                    "portable": "conservative settings and one independent job at a time",
+                    "a6000-48gb": "child runners require at least 40 GiB visible VRAM and "
+                    "compute capability 8.0, then apply track-specific minibatch, AMP, worker, "
+                    "and safe independent-job concurrency settings",
+                    "cross_track_concurrency": 1,
+                    "reason": "tracks stay sequential because simultaneous peak allocations "
+                    "and independent CUDA caching allocators are not bounded by this runner",
+                },
                 "failure_policy": (
                     "stop after first failed track"
                     if args.fail_fast
                     else "continue remaining tracks"
                 ),
-                "tree_profiles": "base/wide/deep/large are forwarded without renaming",
+                "tree_profiles": "reference/large are forwarded without renaming",
+                "cycle_v2_basis_backend": args.cycle_v2_basis_backend,
                 "download_policy": (
                     "allow-download is forwarded to Cycle and Tree; Conductance remains "
                     "verified-cache-only because its child contract exposes no download flag"

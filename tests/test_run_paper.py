@@ -583,6 +583,7 @@ def test_project_docs_and_gpt_handoff_are_separated() -> None:
         "CONDUCTANCE_V2.md",
         "CONDUCTANCE_V3.md",
         "CONDUCTANCE_V4.md",
+        "CONDUCTANCE_V5.md",
         "CYCLE_PE_V2.md",
         "RICH_SCALING_EXPERIMENTS.md",
         "CODE_SUMMARY.md",
@@ -602,7 +603,7 @@ def test_project_docs_and_gpt_handoff_are_separated() -> None:
     package_readme = (ROOT / "gpt_handoff/README_FIRST.md").read_text(encoding="utf-8")
     for document in handoff_files:
         assert document in package_readme
-    assert "V4만이 아니라 NEW GAT 전체 프로젝트" in package_readme
+    assert "V5만이 아니라 NEW GAT 전체 프로젝트" in package_readme
 
     hub = (ROOT / "gpt_handoff/CONDUCTANCE_V4.md").read_text(encoding="utf-8")
     for required in (
@@ -616,6 +617,28 @@ def test_project_docs_and_gpt_handoff_are_separated() -> None:
         "현재 상태",
     ):
         assert required in hub
+
+    v5 = (ROOT / "gpt_handoff/CONDUCTANCE_V5.md").read_text(encoding="utf-8")
+    for required in (
+        "conductance_graph_conditioned_v5",
+        "shared_dynamic_c",
+        "fixed_c",
+        "scripts/run_conductance_v5.py",
+        "--sample-seed-batch-size 1024",
+        "reference",
+        "large",
+    ):
+        assert required in v5
+
+    cycle_v2 = (ROOT / "gpt_handoff/CYCLE_PE_V2.md").read_text(encoding="utf-8")
+    for required in (
+        "cycle_projector_pe_v2",
+        "cycle_basis_v2",
+        "P_{\\mathcal C}=Z(Z^\\top Z)^{-1}Z^\\top=QQ^\\top",
+        "scripts/run_cycle_scaling.py",
+        "reference",
+    ):
+        assert required in cycle_v2
 
 
 def test_all_local_document_links_resolve() -> None:

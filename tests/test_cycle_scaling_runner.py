@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import inspect
 import json
 from pathlib import Path
 
@@ -22,7 +23,7 @@ def test_default_matrix_runs_both_versions_all_profiles_and_seed_zero(tmp_path):
     jobs = scaling.make_jobs(args, scaling._run_dir(args, "matrix"))
     assert args.model_seeds == (0,)
     assert len(jobs) == 8
-    assert len(jobs) * len(args.datasets) == 16
+    assert len(jobs) == 8
     manifest = scaling._manifest_base(
         args,
         "matrix",
@@ -32,12 +33,15 @@ def test_default_matrix_runs_both_versions_all_profiles_and_seed_zero(tmp_path):
         {"source": "stable"},
     )
     assert manifest["fresh_child_runs"] == 8
-    assert manifest["fresh_dataset_trainings"] == 16
+    assert manifest["fresh_dataset_trainings"] == 8
     assert manifest["selected_test_evaluations_planned"] == 4
     assert {(job["version"], job["profile"]) for job in jobs} == {
         (version, profile) for version in scaling.VERSIONS for profile in scaling.PROFILE_ORDER
     }
-    assert all(job["datasets"] == ["zinc12k", "peptides_struct"] for job in jobs)
+    assert {tuple(job["datasets"]) for job in jobs} == {
+        ("zinc12k",),
+        ("peptides_struct",),
+    }
     assert len({job["output_dir"] for job in jobs}) == len(jobs)
 
 
@@ -65,28 +69,160 @@ def test_child_commands_use_real_version_cli_and_exact_profile(version, profile,
         else __import__("research.cycle_pe.v2.benchmark", fromlist=["parser"]).parser
     )
     child = child_parser().parse_args(command[5:])
-    expected = scaling.PROFILES[profile]
+    dataset = job["datasets"][0]
+    expected = scaling._profile_config(profile, dataset, version)
     assert (child.hidden_dim, child.pe_dim, child.layers) == (
         expected["hidden_dim"],
         expected["pe_dim"],
         expected["layers"],
     )
-    assert child.datasets == ["zinc12k", "peptides_struct"]
+    assert child.datasets == [dataset]
     assert child.model_seed == 7 and child.device == "cuda:0"
-    assert child.max_parameters == 5_000_000
+    assert child.max_parameters == 50_000_000
     assert child.validation_only is True
     assert child.test_checkpoint is None
     if version == "v2":
+        assert child.basis_backend == "thin_q"
         assert child.basis_execution == "batched" and child.basis_pair_budget == 32768
 
 
-def test_profiles_include_independent_width_depth_and_combined_growth():
+def test_dfs_basis_backend_is_forwarded_only_to_v2_and_bound_to_run_identity(tmp_path):
+    args = _args(
+        "--versions",
+        "v1",
+        "v2",
+        "--profiles",
+        "reference",
+        "--datasets",
+        "zinc12k",
+        "--basis-backend",
+        "dfs_fundamental",
+        "--results-root",
+        str(tmp_path),
+    )
+    scaling._validate(args)
+    jobs = scaling.make_jobs(args, scaling._run_dir(args, "dfs"))
+    v1, v2 = sorted(jobs, key=lambda job: job["version"])
+    assert "--basis-backend" not in v1["command"]
+    assert v1["resources"]["basis_backend"] is None
+    assert v2["command"][v2["command"].index("--basis-backend") + 1] == "dfs_fundamental"
+    assert v2["resources"]["basis_backend"] == "dfs_fundamental"
+    assert scaling._run_configuration(args)["basis_backend"] == "dfs_fundamental"
+
+    v1_only = _args("--versions", "v1", "--basis-backend", "dfs_fundamental")
+    with pytest.raises(ValueError, match="requires v2"):
+        scaling._validate(v1_only)
+
+
+def test_profiles_are_dataset_aware_reference_scale_and_large():
     assert scaling.PROFILES == {
-        "base": {"hidden_dim": 64, "pe_dim": 32, "layers": 3},
-        "wide": {"hidden_dim": 128, "pe_dim": 64, "layers": 3},
-        "deep": {"hidden_dim": 64, "pe_dim": 32, "layers": 6},
-        "large": {"hidden_dim": 128, "pe_dim": 64, "layers": 6},
+        "reference": {
+            "zinc12k": {
+                "hidden_dim": 128,
+                "pe_dim": 64,
+                "layers": 10,
+                "ffn_multiplier": 4,
+                "dropout": 0.1,
+                "layer_scale": 0.1,
+            },
+            "peptides_struct": {
+                "hidden_dim": 256,
+                "pe_dim": 64,
+                "layers": 6,
+                "ffn_multiplier": 4,
+                "dropout": 0.1,
+                "layer_scale": 0.1,
+            },
+        },
+        "large": {
+            "zinc12k": {
+                "hidden_dim": 192,
+                "pe_dim": 96,
+                "layers": 12,
+                "ffn_multiplier": 4,
+                "dropout": 0.1,
+                "layer_scale": 0.1,
+            },
+            "peptides_struct": {
+                "hidden_dim": 320,
+                "pe_dim": 96,
+                "layers": 8,
+                "ffn_multiplier": 4,
+                "dropout": 0.1,
+                "layer_scale": 0.1,
+            },
+        },
     }
+
+
+def test_a6000_profile_uses_static_dataset_batches_amp_and_heavy_first(tmp_path):
+    args = _args(
+        "--hardware-profile",
+        "a6000-48gb",
+        "--results-root",
+        str(tmp_path),
+    )
+    jobs = scaling.make_jobs(args, scaling._run_dir(args, "a6000"))
+    assert jobs[0]["version"] == "v2"
+    assert jobs[0]["profile"] == "large"
+    assert jobs[0]["datasets"] == ["peptides_struct"]
+    expected_batches = {
+        ("reference", "zinc12k"): 512,
+        ("reference", "peptides_struct"): 128,
+        ("large", "zinc12k"): 256,
+        ("large", "peptides_struct"): 64,
+    }
+    for job in jobs:
+        resources = job["resources"]
+        dataset = job["datasets"][0]
+        assert resources["batch_size"] == expected_batches[job["profile"], dataset]
+        assert resources["workers"] == 8
+        assert resources["amp"] is True
+        command = job["command"]
+        assert command[command.index("--batch-size") + 1] == str(resources["batch_size"])
+        assert "--amp" in command
+        if job["version"] == "v2":
+            assert resources["prefetch_factor"] == 4
+            assert resources["basis_pair_budget"] == 4_194_304
+            assert command[command.index("--hardware-profile") + 1] == "a6000-48gb"
+        else:
+            assert resources["prefetch_factor"] == 2
+            assert resources["basis_pair_budget"] is None
+            assert "--prefetch-factor" not in command
+
+
+@pytest.mark.parametrize(
+    "gpu,passes",
+    [
+        ({"total_bytes": 48 * 1024**3, "compute_capability": [8, 6]}, True),
+        ({"total_bytes": 10 * 1024**3, "compute_capability": [8, 0]}, False),
+        ({"total_bytes": 48 * 1024**3, "compute_capability": [7, 5]}, False),
+    ],
+)
+def test_a6000_capacity_guard_is_capacity_based_not_name_based(gpu, passes):
+    report = {"gpu": {"name": "arbitrary", **gpu}}
+    if passes:
+        scaling._validate_preflight_hardware("a6000-48gb", report)
+    else:
+        with pytest.raises(ValueError, match="40 GiB"):
+            scaling._validate_preflight_hardware("a6000-48gb", report)
+    scaling._validate_preflight_hardware("portable", report)
+
+
+def test_v2_test_only_admission_binds_every_a6000_runtime_field():
+    source = inspect.getsource(scaling.read_test_result)
+    for field in (
+        "ffn_multiplier",
+        "column_chunk_size",
+        "basis_pair_budget",
+        "prefetch_factor",
+        "hardware_profile",
+        "effective_batch_size",
+        "packed_cycle_basis_h2d_tensors_per_batch",
+        "peak_gpu_reserved_bytes",
+        "projector_contraction",
+    ):
+        assert field in source
 
 
 def test_direct_runner_environment_explicitly_unsets_nvml_cuda_check(monkeypatch):
@@ -110,9 +246,9 @@ def _row(version: str, dataset: str, profile: str, seed: int, validation: float)
         "profile": profile,
         "dataset": dataset,
         "model_seed": seed,
-        "config": dict(scaling.PROFILES[profile]),
+        "config": scaling._profile_config(profile, dataset, version),
         "validation_mae": validation,
-        "trainable_parameters": 100 if profile == "base" else 200,
+        "trainable_parameters": 100 if profile == "reference" else 200,
         "elapsed_seconds": 10.0,
         "peak_gpu_memory_bytes": 1024,
         "best_epoch": 3,
@@ -127,23 +263,23 @@ def _row(version: str, dataset: str, profile: str, seed: int, validation: float)
 
 def test_profile_selection_uses_mean_validation_and_one_common_profile():
     rows = [
-        _row("v1", "zinc12k", "base", 0, 0.10),
+        _row("v1", "zinc12k", "reference", 0, 0.10),
         _row("v1", "zinc12k", "large", 0, 0.20),
-        _row("v1", "zinc12k", "base", 1, 0.30),
+        _row("v1", "zinc12k", "reference", 1, 0.30),
         _row("v1", "zinc12k", "large", 1, 0.30),
     ]
     summary = scaling.build_summary(
         rows,
         versions=["v1"],
         datasets=["zinc12k"],
-        profiles=["base", "large"],
+        profiles=["reference", "large"],
         model_seeds=(0, 1),
         complete=True,
     )
     assert summary["status"] == "pending_test_evaluation"
-    assert [row["selected_profile"] for row in summary["profile_selections"]] == ["base"]
+    assert [row["selected_profile"] for row in summary["profile_selections"]] == ["reference"]
     assert len(summary["selected_checkpoints"]) == 2
-    assert {row["selected_profile"] for row in summary["selected_checkpoints"]} == {"base"}
+    assert {row["selected_profile"] for row in summary["selected_checkpoints"]} == {"reference"}
     assert summary["profile_selections"][0]["test_used_for_selection"] is False
     assert summary["test_evaluations"] == []
     assert all("test" not in key for row in summary["runs"] for key in row)
@@ -151,10 +287,10 @@ def test_profile_selection_uses_mean_validation_and_one_common_profile():
 
 def test_incomplete_seed_matrix_withholds_selection_fail_closed():
     summary = scaling.build_summary(
-        [_row("v2", "peptides_struct", "base", 0, 0.2)],
+        [_row("v2", "peptides_struct", "reference", 0, 0.2)],
         versions=["v2"],
         datasets=["peptides_struct"],
-        profiles=["base"],
+        profiles=["reference"],
         model_seeds=(0, 1),
         complete=True,
     )
@@ -167,14 +303,14 @@ def test_incomplete_seed_matrix_withholds_selection_fail_closed():
 def test_selected_profile_creates_one_test_only_job_per_seed_and_attaches_separately(tmp_path):
     rows = [
         _row("v1", "zinc12k", profile, seed, value)
-        for profile, values in (("base", (0.1, 0.2)), ("large", (0.4, 0.3)))
+        for profile, values in (("reference", (0.1, 0.2)), ("large", (0.4, 0.3)))
         for seed, value in enumerate(values)
     ]
     summary = scaling.build_summary(
         rows,
         versions=["v1"],
         datasets=["zinc12k"],
-        profiles=["base", "large"],
+        profiles=["reference", "large"],
         model_seeds=(0, 1),
         complete=True,
     )
@@ -184,7 +320,7 @@ def test_selected_profile_creates_one_test_only_job_per_seed_and_attaches_separa
         "--datasets",
         "zinc12k",
         "--profiles",
-        "base",
+        "reference",
         "large",
         "--model-seeds",
         "0,1",
@@ -258,10 +394,11 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
     output.mkdir()
     job = {
         "version": "v2",
-        "profile": "wide",
+        "profile": "reference",
         "model_seed": 3,
         "datasets": ["zinc12k"],
-        "config": dict(scaling.PROFILES["wide"]),
+        "config": scaling._profile_config("reference", "zinc12k", "v2"),
+        "resources": scaling._job_resources(_args(), "v2", "reference", "zinc12k"),
         "output_dir": str(output),
         "command": [
             "python",
@@ -275,12 +412,25 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
             "32768",
         ],
     }
-    run = output / "zinc12k/cycle_basis_v2"
+    run = output / "zinc12k/cycle_projector_pe_v2"
     run.mkdir(parents=True)
     checkpoint = run / "best.pt"
     checkpoint.write_bytes(b"checkpoint")
     history = run / "history.json"
-    history.write_text(json.dumps([{"epoch": epoch} for epoch in range(1, 5)]), encoding="utf-8")
+    history.write_text(
+        json.dumps(
+            [
+                {
+                    "epoch": epoch,
+                    "train_graphs": 10,
+                    "train_cuda_synchronized_seconds": 1.0,
+                    "train_graphs_per_second": 10.0,
+                }
+                for epoch in range(1, 5)
+            ]
+        ),
+        encoding="utf-8",
+    )
     manifest = {
         "status": "passed",
         "run_mode": "validation_only",
@@ -289,13 +439,22 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
             "model_seed": 3,
             "hidden_dim": 128,
             "pe_dim": 64,
-            "layers": 3,
+            "layers": 10,
+            "ffn_multiplier": 4,
+            "dropout": 0.1,
+            "layer_scale": 0.1,
             "datasets": ["zinc12k"],
             "validation_only": True,
             "test_checkpoint": None,
             "column_chunk_size": 16,
+            "basis_backend": "thin_q",
             "basis_execution": "batched",
             "basis_pair_budget": 32768,
+            "batch_size": 32,
+            "workers": 4,
+            "amp": False,
+            "prefetch_factor": 2,
+            "hardware_profile": "portable",
         },
         "controls": {
             "test_data_access": False,
@@ -316,11 +475,23 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
                     "split_content_sha256": {"train": "a", "validation": "b"},
                 },
                 "models": {
-                    "cycle_basis_v2": {
+                    "cycle_projector_pe_v2": {
                         "validation": 0.2,
                         "trainable_parameters": 1234,
                         "elapsed_seconds": 5.0,
                         "peak_gpu_memory_bytes": 2048,
+                        "peak_gpu_reserved_bytes": 4096,
+                        "effective_batch_size": 32,
+                        "execution": {
+                            "data_pipeline": {
+                                "effective_batch_size": 32,
+                                "workers": 4,
+                                "prefetch_factor": 2,
+                                "packed_cycle_basis_h2d_tensors_per_batch": 1,
+                            },
+                            "precision": {"amp": False, "projector_contraction": "float32"},
+                            "hardware": {"profile": "portable"},
+                        },
                         "best_epoch": 2,
                         "epochs_completed": 4,
                         "checkpoint": str(checkpoint.resolve()),
@@ -339,7 +510,7 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
     row = scaling.read_job_rows(job)[0]
     assert row["validation_mae"] == 0.2 and "test_mae" not in row
     assert row["trainable_parameters"] == 1234
-    metrics["datasets"]["zinc12k"]["models"]["cycle_basis_v2"]["test"] = 0.3
+    metrics["datasets"]["zinc12k"]["models"]["cycle_projector_pe_v2"]["test"] = 0.3
     (output / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
     with pytest.raises(ValueError, match="leaked a test metric"):
         scaling.read_job_rows(job)
@@ -357,7 +528,7 @@ def test_dry_run_prints_full_plan_without_dependency_or_gpu_checks(tmp_path, mon
             "v1",
             "v2",
             "--profiles",
-            "base",
+            "reference",
             "large",
             "--model-seeds",
             "0,2",
@@ -392,7 +563,7 @@ def test_failed_child_leaves_failed_manifest_and_withholds_selection(tmp_path, m
             "--versions",
             "v1",
             "--profiles",
-            "base",
+            "reference",
             "--model-seeds",
             "0",
             "--datasets",
@@ -431,7 +602,7 @@ def _start_interrupted_cycle_run(tmp_path, monkeypatch, run_id):
         "--versions",
         "v1",
         "--profiles",
-        "base",
+        "reference",
         "--model-seeds",
         "0",
         "--datasets",
@@ -584,7 +755,7 @@ def test_same_run_id_resumes_valid_children_and_test_checkpoints(tmp_path, monke
         "--versions",
         "v1",
         "--profiles",
-        "base",
+        "reference",
         "--model-seeds",
         "0,1",
         "--datasets",
@@ -712,7 +883,7 @@ def test_retrained_selected_candidate_rebinds_and_reruns_test_once(tmp_path, mon
         "--versions",
         "v1",
         "--profiles",
-        "base",
+        "reference",
         "--model-seeds",
         "0",
         "--datasets",
@@ -826,7 +997,7 @@ def test_completed_run_returns_without_relaunching_preflight_or_children(tmp_pat
         "--versions",
         "v1",
         "--profiles",
-        "base",
+        "reference",
         "--model-seeds",
         "0",
         "--datasets",
@@ -905,3 +1076,29 @@ def test_quarantine_rejects_resume_orphans_symlink_outside_run(tmp_path):
     with pytest.raises(ValueError, match="indirect|outside the run directory"):
         scaling._quarantine_incomplete_output(job, run_dir)
     assert output.is_dir()
+
+
+def test_projector_v2_attempt_preserves_last_checkpoint_and_requests_resume(tmp_path):
+    run_dir = tmp_path / "run"
+    args = scaling.parser().parse_args(
+        [
+            "--versions",
+            "v2",
+            "--profiles",
+            "reference",
+            "--datasets",
+            "zinc12k",
+            "--model-seeds",
+            "0",
+        ]
+    )
+    job = scaling.make_jobs(args, run_dir)[0]
+    checkpoint = Path(job["output_dir"]) / "zinc12k/cycle_projector_pe_v2/last.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"epoch-state")
+
+    attempt = scaling._candidate_attempt_command(job, run_dir)
+
+    assert attempt[-1] == "--resume"
+    assert checkpoint.read_bytes() == b"epoch-state"
+    assert "quarantined_outputs" not in job

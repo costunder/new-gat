@@ -1,12 +1,30 @@
 # 실험 결과와 구현 상태
 
-기준일: 2026-09-02 (Asia/Seoul).
+기준일: 2026-09-03 (Asia/Seoul).
 
 이 문서는 사용자가 제공한 **서버 결과 출력**과 **현재 소스 버전의 구현**을 구분한 기록이다.
 문서 작성 자체가 새 학습을 실행했다는 뜻은 아니다. 수치는 사용자 로그에서 확인했으며,
 서버의 전체 원본 checkpoint/manifest/history 파일을 로컬로 받아 독립 재검증한 것은 아니다.
 
 ## 1. 소스 버전과 측정 범위
+
+현재 최상위 구조는 [Conductance V5](CONDUCTANCE_V5.md)와 새
+[Cycle PE V2](CYCLE_PE_V2.md)다. V5는 shared graph-conditioned dynamic C와 multi-head W,
+graph-conditioned beta를 분리했고, `fixed_c/shared_dynamic_c` 두 arm을 연구급 architecture에서
+비교한다. Cycle의 과거 `cycle_basis_v2`는 실패 후 폐기했으며 현재 identity는
+`cycle_projector_pe_v2`다. 두 새 구현의 GPU 성능 결과는 아직 수령하지 않았다.
+
+현재 [전체 scaling](RICH_SCALING_EXPERIMENTS.md)은 `reference/large` 두 architecture
+profile을 사용한다. Conductance V1–V5는 106 child/model trainings, Cycle V1/V2는 8
+child/model trainings, Tree V1/V2는 4 child 안에서 8 models를 학습한다. 따라서 합계는
+**118 child runs / 122 fresh model trainings**다. 동일 run-id는 검증된 완료 child를 skip하며
+V5와 새 Cycle V2의 `last.pt`가 있으면 epoch 상태를 복원한다. 과거의
+`base/wide/deep/large` 204-training 계획은 폐기됐고 현재 실행 계약이 아니다.
+
+실행 hardware profile은 보수적인 `portable`과 opt-in `a6000-48gb`로 분리된다. A6000
+profile은 실제 minibatch/sample 크기와 수치 실행을 바꾸므로 portable 결과와 점수나 실행 시간을
+직접 대응시켜 모델 효과 또는 GPU 효과로 해석할 수 없다. 이 profile의 코드·계약 검증만 완료됐고
+A6000 scaling 성능이나 가속 실측은 아직 수령하지 않았다.
 
 후속 사용자 요청으로 현재 기본 실행은 model seed **0 하나**다. 기존 5-seed 측정값은 아래에
 그대로 보존하며, 기본값 변경이 과거 결과나 source revision을 바꾸지는 않는다.
@@ -23,16 +41,14 @@ runner는 각각 `passed`다. 성능 수치와 전체 원본 artifact는 수령�
 중단되어 정식 결과가 아니다. 현재 확대된 V2/V3/V4 8/10/20-job 전체 결과는 수령하지 않았다.
 
 이후 단일 `hidden/layer` 설정만으로는 큰 모델에서의 적합도를 확인할 수 없다는 사용자 요청에
-따라 [전체 모델 규모 확장 실험](RICH_SCALING_EXPERIMENTS.md)을 추가했다. Conductance
-V1/V2/V3/V4, Cycle PE V1/V2, Tree fixed/multi를 모두 포함하고, 각 트랙에서 `base`, `wide`,
-`deep`, `large` 프로필과 기본 model seed 0을 별도 fresh run으로 실행한다. 기본 전체 계획은
-Conductance 172회, Cycle 16회, Tree 16회로 총 204 model trainings이다. Cycle/Tree 후보는
-validation-only로 비교한 뒤 선택 checkpoint에 대해서만 각각 4회의 test-only 평가를 추가한다.
-Tree의 네 profile은 800 updates와 chart 8/8을 고정하고 실제 hidden/message-layer만 바꾼다.
-현재 확인된 것은 runner·manifest·무결성 검사와 로컬 테스트이며 **이 204개 GPU 학습 결과는
-아직 실행·수령하지 않았다.** 같은 인수와 run ID 재실행은 완료 child를 검증·skip하고 미완료
-child만 재시도한다. 진행 중이던 child 내부 epoch는 처음부터 다시 시작한다. 기존 단일 크기
-결과를 scaling 결과로 재분류하지 않는다.
+따라 [전체 모델 규모 확장 실험](RICH_SCALING_EXPERIMENTS.md)을 연구급 크기로 재설계했다.
+Conductance V1–V5, Cycle PE V1/새 V2, Tree fixed/multi를 dataset-aware `reference`/`large`로
+실행한다. 기본 model seed 0 계획은 Conductance 106, Cycle 8, Tree 8 trainings로 총
+**118 child runs / 122 model trainings**이다. Tree child 하나가 fixed/multi 두 모델을
+학습하므로 두 수가 다르다. Cycle/Tree 후보는 validation-only로 비교한 뒤 선택 checkpoint만
+test-only로 평가한다. 현재 확인된 것은 runner·manifest·무결성 검사와 로컬 테스트이며 이 GPU
+학습 결과는 아직 실행·수령하지 않았다. 같은 인수와 run ID 재실행은 완료 child를 검증·skip하고,
+V5와 새 Cycle V2는 `last.pt`부터 이어지며 legacy 미완료 child만 처음부터 재시도한다.
 
 ### 2026-09-02 사용자 서버 실행 보고
 
@@ -46,8 +62,8 @@ child만 재시도한다. 진행 중이던 child 내부 epoch는 처음부터 �
 | Conductance v2 | `gat-direct-c-v2-gpu6-seed0-v1` | 과거 arxiv-only 2-job run `passed`; 현재 8-job 결과 아님 |
 | Conductance v3 | `gat-relative-c-v3-gpu6-seed0-v1` | 과거 arxiv-only 2-job run `passed`; 현재 10-job 결과 아님 |
 | Conductance v4 | `gat-hybrid-c-spatial-v4-gpu6-seed0-v1` | 과거 arxiv-only 4-arm run의 `fixed_c_identity_w`만 200 epochs·child exit 0 뒤 구 report gate 중단; 나머지 3개 pending; 현재 20-job 결과 아님 |
-| Cycle PE v2 | `cycle-pe-v2-gpu6-seed0-v1` | `passed` |
-| 전체 scaling | 미실행 | V1 포함 204-training 실행 코드만 추가; GPU 결과 없음 |
+| 폐기된 구 Cycle PE v2 | `cycle-pe-v2-gpu6-seed0-v1` | 당시 runner `passed`; 새 `cycle_projector_pe_v2` 결과가 아님 |
+| 전체 scaling | 미실행 | V1–V5 포함 118-child/122-training 실행 코드만 추가; GPU 결과 없음 |
 
 V3는 graph-centered score → bounded relative C → isotropic mixture와 학습 alpha의
 대칭 정규화를 사용한다. AdamW backbone/생성기/scalar 그룹을 분리했다. 현재 기본은
@@ -110,7 +126,7 @@ graph binding과 학습 루프→checkpoint→비교표 연결 및 실제 C grad
 | 이전 진단 전용 게시 commit | `ebf8cd19b80e6cd6c742b132e2bb1dadb97b019c` |
 | 이전 commit의 추가 내용 | Conductance 진단 Python/Bash, 전용 테스트, 안내 문서, 트랙 README의 5개 파일 |
 | 기존 학습 코드 | 위 진단 commit은 기존 benchmark의 모델·학습 수식을 변경하지 않음 |
-| Cycle PE 기저벡터 v2 | `cycle-pe-v2-gpu6-seed0-v1` 사용자 보고상 공식 v2 runner `passed`. 성능 수치·전체 artifact는 미수령 |
+| 새 Cycle projector v2 | `cycle_projector_pe_v2` 구현·로컬 계약 검증 완료. 폐기된 구 v2 runner의 `passed`를 재사용하지 않으며 GPU 성능 수치·전체 artifact 없음 |
 | 실행 최적화·선택적 compile·속도 도구 | 이 소스 버전에 포함, 로컬 단위 검증 완료. GPU 가속 실측 미수령 |
 | 단일 seed 기본값·확장 checkpoint 검사 | 5e801c3 GPU full audit 수령, seed 0 다섯 데이터셋 passed |
 | Gate WD × normalization 2×2 | 43afd63 실제 GPU 결과 수령. PPI/arxiv × 4조건 × seed 0 모두 passed |
@@ -119,7 +135,8 @@ graph binding과 학습 루프→checkpoint→비교표 연결 및 실제 C grad
 | Conductance 직접 C v2 | 과거 arxiv-only `gat-direct-c-v2-gpu6-seed0-v1` 사용자 보고상 `passed`; 현재 4-dataset 기본 결과는 미수령 |
 | Conductance 상대 C v3 | 과거 arxiv-only `gat-relative-c-v3-gpu6-seed0-v1` 사용자 보고상 `passed`; 현재 5-dataset 기본 결과는 미수령 |
 | [Conductance C × spatial W v4](CONDUCTANCE_V4.md) | 과거 arxiv run은 첫 arm 뒤 구 report gate에서 중단. 현재 5-dataset × 4-condition = 20-arm 정식 결과 없음; 새 전체 run 필요 |
-| [전체 큰 모델 scaling](RICH_SCALING_EXPERIMENTS.md) | Conductance V1~V4 172 + Cycle V1/V2 16 + Tree fixed/multi 16의 코드·로컬 계약 검증만 완료; GPU 결과 미수령 |
+| [Conductance graph-conditioned v5](CONDUCTANCE_V5.md) | fixed-C/shared-dynamic-C, reference/large, sampling·resume 계약과 로컬 검증 완료; GPU 결과 없음 |
+| [전체 큰 모델 scaling](RICH_SCALING_EXPERIMENTS.md) | Conductance V1–V5 106 + Cycle V1/V2 8 + Tree fixed/multi 8 = 122 trainings의 코드·로컬 계약 검증만 완료; GPU 결과 미수령 |
 | [CODE_SUMMARY.md](CODE_SUMMARY.md) | 이 버전의 source/test/config/script 전체를 파일별로 보존한 스냅샷 |
 
 `ebf8cd1`까지만 받은 서버에는 새 기능이 없으므로 업데이트 후 `git rev-parse HEAD`로

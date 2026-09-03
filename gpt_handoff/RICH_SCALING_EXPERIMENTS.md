@@ -1,150 +1,154 @@
-# 전체 모델 규모 확장 실험
+# Conductance V1–V5·Cycle PE V1/V2·Tree reference/large 전체 scaling
 
-이 문서는 파라미터 수를 억지로 같게 맞추는 실험이 아니다. 각 방법의 원래 수식과
-파라미터화를 유지한 채 모델을 더 넓게 또는 더 깊게 만들어 성능이 어떻게 변하는지 확인하는
-사전 정의 scaling 실험이다. 기존 단일 크기 benchmark는 `base`로 그대로 보존하고, 새로운
-결과는 모두 별도의 `results/*/scaling/` 경로에 저장한다.
+과거 `64/128 × 2/4층` grid는 mechanism probe로만 남기고 현재 scaling 기본 계획에서는
+폐기한다. 새 계획은 파라미터를 버전 사이에 강제로 일치시키지 않으며, 각 구조가 실제 연구급
+capacity에서 성능을 낼 수 있는지를 본다. 기본 seed는 시간 제약 때문에 0 하나다.
 
-## 실험 프로필
+## Architecture profiles
 
-### Conductance V1/V2/V3/V4
+### Conductance V1–V5
 
-| Profile | Hidden | Conductance layers | Dropout |
-|---|---:|---:|---:|
-| `base` | 64 | 2 | 0.5 |
-| `wide` | 128 | 2 | 0.5 |
-| `deep` | 64 | 4 | 0.5 |
-| `large` | 128 | 4 | 0.5 |
+| Profile | Hidden | Layers | V5 heads | V5 FFN | Dropout |
+|---|---:|---:|---:|---:|---:|
+| `reference` | 256 | 8 | 8 | 4 | 0.2 |
+| `large` | 384 | 12 | 8 | 4 | 0.2 |
 
-V1도 제외하지 않는다. V1은 Cora, CiteSeer, PubMed, PPI, ogbn-arxiv에서 실행한다. V2는
-물리 edge ID에 묶인 직접 C이므로 Cora, CiteSeer, PubMed, ogbn-arxiv에서만 실행하고 PPI는
-명시적인 N/A다. V3/V4는 V1의 다섯 데이터를 모두 사용한다.
+V1–V4에는 지원하는 hidden/layers/dropout만 전달한다. V5는 heads/FFN과 activation
+checkpointing을 추가로 쓴다. V2 direct-C만 PPI가 N/A이고 나머지 버전은 V1과 같은 다섯
+dataset을 사용한다. 한 profile/seed당 V1 5, V2 8, V3 10, V4 20, V5 10으로 53회이며
+두 profile에서는 106 fresh validation-only trainings다.
 
-한 profile/seed당 V1 5회, V2 8회, V3 10회, V4 20회로 총 43회다. 시간 제약을 반영한 기본값은
-model seed 0 하나이므로 `43 × 4 × 1 = 172`개의 validation-only fresh training이다. V1
-scaling은 전용 경로에서 test split을 만들거나 평가하지 않는다. V2/V3/V4도 기존
-validation-only 계약을 유지한다. 추가 seed는 `--model-seeds`에 명시한 경우에만 실행한다.
+V5의 두 arm은 architecture, seed와 초기화는 같지만 학습 recipe까지 같은 단일-factor
+ablation은 아니다. fixed-C는 C coordinate 예산을 spatial 그룹에 쓰는 강한 baseline이고,
+dynamic-C는 그 예산을 C calibration/alternation에 쓴다. 따라서 phase별
+`effective_optimizer_steps_by_group`이 다른 end-to-end recipe 비교로 해석한다.
 
 ### Cycle PE V1/V2
 
-| Profile | Hidden | PE width | Message layers |
-|---|---:|---:|---:|
-| `base` | 64 | 32 | 3 |
-| `wide` | 128 | 64 | 3 |
-| `deep` | 64 | 32 | 6 |
-| `large` | 128 | 64 | 6 |
+| Profile | ZINC-12K | Peptides-struct |
+|---|---|---|
+| `reference` | hidden/PE/layers 128/64/10 | 256/64/6 |
+| `large` | 192/96/12 | 320/96/8 |
 
-V1 `cycle_set`과 V2 `cycle_basis_v2`를 모두 ZINC-12K와 Peptides-struct에서 실행한다. 기본값은
-model seed 0 하나이므로 `2 versions × 2 datasets × 4 profiles × 1 seed = 16`개의 fresh
-training이다. 이 16개 후보 학습은 train/validation split만 로드한다. `version × dataset`별로
-요청된 seed의 평균 validation MAE가 가장 낮은 공통 profile 하나를 고정한 다음, 기본 실행에서는
-선택 checkpoint 4개만 test-only 단계에서 각각 한 번 평가한다. 후보 학습에는 test loader나
-test metric이 없다.
+V2는 FFN×4, dropout 0.1, layer scale 0.1을 사용한다. 두 versions × 두 datasets × 두
+profiles = 8 trainings다. 현재 V2 identity는 `cycle_projector_pe_v2`이며 폐기된
+`cycle_basis_v2` 결과나 checkpoint를 혼용하지 않는다.
 
-### Tree fixed/multi
+### Tree V1/V2
 
-| Profile | Hidden | Message layers | Optimizer updates | Train/eval charts |
-|---|---:|---:|---:|---:|
-| `base` | 64 | 2 | 800 | 8/8 |
-| `wide` | 128 | 2 | 800 | 8/8 |
-| `deep` | 64 | 4 | 800 | 8/8 |
-| `large` | 128 | 4 | 800 | 8/8 |
+| Profile | Hidden | Message layers |
+|---|---:|---:|
+| `reference` | 128 | 8 |
+| `large` | 256 | 12 |
 
-CSL과 ZINC 각각에서 모든 profile과 기본 model seed 0을 실행한다. 한 child가 `fixed_bfs`와
-`multi_chart`를 모두 별도 초기화·학습하므로 `2 datasets × 4 profiles × 1 seed × 2 models
-= 16`개의 fresh model training이다. 후보 학습은 공식 validation split만 평가한다. 이후
-`dataset × condition`별로 요청된 seed의 평균 validation 목적값을 사용해 공통 profile 하나를
-선택하고, 기본 실행에서는 선택 checkpoint 4개만 test-only 단계에서 평가한다. 네 profile의
-update 수와 chart 수는 같으므로 `deep/large`의 차이는
-더 오래 학습하거나 chart를 더 본 효과가 아니라 실제 message-layer 증가다. 실제 적용 설정,
-전체/학습 가능 파라미터 수, chart family, checkpoint와 artifact hash를 기록한다.
+CSL/ZINC × fixed-BFS/multi-chart × 두 profiles = 8 model trainings다.
 
-Tree의 공식 데이터는 모든 split을 담은 단일 검증 cache이므로 candidate도 cache 전체의 형식과
-hash를 읽어 검증한다. Manifest는 이 cache 무결성 접근과 모델의 split 사용을 분리한다. 모델
-fit에는 train, profile 목적값에는 validation만 사용하고, 선택 전에는 test metric을 계산하거나
-profile 선택에 사용하지 않는다. 출력 차원도 전체 record label이 아니라 선언된 target metadata로
-정한다.
+## 전체 계획
 
-## 전체 범위와 실행
+- Conductance: 106 child/model trainings.
+- Cycle: 8 child/model trainings.
+- Tree: 4 child runs, 각 두 모델 = 8 model trainings.
+- 합계: **118 child runs, 122 fresh model trainings**.
+- profile 선택 후보는 train/validation만 사용한다. 기존 Cycle/Tree 계약의 selected-checkpoint
+  test-only 단계는 validation 선택 이후 별도 평가이며 재학습하지 않는다.
 
-기본 전체 실행은 Conductance 172 + Cycle 8 + Tree 8 = **188 training child runs**다.
-Cycle과 Tree의 child 하나가 모델 두 개씩을 학습하므로 실제 학습 수는 Conductance 172회,
-Cycle 16회, Tree 16회, 총 **204 fresh model trainings**이다. 학습 완료 후 Cycle 4회와
-Tree 4회의 선택-checkpoint test-only 평가가 추가되지만, 이는 optimizer나 재학습을 만들지
-않으므로 188 training child/204 학습 횟수에 넣지 않는다. 작은
-점검용 프로필이 아니라 실제 공식 데이터 학습이므로 상당한 GPU 시간이 필요하다. 실행계획만
-먼저 확인하려면 다음 명령을 사용한다. `--dry-run`은 결과 폴더를 만들지 않는다.
+다음은 과거에 사용한 물리 GPU 6의 10GB MIG slice를 그대로 지정하는 **portable 실행
+예시**다. GPU 번호는 실제 할당에 맞춰 바꾸되 프로세스 내부 장치는 항상 `cuda:0`을 쓴다.
 
 ```bash
-env -u PYTORCH_NVML_BASED_CUDA_CHECK \
-CUDA_VISIBLE_DEVICES=6 \
+git pull --ff-only
+
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=6 \
 python -B scripts/run_rich_scaling.py \
-  --run-id rich-all-gpu6-v1 \
-  --profiles base wide deep large \
+  --run-id rich-portable-gpu6-seed0-v1 \
+  --profiles reference large \
   --model-seeds 0 \
   --device cuda:0 \
-  --dry-run
+  --hardware-profile portable \
+  --cycle-v2-basis-backend thin_q
 ```
 
-전체 실행은 마지막 `--dry-run`만 제거한다.
+별도 shell fail-fast 설정 없이 각 Python runner가 subprocess return code, artifact, source
+hash와 manifest를 직접 검증한다. 같은 명령/run-id를 다시 실행하면 완료된 child를 검증해
+건너뛰며, V5 Conductance와 새 Cycle V2는 `last.pt`가 있으면 epoch 단위로 이어간다.
+저장 model/optimizer/RNG에서 epoch-boundary continuation을 수행하지만 CUDA bitwise 재현을
+주장하지 않는다. 다른 config/source/job matrix를 같은 run-id와 섞으면 중단한다.
+
+## RTX A6000 48GB throughput profile
+
+GPU 3 한 장이 실제로 할당된 서버에서는 다음처럼 물리 GPU 3을 프로세스 안의 `cuda:0`으로
+매핑한다. `a6000-48gb`의 공통 장치 계약은 **보이는 VRAM 40GiB 이상과 compute capability
+8.0 이상**이다. 아래 통합 명령은 여기에 `--min-free-gb 40`을 명시해 세 트랙의 일반
+preflight에서 시작 시 free VRAM도 40GiB 이상 요구한다. profile 자체의 내장 free-memory
+계약은 Conductance와 Tree가 32GiB 이상이고, Cycle은 전달받은 `--min-free-gb`와 V2의
+worst-case pre-epoch forward/backward capacity probe를 사용한다. 어느 경로도 작은 MIG 장치로
+자동 fallback하지 않는다.
 
 ```bash
-env -u PYTORCH_NVML_BASED_CUDA_CHECK \
-CUDA_VISIBLE_DEVICES=6 \
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
 python -B scripts/run_rich_scaling.py \
-  --run-id rich-all-gpu6-v1 \
-  --profiles base wide deep large \
+  --run-id rich-a6000-gpu3-seed0-v1 \
+  --profiles reference large \
   --model-seeds 0 \
-  --device cuda:0
+  --device cuda:0 \
+  --hardware-profile a6000-48gb \
+  --min-free-gb 40 \
+  --cycle-v2-basis-backend thin_q
 ```
 
-더 짧은 사전 점검이 꼭 필요할 때만 base/large 두 profile로 줄일 수 있다. 이 결과는 네 profile
-전체 결과로 가장하면 안 된다.
+최상위 `--cycle-v2-basis-backend`는 Cycle child의 V2에 전달되고 통합 manifest와 재개
+configuration에 결속된다. `thin_q`가 전체 학습용 기본값이다. DFS forest와 parent-path
+역추적 경로를 진단하려면 새 run ID에서 `dfs_fundamental`을 선택한다. 이 경로는 runtime QR을
+반복하므로 속도 개선용 설정이 아니다.
+
+architecture profile(`reference/large`)과 hardware profile(`portable/a6000-48gb`)은 서로 다른
+축이다. A6000 profile의 실제 실행 차이는 다음과 같다.
+
+| 트랙 | `portable` | `a6000-48gb` |
+|---|---|---|
+| Conductance V5 | FP32, TF32 off, activation checkpoint on, edge chunk 65,536, arxiv seed-node batch 1,024, PPI whole-graph batch 2 | dense BF16 autocast·TF32, conductance geometry FP32, checkpoint off, edge chunk 131,072, arxiv seed-node batch 2,048, PPI whole-graph batch 8, sample prefetch/pinned transfer |
+| Conductance V1–V4 | 기존 FP32 계약. PPI는 V1/V3/V4 batch 2이고 V2는 PPI N/A | 같은 legacy FP32·batch 계약을 그대로 유지 |
+| Cycle V1/V2 | 모든 dataset/profile batch 32, workers 4, prefetch 2, AMP off; V2 column chunk 16, pair budget 32,768 | reference ZINC/Peptides batch 512/128, large 256/64, workers 8, FP16 AMP; V1은 실제 loader prefetch 2, V2는 prefetch 4·FP32 projector·column chunk 32·pair budget 4,194,304 |
+| Tree V1/V2 | batch 16, workers 0, suite config의 FP16 AMP, child concurrency 1 | batch 64, workers 4, 명시적 FP16 AMP, 독립 child concurrency 2 |
+
+Conductance와 Cycle child는 순차 실행한다. Tree만 서로 다른 output/log를 갖는 candidate와
+selected-test child를 최대 2개 병렬화하며 coordinator 하나만 공용 manifest를 원자적으로 쓴다.
+A6000 작업 순서는 큰 workload를 먼저 검증하도록 deterministic heavy-first다. 한 Tree child가
+실패해도 같은 wave에서 통과한 peer artifact는 보존되며 같은 run ID 재실행에서는 실패한 작업만
+새 attempt 경로에서 실행한다.
+
+이 설정은 메모리만 더 쓰는 동치 실행 스위치가 아니다. V5는 real sample/PPI batch와 numeric
+execution이 바뀌고, Cycle은 batch와 AMP가 바뀌며, Tree는 800 optimizer updates마다 보는 graph
+수가 달라진다. 따라서 fixed/dynamic C, Cycle V1/V2, Tree fixed/multi 비교는 같은 hardware
+profile 안에서만 해석한다. 특히 legacy Conductance V1/V3/V4 PPI는 batch 2/FP32이고 V5 A6000
+PPI는 batch 8/BF16이므로 V1–V5 PPI 차이는 descriptive scaling 결과일 뿐 단일 구조 요인의
+인과 비교가 아니다. portable와 A6000 사이의 점수나 wall time 차이를 모델 또는 GPU 하나의
+효과로 직접 해석하지 않는다.
+
+`nvidia-smi` 한 번의 390MiB/13% 화면은 CUDA context 생성, CPU 전처리, validation 또는 작은
+커널 사이의 순간일 수 있어 전체 GPU 활용률의 증거가 아니다. 학습 중 별도 터미널에서 다음처럼
+2초 시계열을 확인한다.
 
 ```bash
-env -u PYTORCH_NVML_BASED_CUDA_CHECK \
-CUDA_VISIBLE_DEVICES=6 \
-python -B scripts/run_rich_scaling.py \
-  --run-id rich-screen-gpu6-v1 \
-  --profiles base large \
-  --model-seeds 0 \
-  --device cuda:0
+nvidia-smi --id=3 \
+  --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw \
+  --format=csv -l 2
 ```
 
-통합 runner는 Conductance, Cycle, Tree를 순서대로 실행한다. 한 트랙이 실패해도 기본값은
-다음 트랙을 계속 실행하고 전체 상태를 `failed`로 남긴다. 첫 실패에서 멈춰야 할 때만
-`--fail-fast`를 명시한다. 어떤 명령에도 `set -euo pipefail`은 필요하지 않다.
+최종 판단에는 이 시계열과 각 child summary에 상위 aggregate까지 보존되는 `runtime`,
+`elapsed_seconds`, `peak_gpu_allocated_bytes`, `peak_gpu_reserved_bytes`를 함께 사용한다. GPU
+utilization이 낮으면서 CPU core가 포화되면 loader/기저 준비 병목이고, VRAM peak가 충분히 낮고
+GPU utilization도 낮으면 다음 run ID에서 batch/concurrency 조정을 검토한다. 현재 한 장면만으로
+batch나 concurrency를 더 올리지는 않는다.
 
-중단 후에는 **인수와 `--run-id`를 바꾸지 않고 같은 명령을 다시 실행**한다. 통합 runner와 세
-하위 runner는 기존 manifest의 설정·소스 hash·작업 행렬을 먼저 대조하고, `passed` 작업의
-artifact와 summary hash를 다시 검증한 뒤 건너뛴다. `pending`, `running`, `failed`였던 작업만
-다시 실행한다. 하위 run 전체가 이미 완료된 경우에는 dependency·source·candidate·선택
-checkpoint·집계 summary를 재검증하고 GPU preflight나 child를 다시 띄우지 않는다.
+## 10GB MIG 메모리 정책
 
-기존 `passed` artifact가 손상됐으면 Conductance는 fail-closed로 중단한다. Cycle은 손상된
-candidate/test 출력을 `resume-orphans`에 보존하고 깨끗한 원래 binding에서 재시도한다. 후보
-재학습으로 선택 checkpoint/hash가 달라지면 이전 test 결과도 보존한 뒤 새 selection에
-재바인딩하여 test-only를 한 번 다시 실행한다. Tree는 손상 attempt를 보존하고
-`resume-attempts`의 새 경로에서 실행한다. Manifest·summary·preflight·output·log가 run 밖이나
-간접 symlink를 가리키면 subprocess 전에 거부한다. 어느 경우도 조용히 덮어쓰지 않는다.
-인수나 소스가 달라졌으면 섞어서 재개하지 않고 새 run ID를 요구한다. 현재 실행 중이던 단일
-child의 epoch 내부 상태를 잇는 방식은 아니므로 그 child만 처음부터 다시 시작하지만, 이전에
-완료·검증된 child는 재학습하지 않는다.
+- V5 activation checkpointing 기본 on.
+- ogbn-arxiv V5 train은 기본 cluster sampling, seed-node batch 1024, edge chunk 65536.
+- PPI는 공식 inductive graph split 때문에 full graph batch 2.
+- 모든 validation은 완전한 공식 graph/split에서 수행한다.
+- Cycle은 projector row pair budget과 AMP/batch를 기록하며 parameter ceiling 50M을 적용한다.
+- 실제 peak memory가 없는 상태에서 large가 10GB에 적합하다고 주장하지 않는다. reference부터
+  실행하고 manifest의 peak allocation으로 large 실행 가능성을 판단한다.
 
-## 결과와 주장 범위
-
-- 통합 상태: `results/rich_scaling/<run-id>/manifest.json`
-- Conductance: `results/conductance_gat/scaling/<run-id>-conductance/`
-- Cycle: `results/cycle_pe/scaling/<run-id>-cycle/`
-- Tree: `results/tree_augmentation/scaling/<run-id>-tree/`
-
-각 후보 child의 최초 학습은 기존 다른 run의 checkpoint를 재사용하지 않는다. 같은 run ID의
-재개에서는 해당 run에서 이미 통과한 checkpoint와 artifact만 검증 후 유지한다. Profile, seed,
-실제 hidden/layer/update/chart 설정, trainable parameter 수, validation, 실행시간과 peak GPU
-memory를 가능한 범위에서 검증한다. Cycle/Tree의 후보 행에는 test 값이 허용되지 않고, validation
-선택이 완료된 checkpoint만 별도 test-evaluation 행에 들어간다. 이 scaling curve는 큰 모델에서
-각 방법이 어떻게 변하는지 보는 실험이다. 서로 다른 버전의 파라미터 수가 같다고 주장하지 않으며,
-버전 간 정규화·optimizer·파라미터화 차이가 사라졌다고도 주장하지 않는다.
-
-현재 저장소에 추가된 것은 실행 코드와 계약 테스트다. 204개 GPU 학습 결과가 완료됐다는 뜻은
-아니며, 서버 manifest와 summary를 수령하기 전에는 성능 결론을 기록하지 않는다.
+현재 이 문서는 실행 계약이다. 새 V5와 projector V2의 GPU 성능 결과는 아직 수령하지 않았다.

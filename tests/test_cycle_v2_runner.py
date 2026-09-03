@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import shlex
 import sys
 from pathlib import Path
 
@@ -39,6 +38,7 @@ def test_v2_dispatch_is_only_basis_model_and_keeps_requested_seeds(
         assert command[2] == "research.cycle_pe.v2.benchmark"
         child = parser().parse_args(command[3:])
         assert child.model_seed == seed
+        assert child.basis_backend == "thin_q"
         assert child.prepare_only is prepare
         assert child.allow_download is prepare
         assert child.batch_size == 32 and child.workers == 4
@@ -49,6 +49,20 @@ def test_v2_dispatch_is_only_basis_model_and_keeps_requested_seeds(
             / f"model-seed-{seed}/benchmark"
         )
     assert sum(name == "gpu_preflight" for name, _, _ in commands) == (0 if prepare else 1)
+
+
+def test_root_runner_forwards_dfs_basis_backend_only_for_v2():
+    from research.cycle_pe.v2.benchmark import parser
+
+    args = _args("--basis-backend", "dfs_fundamental")
+    children = [entry for entry in run_paper._commands(args, "dfs") if entry[0] != "gpu_preflight"]
+    assert len(children) == 1
+    child = parser().parse_args(children[0][1][3:])
+    assert child.basis_backend == "dfs_fundamental"
+
+    v1 = run_paper._parser().parse_args(["--tracks", "cycle_pe"])
+    v1_command = run_paper._commands(v1, "v1-default")[-1][1]
+    assert "--basis-backend" not in v1_command
 
 
 def test_v1_default_dispatch_and_paths_remain_unchanged():
@@ -96,25 +110,23 @@ def test_v2_rejects_unrelated_or_supplementary_tracks_before_dependency_checks(
 
 
 @pytest.mark.parametrize("script", ["prepare_data.sh", "reproduce.sh"])
-def test_v2_wrappers_lock_the_version_and_track(script):
+def test_v2_wrappers_use_direct_python_without_shell_set_flags(script):
     source = (ROOT / "research/cycle_pe/v2" / script).read_text(encoding="utf-8")
-    dispatch = shlex.split(next(row for row in source.splitlines() if row.startswith("exec bash ")))
-    assert dispatch[2:4] == ["${project_root}/scripts/paper.sh", "$@"]
-    args = run_paper._parser().parse_args(
-        ["--tracks", "all", "--cycle-pe-version", "v1", *dispatch[4:]]
-    )
-    assert args.tracks == ["cycle_pe"] and args.cycle_pe_version == "v2"
-    assert args.suite == "benchmark"
-    assert args.prepare_only is (script == "prepare_data.sh")
-    assert args.allow_download is (script == "prepare_data.sh")
-    assert "set -euo pipefail" in source
+    assert "set -" not in source and "scripts/paper.sh" not in source
+    if script == "reproduce.sh":
+        assert "scripts/run_cycle_scaling.py" in source
+        assert "--versions v2 --profiles reference" in source
+    else:
+        assert "-m research.cycle_pe.v2.benchmark" in source
+        assert "--prepare-only --allow-download --device cpu" in source
 
 
-def test_registry_snapshot_describes_basis_v2_not_six_statistics(tmp_path):
+def test_registry_snapshot_describes_projector_v2_not_raw_basis_coordinates(tmp_path):
     snapshot = run_paper._snapshot_registries(tmp_path, ("cycle_pe",), cycle_pe_version="v2")
     payload = Path(snapshot["cycle_pe"]["path"]).read_text(encoding="utf-8")
-    assert "model: cycle_basis_v2" in payload and "version: v2" in payload
-    assert "full SVD" in payload and "truncation: none" in payload
+    assert "model: cycle_projector_pe_v2" in payload and "version: v2" in payload
+    assert "sparse fundamental" in payload and "truncation: none" in payload
+    assert "no raw basis coordinates" in payload
 
 
 def test_v2_manifest_records_version_and_will_not_reuse_existing_output(tmp_path, monkeypatch):
@@ -133,6 +145,8 @@ def test_v2_manifest_records_version_and_will_not_reuse_existing_output(tmp_path
             "cycle_pe",
             "--cycle-pe-version",
             "v2",
+            "--basis-backend",
+            "dfs_fundamental",
             "--prepare-only",
             "--run-id",
             "version-record",
@@ -141,6 +155,7 @@ def test_v2_manifest_records_version_and_will_not_reuse_existing_output(tmp_path
     assert run_paper.main() == 0
     manifest = json.loads((tmp_path / "runs/paper/version-record/manifest.json").read_text())
     assert manifest["execution_protocol"]["cycle_pe_version"] == "v2"
+    assert manifest["execution_protocol"]["basis_backend"] == "dfs_fundamental"
     assert manifest["research_environment"]["profile_id"] == "legacy-cu118"
     assert manifest["tracks"] == ["cycle_pe"]
     assert run_paper.main() == 2

@@ -15669,6 +15669,802 @@ def test_midrun_source_change_refused(monkeypatch, tmp_path):
         )
 ````
 
+# research/conductance_gat/tests/test_v5_contract.py
+
+````python
+import hashlib
+import json
+
+from research.conductance_gat.v5.model import GraphConditionedConductanceNodeClassifier
+from research.conductance_gat.v5.protocol import COMPARISON_DESIGN
+from research.conductance_gat.v5.report import build_comparison
+from research.conductance_gat.v5.train import (
+    architecture_configuration,
+    build_parser,
+    configuration,
+    configure_phase,
+    phase_schedule,
+    validate_args,
+)
+
+
+def small_model(mode):
+    return GraphConditionedConductanceNodeClassifier(
+        8,
+        3,
+        hidden_channels=32,
+        layers=1,
+        heads=4,
+        ffn_multiplier=2,
+        conductance_mode=mode,
+        activation_checkpoint=False,
+    )
+
+
+def test_fixed_control_has_updates_in_every_scheduled_phase():
+    network = small_model("fixed_one")
+    for phase in ("spatial_warmup", "conductance_calibration", "alternating", "joint"):
+        state = configure_phase(network, phase, 0)
+        assert state["active_parameter_groups"]
+        assert "conductance" not in state["active_parameter_groups"]
+    calibration = configure_phase(network, "conductance_calibration", 0)
+    assert calibration["coordinate"] == "fixed_spatial_control"
+    assert calibration["active_parameter_groups"] == ["backbone", "beta", "spatial_w"]
+
+
+def test_schedule_always_reserves_joint_selection_epochs():
+    for epochs in (4, 5, 17, 300):
+        schedule = phase_schedule(epochs, [0.1, 0.1, 0.4, 0.4])
+        assert schedule[-1]["name"] == "joint"
+        assert schedule[-1]["length"] >= 1
+        assert sum(item["length"] for item in schedule) == epochs
+
+
+def test_cli_resume_and_sampling_contract():
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--dataset",
+            "ogbn-arxiv",
+            "--condition",
+            "shared_dynamic_c",
+            "--output-dir",
+            "out",
+            "--sampling",
+            "neighbor",
+            "--num-neighbors",
+            "15",
+            "10",
+            "5",
+        ]
+    )
+    validate_args(args)
+    assert args.resume is True
+    assert args.activation_checkpoint is True
+    assert args.sample_seed_batch_size == 1024
+    assert args.num_neighbors == [15, 10, 5]
+    architecture = architecture_configuration(args)
+    assert architecture["beta_parameterization"] == "sigmoid"
+    assert architecture["beta_initial"] == 0.1
+    assert "beta_min" not in architecture and "beta_max" not in architecture
+    assert "beta_min" not in configuration(args) and "beta_max" not in configuration(args)
+
+
+def test_cli_can_reproduce_historical_margin_beta_ablation():
+    args = build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            "shared_dynamic_c",
+            "--output-dir",
+            "out",
+            "--beta-parameterization",
+            "margin_sigmoid",
+            "--beta-initial",
+            "0.5",
+            "--beta-min",
+            "0.05",
+            "--beta-max",
+            "0.95",
+        ]
+    )
+    validate_args(args)
+    beta = {
+        key: value
+        for key, value in architecture_configuration(args).items()
+        if key.startswith("beta_")
+    }
+    assert beta == {
+        "beta_parameterization": "margin_sigmoid",
+        "beta_initial": 0.5,
+        "beta_min": 0.05,
+        "beta_max": 0.95,
+    }
+
+
+def test_report_is_partial_safe_then_requires_complete_pairs(tmp_path):
+    manifest = {
+        "status": "running",
+        "config": {"datasets": ["cora"], "model_seed": 0, "batch_size": 1},
+        "jobs": [
+            {
+                "dataset": "cora",
+                "condition": condition,
+                "architecture": {
+                    "hidden_channels": 32,
+                    "layers": 1,
+                    "heads": 4,
+                    "ffn_multiplier": 2,
+                    "dropout": 0.0,
+                },
+                "sampling": "full",
+                "status": "pending",
+                "output_dir": str(tmp_path / condition),
+            }
+            for condition in ("fixed_c", "shared_dynamic_c")
+        ],
+    }
+    partial = build_comparison(tmp_path, manifest)
+    assert partial["status"] == "partial"
+    assert partial["rows"] == []
+    for job in manifest["jobs"]:
+        output = tmp_path / job["condition"]
+        output.mkdir()
+        checkpoint, last, history = output / "best.pt", output / "last.pt", output / "history.json"
+        checkpoint.write_bytes(b"best")
+        last.write_bytes(b"last")
+        history.write_text("[]", encoding="utf-8")
+
+        def digest(path):
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+        cache_sha256 = "c" * 64
+        source_sha256 = {"implementation.py": "s" * 64}
+        initial_state_sha256 = "i" * 64
+        protocol = {"data_sha256": cache_sha256, "dataset": "cora"}
+        configuration = {
+            **job["architecture"],
+            "model_seed": 0,
+            "batch_size": 1,
+            "sampling": "full",
+        }
+        schedule = [{"name": "joint", "start_epoch": 1, "end_epoch": 4, "length": 4}]
+        identity = {
+            "cache_sha256": cache_sha256,
+            "source_sha256": source_sha256,
+            "initial_state_sha256": initial_state_sha256,
+        }
+        identity_sha256 = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        (output / "metrics.json").write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "research_suite": "conductance_graph_conditioned_v5",
+                    "dataset": "cora",
+                    "condition": job["condition"],
+                    "model_seed": 0,
+                    "evaluation_split": "validation",
+                    "test_evaluated": False,
+                    "validation": 0.8,
+                    "metric_name": "accuracy",
+                    "total_parameters": 10,
+                    "trainable_parameters": 8,
+                    "allocated_parameter_capacity": 10,
+                    "best_epoch": 4,
+                    "configuration": configuration,
+                    "schedule": schedule,
+                    "cache_sha256": cache_sha256,
+                    "source_sha256": source_sha256,
+                    "versions": {"torch": "fixture"},
+                    "initial_state_sha256": initial_state_sha256,
+                    "protocol": protocol,
+                    "resume_identity": identity,
+                    "resume_identity_sha256": identity_sha256,
+                    "comparison_design": COMPARISON_DESIGN,
+                    "effective_optimizer_steps_by_group": {
+                        "backbone": 4,
+                        "spatial_w": 4,
+                        "beta": 4,
+                        "conductance": 0,
+                    },
+                    "checkpoint": str(checkpoint.resolve()),
+                    "checkpoint_sha256": digest(checkpoint),
+                    "last_checkpoint": str(last.resolve()),
+                    "last_checkpoint_sha256": digest(last),
+                    "history": str(history.resolve()),
+                    "history_sha256": digest(history),
+                    "selected_checkpoint_recheck": {
+                        "recorded": 0.8,
+                        "recomputed": 0.8,
+                        "delta": 0.0,
+                        "non_gating": True,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        job["status"] = "passed"
+    manifest["status"] = "passed"
+    complete = build_comparison(tmp_path, manifest)
+    assert complete["status"] == "passed"
+    assert complete["contrasts"][0]["dynamic_minus_fixed"] == 0
+````
+
+# research/conductance_gat/tests/test_v5_core.py
+
+````python
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.v5.diagnostics import require_first_step_conductance_gradient
+from research.conductance_gat.v5.model import (
+    GraphConditionedBeta,
+    GraphConditionedConductanceNodeClassifier,
+)
+from research.conductance_gat.v5.operator import shared_head_diffusion
+from research.conductance_gat.v5.protocol import SCALE_PROFILES, beta_configuration
+from research.conductance_gat.v5.train import configure_phase, phase_schedule
+
+
+def graph():
+    return SimpleNamespace(
+        x=torch.randn(7, 5),
+        incidence_edge_index=torch.tensor(
+            [[0, 0, 1, 1, 2, 3, 4, 5], [1, 2, 2, 3, 4, 4, 5, 6]], dtype=torch.long
+        ),
+    )
+
+
+def model(mode="dynamic"):
+    return GraphConditionedConductanceNodeClassifier(
+        5,
+        3,
+        hidden_channels=32,
+        layers=2,
+        heads=4,
+        ffn_multiplier=2,
+        dropout=0.0,
+        conductance_mode=mode,
+        activation_checkpoint=False,
+    )
+
+
+def test_default_beta_is_unmargined_sigmoid_with_nominal_point_one_initialization():
+    torch.manual_seed(2)
+    estimator = GraphConditionedBeta(32, 4)
+    context = torch.randn(5, 2 * 32 + 8)
+    beta = estimator(context)
+    assert estimator.beta_parameterization == "sigmoid"
+    assert estimator.beta_initial == 0.1
+    assert estimator.beta_min is None and estimator.beta_max is None
+    assert torch.all((0 < beta) & (beta < 1))
+    torch.testing.assert_close(
+        estimator.network[-1].bias.sigmoid(),
+        torch.full((4,), 0.1),
+        atol=1e-7,
+        rtol=0,
+    )
+    # The final weight remains small and nonzero so upstream beta features receive
+    # first-step gradients; consequently beta starts near, not exactly at, beta_initial.
+    assert float((beta.detach() - 0.1).abs().max()) < 0.01
+
+
+def test_historical_margin_sigmoid_remains_an_explicit_ablation():
+    torch.manual_seed(2)
+    estimator = GraphConditionedBeta(
+        32,
+        4,
+        beta_parameterization="margin_sigmoid",
+        beta_initial=0.5,
+        beta_min=0.05,
+        beta_max=0.95,
+    )
+    beta = estimator(torch.randn(5, 2 * 32 + 8))
+    assert torch.all((0.05 < beta) & (beta < 0.95))
+    torch.testing.assert_close(
+        estimator.network[-1].bias.sigmoid(),
+        torch.full((4,), 0.5),
+        atol=0,
+        rtol=0,
+    )
+    assert float((beta.detach() - 0.5).abs().max()) < 0.01
+
+
+def test_beta_configuration_omits_irrelevant_margins_and_rejects_invalid_contracts():
+    assert beta_configuration() == {
+        "beta_parameterization": "sigmoid",
+        "beta_initial": 0.1,
+    }
+    with pytest.raises(ValueError, match="only valid for margin_sigmoid"):
+        beta_configuration("sigmoid", 0.1, 0.05, 0.95)
+    with pytest.raises(ValueError, match="requires explicit"):
+        beta_configuration("margin_sigmoid", 0.5)
+    with pytest.raises(ValueError, match="min < initial < max"):
+        beta_configuration("margin_sigmoid", 0.05, 0.05, 0.95)
+
+
+def test_dynamic_c_is_shared_positive_relative_and_not_dead_at_initialization():
+    torch.manual_seed(3)
+    network, data = model(), graph()
+    logits = network(data)
+    c = network.operators[0].estimator.last_c
+    assert c.shape == (data.incidence_edge_index.shape[1],)
+    assert torch.all(c > 0)
+    assert float(c.mean()) == pytest.approx(1.0, abs=2e-6)
+    assert float(c.std()) > 0
+    logits.square().mean().backward()
+    result = require_first_step_conductance_gradient(network)
+    assert result["passed"] and all(row["upstream_gradient_norm"] > 0 for row in result["layers"])
+
+
+def test_undirected_orientation_does_not_change_prediction():
+    torch.manual_seed(4)
+    network, data = model(), graph()
+    network.eval()
+    expected = network(data)
+    reversed_graph = SimpleNamespace(
+        x=data.x,
+        incidence_edge_index=data.incidence_edge_index.flip(0).flip(1),
+    )
+    actual = network(reversed_graph)
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+
+
+def test_shared_operator_is_scale_invariant_but_beta_changes_diffusion():
+    torch.manual_seed(5)
+    message = torch.randn(4, 2, 3)
+    incidence = torch.tensor([[0, 1, 2], [1, 2, 3]])
+    c = torch.tensor([0.5, 1.2, 2.0])
+    batch = torch.zeros(4, dtype=torch.long)
+    beta = torch.tensor([[0.2, 0.8]])
+    expected = shared_head_diffusion(message, c, incidence, batch, beta)
+    actual = shared_head_diffusion(message, 17 * c, incidence, batch, beta)
+    torch.testing.assert_close(actual, expected)
+    no_diffusion = shared_head_diffusion(message, c, incidence, batch, torch.zeros_like(beta))
+    torch.testing.assert_close(no_diffusion, message)
+
+
+def test_chunked_inplace_diffusion_matches_one_shot_values_and_gradients():
+    torch.manual_seed(51)
+    incidence = torch.tensor([[0, 0, 1, 2, 3], [1, 2, 2, 3, 4]])
+    batch = torch.zeros(5, dtype=torch.long)
+    message = torch.randn(5, 2, 3, requires_grad=True)
+    c = torch.rand(5, requires_grad=True).add(0.5)
+    beta = torch.rand(1, 2, requires_grad=True)
+    actual = shared_head_diffusion(message, c, incidence, batch, beta, edge_chunk_size=1)
+
+    tail, head = incidence
+    degree = c.new_zeros(5).index_add(0, tail, c).index_add(0, head, c)
+    inverse = torch.where(degree > 0, degree.rsqrt(), torch.zeros_like(degree))
+    weight = c * inverse[tail] * inverse[head]
+    propagated = message.new_zeros(message.shape)
+    propagated = propagated.index_add(0, tail, weight[:, None, None] * message[head])
+    propagated = propagated.index_add(0, head, weight[:, None, None] * message[tail])
+    expected = message + beta[batch, :, None] * (propagated - (degree > 0)[:, None, None] * message)
+    torch.testing.assert_close(actual, expected)
+    actual_gradients = torch.autograd.grad(
+        actual.square().sum(), (message, c, beta), retain_graph=True
+    )
+    expected_gradients = torch.autograd.grad(expected.square().sum(), (message, c, beta))
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient)
+
+
+def test_default_profile_is_research_scale_and_phase_schedule_is_nonempty():
+    profile = SCALE_PROFILES["reference"]
+    network = GraphConditionedConductanceNodeClassifier(128, 40, **profile)
+    assert sum(parameter.numel() for parameter in network.parameters()) > 5_000_000
+    schedule = phase_schedule(20, [0.1, 0.1, 0.4, 0.4])
+    assert [item["length"] for item in schedule] == [2, 2, 8, 8]
+    warmup = configure_phase(network, "spatial_warmup", 0)
+    assert warmup["conductance_override"] == "ones"
+    calibration = configure_phase(network, "conductance_calibration", 0)
+    assert calibration["active_parameter_groups"] == ["conductance"]
+
+
+def test_sampler_carries_original_structure_and_nontrivial_seed_batch():
+    pytest.importorskip("torch_geometric")
+    from torch_geometric.data import Data
+
+    from research.conductance_gat.v5.sampling import TransductiveGraphSampler
+
+    data = graph()
+    incidence = data.incidence_edge_index
+    arcs = torch.cat((incidence, incidence.flip(0)), dim=1)
+    source = Data(x=data.x, y=torch.arange(7) % 3, edge_index=arcs, incidence_edge_index=incidence)
+    sampler = TransductiveGraphSampler(
+        source,
+        torch.arange(7),
+        mode="neighbor",
+        seed_batch_size=4,
+        fanouts=[2, 1],
+        model_seed=0,
+    )
+    sampled = next(sampler.iter_epoch(1))
+    assert sampled.graph_structure.shape == (1, 6)
+    assert sampled.full_degree.shape == (sampled.num_nodes,)
+    assert int(sampled.train_mask.sum()) == 4
+    assert torch.all(sampled.sampling_correction >= 1)
+````
+
+# research/conductance_gat/tests/test_v5_efficiency.py
+
+````python
+import inspect
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.v5 import model as v5_model
+from research.conductance_gat.v5 import operator as v5_operator
+from research.conductance_gat.v5.train import (
+    build_parser,
+    merge_efficiency,
+    require_finite_gradient_norm_async,
+    validate_args,
+    validate_hardware_runtime,
+)
+
+
+def test_resume_efficiency_adds_elapsed_and_keeps_cross_segment_peak():
+    merged = merge_efficiency(120.5, 8_000, 12_000, 30.25, 9_000, 11_000)
+    assert merged == {
+        "elapsed_seconds": 150.75,
+        "peak_cuda_allocated_bytes": 9_000,
+        "peak_cuda_reserved_bytes": 12_000,
+    }
+
+
+def test_resume_efficiency_accepts_legacy_zero_defaults_and_rejects_negative_values():
+    assert merge_efficiency(0, 0, 0, 2.5, 100, 200)["elapsed_seconds"] == 2.5
+    with pytest.raises(ValueError, match="nonnegative"):
+        merge_efficiency(-1, 0, 0, 1, 1, 1)
+
+
+def _a6000_args():
+    args = build_parser().parse_args(
+        [
+            "--dataset",
+            "ppi",
+            "--condition",
+            "shared_dynamic_c",
+            "--output-dir",
+            "out",
+            "--hardware-profile",
+            "a6000-48gb",
+        ]
+    )
+    validate_args(args)
+    return args
+
+
+def test_a6000_profile_resolves_real_batches_and_fails_closed_on_mig(monkeypatch):
+    args = _a6000_args()
+    assert (args.batch_size, args.sample_seed_batch_size, args.edge_chunk_size) == (
+        8,
+        2048,
+        131072,
+    )
+    assert args.precision == "bf16" and args.tf32 is True
+    assert args.activation_checkpoint is False and args.sample_prefetch is True
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            name="MIG 1g.10gb", total_memory=10 * 2**30, major=8, minor=0
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (9 * 2**30, 10 * 2**30))
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    with pytest.raises(RuntimeError, match="at least 40 GiB"):
+        validate_hardware_runtime(args, torch.device("cuda:0"))
+
+
+def test_a6000_runtime_records_visible_capacity_and_has_no_fp32_fallback(monkeypatch):
+    args = _a6000_args()
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(
+            name="RTX A6000", total_memory=48 * 2**30, major=8, minor=6
+        ),
+    )
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (44 * 2**30, 48 * 2**30))
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    with pytest.raises(RuntimeError, match="FP32 fallback is forbidden"):
+        validate_hardware_runtime(args, torch.device("cuda:0"))
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    actual = validate_hardware_runtime(args, torch.device("cuda:0"))
+    assert actual["compute_capability"] == [8, 6]
+    assert actual["total_memory_bytes"] == 48 * 2**30
+    assert actual["free_memory_bytes_at_start"] == 44 * 2**30
+    assert actual["graph_batch_size"] == 8
+
+
+def test_gradient_finite_assert_uses_async_primitive(monkeypatch):
+    observed = []
+    monkeypatch.setattr(
+        torch, "_assert_async", lambda predicate, message: observed.append((predicate, message))
+    )
+    require_finite_gradient_norm_async(torch.tensor(3.0))
+    assert len(observed) == 1 and bool(observed[0][0])
+
+
+def test_model_and_operator_hot_paths_have_no_cuda_scalar_reduction_reads():
+    source = inspect.getsource(v5_model) + inspect.getsource(v5_operator)
+    for forbidden in (".item()", ".any()", ".all()", "torch.equal(", "int(batch.max"):
+        assert forbidden not in source
+````
+
+# research/conductance_gat/tests/test_v5_p0_integrity.py
+
+````python
+import copy
+import hashlib
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch.nn import functional as F
+
+from research.conductance_gat.v5.diagnostics import require_finite_tensor
+from research.conductance_gat.v5.model import GraphConditionedConductanceNodeClassifier
+from research.conductance_gat.v5.train import (
+    _canonical_sha256,
+    build_parser,
+    build_resume_identity,
+    configure_phase,
+    make_optimizer,
+    parameter_group,
+    phase_schedule,
+    recover_best_checkpoint,
+    validate_args,
+    validate_resume_identity,
+    validate_selected_checkpoint,
+)
+
+
+def _graph(structure=None):
+    return SimpleNamespace(
+        x=torch.randn(9, 6),
+        y=torch.arange(9) % 3,
+        incidence_edge_index=torch.tensor(
+            [[0, 0, 1, 2, 2, 3, 4, 5, 6, 7], [1, 2, 2, 3, 4, 4, 5, 6, 7, 8]],
+            dtype=torch.long,
+        ),
+        graph_structure=structure,
+    )
+
+
+def _model():
+    return GraphConditionedConductanceNodeClassifier(
+        6,
+        3,
+        hidden_channels=32,
+        layers=1,
+        heads=4,
+        ffn_multiplier=2,
+        dropout=0.0,
+        conductance_mode="dynamic",
+        activation_checkpoint=False,
+    )
+
+
+def _identity():
+    args = build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            "shared_dynamic_c",
+            "--output-dir",
+            "out",
+            "--epochs",
+            "4",
+            "--hidden-channels",
+            "32",
+            "--layers",
+            "1",
+            "--heads",
+            "4",
+            "--no-activation-checkpoint",
+        ]
+    )
+    validate_args(args)
+    return build_resume_identity(
+        args,
+        {"data_sha256": "d" * 64, "dataset": "cora", "split": "official"},
+        phase_schedule(args.epochs, list(args.phase_fractions)),
+        initial_state_sha256="i" * 64,
+        source_sha256={"implementation.py": "s" * 64},
+        runtime_versions={"torch": "fixture"},
+    )
+
+
+def test_nonfinite_logits_and_loss_fail_fast():
+    require_finite_tensor(torch.tensor([0.0, 1.0]), "training logits")
+    with pytest.raises(FloatingPointError, match="training logits"):
+        require_finite_tensor(torch.tensor([float("nan")]), "training logits")
+    with pytest.raises(FloatingPointError, match="training loss"):
+        require_finite_tensor(torch.tensor(float("inf")), "training loss")
+
+
+def test_stale_primary_best_recovers_exact_bound_previous_slot(tmp_path):
+    primary, previous = tmp_path / "best.pt", tmp_path / "best.previous.pt"
+    primary.write_bytes(b"new-uncommitted-best")
+    previous.write_bytes(b"old-last-bound-best")
+    expected = hashlib.sha256(previous.read_bytes()).hexdigest()
+    assert recover_best_checkpoint(primary, previous, expected) == "previous"
+    assert primary.read_bytes() == b"old-last-bound-best"
+    assert hashlib.sha256(primary.read_bytes()).hexdigest() == expected
+
+
+def test_resume_and_selected_best_metadata_reject_mismatches():
+    identity = _identity()
+    digest = _canonical_sha256(identity)
+    validate_resume_identity(identity, identity, digest)
+    stale = copy.deepcopy(identity)
+    stale["cache_sha256"] = "x" * 64
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        validate_resume_identity(stale, identity, _canonical_sha256(stale))
+    selected = {
+        "resume_identity": identity,
+        "resume_identity_sha256": digest,
+        "epoch": 4,
+        "validation": 0.75,
+    }
+    validate_selected_checkpoint(
+        selected,
+        expected_identity=identity,
+        expected_identity_sha256=digest,
+        expected_epoch=4,
+        expected_metric=0.75,
+    )
+    selected["validation"] = 0.7
+    with pytest.raises(ValueError, match="best_metric"):
+        validate_selected_checkpoint(
+            selected,
+            expected_identity=identity,
+            expected_identity_sha256=digest,
+            expected_epoch=4,
+            expected_metric=0.75,
+        )
+
+
+def test_graph_form_context_changes_dynamic_c_and_head_beta():
+    torch.manual_seed(19)
+    network = _model().eval()
+    first = _graph(torch.zeros(1, 6))
+    network(first)
+    first_c = network.operators[0].estimator.last_c.clone()
+    first_beta = network.operators[0].last_beta.clone()
+    second = SimpleNamespace(**vars(first))
+    second.graph_structure = torch.tensor([[8.0, 11.0, 2.0, 1.5, 5.0, 0.2]])
+    network(second)
+    assert not torch.equal(network.operators[0].estimator.last_c, first_c)
+    assert not torch.equal(network.operators[0].last_beta, first_beta)
+
+
+def _one_step(network, optimizer, data, phase, phase_epoch):
+    state = configure_phase(network, phase, phase_epoch)
+    before = {name: value.detach().clone() for name, value in network.named_parameters()}
+    optimizer.zero_grad(set_to_none=True)
+    loss = F.cross_entropy(network(data), data.y)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(
+        (value for value in network.parameters() if value.requires_grad),
+        5.0,
+        error_if_nonfinite=True,
+    )
+    optimizer.step()
+    delta = {name: 0.0 for name in ("backbone", "spatial_w", "beta", "conductance")}
+    for name, value in network.named_parameters():
+        delta[parameter_group(name)] += float((value.detach() - before[name]).abs().sum())
+    return state, delta
+
+
+def test_phase_steps_update_only_the_declared_parameter_coordinate():
+    torch.manual_seed(23)
+    network, data = _model(), _graph()
+    optimizer = make_optimizer(network)
+    calibration, calibration_delta = _one_step(
+        network, optimizer, data, "conductance_calibration", 0
+    )
+    assert calibration["active_parameter_groups"] == ["conductance"]
+    assert calibration_delta["conductance"] > 0
+    assert all(calibration_delta[name] == 0 for name in ("backbone", "spatial_w", "beta"))
+    spatial, spatial_delta = _one_step(network, optimizer, data, "alternating", 1)
+    assert spatial["active_parameter_groups"] == ["backbone", "beta", "spatial_w"]
+    assert spatial_delta["conductance"] == 0
+    assert sum(spatial_delta[name] for name in ("backbone", "spatial_w", "beta")) > 0
+````
+
+# research/conductance_gat/tests/test_v5_sampling_performance.py
+
+````python
+import time
+
+import torch
+
+from research.conductance_gat.v5.sampling import (
+    csr_neighbors,
+    csr_values,
+    induced_physical_edge_ids,
+    physical_edge_id_csr,
+)
+
+
+def naive_neighbors(arcs, rowptr, nodes):
+    return torch.cat([arcs[1, rowptr[node] : rowptr[node + 1]] for node in nodes])
+
+
+def test_vectorized_csr_gather_preserves_row_order_and_candidate_multiset():
+    arcs = torch.tensor([[0, 0, 1, 2, 2], [1, 2, 0, 0, 3]], dtype=torch.long)
+    rowptr = torch.tensor([0, 2, 3, 5, 5], dtype=torch.long)
+    # Include unsorted, duplicate, and empty rows to pin down the exact contract.
+    nodes = torch.tensor([2, 0, 2, 3, 1], dtype=torch.long)
+    expected = naive_neighbors(arcs, rowptr, nodes)
+    actual = csr_neighbors(arcs, rowptr, nodes)
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual.sort().values, expected.sort().values)
+
+
+def test_vectorized_csr_gather_large_frontier_smoke():
+    nodes, degree = 100_000, 8
+    sources = torch.arange(nodes).repeat_interleave(degree)
+    offsets = torch.arange(1, degree + 1).repeat(nodes)
+    destinations = (sources + offsets) % nodes
+    arcs = torch.stack((sources, destinations))
+    rowptr = torch.arange(0, (nodes + 1) * degree, degree)
+    frontier = torch.arange(0, nodes, 2)
+    started = time.perf_counter()
+    result = csr_neighbors(arcs, rowptr, frontier)
+    elapsed = time.perf_counter() - started
+    assert result.shape == (frontier.numel() * degree,)
+    # A generous smoke guard catches accidental reintroduction of per-node Python
+    # work without pretending to be a stable microbenchmark across CI hardware.
+    assert elapsed < 10.0
+
+
+def test_incident_edge_csr_matches_full_scan_induced_edges():
+    incidence = torch.tensor([[0, 0, 1, 2, 2, 4, 5], [1, 2, 2, 3, 4, 5, 6]], dtype=torch.long)
+    edge_ids, rowptr = physical_edge_id_csr(incidence, 7)
+    nodes = torch.tensor([4, 2, 0, 1], dtype=torch.long)
+    actual, candidate_count = induced_physical_edge_ids(incidence, edge_ids, rowptr, nodes, 7)
+    membership = torch.zeros(7, dtype=torch.bool)
+    membership[nodes] = True
+    expected = (membership[incidence[0]] & membership[incidence[1]]).nonzero().flatten()
+    assert torch.equal(actual, expected)
+    assert candidate_count == csr_values(edge_ids, rowptr, nodes.unique()).numel()
+
+
+def test_large_induced_lookup_scales_with_sample_incident_edges():
+    num_nodes, degree = 100_000, 8
+    tail = torch.arange(num_nodes).repeat_interleave(degree)
+    offsets = torch.arange(1, degree + 1).repeat(num_nodes)
+    incidence = torch.stack((tail, (tail + offsets) % num_nodes))
+    edge_ids, rowptr = physical_edge_id_csr(incidence, num_nodes)
+    selected = torch.arange(128, dtype=torch.long)
+    started = time.perf_counter()
+    result, candidate_count = induced_physical_edge_ids(
+        incidence, edge_ids, rowptr, selected, num_nodes
+    )
+    elapsed = time.perf_counter() - started
+    # The lookup touches only the selected CSR rows (two endpoint directions),
+    # rather than scanning all 800k physical edges for every training batch.
+    assert candidate_count <= selected.numel() * 2 * degree
+    assert result.numel() > 0
+    assert elapsed < 10.0
+````
+
 # research/conductance_gat/v2/__init__.py
 
 ````python
@@ -22348,6 +23144,2784 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ````
 
+# research/conductance_gat/v5/__init__.py
+
+````python
+"""Graph-conditioned shared-conductance GNN V5.
+
+The package is intentionally import-light: protocol constants can be inspected
+without importing PyTorch or PyG.  Model/training modules are opt-in imports.
+"""
+````
+
+# research/conductance_gat/v5/diagnostics.py
+
+````python
+"""Focused diagnostics for V5 C/beta learning and checkpoint interventions."""
+
+from __future__ import annotations
+
+import math
+from contextlib import contextmanager
+from typing import Any
+
+import torch
+from torch import Tensor, nn
+
+
+def require_finite_tensor(value: Tensor, label: str) -> None:
+    """Reject non-finite model outputs before they can contaminate metrics/state."""
+
+    if not bool(torch.isfinite(value.detach()).all()):
+        raise FloatingPointError(f"nonfinite {label}")
+
+
+def tensor_moments(value: Tensor | None) -> dict[str, float | int | None]:
+    if value is None or not value.numel():
+        return {"count": 0, "mean": None, "std": None, "min": None, "max": None, "cv": None}
+    flat = value.detach().double().flatten()
+    mean, std = float(flat.mean()), float(flat.std(correction=0))
+    return {
+        "count": flat.numel(),
+        "mean": mean,
+        "std": std,
+        "min": float(flat.min()),
+        "max": float(flat.max()),
+        "cv": std / abs(mean) if mean else None,
+    }
+
+
+def parameter_norm(parameters, *, gradient: bool = False) -> float | None:
+    values = []
+    for parameter in parameters:
+        value = parameter.grad if gradient else parameter
+        if value is not None:
+            values.append(value.detach().double().square().sum())
+    return float(torch.stack(values).sum().sqrt()) if values else None
+
+
+def layer_diagnostics(model: nn.Module, *, gradients: bool = False) -> list[dict[str, Any]]:
+    rows = []
+    for layer, operator in enumerate(model.operators):
+        estimator_parameters = list(operator.estimator.parameters())
+        beta_parameters = list(operator.beta_estimator.parameters())
+        rows.append(
+            {
+                "layer": layer,
+                "conductance": tensor_moments(operator.estimator.last_c),
+                "log_conductance": tensor_moments(operator.estimator.last_log_c),
+                "score": tensor_moments(operator.estimator.last_scores),
+                "beta": tensor_moments(operator.last_beta),
+                "sampling_correction": tensor_moments(operator.last_sampling_correction),
+                "conductance_parameter_norm": parameter_norm(estimator_parameters),
+                "conductance_gradient_norm": (
+                    parameter_norm(estimator_parameters, gradient=True) if gradients else None
+                ),
+                "beta_parameter_norm": parameter_norm(beta_parameters),
+                "beta_gradient_norm": (
+                    parameter_norm(beta_parameters, gradient=True) if gradients else None
+                ),
+            }
+        )
+    return rows
+
+
+def require_first_step_conductance_gradient(model: nn.Module) -> dict[str, Any]:
+    """Fail if V4-style identity initialization starves C on its first active step."""
+
+    if model.conductance_mode != "dynamic":
+        return {"applicable": False, "passed": True, "layers": []}
+    rows = []
+    for layer, operator in enumerate(model.operators):
+        named = list(operator.estimator.named_parameters())
+        total = parameter_norm((value for _, value in named), gradient=True)
+        upstream = parameter_norm(
+            (value for name, value in named if "score_network.4" not in name), gradient=True
+        )
+        passed = total is not None and total > 0 and upstream is not None and upstream > 0
+        rows.append(
+            {
+                "layer": layer,
+                "total_gradient_norm": total,
+                "upstream_gradient_norm": upstream,
+                "passed": passed,
+            }
+        )
+    if not all(row["passed"] for row in rows):
+        raise RuntimeError("V5 first active-C backward has a zero conductance gradient path")
+    return {"applicable": True, "passed": True, "layers": rows}
+
+
+@contextmanager
+def conductance_intervention(model: nn.Module, mode: str | None):
+    previous = [operator.estimator.override for operator in model.operators]
+    try:
+        for operator in model.operators:
+            operator.estimator.override = mode
+        yield
+    finally:
+        for operator, value in zip(model.operators, previous, strict=True):
+            operator.estimator.override = value
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    source,
+    indices: Tensor | None,
+    *,
+    device: torch.device,
+    precision: str = "fp32",
+) -> dict[str, Any]:
+    model.eval()
+    if indices is not None:
+        # PyG Data.to mutates storage. Clone so sampled training keeps its
+        # canonical full graph on CPU after full-graph validation.
+        graph = source.clone().to(device)
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=precision == "bf16",
+        ):
+            logits = model(graph)
+        require_finite_tensor(logits, "validation logits")
+        selected = logits.index_select(0, indices.to(device))
+        target = graph.y.index_select(0, indices.to(device))
+        metric = float((selected.argmax(dim=-1) == target).float().mean())
+        count = int(target.numel())
+    else:
+        totals = torch.zeros(5, dtype=torch.long, device=device)
+        for graph in source:
+            graph._v5_num_graphs = int(graph.num_graphs)
+            graph = graph.to(device, non_blocking=True)
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.bfloat16,
+                enabled=precision == "bf16",
+            ):
+                logits = model(graph)
+            prediction = logits > 0
+            target = graph.y.bool()
+            totals += torch.stack(
+                (
+                    (prediction & target).sum(),
+                    (prediction & ~target).sum(),
+                    (~prediction & target).sum(),
+                    target.new_tensor(target.numel(), dtype=torch.long),
+                    torch.isfinite(logits).all().long(),
+                )
+            )
+        tp, fp, fn, count, finite_batches = (int(value) for value in totals.cpu().tolist())
+        if finite_batches != len(source):
+            raise FloatingPointError("nonfinite validation logits")
+        denominator = 2 * tp + fp + fn
+        metric = 2 * tp / denominator if denominator else 0.0
+    if not math.isfinite(metric):
+        raise FloatingPointError("nonfinite validation metric")
+    return {"metric": metric, "label_count": count, "layers": layer_diagnostics(model)}
+
+
+def selected_checkpoint_interventions(
+    model: nn.Module,
+    source,
+    indices: Tensor | None,
+    *,
+    device: torch.device,
+    precision: str = "fp32",
+) -> dict[str, Any]:
+    result = {}
+    for name, override in (
+        ("learned", None),
+        ("c_one", "ones"),
+        ("mean_c", "mean"),
+        ("shuffled_c", "shuffle"),
+    ):
+        with conductance_intervention(model, override):
+            result[name] = evaluate(model, source, indices, device=device, precision=precision)
+    baseline = result["learned"]["metric"]
+    for value in result.values():
+        value["delta_from_learned"] = value["metric"] - baseline
+    return result
+````
+
+# research/conductance_gat/v5/model.py
+
+````python
+"""Research-scale graph-conditioned shared-conductance network (V5)."""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from .operator import graph_weighted_mean, shared_head_diffusion
+from .protocol import (
+    DEFAULT_BETA_INITIAL,
+    DEFAULT_BETA_PARAMETERIZATION,
+    beta_configuration,
+)
+
+
+def _positive_int(name: str, value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+
+
+def _graph_node_mean(values: Tensor, node_graph: Tensor, num_graphs: int) -> Tensor:
+    sums = values.new_zeros((num_graphs, values.shape[1])).index_add(0, node_graph, values)
+    counts = values.new_zeros(num_graphs).index_add(0, node_graph, values.new_ones(values.shape[0]))
+    return sums / counts.clamp_min(1)[:, None]
+
+
+def _node_degree(state: Tensor, incidence: Tensor) -> Tensor:
+    tail, head = incidence
+    ones = state.new_ones(tail.numel())
+    return state.new_zeros(state.shape[0]).index_add(0, tail, ones).index_add(0, head, ones)
+
+
+def graph_context_features(
+    state: Tensor,
+    incidence: Tensor,
+    node_graph: Tensor,
+    num_graphs: int,
+    full_degree: Tensor | None = None,
+    graph_structure: Tensor | None = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Pool clean hidden state and local/original structural statistics."""
+
+    sample_degree = _node_degree(state, incidence)
+    if full_degree is None:
+        full_degree = sample_degree
+    if full_degree.shape != sample_degree.shape or full_degree.device != state.device:
+        raise ValueError("full_degree must contain one same-device value per node")
+    full_degree = full_degree.to(state.dtype)
+    mean = _graph_node_mean(state, node_graph, num_graphs)
+    second = _graph_node_mean(state.square(), node_graph, num_graphs)
+    std = (second - mean.square()).clamp_min(0).sqrt()
+    coverage = sample_degree / full_degree.clamp_min(1)
+    coverage_mean = _graph_node_mean(coverage[:, None], node_graph, num_graphs)
+    coverage_std = (
+        (
+            _graph_node_mean(coverage.square()[:, None], node_graph, num_graphs)
+            - coverage_mean.square()
+        )
+        .clamp_min(0)
+        .sqrt()
+    )
+    if graph_structure is None:
+        node_count = state.new_zeros(num_graphs).index_add(
+            0, node_graph, state.new_ones(state.shape[0])
+        )
+        edge_graph = node_graph[incidence[0]]
+        edge_count = state.new_zeros(num_graphs).index_add(
+            0, edge_graph, state.new_ones(edge_graph.numel())
+        )
+        log_degree = full_degree.log1p()[:, None]
+        degree_mean = _graph_node_mean(log_degree, node_graph, num_graphs)
+        degree_std = (
+            (_graph_node_mean(log_degree.square(), node_graph, num_graphs) - degree_mean.square())
+            .clamp_min(0)
+            .sqrt()
+        )
+        density = 2 * edge_count / (node_count * (node_count - 1)).clamp_min(1)
+        graph_structure = torch.stack(
+            (
+                node_count.log1p(),
+                edge_count.log1p(),
+                degree_mean[:, 0],
+                degree_std[:, 0],
+                edge_count / node_count.clamp_min(1),
+                density,
+            ),
+            dim=1,
+        )
+    if graph_structure.shape != (num_graphs, 6) or graph_structure.device != state.device:
+        raise ValueError("graph_structure must be a same-device num_graphs x 6 tensor")
+    return (
+        torch.cat((mean, std, graph_structure.to(state.dtype), coverage_mean, coverage_std), dim=1),
+        sample_degree,
+        full_degree,
+    )
+
+
+class GraphConditionedConductance(nn.Module):
+    """One symmetric positive relative-C field shared by every feature head."""
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        mode: str = "dynamic",
+        score_channels: int | None = None,
+        max_log_conductance: float = 2.0,
+        initial_score_std: float = 1.0e-3,
+        edge_chunk_size: int = 65536,
+    ) -> None:
+        super().__init__()
+        _positive_int("channels", channels)
+        if mode not in {"dynamic", "fixed_one"}:
+            raise ValueError(f"unsupported conductance mode: {mode}")
+        score_channels = score_channels or max(32, min(128, channels // 2))
+        _positive_int("score_channels", score_channels)
+        if not math.isfinite(max_log_conductance) or max_log_conductance <= 0:
+            raise ValueError("max_log_conductance must be finite and positive")
+        if not math.isfinite(initial_score_std) or initial_score_std <= 0:
+            raise ValueError("initial_score_std must be finite and positive")
+        _positive_int("edge_chunk_size", edge_chunk_size)
+        self.channels = channels
+        self.mode = mode
+        self.max_log_conductance = float(max_log_conductance)
+        self.edge_chunk_size = edge_chunk_size
+        self.node_projection = nn.Linear(channels, score_channels)
+        self.context_projection = nn.Linear(2 * channels + 8, score_channels)
+        edge_width = 4 * score_channels + 8
+        self.score_norm = nn.LayerNorm(edge_width)
+        self.score_network = nn.Sequential(
+            nn.Linear(edge_width, 2 * score_channels),
+            nn.SiLU(),
+            nn.Linear(2 * score_channels, score_channels),
+            nn.SiLU(),
+            nn.Linear(score_channels, 1, bias=False),
+        )
+        # Nonzero identity-near init fixes V4's first-step dead-gradient path.
+        nn.init.normal_(self.score_network[-1].weight, 0.0, initial_score_std)
+        self.last_scores: Tensor | None = None
+        self.last_log_c: Tensor | None = None
+        self.last_c: Tensor | None = None
+        self.override: str | None = None
+        if mode == "fixed_one":
+            self.requires_grad_(False)
+
+    def _score_chunk(
+        self,
+        projected: Tensor,
+        context: Tensor,
+        tail: Tensor,
+        head: Tensor,
+        sample_degree: Tensor,
+        full_degree: Tensor,
+        edge_graph: Tensor,
+    ) -> Tensor:
+        left, right = projected[tail], projected[head]
+        sample_ratio = (
+            torch.stack(
+                (
+                    sample_degree[tail] / full_degree[tail].clamp_min(1),
+                    sample_degree[head] / full_degree[head].clamp_min(1),
+                ),
+                dim=1,
+            )
+            .sort(dim=1)
+            .values
+        )
+        inv_full = (
+            torch.stack(
+                (
+                    torch.where(full_degree[tail] > 0, full_degree[tail].reciprocal(), 0),
+                    torch.where(full_degree[head] > 0, full_degree[head].reciprocal(), 0),
+                ),
+                dim=1,
+            )
+            .sort(dim=1)
+            .values
+        )
+        local = torch.cat(
+            (
+                torch.stack(
+                    (
+                        (sample_degree[tail] + sample_degree[head]).log1p(),
+                        (sample_degree[tail] - sample_degree[head]).abs().log1p(),
+                        (full_degree[tail] + full_degree[head]).log1p(),
+                        (full_degree[tail] - full_degree[head]).abs().log1p(),
+                    ),
+                    dim=1,
+                ),
+                sample_ratio,
+                inv_full,
+            ),
+            dim=1,
+        )
+        features = torch.cat(
+            (
+                left + right,
+                (left - right).abs(),
+                left * right,
+                context[edge_graph],
+                local,
+            ),
+            dim=1,
+        )
+        return self.score_network(self.score_norm(features)).squeeze(-1)
+
+    def forward(
+        self,
+        state: Tensor,
+        incidence: Tensor,
+        node_graph: Tensor,
+        num_graphs: int,
+        *,
+        graph_context: Tensor,
+        sample_degree: Tensor,
+        full_degree: Tensor,
+        edge_normalization_weight: Tensor | None = None,
+    ) -> Tensor:
+        tail, head = incidence
+        edge_graph = node_graph[tail]
+        if self.mode == "fixed_one" or self.override == "ones":
+            c = state.new_ones(tail.numel())
+            self.last_scores = state.new_zeros(tail.numel())
+            self.last_log_c = state.new_zeros(tail.numel())
+            self.last_c = c.detach()
+            return c
+        projected = F.silu(self.node_projection(state))
+        context = F.silu(self.context_projection(graph_context))
+        scores = (
+            torch.cat(
+                [
+                    self._score_chunk(
+                        projected,
+                        context,
+                        tail[start : start + self.edge_chunk_size],
+                        head[start : start + self.edge_chunk_size],
+                        sample_degree,
+                        full_degree,
+                        edge_graph[start : start + self.edge_chunk_size],
+                    )
+                    for start in range(0, tail.numel(), self.edge_chunk_size)
+                ]
+            )
+            if tail.numel()
+            else state.new_empty(0)
+        )
+        if edge_normalization_weight is None:
+            edge_normalization_weight = torch.ones_like(scores)
+        centered = (
+            scores
+            - graph_weighted_mean(scores, edge_graph, num_graphs, edge_normalization_weight)[
+                edge_graph
+            ]
+        )
+        log_c = self.max_log_conductance * torch.tanh(centered / self.max_log_conductance)
+        raw_c = log_c.exp()
+        c = raw_c / graph_weighted_mean(raw_c, edge_graph, num_graphs, edge_normalization_weight)[
+            edge_graph
+        ].clamp_min(torch.finfo(state.dtype).tiny)
+        if self.override == "mean":
+            c = graph_weighted_mean(c, edge_graph, num_graphs, edge_normalization_weight)[
+                edge_graph
+            ]
+        elif self.override == "shuffle" and c.numel() > 1:
+            replacement = c.clone()
+            for graph_id in range(num_graphs):
+                selected = (edge_graph == graph_id).nonzero(as_tuple=False).flatten()
+                replacement[selected] = c[selected.flip(0)]
+            c = replacement
+        elif self.override not in {None, "mean", "shuffle"}:
+            raise ValueError(f"unsupported C intervention: {self.override}")
+        self.last_scores, self.last_log_c, self.last_c = scores.detach(), log_c.detach(), c.detach()
+        return c
+
+
+class GraphConditionedBeta(nn.Module):
+    """Predict a graph-specific diffusion magnitude for each W head."""
+
+    def __init__(
+        self,
+        channels: int,
+        heads: int,
+        *,
+        beta_parameterization: str = DEFAULT_BETA_PARAMETERIZATION,
+        beta_initial: float = DEFAULT_BETA_INITIAL,
+        beta_min: float | None = None,
+        beta_max: float | None = None,
+    ) -> None:
+        super().__init__()
+        configuration = beta_configuration(beta_parameterization, beta_initial, beta_min, beta_max)
+        width = max(32, min(128, channels // 2))
+        self.network = nn.Sequential(
+            nn.LayerNorm(2 * channels + 8),
+            nn.Linear(2 * channels + 8, width),
+            nn.SiLU(),
+            nn.Linear(width, heads),
+        )
+        nn.init.normal_(self.network[-1].weight, 0.0, 1.0e-3)
+        initial_fraction = float(configuration["beta_initial"])
+        if beta_parameterization == "margin_sigmoid":
+            initial_fraction = (initial_fraction - float(configuration["beta_min"])) / (
+                float(configuration["beta_max"]) - float(configuration["beta_min"])
+            )
+        initial_logit = math.log(initial_fraction / (1 - initial_fraction))
+        nn.init.constant_(self.network[-1].bias, initial_logit)
+        self.beta_parameterization = beta_parameterization
+        self.beta_initial = float(configuration["beta_initial"])
+        self.beta_min = float(configuration["beta_min"]) if "beta_min" in configuration else None
+        self.beta_max = float(configuration["beta_max"]) if "beta_max" in configuration else None
+
+    def forward(self, context: Tensor) -> Tensor:
+        beta = self.network(context).sigmoid()
+        if self.beta_parameterization == "margin_sigmoid":
+            beta = self.beta_min + (self.beta_max - self.beta_min) * beta
+        return beta
+
+
+class SharedConductanceMultihead(nn.Module):
+    """One shared C with head-specific spatial W and graph-conditioned beta."""
+
+    def __init__(
+        self,
+        channels: int,
+        heads: int,
+        *,
+        conductance_mode: str,
+        max_log_conductance: float,
+        beta_parameterization: str,
+        beta_initial: float,
+        beta_min: float | None,
+        beta_max: float | None,
+        edge_chunk_size: int,
+    ) -> None:
+        super().__init__()
+        if channels % heads:
+            raise ValueError("hidden channels must be divisible by heads")
+        self.channels, self.heads, self.head_width = channels, heads, channels // heads
+        self.conductance_mode = conductance_mode
+        self.estimator = GraphConditionedConductance(
+            channels,
+            mode=conductance_mode,
+            max_log_conductance=max_log_conductance,
+            edge_chunk_size=edge_chunk_size,
+        )
+        self.value_weight = nn.Parameter(torch.empty(heads, channels, self.head_width))
+        nn.init.xavier_uniform_(self.value_weight.reshape(channels, channels))
+        self.output_projection = nn.Linear(channels, channels, bias=False)
+        self.beta_estimator = GraphConditionedBeta(
+            channels,
+            heads,
+            beta_parameterization=beta_parameterization,
+            beta_initial=beta_initial,
+            beta_min=beta_min,
+            beta_max=beta_max,
+        )
+        self.edge_chunk_size = edge_chunk_size
+        self.last_beta: Tensor | None = None
+        self.last_sampling_correction: Tensor | None = None
+
+    def forward(
+        self,
+        state: Tensor,
+        incidence: Tensor,
+        node_graph: Tensor,
+        num_graphs: int,
+        *,
+        full_degree: Tensor | None,
+        graph_structure: Tensor | None,
+        edge_normalization_weight: Tensor | None,
+        sampling_correction: Tensor | None,
+    ) -> Tensor:
+        # Dynamic-C geometry stays FP32 under an outer BF16 autocast region.
+        # This includes its score network, centering/exp gauge and beta sigmoid.
+        with torch.autocast(device_type=state.device.type, enabled=False):
+            fp32_state = state.float()
+            context, sample_degree, full_degree = graph_context_features(
+                fp32_state, incidence, node_graph, num_graphs, full_degree, graph_structure
+            )
+            c = self.estimator(
+                fp32_state,
+                incidence,
+                node_graph,
+                num_graphs,
+                graph_context=context,
+                sample_degree=sample_degree,
+                full_degree=full_degree,
+                edge_normalization_weight=edge_normalization_weight,
+            )
+            beta = self.beta_estimator(context)
+        value = torch.einsum("nd,hdk->nhk", state, self.value_weight)
+        diffused = shared_head_diffusion(
+            value,
+            c,
+            incidence,
+            node_graph,
+            beta,
+            sampling_correction=sampling_correction,
+            edge_chunk_size=self.edge_chunk_size,
+        )
+        self.last_beta = beta.detach()
+        self.last_sampling_correction = (
+            None if sampling_correction is None else sampling_correction.detach()
+        )
+        return self.output_projection(diffused.reshape(state.shape[0], self.channels))
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, channels: int, multiplier: int) -> None:
+        super().__init__()
+        inner = channels * multiplier
+        self.input_projection = nn.Linear(channels, 2 * inner)
+        self.output_projection = nn.Linear(inner, channels)
+
+    def forward(self, state: Tensor) -> Tensor:
+        gate, value = self.input_projection(state).chunk(2, dim=-1)
+        return self.output_projection(F.silu(gate) * value)
+
+
+class ConductanceBlock(nn.Module):
+    """Pre-norm operator residual followed by a pre-norm SwiGLU residual."""
+
+    def __init__(
+        self,
+        channels: int,
+        heads: int,
+        ffn_multiplier: int,
+        dropout: float,
+        **operator_kwargs: Any,
+    ) -> None:
+        super().__init__()
+        self.operator_norm = nn.LayerNorm(channels)
+        self.operator = SharedConductanceMultihead(channels, heads, **operator_kwargs)
+        self.ffn_norm = nn.LayerNorm(channels)
+        self.ffn = SwiGLU(channels, ffn_multiplier)
+        self.dropout = float(dropout)
+
+    def forward(self, state: Tensor, *args: Any, **kwargs: Any) -> Tensor:
+        clean = self.operator_norm(state)
+        state = state + F.dropout(
+            self.operator(clean, *args, **kwargs), self.dropout, self.training
+        )
+        return state + F.dropout(self.ffn(self.ffn_norm(state)), self.dropout, self.training)
+
+
+class GraphConditionedConductanceNodeClassifier(nn.Module):
+    """Deep V5 classifier shared by fixed-C and graph-conditioned-C arms."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        classes: int,
+        *,
+        hidden_channels: int = 256,
+        layers: int = 8,
+        heads: int = 8,
+        ffn_multiplier: int = 4,
+        dropout: float = 0.2,
+        conductance_mode: str = "dynamic",
+        max_log_conductance: float = 2.0,
+        beta_parameterization: str = DEFAULT_BETA_PARAMETERIZATION,
+        beta_initial: float = DEFAULT_BETA_INITIAL,
+        beta_min: float | None = None,
+        beta_max: float | None = None,
+        edge_chunk_size: int = 65536,
+        activation_checkpoint: bool = True,
+    ) -> None:
+        super().__init__()
+        for name, value in (
+            ("in_channels", in_channels),
+            ("classes", classes),
+            ("hidden_channels", hidden_channels),
+            ("layers", layers),
+            ("heads", heads),
+            ("ffn_multiplier", ffn_multiplier),
+            ("edge_chunk_size", edge_chunk_size),
+        ):
+            _positive_int(name, value)
+        if hidden_channels % heads:
+            raise ValueError("hidden_channels must be divisible by heads")
+        if (
+            not isinstance(dropout, (int, float))
+            or isinstance(dropout, bool)
+            or not 0 <= dropout < 1
+        ):
+            raise ValueError("dropout must be in [0, 1)")
+        self.in_channels, self.classes = in_channels, classes
+        self.hidden_channels, self.layers, self.heads = hidden_channels, layers, heads
+        self.ffn_multiplier, self.dropout = ffn_multiplier, float(dropout)
+        self.conductance_mode = conductance_mode
+        self.activation_checkpoint = bool(activation_checkpoint)
+        self.input_norm = nn.LayerNorm(in_channels)
+        self.encoder = nn.Linear(in_channels, hidden_channels)
+        operator_kwargs = {
+            "conductance_mode": conductance_mode,
+            "max_log_conductance": max_log_conductance,
+            "beta_parameterization": beta_parameterization,
+            "beta_initial": beta_initial,
+            "beta_min": beta_min,
+            "beta_max": beta_max,
+            "edge_chunk_size": edge_chunk_size,
+        }
+        self.blocks = nn.ModuleList(
+            ConductanceBlock(
+                hidden_channels, heads, ffn_multiplier, self.dropout, **operator_kwargs
+            )
+            for _ in range(layers)
+        )
+        self.final_norm = nn.LayerNorm(hidden_channels)
+        self.decoder = nn.Linear(hidden_channels, classes)
+
+    @property
+    def operators(self) -> list[SharedConductanceMultihead]:
+        return [block.operator for block in self.blocks]
+
+    def forward(self, graph: Any) -> Tensor:
+        x, incidence = graph.x, graph.incidence_edge_index
+        if x.ndim != 2 or x.shape[1] != self.in_channels or not x.is_floating_point():
+            raise ValueError("graph.x must be a floating node matrix with configured width")
+        if incidence.dtype != torch.long or incidence.ndim != 2 or incidence.shape[0] != 2:
+            raise ValueError("incidence_edge_index must be a 2 x E int64 tensor")
+        if incidence.device != x.device:
+            raise ValueError("graph state and incidence must share a device")
+        batch = getattr(graph, "batch", None)
+        if batch is None:
+            batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            num_graphs = 1
+        else:
+            if (
+                batch.dtype != torch.long
+                or batch.shape != (x.shape[0],)
+                or batch.device != x.device
+            ):
+                raise ValueError("batch must contain one graph index per node")
+            num_graphs = getattr(graph, "_v5_num_graphs", None)
+            if isinstance(num_graphs, bool) or not isinstance(num_graphs, int) or num_graphs < 1:
+                raise ValueError("batched graphs must carry a positive CPU-declared _v5_num_graphs")
+        h = self.encoder(self.input_norm(x))
+        kwargs = {
+            "full_degree": getattr(graph, "full_degree", None),
+            "graph_structure": getattr(graph, "graph_structure", None),
+            "edge_normalization_weight": getattr(graph, "edge_normalization_weight", None),
+            "sampling_correction": getattr(graph, "sampling_correction", None),
+        }
+        for block in self.blocks:
+            if self.activation_checkpoint and self.training and torch.is_grad_enabled():
+                from torch.utils.checkpoint import checkpoint
+
+                h = checkpoint(
+                    lambda value, layer=block: layer(value, incidence, batch, num_graphs, **kwargs),
+                    h,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                h = block(h, incidence, batch, num_graphs, **kwargs)
+        return self.decoder(self.final_norm(h))
+
+
+ConductanceV5 = GraphConditionedConductanceNodeClassifier
+V5NodeClassifier = GraphConditionedConductanceNodeClassifier
+````
+
+# research/conductance_gat/v5/operator.py
+
+````python
+"""Sparse shared-conductance, multi-head diffusion for V5."""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor
+
+
+def graph_weighted_mean(
+    values: Tensor,
+    graph_index: Tensor,
+    num_graphs: int,
+    weights: Tensor | None = None,
+) -> Tensor:
+    """One weighted scalar mean per graph; empty graphs map to zero."""
+
+    if values.ndim != 1 or graph_index.shape != values.shape or graph_index.dtype != torch.long:
+        raise ValueError("values and graph_index must be aligned one-dimensional tensors")
+    if graph_index.device != values.device:
+        raise ValueError("values and graph_index must share a device")
+    if isinstance(num_graphs, bool) or not isinstance(num_graphs, int) or num_graphs < 0:
+        raise ValueError("num_graphs must be a nonnegative integer")
+    if weights is None:
+        weights = torch.ones_like(values)
+    if (
+        weights.shape != values.shape
+        or weights.dtype != values.dtype
+        or weights.device != values.device
+    ):
+        raise ValueError("weights must match values")
+    numerator = values.new_zeros(num_graphs).index_add(0, graph_index, values * weights)
+    denominator = values.new_zeros(num_graphs).index_add(0, graph_index, weights)
+    return numerator / denominator.clamp_min(torch.finfo(values.dtype).tiny)
+
+
+def weighted_degree(
+    edge_weight: Tensor,
+    incidence: Tensor,
+    num_nodes: int,
+    *,
+    edge_chunk_size: int = 65536,
+) -> Tensor:
+    """Weighted undirected node degree without constructing an adjacency."""
+
+    degree = edge_weight.new_zeros(num_nodes)
+    for start in range(0, edge_weight.numel(), edge_chunk_size):
+        stop = start + edge_chunk_size
+        tail, head = incidence[:, start:stop]
+        values = edge_weight[start:stop]
+        degree.index_add_(0, tail, values)
+        degree.index_add_(0, head, values)
+    return degree
+
+
+def shared_head_diffusion(
+    message: Tensor,
+    relative_c: Tensor,
+    incidence: Tensor,
+    node_graph: Tensor,
+    beta: Tensor,
+    *,
+    sampling_correction: Tensor | None = None,
+    edge_chunk_size: int = 65536,
+) -> Tensor:
+    """Diffuse ``N x heads x width`` messages with one C shared by all heads.
+
+    For head h this is ``V_h + beta_h(G) * (P_C V_h - V_h)`` on
+    nonisolated nodes. Isolates retain V exactly. ``sampling_correction`` is a
+    known importance weight, not part of learned C.
+    """
+
+    if message.ndim != 3 or not message.is_floating_point():
+        raise ValueError("message must be an N x heads x width floating tensor")
+    if incidence.dtype != torch.long or incidence.ndim != 2 or incidence.shape[0] != 2:
+        raise ValueError("incidence must be a 2 x E int64 tensor")
+    if relative_c.ndim != 1 or relative_c.shape[0] != incidence.shape[1]:
+        raise ValueError("relative_c must contain one value per physical edge")
+    if not relative_c.is_floating_point():
+        raise ValueError("relative_c must be floating point")
+    if node_graph.dtype != torch.long or node_graph.shape != (message.shape[0],):
+        raise ValueError("node_graph must contain one graph index per node")
+    if beta.ndim != 2 or beta.shape[1] != message.shape[1]:
+        raise ValueError("beta must have shape num_graphs x heads")
+    if any(value.device != message.device for value in (relative_c, incidence, node_graph, beta)):
+        raise ValueError("all diffusion inputs must share a device")
+    if sampling_correction is None:
+        sampling_correction = torch.ones_like(relative_c)
+    if (
+        sampling_correction.shape != relative_c.shape
+        or sampling_correction.dtype != relative_c.dtype
+        or sampling_correction.device != message.device
+    ):
+        raise ValueError("sampling_correction must match relative_c")
+    if (
+        isinstance(edge_chunk_size, bool)
+        or not isinstance(edge_chunk_size, int)
+        or edge_chunk_size < 1
+    ):
+        raise ValueError("edge_chunk_size must be a positive integer")
+
+    # FP32 island for the conductance geometry.  Dense encoder/W/FFN kernels
+    # may run under BF16 autocast, but centering, weighted degree and diffusion
+    # do not. Cache structure is validated once before training; CUDA boolean
+    # reductions here would otherwise serialize every layer and every batch.
+    compute_dtype = (
+        torch.float32 if message.dtype in {torch.float16, torch.bfloat16} else message.dtype
+    )
+    message_compute = message.to(compute_dtype)
+    effective = relative_c.to(compute_dtype) * sampling_correction.to(compute_dtype)
+    degree = weighted_degree(
+        effective, incidence, message.shape[0], edge_chunk_size=edge_chunk_size
+    )
+    active = degree > 0
+    inverse = torch.where(active, degree.rsqrt(), torch.zeros_like(degree))
+    propagated = torch.zeros_like(message_compute)
+    for start in range(0, effective.numel(), edge_chunk_size):
+        stop = start + edge_chunk_size
+        tail, head = incidence[:, start:stop]
+        weight = effective[start:stop] * inverse[tail] * inverse[head]
+        propagated.index_add_(0, tail, weight[:, None, None] * message_compute[head])
+        propagated.index_add_(0, head, weight[:, None, None] * message_compute[tail])
+    node_beta = beta.to(compute_dtype)[node_graph].unsqueeze(-1)
+    output = message_compute + node_beta * (propagated - active[:, None, None] * message_compute)
+    return output.to(message.dtype)
+````
+
+# research/conductance_gat/v5/protocol.py
+
+````python
+"""Protocol constants for graph-conditioned shared-conductance V5."""
+
+from __future__ import annotations
+
+import math
+
+SUITE = "conductance_graph_conditioned_v5"
+PARAMETERIZATION = "shared_dynamic_relative_c_with_multihead_w_and_graph_beta"
+BETA_PARAMETERIZATIONS = ("sigmoid", "margin_sigmoid")
+DEFAULT_BETA_PARAMETERIZATION = "sigmoid"
+DEFAULT_BETA_INITIAL = 0.1
+DATASETS = ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv")
+DEFAULT_DATASETS = DATASETS
+METRIC_BY_DATASET = {
+    dataset: "micro_f1" if dataset == "ppi" else "accuracy" for dataset in DATASETS
+}
+BATCH_SIZE_BY_DATASET = {dataset: 2 if dataset == "ppi" else 1 for dataset in DATASETS}
+DEFAULT_EDGE_CHUNK_SIZE = 65536
+
+
+def beta_configuration(
+    beta_parameterization: str = DEFAULT_BETA_PARAMETERIZATION,
+    beta_initial: float = DEFAULT_BETA_INITIAL,
+    beta_min: float | None = None,
+    beta_max: float | None = None,
+) -> dict[str, float | str]:
+    """Validate and canonicalize the graph-beta parameterization contract."""
+
+    if beta_parameterization not in BETA_PARAMETERIZATIONS:
+        raise ValueError(f"unsupported beta parameterization: {beta_parameterization}")
+    if (
+        isinstance(beta_initial, bool)
+        or not isinstance(beta_initial, (int, float))
+        or not math.isfinite(beta_initial)
+    ):
+        raise ValueError("beta_initial must be finite")
+    initial = float(beta_initial)
+    if beta_parameterization == "sigmoid":
+        if beta_min is not None or beta_max is not None:
+            raise ValueError("beta_min/beta_max are only valid for margin_sigmoid")
+        if not 0 < initial < 1:
+            raise ValueError("sigmoid beta_initial must be strictly inside (0, 1)")
+        return {
+            "beta_parameterization": beta_parameterization,
+            "beta_initial": initial,
+        }
+    if beta_min is None or beta_max is None:
+        raise ValueError("margin_sigmoid requires explicit beta_min and beta_max")
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+        for value in (beta_min, beta_max)
+    ):
+        raise ValueError("beta_min and beta_max must be finite")
+    lower, upper = float(beta_min), float(beta_max)
+    if not 0 <= lower < initial < upper <= 1:
+        raise ValueError("margin_sigmoid beta bounds must satisfy 0 <= min < initial < max <= 1")
+    return {
+        "beta_parameterization": beta_parameterization,
+        "beta_initial": initial,
+        "beta_min": lower,
+        "beta_max": upper,
+    }
+
+
+# Hardware profiles leave the V5 architecture unchanged but alter the numeric
+# execution and optimization recipe (including precision and real batch/sample
+# sizes), so metrics must not be compared across profiles.  The A6000 profile
+# is opt-in and is checked against the *visible* device at child start so it
+# cannot accidentally be used on a 10 GiB MIG slice.
+HARDWARE_PROFILES = {
+    "portable": {
+        "precision": "fp32",
+        "tf32": False,
+        "activation_checkpoint": True,
+        "edge_chunk_size": DEFAULT_EDGE_CHUNK_SIZE,
+        "sample_seed_batch_size": 1024,
+        "ppi_batch_size": 2,
+        "sample_prefetch": False,
+        "pin_memory": True,
+        "minimum_total_memory_gib": 0.0,
+        "minimum_free_memory_gib": 0.0,
+        "minimum_compute_capability_major": 0,
+    },
+    "a6000-48gb": {
+        "precision": "bf16",
+        "tf32": True,
+        "activation_checkpoint": False,
+        "edge_chunk_size": 131072,
+        "sample_seed_batch_size": 2048,
+        "ppi_batch_size": 8,
+        "sample_prefetch": True,
+        "pin_memory": True,
+        "minimum_total_memory_gib": 40.0,
+        "minimum_free_memory_gib": 32.0,
+        "minimum_compute_capability_major": 8,
+    },
+}
+
+# Research-scale defaults; V1--V4's 64-wide/two-layer settings remain mechanism probes.
+SCALE_PROFILES = {
+    "reference": {
+        "hidden_channels": 256,
+        "layers": 8,
+        "heads": 8,
+        "ffn_multiplier": 4,
+        "dropout": 0.2,
+    },
+    "large": {
+        "hidden_channels": 384,
+        "layers": 12,
+        "heads": 8,
+        "ffn_multiplier": 4,
+        "dropout": 0.2,
+    },
+}
+COMMON = {
+    **SCALE_PROFILES["reference"],
+    "lr": 0.0005,
+    "conductance_lr_multiplier": 1.0,
+    "beta_lr_multiplier": 1.0,
+    "weight_decay": 0.01,
+    "conductance_weight_decay": 0.0,
+    "scalar_weight_decay": 0.0,
+    "optimizer": "AdamW",
+    "max_log_conductance": 2.0,
+    "beta_parameterization": DEFAULT_BETA_PARAMETERIZATION,
+    "beta_initial": DEFAULT_BETA_INITIAL,
+    "amp": False,
+    "compile": False,
+    "gradient_clip_norm": 5.0,
+}
+
+# W_h, graph-conditioned beta_h, FFNs and the classifier are learned in both arms.
+CONDITIONS = {
+    "fixed_c": {"conductance_mode": "fixed_one"},
+    "shared_dynamic_c": {"conductance_mode": "dynamic"},
+}
+SAMPLING_MODES = ("full", "neighbor", "cluster")
+TRAINING_PHASES = ("spatial_warmup", "conductance_calibration", "alternating", "joint")
+
+# This is deliberately an end-to-end recipe comparison.  The fixed arm spends
+# dynamic-C calibration/alternation turns updating its spatial model, whereas
+# the dynamic arm spends those turns on C.  Effective group step counts are
+# therefore mandatory output metadata and the contrast is not a one-variable
+# causal estimate of merely replacing C=1.
+COMPARISON_DESIGN = {
+    "estimand": "fixed-C training recipe versus shared-dynamic-C training recipe",
+    "single_factor_causal_effect_of_c": False,
+    "unequal_parameter_group_update_allocation": True,
+    "required_audit_field": "effective_optimizer_steps_by_group",
+    "checkpoint_selection": "best validation metric within joint phase only",
+    "hardware_profile_comparability": (
+        "compare fixed_c versus shared_dynamic_c only under the same hardware profile; "
+        "portable and a6000-48gb are distinct optimization recipes"
+    ),
+    "resume_semantics": (
+        "epoch-boundary deterministic resume with exact stored RNG/optimizer/model state; "
+        "CUDA kernels are not claimed bitwise deterministic"
+    ),
+}
+
+PROTOCOL_NOTE = (
+    "V5 compares fixed C=1 against one shared graph-conditioned dynamic conductance field "
+    "per layer. Both arms learn identical multi-head W_h and graph-conditioned beta_h. "
+    "The default beta is an un-margined sigmoid with nominal beta_0=0.1; the historical "
+    "bounded-margin sigmoid remains an explicit ablation. "
+    "Dynamic C is symmetric, positive, bounded and relative; beta carries identifiable "
+    "diffusion magnitude. Transductive datasets may train on dependency-free samples that "
+    "retain original degrees and apply explicit boundary correction; validation remains the "
+    "complete official graph. PPI retains its official 20/2/2 split. No test labels are used."
+    " The two arms use intentionally different phase-wise parameter-group update allocations, "
+    "so their reported contrast is a recipe comparison, not a single-C causal effect."
+    " The a6000-48gb profile changes real batch/sample size and numeric execution, so it must "
+    "not be pooled with or directly contrasted against portable-profile metrics."
+)
+````
+
+# research/conductance_gat/v5/report.py
+
+````python
+"""Build a compact, integrity-checked comparison of the two V5 conditions."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import io
+import json
+import math
+from pathlib import Path
+from typing import Any
+
+from chartgat.cache import atomic_write_bytes, atomic_write_json
+
+from .protocol import COMPARISON_DESIGN, CONDITIONS, SUITE
+
+
+class ComparisonIntegrityError(ValueError):
+    pass
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _artifact(
+    child: dict[str, Any], job: dict[str, Any], path_key: str, hash_key: str, filename: str
+) -> None:
+    output = Path(job["output_dir"]).expanduser().resolve()
+    path_value, digest = child.get(path_key), child.get(hash_key)
+    if not isinstance(path_value, str) or not isinstance(digest, str) or len(digest) != 64:
+        raise ComparisonIntegrityError(f"missing {path_key}/{hash_key} integrity metadata")
+    path = Path(path_value).expanduser().resolve()
+    if path != output / filename or not path.is_file() or _sha256(path) != digest:
+        raise ComparisonIntegrityError(f"{path_key} path/hash integrity failed")
+
+
+def _job_seed(job: dict[str, Any], manifest: dict[str, Any]) -> int:
+    command = job.get("command")
+    if isinstance(command, list) and "--model-seed" in command:
+        index = command.index("--model-seed") + 1
+        if index < len(command):
+            return int(command[index])
+    return int(manifest.get("config", {}).get("model_seed", 0))
+
+
+def _validate_child(
+    child: dict[str, Any], job: dict[str, Any], manifest: dict[str, Any], path: Path
+) -> dict[str, Any]:
+    if child.get("research_suite") != SUITE:
+        raise ComparisonIntegrityError(f"invalid V5 child metrics: {path}")
+    for key, expected in (
+        ("dataset", job.get("dataset")),
+        ("condition", job.get("condition")),
+        ("model_seed", _job_seed(job, manifest)),
+        ("evaluation_split", "validation"),
+        ("test_evaluated", False),
+    ):
+        if child.get(key) != expected:
+            raise ComparisonIntegrityError(f"job/child {key} mismatch: {path}")
+    configuration = child.get("configuration")
+    if not isinstance(configuration, dict):
+        raise ComparisonIntegrityError(f"missing child configuration: {path}")
+    if any(configuration.get(key) != value for key, value in job.get("architecture", {}).items()):
+        raise ComparisonIntegrityError(f"job/child architecture mismatch: {path}")
+    execution = job.get("execution")
+    expected_batch = (
+        execution.get("batch_size")
+        if isinstance(execution, dict)
+        else 2
+        if child["dataset"] == "ppi"
+        else manifest.get("config", {}).get("batch_size", 1)
+    )
+    if (
+        configuration.get("sampling") != job.get("sampling", configuration.get("sampling"))
+        or configuration.get("batch_size") != expected_batch
+        or configuration.get("model_seed") != child["model_seed"]
+    ):
+        raise ComparisonIntegrityError(f"job/child training configuration mismatch: {path}")
+    if isinstance(execution, dict):
+        hardware = child.get("hardware_execution")
+        expected_hardware = {
+            "profile": execution["hardware_profile"],
+            "precision": execution["precision"],
+            "tf32": execution["tf32"],
+            "activation_checkpoint": execution["activation_checkpoint"],
+            "edge_chunk_size": execution["edge_chunk_size"],
+            "sample_seed_batch_size": execution["sample_seed_batch_size"],
+            "graph_batch_size": execution["batch_size"],
+            "sample_prefetch": execution["sample_prefetch"],
+            "pin_memory": execution["pin_memory"],
+        }
+        if not isinstance(hardware, dict) or any(
+            hardware.get(key) != value for key, value in expected_hardware.items()
+        ):
+            raise ComparisonIntegrityError(f"job/child hardware execution mismatch: {path}")
+    validation = child.get("validation")
+    if (
+        isinstance(validation, bool)
+        or not isinstance(validation, (int, float))
+        or not math.isfinite(validation)
+        or not 0 <= validation <= 1
+    ):
+        raise ComparisonIntegrityError(f"nonfinite/out-of-range validation metric: {path}")
+    for key in ("cache_sha256", "initial_state_sha256"):
+        if not isinstance(child.get(key), str) or len(child[key]) != 64:
+            raise ComparisonIntegrityError(f"invalid {key}: {path}")
+    if not isinstance(child.get("source_sha256"), dict) or not child["source_sha256"]:
+        raise ComparisonIntegrityError(f"missing implementation source hashes: {path}")
+    if not isinstance(child.get("versions"), dict) or not child["versions"]:
+        raise ComparisonIntegrityError(f"missing runtime versions: {path}")
+    if child.get("protocol", {}).get("data_sha256") != child["cache_sha256"]:
+        raise ComparisonIntegrityError(f"cache/protocol hash mismatch: {path}")
+    identity, identity_hash = child.get("resume_identity"), child.get("resume_identity_sha256")
+    if not isinstance(identity, dict) or _canonical_sha256(identity) != identity_hash:
+        raise ComparisonIntegrityError(f"resume identity hash mismatch: {path}")
+    for key in ("cache_sha256", "source_sha256", "initial_state_sha256"):
+        if identity.get(key) != child.get(key):
+            raise ComparisonIntegrityError(f"resume identity {key} mismatch: {path}")
+    if child.get("comparison_design") != COMPARISON_DESIGN:
+        raise ComparisonIntegrityError(f"comparison design metadata mismatch: {path}")
+    group_steps = child.get("effective_optimizer_steps_by_group")
+    if not isinstance(group_steps, dict) or any(
+        isinstance(group_steps.get(name), bool)
+        or not isinstance(group_steps.get(name), int)
+        or group_steps[name] < 0
+        for name in ("backbone", "spatial_w", "beta", "conductance")
+    ):
+        raise ComparisonIntegrityError(f"invalid effective group step counts: {path}")
+    capacity = child.get("allocated_parameter_capacity")
+    trainable = child.get("trainable_parameters")
+    if any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+        for value in (capacity, trainable)
+    ):
+        raise ComparisonIntegrityError(f"invalid parameter capacity: {path}")
+    _artifact(child, job, "checkpoint", "checkpoint_sha256", "best.pt")
+    _artifact(child, job, "last_checkpoint", "last_checkpoint_sha256", "last.pt")
+    _artifact(child, job, "history", "history_sha256", "history.json")
+    recheck = child.get("selected_checkpoint_recheck")
+    if (
+        not isinstance(recheck, dict)
+        or recheck.get("non_gating") is not True
+        or not all(
+            math.isfinite(float(recheck.get(key))) for key in ("recorded", "recomputed", "delta")
+        )
+    ):
+        raise ComparisonIntegrityError(f"invalid selected-checkpoint recheck: {path}")
+    return {
+        "dataset": child["dataset"],
+        "condition": child["condition"],
+        "validation": float(validation),
+        "metric": child["metric_name"],
+        "parameters": int(child["total_parameters"]),
+        "allocated_parameter_capacity": capacity,
+        "trainable_parameters": trainable,
+        "best_epoch": int(child["best_epoch"]),
+        "effective_optimizer_steps_by_group": group_steps,
+        "cache_sha256": child["cache_sha256"],
+        "source_sha256": child["source_sha256"],
+        "runtime_versions": child["versions"],
+        "initial_state_sha256": child["initial_state_sha256"],
+        "configuration": configuration,
+        "schedule": child.get("schedule"),
+        "protocol": child["protocol"],
+        "metrics_path": str(path.resolve()),
+    }
+
+
+def _metrics_path(run_dir: Path, job: dict[str, Any]) -> Path:
+    for key in ("output_dir", "directory", "path"):
+        if key in job:
+            path = Path(job[key])
+            if not path.is_absolute():
+                path = run_dir / path
+            return path / "metrics.json" if path.is_dir() or not path.suffix else path
+    return run_dir / job["dataset"] / job["condition"] / "metrics.json"
+
+
+def build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    jobs = manifest.get("jobs", [])
+    rows, job_status = [], []
+    job_keys = [(job.get("dataset"), job.get("condition")) for job in jobs]
+    if len(job_keys) != len(set(job_keys)):
+        raise ComparisonIntegrityError("duplicate dataset/condition job in V5 manifest")
+    for job in jobs:
+        path = _metrics_path(run_dir, job)
+        if not path.exists():
+            job_status.append(
+                {
+                    "dataset": job.get("dataset"),
+                    "condition": job.get("condition"),
+                    "status": job.get("status", "pending"),
+                    "metrics_path": str(path),
+                }
+            )
+            continue
+        child = json.loads(path.read_text(encoding="utf-8"))
+        status = child.get("status", job.get("status", "pending"))
+        job_status.append(
+            {
+                "dataset": job.get("dataset"),
+                "condition": job.get("condition"),
+                "status": status,
+                "metrics_path": str(path.resolve()),
+            }
+        )
+        if status != "passed":
+            continue
+        rows.append(_validate_child(child, job, manifest, path))
+    indexed = {(row["dataset"], row["condition"]): row for row in rows}
+    requested_datasets = manifest.get("config", {}).get("datasets")
+    if not isinstance(requested_datasets, list):
+        requested_datasets = sorted({job["dataset"] for job in jobs})
+    datasets = sorted(requested_datasets)
+    contrasts, complete = [], manifest.get("status") == "passed"
+    expected_matrix = {(dataset, condition) for dataset in datasets for condition in CONDITIONS}
+    if complete and set(job_keys) != expected_matrix:
+        raise ComparisonIntegrityError(
+            "passed manifest does not contain the exact dataset x 2 matrix"
+        )
+    for dataset in datasets:
+        keys = [(dataset, condition) for condition in CONDITIONS]
+        if not all(key in indexed for key in keys):
+            if complete:
+                raise ComparisonIntegrityError(f"incomplete fixed/dynamic pair for {dataset}")
+            continue
+        if not complete:
+            continue
+        fixed, dynamic = indexed[(dataset, "fixed_c")], indexed[(dataset, "shared_dynamic_c")]
+        for field in (
+            "cache_sha256",
+            "source_sha256",
+            "runtime_versions",
+            "allocated_parameter_capacity",
+            "initial_state_sha256",
+            "configuration",
+            "schedule",
+            "protocol",
+            "metric",
+        ):
+            if fixed[field] != dynamic[field]:
+                raise ComparisonIntegrityError(f"{dataset}: fixed/dynamic {field} mismatch")
+        contrasts.append(
+            {
+                "dataset": dataset,
+                "metric": fixed["metric"],
+                "fixed_c": fixed["validation"],
+                "shared_dynamic_c": dynamic["validation"],
+                "dynamic_minus_fixed": dynamic["validation"] - fixed["validation"],
+                "comparison_design": COMPARISON_DESIGN,
+                "fixed_effective_optimizer_steps_by_group": fixed[
+                    "effective_optimizer_steps_by_group"
+                ],
+                "dynamic_effective_optimizer_steps_by_group": dynamic[
+                    "effective_optimizer_steps_by_group"
+                ],
+            }
+        )
+    if complete and len(rows) != len(jobs):
+        raise ComparisonIntegrityError("passed manifest does not contain all passed child metrics")
+    return {
+        "schema_version": 1,
+        "status": "passed" if complete else "partial",
+        "complete": complete,
+        "research_suite": SUITE,
+        "test_evaluated": False,
+        "comparison_design": COMPARISON_DESIGN,
+        "jobs": job_status,
+        "rows": rows,
+        "contrasts": contrasts,
+    }
+
+
+def markdown(report: dict[str, Any]) -> str:
+    lines = [
+        "# Conductance V5 validation comparison",
+        "",
+        "Test labels were not evaluated.",
+        "",
+        "| Dataset | Metric | Fixed C | Dynamic C | Dynamic - fixed |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for row in report["contrasts"]:
+        lines.append(
+            f"| {row['dataset']} | {row['metric']} | {row['fixed_c']:.6f} | "
+            f"{row['shared_dynamic_c']:.6f} | {row['dynamic_minus_fixed']:+.6f} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def csv_text(report: dict[str, Any]) -> str:
+    stream = io.StringIO()
+    writer = csv.DictWriter(
+        stream, fieldnames=list(report["contrasts"][0]) if report["contrasts"] else []
+    )
+    if report["contrasts"]:
+        writer.writeheader()
+        writer.writerows(report["contrasts"])
+    return stream.getvalue()
+
+
+def write_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    report = build_comparison(run_dir, manifest)
+    atomic_write_json(run_dir / "comparison.json", report)
+    atomic_write_bytes(run_dir / "comparison.md", markdown(report).encode("utf-8"))
+    atomic_write_bytes(run_dir / "comparison.csv", csv_text(report).encode("utf-8"))
+    return report
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-dir", required=True, type=Path)
+    parser.add_argument("--manifest", type=Path)
+    args = parser.parse_args(argv)
+    run_dir = args.run_dir.expanduser().resolve()
+    manifest_path = args.manifest or run_dir / "manifest.json"
+    write_comparison(run_dir, json.loads(manifest_path.read_text(encoding="utf-8")))
+    print(f"passed: {run_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# research/conductance_gat/v5/sampling.py
+
+````python
+"""Dependency-stable transductive samplers with explicit boundary metadata."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Iterator, Sequence
+
+import torch
+from torch import Tensor
+
+
+def physical_degree(
+    incidence: Tensor, num_nodes: int, *, dtype: torch.dtype = torch.float32
+) -> Tensor:
+    tail, head = incidence
+    degree = torch.zeros(num_nodes, dtype=dtype)
+    ones = torch.ones(tail.numel(), dtype=dtype)
+    return degree.index_add(0, tail.cpu(), ones).index_add(0, head.cpu(), ones)
+
+
+def csr_values(values: Tensor, rowptr: Tensor, rows: Tensor) -> Tensor:
+    """Gather arbitrary one-dimensional CSR values without a Python row loop."""
+
+    if (
+        values.dtype != torch.long
+        or values.ndim != 1
+        or rowptr.dtype != torch.long
+        or rowptr.ndim != 1
+        or rows.dtype != torch.long
+        or rows.ndim != 1
+    ):
+        raise ValueError("values, rowptr and rows must be int64 CSR tensors")
+    if any(value.device.type != "cpu" for value in (values, rowptr, rows)):
+        raise ValueError("dependency-free CSR sampling expects CPU tensors")
+    if rowptr.numel() < 1 or int(rowptr[-1]) != values.numel():
+        raise ValueError("CSR rowptr does not span values")
+    if not rows.numel():
+        return torch.empty(0, dtype=torch.long)
+    if int(rows.min()) < 0 or int(rows.max()) + 1 >= rowptr.numel():
+        raise ValueError("CSR row lies outside rowptr")
+    starts, stops = rowptr[rows], rowptr[rows + 1]
+    lengths = stops - starts
+    total = int(lengths.sum())
+    if total == 0:
+        return torch.empty(0, dtype=torch.long)
+    repeated_starts = torch.repeat_interleave(starts, lengths)
+    output_row_start = torch.repeat_interleave(lengths.cumsum(0) - lengths, lengths)
+    within_row = torch.arange(total, dtype=torch.long) - output_row_start
+    return values[repeated_starts + within_row]
+
+
+def csr_neighbors(arcs: Tensor, rowptr: Tensor, nodes: Tensor) -> Tensor:
+    """Gather CSR neighbor rows in node order without a Python node loop."""
+
+    if arcs.dtype != torch.long or arcs.ndim != 2 or arcs.shape[0] != 2:
+        raise ValueError("arcs must be a 2 x E int64 tensor")
+    return csr_values(arcs[1], rowptr, nodes)
+
+
+def physical_edge_id_csr(incidence: Tensor, num_nodes: int) -> tuple[Tensor, Tensor]:
+    """Build a bidirectional node->physical-edge CSR once per full graph."""
+
+    if incidence.dtype != torch.long or incidence.ndim != 2 or incidence.shape[0] != 2:
+        raise ValueError("incidence must be a 2 x E int64 tensor")
+    if incidence.device.type != "cpu" or num_nodes < 1:
+        raise ValueError("physical-edge CSR requires a positive CPU graph")
+    if incidence.numel() and (int(incidence.min()) < 0 or int(incidence.max()) >= num_nodes):
+        raise ValueError("incidence endpoint lies outside the graph")
+    edge_count = incidence.shape[1]
+    sources = torch.cat((incidence[0], incidence[1]))
+    edge_ids = torch.arange(edge_count, dtype=torch.long).repeat(2)
+    order = torch.argsort(sources * num_nodes + torch.cat((incidence[1], incidence[0])))
+    sources, edge_ids = sources[order], edge_ids[order]
+    counts = torch.bincount(sources, minlength=num_nodes)
+    rowptr = torch.cat((torch.zeros(1, dtype=torch.long), counts.cumsum(0)))
+    return edge_ids, rowptr
+
+
+def induced_physical_edge_ids(
+    incidence: Tensor,
+    incident_edge_ids: Tensor,
+    incident_rowptr: Tensor,
+    nodes: Tensor,
+    num_nodes: int,
+) -> tuple[Tensor, int]:
+    """Find induced physical edges from sampled-node incident rows only."""
+
+    nodes = nodes.unique(sorted=True)
+    candidates = csr_values(incident_edge_ids, incident_rowptr, nodes)
+    candidate_count = int(candidates.numel())
+    if not candidate_count:
+        return torch.empty(0, dtype=torch.long), 0
+    candidates = candidates.unique(sorted=True)
+    membership = torch.zeros(num_nodes, dtype=torch.bool)
+    membership[nodes] = True
+    endpoints = incidence[:, candidates]
+    keep = membership[endpoints[0]] & membership[endpoints[1]]
+    return candidates[keep], candidate_count
+
+
+class TransductiveGraphSampler:
+    """Yield induced train subgraphs without PyG sampling extensions.
+
+    Neighbor sampling expands a seed batch hop by hop, limiting each hop to an
+    average fanout per original seed so deep architectures cannot grow an
+    exponential sample. Cluster sampling performs one randomized breadth-first
+    expansion to a node budget. Both carry original-graph degree and a bounded
+    degree-ratio boundary correction. The correction is metadata, never learned C.
+    """
+
+    def __init__(
+        self,
+        graph,
+        train_indices: Tensor,
+        *,
+        mode: str,
+        seed_batch_size: int,
+        fanouts: Sequence[int],
+        model_seed: int,
+    ) -> None:
+        if mode not in {"neighbor", "cluster"}:
+            raise ValueError("sample mode must be neighbor or cluster")
+        if seed_batch_size < 1 or not fanouts or any(value < 1 for value in fanouts):
+            raise ValueError("seed batch size and every fanout must be positive")
+        self.graph = graph.cpu()
+        self.train_indices = train_indices.detach().cpu().long()
+        self.mode = mode
+        self.seed_batch_size = int(seed_batch_size)
+        self.fanouts = tuple(int(value) for value in fanouts)
+        self.model_seed = int(model_seed)
+        self.num_nodes = int(graph.x.shape[0])
+        self.incidence = graph.incidence_edge_index.detach().cpu().long()
+        self.incident_edge_ids, self.incident_rowptr = physical_edge_id_csr(
+            self.incidence, self.num_nodes
+        )
+        self.last_induced_candidate_arc_count = 0
+        arcs = graph.edge_index.detach().cpu().long()
+        order = torch.argsort(arcs[0] * self.num_nodes + arcs[1])
+        self.arcs = arcs[:, order]
+        counts = torch.bincount(self.arcs[0], minlength=self.num_nodes)
+        self.rowptr = torch.cat((torch.zeros(1, dtype=torch.long), counts.cumsum(0)))
+        self.full_degree = physical_degree(self.incidence, self.num_nodes)
+        log_degree = self.full_degree.log1p()
+        edge_count = float(self.incidence.shape[1])
+        self.graph_structure = torch.tensor(
+            [
+                [
+                    math.log1p(self.num_nodes),
+                    math.log1p(edge_count),
+                    float(log_degree.mean()),
+                    float(log_degree.std(correction=0)),
+                    edge_count / self.num_nodes,
+                    2 * edge_count / max(self.num_nodes * (self.num_nodes - 1), 1),
+                ]
+            ],
+            dtype=torch.float32,
+        )
+        if not self.train_indices.numel():
+            raise ValueError("sampler requires nonempty train indices")
+        if int(self.train_indices.min()) < 0 or int(self.train_indices.max()) >= self.num_nodes:
+            raise ValueError("train index lies outside graph")
+
+    def __len__(self) -> int:
+        return math.ceil(self.train_indices.numel() / self.seed_batch_size)
+
+    def _neighbors(self, nodes: Tensor) -> Tensor:
+        return csr_neighbors(self.arcs, self.rowptr, nodes)
+
+    @staticmethod
+    def _random_limit(values: Tensor, limit: int, generator: torch.Generator) -> Tensor:
+        values = values.unique()
+        if values.numel() <= limit:
+            return values
+        return values[torch.randperm(values.numel(), generator=generator)[:limit]]
+
+    def _neighbor_nodes(self, seeds: Tensor, generator: torch.Generator) -> Tensor:
+        selected, frontier = seeds.unique(), seeds.unique()
+        for fanout in self.fanouts:
+            candidates = self._neighbors(frontier)
+            if not candidates.numel():
+                break
+            candidates = self._random_limit(candidates, seeds.numel() * fanout, generator)
+            unseen = candidates[~torch.isin(candidates, selected)]
+            if not unseen.numel():
+                break
+            selected = torch.cat((selected, unseen)).unique()
+            frontier = unseen
+        return selected
+
+    def _cluster_nodes(self, seeds: Tensor, generator: torch.Generator) -> Tensor:
+        budget = max(seeds.numel(), seeds.numel() * (1 + sum(self.fanouts)))
+        selected, frontier = seeds.unique(), seeds.unique()
+        while selected.numel() < budget and frontier.numel():
+            candidates = self._neighbors(frontier)
+            unseen = candidates[~torch.isin(candidates, selected)]
+            unseen = self._random_limit(unseen, budget - selected.numel(), generator)
+            if not unseen.numel():
+                break
+            selected = torch.cat((selected, unseen)).unique()
+            frontier = unseen
+        return selected
+
+    def _induced(self, nodes: Tensor, seeds: Tensor):
+        from torch_geometric.data import Data
+
+        nodes = nodes.unique(sorted=True)
+        edge_ids, self.last_induced_candidate_arc_count = induced_physical_edge_ids(
+            self.incidence,
+            self.incident_edge_ids,
+            self.incident_rowptr,
+            nodes,
+            self.num_nodes,
+        )
+        global_incidence = self.incidence[:, edge_ids]
+        local = torch.full((self.num_nodes,), -1, dtype=torch.long)
+        local[nodes] = torch.arange(nodes.numel())
+        incidence = local[global_incidence]
+        arcs = torch.cat((incidence, incidence.flip(0)), dim=1)
+        sample_degree = physical_degree(incidence, nodes.numel())
+        full_degree = self.full_degree[nodes]
+        if incidence.shape[1]:
+            ratio = full_degree / sample_degree.clamp_min(1)
+            correction = (ratio[incidence[0]] * ratio[incidence[1]]).sqrt().clamp(1.0, 64.0)
+        else:
+            correction = torch.empty(0, dtype=torch.float32)
+        train_mask = torch.isin(nodes, seeds)
+        return Data(
+            x=self.graph.x[nodes],
+            y=self.graph.y[nodes],
+            edge_index=arcs,
+            incidence_edge_index=incidence,
+            full_degree=full_degree,
+            graph_structure=self.graph_structure,
+            sampling_correction=correction,
+            edge_normalization_weight=correction,
+            train_mask=train_mask,
+            global_node_id=nodes,
+            sample_seed_count=torch.tensor([int(seeds.numel())]),
+        )
+
+    def iter_epoch(self, epoch: int) -> Iterator:
+        generator = torch.Generator().manual_seed(self.model_seed + 1_000_003 * int(epoch))
+        order = self.train_indices[torch.randperm(self.train_indices.numel(), generator=generator)]
+        for start in range(0, order.numel(), self.seed_batch_size):
+            seeds = order[start : start + self.seed_batch_size]
+            nodes = (
+                self._neighbor_nodes(seeds, generator)
+                if self.mode == "neighbor"
+                else self._cluster_nodes(seeds, generator)
+            )
+            yield self._induced(nodes, seeds)
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "implementation": "dependency_free_induced_subgraph",
+            "induced_edge_enumeration": (
+                "bidirectional physical-edge CSR; O(sample incident arcs), no per-batch full-E scan"
+            ),
+            "seed_batch_size": self.seed_batch_size,
+            "fanouts": list(self.fanouts),
+            "batches_per_epoch": len(self),
+            "original_degree_carried": True,
+            "boundary_correction": (
+                "sqrt(full_degree/sample_degree endpoint product), clamp[1,64]; "
+                "explicit approximation, not claimed unbiased"
+            ),
+            "normalization_importance_weight": "same boundary correction",
+            "original_graph_context_carried": True,
+            "validation_graph": "complete_official_graph",
+        }
+````
+
+# research/conductance_gat/v5/train.py
+
+````python
+"""Train one resumable graph-conditioned conductance V5 arm on official V1 caches."""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import hashlib
+import json
+import math
+import time
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from chartgat.cache import atomic_publish, atomic_write_json
+
+from ..ablation.model import state_sha256
+from ..ablation.train import _configure_fp32, _make_data, _require_cuda, training_loss
+from ..benchmark import _seed, _versions
+from ..benchmark_data import load_dataset, sha256_file
+from .diagnostics import (
+    evaluate,
+    layer_diagnostics,
+    require_finite_tensor,
+    require_first_step_conductance_gradient,
+    selected_checkpoint_interventions,
+)
+from .model import GraphConditionedConductanceNodeClassifier
+from .protocol import (
+    BATCH_SIZE_BY_DATASET,
+    BETA_PARAMETERIZATIONS,
+    COMMON,
+    COMPARISON_DESIGN,
+    CONDITIONS,
+    DATASETS,
+    HARDWARE_PROFILES,
+    METRIC_BY_DATASET,
+    SAMPLING_MODES,
+    SUITE,
+    TRAINING_PHASES,
+    beta_configuration,
+)
+from .sampling import TransductiveGraphSampler
+
+ROOT = Path(__file__).resolve().parents[3]
+RESUME_SEMANTICS = (
+    "epoch-boundary deterministic resume from stored model/optimizer/RNG state; "
+    "CUDA kernels are not claimed bitwise deterministic"
+)
+_PARAMETER_GROUPS = ("backbone", "spatial_w", "beta", "conductance")
+_SHARED_IMPLEMENTATION_SOURCES = (
+    "research/conductance_gat/ablation/train.py",
+    "research/conductance_gat/benchmark.py",
+    "research/conductance_gat/benchmark_data.py",
+    "src/chartgat/cache.py",
+)
+
+
+def architecture_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    result = {
+        "hidden_channels": args.hidden_channels,
+        "layers": args.layers,
+        "heads": args.heads,
+        "ffn_multiplier": args.ffn_multiplier,
+        "dropout": args.dropout,
+        "activation_checkpoint": args.activation_checkpoint,
+    }
+    result.update(
+        beta_configuration(
+            args.beta_parameterization,
+            args.beta_initial,
+            args.beta_min,
+            args.beta_max,
+        )
+    )
+    return result
+
+
+def configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        **COMMON,
+        **architecture_configuration(args),
+        "model_seed": args.model_seed,
+        "epochs": args.epochs,
+        "patience": args.patience,
+        "batch_size": args.batch_size,
+        "workers": args.workers,
+        "device": args.device,
+        "edge_chunk_size": args.edge_chunk_size,
+        "sampling": args.sampling,
+        "num_neighbors": list(args.num_neighbors),
+        "sample_seed_batch_size": args.sample_seed_batch_size,
+        "phase_fractions": list(args.phase_fractions),
+        "hardware_profile": args.hardware_profile,
+        "precision": args.precision,
+        "amp": args.precision == "bf16",
+        "tf32": args.tf32,
+        "pin_memory": args.pin_memory,
+        "loader_workers": args.workers,
+        "loader_worker_policy": (
+            "zero: PPI has only 20 in-memory training graphs; subprocess IPC/startup can "
+            "cost more than collating three batch-8 steps and complicates exact resume audits"
+        ),
+        "sample_prefetch": args.sample_prefetch,
+    }
+
+
+def resolve_hardware_arguments(args: argparse.Namespace) -> None:
+    """Resolve explicit execution defaults before identity/config creation."""
+
+    profile = HARDWARE_PROFILES[args.hardware_profile]
+    if args.batch_size is None:
+        args.batch_size = (
+            profile["ppi_batch_size"]
+            if args.dataset == "ppi"
+            else BATCH_SIZE_BY_DATASET[args.dataset]
+        )
+    if args.edge_chunk_size is None:
+        args.edge_chunk_size = profile["edge_chunk_size"]
+    if args.sample_seed_batch_size is None:
+        args.sample_seed_batch_size = profile["sample_seed_batch_size"]
+    if args.activation_checkpoint is None:
+        args.activation_checkpoint = profile["activation_checkpoint"]
+    args.precision = profile["precision"]
+    args.tf32 = profile["tf32"]
+    args.pin_memory = profile["pin_memory"]
+    args.sample_prefetch = profile["sample_prefetch"]
+
+
+def validate_hardware_runtime(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
+    """Fail closed when an opt-in high-memory profile is not actually available."""
+
+    profile = HARDWARE_PROFILES[args.hardware_profile]
+    properties = torch.cuda.get_device_properties(device)
+    total_bytes = int(properties.total_memory)
+    total_gib = total_bytes / 2**30
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    free_bytes = int(free_bytes)
+    free_gib = free_bytes / 2**30
+    capability = (int(properties.major), int(properties.minor))
+    if total_gib < profile["minimum_total_memory_gib"]:
+        raise RuntimeError(
+            f"hardware profile {args.hardware_profile} requires at least "
+            f"{profile['minimum_total_memory_gib']:.0f} GiB on the visible GPU; "
+            f"found {total_gib:.2f} GiB"
+        )
+    if capability[0] < profile["minimum_compute_capability_major"]:
+        raise RuntimeError(
+            f"hardware profile {args.hardware_profile} requires compute capability "
+            f">={profile['minimum_compute_capability_major']}.0; found "
+            f"{capability[0]}.{capability[1]}"
+        )
+    if free_gib < profile["minimum_free_memory_gib"]:
+        raise RuntimeError(
+            f"hardware profile {args.hardware_profile} requires at least "
+            f"{profile['minimum_free_memory_gib']:.0f} GiB free at child start; "
+            f"found {free_gib:.2f} GiB"
+        )
+    if args.precision == "bf16" and not torch.cuda.is_bf16_supported():
+        raise RuntimeError("BF16 is required by this hardware profile; FP32 fallback is forbidden")
+    return {
+        "profile": args.hardware_profile,
+        "device_name": properties.name,
+        "total_memory_bytes": total_bytes,
+        "total_memory_gib": total_gib,
+        "free_memory_bytes_at_start": free_bytes,
+        "free_memory_gib_at_start": free_gib,
+        "compute_capability": list(capability),
+        "precision": args.precision,
+        "tf32": args.tf32,
+        "dense_autocast": args.precision == "bf16",
+        "conductance_geometry_dtype": "float32",
+        "activation_checkpoint": args.activation_checkpoint,
+        "edge_chunk_size": args.edge_chunk_size,
+        "sample_seed_batch_size": args.sample_seed_batch_size,
+        "graph_batch_size": args.batch_size,
+        "sample_prefetch": args.sample_prefetch,
+        "pin_memory": args.pin_memory,
+        "loader_workers": args.workers,
+        "loader_worker_policy": (
+            "zero: PPI is 20 static in-memory training graphs; multi-process IPC is not "
+            "assumed faster and would widen the exact-resume audit surface"
+        ),
+    }
+
+
+def configure_compute(args: argparse.Namespace) -> None:
+    _configure_fp32()
+    if args.tf32:
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
+def autocast_context(args: argparse.Namespace):
+    return torch.autocast(
+        device_type="cuda", dtype=torch.bfloat16, enabled=args.precision == "bf16"
+    )
+
+
+def require_finite_gradient_norm_async(value: torch.Tensor) -> None:
+    """Enqueue a stream-ordered finite assertion without a CUDA-to-host scalar read."""
+
+    predicate = torch.isfinite(value)
+    assertion = getattr(torch, "_assert_async", None)
+    if assertion is None:
+        require_finite_tensor(value, "gradient norm")
+        return
+    assertion(predicate, "nonfinite gradient norm")
+
+
+def phase_schedule(epochs: int, fractions: list[float]) -> list[dict[str, Any]]:
+    if epochs < 4 or len(fractions) != 4 or any(value <= 0 for value in fractions):
+        raise ValueError("epochs must be >=4 and all four phase fractions must be positive")
+    total = sum(fractions)
+    if not math.isfinite(total):
+        raise ValueError("phase fractions must be finite")
+    raw = [epochs * value / total for value in fractions]
+    lengths = [max(1, int(math.floor(value))) for value in raw]
+    while sum(lengths) < epochs:
+        index = max(range(4), key=lambda i: raw[i] - lengths[i])
+        lengths[index] += 1
+    while sum(lengths) > epochs:
+        candidates = [i for i, value in enumerate(lengths) if value > 1]
+        lengths[max(candidates, key=lambda i: lengths[i] - raw[i])] -= 1
+    result, start = [], 1
+    for name, length in zip(TRAINING_PHASES, lengths, strict=True):
+        result.append(
+            {"name": name, "start_epoch": start, "end_epoch": start + length - 1, "length": length}
+        )
+        start += length
+    return result
+
+
+def phase_at(schedule: list[dict[str, Any]], epoch: int) -> tuple[str, int]:
+    for item in schedule:
+        if item["start_epoch"] <= epoch <= item["end_epoch"]:
+            return item["name"], epoch - item["start_epoch"]
+    raise ValueError("epoch outside phase schedule")
+
+
+def parameter_group(name: str) -> str:
+    if ".operator.estimator." in name:
+        return "conductance"
+    if ".operator.beta_estimator." in name:
+        return "beta"
+    if ".operator.value_weight" in name or ".operator.output_projection." in name:
+        return "spatial_w"
+    return "backbone"
+
+
+def make_optimizer(model) -> torch.optim.AdamW:
+    grouped = {key: [] for key in ("backbone", "spatial_w", "beta", "conductance")}
+    names = {key: [] for key in grouped}
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            group = parameter_group(name)
+            grouped[group].append(parameter)
+            names[group].append(name)
+    options = {
+        "backbone": (COMMON["lr"], COMMON["weight_decay"]),
+        "spatial_w": (COMMON["lr"], COMMON["weight_decay"]),
+        "beta": (COMMON["lr"] * COMMON["beta_lr_multiplier"], COMMON["scalar_weight_decay"]),
+        "conductance": (
+            COMMON["lr"] * COMMON["conductance_lr_multiplier"],
+            COMMON["conductance_weight_decay"],
+        ),
+    }
+    groups = [
+        {
+            "name": name,
+            "params": values,
+            "parameter_names": names[name],
+            "lr": options[name][0],
+            "weight_decay": options[name][1],
+        }
+        for name, values in grouped.items()
+        if values
+    ]
+    return torch.optim.AdamW(groups, lr=COMMON["lr"])
+
+
+def optimizer_metadata(optimizer) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": group["name"],
+            "lr": group["lr"],
+            "weight_decay": group["weight_decay"],
+            "parameter_names": list(group["parameter_names"]),
+            "parameter_count": sum(parameter.numel() for parameter in group["params"]),
+        }
+        for group in optimizer.param_groups
+    ]
+
+
+def merge_efficiency(
+    previous_elapsed_seconds: float,
+    previous_peak_allocated_bytes: int,
+    previous_peak_reserved_bytes: int,
+    current_elapsed_seconds: float,
+    current_peak_allocated_bytes: int,
+    current_peak_reserved_bytes: int,
+) -> dict[str, float | int]:
+    """Accumulate wall time and retain the maximum GPU peaks across resumes."""
+
+    values = (
+        previous_elapsed_seconds,
+        previous_peak_allocated_bytes,
+        previous_peak_reserved_bytes,
+        current_elapsed_seconds,
+        current_peak_allocated_bytes,
+        current_peak_reserved_bytes,
+    )
+    if any(value < 0 for value in values):
+        raise ValueError("efficiency counters must be nonnegative")
+    return {
+        "elapsed_seconds": float(previous_elapsed_seconds + current_elapsed_seconds),
+        "peak_cuda_allocated_bytes": max(
+            int(previous_peak_allocated_bytes), int(current_peak_allocated_bytes)
+        ),
+        "peak_cuda_reserved_bytes": max(
+            int(previous_peak_reserved_bytes), int(current_peak_reserved_bytes)
+        ),
+    }
+
+
+def configure_phase(model, phase: str, phase_epoch: int) -> dict[str, Any]:
+    dynamic = model.conductance_mode == "dynamic"
+    if phase == "spatial_warmup":
+        active, override, training_mode = {"backbone", "spatial_w", "beta"}, "ones", True
+        coordinate = "spatial"
+    elif phase == "conductance_calibration":
+        # The fixed-C arm remains a fully optimized, strong baseline rather than
+        # wasting dynamic-C's calibration allocation as no-op epochs.
+        active, override, training_mode = (
+            ({"conductance"}, None, False)
+            if dynamic
+            else ({"backbone", "spatial_w", "beta"}, "ones", True)
+        )
+        coordinate = "conductance" if dynamic else "fixed_spatial_control"
+    elif phase == "alternating":
+        conductance_turn = dynamic and phase_epoch % 2 == 0
+        active = {"conductance"} if conductance_turn else {"backbone", "spatial_w", "beta"}
+        override, training_mode = None, not conductance_turn
+        coordinate = "conductance" if conductance_turn else "spatial"
+    elif phase == "joint":
+        active = {"backbone", "spatial_w", "beta"} | ({"conductance"} if dynamic else set())
+        override, training_mode, coordinate = None, True, "joint"
+    else:
+        raise ValueError(f"unknown phase: {phase}")
+    for name, parameter in model.named_parameters():
+        parameter.requires_grad_(parameter_group(name) in active)
+    for operator in model.operators:
+        operator.estimator.override = override
+    model.train(training_mode)
+    return {
+        "phase": phase,
+        "phase_epoch": phase_epoch,
+        "coordinate": coordinate,
+        "active_parameter_groups": sorted(active),
+        "conductance_override": override,
+        "dropout_on": training_mode,
+    }
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", required=True, choices=DATASETS)
+    parser.add_argument("--condition", required=True, choices=tuple(CONDITIONS))
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--data-root", type=Path, default=Path("data/paper"))
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--model-seed", type=int, default=0)
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--hidden-channels", type=int, default=COMMON["hidden_channels"])
+    parser.add_argument("--layers", type=int, default=COMMON["layers"])
+    parser.add_argument("--heads", type=int, default=COMMON["heads"])
+    parser.add_argument("--ffn-multiplier", type=int, default=COMMON["ffn_multiplier"])
+    parser.add_argument("--dropout", type=float, default=COMMON["dropout"])
+    parser.add_argument(
+        "--beta-parameterization",
+        choices=BETA_PARAMETERIZATIONS,
+        default=COMMON["beta_parameterization"],
+    )
+    parser.add_argument("--beta-initial", type=float, default=COMMON["beta_initial"])
+    parser.add_argument("--beta-min", type=float)
+    parser.add_argument("--beta-max", type=float)
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--edge-chunk-size", type=int)
+    parser.add_argument("--sampling", choices=SAMPLING_MODES, default="full")
+    parser.add_argument("--num-neighbors", type=int, nargs="+", default=[15, 10])
+    parser.add_argument("--sample-seed-batch-size", type=int)
+    parser.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
+    parser.add_argument(
+        "--phase-fractions",
+        type=float,
+        nargs=4,
+        default=[0.1, 0.1, 0.4, 0.4],
+        metavar=("WARMUP", "C_CAL", "ALTERNATE", "JOINT"),
+    )
+    parser.add_argument(
+        "--activation-checkpoint", action=argparse.BooleanOptionalAction, default=None
+    )
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    return parser
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    resolve_hardware_arguments(args)
+    integers = (
+        args.epochs,
+        args.patience,
+        args.hidden_channels,
+        args.layers,
+        args.heads,
+        args.ffn_multiplier,
+        args.edge_chunk_size,
+        args.sample_seed_batch_size,
+    )
+    if min(integers) < 1 or args.model_seed < 0 or any(value < 1 for value in args.num_neighbors):
+        raise ValueError("integer architecture/training/sampling values must be positive")
+    if args.epochs < 4 or args.hidden_channels % args.heads:
+        raise ValueError("V5 requires >=4 epochs and hidden_channels divisible by heads")
+    if not 0 <= args.dropout < 1:
+        raise ValueError("dropout must be in [0,1)")
+    beta_configuration(
+        args.beta_parameterization,
+        args.beta_initial,
+        args.beta_min,
+        args.beta_max,
+    )
+    if args.workers != 0:
+        raise ValueError("V5 currently requires workers=0 for exact resumability")
+    if args.dataset != "ppi" and args.batch_size != BATCH_SIZE_BY_DATASET[args.dataset]:
+        raise ValueError("transductive full/sampled graph batch-size must be 1")
+    if args.dataset == "ppi" and args.hardware_profile == "portable" and args.batch_size != 2:
+        raise ValueError("portable PPI retains the V1 graph batch-size of 2")
+    if args.dataset == "ppi" and args.sampling != "full":
+        raise ValueError(
+            "PPI already supplies inductive graph minibatches; sampling is transductive-only"
+        )
+    if args.sampling != "full" and args.sample_seed_batch_size < 32:
+        raise ValueError("sample-seed-batch-size below 32 is forbidden as accidentally tiny")
+    phase_schedule(args.epochs, list(args.phase_fractions))
+
+
+def validate_cached_graphs_once(payload: dict[str, Any]) -> None:
+    """Validate immutable graph structure on CPU, outside the CUDA hot path."""
+
+    graphs = payload.get("graphs")
+    if not isinstance(graphs, list) or not graphs:
+        raise ValueError("verified payload must contain nonempty graphs")
+    for graph in graphs:
+        x, incidence = graph.get("x"), graph.get("incidence_edge_index")
+        if not isinstance(x, torch.Tensor) or x.device.type != "cpu" or x.ndim != 2:
+            raise ValueError("cached graph.x must be a two-dimensional CPU tensor")
+        if (
+            not isinstance(incidence, torch.Tensor)
+            or incidence.device.type != "cpu"
+            or incidence.dtype != torch.long
+            or incidence.ndim != 2
+            or incidence.shape[0] != 2
+        ):
+            raise ValueError("cached incidence must be a 2 x E CPU int64 tensor")
+        if incidence.numel() and (int(incidence.min()) < 0 or int(incidence.max()) >= x.shape[0]):
+            raise ValueError("cached incidence endpoint lies outside graph.x")
+
+
+def _prepare_data(payload, args, device):
+    validate_cached_graphs_once(payload)
+    if args.sampling == "full" or args.dataset == "ppi":
+        data, indices = _make_data(payload, args, device)
+        return data, indices, None
+    from torch_geometric.data import Data
+
+    graph = Data(**payload["graphs"][0])
+    indices = {
+        key: payload["splits"][key].nonzero(as_tuple=False).flatten().long()
+        for key in ("train", "validation")
+    }
+    sampler = TransductiveGraphSampler(
+        graph,
+        indices["train"],
+        mode=args.sampling,
+        seed_batch_size=args.sample_seed_batch_size,
+        fanouts=args.num_neighbors,
+        model_seed=args.model_seed,
+    )
+    return graph, indices, sampler
+
+
+def _prefetched_samples(iterator, *, pin_memory: bool):
+    """Prepare one deterministic CPU sample ahead while CUDA trains the current one."""
+
+    source = iter(iterator)
+
+    def take_one():
+        try:
+            graph = next(source)
+        except StopIteration:
+            return None
+        return graph.pin_memory() if pin_memory else graph
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        pending = executor.submit(take_one)
+        while True:
+            graph = pending.result()
+            if graph is None:
+                return
+            pending = executor.submit(take_one)
+            yield graph
+
+
+def _training_batches(data, indices, sampler, epoch, device, model_seed, args):
+    if sampler is not None:
+        samples = sampler.iter_epoch(epoch)
+        if args.sample_prefetch:
+            samples = _prefetched_samples(samples, pin_memory=args.pin_memory)
+        for graph in samples:
+            graph = graph.to(device, non_blocking=args.pin_memory)
+            yield graph, graph.train_mask.nonzero(as_tuple=False).flatten()
+    elif indices is not None:
+        yield data, indices["train"]
+    else:
+        # Re-seeding by epoch makes PPI minibatch order identical after resume.
+        if getattr(data["train"], "generator", None) is not None:
+            data["train"].generator.manual_seed(model_seed + 1_000_003 * epoch)
+        for graph in data["train"]:
+            graph._v5_num_graphs = int(graph.num_graphs)
+            yield graph.to(device, non_blocking=True), None
+
+
+def _validation_source(data, sampler):
+    return data if sampler is None else sampler.graph
+
+
+def _save(path: Path, payload: dict[str, Any]) -> None:
+    atomic_publish(path, lambda target: torch.save(payload, target))
+
+
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def implementation_source_hashes() -> dict[str, str]:
+    """Fingerprint every source that implements the child training path."""
+
+    paths = [ROOT / value for value in _SHARED_IMPLEMENTATION_SOURCES]
+    paths.extend((ROOT / "research/conductance_gat/v5").glob("*.py"))
+    missing = [path for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"V5 implementation source is missing: {missing[0]}")
+    return {path.relative_to(ROOT).as_posix(): sha256_file(path) for path in sorted(set(paths))}
+
+
+def build_resume_identity(
+    args: argparse.Namespace,
+    protocol: dict[str, Any],
+    schedule: list[dict[str, Any]],
+    *,
+    initial_state_sha256: str,
+    source_sha256: dict[str, str] | None = None,
+    runtime_versions: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Bind a last checkpoint to data, recipe, implementation, and runtime."""
+
+    cache_sha256 = protocol.get("data_sha256")
+    if not isinstance(cache_sha256, str) or len(cache_sha256) != 64:
+        raise ValueError("official dataset protocol has no valid data_sha256")
+    if len(initial_state_sha256) != 64:
+        raise ValueError("initial model state fingerprint is invalid")
+    return {
+        "schema_version": 1,
+        "research_suite": SUITE,
+        "dataset": args.dataset,
+        "condition": args.condition,
+        "configuration": configuration(args),
+        "schedule": schedule,
+        "dataset_protocol": protocol,
+        "dataset_protocol_sha256": _canonical_sha256(protocol),
+        "cache_sha256": cache_sha256,
+        "initial_state_sha256": initial_state_sha256,
+        "source_sha256": source_sha256 or implementation_source_hashes(),
+        "runtime_versions": runtime_versions or _versions(),
+        "resume_semantics": RESUME_SEMANTICS,
+    }
+
+
+def validate_resume_identity(actual: Any, expected: dict[str, Any], stored_sha256: Any) -> None:
+    """Reject stale/tampered last checkpoints before loading mutable state."""
+
+    if not isinstance(actual, dict):
+        raise ValueError("last.pt has no valid V5 resume identity")
+    actual_sha256 = _canonical_sha256(actual)
+    if stored_sha256 != actual_sha256:
+        raise ValueError("last.pt resume identity hash mismatch")
+    if actual != expected:
+        keys = sorted(
+            key for key in set(actual) | set(expected) if actual.get(key) != expected.get(key)
+        )
+        detail = ", ".join(keys) if keys else "unknown"
+        raise ValueError(f"last.pt resume identity mismatch: {detail}")
+
+
+def recover_best_checkpoint(checkpoint: Path, previous: Path, expected_hash: Any) -> str:
+    """Recover the best->last publication crash window from a two-slot journal."""
+
+    if expected_hash is None:
+        # A crash after publishing the first joint best but before last.pt may
+        # leave an unbound primary. The same epoch is replayed and republishes it.
+        return "not_yet_bound"
+    if (
+        not isinstance(expected_hash, str)
+        or len(expected_hash) != 64
+        or any(value not in "0123456789abcdef" for value in expected_hash)
+    ):
+        raise ValueError("last.pt best-checkpoint hash is invalid")
+    if checkpoint.is_file() and sha256_file(checkpoint) == expected_hash:
+        return "primary"
+    if not previous.is_file() or sha256_file(previous) != expected_hash:
+        raise ValueError("last.pt best checkpoint has no valid recovery slot")
+    previous_bytes = previous.read_bytes()
+    atomic_publish(checkpoint, lambda target, data=previous_bytes: target.write_bytes(data))
+    if sha256_file(checkpoint) != expected_hash:
+        raise ValueError("best-checkpoint recovery did not preserve its exact hash")
+    return "previous"
+
+
+def publish_best_checkpoint(checkpoint: Path, previous: Path, payload: dict[str, Any]) -> str:
+    """Rotate the primary into the recovery slot, then atomically publish best."""
+
+    if checkpoint.is_file():
+        previous_bytes = checkpoint.read_bytes()
+        atomic_publish(previous, lambda target, data=previous_bytes: target.write_bytes(data))
+    _save(checkpoint, payload)
+    return sha256_file(checkpoint)
+
+
+def count_effective_group_step(
+    counts: dict[str, int], optimizer: torch.optim.Optimizer, active_groups: list[str]
+) -> dict[str, int]:
+    updated = {name: int(counts.get(name, 0)) for name in _PARAMETER_GROUPS}
+    present = {str(group["name"]) for group in optimizer.param_groups}
+    for name in set(active_groups) & present:
+        updated[name] += 1
+    return updated
+
+
+def validate_selected_checkpoint(
+    selected: Any,
+    *,
+    expected_identity: dict[str, Any],
+    expected_identity_sha256: str,
+    expected_epoch: int,
+    expected_metric: float,
+) -> None:
+    if not isinstance(selected, dict):
+        raise ValueError("best.pt payload is invalid")
+    validate_resume_identity(
+        selected.get("resume_identity"),
+        expected_identity,
+        selected.get("resume_identity_sha256"),
+    )
+    if selected.get("resume_identity_sha256") != expected_identity_sha256:
+        raise ValueError("best.pt identity is not the selected last.pt identity")
+    if selected.get("epoch") != expected_epoch:
+        raise ValueError("best.pt epoch does not match last.pt best_epoch")
+    metric = selected.get("validation")
+    if (
+        isinstance(metric, bool)
+        or not isinstance(metric, (int, float))
+        or not math.isfinite(metric)
+    ):
+        raise ValueError("best.pt validation metadata is invalid")
+    if float(metric) != expected_metric:
+        raise ValueError("best.pt validation does not match last.pt best_metric")
+
+
+def train_model(payload, protocol, args, device: torch.device, output: Path) -> dict[str, Any]:
+    _require_cuda(device)
+    validate_args(args)
+    if payload.get("dataset") != args.dataset:
+        raise ValueError("requested dataset does not match the verified payload")
+    hardware_runtime = validate_hardware_runtime(args, device)
+    configure_compute(args)
+    _seed(args.model_seed)
+    data, indices, sampler = _prepare_data(payload, args, device)
+    architecture = architecture_configuration(args)
+    model = GraphConditionedConductanceNodeClassifier(
+        payload["graphs"][0]["x"].shape[1],
+        payload["classes"],
+        **architecture,
+        conductance_mode=CONDITIONS[args.condition]["conductance_mode"],
+        max_log_conductance=COMMON["max_log_conductance"],
+        edge_chunk_size=args.edge_chunk_size,
+    ).to(device)
+    initial_state_sha256 = state_sha256(model)
+    optimizer = make_optimizer(model)
+    schedule = phase_schedule(args.epochs, list(args.phase_fractions))
+    resume_identity = build_resume_identity(
+        args, protocol, schedule, initial_state_sha256=initial_state_sha256
+    )
+    resume_identity_sha256 = _canonical_sha256(resume_identity)
+    checkpoint, previous_checkpoint, last_path, history_path = (
+        output / "best.pt",
+        output / "best.previous.pt",
+        output / "last.pt",
+        output / "history.json",
+    )
+    history: list[dict[str, Any]] = []
+    start_epoch, best_metric, best_epoch, optimizer_steps = 1, -math.inf, 0, 0
+    global_best_metric, global_best_epoch = -math.inf, 0
+    elapsed_before = 0.0
+    peak_allocated_before = peak_reserved_before = 0
+    first_c_gradient = None
+    best_checkpoint_sha256 = None
+    best_recovery_slot = "fresh"
+    effective_group_steps = {name: 0 for name in _PARAMETER_GROUPS}
+    if args.resume and last_path.exists():
+        saved = torch.load(last_path, map_location=device, weights_only=False)
+        validate_resume_identity(
+            saved.get("resume_identity"),
+            resume_identity,
+            saved.get("resume_identity_sha256"),
+        )
+        saved_history, saved_epoch = saved.get("history"), saved.get("epoch")
+        if (
+            not isinstance(saved_history, list)
+            or isinstance(saved_epoch, bool)
+            or not isinstance(saved_epoch, int)
+            or saved_epoch != len(saved_history)
+            or saved_epoch < 1
+        ):
+            raise ValueError("last.pt epoch/history state is invalid")
+        model.load_state_dict(saved["model_state"])
+        optimizer.load_state_dict(saved["optimizer_state"])
+        history = saved_history
+        start_epoch = args.epochs + 1 if saved.get("complete") is True else saved_epoch + 1
+        best_metric, best_epoch = float(saved["best_metric"]), int(saved["best_epoch"])
+        global_best_metric = float(saved.get("global_best_metric", best_metric))
+        global_best_epoch = int(saved.get("global_best_epoch", best_epoch))
+        elapsed_before = float(saved.get("elapsed_seconds", 0.0))
+        peak_allocated_before = int(saved.get("peak_cuda_allocated_bytes", 0))
+        peak_reserved_before = int(saved.get("peak_cuda_reserved_bytes", 0))
+        optimizer_steps, first_c_gradient = int(saved["optimizer_steps"]), saved["first_c_gradient"]
+        raw_group_steps = saved.get("effective_optimizer_steps_by_group")
+        if not isinstance(raw_group_steps, dict) or any(
+            isinstance(raw_group_steps.get(name), bool)
+            or not isinstance(raw_group_steps.get(name), int)
+            or raw_group_steps[name] < 0
+            for name in _PARAMETER_GROUPS
+        ):
+            raise ValueError("last.pt effective parameter-group step counts are invalid")
+        effective_group_steps = {name: raw_group_steps[name] for name in _PARAMETER_GROUPS}
+        best_checkpoint_sha256 = saved.get("best_checkpoint_sha256")
+        best_recovery_slot = recover_best_checkpoint(
+            checkpoint, previous_checkpoint, best_checkpoint_sha256
+        )
+        torch.set_rng_state(saved["cpu_rng_state"])
+        torch.cuda.set_rng_state(saved["cuda_rng_state"], device)
+    validation_indices = indices["validation"] if indices is not None else None
+    validation_data = _validation_source(data, sampler)
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize(device)
+    started = time.perf_counter()
+    for epoch in range(start_epoch, args.epochs + 1):
+        epoch_started = time.perf_counter()
+        phase, local_epoch = phase_at(schedule, epoch)
+        phase_state = configure_phase(model, phase, local_epoch)
+        loss_sum = torch.zeros((), dtype=torch.float32, device=device)
+        label_count, batch_count = 0, 0
+        maximum_preclip_gradient_norm = torch.zeros((), dtype=torch.float32, device=device)
+        for graph, train_indices in _training_batches(
+            data, indices, sampler, epoch, device, args.model_seed, args
+        ):
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_context(args):
+                logits = model(graph)
+                loss, count = training_loss(logits, graph, train_indices)
+            if phase_state["active_parameter_groups"]:
+                loss.backward()
+                if (
+                    args.condition == "shared_dynamic_c"
+                    and phase_state["coordinate"] in {"conductance", "joint"}
+                    and first_c_gradient is None
+                ):
+                    first_c_gradient = require_first_step_conductance_gradient(model)
+                gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    (value for value in model.parameters() if value.requires_grad),
+                    COMMON["gradient_clip_norm"],
+                    error_if_nonfinite=False,
+                    foreach=True,
+                )
+                require_finite_gradient_norm_async(gradient_norm)
+                maximum_preclip_gradient_norm = torch.maximum(
+                    maximum_preclip_gradient_norm, gradient_norm.float()
+                )
+                optimizer.step()
+                optimizer_steps += 1
+                effective_group_steps = count_effective_group_step(
+                    effective_group_steps, optimizer, phase_state["active_parameter_groups"]
+                )
+            loss_sum += loss.detach().float() * count
+            label_count += count
+            batch_count += 1
+        if not label_count:
+            raise RuntimeError("training phase produced no supervised labels")
+        observation = evaluate(
+            model,
+            validation_data if indices is not None else data["validation"],
+            validation_indices,
+            device=device,
+            precision=args.precision,
+        )
+        metric = float(observation["metric"])
+        train_loss_tensor = loss_sum / label_count
+        require_finite_tensor(train_loss_tensor, "epoch training loss")
+        train_loss = float(train_loss_tensor)
+        maximum_preclip_gradient_norm_value = float(maximum_preclip_gradient_norm)
+        if not math.isfinite(train_loss) or not math.isfinite(metric):
+            raise FloatingPointError("nonfinite epoch loss or validation metric")
+        row = {
+            "epoch": epoch,
+            "phase": phase_state,
+            "optimizer_steps": optimizer_steps,
+            "effective_optimizer_steps_by_group": dict(effective_group_steps),
+            "train_loss": train_loss,
+            "train_label_count": label_count,
+            "train_batches": batch_count,
+            "maximum_preclip_gradient_norm": maximum_preclip_gradient_norm_value,
+            "elapsed_wall_seconds": time.perf_counter() - epoch_started,
+            "validation": metric,
+            "layers": layer_diagnostics(model),
+        }
+        history.append(row)
+        atomic_write_json(history_path, history)
+        if metric > global_best_metric:
+            global_best_metric, global_best_epoch = metric, epoch
+        # Model selection is joint-phase only. Otherwise the dynamic arm could
+        # accidentally publish its C=1 warmup checkpoint as the V5 result.
+        if phase == "joint" and metric > best_metric:
+            best_metric, best_epoch = metric, epoch
+            best_checkpoint_sha256 = publish_best_checkpoint(
+                checkpoint,
+                previous_checkpoint,
+                {
+                    "model_state": model.state_dict(),
+                    "architecture": architecture,
+                    "condition": args.condition,
+                    "configuration": configuration(args),
+                    "schedule": schedule,
+                    "resume_identity": resume_identity,
+                    "resume_identity_sha256": resume_identity_sha256,
+                    "epoch": epoch,
+                    "validation": metric,
+                },
+            )
+        efficiency = merge_efficiency(
+            elapsed_before,
+            peak_allocated_before,
+            peak_reserved_before,
+            time.perf_counter() - started,
+            torch.cuda.max_memory_allocated(device),
+            torch.cuda.max_memory_reserved(device),
+        )
+        stop_after_epoch = epoch == args.epochs or (
+            phase == "joint" and best_epoch > 0 and epoch - best_epoch >= args.patience
+        )
+        _save(
+            last_path,
+            {
+                "schema_version": 2,
+                "complete": stop_after_epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "resume_identity": resume_identity,
+                "resume_identity_sha256": resume_identity_sha256,
+                "epoch": epoch,
+                "phase": phase_state,
+                "history": history,
+                "best_metric": best_metric,
+                "best_epoch": best_epoch,
+                "best_checkpoint_sha256": best_checkpoint_sha256,
+                "optimizer_steps": optimizer_steps,
+                "effective_optimizer_steps_by_group": effective_group_steps,
+                "global_best_metric": global_best_metric,
+                "global_best_epoch": global_best_epoch,
+                "first_c_gradient": first_c_gradient,
+                "cpu_rng_state": torch.get_rng_state(),
+                "cuda_rng_state": torch.cuda.get_rng_state(device),
+                **efficiency,
+            },
+        )
+        if epoch == 1 or epoch % 10 == 0:
+            print(
+                f"{args.dataset}/{args.condition} epoch={epoch} phase={phase} "
+                f"loss={row['train_loss']:.6f} val={metric:.6f} "
+                f"joint_best={best_metric:.6f}",
+                flush=True,
+            )
+        if stop_after_epoch:
+            break
+    if best_epoch < 1 or not math.isfinite(best_metric) or best_checkpoint_sha256 is None:
+        raise RuntimeError("V5 completed without a finite joint-phase best checkpoint")
+    best_recovery_slot = recover_best_checkpoint(
+        checkpoint, previous_checkpoint, best_checkpoint_sha256
+    )
+    selected = torch.load(checkpoint, map_location=device, weights_only=False)
+    validate_selected_checkpoint(
+        selected,
+        expected_identity=resume_identity,
+        expected_identity_sha256=resume_identity_sha256,
+        expected_epoch=best_epoch,
+        expected_metric=best_metric,
+    )
+    model.load_state_dict(selected["model_state"])
+    for operator in model.operators:
+        operator.estimator.override = None
+    interventions = selected_checkpoint_interventions(
+        model,
+        validation_data if indices is not None else data["validation"],
+        validation_indices,
+        device=device,
+        precision=args.precision,
+    )
+    learned_metric = float(interventions["learned"]["metric"])
+    if not math.isfinite(learned_metric):
+        raise FloatingPointError("selected best checkpoint produced a nonfinite metric")
+    selected_checkpoint_recheck = {
+        "recorded": best_metric,
+        "recomputed": learned_metric,
+        "delta": learned_metric - best_metric,
+        "declared_tolerance": 1e-6,
+        "within_declared_tolerance": math.isclose(
+            learned_metric, best_metric, rel_tol=0.0, abs_tol=1e-6
+        ),
+        "non_gating": True,
+        "reason": "CUDA scatter/threshold replay is not claimed bitwise deterministic",
+    }
+    torch.cuda.synchronize(device)
+    efficiency = merge_efficiency(
+        elapsed_before,
+        peak_allocated_before,
+        peak_reserved_before,
+        time.perf_counter() - started,
+        torch.cuda.max_memory_allocated(device),
+        torch.cuda.max_memory_reserved(device),
+    )
+    return {
+        "schema_version": 1,
+        "status": "passed",
+        "research_suite": SUITE,
+        "dataset": args.dataset,
+        "condition": args.condition,
+        "model_seed": args.model_seed,
+        **CONDITIONS[args.condition],
+        "configuration": configuration(args),
+        "schedule": schedule,
+        "best_epoch": best_epoch,
+        "epochs_run": len(history),
+        "optimizer_steps": optimizer_steps,
+        "effective_optimizer_steps_by_group": effective_group_steps,
+        "comparison_design": COMPARISON_DESIGN,
+        "hardware_execution": {
+            **hardware_runtime,
+            "timing_boundary": "CUDA synchronized before measured run and final accounting",
+            "gpu_sm_utilization": "not measured; use a time-series device monitor",
+            "small_full_graph_limit": (
+                "Cora/Citeseer/PubMed are single small full graphs and cannot fill 48 GiB "
+                "without scientifically invalid duplicate work"
+            ),
+        },
+        "gradient_clipping": {
+            "max_norm": COMMON["gradient_clip_norm"],
+            "error_if_nonfinite": "stream_ordered_async_assert_before_optimizer_step",
+            "maximum_observed_preclip_norm": max(
+                row["maximum_preclip_gradient_norm"] for row in history
+            ),
+        },
+        "global_best_validation": global_best_metric,
+        "global_best_epoch": global_best_epoch,
+        "validation": best_metric,
+        "metric_name": METRIC_BY_DATASET[args.dataset],
+        "checkpoint": str(checkpoint.resolve()),
+        "checkpoint_sha256": sha256_file(checkpoint),
+        "best_previous_checkpoint": str(previous_checkpoint.resolve()),
+        "best_checkpoint_recovery_slot": best_recovery_slot,
+        "resume_identity": resume_identity,
+        "resume_identity_sha256": resume_identity_sha256,
+        "resume_semantics": RESUME_SEMANTICS,
+        "last_checkpoint": str(last_path.resolve()),
+        "last_checkpoint_sha256": sha256_file(last_path),
+        "history": str(history_path.resolve()),
+        "optimizer_groups": optimizer_metadata(optimizer),
+        "total_parameters": sum(value.numel() for value in model.parameters()),
+        "trainable_parameters": sum(
+            value.numel() for value in model.parameters() if value.requires_grad
+        ),
+        "allocated_parameter_capacity": sum(value.numel() for value in model.parameters()),
+        "first_active_conductance_gradient": first_c_gradient,
+        "selected_checkpoint_interventions": interventions,
+        "selected_checkpoint_recheck": selected_checkpoint_recheck,
+        "sampling": sampler.metadata()
+        if sampler is not None
+        else {"mode": "full", "validation_graph": "complete_official_graph"},
+        "protocol": protocol,
+        "cache_sha256": protocol["data_sha256"],
+        "source_sha256": resume_identity["source_sha256"],
+        "initial_state_sha256": initial_state_sha256,
+        "history_sha256": sha256_file(history_path),
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+        "versions": _versions(),
+        "gpu": torch.cuda.get_device_name(device),
+        "throughput": {
+            "supervised_labels_per_elapsed_second": (
+                sum(row["train_label_count"] for row in history) / efficiency["elapsed_seconds"]
+                if efficiency["elapsed_seconds"] > 0
+                else None
+            ),
+            "training_batches_per_elapsed_second": (
+                sum(row["train_batches"] for row in history) / efficiency["elapsed_seconds"]
+                if efficiency["elapsed_seconds"] > 0
+                else None
+            ),
+            "elapsed_includes_validation_checkpointing_and_interventions": True,
+        },
+        "peak_cuda_allocated_fraction_of_visible_capacity": (
+            efficiency["peak_cuda_allocated_bytes"] / hardware_runtime["total_memory_bytes"]
+        ),
+        "peak_cuda_reserved_fraction_of_visible_capacity": (
+            efficiency["peak_cuda_reserved_bytes"] / hardware_runtime["total_memory_bytes"]
+        ),
+        **efficiency,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    validate_args(args)
+    device = torch.device(args.device)
+    _require_cuda(device)
+    output, data_root = (
+        args.output_dir.expanduser().resolve(),
+        args.data_root.expanduser().resolve(),
+    )
+    if output == data_root or output.is_relative_to(data_root) or data_root.is_relative_to(output):
+        raise ValueError("V5 output and V1 dataset cache must not overlap")
+    if (
+        output.exists()
+        and any(output.iterdir())
+        and not (args.resume and (output / "last.pt").exists())
+    ):
+        raise FileExistsError("nonempty output has no resumable V5 last.pt")
+    output.mkdir(parents=True, exist_ok=True)
+    record = {
+        "schema_version": 1,
+        "status": "running",
+        "research_suite": SUITE,
+        "dataset": args.dataset,
+        "condition": args.condition,
+        "configuration": configuration(args),
+        "test_evaluated": False,
+    }
+    atomic_write_json(output / "metrics.json", record)
+    try:
+        payload, protocol = load_dataset(args.dataset, data_root, allow_download=False)
+        record.update(train_model(payload, protocol, args, device, output))
+    except BaseException as exc:
+        record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        atomic_write_json(output / "metrics.json", record)
+        raise
+    atomic_write_json(output / "metrics.json", record)
+    print(f"passed: {output}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # research/cycle_pe/__init__.py
 
 ````python
@@ -28945,21 +32519,25 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
 from research.cycle_pe.v2 import benchmark
 from research.cycle_pe.v2.data import DATASETS
 from research.cycle_pe.v2.model import MODEL_NAME
 
 
-def test_v2_defaults_match_official_v1_protocol_but_not_its_representation() -> None:
+def test_v2_defaults_use_deep_projector_model_on_official_data() -> None:
     args = benchmark.parser().parse_args([])
     assert tuple(args.datasets) == DATASETS == ("zinc12k", "peptides_struct")
-    assert (args.hidden_dim, args.pe_dim, args.layers) == (64, 32, 3)
+    assert (args.hidden_dim, args.pe_dim, args.layers) == (128, 64, 10)
+    assert (args.ffn_multiplier, args.dropout, args.layer_scale) == (4, 0.1, 0.1)
     assert (args.epochs, args.patience, args.lr, args.batch_size) == (300, 50, 1e-3, 32)
-    assert args.max_parameters == 500_000
+    assert args.max_parameters == 20_000_000
     assert args.column_chunk_size == 16
+    assert args.basis_backend == "thin_q"
+    assert args.hardware_profile == "portable" and args.prefetch_factor == 2
     assert args.output_dir == Path("results/cycle_pe_v2/benchmark")
-    assert MODEL_NAME == "cycle_basis_v2"
+    assert MODEL_NAME == "cycle_projector_pe_v2"
     assert not hasattr(args, "baselines")
     assert not hasattr(args, "tiny")
     assert not hasattr(args, "max_cycle_rank")
@@ -29003,8 +32581,8 @@ def test_hashes_include_basis_data_encoder_and_reused_backbone_sources() -> None
 def test_prepare_only_records_separate_version_without_claiming_training(tmp_path, monkeypatch):
     loaded = []
 
-    def fake_load(root, dataset, *, allow_download):
-        loaded.append((dataset, allow_download))
+    def fake_load(root, dataset, *, allow_download, basis_backend):
+        loaded.append((dataset, allow_download, basis_backend))
         return {}, {"official_splits": True, "unit_fixture_only": True, "basis": "full_left_null"}
 
     monkeypatch.setattr(benchmark, "load_benchmark", fake_load)
@@ -29026,7 +32604,7 @@ def test_prepare_only_records_separate_version_without_claiming_training(tmp_pat
         )
         == 0
     )
-    assert loaded == [("zinc12k", False)]
+    assert loaded == [("zinc12k", False, "thin_q")]
     metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     for document in (metrics, manifest):
@@ -29034,12 +32612,49 @@ def test_prepare_only_records_separate_version_without_claiming_training(tmp_pat
         assert document["track"] == "cycle_pe"
         assert document["version"] == "v2"
     assert metrics["datasets"]["zinc12k"]["models"] == {}
-    assert manifest["controls"]["model"] == "cycle_basis_v2"
+    assert manifest["controls"]["model"] == "cycle_projector_pe_v2"
     assert "no truncation" in manifest["controls"]["basis_input"]
     assert manifest["controls"]["basis_rank_dependent_parameters"] is False
-    assert "SVD basis" in manifest["seeds"]["chart_seed"]
-    with pytest.raises(FileExistsError):
+    assert manifest["controls"]["basis_backend"] == "thin_q"
+    assert "projector is chart invariant" in manifest["seeds"]["chart_seed"]
+    manifest_bytes = (output / "manifest.json").read_bytes()
+    metrics_bytes = (output / "metrics.json").read_bytes()
+    # A different dataset/data-root command must fail before mutating artifacts.
+    with pytest.raises(ValueError, match="does not match"):
         benchmark.main(["--prepare-only", "--output-dir", str(output)])
+    assert (output / "manifest.json").read_bytes() == manifest_bytes
+    assert (output / "metrics.json").read_bytes() == metrics_bytes
+
+
+def test_dfs_backend_is_recorded_and_forwarded_to_data_preparation(tmp_path, monkeypatch):
+    seen = []
+
+    def fake_load(*args, **kwargs):
+        seen.append(kwargs["basis_backend"])
+        return {}, {"basis_backend": kwargs["basis_backend"], "official_splits": True}
+
+    monkeypatch.setattr(benchmark, "load_benchmark", fake_load)
+    output = tmp_path / "dfs"
+    benchmark.main(
+        [
+            "--datasets",
+            "zinc12k",
+            "--prepare-only",
+            "--device",
+            "cpu",
+            "--basis-backend",
+            "dfs_fundamental",
+            "--output-dir",
+            str(output),
+            "--data-root",
+            str(tmp_path),
+        ]
+    )
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert seen == ["dfs_fundamental"]
+    assert manifest["arguments"]["basis_backend"] == "dfs_fundamental"
+    assert manifest["controls"]["basis_backend"] == "dfs_fundamental"
+    assert "not an end-to-end linear-time speedup" in manifest["controls"]["basis_backend_runtime"]
 
 
 def test_only_v2_model_is_dispatched_once_per_official_dataset(tmp_path, monkeypatch):
@@ -29076,12 +32691,116 @@ def test_preparation_failure_is_persisted_not_reported_as_success(tmp_path, monk
 
 def test_runner_selects_validation_checkpoint_before_single_test_evaluation() -> None:
     source = inspect.getsource(benchmark._train_model)
-    assert source.count("evaluate(model, test_loader, device)") == 1
+    assert source.count("evaluate(model, test_loader, device, amp=args.amp)") == 1
     assert source.index(
         'model.load_state_dict(selected["state_dict"], strict=True)'
-    ) < source.index("evaluate(model, test_loader, device)")
+    ) < source.index("evaluate(model, test_loader, device, amp=args.amp)")
     assert "if validation < best:" in source
     assert "weights_only=True" in source
+
+
+def test_two_slot_best_checkpoint_recovers_exact_previous_bytes(tmp_path):
+    best = tmp_path / "best.pt"
+    previous = tmp_path / "best.previous.pt"
+    old_bytes, interrupted_new_bytes = b"selected-best", b"new-before-last"
+    previous.write_bytes(old_bytes)
+    best.write_bytes(interrupted_new_bytes)
+    expected = hashlib.sha256(old_bytes).hexdigest()
+    benchmark._recover_best_checkpoint(best, previous, expected)
+    assert best.read_bytes() == old_bytes
+    with pytest.raises(ValueError, match="recovery slot"):
+        benchmark._recover_best_checkpoint(best, previous, "0" * 64)
+
+
+def test_exact_multidataset_resume_skips_completed_datasets(tmp_path, monkeypatch):
+    trained, loaded = [], []
+    monkeypatch.setattr(benchmark, "_validate", lambda args: None)
+
+    def fake_load(root, dataset, **kwargs):
+        loaded.append(dataset)
+        return {}, {"official_splits": True}
+
+    def fake_train(dataset, splits, args):
+        trained.append(dataset)
+        return {"validation": 0.5, "fresh_training": True}
+
+    monkeypatch.setattr(benchmark, "load_benchmark", fake_load)
+    monkeypatch.setattr(benchmark, "_train_model", fake_train)
+    output = tmp_path / "resume"
+    command = ["--output-dir", str(output), "--data-root", str(tmp_path)]
+    assert benchmark.main(command) == 0
+    assert trained == loaded == list(DATASETS)
+
+    monkeypatch.setattr(benchmark, "_completed_training_dataset", lambda *args: True)
+    assert benchmark.main(command) == 0
+    assert trained == loaded == list(DATASETS)
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "passed" and manifest["resume_count"] == 1
+
+
+def test_epoch_checkpoint_contract_contains_all_resume_state():
+    source = inspect.getsource(benchmark._train_model)
+    for field in (
+        "model_state_dict",
+        "optimizer_state_dict",
+        "scheduler_state_dict",
+        "scaler_state_dict",
+        "rng_state",
+        "history",
+        "best_checkpoint_sha256",
+        "elapsed_seconds",
+        "peak_gpu_memory_bytes",
+        "peak_gpu_reserved_bytes",
+        "effective_batch_size",
+        "batch_calibration",
+    ):
+        assert f'"{field}"' in source
+    assert "best_checkpoint_bytes" not in source
+    assert 'previous_checkpoint = run / "best.previous.pt"' in source
+
+
+def test_a6000_probe_never_resizes_training_batch_midrun() -> None:
+    source = inspect.getsource(benchmark._calibrate_batch_size)
+    assert "candidate //" not in source
+    assert 'automatic_backoff": False' in source
+    assert "model.train()" in source and "torch.random.fork_rng" in source
+    train_source = inspect.getsource(benchmark._train_model)
+    assert "effective_batch_size = preview.get" in train_source
+    assert "batch_calibration.get" in train_source
+
+
+def test_completed_dataset_skip_requires_exact_artifact_hashes_and_complete_last(tmp_path):
+    args = benchmark.parser().parse_args(["--datasets", "zinc12k", "--output-dir", str(tmp_path)])
+    args.output_dir = tmp_path.resolve()
+    run = args.output_dir / "zinc12k" / MODEL_NAME
+    run.mkdir(parents=True)
+    best, history, last = run / "best.pt", run / "history.json", run / "last.pt"
+    best.write_bytes(b"best")
+    history.write_text("[]", encoding="utf-8")
+    torch.save(
+        {
+            "complete": True,
+            "resume_configuration": benchmark._resume_configuration("zinc12k", args),
+        },
+        last,
+    )
+
+    def digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    result = {
+        "checkpoint": str(best),
+        "checkpoint_sha256": digest(best),
+        "history": str(history),
+        "history_sha256": digest(history),
+        "last_checkpoint": str(last),
+        "last_checkpoint_sha256": digest(last),
+        "fresh_training": True,
+    }
+    entry = {"metric": "mae", "models": {MODEL_NAME: result}}
+    assert benchmark._completed_training_dataset(entry, "zinc12k", args)
+    history.write_text("corrupt", encoding="utf-8")
+    assert not benchmark._completed_training_dataset(entry, "zinc12k", args)
 ````
 
 # research/cycle_pe/tests/test_v2_data.py
@@ -29116,8 +32835,12 @@ def _official(num_nodes=4, edges=((0, 1), (1, 2), (2, 3), (0, 3)), *, dataset="z
     )
 
 
-def _graph(*args, **kwargs):
-    return data.prepare_graph(_official(*args, **kwargs), dataset=kwargs.get("dataset", "zinc12k"))
+def _graph(*args, basis_backend="thin_q", **kwargs):
+    return data.prepare_graph(
+        _official(*args, **kwargs),
+        dataset=kwargs.get("dataset", "zinc12k"),
+        basis_backend=basis_backend,
+    )
 
 
 def _edges(pairs):
@@ -29148,32 +32871,50 @@ def test_entire_left_nullspace_is_returned_for_connected_disconnected_and_empty(
     basis.validate_cycle_basis(nodes, edge_index, values)
 
 
-def test_uses_full_svd_not_reduced_svd_or_fixed_cycle_width(monkeypatch):
-    original = np.linalg.svd
-    calls = []
+def test_uses_sparse_fundamental_cycles_and_thin_qr_without_svd(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("spectral/rank decomposition is forbidden")
 
-    def observed(values, *, full_matrices):
-        calls.append((values.shape, full_matrices))
-        return original(values, full_matrices=full_matrices)
-
-    monkeypatch.setattr(basis.np.linalg, "svd", observed)
+    for name in ("svd", "eig", "eigh", "matrix_rank"):
+        monkeypatch.setattr(basis.np.linalg, name, forbidden)
     pairs = [(u, v) for u in range(8) for v in range(u + 1, 8)]
+    sparse_values = basis.sparse_left_nullspace_basis(8, _edges(pairs))
     values = basis.left_nullspace_basis(8, _edges(pairs))
+    assert sparse_values.shape == (28, 21) and sparse_values.nnz < np.prod(sparse_values.shape)
     assert values.shape == (28, 21)
-    assert calls == [((28, 8), True)]
+    np.testing.assert_allclose(values.T @ values, np.eye(21), atol=2e-6)
 
 
-def test_svd_rank_must_agree_with_graph_rank(monkeypatch):
-    original = np.linalg.svd
+def test_dfs_fundamental_backend_returns_raw_signed_cycles_with_same_projector():
+    pairs = [(u, v) for u in range(5) for v in range(u + 1, 5)]
+    edge_index = _edges(pairs)
+    raw_sparse = basis.dfs_fundamental_cycle_basis(5, edge_index)
+    raw = basis.build_cycle_basis(5, edge_index, backend="dfs_fundamental")
+    q = basis.build_cycle_basis(5, edge_index, backend="thin_q")
+    assert raw_sparse.shape == raw.shape == q.shape == (10, 6)
+    np.testing.assert_array_equal(raw, raw_sparse.toarray())
+    assert set(np.unique(raw)) <= {-1.0, 0.0, 1.0}
+    assert not np.allclose(raw.T @ raw, np.eye(6))
+    raw_q, _ = np.linalg.qr(raw.astype(np.float64), mode="reduced")
+    np.testing.assert_allclose(raw_q @ raw_q.T, q @ q.T, atol=2e-6)
+    basis.validate_cycle_basis(5, edge_index, raw_sparse)
 
-    def incorrect(values, *, full_matrices):
-        left, singular, right = original(values, full_matrices=full_matrices)
-        singular[:] = 1.0
-        return left, singular, right
 
-    monkeypatch.setattr(basis.np.linalg, "svd", incorrect)
-    with pytest.raises(ValueError, match="disagrees"):
-        basis.left_nullspace_basis(3, _edges([(0, 1), (0, 2), (1, 2)]))
+def test_unknown_basis_backend_fails_closed():
+    with pytest.raises(ValueError, match="backend"):
+        basis.build_cycle_basis(3, _edges([(0, 1)]), backend="unknown")
+    with pytest.raises(ValueError, match="basis_backend"):
+        data.prepare_graph(_official(), basis_backend="unknown")
+
+
+def test_generic_nonorthogonal_basis_is_valid_but_rank_deficiency_is_not():
+    edge_index = _edges([(0, 1), (0, 2), (1, 2), (1, 3), (2, 3)])
+    q = basis.left_nullspace_basis(4, edge_index)
+    changed = q @ np.asarray([[2.0, 0.5], [-1.0, 3.0]])
+    basis.validate_cycle_basis(4, edge_index, changed)
+    changed[:, 1] = changed[:, 0]
+    with pytest.raises(ValueError, match="full column rank"):
+        basis.validate_cycle_basis(4, edge_index, changed)
 
 
 @pytest.mark.parametrize(
@@ -29186,14 +32927,26 @@ def test_svd_rank_must_agree_with_graph_rank(monkeypatch):
         (3, np.array([0, 1]), "shape"),
         (3, _edges([(0, 3)]), "out of range"),
         (3, _edges([(-1, 1)]), "out of range"),
-        (3, _edges([(0, 0)]), "orientation"),
-        (3, _edges([(1, 0)]), "orientation"),
+        (3, _edges([(0, 0)]), "self-loop"),
         (3, _edges([(0, 1), (0, 1)]), "duplicate"),
     ],
 )
 def test_basis_input_contract_rejects_invalid_incidence_inputs(nodes, edges, error):
     with pytest.raises(ValueError, match=error):
         basis.left_nullspace_basis(nodes, edges)
+
+
+def test_arbitrary_edge_orientation_is_accepted_and_transports_projector():
+    edges = _edges([(0, 1), (0, 2), (1, 2)])
+    changed = edges.copy()
+    changed[:, 1] = changed[::-1, 1]
+    q, changed_q = basis.left_nullspace_basis(3, edges), basis.left_nullspace_basis(3, changed)
+    signs = np.asarray([1.0, -1.0, 1.0])
+    np.testing.assert_allclose(
+        changed_q @ changed_q.T,
+        signs[:, None] * (q @ q.T) * signs[None, :],
+        atol=2e-6,
+    )
 
 
 @pytest.mark.parametrize("kind", ["nonfinite", "wrong_width", "outside_nullspace", "rank", "half"])
@@ -29214,21 +32967,12 @@ def test_basis_validation_rejects_incomplete_or_corrupt_coordinates(kind):
         basis.validate_cycle_basis(3, edge_index, values)
 
 
-@pytest.mark.parametrize("num_nodes", [4, 100, 1000, 100_000])
-def test_orthonormality_tolerance_never_accepts_rank_deficiency_on_large_graphs(num_nodes):
-    edges = num_nodes * (num_nodes - 1) // 2
-    rank = edges - num_nodes + 1
-    # No large allocation or SVD is needed to check the validation bound.
-    tolerance = basis._orthonormality_tolerance(np.dtype("float32"), edges, rank)
-    assert 0 < tolerance <= 0.01 < 1.0
-
-
 def test_edge_order_alignment_is_exact_not_assumed_lexicographic():
     pairs = _edges([(0, 1), (0, 2), (0, 3), (1, 2), (2, 3)])
     original = basis.left_nullspace_basis(4, pairs)
     permutation = np.array([3, 0, 4, 1, 2])
     transformed = basis.left_nullspace_basis(4, pairs[:, permutation])
-    # SVD may rotate coordinates; the two spans must agree after row transport.
+    # Different spanning forests may rotate coordinates; the spaces must agree.
     transported = original[permutation]
     alignment = transported.T @ transformed
     np.testing.assert_allclose(transported @ alignment, transformed, atol=2e-7)
@@ -29245,6 +32989,7 @@ def test_official_chemistry_targets_preserved_and_directed_copies_sorted(dataset
         "edge_attr",
         "y",
         "cycle_basis",
+        "cycle_basis_is_orthonormal",
     }
     torch.testing.assert_close(graph.x, source.x)
     torch.testing.assert_close(graph.y, source.y)
@@ -29252,6 +32997,7 @@ def test_official_chemistry_targets_preserved_and_directed_copies_sorted(dataset
     torch.testing.assert_close(graph.edge_attr[:, 0], torch.tensor([3, 2, 1, 1]))
     assert graph.cycle_basis.shape == (4, 1)
     assert graph.cycle_basis.dtype == torch.float32
+    assert graph.cycle_basis_is_orthonormal.item() is True
     incidence, _ = basis.incidence_and_cycle_rank(4, graph.edge_index.numpy())
     np.testing.assert_allclose(incidence.T @ graph.cycle_basis.numpy(), 0, atol=1e-7)
 
@@ -29304,8 +33050,15 @@ def test_ragged_batch_keeps_whole_matrices_and_never_mixes_columns():
     assert [matrix.shape for matrix in batch.cycle_bases] == [(1, 0), (5, 2), (0, 0), (4, 1)]
     torch.testing.assert_close(batch.ptr, torch.tensor([0, 2, 6, 7, 11]))
     torch.testing.assert_close(batch.edge_ptr, torch.tensor([0, 1, 6, 6, 10]))
+    assert batch.cycle_basis_shapes == ((1, 0), (5, 2), (0, 0), (4, 1))
+    assert batch.cycle_basis_is_orthonormal == (True, True, True, True)
+    assert batch.packed_cycle_basis.is_contiguous()
+    assert batch.packed_cycle_basis.numel() == 14
     for index, graph in enumerate(graphs):
-        assert batch.cycle_bases[index] is graph.cycle_basis
+        torch.testing.assert_close(batch.cycle_bases[index], graph.cycle_basis)
+        assert batch.cycle_bases[index].untyped_storage().data_ptr() == (
+            batch.packed_cycle_basis.untyped_storage().data_ptr()
+        )
         start, end = batch.edge_ptr[index : index + 2]
         torch.testing.assert_close(
             batch.edge_index[:, start:end] - batch.ptr[index], graph.edge_index
@@ -29316,7 +33069,7 @@ def test_ragged_batch_keeps_whole_matrices_and_never_mixes_columns():
         torch.testing.assert_close(before, after)
 
 
-def test_ragged_pin_memory_visits_basis_matrices(monkeypatch):
+def test_ragged_pin_memory_uses_one_packed_basis_tensor(monkeypatch):
     batch = data.collate([_graph(), _graph(1, [])])
     called = []
 
@@ -29327,8 +33080,27 @@ def test_ragged_pin_memory_visits_basis_matrices(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "pin_memory", pin)
     pinned = batch.pin_memory()
     assert isinstance(pinned.cycle_bases, tuple)
-    assert all(id(matrix) in called for matrix in batch.cycle_bases)
-    assert len(called) == len(fields(batch)) - 1 + len(batch.cycle_bases)
+    assert id(batch.packed_cycle_basis) in called
+    assert all(id(matrix) not in called for matrix in batch.cycle_bases)
+    assert len(called) == sum(
+        isinstance(getattr(batch, field.name), torch.Tensor) for field in fields(batch)
+    )
+
+
+def test_batch_to_transfers_packed_basis_once_not_once_per_graph(monkeypatch):
+    batch = data.collate([_graph(), _graph(), _graph(1, [])])
+    transferred = []
+    original = torch.Tensor.to
+
+    def moved(tensor, *args, **kwargs):
+        transferred.append(id(tensor))
+        return original(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", moved)
+    result = batch.to("cpu")
+    assert transferred.count(id(batch.packed_cycle_basis)) == 1
+    assert all(id(matrix) not in transferred for matrix in batch.cycle_bases)
+    assert result.cycle_basis_shapes == batch.cycle_basis_shapes
 
 
 def test_collation_rejects_empty_or_inconsistent_graph_schemas():
@@ -29359,11 +33131,17 @@ def _rewrite_cache(cache, meta, rows):
     meta.write_text(json.dumps(metadata))
 
 
-def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_svd(tmp_path, monkeypatch):
+def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_basis_rebuild(
+    tmp_path, monkeypatch
+):
     _install_official_fixture(monkeypatch)
     first, protocol = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
     assert protocol["official_splits"]
-    assert protocol["preparation"]["representation"] == "complete_orthonormal_left_nullspace_basis"
+    assert (
+        protocol["preparation"]["representation"]
+        == "coordinate_free_cycle_projector_from_cached_thin_q"
+    )
+    assert data.CACHE_NAMESPACE == "cycle_pe_v2_projector_kernel_benchmark"
     assert set(protocol["preparation"]["implementation_sha256"]) == {
         "v2/basis.py",
         "v2/data.py",
@@ -29372,9 +33150,9 @@ def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_svd(tmp_pat
     assert not (tmp_path / "cycle_pe_benchmark").exists()
 
     def no_svd(*args, **kwargs):
-        raise AssertionError("cached bases must not be recomputed")
+        raise AssertionError("cached thin-Q matrices must not be recomputed")
 
-    monkeypatch.setattr(data, "left_nullspace_basis", no_svd)
+    monkeypatch.setattr(data, "build_cycle_basis", no_svd)
     second, restored = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
     assert restored == protocol
     for split in data.SPLITS:
@@ -29383,6 +33161,38 @@ def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_svd(tmp_pat
                 torch.testing.assert_close(
                     getattr(original, field.name), getattr(cached, field.name)
                 )
+
+
+def test_basis_backends_use_separate_caches_and_preserve_representation_metadata(
+    tmp_path, monkeypatch
+):
+    _install_official_fixture(monkeypatch)
+    thin, thin_protocol = data.load_benchmark(
+        tmp_path,
+        "zinc12k",
+        allow_download=False,
+        splits=("train",),
+        basis_backend="thin_q",
+    )
+    raw, raw_protocol = data.load_benchmark(
+        tmp_path,
+        "zinc12k",
+        allow_download=False,
+        splits=("train",),
+        basis_backend="dfs_fundamental",
+    )
+    assert thin_protocol["cache_directory"] != raw_protocol["cache_directory"]
+    assert thin_protocol["basis_backend"] == "thin_q"
+    assert raw_protocol["basis_backend"] == "dfs_fundamental"
+    assert "not an end-to-end linear-time speedup" in raw_protocol["basis_runtime"]
+    assert all(graph.cycle_basis_is_orthonormal.item() for graph in thin["train"])
+    assert not any(graph.cycle_basis_is_orthonormal.item() for graph in raw["train"])
+    raw_cycle = raw["train"][0].cycle_basis
+    assert set(raw_cycle.unique().tolist()) <= {-1.0, 0.0, 1.0}
+    assert not torch.allclose(
+        raw_cycle.T @ raw_cycle,
+        torch.eye(raw_cycle.shape[1], dtype=raw_cycle.dtype),
+    )
 
 
 @pytest.mark.parametrize("missing", ["payload", "metadata"])
@@ -29455,7 +33265,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from research.cycle_pe.paper_model import _MessageLayer
 from research.cycle_pe.v2.data import Graph, collate, prepare_graph
 from research.cycle_pe.v2.model import (
     MODEL_NAME,
@@ -29465,7 +33274,13 @@ from research.cycle_pe.v2.model import (
 )
 
 
-def _graph(n: int = 4, *, complete: bool = False, forest: bool = False) -> Graph:
+def _graph(
+    n: int = 4,
+    *,
+    complete: bool = False,
+    forest: bool = False,
+    basis_backend: str = "thin_q",
+) -> Graph:
     if complete:
         edges = [(u, v) for u in range(n) for v in range(u + 1, n)]
     elif forest:
@@ -29481,25 +33296,25 @@ def _graph(n: int = 4, *, complete: bool = False, forest: bool = False) -> Graph
             .T.contiguous(),
             edge_attr=torch.ones((2 * len(edges), 1), dtype=torch.long),
             y=torch.tensor([0.7]),
-        )
+        ),
+        basis_backend=basis_backend,
     )
 
 
-def test_raw_signed_coordinates_reach_first_learned_layer_without_truncation() -> None:
+def test_no_raw_basis_coordinate_reaches_a_learned_layer() -> None:
     graph = _graph(7, complete=True)
     basis = graph.cycle_basis
     encoder = LeftNullBasisEncoder(5, 8, column_chunk_size=4)
     observed = []
     hook = encoder.column_phi[0].register_forward_pre_hook(
-        lambda _module, args: observed.append(args[0][:, :, -1].detach().clone())
+        lambda _module, args: observed.append(args[0].detach().clone())
     )
     output = encoder(torch.randn(len(basis), 5), basis)
     hook.remove()
     assert basis.shape == (21, 15)
     assert output.shape == (21, 8)
-    assert max(value.shape[1] for value in observed) <= 4
-    torch.testing.assert_close(torch.cat(observed[::2], dim=1), basis)
-    torch.testing.assert_close(torch.cat(observed[1::2], dim=1), -basis)
+    assert len(observed) == 1
+    assert observed[0].shape == (21, 5)
 
 
 def test_every_basis_column_participates_in_autograd_and_parameters_are_rank_independent() -> None:
@@ -29515,21 +33330,47 @@ def test_every_basis_column_participates_in_autograd_and_parameters_are_rank_ind
         assert sum(p.numel() for p in encoder.parameters()) == parameters_before
 
 
-def test_chunk_size_changes_allocation_not_values_or_gradients() -> None:
+def test_chunk_size_changes_rank_core_allocation_not_values_or_gradients(monkeypatch) -> None:
     torch.manual_seed(7)
     graph = _graph(6, complete=True)
     encoder = LeftNullBasisEncoder(5, 9, column_chunk_size=1)
     bond = torch.randn(len(graph.edge_attr), 5)
     basis = graph.cycle_basis.clone().requires_grad_()
+    original_einsum = torch.einsum
+    core_shapes: list[tuple[int, ...]] = []
+
+    def observed(equation, *operands):
+        result = original_einsum(equation, *operands)
+        if equation == "md,ma,mb->dab":
+            core_shapes.append(tuple(result.shape))
+        return result
+
+    monkeypatch.setattr(torch, "einsum", observed)
     expected = encoder(bond, basis)
     expected.sum().backward()
     gradient = basis.grad.clone()
+    one_column_shapes = tuple(core_shapes)
+    core_shapes.clear()
     basis.grad = None
     encoder.column_chunk_size = 4
     actual = encoder(bond, basis)
     actual.sum().backward()
+    four_column_shapes = tuple(core_shapes)
     torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
     torch.testing.assert_close(basis.grad, gradient, atol=2e-6, rtol=2e-6)
+    assert one_column_shapes and four_column_shapes
+    assert len(one_column_shapes) > len(four_column_shapes)
+    assert all(shape[1:] == (1, 1) for shape in one_column_shapes)
+    assert any(max(shape[1:]) == 4 for shape in four_column_shapes)
+
+
+def test_pair_free_private_contract_handles_nonempty_rank_zero_input() -> None:
+    encoder = LeftNullBasisEncoder(5, 8)
+    q = torch.empty(4, 0)
+    values = torch.randn(4, 8, requires_grad=True)
+    mixed, leverage = encoder._projector_mix(q, values, pair_budget=1)
+    assert torch.equal(mixed, torch.zeros_like(values))
+    assert torch.equal(leverage, torch.zeros(4))
 
 
 def test_column_sign_and_order_symmetry_after_nonlinear_column_encoding() -> None:
@@ -29544,7 +33385,7 @@ def test_column_sign_and_order_symmetry_after_nonlinear_column_encoding() -> Non
     torch.testing.assert_close(encoder(bond, graph.cycle_basis), encoder(bond, changed))
 
 
-def test_relative_sign_structure_is_not_replaced_by_entrywise_absolute_values() -> None:
+def test_independent_edge_orientation_signs_are_unobservable() -> None:
     torch.manual_seed(17)
     encoder = LeftNullBasisEncoder(7, 8)
     bond = torch.randn(4, 7)
@@ -29552,7 +33393,7 @@ def test_relative_sign_structure_is_not_replaced_by_entrywise_absolute_values() 
     changed = basis.clone()
     changed[1] *= -1
     torch.testing.assert_close(basis.abs(), changed.abs())
-    assert not torch.allclose(encoder(bond, basis), encoder(bond, changed), atol=1e-8, rtol=1e-7)
+    torch.testing.assert_close(encoder(bond, basis), encoder(bond, changed))
 
 
 def test_edge_order_equivariance_with_transported_full_basis() -> None:
@@ -29584,7 +33425,7 @@ def test_full_model_ragged_batch_matches_individual_graphs_and_backpropagates() 
     batch = collate(graphs)
     output = model(batch)
     assert output.shape == (3, 1)
-    assert all(isinstance(layer, _MessageLayer) for layer in model.layers)
+    assert all(hasattr(layer, "edge_ffn") and hasattr(layer, "node_ffn") for layer in model.layers)
     (output - batch.y).abs().mean().backward()
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
     model.eval()
@@ -29622,7 +33463,8 @@ def test_official_target_width_parameter_budget_and_edgeless_readout(dataset, wi
     output = model(collate([graph]))
     assert output.shape == (1, targets)
     assert torch.isfinite(output).all()
-    assert sum(p.numel() for p in model.parameters()) <= 500_000
+    parameters = sum(p.numel() for p in model.parameters())
+    assert 1_000_000 < parameters <= 20_000_000
 
 
 @pytest.mark.parametrize("kwargs", [{"bond_dim": 0}, {"pe_dim": 0}, {"column_chunk_size": 0}])
@@ -29642,16 +33484,15 @@ def test_basis_schema_errors_fail_loudly() -> None:
         encoder(torch.zeros(0, 5), torch.zeros(0, 1))
 
 
-def test_protocol_names_actual_basis_input_and_states_gauge_and_compression_limits() -> None:
+def test_protocol_names_intrinsic_projector_and_deep_backbone() -> None:
     protocol = architecture_protocol()
-    assert MODEL_NAME == "cycle_basis_v2"
-    assert "full signed left-nullspace basis" in protocol["positional_encoding"]
-    assert "no train-fitted padding, truncation" in protocol["basis_width"]
-    assert "not arbitrary O(beta)" in protocol["cycle_symmetry"]
-    assert "not guaranteed injective" in protocol["limits"]
+    assert MODEL_NAME == "cycle_projector_pe_v2"
+    assert "P=Q Q.T" in protocol["positional_encoding"]
+    assert "invertible cycle-basis replacement" in protocol["symmetry"]
+    assert "pre-norm residual" in protocol["backbone"]
 
 
-def _disconnected_graph() -> Graph:
+def _disconnected_graph(*, basis_backend: str = "thin_q") -> Graph:
     edges = [(0, 1), (0, 2), (1, 2), (3, 4), (3, 5), (4, 5)]
     return prepare_graph(
         SimpleNamespace(
@@ -29660,7 +33501,8 @@ def _disconnected_graph() -> Graph:
             edge_index=torch.tensor(edges + [(v, u) for u, v in edges], dtype=torch.long).T,
             edge_attr=torch.ones((2 * len(edges), 1), dtype=torch.long),
             y=torch.tensor([0.7]),
-        )
+        ),
+        basis_backend=basis_backend,
     )
 
 
@@ -29745,11 +33587,12 @@ def test_batched_encoder_keeps_graph_column_segments_signs_and_edge_order_separa
     torch.testing.assert_close(altered[: len(bases[0])], expected[: len(bases[0])])
 
 
-def test_batched_encoder_shares_mlp_calls_and_honors_pair_budget_without_truncation() -> None:
+def test_batched_encoder_keeps_raw_basis_out_of_mlps_and_pair_budget_is_exact(
+    monkeypatch,
+) -> None:
     encoder = LeftNullBasisEncoder(5, 9, column_chunk_size=2)
     bases = tuple(_graph(5, complete=True).cycle_basis for _ in range(3))
     bond = torch.randn(sum(len(basis) for basis in bases), 5)
-    pair_count = sum(basis.numel() for basis in bases)
     calls: dict[str, list[torch.Tensor]] = {"phi": [], "psi": []}
     hooks = [
         module.register_forward_pre_hook(
@@ -29758,18 +33601,26 @@ def test_batched_encoder_shares_mlp_calls_and_honors_pair_budget_without_truncat
         for key, module in (("phi", encoder.column_phi[0]), ("psi", encoder.edge_psi[0]))
     ]
     try:
-        encoder.forward_batch(bond, bases, pair_budget=pair_count)
-        assert len(calls["phi"]) == len(calls["psi"]) == 2
-        # One shared positive and one shared negative call cover all entries.
-        assert sum(len(value) for value in calls["phi"]) == 2 * pair_count
-        assert calls["phi"][0].shape == (pair_count, 6)
-        torch.testing.assert_close(calls["phi"][0][:, -1], -calls["phi"][1][:, -1])
+        expected = encoder.forward_batch(bond, bases, pair_budget=10_000)
+        assert len(calls["phi"]) == len(calls["psi"]) == 1
+        assert len(calls["phi"][0]) == len(bond)
+        assert all(value.shape[1] == 5 for value in calls["phi"])
         for values in calls.values():
             values.clear()
-        encoder.forward_batch(bond, bases, pair_budget=7)
-        for values in calls.values():
-            assert max(len(value) for value in values) <= 7
-            assert sum(len(value) for value in values) == 2 * pair_count
+        original_einsum = torch.einsum
+        core_sizes = []
+
+        def observed(equation, *operands):
+            result = original_einsum(equation, *operands)
+            if equation == "gmd,gma,gmb->gdab":
+                core_sizes.append(result.numel())
+            return result
+
+        monkeypatch.setattr(torch, "einsum", observed)
+        actual = encoder.forward_batch(bond, bases, pair_budget=7)
+        torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+        assert core_sizes and max(core_sizes) <= 7
+        assert len(calls["phi"]) == len(calls["psi"]) == 1
     finally:
         for hook in hooks:
             hook.remove()
@@ -29815,6 +33666,40 @@ def test_full_batched_model_matches_reference_state_dict_outputs_and_gradients()
     _assert_parameter_gradients_match(batched, reference)
 
 
+@pytest.mark.parametrize("basis_execution", ["reference", "batched"])
+def test_raw_dfs_and_cached_thin_q_backends_give_same_projector_model_output(
+    basis_execution,
+) -> None:
+    torch.manual_seed(71)
+    model = CycleBasisPEModel(
+        dataset="zinc12k",
+        hidden=12,
+        pe_dim=6,
+        layers=2,
+        column_chunk_size=2,
+        basis_execution=basis_execution,
+        basis_pair_budget=7,
+    ).eval()
+    thin_graphs = [
+        _graph(4),
+        _graph(5, complete=True),
+        _graph(4, forest=True),
+        _disconnected_graph(),
+    ]
+    raw_graphs = [
+        _graph(4, basis_backend="dfs_fundamental"),
+        _graph(5, complete=True, basis_backend="dfs_fundamental"),
+        _graph(4, forest=True, basis_backend="dfs_fundamental"),
+        _disconnected_graph(basis_backend="dfs_fundamental"),
+    ]
+    assert all(graph.cycle_basis_is_orthonormal.item() for graph in thin_graphs)
+    assert not any(graph.cycle_basis_is_orthonormal.item() for graph in raw_graphs)
+    with torch.no_grad():
+        thin_output = model(collate(thin_graphs))
+        raw_output = model(collate(raw_graphs))
+    torch.testing.assert_close(raw_output, thin_output, atol=4e-5, rtol=4e-5)
+
+
 @pytest.mark.parametrize("kwargs", [{"basis_execution": "unknown"}, {"basis_pair_budget": 0}])
 def test_full_model_rejects_invalid_execution_settings(kwargs):
     with pytest.raises(ValueError, match="basis_"):
@@ -29838,42 +33723,37 @@ def test_batched_encoder_rejects_invalid_schema_and_budget() -> None:
 # research/cycle_pe/v2/__init__.py
 
 ````python
-"""Cycle PE v2: complete incidence left-nullspace basis inputs.
+"""Cycle PE v2: coordinate-free incidence-cycle-space projector PE.
 
 The original cycle-set summary experiment remains unchanged in the parent
-package. This package has separate data, cache, model and experiment entrypoints.
+package. The production backend caches thin-Q coordinates; the optional DFS
+backend may cache raw fundamental cycles but orthonormalizes them before any
+learned layer. Both paths use the same intrinsic projector kernel and deep
+residual molecular GNN.
 """
 ````
 
 # research/cycle_pe/v2/basis.py
 
 ````python
-"""Complete orthonormal left-nullspace bases of oriented graph incidence.
+"""Sparse, chart-independent construction of the graph circulation space.
 
-Rows correspond to the supplied, canonical undirected edges. Columns are all
-``beta = m - n + c`` basis vectors of ``ker(B.T)``. No statistics, projector,
-padding width or truncated spectrum replaces these vectors.
-
-An SVD basis is coordinate-dependent: signs, column order and rotations within
-the nullspace are not intrinsic graph labels. Canonical edge ordering stabilizes
-one input convention but does not promise relabeling or cross-LAPACK invariance.
+For edge-by-node incidence ``B``, the cycle space is ``ker(B.T)`` with exact
+dimension ``m - n + components``.  We construct a sparse fundamental basis;
+the model subsequently uses only its coordinate-free orthogonal projector.
 """
 
 from __future__ import annotations
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from scipy import sparse
+
+BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
+DEFAULT_BASIS_BACKEND = "thin_q"
 
 
-def incidence_and_cycle_rank(
-    num_nodes: int, edge_index: ArrayLike
-) -> tuple[NDArray[np.float64], int]:
-    """Return ``B[m,n]`` (tail -1, head +1) and exact combinatorial nullity.
-
-    The graph must be simple and loop-free, with exactly one row per bond and
-    orientation ``u < v``. Isolated vertices count as connected components.
-    Input edge order is preserved, so returned basis rows remain aligned.
-    """
+def _checked_edges(num_nodes: int, edge_index: ArrayLike) -> NDArray[np.int64]:
     if isinstance(num_nodes, bool) or not isinstance(num_nodes, (int, np.integer)):
         raise ValueError("num_nodes must be a positive integer")
     if num_nodes < 1:
@@ -29883,28 +33763,41 @@ def incidence_and_cycle_rank(
         raise ValueError("edge_index must have shape (2, num_edges)")
     if not np.issubdtype(edges.dtype, np.integer) or np.issubdtype(edges.dtype, np.bool_):
         raise ValueError("edge_index must contain integer node indices")
+    edges = edges.astype(np.int64, copy=False)
     if np.any(edges < 0) or np.any(edges >= num_nodes):
         raise ValueError("edge endpoint out of range")
-    if np.any(edges[0] >= edges[1]):
-        raise ValueError("edges must have canonical loop-free orientation u < v")
-    pairs = list(map(tuple, edges.T.tolist()))
-    if len(set(pairs)) != len(pairs):
+    if np.any(edges[0] == edges[1]):
+        raise ValueError("self-loops are not supported")
+    undirected = [tuple(sorted(pair)) for pair in edges.T.tolist()]
+    if len(set(undirected)) != len(undirected):
         raise ValueError("duplicate undirected edge")
+    return edges
 
-    parent = list(range(num_nodes))
+
+def incidence_and_cycle_rank(
+    num_nodes: int, edge_index: ArrayLike
+) -> tuple[NDArray[np.float64], int]:
+    """Return supplied-orientation incidence ``B[m,n]`` and exact nullity."""
+    edges = _checked_edges(num_nodes, edge_index)
+    parent = np.arange(num_nodes, dtype=np.int64)
+    size = np.ones(num_nodes, dtype=np.int64)
 
     def find(vertex: int) -> int:
         while parent[vertex] != vertex:
             parent[vertex] = parent[parent[vertex]]
-            vertex = parent[vertex]
+            vertex = int(parent[vertex])
         return vertex
 
     components = num_nodes
-    for u, v in pairs:
-        left, right = find(u), find(v)
-        if left != right:
-            parent[right] = left
-            components -= 1
+    for u_raw, v_raw in edges.T:
+        u, v = find(int(u_raw)), find(int(v_raw))
+        if u == v:
+            continue
+        if size[u] < size[v]:
+            u, v = v, u
+        parent[v] = u
+        size[u] += size[v]
+        components -= 1
     edge_count = edges.shape[1]
     incidence = np.zeros((edge_count, num_nodes), dtype=np.float64)
     rows = np.arange(edge_count)
@@ -29913,84 +33806,299 @@ def incidence_and_cycle_rank(
     return incidence, edge_count - num_nodes + components
 
 
-def _orthonormality_tolerance(dtype: np.dtype, edge_count: int, cycle_rank: int) -> float:
-    # A rank-deficient Gram matrix has distance at least 1 from identity.
-    # Never let size scaling weaken the full-rank certificate to that point.
-    return min(
-        0.01,
-        32.0 * np.finfo(dtype).eps * max(1.0, np.sqrt(edge_count)) * max(1, cycle_rank),
-    )
+def sparse_left_nullspace_basis(num_nodes: int, edge_index: ArrayLike) -> sparse.csr_matrix:
+    """Build a sparse full basis of ``ker(B.T)`` without SVD/eigendecomposition.
+
+    Union/find selects a spanning forest.  Each chord closes one fundamental
+    cycle, so the chord rows form an identity matrix and prove full rank.
+    Complexity is linear plus the total length of the fundamental cycles.
+    """
+    edges = _checked_edges(num_nodes, edge_index)
+    edge_count = edges.shape[1]
+    union_parent = np.arange(num_nodes, dtype=np.int64)
+    union_size = np.ones(num_nodes, dtype=np.int64)
+
+    def find(vertex: int) -> int:
+        while union_parent[vertex] != vertex:
+            union_parent[vertex] = union_parent[union_parent[vertex]]
+            vertex = int(union_parent[vertex])
+        return vertex
+
+    tree_edges: list[int] = []
+    chords: list[int] = []
+    for edge, (u_raw, v_raw) in enumerate(edges.T):
+        u, v = find(int(u_raw)), find(int(v_raw))
+        if u == v:
+            chords.append(edge)
+            continue
+        if union_size[u] < union_size[v]:
+            u, v = v, u
+        union_parent[v] = u
+        union_size[u] += union_size[v]
+        tree_edges.append(edge)
+    rank = len(chords)
+    if rank == 0:
+        return sparse.csr_matrix((edge_count, 0), dtype=np.float32)
+
+    adjacency: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
+    for edge in tree_edges:
+        tail, head = map(int, edges[:, edge])
+        adjacency[tail].append((head, edge))
+        adjacency[head].append((tail, edge))
+
+    # up_sign[v] is the coefficient for traversing v -> parent[v].
+    forest_parent = np.full(num_nodes, -1, dtype=np.int64)
+    parent_edge = np.full(num_nodes, -1, dtype=np.int64)
+    up_sign = np.zeros(num_nodes, dtype=np.int8)
+    depth = np.zeros(num_nodes, dtype=np.int64)
+    for root in range(num_nodes):
+        if forest_parent[root] != -1:
+            continue
+        forest_parent[root] = root
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            for neighbor, edge in adjacency[node]:
+                if forest_parent[neighbor] != -1:
+                    continue
+                forest_parent[neighbor] = node
+                parent_edge[neighbor] = edge
+                depth[neighbor] = depth[node] + 1
+                tail, head = map(int, edges[:, edge])
+                up_sign[neighbor] = 1 if (neighbor, node) == (tail, head) else -1
+                stack.append(neighbor)
+
+    rows: list[int] = []
+    columns: list[int] = []
+    values: list[float] = []
+
+    def append_up(vertex: int, column: int, multiplier: int) -> int:
+        rows.append(int(parent_edge[vertex]))
+        columns.append(column)
+        values.append(float(multiplier * int(up_sign[vertex])))
+        return int(forest_parent[vertex])
+
+    for column, chord in enumerate(chords):
+        tail, head = map(int, edges[:, chord])
+        # chord tail -> head is closed by tree path head -> tail.
+        left, right = head, tail
+        while depth[left] > depth[right]:
+            left = append_up(left, column, +1)
+        while depth[right] > depth[left]:
+            right = append_up(right, column, -1)
+        while left != right:
+            left = append_up(left, column, +1)
+            right = append_up(right, column, -1)
+        rows.append(chord)
+        columns.append(column)
+        values.append(1.0)
+
+    result = sparse.coo_matrix(
+        (np.asarray(values, dtype=np.float32), (rows, columns)),
+        shape=(edge_count, rank),
+        dtype=np.float32,
+    ).tocsr()
+    result.sum_duplicates()
+    result.sort_indices()
+    return result
+
+
+def dfs_fundamental_cycle_basis(num_nodes: int, edge_index: ArrayLike) -> sparse.csr_matrix:
+    """Return the signed fundamental-cycle basis of an iterative DFS forest.
+
+    DFS chooses one spanning tree per connected component.  Every non-tree edge
+    (chord) contributes that edge plus the unique parent path between its
+    endpoints.  The chord row of its own column is one and every other chord row
+    is zero, so the columns are independent without a numerical rank test.
+
+    Discovering the forest costs ``O(num_nodes + num_edges)``.  Materializing
+    the explicit basis additionally costs ``O(nnz(Z))``; that output term can be
+    superlinear because one tree edge may occur in many fundamental cycles.
+    """
+    edges = _checked_edges(num_nodes, edge_index)
+    edge_count = edges.shape[1]
+    adjacency: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
+    for edge, (tail_raw, head_raw) in enumerate(edges.T):
+        tail, head = int(tail_raw), int(head_raw)
+        adjacency[tail].append((head, edge))
+        adjacency[head].append((tail, edge))
+
+    forest_parent = np.full(num_nodes, -1, dtype=np.int64)
+    parent_edge = np.full(num_nodes, -1, dtype=np.int64)
+    up_sign = np.zeros(num_nodes, dtype=np.int8)
+    depth = np.zeros(num_nodes, dtype=np.int64)
+    tree_edge = np.zeros(edge_count, dtype=np.bool_)
+
+    # Store the next adjacency position on the stack.  This is iterative DFS
+    # with explicit backtracking, rather than all-simple-cycle enumeration.
+    for root in range(num_nodes):
+        if forest_parent[root] != -1:
+            continue
+        forest_parent[root] = root
+        stack: list[tuple[int, int]] = [(root, 0)]
+        while stack:
+            node, position = stack[-1]
+            if position == len(adjacency[node]):
+                stack.pop()
+                continue
+            stack[-1] = (node, position + 1)
+            neighbor, edge = adjacency[node][position]
+            if forest_parent[neighbor] != -1:
+                continue
+            forest_parent[neighbor] = node
+            parent_edge[neighbor] = edge
+            depth[neighbor] = depth[node] + 1
+            tail, head = map(int, edges[:, edge])
+            up_sign[neighbor] = 1 if (neighbor, node) == (tail, head) else -1
+            tree_edge[edge] = True
+            stack.append((neighbor, 0))
+
+    chords = np.flatnonzero(~tree_edge)
+    rank = len(chords)
+    if rank == 0:
+        return sparse.csr_matrix((edge_count, 0), dtype=np.float32)
+
+    rows: list[int] = []
+    columns: list[int] = []
+    values: list[float] = []
+
+    def append_up(vertex: int, column: int, multiplier: int) -> int:
+        edge = int(parent_edge[vertex])
+        if edge < 0:
+            raise RuntimeError("DFS chord endpoints do not share a spanning-tree component")
+        rows.append(edge)
+        columns.append(column)
+        values.append(float(multiplier * int(up_sign[vertex])))
+        return int(forest_parent[vertex])
+
+    for column, chord_raw in enumerate(chords):
+        chord = int(chord_raw)
+        tail, head = map(int, edges[:, chord])
+        # Traverse the chord tail -> head, then the parent path head -> tail.
+        left, right = head, tail
+        while depth[left] > depth[right]:
+            left = append_up(left, column, +1)
+        while depth[right] > depth[left]:
+            right = append_up(right, column, -1)
+        while left != right:
+            left = append_up(left, column, +1)
+            right = append_up(right, column, -1)
+        rows.append(chord)
+        columns.append(column)
+        values.append(1.0)
+
+    result = sparse.coo_matrix(
+        (np.asarray(values, dtype=np.float32), (rows, columns)),
+        shape=(edge_count, rank),
+        dtype=np.float32,
+    ).tocsr()
+    result.sum_duplicates()
+    result.sort_indices()
+    return result
 
 
 def validate_cycle_basis(num_nodes: int, edge_index: ArrayLike, basis: ArrayLike) -> None:
-    """Reject wrong dimension, nonfinite, non-null or non-orthonormal columns.
+    """Certify dimension, finite values, nullness and full column rank.
 
-    Float32 storage is intentional. Checks are accumulated in float64, with
-    tolerances scaled by the stored precision, matrix size and input norm.
-    Together, exact nullity and orthonormal columns certify a full basis rather
-    than merely a collection of vectors from the nullspace.
+    Orthonormality is deliberately not required: a cycle space is intrinsic,
+    while a coordinate chart is not.  The downstream PE is invariant to every
+    invertible basis replacement ``Z -> ZR``.
     """
     incidence, cycle_rank = incidence_and_cycle_rank(num_nodes, edge_index)
-    raw = np.asarray(basis)
-    if raw.ndim != 2 or raw.shape != (len(incidence), cycle_rank):
+    if sparse.issparse(basis):
+        raw = basis
+        shape = raw.shape
+        if not np.issubdtype(raw.dtype, np.floating) or not np.all(np.isfinite(raw.data)):
+            raise ValueError("cycle_basis must contain finite floating-point values")
+        values = raw.astype(np.float64, copy=False)
+        dense = values.toarray()
+    else:
+        raw = np.asarray(basis)
+        shape = raw.shape
+        if not np.issubdtype(raw.dtype, np.floating) or not np.all(np.isfinite(raw)):
+            raise ValueError("cycle_basis must contain finite floating-point values")
+        if raw.dtype.itemsize < 4:
+            raise ValueError("cycle_basis storage requires float32 or float64 precision")
+        dense = raw.astype(np.float64, copy=False)
+        values = dense
+    if len(shape) != 2 or shape != (len(incidence), cycle_rank):
         raise ValueError(
-            f"cycle_basis must have shape ({len(incidence)}, {cycle_rank}); got {raw.shape}"
+            f"cycle_basis must have shape ({len(incidence)}, {cycle_rank}); got {shape}"
         )
-    if not np.issubdtype(raw.dtype, np.floating) or not np.all(np.isfinite(raw)):
-        raise ValueError("cycle_basis must contain finite floating-point values")
-    if raw.dtype.itemsize < 4:
-        raise ValueError("cycle_basis storage requires float32 or float64 precision")
     if not cycle_rank:
         return
-    values = raw.astype(np.float64, copy=False)
     epsilon = np.finfo(raw.dtype).eps
     residual = np.linalg.norm(incidence.T @ values, ord="fro")
-    residual_scale = max(1.0, np.linalg.norm(incidence, ord="fro")) * max(
-        1.0, np.linalg.norm(values, ord="fro")
+    scale = max(1.0, np.linalg.norm(incidence, ord="fro")) * max(
+        1.0, np.linalg.norm(dense, ord="fro")
     )
-    if residual > 32.0 * epsilon * residual_scale:
-        raise ValueError("cycle_basis is not in the left nullspace: B.T @ U_c != 0")
-    gram_error = np.linalg.norm(values.T @ values - np.eye(cycle_rank), ord="fro")
-    gram_tolerance = _orthonormality_tolerance(raw.dtype, len(values), cycle_rank)
-    if gram_error > gram_tolerance:
-        raise ValueError("cycle_basis columns must be orthonormal and full rank")
+    if residual > 64.0 * epsilon * scale:
+        raise ValueError("cycle_basis is not in the left nullspace: B.T @ Z != 0")
+    gram = dense.T @ dense
+    try:
+        factor = np.linalg.cholesky(gram)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("cycle_basis must have full column rank") from exc
+    diagonal = np.diag(factor)
+    if diagonal.min() <= np.sqrt(epsilon) * max(1.0, diagonal.max()):
+        raise ValueError("cycle_basis must have numerically full column rank")
 
 
 def left_nullspace_basis(num_nodes: int, edge_index: ArrayLike) -> NDArray[np.float32]:
-    """Compute every left-nullspace vector with full SVD, preserving edge rows.
-
-    ``B = U S V.T`` implies ``U_c = U[:, rank(B):]``. The rank is checked
-    against ``n-c``; it is not chosen by a user-specified width. Forests have
-    shape ``(m, 0)`` and edgeless graphs ``(0, 0)``.
-    """
-    incidence, cycle_rank = incidence_and_cycle_rank(num_nodes, edge_index)
-    edge_count = len(incidence)
-    if not cycle_rank:
+    """Build sparse fundamental cycles, then cache-ready thin-QR coordinates."""
+    fundamental = sparse_left_nullspace_basis(num_nodes, edge_index)
+    validate_cycle_basis(num_nodes, edge_index, fundamental)
+    edge_count, rank = fundamental.shape
+    if rank == 0:
         return np.empty((edge_count, 0), dtype=np.float32)
-    left, singular_values, _ = np.linalg.svd(incidence, full_matrices=True)
-    threshold = (
-        np.finfo(np.float64).eps
-        * max(incidence.shape)
-        * (float(singular_values[0]) if len(singular_values) else 0.0)
-    )
-    numerical_rank = int(np.count_nonzero(singular_values > threshold))
-    expected_rank = edge_count - cycle_rank
-    if numerical_rank != expected_rank:
-        raise ValueError(f"incidence SVD rank {numerical_rank} disagrees with n-c={expected_rank}")
-    basis = np.ascontiguousarray(left[:, expected_rank:], dtype=np.float64)
-    validate_cycle_basis(num_nodes, edge_index, basis)
-    result = basis.astype(np.float32)
+    q, _ = np.linalg.qr(fundamental.toarray().astype(np.float64), mode="reduced")
+    for column in range(rank):
+        pivot = int(np.argmax(np.abs(q[:, column])))
+        if q[pivot, column] < 0:
+            q[:, column] *= -1.0
+    result = np.ascontiguousarray(q, dtype=np.float32)
     validate_cycle_basis(num_nodes, edge_index, result)
     return result
 
 
-__all__ = ["incidence_and_cycle_rank", "left_nullspace_basis", "validate_cycle_basis"]
+def build_cycle_basis(
+    num_nodes: int,
+    edge_index: ArrayLike,
+    *,
+    backend: str = DEFAULT_BASIS_BACKEND,
+) -> NDArray[np.float32]:
+    """Build the selected dense cache representation of ``ker(B.T)``.
+
+    ``thin_q`` preserves the production representation used by the fast model
+    path. ``dfs_fundamental`` stores raw signed fundamental cycles selected by
+    iterative DFS; the model must orthonormalize those coordinates before using
+    ``Q Q.T`` as a projector.
+    """
+    if backend not in BASIS_BACKENDS:
+        raise ValueError(f"basis backend must be one of {BASIS_BACKENDS}")
+    if backend == "thin_q":
+        return left_nullspace_basis(num_nodes, edge_index)
+    fundamental = dfs_fundamental_cycle_basis(num_nodes, edge_index)
+    validate_cycle_basis(num_nodes, edge_index, fundamental)
+    return np.ascontiguousarray(fundamental.toarray(), dtype=np.float32)
+
+
+__all__ = [
+    "BASIS_BACKENDS",
+    "DEFAULT_BASIS_BACKEND",
+    "build_cycle_basis",
+    "dfs_fundamental_cycle_basis",
+    "incidence_and_cycle_rank",
+    "left_nullspace_basis",
+    "sparse_left_nullspace_basis",
+    "validate_cycle_basis",
+]
 ````
 
 # research/cycle_pe/v2/benchmark.py
 
 ````python
-"""Train Cycle PE v2 from full left-nullspace bases on official molecular splits.
+"""Train rebuilt Cycle PE v2 from a coordinate-free cycle-space projector PE.
 
 This is an isolated experiment: it does not change or invoke the v1 cycle-set
 model, and it never trains comparison-paper models. Actual training is CUDA-only.
@@ -30014,10 +34122,19 @@ from torch.utils.data import DataLoader
 
 from chartgat.cache import atomic_publish, atomic_write_json
 from chartgat.execution import add_execution_arguments, configure_execution
-from research.cycle_pe.v2.data import DATASETS, Graph, collate, load_benchmark
+from research.cycle_pe.v2.data import (
+    BASIS_BACKENDS,
+    DATASETS,
+    DEFAULT_BASIS_BACKEND,
+    Graph,
+    collate,
+    load_benchmark,
+)
 from research.cycle_pe.v2.model import MODEL_NAME, CycleBasisPEModel, architecture_protocol
 
 TRACK_NAME = "cycle_pe"
+HARDWARE_PROFILES = ("portable", "a6000-48gb")
+A6000_MIN_TOTAL_BYTES = 40 * 1024**3
 IMPLEMENTATION_FILES = (
     "research/cycle_pe/v2/benchmark.py",
     "research/cycle_pe/v2/basis.py",
@@ -30051,6 +34168,13 @@ def parser() -> argparse.ArgumentParser:
         result.add_argument(f"--{seed}-seed", type=int, default=0)
     result.add_argument("--batch-size", type=int, default=32)
     result.add_argument("--workers", type=int, default=0)
+    result.add_argument("--prefetch-factor", type=int, default=2)
+    result.add_argument(
+        "--hardware-profile",
+        choices=HARDWARE_PROFILES,
+        default="portable",
+        help="portable keeps legacy execution; a6000-48gb enables a guarded high-throughput run",
+    )
     result.add_argument("--prepare-only", action="store_true")
     result.add_argument("--allow-download", action="store_true")
     result.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
@@ -30058,18 +34182,41 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--patience", type=int, default=50)
     result.add_argument("--lr", type=float, default=1e-3)
     result.add_argument("--weight-decay", type=float, default=0.0)
-    result.add_argument("--hidden-dim", type=int, default=64)
-    result.add_argument("--pe-dim", type=int, default=32)
-    result.add_argument("--layers", type=int, default=3)
-    result.add_argument("--max-parameters", type=int, default=500_000)
+    result.add_argument("--hidden-dim", type=int, default=128)
+    result.add_argument("--pe-dim", type=int, default=64)
+    result.add_argument("--layers", type=int, default=10)
+    result.add_argument("--ffn-multiplier", type=int, default=4)
+    result.add_argument("--dropout", type=float, default=0.1)
+    result.add_argument("--layer-scale", type=float, default=0.1)
+    result.add_argument("--max-parameters", type=int, default=20_000_000)
     result.add_argument(
         "--column-chunk-size",
         type=int,
         default=16,
-        help="basis columns processed per temporary chunk; never truncates the cycle rank",
+        help="legacy-compatible option; never truncates the cycle space",
+    )
+    result.add_argument(
+        "--basis-backend",
+        choices=BASIS_BACKENDS,
+        default=DEFAULT_BASIS_BACKEND,
+        help=(
+            "thin_q caches model-ready Q (default); dfs_fundamental caches raw DFS "
+            "fundamental cycles and repeats graph-local QR in every model forward"
+        ),
     )
     result.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
-    result.add_argument("--basis-pair-budget", type=int, default=32768)
+    result.add_argument(
+        "--basis-pair-budget",
+        type=int,
+        default=32768,
+        help="maximum elements in a temporary feature-by-rank-by-rank contraction core",
+    )
+    result.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="resume an exactly matching interrupted V2 run from its atomic epoch checkpoint",
+    )
     result.add_argument("--validation-only", action="store_true", help=argparse.SUPPRESS)
     result.add_argument("--test-checkpoint", type=Path, help=argparse.SUPPRESS)
     add_execution_arguments(result)
@@ -30081,18 +34228,26 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("seeds must be nonnegative")
     for key in (
         "batch_size",
+        "prefetch_factor",
         "epochs",
         "patience",
         "hidden_dim",
         "pe_dim",
         "layers",
+        "ffn_multiplier",
         "max_parameters",
         "column_chunk_size",
         "basis_pair_budget",
     ):
         if getattr(args, key) < 1:
             raise ValueError(f"--{key.replace('_', '-')} must be positive")
-    if args.workers < 0 or args.lr <= 0 or args.weight_decay < 0:
+    if (
+        args.workers < 0
+        or args.lr <= 0
+        or args.weight_decay < 0
+        or not 0 <= args.dropout < 1
+        or not 0 < args.layer_scale <= 1
+    ):
         raise ValueError("invalid worker count or optimizer settings")
     if len(set(args.datasets)) != len(args.datasets):
         raise ValueError("datasets must not contain duplicates")
@@ -30125,33 +34280,259 @@ def _worker_seed(_: int) -> None:
 
 def _loader(graphs: list[Graph], args: argparse.Namespace, *, train: bool) -> DataLoader:
     generator = torch.Generator().manual_seed(args.model_seed)
+    options: dict[str, Any] = {
+        "dataset": graphs,
+        "batch_size": getattr(args, "effective_batch_size", args.batch_size),
+        "shuffle": train,
+        "num_workers": args.workers,
+        "pin_memory": True,
+        "collate_fn": collate,
+        "generator": generator,
+        "worker_init_fn": _worker_seed,
+        "persistent_workers": args.workers > 0,
+    }
+    if args.workers > 0:
+        options["prefetch_factor"] = args.prefetch_factor
     return DataLoader(
-        graphs,
-        batch_size=args.batch_size,
-        shuffle=train,
-        num_workers=args.workers,
-        pin_memory=True,
-        collate_fn=collate,
-        generator=generator,
-        worker_init_fn=_worker_seed,
-        persistent_workers=args.workers > 0,
+        **options,
     )
 
 
-@torch.no_grad()
-def evaluate(model: CycleBasisPEModel, loader: DataLoader, device: torch.device) -> float:
+def _resume_configuration(dataset: str, args: argparse.Namespace) -> dict[str, Any]:
+    names = (
+        "model_seed",
+        "batch_size",
+        "workers",
+        "prefetch_factor",
+        "hardware_profile",
+        "epochs",
+        "patience",
+        "lr",
+        "weight_decay",
+        "hidden_dim",
+        "pe_dim",
+        "layers",
+        "ffn_multiplier",
+        "dropout",
+        "layer_scale",
+        "column_chunk_size",
+        "basis_backend",
+        "basis_execution",
+        "basis_pair_budget",
+        "amp",
+        "compile",
+    )
+    return {
+        "schema": "cycle-projector-pe-v2-epoch-resume-1",
+        "dataset": dataset,
+        "model": MODEL_NAME,
+        "arguments": {name: getattr(args, name) for name in names},
+        "implementation_sha256": implementation_hashes(),
+    }
+
+
+def _capture_rng(loader: DataLoader) -> dict[str, Any]:
+    numpy_state = np.random.get_state()
+    return {
+        "python": random.getstate(),
+        "numpy": {
+            "kind": numpy_state[0],
+            "state": torch.from_numpy(numpy_state[1].copy()),
+            "position": int(numpy_state[2]),
+            "has_gauss": int(numpy_state[3]),
+            "cached_gaussian": float(numpy_state[4]),
+        },
+        "torch_cpu": torch.random.get_rng_state(),
+        "torch_cuda": torch.cuda.get_rng_state_all(),
+        "loader": loader.generator.get_state() if loader.generator is not None else None,
+    }
+
+
+def _restore_rng(state: dict[str, Any], loader: DataLoader) -> None:
+    if not isinstance(state, dict) or set(state) != {
+        "python",
+        "numpy",
+        "torch_cpu",
+        "torch_cuda",
+        "loader",
+    }:
+        raise ValueError("last.pt RNG state is invalid")
+    random.setstate(state["python"])
+    numpy_state = state["numpy"]
+    np.random.set_state(
+        (
+            numpy_state["kind"],
+            numpy_state["state"].cpu().numpy().astype(np.uint32, copy=False),
+            numpy_state["position"],
+            numpy_state["has_gauss"],
+            numpy_state["cached_gaussian"],
+        )
+    )
+    torch.random.set_rng_state(state["torch_cpu"].cpu())
+    torch.cuda.set_rng_state_all(state["torch_cuda"])
+    if loader.generator is not None and state["loader"] is not None:
+        loader.generator.set_state(state["loader"].cpu())
+
+
+def _artifact_matches(path_value: Any, digest_value: Any) -> bool:
+    if not isinstance(path_value, str) or not isinstance(digest_value, str):
+        return False
+    path = Path(path_value)
+    return path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == digest_value
+
+
+def _recover_best_checkpoint(checkpoint: Path, previous: Path, expected_hash: Any) -> None:
+    """Restore the best file after the best->last atomic publication crash window."""
+    if not isinstance(expected_hash, str):
+        raise ValueError("last.pt best-checkpoint hash is invalid")
+    if (
+        checkpoint.is_file()
+        and hashlib.sha256(checkpoint.read_bytes()).hexdigest() == expected_hash
+    ):
+        return
+    if not previous.is_file() or hashlib.sha256(previous.read_bytes()).hexdigest() != expected_hash:
+        raise ValueError("last.pt best checkpoint has no valid recovery slot")
+    previous_bytes = previous.read_bytes()
+    atomic_publish(checkpoint, lambda path, payload=previous_bytes: path.write_bytes(payload))
+    if hashlib.sha256(checkpoint.read_bytes()).hexdigest() != expected_hash:
+        raise ValueError("best-checkpoint recovery did not preserve its exact hash")
+
+
+def _hardware_report(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
+    properties = torch.cuda.get_device_properties(device)
+    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+    report = {
+        "profile": args.hardware_profile,
+        "name": properties.name,
+        "total_bytes": int(total_bytes),
+        "free_bytes_at_start": int(free_bytes),
+        "compute_capability": [int(properties.major), int(properties.minor)],
+    }
+    if args.hardware_profile == "a6000-48gb":
+        if total_bytes < A6000_MIN_TOTAL_BYTES or properties.major < 8:
+            raise RuntimeError(
+                "a6000-48gb requires one visible CUDA device with >=40 GiB total memory "
+                "and compute capability >=8.0; refusing a MIG/small-device fallback"
+            )
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    else:
+        torch.set_float32_matmul_precision("highest")
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    report["tf32_matmul"] = bool(torch.backends.cuda.matmul.allow_tf32)
+    report["tf32_cudnn"] = bool(torch.backends.cudnn.allow_tf32)
+    return report
+
+
+def _graph_probe_cost(graph: Graph) -> int:
+    return int(
+        graph.x.numel()
+        + graph.edge_attr.numel()
+        + graph.cycle_basis.numel()
+        + graph.edge_index.numel()
+    )
+
+
+def _is_cuda_oom(error: BaseException) -> bool:
+    return isinstance(error, torch.cuda.OutOfMemoryError) or "out of memory" in str(error).lower()
+
+
+def _calibrate_batch_size(
+    model: CycleBasisPEModel,
+    dataset: str,
+    train_graphs: list[Graph],
+    args: argparse.Namespace,
+    device: torch.device,
+) -> tuple[int, dict[str, Any]]:
+    """Probe the preregistered batch before epoch 1 and fail closed on OOM.
+
+    No optimizer step is made and torch RNG is restored around every probe.  A
+    batch size is never silently resized: an OOM requires an explicit new run
+    configuration/run ID, so candidate protocols remain comparable.
+    """
+    requested = min(args.batch_size, len(train_graphs))
+    if requested < 1:
+        raise ValueError(f"{dataset}: official training split is empty")
+    if args.hardware_profile != "a6000-48gb":
+        return requested, {
+            "policy": "fixed-portable",
+            "requested_batch_size": args.batch_size,
+            "effective_batch_size": requested,
+            "attempts": [],
+        }
+    largest = sorted(train_graphs, key=_graph_probe_cost, reverse=True)
+    candidate = requested
+    model.zero_grad(set_to_none=True)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    was_training = model.training
+    if any(True for _ in model.named_buffers()):
+        raise RuntimeError(
+            "A6000 training-mode capacity probe requires a buffer-free model; review new buffers"
+        )
+    try:
+        probe = collate(largest[:candidate]).to(device)
+        cuda_index = device.index if device.index is not None else torch.cuda.current_device()
+        with torch.random.fork_rng(devices=[cuda_index]):
+            # The current architecture is asserted buffer-free, so training mode
+            # includes dropout's true activation path without mutating model state.
+            model.train()
+            with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
+                prediction = model(probe)
+                loss = (prediction.float() - probe.y).abs().mean()
+            loss.backward()
+            torch.cuda.synchronize(device)
+        peak = int(torch.cuda.max_memory_allocated(device))
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as error:
+        if not _is_cuda_oom(error):
+            raise
+        model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+        raise RuntimeError(
+            f"{dataset}: preregistered A6000 batch size {candidate} failed the "
+            "pre-epoch OOM probe; choose an explicit smaller --batch-size and new run ID"
+        ) from error
+    finally:
+        model.train(was_training)
+    model.zero_grad(set_to_none=True)
+    del probe, prediction, loss
+    torch.cuda.empty_cache()
+    return candidate, {
+        "policy": "preregistered-worst-case-forward-backward-probe",
+        "requested_batch_size": args.batch_size,
+        "effective_batch_size": candidate,
+        "attempts": [{"batch_size": candidate, "status": "passed", "peak_bytes": peak}],
+        "automatic_backoff": False,
+        "mid_epoch_backoff": False,
+        "oom_policy": "clear cache, fail, and require an explicit new run configuration",
+    }
+
+
+@torch.inference_mode()
+def evaluate(
+    model: CycleBasisPEModel,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    amp: bool = False,
+) -> float:
     model.eval()
     total = torch.zeros((), device=device, dtype=torch.float64)
+    all_finite = torch.ones((), device=device, dtype=torch.bool)
     count = 0
     for batch in loader:
         batch = batch.to(device)
-        predicted = model(batch).float()
-        if not torch.isfinite(predicted).all():
-            raise FloatingPointError("nonfinite validation/test prediction")
+        with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+            predicted = model(batch).float()
+        all_finite.logical_and_(torch.isfinite(predicted).all())
         total += (predicted - batch.y).abs().sum().double()
         count += batch.y.numel()
     if count == 0:
         raise ValueError("cannot evaluate an empty official split")
+    if not bool(all_finite):
+        raise FloatingPointError("nonfinite validation/test prediction")
     return float(total / count)
 
 
@@ -30164,6 +34545,7 @@ def _train_model(
         raise RuntimeError("Cycle PE v2 benchmark training requires CUDA; no CPU fallback")
     _seed(args.model_seed)
     device = torch.device(args.device)
+    hardware = _hardware_report(args, device)
     model = CycleBasisPEModel(
         dataset=dataset,
         hidden=args.hidden_dim,
@@ -30172,6 +34554,9 @@ def _train_model(
         column_chunk_size=args.column_chunk_size,
         basis_execution=args.basis_execution,
         basis_pair_budget=args.basis_pair_budget,
+        ffn_multiplier=args.ffn_multiplier,
+        dropout=args.dropout,
+        layer_scale=args.layer_scale,
     ).to(device)
     execution = configure_execution(model, args, device)
     execution.update(basis_execution=args.basis_execution, basis_pair_budget=args.basis_pair_budget)
@@ -30180,42 +34565,124 @@ def _train_model(
         raise ValueError(
             f"{dataset}/{MODEL_NAME}: {parameters} parameters exceeds budget {args.max_parameters}"
         )
-    train_loader = _loader(splits["train"], args, train=True)
-    validation_loader = _loader(splits["validation"], args, train=False)
     validation_only = bool(getattr(args, "validation_only", False))
     expected_splits = (
         {"train", "validation"} if validation_only else {"train", "validation", "test"}
     )
     if set(splits) != expected_splits:
         raise ValueError(f"unexpected benchmark splits: {sorted(splits)}")
+    run = args.output_dir / dataset / MODEL_NAME
+    last_checkpoint = run / "last.pt"
+    checkpoint = run / "best.pt"
+    previous_checkpoint = run / "best.previous.pt"
+    history_path = run / "history.json"
+    if run.exists() and any(run.iterdir()) and not last_checkpoint.is_file():
+        known = {checkpoint, previous_checkpoint, history_path}
+        if not args.resume or any(path not in known for path in run.iterdir()):
+            raise FileExistsError(f"non-resumable or mismatched existing model directory: {run}")
+    run.mkdir(parents=True, exist_ok=True)
+    resume_configuration = _resume_configuration(dataset, args)
+    if last_checkpoint.is_file():
+        preview = torch.load(last_checkpoint, map_location="cpu", weights_only=True)
+        if not isinstance(preview, dict) or preview.get("resume_configuration") != (
+            resume_configuration
+        ):
+            raise ValueError("last.pt does not match the requested V2 implementation/configuration")
+        effective_batch_size = preview.get("effective_batch_size")
+        batch_calibration = preview.get("batch_calibration")
+        if (
+            isinstance(effective_batch_size, bool)
+            or not isinstance(effective_batch_size, int)
+            or not 1 <= effective_batch_size <= args.batch_size
+            or not isinstance(batch_calibration, dict)
+            or batch_calibration.get("effective_batch_size") != effective_batch_size
+        ):
+            raise ValueError("last.pt effective batch/calibration state is invalid")
+    else:
+        effective_batch_size, batch_calibration = _calibrate_batch_size(
+            model, dataset, splits["train"], args, device
+        )
+    args.effective_batch_size = effective_batch_size
+    train_loader = _loader(splits["train"], args, train=True)
+    validation_loader = _loader(splits["validation"], args, train=False)
     test_loader = None if validation_only else _loader(splits["test"], args, train=False)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, factor=0.5, patience=25, min_lr=1e-6
     )
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
-    run = args.output_dir / dataset / MODEL_NAME
-    run.mkdir(parents=True, exist_ok=False)
-    checkpoint = run / "best.pt"
-    history_path = run / "history.json"
+    execution.update(
+        hardware=hardware,
+        precision={
+            "amp": bool(args.amp),
+            "autocast_dtype": "float16" if args.amp else "disabled",
+            "projector_contraction": "float32",
+            "backbone_autocast": bool(args.amp),
+        },
+        data_pipeline={
+            "requested_batch_size": args.batch_size,
+            "effective_batch_size": effective_batch_size,
+            "workers": args.workers,
+            "prefetch_factor": args.prefetch_factor if args.workers else None,
+            "persistent_workers": args.workers > 0,
+            "pin_memory": True,
+            "packed_cycle_basis_h2d_tensors_per_batch": 1,
+            "batch_calibration": batch_calibration,
+        },
+    )
     history = []
     best = math.inf
     best_epoch = 0
+    start_epoch = 1
+    elapsed_before = 0.0
+    previous_peak = 0
+    previous_reserved_peak = 0
+    if last_checkpoint.is_file():
+        state = torch.load(last_checkpoint, map_location=device, weights_only=True)
+        if not isinstance(state, dict) or state.get("resume_configuration") != resume_configuration:
+            raise ValueError("last.pt does not match the requested V2 implementation/configuration")
+        saved_history = state.get("history")
+        last_epoch = state.get("epoch")
+        if (
+            not isinstance(saved_history, list)
+            or isinstance(last_epoch, bool)
+            or not isinstance(last_epoch, int)
+            or last_epoch != len(saved_history)
+            or last_epoch < 1
+        ):
+            raise ValueError("last.pt epoch/history state is invalid")
+        model.load_state_dict(state["model_state_dict"], strict=True)
+        optimizer.load_state_dict(state["optimizer_state_dict"])
+        scheduler.load_state_dict(state["scheduler_state_dict"])
+        scaler.load_state_dict(state["scaler_state_dict"])
+        history = saved_history
+        best, best_epoch = float(state["best"]), int(state["best_epoch"])
+        elapsed_before = float(state.get("elapsed_seconds", 0.0))
+        previous_peak = int(state.get("peak_gpu_memory_bytes", 0))
+        previous_reserved_peak = int(state.get("peak_gpu_reserved_bytes", 0))
+        expected_best_hash = state.get("best_checkpoint_sha256")
+        _recover_best_checkpoint(checkpoint, previous_checkpoint, expected_best_hash)
+        atomic_write_json(history_path, history)
+        _restore_rng(state["rng_state"], train_loader)
+        start_epoch = args.epochs + 1 if state.get("complete") is True else last_epoch + 1
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
     started = time.perf_counter()
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
+        if epoch - 1 - best_epoch >= args.patience:
+            break
         epoch_started = time.perf_counter()
         model.train()
         train_sum = torch.zeros((), device=device, dtype=torch.float64)
         train_count = 0
+        train_graph_count = 0
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
                 predicted = model(batch)
                 loss = (predicted.float() - batch.y).abs().mean()
-            if not torch.isfinite(loss):
+            if not args.amp and not torch.isfinite(loss):
                 raise FloatingPointError(f"{dataset}/{MODEL_NAME}: nonfinite training loss")
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -30224,8 +34691,13 @@ def _train_model(
             scaler.update()
             train_sum += loss.detach().double() * batch.y.numel()
             train_count += batch.y.numel()
-        validation = evaluate(model, validation_loader, device)
+            train_graph_count += batch.y.shape[0]
+        torch.cuda.synchronize(device)
+        train_seconds = time.perf_counter() - epoch_started
+        validation = evaluate(model, validation_loader, device, amp=args.amp)
         train_mae = float(train_sum / train_count)
+        if not math.isfinite(train_mae):
+            raise FloatingPointError(f"{dataset}/{MODEL_NAME}: nonfinite epoch training loss")
         torch.cuda.synchronize(device)
         epoch_seconds = time.perf_counter() - epoch_started
         scheduler.step(validation)
@@ -30235,6 +34707,9 @@ def _train_model(
                 "train_mae": train_mae,
                 "validation_mae": validation,
                 "epoch_seconds": epoch_seconds,
+                "train_cuda_synchronized_seconds": train_seconds,
+                "train_graphs": train_graph_count,
+                "train_graphs_per_second": train_graph_count / train_seconds,
                 "learning_rate": optimizer.param_groups[0]["lr"],
             }
         )
@@ -30248,12 +34723,46 @@ def _train_model(
                 "dataset": dataset,
                 "model": MODEL_NAME,
                 "model_seed": args.model_seed,
+                "effective_batch_size": effective_batch_size,
+                "batch_calibration": batch_calibration,
+                "hardware": hardware,
                 "arguments": {
                     key: str(value) if isinstance(value, Path) else value
                     for key, value in vars(args).items()
                 },
             }
+            if checkpoint.is_file():
+                previous_bytes = checkpoint.read_bytes()
+                atomic_publish(
+                    previous_checkpoint,
+                    lambda path, payload=previous_bytes: path.write_bytes(payload),
+                )
             atomic_publish(checkpoint, lambda path, state=payload: torch.save(state, path))
+        elapsed_so_far = elapsed_before + time.perf_counter() - started
+        peak_so_far = max(previous_peak, torch.cuda.max_memory_allocated(device))
+        reserved_peak_so_far = max(previous_reserved_peak, torch.cuda.max_memory_reserved(device))
+        last_state = {
+            "schema_version": 1,
+            "resume_configuration": resume_configuration,
+            "complete": False,
+            "epoch": epoch,
+            "history": history,
+            "best": best,
+            "best_epoch": best_epoch,
+            "best_checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "rng_state": _capture_rng(train_loader),
+            "elapsed_seconds": elapsed_so_far,
+            "peak_gpu_memory_bytes": peak_so_far,
+            "peak_gpu_reserved_bytes": reserved_peak_so_far,
+            "effective_batch_size": effective_batch_size,
+            "batch_calibration": batch_calibration,
+            "hardware": hardware,
+        }
+        atomic_publish(last_checkpoint, lambda path, state=last_state: torch.save(state, path))
         print(
             f"{dataset}/{MODEL_NAME} epoch={epoch} train_mae={train_mae:.6f} "
             f"validation_mae={validation:.6f} best={best:.6f} seconds={epoch_seconds:.2f}",
@@ -30261,13 +34770,16 @@ def _train_model(
         )
         if epoch - best_epoch >= args.patience:
             break
+    completed_state = torch.load(last_checkpoint, map_location=device, weights_only=True)
+    completed_state["complete"] = True
+    atomic_publish(last_checkpoint, lambda path, state=completed_state: torch.save(state, path))
     test = None
     if not validation_only:
         selected = torch.load(checkpoint, map_location=device, weights_only=True)
         model.load_state_dict(selected["state_dict"], strict=True)
         # Standard runner: test is touched once after validation selects the checkpoint.
         assert test_loader is not None
-        test = evaluate(model, test_loader, device)
+        test = evaluate(model, test_loader, device, amp=args.amp)
     torch.cuda.synchronize(device)
     result = {
         "validation": best,
@@ -30277,10 +34789,19 @@ def _train_model(
         "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
         "history": str(history_path),
         "history_sha256": hashlib.sha256(history_path.read_bytes()).hexdigest(),
-        "elapsed_seconds": time.perf_counter() - started,
-        "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
+        "elapsed_seconds": elapsed_before + time.perf_counter() - started,
+        "peak_gpu_memory_bytes": max(previous_peak, torch.cuda.max_memory_allocated(device)),
+        "peak_gpu_reserved_bytes": max(
+            previous_reserved_peak, torch.cuda.max_memory_reserved(device)
+        ),
         "epochs_completed": len(history),
+        "last_checkpoint": str(last_checkpoint),
+        "last_checkpoint_sha256": hashlib.sha256(last_checkpoint.read_bytes()).hexdigest(),
         "execution": execution,
+        "effective_batch_size": effective_batch_size,
+        "batch_calibration": batch_calibration,
+        "hardware": hardware,
+        "training_graphs_per_epoch": len(splits["train"]),
         "epoch_timing": "cuda_synchronized_train_and_validation_excluding_checkpoint_io",
         "evaluation_splits": ["train", "validation"],
         "fresh_training": True,
@@ -30304,6 +34825,7 @@ def _evaluate_test_checkpoint(
         raise FileNotFoundError(f"Selected checkpoint does not exist: {checkpoint}")
     checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     device = torch.device(args.device)
+    hardware = _hardware_report(args, device)
     payload = torch.load(checkpoint, map_location=device, weights_only=True)
     if not isinstance(payload, dict) or not isinstance(payload.get("state_dict"), dict):
         raise ValueError("Selected checkpoint has an invalid payload schema")
@@ -30325,11 +34847,15 @@ def _evaluate_test_checkpoint(
         "column_chunk_size",
         "basis_execution",
         "basis_pair_budget",
+        "ffn_multiplier",
+        "dropout",
+        "layer_scale",
     ):
         if saved_arguments.get(name) != getattr(args, name):
             raise ValueError(f"Selected checkpoint architecture mismatch for {name}")
     validation = payload.get("validation_mae")
     epoch = payload.get("epoch")
+    effective_batch_size = payload.get("effective_batch_size")
     if (
         isinstance(validation, bool)
         or not isinstance(validation, (int, float))
@@ -30338,8 +34864,12 @@ def _evaluate_test_checkpoint(
         or isinstance(epoch, bool)
         or not isinstance(epoch, int)
         or epoch < 1
+        or isinstance(effective_batch_size, bool)
+        or not isinstance(effective_batch_size, int)
+        or not 1 <= effective_batch_size <= args.batch_size
     ):
         raise ValueError("Selected checkpoint validation metadata is invalid")
+    args.effective_batch_size = effective_batch_size
     _seed(args.model_seed)
     model = CycleBasisPEModel(
         dataset=dataset,
@@ -30349,6 +34879,9 @@ def _evaluate_test_checkpoint(
         column_chunk_size=args.column_chunk_size,
         basis_execution=args.basis_execution,
         basis_pair_budget=args.basis_pair_budget,
+        ffn_multiplier=args.ffn_multiplier,
+        dropout=args.dropout,
+        layer_scale=args.layer_scale,
     ).to(device)
     parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if parameters > args.max_parameters:
@@ -30357,12 +34890,31 @@ def _evaluate_test_checkpoint(
         )
     model.load_state_dict(payload["state_dict"], strict=True)
     execution = configure_execution(model, args, device)
-    execution.update(basis_execution=args.basis_execution, basis_pair_budget=args.basis_pair_budget)
+    execution.update(
+        basis_execution=args.basis_execution,
+        basis_pair_budget=args.basis_pair_budget,
+        hardware=hardware,
+        precision={
+            "amp": bool(args.amp),
+            "autocast_dtype": "float16" if args.amp else "disabled",
+            "projector_contraction": "float32",
+            "backbone_autocast": bool(args.amp),
+        },
+        data_pipeline={
+            "requested_batch_size": args.batch_size,
+            "effective_batch_size": effective_batch_size,
+            "workers": args.workers,
+            "prefetch_factor": args.prefetch_factor if args.workers else None,
+            "persistent_workers": args.workers > 0,
+            "pin_memory": True,
+            "packed_cycle_basis_h2d_tensors_per_batch": 1,
+        },
+    )
     test_loader = _loader(test_graphs, args, train=False)
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
     started = time.perf_counter()
-    test = evaluate(model, test_loader, device)
+    test = evaluate(model, test_loader, device, amp=args.amp)
     torch.cuda.synchronize(device)
     return {
         "test": test,
@@ -30373,10 +34925,43 @@ def _evaluate_test_checkpoint(
         "checkpoint_sha256": checkpoint_sha256,
         "evaluation_seconds": time.perf_counter() - started,
         "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_gpu_reserved_bytes": torch.cuda.max_memory_reserved(device),
         "execution": execution,
+        "effective_batch_size": effective_batch_size,
+        "hardware": hardware,
         "evaluation_splits": ["test"],
         "fresh_training": False,
     }
+
+
+def _completed_training_dataset(entry: Any, dataset: str, args: argparse.Namespace) -> bool:
+    """Fail closed while deciding whether a completed dataset may be skipped."""
+    try:
+        if not isinstance(entry, dict) or entry.get("metric") != "mae":
+            return False
+        models = entry.get("models")
+        if not isinstance(models, dict) or set(models) != {MODEL_NAME}:
+            return False
+        result = models[MODEL_NAME]
+        run = (args.output_dir / dataset / MODEL_NAME).resolve()
+        bindings = (
+            ("checkpoint", "checkpoint_sha256", run / "best.pt"),
+            ("history", "history_sha256", run / "history.json"),
+            ("last_checkpoint", "last_checkpoint_sha256", run / "last.pt"),
+        )
+        for path_key, hash_key, expected in bindings:
+            path = Path(result[path_key]).resolve()
+            if path != expected or not _artifact_matches(str(path), result[hash_key]):
+                return False
+        last = torch.load(run / "last.pt", map_location="cpu", weights_only=True)
+        return bool(
+            isinstance(last, dict)
+            and last.get("complete") is True
+            and last.get("resume_configuration") == _resume_configuration(dataset, args)
+            and result.get("fresh_training") is True
+        )
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30386,14 +34971,11 @@ def main(argv: list[str] | None = None) -> int:
     args.output_dir = args.output_dir.expanduser().resolve()
     if args.test_checkpoint is not None:
         args.test_checkpoint = args.test_checkpoint.expanduser().resolve()
-    if args.output_dir.exists() and any(args.output_dir.iterdir()):
-        raise FileExistsError(f"Output directory is not empty: {args.output_dir}; choose a new run")
+    output_was_nonempty = args.output_dir.exists() and any(args.output_dir.iterdir())
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = args.output_dir / "manifest.json"
-    if manifest_path.exists():
-        raise FileExistsError(
-            f"Run already exists: {args.output_dir}; choose a new output directory"
-        )
+    if output_was_nonempty and not manifest_path.is_file():
+        raise FileExistsError(f"nonempty V2 output has no resumable manifest: {args.output_dir}")
     arguments = {
         key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
     }
@@ -30428,7 +35010,7 @@ def main(argv: list[str] | None = None) -> int:
             "model_seed": args.model_seed,
             "data_seed": "unused: fixed official graphs",
             "split_seed": "unused: official splits",
-            "chart_seed": "unused: canonical incidence with full numerical SVD basis",
+            "chart_seed": "unused: selected spanning-forest chart; projector is chart invariant",
         },
         "controls": {
             "model": MODEL_NAME,
@@ -30436,13 +35018,41 @@ def main(argv: list[str] | None = None) -> int:
             "test_checkpoint_selection": False,
             "parameter_budget": args.max_parameters,
             "target_policy": "official labels unchanged",
-            "basis_input": "all signed left-nullspace basis columns, no truncation",
+            "basis_input": (
+                "all cached thin-Q columns; learned input is only the basis-invariant "
+                "projector kernel, with no truncation"
+                if args.basis_backend == "thin_q"
+                else "all raw DFS fundamental columns, runtime-orthonormalized before the "
+                "basis-invariant projector kernel; diagnostic backend with no truncation"
+            ),
+            "basis_backend": args.basis_backend,
+            "basis_backend_runtime": (
+                "cached orthonormal Q; no factorization in model forward"
+                if args.basis_backend == "thin_q"
+                else "diagnostic only: reduced QR O(E*beta^2) repeats per graph/model forward; "
+                "not an end-to-end linear-time speedup"
+            ),
             "basis_rank_dependent_parameters": False,
             "column_chunk_size": args.column_chunk_size,
-            "column_chunk_policy": "allocation only; every basis column is processed",
+            "column_chunk_policy": (
+                "legacy CLI compatibility only; the complete projector is used and "
+                "basis-pair-budget bounds pair-free feature/rank contraction cores"
+            ),
+            "epoch_resume": "atomic last.pt plus best.pt/best.previous.pt two-slot recovery",
+            "resume_determinism": (
+                "exact configuration/source/artifact binding and epoch-boundary model, "
+                "optimizer, scheduler, scaler, history, RNG, and loader-state restoration; "
+                "bitwise equivalence "
+                "is not promised for nondeterministic CUDA kernels"
+            ),
             "test_data_access": run_mode in {"standard", "test_only"},
             "fresh_training": run_mode in {"standard", "validation_only"},
             "optimizer_created": run_mode in {"standard", "validation_only"},
+            "hardware_profile_optimization_identity": (
+                "batch size changes optimizer-step count and trajectory; compare scores only "
+                "within an identical hardware profile and batch contract"
+            ),
+            "automatic_oom_backoff": False,
         },
     }
     metrics: dict[str, Any] = {
@@ -30455,9 +35065,75 @@ def main(argv: list[str] | None = None) -> int:
         "run_mode": run_mode,
         "datasets": {},
     }
+    resume_identity = {
+        "schema": "cycle-projector-pe-v2-multidataset-resume-1",
+        "run_mode": run_mode,
+        "arguments": {key: value for key, value in arguments.items() if key != "resume"},
+        "implementation_sha256": manifest["implementation_sha256"],
+    }
+    manifest["resume_identity"] = resume_identity
+    metrics_path = args.output_dir / "metrics.json"
+    if manifest_path.is_file():
+        if not args.resume:
+            raise FileExistsError(
+                f"V2 run already exists and --no-resume was requested: {args.output_dir}"
+            )
+        if not metrics_path.is_file():
+            raise ValueError("resumable V2 manifest has no metrics document")
+        stored_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        stored_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        immutable_keys = (
+            "schema_version",
+            "track",
+            "version",
+            "suite",
+            "protocol",
+            "run_mode",
+            "arguments",
+            "software",
+            "architecture",
+            "implementation_sha256",
+            "seeds",
+            "controls",
+            "resume_identity",
+        )
+        if (
+            not isinstance(stored_manifest, dict)
+            or stored_manifest.get("status") not in {"running", "failed", "passed"}
+            or any(stored_manifest.get(key) != manifest.get(key) for key in immutable_keys)
+            or not isinstance(stored_metrics, dict)
+            or stored_metrics.get("track") != TRACK_NAME
+            or stored_metrics.get("version") != "v2"
+            or stored_metrics.get("suite") != "benchmark"
+            or stored_metrics.get("model_seed") != args.model_seed
+            or stored_metrics.get("run_mode") != run_mode
+            or not isinstance(stored_metrics.get("datasets"), dict)
+            or not set(stored_metrics["datasets"]).issubset(set(args.datasets))
+        ):
+            raise ValueError("existing V2 output does not match this implementation/configuration")
+        manifest, metrics = stored_manifest, stored_metrics
+        manifest["status"] = metrics["status"] = "running"
+        manifest.pop("error", None)
+        manifest["resume_count"] = int(manifest.get("resume_count", 0)) + 1
     atomic_write_json(manifest_path, manifest)
+    atomic_write_json(metrics_path, metrics)
     try:
         for dataset in args.datasets:
+            existing_dataset = metrics["datasets"].get(dataset)
+            if (
+                existing_dataset is not None
+                and not args.prepare_only
+                and args.test_checkpoint is None
+            ):
+                existing_models = (
+                    existing_dataset.get("models") if isinstance(existing_dataset, dict) else None
+                )
+                if isinstance(existing_models, dict) and existing_models:
+                    if _completed_training_dataset(existing_dataset, dataset, args):
+                        continue
+                    raise ValueError(
+                        f"{dataset}: existing completed artifacts failed resume validation"
+                    )
             started = time.perf_counter()
             requested_splits = (
                 ("test",)
@@ -30468,7 +35144,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             if requested_splits is None:
                 splits, protocol = load_benchmark(
-                    args.data_root, dataset, allow_download=args.allow_download
+                    args.data_root,
+                    dataset,
+                    allow_download=args.allow_download,
+                    basis_backend=args.basis_backend,
                 )
             else:
                 splits, protocol = load_benchmark(
@@ -30476,6 +35155,7 @@ def main(argv: list[str] | None = None) -> int:
                     dataset,
                     allow_download=args.allow_download,
                     splits=requested_splits,
+                    basis_backend=args.basis_backend,
                 )
             dataset_metrics: dict[str, Any] = {
                 "metric": "mae",
@@ -30491,19 +35171,24 @@ def main(argv: list[str] | None = None) -> int:
                 atomic_write_json(args.output_dir / "metrics.json", metrics)
             elif not args.prepare_only:
                 dataset_metrics["models"][MODEL_NAME] = _train_model(dataset, splits, args)
-                atomic_write_json(args.output_dir / "metrics.json", metrics)
+            atomic_write_json(metrics_path, metrics)
             del splits
         metrics["status"] = manifest["status"] = "prepared" if args.prepare_only else "passed"
-        atomic_write_json(args.output_dir / "metrics.json", metrics)
+        atomic_write_json(metrics_path, metrics)
         manifest["dataset_protocols"] = {
             name: data["protocol"] for name, data in metrics["datasets"].items()
         }
+        if not args.prepare_only:
+            manifest["execution_by_dataset"] = {
+                name: data["models"][MODEL_NAME].get("execution")
+                for name, data in metrics["datasets"].items()
+            }
         atomic_write_json(manifest_path, manifest)
     except Exception as exc:
         manifest["status"] = metrics["status"] = "failed"
         manifest["error"] = f"{type(exc).__name__}: {exc}"
         atomic_write_json(manifest_path, manifest)
-        atomic_write_json(args.output_dir / "metrics.json", metrics)
+        atomic_write_json(metrics_path, metrics)
         raise
     print(json.dumps({"status": metrics["status"], "output_dir": str(args.output_dir)}), flush=True)
     return 0
@@ -30516,11 +35201,12 @@ if __name__ == "__main__":
 # research/cycle_pe/v2/data.py
 
 ````python
-"""Official molecular splits with complete, graph-local cycle basis matrices.
+"""Official molecular splits with coordinate-free cycle-space inputs.
 
 Only the official split adapter and source fingerprint are shared with v1.
-Neither v1 graph preparation nor cycle-set statistics are used here. Cached
-columns and ragged batches retain all cycle vectors without global column IDs.
+Neither v1 graph preparation nor cycle-set statistics are used here.  The
+production backend caches a thin-QR ``Q``; a diagnostic DFS backend can instead
+cache raw fundamental cycles and records that representation explicitly.
 """
 
 from __future__ import annotations
@@ -30543,12 +35229,17 @@ from chartgat.cache import (
     atomic_write_json,
 )
 from research.cycle_pe.benchmark_data import graph_fingerprint, load_official_splits
-from research.cycle_pe.v2.basis import left_nullspace_basis, validate_cycle_basis
+from research.cycle_pe.v2.basis import (
+    BASIS_BACKENDS,
+    DEFAULT_BASIS_BACKEND,
+    build_cycle_basis,
+    validate_cycle_basis,
+)
 
 DATASETS = ("zinc12k", "peptides_struct")
 SPLITS = ("train", "validation", "test")
-CACHE_VERSION = "complete-left-nullspace-svd-v2-1"
-CACHE_NAMESPACE = "cycle_pe_v2_benchmark"
+CACHE_VERSION = "selectable-dfs-fundamental-projector-kernel-v2-3"
+CACHE_NAMESPACE = "cycle_pe_v2_projector_kernel_benchmark"
 SCHEMAS = {
     "zinc12k": {"atoms": (28,), "bonds": (4,), "targets": 1},
     "peptides_struct": {
@@ -30570,6 +35261,7 @@ class Graph:
     edge_attr: Tensor
     y: Tensor
     cycle_basis: Tensor
+    cycle_basis_is_orthonormal: Tensor
 
 
 @dataclass
@@ -30580,15 +35272,36 @@ class Batch:
     y: Tensor
     batch: Tensor
     ptr: Tensor
-    cycle_bases: tuple[Tensor, ...]
+    packed_cycle_basis: Tensor
+    cycle_basis_shapes: tuple[tuple[int, int], ...]
+    cycle_basis_is_orthonormal: tuple[bool, ...]
     edge_ptr: Tensor
+
+    @property
+    def cycle_bases(self) -> tuple[Tensor, ...]:
+        """Return zero-copy matrix views over one contiguous transfer tensor.
+
+        Keeping the ragged matrices packed means a minibatch performs one basis-data
+        host-to-device copy instead of one copy per molecular graph.  Shapes stay
+        as CPU-side Python metadata, so reconstructing the views never calls
+        ``Tensor.item()`` and cannot introduce a CUDA synchronization.
+        """
+        offset = 0
+        matrices = []
+        for rows, columns in self.cycle_basis_shapes:
+            elements = rows * columns
+            matrices.append(self.packed_cycle_basis.narrow(0, offset, elements).view(rows, columns))
+            offset += elements
+        if offset != self.packed_cycle_basis.numel():
+            raise ValueError("packed cycle-basis data disagree with shape metadata")
+        return tuple(matrices)
 
     def to(self, device: torch.device | str) -> Batch:
         return Batch(
             **{
-                field.name: tuple(value.to(device, non_blocking=True) for value in current)
-                if field.name == "cycle_bases"
-                else current.to(device, non_blocking=True)
+                field.name: current.to(device, non_blocking=True)
+                if isinstance(current, Tensor)
+                else current
                 for field in fields(self)
                 for current in (getattr(self, field.name),)
             }
@@ -30597,9 +35310,7 @@ class Batch:
     def pin_memory(self) -> Batch:
         return Batch(
             **{
-                field.name: tuple(value.pin_memory() for value in current)
-                if field.name == "cycle_bases"
-                else current.pin_memory()
+                field.name: current.pin_memory() if isinstance(current, Tensor) else current
                 for field in fields(self)
                 for current in (getattr(self, field.name),)
             }
@@ -30630,7 +35341,13 @@ def collate(graphs: list[Graph]) -> Batch:
         y=torch.stack([graph.y for graph in graphs]),
         batch=torch.repeat_interleave(torch.arange(len(graphs)), torch.tensor(counts)),
         ptr=ptr,
-        cycle_bases=tuple(graph.cycle_basis for graph in graphs),
+        packed_cycle_basis=torch.cat(
+            [graph.cycle_basis.reshape(-1) for graph in graphs], dim=0
+        ).contiguous(),
+        cycle_basis_shapes=tuple(tuple(graph.cycle_basis.shape) for graph in graphs),
+        cycle_basis_is_orthonormal=tuple(
+            bool(graph.cycle_basis_is_orthonormal.item()) for graph in graphs
+        ),
         edge_ptr=edge_ptr,
     )
 
@@ -30724,6 +35441,11 @@ def validate_graph(graph: Graph, *, dataset: str | None = None, check_basis: boo
         or graph.cycle_basis.shape[0] != edge_count
     ):
         raise ValueError("invalid prepared cycle-basis schema")
+    if (
+        graph.cycle_basis_is_orthonormal.dtype != torch.bool
+        or graph.cycle_basis_is_orthonormal.ndim != 0
+    ):
+        raise ValueError("invalid cycle-basis representation metadata")
     if (graph.x < 0).any() or (graph.edge_attr < 0).any():
         raise ValueError("categorical features must be nonnegative")
     if dataset is not None:
@@ -30740,33 +35462,76 @@ def validate_graph(graph: Graph, *, dataset: str | None = None, check_basis: boo
                 raise ValueError(f"{dataset}: categorical {name} index out of range")
     if check_basis:
         validate_cycle_basis(len(graph.x), graph.edge_index.numpy(), graph.cycle_basis.numpy())
+        rank = graph.cycle_basis.shape[1]
+        if rank and bool(graph.cycle_basis_is_orthonormal.item()):
+            gram = graph.cycle_basis.double().T @ graph.cycle_basis.double()
+            if not torch.allclose(gram, torch.eye(rank, dtype=torch.float64), atol=2e-5, rtol=2e-5):
+                raise ValueError("cached cycle_basis must be thin-QR orthonormal")
 
 
-def prepare_graph(data: Any, *, dataset: str | None = None) -> Graph:
-    """Preserve official chemistry/targets and attach the full raw SVD basis."""
+def prepare_graph(
+    data: Any,
+    *,
+    dataset: str | None = None,
+    basis_backend: str = DEFAULT_BASIS_BACKEND,
+) -> Graph:
+    """Preserve official data and attach the selected cycle-space representation."""
+    if basis_backend not in BASIS_BACKENDS:
+        raise ValueError(f"basis_backend must be one of {BASIS_BACKENDS}")
     x, edge_index, edge_attr, y = _canonical_inputs(data)
     graph = Graph(
         x=x,
         edge_index=edge_index,
         edge_attr=edge_attr,
         y=y,
-        cycle_basis=torch.from_numpy(left_nullspace_basis(len(x), edge_index.numpy())),
+        cycle_basis=torch.from_numpy(
+            build_cycle_basis(len(x), edge_index.numpy(), backend=basis_backend)
+        ),
+        cycle_basis_is_orthonormal=torch.tensor(basis_backend == "thin_q"),
     )
     validate_graph(graph, dataset=dataset)
     return graph
 
 
-def preparation_signature(dataset: str) -> dict[str, Any]:
+def preparation_signature(
+    dataset: str, *, basis_backend: str = DEFAULT_BASIS_BACKEND
+) -> dict[str, Any]:
     if dataset not in DATASETS:
         raise ValueError(f"unknown cycle PE v2 dataset: {dataset}")
+    if basis_backend not in BASIS_BACKENDS:
+        raise ValueError(f"basis_backend must be one of {BASIS_BACKENDS}")
     directory = Path(__file__).resolve().parent
+    orthonormal = basis_backend == "thin_q"
     return {
         "version": CACHE_VERSION,
         "dataset": dataset,
-        "representation": "complete_orthonormal_left_nullspace_basis",
+        "basis_backend": basis_backend,
+        "representation": (
+            "coordinate_free_cycle_projector_from_cached_thin_q"
+            if orthonormal
+            else "coordinate_free_cycle_projector_from_runtime_qr_of_dfs_fundamental"
+        ),
         "incidence": "B[m,n], canonical sorted u<v edges, tail -1 and head +1",
-        "basis": "numpy.linalg.svd(B, full_matrices=True); all m-n+c left-null columns",
-        "storage": "float32 matrices [num_edges, cycle_rank], graph-local ragged columns",
+        "basis": (
+            "spanning forest -> sparse fundamental Z -> thin QR Q; all beta=m-n+c "
+            "columns, no eigendecomposition"
+            if orthonormal
+            else "iterative DFS spanning forest + one parent-path fundamental cycle per "
+            "non-tree edge; all beta=m-n+c columns, no all-simple-cycle enumeration"
+        ),
+        "storage": (
+            "float32 orthonormal Q [num_edges, cycle_rank], graph-local ragged"
+            if orthonormal
+            else "float32 dense raw DFS fundamental Z [num_edges, cycle_rank], graph-local "
+            "ragged; representation flag requires runtime thin QR before projector use"
+        ),
+        "construction_complexity": (
+            "DFS forest O(V+E); sparse explicit Z O(V+E+nnz(Z)); dense cache materialization "
+            "Omega(E*beta); reduced QR O(E*beta^2)"
+            if orthonormal
+            else "DFS forest O(V+E); sparse explicit Z O(V+E+nnz(Z)); dense cache materialization "
+            "Omega(E*beta); runtime reduced QR O(E*beta^2) per graph/model forward"
+        ),
         "numpy_version": np.__version__,
         "implementation_sha256": {
             "v2/basis.py": hashlib.sha256((directory / "basis.py").read_bytes()).hexdigest(),
@@ -30802,6 +35567,7 @@ def load_benchmark(
     *,
     allow_download: bool,
     splits: tuple[str, ...] = SPLITS,
+    basis_backend: str = DEFAULT_BASIS_BACKEND,
 ) -> tuple[dict[str, list[Graph]], dict[str, Any]]:
     """Load fixed official splits, validating immutable basis caches fail-closed."""
     if (
@@ -30810,7 +35576,7 @@ def load_benchmark(
         or any(split not in SPLITS for split in splits)
     ):
         raise ValueError("splits must be a nonempty unique subset of official splits")
-    signature = preparation_signature(dataset)
+    signature = preparation_signature(dataset, basis_backend=basis_backend)
     official = load_official_splits(
         data_root,
         dataset,
@@ -30857,10 +35623,11 @@ def load_benchmark(
         else:
             graphs = []
             for index, data in enumerate(official[split]):
-                graphs.append(prepare_graph(data, dataset=dataset))
+                graphs.append(prepare_graph(data, dataset=dataset, basis_backend=basis_backend))
                 if (index + 1) % 1000 == 0:
                     print(
-                        f"{dataset}/{split}: full cycle bases {index + 1}/{len(official[split])}",
+                        f"{dataset}/{split}: projector-ready cycle spaces "
+                        f"{index + 1}/{len(official[split])}",
                         flush=True,
                     )
             rows = [
@@ -30892,17 +35659,34 @@ def load_benchmark(
         else "OGB 9 atom / 3 bond categorical fields",
         "preparation": signature,
         "cache_directory": str(cache_dir),
-        "basis_storage": "all beta=m-n+c columns per graph; no padding or truncation",
-        "basis_coordinates": "SVD coordinates are not invariant to arbitrary nullspace rotations",
+        "basis_backend": basis_backend,
+        "basis_storage": (
+            "all beta=m-n+c thin-Q columns; no padding or truncation"
+            if basis_backend == "thin_q"
+            else "all beta=m-n+c raw DFS fundamental columns; no padding or truncation"
+        ),
+        "basis_coordinates": (
+            "model uses only P=Q Q.T through K=P Hadamard-square P; raw fundamental Z is "
+            "thin-QR orthonormalized before use; arbitrary basis coordinates, Q signs and "
+            "Q rotations are unobservable"
+        ),
+        "basis_runtime": (
+            "cached Q fast path; no factorization in model forward"
+            if basis_backend == "thin_q"
+            else "diagnostic correctness path; graph-local reduced QR is repeated in model "
+            "forward, so this backend is not an end-to-end linear-time speedup"
+        ),
     }
     return result, protocol
 
 
 __all__ = [
     "Batch",
+    "BASIS_BACKENDS",
     "CACHE_NAMESPACE",
     "CACHE_VERSION",
     "DATASETS",
+    "DEFAULT_BASIS_BACKEND",
     "Graph",
     "collate",
     "load_benchmark",
@@ -30918,14 +35702,19 @@ __all__ = [
 registry_version: 1
 track: cycle_pe
 version: v2
-model: cycle_basis_v2
-claim: Full orthonormal left-nullspace basis is input to a learned encoder; no six-statistic PE.
+model: cycle_projector_pe_v2
+claim: Coordinate-free cycle-space projector-kernel PE with a deep residual edge-aware GNN.
 gpu_training_verified: false
 representation:
-  construction: full SVD of the canonical edge-by-node incidence matrix
-  basis_contract: B.T @ U_c = 0; U_c.T @ U_c = I; beta = m - n + components
+  default_backend: thin_q
+  selectable_backends: [thin_q, dfs_fundamental]
+  construction: sparse fundamental cycles; thin_q caches model-ready Q; dfs_fundamental caches raw signed cycles from iterative DFS forest plus non-tree-edge parent paths
+  complexity: DFS forest O(V+E); explicit sparse Z O(V+E+nnz(Z)); dense cache Omega(E*beta); thin QR O(E*beta^2)
+  diagnostic_warning: dfs_fundamental repeats graph-local thin QR per model forward and is not an end-to-end linear-time speedup
+  basis_contract: B.T @ Z = 0; rank(Z) = beta = m - n + components; projector receives Q with Q.T @ Q = I
   truncation: none
-  symmetries: cycle-column signs and permutations only; not arbitrary basis rotation
+  learned_input: K = (Q Q.T) hadamard-square (Q Q.T); no raw basis coordinates
+  symmetries: arbitrary basis-change and edge-orientation invariant; edge-permutation equivariant
 datasets:
   - id: zinc12k
     name: ZINC-12K
@@ -30933,7 +35722,7 @@ datasets:
     split: official 10000/1000/1000 train/validation/test
     metrics: [mae]
     adapter: research.cycle_pe.v2.data.load_benchmark
-    cache_namespace: cycle_pe_v2_benchmark/zinc12k
+    cache_namespace: cycle_pe_v2_projector_kernel_benchmark/zinc12k
     targets: official supplied labels unchanged
   - id: peptides_struct
     name: LRGB Peptides-struct
@@ -30941,57 +35730,49 @@ datasets:
     split: official 10873/2331/2331 train/validation/test
     metrics: [mae]
     adapter: research.cycle_pe.v2.data.load_benchmark
-    cache_namespace: cycle_pe_v2_benchmark/peptides_struct
+    cache_namespace: cycle_pe_v2_projector_kernel_benchmark/peptides_struct
     targets: all 11 official supplied labels unchanged
 ````
 
 # research/cycle_pe/v2/model.py
 
 ````python
-"""Cycle PE v2: learn from every signed vector of the left-nullspace basis.
+"""Coordinate-free cycle-space PE and a deep residual molecular GNN.
 
-No precomputed cycle statistics, projector, train-fitted width or truncation is
-used here. The variable number of columns is handled by a learned column-set
-encoder. Its fixed-width output is a learned PE, not a lossless basis codec.
+For any full basis ``Z`` of ``ker(B.T)``, let
+
+``P_Z = Z (Z.T Z)^-1 Z.T`` and ``K_Z = P_Z * P_Z`` (Hadamard square).
+
+``P_Z`` is invariant to every invertible chart replacement ``Z -> ZR``.
+Squaring entrywise also removes independent incidence-orientation signs, while
+``K_Z X`` remains equivariant to edge permutations.  Consequently no arbitrary
+SVD/fundamental-cycle coordinate is ever presented to a learned layer.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 
 import torch
 from torch import Tensor, nn
+from torch.nn.utils.rnn import pad_sequence
 
-from research.cycle_pe.benchmark_models import (
-    ATOM_DIMS,
-    BOND_DIMS,
-    CategoricalEncoder,
-    _pool,
-)
-from research.cycle_pe.paper_model import _message_topology, _MessageLayer
+from research.cycle_pe.benchmark_models import ATOM_DIMS, BOND_DIMS, CategoricalEncoder, _pool
+from research.cycle_pe.paper_model import _message_topology
 from research.cycle_pe.v2.data import DATASETS, Batch
 
-MODEL_NAME = "cycle_basis_v2"
+MODEL_NAME = "cycle_projector_pe_v2"
 BASIS_EXECUTIONS = ("batched", "reference")
-
-# graph index, first column, block width, flattened start, flattened stop
-PairSlice = tuple[int, int, int, int, int]
 
 
 class LeftNullBasisEncoder(nn.Module):
-    """Contextual encoder of all columns of U in ker(B.T).
+    """Bond-conditioned PE from the intrinsic cycle-space projector kernel.
 
-    For each signed column u, phi([bond_e, u_e]) is learned BEFORE the edge
-    aggregation. The pooled column context is then passed to each edge through
-    psi([bond_e, u_e, context]). Averaging the full nonlinear encodings f(u) and
-    f(-u) handles column signs; summing columns handles their ordering. Applying
-    an entrywise absolute value before the learned encoder would discard relative
-    sign structure and is deliberately not done.
-
-    This is not invariant to arbitrary orthogonal rotations U -> UQ or independent
-    edge orientation changes. Data preparation fixes canonical edge orientations.
-    Column chunking changes temporary allocation, never the selected basis rank.
+    The historical class name is retained for import compatibility. Production
+    Production data stores orthonormal ``Q`` and marks it as such, so no
+    factorization occurs during training.  The diagnostic DFS-fundamental data
+    backend stores raw ``Z`` and therefore takes the generic graph-local QR path.
     """
 
     def __init__(self, bond_dim: int, pe_dim: int, *, column_chunk_size: int = 16):
@@ -31000,198 +35781,372 @@ class LeftNullBasisEncoder(nn.Module):
             raise ValueError("bond_dim, pe_dim and column_chunk_size must be positive")
         self.bond_dim = bond_dim
         self.pe_dim = pe_dim
+        # Kept as a public compatibility knob; low-rank contraction cores, not
+        # arbitrary basis columns, are now the bounded execution unit.
         self.column_chunk_size = column_chunk_size
         self.column_phi = nn.Sequential(
-            nn.Linear(bond_dim + 1, pe_dim),
-            nn.GELU(),
-            nn.Linear(pe_dim, pe_dim),
-            nn.GELU(),
+            nn.Linear(bond_dim, pe_dim), nn.SiLU(), nn.Linear(pe_dim, pe_dim)
         )
         self.edge_psi = nn.Sequential(
-            nn.Linear(bond_dim + 1 + pe_dim, pe_dim),
-            nn.GELU(),
-            nn.Linear(pe_dim, pe_dim),
-            nn.GELU(),
+            nn.Linear(2 * pe_dim + 3, 2 * pe_dim),
+            nn.SiLU(),
+            nn.Linear(2 * pe_dim, pe_dim),
+            nn.SiLU(),
         )
-        self.output = nn.Sequential(nn.Linear(pe_dim, pe_dim), nn.GELU(), nn.Linear(pe_dim, pe_dim))
+        self.output = nn.Sequential(nn.Linear(pe_dim, pe_dim), nn.SiLU())
 
-    def _signed_columns(self, bond: Tensor, columns: Tensor) -> Tensor:
-        edge_count, column_count = columns.shape
-        local = torch.cat(
+    def _checked_q(self, basis: Tensor, *, orthonormal_input: bool) -> Tensor:
+        if basis.ndim != 2:
+            raise ValueError("basis must have shape [num_edges, cycle_rank]")
+        if not basis.is_floating_point():
+            raise ValueError("basis must be a floating point tensor [num_edges, cycle_rank]")
+        edge_count, rank = basis.shape
+        if edge_count == 0 and rank:
+            raise ValueError("an edgeless graph cannot have nonzero cycle rank")
+        if rank > edge_count:
+            raise ValueError("cycle rank cannot exceed the edge count")
+        if rank == 0:
+            return basis.float()
+        if orthonormal_input:
+            # Cache validation certifies Q.T@Q=I. Avoid a GPU synchronization or
+            # repeated QR in the hot path.
+            return basis.float()
+        q, triangular = torch.linalg.qr(basis.float(), mode="reduced")
+        threshold = torch.finfo(q.dtype).eps * max(edge_count, rank) * 16.0
+        if bool((triangular.diagonal().abs() <= threshold).any()):
+            raise ValueError("basis must have full column rank")
+        return q
+
+    def _projector_mix(
+        self, q: Tensor, values: Tensor, *, pair_budget: int | None
+    ) -> tuple[Tensor, Tensor]:
+        # The projector contraction is the sole forced-FP32 region.  The PE
+        # MLPs and graph backbone remain eligible for the caller's autocast.
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            q, values = q.float(), values.float()
+            edge_count, rank = q.shape
+            leverage = q.square().sum(dim=1)
+            if edge_count == 0 or rank == 0:
+                return values.new_zeros(values.shape), leverage
+            feature_count = values.shape[1]
+            budget = pair_budget or max(1, feature_count * rank * rank)
+            rank_block = min(rank, self.column_chunk_size, max(1, math.isqrt(budget)))
+            feature_block = max(1, min(feature_count, budget // (rank_block * rank_block)))
+            feature_parts = []
+            for feature_start in range(0, feature_count, feature_block):
+                selected = values[:, feature_start : feature_start + feature_block]
+                mixed = selected.new_zeros(selected.shape)
+                for left_start in range(0, rank, rank_block):
+                    left = q[:, left_start : left_start + rank_block]
+                    for right_start in range(0, rank, rank_block):
+                        right = q[:, right_start : right_start + rank_block]
+                        # core[d,a,b] = sum_j V[j,d] Q[j,a] Q[j,b]. This realizes
+                        # ((Q Q.T) Hadamard-square (Q Q.T)) @ V without ever
+                        # allocating an edge-by-edge matrix.
+                        core = torch.einsum("md,ma,mb->dab", selected, left, right)
+                        mixed = mixed + torch.einsum("ma,dab,mb->md", left, core, right)
+                feature_parts.append(mixed)
+            return torch.cat(feature_parts, dim=1), leverage
+
+    def _projector_mix_batch(
+        self,
+        qs: Sequence[Tensor],
+        value_parts: Sequence[Tensor],
+        *,
+        pair_budget: int,
+    ) -> tuple[list[Tensor], list[Tensor]]:
+        """Rank-grouped projector contractions without an edge-pair matrix.
+
+        Molecular graphs with equal cycle rank are edge-padded and contracted
+        together.  The temporary ``[graphs, features, r_block, r_block]`` core
+        never exceeds ``pair_budget`` elements; padding never creates an
+        ``m x m`` tensor.  Results are restored to their original graph order.
+        """
+        if len(qs) != len(value_parts):
+            raise ValueError("basis/value graph counts must agree")
+        mixed_parts: list[Tensor | None] = [None] * len(qs)
+        leverage_parts: list[Tensor | None] = [None] * len(qs)
+        by_rank: dict[int, list[int]] = {}
+        for index, (q, values) in enumerate(zip(qs, value_parts, strict=True)):
+            if q.shape[0] != values.shape[0]:
+                raise ValueError("basis rows must align with graph bond embeddings")
+            by_rank.setdefault(q.shape[1], []).append(index)
+
+        with torch.autocast(
+            device_type=value_parts[0].device.type if value_parts else "cpu", enabled=False
+        ):
+            for rank, indices in by_rank.items():
+                if rank == 0:
+                    for index in indices:
+                        values = value_parts[index].float()
+                        mixed_parts[index] = values.new_zeros(values.shape)
+                        leverage_parts[index] = values.new_zeros(values.shape[0])
+                    continue
+                feature_count = value_parts[indices[0]].shape[1]
+                initial_rank_block = min(
+                    rank, self.column_chunk_size, max(1, math.isqrt(pair_budget))
+                )
+                # Reserve at least a modest feature tile when possible.  This
+                # batches many small molecules instead of launching one kernel
+                # per graph, while the exact core limit remains enforced below.
+                graph_block = max(
+                    1,
+                    pair_budget
+                    // (initial_rank_block * initial_rank_block * min(feature_count, 8)),
+                )
+                for graph_start in range(0, len(indices), graph_block):
+                    selected_indices = indices[graph_start : graph_start + graph_block]
+                    graph_count = len(selected_indices)
+                    q_padded = pad_sequence(
+                        [qs[index].float() for index in selected_indices], batch_first=True
+                    )
+                    values_padded = pad_sequence(
+                        [value_parts[index].float() for index in selected_indices],
+                        batch_first=True,
+                    )
+                    leverage_padded = q_padded.square().sum(dim=2)
+                    mixed_padded = values_padded.new_zeros(values_padded.shape)
+                    rank_block = min(
+                        rank,
+                        self.column_chunk_size,
+                        max(1, math.isqrt(pair_budget // graph_count)),
+                    )
+                    feature_block = max(
+                        1,
+                        min(
+                            feature_count,
+                            pair_budget // (graph_count * rank_block * rank_block),
+                        ),
+                    )
+                    for feature_start in range(0, feature_count, feature_block):
+                        selected = values_padded[
+                            :, :, feature_start : feature_start + feature_block
+                        ]
+                        mixed = selected.new_zeros(selected.shape)
+                        for left_start in range(0, rank, rank_block):
+                            left = q_padded[:, :, left_start : left_start + rank_block]
+                            for right_start in range(0, rank, rank_block):
+                                right = q_padded[:, :, right_start : right_start + rank_block]
+                                core = torch.einsum("gmd,gma,gmb->gdab", selected, left, right)
+                                if core.numel() > pair_budget:
+                                    raise RuntimeError("projector core exceeded basis_pair_budget")
+                                mixed.add_(torch.einsum("gma,gdab,gmb->gmd", left, core, right))
+                        mixed_padded[:, :, feature_start : feature_start + selected.shape[2]] = (
+                            mixed
+                        )
+                    for local, index in enumerate(selected_indices):
+                        edge_count = qs[index].shape[0]
+                        mixed_parts[index] = mixed_padded[local, :edge_count]
+                        leverage_parts[index] = leverage_padded[local, :edge_count]
+        if any(part is None for part in mixed_parts + leverage_parts):
+            raise RuntimeError("incomplete rank-grouped projector result")
+        return (
+            [part for part in mixed_parts if part is not None],
+            [part for part in leverage_parts if part is not None],
+        )
+
+    @staticmethod
+    def _intrinsic_features(values: Tensor, mixed: Tensor, leverage: Tensor, rank: int) -> Tensor:
+        safe = leverage.clamp_min(torch.finfo(leverage.dtype).eps)
+        rank_fraction = leverage.new_full((len(leverage), 1), rank / max(1, len(leverage)))
+        return torch.cat(
             (
-                bond[:, None, :].expand(edge_count, column_count, self.bond_dim),
-                columns[:, :, None],
+                values.float() * leverage[:, None],
+                mixed / safe[:, None],
+                leverage[:, None],
+                leverage.sqrt()[:, None],
+                rank_fraction,
             ),
-            dim=2,
+            dim=1,
         )
-        context = self.column_phi(local).mean(dim=0, keepdim=True)
-        return self.edge_psi(torch.cat((local, context.expand(edge_count, -1, -1)), dim=2))
 
-    def forward(self, bond: Tensor, basis: Tensor) -> Tensor:
-        """Original single-graph reference, retained for execution comparisons."""
+    def _encode(
+        self,
+        bond: Tensor,
+        basis: Tensor,
+        *,
+        pair_budget: int | None,
+        orthonormal_input: bool,
+    ) -> Tensor:
         if bond.ndim != 2 or bond.shape[1] != self.bond_dim:
             raise ValueError("bond embeddings have an invalid shape")
         if basis.ndim != 2 or basis.shape[0] != bond.shape[0]:
             raise ValueError("basis must have shape (num_edges, cycle_rank)")
-        if basis.device != bond.device or not basis.is_floating_point():
-            raise ValueError("basis must be floating point on the bond embedding device")
+        if basis.device != bond.device:
+            raise ValueError("basis must be on the bond embedding device")
         edge_count, rank = basis.shape
         if rank == 0:
-            # A forest has no cycle coordinates. Do not create a learned bias PE.
             return bond.new_zeros((edge_count, self.pe_dim))
-        if edge_count == 0:
-            raise ValueError("an edgeless graph cannot have nonzero cycle rank")
-        # Float32 also keeps small signed SVD coordinates intact under AMP.
-        with torch.autocast(device_type=bond.device.type, enabled=False):
-            bond, basis = bond.float(), basis.float()
-            encoded = bond.new_zeros((edge_count, self.pe_dim))
-            for start in range(0, rank, self.column_chunk_size):
-                columns = basis[:, start : start + self.column_chunk_size]
-                positive = self._signed_columns(bond, columns)
-                negative = self._signed_columns(bond, -columns)
-                encoded = encoded + (0.5 * (positive + negative)).sum(dim=1)
-            return self.output(encoded / math.sqrt(rank))
+        q = self._checked_q(basis, orthonormal_input=orthonormal_input)
+        values = self.column_phi(bond)
+        mixed, leverage = self._projector_mix(q, values, pair_budget=pair_budget)
+        features = self._intrinsic_features(values, mixed, leverage, rank)
+        encoded = self.output(self.edge_psi(features))
+        # Bridges (hence every edge in an acyclic component) have zero cycle
+        # leverage and exactly zero PE despite affine biases.
+        return encoded * leverage.sqrt()[:, None].to(encoded.dtype)
 
-    def _pair_groups(self, bases: Sequence[Tensor], budget: int) -> Iterator[list[PairSlice]]:
-        """Pack graph-local column blocks without allocating all pair indices.
+    def forward(self, bond: Tensor, basis: Tensor) -> Tensor:
+        return self._encode(bond, basis, pair_budget=None, orthonormal_input=False)
 
-        Splitting a column across groups is allowed: its complete edge mean is
-        accumulated in the first pass before any second-pass edge encoding.
-        """
-        group: list[PairSlice] = []
-        available = budget
-        for graph, basis in enumerate(bases):
-            edge_count, rank = basis.shape
-            for first in range(0, rank, self.column_chunk_size):
-                width = min(self.column_chunk_size, rank - first)
-                start, size = 0, edge_count * width
-                while start < size:
-                    stop = min(size, start + available)
-                    group.append((graph, first, width, start, stop))
-                    available -= stop - start
-                    start = stop
-                    if not available:
-                        yield group
-                        group, available = [], budget
-        if group:
-            yield group
-
-    def _pack_pairs(
+    def forward_batch(
         self,
         bond: Tensor,
         bases: Sequence[Tensor],
-        group: list[PairSlice],
-        edge_offsets: list[int],
-        column_offsets: list[int],
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        edge_ids, column_ids, values = [], [], []
-        for graph, first, width, start, stop in group:
-            flat = torch.arange(start, stop, device=bond.device)
-            rows = flat.div(width, rounding_mode="floor")
-            columns = first + flat.remainder(width)
-            edge_ids.append(rows + edge_offsets[graph])
-            column_ids.append(columns + column_offsets[graph])
-            # Index only this bounded slice: flattening a noncontiguous column
-            # block first could silently allocate its entire m-by-block array.
-            values.append(bases[graph][rows, columns])
-        edge_index = torch.cat(edge_ids)
-        column_index = torch.cat(column_ids)
-        local = torch.cat((bond[edge_index], torch.cat(values)[:, None]), dim=1)
-        return local, edge_index, column_index
-
-    def forward_batch(
-        self, bond: Tensor, bases: Sequence[Tensor], *, pair_budget: int = 32768
+        *,
+        pair_budget: int = 32768,
+        orthonormal_input: bool | Sequence[bool] = False,
     ) -> Tensor:
-        """Same signed-column encoder with shared, bounded batched MLP calls.
-
-        A segment identifies one (graph, basis column), never merely its column
-        number. Two passes retain each column's full edge-mean context even if
-        one column has more edges than the budget. Every basis entry is used.
-
-        ``pair_budget`` bounds rows per phi/psi call for each sign, not total
-        autograd memory: backward still retains activations from all groups.
-        No persistent buffers or trainable parameters are added.
-        """
         if pair_budget < 1:
             raise ValueError("pair_budget must be positive")
-        if bond.ndim != 2 or bond.shape[1] != self.bond_dim:
-            raise ValueError("bond embeddings have an invalid shape")
-        edge_offsets, column_offsets = [0], [0]
-        counts, ranks = [], []
-        for basis in bases:
-            if basis.ndim != 2:
-                raise ValueError("basis must have shape (num_edges, cycle_rank)")
-            if basis.device != bond.device or not basis.is_floating_point():
-                raise ValueError("basis must be floating point on the bond embedding device")
-            edge_count, rank = basis.shape
-            if not edge_count and rank:
-                raise ValueError("an edgeless graph cannot have nonzero cycle rank")
-            counts.append(edge_count)
-            ranks.append(rank)
-            edge_offsets.append(edge_offsets[-1] + edge_count)
-            column_offsets.append(column_offsets[-1] + rank)
-        if edge_offsets[-1] != len(bond):
-            raise ValueError("basis rows must align with the concatenated bond embeddings")
-        if not column_offsets[-1]:
-            return bond.new_zeros((len(bond), self.pe_dim))
+        counts = [basis.shape[0] for basis in bases]
+        if sum(counts) != len(bond):
+            raise ValueError("basis rows must align with concatenated bond embeddings")
+        if not bases:
+            return bond.new_zeros((0, self.pe_dim))
+        if isinstance(orthonormal_input, bool):
+            orthonormal_flags = [orthonormal_input] * len(bases)
+        else:
+            orthonormal_flags = list(orthonormal_input)
+            if len(orthonormal_flags) != len(bases) or any(
+                not isinstance(flag, bool) for flag in orthonormal_flags
+            ):
+                raise ValueError("one Boolean orthonormal-input flag is required per basis")
+        qs = [
+            self._checked_q(basis, orthonormal_input=flag)
+            for basis, flag in zip(bases, orthonormal_flags, strict=True)
+        ]
+        values = self.column_phi(bond)
+        value_parts = list(torch.split(values, counts))
+        mixed_parts, leverage_parts = self._projector_mix_batch(
+            qs, value_parts, pair_budget=pair_budget
+        )
+        features = torch.cat(
+            [
+                self._intrinsic_features(value, mixed, leverage, q.shape[1])
+                for q, value, mixed, leverage in zip(
+                    qs, value_parts, mixed_parts, leverage_parts, strict=True
+                )
+            ],
+            dim=0,
+        )
+        leverage = torch.cat(leverage_parts)
+        encoded = self.output(self.edge_psi(features))
+        return encoded * leverage.sqrt()[:, None].to(encoded.dtype)
 
-        with torch.autocast(device_type=bond.device.type, enabled=False):
-            bond = bond.float()
-            bases = tuple(basis.float() for basis in bases)
-            groups = list(self._pair_groups(bases, pair_budget))
-            count_tensor = torch.tensor(counts, device=bond.device, dtype=torch.long)
-            rank_tensor = torch.tensor(ranks, device=bond.device, dtype=torch.long)
-            column_sizes = torch.repeat_interleave(
-                count_tensor, rank_tensor, output_size=column_offsets[-1]
-            ).to(bond.dtype)
-            positive_context = bond.new_zeros((column_offsets[-1], self.pe_dim))
-            negative_context = torch.zeros_like(positive_context)
-            for group in groups:
-                local, _, column_index = self._pack_pairs(
-                    bond, bases, group, edge_offsets, column_offsets
-                )
-                negative = torch.cat((local[:, :-1], -local[:, -1:]), dim=1)
-                positive_context.index_add_(0, column_index, self.column_phi(local))
-                negative_context.index_add_(0, column_index, self.column_phi(negative))
-            positive_context = positive_context / column_sizes[:, None]
-            negative_context = negative_context / column_sizes[:, None]
 
-            encoded = bond.new_zeros((len(bond), self.pe_dim))
-            for group in groups:
-                local, edge_index, column_index = self._pack_pairs(
-                    bond, bases, group, edge_offsets, column_offsets
-                )
-                negative = torch.cat((local[:, :-1], -local[:, -1:]), dim=1)
-                positive = self.edge_psi(torch.cat((local, positive_context[column_index]), dim=1))
-                negative = self.edge_psi(
-                    torch.cat((negative, negative_context[column_index]), dim=1)
-                )
-                encoded.index_add_(0, edge_index, 0.5 * (positive + negative))
-            edge_ranks = torch.repeat_interleave(rank_tensor, count_tensor, output_size=len(bond))
-            result = self.output(encoded / edge_ranks.clamp_min(1).to(bond.dtype).sqrt()[:, None])
-            # Forest edges remain exactly zero, including output-MLP biases.
-            return torch.where(edge_ranks[:, None] > 0, result, torch.zeros_like(result))
+class _ResidualEdgeGraphBlock(nn.Module):
+    """Pre-norm residual edge-aware message block with separate FFNs."""
+
+    def __init__(
+        self,
+        hidden: int,
+        *,
+        ffn_multiplier: int,
+        dropout: float,
+        layer_scale: float,
+    ) -> None:
+        super().__init__()
+        expanded = hidden * ffn_multiplier
+        self.edge_update_norm = nn.LayerNorm(hidden)
+        self.edge_node_norm = nn.LayerNorm(hidden)
+        self.edge_update = nn.Sequential(
+            nn.Linear(3 * hidden, 2 * hidden),
+            nn.SiLU(),
+            nn.Linear(2 * hidden, hidden),
+        )
+        self.edge_ffn_norm = nn.LayerNorm(hidden)
+        self.edge_ffn = nn.Sequential(
+            nn.Linear(hidden, expanded), nn.SiLU(), nn.Linear(expanded, hidden)
+        )
+        self.message_node_norm = nn.LayerNorm(hidden)
+        self.message_edge_norm = nn.LayerNorm(hidden)
+        self.message = nn.Sequential(
+            nn.Linear(3 * hidden, 2 * hidden),
+            nn.SiLU(),
+            nn.Linear(2 * hidden, hidden),
+        )
+        self.message_gate = nn.Sequential(
+            nn.Linear(3 * hidden, hidden), nn.SiLU(), nn.Linear(hidden, hidden), nn.Sigmoid()
+        )
+        self.node_update = nn.Sequential(
+            nn.Linear(2 * hidden, 2 * hidden),
+            nn.SiLU(),
+            nn.Linear(2 * hidden, hidden),
+        )
+        self.node_ffn_norm = nn.LayerNorm(hidden)
+        self.node_ffn = nn.Sequential(
+            nn.Linear(hidden, expanded), nn.SiLU(), nn.Linear(expanded, hidden)
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.edge_scale = nn.Parameter(torch.full((hidden,), layer_scale))
+        self.edge_ffn_scale = nn.Parameter(torch.full((hidden,), layer_scale))
+        self.node_scale = nn.Parameter(torch.full((hidden,), layer_scale))
+        self.node_ffn_scale = nn.Parameter(torch.full((hidden,), layer_scale))
+
+    def forward(
+        self, node: Tensor, edge: Tensor, edge_index: Tensor, *, topology
+    ) -> tuple[Tensor, Tensor]:
+        u, v = edge_index[:, 0], edge_index[:, 1]
+        normalized_node = self.edge_node_norm(node)
+        normalized_edge = self.edge_update_norm(edge)
+        symmetric = torch.cat(
+            (
+                normalized_node[u] + normalized_node[v],
+                (normalized_node[u] - normalized_node[v]).abs(),
+                normalized_edge,
+            ),
+            dim=1,
+        )
+        edge = edge + self.dropout(self.edge_update(symmetric)) * self.edge_scale
+        edge = edge + self.dropout(self.edge_ffn(self.edge_ffn_norm(edge))) * self.edge_ffn_scale
+
+        source, target, degree = topology
+        normalized_node = self.message_node_norm(node)
+        normalized_edge = self.message_edge_norm(edge)
+        directed_edge = torch.cat((normalized_edge, normalized_edge), dim=0)
+        message_input = torch.cat(
+            (normalized_node[source], normalized_node[target], directed_edge), dim=1
+        )
+        messages = self.message(message_input) * self.message_gate(message_input)
+        aggregate = torch.zeros_like(node)
+        # Autocast may produce FP16/BF16 messages while the residual stream is
+        # FP32. index_add_ requires exact dtype agreement.
+        aggregate.index_add_(0, target, messages.to(aggregate.dtype))
+        aggregate = aggregate / degree[:, None]
+        node = (
+            node
+            + self.dropout(self.node_update(torch.cat((normalized_node, aggregate), dim=1)))
+            * self.node_scale
+        )
+        node = node + self.dropout(self.node_ffn(self.node_ffn_norm(node))) * self.node_ffn_scale
+        return node, edge
 
 
 class CycleBasisPEModel(nn.Module):
-    """V2 basis-vector PE with the unchanged cycle-track message backbone."""
+    """Projector-kernel PE with a deep, stable molecular graph backbone."""
 
     def __init__(
         self,
         *,
         dataset: str,
-        hidden: int = 64,
-        pe_dim: int = 32,
-        layers: int = 3,
+        hidden: int = 128,
+        pe_dim: int = 64,
+        layers: int = 10,
         column_chunk_size: int = 16,
         basis_execution: str = "batched",
         basis_pair_budget: int = 32768,
-    ):
+        ffn_multiplier: int = 4,
+        dropout: float = 0.0,
+        layer_scale: float = 0.1,
+    ) -> None:
         super().__init__()
         if dataset not in DATASETS:
             raise ValueError(f"unknown dataset: {dataset}")
-        if min(hidden, pe_dim, layers) < 1:
-            raise ValueError("hidden, pe_dim and layers must be positive")
+        if min(hidden, pe_dim, layers, ffn_multiplier) < 1:
+            raise ValueError("hidden, pe_dim, layers and ffn_multiplier must be positive")
+        if not 0.0 <= dropout < 1.0 or not 0.0 < layer_scale <= 1.0:
+            raise ValueError("dropout or layer_scale is outside its stable range")
         if basis_execution not in BASIS_EXECUTIONS:
             raise ValueError(f"basis_execution must be one of {BASIS_EXECUTIONS}")
         if basis_pair_budget < 1:
@@ -31201,17 +36156,35 @@ class CycleBasisPEModel(nn.Module):
         self.node_encoder = CategoricalEncoder((28,) if dataset == "zinc12k" else ATOM_DIMS, hidden)
         self.bond_encoder = CategoricalEncoder((4,) if dataset == "zinc12k" else BOND_DIMS, hidden)
         self.pe_encoder = LeftNullBasisEncoder(hidden, pe_dim, column_chunk_size=column_chunk_size)
-        self.edge_encoder = nn.Sequential(nn.Linear(hidden + pe_dim, hidden), nn.GELU())
-        self.layers = nn.ModuleList(_MessageLayer(hidden) for _ in range(layers))
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(hidden + pe_dim, hidden), nn.SiLU(), nn.Linear(hidden, hidden)
+        )
+        self.layers = nn.ModuleList(
+            _ResidualEdgeGraphBlock(
+                hidden,
+                ffn_multiplier=ffn_multiplier,
+                dropout=dropout,
+                layer_scale=layer_scale,
+            )
+            for _ in range(layers)
+        )
+        self.final_node_norm = nn.LayerNorm(hidden)
+        self.final_edge_norm = nn.LayerNorm(hidden)
         self.graph_trunk = nn.Sequential(
-            nn.Linear(4 * hidden, hidden), nn.GELU(), nn.Linear(hidden, hidden)
+            nn.Linear(6 * hidden, 2 * hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(2 * hidden, hidden),
+            nn.SiLU(),
         )
         self.graph_head = nn.Linear(hidden, 1 if dataset == "zinc12k" else 11)
 
     def forward(self, batch: Batch) -> Tensor:
         graph_count = len(batch.ptr) - 1
         if len(batch.cycle_bases) != graph_count:
-            raise ValueError("one left-nullspace basis is required per graph")
+            raise ValueError("one cycle-space basis is required per graph")
+        if len(batch.cycle_basis_is_orthonormal) != graph_count:
+            raise ValueError("one cycle-space representation flag is required per graph")
         counts = [basis.shape[0] for basis in batch.cycle_bases]
         if sum(counts) != len(batch.edge_attr):
             raise ValueError("ragged basis rows do not align with batch bonds")
@@ -31220,88 +36193,113 @@ class CycleBasisPEModel(nn.Module):
         if self.basis_execution == "reference":
             positional = torch.cat(
                 [
-                    self.pe_encoder(part, basis)
-                    for part, basis in zip(
-                        torch.split(bond, counts), batch.cycle_bases, strict=True
+                    self.pe_encoder._encode(
+                        part,
+                        basis,
+                        pair_budget=None,
+                        orthonormal_input=is_orthonormal,
                     )
-                ]
+                    for part, basis, is_orthonormal in zip(
+                        torch.split(bond, counts),
+                        batch.cycle_bases,
+                        batch.cycle_basis_is_orthonormal,
+                        strict=True,
+                    )
+                ],
+                dim=0,
             )
         else:
             positional = self.pe_encoder.forward_batch(
-                bond, batch.cycle_bases, pair_budget=self.basis_pair_budget
+                bond,
+                batch.cycle_bases,
+                pair_budget=self.basis_pair_budget,
+                orthonormal_input=batch.cycle_basis_is_orthonormal,
             )
         edge = self.edge_encoder(torch.cat((bond, positional), dim=1))
-        with torch.autocast(device_type=node.device.type, enabled=False):
-            node, edge = node.float(), edge.float()
-            topology = _message_topology(node, batch.edge_index.T)
-            for layer in self.layers:
-                node, edge = layer(node, edge, batch.edge_index.T, topology=topology)
-            node_mean, node_max = _pool(node, batch.batch, graph_count)
-            edge_graph = batch.batch[batch.edge_index[0]]
-            edge_mean, edge_max = _pool(edge, edge_graph, graph_count)
-            pooled = torch.cat((node_mean, node_max, edge_mean, edge_max), dim=1)
+        # The outer training/evaluation autocast remains active for the deep
+        # backbone.  Only the projector contractions above force FP32.
+        edge_index = batch.edge_index.T
+        topology = _message_topology(node, edge_index)
+        for layer in self.layers:
+            node, edge = layer(node, edge, edge_index, topology=topology)
+        node = self.final_node_norm(node)
+        edge = self.final_edge_norm(edge)
+        node_mean, node_max = _pool(node, batch.batch, graph_count)
+        node_sizes = (batch.ptr[1:] - batch.ptr[:-1]).to(node.dtype)[:, None]
+        node_sum = node_mean * node_sizes
+        edge_graph = batch.batch[batch.edge_index[0]]
+        edge_mean, edge_max = _pool(edge, edge_graph, graph_count)
+        edge_sizes = (batch.edge_ptr[1:] - batch.edge_ptr[:-1]).to(edge.dtype)[:, None]
+        edge_sum = edge_mean * edge_sizes
+        pooled = torch.cat((node_sum, node_mean, node_max, edge_sum, edge_mean, edge_max), dim=1)
         return self.graph_head(self.graph_trunk(pooled))
 
 
 def architecture_protocol() -> dict[str, str]:
     return {
         "model": MODEL_NAME,
+        "cycle_space": (
+            "default thin_q caches a thin-QR orthonormalization Q of a sparse fundamental "
+            "basis Z of ker(B.T); optional dfs_fundamental caches raw DFS Z and performs "
+            "graph-local QR before projector use; beta=m-n+components; no truncation"
+        ),
         "positional_encoding": (
-            "full signed left-nullspace basis U_c of incidence B; B.T @ U_c = 0; "
-            "every beta=m-n+components column enters a learned contextual column encoder"
+            "P=Q Q.T and orientation-free K=P Hadamard-square P; learned bond values are "
+            "mixed as K phi(bond), normalized by leverage diag(P), then fused with local "
+            "cycle-weighted values and leverage"
         ),
-        "basis_aggregation": (
-            "phi([bond_e,U_e,k]) then edge-axis mean column context; "
-            "psi([bond_e,U_e,k,context]); average nonlinear f(u),f(-u); "
-            "sum all columns / sqrt(beta), then learned PE MLP"
+        "symmetry": (
+            "invariant to every invertible cycle-basis replacement Z->ZR and independent "
+            "edge-orientation flips; edge-permutation equivariant"
         ),
-        "basis_execution": (
-            "batched (default): budget-bounded edge/column pairs with distinct graph-column "
-            "segments and two-pass complete column context; reference: original per-graph "
-            "encoder; identical parameters and basis formula, floating-point reductions may differ"
-        ),
-        "basis_width": (
-            "ragged graph-local full rank; no train-fitted padding, truncation, "
-            "projector or handcrafted cycle statistics; forests receive zero PE"
+        "execution": (
+            "thin_q has no QR/SVD/pinv in training; dfs_fundamental is a diagnostic "
+            "correctness backend with repeated per-forward QR, not a speedup; K@V uses "
+            "pair-free rank-grouped contractions and never m-by-m storage"
         ),
         "backbone": (
-            "unchanged cycle_pe.paper_model._MessageLayer edge-aware GNN; "
-            "not a separately trained external-model baseline"
+            "deep pre-norm residual edge/node message blocks; gated directed messages; "
+            "separate edge and node FFNs; LayerScale and dropout for stable deep training"
         ),
-        "pe_injection": "concatenate learned full-basis PE with categorical bond embedding",
-        "pooling": "node mean/max and edge mean/max, then graph MLP",
-        "cycle_symmetry": (
-            "cycle-column sign and permutation invariant; not arbitrary O(beta) "
-            "basis-rotation invariant, not invariant to independent edge reorientation"
+        "pe_injection": "concatenate projector-kernel PE with categorical bond embedding",
+        "pooling": "node and edge sum/mean/max followed by a two-layer graph trunk",
+        "forest_policy": (
+            "bridges, including every edge of an acyclic component, have zero leverage and PE"
         ),
-        "limits": (
-            "canonical incidence orientation and numerical SVD basis are part of the protocol; "
-            "fixed-width learned PE is not guaranteed injective or a lossless cycle codec"
+        "numeric_policy": (
+            "projector contraction executes in FP32; PE MLPs and the deep backbone honor "
+            "outer AMP, with FP32 residual accumulation where required"
         ),
-        "reference_comparison": "external published tables only; trains only our cycle_basis_v2",
-        "numeric_policy": "basis encoder, message layers and scatter pooling stay FP32 under AMP",
+        "reference_comparison": f"external published tables only; trains only {MODEL_NAME}",
     }
+
+
+__all__ = [
+    "BASIS_EXECUTIONS",
+    "MODEL_NAME",
+    "CycleBasisPEModel",
+    "LeftNullBasisEncoder",
+    "architecture_protocol",
+]
 ````
 
 # research/cycle_pe/v2/prepare_data.sh
 
 ````bash
 #!/usr/bin/env bash
-set -euo pipefail
-
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-exec bash "${project_root}/scripts/paper.sh" "$@" --suite benchmark --tracks cycle_pe --cycle-pe-version v2 --prepare-only --allow-download
+cd "${project_root}" || exit 1
+exec python -B -m research.cycle_pe.v2.benchmark "$@" --prepare-only --allow-download --device cpu
 ````
 
 # research/cycle_pe/v2/reproduce.sh
 
 ````bash
 #!/usr/bin/env bash
-set -euo pipefail
-
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-# Keep this entrypoint on v2 even if generic selection flags are supplied.
-exec bash "${project_root}/scripts/paper.sh" "$@" --suite benchmark --tracks cycle_pe --cycle-pe-version v2
+cd "${project_root}" || exit 1
+# Dataset-aware reference sizes: ZINC 128/64/10, Peptides 256/64/6.
+exec python -B "${project_root}/scripts/run_cycle_scaling.py" "$@" --versions v2 --profiles reference --model-seeds 0
 ````
 
 # research/tree_augmentation/__init__.py
@@ -35731,7 +40729,7 @@ PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "cycle.basis_v2.test",
         "cycle_pe",
         r"metrics\.json",
-        r"datasets\.[^.]+\.models\.cycle_basis_v2\.test",
+        r"datasets\.[^.]+\.models\.cycle_projector_pe_v2\.test",
         # The basis-input experiment is a separate model, not another seed or
         # condition of the existing six-statistic cycle-set experiment.
         pairable=False,
@@ -35841,7 +40839,7 @@ EFFICIENCY_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "cycle.basis_v2.efficiency",
         "cycle_pe",
         r"metrics\.json",
-        r"datasets\.[^.]+\.models\.cycle_basis_v2\."
+        r"datasets\.[^.]+\.models\.cycle_projector_pe_v2\."
         r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
         pairable=False,
     ),
@@ -40783,7 +45781,7 @@ if __name__ == "__main__":
 
 ````python
 #!/usr/bin/env python3
-"""Run validation-only architecture scaling for Conductance V1, V2, V3 and V4."""
+"""Run validation-only reference-scale experiments for Conductance V1 through V5."""
 
 from __future__ import annotations
 
@@ -40827,6 +45825,20 @@ from research.conductance_gat.v4.protocol import (  # noqa: E402
 from research.conductance_gat.v4.protocol import (  # noqa: E402
     DATASETS as V4_DATASETS,
 )
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    BETA_PARAMETERIZATIONS,
+    DEFAULT_BETA_INITIAL,
+    DEFAULT_BETA_PARAMETERIZATION,
+    HARDWARE_PROFILES,
+    SCALE_PROFILES,
+    beta_configuration,
+)
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    CONDITIONS as V5_CONDITIONS,
+)
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    DATASETS as V5_DATASETS,
+)
 from scripts import run_conductance_factorial as shared  # noqa: E402
 from scripts.check_dependencies import (  # noqa: E402
     DependencyCheckError,
@@ -40835,11 +45847,10 @@ from scripts.check_dependencies import (  # noqa: E402
 )
 
 V1_DATASETS = ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv")
+# V5 owns these profiles. Legacy versions receive only their supported
+# width/depth/dropout subset; heads and FFN expansion remain V5-specific.
 PROFILES: dict[str, dict[str, Any]] = {
-    "base": {"hidden_channels": 64, "layers": 2, "dropout": 0.5},
-    "wide": {"hidden_channels": 128, "layers": 2, "dropout": 0.5},
-    "deep": {"hidden_channels": 64, "layers": 4, "dropout": 0.5},
-    "large": {"hidden_channels": 128, "layers": 4, "dropout": 0.5},
+    name: dict(configuration) for name, configuration in SCALE_PROFILES.items()
 }
 VERSIONS: dict[str, dict[str, Any]] = {
     "v1": {
@@ -40861,6 +45872,11 @@ VERSIONS: dict[str, dict[str, Any]] = {
         "module": "research.conductance_gat.v4.train",
         "datasets": tuple(V4_DATASETS),
         "conditions": tuple(V4_CONDITIONS),
+    },
+    "v5": {
+        "module": "research.conductance_gat.v5.train",
+        "datasets": tuple(V5_DATASETS),
+        "conditions": tuple(V5_CONDITIONS),
     },
 }
 ALL_DATASETS = tuple(
@@ -40888,6 +45904,37 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--patience", type=int, default=50)
     result.add_argument("--workers", type=int, default=0)
     result.add_argument("--edge-chunk-size", type=int, default=65536)
+    result.add_argument("--v5-edge-chunk-size", type=int)
+    result.add_argument("--v5-ppi-batch-size", type=int)
+    result.add_argument(
+        "--v5-beta-parameterization",
+        choices=BETA_PARAMETERIZATIONS,
+        default=DEFAULT_BETA_PARAMETERIZATION,
+    )
+    result.add_argument("--v5-beta-initial", type=float, default=DEFAULT_BETA_INITIAL)
+    result.add_argument("--v5-beta-min", type=float)
+    result.add_argument("--v5-beta-max", type=float)
+    result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
+    result.add_argument(
+        "--v5-sampling",
+        choices=("auto", "full", "neighbor", "cluster"),
+        default="auto",
+        help="V5 only: auto uses cluster sampling for ogbn-arxiv and full otherwise",
+    )
+    result.add_argument(
+        "--v5-num-neighbors",
+        nargs="+",
+        type=int,
+        default=[15, 10],
+        help="V5 only: hop fanouts; first value is also the cluster budget hint",
+    )
+    result.add_argument("--v5-sample-seed-batch-size", type=int)
+    result.add_argument(
+        "--v5-activation-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="V5 only: override the selected hardware profile's checkpoint policy",
+    )
     result.add_argument("--min-free-gb", type=float, default=8.0)
     result.add_argument("--dry-run", action="store_true", help="Print every child without writes")
     return result
@@ -40907,6 +45954,17 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("model seeds must be nonnegative")
     if min(args.epochs, args.patience, args.edge_chunk_size) < 1 or args.workers != 0:
         raise ValueError("epochs/patience/chunk size must be positive and workers must be 0")
+    if (
+        not args.v5_num_neighbors
+        or any(value < 1 for value in args.v5_num_neighbors)
+        or (args.v5_sample_seed_batch_size is not None and args.v5_sample_seed_batch_size < 1)
+        or (args.v5_edge_chunk_size is not None and args.v5_edge_chunk_size < 1)
+        or (args.v5_ppi_batch_size is not None and args.v5_ppi_batch_size < 1)
+    ):
+        raise ValueError("V5 neighbor fanouts and sample seed batch size must be positive")
+    if args.hardware_profile == "portable" and args.v5_ppi_batch_size not in {None, 2}:
+        raise ValueError("portable V5 PPI retains graph batch-size 2")
+    _v5_beta_configuration(args)
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
         raise ValueError("CUDA is required; CPU training/fallback is not supported")
     if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
@@ -40921,6 +45979,46 @@ def _selected_datasets(args: argparse.Namespace, version: str) -> list[str]:
     supported = VERSIONS[version]["datasets"]
     requested = supported if args.datasets is None else args.datasets
     return [dataset for dataset in requested if dataset in supported]
+
+
+def _v5_execution(args: argparse.Namespace, dataset: str) -> dict[str, Any]:
+    profile = HARDWARE_PROFILES[args.hardware_profile]
+    batch_size = 1
+    if dataset == "ppi":
+        batch_size = args.v5_ppi_batch_size or profile["ppi_batch_size"]
+    return {
+        "hardware_profile": args.hardware_profile,
+        "precision": profile["precision"],
+        "tf32": profile["tf32"],
+        "batch_size": batch_size,
+        "sample_seed_batch_size": (
+            args.v5_sample_seed_batch_size or profile["sample_seed_batch_size"]
+        ),
+        "edge_chunk_size": args.v5_edge_chunk_size or profile["edge_chunk_size"],
+        "activation_checkpoint": (
+            profile["activation_checkpoint"]
+            if args.v5_activation_checkpoint is None
+            else args.v5_activation_checkpoint
+        ),
+        "sample_prefetch": profile["sample_prefetch"],
+        "pin_memory": profile["pin_memory"],
+    }
+
+
+def _v5_beta_configuration(args: argparse.Namespace) -> dict[str, float | str]:
+    return beta_configuration(
+        args.v5_beta_parameterization,
+        args.v5_beta_initial,
+        args.v5_beta_min,
+        args.v5_beta_max,
+    )
+
+
+def _effective_min_free_gb(args: argparse.Namespace) -> float:
+    return max(
+        float(args.min_free_gb),
+        float(HARDWARE_PROFILES[args.hardware_profile]["minimum_free_memory_gib"]),
+    )
 
 
 def _exclusions(args: argparse.Namespace) -> list[dict[str, str]]:
@@ -40953,7 +46051,15 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     for version in args.versions:
         spec = VERSIONS[version]
         for profile_name in args.profiles:
-            profile = PROFILES[profile_name]
+            full_profile = PROFILES[profile_name]
+            profile_fields = (
+                ("hidden_channels", "layers", "heads", "ffn_multiplier", "dropout")
+                if version == "v5"
+                else ("hidden_channels", "layers", "dropout")
+            )
+            profile = {key: full_profile[key] for key in profile_fields}
+            if version == "v5":
+                profile.update(_v5_beta_configuration(args))
             for seed in args.model_seeds:
                 for dataset in _selected_datasets(args, version):
                     for condition in spec["conditions"]:
@@ -40996,10 +46102,48 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             "--batch-size",
                             "2" if dataset == "ppi" or version == "v1" else "1",
                         ]
+                        execution = None
                         if version != "v1":
                             command += ["--condition", condition]
                         if version in {"v2", "v3", "v4"}:
                             command += ["--edge-chunk-size", str(args.edge_chunk_size)]
+                        sampling = None
+                        if version == "v5":
+                            execution = _v5_execution(args, dataset)
+                            batch_position = command.index("--batch-size") + 1
+                            command[batch_position] = str(execution["batch_size"])
+                            sampling = (
+                                "cluster"
+                                if args.v5_sampling == "auto" and dataset == "ogbn-arxiv"
+                                else "full"
+                                if args.v5_sampling == "auto"
+                                else args.v5_sampling
+                            )
+                            if dataset == "ppi" and sampling != "full":
+                                raise ValueError("V5 PPI is inductive and requires full sampling")
+                            command += [
+                                "--heads",
+                                str(profile["heads"]),
+                                "--ffn-multiplier",
+                                str(profile["ffn_multiplier"]),
+                                "--sampling",
+                                sampling,
+                                "--hardware-profile",
+                                args.hardware_profile,
+                                "--sample-seed-batch-size",
+                                str(execution["sample_seed_batch_size"]),
+                                "--edge-chunk-size",
+                                str(execution["edge_chunk_size"]),
+                                (
+                                    "--activation-checkpoint"
+                                    if execution["activation_checkpoint"]
+                                    else "--no-activation-checkpoint"
+                                ),
+                                "--num-neighbors",
+                                *(str(value) for value in args.v5_num_neighbors),
+                            ]
+                            for name, value in _v5_beta_configuration(args).items():
+                                command += ["--" + name.replace("_", "-"), str(value)]
                         job_id = f"{version}/{profile_name}/model-seed-{seed}/{dataset}/{condition}"
                         jobs.append(
                             {
@@ -41007,6 +46151,13 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                                 "version": version,
                                 "profile": profile_name,
                                 "architecture": dict(profile),
+                                "sampling": sampling,
+                                "execution": execution,
+                                "occupancy_expectation": (
+                                    "expected low occupancy; one small full graph/no minibatch axis"
+                                    if dataset in {"cora", "citeseer", "pubmed"}
+                                    else "dataset exposes a real graph/sample minibatch axis"
+                                ),
                                 "model_seed": seed,
                                 "dataset": dataset,
                                 "condition": condition,
@@ -41025,6 +46176,22 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                         )
     if not jobs:
         raise ValueError("selection produces no supported version/dataset/profile jobs")
+    if args.hardware_profile == "a6000-48gb":
+        # Child processes remain sequential to avoid unbounded multi-process CUDA
+        # memory contention. Run the genuinely large V5 workloads first instead
+        # of presenting Cora's unavoidable low utilization as the initial job.
+        version_order = {"v5": 0, "v4": 1, "v3": 2, "v2": 3, "v1": 4}
+        dataset_order = {"ogbn-arxiv": 0, "ppi": 1, "pubmed": 2, "citeseer": 3, "cora": 4}
+        profile_order = {"reference": 0, "large": 1}
+        jobs.sort(
+            key=lambda job: (
+                version_order[job["version"]],
+                dataset_order[job["dataset"]],
+                profile_order[job["profile"]],
+                job["model_seed"],
+                job["condition"],
+            )
+        )
     return jobs
 
 
@@ -41050,6 +46217,7 @@ def _source_snapshot() -> dict[str, str]:
     paths += list((ROOT / "research/conductance_gat/v2").glob("*.py"))
     paths += list((ROOT / "research/conductance_gat/v3").glob("*.py"))
     paths += list((ROOT / "research/conductance_gat/v4").glob("*.py"))
+    paths += list((ROOT / "research/conductance_gat/v5").glob("*.py"))
     paths += [
         ROOT / "src/chartgat/cache.py",
         ROOT / "src/chartgat/execution.py",
@@ -41071,11 +46239,123 @@ def _check_sources(manifest: dict[str, Any]) -> None:
         raise RuntimeError("Conductance scaling source changed during execution")
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _hardware_requirements(hardware_profile: str) -> dict[str, int]:
+    try:
+        profile = HARDWARE_PROFILES[hardware_profile]
+    except KeyError as exc:
+        raise RuntimeError(f"unknown hardware profile: {hardware_profile}") from exc
+    return {
+        "minimum_total_memory_bytes": int(float(profile["minimum_total_memory_gib"]) * 1024**3),
+        "minimum_free_memory_bytes": int(float(profile["minimum_free_memory_gib"]) * 1024**3),
+        "minimum_compute_capability_major": int(profile["minimum_compute_capability_major"]),
+    }
+
+
+def _validate_hardware_preflight(payload: Any, hardware_profile: str) -> dict[str, Any]:
+    """Validate and normalize the preflight certificate before any child starts."""
+    if not isinstance(payload, dict) or payload.get("status") != "passed":
+        raise RuntimeError("GPU preflight returned without a passed certificate")
+    gpu = payload.get("gpu")
+    if not isinstance(gpu, dict):
+        raise RuntimeError("GPU preflight is missing the visible GPU record")
+    name = gpu.get("name")
+    total_bytes = gpu.get("total_bytes")
+    free_bytes = gpu.get("free_bytes")
+    capability = gpu.get("compute_capability")
+    if not isinstance(name, str) or not name.strip():
+        raise RuntimeError("GPU preflight device name must be a nonempty string")
+    if isinstance(total_bytes, bool) or not isinstance(total_bytes, int) or total_bytes < 1:
+        raise RuntimeError("GPU preflight total_bytes must be a positive integer")
+    if (
+        isinstance(free_bytes, bool)
+        or not isinstance(free_bytes, int)
+        or free_bytes < 0
+        or free_bytes > total_bytes
+    ):
+        raise RuntimeError("GPU preflight free_bytes must be an integer within device capacity")
+    if (
+        not isinstance(capability, list)
+        or len(capability) != 2
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in capability)
+        or any(value < 0 for value in capability)
+    ):
+        raise RuntimeError("GPU preflight compute_capability must be two nonnegative integers")
+    requirements = _hardware_requirements(hardware_profile)
+    if total_bytes < requirements["minimum_total_memory_bytes"]:
+        raise RuntimeError(
+            f"{hardware_profile} requires at least "
+            f"{requirements['minimum_total_memory_bytes'] / 1024**3:g} GiB of visible GPU "
+            "memory; a smaller GPU or MIG slice must use the portable profile"
+        )
+    if free_bytes < requirements["minimum_free_memory_bytes"]:
+        raise RuntimeError(
+            f"{hardware_profile} requires at least "
+            f"{requirements['minimum_free_memory_bytes'] / 1024**3:g} GiB free at "
+            "preflight; wait for other GPU jobs or use the portable profile"
+        )
+    if capability[0] < requirements["minimum_compute_capability_major"]:
+        raise RuntimeError(
+            f"{hardware_profile} requires CUDA compute capability "
+            f"{requirements['minimum_compute_capability_major']}.0 or newer"
+        )
+    return {
+        "status": "passed",
+        "hardware_profile": hardware_profile,
+        "gpu": {
+            "name": name,
+            "total_bytes": total_bytes,
+            "free_bytes": free_bytes,
+            "compute_capability": capability,
+        },
+        "requirements": requirements,
+    }
+
+
+def _accepted_hardware_preflight(path: Path, hardware_profile: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise RuntimeError(f"GPU preflight returned without its JSON certificate: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"GPU preflight certificate is unreadable: {exc}") from exc
+    accepted = _validate_hardware_preflight(payload, hardware_profile)
+    return {"path": str(path), "sha256": _sha256(path), **accepted}
+
+
+def _verify_preflight_evidence(
+    manifest: dict[str, Any], run_dir: Path, hardware_profile: str
+) -> None:
+    evidence = manifest.get("gpu_preflight")
+    jobs = manifest["jobs"]
+    if evidence is None:
+        if manifest.get("status") == "passed" or any(
+            job.get("status") != "pending" for job in jobs
+        ):
+            raise RuntimeError("existing run has child state without accepted GPU preflight")
+        return
+    if not isinstance(evidence, dict):
+        raise RuntimeError("existing GPU preflight evidence must be a JSON object")
+    lexical = Path(os.path.abspath(Path(evidence.get("path", "")).expanduser()))
+    resolved = lexical.resolve()
+    expected = (run_dir / "gpu-preflight.json").resolve()
+    if resolved != lexical or resolved != expected or not resolved.is_relative_to(run_dir):
+        raise RuntimeError("existing GPU preflight evidence aliases or escapes the run")
+    actual = _accepted_hardware_preflight(lexical, hardware_profile)
+    if evidence != actual:
+        raise RuntimeError("existing GPU preflight evidence or certificate hash changed")
+
+
 _JOB_IDENTITY_KEYS = (
     "job_id",
     "version",
     "profile",
     "architecture",
+    "execution",
+    "occupancy_expectation",
     "model_seed",
     "dataset",
     "condition",
@@ -41118,7 +46398,7 @@ def _load_resume_manifest(
         raise RuntimeError("existing manifest must be a JSON object")
     for key, expected in (
         ("schema_version", 1),
-        ("suite", "conductance_architecture_scaling_v1_v4"),
+        ("suite", "conductance_architecture_scaling_v1_v5"),
         ("run_id", run_id),
         ("config", config),
         ("exclusions", exclusions),
@@ -41162,6 +46442,7 @@ def _load_resume_manifest(
             _verify_passed_job(job)
     if manifest["status"] == "passed" and any(job["status"] != "passed" for job in existing_jobs):
         raise RuntimeError("passed manifest contains a non-passed job")
+    _verify_preflight_evidence(manifest, run_dir, str(config["hardware_profile"]))
     return manifest
 
 
@@ -41253,6 +46534,22 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
     for key, expected in job["architecture"].items():
         if configuration.get(key) != expected:
             raise RuntimeError(f"child architecture mismatch for {key}")
+    if job["version"] == "v5":
+        execution = job["execution"]
+        expected_configuration = {
+            "hardware_profile": execution["hardware_profile"],
+            "precision": execution["precision"],
+            "tf32": execution["tf32"],
+            "batch_size": execution["batch_size"],
+            "sample_seed_batch_size": execution["sample_seed_batch_size"],
+            "edge_chunk_size": execution["edge_chunk_size"],
+            "activation_checkpoint": execution["activation_checkpoint"],
+            "sampling": job["sampling"],
+            "sample_prefetch": execution["sample_prefetch"],
+            "pin_memory": execution["pin_memory"],
+        }
+        if any(configuration.get(key) != value for key, value in expected_configuration.items()):
+            raise RuntimeError("V5 child resolved execution configuration mismatch")
     validation = _number(child.get("validation"), "validation", minimum=0.0)
     if validation > 1:
         raise RuntimeError("validation metric must be at most one")
@@ -41262,10 +46559,31 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("child trainable parameter count is invalid")
     if isinstance(total, bool) or not isinstance(total, int) or total < trainable:
         raise RuntimeError("child total parameter count is invalid")
+    hardware_execution = child.get("hardware_execution")
+    if job["version"] == "v5":
+        execution = job["execution"]
+        expected_hardware = {
+            "profile": execution["hardware_profile"],
+            "precision": execution["precision"],
+            "tf32": execution["tf32"],
+            "activation_checkpoint": execution["activation_checkpoint"],
+            "edge_chunk_size": execution["edge_chunk_size"],
+            "sample_seed_batch_size": execution["sample_seed_batch_size"],
+            "graph_batch_size": execution["batch_size"],
+            "sample_prefetch": execution["sample_prefetch"],
+            "pin_memory": execution["pin_memory"],
+        }
+        if not isinstance(hardware_execution, dict) or any(
+            hardware_execution.get(key) != value for key, value in expected_hardware.items()
+        ):
+            raise RuntimeError("V5 child hardware execution metadata mismatch")
     elapsed = _number(child.get("elapsed_seconds"), "elapsed_seconds", minimum=0.0)
     peak_memory = child.get("peak_cuda_allocated_bytes", child.get("peak_gpu_memory_bytes"))
     if isinstance(peak_memory, bool) or not isinstance(peak_memory, int) or peak_memory < 0:
         raise RuntimeError("child peak CUDA allocation is invalid")
+    peak_reserved = child.get("peak_cuda_reserved_bytes", peak_memory)
+    if isinstance(peak_reserved, bool) or not isinstance(peak_reserved, int) or peak_reserved < 0:
+        raise RuntimeError("child peak CUDA reservation is invalid")
     return {
         "metrics_sha256": hashlib.sha256(raw).hexdigest(),
         "validation": validation,
@@ -41276,9 +46594,10 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
         "total_parameters": total,
         "elapsed_seconds": elapsed,
         "peak_cuda_allocated_bytes": peak_memory,
-        "actual_configuration": {
-            key: configuration[key] for key in ("hidden_channels", "layers", "dropout")
-        },
+        "peak_cuda_reserved_bytes": peak_reserved,
+        "hardware_execution": hardware_execution,
+        "throughput": child.get("throughput"),
+        "actual_configuration": {key: configuration[key] for key in job["architecture"]},
         "test_evaluated": False,
     }
 
@@ -41294,6 +46613,7 @@ def _aggregate(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         validations = [member["result"]["validation"] for member in members]
         elapsed = [member["result"]["elapsed_seconds"] for member in members]
         memories = [member["result"]["peak_cuda_allocated_bytes"] for member in members]
+        reservations = [member["result"]["peak_cuda_reserved_bytes"] for member in members]
         output.append(
             {
                 "version": key[0],
@@ -41317,6 +46637,8 @@ def _aggregate(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 ),
                 "elapsed_seconds_mean": statistics.fmean(elapsed),
                 "peak_cuda_allocated_bytes_max": max(memories),
+                "peak_cuda_reserved_bytes_max": max(reservations),
+                "hardware_execution": members[0]["result"].get("hardware_execution"),
             }
         )
     return output
@@ -41341,7 +46663,7 @@ def _summary(manifest: dict[str, Any]) -> dict[str, Any]:
     }
     return {
         "schema_version": 1,
-        "suite": "conductance_architecture_scaling_v1_v4",
+        "suite": "conductance_architecture_scaling_v1_v5",
         "run_id": manifest["run_id"],
         "status": manifest["status"],
         "valid_for_validation_comparison": complete
@@ -41363,12 +46685,12 @@ def _write_summary(run_dir: Path, manifest: dict[str, Any]) -> None:
     )
     atomic_write_json(summary_json, summary)
     lines = [
-        "# Conductance V1-V4 architecture scaling",
+        "# Conductance V1-V5 reference-scale comparison",
         "",
         f"- Status: `{summary['status']}`",
         f"- Validation comparison released: `{summary['valid_for_validation_comparison']}`",
         "- Test evaluated: `false`",
-        "- Profiles: base 64x2, wide 128x2, deep 64x4, large 128x4; dropout 0.5",
+        "- Profiles: reference 256x8x8-head and large 384x12x8-head; FFN expansion 4.",
         "- The table is descriptive validation scaling across independent model seeds.",
         "",
         "| Version | Profile | Dataset | Condition | n | Validation mean | Sample SD | "
@@ -41395,7 +46717,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    run_id = args.run_id or "scaling-v1-v4-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    run_id = args.run_id or "scaling-v1-v5-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
     results_root = args.results_root.expanduser().resolve()
     run_dir = (results_root / "conductance_gat/scaling" / run_id).resolve()
     data_root = args.data_root.expanduser().resolve()
@@ -41429,6 +46751,19 @@ def main(argv: list[str] | None = None) -> int:
         "device": args.device,
         "min_free_gb": args.min_free_gb,
         "edge_chunk_size": args.edge_chunk_size,
+        "v5_edge_chunk_size": args.v5_edge_chunk_size,
+        "v5_ppi_batch_size": args.v5_ppi_batch_size,
+        "v5_beta": _v5_beta_configuration(args),
+        "hardware_profile": args.hardware_profile,
+        "effective_min_free_gb": _effective_min_free_gb(args),
+        "v5_sampling": args.v5_sampling,
+        "v5_num_neighbors": list(args.v5_num_neighbors),
+        "v5_sample_seed_batch_size": args.v5_sample_seed_batch_size,
+        "v5_activation_checkpoint": args.v5_activation_checkpoint,
+        "v5_resolved_execution_by_dataset": {
+            dataset: _v5_execution(args, dataset)
+            for dataset in (_selected_datasets(args, "v5") if "v5" in args.versions else [])
+        },
         "data_root": str(data_root),
     }
     if args.dry_run:
@@ -41495,7 +46830,7 @@ def main(argv: list[str] | None = None) -> int:
         run_dir.mkdir(parents=True, exist_ok=False)
         manifest = {
             "schema_version": 1,
-            "suite": "conductance_architecture_scaling_v1_v4",
+            "suite": "conductance_architecture_scaling_v1_v5",
             "run_id": run_id,
             "status": "running",
             "source_integrity_valid": True,
@@ -41503,12 +46838,24 @@ def main(argv: list[str] | None = None) -> int:
             "config": config,
             "protocol": {
                 "purpose": "architecture scale response, not parameter matching",
-                "profiles": "base/wide/deep/large all run for every selected version",
+                "profiles": "reference/large run for every version; V5 additionally uses heads/FFN",
                 "selection": "best validation checkpoint within each independent child",
                 "test": "never loaded into a V1 scaling loader and never evaluated by any child",
                 "aggregation": "validation mean and sample standard deviation across model seeds",
                 "release": (
                     "comparison valid only after every planned child and source check passes"
+                ),
+                "hardware_execution": (
+                    "portable preserves legacy execution; a6000-48gb changes V5's explicit "
+                    "optimization/precision recipe, runs large V5 jobs first, and keeps child "
+                    "processes sequential to avoid unsafe CUDA memory contention. Portable and "
+                    "A6000 metrics are not directly comparable; V5 fixed/dynamic interpretation "
+                    "requires the same profile. V1-V5 PPI remains descriptive because V5 uses "
+                    "profile-specific real graph batches while legacy versions retain batch 2"
+                ),
+                "small_graph_limit": (
+                    "single Cora/Citeseer/PubMed full graphs cannot fill a 48 GiB GPU; no "
+                    "duplicate examples or dummy compute are introduced"
                 ),
             },
             "exclusions": exclusions,
@@ -41533,7 +46880,7 @@ def main(argv: list[str] | None = None) -> int:
             args.device,
             "--require-paper-deps",
             "--min-free-gb",
-            str(args.min_free_gb),
+            str(_effective_min_free_gb(args)),
             "--json-out",
             str(preflight_output),
         ]
@@ -41542,6 +46889,10 @@ def main(argv: list[str] | None = None) -> int:
         status = shared.run_logged(preflight, preflight_log, environment)
         if status:
             raise RuntimeError(f"GPU preflight failed with exit code {status}")
+        manifest["gpu_preflight"] = _accepted_hardware_preflight(
+            preflight_output, args.hardware_profile
+        )
+        atomic_write_json(manifest_path, manifest)
         remaining = sum(job["status"] != "passed" for job in jobs)
         print(
             f"Run: {run_id}; {remaining}/{len(jobs)} validation-only fresh trainings remaining",
@@ -41553,15 +46904,23 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             current = job
             _check_sources(manifest)
-            _discard_incomplete_child(job, run_dir)
+            attempt_command = list(job["command"])
+            last_checkpoint = Path(job["output_dir"]) / "last.pt"
+            if job["version"] == "v5" and last_checkpoint.is_file():
+                attempt_command.append("--resume")
+            else:
+                _discard_incomplete_child(job, run_dir)
+            job["attempt_command"] = attempt_command
             job["status"] = "running"
             atomic_write_json(manifest_path, manifest)
             _write_summary(run_dir, manifest)
             print(f"\n[{index}/{len(jobs)}] {job['job_id']}", flush=True)
+            if "expected low occupancy" in job["occupancy_expectation"]:
+                print(job["occupancy_expectation"], flush=True)
             started = time.monotonic()
             attempt_log = _next_attempt_log(Path(job["log_path"]), run_dir, str(job["job_id"]))
             job["attempt_log_path"] = str(attempt_log)
-            status = shared.run_logged(job["command"], attempt_log, environment)
+            status = shared.run_logged(attempt_command, attempt_log, environment)
             job.update(exit_code=status, elapsed_wall_seconds=time.monotonic() - started)
             _check_sources(manifest)
             if status:
@@ -42531,6 +47890,629 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ````
 
+# scripts/run_conductance_v5.py
+
+````python
+#!/usr/bin/env python3
+"""Run the fixed-C versus shared-dynamic-C Conductance V5 comparison.
+
+The runner is deliberately restartable.  Reusing the exact run ID verifies the
+stored configuration, source snapshot, and completed child artifacts, then runs
+only missing or interrupted children.  It never silently falls back to CPU.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import shutil
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_json  # noqa: E402
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    BETA_PARAMETERIZATIONS,
+    COMPARISON_DESIGN,
+    CONDITIONS,
+    DATASETS,
+    DEFAULT_BETA_INITIAL,
+    DEFAULT_BETA_PARAMETERIZATION,
+    DEFAULT_DATASETS,
+    HARDWARE_PROFILES,
+    SCALE_PROFILES,
+    SUITE,
+    beta_configuration,
+)
+from scripts import run_conductance_factorial as shared  # noqa: E402
+from scripts.check_dependencies import (  # noqa: E402
+    DependencyCheckError,
+    check_dependencies,
+    error_message,
+)
+
+RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
+SAMPLING_CHOICES = ("auto", "full", "neighbor", "cluster")
+TRANSDUCTIVE_DATASETS = frozenset({"cora", "citeseer", "pubmed", "ogbn-arxiv"})
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DEFAULT_DATASETS))
+    result.add_argument("--profile", choices=tuple(SCALE_PROFILES), default="reference")
+    result.add_argument("--hidden-channels", type=int)
+    result.add_argument("--layers", type=int)
+    result.add_argument("--heads", type=int)
+    result.add_argument("--ffn-multiplier", type=int)
+    result.add_argument("--dropout", type=float)
+    result.add_argument(
+        "--beta-parameterization",
+        choices=BETA_PARAMETERIZATIONS,
+        default=DEFAULT_BETA_PARAMETERIZATION,
+    )
+    result.add_argument("--beta-initial", type=float, default=DEFAULT_BETA_INITIAL)
+    result.add_argument("--beta-min", type=float)
+    result.add_argument("--beta-max", type=float)
+    result.add_argument("--model-seed", type=int, default=0)
+    result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    result.add_argument("--results-root", type=Path, default=ROOT / "results")
+    result.add_argument("--run-id")
+    result.add_argument("--device", default="cuda")
+    result.add_argument("--epochs", type=int, default=300)
+    result.add_argument("--patience", type=int, default=50)
+    result.add_argument("--workers", type=int, default=0)
+    result.add_argument("--batch-size", type=int, default=1)
+    result.add_argument("--ppi-batch-size", type=int)
+    result.add_argument("--sample-seed-batch-size", type=int)
+    result.add_argument("--edge-chunk-size", type=int)
+    result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
+    result.add_argument(
+        "--activation-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override the selected hardware profile's checkpoint policy",
+    )
+    result.add_argument(
+        "--sampling",
+        choices=SAMPLING_CHOICES,
+        default="auto",
+        help="auto uses cluster sampling only for ogbn-arxiv and full graphs elsewhere",
+    )
+    result.add_argument(
+        "--num-neighbors",
+        nargs="+",
+        type=int,
+        default=[15, 10],
+        help="fanout values forwarded to neighbor sampling",
+    )
+    result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument("--dry-run", action="store_true")
+    return result
+
+
+def _architecture(args: argparse.Namespace) -> dict[str, Any]:
+    architecture = dict(SCALE_PROFILES[args.profile])
+    for name in ("hidden_channels", "layers", "heads", "ffn_multiplier", "dropout"):
+        override = getattr(args, name)
+        if override is not None:
+            architecture[name] = override
+    architecture.update(
+        beta_configuration(
+            args.beta_parameterization,
+            args.beta_initial,
+            args.beta_min,
+            args.beta_max,
+        )
+    )
+    return architecture
+
+
+def _sampling(dataset: str, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    return "cluster" if dataset == "ogbn-arxiv" else "full"
+
+
+def _resolved_execution(args: argparse.Namespace, dataset: str) -> dict[str, Any]:
+    profile = HARDWARE_PROFILES[args.hardware_profile]
+    batch_size = 1
+    if dataset == "ppi":
+        batch_size = args.ppi_batch_size or profile["ppi_batch_size"]
+    return {
+        "hardware_profile": args.hardware_profile,
+        "precision": profile["precision"],
+        "tf32": profile["tf32"],
+        "batch_size": batch_size,
+        "sample_seed_batch_size": (
+            args.sample_seed_batch_size or profile["sample_seed_batch_size"]
+        ),
+        "edge_chunk_size": args.edge_chunk_size or profile["edge_chunk_size"],
+        "activation_checkpoint": (
+            profile["activation_checkpoint"]
+            if args.activation_checkpoint is None
+            else args.activation_checkpoint
+        ),
+        "sample_prefetch": profile["sample_prefetch"],
+        "pin_memory": profile["pin_memory"],
+    }
+
+
+def _effective_min_free_gb(args: argparse.Namespace) -> float:
+    return max(
+        float(args.min_free_gb),
+        float(HARDWARE_PROFILES[args.hardware_profile]["minimum_free_memory_gib"]),
+    )
+
+
+def _validate(args: argparse.Namespace) -> None:
+    if not args.datasets or len(set(args.datasets)) != len(args.datasets):
+        raise ValueError("datasets must be nonempty and contain no duplicates")
+    if args.model_seed < 0:
+        raise ValueError("model seed must be nonnegative")
+    architecture = _architecture(args)
+    integer_fields = ("hidden_channels", "layers", "heads", "ffn_multiplier")
+    if any(
+        isinstance(architecture[name], bool) or int(architecture[name]) < 1
+        for name in integer_fields
+    ):
+        raise ValueError("width, depth, heads, and FFN multiplier must be positive")
+    if architecture["hidden_channels"] % architecture["heads"]:
+        raise ValueError("hidden channels must be divisible by heads")
+    if not 0 <= float(architecture["dropout"]) < 1:
+        raise ValueError("dropout must be in [0, 1)")
+    if (
+        min(
+            args.epochs,
+            args.patience,
+            args.batch_size,
+            args.ppi_batch_size or 1,
+            args.sample_seed_batch_size or 1,
+            args.edge_chunk_size or 1,
+        )
+        < 1
+    ):
+        raise ValueError("epochs, patience, batch sizes, and edge chunk size must be positive")
+    if args.batch_size != 1:
+        raise ValueError(
+            "V5 runner-level batch size must be 1; PPI graph batching is profile-controlled"
+        )
+    if args.hardware_profile == "portable" and args.ppi_batch_size not in {None, 2}:
+        raise ValueError("portable PPI retains graph batch-size 2")
+    if (
+        args.workers != 0
+        or not args.num_neighbors
+        or any(value < 1 for value in args.num_neighbors)
+    ):
+        raise ValueError(
+            "V5 requires workers=0 for reproducible epoch resume and positive neighbor fanouts"
+        )
+    if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
+        raise ValueError("CUDA is required; CPU fallback is not supported")
+    if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
+        raise ValueError("minimum free GPU memory must be finite and nonnegative")
+    if args.run_id is not None and RUN_ID_PATTERN.fullmatch(args.run_id) is None:
+        raise ValueError("run ID must be 1-120 letters, digits, underscores, or hyphens")
+    if args.sampling in {"neighbor", "cluster"} and any(
+        dataset not in TRANSDUCTIVE_DATASETS for dataset in args.datasets
+    ):
+        raise ValueError("neighbor/cluster sampling is transductive-only; PPI requires full")
+
+
+def make_jobs(
+    args: argparse.Namespace, run_dir: Path, architecture: dict[str, Any]
+) -> list[dict[str, Any]]:
+    jobs: list[dict[str, Any]] = []
+    data_root = args.data_root.expanduser().resolve()
+    for dataset in args.datasets:
+        sampling = _sampling(dataset, args.sampling)
+        execution = _resolved_execution(args, dataset)
+        child_batch_size = execution["batch_size"]
+        for condition in CONDITIONS:
+            output = run_dir / dataset / condition
+            command = [
+                sys.executable,
+                "-B",
+                "-u",
+                "-m",
+                "research.conductance_gat.v5.train",
+                "--dataset",
+                dataset,
+                "--condition",
+                condition,
+                "--output-dir",
+                str(output),
+                "--data-root",
+                str(data_root),
+                "--device",
+                args.device,
+                "--model-seed",
+                str(args.model_seed),
+                "--epochs",
+                str(args.epochs),
+                "--patience",
+                str(args.patience),
+                "--workers",
+                str(args.workers),
+                "--batch-size",
+                str(child_batch_size),
+                "--hardware-profile",
+                args.hardware_profile,
+                "--sample-seed-batch-size",
+                str(execution["sample_seed_batch_size"]),
+                "--edge-chunk-size",
+                str(execution["edge_chunk_size"]),
+                "--sampling",
+                sampling,
+                (
+                    "--activation-checkpoint"
+                    if execution["activation_checkpoint"]
+                    else "--no-activation-checkpoint"
+                ),
+                "--num-neighbors",
+                *(str(value) for value in args.num_neighbors),
+            ]
+            for name, value in architecture.items():
+                command.extend(("--" + name.replace("_", "-"), str(value)))
+            jobs.append(
+                {
+                    "job_id": f"{dataset}/{condition}",
+                    "dataset": dataset,
+                    "condition": condition,
+                    "architecture": dict(architecture),
+                    "sampling": sampling,
+                    "batch_size": child_batch_size,
+                    "num_neighbors": list(args.num_neighbors),
+                    "execution": execution,
+                    "status": "pending",
+                    "output_dir": str(output),
+                    "metrics_path": str(output / "metrics.json"),
+                    "log_path": str(run_dir / "logs" / f"{dataset}--{condition}.log"),
+                    "command": command,
+                }
+            )
+    return jobs
+
+
+def _source_snapshot() -> dict[str, str]:
+    paths = [
+        Path(__file__),
+        ROOT / "scripts/check_dependencies.py",
+        ROOT / "scripts/gpu_preflight.py",
+        ROOT / "scripts/run_conductance_factorial.py",
+        ROOT / "src/chartgat/cache.py",
+        ROOT / "src/chartgat/execution.py",
+    ]
+    paths += list((ROOT / "research/conductance_gat/v5").glob("*.py"))
+    return {
+        path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(set(paths))
+    }
+
+
+def _identity(job: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "job_id",
+        "dataset",
+        "condition",
+        "architecture",
+        "sampling",
+        "batch_size",
+        "num_neighbors",
+        "execution",
+        "output_dir",
+        "metrics_path",
+        "log_path",
+        "command",
+    )
+    return {key: job[key] for key in keys}
+
+
+def _load_metrics(job: dict[str, Any]) -> dict[str, Any]:
+    path = Path(job["metrics_path"])
+    if not path.is_file():
+        raise RuntimeError(f"child returned without metrics: {path}")
+    raw = path.read_bytes()
+    payload = json.loads(raw)
+    if not isinstance(payload, dict) or payload.get("status") != "passed":
+        raise RuntimeError("child metrics do not certify status=passed")
+    for key, expected in (
+        ("dataset", job["dataset"]),
+        ("condition", job["condition"]),
+        ("model_seed", int(job["command"][job["command"].index("--model-seed") + 1])),
+        ("evaluation_split", "validation"),
+        ("test_evaluated", False),
+    ):
+        if payload.get(key) != expected:
+            raise RuntimeError(f"child metric {key} mismatch")
+    configuration = payload.get("configuration")
+    if not isinstance(configuration, dict) or any(
+        configuration.get(key) != value for key, value in job["architecture"].items()
+    ):
+        raise RuntimeError("child architecture does not match the requested V5 profile")
+    if configuration.get("sampling") != job["sampling"]:
+        raise RuntimeError("child sampling mode does not match the requested V5 job")
+    if configuration.get("batch_size") != job["batch_size"]:
+        raise RuntimeError("child graph batch size does not match the V5 dataset contract")
+    execution = job["execution"]
+    for key in ("hardware_profile", "precision", "tf32", "edge_chunk_size"):
+        if configuration.get(key) != execution[key]:
+            raise RuntimeError(f"child hardware execution mismatch for {key}")
+    hardware = payload.get("hardware_execution")
+    expected_hardware = {
+        "profile": execution["hardware_profile"],
+        "precision": execution["precision"],
+        "tf32": execution["tf32"],
+        "activation_checkpoint": execution["activation_checkpoint"],
+        "edge_chunk_size": execution["edge_chunk_size"],
+        "sample_seed_batch_size": execution["sample_seed_batch_size"],
+        "graph_batch_size": execution["batch_size"],
+        "sample_prefetch": execution["sample_prefetch"],
+        "pin_memory": execution["pin_memory"],
+    }
+    if not isinstance(hardware, dict) or any(
+        hardware.get(key) != value for key, value in expected_hardware.items()
+    ):
+        raise RuntimeError("child hardware execution metadata is missing or inconsistent")
+    return {
+        "metrics_sha256": hashlib.sha256(raw).hexdigest(),
+        "validation": payload.get("validation"),
+        "metric_name": payload.get("metric_name"),
+        "best_epoch": payload.get("best_epoch"),
+        "epochs_run": payload.get("epochs_run"),
+        "trainable_parameters": payload.get("trainable_parameters"),
+        "peak_cuda_allocated_bytes": payload.get(
+            "peak_cuda_allocated_bytes", payload.get("peak_gpu_memory_bytes")
+        ),
+        "peak_cuda_reserved_bytes": payload.get("peak_cuda_reserved_bytes"),
+        "throughput": payload.get("throughput"),
+        "hardware_execution": hardware,
+    }
+
+
+def _next_log(path: Path) -> Path:
+    if not path.exists():
+        return path
+    attempt = 1
+    while True:
+        candidate = path.with_name(f"{path.stem}.attempt-{attempt}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        attempt += 1
+
+
+def _safe_clear(job: dict[str, Any], run_dir: Path) -> None:
+    lexical = Path(os.path.abspath(Path(job["output_dir"])))
+    resolved = lexical.resolve()
+    if resolved != lexical or resolved == run_dir or not resolved.is_relative_to(run_dir):
+        raise RuntimeError(f"refusing to clear unsafe child output: {lexical}")
+    if lexical.exists():
+        if not lexical.is_dir():
+            raise RuntimeError(f"child output is not a directory: {lexical}")
+        shutil.rmtree(lexical)
+
+
+def _write_comparison(run_dir: Path, manifest: dict[str, Any]) -> None:
+    from research.conductance_gat.v5.report import write_comparison
+
+    write_comparison(run_dir, manifest)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        _validate(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    architecture = _architecture(args)
+    run_id = args.run_id or "dynamic-c-v5-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    results_root = args.results_root.expanduser().resolve()
+    data_root = args.data_root.expanduser().resolve()
+    run_dir = (results_root / "conductance_gat/v5" / run_id).resolve()
+    if not run_dir.is_relative_to(results_root) or (
+        run_dir == data_root
+        or run_dir.is_relative_to(data_root)
+        or data_root.is_relative_to(run_dir)
+    ):
+        print(
+            "experiment outputs must stay inside results and outside the data cache",
+            file=sys.stderr,
+        )
+        return 2
+    jobs = make_jobs(args, run_dir, architecture)
+    config = {
+        "datasets": list(args.datasets),
+        "profile": args.profile,
+        "architecture": architecture,
+        "model_seed": args.model_seed,
+        "epochs": args.epochs,
+        "patience": args.patience,
+        "workers": args.workers,
+        "batch_size": args.batch_size,
+        "ppi_batch_size": args.ppi_batch_size,
+        "sample_seed_batch_size": args.sample_seed_batch_size,
+        "edge_chunk_size": args.edge_chunk_size,
+        "activation_checkpoint": args.activation_checkpoint,
+        "hardware_profile": args.hardware_profile,
+        "resolved_execution_by_dataset": {
+            dataset: _resolved_execution(args, dataset) for dataset in args.datasets
+        },
+        "sampling": args.sampling,
+        "num_neighbors": list(args.num_neighbors),
+        "device": args.device,
+        "min_free_gb": args.min_free_gb,
+        "effective_min_free_gb": _effective_min_free_gb(args),
+        "data_root": str(data_root),
+    }
+    if args.dry_run:
+        print(
+            f"{len(jobs)} V5 validation-only trainings; profile={args.profile}; "
+            f"architecture={architecture}"
+        )
+        for job in jobs:
+            print(shlex.join(job["command"]))
+        print(f"Manifest: {run_dir / 'manifest.json'}")
+        return 0
+    try:
+        dependencies = check_dependencies()
+    except DependencyCheckError as exc:
+        print(error_message(exc), file=sys.stderr)
+        return exc.exit_code
+    sources = _source_snapshot()
+    manifest_path = run_dir / "manifest.json"
+    if run_dir.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            expected = {
+                "schema_version": 1,
+                "suite": SUITE,
+                "run_id": run_id,
+                "config": config,
+                "source_sha256": sources,
+                "dependencies": dependencies,
+            }
+            if any(manifest.get(key) != value for key, value in expected.items()):
+                raise RuntimeError("existing run contract differs from this invocation")
+            if [_identity(job) for job in manifest.get("jobs", [])] != [
+                _identity(job) for job in jobs
+            ]:
+                raise RuntimeError("existing V5 job matrix differs from this invocation")
+            for job in manifest["jobs"]:
+                if job.get("status") == "passed":
+                    result = _load_metrics(job)
+                    if job.get("result") != result:
+                        raise RuntimeError(f"passed artifact changed: {job['job_id']}")
+                else:
+                    job["status"] = "pending"
+                    for key in ("result", "error", "exit_code", "elapsed_seconds"):
+                        job.pop(key, None)
+            jobs = manifest["jobs"]
+            manifest.update(status="running", resumed_at_utc=dt.datetime.now(dt.UTC).isoformat())
+            manifest["resume_count"] = int(manifest.get("resume_count", 0)) + 1
+            manifest.pop("error", None)
+            manifest.pop("finished_at_utc", None)
+        except Exception as exc:
+            print(f"Refusing to resume: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+    else:
+        run_dir.mkdir(parents=True)
+        manifest = {
+            "schema_version": 1,
+            "suite": SUITE,
+            "run_id": run_id,
+            "status": "running",
+            "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+            "config": config,
+            "conditions": list(CONDITIONS),
+            "jobs": jobs,
+            "dependencies": dependencies,
+            "source_sha256": sources,
+            "protocol": {
+                "comparison_design": dict(COMPARISON_DESIGN),
+                "architecture": "same multi-head W/beta/FFN architecture and initialization",
+                "update_allocation": (
+                    "fixed-C strong spatial recipe versus dynamic-C coordinate recipe; "
+                    "not a single-factor causal C contrast"
+                ),
+                "selection": "best validation checkpoint; no test evaluation",
+                "sampling": "full validation; auto uses cluster train sampling only on ogbn-arxiv",
+                "hardware_execution": (
+                    "portable preserves FP32/checkpointed defaults; a6000-48gb is an opt-in "
+                    "BF16-dense/TF32 throughput recipe with FP32 conductance geometry, larger "
+                    "real batches and no synthetic duplicate work. Profiles are distinct "
+                    "optimization recipes and their metrics must not be directly compared"
+                ),
+                "resume": (
+                    "same immutable run contract skips hash-verified passed jobs and resumes V5 "
+                    "at epoch boundaries; CUDA bitwise determinism is not claimed"
+                ),
+            },
+        }
+    atomic_write_json(manifest_path, manifest)
+    _write_comparison(run_dir, manifest)
+    environment = shared._environment()
+    environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+    current: dict[str, Any] | None = None
+    try:
+        preflight = [
+            sys.executable,
+            "-B",
+            str(ROOT / "scripts/gpu_preflight.py"),
+            "--device",
+            args.device,
+            "--require-paper-deps",
+            "--min-free-gb",
+            str(_effective_min_free_gb(args)),
+            "--json-out",
+            str(run_dir / "gpu-preflight.json"),
+        ]
+        if shared.run_logged(preflight, _next_log(run_dir / "logs/preflight.log"), environment):
+            raise RuntimeError("GPU preflight failed")
+        for index, job in enumerate(jobs, start=1):
+            if job["status"] == "passed":
+                print(f"[{index}/{len(jobs)}] verified, skip {job['job_id']}", flush=True)
+                continue
+            current = job
+            if _source_snapshot() != sources:
+                raise RuntimeError("V5 source changed during execution")
+            attempt_command = list(job["command"])
+            last_checkpoint = Path(job["output_dir"]) / "last.pt"
+            if last_checkpoint.is_file():
+                attempt_command.append("--resume")
+            else:
+                _safe_clear(job, run_dir)
+            job["attempt_command"] = attempt_command
+            job["status"] = "running"
+            atomic_write_json(manifest_path, manifest)
+            started = time.monotonic()
+            status = shared.run_logged(
+                attempt_command, _next_log(Path(job["log_path"])), environment
+            )
+            job.update(exit_code=status, elapsed_seconds=time.monotonic() - started)
+            if status:
+                raise RuntimeError(f"{job['job_id']} failed with exit code {status}")
+            job["result"] = _load_metrics(job)
+            job["status"] = "passed"
+            current = None
+            atomic_write_json(manifest_path, manifest)
+            _write_comparison(run_dir, manifest)
+        if _source_snapshot() != sources:
+            raise RuntimeError("V5 source changed during execution")
+        manifest.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+    except (Exception, KeyboardInterrupt) as exc:
+        manifest.update(
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}",
+            finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+        )
+        if current is not None:
+            current.update(status="failed", error=manifest["error"])
+        atomic_write_json(manifest_path, manifest)
+        _write_comparison(run_dir, manifest)
+        print(f"Failed: {manifest['error']}\nSaved partial results: {run_dir}", file=sys.stderr)
+        return 130 if isinstance(exc, KeyboardInterrupt) else 1
+    atomic_write_json(manifest_path, manifest)
+    _write_comparison(run_dir, manifest)
+    print(f"V5 comparison passed: {run_dir / 'comparison.md'}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # scripts/run_cycle_scaling.py
 
 ````python
@@ -42574,14 +48556,53 @@ from scripts.check_dependencies import (  # noqa: E402
 
 DATASETS = ("zinc12k", "peptides_struct")
 VERSIONS = ("v1", "v2")
-PROFILE_ORDER = ("base", "wide", "deep", "large")
-PROFILES: dict[str, dict[str, int]] = {
-    "base": {"hidden_dim": 64, "pe_dim": 32, "layers": 3},
-    "wide": {"hidden_dim": 128, "pe_dim": 64, "layers": 3},
-    "deep": {"hidden_dim": 64, "pe_dim": 32, "layers": 6},
-    "large": {"hidden_dim": 128, "pe_dim": 64, "layers": 6},
+PROFILE_ORDER = ("reference", "large")
+HARDWARE_PROFILES = ("portable", "a6000-48gb")
+BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
+A6000_MIN_TOTAL_BYTES = 40 * 1024**3
+A6000_BATCH_SIZE = {
+    "reference": {"zinc12k": 512, "peptides_struct": 128},
+    "large": {"zinc12k": 256, "peptides_struct": 64},
 }
-MODEL_NAMES = {"v1": "cycle_set", "v2": "cycle_basis_v2"}
+PROFILES: dict[str, dict[str, dict[str, float | int]]] = {
+    "reference": {
+        "zinc12k": {
+            "hidden_dim": 128,
+            "pe_dim": 64,
+            "layers": 10,
+            "ffn_multiplier": 4,
+            "dropout": 0.1,
+            "layer_scale": 0.1,
+        },
+        "peptides_struct": {
+            "hidden_dim": 256,
+            "pe_dim": 64,
+            "layers": 6,
+            "ffn_multiplier": 4,
+            "dropout": 0.1,
+            "layer_scale": 0.1,
+        },
+    },
+    "large": {
+        "zinc12k": {
+            "hidden_dim": 192,
+            "pe_dim": 96,
+            "layers": 12,
+            "ffn_multiplier": 4,
+            "dropout": 0.1,
+            "layer_scale": 0.1,
+        },
+        "peptides_struct": {
+            "hidden_dim": 320,
+            "pe_dim": 96,
+            "layers": 8,
+            "ffn_multiplier": 4,
+            "dropout": 0.1,
+            "layer_scale": 0.1,
+        },
+    },
+}
+MODEL_NAMES = {"v1": "cycle_set", "v2": "cycle_projector_pe_v2"}
 MODULES = {
     "v1": "research.cycle_pe.benchmark",
     "v2": "research.cycle_pe.v2.benchmark",
@@ -42647,8 +48668,22 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
     result.add_argument("--device", default="cuda")
-    result.add_argument("--batch-size", type=int, default=32)
-    result.add_argument("--workers", type=int, default=4)
+    result.add_argument("--hardware-profile", choices=HARDWARE_PROFILES, default="portable")
+    result.add_argument(
+        "--batch-size",
+        type=int,
+        default=0,
+        help="explicit fixed override; 0 uses the preregistered hardware/dataset/profile value",
+    )
+    result.add_argument(
+        "--workers", type=int, default=-1, help="explicit override; -1 selects by hardware profile"
+    )
+    result.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=0,
+        help="explicit override; 0 selects by hardware profile",
+    )
     result.add_argument("--epochs", type=int, default=300)
     result.add_argument("--patience", type=int, default=50)
     result.add_argument("--lr", type=float, default=1e-3)
@@ -42656,15 +48691,16 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--max-parameters",
         type=int,
-        default=5_000_000,
-        help="fail-closed ceiling per model; large profile needs more than the legacy 500k cap",
+        default=50_000_000,
+        help="fail-closed ceiling per model for the reference-scale profiles",
     )
     result.add_argument("--allow-download", action="store_true")
-    result.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
+    result.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     result.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
-    result.add_argument("--column-chunk-size", type=int, default=16)
+    result.add_argument("--column-chunk-size", type=int, default=0)
+    result.add_argument("--basis-backend", choices=BASIS_BACKENDS, default="thin_q")
     result.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
-    result.add_argument("--basis-pair-budget", type=int, default=32768)
+    result.add_argument("--basis-pair-budget", type=int, default=0)
     result.add_argument("--min-free-gb", type=float, default=8.0)
     result.add_argument("--fail-fast", action="store_true")
     result.add_argument("--dry-run", action="store_true")
@@ -42676,17 +48712,25 @@ def _validate(args: argparse.Namespace) -> None:
         values = getattr(args, name)
         if not values or len(set(values)) != len(values):
             raise ValueError(f"--{name} must be nonempty and contain no duplicates")
+    if args.basis_backend != "thin_q" and "v2" not in args.versions:
+        raise ValueError("nondefault --basis-backend requires v2 in --versions")
     for name in (
-        "batch_size",
         "epochs",
         "patience",
         "max_parameters",
-        "column_chunk_size",
-        "basis_pair_budget",
     ):
         if getattr(args, name) < 1:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
-    if args.workers < 0 or args.lr <= 0 or args.weight_decay < 0 or args.min_free_gb < 0:
+    if (
+        args.batch_size < 0
+        or args.workers < -1
+        or args.prefetch_factor < 0
+        or args.column_chunk_size < 0
+        or args.basis_pair_budget < 0
+        or args.lr <= 0
+        or args.weight_decay < 0
+        or args.min_free_gb < 0
+    ):
         raise ValueError("invalid worker, optimizer, or GPU-memory setting")
     if not args.device.lower().startswith("cuda"):
         raise ValueError("Cycle PE scaling training requires CUDA; no CPU fallback")
@@ -42700,86 +48744,153 @@ def _run_dir(args: argparse.Namespace, run_id: str) -> Path:
     return (args.results_root.expanduser().resolve() / "cycle_pe/scaling" / run_id).resolve()
 
 
+def _profile_config(profile: str, dataset: str, version: str) -> dict[str, float | int]:
+    config = dict(PROFILES[profile][dataset])
+    if version == "v1":
+        return {key: config[key] for key in ("hidden_dim", "pe_dim", "layers")}
+    return config
+
+
+def _job_resources(
+    args: argparse.Namespace, version: str, profile: str, dataset: str
+) -> dict[str, Any]:
+    accelerated = args.hardware_profile == "a6000-48gb"
+    is_v2 = version == "v2"
+    return {
+        "hardware_profile": args.hardware_profile,
+        "batch_size": args.batch_size
+        or (A6000_BATCH_SIZE[profile][dataset] if accelerated else 32),
+        "workers": args.workers if args.workers >= 0 else (8 if accelerated else 4),
+        # V1's frozen loader exposes no prefetch CLI and therefore uses the
+        # DataLoader default (2); never claim the V2-only override for V1.
+        "prefetch_factor": (args.prefetch_factor or (4 if accelerated else 2) if is_v2 else 2),
+        "amp": accelerated if args.amp is None else args.amp,
+        "column_chunk_size": (
+            args.column_chunk_size or (32 if accelerated else 16) if is_v2 else None
+        ),
+        "basis_pair_budget": (
+            args.basis_pair_budget or (4_194_304 if accelerated else 32768) if is_v2 else None
+        ),
+        "basis_execution": args.basis_execution if is_v2 else None,
+        "basis_backend": args.basis_backend if is_v2 else None,
+        "precision_scope": (
+            "projector_fp32_backbone_amp" if version == "v2" else "legacy_v1_partial_amp"
+        ),
+        "version": version,
+    }
+
+
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     data_root = args.data_root.expanduser().resolve()
     for version in args.versions:
         for profile in args.profiles:
-            config = PROFILES[profile]
             for seed in args.model_seeds:
-                output = run_dir / "results" / version / profile / f"model-seed-{seed}"
-                job_id = f"{version}:{profile}:model-seed-{seed}"
-                command = [
-                    sys.executable,
-                    "-B",
-                    "-u",
-                    "-m",
-                    MODULES[version],
-                    "--suite",
-                    "benchmark",
-                    "--datasets",
-                    *args.datasets,
-                    "--data-root",
-                    str(data_root),
-                    "--output-dir",
-                    str(output),
-                    "--device",
-                    args.device,
-                    "--model-seed",
-                    str(seed),
-                    "--batch-size",
-                    str(args.batch_size),
-                    "--workers",
-                    str(args.workers),
-                    "--epochs",
-                    str(args.epochs),
-                    "--patience",
-                    str(args.patience),
-                    "--lr",
-                    str(args.lr),
-                    "--weight-decay",
-                    str(args.weight_decay),
-                    "--hidden-dim",
-                    str(config["hidden_dim"]),
-                    "--pe-dim",
-                    str(config["pe_dim"]),
-                    "--layers",
-                    str(config["layers"]),
-                    "--max-parameters",
-                    str(args.max_parameters),
-                    "--validation-only",
-                    "--amp" if args.amp else "--no-amp",
-                    "--compile" if args.compile else "--no-compile",
-                ]
-                if args.allow_download:
-                    command.append("--allow-download")
-                if version == "v2":
-                    command += [
-                        "--column-chunk-size",
-                        str(args.column_chunk_size),
-                        "--basis-execution",
-                        args.basis_execution,
-                        "--basis-pair-budget",
-                        str(args.basis_pair_budget),
+                for dataset in args.datasets:
+                    config = _profile_config(profile, dataset, version)
+                    resources = _job_resources(args, version, profile, dataset)
+                    output = (
+                        run_dir / "results" / version / profile / dataset / f"model-seed-{seed}"
+                    )
+                    job_id = f"{version}:{profile}:{dataset}:model-seed-{seed}"
+                    command = [
+                        sys.executable,
+                        "-B",
+                        "-u",
+                        "-m",
+                        MODULES[version],
+                        "--suite",
+                        "benchmark",
+                        "--datasets",
+                        dataset,
+                        "--data-root",
+                        str(data_root),
+                        "--output-dir",
+                        str(output),
+                        "--device",
+                        args.device,
+                        "--model-seed",
+                        str(seed),
+                        "--batch-size",
+                        str(resources["batch_size"]),
+                        "--workers",
+                        str(resources["workers"]),
+                        "--epochs",
+                        str(args.epochs),
+                        "--patience",
+                        str(args.patience),
+                        "--lr",
+                        str(args.lr),
+                        "--weight-decay",
+                        str(args.weight_decay),
+                        "--hidden-dim",
+                        str(config["hidden_dim"]),
+                        "--pe-dim",
+                        str(config["pe_dim"]),
+                        "--layers",
+                        str(config["layers"]),
+                        "--max-parameters",
+                        str(args.max_parameters),
+                        "--validation-only",
+                        "--amp" if resources["amp"] else "--no-amp",
+                        "--compile" if args.compile else "--no-compile",
                     ]
-                jobs.append(
-                    {
-                        "job_id": job_id,
-                        "version": version,
-                        "profile": profile,
-                        "model_seed": seed,
-                        "datasets": list(args.datasets),
-                        "config": dict(config),
-                        "status": "pending",
-                        "command": command,
-                        "output_dir": str(output),
-                        "log_path": str(
-                            run_dir / "logs" / f"{version}--{profile}--seed-{seed}.log"
-                        ),
-                        "returncode": None,
-                        "artifact_errors": [],
-                    }
-                )
+                    if args.allow_download:
+                        command.append("--allow-download")
+                    if version == "v2":
+                        command += [
+                            "--ffn-multiplier",
+                            str(config["ffn_multiplier"]),
+                            "--dropout",
+                            str(config["dropout"]),
+                            "--layer-scale",
+                            str(config["layer_scale"]),
+                            "--column-chunk-size",
+                            str(resources["column_chunk_size"]),
+                            "--basis-backend",
+                            args.basis_backend,
+                            "--basis-execution",
+                            args.basis_execution,
+                            "--basis-pair-budget",
+                            str(resources["basis_pair_budget"]),
+                            "--prefetch-factor",
+                            str(resources["prefetch_factor"]),
+                            "--hardware-profile",
+                            args.hardware_profile,
+                        ]
+                    jobs.append(
+                        {
+                            "job_id": job_id,
+                            "version": version,
+                            "profile": profile,
+                            "model_seed": seed,
+                            "datasets": [dataset],
+                            "config": dict(config),
+                            "resources": resources,
+                            "status": "pending",
+                            "command": command,
+                            "output_dir": str(output),
+                            "log_path": str(
+                                run_dir
+                                / "logs"
+                                / f"{version}--{profile}--{dataset}--seed-{seed}.log"
+                            ),
+                            "returncode": None,
+                            "artifact_errors": [],
+                        }
+                    )
+    if args.hardware_profile == "a6000-48gb":
+        # Put the genuinely heavy candidate first so capacity/utilization is
+        # exercised immediately instead of spending the first hours on V1/ZINC.
+        # This deterministic order is persisted as part of the manifest plan.
+        jobs.sort(
+            key=lambda job: (
+                job["version"] != "v2",
+                job["profile"] != "large",
+                job["datasets"] != ["peptides_struct"],
+                job["model_seed"],
+            )
+        )
     return jobs
 
 
@@ -42797,6 +48908,24 @@ def _environment() -> dict[str, str]:
     environment["PYTHONUNBUFFERED"] = "1"
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     return environment
+
+
+def _validate_preflight_hardware(profile: str, report: dict[str, Any]) -> None:
+    if profile != "a6000-48gb":
+        return
+    gpu = report.get("gpu")
+    if (
+        not isinstance(gpu, dict)
+        or not isinstance(gpu.get("total_bytes"), int)
+        or gpu["total_bytes"] < A6000_MIN_TOTAL_BYTES
+        or not isinstance(gpu.get("compute_capability"), list)
+        or not gpu["compute_capability"]
+        or gpu["compute_capability"][0] < 8
+    ):
+        raise ValueError(
+            "a6000-48gb requires >=40 GiB total memory and compute capability >=8.0; "
+            "MIG/small-device fallback is forbidden"
+        )
 
 
 def run_logged(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
@@ -42894,6 +49023,9 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
         "hidden_dim": job["config"]["hidden_dim"],
         "pe_dim": job["config"]["pe_dim"],
         "layers": job["config"]["layers"],
+        "batch_size": job["resources"]["batch_size"],
+        "workers": job["resources"]["workers"],
+        "amp": job["resources"]["amp"],
         "validation_only": True,
         "test_checkpoint": None,
     }
@@ -42903,19 +49035,28 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
             raise ValueError(f"child argument mismatch for {name}: {actual} != {expected}")
     if expected_version == "v2":
         expected_v2 = {
+            "ffn_multiplier": job["config"]["ffn_multiplier"],
+            "dropout": job["config"]["dropout"],
+            "layer_scale": job["config"]["layer_scale"],
             "column_chunk_size": 16,
+            "basis_backend": job["resources"]["basis_backend"],
             "basis_execution": "batched",
             "basis_pair_budget": 32768,
+            "prefetch_factor": job["resources"]["prefetch_factor"],
+            "hardware_profile": job["resources"]["hardware_profile"],
         }
         command = job.get("command", [])
         for flag, name in (
             ("--column-chunk-size", "column_chunk_size"),
+            ("--basis-backend", "basis_backend"),
             ("--basis-execution", "basis_execution"),
             ("--basis-pair-budget", "basis_pair_budget"),
         ):
             if flag in command:
                 value = command[command.index(flag) + 1]
-                expected_v2[name] = int(value) if name != "basis_execution" else value
+                expected_v2[name] = (
+                    int(value) if name not in {"basis_backend", "basis_execution"} else value
+                )
         for name, expected in expected_v2.items():
             if arguments.get(name) != expected:
                 raise ValueError(f"child argument mismatch for {name}")
@@ -42968,6 +49109,37 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
         peak_memory = int(
             _finite_number(result.get("peak_gpu_memory_bytes"), f"{dataset}/peak_gpu_memory_bytes")
         )
+        reserved_memory = (
+            int(
+                _finite_number(
+                    result.get("peak_gpu_reserved_bytes"),
+                    f"{dataset}/peak_gpu_reserved_bytes",
+                )
+            )
+            if expected_version == "v2"
+            else None
+        )
+        if expected_version == "v2":
+            execution = result.get("execution")
+            pipeline = execution.get("data_pipeline") if isinstance(execution, dict) else None
+            precision = execution.get("precision") if isinstance(execution, dict) else None
+            hardware = execution.get("hardware") if isinstance(execution, dict) else None
+            if (
+                result.get("effective_batch_size") != job["resources"]["batch_size"]
+                or not isinstance(pipeline, dict)
+                or pipeline.get("effective_batch_size") != job["resources"]["batch_size"]
+                or pipeline.get("workers") != job["resources"]["workers"]
+                or pipeline.get("prefetch_factor") != job["resources"]["prefetch_factor"]
+                or pipeline.get("packed_cycle_basis_h2d_tensors_per_batch") != 1
+                or not isinstance(precision, dict)
+                or precision.get("amp") is not job["resources"]["amp"]
+                or precision.get("projector_contraction") != "float32"
+                or not isinstance(hardware, dict)
+                or hardware.get("profile") != job["resources"]["hardware_profile"]
+                or reserved_memory is None
+                or reserved_memory < peak_memory
+            ):
+                raise ValueError(f"{dataset}: V2 runtime/resource evidence mismatch")
         best_epoch = int(
             _finite_number(result.get("best_epoch"), f"{dataset}/best_epoch", minimum=1)
         )
@@ -42996,6 +49168,24 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
             or history_payload[-1].get("epoch") != epochs_completed
         ):
             raise ValueError(f"{dataset}: history length/epoch metadata mismatch")
+        if expected_version == "v2" and any(
+            not isinstance(epoch_row.get("train_graphs"), int)
+            or epoch_row["train_graphs"] < 1
+            or _finite_number(
+                epoch_row.get("train_cuda_synchronized_seconds"),
+                f"{dataset}/train_seconds",
+                minimum=0,
+            )
+            <= 0
+            or _finite_number(
+                epoch_row.get("train_graphs_per_second"),
+                f"{dataset}/train_graphs_per_second",
+                minimum=0,
+            )
+            <= 0
+            for epoch_row in history_payload
+        ):
+            raise ValueError(f"{dataset}: V2 throughput history is invalid")
         rows.append(
             {
                 "version": expected_version,
@@ -43003,10 +49193,14 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
                 "dataset": dataset,
                 "model_seed": job["model_seed"],
                 "config": dict(job["config"]),
+                "resources": dict(job["resources"]),
                 "validation_mae": validation,
                 "trainable_parameters": parameters,
                 "elapsed_seconds": elapsed,
                 "peak_gpu_memory_bytes": peak_memory,
+                "peak_gpu_reserved_bytes": reserved_memory,
+                "effective_batch_size": result.get("effective_batch_size"),
+                "execution": result.get("execution"),
                 "best_epoch": best_epoch,
                 "epochs_completed": epochs_completed,
                 "checkpoint": checkpoint,
@@ -43053,7 +49247,7 @@ def build_summary(
             "checkpoint_selection": "validation MAE only inside each candidate training",
             "final_test_report": "separate test_evaluations rows after selection",
         },
-        "profiles": {name: dict(PROFILES[name]) for name in profiles},
+        "profiles": {name: PROFILES[name] for name in profiles},
         "requested_model_seeds": list(model_seeds),
         "runs": rows,
         "profile_aggregates": [],
@@ -43097,7 +49291,7 @@ def build_summary(
                         "version": version,
                         "dataset": dataset,
                         "profile": profile,
-                        "config": dict(PROFILES[profile]),
+                        "config": dict(group[0]["config"]),
                         "model_seeds": sorted(seeds),
                         "validation_mae": _stats([row["validation_mae"] for row in group]),
                         "trainable_parameters": sorted(
@@ -43202,7 +49396,8 @@ def make_test_jobs(
         dataset = selection["dataset"]
         seed = selection["model_seed"]
         profile = selection["selected_profile"]
-        config = PROFILES[profile]
+        config = _profile_config(profile, dataset, version)
+        resources = _job_resources(args, version, profile, dataset)
         output = run_dir / "test-evaluations" / version / dataset / f"model-seed-{seed}"
         job_id = f"test:{version}:{dataset}:model-seed-{seed}"
         command = [
@@ -43224,9 +49419,9 @@ def make_test_jobs(
             "--model-seed",
             str(seed),
             "--batch-size",
-            str(args.batch_size),
+            str(resources["batch_size"]),
             "--workers",
-            str(args.workers),
+            str(resources["workers"]),
             "--hidden-dim",
             str(config["hidden_dim"]),
             "--pe-dim",
@@ -43237,18 +49432,31 @@ def make_test_jobs(
             str(args.max_parameters),
             "--test-checkpoint",
             selection["checkpoint"],
+            "--amp" if resources["amp"] else "--no-amp",
             "--compile" if args.compile else "--no-compile",
         ]
         if args.allow_download:
             command.append("--allow-download")
         if version == "v2":
             command += [
+                "--ffn-multiplier",
+                str(config["ffn_multiplier"]),
+                "--dropout",
+                str(config["dropout"]),
+                "--layer-scale",
+                str(config["layer_scale"]),
                 "--column-chunk-size",
-                str(args.column_chunk_size),
+                str(resources["column_chunk_size"]),
+                "--basis-backend",
+                args.basis_backend,
                 "--basis-execution",
                 args.basis_execution,
                 "--basis-pair-budget",
-                str(args.basis_pair_budget),
+                str(resources["basis_pair_budget"]),
+                "--prefetch-factor",
+                str(resources["prefetch_factor"]),
+                "--hardware-profile",
+                args.hardware_profile,
             ]
         jobs.append(
             {
@@ -43260,6 +49468,7 @@ def make_test_jobs(
                 "model_seed": seed,
                 "selected_profile": profile,
                 "config": dict(config),
+                "resources": resources,
                 "checkpoint": selection["checkpoint"],
                 "checkpoint_sha256": selection["checkpoint_sha256"],
                 "selected_validation_mae": selection["selected_validation_mae"],
@@ -43300,6 +49509,9 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
         "hidden_dim": job["config"]["hidden_dim"],
         "pe_dim": job["config"]["pe_dim"],
         "layers": job["config"]["layers"],
+        "batch_size": job["resources"]["batch_size"],
+        "workers": job["resources"]["workers"],
+        "amp": job["resources"]["amp"],
         "validation_only": False,
         "test_checkpoint": str(Path(job["checkpoint"]).resolve()),
     }
@@ -43308,6 +49520,21 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
     for name, expected in expected_arguments.items():
         if arguments.get(name) != expected:
             raise ValueError(f"test-only argument mismatch for {name}")
+    if version == "v2":
+        expected_v2_arguments = {
+            "ffn_multiplier": job["config"]["ffn_multiplier"],
+            "dropout": job["config"]["dropout"],
+            "layer_scale": job["config"]["layer_scale"],
+            "column_chunk_size": job["resources"]["column_chunk_size"],
+            "basis_backend": job["resources"]["basis_backend"],
+            "basis_execution": job["resources"]["basis_execution"],
+            "basis_pair_budget": job["resources"]["basis_pair_budget"],
+            "prefetch_factor": job["resources"]["prefetch_factor"],
+            "hardware_profile": job["resources"]["hardware_profile"],
+        }
+        for name, expected in expected_v2_arguments.items():
+            if arguments.get(name) != expected:
+                raise ValueError(f"V2 test-only argument mismatch for {name}")
     controls = manifest.get("controls")
     if (
         not isinstance(controls, dict)
@@ -43342,6 +49569,32 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("test-only result contains training or candidate metrics")
     if result.get("evaluation_splits") != ["test"] or result.get("fresh_training") is not False:
         raise ValueError("test-only result has invalid split/training markers")
+    if version == "v2":
+        execution = result.get("execution")
+        pipeline = execution.get("data_pipeline") if isinstance(execution, dict) else None
+        precision = execution.get("precision") if isinstance(execution, dict) else None
+        hardware = execution.get("hardware") if isinstance(execution, dict) else None
+        allocated = _finite_number(
+            result.get("peak_gpu_memory_bytes"), "test/peak_gpu_memory_bytes"
+        )
+        reserved = _finite_number(
+            result.get("peak_gpu_reserved_bytes"), "test/peak_gpu_reserved_bytes"
+        )
+        if (
+            result.get("effective_batch_size") != job["resources"]["batch_size"]
+            or not isinstance(pipeline, dict)
+            or pipeline.get("effective_batch_size") != job["resources"]["batch_size"]
+            or pipeline.get("workers") != job["resources"]["workers"]
+            or pipeline.get("prefetch_factor") != job["resources"]["prefetch_factor"]
+            or pipeline.get("packed_cycle_basis_h2d_tensors_per_batch") != 1
+            or not isinstance(precision, dict)
+            or precision.get("amp") is not job["resources"]["amp"]
+            or precision.get("projector_contraction") != "float32"
+            or not isinstance(hardware, dict)
+            or hardware.get("profile") != job["resources"]["hardware_profile"]
+            or reserved < allocated
+        ):
+            raise ValueError("V2 test-only runtime/resource evidence mismatch")
     checkpoint = str(Path(job["checkpoint"]).resolve())
     if (
         result.get("checkpoint") != checkpoint
@@ -43377,6 +49630,18 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
         "peak_gpu_memory_bytes": int(
             _finite_number(result.get("peak_gpu_memory_bytes"), "test/peak_gpu_memory_bytes")
         ),
+        "peak_gpu_reserved_bytes": (
+            int(
+                _finite_number(
+                    result.get("peak_gpu_reserved_bytes"),
+                    "test/peak_gpu_reserved_bytes",
+                )
+            )
+            if version == "v2"
+            else None
+        ),
+        "effective_batch_size": result.get("effective_batch_size"),
+        "execution": result.get("execution"),
         "fresh_training": False,
         "output_dir": str(output.resolve()),
         "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
@@ -43483,8 +49748,10 @@ def _run_configuration(args: argparse.Namespace) -> dict[str, Any]:
         "model_seeds": list(args.model_seeds),
         "data_root": str(args.data_root.expanduser().resolve()),
         "device": args.device,
+        "hardware_profile": args.hardware_profile,
         "batch_size": args.batch_size,
         "workers": args.workers,
+        "prefetch_factor": args.prefetch_factor,
         "epochs": args.epochs,
         "patience": args.patience,
         "lr": args.lr,
@@ -43494,6 +49761,7 @@ def _run_configuration(args: argparse.Namespace) -> dict[str, Any]:
         "amp": args.amp,
         "compile": args.compile,
         "column_chunk_size": args.column_chunk_size,
+        "basis_backend": args.basis_backend,
         "basis_execution": args.basis_execution,
         "basis_pair_budget": args.basis_pair_budget,
         "min_free_gb": args.min_free_gb,
@@ -43724,6 +49992,18 @@ def _quarantine_incomplete_output(job: dict[str, Any], run_dir: Path) -> None:
     job.setdefault("quarantined_outputs", []).append(str(target))
 
 
+def _candidate_attempt_command(job: dict[str, Any], run_dir: Path) -> list[str]:
+    """Keep a resumable projector checkpoint; quarantine every other partial child."""
+    command = list(job["command"])
+    dataset = job["datasets"][0]
+    checkpoint = Path(job["output_dir"]) / dataset / MODEL_NAMES[job["version"]] / "last.pt"
+    if job["version"] == "v2" and checkpoint.is_file():
+        command.append("--resume")
+    else:
+        _quarantine_incomplete_output(job, run_dir)
+    return command
+
+
 def _validated_log_path(log_path: Path, run_dir: Path) -> Path:
     """Reject indirect or out-of-run log targets before opening them for append."""
     lexical = Path(os.path.abspath(log_path.expanduser()))
@@ -43778,10 +50058,10 @@ def _manifest_base(
         "output_dir": str(run_dir),
         "versions": list(args.versions),
         "datasets": list(args.datasets),
-        "profiles": {name: dict(PROFILES[name]) for name in args.profiles},
+        "profiles": {name: PROFILES[name] for name in args.profiles},
         "model_seeds": list(args.model_seeds),
         "fresh_child_runs": len(jobs),
-        "fresh_dataset_trainings": len(jobs) * len(args.datasets),
+        "fresh_dataset_trainings": len(jobs),
         "selected_test_evaluations_planned": len(args.versions)
         * len(args.datasets)
         * len(args.model_seeds),
@@ -43794,7 +50074,17 @@ def _manifest_base(
             "candidate_loaded_splits": ["train", "validation"],
             "test_role": "one test-only evaluation of each selected checkpoint; no retraining",
             "official_splits": True,
+            "hardware_profile_identity": (
+                "batch size changes optimizer-step count and trajectory; hardware_profile and "
+                "resolved resources are immutable optimization identity"
+            ),
+            "cross_profile_comparison": (
+                "portable and a6000-48gb scores are not direct paired comparisons; compare V1/V2 "
+                "only within the same hardware profile and resolved batch policy"
+            ),
         },
+        "hardware_profile": args.hardware_profile,
+        "resolved_resource_matrix": {job["job_id"]: job["resources"] for job in jobs},
         "resource_reporting": (
             "per-dataset trainable parameters, CUDA-synchronized training runtime, "
             "peak allocated GPU memory, epochs and best epoch"
@@ -43834,7 +50124,7 @@ def main(argv: list[str] | None = None) -> int:
     jobs = make_jobs(args, run_dir)
     if args.dry_run:
         print(
-            f"{len(jobs)} fresh child runs; {len(jobs) * len(args.datasets)} fresh dataset "
+            f"{len(jobs)} fresh child runs; {len(jobs)} fresh dataset "
             "trainings (train+validation only); "
             f"{len(args.versions) * len(args.datasets) * len(args.model_seeds)} "
             "selected-checkpoint test evaluations are deferred until validation selection"
@@ -43894,7 +50184,7 @@ def main(argv: list[str] | None = None) -> int:
                 datasets=list(args.datasets),
                 profiles=list(args.profiles),
                 model_seeds=args.model_seeds,
-                complete=len(rows) == len(jobs) * len(args.datasets),
+                complete=len(rows) == len(jobs),
             )
             if verified_validation["status"] != "pending_test_evaluation":
                 raise ValueError("completed candidate matrix no longer validates")
@@ -43952,11 +50242,13 @@ def main(argv: list[str] | None = None) -> int:
         preflight_log = _validated_log_path(run_dir / "logs/gpu-preflight.log", run_dir)
         preflight_code = run_logged(preflight_command, preflight_log, environment)
         preflight_errors: list[str] = []
+        preflight_payload: dict[str, Any] | None = None
         if preflight_code == 0:
             try:
                 preflight_payload = _json_object(preflight_output)
                 if preflight_payload.get("status") != "passed":
                     preflight_errors.append("GPU preflight JSON does not have status=passed")
+                _validate_preflight_hardware(args.hardware_profile, preflight_payload)
             except (OSError, ValueError, json.JSONDecodeError) as exc:
                 preflight_errors.append(f"{type(exc).__name__}: {exc}")
         manifest["preflight"] = {
@@ -43965,6 +50257,8 @@ def main(argv: list[str] | None = None) -> int:
             "command": preflight_command,
             "output": str(preflight_output),
             "artifact_errors": preflight_errors,
+            "gpu": preflight_payload.get("gpu") if preflight_payload else None,
+            "hardware_profile": args.hardware_profile,
         }
         if manifest["preflight"]["status"] != "passed":
             failed = True
@@ -43973,13 +50267,14 @@ def main(argv: list[str] | None = None) -> int:
             for job in jobs:
                 if job["status"] == "passed":
                     continue
-                _quarantine_incomplete_output(job, run_dir)
+                attempt_command = _candidate_attempt_command(job, run_dir)
+                job["attempt_command"] = attempt_command
                 job["artifact_errors"] = []
                 job["status"] = "running"
                 job["started_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
                 atomic_write_json(manifest_path, manifest, sort_keys=False)
                 log_path = _validated_log_path(Path(job["log_path"]), run_dir)
-                code = run_logged(job["command"], log_path, environment)
+                code = run_logged(attempt_command, log_path, environment)
                 job["returncode"] = code
                 job["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
                 if code == 0:
@@ -43996,9 +50291,7 @@ def main(argv: list[str] | None = None) -> int:
                 if failed and args.fail_fast:
                     break
         candidate_complete = (
-            not failed
-            and len(rows) == len(jobs) * len(args.datasets)
-            and all(job["status"] == "passed" for job in jobs)
+            not failed and len(rows) == len(jobs) and all(job["status"] == "passed" for job in jobs)
         )
         validation_summary = build_summary(
             rows,
@@ -44153,6 +50446,7 @@ CYCLE_BREC_OFFICIAL_SEEDS = (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
 CYCLE_VARIANTS = ("no_pe", "raw", "set", "projector")
 DEFAULT_CYCLE_VARIANTS = ("raw", "set", "projector")
 CYCLE_CORE_TARGETS = ("edge", "node", "graph")
+CYCLE_BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 
@@ -44350,10 +50644,16 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
                     label = "benchmark-v2" if cycle_v2 else suite
                     overrides: list[str] = []
                     if cycle_v2:
-                        overrides.extend((
-                            "--basis-execution", args.basis_execution,
-                            "--basis-pair-budget", str(args.basis_pair_budget),
-                        ))
+                        overrides.extend(
+                            (
+                                "--basis-backend",
+                                args.basis_backend,
+                                "--basis-execution",
+                                args.basis_execution,
+                                "--basis-pair-budget",
+                                str(args.basis_pair_budget),
+                            )
+                        )
                         if args.cycle_epochs is not None:
                             overrides.extend(("--epochs", str(args.cycle_epochs)))
                         if args.cycle_learning_rate is not None:
@@ -44626,6 +50926,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--cycle-epochs", type=int)
     parser.add_argument("--cycle-learning-rate", type=float)
+    parser.add_argument("--basis-backend", choices=CYCLE_BASIS_BACKENDS, default="thin_q")
     parser.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
     parser.add_argument("--basis-pair-budget", type=int, default=32768)
     parser.add_argument(
@@ -44673,6 +50974,9 @@ def main() -> int:
         return 2
     if args.basis_pair_budget < 1:
         print("--basis-pair-budget must be positive", file=sys.stderr)
+        return 2
+    if args.basis_backend != "thin_q" and args.cycle_pe_version != "v2":
+        print("nondefault --basis-backend requires --cycle-pe-version v2", file=sys.stderr)
         return 2
     if args.cycle_pe_version == "v2" and (
         args.suite != "benchmark" or _selected_tracks(args.tracks) != ("cycle_pe",)
@@ -44755,6 +51059,7 @@ def main() -> int:
         "executed_model_seeds": ([] if args.prepare_only else list(args.model_seeds)),
         "execution_protocol": {
             "torch_compile": args.compile and not args.prepare_only,
+            "basis_backend": args.basis_backend if args.cycle_pe_version == "v2" else None,
             "basis_execution": args.basis_execution if args.cycle_pe_version == "v2" else None,
             "basis_pair_budget": args.basis_pair_budget if args.cycle_pe_version == "v2" else None,
             "cycle_pe_version": args.cycle_pe_version if "cycle_pe" in tracks else None,
@@ -44904,9 +51209,20 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    BETA_PARAMETERIZATIONS,
+    DEFAULT_BETA_INITIAL,
+    DEFAULT_BETA_PARAMETERIZATION,
+    beta_configuration,
+)
 
 TRACKS = ("conductance", "cycle", "tree")
-PROFILES = ("base", "wide", "deep", "large")
+PROFILES = ("reference", "large")
+HARDWARE_PROFILES = ("portable", "a6000-48gb")
+CYCLE_V2_BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
 DEFAULT_MODEL_SEEDS = (0,)
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
 
@@ -44934,6 +51250,10 @@ CONDUCTANCE_MATRIX = {
             "fixed_c_spatial_w",
             "relative_c_spatial_w",
         ),
+    },
+    "v5": {
+        "datasets": ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"),
+        "conditions": ("fixed_c", "shared_dynamic_c"),
     },
 }
 CYCLE_VERSIONS = ("v1", "v2")
@@ -44965,7 +51285,31 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
     result.add_argument("--run-id")
     result.add_argument("--device", default="cuda")
+    result.add_argument(
+        "--hardware-profile",
+        choices=HARDWARE_PROFILES,
+        default="portable",
+        help=(
+            "portable keeps conservative child settings; a6000-48gb enables each track's "
+            "recorded high-throughput settings and fails closed below 40 GiB visible VRAM or "
+            "compute capability 8.0"
+        ),
+    )
     result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument(
+        "--v5-beta-parameterization",
+        choices=BETA_PARAMETERIZATIONS,
+        default=DEFAULT_BETA_PARAMETERIZATION,
+    )
+    result.add_argument("--v5-beta-initial", type=float, default=DEFAULT_BETA_INITIAL)
+    result.add_argument("--v5-beta-min", type=float)
+    result.add_argument("--v5-beta-max", type=float)
+    result.add_argument(
+        "--cycle-v2-basis-backend",
+        choices=CYCLE_V2_BASIS_BACKENDS,
+        default="thin_q",
+        help="Cycle V2 basis construction; thin_q is the production default",
+    )
     result.add_argument("--allow-download", action="store_true")
     result.add_argument(
         "--fail-fast",
@@ -44992,6 +51336,7 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("minimum free GPU memory must be finite and nonnegative")
     if args.run_id is not None and RUN_ID_PATTERN.fullmatch(args.run_id) is None:
         raise ValueError("run ID must be 1-120 letters, digits, underscores, or hyphens")
+    _v5_beta_configuration(args)
 
 
 def _default_run_id() -> str:
@@ -45054,16 +51399,25 @@ def _expected_counts(track: str, profiles: list[str], model_seeds: list[int]) ->
             "model_trainings": combinations * trainings_per_combination,
         }
     if track == "cycle":
-        child_runs = combinations * len(CYCLE_VERSIONS)
+        child_runs = combinations * len(CYCLE_VERSIONS) * len(CYCLE_DATASETS)
         return {
             "child_runs": child_runs,
-            "model_trainings": child_runs * len(CYCLE_DATASETS),
+            "model_trainings": child_runs,
         }
     child_runs = combinations * len(TREE_SUITES)
     return {
         "child_runs": child_runs,
         "model_trainings": child_runs * len(TREE_MODELS),
     }
+
+
+def _v5_beta_configuration(args: argparse.Namespace) -> dict[str, float | str]:
+    return beta_configuration(
+        args.v5_beta_parameterization,
+        args.v5_beta_initial,
+        args.v5_beta_min,
+        args.v5_beta_max,
+    )
 
 
 def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
@@ -45096,11 +51450,14 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             command += ["--datasets", *requested_matrix["datasets"]]
             command += ["--profiles", *profiles]
             command += ["--model-seeds", ",".join(str(seed) for seed in args.model_seeds)]
+            command += ["--basis-backend", args.cycle_v2_basis_backend]
         else:
             command += ["--versions", *requested_matrix["versions"]]
             command += ["--datasets", *requested_matrix["requested_datasets"]]
             command += ["--profiles", *profiles]
             command += ["--model-seeds", *(str(seed) for seed in args.model_seeds)]
+            for name, value in _v5_beta_configuration(args).items():
+                command += ["--v5-" + name.replace("_", "-"), str(value)]
         command += [
             "--data-root",
             str(data_root),
@@ -45110,6 +51467,8 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             child_run_id,
             "--device",
             args.device,
+            "--hardware-profile",
+            args.hardware_profile,
             "--min-free-gb",
             str(args.min_free_gb),
         ]
@@ -45300,7 +51659,7 @@ def _exact_string_mapping_keys(value: Any, expected: list[str], label: str) -> d
 
 
 def _validate_conductance_summary(payload: dict[str, Any], job: dict[str, Any]) -> dict[str, int]:
-    if payload.get("suite") != "conductance_architecture_scaling_v1_v4":
+    if payload.get("suite") != "conductance_architecture_scaling_v1_v5":
         raise RuntimeError("Conductance child summary suite mismatch")
     if payload.get("run_id") != job["child_run_id"]:
         raise RuntimeError("Conductance child summary run ID mismatch")
@@ -45396,12 +51755,13 @@ def _validate_cycle_summary(payload: dict[str, Any], job: dict[str, Any]) -> dic
         label="Cycle training rows",
     )
     expected_children = {
-        (version, profile, seed)
+        (version, profile, seed, dataset)
         for version in matrix["versions"]
         for profile in matrix["profiles"]
         for seed in matrix["model_seeds"]
+        for dataset in matrix["datasets"]
     }
-    observed_children = {(key[0], key[1], key[2]) for key in runs}
+    observed_children = set(runs)
     if observed_children != expected_children:
         raise RuntimeError("Cycle child-run matrix is incomplete")
     if any("test" in key.lower() for row in runs.values() for key in row):
@@ -45720,7 +52080,10 @@ def _config_payload(
         "tree_profiles": list(args.profiles),
         "model_seeds": list(args.model_seeds),
         "device": args.device,
+        "hardware_profile": args.hardware_profile,
         "min_free_gb": args.min_free_gb,
+        "v5_beta": _v5_beta_configuration(args),
+        "cycle_v2_basis_backend": args.cycle_v2_basis_backend,
         "allow_download": args.allow_download,
         "data_root": str(data_root),
         "results_root": str(results_root),
@@ -45828,6 +52191,10 @@ def _print_plan(args: argparse.Namespace, run_id: str, jobs: list[dict[str, Any]
         f"{totals['model_trainings']} fresh model trainings"
     )
     print(f"profiles={list(args.profiles)}; model_seeds={list(args.model_seeds)}")
+    print(
+        f"hardware_profile={args.hardware_profile}; track_concurrency=1 "
+        "(independent-job concurrency is owned by each child runner)"
+    )
     for job in jobs:
         expected = job["expected_counts"]
         print(
@@ -45902,14 +52269,25 @@ def main(argv: list[str] | None = None) -> int:
             "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
             "config": config,
             "protocol": {
-                "purpose": "larger-model scaling for every selected V1/V2/V3/V4 track",
+                "purpose": "reference-scale training for every selected V1/V2/V3/V4/V5 track",
                 "execution": "selected track runners execute sequentially without a shell",
+                "hardware_profile": {
+                    "name": args.hardware_profile,
+                    "portable": "conservative settings and one independent job at a time",
+                    "a6000-48gb": "child runners require at least 40 GiB visible VRAM and "
+                    "compute capability 8.0, then apply track-specific minibatch, AMP, worker, "
+                    "and safe independent-job concurrency settings",
+                    "cross_track_concurrency": 1,
+                    "reason": "tracks stay sequential because simultaneous peak allocations "
+                    "and independent CUDA caching allocators are not bounded by this runner",
+                },
                 "failure_policy": (
                     "stop after first failed track"
                     if args.fail_fast
                     else "continue remaining tracks"
                 ),
-                "tree_profiles": "base/wide/deep/large are forwarded without renaming",
+                "tree_profiles": "reference/large are forwarded without renaming",
+                "cycle_v2_basis_backend": args.cycle_v2_basis_backend,
                 "download_policy": (
                     "allow-download is forwarded to Cycle and Tree; Conductance remains "
                     "verified-cache-only because its child contract exposes no download flag"
@@ -46023,6 +52401,7 @@ then one test-only child per seed evaluates the selected checkpoints without ret
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import hashlib
 import json
@@ -46032,7 +52411,9 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -46051,38 +52432,44 @@ from scripts.check_dependencies import (  # noqa: E402
 SUITES = ("csl", "zinc")
 MODELS = ("fixed_bfs", "multi_chart")
 PROFILE_CONFIGS: dict[str, dict[str, int]] = {
-    "base": {
-        "hidden_dim": 64,
-        "message_layers": 2,
-        "optimizer_updates": 800,
-        "train_charts_per_graph": 8,
-        "eval_charts_per_graph": 8,
-    },
-    "wide": {
+    "reference": {
         "hidden_dim": 128,
-        "message_layers": 2,
-        "optimizer_updates": 800,
-        "train_charts_per_graph": 8,
-        "eval_charts_per_graph": 8,
-    },
-    "deep": {
-        "hidden_dim": 64,
-        "message_layers": 4,
+        "message_layers": 8,
         "optimizer_updates": 800,
         "train_charts_per_graph": 8,
         "eval_charts_per_graph": 8,
     },
     "large": {
-        "hidden_dim": 128,
-        "message_layers": 4,
+        "hidden_dim": 256,
+        "message_layers": 12,
         "optimizer_updates": 800,
         "train_charts_per_graph": 8,
         "eval_charts_per_graph": 8,
     },
 }
 PROFILES = tuple(PROFILE_CONFIGS)
+HARDWARE_PROFILES = ("portable", "a6000-48gb")
+HARDWARE_PROFILE_DEFAULTS: dict[str, dict[str, int | bool | None]] = {
+    "portable": {
+        "batch_size": 16,
+        "workers": 0,
+        "amp": None,
+        "job_concurrency": 1,
+    },
+    "a6000-48gb": {
+        "batch_size": 64,
+        "workers": 4,
+        "amp": True,
+        "job_concurrency": 2,
+    },
+}
+A6000_MIN_VISIBLE_BYTES = 40 * 1024**3
+A6000_MIN_FREE_BYTES = 32 * 1024**3
+A6000_MIN_COMPUTE_CAPABILITY = (8, 0)
 DEFAULT_MODEL_SEEDS = (0,)
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
+_ACTIVE_PROCESS_LOCK = threading.Lock()
+_ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
 
 
 def _csv_subset(value: str, *, choices: tuple[str, ...], option: str) -> tuple[str, ...]:
@@ -46136,8 +52523,30 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
     result.add_argument("--run-id")
     result.add_argument("--device", default="cuda")
-    result.add_argument("--batch-size", type=int, default=16)
-    result.add_argument("--workers", type=int, default=0)
+    result.add_argument(
+        "--hardware-profile",
+        choices=HARDWARE_PROFILES,
+        default="portable",
+        help="portable defaults or an RTX A6000-class 48 GB throughput contract",
+    )
+    result.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="override the hardware-profile graph minibatch size",
+    )
+    result.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="override the hardware-profile DataLoader worker count",
+    )
+    result.add_argument(
+        "--job-concurrency",
+        type=int,
+        default=None,
+        help="override concurrent independent candidate/test child processes",
+    )
     result.add_argument("--min-free-gb", type=float, default=8.0)
     result.add_argument("--allow-download", action="store_true")
     result.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
@@ -46145,13 +52554,26 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
+def _resolve_hardware_profile(args: argparse.Namespace) -> None:
+    if getattr(args, "_hardware_profile_resolved", False):
+        return
+    defaults = HARDWARE_PROFILE_DEFAULTS[args.hardware_profile]
+    for field in ("batch_size", "workers", "amp", "job_concurrency"):
+        if getattr(args, field) is None:
+            setattr(args, field, defaults[field])
+    args._hardware_profile_resolved = True
+
+
 def _validate(args: argparse.Namespace) -> None:
+    _resolve_hardware_profile(args)
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
         raise ValueError("Tree scaling requires an explicit CUDA device; no CPU fallback")
     if min(args.data_seed, args.split_seed, args.chart_seed, *args.model_seeds) < 0:
         raise ValueError("all seed axes must be non-negative")
-    if args.batch_size < 1 or args.workers < 0:
-        raise ValueError("batch size must be positive and workers must be non-negative")
+    if args.batch_size < 1 or args.workers < 0 or args.job_concurrency < 1:
+        raise ValueError(
+            "batch size and job concurrency must be positive; workers must be non-negative"
+        )
     if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
         raise ValueError("minimum free GPU memory must be finite and non-negative")
     if args.run_id is not None and RUN_ID_PATTERN.fullmatch(args.run_id) is None:
@@ -46163,6 +52585,7 @@ def _default_run_id() -> str:
 
 
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
+    _resolve_hardware_profile(args)
     jobs: list[dict[str, Any]] = []
     data_root = args.data_root.expanduser().resolve()
     for suite in args.suites:
@@ -46225,6 +52648,18 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                         "command": command,
                     }
                 )
+    if args.hardware_profile == "a6000-48gb":
+        # Exercise the highest expected memory/compute demand first.  If the declared
+        # concurrency is unsafe, the run fails before spending time on all light candidates.
+        suite_priority = {"zinc": 0, "csl": 1}
+        profile_priority = {"large": 0, "reference": 1}
+        jobs.sort(
+            key=lambda job: (
+                suite_priority[job["suite"]],
+                profile_priority[job["profile"]],
+                job["model_seed"],
+            )
+        )
     return jobs
 
 
@@ -46286,6 +52721,62 @@ def _environment() -> dict[str, str]:
     return environment
 
 
+def _validate_hardware_preflight(payload: dict[str, Any], hardware_profile: str) -> None:
+    if payload.get("status") != "passed":
+        raise RuntimeError("GPU preflight returned without a passed certificate")
+    if hardware_profile != "a6000-48gb":
+        return
+    gpu = payload.get("gpu")
+    if not isinstance(gpu, dict):
+        raise RuntimeError("a6000-48gb preflight is missing the visible GPU record")
+    total_bytes = gpu.get("total_bytes")
+    free_bytes = gpu.get("free_bytes")
+    capability = gpu.get("compute_capability")
+    if (
+        isinstance(total_bytes, bool)
+        or not isinstance(total_bytes, int)
+        or total_bytes < A6000_MIN_VISIBLE_BYTES
+    ):
+        raise RuntimeError(
+            "a6000-48gb requires at least 40 GiB of visible GPU memory; "
+            "a 10 GiB MIG slice must use the portable profile"
+        )
+    if (
+        isinstance(free_bytes, bool)
+        or not isinstance(free_bytes, int)
+        or free_bytes < A6000_MIN_FREE_BYTES
+    ):
+        raise RuntimeError(
+            "a6000-48gb concurrency requires at least 32 GiB free at preflight; "
+            "wait for other GPU jobs or use the portable profile"
+        )
+    if (
+        not isinstance(capability, list)
+        or len(capability) != 2
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in capability)
+        or tuple(capability) < A6000_MIN_COMPUTE_CAPABILITY
+    ):
+        raise RuntimeError("a6000-48gb requires CUDA compute capability 8.0 or newer")
+
+
+def _stop_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def _stop_active_processes() -> None:
+    with _ACTIVE_PROCESS_LOCK:
+        active = tuple(_ACTIVE_PROCESSES)
+    for process in active:
+        _stop_process(process)
+
+
 def _run_logged(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("x", encoding="utf-8", newline="\n") as log:
@@ -46300,6 +52791,8 @@ def _run_logged(command: list[str], log_path: Path, environment: dict[str, str])
             errors="replace",
             bufsize=1,
         )
+        with _ACTIVE_PROCESS_LOCK:
+            _ACTIVE_PROCESSES.add(process)
         try:
             assert process.stdout is not None
             for line in process.stdout:
@@ -46308,16 +52801,117 @@ def _run_logged(command: list[str], log_path: Path, environment: dict[str, str])
                 log.flush()
             return process.wait()
         except BaseException:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
+            _stop_process(process)
             raise
         finally:
+            with _ACTIVE_PROCESS_LOCK:
+                _ACTIVE_PROCESSES.discard(process)
             if process.stdout is not None:
                 process.stdout.close()
+
+
+def _run_wave(
+    jobs: list[dict[str, Any]],
+    environment: dict[str, str],
+) -> list[tuple[dict[str, Any], int | None, float, BaseException | None]]:
+    """Run one bounded wave; workers never mutate the shared manifest."""
+
+    def invoke(
+        job: dict[str, Any],
+    ) -> tuple[dict[str, Any], int | None, float, BaseException | None]:
+        started = time.monotonic()
+        try:
+            status = _run_logged(job["command"], Path(job["log_path"]), environment)
+        except BaseException as error:
+            return job, None, time.monotonic() - started, error
+        return job, status, time.monotonic() - started, None
+
+    if len(jobs) == 1:
+        return [invoke(jobs[0])]
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs))
+    futures = [executor.submit(invoke, job) for job in jobs]
+    try:
+        # Wait in completion order so an early failure is observed promptly, but return in input
+        # order so coordinator-owned manifest updates and failure messages stay deterministic.
+        by_future = {future: index for index, future in enumerate(futures)}
+        results: list[tuple[dict[str, Any], int | None, float, BaseException | None] | None] = [
+            None
+        ] * len(futures)
+        for future in concurrent.futures.as_completed(futures):
+            results[by_future[future]] = future.result()
+        if any(result is None for result in results):
+            raise RuntimeError("concurrent job wave returned an incomplete result set")
+        return [result for result in results if result is not None]
+    except BaseException:
+        _stop_active_processes()
+        for future in futures:
+            future.cancel()
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _execute_job_matrix(
+    jobs: list[dict[str, Any]],
+    *,
+    concurrency: int,
+    environment: dict[str, str],
+    manifest: dict[str, Any],
+    run_dir: Path,
+    validator: Callable[[dict[str, Any]], dict[str, Any]],
+    describe: Callable[[dict[str, Any]], str],
+) -> None:
+    """Execute independent jobs in bounded waves with coordinator-only state writes."""
+    pending = [job for job in jobs if job["status"] != "passed"]
+    for job in jobs:
+        if job["status"] == "passed":
+            print(f"skip verified {describe(job)}", flush=True)
+    for offset in range(0, len(pending), concurrency):
+        wave = pending[offset : offset + concurrency]
+        _check_sources(manifest)
+        started_at = dt.datetime.now(dt.UTC).isoformat()
+        for job in wave:
+            job.update(status="running", started_at_utc=started_at)
+            print(f"\n{describe(job)}", flush=True)
+        _write_state(run_dir, manifest)
+        try:
+            outcomes = _run_wave(wave, environment)
+            _check_sources(manifest)
+        except BaseException as error:
+            detail = f"{type(error).__name__}: {error}"
+            for job in wave:
+                if job.get("status") == "running":
+                    job.update(status="failed", error=detail)
+            _write_state(run_dir, manifest)
+            raise
+        errors: list[str] = []
+        interruption: BaseException | None = None
+        for job, status, elapsed, invocation_error in outcomes:
+            job.update(
+                exit_code=status,
+                elapsed_seconds=elapsed,
+                finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+            )
+            try:
+                if invocation_error is not None:
+                    raise invocation_error
+                if status:
+                    raise RuntimeError(f"child exited with code {status}")
+                job["result"] = validator(job)
+            except BaseException as error:
+                detail = f"{type(error).__name__}: {error}"
+                job.update(status="failed", error=detail)
+                errors.append(f"{describe(job)}: {detail}")
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    interruption = error
+            else:
+                job["status"] = "passed"
+                job.pop("error", None)
+        _write_state(run_dir, manifest)
+        if interruption is not None:
+            raise interruption
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
 
 def _read_mapping(path: Path, label: str) -> dict[str, Any]:
@@ -46344,6 +52938,38 @@ def _finite_metric_mapping(values: Any, label: str) -> dict[str, float]:
             raise RuntimeError(f"non-finite child metric in {label}/{key}")
         result[str(key)] = numeric
     return result
+
+
+def _validated_runtime(
+    child_summary: dict[str, Any],
+    child_manifest: dict[str, Any],
+    command: list[str],
+    label: str,
+) -> dict[str, Any]:
+    runtime = child_summary.get("runtime")
+    if not isinstance(runtime, dict) or runtime != child_manifest.get("runtime"):
+        raise RuntimeError(f"{label} runtime metadata is missing or disagrees")
+    expected_batch = int(command[command.index("--batch-size") + 1])
+    expected_workers = int(command[command.index("--workers") + 1])
+    if runtime.get("batch_size") != expected_batch or runtime.get("workers") != expected_workers:
+        raise RuntimeError(f"{label} runtime does not record the requested input pipeline")
+    for field in ("elapsed_seconds", "peak_gpu_allocated_bytes", "peak_gpu_reserved_bytes"):
+        value = runtime.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RuntimeError(f"{label} runtime {field} must be numeric")
+        if not math.isfinite(float(value)) or value < 0:
+            raise RuntimeError(f"{label} runtime {field} must be finite and non-negative")
+    if not isinstance(runtime.get("amp_requested"), bool) or not isinstance(
+        runtime.get("amp_effective"), bool
+    ):
+        raise RuntimeError(f"{label} runtime AMP state is missing")
+    if "--amp" in command and (
+        runtime["amp_requested"] is not True or runtime["amp_effective"] is not True
+    ):
+        raise RuntimeError(f"{label} did not apply the requested CUDA AMP setting")
+    if "--no-amp" in command and runtime["amp_requested"] is not False:
+        raise RuntimeError(f"{label} did not apply the requested no-AMP setting")
+    return dict(runtime)
 
 
 def _validate_child(job: dict[str, Any]) -> dict[str, Any]:
@@ -46403,6 +53029,9 @@ def _validate_child(job: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError(f"child {payload_name} does not record the requested profile")
     if child_manifest.get("settings_overrides") != job["profile_config"]:
         raise RuntimeError("child manifest does not record the exact scaling overrides")
+    checked_runtime = _validated_runtime(
+        child_summary, child_manifest, job["command"], "candidate child"
+    )
     models = child_summary.get("models")
     if not isinstance(models, dict) or set(models) != set(MODELS):
         raise RuntimeError("child summary must contain exactly fixed_bfs and multi_chart")
@@ -46492,6 +53121,7 @@ def _validate_child(job: dict[str, Any]) -> dict[str, Any]:
         "parameter_counts": checked_parameters,
         "quadrant_metrics": checked_metrics,
         "selection_objectives": selection_objectives,
+        "runtime": checked_runtime,
         "checkpoints": checked_checkpoints,
         "child_manifest_sha256": _sha256(manifest_path),
         "child_summary_sha256": _sha256(summary_path),
@@ -46616,7 +53246,7 @@ def _make_selected_test_job(
         "--workers",
         str(args.workers),
         "--eval-charts-per-graph",
-        str(PROFILE_CONFIGS["base"]["eval_charts_per_graph"]),
+        str(PROFILE_CONFIGS["reference"]["eval_charts_per_graph"]),
         "--evaluation-scope",
         "selected_test",
         "--fixed-checkpoint",
@@ -46690,6 +53320,9 @@ def _validate_selected_test(job: dict[str, Any]) -> dict[str, Any]:
         or child_summary.get("model_split_usage") != expected_model_split_usage
     ):
         raise RuntimeError("selected-test summary does not certify exactly one test phase")
+    checked_runtime = _validated_runtime(
+        child_summary, child_manifest, job["command"], "selected-test child"
+    )
     selection = job["selection"]
     selected_inputs = job["selected_inputs"]
     expected_inputs = {name: selected_inputs[name]["checkpoint"] for name in MODELS}
@@ -46761,6 +53394,7 @@ def _validate_selected_test(job: dict[str, Any]) -> dict[str, Any]:
         "selected_checkpoints": expected_inputs,
         "test_metrics": checked_metrics,
         "parameter_counts": checked_parameters,
+        "runtime": checked_runtime,
         "dataset_cache_integrity": expected_cache_integrity,
         "model_split_usage": expected_model_split_usage,
         "test_evaluated": True,
@@ -46842,8 +53476,10 @@ def _run_config(args: argparse.Namespace, data_root: Path) -> dict[str, Any]:
         "split_seed": args.split_seed,
         "chart_seed": args.chart_seed,
         "device": args.device,
+        "hardware_profile": args.hardware_profile,
         "batch_size": args.batch_size,
         "workers": args.workers,
+        "job_concurrency": args.job_concurrency,
         "min_free_gb": args.min_free_gb,
         "amp_override": args.amp,
         "allow_download": args.allow_download,
@@ -47319,10 +53955,32 @@ def main(argv: list[str] | None = None) -> int:
                     "retraining",
                 },
                 "failure_policy": "stop at first failed or unverifiable child; preserve completed "
-                "artifacts for exact-request continuation",
+                "artifacts for exact-request continuation; with concurrency greater than one, "
+                "already-running peers in the same bounded wave are allowed to finish and are "
+                "validated independently",
                 "uncertainty": "default model seed is 0; explicit comma-separated multiple seeds "
                 "remain supported and are aggregated without treating child models as datasets",
                 "device": "CUDA required; no CPU fallback",
+                "hardware_profile": {
+                    "name": args.hardware_profile,
+                    "effective_batch_size": args.batch_size,
+                    "effective_workers": args.workers,
+                    "effective_amp_override": args.amp,
+                    "independent_job_concurrency": args.job_concurrency,
+                    "a6000_requirements": {
+                        "minimum_visible_gpu_bytes": A6000_MIN_VISIBLE_BYTES,
+                        "minimum_free_gpu_bytes": A6000_MIN_FREE_BYTES,
+                        "minimum_compute_capability": list(A6000_MIN_COMPUTE_CAPABILITY),
+                    },
+                    "parallel_safety": "candidate and selected-test children have disjoint "
+                    "output directories and logs; only the coordinator atomically writes the "
+                    "shared manifest",
+                    "scientific_scope": "batch size is part of the immutable optimization "
+                    "protocol: a6000-48gb batch 64 exposes four times as many graph samples per "
+                    "800 optimizer updates as portable batch 16. Compare fixed_bfs against "
+                    "multi_chart within one hardware profile; do not attribute differences "
+                    "between hardware profiles to GPU speed alone",
+                },
             },
         }
     else:
@@ -47334,7 +53992,6 @@ def main(argv: list[str] | None = None) -> int:
         manifest.pop("finished_at_utc", None)
     _write_state(run_dir, manifest)
     environment = _environment()
-    current_job: dict[str, Any] | None = None
     try:
         invocation = manifest["invocation_count"]
         preflight_path = _validated_write_path(
@@ -47362,8 +54019,7 @@ def main(argv: list[str] | None = None) -> int:
         if status:
             raise RuntimeError(f"GPU preflight failed with exit code {status}")
         preflight_result = _read_mapping(preflight_path, "gpu-preflight.json")
-        if preflight_result.get("status") != "passed":
-            raise RuntimeError("GPU preflight returned without a passed certificate")
+        _validate_hardware_preflight(preflight_result, args.hardware_profile)
         preflight_record = {
             "path": str(preflight_path),
             "sha256": _sha256(preflight_path),
@@ -47373,40 +54029,25 @@ def main(argv: list[str] | None = None) -> int:
         _write_state(run_dir, manifest)
         print(
             f"Run: {run_id}; {len(jobs)} child runs; "
-            f"{len(jobs) * len(MODELS)} fresh model trainings",
+            f"{len(jobs) * len(MODELS)} fresh model trainings; "
+            f"hardware={args.hardware_profile}; concurrency={args.job_concurrency}; "
+            f"batch={args.batch_size}; workers={args.workers}; amp={args.amp}",
             flush=True,
         )
-        for index, job in enumerate(jobs, start=1):
-            if job["status"] == "passed":
-                print(
-                    f"[{index}/{len(jobs)}] skip verified {job['suite']} / {job['profile']} / "
-                    f"model seed {job['model_seed']}",
-                    flush=True,
-                )
-                continue
-            current_job = job
-            _check_sources(manifest)
-            job["status"] = "running"
-            _write_state(run_dir, manifest)
-            print(
-                f"\n[{index}/{len(jobs)}] {job['suite']} / {job['profile']} / "
-                f"model seed {job['model_seed']} (fixed_bfs + multi_chart)",
-                flush=True,
-            )
-            started = time.monotonic()
-            status = _run_logged(job["command"], Path(job["log_path"]), environment)
-            job.update(exit_code=status, elapsed_seconds=time.monotonic() - started)
-            _check_sources(manifest)
-            if status:
-                raise RuntimeError(
-                    f"{job['suite']}/{job['profile']}/seed-{job['model_seed']} failed "
-                    f"with exit code {status}"
-                )
-            job["result"] = _validate_child(job)
-            job["status"] = "passed"
-            job.pop("error", None)
-            _write_state(run_dir, manifest)
-            current_job = None
+        candidate_positions = {id(job): index for index, job in enumerate(jobs, start=1)}
+        _execute_job_matrix(
+            jobs,
+            concurrency=args.job_concurrency,
+            environment=environment,
+            manifest=manifest,
+            run_dir=run_dir,
+            validator=_validate_child,
+            describe=lambda job: (
+                f"[{candidate_positions[id(job)]}/{len(jobs)}] {job['suite']} / "
+                f"{job['profile']} / model seed {job['model_seed']} "
+                "(fixed_bfs + multi_chart)"
+            ),
+        )
         _check_sources(manifest)
         selections, selected_jobs = _prepare_selected_jobs(
             args,
@@ -47417,44 +54058,24 @@ def main(argv: list[str] | None = None) -> int:
         manifest["selections"] = selections
         manifest["selected_test_jobs"] = selected_jobs
         _write_state(run_dir, manifest)
-        for selected_job in selected_jobs:
-            if selected_job["status"] == "passed":
-                print(
-                    f"[selected test] skip verified {selected_job['suite']} / "
-                    f"model seed {selected_job['model_seed']}",
-                    flush=True,
-                )
-                continue
-            current_job = selected_job
-            selection = selected_job["selection"]
-            model_seed = selected_job["model_seed"]
-            suite = selected_job["suite"]
-            selected_job["status"] = "running"
-            _write_state(run_dir, manifest)
-            print(
-                f"\n[selected test] {suite} / model seed {model_seed}: "
+
+        def selected_description(job: dict[str, Any]) -> str:
+            selection = job["selection"]
+            return (
+                f"[selected test] {job['suite']} / model seed {job['model_seed']}: "
                 f"fixed={selection['conditions']['fixed_bfs']['selected_profile']}, "
-                f"multi={selection['conditions']['multi_chart']['selected_profile']}",
-                flush=True,
+                f"multi={selection['conditions']['multi_chart']['selected_profile']}"
             )
-            started = time.monotonic()
-            status = _run_logged(
-                selected_job["command"], Path(selected_job["log_path"]), environment
-            )
-            selected_job.update(
-                exit_code=status,
-                elapsed_seconds=time.monotonic() - started,
-            )
-            _check_sources(manifest)
-            if status:
-                raise RuntimeError(
-                    f"{suite}/seed-{model_seed} selected test failed with exit code {status}"
-                )
-            selected_job["result"] = _validate_selected_test(selected_job)
-            selected_job["status"] = "passed"
-            selected_job.pop("error", None)
-            _write_state(run_dir, manifest)
-            current_job = None
+
+        _execute_job_matrix(
+            selected_jobs,
+            concurrency=args.job_concurrency,
+            environment=environment,
+            manifest=manifest,
+            run_dir=run_dir,
+            validator=_validate_selected_test,
+            describe=selected_description,
+        )
         _check_sources(manifest)
         manifest.update(
             status="passed",
@@ -47467,8 +54088,7 @@ def main(argv: list[str] | None = None) -> int:
             error=f"{type(error).__name__}: {error}",
             finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
         )
-        if current_job is not None:
-            current_job.update(status="failed", error=manifest["error"])
+        _stop_active_processes()
         _write_state(run_dir, manifest)
         print(
             f"Failed: {manifest['error']}\nSaved partial results: {run_dir}",
@@ -48787,7 +55407,7 @@ def test_disabled_bootstrap_keeps_multi_seed_statistics_but_is_explicitly_labell
     [
         ("conductance_gat", "cora", "conductance"),
         ("cycle_pe", "zinc12k", "cycle_set"),
-        ("cycle_pe", "zinc12k", "cycle_basis_v2"),
+        ("cycle_pe", "zinc12k", "cycle_projector_pe_v2"),
     ],
 )
 def test_benchmarks_aggregate_only_our_model_and_ignore_published_scores(
@@ -48864,7 +55484,7 @@ def test_cycle_v1_and_basis_v2_keep_independent_summary_and_efficiency_rows(
     for seed in (0, 1):
         output = tmp_path / f"seed-{seed}"
         models = {}
-        for model, offset in (("cycle_set", 0.1), ("cycle_basis_v2", 0.7)):
+        for model, offset in (("cycle_set", 0.1), ("cycle_projector_pe_v2", 0.7)):
             models[model] = {
                 "test": offset + seed * 0.02,
                 "validation": 9.0,
@@ -48922,11 +55542,11 @@ def test_cycle_v1_and_basis_v2_keep_independent_summary_and_efficiency_rows(
         summaries = {row["metric"]: row for row in csv.DictReader(stream)}
     assert set(summaries) == {
         "datasets.zinc12k.models.cycle_set.test",
-        "datasets.zinc12k.models.cycle_basis_v2.test",
+        "datasets.zinc12k.models.cycle_projector_pe_v2.test",
     }
     for model, expected_mean, expected_rule in (
         ("cycle_set", 0.11, "cycle.our_model.test"),
-        ("cycle_basis_v2", 0.71, "cycle.basis_v2.test"),
+        ("cycle_projector_pe_v2", 0.71, "cycle.basis_v2.test"),
     ):
         row = summaries[f"datasets.zinc12k.models.{model}.test"]
         assert float(row["mean"]) == pytest.approx(expected_mean)
@@ -48940,7 +55560,7 @@ def test_cycle_v1_and_basis_v2_keep_independent_summary_and_efficiency_rows(
     }
     assert {row["metric"] for row in efficiency} == {
         f"datasets.zinc12k.models.{model}.{metric}"
-        for model in ("cycle_set", "cycle_basis_v2")
+        for model in ("cycle_set", "cycle_projector_pe_v2")
         for metric in ("trainable_parameters", "elapsed_seconds", "peak_gpu_memory_bytes")
     }
     with (tmp_path / "aggregate" / "paired.csv").open(encoding="utf-8", newline="") as stream:
@@ -49921,7 +56541,10 @@ def test_compiled_full_model_blocks_preserve_forward_backward_and_empty_graphs(m
         (expected.square() * weights).sum().backward()
         _compare_parameter_gradients(model, reference)
     assert counts
-    assert set(executions) == set(report["compiled_modules"])
+    # The deep backbone has more heterogeneous Sequential layouts than this
+    # deliberately shared counted backend's recompile cache admits.
+    assert set(executions).issubset(set(report["compiled_modules"]))
+    assert {"pe_encoder.column_phi", "layers.0.message"}.issubset(executions)
     assert all(count <= 3 for count in counts.values()), counts
     reference.load_state_dict(model.state_dict(), strict=True)
 ````
@@ -52471,6 +59094,7 @@ from research.conductance_gat.ablation import train as ablation_train
 from research.conductance_gat.v2 import train as v2_train
 from research.conductance_gat.v3 import train as v3_train
 from research.conductance_gat.v4 import train as v4_train
+from research.conductance_gat.v5 import train as v5_train
 from scripts import run_conductance_scaling as runner
 
 
@@ -52481,15 +59105,21 @@ def _argument(command: list[str], name: str) -> str:
 def test_default_plan_covers_all_versions_profiles_seed_zero_and_supported_datasets():
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
-    assert args.versions == ["v1", "v2", "v3", "v4"]
-    assert args.profiles == ["base", "wide", "deep", "large"]
+    assert args.versions == ["v1", "v2", "v3", "v4", "v5"]
+    assert args.profiles == ["reference", "large"]
     assert args.model_seeds == [0]
-    assert len(jobs) == 172
+    assert len(jobs) == 106
     assert {job["profile"] for job in jobs} == set(runner.PROFILES)
     assert {job["model_seed"] for job in jobs} == set(runner.DEFAULT_MODEL_SEEDS)
     assert not any(job["version"] == "v2" and job["dataset"] == "ppi" for job in jobs)
     assert any(job["version"] == "v1" and job["dataset"] == "ppi" for job in jobs)
     assert any(job["version"] == "v4" and job["dataset"] == "ppi" for job in jobs)
+    assert any(job["version"] == "v5" and job["dataset"] == "ppi" for job in jobs)
+    v5_jobs = [job for job in jobs if job["version"] == "v5"]
+    assert all(job["architecture"]["beta_parameterization"] == "sigmoid" for job in v5_jobs)
+    assert all(job["architecture"]["beta_initial"] == 0.1 for job in v5_jobs)
+    assert all("beta_min" not in job["architecture"] for job in v5_jobs)
+    assert all(_argument(job["command"], "--beta-initial") == "0.1" for job in v5_jobs)
 
 
 @pytest.mark.parametrize(
@@ -52536,13 +59166,23 @@ def test_large_profile_is_forwarded_to_every_child_and_outputs_are_unique():
     )
     runner._validate(args)
     jobs = runner.make_jobs(args, Path("fixture"))
-    assert len(jobs) == 18
+    assert len(jobs) == 22
     assert len({job["output_dir"] for job in jobs}) == len(jobs)
     for job in jobs:
-        assert _argument(job["command"], "--hidden-channels") == "128"
-        assert _argument(job["command"], "--layers") == "4"
-        assert _argument(job["command"], "--dropout") == "0.5"
-        assert job["architecture"] == runner.PROFILES["large"]
+        assert _argument(job["command"], "--hidden-channels") == "384"
+        assert _argument(job["command"], "--layers") == "12"
+        assert _argument(job["command"], "--dropout") == "0.2"
+        expected_architecture = {
+            key: runner.PROFILES["large"][key] for key in ("hidden_channels", "layers", "dropout")
+        }
+        if job["version"] == "v5":
+            expected_architecture.update(
+                heads=8,
+                ffn_multiplier=4,
+                beta_parameterization="sigmoid",
+                beta_initial=0.1,
+            )
+        assert job["architecture"] == expected_architecture
         module = _argument(job["command"], "-m")
         if job["version"] == "v1":
             assert module == "research.conductance_gat.scaling_v1"
@@ -52555,7 +59195,7 @@ def test_explicit_ppi_records_v2_as_not_applicable_instead_of_inventing_transfer
     args = runner.parser().parse_args(["--datasets", "ppi"])
     jobs = runner.make_jobs(args, Path("fixture"))
     exclusions = runner._exclusions(args)
-    assert {job["version"] for job in jobs} == {"v1", "v3", "v4"}
+    assert {job["version"] for job in jobs} == {"v1", "v3", "v4", "v5"}
     assert exclusions == [
         {
             "version": "v2",
@@ -52567,6 +59207,78 @@ def test_explicit_ppi_records_v2_as_not_applicable_instead_of_inventing_transfer
             ),
         }
     ]
+
+
+def test_a6000_profile_runs_large_v5_work_first_and_binds_resolved_execution():
+    args = runner.parser().parse_args(
+        [
+            "--versions",
+            "v5",
+            "--profiles",
+            "reference",
+            "--datasets",
+            "cora",
+            "ppi",
+            "ogbn-arxiv",
+            "--hardware-profile",
+            "a6000-48gb",
+        ]
+    )
+    runner._validate(args)
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert jobs[0]["dataset"] == "ogbn-arxiv"
+    ppi = next(job for job in jobs if job["dataset"] == "ppi")
+    assert ppi["execution"]["batch_size"] == 8
+    assert ppi["execution"]["precision"] == "bf16"
+    assert ppi["execution"]["tf32"] is True
+    assert ppi["execution"]["activation_checkpoint"] is False
+    assert ppi["command"].count("--edge-chunk-size") == 1
+    assert _argument(ppi["command"], "--edge-chunk-size") == "131072"
+    cora = next(job for job in jobs if job["dataset"] == "cora")
+    assert "expected low occupancy" in cora["occupancy_expectation"]
+
+
+def test_v5_margin_beta_ablation_is_validated_and_forwarded_by_scaling_runner():
+    args = runner.parser().parse_args(
+        [
+            "--versions",
+            "v5",
+            "--profiles",
+            "reference",
+            "--datasets",
+            "cora",
+            "--v5-beta-parameterization",
+            "margin_sigmoid",
+            "--v5-beta-initial",
+            "0.5",
+            "--v5-beta-min",
+            "0.05",
+            "--v5-beta-max",
+            "0.95",
+        ]
+    )
+    runner._validate(args)
+    jobs = runner.make_jobs(args, Path("fixture"))
+    for job in jobs:
+        assert {
+            key: job["architecture"][key]
+            for key in ("beta_parameterization", "beta_initial", "beta_min", "beta_max")
+        } == {
+            "beta_parameterization": "margin_sigmoid",
+            "beta_initial": 0.5,
+            "beta_min": 0.05,
+            "beta_max": 0.95,
+        }
+        child = v5_train.build_parser().parse_args(job["command"][5:])
+        v5_train.validate_args(child)
+        assert (child.beta_parameterization, child.beta_initial) == ("margin_sigmoid", 0.5)
+        assert (child.beta_min, child.beta_max) == (0.05, 0.95)
+
+
+def test_v5_default_beta_rejects_irrelevant_margin_flags_in_scaling_runner():
+    args = runner.parser().parse_args(["--v5-beta-min", "0.05"])
+    with pytest.raises(ValueError, match="only valid for margin_sigmoid"):
+        runner._validate(args)
 
 
 @pytest.mark.parametrize("option", ["--help", "--dry-run"])
@@ -52583,7 +59295,7 @@ def test_stdlib_inspection_has_no_writes(tmp_path, option):
             "--versions",
             "v1",
             "--profiles",
-            "base",
+            "reference",
             "--datasets",
             "cora",
             "--model-seeds",
@@ -52708,7 +59420,13 @@ def test_v1_validation_only_path_does_not_construct_a_test_loader(monkeypatch):
     assert 3 not in observed
 
 
-def _stub(tmp_path, monkeypatch, *, expose_test: bool = False):
+def _stub(
+    tmp_path,
+    monkeypatch,
+    *,
+    expose_test: bool = False,
+    preflight_gpu: dict | None = None,
+):
     calls: list[list[str]] = []
     monkeypatch.setattr(runner, "check_dependencies", lambda: {"unit_fixture_only": True})
     monkeypatch.setattr(runner, "_source_snapshot", lambda: {"unit-source": "stable"})
@@ -52716,6 +59434,23 @@ def _stub(tmp_path, monkeypatch, *, expose_test: bool = False):
     def dispatch(command, log, environment):
         calls.append(command)
         if any(Path(part).name == "gpu_preflight.py" for part in command):
+            json_out = Path(_argument(command, "--json-out"))
+            json_out.parent.mkdir(parents=True, exist_ok=True)
+            json_out.write_text(
+                json.dumps(
+                    {
+                        "status": "passed",
+                        "gpu": preflight_gpu
+                        or {
+                            "name": "NVIDIA RTX A6000 fixture",
+                            "total_bytes": 48 * 1024**3,
+                            "free_bytes": 47 * 1024**3,
+                            "compute_capability": [8, 6],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             return 0
         output = Path(_argument(command, "--output-dir"))
         output.mkdir(parents=True)
@@ -52758,7 +59493,7 @@ def _stub(tmp_path, monkeypatch, *, expose_test: bool = False):
         "v1",
         "v4",
         "--profiles",
-        "base",
+        "reference",
         "--datasets",
         "cora",
         "--model-seeds",
@@ -52776,11 +59511,106 @@ def test_success_is_released_only_after_every_child_metric_is_valid(tmp_path, mo
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "passed"
+    preflight = manifest["gpu_preflight"]
+    assert preflight["status"] == "passed"
+    assert preflight["hardware_profile"] == "portable"
+    assert preflight["sha256"] == runner._sha256(Path(preflight["path"]))
+    assert preflight["gpu"]["name"] == "NVIDIA RTX A6000 fixture"
+    assert preflight["requirements"] == runner._hardware_requirements("portable")
     assert all(job["status"] == "passed" for job in manifest["jobs"])
     assert summary["valid_for_validation_comparison"] is True
     assert summary["test_evaluated"] is False
     assert {row["n"] for row in summary["rows"]} == {2}
     assert all(row["validation_mean"] == 0.75 for row in summary["rows"])
+
+
+def test_hardware_preflight_schema_rejects_bool_and_malformed_gpu_fields():
+    valid = {
+        "status": "passed",
+        "gpu": {
+            "name": "NVIDIA RTX A6000 fixture",
+            "total_bytes": 48 * 1024**3,
+            "free_bytes": 47 * 1024**3,
+            "compute_capability": [8, 6],
+        },
+    }
+    accepted = runner._validate_hardware_preflight(valid, "a6000-48gb")
+    assert accepted["hardware_profile"] == "a6000-48gb"
+    assert accepted["requirements"]["minimum_total_memory_bytes"] == 40 * 1024**3
+
+    for key, value in (
+        ("total_bytes", True),
+        ("free_bytes", False),
+        ("compute_capability", [True, 0]),
+    ):
+        malformed = json.loads(json.dumps(valid))
+        malformed["gpu"][key] = value
+        with pytest.raises(RuntimeError, match="GPU preflight"):
+            runner._validate_hardware_preflight(malformed, "a6000-48gb")
+
+
+@pytest.mark.parametrize(
+    "gpu,error",
+    [
+        (
+            {
+                "name": "MIG 1g.10gb fixture",
+                "total_bytes": 10 * 1024**3,
+                "free_bytes": 9 * 1024**3,
+                "compute_capability": [8, 0],
+            },
+            "40 GiB",
+        ),
+        (
+            {
+                "name": "NVIDIA RTX A6000 fixture",
+                "total_bytes": 48 * 1024**3,
+                "free_bytes": 31 * 1024**3,
+                "compute_capability": [8, 6],
+            },
+            "32 GiB",
+        ),
+        (
+            {
+                "name": "48 GiB legacy fixture",
+                "total_bytes": 48 * 1024**3,
+                "free_bytes": 47 * 1024**3,
+                "compute_capability": [7, 5],
+            },
+            "8.0",
+        ),
+    ],
+)
+def test_a6000_hardware_preflight_enforces_capacity_free_memory_and_capability(gpu, error):
+    with pytest.raises(RuntimeError, match=error):
+        runner._validate_hardware_preflight({"status": "passed", "gpu": gpu}, "a6000-48gb")
+
+
+def test_a6000_legacy_only_plan_rejects_mig_before_any_child_launch(tmp_path, monkeypatch):
+    options, calls = _stub(
+        tmp_path,
+        monkeypatch,
+        preflight_gpu={
+            "name": "MIG 1g.10gb fixture",
+            "total_bytes": 10 * 1024**3,
+            "free_bytes": 9 * 1024**3,
+            "compute_capability": [8, 0],
+        },
+    )
+    options.remove("v4")
+    options += ["--hardware-profile", "a6000-48gb"]
+
+    assert runner.main(options) == 1
+    assert len(calls) == 1
+    assert any(Path(part).name == "gpu_preflight.py" for part in calls[0])
+    manifest = json.loads(
+        (tmp_path / "conductance_gat/scaling/unit-fixture/manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["status"] == "failed"
+    assert all(job["status"] == "pending" for job in manifest["jobs"])
+    assert "gpu_preflight" not in manifest
 
 
 def test_completed_run_is_verified_and_reused_without_any_execution(tmp_path, monkeypatch):
@@ -55224,6 +62054,356 @@ def test_source_snapshot_covers_all_v4_and_shared_execution_code():
         assert name in snapshot and len(snapshot[name]) == 64
 ````
 
+# tests/test_conductance_v5_runner.py
+
+````python
+"""V5 orchestration contracts; no GPU training is launched."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from research.conductance_gat.v5 import train
+from scripts import run_conductance_v5 as runner
+
+
+def _value(command: list[str], option: str) -> str:
+    return command[command.index(option) + 1]
+
+
+def test_reference_plan_parses_with_real_child_cli_and_memory_controls(tmp_path):
+    args = runner.parser().parse_args(["--datasets", "ogbn-arxiv", "--results-root", str(tmp_path)])
+    runner._validate(args)
+    architecture = runner._architecture(args)
+    jobs = runner.make_jobs(args, tmp_path / "run", architecture)
+    assert architecture == {
+        "hidden_channels": 256,
+        "layers": 8,
+        "heads": 8,
+        "ffn_multiplier": 4,
+        "dropout": 0.2,
+        "beta_parameterization": "sigmoid",
+        "beta_initial": 0.1,
+    }
+    assert len(jobs) == 2
+    assert {job["condition"] for job in jobs} == {"fixed_c", "shared_dynamic_c"}
+    assert {job["sampling"] for job in jobs} == {"cluster"}
+    for job in jobs:
+        child = train.build_parser().parse_args(job["command"][5:])
+        assert child.sample_seed_batch_size == 1024
+        assert child.activation_checkpoint is True
+        assert child.num_neighbors == [15, 10]
+        assert child.hidden_channels == 256 and child.layers == 8 and child.heads == 8
+        assert child.beta_parameterization == "sigmoid" and child.beta_initial == 0.1
+        assert child.beta_min is None and child.beta_max is None
+
+
+def test_margin_beta_ablation_is_validated_and_forwarded_to_every_child(tmp_path):
+    options = [
+        "--datasets",
+        "cora",
+        "--beta-parameterization",
+        "margin_sigmoid",
+        "--beta-initial",
+        "0.5",
+        "--beta-min",
+        "0.05",
+        "--beta-max",
+        "0.95",
+    ]
+    args = runner.parser().parse_args(options)
+    runner._validate(args)
+    architecture = runner._architecture(args)
+    assert architecture["beta_parameterization"] == "margin_sigmoid"
+    assert architecture["beta_initial"] == 0.5
+    assert architecture["beta_min"] == 0.05
+    assert architecture["beta_max"] == 0.95
+    jobs = runner.make_jobs(args, tmp_path / "run", architecture)
+    for job in jobs:
+        child = train.build_parser().parse_args(job["command"][5:])
+        train.validate_args(child)
+        assert child.beta_parameterization == "margin_sigmoid"
+        assert (child.beta_initial, child.beta_min, child.beta_max) == (0.5, 0.05, 0.95)
+
+
+def test_default_runner_contract_contains_no_irrelevant_beta_margins():
+    args = runner.parser().parse_args(["--datasets", "cora"])
+    architecture = runner._architecture(args)
+    assert architecture["beta_parameterization"] == "sigmoid"
+    assert architecture["beta_initial"] == 0.1
+    assert "beta_min" not in architecture and "beta_max" not in architecture
+    invalid = runner.parser().parse_args(["--datasets", "cora", "--beta-min", "0.05"])
+    with pytest.raises(ValueError, match="only valid for margin_sigmoid"):
+        runner._validate(invalid)
+
+
+def test_ppi_auto_uses_full_graph_and_graph_batch_two(tmp_path):
+    args = runner.parser().parse_args(["--datasets", "ppi"])
+    jobs = runner.make_jobs(args, tmp_path / "run", runner._architecture(args))
+    assert {job["sampling"] for job in jobs} == {"full"}
+    assert {_value(job["command"], "--batch-size") for job in jobs} == {"2"}
+    assert {job["batch_size"] for job in jobs} == {2}
+
+
+def test_a6000_profile_forwards_real_larger_batches_and_numeric_policy(tmp_path):
+    args = runner.parser().parse_args(
+        ["--datasets", "ogbn-arxiv", "ppi", "--hardware-profile", "a6000-48gb"]
+    )
+    runner._validate(args)
+    jobs = runner.make_jobs(args, tmp_path / "run", runner._architecture(args))
+    arxiv = next(job for job in jobs if job["dataset"] == "ogbn-arxiv")
+    ppi = next(job for job in jobs if job["dataset"] == "ppi")
+    assert arxiv["execution"] == {
+        "hardware_profile": "a6000-48gb",
+        "precision": "bf16",
+        "tf32": True,
+        "batch_size": 1,
+        "sample_seed_batch_size": 2048,
+        "edge_chunk_size": 131072,
+        "activation_checkpoint": False,
+        "sample_prefetch": True,
+        "pin_memory": True,
+    }
+    assert ppi["batch_size"] == 8
+    assert _value(ppi["command"], "--batch-size") == "8"
+    assert "--no-activation-checkpoint" in ppi["command"]
+
+
+def test_runner_rejects_batch_override_that_would_change_dataset_contract():
+    args = runner.parser().parse_args(["--batch-size", "2"])
+    with pytest.raises(ValueError, match="runner-level batch size must be 1"):
+        runner._validate(args)
+
+
+def test_same_run_preserves_last_checkpoint_and_adds_resume(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "check_dependencies", lambda: {"fixture": True})
+    monkeypatch.setattr(runner, "_source_snapshot", lambda: {"source": "stable"})
+    monkeypatch.setattr(runner, "_write_comparison", lambda *_args: None)
+    attempts: list[list[str]] = []
+    first = True
+
+    def dispatch(command, _log, _environment):
+        nonlocal first
+        if any(Path(item).name == "gpu_preflight.py" for item in command):
+            return 0
+        attempts.append(list(command))
+        output = Path(_value(command, "--output-dir"))
+        output.mkdir(parents=True, exist_ok=True)
+        if first:
+            first = False
+            (output / "last.pt").write_bytes(b"resume-state")
+            return 9
+        configuration = {
+            **runner._architecture(runner.parser().parse_args(["--datasets", "cora"])),
+            "sampling": _value(command, "--sampling"),
+            "batch_size": int(_value(command, "--batch-size")),
+            "hardware_profile": _value(command, "--hardware-profile"),
+            "precision": "fp32",
+            "tf32": False,
+            "edge_chunk_size": int(_value(command, "--edge-chunk-size")),
+        }
+        hardware_execution = {
+            "profile": "portable",
+            "precision": "fp32",
+            "tf32": False,
+            "activation_checkpoint": "--activation-checkpoint" in command,
+            "edge_chunk_size": int(_value(command, "--edge-chunk-size")),
+            "sample_seed_batch_size": int(_value(command, "--sample-seed-batch-size")),
+            "graph_batch_size": int(_value(command, "--batch-size")),
+            "sample_prefetch": False,
+            "pin_memory": True,
+        }
+        (output / "metrics.json").write_text(
+            json.dumps(
+                {
+                    "status": "passed",
+                    "dataset": _value(command, "--dataset"),
+                    "condition": _value(command, "--condition"),
+                    "model_seed": int(_value(command, "--model-seed")),
+                    "evaluation_split": "validation",
+                    "test_evaluated": False,
+                    "configuration": configuration,
+                    "validation": 0.5,
+                    "metric_name": "accuracy",
+                    "best_epoch": 2,
+                    "epochs_run": 3,
+                    "trainable_parameters": 1_000_000,
+                    "peak_cuda_allocated_bytes": 1024,
+                    "peak_cuda_reserved_bytes": 2048,
+                    "hardware_execution": hardware_execution,
+                    "throughput": {"training_batches_per_elapsed_second": 1.0},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr(runner.shared, "run_logged", dispatch)
+    options = [
+        "--datasets",
+        "cora",
+        "--results-root",
+        str(tmp_path),
+        "--run-id",
+        "resume-v5",
+    ]
+    assert runner.main(options) == 1
+    assert runner.main(options) == 0
+    assert "--resume" in attempts[1]
+    assert (tmp_path / "conductance_gat/v5/resume-v5/cora/fixed_c/last.pt").read_bytes() == (
+        b"resume-state"
+    )
+````
+
+# tests/test_cycle_pe_v2_projector.py
+
+````python
+"""Mathematical and integration contracts for rebuilt Cycle PE v2."""
+
+from __future__ import annotations
+
+import inspect
+
+import numpy as np
+import torch
+from scipy import sparse
+
+from research.cycle_pe.v2.basis import (
+    incidence_and_cycle_rank,
+    left_nullspace_basis,
+    sparse_left_nullspace_basis,
+    validate_cycle_basis,
+)
+from research.cycle_pe.v2.data import Graph, collate
+from research.cycle_pe.v2.model import CycleBasisPEModel, LeftNullBasisEncoder
+
+EDGES = np.asarray([(0, 1), (2, 1), (2, 0), (3, 4), (5, 4), (5, 3)], dtype=np.int64).T
+
+
+def _projector(basis: np.ndarray) -> np.ndarray:
+    q, _ = np.linalg.qr(basis.astype(np.float64), mode="reduced")
+    return q @ q.T
+
+
+def test_sparse_basis_has_exact_cycle_dimension_and_is_in_left_nullspace():
+    # Two triangles plus isolated node 6: m-n+c = 6-7+3 = 2.
+    incidence, rank = incidence_and_cycle_rank(7, EDGES)
+    basis = sparse_left_nullspace_basis(7, EDGES)
+    assert sparse.isspmatrix_csr(basis)
+    assert rank == 2 and basis.shape == (6, 2)
+    np.testing.assert_allclose(incidence.T @ basis.toarray(), 0.0, atol=0.0)
+    assert np.linalg.matrix_rank(basis.toarray()) == rank
+    validate_cycle_basis(7, EDGES, basis)
+
+    q = left_nullspace_basis(7, EDGES)
+    np.testing.assert_allclose(q.T @ q, np.eye(rank), atol=2e-6)
+    np.testing.assert_allclose(incidence.T @ q, 0.0, atol=2e-6)
+
+
+def test_cycle_space_projector_transforms_correctly_under_orientation_and_permutation():
+    q = left_nullspace_basis(7, EDGES)
+    projector = _projector(q)
+
+    signs = np.asarray([-1, 1, -1, 1, -1, 1], dtype=np.float64)
+    flipped_edges = EDGES.copy()
+    flipped = signs < 0
+    flipped_edges[:, flipped] = flipped_edges[::-1, flipped]
+    q_flipped = left_nullspace_basis(7, flipped_edges)
+    np.testing.assert_allclose(
+        _projector(q_flipped), signs[:, None] * projector * signs[None, :], atol=2e-6
+    )
+
+    permutation = np.asarray([5, 2, 0, 4, 1, 3])
+    q_permuted = left_nullspace_basis(7, EDGES[:, permutation])
+    np.testing.assert_allclose(
+        _projector(q_permuted), projector[np.ix_(permutation, permutation)], atol=2e-6
+    )
+
+
+def test_projector_kernel_encoder_is_basis_and_orientation_invariant_and_permutation_equivariant():
+    torch.manual_seed(9)
+    q = torch.from_numpy(left_nullspace_basis(7, EDGES))
+    bond = torch.randn(6, 5)
+    encoder = LeftNullBasisEncoder(5, 7).eval()
+    reference = encoder(bond, q)
+
+    change = torch.tensor([[2.0, -0.5], [0.75, 1.5]])
+    torch.testing.assert_close(encoder(bond, q @ change), reference, atol=3e-5, rtol=3e-5)
+
+    signs = torch.tensor([-1.0, 1.0, -1.0, 1.0, -1.0, 1.0])
+    torch.testing.assert_close(encoder(bond, signs[:, None] * q), reference, atol=3e-5, rtol=3e-5)
+
+    permutation = torch.tensor([5, 2, 0, 4, 1, 3])
+    actual = encoder(bond[permutation], q[permutation])
+    torch.testing.assert_close(actual, reference[permutation], atol=3e-5, rtol=3e-5)
+
+    chunked = encoder.forward_batch(bond, (q,), pair_budget=7, orthonormal_input=True)
+    torch.testing.assert_close(chunked, reference, atol=3e-5, rtol=3e-5)
+
+
+def test_pair_free_low_rank_contraction_matches_explicit_kernel_and_bounds_core(monkeypatch):
+    torch.manual_seed(19)
+    q, _ = torch.linalg.qr(torch.randn(23, 4), mode="reduced")
+    values = torch.randn(23, 6, requires_grad=True)
+    encoder = LeftNullBasisEncoder(6, 8)
+    original_einsum = torch.einsum
+    core_sizes = []
+
+    def observed(equation, *operands):
+        result = original_einsum(equation, *operands)
+        if equation == "md,ma,mb->dab":
+            core_sizes.append(result.numel())
+        return result
+
+    monkeypatch.setattr(torch, "einsum", observed)
+    actual, leverage = encoder._projector_mix(q, values, pair_budget=7)
+    projector = q @ q.T
+    expected = projector.square() @ values
+    torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+    torch.testing.assert_close(leverage, projector.diagonal(), atol=2e-6, rtol=2e-6)
+    actual.square().sum().backward()
+    assert values.grad is not None and torch.isfinite(values.grad).all()
+    assert core_sizes and max(core_sizes) <= 7
+    source = inspect.getsource(LeftNullBasisEncoder._projector_mix)
+    assert "projector_rows" not in source and "@ q.T" not in source
+
+
+def _graph(num_nodes: int, edges: list[tuple[int, int]]) -> Graph:
+    edge_index = torch.tensor(edges, dtype=torch.long).reshape(-1, 2).T
+    q = left_nullspace_basis(num_nodes, edge_index.numpy())
+    return Graph(
+        x=torch.arange(num_nodes, dtype=torch.long).remainder(28)[:, None],
+        edge_index=edge_index,
+        edge_attr=torch.zeros(len(edges), 1, dtype=torch.long),
+        y=torch.zeros(1),
+        cycle_basis=torch.from_numpy(q),
+        cycle_basis_is_orthonormal=torch.tensor(True),
+    )
+
+
+def test_deep_residual_model_runs_forward_backward_with_cycle_forest_and_isolate():
+    cyclic = _graph(4, [(0, 1), (1, 2), (2, 3), (0, 3), (0, 2)])
+    forest = _graph(3, [(0, 1)])
+    batch = collate([cyclic, forest])
+    model = CycleBasisPEModel(
+        dataset="zinc12k",
+        hidden=16,
+        pe_dim=8,
+        layers=6,
+        ffn_multiplier=2,
+        dropout=0.0,
+        basis_pair_budget=8,
+    )
+    prediction = model(batch)
+    assert prediction.shape == (2, 1) and torch.isfinite(prediction).all()
+    prediction.square().mean().backward()
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.requires_grad]
+    assert any(gradient is not None and torch.isfinite(gradient).all() for gradient in gradients)
+````
+
 # tests/test_cycle_scaling_runner.py
 
 ````python
@@ -55233,6 +62413,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import inspect
 import json
 from pathlib import Path
 
@@ -55251,7 +62432,7 @@ def test_default_matrix_runs_both_versions_all_profiles_and_seed_zero(tmp_path):
     jobs = scaling.make_jobs(args, scaling._run_dir(args, "matrix"))
     assert args.model_seeds == (0,)
     assert len(jobs) == 8
-    assert len(jobs) * len(args.datasets) == 16
+    assert len(jobs) == 8
     manifest = scaling._manifest_base(
         args,
         "matrix",
@@ -55261,12 +62442,15 @@ def test_default_matrix_runs_both_versions_all_profiles_and_seed_zero(tmp_path):
         {"source": "stable"},
     )
     assert manifest["fresh_child_runs"] == 8
-    assert manifest["fresh_dataset_trainings"] == 16
+    assert manifest["fresh_dataset_trainings"] == 8
     assert manifest["selected_test_evaluations_planned"] == 4
     assert {(job["version"], job["profile"]) for job in jobs} == {
         (version, profile) for version in scaling.VERSIONS for profile in scaling.PROFILE_ORDER
     }
-    assert all(job["datasets"] == ["zinc12k", "peptides_struct"] for job in jobs)
+    assert {tuple(job["datasets"]) for job in jobs} == {
+        ("zinc12k",),
+        ("peptides_struct",),
+    }
     assert len({job["output_dir"] for job in jobs}) == len(jobs)
 
 
@@ -55294,28 +62478,160 @@ def test_child_commands_use_real_version_cli_and_exact_profile(version, profile,
         else __import__("research.cycle_pe.v2.benchmark", fromlist=["parser"]).parser
     )
     child = child_parser().parse_args(command[5:])
-    expected = scaling.PROFILES[profile]
+    dataset = job["datasets"][0]
+    expected = scaling._profile_config(profile, dataset, version)
     assert (child.hidden_dim, child.pe_dim, child.layers) == (
         expected["hidden_dim"],
         expected["pe_dim"],
         expected["layers"],
     )
-    assert child.datasets == ["zinc12k", "peptides_struct"]
+    assert child.datasets == [dataset]
     assert child.model_seed == 7 and child.device == "cuda:0"
-    assert child.max_parameters == 5_000_000
+    assert child.max_parameters == 50_000_000
     assert child.validation_only is True
     assert child.test_checkpoint is None
     if version == "v2":
+        assert child.basis_backend == "thin_q"
         assert child.basis_execution == "batched" and child.basis_pair_budget == 32768
 
 
-def test_profiles_include_independent_width_depth_and_combined_growth():
+def test_dfs_basis_backend_is_forwarded_only_to_v2_and_bound_to_run_identity(tmp_path):
+    args = _args(
+        "--versions",
+        "v1",
+        "v2",
+        "--profiles",
+        "reference",
+        "--datasets",
+        "zinc12k",
+        "--basis-backend",
+        "dfs_fundamental",
+        "--results-root",
+        str(tmp_path),
+    )
+    scaling._validate(args)
+    jobs = scaling.make_jobs(args, scaling._run_dir(args, "dfs"))
+    v1, v2 = sorted(jobs, key=lambda job: job["version"])
+    assert "--basis-backend" not in v1["command"]
+    assert v1["resources"]["basis_backend"] is None
+    assert v2["command"][v2["command"].index("--basis-backend") + 1] == "dfs_fundamental"
+    assert v2["resources"]["basis_backend"] == "dfs_fundamental"
+    assert scaling._run_configuration(args)["basis_backend"] == "dfs_fundamental"
+
+    v1_only = _args("--versions", "v1", "--basis-backend", "dfs_fundamental")
+    with pytest.raises(ValueError, match="requires v2"):
+        scaling._validate(v1_only)
+
+
+def test_profiles_are_dataset_aware_reference_scale_and_large():
     assert scaling.PROFILES == {
-        "base": {"hidden_dim": 64, "pe_dim": 32, "layers": 3},
-        "wide": {"hidden_dim": 128, "pe_dim": 64, "layers": 3},
-        "deep": {"hidden_dim": 64, "pe_dim": 32, "layers": 6},
-        "large": {"hidden_dim": 128, "pe_dim": 64, "layers": 6},
+        "reference": {
+            "zinc12k": {
+                "hidden_dim": 128,
+                "pe_dim": 64,
+                "layers": 10,
+                "ffn_multiplier": 4,
+                "dropout": 0.1,
+                "layer_scale": 0.1,
+            },
+            "peptides_struct": {
+                "hidden_dim": 256,
+                "pe_dim": 64,
+                "layers": 6,
+                "ffn_multiplier": 4,
+                "dropout": 0.1,
+                "layer_scale": 0.1,
+            },
+        },
+        "large": {
+            "zinc12k": {
+                "hidden_dim": 192,
+                "pe_dim": 96,
+                "layers": 12,
+                "ffn_multiplier": 4,
+                "dropout": 0.1,
+                "layer_scale": 0.1,
+            },
+            "peptides_struct": {
+                "hidden_dim": 320,
+                "pe_dim": 96,
+                "layers": 8,
+                "ffn_multiplier": 4,
+                "dropout": 0.1,
+                "layer_scale": 0.1,
+            },
+        },
     }
+
+
+def test_a6000_profile_uses_static_dataset_batches_amp_and_heavy_first(tmp_path):
+    args = _args(
+        "--hardware-profile",
+        "a6000-48gb",
+        "--results-root",
+        str(tmp_path),
+    )
+    jobs = scaling.make_jobs(args, scaling._run_dir(args, "a6000"))
+    assert jobs[0]["version"] == "v2"
+    assert jobs[0]["profile"] == "large"
+    assert jobs[0]["datasets"] == ["peptides_struct"]
+    expected_batches = {
+        ("reference", "zinc12k"): 512,
+        ("reference", "peptides_struct"): 128,
+        ("large", "zinc12k"): 256,
+        ("large", "peptides_struct"): 64,
+    }
+    for job in jobs:
+        resources = job["resources"]
+        dataset = job["datasets"][0]
+        assert resources["batch_size"] == expected_batches[job["profile"], dataset]
+        assert resources["workers"] == 8
+        assert resources["amp"] is True
+        command = job["command"]
+        assert command[command.index("--batch-size") + 1] == str(resources["batch_size"])
+        assert "--amp" in command
+        if job["version"] == "v2":
+            assert resources["prefetch_factor"] == 4
+            assert resources["basis_pair_budget"] == 4_194_304
+            assert command[command.index("--hardware-profile") + 1] == "a6000-48gb"
+        else:
+            assert resources["prefetch_factor"] == 2
+            assert resources["basis_pair_budget"] is None
+            assert "--prefetch-factor" not in command
+
+
+@pytest.mark.parametrize(
+    "gpu,passes",
+    [
+        ({"total_bytes": 48 * 1024**3, "compute_capability": [8, 6]}, True),
+        ({"total_bytes": 10 * 1024**3, "compute_capability": [8, 0]}, False),
+        ({"total_bytes": 48 * 1024**3, "compute_capability": [7, 5]}, False),
+    ],
+)
+def test_a6000_capacity_guard_is_capacity_based_not_name_based(gpu, passes):
+    report = {"gpu": {"name": "arbitrary", **gpu}}
+    if passes:
+        scaling._validate_preflight_hardware("a6000-48gb", report)
+    else:
+        with pytest.raises(ValueError, match="40 GiB"):
+            scaling._validate_preflight_hardware("a6000-48gb", report)
+    scaling._validate_preflight_hardware("portable", report)
+
+
+def test_v2_test_only_admission_binds_every_a6000_runtime_field():
+    source = inspect.getsource(scaling.read_test_result)
+    for field in (
+        "ffn_multiplier",
+        "column_chunk_size",
+        "basis_pair_budget",
+        "prefetch_factor",
+        "hardware_profile",
+        "effective_batch_size",
+        "packed_cycle_basis_h2d_tensors_per_batch",
+        "peak_gpu_reserved_bytes",
+        "projector_contraction",
+    ):
+        assert field in source
 
 
 def test_direct_runner_environment_explicitly_unsets_nvml_cuda_check(monkeypatch):
@@ -55339,9 +62655,9 @@ def _row(version: str, dataset: str, profile: str, seed: int, validation: float)
         "profile": profile,
         "dataset": dataset,
         "model_seed": seed,
-        "config": dict(scaling.PROFILES[profile]),
+        "config": scaling._profile_config(profile, dataset, version),
         "validation_mae": validation,
-        "trainable_parameters": 100 if profile == "base" else 200,
+        "trainable_parameters": 100 if profile == "reference" else 200,
         "elapsed_seconds": 10.0,
         "peak_gpu_memory_bytes": 1024,
         "best_epoch": 3,
@@ -55356,23 +62672,23 @@ def _row(version: str, dataset: str, profile: str, seed: int, validation: float)
 
 def test_profile_selection_uses_mean_validation_and_one_common_profile():
     rows = [
-        _row("v1", "zinc12k", "base", 0, 0.10),
+        _row("v1", "zinc12k", "reference", 0, 0.10),
         _row("v1", "zinc12k", "large", 0, 0.20),
-        _row("v1", "zinc12k", "base", 1, 0.30),
+        _row("v1", "zinc12k", "reference", 1, 0.30),
         _row("v1", "zinc12k", "large", 1, 0.30),
     ]
     summary = scaling.build_summary(
         rows,
         versions=["v1"],
         datasets=["zinc12k"],
-        profiles=["base", "large"],
+        profiles=["reference", "large"],
         model_seeds=(0, 1),
         complete=True,
     )
     assert summary["status"] == "pending_test_evaluation"
-    assert [row["selected_profile"] for row in summary["profile_selections"]] == ["base"]
+    assert [row["selected_profile"] for row in summary["profile_selections"]] == ["reference"]
     assert len(summary["selected_checkpoints"]) == 2
-    assert {row["selected_profile"] for row in summary["selected_checkpoints"]} == {"base"}
+    assert {row["selected_profile"] for row in summary["selected_checkpoints"]} == {"reference"}
     assert summary["profile_selections"][0]["test_used_for_selection"] is False
     assert summary["test_evaluations"] == []
     assert all("test" not in key for row in summary["runs"] for key in row)
@@ -55380,10 +62696,10 @@ def test_profile_selection_uses_mean_validation_and_one_common_profile():
 
 def test_incomplete_seed_matrix_withholds_selection_fail_closed():
     summary = scaling.build_summary(
-        [_row("v2", "peptides_struct", "base", 0, 0.2)],
+        [_row("v2", "peptides_struct", "reference", 0, 0.2)],
         versions=["v2"],
         datasets=["peptides_struct"],
-        profiles=["base"],
+        profiles=["reference"],
         model_seeds=(0, 1),
         complete=True,
     )
@@ -55396,14 +62712,14 @@ def test_incomplete_seed_matrix_withholds_selection_fail_closed():
 def test_selected_profile_creates_one_test_only_job_per_seed_and_attaches_separately(tmp_path):
     rows = [
         _row("v1", "zinc12k", profile, seed, value)
-        for profile, values in (("base", (0.1, 0.2)), ("large", (0.4, 0.3)))
+        for profile, values in (("reference", (0.1, 0.2)), ("large", (0.4, 0.3)))
         for seed, value in enumerate(values)
     ]
     summary = scaling.build_summary(
         rows,
         versions=["v1"],
         datasets=["zinc12k"],
-        profiles=["base", "large"],
+        profiles=["reference", "large"],
         model_seeds=(0, 1),
         complete=True,
     )
@@ -55413,7 +62729,7 @@ def test_selected_profile_creates_one_test_only_job_per_seed_and_attaches_separa
         "--datasets",
         "zinc12k",
         "--profiles",
-        "base",
+        "reference",
         "large",
         "--model-seeds",
         "0,1",
@@ -55487,10 +62803,11 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
     output.mkdir()
     job = {
         "version": "v2",
-        "profile": "wide",
+        "profile": "reference",
         "model_seed": 3,
         "datasets": ["zinc12k"],
-        "config": dict(scaling.PROFILES["wide"]),
+        "config": scaling._profile_config("reference", "zinc12k", "v2"),
+        "resources": scaling._job_resources(_args(), "v2", "reference", "zinc12k"),
         "output_dir": str(output),
         "command": [
             "python",
@@ -55504,12 +62821,25 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
             "32768",
         ],
     }
-    run = output / "zinc12k/cycle_basis_v2"
+    run = output / "zinc12k/cycle_projector_pe_v2"
     run.mkdir(parents=True)
     checkpoint = run / "best.pt"
     checkpoint.write_bytes(b"checkpoint")
     history = run / "history.json"
-    history.write_text(json.dumps([{"epoch": epoch} for epoch in range(1, 5)]), encoding="utf-8")
+    history.write_text(
+        json.dumps(
+            [
+                {
+                    "epoch": epoch,
+                    "train_graphs": 10,
+                    "train_cuda_synchronized_seconds": 1.0,
+                    "train_graphs_per_second": 10.0,
+                }
+                for epoch in range(1, 5)
+            ]
+        ),
+        encoding="utf-8",
+    )
     manifest = {
         "status": "passed",
         "run_mode": "validation_only",
@@ -55518,13 +62848,22 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
             "model_seed": 3,
             "hidden_dim": 128,
             "pe_dim": 64,
-            "layers": 3,
+            "layers": 10,
+            "ffn_multiplier": 4,
+            "dropout": 0.1,
+            "layer_scale": 0.1,
             "datasets": ["zinc12k"],
             "validation_only": True,
             "test_checkpoint": None,
             "column_chunk_size": 16,
+            "basis_backend": "thin_q",
             "basis_execution": "batched",
             "basis_pair_budget": 32768,
+            "batch_size": 32,
+            "workers": 4,
+            "amp": False,
+            "prefetch_factor": 2,
+            "hardware_profile": "portable",
         },
         "controls": {
             "test_data_access": False,
@@ -55545,11 +62884,23 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
                     "split_content_sha256": {"train": "a", "validation": "b"},
                 },
                 "models": {
-                    "cycle_basis_v2": {
+                    "cycle_projector_pe_v2": {
                         "validation": 0.2,
                         "trainable_parameters": 1234,
                         "elapsed_seconds": 5.0,
                         "peak_gpu_memory_bytes": 2048,
+                        "peak_gpu_reserved_bytes": 4096,
+                        "effective_batch_size": 32,
+                        "execution": {
+                            "data_pipeline": {
+                                "effective_batch_size": 32,
+                                "workers": 4,
+                                "prefetch_factor": 2,
+                                "packed_cycle_basis_h2d_tensors_per_batch": 1,
+                            },
+                            "precision": {"amp": False, "projector_contraction": "float32"},
+                            "hardware": {"profile": "portable"},
+                        },
                         "best_epoch": 2,
                         "epochs_completed": 4,
                         "checkpoint": str(checkpoint.resolve()),
@@ -55568,7 +62919,7 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
     row = scaling.read_job_rows(job)[0]
     assert row["validation_mae"] == 0.2 and "test_mae" not in row
     assert row["trainable_parameters"] == 1234
-    metrics["datasets"]["zinc12k"]["models"]["cycle_basis_v2"]["test"] = 0.3
+    metrics["datasets"]["zinc12k"]["models"]["cycle_projector_pe_v2"]["test"] = 0.3
     (output / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
     with pytest.raises(ValueError, match="leaked a test metric"):
         scaling.read_job_rows(job)
@@ -55586,7 +62937,7 @@ def test_dry_run_prints_full_plan_without_dependency_or_gpu_checks(tmp_path, mon
             "v1",
             "v2",
             "--profiles",
-            "base",
+            "reference",
             "large",
             "--model-seeds",
             "0,2",
@@ -55621,7 +62972,7 @@ def test_failed_child_leaves_failed_manifest_and_withholds_selection(tmp_path, m
             "--versions",
             "v1",
             "--profiles",
-            "base",
+            "reference",
             "--model-seeds",
             "0",
             "--datasets",
@@ -55660,7 +63011,7 @@ def _start_interrupted_cycle_run(tmp_path, monkeypatch, run_id):
         "--versions",
         "v1",
         "--profiles",
-        "base",
+        "reference",
         "--model-seeds",
         "0",
         "--datasets",
@@ -55813,7 +63164,7 @@ def test_same_run_id_resumes_valid_children_and_test_checkpoints(tmp_path, monke
         "--versions",
         "v1",
         "--profiles",
-        "base",
+        "reference",
         "--model-seeds",
         "0,1",
         "--datasets",
@@ -55941,7 +63292,7 @@ def test_retrained_selected_candidate_rebinds_and_reruns_test_once(tmp_path, mon
         "--versions",
         "v1",
         "--profiles",
-        "base",
+        "reference",
         "--model-seeds",
         "0",
         "--datasets",
@@ -56055,7 +63406,7 @@ def test_completed_run_returns_without_relaunching_preflight_or_children(tmp_pat
         "--versions",
         "v1",
         "--profiles",
-        "base",
+        "reference",
         "--model-seeds",
         "0",
         "--datasets",
@@ -56134,6 +63485,32 @@ def test_quarantine_rejects_resume_orphans_symlink_outside_run(tmp_path):
     with pytest.raises(ValueError, match="indirect|outside the run directory"):
         scaling._quarantine_incomplete_output(job, run_dir)
     assert output.is_dir()
+
+
+def test_projector_v2_attempt_preserves_last_checkpoint_and_requests_resume(tmp_path):
+    run_dir = tmp_path / "run"
+    args = scaling.parser().parse_args(
+        [
+            "--versions",
+            "v2",
+            "--profiles",
+            "reference",
+            "--datasets",
+            "zinc12k",
+            "--model-seeds",
+            "0",
+        ]
+    )
+    job = scaling.make_jobs(args, run_dir)[0]
+    checkpoint = Path(job["output_dir"]) / "zinc12k/cycle_projector_pe_v2/last.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"epoch-state")
+
+    attempt = scaling._candidate_attempt_command(job, run_dir)
+
+    assert attempt[-1] == "--resume"
+    assert checkpoint.read_bytes() == b"epoch-state"
+    assert "quarantined_outputs" not in job
 ````
 
 # tests/test_cycle_v2_runner.py
@@ -56144,7 +63521,6 @@ def test_quarantine_rejects_resume_orphans_symlink_outside_run(tmp_path):
 from __future__ import annotations
 
 import json
-import shlex
 import sys
 from pathlib import Path
 
@@ -56180,6 +63556,7 @@ def test_v2_dispatch_is_only_basis_model_and_keeps_requested_seeds(
         assert command[2] == "research.cycle_pe.v2.benchmark"
         child = parser().parse_args(command[3:])
         assert child.model_seed == seed
+        assert child.basis_backend == "thin_q"
         assert child.prepare_only is prepare
         assert child.allow_download is prepare
         assert child.batch_size == 32 and child.workers == 4
@@ -56190,6 +63567,20 @@ def test_v2_dispatch_is_only_basis_model_and_keeps_requested_seeds(
             / f"model-seed-{seed}/benchmark"
         )
     assert sum(name == "gpu_preflight" for name, _, _ in commands) == (0 if prepare else 1)
+
+
+def test_root_runner_forwards_dfs_basis_backend_only_for_v2():
+    from research.cycle_pe.v2.benchmark import parser
+
+    args = _args("--basis-backend", "dfs_fundamental")
+    children = [entry for entry in run_paper._commands(args, "dfs") if entry[0] != "gpu_preflight"]
+    assert len(children) == 1
+    child = parser().parse_args(children[0][1][3:])
+    assert child.basis_backend == "dfs_fundamental"
+
+    v1 = run_paper._parser().parse_args(["--tracks", "cycle_pe"])
+    v1_command = run_paper._commands(v1, "v1-default")[-1][1]
+    assert "--basis-backend" not in v1_command
 
 
 def test_v1_default_dispatch_and_paths_remain_unchanged():
@@ -56237,25 +63628,23 @@ def test_v2_rejects_unrelated_or_supplementary_tracks_before_dependency_checks(
 
 
 @pytest.mark.parametrize("script", ["prepare_data.sh", "reproduce.sh"])
-def test_v2_wrappers_lock_the_version_and_track(script):
+def test_v2_wrappers_use_direct_python_without_shell_set_flags(script):
     source = (ROOT / "research/cycle_pe/v2" / script).read_text(encoding="utf-8")
-    dispatch = shlex.split(next(row for row in source.splitlines() if row.startswith("exec bash ")))
-    assert dispatch[2:4] == ["${project_root}/scripts/paper.sh", "$@"]
-    args = run_paper._parser().parse_args(
-        ["--tracks", "all", "--cycle-pe-version", "v1", *dispatch[4:]]
-    )
-    assert args.tracks == ["cycle_pe"] and args.cycle_pe_version == "v2"
-    assert args.suite == "benchmark"
-    assert args.prepare_only is (script == "prepare_data.sh")
-    assert args.allow_download is (script == "prepare_data.sh")
-    assert "set -euo pipefail" in source
+    assert "set -" not in source and "scripts/paper.sh" not in source
+    if script == "reproduce.sh":
+        assert "scripts/run_cycle_scaling.py" in source
+        assert "--versions v2 --profiles reference" in source
+    else:
+        assert "-m research.cycle_pe.v2.benchmark" in source
+        assert "--prepare-only --allow-download --device cpu" in source
 
 
-def test_registry_snapshot_describes_basis_v2_not_six_statistics(tmp_path):
+def test_registry_snapshot_describes_projector_v2_not_raw_basis_coordinates(tmp_path):
     snapshot = run_paper._snapshot_registries(tmp_path, ("cycle_pe",), cycle_pe_version="v2")
     payload = Path(snapshot["cycle_pe"]["path"]).read_text(encoding="utf-8")
-    assert "model: cycle_basis_v2" in payload and "version: v2" in payload
-    assert "full SVD" in payload and "truncation: none" in payload
+    assert "model: cycle_projector_pe_v2" in payload and "version: v2" in payload
+    assert "sparse fundamental" in payload and "truncation: none" in payload
+    assert "no raw basis coordinates" in payload
 
 
 def test_v2_manifest_records_version_and_will_not_reuse_existing_output(tmp_path, monkeypatch):
@@ -56274,6 +63663,8 @@ def test_v2_manifest_records_version_and_will_not_reuse_existing_output(tmp_path
             "cycle_pe",
             "--cycle-pe-version",
             "v2",
+            "--basis-backend",
+            "dfs_fundamental",
             "--prepare-only",
             "--run-id",
             "version-record",
@@ -56282,6 +63673,7 @@ def test_v2_manifest_records_version_and_will_not_reuse_existing_output(tmp_path
     assert run_paper.main() == 0
     manifest = json.loads((tmp_path / "runs/paper/version-record/manifest.json").read_text())
     assert manifest["execution_protocol"]["cycle_pe_version"] == "v2"
+    assert manifest["execution_protocol"]["basis_backend"] == "dfs_fundamental"
     assert manifest["research_environment"]["profile_id"] == "legacy-cu118"
     assert manifest["tracks"] == ["cycle_pe"]
     assert run_paper.main() == 2
@@ -59061,23 +66453,27 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
     assert [job["track"] for job in jobs] == ["conductance", "cycle", "tree"]
     assert runner._totals(jobs) == {
         "track_runs": 3,
-        "child_runs": 188,
-        "model_trainings": 204,
+        "child_runs": 118,
+        "model_trainings": 122,
     }
 
     conductance, cycle, tree = jobs
-    assert conductance["profiles"] == ["base", "wide", "deep", "large"]
-    assert conductance["command"][conductance["command"].index("--profiles") + 1 :][:4] == [
-        "base",
-        "wide",
-        "deep",
+    assert conductance["profiles"] == ["reference", "large"]
+    assert conductance["command"][conductance["command"].index("--profiles") + 1 :][:2] == [
+        "reference",
         "large",
     ]
     assert _option(cycle["command"], "--model-seeds") == "0"
-    assert _option(tree["command"], "--profiles") == "base,wide,deep,large"
+    assert _option(cycle["command"], "--basis-backend") == "thin_q"
+    assert _option(tree["command"], "--profiles") == "reference,large"
     assert _option(tree["command"], "--model-seeds") == "0"
     assert _option(tree["command"], "--suites") == "csl,zinc"
-    assert conductance["requested_matrix"]["versions"] == ["v1", "v2", "v3", "v4"]
+    assert all(_option(job["command"], "--hardware-profile") == "portable" for job in jobs)
+    assert _option(conductance["command"], "--v5-beta-parameterization") == "sigmoid"
+    assert _option(conductance["command"], "--v5-beta-initial") == "0.1"
+    assert "--v5-beta-min" not in conductance["command"]
+    assert all("--v5-beta-parameterization" not in job["command"] for job in (cycle, tree))
+    assert conductance["requested_matrix"]["versions"] == ["v1", "v2", "v3", "v4", "v5"]
     assert cycle["requested_matrix"]["datasets"] == ["zinc12k", "peptides_struct"]
     assert Path(conductance["summary_path"]).relative_to(tmp_path) == Path(
         "conductance_gat/scaling/matrix-conductance/summary.json"
@@ -59098,7 +66494,7 @@ def test_selection_and_download_flag_are_mapped_only_to_supported_child_clis(tmp
             "cycle",
             "tree",
             "--profiles",
-            "deep",
+            "reference",
             "large",
             "--model-seeds",
             "2",
@@ -59110,11 +66506,83 @@ def test_selection_and_download_flag_are_mapped_only_to_supported_child_clis(tmp
     )
     runner._validate(args)
     jobs = runner.make_jobs(args, "selected")
-    assert runner._totals(jobs)["model_trainings"] == (43 + 4 + 4) * 2 * 2
+    assert runner._totals(jobs)["model_trainings"] == (53 + 4 + 4) * 2 * 2
     assert "--allow-download" not in jobs[0]["command"]
     assert "--allow-download" in jobs[1]["command"]
     assert "--allow-download" in jobs[2]["command"]
-    assert _option(jobs[2]["command"], "--profiles") == "deep,large"
+    assert _option(jobs[2]["command"], "--profiles") == "reference,large"
+
+
+def test_a6000_hardware_profile_is_forwarded_to_every_track_and_bound_to_config(
+    tmp_path: Path,
+) -> None:
+    args = runner.parser().parse_args(
+        ["--hardware-profile", "a6000-48gb", "--results-root", str(tmp_path)]
+    )
+    runner._validate(args)
+    jobs = runner.make_jobs(args, "a6000")
+    assert all(_option(job["command"], "--hardware-profile") == "a6000-48gb" for job in jobs)
+    config = runner._config_payload(args, data_root=tmp_path / "data", results_root=tmp_path)
+    assert config["hardware_profile"] == "a6000-48gb"
+
+
+def test_cycle_v2_basis_backend_is_forwarded_only_to_cycle_and_bound_to_config(
+    tmp_path: Path,
+) -> None:
+    args = runner.parser().parse_args(
+        [
+            "--cycle-v2-basis-backend",
+            "dfs_fundamental",
+            "--results-root",
+            str(tmp_path),
+        ]
+    )
+    runner._validate(args)
+    conductance, cycle, tree = runner.make_jobs(args, "dfs")
+    assert "--basis-backend" not in conductance["command"]
+    assert _option(cycle["command"], "--basis-backend") == "dfs_fundamental"
+    assert "--basis-backend" not in tree["command"]
+    config = runner._config_payload(args, data_root=tmp_path / "data", results_root=tmp_path)
+    assert config["cycle_v2_basis_backend"] == "dfs_fundamental"
+
+
+def test_v5_margin_beta_ablation_is_forwarded_only_to_conductance_and_bound_to_config(
+    tmp_path: Path,
+) -> None:
+    args = runner.parser().parse_args(
+        [
+            "--v5-beta-parameterization",
+            "margin_sigmoid",
+            "--v5-beta-initial",
+            "0.5",
+            "--v5-beta-min",
+            "0.05",
+            "--v5-beta-max",
+            "0.95",
+            "--results-root",
+            str(tmp_path),
+        ]
+    )
+    runner._validate(args)
+    conductance, cycle, tree = runner.make_jobs(args, "margin")
+    assert _option(conductance["command"], "--v5-beta-parameterization") == "margin_sigmoid"
+    assert _option(conductance["command"], "--v5-beta-initial") == "0.5"
+    assert _option(conductance["command"], "--v5-beta-min") == "0.05"
+    assert _option(conductance["command"], "--v5-beta-max") == "0.95"
+    assert all("--v5-beta-parameterization" not in job["command"] for job in (cycle, tree))
+    config = runner._config_payload(args, data_root=tmp_path / "data", results_root=tmp_path)
+    assert config["v5_beta"] == {
+        "beta_parameterization": "margin_sigmoid",
+        "beta_initial": 0.5,
+        "beta_min": 0.05,
+        "beta_max": 0.95,
+    }
+
+
+def test_rich_runner_rejects_margin_values_for_default_no_margin_beta():
+    args = runner.parser().parse_args(["--v5-beta-max", "0.95"])
+    with pytest.raises(ValueError, match="only valid for margin_sigmoid"):
+        runner._validate(args)
 
 
 def test_central_source_inventory_covers_imported_child_code_and_tree_config():
@@ -59155,22 +66623,25 @@ def test_dry_run_prints_complete_plan_without_writes_or_processes(
             "cycle",
             "tree",
             "--profiles",
-            "base",
-            "deep",
+            "reference",
+            "large",
             "--model-seeds",
             "0",
             "--results-root",
             str(tmp_path),
             "--run-id",
             "dry",
+            "--cycle-v2-basis-backend",
+            "dfs_fundamental",
             "--dry-run",
         ]
     )
     output = capsys.readouterr().out
     assert code == 0
-    assert "2 track runs; 8 child runs; 16 fresh model trainings" in output
-    assert "child profiles=['base', 'deep']" in output
-    assert "--profiles base,deep" in output
+    assert "2 track runs; 12 child runs; 16 fresh model trainings" in output
+    assert "child profiles=['reference', 'large']" in output
+    assert "--profiles reference,large" in output
+    assert "--basis-backend dfs_fundamental" in output
     assert "no files or directories were written" in output
     assert list(tmp_path.iterdir()) == []
 
@@ -59214,7 +66685,7 @@ def _write_summary(command: list[str], *, malformed: str | None = None) -> None:
         output = results_root / "conductance_gat/scaling" / run_id
         payload = {
             "status": "failed" if malformed == "status" else "passed",
-            "suite": "conductance_architecture_scaling_v1_v4",
+            "suite": "conductance_architecture_scaling_v1_v5",
             "run_id": run_id,
             "valid_for_validation_comparison": malformed != "status",
             "test_evaluated": False,
@@ -59414,7 +66885,7 @@ def _write_summary(command: list[str], *, malformed: str | None = None) -> None:
 def _base_options(tmp_path: Path) -> list[str]:
     return [
         "--profiles",
-        "base",
+        "reference",
         "--model-seeds",
         "0",
         "--data-root",
@@ -59448,10 +66919,10 @@ def test_success_runs_tracks_sequentially_and_certifies_all_summaries(
     assert manifest["status"] == "passed"
     assert manifest["planned_counts"] == {
         "track_runs": 3,
-        "child_runs": 47,
-        "model_trainings": 51,
+        "child_runs": 59,
+        "model_trainings": 61,
     }
-    assert manifest["completed_counts"]["verified_model_trainings"] == 51
+    assert manifest["completed_counts"]["verified_model_trainings"] == 61
     assert all(job["status"] == "passed" for job in manifest["jobs"])
     assert all(len(job["result"]["summary_sha256"]) == 64 for job in manifest["jobs"])
 
@@ -60279,6 +67750,7 @@ def test_project_docs_and_gpt_handoff_are_separated() -> None:
         "CONDUCTANCE_V2.md",
         "CONDUCTANCE_V3.md",
         "CONDUCTANCE_V4.md",
+        "CONDUCTANCE_V5.md",
         "CYCLE_PE_V2.md",
         "RICH_SCALING_EXPERIMENTS.md",
         "CODE_SUMMARY.md",
@@ -60298,7 +67770,7 @@ def test_project_docs_and_gpt_handoff_are_separated() -> None:
     package_readme = (ROOT / "gpt_handoff/README_FIRST.md").read_text(encoding="utf-8")
     for document in handoff_files:
         assert document in package_readme
-    assert "V4만이 아니라 NEW GAT 전체 프로젝트" in package_readme
+    assert "V5만이 아니라 NEW GAT 전체 프로젝트" in package_readme
 
     hub = (ROOT / "gpt_handoff/CONDUCTANCE_V4.md").read_text(encoding="utf-8")
     for required in (
@@ -60312,6 +67784,28 @@ def test_project_docs_and_gpt_handoff_are_separated() -> None:
         "현재 상태",
     ):
         assert required in hub
+
+    v5 = (ROOT / "gpt_handoff/CONDUCTANCE_V5.md").read_text(encoding="utf-8")
+    for required in (
+        "conductance_graph_conditioned_v5",
+        "shared_dynamic_c",
+        "fixed_c",
+        "scripts/run_conductance_v5.py",
+        "--sample-seed-batch-size 1024",
+        "reference",
+        "large",
+    ):
+        assert required in v5
+
+    cycle_v2 = (ROOT / "gpt_handoff/CYCLE_PE_V2.md").read_text(encoding="utf-8")
+    for required in (
+        "cycle_projector_pe_v2",
+        "cycle_basis_v2",
+        "P_{\\mathcal C}=Z(Z^\\top Z)^{-1}Z^\\top=QQ^\\top",
+        "scripts/run_cycle_scaling.py",
+        "reference",
+    ):
+        assert required in cycle_v2
 
 
 def test_all_local_document_links_resolve() -> None:
@@ -60397,6 +67891,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -60412,39 +67907,31 @@ def _digest(path: Path) -> str:
 def test_default_matrix_trains_both_versions_across_larger_profiles() -> None:
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
+    assert [(job["suite"], job["profile"]) for job in jobs] == [
+        ("csl", "reference"),
+        ("csl", "large"),
+        ("zinc", "reference"),
+        ("zinc", "large"),
+    ]
     assert args.suites == ("csl", "zinc")
-    assert args.profiles == ("base", "wide", "deep", "large")
+    assert args.profiles == ("reference", "large")
     assert args.model_seeds == (0,)
-    assert len(jobs) == 8
-    assert sum(len(job["trained_models"]) for job in jobs) == 16
+    assert len(jobs) == 4
+    assert sum(len(job["trained_models"]) for job in jobs) == 8
     assert len(args.suites) * len(runner.MODELS) == 4
     assert len(args.suites) * len(args.model_seeds) * len(runner.MODELS) == 4
     assert len({job["output_dir"] for job in jobs}) == len(jobs)
     assert runner.PROFILE_CONFIGS == {
-        "base": {
-            "hidden_dim": 64,
-            "message_layers": 2,
-            "optimizer_updates": 800,
-            "train_charts_per_graph": 8,
-            "eval_charts_per_graph": 8,
-        },
-        "wide": {
+        "reference": {
             "hidden_dim": 128,
-            "message_layers": 2,
-            "optimizer_updates": 800,
-            "train_charts_per_graph": 8,
-            "eval_charts_per_graph": 8,
-        },
-        "deep": {
-            "hidden_dim": 64,
-            "message_layers": 4,
+            "message_layers": 8,
             "optimizer_updates": 800,
             "train_charts_per_graph": 8,
             "eval_charts_per_graph": 8,
         },
         "large": {
-            "hidden_dim": 128,
-            "message_layers": 4,
+            "hidden_dim": 256,
+            "message_layers": 12,
             "optimizer_updates": 800,
             "train_charts_per_graph": 8,
             "eval_charts_per_graph": 8,
@@ -60458,13 +67945,200 @@ def test_default_matrix_trains_both_versions_across_larger_profiles() -> None:
             assert command[command.index("--" + key.replace("_", "-")) + 1] == str(value)
 
 
+def test_a6000_profile_resolves_recorded_high_throughput_settings() -> None:
+    args = runner.parser().parse_args(["--hardware-profile", "a6000-48gb"])
+    runner._validate(args)
+    assert (args.batch_size, args.workers, args.amp, args.job_concurrency) == (64, 4, True, 2)
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert [(job["suite"], job["profile"]) for job in jobs] == [
+        ("zinc", "large"),
+        ("zinc", "reference"),
+        ("csl", "large"),
+        ("csl", "reference"),
+    ]
+    assert all(job["command"][job["command"].index("--batch-size") + 1] == "64" for job in jobs)
+    assert all(job["command"][job["command"].index("--workers") + 1] == "4" for job in jobs)
+    assert all("--amp" in job["command"] for job in jobs)
+    config = runner._run_config(args, Path("data").resolve())
+    assert config["hardware_profile"] == "a6000-48gb"
+    assert config["job_concurrency"] == 2
+
+
+def test_profile_selection_is_independent_of_a6000_heavy_first_job_order() -> None:
+    args = runner.parser().parse_args(["--hardware-profile", "a6000-48gb"])
+    runner._validate(args)
+    jobs = [job for job in runner.make_jobs(args, Path("fixture")) if job["suite"] == "csl"]
+    for job in jobs:
+        score = 0.8 if job["profile"] == "large" else 0.7
+        job["status"] = "passed"
+        job["result"] = {
+            "selection_objectives": {
+                model: {
+                    "metric": "unit",
+                    "direction": "maximize",
+                    "value": score,
+                }
+                for model in runner.MODELS
+            },
+            "checkpoints": {
+                model: {"path": f"{job['profile']}-{model}.pt", "sha256": "unit"}
+                for model in runner.MODELS
+            },
+            "parameter_counts": {model: {"total": 1, "trainable": 1} for model in runner.MODELS},
+            "quadrant_metrics": {model: {"unit": {"accuracy": score}} for model in runner.MODELS},
+            "child_summary_sha256": "unit",
+        }
+    forward = runner._select_profiles(
+        jobs, suite="csl", model_seeds=(0,), profiles=("reference", "large")
+    )
+    reverse = runner._select_profiles(
+        list(reversed(jobs)),
+        suite="csl",
+        model_seeds=(0,),
+        profiles=("reference", "large"),
+    )
+    assert forward == reverse
+    assert all(
+        condition["selected_profile"] == "large" for condition in forward["conditions"].values()
+    )
+
+
+def test_a6000_preflight_rejects_mig_and_old_compute_capability() -> None:
+    base = {
+        "status": "passed",
+        "gpu": {
+            "free_bytes": 47 * 1024**3,
+            "total_bytes": 48 * 1024**3,
+            "compute_capability": [8, 6],
+        },
+    }
+    runner._validate_hardware_preflight(base, "a6000-48gb")
+    mig = json.loads(json.dumps(base))
+    mig["gpu"]["total_bytes"] = 10 * 1024**3
+    with pytest.raises(RuntimeError, match="40 GiB"):
+        runner._validate_hardware_preflight(mig, "a6000-48gb")
+    busy = json.loads(json.dumps(base))
+    busy["gpu"]["free_bytes"] = 31 * 1024**3
+    with pytest.raises(RuntimeError, match="32 GiB free"):
+        runner._validate_hardware_preflight(busy, "a6000-48gb")
+    old = json.loads(json.dumps(base))
+    old["gpu"]["compute_capability"] = [7, 5]
+    with pytest.raises(RuntimeError, match="capability 8.0"):
+        runner._validate_hardware_preflight(old, "a6000-48gb")
+
+
+def test_bounded_wave_runs_independent_jobs_concurrently_with_single_manifest_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    barrier = threading.Barrier(2)
+    worker_threads: list[int] = []
+    writer_threads: list[int] = []
+    main_thread = threading.get_ident()
+    jobs = [
+        {
+            "status": "pending",
+            "command": [f"job-{index}"],
+            "log_path": str(tmp_path / f"job-{index}.log"),
+        }
+        for index in range(2)
+    ]
+    manifest = {"jobs": jobs, "sources": {}}
+
+    def dispatch(_command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        worker_threads.append(threading.get_ident())
+        barrier.wait(timeout=5)
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    monkeypatch.setattr(runner, "_check_sources", lambda _manifest: None)
+    monkeypatch.setattr(
+        runner,
+        "_write_state",
+        lambda _run_dir, _manifest: writer_threads.append(threading.get_ident()),
+    )
+    runner._execute_job_matrix(
+        jobs,
+        concurrency=2,
+        environment={},
+        manifest=manifest,
+        run_dir=tmp_path,
+        validator=lambda job: {"accepted": job["command"][0]},
+        describe=lambda job: job["command"][0],
+    )
+    assert len(set(worker_threads)) == 2
+    assert set(worker_threads) == set(worker_threads) - {main_thread}
+    assert writer_threads and set(writer_threads) == {main_thread}
+    assert [job["status"] for job in jobs] == ["passed", "passed"]
+
+
+@pytest.mark.parametrize("failure_mode", ["nonzero", "exception"])
+def test_concurrent_wave_preserves_successful_peer_and_retries_only_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_mode: str
+) -> None:
+    barrier = threading.Barrier(2)
+    jobs = [
+        {
+            "status": "pending",
+            "command": [f"job-{index}"],
+            "log_path": str(tmp_path / f"job-{index}.log"),
+        }
+        for index in range(2)
+    ]
+    manifest = {"jobs": jobs, "sources": {}}
+
+    def first_dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        barrier.wait(timeout=5)
+        if command[0] == "job-1":
+            if failure_mode == "exception":
+                raise RuntimeError("worker failure")
+            return 7
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", first_dispatch)
+    monkeypatch.setattr(runner, "_check_sources", lambda _manifest: None)
+    monkeypatch.setattr(runner, "_write_state", lambda *_args: None)
+    with pytest.raises(RuntimeError):
+        runner._execute_job_matrix(
+            jobs,
+            concurrency=2,
+            environment={},
+            manifest=manifest,
+            run_dir=tmp_path,
+            validator=lambda job: {"accepted": job["command"][0]},
+            describe=lambda job: job["command"][0],
+        )
+    assert jobs[0]["status"] == "passed"
+    assert jobs[0]["result"] == {"accepted": "job-0"}
+    assert jobs[1]["status"] == "failed"
+
+    jobs[1]["status"] = "pending"
+    resumed_calls: list[str] = []
+
+    def resumed_dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        resumed_calls.append(command[0])
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", resumed_dispatch)
+    runner._execute_job_matrix(
+        jobs,
+        concurrency=2,
+        environment={},
+        manifest=manifest,
+        run_dir=tmp_path,
+        validator=lambda job: {"accepted": job["command"][0]},
+        describe=lambda job: job["command"][0],
+    )
+    assert resumed_calls == ["job-1"]
+    assert [job["status"] for job in jobs] == ["passed", "passed"]
+
+
 def test_default_dry_run_reports_seed_zero_plan_without_writes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert runner.main(["--results-root", str(tmp_path), "--dry-run"]) == 0
     output = capsys.readouterr().out
-    assert "8 validation-candidate child runs" in output
-    assert "16 fresh model trainings" in output
+    assert "4 validation-candidate child runs" in output
+    assert "8 fresh model trainings" in output
     assert "4 aggregate profile selections" in output
     assert "4 selected-checkpoint test evaluations" in output
     assert list(tmp_path.iterdir()) == []
@@ -60486,8 +68160,8 @@ def test_paper_scaling_overrides_are_opt_in_and_validated() -> None:
     }
     effective, overrides = tree_paper._apply_setting_overrides(
         defaults,
-        hidden_dim=128,
-        message_layers=4,
+        hidden_dim=256,
+        message_layers=12,
         optimizer_updates=800,
         train_charts_per_graph=8,
         eval_charts_per_graph=8,
@@ -60602,6 +68276,16 @@ def _write_child(job: dict[str, object], *, malformed: str | None = None) -> Non
         path = output / f"{name}_model.pt"
         path.write_bytes(f"unit-{name}".encode())
         checkpoints[name] = str(path.resolve())
+    amp = "--no-amp" not in command
+    runtime = {
+        "batch_size": int(command[command.index("--batch-size") + 1]),
+        "workers": int(command[command.index("--workers") + 1]),
+        "amp_requested": amp,
+        "amp_effective": amp,
+        "elapsed_seconds": 1.25,
+        "peak_gpu_allocated_bytes": 1_000_000,
+        "peak_gpu_reserved_bytes": 2_000_000,
+    }
     summary = {
         "suite": job["suite"],
         "seed_axes": axes,
@@ -60628,6 +68312,7 @@ def _write_child(job: dict[str, object], *, malformed: str | None = None) -> Non
             "fixed_and_multi_optimizer_updates_matched": True,
         },
         "checkpoints": checkpoints,
+        "runtime": runtime,
     }
     summary_path = output / "summary.json"
     summary_path.write_text(json.dumps(summary, allow_nan=True), encoding="utf-8")
@@ -60644,6 +68329,7 @@ def _write_child(job: dict[str, object], *, malformed: str | None = None) -> Non
         "model_split_usage": summary["model_split_usage"],
         "effective_settings": profile,
         "settings_overrides": profile,
+        "runtime": runtime,
         "artifacts": artifacts,
     }
     (output / "manifest.json").write_text(json.dumps(child_manifest), encoding="utf-8")
@@ -60676,6 +68362,16 @@ def _write_selected_child(job: dict[str, object]) -> None:
         }
         for name in runner.MODELS
     }
+    amp = "--no-amp" not in command
+    runtime = {
+        "batch_size": int(command[command.index("--batch-size") + 1]),
+        "workers": int(command[command.index("--workers") + 1]),
+        "amp_requested": amp,
+        "amp_effective": amp,
+        "elapsed_seconds": 0.5,
+        "peak_gpu_allocated_bytes": 750_000,
+        "peak_gpu_reserved_bytes": 1_500_000,
+    }
     summary = {
         "suite": job["suite"],
         "seed_axes": axes,
@@ -60703,6 +68399,7 @@ def _write_selected_child(job: dict[str, object]) -> None:
             name: selected_inputs[name]["parameter_counts"] for name in runner.MODELS
         },
         "models": models,
+        "runtime": runtime,
     }
     summary_path = output / "summary.json"
     summary_path.write_text(json.dumps(summary), encoding="utf-8")
@@ -60715,6 +68412,7 @@ def _write_selected_child(job: dict[str, object]) -> None:
         "dataset_cache_integrity": summary["dataset_cache_integrity"],
         "model_split_usage": summary["model_split_usage"],
         "selected_checkpoint_inputs": expected_checkpoints,
+        "runtime": runtime,
         "artifacts": {"summary.json": {"path": str(summary_path), "sha256": _digest(summary_path)}},
     }
     (output / "manifest.json").write_text(json.dumps(child_manifest), encoding="utf-8")
@@ -60742,7 +68440,17 @@ def _stub(
             preflight = Path(command[command.index("--json-out") + 1])
             if failure != "preflight_missing":
                 preflight.write_text(
-                    json.dumps({"status": "failed" if failure == "preflight_status" else "passed"}),
+                    json.dumps(
+                        {
+                            "status": "failed" if failure == "preflight_status" else "passed",
+                            "gpu": {
+                                "name": "unit A6000",
+                                "free_bytes": 47 * 1024**3,
+                                "total_bytes": 48 * 1024**3,
+                                "compute_capability": [8, 6],
+                            },
+                        }
+                    ),
                     encoding="utf-8",
                 )
             return 0
@@ -60762,6 +68470,8 @@ def _stub(
                 for call in calls
             )
             if failure == "second_child_exit" and candidate_call_count == 2:
+                return 9
+            if failure == "seed4_exit" and candidate["model_seed"] == 4:
                 return 9
             if failure == "second_child_interrupt" and candidate_call_count == 2:
                 raise KeyboardInterrupt
@@ -60793,7 +68503,7 @@ def _stub(
         "--suites",
         "csl",
         "--profiles",
-        "wide",
+        "large",
         "--model-seeds",
         "3,4",
     ]
@@ -60829,7 +68539,7 @@ def test_success_checks_metrics_parameters_artifacts_and_records_profile(
     assert all(row["test_evaluated"] is True for row in summary["selected_test_results"])
     assert all(row["test_used_for_selection"] is False for row in summary["selected_test_results"])
     assert all(
-        job["result"]["profile_config"] == runner.PROFILE_CONFIGS["wide"]
+        job["result"]["profile_config"] == runner.PROFILE_CONFIGS["large"]
         for job in manifest["jobs"]
     )
     assert all(
@@ -60901,6 +68611,60 @@ def test_resume_skips_verified_candidate_and_retries_incomplete_child_on_new_pat
     assert all(job["status"] == "passed" for job in resumed["jobs"])
 
 
+def test_a6000_failed_concurrent_peer_preserves_passed_artifact_for_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, first_calls = _stub(tmp_path, monkeypatch, failure="seed4_exit")
+    options += ["--hardware-profile", "a6000-48gb"]
+    assert runner.main(options) == 1
+    root = tmp_path / "tree_augmentation/scaling/unit"
+    failed = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert failed["config"]["job_concurrency"] == 2
+    assert failed["config"]["batch_size"] == 64
+    assert [job["status"] for job in failed["jobs"]] == ["passed", "failed"]
+    passed_output = Path(failed["jobs"][0]["output_dir"])
+    passed_digest = _digest(passed_output / "summary.json")
+
+    resume_options, resume_calls = _stub(tmp_path, monkeypatch)
+    resume_options += ["--hardware-profile", "a6000-48gb"]
+    assert runner.main(resume_options) == 0
+    candidate_calls = [
+        call
+        for call in resume_calls
+        if "--evaluation-scope" in call
+        and call[call.index("--evaluation-scope") + 1] == "validation"
+    ]
+    assert len(candidate_calls) == 1
+    assert "--amp" in candidate_calls[0]
+    assert candidate_calls[0][candidate_calls[0].index("--batch-size") + 1] == "64"
+    assert _digest(passed_output / "summary.json") == passed_digest
+    resumed = json.loads((root / "manifest.json").read_text("utf-8"))
+    assert [job["status"] for job in resumed["jobs"]] == ["passed", "passed"]
+    assert all("runtime" in job["result"] for job in resumed["jobs"])
+    summary = json.loads((root / "summary.json").read_text("utf-8"))
+    assert all(result["runtime"]["peak_gpu_allocated_bytes"] > 0 for result in summary["results"])
+
+
+def test_a6000_concurrent_wave_fails_closed_if_source_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    options, calls = _stub(tmp_path, monkeypatch)
+    options += ["--hardware-profile", "a6000-48gb"]
+    stable = {"git_revision": "unit", "sha256": {"unit-source": "stable"}}
+    changed = {"git_revision": "unit", "sha256": {"unit-source": "changed"}}
+    snapshots = iter((stable, stable, changed))
+    monkeypatch.setattr(runner, "_source_snapshot", lambda: next(snapshots, changed))
+    assert runner.main(options) == 1
+    manifest = json.loads(
+        (tmp_path / "tree_augmentation/scaling/unit/manifest.json").read_text("utf-8")
+    )
+    assert manifest["source_integrity_valid"] is False
+    assert manifest["status"] == "failed"
+    candidate_calls = [call for call in calls if "--evaluation-scope" in call]
+    assert len(candidate_calls) == 2
+    assert manifest["selected_test_jobs"] == []
+
+
 def test_resume_skips_candidates_and_verified_selected_checkpoint_evaluation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -60965,7 +68729,7 @@ def test_passed_candidate_result_mismatch_schedules_a_new_attempt(tmp_path: Path
             "--suites",
             "csl",
             "--profiles",
-            "wide",
+            "large",
             "--model-seeds",
             "3",
         ]
@@ -61068,7 +68832,7 @@ def test_retry_path_rejects_resume_attempts_symlink_outside_run(
     command = ["python", "child.py", "--output-dir", str(original_output)]
     expected = {
         "suite": "csl",
-        "profile": "base",
+        "profile": "reference",
         "model_seed": 0,
         "command": command,
         "output_dir": str(original_output),

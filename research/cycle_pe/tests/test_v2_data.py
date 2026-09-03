@@ -27,8 +27,12 @@ def _official(num_nodes=4, edges=((0, 1), (1, 2), (2, 3), (0, 3)), *, dataset="z
     )
 
 
-def _graph(*args, **kwargs):
-    return data.prepare_graph(_official(*args, **kwargs), dataset=kwargs.get("dataset", "zinc12k"))
+def _graph(*args, basis_backend="thin_q", **kwargs):
+    return data.prepare_graph(
+        _official(*args, **kwargs),
+        dataset=kwargs.get("dataset", "zinc12k"),
+        basis_backend=basis_backend,
+    )
 
 
 def _edges(pairs):
@@ -59,32 +63,50 @@ def test_entire_left_nullspace_is_returned_for_connected_disconnected_and_empty(
     basis.validate_cycle_basis(nodes, edge_index, values)
 
 
-def test_uses_full_svd_not_reduced_svd_or_fixed_cycle_width(monkeypatch):
-    original = np.linalg.svd
-    calls = []
+def test_uses_sparse_fundamental_cycles_and_thin_qr_without_svd(monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("spectral/rank decomposition is forbidden")
 
-    def observed(values, *, full_matrices):
-        calls.append((values.shape, full_matrices))
-        return original(values, full_matrices=full_matrices)
-
-    monkeypatch.setattr(basis.np.linalg, "svd", observed)
+    for name in ("svd", "eig", "eigh", "matrix_rank"):
+        monkeypatch.setattr(basis.np.linalg, name, forbidden)
     pairs = [(u, v) for u in range(8) for v in range(u + 1, 8)]
+    sparse_values = basis.sparse_left_nullspace_basis(8, _edges(pairs))
     values = basis.left_nullspace_basis(8, _edges(pairs))
+    assert sparse_values.shape == (28, 21) and sparse_values.nnz < np.prod(sparse_values.shape)
     assert values.shape == (28, 21)
-    assert calls == [((28, 8), True)]
+    np.testing.assert_allclose(values.T @ values, np.eye(21), atol=2e-6)
 
 
-def test_svd_rank_must_agree_with_graph_rank(monkeypatch):
-    original = np.linalg.svd
+def test_dfs_fundamental_backend_returns_raw_signed_cycles_with_same_projector():
+    pairs = [(u, v) for u in range(5) for v in range(u + 1, 5)]
+    edge_index = _edges(pairs)
+    raw_sparse = basis.dfs_fundamental_cycle_basis(5, edge_index)
+    raw = basis.build_cycle_basis(5, edge_index, backend="dfs_fundamental")
+    q = basis.build_cycle_basis(5, edge_index, backend="thin_q")
+    assert raw_sparse.shape == raw.shape == q.shape == (10, 6)
+    np.testing.assert_array_equal(raw, raw_sparse.toarray())
+    assert set(np.unique(raw)) <= {-1.0, 0.0, 1.0}
+    assert not np.allclose(raw.T @ raw, np.eye(6))
+    raw_q, _ = np.linalg.qr(raw.astype(np.float64), mode="reduced")
+    np.testing.assert_allclose(raw_q @ raw_q.T, q @ q.T, atol=2e-6)
+    basis.validate_cycle_basis(5, edge_index, raw_sparse)
 
-    def incorrect(values, *, full_matrices):
-        left, singular, right = original(values, full_matrices=full_matrices)
-        singular[:] = 1.0
-        return left, singular, right
 
-    monkeypatch.setattr(basis.np.linalg, "svd", incorrect)
-    with pytest.raises(ValueError, match="disagrees"):
-        basis.left_nullspace_basis(3, _edges([(0, 1), (0, 2), (1, 2)]))
+def test_unknown_basis_backend_fails_closed():
+    with pytest.raises(ValueError, match="backend"):
+        basis.build_cycle_basis(3, _edges([(0, 1)]), backend="unknown")
+    with pytest.raises(ValueError, match="basis_backend"):
+        data.prepare_graph(_official(), basis_backend="unknown")
+
+
+def test_generic_nonorthogonal_basis_is_valid_but_rank_deficiency_is_not():
+    edge_index = _edges([(0, 1), (0, 2), (1, 2), (1, 3), (2, 3)])
+    q = basis.left_nullspace_basis(4, edge_index)
+    changed = q @ np.asarray([[2.0, 0.5], [-1.0, 3.0]])
+    basis.validate_cycle_basis(4, edge_index, changed)
+    changed[:, 1] = changed[:, 0]
+    with pytest.raises(ValueError, match="full column rank"):
+        basis.validate_cycle_basis(4, edge_index, changed)
 
 
 @pytest.mark.parametrize(
@@ -97,14 +119,26 @@ def test_svd_rank_must_agree_with_graph_rank(monkeypatch):
         (3, np.array([0, 1]), "shape"),
         (3, _edges([(0, 3)]), "out of range"),
         (3, _edges([(-1, 1)]), "out of range"),
-        (3, _edges([(0, 0)]), "orientation"),
-        (3, _edges([(1, 0)]), "orientation"),
+        (3, _edges([(0, 0)]), "self-loop"),
         (3, _edges([(0, 1), (0, 1)]), "duplicate"),
     ],
 )
 def test_basis_input_contract_rejects_invalid_incidence_inputs(nodes, edges, error):
     with pytest.raises(ValueError, match=error):
         basis.left_nullspace_basis(nodes, edges)
+
+
+def test_arbitrary_edge_orientation_is_accepted_and_transports_projector():
+    edges = _edges([(0, 1), (0, 2), (1, 2)])
+    changed = edges.copy()
+    changed[:, 1] = changed[::-1, 1]
+    q, changed_q = basis.left_nullspace_basis(3, edges), basis.left_nullspace_basis(3, changed)
+    signs = np.asarray([1.0, -1.0, 1.0])
+    np.testing.assert_allclose(
+        changed_q @ changed_q.T,
+        signs[:, None] * (q @ q.T) * signs[None, :],
+        atol=2e-6,
+    )
 
 
 @pytest.mark.parametrize("kind", ["nonfinite", "wrong_width", "outside_nullspace", "rank", "half"])
@@ -125,21 +159,12 @@ def test_basis_validation_rejects_incomplete_or_corrupt_coordinates(kind):
         basis.validate_cycle_basis(3, edge_index, values)
 
 
-@pytest.mark.parametrize("num_nodes", [4, 100, 1000, 100_000])
-def test_orthonormality_tolerance_never_accepts_rank_deficiency_on_large_graphs(num_nodes):
-    edges = num_nodes * (num_nodes - 1) // 2
-    rank = edges - num_nodes + 1
-    # No large allocation or SVD is needed to check the validation bound.
-    tolerance = basis._orthonormality_tolerance(np.dtype("float32"), edges, rank)
-    assert 0 < tolerance <= 0.01 < 1.0
-
-
 def test_edge_order_alignment_is_exact_not_assumed_lexicographic():
     pairs = _edges([(0, 1), (0, 2), (0, 3), (1, 2), (2, 3)])
     original = basis.left_nullspace_basis(4, pairs)
     permutation = np.array([3, 0, 4, 1, 2])
     transformed = basis.left_nullspace_basis(4, pairs[:, permutation])
-    # SVD may rotate coordinates; the two spans must agree after row transport.
+    # Different spanning forests may rotate coordinates; the spaces must agree.
     transported = original[permutation]
     alignment = transported.T @ transformed
     np.testing.assert_allclose(transported @ alignment, transformed, atol=2e-7)
@@ -156,6 +181,7 @@ def test_official_chemistry_targets_preserved_and_directed_copies_sorted(dataset
         "edge_attr",
         "y",
         "cycle_basis",
+        "cycle_basis_is_orthonormal",
     }
     torch.testing.assert_close(graph.x, source.x)
     torch.testing.assert_close(graph.y, source.y)
@@ -163,6 +189,7 @@ def test_official_chemistry_targets_preserved_and_directed_copies_sorted(dataset
     torch.testing.assert_close(graph.edge_attr[:, 0], torch.tensor([3, 2, 1, 1]))
     assert graph.cycle_basis.shape == (4, 1)
     assert graph.cycle_basis.dtype == torch.float32
+    assert graph.cycle_basis_is_orthonormal.item() is True
     incidence, _ = basis.incidence_and_cycle_rank(4, graph.edge_index.numpy())
     np.testing.assert_allclose(incidence.T @ graph.cycle_basis.numpy(), 0, atol=1e-7)
 
@@ -215,8 +242,15 @@ def test_ragged_batch_keeps_whole_matrices_and_never_mixes_columns():
     assert [matrix.shape for matrix in batch.cycle_bases] == [(1, 0), (5, 2), (0, 0), (4, 1)]
     torch.testing.assert_close(batch.ptr, torch.tensor([0, 2, 6, 7, 11]))
     torch.testing.assert_close(batch.edge_ptr, torch.tensor([0, 1, 6, 6, 10]))
+    assert batch.cycle_basis_shapes == ((1, 0), (5, 2), (0, 0), (4, 1))
+    assert batch.cycle_basis_is_orthonormal == (True, True, True, True)
+    assert batch.packed_cycle_basis.is_contiguous()
+    assert batch.packed_cycle_basis.numel() == 14
     for index, graph in enumerate(graphs):
-        assert batch.cycle_bases[index] is graph.cycle_basis
+        torch.testing.assert_close(batch.cycle_bases[index], graph.cycle_basis)
+        assert batch.cycle_bases[index].untyped_storage().data_ptr() == (
+            batch.packed_cycle_basis.untyped_storage().data_ptr()
+        )
         start, end = batch.edge_ptr[index : index + 2]
         torch.testing.assert_close(
             batch.edge_index[:, start:end] - batch.ptr[index], graph.edge_index
@@ -227,7 +261,7 @@ def test_ragged_batch_keeps_whole_matrices_and_never_mixes_columns():
         torch.testing.assert_close(before, after)
 
 
-def test_ragged_pin_memory_visits_basis_matrices(monkeypatch):
+def test_ragged_pin_memory_uses_one_packed_basis_tensor(monkeypatch):
     batch = data.collate([_graph(), _graph(1, [])])
     called = []
 
@@ -238,8 +272,27 @@ def test_ragged_pin_memory_visits_basis_matrices(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "pin_memory", pin)
     pinned = batch.pin_memory()
     assert isinstance(pinned.cycle_bases, tuple)
-    assert all(id(matrix) in called for matrix in batch.cycle_bases)
-    assert len(called) == len(fields(batch)) - 1 + len(batch.cycle_bases)
+    assert id(batch.packed_cycle_basis) in called
+    assert all(id(matrix) not in called for matrix in batch.cycle_bases)
+    assert len(called) == sum(
+        isinstance(getattr(batch, field.name), torch.Tensor) for field in fields(batch)
+    )
+
+
+def test_batch_to_transfers_packed_basis_once_not_once_per_graph(monkeypatch):
+    batch = data.collate([_graph(), _graph(), _graph(1, [])])
+    transferred = []
+    original = torch.Tensor.to
+
+    def moved(tensor, *args, **kwargs):
+        transferred.append(id(tensor))
+        return original(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", moved)
+    result = batch.to("cpu")
+    assert transferred.count(id(batch.packed_cycle_basis)) == 1
+    assert all(id(matrix) not in transferred for matrix in batch.cycle_bases)
+    assert result.cycle_basis_shapes == batch.cycle_basis_shapes
 
 
 def test_collation_rejects_empty_or_inconsistent_graph_schemas():
@@ -270,11 +323,17 @@ def _rewrite_cache(cache, meta, rows):
     meta.write_text(json.dumps(metadata))
 
 
-def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_svd(tmp_path, monkeypatch):
+def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_basis_rebuild(
+    tmp_path, monkeypatch
+):
     _install_official_fixture(monkeypatch)
     first, protocol = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
     assert protocol["official_splits"]
-    assert protocol["preparation"]["representation"] == "complete_orthonormal_left_nullspace_basis"
+    assert (
+        protocol["preparation"]["representation"]
+        == "coordinate_free_cycle_projector_from_cached_thin_q"
+    )
+    assert data.CACHE_NAMESPACE == "cycle_pe_v2_projector_kernel_benchmark"
     assert set(protocol["preparation"]["implementation_sha256"]) == {
         "v2/basis.py",
         "v2/data.py",
@@ -283,9 +342,9 @@ def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_svd(tmp_pat
     assert not (tmp_path / "cycle_pe_benchmark").exists()
 
     def no_svd(*args, **kwargs):
-        raise AssertionError("cached bases must not be recomputed")
+        raise AssertionError("cached thin-Q matrices must not be recomputed")
 
-    monkeypatch.setattr(data, "left_nullspace_basis", no_svd)
+    monkeypatch.setattr(data, "build_cycle_basis", no_svd)
     second, restored = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
     assert restored == protocol
     for split in data.SPLITS:
@@ -294,6 +353,38 @@ def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_svd(tmp_pat
                 torch.testing.assert_close(
                     getattr(original, field.name), getattr(cached, field.name)
                 )
+
+
+def test_basis_backends_use_separate_caches_and_preserve_representation_metadata(
+    tmp_path, monkeypatch
+):
+    _install_official_fixture(monkeypatch)
+    thin, thin_protocol = data.load_benchmark(
+        tmp_path,
+        "zinc12k",
+        allow_download=False,
+        splits=("train",),
+        basis_backend="thin_q",
+    )
+    raw, raw_protocol = data.load_benchmark(
+        tmp_path,
+        "zinc12k",
+        allow_download=False,
+        splits=("train",),
+        basis_backend="dfs_fundamental",
+    )
+    assert thin_protocol["cache_directory"] != raw_protocol["cache_directory"]
+    assert thin_protocol["basis_backend"] == "thin_q"
+    assert raw_protocol["basis_backend"] == "dfs_fundamental"
+    assert "not an end-to-end linear-time speedup" in raw_protocol["basis_runtime"]
+    assert all(graph.cycle_basis_is_orthonormal.item() for graph in thin["train"])
+    assert not any(graph.cycle_basis_is_orthonormal.item() for graph in raw["train"])
+    raw_cycle = raw["train"][0].cycle_basis
+    assert set(raw_cycle.unique().tolist()) <= {-1.0, 0.0, 1.0}
+    assert not torch.allclose(
+        raw_cycle.T @ raw_cycle,
+        torch.eye(raw_cycle.shape[1], dtype=raw_cycle.dtype),
+    )
 
 
 @pytest.mark.parametrize("missing", ["payload", "metadata"])

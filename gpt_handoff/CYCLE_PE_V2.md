@@ -1,134 +1,176 @@
-# Cycle PE v2 — 좌영공간 기저벡터 입력
+# Cycle PE V2 — coordinate-free left-nullspace projector PE
 
-발생행렬 `B`의 좌영공간 `ker(B.T)`을 이루는 **기저벡터 전체**를 모델에 넣는 버전이다.
-기존 통계형 `cycle_set`(v1)은 수정하거나 대체하지 않는다. 다른 연구 트랙과 결합하지 않으며,
-외부 비교 모델도 실행하지 않는다.
+## 구 V2 폐기
 
-이 소스 버전에는 v2 구현·단위 검사가 포함되어 있다. 이전 진단 전용 commit `ebf8cd1`에는
-없었다. 기존 `cycle_set` 5-seed 결과는 v1 결과다. 2026-09-02 사용자 보고상 source/pull
-revision `7b4cd32`, run `cycle-pe-v2-gpu6-seed0-v1`은 `passed`다. Preflight GPU는
-`NVIDIA A100-SXM4-80GB MIG 1g.10gb`였고 `CUDA_VISIBLE_DEVICES=6`을 프로세스 내부
-`cuda:0`으로 사용했다. v2 성능 수치와 전체 원본 artifact는 수령하지 않았으며, 이를 기존
-v1 점수와 합치지 않는다. 게시·실험 범위는 [실험 상태](EXPERIMENT_STATUS.md)에 기록한다.
+과거 `cycle_basis_v2`는 좌영공간 기저의 임의 column을 학습기에 직접 보여 주었고 실제 GPU
+결과도 실패했다. 그 구현과 checkpoint/result identity는 폐기되었으며 새 V2와 호환되지 않는다.
+현재 유일한 V2 model identity는 `cycle_projector_pe_v2`다.
 
-V1과 V2를 모두 hidden 64/128, PE 32/64, message layer 3/6에서 실행하는 큰 모델 suite는
-[전체 모델 규모 확장 실험](RICH_SCALING_EXPERIMENTS.md)을 따른다. 기존 v1을 제외하지 않고
-같은 공식 ZINC-12K/Peptides-struct에서 별도 fresh run으로 실행한다.
+## 수학 계약
 
-## 실행
-
-저장소 최상위 폴더에서 실행한다. [전체 인수인계](HANDOFF.md)의 환경 계약에 따라 GPU 의존성
-설치를 끝내고 해당 Conda 환경을 활성화해야 한다. Ubuntu 18.04/glibc 2.27에서는
-전용 `new-gat-legacy` 환경과 `setup_gpu.sh --profile legacy-cu118`을 사용한다.
-환경 생성·활성화만으로 연구 패키지 설치가 완료되는 것은 아니다.
-
-먼저 공식 데이터와 v2 기저 캐시를 준비한다. 이미 받은 공식 원본은 재사용하며, v1의
-6개 통계 캐시는 읽지 않는다. 기저 계산은 CPU 전처리이며 모델 학습은 하지 않는다.
-
-```bash
-bash research/cycle_pe/v2/prepare_data.sh
-```
-
-준비가 성공한 후 v2만 학습·평가한다.
-
-```bash
-bash research/cycle_pe/v2/reproduce.sh
-```
-
-기본값은 ZINC-12K와 Peptides-struct, CUDA float32, model seed `0`, batch size `32`,
-workers `4`, 최대 300 epochs, validation patience `50`이다. 여러 seed를 반복하려면
-`--model-seeds 0,1,2,3,4`처럼 명시한다. 기본 명령도 축소 데이터가 아니라 전체 공식
-데이터에서 seed 0을 학습한다.
-
-공통 옵션 `--run-id`, `--data-root`, `--results-root`, `--batch-size`, `--workers`, `--fail-fast`를
-사용할 수 있다. 준비와 학습의 data root는 같아야 한다. 기존 run을 덮어쓰거나 자동 재개하지 않는다.
-`--cycle-epochs`와 `--cycle-learning-rate`는 v2의 epoch 수와 Adam learning rate를 변경한다.
-기본 root `scripts/reproduce.sh`와 기존 `research/cycle_pe/reproduce.sh`는 여전히 v1을 실행한다.
-v2 wrapper는 다른 track/version 선택 옵션을 전달해도 Cycle PE v2 benchmark만 선택한다.
-
-## 데이터와 평가
-
-| 데이터 | 공식 train / validation / test | 예측 대상·지표 |
-|---|---|---|
-| ZINC-12K | 10,000 / 1,000 / 1,000 | supplied graph target, MAE |
-| Peptides-struct | 10,873 / 2,331 / 2,331 | supplied 11 graph targets, MAE |
-
-원본 atom/bond 범주형 입력과 target을 그대로 사용한다. target 재정규화, split 재추출,
-3D target의 입력 사용은 하지 않는다. validation으로 checkpoint를 선택한 후 test를 한 번 평가한다.
-v1과 데이터·backbone·기본 학습 조건을 공유하지만 encoder와 파라미터 수는 다르므로 결과에 기록한다.
-
-## 실제로 전달하는 기저
-
-노드 `n`개, 무방향 엣지 `m`개, 연결 성분 `c`개인 그래프에서 다음을 사용한다.
+무방향 그래프의 공급 orientation으로 edge-by-node incidence를
 
 \[
-B\in\mathbb R^{m\times n},\quad
-\beta=m-n+c,\quad
-U_c\in\mathbb R^{m\times\beta},\quad
-B^\top U_c=0,\quad U_c^\top U_c=I_\beta.
+B\in\mathbb R^{m\times n},\qquad B_{e,u}=-1,\ B_{e,v}=+1
 \]
 
-엣지 방향은 노드 index가 작은 쪽에서 큰 쪽으로 고정하고, 엣지를 정렬할 때 bond feature도
-같이 이동한다. float64 full SVD `B = U S V.T`에서 `U[:, rank(B):]`를 취하고 float32로 저장한다.
-각 **열은 좌영공간의 기저벡터**, 각 **행은 해당 엣지의 기저 좌표**다. 원핫 ID가 아니다.
+로 두면 cycle space는
 
-- 모든 `beta`개 열을 저장·입력한다. 고정된 상위 k개 선택, train 최대 폭에 의한 자르기,
-  6개 수작업 통계, dense cycle projector로 대체하지 않는다.
-- 서로 다른 그래프의 기저 좌표를 섞지 않는다. 배치 안에서도 `[m_i, beta_i]` 행렬을
-  각각 보존하고 그래프별로 인코딩한다.
-- tree/forest는 `[m, 0]`, edgeless graph는 `[0, 0]` 기저와 0 PE를 사용한다.
-- 전처리와 캐시 로딩에서 전체 열 수, `B.T @ U_c`, `U_c.T @ U_c`, 유한값과 엣지 정렬을 검사한다.
+\[
+\mathcal C(G)=\ker(B^\top),\qquad \beta=m-n+k
+\]
 
-## 가변 기저를 받는 학습 인코더
+이다. 구현은 SVD/eigendecomposition을 매번 수행하지 않는다. Union-find spanning forest의
+각 chord가 닫는 fundamental cycle로 sparse full-rank
 
-열 개수가 그래프마다 다르므로 동일한 학습 함수를 모든 기저 열에 적용한다. 기저 열 `u_k`와
-엣지 bond embedding `h_e`에 대해 먼저 `phi([h_e, u_k[e]])`를 계산하고 엣지 방향으로 평균하여
-**그 기저벡터 전체의 문맥**을 만든다. 이어 `psi([h_e, u_k[e], context_k])`를 계산한다.
+\[
+Z\in\mathbb R^{m\times\beta},\qquad B^\top Z=0
+\]
 
-`u_k`와 `-u_k`를 각각 비선형 인코딩한 결과를 평균하고, 모든 열의 출력을 합쳐
-`sqrt(beta)`로 나눈 뒤 PE MLP에 넣는다. 입력을 먼저 절댓값이나 통계로 바꾸지 않는다.
-최종 학습 PE를 bond embedding과 결합해 기존 Cycle PE의 edge-aware message layer로 전달한다.
+를 만들고 데이터 준비 시 orthonormal \(Q\)로 변환·검증해 cache한다. 학습기에는 arbitrary
+basis column이 아니라 coordinate-free projector만 제공한다.
 
-기저 **입력**은 topology-only지만, 학습 인코더는 bond feature에도 조건화된다.
-최종 고정 차원 PE는 학습된 압축 표현이며, 기저의 손실 없는 복원이나 단사성을 보장하지 않는다.
-`--column-chunk-size`(직접 benchmark CLI, 기본 16)는 임시 열 처리 크기이며 기저 개수 제한이 아니다.
-역전파는 모든 열의 연산 그래프를 유지하므로 chunking이 전체 학습 메모리를 일정하게 만들지는 않는다.
+\[
+P_{\mathcal C}=Z(Z^\top Z)^{-1}Z^\top=QQ^\top.
+\]
 
-기본 `--basis-execution batched`는 여러 그래프의 엣지×기저 열 연산을 묶는다.
-각 `(graph, column)`의 context는 서로 분리하며 모든 signed 계수를 보존한다.
-`--basis-pair-budget 32768`은 MLP 호출당 pair 수이며 기저 열 개수 제한이 아니다.
-`--basis-execution reference`로 같은 파라미터를 쓰는 기존 그래프별 경로를 선택할 수 있다.
-선택적 컴파일 및 실제 train 데이터의 속도 비교 범위는 [실험 상태](EXPERIMENT_STATUS.md)를 따른다.
+이는 모든 invertible basis change \(Z\mapsto ZR\)에 불변이다. Edge orientation을 뒤집으면
+\(P\mapsto SPS\), \(S_{ee}\in\{-1,+1\}\)이므로 다음 orientation-free kernel을 사용한다.
 
-## 보장하지 않는 것
+\[
+K_{\mathcal C}=P_{\mathcal C}\odot P_{\mathcal C}.
+\]
 
-기저 열의 부호 반전과 순서 변경에는 불변이다. 하지만 같은 좌영공간의 다른 직교기저
-`U_c Q`에 대한 **임의 회전 불변성은 없다**. SVD의 영특이값 공간은 다차원일 수 있으므로,
-노드 재번호화 후 SVD를 다시 계산하거나 수치 라이브러리를 바꾸면 부호·순서 이상의 기저 변화가
-생길 수 있다. 재계산 후 graph-isomorphism invariance나 독립적인 엣지 방향 변경 불변성을
-주장하지 않는다. 이 한계는 실험 결과 해석 시 별도로 다뤄야 한다.
+Bond embedding \(X_E\)에 대한 핵심 cycle mixing과 leverage는
 
-Dense SVD는 그래프별 CPU 전처리 비용이 있고 큰 그래프용 확장성을 보장하지 않는다.
-캐시 signature에 구현 hash와 NumPy 버전, 원본 split fingerprint를 기록한다. 동일 캐시를
-보존하는 것이 재현에 중요하다. 서로 다른 기저/코드/환경의 결과를 같은 seed 반복으로 합치지 않는다.
-이 버전의 도입이나 단위 검사 통과는 novelty 또는 성능 향상의 입증이 아니다.
+\[
+M_E=K_{\mathcal C}\phi(X_E),\qquad
+\ell_e=(P_{\mathcal C})_{ee}=\|Q_{e,:}\|_2^2
+\]
 
-## 산출물과 검증 범위
+다. PE encoder는 local value, (M_E/\max(\ell_e,\epsilon)), leverage와 rank fraction을
+결합한다. Bridge와 acyclic component의 모든 edge는 \(\ell_e=0\)이므로 최종 PE가 정확히 0이다.
+Production forward는 \(P\)나 \(K\)의 \(m\times m\) 행렬을 만들거나 저장하지 않는다. 대신
 
-| 위치 | 내용 |
-|---|---|
-| `data/paper/cycle_pe_v2_benchmark/<dataset>/<signature>/` | 전체 기저와 공식 입력·target 캐시 |
-| `research/cycle_pe/v2/results/paper/<run-id>/model-seed-<seed>/benchmark/` | v2 학습 결과 |
-| 위 경로의 `<dataset>/cycle_basis_v2/` | `best.pt`, `history.json` |
-| `runs/paper/<run-id>/` | manifest, 로그, 환경·데이터 계약 기록, 집계 |
+\[
+(K\phi(X_E))_{i,d}
+=q_i^\top\!\left[Q^\top\operatorname{diag}(\phi(X_E)_{:,d})Q\right]q_i
+\]
 
-`--results-root`를 지정하면 결과는 `<results-root>/cycle_pe_v2/<run-id>/` 아래에 저장된다.
-집계는 `cycle_basis_v2.test`만 성능으로 읽으며, v1 `cycle_set`·validation·외부 논문 수치와
-합치지 않는다. 각 버전의 checkpoint와 결과 디렉터리는 독립이다.
-기존 일반 `check_datasets.py`의 v1 검사 결과는 v2 기저 검증을 대신하지 않는다.
-v2 데이터 준비/로딩 경로 자체가 캐시 checksum·공식 내용·기저 수학 조건을 검증한다.
+를 feature/rank block의 pair-free low-rank contraction으로 계산한다. 시간 복잡도는
+\(O(m\beta^2d)\)이고 `--basis-pair-budget`는 임시 feature-by-rank-by-rank core allocation의
+원소 수를 제한한다.
 
-검사는 작은 수학/배치 fixture를 사용하는 개발 단위 검사다. 실험 CLI에는 가짜 데이터나
-CPU 학습 fallback이 없다. 사용자 보고상 공식 v2 runner는 `passed`지만, 성능 수치와 전체
-artifact의 독립 검증은 아직 필요하다. 구버전 Torch의 체크포인트 보안 제약은
-[전체 인수인계](HANDOFF.md)의 환경 절을 따른다.
+## 선택 가능한 basis backend
+
+`--basis-backend`는 다음 두 경로를 선택한다.
+
+- `thin_q`(기본): union-find spanning forest에서 sparse fundamental \(Z\)를 만들고 데이터 준비
+  시 reduced thin QR을 한 번 수행해 model-ready \(Q\)를 cache한다. 학습 forward에는 QR이 없다.
+- `dfs_fundamental`: iterative DFS spanning forest를 만들고, 각 non-tree edge(chord)에 대해
+  DFS parent pointer를 역추적해 유일한 tree path와 chord를 합친 signed fundamental cycle 열을
+  만든다. raw \(Z\)를 cache하며 projector에 넣기 직전 graph별 reduced QR로 \(Q\)를 만든다.
+
+DFS가 선택하는 tree edge가 \(n-k\)개이고 나머지 chord가 \(m-n+k=\beta\)개이므로 정확히
+cycle-space 차원만큼의 독립 열을 만든다. 각 열은
+
+\[
+z_j=\pm e_{\text{chord }j}+\text{signed parent path},\qquad B^\top z_j=0
+\]
+
+을 만족한다. 이는 모든 simple cycle을 backtracking으로 열거하는 알고리즘이 아니다. 모든 simple
+cycle 열거는 출력 개수 자체가 지수적으로 커질 수 있으므로 선형 시간이라고 할 수 없다.
+
+복잡도 주장은 다음처럼 분리한다.
+
+- DFS forest 발견: \(O(|V|+|E|)\)
+- explicit sparse fundamental basis 복원: \(O(|V|+|E|+\operatorname{nnz}(Z))\)
+- 현재 dense cache materialization: 최소 \(\Omega(m\beta)\) storage/write
+- raw backend의 graph별 reduced QR: 통상 \(O(m\beta^2)\), 매 model forward 반복
+- 이후 projector-kernel contraction: \(O(m\beta^2d)\)
+
+따라서 `dfs_fundamental`은 DFS로 선택된 실제 cycle basis를 검사·비교하기 위한 진단 backend이지,
+전체 projector V2 학습을 선형 시간으로 만드는 가속 옵션은 아니다. 두 backend는 최종적으로 같은
+cycle-space projector를 사용하므로 모델 identity는 `cycle_projector_pe_v2`로 유지하지만, cache
+signature, CLI arguments, manifest와 resume identity는 backend를 구분하고 혼용을 거부한다.
+
+## 모델과 실제 규모
+
+현재 V2는 projector bond PE를 쓰는 residual molecular GNN이다. model identity는
+`cycle_projector_pe_v2`이고 구 `cycle_basis_v2` artifact를 읽지 않는다.
+
+| Profile | ZINC-12K | Peptides-struct |
+|---|---|---|
+| `reference` | hidden 128, PE 64, 10 layers | hidden 256, PE 64, 6 layers |
+| `large` | hidden 192, PE 96, 12 layers | hidden 320, PE 96, 8 layers |
+
+모두 FFN multiplier 4, dropout 0.1, layer scale 0.1이다. fail-closed parameter ceiling은
+50M이다. 이는 실행 architecture 계약이지 성능 결과가 아니다.
+
+## 실행과 재개
+
+Architecture profile과 hardware profile은 서로 다른 축이다. Scaling runner가 V1/V2에 적용하는
+실행 자원은 다음과 같다.
+
+| 설정 | `portable` | `a6000-48gb` |
+|---|---|---|
+| graph batch | 모든 dataset/profile 32 | `reference`: ZINC 512, Peptides 128; `large`: ZINC 256, Peptides 64 |
+| loader | workers 4, prefetch 2 | workers 8; V1 prefetch 2, V2 prefetch 4 |
+| numeric path | AMP off, FP32 | backbone FP16 AMP; V2 projector contraction FP32 |
+| V2 contraction | column chunk 16, pair budget 32,768 | column chunk 32, pair budget 4,194,304, packed cycle-basis H2D |
+
+`a6000-48gb`는 보이는 VRAM 40GiB 이상과 compute capability 8.0 이상을 요구한다. V2는 epoch
+1 전에 큰 graph부터 구성한 요청 batch의 training-mode forward/backward를 실행해 capacity를
+검사한다. OOM이면 batch를 자동으로 줄이거나 중간 epoch에서 protocol을 바꾸지 않고 실패하며,
+명시적으로 더 작은 `--batch-size`와 새 run-id를 요구한다.
+
+다음 GPU 6 명령은 과거 10GB MIG 할당 번호를 보존한 portable 예시다.
+
+```bash
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=6 \
+python -B scripts/run_cycle_scaling.py \
+  --versions v1 v2 --profiles reference large \
+  --datasets zinc12k peptides_struct --model-seeds 0 \
+  --device cuda:0 --hardware-profile portable \
+  --run-id cycle-v1-v2-portable-gpu6
+```
+
+물리 GPU 3의 RTX A6000을 프로세스 내부 `cuda:0`으로 매핑하는 실행은 다음과 같다. 이 명령은
+profile의 장치 계약에 더해 모든 child의 일반 preflight에 free VRAM 40GiB를 요구한다.
+
+```bash
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+python -B scripts/run_cycle_scaling.py \
+  --versions v1 v2 --profiles reference large \
+  --datasets zinc12k peptides_struct --model-seeds 0 \
+  --device cuda:0 --hardware-profile a6000-48gb \
+  --min-free-gb 40 \
+  --run-id cycle-v1-v2-a6000-gpu3
+```
+
+V2만 실행하려면 `--versions v2 --profiles reference`를 쓴다. 각 dataset/profile/seed는
+서로 다른 output을 가진다. 동일 run-id 재실행 시 완결 artifact는 검증 후 건너뛰고, 새 V2의
+`<output>/<dataset>/cycle_projector_pe_v2/last.pt`가 있으면 output을 삭제하지 않고
+`--resume`으로 model/optimizer/epoch/history/RNG를 복원한다.
+
+재개 계약은 동일한 config/source/artifact hash 결속과 epoch boundary의 model·optimizer·
+scheduler·AMP scaler·history·RNG/DataLoader 상태 복원이다. CUDA scatter/reduction처럼
+비결정적일 수 있는 kernel까지 중단 없는 실행과 bitwise 동일하다고 보장하지는 않는다.
+
+DFS fundamental backend를 명시적으로 검사하려면 같은 scaling 명령에 다음 인수를 추가한다.
+
+```bash
+--basis-backend dfs_fundamental
+```
+
+기본 `thin_q`가 전체 학습용 경로다. DFS backend는 runtime QR 비용 때문에 wall time 개선을 기대하는
+옵션이 아니며, 두 backend의 결과와 timing은 manifest의 `basis_backend`를 확인해 구분한다.
+
+seed 0에서 V1/V2 × 두 datasets × reference/large는 8 fresh candidate trainings이고,
+validation profile 선택 뒤 4 selected-checkpoint test-only evaluations가 추가된다. 후자는 optimizer
+step이나 재학습이 아니다. 같은 hardware profile 안에서 V1/V2를 비교한다. A6000은 batch와
+numeric execution이 실제로 달라지므로 portable와 A6000 사이의 점수나 wall time 차이를 PE 또는
+GPU 하나의 효과로 직접 해석하지 않는다.
+
+현재 새 V2 GPU 결과는 없다. 구 V2 실패값을 새 projector V2 결과로 재사용하거나 SOTA와
+비교해서는 안 된다.

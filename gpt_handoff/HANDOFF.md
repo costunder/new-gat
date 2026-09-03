@@ -1,8 +1,8 @@
 # NEW GAT 연구 프로젝트 Hand-off
 
-작성 기준일: 2026-09-02 (Asia/Seoul)
+작성 기준일: 2026-09-03 (Asia/Seoul)
 
-이 문서는 `gpt_handoff/`의 아홉 파일 중 전체 프로젝트 인수인계를 담당한다. 외부 ChatGPT 또는
+이 문서는 `gpt_handoff/`의 열 파일 중 전체 프로젝트 인수인계를 담당한다. 외부 ChatGPT 또는
 연구 리뷰어가 저장소를 처음 받아도 수학적 가설, 구현 경계,
 데이터 계약, 실행법, 검증 범위와 미완료 항목을 혼동하지 않도록 만든 인수인계 문서다.
 원문 코드는 같은 폴더의 `CODE_SUMMARY.md`에 파일별로 들어 있다.
@@ -11,6 +11,41 @@
 이 문서는 실행 입문서가 아니라 연구·구현 교차검토용이다.
 
 ## 0. 리뷰어가 먼저 알아야 할 판정
+
+### 2026-09-03 V5와 새 Cycle PE V2 — 이 항목이 아래 과거 V2/V4/scaling 기록보다 우선한다
+
+- [CONDUCTANCE_V5.md](CONDUCTANCE_V5.md)의 V5는 고정 edge table이 아니라 그래프와
+  sample의 hidden/구조 문맥에서 shared C를 매 forward 생성한다. C는 layer 내 모든 feature
+  head가 공유하고, head별 W와 graph-conditioned beta가 feature/frequency 역할을 맡는다.
+  beta 기본값은 hard margin 없는 sigmoid와 nominal 초기값 0.1이다. 과거
+  `0.05+0.90*sigmoid`/초기 0.5는 삭제하지 않고 명시적 `margin_sigmoid` ablation으로만 남긴다.
+- V5는 `fixed_c`와 `shared_dynamic_c` 두 arm을 같은 architecture·seed·초기화에서 비교하지만
+  phase별 update allocation은 다르다. fixed arm은 C coordinate 예산까지 spatial 그룹에 쓰는
+  strong recipe이고 dynamic arm은 그 예산으로 C를 calibration/alternation한다. 따라서 C 하나의
+  단일-factor 인과효과가 아닌 end-to-end recipe 비교다. reference는 hidden 256/8 layers/8
+  heads/FFN×4, large는 384/12/8/4다.
+- V5 `portable`은 FP32, TF32 off, activation checkpoint on, edge chunk 65,536, ogbn-arxiv
+  seed-node batch 1,024, PPI whole-graph batch 2다. `a6000-48gb`는 dense BF16/TF32와 FP32
+  conductance geometry, checkpoint off, edge chunk 131,072, arxiv seed batch 2,048, PPI batch
+  8 및 sample prefetch를 쓴다. 세 citation full graphs는 어느 profile에서도 batch 1이라 작은
+  단일 graph가 48GB VRAM을 채우지는 않는다. Validation은 항상 완전한 공식 graph/split이다.
+- 과거 `cycle_basis_v2` 구현과 artifact identity는 폐기했다. 새
+  [CYCLE_PE_V2.md](CYCLE_PE_V2.md)는 sparse fundamental basis로 좌영공간을 구성한 뒤
+  basis/orientation 불변 kernel `(QQ^T)⊙(QQ^T)`만 학습기에 제공하며 model identity는
+  `cycle_projector_pe_v2`다. 기본 `thin_q`는 준비 시 QR을 한 번 수행해 cache하고,
+  선택적 `dfs_fundamental`은 iterative DFS forest와 non-tree edge의 parent-path 역추적으로
+  raw fundamental cycle basis를 만든다. DFS forest 탐색은 `O(V+E)`지만 명시적 basis 출력에는
+  `O(nnz(Z))`가 추가되며, projector 불변성을 보존하는 raw backend의 runtime QR은 선형 시간이 아니다.
+- 새 scaling 기본값은 `reference/large`다. Conductance V1–V5 106 child/models, Cycle PE
+  V1/V2 8 child/models, Tree V1/V2 4 child 안의 8 models를 합쳐 **118 child runs / 122 fresh
+  model trainings**다. Cycle 4회와 Tree 4회의 selected-checkpoint test-only 평가는 재학습이
+  아니다. 상세 행렬은 [RICH_SCALING_EXPERIMENTS.md](RICH_SCALING_EXPERIMENTS.md)를 따른다.
+- Hardware profile은 architecture profile과 별도다. A6000 실행은 V5와 Cycle/Tree의 실제
+  batch·sample·precision을 바꾸므로 portable와 점수나 wall time을 직접 대응시켜 모델 또는 GPU
+  효과로 해석하지 않는다. Conductance V1–V4 legacy FP32·batch 계약도 바꾸지 않으므로 A6000
+  PPI의 V1–V5 cross-version 값은 descriptive다.
+- 새 V5와 projector V2의 GPU 성능 결과는 아직 없다. 현재 단계는 구조 구현·검증이며 아래의
+  과거 단일-seed 값이나 폐기된 V2 결과를 새 버전 성능으로 재사용하지 않는다.
 
 ### 2026-09-01 추가 요청 반영: 상대 C graph operator × spatial W v4
 
@@ -372,11 +407,13 @@ checkpoint 진단**, **2×2 및 C-learning 재학습 결과**가 있다. 결과 
 
 - 이전 진단 전용 게시 commit은 `ebf8cd19b80e6cd6c742b132e2bb1dadb97b019c`다.
   해당 commit은 진단 Python/Bash, 테스트, 안내, 트랙 README의 **5개 파일만** 추가·갱신했다.
-- 이번 소스 버전에는 기저벡터 Cycle PE v2, 실행 최적화·속도 도구, 단일 seed 기본값,
-  확장 진단·2×2·C-learning 및 별도 Conductance 직접 C v2·상대 C v3·C × spatial W v4
+- 이번 소스 버전에는 projector Cycle PE v2, 실행 최적화·속도 도구, 단일 seed 기본값,
+  확장 진단·2×2·C-learning 및 별도 Conductance 직접 C v2·상대 C v3·C × spatial W v4,
+  graph-conditioned shared dynamic C v5
   코드가 포함된다. `CODE_SUMMARY.md`는 게시 직전 생성기로 현재 소스와의 일치 여부를 확인하는
   원문 스냅샷이다.
-- 제공된 Cycle 결과는 `cycle_set` v1이다. 이를 `cycle_basis_v2`의 학습 결과로 쓰지 않는다.
+- 제공된 Cycle 결과는 `cycle_set` v1이다. 이를 폐기된 구 `cycle_basis_v2`나 현재
+  `cycle_projector_pe_v2`의 학습 결과로 쓰지 않는다.
   기존 benchmark 결과와 당시 진단은 이번 최적화의 가속 실측도 아니다.
 - 원격 서버의 전체 checkpoint/manifest를 직접 내려받아 검사한 것은 아니다. 사용자 로그로
   확인한 사실, 로컬 단위 검증, 추가 검증이 필요한 가설을 분리한다.
@@ -448,12 +485,12 @@ Ruff 및 diff 검사 통과다. 생략은 Linux/Bash 전용 62개와 로컬 PyG 
 컴파일 경로 실행, 출력·입력/전체 parameter gradient 및 checkpoint 호환성을 확인한다.
 이는 GPU Inductor 코드 생성·구형 Singularity compiler 호환성·실제 GPU 가속 검증이 아니다.
 
-### 2026-08-31 Cycle PE v2: 좌영공간 기저벡터 자체를 입력
+### 2026-08-31 Cycle PE v2: 폐기된 구 구현 기록
 
 사용자는 기존 기본 Cycle PE가 기저벡터 자체를 받는다고 이해했으나, 실제 v1 기본 경로는
 기저를 계산한 뒤 여섯 수작업 통계로 요약한 `cycle_set`이었다. 두 표현을 동일시하지 않는다.
-요청에 따라 `research/cycle_pe/v2/`에 **기저벡터 입력 버전**을 독립 구현했다. 연구 트랙은
-여전히 세 개이고, Cycle PE에 별도 버전을 추가한 것이며 다른 트랙과 결합하지 않았다.
+당시 요청에 따라 `research/cycle_pe/v2/`에 **기저벡터 입력 버전**을 독립 구현했다. 아래는
+폐기된 과거 설계의 감사 기록이며 현재 코드는 projector 방식으로 전면 교체됐다.
 
 - `basis.py`: canonical `u<v` incidence `B[m,n]`에서 float64 full SVD로 전체 좌영공간
   `U_c[m,beta]`를 계산한다. `beta=m-n+c`, `B.T @ U_c≈0`, `U_c.T @ U_c≈I`를 검사하고
@@ -469,13 +506,13 @@ Ruff 및 diff 검사 통과다. 생략은 Linux/Bash 전용 62개와 로컬 PyG 
 - 임의의 `U_c Q` 직교 회전이나 엣지 재정향 불변성은 없다. SVD를 재계산하는 graph relabeling은
   기저 회전을 일으킬 수 있으므로 graph-isomorphism invariance를 주장하지 않는다. 고정 폭의
   학습 PE는 무손실 codec이 아니다. Dense SVD 전처리와 모든 열을 통한 학습의 비용도 남는다.
-- `benchmark.py`: CUDA-only, float32 기본, 기존 message backbone과 공식 입력/target 유지,
-  validation checkpoint 선택 후 test 1회. 모델 이름은 `cycle_basis_v2`, track은 `cycle_pe`,
+- 당시 `benchmark.py`: CUDA-only, float32 기본, 기존 message backbone과 공식 입력/target 유지,
+  validation checkpoint 선택 후 test 1회. 폐기된 당시 모델 이름은 `cycle_basis_v2`, track은 `cycle_pe`,
   version은 `v2`다. 기본 데이터·batch·epochs·optimizer는 v1과 같고 파라미터 수는 따로 기록한다.
 - 전용 `prepare_data.sh`/`reproduce.sh`는 root runner의 `--cycle-pe-version v2`를 사용한다.
   v2는 `cycle_pe` 단독 benchmark만 허용한다. 기본 전체 실행과 v1 경로는 그대로다.
   결과는 `research/cycle_pe/v2/results/paper/`, custom root는 `cycle_pe_v2/` 아래에 분리한다.
-- 집계 schema는 paper 5 / efficiency 4이며 `cycle_basis_v2.test` 및 효율 지표만 명시적으로
+- 당시 집계 schema는 paper 5 / efficiency 4이며 폐기된 `cycle_basis_v2.test` 및 효율 지표만 명시적으로
   추가했다. v1·v2는 별도 model metric path로 집계하며 외부 논문 수치·validation과 합치지 않는다.
 - `v2/datasets.yaml`은 v2 run에 보존하는 데이터/표현 계약이다. 기존 일반 `check_datasets.py`의
   v1 registry 검증이 v2 기저를 검증했다고 해석하지 않는다. v2 로더 자체가 수학·내용을 검사한다.
@@ -1175,9 +1212,10 @@ label 수로 train/validation 합산한다.
 ## 5. 연구 트랙 B — Static Cycle-space PE
 
 **기본 실행 범위:** `benchmark.py`는 ZINC-12K/Peptides-struct에서 여섯 통계형 `cycle_set`
-v1만 학습한다. 좌영공간 기저벡터 전체를 입력하는 모델은 별도 `v2/`의 `cycle_basis_v2`이며
-사용자 보고상 `cycle-pe-v2-gpu6-seed0-v1` runner가 `passed`했다. 성능 수치와 전체 artifact는
-수령하지 않았다. 아래 네 variant, CycleCount/BREC/보조 ZINC 설명은 명시적으로
+v1만 학습한다. 현재 별도 `v2/` 모델은 방향·기저 선택 불변 projector를 쓰는
+`cycle_projector_pe_v2`다. 사용자 보고의 `cycle-pe-v2-gpu6-seed0-v1`은 폐기된 구
+`cycle_basis_v2` runner이므로 새 V2 성능으로 재분류하지 않는다. 새 V2 성능 수치와 전체
+artifact는 아직 없다. 아래 네 variant, CycleCount/BREC/보조 ZINC 설명은 명시적으로
 선택하는 `core/all` suite 계약이다. 기본 benchmark가 이 네 모델을 모두 실행하는 것은 아니다.
 
 ### 5.1 실제 가설
@@ -1210,8 +1248,8 @@ Raw width는 train split의 최대 `β`만으로 정한다. OOD graph의 `β`가
 test-fit하지 않고 해당 split을 N/A로 기록하며 다른 PE variant 평가는 계속한다. Validation
 일부가 overflow면 compatible subset만 early stopping에 사용하고 full validation raw metric은
 N/A다.
-여기의 `raw`는 `cycle_basis_v2`가 아니다. Train-width/overflow 제약은 전체 가변 기저를
-보존하는 v2에 적용되지 않는다.
+여기의 `raw`는 새 `cycle_projector_pe_v2`가 아니다. Train-width/overflow 제약은 projector
+V2에 적용되지 않는다.
 
 공통 backbone은 variable-edge/variable-β graph list batch, node/edge encoder, symmetric endpoint
 edge update, 양방향 mean message passing, residual LayerNorm, node/edge mean-max graph pooling을
@@ -1323,9 +1361,9 @@ aggregation, variant-lazy projector, ZINC fixture와 CLI collision/partial prese
 ### 5.7 반드시 재검토할 gap
 
 1. 보조 CycleCount 20k/BREC 400-pair 전체 결과는 제공받지 않았다. 기본 benchmark의
-   ZINC-12K/Peptides-struct `cycle_set` v1 5-seed 결과는 확보했지만, 기저벡터 v2의
-   runner `passed` 보고에 대응하는 성능 수치·전체 artifact와 같은 backbone의 PE 제외 효과
-   분리는 아직 없다.
+   ZINC-12K/Peptides-struct `cycle_set` v1 5-seed 결과는 확보했지만, 새 projector V2의
+   성능 수치·전체 artifact와 같은 backbone의 PE 제외 효과 분리는 아직 없다. 과거 구 V2의
+   runner `passed` 보고는 새 V2 증거가 아니다.
 2. 모든 variant가 `F_T`를 계산한다. Set 통계와 projector만 요청에 따라 생략되며,
    `no_pe/raw/set`은 dense projector를 만들지 않는다. Projector variant 자체는 dense `m×m`,
    O(m²)이고 대형 graph scaling 검증이 없다.
@@ -1499,8 +1537,10 @@ roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사�
 | Conductance 직접 C v2 (별도 실행) | Cora/CiteSeer/PubMed/ogbn-arxiv × 2조건; PPI N/A | 과거 arxiv-only `gat-direct-c-v2-gpu6-seed0-v1` 사용자 보고 `passed`; 확대 기본 결과 미수령 |
 | Conductance 상대 C v3 (별도 실행) | v1의 5개 데이터 × 2조건; PPI 공식 inductive protocol | 과거 arxiv-only `gat-relative-c-v3-gpu6-seed0-v1` 사용자 보고 `passed`; 확대 기본 결과 미수령 |
 | Conductance C × spatial W v4 (별도 실행) | v1의 5개 데이터 × 고정/상대 C × identity/학습 W | 과거 arxiv 첫 arm 뒤 구 report gate 중단; 확대 기본 20-arm 정식 결과 없음 |
+| Conductance graph-conditioned v5 (별도 실행) | v1의 5개 데이터 × fixed/shared-dynamic C, reference/large | 코드·로컬 계약 검증만 완료; GPU 성능·가속 결과 없음 |
 | Cycle PE v1 | ZINC-12K, Peptides-struct | `cycle_set` 5-seed 집계 |
-| Cycle PE v2 | 위와 같은 공식 원본·split, 별도 기저 cache | `cycle-pe-v2-gpu6-seed0-v1` 사용자 보고 `passed`; 성능 수치·전체 artifact 미수령 |
+| 폐기된 구 Cycle PE v2 | 위와 같은 공식 원본·split, 구 기저 cache | `cycle-pe-v2-gpu6-seed0-v1` 사용자 보고 `passed`; 현재 결과로 재사용 금지 |
+| 현재 Cycle projector PE v2 | 위와 같은 공식 원본·split, 별도 projector cache | `cycle_projector_pe_v2` 코드·로컬 계약 검증만 완료; GPU 성능·가속 결과 없음 |
 | Tree augmentation | CSL, ZINC-12K | fixed-BFS/multi-chart 5-seed 집계 |
 
 아래 12개는 `scripts/check_datasets.py --profile paper --json`이 확인하는 **보조 `core/all`
@@ -1583,22 +1623,30 @@ Read-only protocol 교차검토에서는 CycleCount full specification/hash가 �
 
 단일 기본 크기만으로 큰 모델의 적합도를 놓치지 않도록 `scripts/run_rich_scaling.py`와 세
 트랙별 scaling runner를 추가했다. 이것은 파라미터 수를 맞추는 실험이 아니라 각 원래 방법을
-더 넓고 깊게 만드는 사전 정의 scaling curve다. Conductance는 V1~V4를 모두 포함해
-`64×2`, `128×2`, `64×4`, `128×4`를 실행한다. Cycle V1/V2는 hidden/PE/layer를
-`64/32/3`, `128/64/3`, `64/32/6`, `128/64/6`으로 확장한다. Tree는 hidden 64/128과
-실제 message layer 2/4를 조합하고, 모든 profile에서 800 updates와 chart 8/8을 고정한 채
-fixed/multi를 모두 새로 학습한다.
+연구급 규모로 키우는 dataset-aware scaling curve다. 과거 `64/128 × 2/4층` toy grid는
+폐기했다. Conductance V1–V5는 `reference=256×8`, `large=384×12`를 쓰고 V5에는 8 heads,
+FFN multiplier 4, sampling과 activation checkpoint까지 명시한다. Cycle V1/새 V2는 ZINC
+`128/64/10`·Peptides `256/64/6`의 reference와 더 큰 large 구성을 쓴다. Tree도
+`128×8` reference와 `256×12` large에서 800 updates와 chart 8/8을 고정한다.
 
-기본 model seed 0 전체는 Conductance 172, Cycle 16, Tree 16으로 총 204 fresh trainings다.
-Cycle과 Tree는 요청된 seed의 평균 validation으로 공통 profile을 선택한 뒤 선택된 checkpoint
-4개씩만 test-only로 평가하며, 이 8회는 재학습이 아니므로 204 학습 횟수에 포함하지 않는다.
+기본 model seed 0 전체는 Conductance 106, Cycle 8, Tree 8 model trainings로 총
+**118 child runs / 122 model trainings**다. Tree child 하나가 fixed/multi 두 모델을 학습해
+child와 training 수가 다르다. Cycle과 Tree는 validation으로 profile을 선택한 뒤 선택된
+checkpoint만 test-only로 평가하며 이 평가는 122 학습 횟수에 포함하지 않는다.
 트랙별 결과와 통합 manifest는 기존 기본 결과와 별도 경로에 저장한다. 같은 인수와 run ID로
 재실행하면 설정·소스·artifact를 검증하고 완료 child는 건너뛰며 미완료 child만 재실행한다.
-완료된 하위 run은 GPU preflight 없이 전체 artifact와 집계를 검증해 반환한다. 진행 중이던
-단일 child의 epoch 상태는 이어받지 않고 그 child만 처음부터 다시 시작한다.
+완료된 하위 run은 GPU preflight 없이 전체 artifact와 집계를 검증해 반환한다. V5와 새 Cycle
+V2는 `last.pt`가 있으면 model·optimizer·epoch·RNG를 epoch 경계에서 복원하고, checkpoint
+계약이 없는 legacy child만 처음부터 다시 시작한다. CUDA kernel의 bitwise 동일성은 주장하지 않는다.
 한 트랙 실패 뒤에도 기본 통합 runner는 가능한 다음 트랙을 실행하되 전체 상태는 failed로 남긴다.
 자세한 profile, 명령, 결과 경계는 [RICH_SCALING_EXPERIMENTS.md](RICH_SCALING_EXPERIMENTS.md)를
 따른다. 현재는 코드와 로컬 계약 검증만 완료됐고 GPU scaling 결과는 없다.
+
+`portable`과 `a6000-48gb`는 같은 계산을 다른 GPU에서 재는 단순 timing pair가 아니다. A6000은
+V5의 BF16·sample/PPI batch, Cycle의 FP16 AMP·dataset별 batch, Tree의 FP16 AMP·batch와
+concurrency를 바꾼다. 각 arm/version 비교는 같은 hardware profile 안에서 하고 profile 간
+성능·시간 차이를 모델 또는 GPU 단일 효과로 해석하지 않는다. 통합 GPU 3 명령은 free VRAM
+40GiB를 명시적으로 요구하며 정확한 값과 장치 계약은 위 scaling 문서를 따른다.
 
 ### P0 — 이미 나온 결과의 검증과 Conductance 실패 원인 분리
 
@@ -1620,9 +1668,15 @@ Cycle과 Tree는 요청된 seed의 평균 validation으로 공통 profile을 선
    GPU 가속 실측으로 과장하지 않는다.
 5. Conductance C × spatial W v4에서 v1의 5개 데이터 × 네 조건, 총 20 jobs를 seed 0으로
    fresh 실행한다. PPI는 V3와 같은 계약을 사용하고 과거 arxiv partial arm을 재사용하지 않는다.
-6. Cycle PE v2는 별도 코드·cache·run으로 GPU 검증한다. 기존 `cycle_set` 결과를 기저벡터 실적으로
-   재분류하지 않는다. 실행 최적화 역시 동등성·peak memory·GPU 속도를 별도로 측정한다.
-7. 과거 Tree 기본 결과의 validation 미사용과 연속 target에 부적절한 rounded 지표를
+6. Conductance V5는 동일 architecture·seed·초기화에서 `fixed_c` strong spatial recipe와
+   `shared_dynamic_c` coordinate recipe를 비교하고 reference/large, portable 10GB MIG와
+   `a6000-48gb` 실행 profile을 각각 검증한다. phase별 effective optimizer step을 보고하며
+   단일 C 인과효과나 portable↔A6000 직접 비교로 해석하지 않는다.
+   V1–V4 결과를 V5 결과로 재사용하지 않는다.
+7. 새 Cycle projector V2는 별도 코드·cache·run으로 GPU 검증한다. 기존 `cycle_set`이나
+   폐기된 `cycle_basis_v2` 결과를 새 V2 실적으로 재분류하지 않는다. 실행 최적화 역시
+   동등성·peak memory·GPU 속도를 별도로 측정한다.
+8. 과거 Tree 기본 결과의 validation 미사용과 연속 target에 부적절한 rounded 지표를
    반영해 claim을 제한한다. 새 scaling suite는 공식 validation의 graph-macro 목적값으로
    profile을 선택하고 CSL accuracy/ZINC MAE를 분리하지만, 과거 결과를 소급 재해석하지 않는다.
 
@@ -1634,7 +1688,7 @@ cycle candidate CLI, stale S2 full-cache cardinality(112/24/48) 계약 교정을
 위 코드 gate의 완료는 모든 scientific gap 해소를 의미하지 않는다. 기본 benchmark 집계와
 seed 0 진단·2×2·C-learning 재학습과 평균-C 검사는 있지만 보조 suite 전체,
 Conductance 직접 C v2·상대 C v3·C × spatial W v4의 확대된 8/10/20-job 결과,
-Cycle PE 기저벡터 v2의 결과와 가속 실측까지
+V5와 새 Cycle projector V2의 결과 및 가속 실측까지
 완료된 것은 아니다.
 
 ### P1 — 강한 scientific claim 전에
@@ -1642,8 +1696,9 @@ Cycle PE 기저벡터 v2의 결과와 가속 실측까지
 1. Conductance: 관련 논문 표를 인용한 비교의 조건 확인, real physical/sensor conductance data
    또는 명확한 synthetic-only claim. 외부 모델을 저장소에 추가하는 작업은 현재 범위 밖이다.
 2. Cycle PE: v1/v2 및 같은 backbone의 PE 제외 효과 분리, degree/`(n,m,β)` matched
-   counterfactual, 기존 논문과의 수학적 차이 설명. v2의 임의 기저 회전/재정향 비불변성과
-   dense SVD·전체 기저 메모리 비용을 확인하고, 보조 projector 비용은 별도로 측정한다.
+   counterfactual, 기존 논문과의 수학적 차이 설명. 새 V2의 기저 회전·edge orientation 불변성을
+   실측하고 sparse fundamental basis 준비/QR와 pair-free contraction 비용을 분리해 측정한다.
+   보조 `core/all` suite의 dense projector 비용은 별도로 측정한다.
 3. Tree augmentation: 우리 모델의 BFS-only/DFS-only/Wilson-only ablation, validation 기반 selection,
    large-β scaling.
 4. Leakage negative tests와 graph/canonical hash guard 강화.
@@ -1662,9 +1717,9 @@ Cycle PE 기저벡터 v2의 결과와 가속 실측까지
 ## 10. 외부 ChatGPT에게 권장하는 교차검증 질문
 
 `README_FIRST.md`, 이 파일, `EXPERIMENT_STATUS.md`, `CONDUCTANCE_V2.md`,
-`CONDUCTANCE_V3.md`, `CONDUCTANCE_V4.md`, `CYCLE_PE_V2.md`,
-`RICH_SCALING_EXPERIMENTS.md`, `CODE_SUMMARY.md`의 아홉 파일을 함께 주고 다음을 요청한다.
-먼저 기본 benchmark/기저벡터 v2/보조 `core/all` 범위를 구분한다.
+`CONDUCTANCE_V3.md`, `CONDUCTANCE_V4.md`, `CONDUCTANCE_V5.md`, `CYCLE_PE_V2.md`,
+`RICH_SCALING_EXPERIMENTS.md`, `CODE_SUMMARY.md`의 열 파일을 함께 주고 다음을 요청한다.
+먼저 기본 benchmark/새 projector v2/보조 `core/all` 범위를 구분한다.
 
 1. `B∈R^{m×n}` convention에서 `ker(B^T)`, `L=B^TB`, fundamental basis와 pseudoinverse 설명이
    수학적으로 정확한가?
@@ -1686,8 +1741,10 @@ Cycle PE 기저벡터 v2의 결과와 가속 실측까지
 14. 현재 artifact만으로 허용되는 claim과 금지해야 할 claim을 분리해 달라.
 15. seed 0의 C 상수화·rho·전파 우회 결과에서 관측과 원인 가설을 정확히 구분하는가?
     그래프별 최대 차수 스텝과 C 공통 스케일 상쇄가 어떤 최적화 한계를 만드는가?
-16. Cycle `cycle_set` 결과와 `cycle_basis_v2` 구현, GitHub 게시본과 로컬 소스 스냅샷을
-    혼동하지 않는가? v2의 sign/order 불변성을 arbitrary basis-rotation 불변성으로 과장하는가?
+16. Cycle `cycle_set`, 폐기된 `cycle_basis_v2`, 현재 `cycle_projector_pe_v2` 결과와
+    artifact identity를 혼동하지 않는가? `P⊙P`의 방향·기저 선택 불변성과
+    `(KV)_{i,d}=q_i^T[Q^T diag(V_:d)Q]q_i` pair-free contraction이 실제 구현·수학 계약과
+    일치하며, production forward가 `m×m` 행렬을 만들지 않는가?
 17. Tree의 CSL 5-seed/단일 split과 chart-sampler OOD, ZINC MAE 및 부적절한 rounded
     보조 지표를 실제 의미에 맞게 해석하는가?
 18. 2×2의 node-degree 개선과 learned C의 순수 효과를 혼동하지 않는가? Mean-C 추론 개입과
@@ -1706,6 +1763,10 @@ Cycle PE 기저벡터 v2의 결과와 가속 실측까지
 22. 상대 C v3의 방향 불변 특징, graph-global centering/mean, gamma/tau/alpha,
     symmetric degree 미분과 AdamW 그룹이 코드·문서에서 일치하는가? Validation 개입과 fresh
     fixed-C 학습, v2↔v3의 다요인 차이를 혼동하거나 gamma 하나를 C 유용성의 증거로 쓰는가?
+23. V5에서 C는 head별 복제가 아닌 graph-conditioned shared field인가? fixed/dynamic 조건의
+    동일 architecture·초기화와 서로 다른 phase update allocation을 모두 공개하고, 이를 C 하나의
+    인과효과가 아니라 strong-recipe 비교로 해석하는가? sampling scale 정규화와 epoch-boundary
+    resume 및 CUDA non-bitwise 한계도 실제 코드와 일치하는가?
 
 ## 11. 공식 데이터/프로토콜 출처
 
@@ -1724,11 +1785,11 @@ Cycle PE 기저벡터 v2의 결과와 가속 실측까지
 5-seed 결과, Conductance seed 0 GPU 진단과 PPI/arxiv 2×2·C-learning 재학습도 있다.
 Node-degree 개선은 관측했지만 같은 정규화에서 learned C의 validation 이득은 관측하지
 못했다. PPI의 평균-C 개입은 현재 learned checkpoint의 의존도를 확인했지만 이 두 결과는
-모순이 아니다. 과거 arxiv-only Conductance v2·v3와 Cycle PE v2는 사용자 보고상 runner가 `passed`했지만
-성능 수치와 전체 artifact를 수령하지 않아 효과를 판정하지 않는다. 다음 작업자는 이 세 run의
-원본 artifact를 확보·검증하고, V2/V3/V4의 확대된 8/10/20개 학습을 새 run으로 완료하며,
-최적화의 GPU 검증과
+모순이 아니다. 과거 arxiv-only Conductance v2·v3와 폐기된 구 Cycle V2는 사용자 보고상
+runner가 `passed`했지만 성능 수치와 전체 artifact를 수령하지 않아 효과를 판정하지 않는다.
+다음 작업자는 이 세 과거 run의 원본 artifact를 확보·검증하고, V2/V3/V4 확대 run과 V5,
+새 Cycle projector V2 학습을 완료하며 최적화의 GPU 검증과
 Tree protocol 한계를 독립적으로 다뤄야 한다. V1을 포함한 전체 큰 모델 scaling suite도
-코드만 준비됐으므로 204개 결과가 있는 것처럼 주장하지 말고 서버 manifest를 별도로
+코드만 준비됐으므로 118 child / 122 training 결과가 있는 것처럼 주장하지 말고 서버 manifest를 별도로
 확보·검증해야 한다.
 Adaptive MST나 세 트랙 결합은 이후 별도 실험이며 기존 결과를 덮어쓰지 않는다.

@@ -15,6 +15,7 @@ from research.conductance_gat.ablation import train as ablation_train
 from research.conductance_gat.v2 import train as v2_train
 from research.conductance_gat.v3 import train as v3_train
 from research.conductance_gat.v4 import train as v4_train
+from research.conductance_gat.v5 import train as v5_train
 from scripts import run_conductance_scaling as runner
 
 
@@ -25,15 +26,21 @@ def _argument(command: list[str], name: str) -> str:
 def test_default_plan_covers_all_versions_profiles_seed_zero_and_supported_datasets():
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
-    assert args.versions == ["v1", "v2", "v3", "v4"]
-    assert args.profiles == ["base", "wide", "deep", "large"]
+    assert args.versions == ["v1", "v2", "v3", "v4", "v5"]
+    assert args.profiles == ["reference", "large"]
     assert args.model_seeds == [0]
-    assert len(jobs) == 172
+    assert len(jobs) == 106
     assert {job["profile"] for job in jobs} == set(runner.PROFILES)
     assert {job["model_seed"] for job in jobs} == set(runner.DEFAULT_MODEL_SEEDS)
     assert not any(job["version"] == "v2" and job["dataset"] == "ppi" for job in jobs)
     assert any(job["version"] == "v1" and job["dataset"] == "ppi" for job in jobs)
     assert any(job["version"] == "v4" and job["dataset"] == "ppi" for job in jobs)
+    assert any(job["version"] == "v5" and job["dataset"] == "ppi" for job in jobs)
+    v5_jobs = [job for job in jobs if job["version"] == "v5"]
+    assert all(job["architecture"]["beta_parameterization"] == "sigmoid" for job in v5_jobs)
+    assert all(job["architecture"]["beta_initial"] == 0.1 for job in v5_jobs)
+    assert all("beta_min" not in job["architecture"] for job in v5_jobs)
+    assert all(_argument(job["command"], "--beta-initial") == "0.1" for job in v5_jobs)
 
 
 @pytest.mark.parametrize(
@@ -80,13 +87,23 @@ def test_large_profile_is_forwarded_to_every_child_and_outputs_are_unique():
     )
     runner._validate(args)
     jobs = runner.make_jobs(args, Path("fixture"))
-    assert len(jobs) == 18
+    assert len(jobs) == 22
     assert len({job["output_dir"] for job in jobs}) == len(jobs)
     for job in jobs:
-        assert _argument(job["command"], "--hidden-channels") == "128"
-        assert _argument(job["command"], "--layers") == "4"
-        assert _argument(job["command"], "--dropout") == "0.5"
-        assert job["architecture"] == runner.PROFILES["large"]
+        assert _argument(job["command"], "--hidden-channels") == "384"
+        assert _argument(job["command"], "--layers") == "12"
+        assert _argument(job["command"], "--dropout") == "0.2"
+        expected_architecture = {
+            key: runner.PROFILES["large"][key] for key in ("hidden_channels", "layers", "dropout")
+        }
+        if job["version"] == "v5":
+            expected_architecture.update(
+                heads=8,
+                ffn_multiplier=4,
+                beta_parameterization="sigmoid",
+                beta_initial=0.1,
+            )
+        assert job["architecture"] == expected_architecture
         module = _argument(job["command"], "-m")
         if job["version"] == "v1":
             assert module == "research.conductance_gat.scaling_v1"
@@ -99,7 +116,7 @@ def test_explicit_ppi_records_v2_as_not_applicable_instead_of_inventing_transfer
     args = runner.parser().parse_args(["--datasets", "ppi"])
     jobs = runner.make_jobs(args, Path("fixture"))
     exclusions = runner._exclusions(args)
-    assert {job["version"] for job in jobs} == {"v1", "v3", "v4"}
+    assert {job["version"] for job in jobs} == {"v1", "v3", "v4", "v5"}
     assert exclusions == [
         {
             "version": "v2",
@@ -111,6 +128,78 @@ def test_explicit_ppi_records_v2_as_not_applicable_instead_of_inventing_transfer
             ),
         }
     ]
+
+
+def test_a6000_profile_runs_large_v5_work_first_and_binds_resolved_execution():
+    args = runner.parser().parse_args(
+        [
+            "--versions",
+            "v5",
+            "--profiles",
+            "reference",
+            "--datasets",
+            "cora",
+            "ppi",
+            "ogbn-arxiv",
+            "--hardware-profile",
+            "a6000-48gb",
+        ]
+    )
+    runner._validate(args)
+    jobs = runner.make_jobs(args, Path("fixture"))
+    assert jobs[0]["dataset"] == "ogbn-arxiv"
+    ppi = next(job for job in jobs if job["dataset"] == "ppi")
+    assert ppi["execution"]["batch_size"] == 8
+    assert ppi["execution"]["precision"] == "bf16"
+    assert ppi["execution"]["tf32"] is True
+    assert ppi["execution"]["activation_checkpoint"] is False
+    assert ppi["command"].count("--edge-chunk-size") == 1
+    assert _argument(ppi["command"], "--edge-chunk-size") == "131072"
+    cora = next(job for job in jobs if job["dataset"] == "cora")
+    assert "expected low occupancy" in cora["occupancy_expectation"]
+
+
+def test_v5_margin_beta_ablation_is_validated_and_forwarded_by_scaling_runner():
+    args = runner.parser().parse_args(
+        [
+            "--versions",
+            "v5",
+            "--profiles",
+            "reference",
+            "--datasets",
+            "cora",
+            "--v5-beta-parameterization",
+            "margin_sigmoid",
+            "--v5-beta-initial",
+            "0.5",
+            "--v5-beta-min",
+            "0.05",
+            "--v5-beta-max",
+            "0.95",
+        ]
+    )
+    runner._validate(args)
+    jobs = runner.make_jobs(args, Path("fixture"))
+    for job in jobs:
+        assert {
+            key: job["architecture"][key]
+            for key in ("beta_parameterization", "beta_initial", "beta_min", "beta_max")
+        } == {
+            "beta_parameterization": "margin_sigmoid",
+            "beta_initial": 0.5,
+            "beta_min": 0.05,
+            "beta_max": 0.95,
+        }
+        child = v5_train.build_parser().parse_args(job["command"][5:])
+        v5_train.validate_args(child)
+        assert (child.beta_parameterization, child.beta_initial) == ("margin_sigmoid", 0.5)
+        assert (child.beta_min, child.beta_max) == (0.05, 0.95)
+
+
+def test_v5_default_beta_rejects_irrelevant_margin_flags_in_scaling_runner():
+    args = runner.parser().parse_args(["--v5-beta-min", "0.05"])
+    with pytest.raises(ValueError, match="only valid for margin_sigmoid"):
+        runner._validate(args)
 
 
 @pytest.mark.parametrize("option", ["--help", "--dry-run"])
@@ -127,7 +216,7 @@ def test_stdlib_inspection_has_no_writes(tmp_path, option):
             "--versions",
             "v1",
             "--profiles",
-            "base",
+            "reference",
             "--datasets",
             "cora",
             "--model-seeds",
@@ -252,7 +341,13 @@ def test_v1_validation_only_path_does_not_construct_a_test_loader(monkeypatch):
     assert 3 not in observed
 
 
-def _stub(tmp_path, monkeypatch, *, expose_test: bool = False):
+def _stub(
+    tmp_path,
+    monkeypatch,
+    *,
+    expose_test: bool = False,
+    preflight_gpu: dict | None = None,
+):
     calls: list[list[str]] = []
     monkeypatch.setattr(runner, "check_dependencies", lambda: {"unit_fixture_only": True})
     monkeypatch.setattr(runner, "_source_snapshot", lambda: {"unit-source": "stable"})
@@ -260,6 +355,23 @@ def _stub(tmp_path, monkeypatch, *, expose_test: bool = False):
     def dispatch(command, log, environment):
         calls.append(command)
         if any(Path(part).name == "gpu_preflight.py" for part in command):
+            json_out = Path(_argument(command, "--json-out"))
+            json_out.parent.mkdir(parents=True, exist_ok=True)
+            json_out.write_text(
+                json.dumps(
+                    {
+                        "status": "passed",
+                        "gpu": preflight_gpu
+                        or {
+                            "name": "NVIDIA RTX A6000 fixture",
+                            "total_bytes": 48 * 1024**3,
+                            "free_bytes": 47 * 1024**3,
+                            "compute_capability": [8, 6],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             return 0
         output = Path(_argument(command, "--output-dir"))
         output.mkdir(parents=True)
@@ -302,7 +414,7 @@ def _stub(tmp_path, monkeypatch, *, expose_test: bool = False):
         "v1",
         "v4",
         "--profiles",
-        "base",
+        "reference",
         "--datasets",
         "cora",
         "--model-seeds",
@@ -320,11 +432,106 @@ def test_success_is_released_only_after_every_child_metric_is_valid(tmp_path, mo
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "passed"
+    preflight = manifest["gpu_preflight"]
+    assert preflight["status"] == "passed"
+    assert preflight["hardware_profile"] == "portable"
+    assert preflight["sha256"] == runner._sha256(Path(preflight["path"]))
+    assert preflight["gpu"]["name"] == "NVIDIA RTX A6000 fixture"
+    assert preflight["requirements"] == runner._hardware_requirements("portable")
     assert all(job["status"] == "passed" for job in manifest["jobs"])
     assert summary["valid_for_validation_comparison"] is True
     assert summary["test_evaluated"] is False
     assert {row["n"] for row in summary["rows"]} == {2}
     assert all(row["validation_mean"] == 0.75 for row in summary["rows"])
+
+
+def test_hardware_preflight_schema_rejects_bool_and_malformed_gpu_fields():
+    valid = {
+        "status": "passed",
+        "gpu": {
+            "name": "NVIDIA RTX A6000 fixture",
+            "total_bytes": 48 * 1024**3,
+            "free_bytes": 47 * 1024**3,
+            "compute_capability": [8, 6],
+        },
+    }
+    accepted = runner._validate_hardware_preflight(valid, "a6000-48gb")
+    assert accepted["hardware_profile"] == "a6000-48gb"
+    assert accepted["requirements"]["minimum_total_memory_bytes"] == 40 * 1024**3
+
+    for key, value in (
+        ("total_bytes", True),
+        ("free_bytes", False),
+        ("compute_capability", [True, 0]),
+    ):
+        malformed = json.loads(json.dumps(valid))
+        malformed["gpu"][key] = value
+        with pytest.raises(RuntimeError, match="GPU preflight"):
+            runner._validate_hardware_preflight(malformed, "a6000-48gb")
+
+
+@pytest.mark.parametrize(
+    "gpu,error",
+    [
+        (
+            {
+                "name": "MIG 1g.10gb fixture",
+                "total_bytes": 10 * 1024**3,
+                "free_bytes": 9 * 1024**3,
+                "compute_capability": [8, 0],
+            },
+            "40 GiB",
+        ),
+        (
+            {
+                "name": "NVIDIA RTX A6000 fixture",
+                "total_bytes": 48 * 1024**3,
+                "free_bytes": 31 * 1024**3,
+                "compute_capability": [8, 6],
+            },
+            "32 GiB",
+        ),
+        (
+            {
+                "name": "48 GiB legacy fixture",
+                "total_bytes": 48 * 1024**3,
+                "free_bytes": 47 * 1024**3,
+                "compute_capability": [7, 5],
+            },
+            "8.0",
+        ),
+    ],
+)
+def test_a6000_hardware_preflight_enforces_capacity_free_memory_and_capability(gpu, error):
+    with pytest.raises(RuntimeError, match=error):
+        runner._validate_hardware_preflight({"status": "passed", "gpu": gpu}, "a6000-48gb")
+
+
+def test_a6000_legacy_only_plan_rejects_mig_before_any_child_launch(tmp_path, monkeypatch):
+    options, calls = _stub(
+        tmp_path,
+        monkeypatch,
+        preflight_gpu={
+            "name": "MIG 1g.10gb fixture",
+            "total_bytes": 10 * 1024**3,
+            "free_bytes": 9 * 1024**3,
+            "compute_capability": [8, 0],
+        },
+    )
+    options.remove("v4")
+    options += ["--hardware-profile", "a6000-48gb"]
+
+    assert runner.main(options) == 1
+    assert len(calls) == 1
+    assert any(Path(part).name == "gpu_preflight.py" for part in calls[0])
+    manifest = json.loads(
+        (tmp_path / "conductance_gat/scaling/unit-fixture/manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["status"] == "failed"
+    assert all(job["status"] == "pending" for job in manifest["jobs"])
+    assert "gpu_preflight" not in manifest
 
 
 def test_completed_run_is_verified_and_reused_without_any_execution(tmp_path, monkeypatch):

@@ -35,23 +35,27 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
     assert [job["track"] for job in jobs] == ["conductance", "cycle", "tree"]
     assert runner._totals(jobs) == {
         "track_runs": 3,
-        "child_runs": 188,
-        "model_trainings": 204,
+        "child_runs": 118,
+        "model_trainings": 122,
     }
 
     conductance, cycle, tree = jobs
-    assert conductance["profiles"] == ["base", "wide", "deep", "large"]
-    assert conductance["command"][conductance["command"].index("--profiles") + 1 :][:4] == [
-        "base",
-        "wide",
-        "deep",
+    assert conductance["profiles"] == ["reference", "large"]
+    assert conductance["command"][conductance["command"].index("--profiles") + 1 :][:2] == [
+        "reference",
         "large",
     ]
     assert _option(cycle["command"], "--model-seeds") == "0"
-    assert _option(tree["command"], "--profiles") == "base,wide,deep,large"
+    assert _option(cycle["command"], "--basis-backend") == "thin_q"
+    assert _option(tree["command"], "--profiles") == "reference,large"
     assert _option(tree["command"], "--model-seeds") == "0"
     assert _option(tree["command"], "--suites") == "csl,zinc"
-    assert conductance["requested_matrix"]["versions"] == ["v1", "v2", "v3", "v4"]
+    assert all(_option(job["command"], "--hardware-profile") == "portable" for job in jobs)
+    assert _option(conductance["command"], "--v5-beta-parameterization") == "sigmoid"
+    assert _option(conductance["command"], "--v5-beta-initial") == "0.1"
+    assert "--v5-beta-min" not in conductance["command"]
+    assert all("--v5-beta-parameterization" not in job["command"] for job in (cycle, tree))
+    assert conductance["requested_matrix"]["versions"] == ["v1", "v2", "v3", "v4", "v5"]
     assert cycle["requested_matrix"]["datasets"] == ["zinc12k", "peptides_struct"]
     assert Path(conductance["summary_path"]).relative_to(tmp_path) == Path(
         "conductance_gat/scaling/matrix-conductance/summary.json"
@@ -72,7 +76,7 @@ def test_selection_and_download_flag_are_mapped_only_to_supported_child_clis(tmp
             "cycle",
             "tree",
             "--profiles",
-            "deep",
+            "reference",
             "large",
             "--model-seeds",
             "2",
@@ -84,11 +88,83 @@ def test_selection_and_download_flag_are_mapped_only_to_supported_child_clis(tmp
     )
     runner._validate(args)
     jobs = runner.make_jobs(args, "selected")
-    assert runner._totals(jobs)["model_trainings"] == (43 + 4 + 4) * 2 * 2
+    assert runner._totals(jobs)["model_trainings"] == (53 + 4 + 4) * 2 * 2
     assert "--allow-download" not in jobs[0]["command"]
     assert "--allow-download" in jobs[1]["command"]
     assert "--allow-download" in jobs[2]["command"]
-    assert _option(jobs[2]["command"], "--profiles") == "deep,large"
+    assert _option(jobs[2]["command"], "--profiles") == "reference,large"
+
+
+def test_a6000_hardware_profile_is_forwarded_to_every_track_and_bound_to_config(
+    tmp_path: Path,
+) -> None:
+    args = runner.parser().parse_args(
+        ["--hardware-profile", "a6000-48gb", "--results-root", str(tmp_path)]
+    )
+    runner._validate(args)
+    jobs = runner.make_jobs(args, "a6000")
+    assert all(_option(job["command"], "--hardware-profile") == "a6000-48gb" for job in jobs)
+    config = runner._config_payload(args, data_root=tmp_path / "data", results_root=tmp_path)
+    assert config["hardware_profile"] == "a6000-48gb"
+
+
+def test_cycle_v2_basis_backend_is_forwarded_only_to_cycle_and_bound_to_config(
+    tmp_path: Path,
+) -> None:
+    args = runner.parser().parse_args(
+        [
+            "--cycle-v2-basis-backend",
+            "dfs_fundamental",
+            "--results-root",
+            str(tmp_path),
+        ]
+    )
+    runner._validate(args)
+    conductance, cycle, tree = runner.make_jobs(args, "dfs")
+    assert "--basis-backend" not in conductance["command"]
+    assert _option(cycle["command"], "--basis-backend") == "dfs_fundamental"
+    assert "--basis-backend" not in tree["command"]
+    config = runner._config_payload(args, data_root=tmp_path / "data", results_root=tmp_path)
+    assert config["cycle_v2_basis_backend"] == "dfs_fundamental"
+
+
+def test_v5_margin_beta_ablation_is_forwarded_only_to_conductance_and_bound_to_config(
+    tmp_path: Path,
+) -> None:
+    args = runner.parser().parse_args(
+        [
+            "--v5-beta-parameterization",
+            "margin_sigmoid",
+            "--v5-beta-initial",
+            "0.5",
+            "--v5-beta-min",
+            "0.05",
+            "--v5-beta-max",
+            "0.95",
+            "--results-root",
+            str(tmp_path),
+        ]
+    )
+    runner._validate(args)
+    conductance, cycle, tree = runner.make_jobs(args, "margin")
+    assert _option(conductance["command"], "--v5-beta-parameterization") == "margin_sigmoid"
+    assert _option(conductance["command"], "--v5-beta-initial") == "0.5"
+    assert _option(conductance["command"], "--v5-beta-min") == "0.05"
+    assert _option(conductance["command"], "--v5-beta-max") == "0.95"
+    assert all("--v5-beta-parameterization" not in job["command"] for job in (cycle, tree))
+    config = runner._config_payload(args, data_root=tmp_path / "data", results_root=tmp_path)
+    assert config["v5_beta"] == {
+        "beta_parameterization": "margin_sigmoid",
+        "beta_initial": 0.5,
+        "beta_min": 0.05,
+        "beta_max": 0.95,
+    }
+
+
+def test_rich_runner_rejects_margin_values_for_default_no_margin_beta():
+    args = runner.parser().parse_args(["--v5-beta-max", "0.95"])
+    with pytest.raises(ValueError, match="only valid for margin_sigmoid"):
+        runner._validate(args)
 
 
 def test_central_source_inventory_covers_imported_child_code_and_tree_config():
@@ -129,22 +205,25 @@ def test_dry_run_prints_complete_plan_without_writes_or_processes(
             "cycle",
             "tree",
             "--profiles",
-            "base",
-            "deep",
+            "reference",
+            "large",
             "--model-seeds",
             "0",
             "--results-root",
             str(tmp_path),
             "--run-id",
             "dry",
+            "--cycle-v2-basis-backend",
+            "dfs_fundamental",
             "--dry-run",
         ]
     )
     output = capsys.readouterr().out
     assert code == 0
-    assert "2 track runs; 8 child runs; 16 fresh model trainings" in output
-    assert "child profiles=['base', 'deep']" in output
-    assert "--profiles base,deep" in output
+    assert "2 track runs; 12 child runs; 16 fresh model trainings" in output
+    assert "child profiles=['reference', 'large']" in output
+    assert "--profiles reference,large" in output
+    assert "--basis-backend dfs_fundamental" in output
     assert "no files or directories were written" in output
     assert list(tmp_path.iterdir()) == []
 
@@ -188,7 +267,7 @@ def _write_summary(command: list[str], *, malformed: str | None = None) -> None:
         output = results_root / "conductance_gat/scaling" / run_id
         payload = {
             "status": "failed" if malformed == "status" else "passed",
-            "suite": "conductance_architecture_scaling_v1_v4",
+            "suite": "conductance_architecture_scaling_v1_v5",
             "run_id": run_id,
             "valid_for_validation_comparison": malformed != "status",
             "test_evaluated": False,
@@ -388,7 +467,7 @@ def _write_summary(command: list[str], *, malformed: str | None = None) -> None:
 def _base_options(tmp_path: Path) -> list[str]:
     return [
         "--profiles",
-        "base",
+        "reference",
         "--model-seeds",
         "0",
         "--data-root",
@@ -422,10 +501,10 @@ def test_success_runs_tracks_sequentially_and_certifies_all_summaries(
     assert manifest["status"] == "passed"
     assert manifest["planned_counts"] == {
         "track_runs": 3,
-        "child_runs": 47,
-        "model_trainings": 51,
+        "child_runs": 59,
+        "model_trainings": 61,
     }
-    assert manifest["completed_counts"]["verified_model_trainings"] == 51
+    assert manifest["completed_counts"]["verified_model_trainings"] == 61
     assert all(job["status"] == "passed" for job in manifest["jobs"])
     assert all(len(job["result"]["summary_sha256"]) == 64 for job in manifest["jobs"])
 

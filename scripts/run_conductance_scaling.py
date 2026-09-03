@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run validation-only architecture scaling for Conductance V1, V2, V3 and V4."""
+"""Run validation-only reference-scale experiments for Conductance V1 through V5."""
 
 from __future__ import annotations
 
@@ -43,6 +43,20 @@ from research.conductance_gat.v4.protocol import (  # noqa: E402
 from research.conductance_gat.v4.protocol import (  # noqa: E402
     DATASETS as V4_DATASETS,
 )
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    BETA_PARAMETERIZATIONS,
+    DEFAULT_BETA_INITIAL,
+    DEFAULT_BETA_PARAMETERIZATION,
+    HARDWARE_PROFILES,
+    SCALE_PROFILES,
+    beta_configuration,
+)
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    CONDITIONS as V5_CONDITIONS,
+)
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    DATASETS as V5_DATASETS,
+)
 from scripts import run_conductance_factorial as shared  # noqa: E402
 from scripts.check_dependencies import (  # noqa: E402
     DependencyCheckError,
@@ -51,11 +65,10 @@ from scripts.check_dependencies import (  # noqa: E402
 )
 
 V1_DATASETS = ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv")
+# V5 owns these profiles. Legacy versions receive only their supported
+# width/depth/dropout subset; heads and FFN expansion remain V5-specific.
 PROFILES: dict[str, dict[str, Any]] = {
-    "base": {"hidden_channels": 64, "layers": 2, "dropout": 0.5},
-    "wide": {"hidden_channels": 128, "layers": 2, "dropout": 0.5},
-    "deep": {"hidden_channels": 64, "layers": 4, "dropout": 0.5},
-    "large": {"hidden_channels": 128, "layers": 4, "dropout": 0.5},
+    name: dict(configuration) for name, configuration in SCALE_PROFILES.items()
 }
 VERSIONS: dict[str, dict[str, Any]] = {
     "v1": {
@@ -77,6 +90,11 @@ VERSIONS: dict[str, dict[str, Any]] = {
         "module": "research.conductance_gat.v4.train",
         "datasets": tuple(V4_DATASETS),
         "conditions": tuple(V4_CONDITIONS),
+    },
+    "v5": {
+        "module": "research.conductance_gat.v5.train",
+        "datasets": tuple(V5_DATASETS),
+        "conditions": tuple(V5_CONDITIONS),
     },
 }
 ALL_DATASETS = tuple(
@@ -104,6 +122,37 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--patience", type=int, default=50)
     result.add_argument("--workers", type=int, default=0)
     result.add_argument("--edge-chunk-size", type=int, default=65536)
+    result.add_argument("--v5-edge-chunk-size", type=int)
+    result.add_argument("--v5-ppi-batch-size", type=int)
+    result.add_argument(
+        "--v5-beta-parameterization",
+        choices=BETA_PARAMETERIZATIONS,
+        default=DEFAULT_BETA_PARAMETERIZATION,
+    )
+    result.add_argument("--v5-beta-initial", type=float, default=DEFAULT_BETA_INITIAL)
+    result.add_argument("--v5-beta-min", type=float)
+    result.add_argument("--v5-beta-max", type=float)
+    result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
+    result.add_argument(
+        "--v5-sampling",
+        choices=("auto", "full", "neighbor", "cluster"),
+        default="auto",
+        help="V5 only: auto uses cluster sampling for ogbn-arxiv and full otherwise",
+    )
+    result.add_argument(
+        "--v5-num-neighbors",
+        nargs="+",
+        type=int,
+        default=[15, 10],
+        help="V5 only: hop fanouts; first value is also the cluster budget hint",
+    )
+    result.add_argument("--v5-sample-seed-batch-size", type=int)
+    result.add_argument(
+        "--v5-activation-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="V5 only: override the selected hardware profile's checkpoint policy",
+    )
     result.add_argument("--min-free-gb", type=float, default=8.0)
     result.add_argument("--dry-run", action="store_true", help="Print every child without writes")
     return result
@@ -123,6 +172,17 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("model seeds must be nonnegative")
     if min(args.epochs, args.patience, args.edge_chunk_size) < 1 or args.workers != 0:
         raise ValueError("epochs/patience/chunk size must be positive and workers must be 0")
+    if (
+        not args.v5_num_neighbors
+        or any(value < 1 for value in args.v5_num_neighbors)
+        or (args.v5_sample_seed_batch_size is not None and args.v5_sample_seed_batch_size < 1)
+        or (args.v5_edge_chunk_size is not None and args.v5_edge_chunk_size < 1)
+        or (args.v5_ppi_batch_size is not None and args.v5_ppi_batch_size < 1)
+    ):
+        raise ValueError("V5 neighbor fanouts and sample seed batch size must be positive")
+    if args.hardware_profile == "portable" and args.v5_ppi_batch_size not in {None, 2}:
+        raise ValueError("portable V5 PPI retains graph batch-size 2")
+    _v5_beta_configuration(args)
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
         raise ValueError("CUDA is required; CPU training/fallback is not supported")
     if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
@@ -137,6 +197,46 @@ def _selected_datasets(args: argparse.Namespace, version: str) -> list[str]:
     supported = VERSIONS[version]["datasets"]
     requested = supported if args.datasets is None else args.datasets
     return [dataset for dataset in requested if dataset in supported]
+
+
+def _v5_execution(args: argparse.Namespace, dataset: str) -> dict[str, Any]:
+    profile = HARDWARE_PROFILES[args.hardware_profile]
+    batch_size = 1
+    if dataset == "ppi":
+        batch_size = args.v5_ppi_batch_size or profile["ppi_batch_size"]
+    return {
+        "hardware_profile": args.hardware_profile,
+        "precision": profile["precision"],
+        "tf32": profile["tf32"],
+        "batch_size": batch_size,
+        "sample_seed_batch_size": (
+            args.v5_sample_seed_batch_size or profile["sample_seed_batch_size"]
+        ),
+        "edge_chunk_size": args.v5_edge_chunk_size or profile["edge_chunk_size"],
+        "activation_checkpoint": (
+            profile["activation_checkpoint"]
+            if args.v5_activation_checkpoint is None
+            else args.v5_activation_checkpoint
+        ),
+        "sample_prefetch": profile["sample_prefetch"],
+        "pin_memory": profile["pin_memory"],
+    }
+
+
+def _v5_beta_configuration(args: argparse.Namespace) -> dict[str, float | str]:
+    return beta_configuration(
+        args.v5_beta_parameterization,
+        args.v5_beta_initial,
+        args.v5_beta_min,
+        args.v5_beta_max,
+    )
+
+
+def _effective_min_free_gb(args: argparse.Namespace) -> float:
+    return max(
+        float(args.min_free_gb),
+        float(HARDWARE_PROFILES[args.hardware_profile]["minimum_free_memory_gib"]),
+    )
 
 
 def _exclusions(args: argparse.Namespace) -> list[dict[str, str]]:
@@ -169,7 +269,15 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     for version in args.versions:
         spec = VERSIONS[version]
         for profile_name in args.profiles:
-            profile = PROFILES[profile_name]
+            full_profile = PROFILES[profile_name]
+            profile_fields = (
+                ("hidden_channels", "layers", "heads", "ffn_multiplier", "dropout")
+                if version == "v5"
+                else ("hidden_channels", "layers", "dropout")
+            )
+            profile = {key: full_profile[key] for key in profile_fields}
+            if version == "v5":
+                profile.update(_v5_beta_configuration(args))
             for seed in args.model_seeds:
                 for dataset in _selected_datasets(args, version):
                     for condition in spec["conditions"]:
@@ -212,10 +320,48 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             "--batch-size",
                             "2" if dataset == "ppi" or version == "v1" else "1",
                         ]
+                        execution = None
                         if version != "v1":
                             command += ["--condition", condition]
                         if version in {"v2", "v3", "v4"}:
                             command += ["--edge-chunk-size", str(args.edge_chunk_size)]
+                        sampling = None
+                        if version == "v5":
+                            execution = _v5_execution(args, dataset)
+                            batch_position = command.index("--batch-size") + 1
+                            command[batch_position] = str(execution["batch_size"])
+                            sampling = (
+                                "cluster"
+                                if args.v5_sampling == "auto" and dataset == "ogbn-arxiv"
+                                else "full"
+                                if args.v5_sampling == "auto"
+                                else args.v5_sampling
+                            )
+                            if dataset == "ppi" and sampling != "full":
+                                raise ValueError("V5 PPI is inductive and requires full sampling")
+                            command += [
+                                "--heads",
+                                str(profile["heads"]),
+                                "--ffn-multiplier",
+                                str(profile["ffn_multiplier"]),
+                                "--sampling",
+                                sampling,
+                                "--hardware-profile",
+                                args.hardware_profile,
+                                "--sample-seed-batch-size",
+                                str(execution["sample_seed_batch_size"]),
+                                "--edge-chunk-size",
+                                str(execution["edge_chunk_size"]),
+                                (
+                                    "--activation-checkpoint"
+                                    if execution["activation_checkpoint"]
+                                    else "--no-activation-checkpoint"
+                                ),
+                                "--num-neighbors",
+                                *(str(value) for value in args.v5_num_neighbors),
+                            ]
+                            for name, value in _v5_beta_configuration(args).items():
+                                command += ["--" + name.replace("_", "-"), str(value)]
                         job_id = f"{version}/{profile_name}/model-seed-{seed}/{dataset}/{condition}"
                         jobs.append(
                             {
@@ -223,6 +369,13 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                                 "version": version,
                                 "profile": profile_name,
                                 "architecture": dict(profile),
+                                "sampling": sampling,
+                                "execution": execution,
+                                "occupancy_expectation": (
+                                    "expected low occupancy; one small full graph/no minibatch axis"
+                                    if dataset in {"cora", "citeseer", "pubmed"}
+                                    else "dataset exposes a real graph/sample minibatch axis"
+                                ),
                                 "model_seed": seed,
                                 "dataset": dataset,
                                 "condition": condition,
@@ -241,6 +394,22 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                         )
     if not jobs:
         raise ValueError("selection produces no supported version/dataset/profile jobs")
+    if args.hardware_profile == "a6000-48gb":
+        # Child processes remain sequential to avoid unbounded multi-process CUDA
+        # memory contention. Run the genuinely large V5 workloads first instead
+        # of presenting Cora's unavoidable low utilization as the initial job.
+        version_order = {"v5": 0, "v4": 1, "v3": 2, "v2": 3, "v1": 4}
+        dataset_order = {"ogbn-arxiv": 0, "ppi": 1, "pubmed": 2, "citeseer": 3, "cora": 4}
+        profile_order = {"reference": 0, "large": 1}
+        jobs.sort(
+            key=lambda job: (
+                version_order[job["version"]],
+                dataset_order[job["dataset"]],
+                profile_order[job["profile"]],
+                job["model_seed"],
+                job["condition"],
+            )
+        )
     return jobs
 
 
@@ -266,6 +435,7 @@ def _source_snapshot() -> dict[str, str]:
     paths += list((ROOT / "research/conductance_gat/v2").glob("*.py"))
     paths += list((ROOT / "research/conductance_gat/v3").glob("*.py"))
     paths += list((ROOT / "research/conductance_gat/v4").glob("*.py"))
+    paths += list((ROOT / "research/conductance_gat/v5").glob("*.py"))
     paths += [
         ROOT / "src/chartgat/cache.py",
         ROOT / "src/chartgat/execution.py",
@@ -287,11 +457,123 @@ def _check_sources(manifest: dict[str, Any]) -> None:
         raise RuntimeError("Conductance scaling source changed during execution")
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _hardware_requirements(hardware_profile: str) -> dict[str, int]:
+    try:
+        profile = HARDWARE_PROFILES[hardware_profile]
+    except KeyError as exc:
+        raise RuntimeError(f"unknown hardware profile: {hardware_profile}") from exc
+    return {
+        "minimum_total_memory_bytes": int(float(profile["minimum_total_memory_gib"]) * 1024**3),
+        "minimum_free_memory_bytes": int(float(profile["minimum_free_memory_gib"]) * 1024**3),
+        "minimum_compute_capability_major": int(profile["minimum_compute_capability_major"]),
+    }
+
+
+def _validate_hardware_preflight(payload: Any, hardware_profile: str) -> dict[str, Any]:
+    """Validate and normalize the preflight certificate before any child starts."""
+    if not isinstance(payload, dict) or payload.get("status") != "passed":
+        raise RuntimeError("GPU preflight returned without a passed certificate")
+    gpu = payload.get("gpu")
+    if not isinstance(gpu, dict):
+        raise RuntimeError("GPU preflight is missing the visible GPU record")
+    name = gpu.get("name")
+    total_bytes = gpu.get("total_bytes")
+    free_bytes = gpu.get("free_bytes")
+    capability = gpu.get("compute_capability")
+    if not isinstance(name, str) or not name.strip():
+        raise RuntimeError("GPU preflight device name must be a nonempty string")
+    if isinstance(total_bytes, bool) or not isinstance(total_bytes, int) or total_bytes < 1:
+        raise RuntimeError("GPU preflight total_bytes must be a positive integer")
+    if (
+        isinstance(free_bytes, bool)
+        or not isinstance(free_bytes, int)
+        or free_bytes < 0
+        or free_bytes > total_bytes
+    ):
+        raise RuntimeError("GPU preflight free_bytes must be an integer within device capacity")
+    if (
+        not isinstance(capability, list)
+        or len(capability) != 2
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in capability)
+        or any(value < 0 for value in capability)
+    ):
+        raise RuntimeError("GPU preflight compute_capability must be two nonnegative integers")
+    requirements = _hardware_requirements(hardware_profile)
+    if total_bytes < requirements["minimum_total_memory_bytes"]:
+        raise RuntimeError(
+            f"{hardware_profile} requires at least "
+            f"{requirements['minimum_total_memory_bytes'] / 1024**3:g} GiB of visible GPU "
+            "memory; a smaller GPU or MIG slice must use the portable profile"
+        )
+    if free_bytes < requirements["minimum_free_memory_bytes"]:
+        raise RuntimeError(
+            f"{hardware_profile} requires at least "
+            f"{requirements['minimum_free_memory_bytes'] / 1024**3:g} GiB free at "
+            "preflight; wait for other GPU jobs or use the portable profile"
+        )
+    if capability[0] < requirements["minimum_compute_capability_major"]:
+        raise RuntimeError(
+            f"{hardware_profile} requires CUDA compute capability "
+            f"{requirements['minimum_compute_capability_major']}.0 or newer"
+        )
+    return {
+        "status": "passed",
+        "hardware_profile": hardware_profile,
+        "gpu": {
+            "name": name,
+            "total_bytes": total_bytes,
+            "free_bytes": free_bytes,
+            "compute_capability": capability,
+        },
+        "requirements": requirements,
+    }
+
+
+def _accepted_hardware_preflight(path: Path, hardware_profile: str) -> dict[str, Any]:
+    if not path.is_file():
+        raise RuntimeError(f"GPU preflight returned without its JSON certificate: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"GPU preflight certificate is unreadable: {exc}") from exc
+    accepted = _validate_hardware_preflight(payload, hardware_profile)
+    return {"path": str(path), "sha256": _sha256(path), **accepted}
+
+
+def _verify_preflight_evidence(
+    manifest: dict[str, Any], run_dir: Path, hardware_profile: str
+) -> None:
+    evidence = manifest.get("gpu_preflight")
+    jobs = manifest["jobs"]
+    if evidence is None:
+        if manifest.get("status") == "passed" or any(
+            job.get("status") != "pending" for job in jobs
+        ):
+            raise RuntimeError("existing run has child state without accepted GPU preflight")
+        return
+    if not isinstance(evidence, dict):
+        raise RuntimeError("existing GPU preflight evidence must be a JSON object")
+    lexical = Path(os.path.abspath(Path(evidence.get("path", "")).expanduser()))
+    resolved = lexical.resolve()
+    expected = (run_dir / "gpu-preflight.json").resolve()
+    if resolved != lexical or resolved != expected or not resolved.is_relative_to(run_dir):
+        raise RuntimeError("existing GPU preflight evidence aliases or escapes the run")
+    actual = _accepted_hardware_preflight(lexical, hardware_profile)
+    if evidence != actual:
+        raise RuntimeError("existing GPU preflight evidence or certificate hash changed")
+
+
 _JOB_IDENTITY_KEYS = (
     "job_id",
     "version",
     "profile",
     "architecture",
+    "execution",
+    "occupancy_expectation",
     "model_seed",
     "dataset",
     "condition",
@@ -334,7 +616,7 @@ def _load_resume_manifest(
         raise RuntimeError("existing manifest must be a JSON object")
     for key, expected in (
         ("schema_version", 1),
-        ("suite", "conductance_architecture_scaling_v1_v4"),
+        ("suite", "conductance_architecture_scaling_v1_v5"),
         ("run_id", run_id),
         ("config", config),
         ("exclusions", exclusions),
@@ -378,6 +660,7 @@ def _load_resume_manifest(
             _verify_passed_job(job)
     if manifest["status"] == "passed" and any(job["status"] != "passed" for job in existing_jobs):
         raise RuntimeError("passed manifest contains a non-passed job")
+    _verify_preflight_evidence(manifest, run_dir, str(config["hardware_profile"]))
     return manifest
 
 
@@ -469,6 +752,22 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
     for key, expected in job["architecture"].items():
         if configuration.get(key) != expected:
             raise RuntimeError(f"child architecture mismatch for {key}")
+    if job["version"] == "v5":
+        execution = job["execution"]
+        expected_configuration = {
+            "hardware_profile": execution["hardware_profile"],
+            "precision": execution["precision"],
+            "tf32": execution["tf32"],
+            "batch_size": execution["batch_size"],
+            "sample_seed_batch_size": execution["sample_seed_batch_size"],
+            "edge_chunk_size": execution["edge_chunk_size"],
+            "activation_checkpoint": execution["activation_checkpoint"],
+            "sampling": job["sampling"],
+            "sample_prefetch": execution["sample_prefetch"],
+            "pin_memory": execution["pin_memory"],
+        }
+        if any(configuration.get(key) != value for key, value in expected_configuration.items()):
+            raise RuntimeError("V5 child resolved execution configuration mismatch")
     validation = _number(child.get("validation"), "validation", minimum=0.0)
     if validation > 1:
         raise RuntimeError("validation metric must be at most one")
@@ -478,10 +777,31 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("child trainable parameter count is invalid")
     if isinstance(total, bool) or not isinstance(total, int) or total < trainable:
         raise RuntimeError("child total parameter count is invalid")
+    hardware_execution = child.get("hardware_execution")
+    if job["version"] == "v5":
+        execution = job["execution"]
+        expected_hardware = {
+            "profile": execution["hardware_profile"],
+            "precision": execution["precision"],
+            "tf32": execution["tf32"],
+            "activation_checkpoint": execution["activation_checkpoint"],
+            "edge_chunk_size": execution["edge_chunk_size"],
+            "sample_seed_batch_size": execution["sample_seed_batch_size"],
+            "graph_batch_size": execution["batch_size"],
+            "sample_prefetch": execution["sample_prefetch"],
+            "pin_memory": execution["pin_memory"],
+        }
+        if not isinstance(hardware_execution, dict) or any(
+            hardware_execution.get(key) != value for key, value in expected_hardware.items()
+        ):
+            raise RuntimeError("V5 child hardware execution metadata mismatch")
     elapsed = _number(child.get("elapsed_seconds"), "elapsed_seconds", minimum=0.0)
     peak_memory = child.get("peak_cuda_allocated_bytes", child.get("peak_gpu_memory_bytes"))
     if isinstance(peak_memory, bool) or not isinstance(peak_memory, int) or peak_memory < 0:
         raise RuntimeError("child peak CUDA allocation is invalid")
+    peak_reserved = child.get("peak_cuda_reserved_bytes", peak_memory)
+    if isinstance(peak_reserved, bool) or not isinstance(peak_reserved, int) or peak_reserved < 0:
+        raise RuntimeError("child peak CUDA reservation is invalid")
     return {
         "metrics_sha256": hashlib.sha256(raw).hexdigest(),
         "validation": validation,
@@ -492,9 +812,10 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
         "total_parameters": total,
         "elapsed_seconds": elapsed,
         "peak_cuda_allocated_bytes": peak_memory,
-        "actual_configuration": {
-            key: configuration[key] for key in ("hidden_channels", "layers", "dropout")
-        },
+        "peak_cuda_reserved_bytes": peak_reserved,
+        "hardware_execution": hardware_execution,
+        "throughput": child.get("throughput"),
+        "actual_configuration": {key: configuration[key] for key in job["architecture"]},
         "test_evaluated": False,
     }
 
@@ -510,6 +831,7 @@ def _aggregate(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         validations = [member["result"]["validation"] for member in members]
         elapsed = [member["result"]["elapsed_seconds"] for member in members]
         memories = [member["result"]["peak_cuda_allocated_bytes"] for member in members]
+        reservations = [member["result"]["peak_cuda_reserved_bytes"] for member in members]
         output.append(
             {
                 "version": key[0],
@@ -533,6 +855,8 @@ def _aggregate(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 ),
                 "elapsed_seconds_mean": statistics.fmean(elapsed),
                 "peak_cuda_allocated_bytes_max": max(memories),
+                "peak_cuda_reserved_bytes_max": max(reservations),
+                "hardware_execution": members[0]["result"].get("hardware_execution"),
             }
         )
     return output
@@ -557,7 +881,7 @@ def _summary(manifest: dict[str, Any]) -> dict[str, Any]:
     }
     return {
         "schema_version": 1,
-        "suite": "conductance_architecture_scaling_v1_v4",
+        "suite": "conductance_architecture_scaling_v1_v5",
         "run_id": manifest["run_id"],
         "status": manifest["status"],
         "valid_for_validation_comparison": complete
@@ -579,12 +903,12 @@ def _write_summary(run_dir: Path, manifest: dict[str, Any]) -> None:
     )
     atomic_write_json(summary_json, summary)
     lines = [
-        "# Conductance V1-V4 architecture scaling",
+        "# Conductance V1-V5 reference-scale comparison",
         "",
         f"- Status: `{summary['status']}`",
         f"- Validation comparison released: `{summary['valid_for_validation_comparison']}`",
         "- Test evaluated: `false`",
-        "- Profiles: base 64x2, wide 128x2, deep 64x4, large 128x4; dropout 0.5",
+        "- Profiles: reference 256x8x8-head and large 384x12x8-head; FFN expansion 4.",
         "- The table is descriptive validation scaling across independent model seeds.",
         "",
         "| Version | Profile | Dataset | Condition | n | Validation mean | Sample SD | "
@@ -611,7 +935,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    run_id = args.run_id or "scaling-v1-v4-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    run_id = args.run_id or "scaling-v1-v5-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
     results_root = args.results_root.expanduser().resolve()
     run_dir = (results_root / "conductance_gat/scaling" / run_id).resolve()
     data_root = args.data_root.expanduser().resolve()
@@ -645,6 +969,19 @@ def main(argv: list[str] | None = None) -> int:
         "device": args.device,
         "min_free_gb": args.min_free_gb,
         "edge_chunk_size": args.edge_chunk_size,
+        "v5_edge_chunk_size": args.v5_edge_chunk_size,
+        "v5_ppi_batch_size": args.v5_ppi_batch_size,
+        "v5_beta": _v5_beta_configuration(args),
+        "hardware_profile": args.hardware_profile,
+        "effective_min_free_gb": _effective_min_free_gb(args),
+        "v5_sampling": args.v5_sampling,
+        "v5_num_neighbors": list(args.v5_num_neighbors),
+        "v5_sample_seed_batch_size": args.v5_sample_seed_batch_size,
+        "v5_activation_checkpoint": args.v5_activation_checkpoint,
+        "v5_resolved_execution_by_dataset": {
+            dataset: _v5_execution(args, dataset)
+            for dataset in (_selected_datasets(args, "v5") if "v5" in args.versions else [])
+        },
         "data_root": str(data_root),
     }
     if args.dry_run:
@@ -711,7 +1048,7 @@ def main(argv: list[str] | None = None) -> int:
         run_dir.mkdir(parents=True, exist_ok=False)
         manifest = {
             "schema_version": 1,
-            "suite": "conductance_architecture_scaling_v1_v4",
+            "suite": "conductance_architecture_scaling_v1_v5",
             "run_id": run_id,
             "status": "running",
             "source_integrity_valid": True,
@@ -719,12 +1056,24 @@ def main(argv: list[str] | None = None) -> int:
             "config": config,
             "protocol": {
                 "purpose": "architecture scale response, not parameter matching",
-                "profiles": "base/wide/deep/large all run for every selected version",
+                "profiles": "reference/large run for every version; V5 additionally uses heads/FFN",
                 "selection": "best validation checkpoint within each independent child",
                 "test": "never loaded into a V1 scaling loader and never evaluated by any child",
                 "aggregation": "validation mean and sample standard deviation across model seeds",
                 "release": (
                     "comparison valid only after every planned child and source check passes"
+                ),
+                "hardware_execution": (
+                    "portable preserves legacy execution; a6000-48gb changes V5's explicit "
+                    "optimization/precision recipe, runs large V5 jobs first, and keeps child "
+                    "processes sequential to avoid unsafe CUDA memory contention. Portable and "
+                    "A6000 metrics are not directly comparable; V5 fixed/dynamic interpretation "
+                    "requires the same profile. V1-V5 PPI remains descriptive because V5 uses "
+                    "profile-specific real graph batches while legacy versions retain batch 2"
+                ),
+                "small_graph_limit": (
+                    "single Cora/Citeseer/PubMed full graphs cannot fill a 48 GiB GPU; no "
+                    "duplicate examples or dummy compute are introduced"
                 ),
             },
             "exclusions": exclusions,
@@ -749,7 +1098,7 @@ def main(argv: list[str] | None = None) -> int:
             args.device,
             "--require-paper-deps",
             "--min-free-gb",
-            str(args.min_free_gb),
+            str(_effective_min_free_gb(args)),
             "--json-out",
             str(preflight_output),
         ]
@@ -758,6 +1107,10 @@ def main(argv: list[str] | None = None) -> int:
         status = shared.run_logged(preflight, preflight_log, environment)
         if status:
             raise RuntimeError(f"GPU preflight failed with exit code {status}")
+        manifest["gpu_preflight"] = _accepted_hardware_preflight(
+            preflight_output, args.hardware_profile
+        )
+        atomic_write_json(manifest_path, manifest)
         remaining = sum(job["status"] != "passed" for job in jobs)
         print(
             f"Run: {run_id}; {remaining}/{len(jobs)} validation-only fresh trainings remaining",
@@ -769,15 +1122,23 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             current = job
             _check_sources(manifest)
-            _discard_incomplete_child(job, run_dir)
+            attempt_command = list(job["command"])
+            last_checkpoint = Path(job["output_dir"]) / "last.pt"
+            if job["version"] == "v5" and last_checkpoint.is_file():
+                attempt_command.append("--resume")
+            else:
+                _discard_incomplete_child(job, run_dir)
+            job["attempt_command"] = attempt_command
             job["status"] = "running"
             atomic_write_json(manifest_path, manifest)
             _write_summary(run_dir, manifest)
             print(f"\n[{index}/{len(jobs)}] {job['job_id']}", flush=True)
+            if "expected low occupancy" in job["occupancy_expectation"]:
+                print(job["occupancy_expectation"], flush=True)
             started = time.monotonic()
             attempt_log = _next_attempt_log(Path(job["log_path"]), run_dir, str(job["job_id"]))
             job["attempt_log_path"] = str(attempt_log)
-            status = shared.run_logged(job["command"], attempt_log, environment)
+            status = shared.run_logged(attempt_command, attempt_log, environment)
             job.update(exit_code=status, elapsed_wall_seconds=time.monotonic() - started)
             _check_sources(manifest)
             if status:

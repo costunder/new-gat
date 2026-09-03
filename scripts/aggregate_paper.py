@@ -119,7 +119,7 @@ PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "cycle.basis_v2.test",
         "cycle_pe",
         r"metrics\.json",
-        r"datasets\.[^.]+\.models\.cycle_basis_v2\.test",
+        r"datasets\.[^.]+\.models\.cycle_projector_pe_v2\.test",
         # The basis-input experiment is a separate model, not another seed or
         # condition of the existing six-statistic cycle-set experiment.
         pairable=False,
@@ -229,7 +229,7 @@ EFFICIENCY_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "cycle.basis_v2.efficiency",
         "cycle_pe",
         r"metrics\.json",
-        r"datasets\.[^.]+\.models\.cycle_basis_v2\."
+        r"datasets\.[^.]+\.models\.cycle_projector_pe_v2\."
         r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
         pairable=False,
     ),

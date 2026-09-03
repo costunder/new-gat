@@ -1,8 +1,9 @@
-"""Official molecular splits with complete, graph-local cycle basis matrices.
+"""Official molecular splits with coordinate-free cycle-space inputs.
 
 Only the official split adapter and source fingerprint are shared with v1.
-Neither v1 graph preparation nor cycle-set statistics are used here. Cached
-columns and ragged batches retain all cycle vectors without global column IDs.
+Neither v1 graph preparation nor cycle-set statistics are used here.  The
+production backend caches a thin-QR ``Q``; a diagnostic DFS backend can instead
+cache raw fundamental cycles and records that representation explicitly.
 """
 
 from __future__ import annotations
@@ -25,12 +26,17 @@ from chartgat.cache import (
     atomic_write_json,
 )
 from research.cycle_pe.benchmark_data import graph_fingerprint, load_official_splits
-from research.cycle_pe.v2.basis import left_nullspace_basis, validate_cycle_basis
+from research.cycle_pe.v2.basis import (
+    BASIS_BACKENDS,
+    DEFAULT_BASIS_BACKEND,
+    build_cycle_basis,
+    validate_cycle_basis,
+)
 
 DATASETS = ("zinc12k", "peptides_struct")
 SPLITS = ("train", "validation", "test")
-CACHE_VERSION = "complete-left-nullspace-svd-v2-1"
-CACHE_NAMESPACE = "cycle_pe_v2_benchmark"
+CACHE_VERSION = "selectable-dfs-fundamental-projector-kernel-v2-3"
+CACHE_NAMESPACE = "cycle_pe_v2_projector_kernel_benchmark"
 SCHEMAS = {
     "zinc12k": {"atoms": (28,), "bonds": (4,), "targets": 1},
     "peptides_struct": {
@@ -52,6 +58,7 @@ class Graph:
     edge_attr: Tensor
     y: Tensor
     cycle_basis: Tensor
+    cycle_basis_is_orthonormal: Tensor
 
 
 @dataclass
@@ -62,15 +69,36 @@ class Batch:
     y: Tensor
     batch: Tensor
     ptr: Tensor
-    cycle_bases: tuple[Tensor, ...]
+    packed_cycle_basis: Tensor
+    cycle_basis_shapes: tuple[tuple[int, int], ...]
+    cycle_basis_is_orthonormal: tuple[bool, ...]
     edge_ptr: Tensor
+
+    @property
+    def cycle_bases(self) -> tuple[Tensor, ...]:
+        """Return zero-copy matrix views over one contiguous transfer tensor.
+
+        Keeping the ragged matrices packed means a minibatch performs one basis-data
+        host-to-device copy instead of one copy per molecular graph.  Shapes stay
+        as CPU-side Python metadata, so reconstructing the views never calls
+        ``Tensor.item()`` and cannot introduce a CUDA synchronization.
+        """
+        offset = 0
+        matrices = []
+        for rows, columns in self.cycle_basis_shapes:
+            elements = rows * columns
+            matrices.append(self.packed_cycle_basis.narrow(0, offset, elements).view(rows, columns))
+            offset += elements
+        if offset != self.packed_cycle_basis.numel():
+            raise ValueError("packed cycle-basis data disagree with shape metadata")
+        return tuple(matrices)
 
     def to(self, device: torch.device | str) -> Batch:
         return Batch(
             **{
-                field.name: tuple(value.to(device, non_blocking=True) for value in current)
-                if field.name == "cycle_bases"
-                else current.to(device, non_blocking=True)
+                field.name: current.to(device, non_blocking=True)
+                if isinstance(current, Tensor)
+                else current
                 for field in fields(self)
                 for current in (getattr(self, field.name),)
             }
@@ -79,9 +107,7 @@ class Batch:
     def pin_memory(self) -> Batch:
         return Batch(
             **{
-                field.name: tuple(value.pin_memory() for value in current)
-                if field.name == "cycle_bases"
-                else current.pin_memory()
+                field.name: current.pin_memory() if isinstance(current, Tensor) else current
                 for field in fields(self)
                 for current in (getattr(self, field.name),)
             }
@@ -112,7 +138,13 @@ def collate(graphs: list[Graph]) -> Batch:
         y=torch.stack([graph.y for graph in graphs]),
         batch=torch.repeat_interleave(torch.arange(len(graphs)), torch.tensor(counts)),
         ptr=ptr,
-        cycle_bases=tuple(graph.cycle_basis for graph in graphs),
+        packed_cycle_basis=torch.cat(
+            [graph.cycle_basis.reshape(-1) for graph in graphs], dim=0
+        ).contiguous(),
+        cycle_basis_shapes=tuple(tuple(graph.cycle_basis.shape) for graph in graphs),
+        cycle_basis_is_orthonormal=tuple(
+            bool(graph.cycle_basis_is_orthonormal.item()) for graph in graphs
+        ),
         edge_ptr=edge_ptr,
     )
 
@@ -206,6 +238,11 @@ def validate_graph(graph: Graph, *, dataset: str | None = None, check_basis: boo
         or graph.cycle_basis.shape[0] != edge_count
     ):
         raise ValueError("invalid prepared cycle-basis schema")
+    if (
+        graph.cycle_basis_is_orthonormal.dtype != torch.bool
+        or graph.cycle_basis_is_orthonormal.ndim != 0
+    ):
+        raise ValueError("invalid cycle-basis representation metadata")
     if (graph.x < 0).any() or (graph.edge_attr < 0).any():
         raise ValueError("categorical features must be nonnegative")
     if dataset is not None:
@@ -222,33 +259,76 @@ def validate_graph(graph: Graph, *, dataset: str | None = None, check_basis: boo
                 raise ValueError(f"{dataset}: categorical {name} index out of range")
     if check_basis:
         validate_cycle_basis(len(graph.x), graph.edge_index.numpy(), graph.cycle_basis.numpy())
+        rank = graph.cycle_basis.shape[1]
+        if rank and bool(graph.cycle_basis_is_orthonormal.item()):
+            gram = graph.cycle_basis.double().T @ graph.cycle_basis.double()
+            if not torch.allclose(gram, torch.eye(rank, dtype=torch.float64), atol=2e-5, rtol=2e-5):
+                raise ValueError("cached cycle_basis must be thin-QR orthonormal")
 
 
-def prepare_graph(data: Any, *, dataset: str | None = None) -> Graph:
-    """Preserve official chemistry/targets and attach the full raw SVD basis."""
+def prepare_graph(
+    data: Any,
+    *,
+    dataset: str | None = None,
+    basis_backend: str = DEFAULT_BASIS_BACKEND,
+) -> Graph:
+    """Preserve official data and attach the selected cycle-space representation."""
+    if basis_backend not in BASIS_BACKENDS:
+        raise ValueError(f"basis_backend must be one of {BASIS_BACKENDS}")
     x, edge_index, edge_attr, y = _canonical_inputs(data)
     graph = Graph(
         x=x,
         edge_index=edge_index,
         edge_attr=edge_attr,
         y=y,
-        cycle_basis=torch.from_numpy(left_nullspace_basis(len(x), edge_index.numpy())),
+        cycle_basis=torch.from_numpy(
+            build_cycle_basis(len(x), edge_index.numpy(), backend=basis_backend)
+        ),
+        cycle_basis_is_orthonormal=torch.tensor(basis_backend == "thin_q"),
     )
     validate_graph(graph, dataset=dataset)
     return graph
 
 
-def preparation_signature(dataset: str) -> dict[str, Any]:
+def preparation_signature(
+    dataset: str, *, basis_backend: str = DEFAULT_BASIS_BACKEND
+) -> dict[str, Any]:
     if dataset not in DATASETS:
         raise ValueError(f"unknown cycle PE v2 dataset: {dataset}")
+    if basis_backend not in BASIS_BACKENDS:
+        raise ValueError(f"basis_backend must be one of {BASIS_BACKENDS}")
     directory = Path(__file__).resolve().parent
+    orthonormal = basis_backend == "thin_q"
     return {
         "version": CACHE_VERSION,
         "dataset": dataset,
-        "representation": "complete_orthonormal_left_nullspace_basis",
+        "basis_backend": basis_backend,
+        "representation": (
+            "coordinate_free_cycle_projector_from_cached_thin_q"
+            if orthonormal
+            else "coordinate_free_cycle_projector_from_runtime_qr_of_dfs_fundamental"
+        ),
         "incidence": "B[m,n], canonical sorted u<v edges, tail -1 and head +1",
-        "basis": "numpy.linalg.svd(B, full_matrices=True); all m-n+c left-null columns",
-        "storage": "float32 matrices [num_edges, cycle_rank], graph-local ragged columns",
+        "basis": (
+            "spanning forest -> sparse fundamental Z -> thin QR Q; all beta=m-n+c "
+            "columns, no eigendecomposition"
+            if orthonormal
+            else "iterative DFS spanning forest + one parent-path fundamental cycle per "
+            "non-tree edge; all beta=m-n+c columns, no all-simple-cycle enumeration"
+        ),
+        "storage": (
+            "float32 orthonormal Q [num_edges, cycle_rank], graph-local ragged"
+            if orthonormal
+            else "float32 dense raw DFS fundamental Z [num_edges, cycle_rank], graph-local "
+            "ragged; representation flag requires runtime thin QR before projector use"
+        ),
+        "construction_complexity": (
+            "DFS forest O(V+E); sparse explicit Z O(V+E+nnz(Z)); dense cache materialization "
+            "Omega(E*beta); reduced QR O(E*beta^2)"
+            if orthonormal
+            else "DFS forest O(V+E); sparse explicit Z O(V+E+nnz(Z)); dense cache materialization "
+            "Omega(E*beta); runtime reduced QR O(E*beta^2) per graph/model forward"
+        ),
         "numpy_version": np.__version__,
         "implementation_sha256": {
             "v2/basis.py": hashlib.sha256((directory / "basis.py").read_bytes()).hexdigest(),
@@ -284,6 +364,7 @@ def load_benchmark(
     *,
     allow_download: bool,
     splits: tuple[str, ...] = SPLITS,
+    basis_backend: str = DEFAULT_BASIS_BACKEND,
 ) -> tuple[dict[str, list[Graph]], dict[str, Any]]:
     """Load fixed official splits, validating immutable basis caches fail-closed."""
     if (
@@ -292,7 +373,7 @@ def load_benchmark(
         or any(split not in SPLITS for split in splits)
     ):
         raise ValueError("splits must be a nonempty unique subset of official splits")
-    signature = preparation_signature(dataset)
+    signature = preparation_signature(dataset, basis_backend=basis_backend)
     official = load_official_splits(
         data_root,
         dataset,
@@ -339,10 +420,11 @@ def load_benchmark(
         else:
             graphs = []
             for index, data in enumerate(official[split]):
-                graphs.append(prepare_graph(data, dataset=dataset))
+                graphs.append(prepare_graph(data, dataset=dataset, basis_backend=basis_backend))
                 if (index + 1) % 1000 == 0:
                     print(
-                        f"{dataset}/{split}: full cycle bases {index + 1}/{len(official[split])}",
+                        f"{dataset}/{split}: projector-ready cycle spaces "
+                        f"{index + 1}/{len(official[split])}",
                         flush=True,
                     )
             rows = [
@@ -374,17 +456,34 @@ def load_benchmark(
         else "OGB 9 atom / 3 bond categorical fields",
         "preparation": signature,
         "cache_directory": str(cache_dir),
-        "basis_storage": "all beta=m-n+c columns per graph; no padding or truncation",
-        "basis_coordinates": "SVD coordinates are not invariant to arbitrary nullspace rotations",
+        "basis_backend": basis_backend,
+        "basis_storage": (
+            "all beta=m-n+c thin-Q columns; no padding or truncation"
+            if basis_backend == "thin_q"
+            else "all beta=m-n+c raw DFS fundamental columns; no padding or truncation"
+        ),
+        "basis_coordinates": (
+            "model uses only P=Q Q.T through K=P Hadamard-square P; raw fundamental Z is "
+            "thin-QR orthonormalized before use; arbitrary basis coordinates, Q signs and "
+            "Q rotations are unobservable"
+        ),
+        "basis_runtime": (
+            "cached Q fast path; no factorization in model forward"
+            if basis_backend == "thin_q"
+            else "diagnostic correctness path; graph-local reduced QR is repeated in model "
+            "forward, so this backend is not an end-to-end linear-time speedup"
+        ),
     }
     return result, protocol
 
 
 __all__ = [
     "Batch",
+    "BASIS_BACKENDS",
     "CACHE_NAMESPACE",
     "CACHE_VERSION",
     "DATASETS",
+    "DEFAULT_BASIS_BACKEND",
     "Graph",
     "collate",
     "load_benchmark",

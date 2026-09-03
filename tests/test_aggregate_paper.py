@@ -55,7 +55,7 @@ def test_disabled_bootstrap_keeps_multi_seed_statistics_but_is_explicitly_labell
     [
         ("conductance_gat", "cora", "conductance"),
         ("cycle_pe", "zinc12k", "cycle_set"),
-        ("cycle_pe", "zinc12k", "cycle_basis_v2"),
+        ("cycle_pe", "zinc12k", "cycle_projector_pe_v2"),
     ],
 )
 def test_benchmarks_aggregate_only_our_model_and_ignore_published_scores(
@@ -132,7 +132,7 @@ def test_cycle_v1_and_basis_v2_keep_independent_summary_and_efficiency_rows(
     for seed in (0, 1):
         output = tmp_path / f"seed-{seed}"
         models = {}
-        for model, offset in (("cycle_set", 0.1), ("cycle_basis_v2", 0.7)):
+        for model, offset in (("cycle_set", 0.1), ("cycle_projector_pe_v2", 0.7)):
             models[model] = {
                 "test": offset + seed * 0.02,
                 "validation": 9.0,
@@ -190,11 +190,11 @@ def test_cycle_v1_and_basis_v2_keep_independent_summary_and_efficiency_rows(
         summaries = {row["metric"]: row for row in csv.DictReader(stream)}
     assert set(summaries) == {
         "datasets.zinc12k.models.cycle_set.test",
-        "datasets.zinc12k.models.cycle_basis_v2.test",
+        "datasets.zinc12k.models.cycle_projector_pe_v2.test",
     }
     for model, expected_mean, expected_rule in (
         ("cycle_set", 0.11, "cycle.our_model.test"),
-        ("cycle_basis_v2", 0.71, "cycle.basis_v2.test"),
+        ("cycle_projector_pe_v2", 0.71, "cycle.basis_v2.test"),
     ):
         row = summaries[f"datasets.zinc12k.models.{model}.test"]
         assert float(row["mean"]) == pytest.approx(expected_mean)
@@ -208,7 +208,7 @@ def test_cycle_v1_and_basis_v2_keep_independent_summary_and_efficiency_rows(
     }
     assert {row["metric"] for row in efficiency} == {
         f"datasets.zinc12k.models.{model}.{metric}"
-        for model in ("cycle_set", "cycle_basis_v2")
+        for model in ("cycle_set", "cycle_projector_pe_v2")
         for metric in ("trainable_parameters", "elapsed_seconds", "peak_gpu_memory_bytes")
     }
     with (tmp_path / "aggregate" / "paired.csv").open(encoding="utf-8", newline="") as stream:
