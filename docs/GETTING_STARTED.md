@@ -270,6 +270,13 @@ env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 python -B scripts/ru
 계속 실행하고 통합 상태를 failed로 남기며, 첫 실패에서 멈추려면 `--fail-fast`를 추가한다.
 `--cycle-v2-basis-backend thin_q`가 전체 학습용 기본값이며, DFS/역추적 기저를 별도 진단하려면
 새 run ID에서 `dfs_fundamental`로 바꾼다.
+
+이미 구 `base/wide/deep/large` Conductance V1–V4 172회 표를 완료했고 이를 다시 학습하지
+않으려면 같은 통합 runner에 `--conductance-versions v5`를 추가한다. 그러면 Cycle V1/V2와
+Tree는 유지하면서 Conductance는 새 V5 20회만 실행해 전체 계획이 32 child runs / 36 fresh
+model trainings가 된다. 새 모델만 최소 실행하려면 `--tracks conductance cycle
+--conductance-versions v5 --cycle-versions v2`를 사용하며 24/24다. 이전 작은 profile 결과는
+별도 artifact로 보존되며 새 reference/large V5와 동일 크기 비교로 자동 병합되지는 않는다.
 중단 후에는 인수와 `--run-id`를 그대로 두고 같은 명령을 재실행한다. 완료 artifact를 다시
 검증해 통과한 child는 건너뛰고 미완료 child만 다시 실행한다. 실행 중이던 child 하나는
 V5와 새 Cycle V2라면 `last.pt`부터 이어지고, checkpoint 계약이 없는 legacy child만 처음부터

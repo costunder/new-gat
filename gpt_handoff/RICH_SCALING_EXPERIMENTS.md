@@ -101,6 +101,35 @@ configuration에 결속된다. `thin_q`가 전체 학습용 기본값이다. DFS
 역추적 경로를 진단하려면 새 run ID에서 `dfs_fundamental`을 선택한다. 이 경로는 runtime QR을
 반복하므로 속도 개선용 설정이 아니다.
 
+### 완료된 구 Conductance scaling을 다시 돌리지 않는 실행
+
+이미 `base/wide/deep/large`에서 Conductance V1–V4 172회를 완료한 경우 그 결과를 별도
+artifact로 보존하고, 현재 통합 실행에서는 Conductance V5만 선택할 수 있다. Cycle V1/V2와
+Tree까지 아직 남았다면 다음 명령은 **32 child runs / 36 fresh model trainings**만 계획한다.
+
+```bash
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+python -B scripts/run_rich_scaling.py \
+  --run-id remaining-v5-cycle-tree-a6000-gpu3-seed0-r1 \
+  --tracks conductance cycle tree \
+  --conductance-versions v5 \
+  --cycle-versions v1 v2 \
+  --profiles reference large \
+  --model-seeds 0 \
+  --device cuda:0 \
+  --hardware-profile a6000-48gb \
+  --min-free-gb 40 \
+  --v5-beta-parameterization sigmoid \
+  --v5-beta-initial 0.1 \
+  --cycle-v2-basis-backend thin_q \
+  --allow-download
+```
+
+V5와 폐기·재구현된 Cycle V2만 새로 실행할 때는 `--tracks conductance cycle
+--conductance-versions v5 --cycle-versions v2`를 사용한다. reference/large와 seed 0에서
+**24 child runs / 24 fresh model trainings**다. 선택한 버전 목록은 통합 manifest와 재개
+identity에 들어가므로, 중단 후에는 같은 run ID와 같은 목록을 그대로 사용한다.
+
 architecture profile(`reference/large`)과 hardware profile(`portable/a6000-48gb`)은 서로 다른
 축이다. A6000 profile의 실제 실행 차이는 다음과 같다.
 

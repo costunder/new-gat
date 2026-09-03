@@ -51279,6 +51279,18 @@ TRACK_SPECS = {
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--tracks", nargs="+", choices=TRACKS, default=list(TRACKS))
+    result.add_argument(
+        "--conductance-versions",
+        nargs="+",
+        choices=tuple(CONDUCTANCE_MATRIX),
+        default=list(CONDUCTANCE_MATRIX),
+    )
+    result.add_argument(
+        "--cycle-versions",
+        nargs="+",
+        choices=CYCLE_VERSIONS,
+        default=list(CYCLE_VERSIONS),
+    )
     result.add_argument("--profiles", nargs="+", choices=PROFILES, default=list(PROFILES))
     result.add_argument("--model-seeds", nargs="+", type=int, default=list(DEFAULT_MODEL_SEEDS))
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
@@ -51323,6 +51335,8 @@ def parser() -> argparse.ArgumentParser:
 def _validate(args: argparse.Namespace) -> None:
     for label, values in (
         ("tracks", args.tracks),
+        ("conductance versions", args.conductance_versions),
+        ("cycle versions", args.cycle_versions),
         ("profiles", args.profiles),
         ("model seeds", args.model_seeds),
     ):
@@ -51336,6 +51350,12 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("minimum free GPU memory must be finite and nonnegative")
     if args.run_id is not None and RUN_ID_PATTERN.fullmatch(args.run_id) is None:
         raise ValueError("run ID must be 1-120 letters, digits, underscores, or hyphens")
+    if (
+        "cycle" in args.tracks
+        and args.cycle_v2_basis_backend != "thin_q"
+        and "v2" not in args.cycle_versions
+    ):
+        raise ValueError("nondefault Cycle basis backend requires v2 in --cycle-versions")
     _v5_beta_configuration(args)
 
 
@@ -51356,29 +51376,35 @@ def _paths_overlap(first: Path, second: Path) -> bool:
     return first == second or first.is_relative_to(second) or second.is_relative_to(first)
 
 
-def _requested_matrix(track: str, profiles: list[str], model_seeds: list[int]) -> dict[str, Any]:
+def _requested_matrix(
+    track: str,
+    profiles: list[str],
+    model_seeds: list[int],
+    *,
+    conductance_versions: list[str],
+    cycle_versions: list[str],
+) -> dict[str, Any]:
     common = {"profiles": list(profiles), "model_seeds": list(model_seeds)}
     if track == "conductance":
+        selected = {version: CONDUCTANCE_MATRIX[version] for version in conductance_versions}
         requested_datasets = list(
-            dict.fromkeys(
-                dataset for spec in CONDUCTANCE_MATRIX.values() for dataset in spec["datasets"]
-            )
+            dict.fromkeys(dataset for spec in selected.values() for dataset in spec["datasets"])
         )
         return {
             **common,
-            "versions": list(CONDUCTANCE_MATRIX),
+            "versions": list(selected),
             "requested_datasets": requested_datasets,
             "datasets_by_version": {
-                version: list(spec["datasets"]) for version, spec in CONDUCTANCE_MATRIX.items()
+                version: list(spec["datasets"]) for version, spec in selected.items()
             },
             "conditions_by_version": {
-                version: list(spec["conditions"]) for version, spec in CONDUCTANCE_MATRIX.items()
+                version: list(spec["conditions"]) for version, spec in selected.items()
             },
         }
     if track == "cycle":
         return {
             **common,
-            "versions": list(CYCLE_VERSIONS),
+            "versions": list(cycle_versions),
             "datasets": list(CYCLE_DATASETS),
         }
     return {
@@ -51388,23 +51414,25 @@ def _requested_matrix(track: str, profiles: list[str], model_seeds: list[int]) -
     }
 
 
-def _expected_counts(track: str, profiles: list[str], model_seeds: list[int]) -> dict[str, int]:
-    combinations = len(profiles) * len(model_seeds)
+def _expected_counts(track: str, matrix: dict[str, Any]) -> dict[str, int]:
+    combinations = len(matrix["profiles"]) * len(matrix["model_seeds"])
     if track == "conductance":
         trainings_per_combination = sum(
-            len(spec["datasets"]) * len(spec["conditions"]) for spec in CONDUCTANCE_MATRIX.values()
+            len(matrix["datasets_by_version"][version])
+            * len(matrix["conditions_by_version"][version])
+            for version in matrix["versions"]
         )
         return {
             "child_runs": combinations * trainings_per_combination,
             "model_trainings": combinations * trainings_per_combination,
         }
     if track == "cycle":
-        child_runs = combinations * len(CYCLE_VERSIONS) * len(CYCLE_DATASETS)
+        child_runs = combinations * len(matrix["versions"]) * len(matrix["datasets"])
         return {
             "child_runs": child_runs,
             "model_trainings": child_runs,
         }
-    child_runs = combinations * len(TREE_SUITES)
+    child_runs = combinations * len(matrix["suites"])
     return {
         "child_runs": child_runs,
         "model_trainings": child_runs * len(TREE_MODELS),
@@ -51430,7 +51458,13 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
         child_run_id = _child_run_id(run_id, track)
         child_dir = (results_root / spec["results_subdir"] / child_run_id).resolve()
         profiles = list(args.profiles)
-        requested_matrix = _requested_matrix(track, profiles, list(args.model_seeds))
+        requested_matrix = _requested_matrix(
+            track,
+            profiles,
+            list(args.model_seeds),
+            conductance_versions=list(args.conductance_versions),
+            cycle_versions=list(args.cycle_versions),
+        )
         command = [
             sys.executable,
             "-B",
@@ -51493,7 +51527,7 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
                 "log_path": str(results_root / "rich_scaling" / run_id / "logs" / f"{track}.log"),
                 "allow_download_forwarded": download_forwarded,
                 "requested_matrix": requested_matrix,
-                "expected_counts": _expected_counts(track, profiles, list(args.model_seeds)),
+                "expected_counts": _expected_counts(track, requested_matrix),
             }
         )
     return jobs
@@ -52076,6 +52110,8 @@ def _config_payload(
 ) -> dict[str, Any]:
     return {
         "tracks": list(args.tracks),
+        "conductance_versions": list(args.conductance_versions),
+        "cycle_versions": list(args.cycle_versions),
         "shared_profiles": list(args.profiles),
         "tree_profiles": list(args.profiles),
         "model_seeds": list(args.model_seeds),
@@ -52191,6 +52227,10 @@ def _print_plan(args: argparse.Namespace, run_id: str, jobs: list[dict[str, Any]
         f"{totals['model_trainings']} fresh model trainings"
     )
     print(f"profiles={list(args.profiles)}; model_seeds={list(args.model_seeds)}")
+    print(
+        f"conductance_versions={list(args.conductance_versions)}; "
+        f"cycle_versions={list(args.cycle_versions)}"
+    )
     print(
         f"hardware_profile={args.hardware_profile}; track_concurrency=1 "
         "(independent-job concurrency is owned by each child runner)"
@@ -66448,6 +66488,8 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
     runner._validate(args)
     jobs = runner.make_jobs(args, "matrix")
     assert args.tracks == list(runner.TRACKS)
+    assert args.conductance_versions == list(runner.CONDUCTANCE_MATRIX)
+    assert args.cycle_versions == list(runner.CYCLE_VERSIONS)
     assert args.profiles == list(runner.PROFILES)
     assert args.model_seeds == list(runner.DEFAULT_MODEL_SEEDS)
     assert [job["track"] for job in jobs] == ["conductance", "cycle", "tree"]
@@ -66464,6 +66506,7 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
         "large",
     ]
     assert _option(cycle["command"], "--model-seeds") == "0"
+    assert _options(cycle["command"], "--versions") == ["v1", "v2"]
     assert _option(cycle["command"], "--basis-backend") == "thin_q"
     assert _option(tree["command"], "--profiles") == "reference,large"
     assert _option(tree["command"], "--model-seeds") == "0"
@@ -66511,6 +66554,86 @@ def test_selection_and_download_flag_are_mapped_only_to_supported_child_clis(tmp
     assert "--allow-download" in jobs[1]["command"]
     assert "--allow-download" in jobs[2]["command"]
     assert _option(jobs[2]["command"], "--profiles") == "reference,large"
+
+
+def test_completed_conductance_v1_v4_can_be_excluded_from_integrated_plan(tmp_path: Path):
+    args = runner.parser().parse_args(
+        [
+            "--conductance-versions",
+            "v5",
+            "--profiles",
+            "reference",
+            "large",
+            "--model-seeds",
+            "0",
+            "--results-root",
+            str(tmp_path),
+        ]
+    )
+    runner._validate(args)
+    conductance, cycle, tree = runner.make_jobs(args, "remaining")
+    assert _options(conductance["command"], "--versions") == ["v5"]
+    assert _options(cycle["command"], "--versions") == ["v1", "v2"]
+    assert cycle["requested_matrix"]["versions"] == ["v1", "v2"]
+    assert runner._totals([conductance, cycle, tree]) == {
+        "track_runs": 3,
+        "child_runs": 32,
+        "model_trainings": 36,
+    }
+    config = runner._config_payload(args, data_root=tmp_path / "data", results_root=tmp_path)
+    assert config["conductance_versions"] == ["v5"]
+    assert config["cycle_versions"] == ["v1", "v2"]
+
+
+def test_only_new_v5_and_cycle_v2_plan_has_no_legacy_trainings(tmp_path: Path):
+    args = runner.parser().parse_args(
+        [
+            "--tracks",
+            "conductance",
+            "cycle",
+            "--conductance-versions",
+            "v5",
+            "--cycle-versions",
+            "v2",
+            "--results-root",
+            str(tmp_path),
+        ]
+    )
+    runner._validate(args)
+    conductance, cycle = runner.make_jobs(args, "new-only")
+    assert runner._totals([conductance, cycle]) == {
+        "track_runs": 2,
+        "child_runs": 24,
+        "model_trainings": 24,
+    }
+
+
+@pytest.mark.parametrize(
+    ("option", "values", "message"),
+    [
+        ("--conductance-versions", ["v5", "v5"], "conductance versions"),
+        ("--cycle-versions", ["v2", "v2"], "cycle versions"),
+    ],
+)
+def test_duplicate_version_selection_is_rejected(option, values, message):
+    args = runner.parser().parse_args([option, *values])
+    with pytest.raises(ValueError, match=message):
+        runner._validate(args)
+
+
+def test_nondefault_cycle_v2_backend_requires_selected_v2():
+    args = runner.parser().parse_args(
+        [
+            "--tracks",
+            "cycle",
+            "--cycle-versions",
+            "v1",
+            "--cycle-v2-basis-backend",
+            "dfs_fundamental",
+        ]
+    )
+    with pytest.raises(ValueError, match="requires v2"):
+        runner._validate(args)
 
 
 def test_a6000_hardware_profile_is_forwarded_to_every_track_and_bound_to_config(
@@ -66639,6 +66762,8 @@ def test_dry_run_prints_complete_plan_without_writes_or_processes(
     output = capsys.readouterr().out
     assert code == 0
     assert "2 track runs; 12 child runs; 16 fresh model trainings" in output
+    assert "conductance_versions=['v1', 'v2', 'v3', 'v4', 'v5']" in output
+    assert "cycle_versions=['v1', 'v2']" in output
     assert "child profiles=['reference', 'large']" in output
     assert "--profiles reference,large" in output
     assert "--basis-backend dfs_fundamental" in output
@@ -66927,6 +67052,44 @@ def test_success_runs_tracks_sequentially_and_certifies_all_summaries(
     assert all(len(job["result"]["summary_sha256"]) == 64 for job in manifest["jobs"])
 
 
+def test_partial_version_matrix_runs_and_validates_only_selected_versions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    calls: list[list[str]] = []
+
+    def dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        calls.append(command)
+        _write_summary(command)
+        return 0
+
+    options = [
+        "--tracks",
+        "conductance",
+        "cycle",
+        "--conductance-versions",
+        "v5",
+        "--cycle-versions",
+        "v2",
+        *_base_options(tmp_path),
+    ]
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    assert runner.main(options) == 0
+    assert [_options(command, "--versions") for command in calls] == [["v5"], ["v2"]]
+    manifest = json.loads(
+        (tmp_path / "rich_scaling/unit/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["planned_counts"] == {
+        "track_runs": 2,
+        "child_runs": 12,
+        "model_trainings": 12,
+    }
+    assert manifest["completed_counts"]["verified_model_trainings"] == 12
+    assert [job["requested_matrix"]["versions"] for job in manifest["jobs"]] == [
+        ["v5"],
+        ["v2"],
+    ]
+
+
 @pytest.mark.parametrize("track", ["conductance", "cycle", "tree"])
 def test_equal_count_duplicate_child_matrix_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, track: str
@@ -67150,6 +67313,13 @@ def test_resume_rejects_changed_config_and_source_without_launching_children(
     changed[changed.index("--profiles") + 1] = "large"
     assert runner.main(changed) == 2
     assert manifest_path.read_text(encoding="utf-8") == original
+
+    for changed_versions in (
+        [*options, "--conductance-versions", "v5"],
+        [*options, "--cycle-versions", "v2"],
+    ):
+        assert runner.main(changed_versions) == 2
+        assert manifest_path.read_text(encoding="utf-8") == original
 
     payload = json.loads(original)
     payload["source_sha256"]["scripts/run_rich_scaling.py"] = "tampered"
