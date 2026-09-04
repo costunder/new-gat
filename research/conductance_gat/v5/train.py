@@ -240,6 +240,48 @@ def phase_at(schedule: list[dict[str, Any]], epoch: int) -> tuple[str, int]:
     raise ValueError("epoch outside phase schedule")
 
 
+def selection_eligibility(condition: str, phase: str) -> dict[str, bool]:
+    """Return the condition-aware validation-selection roles for one epoch.
+
+    The fixed arm has no latent mechanism to wait for, so every epoch is a
+    scientifically valid primary checkpoint candidate.  The dynamic arm's
+    warmup explicitly overrides C with ones; it may be the best pure predictor,
+    but it is not evidence for learned C and therefore is auxiliary only.
+    """
+
+    if condition not in CONDITIONS:
+        raise ValueError(f"unknown V5 condition: {condition}")
+    if phase not in TRAINING_PHASES:
+        raise ValueError(f"unknown V5 phase: {phase}")
+    dynamic = condition == "shared_dynamic_c"
+    return {
+        "global_prediction": True,
+        "primary": not dynamic or phase != "spatial_warmup",
+        "joint_early_stopping": dynamic and phase == "joint",
+    }
+
+
+def should_stop_early(
+    condition: str,
+    phase: str,
+    epoch: int,
+    *,
+    primary_best_epoch: int,
+    joint_best_epoch: int,
+    patience: int,
+) -> bool:
+    """Apply patience to the checkpoint role valid for each condition."""
+
+    eligibility = selection_eligibility(condition, phase)
+    if condition == "fixed_c":
+        return primary_best_epoch > 0 and epoch - primary_best_epoch >= patience
+    return (
+        eligibility["joint_early_stopping"]
+        and joint_best_epoch > 0
+        and epoch - joint_best_epoch >= patience
+    )
+
+
 def parameter_group(name: str) -> str:
     if ".operator.estimator." in name:
         return "conductance"
@@ -657,6 +699,7 @@ def validate_selected_checkpoint(
     expected_identity_sha256: str,
     expected_epoch: int,
     expected_metric: float,
+    expected_selection_role: str = "primary",
 ) -> None:
     if not isinstance(selected, dict):
         raise ValueError("best.pt payload is invalid")
@@ -678,6 +721,8 @@ def validate_selected_checkpoint(
         raise ValueError("best.pt validation metadata is invalid")
     if float(metric) != expected_metric:
         raise ValueError("best.pt validation does not match last.pt best_metric")
+    if selected.get("selection_role") != expected_selection_role:
+        raise ValueError("best.pt selection role is invalid")
 
 
 def train_model(payload, protocol, args, device: torch.device, output: Path) -> dict[str, Any]:
@@ -714,6 +759,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
     history: list[dict[str, Any]] = []
     start_epoch, best_metric, best_epoch, optimizer_steps = 1, -math.inf, 0, 0
     global_best_metric, global_best_epoch = -math.inf, 0
+    joint_best_metric, joint_best_epoch = -math.inf, 0
     elapsed_before = 0.0
     peak_allocated_before = peak_reserved_before = 0
     first_c_gradient = None
@@ -722,6 +768,8 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
     effective_group_steps = {name: 0 for name in _PARAMETER_GROUPS}
     if args.resume and last_path.exists():
         saved = torch.load(last_path, map_location=device, weights_only=False)
+        if saved.get("schema_version") != 3:
+            raise ValueError("last.pt uses an incompatible V5 selection-state schema")
         validate_resume_identity(
             saved.get("resume_identity"),
             resume_identity,
@@ -743,6 +791,8 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
         best_metric, best_epoch = float(saved["best_metric"]), int(saved["best_epoch"])
         global_best_metric = float(saved.get("global_best_metric", best_metric))
         global_best_epoch = int(saved.get("global_best_epoch", best_epoch))
+        joint_best_metric = float(saved["joint_best_metric"])
+        joint_best_epoch = int(saved["joint_best_epoch"])
         elapsed_before = float(saved.get("elapsed_seconds", 0.0))
         peak_allocated_before = int(saved.get("peak_cuda_allocated_bytes", 0))
         peak_reserved_before = int(saved.get("peak_cuda_reserved_bytes", 0))
@@ -837,12 +887,13 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
             "layers": layer_diagnostics(model),
         }
         history.append(row)
-        atomic_write_json(history_path, history)
+        eligibility = selection_eligibility(args.condition, phase)
         if metric > global_best_metric:
             global_best_metric, global_best_epoch = metric, epoch
-        # Model selection is joint-phase only. Otherwise the dynamic arm could
-        # accidentally publish its C=1 warmup checkpoint as the V5 result.
-        if phase == "joint" and metric > best_metric:
+        # fixed_c selects over its complete training trajectory.  For the
+        # dynamic arm, warmup C=1 is retained as an auxiliary prediction score
+        # but cannot become the mechanism-bearing primary checkpoint.
+        if eligibility["primary"] and metric > best_metric:
             best_metric, best_epoch = metric, epoch
             best_checkpoint_sha256 = publish_best_checkpoint(
                 checkpoint,
@@ -857,8 +908,28 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
                     "resume_identity_sha256": resume_identity_sha256,
                     "epoch": epoch,
                     "validation": metric,
+                    "selection_role": "primary",
+                    "selection_scope": (
+                        "all_epochs" if args.condition == "fixed_c" else "c_active_epochs"
+                    ),
+                    "phase": phase,
                 },
             )
+        if eligibility["joint_early_stopping"] and metric > joint_best_metric:
+            joint_best_metric, joint_best_epoch = metric, epoch
+        row["selection"] = {
+            "primary_eligible": eligibility["primary"],
+            "primary_best_validation": best_metric if math.isfinite(best_metric) else None,
+            "primary_best_epoch": best_epoch or None,
+            "global_prediction_best_validation": global_best_metric,
+            "global_prediction_best_epoch": global_best_epoch,
+            "joint_early_stopping_eligible": eligibility["joint_early_stopping"],
+            "joint_best_validation": (
+                joint_best_metric if math.isfinite(joint_best_metric) else None
+            ),
+            "joint_best_epoch": joint_best_epoch or None,
+        }
+        atomic_write_json(history_path, history)
         efficiency = merge_efficiency(
             elapsed_before,
             peak_allocated_before,
@@ -867,13 +938,18 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
             torch.cuda.max_memory_allocated(device),
             torch.cuda.max_memory_reserved(device),
         )
-        stop_after_epoch = epoch == args.epochs or (
-            phase == "joint" and best_epoch > 0 and epoch - best_epoch >= args.patience
+        stop_after_epoch = epoch == args.epochs or should_stop_early(
+            args.condition,
+            phase,
+            epoch,
+            primary_best_epoch=best_epoch,
+            joint_best_epoch=joint_best_epoch,
+            patience=args.patience,
         )
         _save(
             last_path,
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "complete": stop_after_epoch,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
@@ -889,6 +965,8 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
                 "effective_optimizer_steps_by_group": effective_group_steps,
                 "global_best_metric": global_best_metric,
                 "global_best_epoch": global_best_epoch,
+                "joint_best_metric": joint_best_metric,
+                "joint_best_epoch": joint_best_epoch,
                 "first_c_gradient": first_c_gradient,
                 "cpu_rng_state": torch.get_rng_state(),
                 "cuda_rng_state": torch.cuda.get_rng_state(device),
@@ -896,16 +974,30 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
             },
         )
         if epoch == 1 or epoch % 10 == 0:
+            primary_best_text = f"{best_metric:.6f}" if math.isfinite(best_metric) else "pending"
+            joint_best_text = (
+                "n/a"
+                if args.condition == "fixed_c"
+                else f"{joint_best_metric:.6f}"
+                if math.isfinite(joint_best_metric)
+                else "pending"
+            )
             print(
                 f"{args.dataset}/{args.condition} epoch={epoch} phase={phase} "
                 f"loss={row['train_loss']:.6f} val={metric:.6f} "
-                f"joint_best={best_metric:.6f}",
+                f"primary_best={primary_best_text} "
+                f"global_best={global_best_metric:.6f} "
+                f"joint_best={joint_best_text}",
                 flush=True,
             )
         if stop_after_epoch:
             break
     if best_epoch < 1 or not math.isfinite(best_metric) or best_checkpoint_sha256 is None:
-        raise RuntimeError("V5 completed without a finite joint-phase best checkpoint")
+        raise RuntimeError("V5 completed without a finite primary validation checkpoint")
+    if args.condition == "shared_dynamic_c" and (
+        joint_best_epoch < 1 or not math.isfinite(joint_best_metric)
+    ):
+        raise RuntimeError("dynamic V5 completed without a finite joint early-stopping metric")
     best_recovery_slot = recover_best_checkpoint(
         checkpoint, previous_checkpoint, best_checkpoint_sha256
     )
@@ -916,6 +1008,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
         expected_identity_sha256=resume_identity_sha256,
         expected_epoch=best_epoch,
         expected_metric=best_metric,
+        expected_selection_role="primary",
     )
     model.load_state_dict(selected["model_state"])
     for operator in model.operators:
@@ -983,6 +1076,33 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
         },
         "global_best_validation": global_best_metric,
         "global_best_epoch": global_best_epoch,
+        "joint_best_validation": (
+            joint_best_metric if args.condition == "shared_dynamic_c" else None
+        ),
+        "joint_best_epoch": joint_best_epoch if args.condition == "shared_dynamic_c" else None,
+        "checkpoint_selection": {
+            "primary_role": (
+                "all_epoch_prediction_best"
+                if args.condition == "fixed_c"
+                else "c_active_mechanism_best"
+            ),
+            "primary_validation": best_metric,
+            "primary_epoch": best_epoch,
+            "global_prediction_validation": global_best_metric,
+            "global_prediction_epoch": global_best_epoch,
+            "global_prediction_checkpoint_preserved": (
+                args.condition == "fixed_c" or global_best_epoch == best_epoch
+            ),
+            "early_stopping_monitor": (
+                "primary_all_epoch_best" if args.condition == "fixed_c" else "joint_best"
+            ),
+            "joint_monitor_applicable": args.condition == "shared_dynamic_c",
+            "joint_validation": (
+                joint_best_metric if args.condition == "shared_dynamic_c" else None
+            ),
+            "joint_epoch": joint_best_epoch if args.condition == "shared_dynamic_c" else None,
+            "test_used": False,
+        },
         "validation": best_metric,
         "metric_name": METRIC_BY_DATASET[args.dataset],
         "checkpoint": str(checkpoint.resolve()),

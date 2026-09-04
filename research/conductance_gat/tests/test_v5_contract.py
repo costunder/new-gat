@@ -155,7 +155,35 @@ def test_report_is_partial_safe_then_requires_complete_pairs(tmp_path):
             "batch_size": 1,
             "sampling": "full",
         }
-        schedule = [{"name": "joint", "start_epoch": 1, "end_epoch": 4, "length": 4}]
+        schedule = [
+            {"name": "spatial_warmup", "start_epoch": 1, "end_epoch": 1, "length": 1},
+            {
+                "name": "conductance_calibration",
+                "start_epoch": 2,
+                "end_epoch": 2,
+                "length": 1,
+            },
+            {"name": "alternating", "start_epoch": 3, "end_epoch": 3, "length": 1},
+            {"name": "joint", "start_epoch": 4, "end_epoch": 4, "length": 1},
+        ]
+        dynamic = job["condition"] == "shared_dynamic_c"
+        global_validation = 0.81 if dynamic else 0.8
+        global_epoch = 1 if dynamic else 4
+        joint_validation = 0.8 if dynamic else None
+        joint_epoch = 4 if dynamic else None
+        checkpoint_selection = {
+            "primary_role": ("c_active_mechanism_best" if dynamic else "all_epoch_prediction_best"),
+            "primary_validation": 0.8,
+            "primary_epoch": 4,
+            "global_prediction_validation": global_validation,
+            "global_prediction_epoch": global_epoch,
+            "global_prediction_checkpoint_preserved": not dynamic,
+            "early_stopping_monitor": ("joint_best" if dynamic else "primary_all_epoch_best"),
+            "joint_monitor_applicable": dynamic,
+            "joint_validation": joint_validation,
+            "joint_epoch": joint_epoch,
+            "test_used": False,
+        }
         identity = {
             "cache_sha256": cache_sha256,
             "source_sha256": source_sha256,
@@ -175,6 +203,11 @@ def test_report_is_partial_safe_then_requires_complete_pairs(tmp_path):
                     "evaluation_split": "validation",
                     "test_evaluated": False,
                     "validation": 0.8,
+                    "global_best_validation": global_validation,
+                    "global_best_epoch": global_epoch,
+                    "joint_best_validation": joint_validation,
+                    "joint_best_epoch": joint_epoch,
+                    "checkpoint_selection": checkpoint_selection,
                     "metric_name": "accuracy",
                     "total_parameters": 10,
                     "trainable_parameters": 8,

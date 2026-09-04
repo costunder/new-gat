@@ -3,7 +3,8 @@
 ## 판정
 
 V5는 V4 점수의 후속 반복이 아니라, V3/V4에서 상대 C가 거의 `C=1`로 퇴화한 원인을
-수정하는 새 구조 실험이다. 아직 GPU 성능 결과는 없으며 SOTA 주장을 하지 않는다.
+수정하는 새 구조 실험이다. 2026-09-04 A6000 partial 실행 로그는 수령했지만 유효한
+fixed/dynamic 전체 비교는 아직 없으며 SOTA 주장을 하지 않는다.
 외부 suite identity는 `conductance_graph_conditioned_v5`다.
 
 ## 모델 계약
@@ -83,6 +84,15 @@ coordinate recipe의 end-to-end 비교**이며 C 하나만 치환한 인과효�
 shuffled-C intervention과 C gradient/CV를 함께 읽고, fixed-C와의 점수 차이만으로 C의 순수
 기여를 판정하지 않는다.
 
+Checkpoint 선택도 condition별 역할을 구분한다. `fixed_c`에는 기다려야 할 C mechanism이
+없으므로 모든 epoch 중 validation 최고점을 primary checkpoint로 고르고 그 기준으로 early
+stopping한다. `shared_dynamic_c`의 warm-up은 C를 강제로 1로 우회하므로, 전체 epoch 최고점은
+auxiliary prediction score로만 기록하고 primary checkpoint는 C가 실제로 활성화된 calibration,
+alternating 또는 joint epoch 중에서 선택한다. Dynamic arm의 early stopping은 별도의 joint-phase
+best를 감시해 warm-up 최고점 때문에 C 학습이 시작되기도 전에 중단되지 않게 한다. 최종 비교표의
+primary 차이는 fixed all-epoch best 대 dynamic C-active best이고, dynamic all-epoch prediction
+best와 joint monitor best도 별도 열로 함께 보고한다. Test label은 어느 선택에도 사용하지 않는다.
+
 ## 실제 규모와 execution profile
 
 - `reference`: hidden 256, 8 layers, 8 heads, FFN multiplier 4, dropout 0.2.
@@ -98,7 +108,8 @@ profile 모두 single full-graph batch 1이라 48GB GPU를 가득 채울 minibat
 |---|---|---|
 | dense numeric path | FP32, TF32 off | BF16 autocast, TF32 on |
 | conductance score/centering/degree/diffusion | FP32 | FP32 |
-| activation checkpoint | on | off |
+| block activation checkpoint | on | off |
+| dynamic-C edge-score chunk checkpoint | gradient가 있을 때 on | gradient가 있을 때 on |
 | edge chunk | 65,536 | 131,072 |
 | ogbn-arxiv sampled seed-node batch | 1,024 | 2,048 |
 | PPI whole-graph batch | 2 | 8 |
@@ -107,6 +118,17 @@ profile 모두 single full-graph batch 1이라 48GB GPU를 가득 채울 minibat
 `a6000-48gb`는 보이는 VRAM 40GiB 이상, 시작 시 free VRAM 32GiB 이상, compute capability
 8.0 이상과 BF16 지원을 child 시작 시 검사하고 조건이 맞지 않으면 자동 fallback 없이 중단한다.
 아래 명령은 더 엄격하게 `--min-free-gb 40`을 지정한다.
+
+기존 edge chunking은 forward 임시 tensor만 나눴고 autograd가 모든 chunk의 score-network
+activation을 backward까지 보존했다. 수령한 A6000 run에서는 `shared_dynamic_c`가 C를 처음
+활성화한 epoch 21에 44.47/44.55GiB를 사용한 뒤 추가 104MiB 할당에서 OOM이 발생했다. 현재는
+각 deterministic edge-score chunk를 non-reentrant checkpoint로 재계산하여 batch 크기와
+optimizer-step 수를 바꾸지 않고 saved activation을 제한한다. 합성 reference-size scorer에서
+saved activation은 285.35MiB에서 14.13MiB로 약 20.2배 줄었지만, 실제 reference/large의 CUDA
+peak는 새 실행에서 다시 측정해야 한다. 필요하면 명시적 `--v5-activation-checkpoint`를 새 run
+ID에서 켜는 것이 다음 방어선이다. 직접 V5/scaling runner뿐 아니라 통합
+`run_rich_scaling.py`도 이 tri-state override를 Conductance child에만 전달하고 manifest에
+기록한다.
 
 한 architecture profile에서 다섯 datasets × 두 arms는 10 fresh trainings다. 두
 architecture profiles의 V5만 실행하면 20 trainings이고, V1–V5 전체 reference/large
@@ -145,6 +167,24 @@ epoch 경계에서 복원한다. 저장 RNG/state 기준의 deterministic contin
 kernel까지 bitwise 동일하다고 주장하지 않는다. 다른 config/source/job matrix로 같은 run-id를
 재사용하면 fail closed한다. 재개할 때는 해당 hardware profile과 모든 인수 및 run-id를 그대로
 유지해야 한다.
+
+이 보장은 **같은 implementation hash**에만 적용된다. 아래 실패 run은 메모리와
+checkpoint-selection 구현이 바뀌기 전 source이므로 수정판을 같은 run ID에 억지로 resume하지
+않는다. 새 run ID에서 다시 실행해야 하며, 과거 `fixed_c`의 epoch 10 global-best model state는
+구 코드가 저장하지 않았기 때문에 수정된 primary checkpoint로 복구할 수 없다.
+
+## 2026-09-04 A6000 partial 실행
+
+Run `new-v5-cyclev2-a6000-gpu3-seed0-r1-conductance`, model seed 0에서 첫 job인
+`v5/reference/ogbn-arxiv/fixed_c`는 200 epochs를 완료했다. 로그상 전체 최고 validation은
+epoch 10의 0.692775였지만 구 joint-only 선택은 0.680392를 골랐다. Train loss는 0.579221에서
+0.019955까지 내려가는 동안 validation이 대체로 0.67대로 하락해 과적합 또는 sampled-train/
+full-graph-eval 불일치 신호가 있다. 이 결과는 corrected fixed primary 결과로 쓰지 않는다.
+
+두 번째 `shared_dynamic_c`는 warm-up epoch 20까지 실행한 뒤 최초 C calibration backward에서
+CUDA OOM으로 중단됐다. 따라서 dynamic C 점수, fixed-vs-dynamic 비교 및 나머지 18개 V5 job은
+미완료다. GPU preflight 통과는 장치 가용성 검사였고 이 모델의 peak-memory 적합성을 인증한
+것이 아니었다. 위 partial 수치는 실패 원인과 수정 필요성의 근거이지 V5 성능 결론이 아니다.
 
 ## V1–V5 reference/large 비교
 

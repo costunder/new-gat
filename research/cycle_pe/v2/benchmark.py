@@ -49,6 +49,45 @@ IMPLEMENTATION_FILES = (
 )
 
 
+def _amp_policy(requested: bool, device: torch.device) -> dict[str, Any]:
+    """Choose a range-safe mixed-precision policy for the graph-level readout.
+
+    This model pools both node/edge means and *sums*.  The latter make the
+    backward pass particularly vulnerable to FP16's small exponent range when
+    GradScaler starts at its usual 65536 scale.  A6000/Ampere has native BF16,
+    which keeps FP32's exponent range and needs no loss scaling.  On CUDA
+    devices without BF16 we deliberately retain FP32 rather than silently
+    reintroducing the known FP16 overflow path.
+    """
+    if requested and device.type == "cuda" and torch.cuda.is_bf16_supported():
+        return {
+            "requested": True,
+            "enabled": True,
+            "dtype": torch.bfloat16,
+            "dtype_name": "bfloat16",
+            "fallback": None,
+            "gradient_scaler": False,
+        }
+    return {
+        "requested": bool(requested),
+        "enabled": False,
+        "dtype": torch.float32,
+        "dtype_name": "disabled",
+        "fallback": "bf16_unavailable_use_fp32" if requested else None,
+        "gradient_scaler": False,
+    }
+
+
+def _precision_identity(policy: dict[str, Any]) -> dict[str, Any]:
+    """Return the JSON-safe arithmetic fields that bind artifacts and resume."""
+    return {
+        "amp_effective": policy["enabled"],
+        "autocast_dtype": policy["dtype_name"],
+        "fallback": policy["fallback"],
+        "gradient_scaler": policy["gradient_scaler"],
+    }
+
+
 def implementation_hashes() -> dict[str, str]:
     root = Path(__file__).resolve().parents[3]
     return {
@@ -222,11 +261,17 @@ def _resume_configuration(dataset: str, args: argparse.Namespace) -> dict[str, A
         "amp",
         "compile",
     )
+    precision = _amp_policy(args.amp, torch.device(args.device))
+    precision_identity = _precision_identity(precision)
     return {
-        "schema": "cycle-projector-pe-v2-epoch-resume-1",
+        "schema": "cycle-projector-pe-v2-epoch-resume-2",
         "dataset": dataset,
         "model": MODEL_NAME,
         "arguments": {name: getattr(args, name) for name in names},
+        # --amp is a request, not necessarily the effective arithmetic. Bind
+        # resume to the resolved policy so a checkpoint cannot silently switch
+        # between BF16 and the safe FP32 fallback on another CUDA device.
+        "precision": precision_identity,
         "implementation_sha256": implementation_hashes(),
     }
 
@@ -374,15 +419,19 @@ def _calibrate_batch_size(
         )
     try:
         probe = collate(largest[:candidate]).to(device)
+        precision = _amp_policy(args.amp, device)
         cuda_index = device.index if device.index is not None else torch.cuda.current_device()
         with torch.random.fork_rng(devices=[cuda_index]):
             # The current architecture is asserted buffer-free, so training mode
             # includes dropout's true activation path without mutating model state.
             model.train()
-            with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
+            with torch.autocast("cuda", dtype=precision["dtype"], enabled=precision["enabled"]):
                 prediction = model(probe)
                 loss = (prediction.float() - probe.y).abs().mean()
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"{dataset}: nonfinite capacity-probe loss")
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0, error_if_nonfinite=True)
             torch.cuda.synchronize(device)
         peak = int(torch.cuda.max_memory_allocated(device))
     except (RuntimeError, torch.cuda.OutOfMemoryError) as error:
@@ -419,12 +468,13 @@ def evaluate(
     amp: bool = False,
 ) -> float:
     model.eval()
+    precision = _amp_policy(amp, device)
     total = torch.zeros((), device=device, dtype=torch.float64)
     all_finite = torch.ones((), device=device, dtype=torch.bool)
     count = 0
     for batch in loader:
         batch = batch.to(device)
-        with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+        with torch.autocast("cuda", dtype=precision["dtype"], enabled=precision["enabled"]):
             predicted = model(batch).float()
         all_finite.logical_and_(torch.isfinite(predicted).all())
         total += (predicted - batch.y).abs().sum().double()
@@ -446,6 +496,7 @@ def _train_model(
     _seed(args.model_seed)
     device = torch.device(args.device)
     hardware = _hardware_report(args, device)
+    precision = _amp_policy(args.amp, device)
     model = CycleBasisPEModel(
         dataset=dataset,
         hidden=args.hidden_dim,
@@ -510,14 +561,19 @@ def _train_model(
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, factor=0.5, patience=25, min_lr=1e-6
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
+    # BF16 has FP32's exponent range and does not need loss scaling. Retain a
+    # disabled scaler object so epoch-resume artifacts keep one stable schema.
+    scaler = torch.amp.GradScaler("cuda", enabled=precision["gradient_scaler"])
     execution.update(
         hardware=hardware,
         precision={
             "amp": bool(args.amp),
-            "autocast_dtype": "float16" if args.amp else "disabled",
+            "amp_effective": precision["enabled"],
+            "autocast_dtype": precision["dtype_name"],
+            "fallback": precision["fallback"],
+            "gradient_scaler": precision["gradient_scaler"],
             "projector_contraction": "float32",
-            "backbone_autocast": bool(args.amp),
+            "backbone_autocast": precision["enabled"],
         },
         data_pipeline={
             "requested_batch_size": args.batch_size,
@@ -579,10 +635,10 @@ def _train_model(
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
+            with torch.autocast("cuda", dtype=precision["dtype"], enabled=precision["enabled"]):
                 predicted = model(batch)
                 loss = (predicted.float() - batch.y).abs().mean()
-            if not args.amp and not torch.isfinite(loss):
+            if not torch.isfinite(loss):
                 raise FloatingPointError(f"{dataset}/{MODEL_NAME}: nonfinite training loss")
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -626,6 +682,7 @@ def _train_model(
                 "effective_batch_size": effective_batch_size,
                 "batch_calibration": batch_calibration,
                 "hardware": hardware,
+                "precision": _precision_identity(precision),
                 "arguments": {
                     key: str(value) if isinstance(value, Path) else value
                     for key, value in vars(args).items()
@@ -726,6 +783,7 @@ def _evaluate_test_checkpoint(
     checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     device = torch.device(args.device)
     hardware = _hardware_report(args, device)
+    precision = _amp_policy(args.amp, device)
     payload = torch.load(checkpoint, map_location=device, weights_only=True)
     if not isinstance(payload, dict) or not isinstance(payload.get("state_dict"), dict):
         raise ValueError("Selected checkpoint has an invalid payload schema")
@@ -737,6 +795,8 @@ def _evaluate_test_checkpoint(
     for name, expected in expected_metadata.items():
         if payload.get(name) != expected:
             raise ValueError(f"Selected checkpoint {name} mismatch")
+    if payload.get("precision") != _precision_identity(precision):
+        raise ValueError("Selected checkpoint precision policy mismatch")
     saved_arguments = payload.get("arguments")
     if not isinstance(saved_arguments, dict) or saved_arguments.get("validation_only") is not True:
         raise ValueError("Selected checkpoint was not produced by validation-only training")
@@ -796,9 +856,12 @@ def _evaluate_test_checkpoint(
         hardware=hardware,
         precision={
             "amp": bool(args.amp),
-            "autocast_dtype": "float16" if args.amp else "disabled",
+            "amp_effective": precision["enabled"],
+            "autocast_dtype": precision["dtype_name"],
+            "fallback": precision["fallback"],
+            "gradient_scaler": precision["gradient_scaler"],
             "projector_contraction": "float32",
-            "backbone_autocast": bool(args.amp),
+            "backbone_autocast": precision["enabled"],
         },
         data_pipeline={
             "requested_batch_size": args.batch_size,

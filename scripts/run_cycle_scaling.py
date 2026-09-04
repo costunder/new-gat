@@ -262,6 +262,51 @@ def _job_resources(
     }
 
 
+def _v2_precision_matches(resources: dict[str, Any], precision: Any) -> bool:
+    """Validate the complete V2 arithmetic contract recorded by a child."""
+    required = {
+        "amp",
+        "amp_effective",
+        "autocast_dtype",
+        "fallback",
+        "gradient_scaler",
+        "projector_contraction",
+        "backbone_autocast",
+    }
+    requested = resources.get("amp")
+    if (
+        not isinstance(precision, dict)
+        or set(precision) != required
+        or not isinstance(requested, bool)
+        or precision.get("amp") is not requested
+        or precision.get("gradient_scaler") is not False
+        or precision.get("projector_contraction") != "float32"
+    ):
+        return False
+    if not requested:
+        return (
+            precision.get("amp_effective") is False
+            and precision.get("autocast_dtype") == "disabled"
+            and precision.get("fallback") is None
+            and precision.get("backbone_autocast") is False
+        )
+    bf16 = (
+        precision.get("amp_effective") is True
+        and precision.get("autocast_dtype") == "bfloat16"
+        and precision.get("fallback") is None
+        and precision.get("backbone_autocast") is True
+    )
+    if resources.get("hardware_profile") == "a6000-48gb":
+        return bf16
+    fp32_fallback = (
+        precision.get("amp_effective") is False
+        and precision.get("autocast_dtype") == "disabled"
+        and precision.get("fallback") == "bf16_unavailable_use_fp32"
+        and precision.get("backbone_autocast") is False
+    )
+    return bf16 or fp32_fallback
+
+
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     data_root = args.data_root.expanduser().resolve()
@@ -613,9 +658,7 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
                 or pipeline.get("workers") != job["resources"]["workers"]
                 or pipeline.get("prefetch_factor") != job["resources"]["prefetch_factor"]
                 or pipeline.get("packed_cycle_basis_h2d_tensors_per_batch") != 1
-                or not isinstance(precision, dict)
-                or precision.get("amp") is not job["resources"]["amp"]
-                or precision.get("projector_contraction") != "float32"
+                or not _v2_precision_matches(job["resources"], precision)
                 or not isinstance(hardware, dict)
                 or hardware.get("profile") != job["resources"]["hardware_profile"]
                 or reserved_memory is None
@@ -1069,9 +1112,7 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
             or pipeline.get("workers") != job["resources"]["workers"]
             or pipeline.get("prefetch_factor") != job["resources"]["prefetch_factor"]
             or pipeline.get("packed_cycle_basis_h2d_tensors_per_batch") != 1
-            or not isinstance(precision, dict)
-            or precision.get("amp") is not job["resources"]["amp"]
-            or precision.get("projector_contraction") != "float32"
+            or not _v2_precision_matches(job["resources"], precision)
             or not isinstance(hardware, dict)
             or hardware.get("profile") != job["resources"]["hardware_profile"]
             or reserved < allocated

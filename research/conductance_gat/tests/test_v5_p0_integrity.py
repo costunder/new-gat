@@ -111,6 +111,7 @@ def test_resume_and_selected_best_metadata_reject_mismatches():
         "resume_identity_sha256": digest,
         "epoch": 4,
         "validation": 0.75,
+        "selection_role": "primary",
     }
     validate_selected_checkpoint(
         selected,
@@ -121,6 +122,16 @@ def test_resume_and_selected_best_metadata_reject_mismatches():
     )
     selected["validation"] = 0.7
     with pytest.raises(ValueError, match="best_metric"):
+        validate_selected_checkpoint(
+            selected,
+            expected_identity=identity,
+            expected_identity_sha256=digest,
+            expected_epoch=4,
+            expected_metric=0.75,
+        )
+    selected["validation"] = 0.75
+    selected["selection_role"] = "global_prediction_auxiliary"
+    with pytest.raises(ValueError, match="selection role"):
         validate_selected_checkpoint(
             selected,
             expected_identity=identity,

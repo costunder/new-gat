@@ -24,10 +24,11 @@
   strong recipe이고 dynamic arm은 그 예산으로 C를 calibration/alternation한다. 따라서 C 하나의
   단일-factor 인과효과가 아닌 end-to-end recipe 비교다. reference는 hidden 256/8 layers/8
   heads/FFN×4, large는 384/12/8/4다.
-- V5 `portable`은 FP32, TF32 off, activation checkpoint on, edge chunk 65,536, ogbn-arxiv
+- V5 `portable`은 FP32, TF32 off, block activation checkpoint on, edge chunk 65,536, ogbn-arxiv
   seed-node batch 1,024, PPI whole-graph batch 2다. `a6000-48gb`는 dense BF16/TF32와 FP32
-  conductance geometry, checkpoint off, edge chunk 131,072, arxiv seed batch 2,048, PPI batch
-  8 및 sample prefetch를 쓴다. 세 citation full graphs는 어느 profile에서도 batch 1이라 작은
+  conductance geometry, block checkpoint off, edge chunk 131,072, arxiv seed batch 2,048, PPI batch
+  8 및 sample prefetch를 쓴다. Dynamic-C score MLP는 두 profile 모두 gradient가 있을 때 edge
+  chunk별 checkpoint를 사용한다. 세 citation full graphs는 어느 profile에서도 batch 1이라 작은
   단일 graph가 48GB VRAM을 채우지는 않는다. Validation은 항상 완전한 공식 graph/split이다.
 - 과거 `cycle_basis_v2` 구현과 artifact identity는 폐기했다. 새
   [CYCLE_PE_V2.md](CYCLE_PE_V2.md)는 sparse fundamental basis로 좌영공간을 구성한 뒤
@@ -44,8 +45,9 @@
   batch·sample·precision을 바꾸므로 portable와 점수나 wall time을 직접 대응시켜 모델 또는 GPU
   효과로 해석하지 않는다. Conductance V1–V4 legacy FP32·batch 계약도 바꾸지 않으므로 A6000
   PPI의 V1–V5 cross-version 값은 descriptive다.
-- 새 V5와 projector V2의 GPU 성능 결과는 아직 없다. 현재 단계는 구조 구현·검증이며 아래의
-  과거 단일-seed 값이나 폐기된 V2 결과를 새 버전 성능으로 재사용하지 않는다.
+- 새 V5와 projector V2의 성공한 전체 GPU 성능 결과는 아직 없다. 2026-09-04 A6000 partial은
+  V5 fixed 한 job 뒤 dynamic OOM, Cycle V2 네 job의 gradient overflow로 중단됐고 수정 근거로만
+  사용한다. 아래 과거 단일-seed 값이나 폐기된 V2 결과를 새 버전 성능으로 재사용하지 않는다.
 
 ### 2026-09-01 추가 요청 반영: 상대 C graph operator × spatial W v4
 
@@ -1640,10 +1642,11 @@ V2는 `last.pt`가 있으면 model·optimizer·epoch·RNG를 epoch 경계에서 
 계약이 없는 legacy child만 처음부터 다시 시작한다. CUDA kernel의 bitwise 동일성은 주장하지 않는다.
 한 트랙 실패 뒤에도 기본 통합 runner는 가능한 다음 트랙을 실행하되 전체 상태는 failed로 남긴다.
 자세한 profile, 명령, 결과 경계는 [RICH_SCALING_EXPERIMENTS.md](RICH_SCALING_EXPERIMENTS.md)를
-따른다. 현재는 코드와 로컬 계약 검증만 완료됐고 GPU scaling 결과는 없다.
+따른다. 2026-09-04 V5/Cycle V2 A6000 partial 실패 로그만 수령했으며 유효한 전체 GPU scaling
+결과는 없다.
 
 `portable`과 `a6000-48gb`는 같은 계산을 다른 GPU에서 재는 단순 timing pair가 아니다. A6000은
-V5의 BF16·sample/PPI batch, Cycle의 FP16 AMP·dataset별 batch, Tree의 FP16 AMP·batch와
+V5의 BF16·sample/PPI batch, Cycle V2의 BF16-or-FP32 정책·dataset별 batch, Tree의 FP16 AMP·batch와
 concurrency를 바꾼다. 각 arm/version 비교는 같은 hardware profile 안에서 하고 profile 간
 성능·시간 차이를 모델 또는 GPU 단일 효과로 해석하지 않는다. 통합 GPU 3 명령은 free VRAM
 40GiB를 명시적으로 요구하며 정확한 값과 장치 계약은 위 scaling 문서를 따른다.

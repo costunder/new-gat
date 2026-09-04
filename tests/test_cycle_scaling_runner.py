@@ -191,6 +191,69 @@ def test_a6000_profile_uses_static_dataset_batches_amp_and_heavy_first(tmp_path)
             assert "--prefetch-factor" not in command
 
 
+def test_v2_precision_contract_accepts_only_hardware_valid_modes() -> None:
+    disabled_resources = scaling._job_resources(_args(), "v2", "reference", "zinc12k")
+    disabled = {
+        "amp": False,
+        "amp_effective": False,
+        "autocast_dtype": "disabled",
+        "fallback": None,
+        "gradient_scaler": False,
+        "projector_contraction": "float32",
+        "backbone_autocast": False,
+    }
+    portable_resources = scaling._job_resources(_args("--amp"), "v2", "reference", "zinc12k")
+    bf16 = {
+        **disabled,
+        "amp": True,
+        "amp_effective": True,
+        "autocast_dtype": "bfloat16",
+        "backbone_autocast": True,
+    }
+    fallback = {
+        **disabled,
+        "amp": True,
+        "fallback": "bf16_unavailable_use_fp32",
+    }
+    a6000_resources = scaling._job_resources(
+        _args("--hardware-profile", "a6000-48gb"),
+        "v2",
+        "reference",
+        "zinc12k",
+    )
+
+    assert scaling._v2_precision_matches(disabled_resources, disabled)
+    assert scaling._v2_precision_matches(portable_resources, bf16)
+    assert scaling._v2_precision_matches(portable_resources, fallback)
+    assert scaling._v2_precision_matches(a6000_resources, bf16)
+    assert not scaling._v2_precision_matches(a6000_resources, fallback)
+
+    corrupt_values = {
+        "amp": False,
+        "amp_effective": False,
+        "autocast_dtype": "float16",
+        "fallback": "tampered",
+        "gradient_scaler": True,
+        "projector_contraction": "float16",
+        "backbone_autocast": False,
+    }
+    for field, value in corrupt_values.items():
+        corrupt = dict(bf16)
+        corrupt[field] = value
+        assert not scaling._v2_precision_matches(a6000_resources, corrupt), field
+    for field in tuple(bf16):
+        incomplete = dict(bf16)
+        del incomplete[field]
+        assert not scaling._v2_precision_matches(a6000_resources, incomplete), field
+    extra = {**bf16, "unregistered_precision_field": True}
+    assert not scaling._v2_precision_matches(a6000_resources, extra)
+
+
+def test_both_v2_artifact_admission_paths_enforce_full_precision_contract() -> None:
+    assert "_v2_precision_matches" in inspect.getsource(scaling.read_job_rows)
+    assert "_v2_precision_matches" in inspect.getsource(scaling.read_test_result)
+
+
 @pytest.mark.parametrize(
     "gpu,passes",
     [
@@ -210,7 +273,9 @@ def test_a6000_capacity_guard_is_capacity_based_not_name_based(gpu, passes):
 
 
 def test_v2_test_only_admission_binds_every_a6000_runtime_field():
-    source = inspect.getsource(scaling.read_test_result)
+    source = inspect.getsource(scaling.read_test_result) + inspect.getsource(
+        scaling._v2_precision_matches
+    )
     for field in (
         "ffn_multiplier",
         "column_chunk_size",
@@ -489,7 +554,15 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
                                 "prefetch_factor": 2,
                                 "packed_cycle_basis_h2d_tensors_per_batch": 1,
                             },
-                            "precision": {"amp": False, "projector_contraction": "float32"},
+                            "precision": {
+                                "amp": False,
+                                "amp_effective": False,
+                                "autocast_dtype": "disabled",
+                                "fallback": None,
+                                "gradient_scaler": False,
+                                "projector_contraction": "float32",
+                                "backbone_autocast": False,
+                            },
                             "hardware": {"profile": "portable"},
                         },
                         "best_epoch": 2,

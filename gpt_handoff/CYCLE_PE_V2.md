@@ -116,13 +116,22 @@ Architecture profile과 hardware profile은 서로 다른 축이다. Scaling run
 |---|---|---|
 | graph batch | 모든 dataset/profile 32 | `reference`: ZINC 512, Peptides 128; `large`: ZINC 256, Peptides 64 |
 | loader | workers 4, prefetch 2 | workers 8; V1 prefetch 2, V2 prefetch 4 |
-| numeric path | AMP off, FP32 | backbone FP16 AMP; V2 projector contraction FP32 |
+| numeric path | AMP off, FP32 | BF16 지원 시 backbone BF16 autocast, 미지원 시 FP32 fallback; V2 projector contraction FP32; loss scaling 없음 |
 | V2 contraction | column chunk 16, pair budget 32,768 | column chunk 32, pair budget 4,194,304, packed cycle-basis H2D |
 
 `a6000-48gb`는 보이는 VRAM 40GiB 이상과 compute capability 8.0 이상을 요구한다. V2는 epoch
 1 전에 큰 graph부터 구성한 요청 batch의 training-mode forward/backward를 실행해 capacity를
 검사한다. OOM이면 batch를 자동으로 줄이거나 중간 epoch에서 protocol을 바꾸지 않고 실패하며,
 명시적으로 더 작은 `--batch-size`와 새 run-id를 요구한다.
+
+A6000 mixed precision은 FP16을 사용하지 않는다. 2026-09-04 수령한 실제 서버 로그에서 기존
+FP16 경로는 capacity probe의 비스케일 backward는 통과했지만, 실제 학습의 GradScaler 초기
+배율 65,536에서 gradient가 overflow하여 ZINC와 Peptides-struct 모두 첫 epoch 전에 중단됐다.
+현재 구현은 BF16 지원 CUDA 장치에서 BF16 autocast를 사용하고 GradScaler를 끈다. BF16 미지원
+장치는 위험한 FP16 경로로 자동 회귀하지 않고 FP32로 fallback한다. Loss와 gradient의 finite
+검사는 계속 fail-closed이며 capacity probe와 실제 학습이 같은 precision policy를 사용한다.
+해석된 BF16/FP32 정책은 epoch-resume identity와 best/test checkpoint에도 기록되어, 다른
+산술 정책의 장치로 checkpoint를 조용히 이어 붙이거나 평가하는 것을 거부한다.
 
 다음 GPU 6 명령은 과거 10GB MIG 할당 번호를 보존한 portable 예시다.
 
@@ -172,5 +181,9 @@ step이나 재학습이 아니다. 같은 hardware profile 안에서 V1/V2를 �
 numeric execution이 실제로 달라지므로 portable와 A6000 사이의 점수나 wall time 차이를 PE 또는
 GPU 하나의 효과로 직접 해석하지 않는다.
 
-현재 새 V2 GPU 결과는 없다. 구 V2 실패값을 새 projector V2 결과로 재사용하거나 SOTA와
-비교해서는 안 된다.
+새 projector V2의 **성공한 GPU 성능 결과는 아직 없다.** Run
+`new-v5-cyclev2-a6000-gpu3-seed0-r1-cycle`에서는 두 데이터셋의 projector cache 준비까지
+완료했지만 reference/large 네 학습이 모두 위 FP16 gradient overflow로 중단됐다. 이 실패
+run의 checkpoint나 수치를 성능 결과로 쓰지 않는다. 수정 후에는 implementation/resume
+identity가 달라지므로 새 run ID가 필요하지만, 검증된 dataset/projector cache는 그대로
+재사용할 수 있다. 구 V2 실패값도 새 projector V2 결과로 재사용하거나 SOTA와 비교해서는 안 된다.

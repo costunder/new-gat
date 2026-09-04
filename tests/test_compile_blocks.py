@@ -134,6 +134,7 @@ def _cycle_graph(nodes: int) -> Graph:
         edge_attr=torch.randint(4, (nodes, 1)),
         y=torch.zeros(1),
         cycle_basis=basis,
+        cycle_basis_is_orthonormal=torch.tensor(True),
     )
 
 
@@ -156,6 +157,7 @@ def test_compiled_full_model_blocks_preserve_forward_backward_and_empty_graphs(m
         edge_attr=torch.tensor([[0]]),
         y=torch.zeros(1),
         cycle_basis=torch.empty(1, 0),
+        cycle_basis_is_orthonormal=torch.tensor(True),
     )
     edgeless = Graph(
         x=torch.tensor([[3]]),
@@ -163,6 +165,7 @@ def test_compiled_full_model_blocks_preserve_forward_backward_and_empty_graphs(m
         edge_attr=torch.empty(0, 1, dtype=torch.long),
         y=torch.zeros(1),
         cycle_basis=torch.empty(0, 0),
+        cycle_basis_is_orthonormal=torch.tensor(True),
     )
     for nodes in (4, 7):
         model.zero_grad(set_to_none=True)

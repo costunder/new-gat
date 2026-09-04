@@ -148,7 +148,17 @@ COMPARISON_DESIGN = {
     "single_factor_causal_effect_of_c": False,
     "unequal_parameter_group_update_allocation": True,
     "required_audit_field": "effective_optimizer_steps_by_group",
-    "checkpoint_selection": "best validation metric within joint phase only",
+    "checkpoint_selection": {
+        "primary": (
+            "fixed_c selects its all-epoch validation best; shared_dynamic_c selects its "
+            "C-active validation best from calibration, alternating, or joint phases"
+        ),
+        "auxiliary_prediction": "all-epoch validation best is reported for both arms",
+        "early_stopping": (
+            "fixed_c monitors its all-epoch best; shared_dynamic_c monitors a separate "
+            "joint-phase best so warmup cannot terminate C training"
+        ),
+    },
     "hardware_profile_comparability": (
         "compare fixed_c versus shared_dynamic_c only under the same hardware profile; "
         "portable and a6000-48gb are distinct optimization recipes"

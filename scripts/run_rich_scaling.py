@@ -127,6 +127,15 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--v5-beta-min", type=float)
     result.add_argument("--v5-beta-max", type=float)
     result.add_argument(
+        "--v5-activation-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "V5 only: explicitly override the conductance hardware profile's block "
+            "checkpoint policy; omission preserves that profile's default"
+        ),
+    )
+    result.add_argument(
         "--cycle-v2-basis-backend",
         choices=CYCLE_V2_BASIS_BACKENDS,
         default="thin_q",
@@ -302,6 +311,12 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             command += ["--model-seeds", *(str(seed) for seed in args.model_seeds)]
             for name, value in _v5_beta_configuration(args).items():
                 command += ["--v5-" + name.replace("_", "-"), str(value)]
+            if args.v5_activation_checkpoint is not None:
+                command.append(
+                    "--v5-activation-checkpoint"
+                    if args.v5_activation_checkpoint
+                    else "--no-v5-activation-checkpoint"
+                )
         command += [
             "--data-root",
             str(data_root),
@@ -929,6 +944,7 @@ def _config_payload(
         "hardware_profile": args.hardware_profile,
         "min_free_gb": args.min_free_gb,
         "v5_beta": _v5_beta_configuration(args),
+        "v5_activation_checkpoint": args.v5_activation_checkpoint,
         "cycle_v2_basis_backend": args.cycle_v2_basis_backend,
         "allow_download": args.allow_download,
         "data_root": str(data_root),

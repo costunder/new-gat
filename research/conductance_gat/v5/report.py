@@ -109,6 +109,73 @@ def _validate_child(
         or not 0 <= validation <= 1
     ):
         raise ComparisonIntegrityError(f"nonfinite/out-of-range validation metric: {path}")
+    best_epoch = child.get("best_epoch")
+    global_validation = child.get("global_best_validation")
+    global_epoch = child.get("global_best_epoch")
+    if (
+        isinstance(best_epoch, bool)
+        or not isinstance(best_epoch, int)
+        or best_epoch < 1
+        or isinstance(global_validation, bool)
+        or not isinstance(global_validation, (int, float))
+        or not math.isfinite(global_validation)
+        or not 0 <= global_validation <= 1
+        or isinstance(global_epoch, bool)
+        or not isinstance(global_epoch, int)
+        or global_epoch < 1
+        or global_validation < validation
+    ):
+        raise ComparisonIntegrityError(f"invalid global prediction selection: {path}")
+    selection = child.get("checkpoint_selection")
+    expected_role = (
+        "all_epoch_prediction_best"
+        if child["condition"] == "fixed_c"
+        else "c_active_mechanism_best"
+    )
+    expected_monitor = "primary_all_epoch_best" if child["condition"] == "fixed_c" else "joint_best"
+    if (
+        not isinstance(selection, dict)
+        or selection.get("primary_role") != expected_role
+        or selection.get("primary_validation") != validation
+        or selection.get("primary_epoch") != best_epoch
+        or selection.get("global_prediction_validation") != global_validation
+        or selection.get("global_prediction_epoch") != global_epoch
+        or selection.get("early_stopping_monitor") != expected_monitor
+        or selection.get("test_used") is not False
+    ):
+        raise ComparisonIntegrityError(f"invalid checkpoint selection metadata: {path}")
+    if child["condition"] == "fixed_c":
+        if (
+            global_validation != validation
+            or global_epoch != best_epoch
+            or selection.get("global_prediction_checkpoint_preserved") is not True
+            or selection.get("joint_monitor_applicable") is not False
+            or selection.get("joint_validation") is not None
+            or selection.get("joint_epoch") is not None
+            or child.get("joint_best_validation") is not None
+            or child.get("joint_best_epoch") is not None
+        ):
+            raise ComparisonIntegrityError(f"invalid fixed-C selection roles: {path}")
+    else:
+        joint_validation, joint_epoch = (
+            child.get("joint_best_validation"),
+            child.get("joint_best_epoch"),
+        )
+        if (
+            isinstance(joint_validation, bool)
+            or not isinstance(joint_validation, (int, float))
+            or not math.isfinite(joint_validation)
+            or not 0 <= joint_validation <= 1
+            or isinstance(joint_epoch, bool)
+            or not isinstance(joint_epoch, int)
+            or joint_epoch < 1
+            or selection.get("joint_monitor_applicable") is not True
+            or selection.get("joint_validation") != joint_validation
+            or selection.get("joint_epoch") != joint_epoch
+            or selection.get("global_prediction_checkpoint_preserved")
+            is not bool(global_epoch == best_epoch)
+        ):
+            raise ComparisonIntegrityError(f"invalid dynamic-C selection roles: {path}")
     for key in ("cache_sha256", "initial_state_sha256"):
         if not isinstance(child.get(key), str) or len(child[key]) != 64:
             raise ComparisonIntegrityError(f"invalid {key}: {path}")
@@ -161,7 +228,12 @@ def _validate_child(
         "parameters": int(child["total_parameters"]),
         "allocated_parameter_capacity": capacity,
         "trainable_parameters": trainable,
-        "best_epoch": int(child["best_epoch"]),
+        "best_epoch": best_epoch,
+        "global_prediction_validation": float(global_validation),
+        "global_prediction_epoch": global_epoch,
+        "joint_best_validation": child.get("joint_best_validation"),
+        "joint_best_epoch": child.get("joint_best_epoch"),
+        "checkpoint_selection": selection,
         "effective_optimizer_steps_by_group": group_steps,
         "cache_sha256": child["cache_sha256"],
         "source_sha256": child["source_sha256"],
@@ -255,6 +327,11 @@ def build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                 "fixed_c": fixed["validation"],
                 "shared_dynamic_c": dynamic["validation"],
                 "dynamic_minus_fixed": dynamic["validation"] - fixed["validation"],
+                "shared_dynamic_c_global_prediction": dynamic["global_prediction_validation"],
+                "dynamic_global_prediction_minus_fixed": (
+                    dynamic["global_prediction_validation"] - fixed["validation"]
+                ),
+                "dynamic_joint_best": dynamic["joint_best_validation"],
                 "comparison_design": COMPARISON_DESIGN,
                 "fixed_effective_optimizer_steps_by_group": fixed[
                     "effective_optimizer_steps_by_group"
@@ -285,13 +362,25 @@ def markdown(report: dict[str, Any]) -> str:
         "",
         "Test labels were not evaluated.",
         "",
-        "| Dataset | Metric | Fixed C | Dynamic C | Dynamic - fixed |",
-        "|---|---:|---:|---:|---:|",
+        (
+            "Primary comparison: fixed C uses its all-epoch prediction best; dynamic C uses "
+            "its C-active mechanism best. Dynamic global prediction is auxiliary and may be "
+            "a warmup C=1 epoch."
+        ),
+        "",
+        (
+            "| Dataset | Metric | Fixed global | Dynamic C-active | C-active - fixed | "
+            "Dynamic global (aux) | Aux - fixed | Dynamic joint monitor |"
+        ),
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in report["contrasts"]:
         lines.append(
             f"| {row['dataset']} | {row['metric']} | {row['fixed_c']:.6f} | "
-            f"{row['shared_dynamic_c']:.6f} | {row['dynamic_minus_fixed']:+.6f} |"
+            f"{row['shared_dynamic_c']:.6f} | {row['dynamic_minus_fixed']:+.6f} | "
+            f"{row['shared_dynamic_c_global_prediction']:.6f} | "
+            f"{row['dynamic_global_prediction_minus_fixed']:+.6f} | "
+            f"{row['dynamic_joint_best']:.6f} |"
         )
     return "\n".join(lines) + "\n"
 

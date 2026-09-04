@@ -15829,7 +15829,35 @@ def test_report_is_partial_safe_then_requires_complete_pairs(tmp_path):
             "batch_size": 1,
             "sampling": "full",
         }
-        schedule = [{"name": "joint", "start_epoch": 1, "end_epoch": 4, "length": 4}]
+        schedule = [
+            {"name": "spatial_warmup", "start_epoch": 1, "end_epoch": 1, "length": 1},
+            {
+                "name": "conductance_calibration",
+                "start_epoch": 2,
+                "end_epoch": 2,
+                "length": 1,
+            },
+            {"name": "alternating", "start_epoch": 3, "end_epoch": 3, "length": 1},
+            {"name": "joint", "start_epoch": 4, "end_epoch": 4, "length": 1},
+        ]
+        dynamic = job["condition"] == "shared_dynamic_c"
+        global_validation = 0.81 if dynamic else 0.8
+        global_epoch = 1 if dynamic else 4
+        joint_validation = 0.8 if dynamic else None
+        joint_epoch = 4 if dynamic else None
+        checkpoint_selection = {
+            "primary_role": ("c_active_mechanism_best" if dynamic else "all_epoch_prediction_best"),
+            "primary_validation": 0.8,
+            "primary_epoch": 4,
+            "global_prediction_validation": global_validation,
+            "global_prediction_epoch": global_epoch,
+            "global_prediction_checkpoint_preserved": not dynamic,
+            "early_stopping_monitor": ("joint_best" if dynamic else "primary_all_epoch_best"),
+            "joint_monitor_applicable": dynamic,
+            "joint_validation": joint_validation,
+            "joint_epoch": joint_epoch,
+            "test_used": False,
+        }
         identity = {
             "cache_sha256": cache_sha256,
             "source_sha256": source_sha256,
@@ -15849,6 +15877,11 @@ def test_report_is_partial_safe_then_requires_complete_pairs(tmp_path):
                     "evaluation_split": "validation",
                     "test_evaluated": False,
                     "validation": 0.8,
+                    "global_best_validation": global_validation,
+                    "global_best_epoch": global_epoch,
+                    "joint_best_validation": joint_validation,
+                    "joint_best_epoch": joint_epoch,
+                    "checkpoint_selection": checkpoint_selection,
                     "metric_name": "accuracy",
                     "total_parameters": 10,
                     "trainable_parameters": 8,
@@ -16320,6 +16353,7 @@ def test_resume_and_selected_best_metadata_reject_mismatches():
         "resume_identity_sha256": digest,
         "epoch": 4,
         "validation": 0.75,
+        "selection_role": "primary",
     }
     validate_selected_checkpoint(
         selected,
@@ -16330,6 +16364,16 @@ def test_resume_and_selected_best_metadata_reject_mismatches():
     )
     selected["validation"] = 0.7
     with pytest.raises(ValueError, match="best_metric"):
+        validate_selected_checkpoint(
+            selected,
+            expected_identity=identity,
+            expected_identity_sha256=digest,
+            expected_epoch=4,
+            expected_metric=0.75,
+        )
+    selected["validation"] = 0.75
+    selected["selection_role"] = "global_prediction_auxiliary"
+    with pytest.raises(ValueError, match="selection role"):
         validate_selected_checkpoint(
             selected,
             expected_identity=identity,
@@ -23579,24 +23623,35 @@ class GraphConditionedConductance(nn.Module):
             return c
         projected = F.silu(self.node_projection(state))
         context = F.silu(self.context_projection(graph_context))
-        scores = (
-            torch.cat(
-                [
-                    self._score_chunk(
-                        projected,
-                        context,
-                        tail[start : start + self.edge_chunk_size],
-                        head[start : start + self.edge_chunk_size],
-                        sample_degree,
-                        full_degree,
-                        edge_graph[start : start + self.edge_chunk_size],
-                    )
-                    for start in range(0, tail.numel(), self.edge_chunk_size)
-                ]
+        score_chunks = []
+        for start in range(0, tail.numel(), self.edge_chunk_size):
+            chunk_arguments = (
+                projected,
+                context,
+                tail[start : start + self.edge_chunk_size],
+                head[start : start + self.edge_chunk_size],
+                sample_degree,
+                full_degree,
+                edge_graph[start : start + self.edge_chunk_size],
             )
-            if tail.numel()
-            else state.new_empty(0)
-        )
+            if torch.is_grad_enabled():
+                # Merely slicing the edge MLP did not bound training memory: autograd
+                # retained every chunk's 4*score_channels-wide feature/LN/MLP
+                # activations until backward.  Recompute each deterministic score
+                # chunk during backward so peak saved activations scale with the
+                # configured chunk size instead of the total number of sampled edges.
+                from torch.utils.checkpoint import checkpoint
+
+                score = checkpoint(
+                    self._score_chunk,
+                    *chunk_arguments,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                score = self._score_chunk(*chunk_arguments)
+            score_chunks.append(score)
+        scores = torch.cat(score_chunks) if score_chunks else state.new_empty(0)
         if edge_normalization_weight is None:
             edge_normalization_weight = torch.ones_like(scores)
         centered = (
@@ -23895,7 +23950,7 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
             "sampling_correction": getattr(graph, "sampling_correction", None),
         }
         for block in self.blocks:
-            if self.activation_checkpoint and self.training and torch.is_grad_enabled():
+            if self.activation_checkpoint and torch.is_grad_enabled():
                 from torch.utils.checkpoint import checkpoint
 
                 h = checkpoint(
@@ -24195,7 +24250,17 @@ COMPARISON_DESIGN = {
     "single_factor_causal_effect_of_c": False,
     "unequal_parameter_group_update_allocation": True,
     "required_audit_field": "effective_optimizer_steps_by_group",
-    "checkpoint_selection": "best validation metric within joint phase only",
+    "checkpoint_selection": {
+        "primary": (
+            "fixed_c selects its all-epoch validation best; shared_dynamic_c selects its "
+            "C-active validation best from calibration, alternating, or joint phases"
+        ),
+        "auxiliary_prediction": "all-epoch validation best is reported for both arms",
+        "early_stopping": (
+            "fixed_c monitors its all-epoch best; shared_dynamic_c monitors a separate "
+            "joint-phase best so warmup cannot terminate C training"
+        ),
+    },
     "hardware_profile_comparability": (
         "compare fixed_c versus shared_dynamic_c only under the same hardware profile; "
         "portable and a6000-48gb are distinct optimization recipes"
@@ -24336,6 +24401,73 @@ def _validate_child(
         or not 0 <= validation <= 1
     ):
         raise ComparisonIntegrityError(f"nonfinite/out-of-range validation metric: {path}")
+    best_epoch = child.get("best_epoch")
+    global_validation = child.get("global_best_validation")
+    global_epoch = child.get("global_best_epoch")
+    if (
+        isinstance(best_epoch, bool)
+        or not isinstance(best_epoch, int)
+        or best_epoch < 1
+        or isinstance(global_validation, bool)
+        or not isinstance(global_validation, (int, float))
+        or not math.isfinite(global_validation)
+        or not 0 <= global_validation <= 1
+        or isinstance(global_epoch, bool)
+        or not isinstance(global_epoch, int)
+        or global_epoch < 1
+        or global_validation < validation
+    ):
+        raise ComparisonIntegrityError(f"invalid global prediction selection: {path}")
+    selection = child.get("checkpoint_selection")
+    expected_role = (
+        "all_epoch_prediction_best"
+        if child["condition"] == "fixed_c"
+        else "c_active_mechanism_best"
+    )
+    expected_monitor = "primary_all_epoch_best" if child["condition"] == "fixed_c" else "joint_best"
+    if (
+        not isinstance(selection, dict)
+        or selection.get("primary_role") != expected_role
+        or selection.get("primary_validation") != validation
+        or selection.get("primary_epoch") != best_epoch
+        or selection.get("global_prediction_validation") != global_validation
+        or selection.get("global_prediction_epoch") != global_epoch
+        or selection.get("early_stopping_monitor") != expected_monitor
+        or selection.get("test_used") is not False
+    ):
+        raise ComparisonIntegrityError(f"invalid checkpoint selection metadata: {path}")
+    if child["condition"] == "fixed_c":
+        if (
+            global_validation != validation
+            or global_epoch != best_epoch
+            or selection.get("global_prediction_checkpoint_preserved") is not True
+            or selection.get("joint_monitor_applicable") is not False
+            or selection.get("joint_validation") is not None
+            or selection.get("joint_epoch") is not None
+            or child.get("joint_best_validation") is not None
+            or child.get("joint_best_epoch") is not None
+        ):
+            raise ComparisonIntegrityError(f"invalid fixed-C selection roles: {path}")
+    else:
+        joint_validation, joint_epoch = (
+            child.get("joint_best_validation"),
+            child.get("joint_best_epoch"),
+        )
+        if (
+            isinstance(joint_validation, bool)
+            or not isinstance(joint_validation, (int, float))
+            or not math.isfinite(joint_validation)
+            or not 0 <= joint_validation <= 1
+            or isinstance(joint_epoch, bool)
+            or not isinstance(joint_epoch, int)
+            or joint_epoch < 1
+            or selection.get("joint_monitor_applicable") is not True
+            or selection.get("joint_validation") != joint_validation
+            or selection.get("joint_epoch") != joint_epoch
+            or selection.get("global_prediction_checkpoint_preserved")
+            is not bool(global_epoch == best_epoch)
+        ):
+            raise ComparisonIntegrityError(f"invalid dynamic-C selection roles: {path}")
     for key in ("cache_sha256", "initial_state_sha256"):
         if not isinstance(child.get(key), str) or len(child[key]) != 64:
             raise ComparisonIntegrityError(f"invalid {key}: {path}")
@@ -24388,7 +24520,12 @@ def _validate_child(
         "parameters": int(child["total_parameters"]),
         "allocated_parameter_capacity": capacity,
         "trainable_parameters": trainable,
-        "best_epoch": int(child["best_epoch"]),
+        "best_epoch": best_epoch,
+        "global_prediction_validation": float(global_validation),
+        "global_prediction_epoch": global_epoch,
+        "joint_best_validation": child.get("joint_best_validation"),
+        "joint_best_epoch": child.get("joint_best_epoch"),
+        "checkpoint_selection": selection,
         "effective_optimizer_steps_by_group": group_steps,
         "cache_sha256": child["cache_sha256"],
         "source_sha256": child["source_sha256"],
@@ -24482,6 +24619,11 @@ def build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                 "fixed_c": fixed["validation"],
                 "shared_dynamic_c": dynamic["validation"],
                 "dynamic_minus_fixed": dynamic["validation"] - fixed["validation"],
+                "shared_dynamic_c_global_prediction": dynamic["global_prediction_validation"],
+                "dynamic_global_prediction_minus_fixed": (
+                    dynamic["global_prediction_validation"] - fixed["validation"]
+                ),
+                "dynamic_joint_best": dynamic["joint_best_validation"],
                 "comparison_design": COMPARISON_DESIGN,
                 "fixed_effective_optimizer_steps_by_group": fixed[
                     "effective_optimizer_steps_by_group"
@@ -24512,13 +24654,25 @@ def markdown(report: dict[str, Any]) -> str:
         "",
         "Test labels were not evaluated.",
         "",
-        "| Dataset | Metric | Fixed C | Dynamic C | Dynamic - fixed |",
-        "|---|---:|---:|---:|---:|",
+        (
+            "Primary comparison: fixed C uses its all-epoch prediction best; dynamic C uses "
+            "its C-active mechanism best. Dynamic global prediction is auxiliary and may be "
+            "a warmup C=1 epoch."
+        ),
+        "",
+        (
+            "| Dataset | Metric | Fixed global | Dynamic C-active | C-active - fixed | "
+            "Dynamic global (aux) | Aux - fixed | Dynamic joint monitor |"
+        ),
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in report["contrasts"]:
         lines.append(
             f"| {row['dataset']} | {row['metric']} | {row['fixed_c']:.6f} | "
-            f"{row['shared_dynamic_c']:.6f} | {row['dynamic_minus_fixed']:+.6f} |"
+            f"{row['shared_dynamic_c']:.6f} | {row['dynamic_minus_fixed']:+.6f} | "
+            f"{row['shared_dynamic_c_global_prediction']:.6f} | "
+            f"{row['dynamic_global_prediction_minus_fixed']:+.6f} | "
+            f"{row['dynamic_joint_best']:.6f} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -25079,6 +25233,48 @@ def phase_at(schedule: list[dict[str, Any]], epoch: int) -> tuple[str, int]:
     raise ValueError("epoch outside phase schedule")
 
 
+def selection_eligibility(condition: str, phase: str) -> dict[str, bool]:
+    """Return the condition-aware validation-selection roles for one epoch.
+
+    The fixed arm has no latent mechanism to wait for, so every epoch is a
+    scientifically valid primary checkpoint candidate.  The dynamic arm's
+    warmup explicitly overrides C with ones; it may be the best pure predictor,
+    but it is not evidence for learned C and therefore is auxiliary only.
+    """
+
+    if condition not in CONDITIONS:
+        raise ValueError(f"unknown V5 condition: {condition}")
+    if phase not in TRAINING_PHASES:
+        raise ValueError(f"unknown V5 phase: {phase}")
+    dynamic = condition == "shared_dynamic_c"
+    return {
+        "global_prediction": True,
+        "primary": not dynamic or phase != "spatial_warmup",
+        "joint_early_stopping": dynamic and phase == "joint",
+    }
+
+
+def should_stop_early(
+    condition: str,
+    phase: str,
+    epoch: int,
+    *,
+    primary_best_epoch: int,
+    joint_best_epoch: int,
+    patience: int,
+) -> bool:
+    """Apply patience to the checkpoint role valid for each condition."""
+
+    eligibility = selection_eligibility(condition, phase)
+    if condition == "fixed_c":
+        return primary_best_epoch > 0 and epoch - primary_best_epoch >= patience
+    return (
+        eligibility["joint_early_stopping"]
+        and joint_best_epoch > 0
+        and epoch - joint_best_epoch >= patience
+    )
+
+
 def parameter_group(name: str) -> str:
     if ".operator.estimator." in name:
         return "conductance"
@@ -25496,6 +25692,7 @@ def validate_selected_checkpoint(
     expected_identity_sha256: str,
     expected_epoch: int,
     expected_metric: float,
+    expected_selection_role: str = "primary",
 ) -> None:
     if not isinstance(selected, dict):
         raise ValueError("best.pt payload is invalid")
@@ -25517,6 +25714,8 @@ def validate_selected_checkpoint(
         raise ValueError("best.pt validation metadata is invalid")
     if float(metric) != expected_metric:
         raise ValueError("best.pt validation does not match last.pt best_metric")
+    if selected.get("selection_role") != expected_selection_role:
+        raise ValueError("best.pt selection role is invalid")
 
 
 def train_model(payload, protocol, args, device: torch.device, output: Path) -> dict[str, Any]:
@@ -25553,6 +25752,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
     history: list[dict[str, Any]] = []
     start_epoch, best_metric, best_epoch, optimizer_steps = 1, -math.inf, 0, 0
     global_best_metric, global_best_epoch = -math.inf, 0
+    joint_best_metric, joint_best_epoch = -math.inf, 0
     elapsed_before = 0.0
     peak_allocated_before = peak_reserved_before = 0
     first_c_gradient = None
@@ -25561,6 +25761,8 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
     effective_group_steps = {name: 0 for name in _PARAMETER_GROUPS}
     if args.resume and last_path.exists():
         saved = torch.load(last_path, map_location=device, weights_only=False)
+        if saved.get("schema_version") != 3:
+            raise ValueError("last.pt uses an incompatible V5 selection-state schema")
         validate_resume_identity(
             saved.get("resume_identity"),
             resume_identity,
@@ -25582,6 +25784,8 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
         best_metric, best_epoch = float(saved["best_metric"]), int(saved["best_epoch"])
         global_best_metric = float(saved.get("global_best_metric", best_metric))
         global_best_epoch = int(saved.get("global_best_epoch", best_epoch))
+        joint_best_metric = float(saved["joint_best_metric"])
+        joint_best_epoch = int(saved["joint_best_epoch"])
         elapsed_before = float(saved.get("elapsed_seconds", 0.0))
         peak_allocated_before = int(saved.get("peak_cuda_allocated_bytes", 0))
         peak_reserved_before = int(saved.get("peak_cuda_reserved_bytes", 0))
@@ -25676,12 +25880,13 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
             "layers": layer_diagnostics(model),
         }
         history.append(row)
-        atomic_write_json(history_path, history)
+        eligibility = selection_eligibility(args.condition, phase)
         if metric > global_best_metric:
             global_best_metric, global_best_epoch = metric, epoch
-        # Model selection is joint-phase only. Otherwise the dynamic arm could
-        # accidentally publish its C=1 warmup checkpoint as the V5 result.
-        if phase == "joint" and metric > best_metric:
+        # fixed_c selects over its complete training trajectory.  For the
+        # dynamic arm, warmup C=1 is retained as an auxiliary prediction score
+        # but cannot become the mechanism-bearing primary checkpoint.
+        if eligibility["primary"] and metric > best_metric:
             best_metric, best_epoch = metric, epoch
             best_checkpoint_sha256 = publish_best_checkpoint(
                 checkpoint,
@@ -25696,8 +25901,28 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
                     "resume_identity_sha256": resume_identity_sha256,
                     "epoch": epoch,
                     "validation": metric,
+                    "selection_role": "primary",
+                    "selection_scope": (
+                        "all_epochs" if args.condition == "fixed_c" else "c_active_epochs"
+                    ),
+                    "phase": phase,
                 },
             )
+        if eligibility["joint_early_stopping"] and metric > joint_best_metric:
+            joint_best_metric, joint_best_epoch = metric, epoch
+        row["selection"] = {
+            "primary_eligible": eligibility["primary"],
+            "primary_best_validation": best_metric if math.isfinite(best_metric) else None,
+            "primary_best_epoch": best_epoch or None,
+            "global_prediction_best_validation": global_best_metric,
+            "global_prediction_best_epoch": global_best_epoch,
+            "joint_early_stopping_eligible": eligibility["joint_early_stopping"],
+            "joint_best_validation": (
+                joint_best_metric if math.isfinite(joint_best_metric) else None
+            ),
+            "joint_best_epoch": joint_best_epoch or None,
+        }
+        atomic_write_json(history_path, history)
         efficiency = merge_efficiency(
             elapsed_before,
             peak_allocated_before,
@@ -25706,13 +25931,18 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
             torch.cuda.max_memory_allocated(device),
             torch.cuda.max_memory_reserved(device),
         )
-        stop_after_epoch = epoch == args.epochs or (
-            phase == "joint" and best_epoch > 0 and epoch - best_epoch >= args.patience
+        stop_after_epoch = epoch == args.epochs or should_stop_early(
+            args.condition,
+            phase,
+            epoch,
+            primary_best_epoch=best_epoch,
+            joint_best_epoch=joint_best_epoch,
+            patience=args.patience,
         )
         _save(
             last_path,
             {
-                "schema_version": 2,
+                "schema_version": 3,
                 "complete": stop_after_epoch,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
@@ -25728,6 +25958,8 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
                 "effective_optimizer_steps_by_group": effective_group_steps,
                 "global_best_metric": global_best_metric,
                 "global_best_epoch": global_best_epoch,
+                "joint_best_metric": joint_best_metric,
+                "joint_best_epoch": joint_best_epoch,
                 "first_c_gradient": first_c_gradient,
                 "cpu_rng_state": torch.get_rng_state(),
                 "cuda_rng_state": torch.cuda.get_rng_state(device),
@@ -25735,16 +25967,30 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
             },
         )
         if epoch == 1 or epoch % 10 == 0:
+            primary_best_text = f"{best_metric:.6f}" if math.isfinite(best_metric) else "pending"
+            joint_best_text = (
+                "n/a"
+                if args.condition == "fixed_c"
+                else f"{joint_best_metric:.6f}"
+                if math.isfinite(joint_best_metric)
+                else "pending"
+            )
             print(
                 f"{args.dataset}/{args.condition} epoch={epoch} phase={phase} "
                 f"loss={row['train_loss']:.6f} val={metric:.6f} "
-                f"joint_best={best_metric:.6f}",
+                f"primary_best={primary_best_text} "
+                f"global_best={global_best_metric:.6f} "
+                f"joint_best={joint_best_text}",
                 flush=True,
             )
         if stop_after_epoch:
             break
     if best_epoch < 1 or not math.isfinite(best_metric) or best_checkpoint_sha256 is None:
-        raise RuntimeError("V5 completed without a finite joint-phase best checkpoint")
+        raise RuntimeError("V5 completed without a finite primary validation checkpoint")
+    if args.condition == "shared_dynamic_c" and (
+        joint_best_epoch < 1 or not math.isfinite(joint_best_metric)
+    ):
+        raise RuntimeError("dynamic V5 completed without a finite joint early-stopping metric")
     best_recovery_slot = recover_best_checkpoint(
         checkpoint, previous_checkpoint, best_checkpoint_sha256
     )
@@ -25755,6 +26001,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
         expected_identity_sha256=resume_identity_sha256,
         expected_epoch=best_epoch,
         expected_metric=best_metric,
+        expected_selection_role="primary",
     )
     model.load_state_dict(selected["model_state"])
     for operator in model.operators:
@@ -25822,6 +26069,33 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
         },
         "global_best_validation": global_best_metric,
         "global_best_epoch": global_best_epoch,
+        "joint_best_validation": (
+            joint_best_metric if args.condition == "shared_dynamic_c" else None
+        ),
+        "joint_best_epoch": joint_best_epoch if args.condition == "shared_dynamic_c" else None,
+        "checkpoint_selection": {
+            "primary_role": (
+                "all_epoch_prediction_best"
+                if args.condition == "fixed_c"
+                else "c_active_mechanism_best"
+            ),
+            "primary_validation": best_metric,
+            "primary_epoch": best_epoch,
+            "global_prediction_validation": global_best_metric,
+            "global_prediction_epoch": global_best_epoch,
+            "global_prediction_checkpoint_preserved": (
+                args.condition == "fixed_c" or global_best_epoch == best_epoch
+            ),
+            "early_stopping_monitor": (
+                "primary_all_epoch_best" if args.condition == "fixed_c" else "joint_best"
+            ),
+            "joint_monitor_applicable": args.condition == "shared_dynamic_c",
+            "joint_validation": (
+                joint_best_metric if args.condition == "shared_dynamic_c" else None
+            ),
+            "joint_epoch": joint_best_epoch if args.condition == "shared_dynamic_c" else None,
+            "test_used": False,
+        },
         "validation": best_metric,
         "metric_name": METRIC_BY_DATASET[args.dataset],
         "checkpoint": str(checkpoint.resolve()),
@@ -34149,6 +34423,45 @@ IMPLEMENTATION_FILES = (
 )
 
 
+def _amp_policy(requested: bool, device: torch.device) -> dict[str, Any]:
+    """Choose a range-safe mixed-precision policy for the graph-level readout.
+
+    This model pools both node/edge means and *sums*.  The latter make the
+    backward pass particularly vulnerable to FP16's small exponent range when
+    GradScaler starts at its usual 65536 scale.  A6000/Ampere has native BF16,
+    which keeps FP32's exponent range and needs no loss scaling.  On CUDA
+    devices without BF16 we deliberately retain FP32 rather than silently
+    reintroducing the known FP16 overflow path.
+    """
+    if requested and device.type == "cuda" and torch.cuda.is_bf16_supported():
+        return {
+            "requested": True,
+            "enabled": True,
+            "dtype": torch.bfloat16,
+            "dtype_name": "bfloat16",
+            "fallback": None,
+            "gradient_scaler": False,
+        }
+    return {
+        "requested": bool(requested),
+        "enabled": False,
+        "dtype": torch.float32,
+        "dtype_name": "disabled",
+        "fallback": "bf16_unavailable_use_fp32" if requested else None,
+        "gradient_scaler": False,
+    }
+
+
+def _precision_identity(policy: dict[str, Any]) -> dict[str, Any]:
+    """Return the JSON-safe arithmetic fields that bind artifacts and resume."""
+    return {
+        "amp_effective": policy["enabled"],
+        "autocast_dtype": policy["dtype_name"],
+        "fallback": policy["fallback"],
+        "gradient_scaler": policy["gradient_scaler"],
+    }
+
+
 def implementation_hashes() -> dict[str, str]:
     root = Path(__file__).resolve().parents[3]
     return {
@@ -34322,11 +34635,17 @@ def _resume_configuration(dataset: str, args: argparse.Namespace) -> dict[str, A
         "amp",
         "compile",
     )
+    precision = _amp_policy(args.amp, torch.device(args.device))
+    precision_identity = _precision_identity(precision)
     return {
-        "schema": "cycle-projector-pe-v2-epoch-resume-1",
+        "schema": "cycle-projector-pe-v2-epoch-resume-2",
         "dataset": dataset,
         "model": MODEL_NAME,
         "arguments": {name: getattr(args, name) for name in names},
+        # --amp is a request, not necessarily the effective arithmetic. Bind
+        # resume to the resolved policy so a checkpoint cannot silently switch
+        # between BF16 and the safe FP32 fallback on another CUDA device.
+        "precision": precision_identity,
         "implementation_sha256": implementation_hashes(),
     }
 
@@ -34474,15 +34793,19 @@ def _calibrate_batch_size(
         )
     try:
         probe = collate(largest[:candidate]).to(device)
+        precision = _amp_policy(args.amp, device)
         cuda_index = device.index if device.index is not None else torch.cuda.current_device()
         with torch.random.fork_rng(devices=[cuda_index]):
             # The current architecture is asserted buffer-free, so training mode
             # includes dropout's true activation path without mutating model state.
             model.train()
-            with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
+            with torch.autocast("cuda", dtype=precision["dtype"], enabled=precision["enabled"]):
                 prediction = model(probe)
                 loss = (prediction.float() - probe.y).abs().mean()
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f"{dataset}: nonfinite capacity-probe loss")
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0, error_if_nonfinite=True)
             torch.cuda.synchronize(device)
         peak = int(torch.cuda.max_memory_allocated(device))
     except (RuntimeError, torch.cuda.OutOfMemoryError) as error:
@@ -34519,12 +34842,13 @@ def evaluate(
     amp: bool = False,
 ) -> float:
     model.eval()
+    precision = _amp_policy(amp, device)
     total = torch.zeros((), device=device, dtype=torch.float64)
     all_finite = torch.ones((), device=device, dtype=torch.bool)
     count = 0
     for batch in loader:
         batch = batch.to(device)
-        with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+        with torch.autocast("cuda", dtype=precision["dtype"], enabled=precision["enabled"]):
             predicted = model(batch).float()
         all_finite.logical_and_(torch.isfinite(predicted).all())
         total += (predicted - batch.y).abs().sum().double()
@@ -34546,6 +34870,7 @@ def _train_model(
     _seed(args.model_seed)
     device = torch.device(args.device)
     hardware = _hardware_report(args, device)
+    precision = _amp_policy(args.amp, device)
     model = CycleBasisPEModel(
         dataset=dataset,
         hidden=args.hidden_dim,
@@ -34610,14 +34935,19 @@ def _train_model(
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, factor=0.5, patience=25, min_lr=1e-6
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=args.amp)
+    # BF16 has FP32's exponent range and does not need loss scaling. Retain a
+    # disabled scaler object so epoch-resume artifacts keep one stable schema.
+    scaler = torch.amp.GradScaler("cuda", enabled=precision["gradient_scaler"])
     execution.update(
         hardware=hardware,
         precision={
             "amp": bool(args.amp),
-            "autocast_dtype": "float16" if args.amp else "disabled",
+            "amp_effective": precision["enabled"],
+            "autocast_dtype": precision["dtype_name"],
+            "fallback": precision["fallback"],
+            "gradient_scaler": precision["gradient_scaler"],
             "projector_contraction": "float32",
-            "backbone_autocast": bool(args.amp),
+            "backbone_autocast": precision["enabled"],
         },
         data_pipeline={
             "requested_batch_size": args.batch_size,
@@ -34679,10 +35009,10 @@ def _train_model(
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
+            with torch.autocast("cuda", dtype=precision["dtype"], enabled=precision["enabled"]):
                 predicted = model(batch)
                 loss = (predicted.float() - batch.y).abs().mean()
-            if not args.amp and not torch.isfinite(loss):
+            if not torch.isfinite(loss):
                 raise FloatingPointError(f"{dataset}/{MODEL_NAME}: nonfinite training loss")
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -34726,6 +35056,7 @@ def _train_model(
                 "effective_batch_size": effective_batch_size,
                 "batch_calibration": batch_calibration,
                 "hardware": hardware,
+                "precision": _precision_identity(precision),
                 "arguments": {
                     key: str(value) if isinstance(value, Path) else value
                     for key, value in vars(args).items()
@@ -34826,6 +35157,7 @@ def _evaluate_test_checkpoint(
     checkpoint_sha256 = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     device = torch.device(args.device)
     hardware = _hardware_report(args, device)
+    precision = _amp_policy(args.amp, device)
     payload = torch.load(checkpoint, map_location=device, weights_only=True)
     if not isinstance(payload, dict) or not isinstance(payload.get("state_dict"), dict):
         raise ValueError("Selected checkpoint has an invalid payload schema")
@@ -34837,6 +35169,8 @@ def _evaluate_test_checkpoint(
     for name, expected in expected_metadata.items():
         if payload.get(name) != expected:
             raise ValueError(f"Selected checkpoint {name} mismatch")
+    if payload.get("precision") != _precision_identity(precision):
+        raise ValueError("Selected checkpoint precision policy mismatch")
     saved_arguments = payload.get("arguments")
     if not isinstance(saved_arguments, dict) or saved_arguments.get("validation_only") is not True:
         raise ValueError("Selected checkpoint was not produced by validation-only training")
@@ -34896,9 +35230,12 @@ def _evaluate_test_checkpoint(
         hardware=hardware,
         precision={
             "amp": bool(args.amp),
-            "autocast_dtype": "float16" if args.amp else "disabled",
+            "amp_effective": precision["enabled"],
+            "autocast_dtype": precision["dtype_name"],
+            "fallback": precision["fallback"],
+            "gradient_scaler": precision["gradient_scaler"],
             "projector_contraction": "float32",
-            "backbone_autocast": bool(args.amp),
+            "backbone_autocast": precision["enabled"],
         },
         data_pipeline={
             "requested_batch_size": args.batch_size,
@@ -48268,6 +48605,9 @@ def _load_metrics(job: dict[str, Any]) -> dict[str, Any]:
     return {
         "metrics_sha256": hashlib.sha256(raw).hexdigest(),
         "validation": payload.get("validation"),
+        "global_best_validation": payload.get("global_best_validation"),
+        "joint_best_validation": payload.get("joint_best_validation"),
+        "checkpoint_selection": payload.get("checkpoint_selection"),
         "metric_name": payload.get("metric_name"),
         "best_epoch": payload.get("best_epoch"),
         "epochs_run": payload.get("epochs_run"),
@@ -48426,7 +48766,10 @@ def main(argv: list[str] | None = None) -> int:
                     "fixed-C strong spatial recipe versus dynamic-C coordinate recipe; "
                     "not a single-factor causal C contrast"
                 ),
-                "selection": "best validation checkpoint; no test evaluation",
+                "selection": (
+                    "primary comparison uses fixed all-epoch best versus dynamic C-active "
+                    "best; dynamic all-epoch prediction best is auxiliary; no test evaluation"
+                ),
                 "sampling": "full validation; auto uses cluster train sampling only on ogbn-arxiv",
                 "hardware_execution": (
                     "portable preserves FP32/checkpointed defaults; a6000-48gb is an opt-in "
@@ -48780,6 +49123,51 @@ def _job_resources(
     }
 
 
+def _v2_precision_matches(resources: dict[str, Any], precision: Any) -> bool:
+    """Validate the complete V2 arithmetic contract recorded by a child."""
+    required = {
+        "amp",
+        "amp_effective",
+        "autocast_dtype",
+        "fallback",
+        "gradient_scaler",
+        "projector_contraction",
+        "backbone_autocast",
+    }
+    requested = resources.get("amp")
+    if (
+        not isinstance(precision, dict)
+        or set(precision) != required
+        or not isinstance(requested, bool)
+        or precision.get("amp") is not requested
+        or precision.get("gradient_scaler") is not False
+        or precision.get("projector_contraction") != "float32"
+    ):
+        return False
+    if not requested:
+        return (
+            precision.get("amp_effective") is False
+            and precision.get("autocast_dtype") == "disabled"
+            and precision.get("fallback") is None
+            and precision.get("backbone_autocast") is False
+        )
+    bf16 = (
+        precision.get("amp_effective") is True
+        and precision.get("autocast_dtype") == "bfloat16"
+        and precision.get("fallback") is None
+        and precision.get("backbone_autocast") is True
+    )
+    if resources.get("hardware_profile") == "a6000-48gb":
+        return bf16
+    fp32_fallback = (
+        precision.get("amp_effective") is False
+        and precision.get("autocast_dtype") == "disabled"
+        and precision.get("fallback") == "bf16_unavailable_use_fp32"
+        and precision.get("backbone_autocast") is False
+    )
+    return bf16 or fp32_fallback
+
+
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     data_root = args.data_root.expanduser().resolve()
@@ -49131,9 +49519,7 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
                 or pipeline.get("workers") != job["resources"]["workers"]
                 or pipeline.get("prefetch_factor") != job["resources"]["prefetch_factor"]
                 or pipeline.get("packed_cycle_basis_h2d_tensors_per_batch") != 1
-                or not isinstance(precision, dict)
-                or precision.get("amp") is not job["resources"]["amp"]
-                or precision.get("projector_contraction") != "float32"
+                or not _v2_precision_matches(job["resources"], precision)
                 or not isinstance(hardware, dict)
                 or hardware.get("profile") != job["resources"]["hardware_profile"]
                 or reserved_memory is None
@@ -49587,9 +49973,7 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
             or pipeline.get("workers") != job["resources"]["workers"]
             or pipeline.get("prefetch_factor") != job["resources"]["prefetch_factor"]
             or pipeline.get("packed_cycle_basis_h2d_tensors_per_batch") != 1
-            or not isinstance(precision, dict)
-            or precision.get("amp") is not job["resources"]["amp"]
-            or precision.get("projector_contraction") != "float32"
+            or not _v2_precision_matches(job["resources"], precision)
             or not isinstance(hardware, dict)
             or hardware.get("profile") != job["resources"]["hardware_profile"]
             or reserved < allocated
@@ -51317,6 +51701,15 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--v5-beta-min", type=float)
     result.add_argument("--v5-beta-max", type=float)
     result.add_argument(
+        "--v5-activation-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "V5 only: explicitly override the conductance hardware profile's block "
+            "checkpoint policy; omission preserves that profile's default"
+        ),
+    )
+    result.add_argument(
         "--cycle-v2-basis-backend",
         choices=CYCLE_V2_BASIS_BACKENDS,
         default="thin_q",
@@ -51492,6 +51885,12 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             command += ["--model-seeds", *(str(seed) for seed in args.model_seeds)]
             for name, value in _v5_beta_configuration(args).items():
                 command += ["--v5-" + name.replace("_", "-"), str(value)]
+            if args.v5_activation_checkpoint is not None:
+                command.append(
+                    "--v5-activation-checkpoint"
+                    if args.v5_activation_checkpoint
+                    else "--no-v5-activation-checkpoint"
+                )
         command += [
             "--data-root",
             str(data_root),
@@ -52119,6 +52518,7 @@ def _config_payload(
         "hardware_profile": args.hardware_profile,
         "min_free_gb": args.min_free_gb,
         "v5_beta": _v5_beta_configuration(args),
+        "v5_activation_checkpoint": args.v5_activation_checkpoint,
         "cycle_v2_basis_backend": args.cycle_v2_basis_backend,
         "allow_download": args.allow_download,
         "data_root": str(data_root),
@@ -56539,6 +56939,7 @@ def _cycle_graph(nodes: int) -> Graph:
         edge_attr=torch.randint(4, (nodes, 1)),
         y=torch.zeros(1),
         cycle_basis=basis,
+        cycle_basis_is_orthonormal=torch.tensor(True),
     )
 
 
@@ -56561,6 +56962,7 @@ def test_compiled_full_model_blocks_preserve_forward_backward_and_empty_graphs(m
         edge_attr=torch.tensor([[0]]),
         y=torch.zeros(1),
         cycle_basis=torch.empty(1, 0),
+        cycle_basis_is_orthonormal=torch.tensor(True),
     )
     edgeless = Graph(
         x=torch.tensor([[3]]),
@@ -56568,6 +56970,7 @@ def test_compiled_full_model_blocks_preserve_forward_backward_and_empty_graphs(m
         edge_attr=torch.empty(0, 1, dtype=torch.long),
         y=torch.zeros(1),
         cycle_basis=torch.empty(0, 0),
+        cycle_basis_is_orthonormal=torch.tensor(True),
     )
     for nodes in (4, 7):
         model.zero_grad(set_to_none=True)
@@ -62094,6 +62497,141 @@ def test_source_snapshot_covers_all_v4_and_shared_execution_code():
         assert name in snapshot and len(snapshot[name]) == 64
 ````
 
+# tests/test_conductance_v5_model.py
+
+````python
+"""Memory-safety contracts for the V5 dynamic-conductance model."""
+
+from __future__ import annotations
+
+import copy
+from types import SimpleNamespace
+
+import torch
+import torch.utils.checkpoint
+
+from research.conductance_gat.v5.model import (
+    GraphConditionedConductance,
+    GraphConditionedConductanceNodeClassifier,
+)
+
+
+def _conductance_inputs(*, channels=8):
+    state = torch.randn(7, channels)
+    incidence = torch.tensor([[0, 1, 2, 3, 4, 5, 0], [1, 2, 3, 4, 5, 6, 6]], dtype=torch.long)
+    node_graph = torch.zeros(state.shape[0], dtype=torch.long)
+    degree = torch.bincount(incidence.flatten(), minlength=state.shape[0]).float()
+    context = torch.randn(1, 2 * channels + 8)
+    return state, incidence, node_graph, degree, context
+
+
+def _run_estimator(model, state, incidence, node_graph, degree, context):
+    conductance = model(
+        state,
+        incidence,
+        node_graph,
+        1,
+        graph_context=context,
+        sample_degree=degree,
+        full_degree=degree,
+    )
+    weights = torch.linspace(0.5, 1.5, conductance.numel())
+    (conductance * weights).sum().backward()
+    return (
+        conductance.detach(),
+        state.grad.detach().clone(),
+        {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        },
+    )
+
+
+def test_score_chunk_checkpoint_is_eval_safe_and_preserves_gradients(monkeypatch):
+    state, incidence, node_graph, degree, context = _conductance_inputs()
+    checkpointed = GraphConditionedConductance(8, score_channels=4, edge_chunk_size=2).eval()
+    direct = copy.deepcopy(checkpointed)
+    real_checkpoint = torch.utils.checkpoint.checkpoint
+    calls = []
+
+    def recording_checkpoint(function, *arguments, **kwargs):
+        calls.append(arguments[2].numel())
+        return real_checkpoint(function, *arguments, **kwargs)
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recording_checkpoint)
+    actual = _run_estimator(
+        checkpointed, state.clone().requires_grad_(True), incidence, node_graph, degree, context
+    )
+    monkeypatch.setattr(
+        torch.utils.checkpoint,
+        "checkpoint",
+        lambda function, *arguments, **_kwargs: function(*arguments),
+    )
+    expected = _run_estimator(
+        direct, state.clone().requires_grad_(True), incidence, node_graph, degree, context
+    )
+
+    assert calls == [2, 2, 2, 1]
+    torch.testing.assert_close(actual[0], expected[0], rtol=1e-6, atol=1e-7)
+    torch.testing.assert_close(actual[1], expected[1], rtol=1e-5, atol=1e-7)
+    assert actual[2].keys() == expected[2].keys()
+    for name in actual[2]:
+        torch.testing.assert_close(actual[2][name], expected[2][name], rtol=1e-5, atol=1e-7)
+
+
+def test_block_checkpoint_is_not_disabled_by_calibration_eval_mode(monkeypatch):
+    from research.conductance_gat.v5.train import configure_phase, parameter_group
+
+    model = GraphConditionedConductanceNodeClassifier(
+        5,
+        3,
+        hidden_channels=16,
+        layers=2,
+        heads=4,
+        ffn_multiplier=2,
+        dropout=0.2,
+        conductance_mode="dynamic",
+        edge_chunk_size=3,
+        activation_checkpoint=True,
+    )
+    phase = configure_phase(model, "conductance_calibration", 0)
+    assert phase["active_parameter_groups"] == ["conductance"]
+    assert not model.training
+    graph = SimpleNamespace(
+        # x deliberately does not require gradients.  Calibration must still
+        # discover the trainable conductance parameters captured by the
+        # non-reentrant checkpoint closure.
+        x=torch.randn(8, 5),
+        incidence_edge_index=torch.tensor(
+            [[0, 1, 2, 3, 4, 5, 6, 0], [1, 2, 3, 4, 5, 6, 7, 7]], dtype=torch.long
+        ),
+    )
+    real_checkpoint = torch.utils.checkpoint.checkpoint
+    calls = []
+
+    def recording_checkpoint(function, *arguments, **kwargs):
+        calls.append(getattr(function, "__name__", type(function).__name__))
+        return real_checkpoint(function, *arguments, **kwargs)
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recording_checkpoint)
+    model(graph).square().mean().backward()
+
+    assert calls.count("<lambda>") == model.layers
+    for name, parameter in model.named_parameters():
+        if parameter_group(name) == "conductance":
+            assert parameter.requires_grad
+            assert parameter.grad is not None, name
+            assert torch.isfinite(parameter.grad).all(), name
+        else:
+            assert not parameter.requires_grad
+            assert parameter.grad is None
+    assert all(
+        operator.estimator.score_network[-1].weight.grad.abs().sum() > 0
+        for operator in model.operators
+    )
+````
+
 # tests/test_conductance_v5_runner.py
 
 ````python
@@ -62296,6 +62834,118 @@ def test_same_run_preserves_last_checkpoint_and_adds_resume(tmp_path, monkeypatc
     assert (tmp_path / "conductance_gat/v5/resume-v5/cora/fixed_c/last.pt").read_bytes() == (
         b"resume-state"
     )
+````
+
+# tests/test_conductance_v5_selection.py
+
+````python
+"""CPU-only contracts for V5 checkpoint roles and early stopping."""
+
+from __future__ import annotations
+
+import pytest
+
+from research.conductance_gat.v5 import train
+from research.conductance_gat.v5.protocol import TRAINING_PHASES
+from research.conductance_gat.v5.report import markdown
+
+
+def test_fixed_c_primary_selection_is_valid_in_every_phase():
+    for phase in TRAINING_PHASES:
+        roles = train.selection_eligibility("fixed_c", phase)
+        assert roles == {
+            "global_prediction": True,
+            "primary": True,
+            "joint_early_stopping": False,
+        }
+
+
+def test_dynamic_primary_excludes_c_one_warmup_but_keeps_every_c_active_phase():
+    assert train.selection_eligibility("shared_dynamic_c", "spatial_warmup") == {
+        "global_prediction": True,
+        "primary": False,
+        "joint_early_stopping": False,
+    }
+    for phase in ("conductance_calibration", "alternating", "joint"):
+        roles = train.selection_eligibility("shared_dynamic_c", phase)
+        assert roles["global_prediction"] is True
+        assert roles["primary"] is True
+        assert roles["joint_early_stopping"] is (phase == "joint")
+
+
+def test_fixed_early_stopping_monitors_primary_global_best():
+    assert not train.should_stop_early(
+        "fixed_c",
+        "conductance_calibration",
+        50,
+        primary_best_epoch=1,
+        joint_best_epoch=0,
+        patience=50,
+    )
+    assert train.should_stop_early(
+        "fixed_c",
+        "conductance_calibration",
+        51,
+        primary_best_epoch=1,
+        joint_best_epoch=0,
+        patience=50,
+    )
+
+
+def test_dynamic_early_stopping_uses_separate_joint_tracker():
+    assert not train.should_stop_early(
+        "shared_dynamic_c",
+        "alternating",
+        200,
+        primary_best_epoch=21,
+        joint_best_epoch=0,
+        patience=10,
+    )
+    assert not train.should_stop_early(
+        "shared_dynamic_c",
+        "joint",
+        130,
+        primary_best_epoch=21,
+        joint_best_epoch=121,
+        patience=10,
+    )
+    assert train.should_stop_early(
+        "shared_dynamic_c",
+        "joint",
+        131,
+        primary_best_epoch=21,
+        joint_best_epoch=121,
+        patience=10,
+    )
+
+
+def test_selection_helpers_reject_unknown_contract_values():
+    with pytest.raises(ValueError, match="condition"):
+        train.selection_eligibility("unknown", "joint")
+    with pytest.raises(ValueError, match="phase"):
+        train.selection_eligibility("fixed_c", "unknown")
+
+
+def test_report_labels_primary_and_auxiliary_dynamic_metrics():
+    report = {
+        "contrasts": [
+            {
+                "dataset": "ogbn-arxiv",
+                "metric": "accuracy",
+                "fixed_c": 0.70,
+                "shared_dynamic_c": 0.71,
+                "dynamic_minus_fixed": 0.01,
+                "shared_dynamic_c_global_prediction": 0.72,
+                "dynamic_global_prediction_minus_fixed": 0.02,
+                "dynamic_joint_best": 0.705,
+            }
+        ]
+    }
+    rendered = markdown(report)
+    assert "Primary comparison" in rendered
+    assert "Dynamic C-active" in rendered
+    assert "Dynamic global (aux)" in rendered
+    assert "0.710000" in rendered and "0.720000" in rendered
 ````
 
 # tests/test_cycle_pe_v2_projector.py
@@ -62640,6 +63290,69 @@ def test_a6000_profile_uses_static_dataset_batches_amp_and_heavy_first(tmp_path)
             assert "--prefetch-factor" not in command
 
 
+def test_v2_precision_contract_accepts_only_hardware_valid_modes() -> None:
+    disabled_resources = scaling._job_resources(_args(), "v2", "reference", "zinc12k")
+    disabled = {
+        "amp": False,
+        "amp_effective": False,
+        "autocast_dtype": "disabled",
+        "fallback": None,
+        "gradient_scaler": False,
+        "projector_contraction": "float32",
+        "backbone_autocast": False,
+    }
+    portable_resources = scaling._job_resources(_args("--amp"), "v2", "reference", "zinc12k")
+    bf16 = {
+        **disabled,
+        "amp": True,
+        "amp_effective": True,
+        "autocast_dtype": "bfloat16",
+        "backbone_autocast": True,
+    }
+    fallback = {
+        **disabled,
+        "amp": True,
+        "fallback": "bf16_unavailable_use_fp32",
+    }
+    a6000_resources = scaling._job_resources(
+        _args("--hardware-profile", "a6000-48gb"),
+        "v2",
+        "reference",
+        "zinc12k",
+    )
+
+    assert scaling._v2_precision_matches(disabled_resources, disabled)
+    assert scaling._v2_precision_matches(portable_resources, bf16)
+    assert scaling._v2_precision_matches(portable_resources, fallback)
+    assert scaling._v2_precision_matches(a6000_resources, bf16)
+    assert not scaling._v2_precision_matches(a6000_resources, fallback)
+
+    corrupt_values = {
+        "amp": False,
+        "amp_effective": False,
+        "autocast_dtype": "float16",
+        "fallback": "tampered",
+        "gradient_scaler": True,
+        "projector_contraction": "float16",
+        "backbone_autocast": False,
+    }
+    for field, value in corrupt_values.items():
+        corrupt = dict(bf16)
+        corrupt[field] = value
+        assert not scaling._v2_precision_matches(a6000_resources, corrupt), field
+    for field in tuple(bf16):
+        incomplete = dict(bf16)
+        del incomplete[field]
+        assert not scaling._v2_precision_matches(a6000_resources, incomplete), field
+    extra = {**bf16, "unregistered_precision_field": True}
+    assert not scaling._v2_precision_matches(a6000_resources, extra)
+
+
+def test_both_v2_artifact_admission_paths_enforce_full_precision_contract() -> None:
+    assert "_v2_precision_matches" in inspect.getsource(scaling.read_job_rows)
+    assert "_v2_precision_matches" in inspect.getsource(scaling.read_test_result)
+
+
 @pytest.mark.parametrize(
     "gpu,passes",
     [
@@ -62659,7 +63372,9 @@ def test_a6000_capacity_guard_is_capacity_based_not_name_based(gpu, passes):
 
 
 def test_v2_test_only_admission_binds_every_a6000_runtime_field():
-    source = inspect.getsource(scaling.read_test_result)
+    source = inspect.getsource(scaling.read_test_result) + inspect.getsource(
+        scaling._v2_precision_matches
+    )
     for field in (
         "ffn_multiplier",
         "column_chunk_size",
@@ -62938,7 +63653,15 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
                                 "prefetch_factor": 2,
                                 "packed_cycle_basis_h2d_tensors_per_batch": 1,
                             },
-                            "precision": {"amp": False, "projector_contraction": "float32"},
+                            "precision": {
+                                "amp": False,
+                                "amp_effective": False,
+                                "autocast_dtype": "disabled",
+                                "fallback": None,
+                                "gradient_scaler": False,
+                                "projector_contraction": "float32",
+                                "backbone_autocast": False,
+                            },
                             "hardware": {"profile": "portable"},
                         },
                         "best_epoch": 2,
@@ -63551,6 +64274,66 @@ def test_projector_v2_attempt_preserves_last_checkpoint_and_requests_resume(tmp_
     assert attempt[-1] == "--resume"
     assert checkpoint.read_bytes() == b"epoch-state"
     assert "quarantined_outputs" not in job
+````
+
+# tests/test_cycle_v2_precision.py
+
+````python
+"""Numerical precision regressions for rebuilt Cycle PE V2."""
+
+from __future__ import annotations
+
+import inspect
+
+import torch
+
+from research.cycle_pe.v2 import benchmark
+
+
+def test_amp_policy_uses_bfloat16_without_loss_scaling(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+
+    policy = benchmark._amp_policy(True, torch.device("cuda:0"))
+
+    assert policy["dtype"] == torch.bfloat16
+    assert policy["enabled"] is True
+    assert policy["gradient_scaler"] is False
+    assert policy["fallback"] is None
+
+
+def test_amp_policy_falls_back_to_fp32_not_fp16(monkeypatch) -> None:
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+
+    policy = benchmark._amp_policy(True, torch.device("cuda:0"))
+
+    assert policy["dtype"] == torch.float32
+    assert policy["enabled"] is False
+    assert policy["gradient_scaler"] is False
+    assert policy["fallback"] == "bf16_unavailable_use_fp32"
+
+
+def test_resume_identity_binds_effective_precision(monkeypatch) -> None:
+    args = benchmark.parser().parse_args(["--amp"])
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: True)
+    bf16 = benchmark._resume_configuration("zinc12k", args)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
+    fp32 = benchmark._resume_configuration("zinc12k", args)
+
+    assert bf16["schema"] == fp32["schema"] == "cycle-projector-pe-v2-epoch-resume-2"
+    assert bf16["precision"]["autocast_dtype"] == "bfloat16"
+    assert fp32["precision"]["autocast_dtype"] == "disabled"
+    assert bf16 != fp32
+
+
+def test_training_retains_strict_nonfinite_detection() -> None:
+    source = inspect.getsource(benchmark._train_model)
+    test_source = inspect.getsource(benchmark._evaluate_test_checkpoint)
+
+    assert "dtype=torch.float16" not in source
+    assert "error_if_nonfinite=True" in source
+    assert "if not torch.isfinite(loss):" in source
+    assert '"precision": _precision_identity(precision)' in source
+    assert "Selected checkpoint precision policy mismatch" in test_source
 ````
 
 # tests/test_cycle_v2_runner.py
@@ -66515,6 +67298,9 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
     assert _option(conductance["command"], "--v5-beta-parameterization") == "sigmoid"
     assert _option(conductance["command"], "--v5-beta-initial") == "0.1"
     assert "--v5-beta-min" not in conductance["command"]
+    assert "--v5-activation-checkpoint" not in conductance["command"]
+    assert "--no-v5-activation-checkpoint" not in conductance["command"]
+    assert args.v5_activation_checkpoint is None
     assert all("--v5-beta-parameterization" not in job["command"] for job in (cycle, tree))
     assert conductance["requested_matrix"]["versions"] == ["v1", "v2", "v3", "v4", "v5"]
     assert cycle["requested_matrix"]["datasets"] == ["zinc12k", "peptides_struct"]
@@ -66700,6 +67486,28 @@ def test_v5_margin_beta_ablation_is_forwarded_only_to_conductance_and_bound_to_c
         "beta_min": 0.05,
         "beta_max": 0.95,
     }
+
+
+@pytest.mark.parametrize(
+    ("option", "expected_value"),
+    [
+        ("--v5-activation-checkpoint", True),
+        ("--no-v5-activation-checkpoint", False),
+    ],
+)
+def test_v5_activation_checkpoint_override_is_conductance_only_and_bound_to_config(
+    tmp_path: Path, option: str, expected_value: bool
+) -> None:
+    args = runner.parser().parse_args([option, "--results-root", str(tmp_path)])
+    runner._validate(args)
+    conductance, cycle, tree = runner.make_jobs(args, "checkpoint")
+
+    assert option in conductance["command"]
+    opposite = "--no-v5-activation-checkpoint" if expected_value else "--v5-activation-checkpoint"
+    assert opposite not in conductance["command"]
+    assert all(option not in job["command"] for job in (cycle, tree))
+    config = runner._config_payload(args, data_root=tmp_path / "data", results_root=tmp_path)
+    assert config["v5_activation_checkpoint"] is expected_value
 
 
 def test_rich_runner_rejects_margin_values_for_default_no_margin_beta():

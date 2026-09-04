@@ -221,13 +221,14 @@ python -B scripts/run_conductance_v5.py --datasets cora citeseer pubmed ppi ogbn
 
 물리 GPU 3의 RTX A6000을 쓰는 직접 V5 실행은 다음과 같다. 프로세스 안에서는 이 장치가
 `cuda:0`이다. 이 profile은 dense BF16/TF32, FP32 conductance geometry, PPI batch 8,
-arxiv seed-node batch 2048, 더 큰 edge chunk와 prefetch를 쓰고 activation checkpoint를 끈다.
+arxiv seed-node batch 2048, 더 큰 edge chunk와 prefetch를 쓴다. 전체 block checkpoint는 끄지만
+dynamic-C score MLP는 gradient가 있을 때 edge chunk별로 checkpoint한다.
 
 ```bash
 env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 python -B scripts/run_conductance_v5.py --datasets cora citeseer pubmed ppi ogbn-arxiv --profile reference --model-seed 0 --device cuda:0 --sampling auto --hardware-profile a6000-48gb --min-free-gb 40 --run-id conductance-v5-a6000-gpu3-reference-seed0
 ```
 
-같은 명령과 run ID를 다시 실행하면 완료 조건은 검증 후 건너뛰고, V5의 `last.pt`가 있는
+같은 implementation에서 같은 명령과 run ID를 다시 실행하면 완료 조건은 검증 후 건너뛰고, V5의 `last.pt`가 있는
 미완료 조건은 epoch·optimizer·RNG 상태부터 재개한다. 자세한 식, sampling 의미와 결과 계약은
 [CONDUCTANCE_V5.md](../gpt_handoff/CONDUCTANCE_V5.md)에 있다.
 
@@ -296,8 +297,8 @@ size도 `2`, 분자·트리 데이터는 `32`이며 인용 그래프는 full-bat
 각 트랙의 우리 모델 구성과 평가 규칙은 해당 트랙 문서에 있다.
 
 `a6000-48gb`는 architecture 크기가 아니라 별도의 optimization/execution profile이다.
-Conductance V5의 real sample/PPI batch와 BF16 실행, Cycle V1/V2의 dataset별 batch와 FP16
-AMP, Tree V1/V2의 batch와 동시 child 수가 portable과 달라진다. 따라서 같은 hardware profile
+Conductance V5의 real sample/PPI batch와 BF16 실행, Cycle V1/V2의 dataset별 batch와 mixed
+precision, Tree V1/V2의 batch와 동시 child 수가 portable과 달라진다. 따라서 같은 hardware profile
 안의 arm/version만 주 비교로 해석하고, portable와 A6000 사이의 점수 또는 wall time 차이를
 모델 효과나 GPU 하나의 효과로 직접 해석하지 않는다. 정확한 자원값과 비교 경계는 전체 scaling
 문서의 표를 따른다.
@@ -310,8 +311,9 @@ Conductance v2/v3/v4/v5는 한 번에 model seed 하나만 받아 `--model-seed 
 
 기본 `scripts/run_paper.py --suite benchmark`는 float32로 실행한다. Scaling의 `portable`은
 Conductance와 Cycle에 FP32를 쓰고 Tree에는 기존 suite config의 FP16 AMP를 유지한다. A6000
-profile은 Conductance V5 dense 연산에 BF16, Cycle backbone에 FP16 AMP를 쓰며 Tree의 FP16
-AMP를 명시적으로 고정한다. Conductance geometry와 Cycle projector contraction은 float32를
+profile은 Conductance V5 dense 연산에 BF16을 쓴다. Cycle V2 backbone은 BF16 지원 시 BF16,
+미지원 시 FP32를 쓰고 loss scaling을 사용하지 않으며, Tree는 FP16 AMP를 명시적으로 고정한다.
+Conductance geometry와 Cycle projector contraction은 float32를
 유지한다. GAT는 accuracy/PPI micro-F1, PE는 MAE, 트리 증강은 CSL accuracy/ZINC MAE를
 사용하며 각 트랙 안에서 비교한다.
 

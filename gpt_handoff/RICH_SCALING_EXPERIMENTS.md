@@ -135,9 +135,9 @@ architecture profile(`reference/large`)과 hardware profile(`portable/a6000-48gb
 
 | 트랙 | `portable` | `a6000-48gb` |
 |---|---|---|
-| Conductance V5 | FP32, TF32 off, activation checkpoint on, edge chunk 65,536, arxiv seed-node batch 1,024, PPI whole-graph batch 2 | dense BF16 autocast·TF32, conductance geometry FP32, checkpoint off, edge chunk 131,072, arxiv seed-node batch 2,048, PPI whole-graph batch 8, sample prefetch/pinned transfer |
+| Conductance V5 | FP32, TF32 off, block checkpoint on, dynamic-C score-chunk checkpoint on, edge chunk 65,536, arxiv seed-node batch 1,024, PPI whole-graph batch 2 | dense BF16 autocast·TF32, conductance geometry FP32, block checkpoint off, dynamic-C score-chunk checkpoint on, edge chunk 131,072, arxiv seed-node batch 2,048, PPI whole-graph batch 8, sample prefetch/pinned transfer |
 | Conductance V1–V4 | 기존 FP32 계약. PPI는 V1/V3/V4 batch 2이고 V2는 PPI N/A | 같은 legacy FP32·batch 계약을 그대로 유지 |
-| Cycle V1/V2 | 모든 dataset/profile batch 32, workers 4, prefetch 2, AMP off; V2 column chunk 16, pair budget 32,768 | reference ZINC/Peptides batch 512/128, large 256/64, workers 8, FP16 AMP; V1은 실제 loader prefetch 2, V2는 prefetch 4·FP32 projector·column chunk 32·pair budget 4,194,304 |
+| Cycle V1/V2 | 모든 dataset/profile batch 32, workers 4, prefetch 2, AMP off; V2 column chunk 16, pair budget 32,768 | reference ZINC/Peptides batch 512/128, large 256/64, workers 8; V2는 BF16 지원 시 backbone BF16·미지원 시 FP32, GradScaler off, FP32 projector, prefetch 4·column chunk 32·pair budget 4,194,304; V1은 기존 AMP/loader 계약 유지 |
 | Tree V1/V2 | batch 16, workers 0, suite config의 FP16 AMP, child concurrency 1 | batch 64, workers 4, 명시적 FP16 AMP, 독립 child concurrency 2 |
 
 Conductance와 Cycle child는 순차 실행한다. Tree만 서로 다른 output/log를 갖는 candidate와
@@ -180,4 +180,38 @@ batch나 concurrency를 더 올리지는 않는다.
 - 실제 peak memory가 없는 상태에서 large가 10GB에 적합하다고 주장하지 않는다. reference부터
   실행하고 manifest의 peak allocation으로 large 실행 가능성을 판단한다.
 
-현재 이 문서는 실행 계약이다. 새 V5와 projector V2의 GPU 성능 결과는 아직 수령하지 않았다.
+2026-09-04 run `new-v5-cyclev2-a6000-gpu3-seed0-r1`의 GPU 로그를 수령했다. Conductance는
+20개 중 reference/ogbn-arxiv/fixed-C 하나만 완료했고, dynamic-C는 최초 C calibration에서
+44.47/44.55GiB OOM, 나머지 18개는 미실행이다. 완료된 fixed-C도 구 joint-only 선택이 실제
+epoch-10 global best 0.692775 대신 0.680392를 골라 corrected 비교에 재사용할 수 없다. Cycle V2
+네 학습은 기존 FP16 GradScaler overflow로 모두 첫 epoch 전에 실패했다. 따라서 이 run에는
+새 V5 또는 projector V2의 유효한 전체 성능 결과가 없다. 수정판은 source/resume identity가
+달라 새 run ID를 사용하되 V1–V4, Cycle V1과 Tree를 다시 계획할 필요는 없다.
+
+수정판의 최소 통합 재실행은 다음 24개 job만 계획한다. V1–V4, Cycle V1과 Tree는 포함하지
+않고, 검증된 Cycle dataset/projector cache는 재사용한다. 구 fixed-C job은 실제 epoch-10
+global-best state를 저장하지 않았으므로 corrected checkpoint를 위해 V5 20개 안에서 다시
+학습한다.
+
+```bash
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+python -B scripts/run_rich_scaling.py \
+  --run-id new-v5-cyclev2-a6000-gpu3-seed0-r2 \
+  --tracks conductance cycle \
+  --conductance-versions v5 \
+  --cycle-versions v2 \
+  --profiles reference large \
+  --model-seeds 0 \
+  --device cuda:0 \
+  --hardware-profile a6000-48gb \
+  --min-free-gb 40 \
+  --v5-beta-parameterization sigmoid \
+  --v5-beta-initial 0.1 \
+  --cycle-v2-basis-backend thin_q \
+  --allow-download
+```
+
+기본 A6000 block-checkpoint 정책은 속도를 위해 off이고, dynamic-C score-chunk checkpoint만
+항상 켜진다. 새 score 경로에서도 실제 `large` peak가 부족한 것이 확인될 때만 통합 runner에
+`--v5-activation-checkpoint`를 명시하고 **새 run ID**로 해당 V5 profile을 실행한다. 이 override는
+manifest/config/job command에 결속되며, 같은 run ID 도중에 바꿀 수 없다.

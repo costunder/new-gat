@@ -373,6 +373,9 @@ def _load_metrics(job: dict[str, Any]) -> dict[str, Any]:
     return {
         "metrics_sha256": hashlib.sha256(raw).hexdigest(),
         "validation": payload.get("validation"),
+        "global_best_validation": payload.get("global_best_validation"),
+        "joint_best_validation": payload.get("joint_best_validation"),
+        "checkpoint_selection": payload.get("checkpoint_selection"),
         "metric_name": payload.get("metric_name"),
         "best_epoch": payload.get("best_epoch"),
         "epochs_run": payload.get("epochs_run"),
@@ -531,7 +534,10 @@ def main(argv: list[str] | None = None) -> int:
                     "fixed-C strong spatial recipe versus dynamic-C coordinate recipe; "
                     "not a single-factor causal C contrast"
                 ),
-                "selection": "best validation checkpoint; no test evaluation",
+                "selection": (
+                    "primary comparison uses fixed all-epoch best versus dynamic C-active "
+                    "best; dynamic all-epoch prediction best is auxiliary; no test evaluation"
+                ),
                 "sampling": "full validation; auto uses cluster train sampling only on ogbn-arxiv",
                 "hardware_execution": (
                     "portable preserves FP32/checkpointed defaults; a6000-48gb is an opt-in "

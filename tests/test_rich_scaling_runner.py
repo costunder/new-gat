@@ -57,6 +57,9 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
     assert _option(conductance["command"], "--v5-beta-parameterization") == "sigmoid"
     assert _option(conductance["command"], "--v5-beta-initial") == "0.1"
     assert "--v5-beta-min" not in conductance["command"]
+    assert "--v5-activation-checkpoint" not in conductance["command"]
+    assert "--no-v5-activation-checkpoint" not in conductance["command"]
+    assert args.v5_activation_checkpoint is None
     assert all("--v5-beta-parameterization" not in job["command"] for job in (cycle, tree))
     assert conductance["requested_matrix"]["versions"] == ["v1", "v2", "v3", "v4", "v5"]
     assert cycle["requested_matrix"]["datasets"] == ["zinc12k", "peptides_struct"]
@@ -242,6 +245,28 @@ def test_v5_margin_beta_ablation_is_forwarded_only_to_conductance_and_bound_to_c
         "beta_min": 0.05,
         "beta_max": 0.95,
     }
+
+
+@pytest.mark.parametrize(
+    ("option", "expected_value"),
+    [
+        ("--v5-activation-checkpoint", True),
+        ("--no-v5-activation-checkpoint", False),
+    ],
+)
+def test_v5_activation_checkpoint_override_is_conductance_only_and_bound_to_config(
+    tmp_path: Path, option: str, expected_value: bool
+) -> None:
+    args = runner.parser().parse_args([option, "--results-root", str(tmp_path)])
+    runner._validate(args)
+    conductance, cycle, tree = runner.make_jobs(args, "checkpoint")
+
+    assert option in conductance["command"]
+    opposite = "--no-v5-activation-checkpoint" if expected_value else "--v5-activation-checkpoint"
+    assert opposite not in conductance["command"]
+    assert all(option not in job["command"] for job in (cycle, tree))
+    config = runner._config_payload(args, data_root=tmp_path / "data", results_root=tmp_path)
+    assert config["v5_activation_checkpoint"] is expected_value
 
 
 def test_rich_runner_rejects_margin_values_for_default_no_margin_beta():

@@ -230,24 +230,35 @@ class GraphConditionedConductance(nn.Module):
             return c
         projected = F.silu(self.node_projection(state))
         context = F.silu(self.context_projection(graph_context))
-        scores = (
-            torch.cat(
-                [
-                    self._score_chunk(
-                        projected,
-                        context,
-                        tail[start : start + self.edge_chunk_size],
-                        head[start : start + self.edge_chunk_size],
-                        sample_degree,
-                        full_degree,
-                        edge_graph[start : start + self.edge_chunk_size],
-                    )
-                    for start in range(0, tail.numel(), self.edge_chunk_size)
-                ]
+        score_chunks = []
+        for start in range(0, tail.numel(), self.edge_chunk_size):
+            chunk_arguments = (
+                projected,
+                context,
+                tail[start : start + self.edge_chunk_size],
+                head[start : start + self.edge_chunk_size],
+                sample_degree,
+                full_degree,
+                edge_graph[start : start + self.edge_chunk_size],
             )
-            if tail.numel()
-            else state.new_empty(0)
-        )
+            if torch.is_grad_enabled():
+                # Merely slicing the edge MLP did not bound training memory: autograd
+                # retained every chunk's 4*score_channels-wide feature/LN/MLP
+                # activations until backward.  Recompute each deterministic score
+                # chunk during backward so peak saved activations scale with the
+                # configured chunk size instead of the total number of sampled edges.
+                from torch.utils.checkpoint import checkpoint
+
+                score = checkpoint(
+                    self._score_chunk,
+                    *chunk_arguments,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                score = self._score_chunk(*chunk_arguments)
+            score_chunks.append(score)
+        scores = torch.cat(score_chunks) if score_chunks else state.new_empty(0)
         if edge_normalization_weight is None:
             edge_normalization_weight = torch.ones_like(scores)
         centered = (
@@ -546,7 +557,7 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
             "sampling_correction": getattr(graph, "sampling_correction", None),
         }
         for block in self.blocks:
-            if self.activation_checkpoint and self.training and torch.is_grad_enabled():
+            if self.activation_checkpoint and torch.is_grad_enabled():
                 from torch.utils.checkpoint import checkpoint
 
                 h = checkpoint(
