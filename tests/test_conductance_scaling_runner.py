@@ -9,8 +9,10 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+import torch
 
-from research.conductance_gat import benchmark
+from chartgat.observability import finalize_resource_observability, runtime_resource_snapshot
+from research.conductance_gat import benchmark, scaling_v1
 from research.conductance_gat.ablation import train as ablation_train
 from research.conductance_gat.v2 import train as v2_train
 from research.conductance_gat.v3 import train as v3_train
@@ -23,12 +25,24 @@ def _argument(command: list[str], name: str) -> str:
     return command[command.index(name) + 1]
 
 
+def _resource_observability() -> dict:
+    device = torch.device("cpu")
+    return finalize_resource_observability(
+        runtime_resource_snapshot(device),
+        device,
+        peak_allocated_bytes=None,
+        peak_reserved_bytes=None,
+        sample_interval_seconds=1.0,
+    )
+
+
 def test_default_plan_covers_all_versions_profiles_seed_zero_and_supported_datasets():
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
     assert args.versions == ["v1", "v2", "v3", "v4", "v5"]
     assert args.profiles == ["reference", "large"]
     assert args.model_seeds == [0]
+    assert args.workers == 4
     assert len(jobs) == 106
     assert {job["profile"] for job in jobs} == set(runner.PROFILES)
     assert {job["model_seed"] for job in jobs} == set(runner.DEFAULT_MODEL_SEEDS)
@@ -41,11 +55,35 @@ def test_default_plan_covers_all_versions_profiles_seed_zero_and_supported_datas
     assert all(job["architecture"]["beta_initial"] == 0.1 for job in v5_jobs)
     assert all("beta_min" not in job["architecture"] for job in v5_jobs)
     assert all(_argument(job["command"], "--beta-initial") == "0.1" for job in v5_jobs)
+    for job in jobs:
+        expected_workers = 4 if job["dataset"] == "ppi" else 0
+        assert job["workers"] == expected_workers
+        assert _argument(job["command"], "--workers") == str(expected_workers)
+
+
+def test_legacy_ppi_batch_override_reaches_v1_v3_v4_but_not_v5() -> None:
+    args = runner.parser().parse_args(
+        ["--datasets", "ppi", "--legacy-ppi-batch-size", "5"]
+    )
+    runner._validate(args)
+    jobs = runner.make_jobs(args, Path("fixture"))
+    for job in jobs:
+        batch_size = int(_argument(job["command"], "--batch-size"))
+        assert job["batch_size"] == batch_size
+        if job["version"] in {"v1", "v3", "v4"}:
+            assert batch_size == 5
+        elif job["version"] == "v5":
+            assert batch_size == 2
 
 
 @pytest.mark.parametrize(
     "mutated_relative_path",
-    ["scripts/run_conductance_factorial.py", "scripts/check_dependencies.py"],
+    [
+        "scripts/run_conductance_factorial.py",
+        "scripts/check_dependencies.py",
+        "scripts/telemetry_validation.py",
+        "src/chartgat/observability.py",
+    ],
 )
 def test_source_inventory_covers_imported_scripts_and_rejects_mutation(
     monkeypatch, mutated_relative_path
@@ -328,7 +366,7 @@ def test_v1_validation_only_path_does_not_construct_a_test_loader(monkeypatch):
         validation_only=True,
         model_seed=0,
         batch_size=2,
-        workers=0,
+        workers=4,
         pin_memory=True,
     )
     loaders, indices = benchmark._make_loaders(payload, args, benchmark.torch.device("cpu"))
@@ -339,6 +377,107 @@ def test_v1_validation_only_path_does_not_construct_a_test_loader(monkeypatch):
     ]
     assert observed == [0, 1, 2]
     assert 3 not in observed
+    assert all(loader.kwargs["num_workers"] == 4 for loader in loaders.values())
+    assert all(loader.kwargs["persistent_workers"] is True for loader in loaders.values())
+    assert all(loader.kwargs["prefetch_factor"] == 2 for loader in loaders.values())
+
+
+def test_v1_child_worker_contract_is_dataset_specific():
+    ppi = scaling_v1.build_parser().parse_args(
+        ["--dataset", "ppi", "--output-dir", "out"]
+    )
+    scaling_v1._validate(ppi)
+    assert ppi.workers == 4
+    assert ppi.batch_size == 2
+    assert ppi.worker_configuration_source == "dataset_default"
+    cora = scaling_v1.build_parser().parse_args(
+        ["--dataset", "cora", "--output-dir", "out"]
+    )
+    scaling_v1._validate(cora)
+    assert cora.workers == 0
+    assert cora.batch_size == 1
+    assert cora.worker_configuration_source == "dataset_default"
+    cora.workers = 1
+    with pytest.raises(ValueError, match="no DataLoader"):
+        scaling_v1._validate(cora)
+
+
+def test_legacy_children_accept_explicit_ppi_batches_but_keep_full_graph_at_one():
+    v1_ppi = scaling_v1.build_parser().parse_args(
+        ["--dataset", "ppi", "--output-dir", "out", "--batch-size", "5"]
+    )
+    scaling_v1._validate(v1_ppi)
+    assert v1_ppi.batch_size == 5
+
+    for module, condition in (
+        (v3_train, "relative_c"),
+        (v4_train, "relative_c_spatial_w"),
+    ):
+        ppi = module.build_parser().parse_args(
+            [
+                "--dataset",
+                "ppi",
+                "--condition",
+                condition,
+                "--output-dir",
+                "out",
+                "--batch-size",
+                "5",
+            ]
+        )
+        module._validate_args(ppi)
+        assert ppi.batch_size == 5
+
+        full_graph = module.build_parser().parse_args(
+            [
+                "--dataset",
+                "cora",
+                "--condition",
+                condition,
+                "--output-dir",
+                "out",
+                "--batch-size",
+                "2",
+            ]
+        )
+        with pytest.raises(ValueError, match="one full graph"):
+            module._validate_args(full_graph)
+
+
+def test_direct_v3_v4_and_ablation_default_workers_are_dataset_specific():
+    v3_ppi = v3_train.build_parser().parse_args(
+        ["--dataset", "ppi", "--condition", "relative_c", "--output-dir", "out"]
+    )
+    v3_train._validate_args(v3_ppi)
+    assert v3_ppi.workers == 4
+    assert v3_ppi.worker_configuration_source == "dataset_default"
+
+    v4_ppi = v4_train.build_parser().parse_args(
+        [
+            "--dataset",
+            "ppi",
+            "--condition",
+            "relative_c_spatial_w",
+            "--output-dir",
+            "out",
+        ]
+    )
+    v4_train._validate_args(v4_ppi)
+    assert v4_ppi.workers == 4
+    assert v4_ppi.worker_configuration_source == "dataset_default"
+
+    ablation_ppi = ablation_train.build_parser().parse_args(
+        ["--dataset", "ppi", "--condition", "baseline", "--output-dir", "out"]
+    )
+    ablation_train.resolve_worker_arguments(ablation_ppi)
+    assert ablation_ppi.workers == 4
+    assert ablation_ppi.worker_configuration_source == "dataset_default"
+
+    ablation_cora = ablation_train.build_parser().parse_args(
+        ["--dataset", "cora", "--condition", "baseline", "--output-dir", "out"]
+    )
+    ablation_train.resolve_worker_arguments(ablation_cora)
+    assert ablation_cora.workers == 0
 
 
 def _stub(
@@ -387,7 +526,11 @@ def _stub(
                 _argument(command, "--condition") if "--condition" in command else "conductance"
             ),
             "model_seed": int(_argument(command, "--model-seed")),
-            "configuration": architecture,
+            "configuration": architecture
+            | {
+                "workers": int(_argument(command, "--workers")),
+                "batch_size": int(_argument(command, "--batch-size")),
+            },
             "evaluation_split": "validation",
             "test_evaluated": False,
             "validation": 0.75,
@@ -398,6 +541,11 @@ def _stub(
             "total_parameters": 1300,
             "elapsed_seconds": 1.5,
             "peak_cuda_allocated_bytes": 2048,
+            "resource_observability": _resource_observability(),
+            "throughput": {
+                "scope": "unit fixture measured work",
+                "optimizer_steps_per_second": 2.0,
+            },
         }
         if expose_test:
             record["test"] = 0.9
@@ -443,6 +591,24 @@ def test_success_is_released_only_after_every_child_metric_is_valid(tmp_path, mo
     assert summary["test_evaluated"] is False
     assert {row["n"] for row in summary["rows"]} == {2}
     assert all(row["validation_mean"] == 0.75 for row in summary["rows"])
+    assert len(summary["runs"]) == 10
+    assert all("resource_observability" in row for row in summary["runs"])
+    assert all("throughput" in row for row in summary["runs"])
+
+
+@pytest.mark.parametrize("field", ["resource_observability", "throughput"])
+def test_child_telemetry_is_required_fail_closed(tmp_path, monkeypatch, field):
+    options, _calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options) == 0
+    root = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    job = manifest["jobs"][0]
+    metrics_path = Path(job["metrics_path"])
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics.pop(field)
+    metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+    with pytest.raises(ValueError, match=field):
+        runner._load_child(job)
 
 
 def test_hardware_preflight_schema_rejects_bool_and_malformed_gpu_fields():
@@ -558,7 +724,7 @@ def test_retry_logs_use_new_paths_inside_the_run_directory(tmp_path):
     assert retry_two.is_relative_to(run_dir.resolve())
 
 
-def test_incomplete_child_symlink_cannot_delete_a_passed_sibling(tmp_path):
+def test_incomplete_child_symlink_cannot_move_a_passed_sibling(tmp_path):
     run_dir = tmp_path / "run"
     passed = run_dir / "passed"
     passed.mkdir(parents=True)
@@ -570,8 +736,34 @@ def test_incomplete_child_symlink_cannot_delete_a_passed_sibling(tmp_path):
     except OSError as error:
         pytest.skip(f"directory symlinks are unavailable: {error}")
     with pytest.raises(RuntimeError, match="indirect child output"):
-        runner._discard_incomplete_child({"output_dir": str(indirect)}, run_dir)
+        runner._preserve_incomplete_child({"output_dir": str(indirect)}, run_dir)
     assert marker.read_text(encoding="utf-8") == "preserve"
+
+
+def test_incomplete_child_is_preserved_in_unique_sibling_before_retry(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    output = run_dir / "children" / "candidate"
+    output.mkdir(parents=True)
+    marker = output / "partial.log"
+    marker.write_text("diagnostic evidence", encoding="utf-8")
+    job = {"output_dir": str(output), "status": "failed"}
+
+    runner._preserve_incomplete_child(job, run_dir)
+
+    preserved = output.with_name("candidate.preserved-attempt-1")
+    assert not output.exists()
+    assert (preserved / marker.name).read_text(encoding="utf-8") == "diagnostic evidence"
+    assert job["preserved_incomplete_outputs"] == [
+        {
+            "event": "preserve_incomplete_child_output",
+            "source": str(output),
+            "destination": str(preserved),
+            "reason": "no resumable checkpoint exists; preserve prior artifacts before retry",
+        }
+    ]
+    report = json.loads(capsys.readouterr().err)
+    assert report["source"] == str(output)
+    assert report["destination"] == str(preserved)
 
 
 def test_resume_rejects_passed_output_symlink_alias_before_preflight(tmp_path, monkeypatch):
@@ -724,3 +916,29 @@ def test_any_test_metric_fails_closed_and_stops_following_children(tmp_path, mon
     )
     assert summary["status"] == "failed"
     assert summary["valid_for_validation_comparison"] is False
+
+
+def test_failure_output_write_errors_do_not_replace_child_validation_return_code(
+    tmp_path, monkeypatch, capsys
+):
+    options, _calls = _stub(tmp_path, monkeypatch, expose_test=True)
+    real_atomic_write = runner.atomic_write_json
+    real_write_summary = runner._write_summary
+
+    def atomic_write(path, payload):
+        if payload.get("status") == "failed":
+            raise OSError("manifest disk failure")
+        return real_atomic_write(path, payload)
+
+    def write_summary(run_dir, manifest):
+        if manifest.get("status") == "failed":
+            raise OSError("summary disk failure")
+        return real_write_summary(run_dir, manifest)
+
+    monkeypatch.setattr(runner, "atomic_write_json", atomic_write)
+    monkeypatch.setattr(runner, "_write_summary", write_summary)
+
+    assert runner.main(options) == 1
+    stderr = capsys.readouterr().err
+    assert "summary disk failure" in stderr
+    assert "manifest disk failure" in stderr

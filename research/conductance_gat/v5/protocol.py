@@ -148,6 +148,11 @@ COMPARISON_DESIGN = {
     "single_factor_causal_effect_of_c": False,
     "unequal_parameter_group_update_allocation": True,
     "required_audit_field": "effective_optimizer_steps_by_group",
+    "parameterization": (
+        "fixed C=1 is parameter-free; dynamic C adds only its active score network. "
+        "Shared backbone/W/beta initialization is paired and hash-verified, while total "
+        "parameter capacity is reported separately rather than padded with unused weights"
+    ),
     "checkpoint_selection": {
         "primary": (
             "fixed_c selects its all-epoch validation best; shared_dynamic_c selects its "

@@ -192,20 +192,24 @@ def graph():
 
 def test_fixed_relative_initial_state_and_outputs_match_and_alpha_is_active():
     relative, fixed = classifier(), classifier("fixed_one")
-    assert relative.state_dict().keys() == fixed.state_dict().keys()
-    for name, value in relative.state_dict().items():
-        torch.testing.assert_close(value, fixed.state_dict()[name], atol=0, rtol=0)
+    from research.conductance_gat.ablation.model import shared_backbone_state_sha256
+
+    assert shared_backbone_state_sha256(relative) == shared_backbone_state_sha256(fixed)
     torch.testing.assert_close(relative(graph()), fixed(graph()), atol=0, rtol=0)
     for model in (relative, fixed):
         for operator in model.operators:
             assert operator.raw_alpha.requires_grad
             assert operator.alpha == 0.5
-            assert operator.estimator.gamma == 0.5
-            assert operator.estimator.tau == 1
+            if model.gate_mode == "relative":
+                assert operator.estimator.gamma == 0.5
+                assert operator.estimator.tau == 1
+            else:
+                assert operator.estimator.gamma is None
+                assert operator.estimator.tau is None
             batch = graph()
             c = operator.estimator(batch.x, batch.incidence_edge_index, batch.batch, 2)
             torch.testing.assert_close(c, torch.ones_like(c), atol=0, rtol=0)
-    assert all(not p.requires_grad for op in fixed.operators for p in op.estimator.parameters())
+    assert all(list(op.estimator.parameters()) == [] for op in fixed.operators)
     assert all(p.requires_grad for op in relative.operators for p in op.estimator.parameters())
 
 

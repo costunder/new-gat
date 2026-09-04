@@ -38,30 +38,29 @@ class RelativeConductance(nn.Module):
             raise ValueError("edge_chunk_size must be a positive integer")
         self.gate_mode = gate_mode
         self.edge_chunk_size = edge_chunk_size
-        self.input_norm = nn.LayerNorm(4 * channels + 2)
-        self.network = nn.Sequential(
-            nn.Linear(4 * channels + 2, channels),
-            nn.SiLU(),
-            nn.Linear(channels, channels),
-            nn.SiLU(),
-            # A common final bias is removed exactly by graph centering, so omit it.
-            nn.Linear(channels, 1, bias=False),
-        )
-        nn.init.zeros_(self.network[-1].weight)
-        self.raw_gamma = nn.Parameter(torch.zeros(()))
-        self.raw_tau = nn.Parameter(torch.zeros(()))
+        if gate_mode == "relative":
+            self.input_norm = nn.LayerNorm(4 * channels + 2)
+            self.network = nn.Sequential(
+                nn.Linear(4 * channels + 2, channels),
+                nn.SiLU(),
+                nn.Linear(channels, channels),
+                nn.SiLU(),
+                # A common final bias is removed exactly by graph centering, so omit it.
+                nn.Linear(channels, 1, bias=False),
+            )
+            nn.init.zeros_(self.network[-1].weight)
+            self.raw_gamma = nn.Parameter(torch.zeros(()))
+            self.raw_tau = nn.Parameter(torch.zeros(()))
         self.last_scores: Tensor | None = None
         self.last_centered_scores: Tensor | None = None
-        if gate_mode == "fixed_one":
-            self.requires_grad_(False)
 
     @property
-    def gamma(self) -> Tensor:
-        return self.raw_gamma.sigmoid()
+    def gamma(self) -> Tensor | None:
+        return self.raw_gamma.sigmoid() if self.gate_mode == "relative" else None
 
     @property
-    def tau(self) -> Tensor:
-        return 2 * self.raw_tau.sigmoid()
+    def tau(self) -> Tensor | None:
+        return 2 * self.raw_tau.sigmoid() if self.gate_mode == "relative" else None
 
     def _chunk_scores(self, state: Tensor, tail: Tensor, head: Tensor, log_degree: Tensor):
         left, right = state[tail], state[head]

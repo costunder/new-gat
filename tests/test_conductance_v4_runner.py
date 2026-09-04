@@ -17,7 +17,7 @@ def test_default_twenty_fresh_factorial_trainings_cover_all_v1_datasets():
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
     assert args.datasets == list(DATASETS) and args.model_seed == 0
-    assert args.edge_chunk_size == 65536 and args.batch_size == 1 and args.workers == 0
+    assert args.edge_chunk_size == 65536 and args.batch_size == 1 and args.workers == 4
     assert len(jobs) == len(DATASETS) * len(CONDITIONS) == 20
     assert {(job["dataset"], job["condition"]) for job in jobs} == {
         (dataset, condition) for dataset in DATASETS for condition in CONDITIONS
@@ -30,6 +30,9 @@ def test_default_twenty_fresh_factorial_trainings_cover_all_v1_datasets():
         expected_batch_size = BATCH_SIZE_BY_DATASET[job["dataset"]]
         assert job["batch_size"] == expected_batch_size
         assert command[command.index("--batch-size") + 1] == str(expected_batch_size)
+        expected_workers = 4 if job["dataset"] == "ppi" else 0
+        assert job["workers"] == expected_workers
+        assert command[command.index("--workers") + 1] == str(expected_workers)
         assert "--amp" not in command and "--allow-download" not in command
 
 
@@ -67,7 +70,7 @@ def test_stdlib_inspection_has_no_writes(tmp_path, option):
         ["--min-free-gb", "nan"],
         ["--edge-chunk-size", "0"],
         ["--batch-size", "2"],
-        ["--workers", "1"],
+        ["--workers", "-1"],
     ],
 )
 def test_invalid_inputs_do_not_check_dependencies_or_train(monkeypatch, options):
@@ -81,6 +84,7 @@ def test_ppi_jobs_are_protocol_locked_to_batch_two():
     jobs = runner.make_jobs(args, Path("fixture"))
     assert len(jobs) == 4
     assert {job["batch_size"] for job in jobs} == {2}
+    assert {job["workers"] for job in jobs} == {4}
 
 
 def _stub(tmp_path, monkeypatch, failure=None, change_after=None):

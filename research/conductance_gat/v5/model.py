@@ -127,25 +127,33 @@ class GraphConditionedConductance(nn.Module):
         self.mode = mode
         self.max_log_conductance = float(max_log_conductance)
         self.edge_chunk_size = edge_chunk_size
-        self.node_projection = nn.Linear(channels, score_channels)
-        self.context_projection = nn.Linear(2 * channels + 8, score_channels)
-        edge_width = 4 * score_channels + 8
-        self.score_norm = nn.LayerNorm(edge_width)
-        self.score_network = nn.Sequential(
-            nn.Linear(edge_width, 2 * score_channels),
-            nn.SiLU(),
-            nn.Linear(2 * score_channels, score_channels),
-            nn.SiLU(),
-            nn.Linear(score_channels, 1, bias=False),
-        )
-        # Nonzero identity-near init fixes V4's first-step dead-gradient path.
-        nn.init.normal_(self.score_network[-1].weight, 0.0, initial_score_std)
+        if mode == "dynamic":
+            self.node_projection: nn.Linear | None = nn.Linear(channels, score_channels)
+            self.context_projection: nn.Linear | None = nn.Linear(
+                2 * channels + 8, score_channels
+            )
+            edge_width = 4 * score_channels + 8
+            self.score_norm: nn.LayerNorm | None = nn.LayerNorm(edge_width)
+            self.score_network: nn.Sequential | None = nn.Sequential(
+                nn.Linear(edge_width, 2 * score_channels),
+                nn.SiLU(),
+                nn.Linear(2 * score_channels, score_channels),
+                nn.SiLU(),
+                nn.Linear(score_channels, 1, bias=False),
+            )
+            # Nonzero identity-near init fixes V4's first-step dead-gradient path.
+            nn.init.normal_(self.score_network[-1].weight, 0.0, initial_score_std)
+        else:
+            # A fixed control is an actual parameter-free C=1 operator.  Registering a
+            # frozen score network here would leave modules that can never reach the loss.
+            self.node_projection = None
+            self.context_projection = None
+            self.score_norm = None
+            self.score_network = None
         self.last_scores: Tensor | None = None
         self.last_log_c: Tensor | None = None
         self.last_c: Tensor | None = None
         self.override: str | None = None
-        if mode == "fixed_one":
-            self.requires_grad_(False)
 
     def _score_chunk(
         self,
@@ -206,6 +214,8 @@ class GraphConditionedConductance(nn.Module):
             ),
             dim=1,
         )
+        if self.score_norm is None or self.score_network is None:
+            raise RuntimeError("fixed C=1 has no score network")
         return self.score_network(self.score_norm(features)).squeeze(-1)
 
     def forward(
@@ -228,6 +238,8 @@ class GraphConditionedConductance(nn.Module):
             self.last_log_c = state.new_zeros(tail.numel())
             self.last_c = c.detach()
             return c
+        if self.node_projection is None or self.context_projection is None:
+            raise RuntimeError("dynamic conductance projections are unavailable")
         projected = F.silu(self.node_projection(state))
         context = F.silu(self.context_projection(graph_context))
         score_chunks = []
@@ -351,12 +363,15 @@ class SharedConductanceMultihead(nn.Module):
             raise ValueError("hidden channels must be divisible by heads")
         self.channels, self.heads, self.head_width = channels, heads, channels // heads
         self.conductance_mode = conductance_mode
-        self.estimator = GraphConditionedConductance(
-            channels,
-            mode=conductance_mode,
-            max_log_conductance=max_log_conductance,
-            edge_chunk_size=edge_chunk_size,
-        )
+        # Dynamic-only initialization must not shift the RNG stream used by W, beta,
+        # FFNs or later blocks; those shared parameters remain exactly paired by seed.
+        with torch.random.fork_rng(devices=[]):
+            self.estimator = GraphConditionedConductance(
+                channels,
+                mode=conductance_mode,
+                max_log_conductance=max_log_conductance,
+                edge_chunk_size=edge_chunk_size,
+            )
         self.value_weight = nn.Parameter(torch.empty(heads, channels, self.head_width))
         nn.init.xavier_uniform_(self.value_weight.reshape(channels, channels))
         self.output_projection = nn.Linear(channels, channels, bias=False)

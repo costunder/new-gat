@@ -27,6 +27,21 @@ profile은 실제 minibatch/sample 크기와 수치 실행을 바꾸므로 porta
 직접 대응시켜 모델 효과 또는 GPU 효과로 해석할 수 없다. 2026-09-04 첫 A6000 실행은 아래
 메모리·수치 오류로 중단됐으며 성공한 scaling 성능이나 가속 실측으로 사용하지 않는다.
 
+현재 통합 runner는 단일 `--device`에서 track을 순차 실행하고, 서로 다른 indexed 장치를
+`--devices`로 명시했을 때만 independent track을 GPU별로 병렬 배정한다. 같은 GPU의 최상위 track
+concurrency는 1이며, Tree A6000 child 내부의 명시적 candidate concurrency 2는 별도 계층이다.
+새 resource monitor는 실제 GPU 서버에서 Conductance V5, Cycle PE V1/V2와 Tree V1/V2의 GPU
+SM/메모리 utilization, CUDA allocator, process CPU·RSS/HWM과 system available RAM을
+주기적으로 기록하고, 미지원 측정은 `null`과 원인을 남긴다. 그러나 이 계측이 적용된 수정판의
+완료 GPU artifact는 아직 수령하지 않았으므로 현재 문서에 새 utilization 수치를 제시하지 않는다.
+Rich 학습 runner 자체는 여러 physical batch 후보를 자동 튜닝하지 않으며 manifest에도
+`throughput_candidate_sweep=false`를 기록한다. 별도 CUDA microbenchmark는 현재
+Conductance V1/V5, Cycle PE V1/V2, Tree V1/V2의 명시 후보마다 device-wide GPU
+utilization·peak VRAM·CPU/RAM·처리량과 수치/gradient integrity를 측정하고 10% memory headroom
+기준의 권고를 낸다. 다만 optimizer state·전체 epoch·validation/checkpoint가 없는 고정 real-batch
+측정이고 profile 기본값을 자동 변경하지 않으므로, 현재 profile batch를 최종 학습 최적값으로
+주장할 수는 없다.
+
 후속 사용자 요청으로 현재 기본 실행은 model seed **0 하나**다. 기존 5-seed 측정값은 아래에
 그대로 보존하며, 기본값 변경이 과거 결과나 source revision을 바꾸지는 않는다.
 단일 seed의 std/CI는 null로 기록한다. 새 read-only `--full-audit`는 C 평균/셔플/전파 제거와

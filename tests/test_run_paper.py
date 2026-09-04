@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import ast
+import hashlib
+import inspect
+import json
+import os
 import re
 import shlex
 import sys
@@ -9,11 +13,21 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import torch
 
+from chartgat.observability import finalize_resource_observability, runtime_resource_snapshot
 from scripts.run_paper import (
     CYCLE_BREC_OFFICIAL_SEEDS,
+    _assert_source_hashes_unchanged,
+    _command_plan,
+    _output_sha256,
+    _persist_manifest_after_error,
+    _quarantine_output,
     _run_logged,
+    _source_revision,
     _stop_after_failure,
+    _validate_child_provenance,
+    _validate_child_telemetry,
 )
 from scripts.run_paper import main as run_paper_main
 
@@ -49,6 +63,251 @@ def test_root_brec_protocol_matches_cycle_runner() -> None:
     assert CYCLE_BREC_OFFICIAL_SEEDS == _literal_assignment(CYCLE_RUNNER, "BREC_OFFICIAL_SEEDS")
 
 
+def test_source_revision_hashes_runner_and_owned_child_safety_helper() -> None:
+    snapshot = _source_revision()["source_sha256"]
+    assert {
+        "scripts/run_paper.py",
+        "scripts/process_safety.py",
+        "scripts/telemetry_validation.py",
+        "src/chartgat/observability.py",
+        "research/conductance_gat/benchmark.py",
+        "research/cycle_pe/benchmark.py",
+        "research/tree_augmentation/paper.py",
+    } <= set(snapshot)
+    assert not any("/tests/" in name for name in snapshot)
+    assert all(len(digest) == 64 for digest in snapshot.values())
+
+
+def test_child_telemetry_requires_periodic_resources_and_measured_throughput() -> None:
+    resources = finalize_resource_observability(
+        runtime_resource_snapshot(torch.device("cpu")),
+        torch.device("cpu"),
+        peak_allocated_bytes=None,
+        peak_reserved_bytes=None,
+        sample_interval_seconds=1.0,
+    )
+    valid = {
+        Path("metrics.json"): {
+            "resource_observability": resources,
+            "throughput": {
+                "scope": "unit measured interval",
+                "graphs": 8,
+                "graphs_per_second": 4.0,
+            },
+        }
+    }
+    assert _validate_child_telemetry(valid) == []
+    assert "resource_observability" in " ".join(
+        _validate_child_telemetry(
+            {Path("metrics.json"): {"throughput": valid[Path("metrics.json")]["throughput"]}}
+        )
+    )
+    assert "throughput telemetry" in " ".join(
+        _validate_child_telemetry(
+            {
+                Path("metrics.json"): {
+                    "resource_observability": resources,
+                    "throughput": {"scope": "missing measured rate"},
+                }
+            }
+        )
+    )
+
+
+def test_child_provenance_hash_must_match_current_source() -> None:
+    source = ROOT / "scripts" / "run_paper.py"
+    command = [sys.executable, "-m", "scripts.run_paper"]
+    payloads = {
+        Path("manifest.json"): {
+            "implementation_sha256": {
+                "run_paper.py": hashlib.sha256(source.read_bytes()).hexdigest()
+            }
+        }
+    }
+    assert _validate_child_provenance(command, payloads) == []
+    payloads[Path("manifest.json")]["implementation_sha256"]["run_paper.py"] = "0" * 64
+    assert "does not match the current source" in " ".join(
+        _validate_child_provenance(command, payloads)
+    )
+
+
+def test_incomplete_output_is_preserved_beside_original_path(tmp_path: Path) -> None:
+    output = tmp_path / "child"
+    output.mkdir()
+    (output / "partial.json").write_text('{"status":"running"}\n', encoding="utf-8")
+    preserved = _quarantine_output(output, attempt=1)
+    assert preserved == tmp_path / "child.incomplete-attempt-1"
+    assert not output.exists()
+    assert (preserved / "partial.json").read_text(encoding="utf-8")
+
+
+def test_failure_manifest_reporting_cannot_replace_original_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = RuntimeError("scientific failure")
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("report disk failure")
+
+    monkeypatch.setattr("scripts.run_paper._write_manifest", fail_write)
+    _persist_manifest_after_error(tmp_path / "manifest.json", {}, original)
+    assert str(original) == "scientific failure"
+    assert any("report disk failure" in note for note in original.__notes__)
+
+
+def test_command_plan_and_output_digest_bind_exact_artifacts(tmp_path: Path) -> None:
+    output = tmp_path / "child"
+    output.mkdir()
+    artifact = output / "metrics.json"
+    artifact.write_text('{"status":"passed"}\n', encoding="utf-8")
+    command = [sys.executable, "-m", "example", "--output-dir", str(output)]
+    plan = _command_plan([("child", command, output)])
+    assert plan == [{"name": "child", "command": command, "output": str(output.resolve())}]
+    accepted = _output_sha256(output)
+    artifact.write_text('{"status":"failed"}\n', encoding="utf-8")
+    assert _output_sha256(output) != accepted
+
+
+def test_runtime_source_rehash_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {"scripts/run_paper.py": "a" * 64}
+    monkeypatch.setattr(
+        "scripts.run_paper._source_revision",
+        lambda: {"source_sha256": {"scripts/run_paper.py": "b" * 64}},
+    )
+    with pytest.raises(RuntimeError, match="runtime source changed"):
+        _assert_source_hashes_unchanged(expected)
+
+
+def test_same_run_resume_hash_validates_and_skips_completed_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import scripts.run_paper as runner
+
+    project = tmp_path / "repository"
+    project.mkdir()
+    output = tmp_path / "results" / "paper-unit" / "child"
+    command = [sys.executable, "-m", "unit.child", "--output-dir", str(output)]
+    calls: list[list[str]] = []
+    aggregate_calls: list[Path] = []
+    dependencies = {"status": "passed", "torch": "unit"}
+
+    monkeypatch.setattr(runner, "PROJECT_ROOT", project)
+    monkeypatch.setattr(runner, "check_dependencies", lambda: dict(dependencies))
+    monkeypatch.setattr(
+        runner,
+        "_source_revision",
+        lambda: {
+            "git_available": False,
+            "revision": None,
+            "dirty": None,
+            "source_sha256": {"scripts/run_paper.py": "a" * 64},
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "_commands",
+        lambda _args, _run_id: [("unit-child", command, output)],
+    )
+    monkeypatch.setattr(
+        runner,
+        "_track_run_root",
+        lambda *_args, **_kwargs: output.parent,
+    )
+    monkeypatch.setattr(runner, "_snapshot_registries", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        runner,
+        "_environment_snapshot",
+        lambda path: {"path": str(path), "sha256": "b" * 64},
+    )
+    monkeypatch.setattr(runner, "_validate_completed_output", lambda *_args, **_kwargs: [])
+
+    def aggregate_once(manifest_path: Path) -> dict[str, object]:
+        aggregate_calls.append(manifest_path)
+        aggregate_dir = manifest_path.parent / "aggregate"
+        aggregate_dir.mkdir()
+        (aggregate_dir / "aggregate.json").write_text("{}\n", encoding="utf-8")
+        for name in ("samples.csv", "metrics.csv", "paired.csv", "efficiency.csv", "failures.csv"):
+            (aggregate_dir / name).write_text("", encoding="utf-8")
+        return {"schema_version": 3}
+
+    monkeypatch.setattr(runner, "aggregate_manifest", aggregate_once)
+
+    def run_once(child_command: list[str], *, log_path: Path) -> int:
+        calls.append(child_command)
+        output.mkdir(parents=True)
+        (output / "metrics.json").write_text('{"status":"passed"}\n', encoding="utf-8")
+        log_path.write_text("completed\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", run_once)
+    argv = [str(RUNNER), "--run-id", "paper-unit", "--tracks", "conductance_gat"]
+    with patch.object(sys, "argv", argv):
+        assert runner.main() == 0
+    accepted_digest = _output_sha256(output)
+
+    def forbidden_rerun(*_args, **_kwargs):
+        raise AssertionError("validated completed child must not be rerun")
+
+    monkeypatch.setattr(runner, "_run_logged", forbidden_rerun)
+    monkeypatch.setattr(
+        runner,
+        "aggregate_manifest",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("validated completed aggregation must not be regenerated")
+        ),
+    )
+    with patch.object(sys, "argv", argv):
+        assert runner.main() == 0
+    manifest = json.loads(
+        (project / "runs" / "paper" / "paper-unit" / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert calls == [command]
+    assert len(aggregate_calls) == 1
+    assert manifest["resume_count"] == 1
+    assert manifest["commands"][0]["resume_validation"] == "passed_and_skipped"
+    assert manifest["commands"][0]["accepted_output_sha256"] == accepted_digest
+
+    manifest["aggregation"]["status"] = "failed"
+    manifest_path = project / "runs" / "paper" / "paper-unit" / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(runner, "aggregate_manifest", aggregate_once)
+    with patch.object(sys, "argv", argv):
+        assert runner.main() == 0
+    regenerated = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert len(aggregate_calls) == 2
+    assert len(regenerated["preserved_aggregate_outputs"]) == 1
+    assert Path(regenerated["preserved_aggregate_outputs"][0]).is_dir()
+
+    monkeypatch.setattr(
+        runner,
+        "_source_revision",
+        lambda: {
+            "git_available": False,
+            "revision": None,
+            "dirty": None,
+            "source_sha256": {"scripts/run_paper.py": "c" * 64},
+        },
+    )
+    with patch.object(sys, "argv", argv):
+        assert runner.main() == 2
+
+    monkeypatch.setattr(
+        runner,
+        "_source_revision",
+        lambda: {
+            "git_available": False,
+            "revision": None,
+            "dirty": None,
+            "source_sha256": {"scripts/run_paper.py": "a" * 64},
+        },
+    )
+    dependencies["torch"] = "different-runtime"
+    with patch.object(sys, "argv", argv):
+        assert runner.main() == 2
+
+
 def test_logged_child_uses_utf8_for_non_ascii_artifacts(tmp_path: Path) -> None:
     log_path = tmp_path / "child.log"
     return_code = _run_logged(
@@ -57,6 +316,27 @@ def test_logged_child_uses_utf8_for_non_ascii_artifacts(tmp_path: Path) -> None:
     )
     assert return_code == 0
     assert log_path.read_text(encoding="utf-8").strip() == "프로젝트/결과/β"
+
+
+def test_logged_child_unsets_broken_nvml_cuda_check_and_uses_owned_child_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
+    log_path = tmp_path / "environment.log"
+    return_code = _run_logged(
+        [
+            sys.executable,
+            "-c",
+            ("import os; print(os.environ.get('PYTORCH_NVML_BASED_CUDA_CHECK', 'unset'))"),
+        ],
+        log_path=log_path,
+    )
+    assert return_code == 0
+    assert log_path.read_text(encoding="utf-8").strip() == "unset"
+    source = inspect.getsource(_run_logged)
+    assert "terminate_owned_child" in source
+    assert "except BaseException" in source
+    assert os.environ["PYTORCH_NVML_BASED_CUDA_CHECK"] == "1"
 
 
 def test_paper_runner_defaults_to_cuda_and_every_independent_track(
@@ -352,9 +632,10 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert len(v2_commands) == 1
     v2_command = shlex.split(v2_commands[0])
     v2_source = (ROOT / v2_command[1]).read_text(encoding="utf-8")
-    assert "set -euo pipefail" in v2_source
+    assert "set -" not in v2_source
     assert 'source "${project_root}/scripts/conda_env.sh"' in v2_source
-    assert 'exec "${environment_python}" -B scripts/run_conductance_v2.py "$@"' in v2_source
+    assert '"${environment_python}" -B scripts/run_conductance_v2.py "$@"' in v2_source
+    assert "exec " not in v2_source and "exit " not in v2_source
     v2_args = run_conductance_v2.parser().parse_args(v2_command[2:])
     run_conductance_v2._validate(v2_args)
     assert v2_args.datasets == ["cora", "citeseer", "pubmed", "ogbn-arxiv"]
@@ -369,9 +650,10 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert len(v3_commands) == 1
     v3_command = shlex.split(v3_commands[0])
     v3_source = (ROOT / v3_command[1]).read_text(encoding="utf-8")
-    assert "set -euo pipefail" in v3_source
+    assert "set -" not in v3_source
     assert 'source "${project_root}/scripts/conda_env.sh"' in v3_source
-    assert 'exec "${environment_python}" -B scripts/run_conductance_v3.py "$@"' in v3_source
+    assert '"${environment_python}" -B scripts/run_conductance_v3.py "$@"' in v3_source
+    assert "exec " not in v3_source and "exit " not in v3_source
     v3_args = run_conductance_v3.parser().parse_args(v3_command[2:])
     run_conductance_v3._validate(v3_args)
     assert v3_args.datasets == ["cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"]
@@ -394,9 +676,10 @@ def test_readme_commands_use_full_independent_protocols() -> None:
     assert len(v4_commands) == 1
     v4_command = shlex.split(v4_commands[0])
     v4_source = (ROOT / v4_command[1]).read_text(encoding="utf-8")
-    assert "set -euo pipefail" in v4_source
+    assert "set -" not in v4_source
     assert 'source "${project_root}/scripts/conda_env.sh"' in v4_source
-    assert 'exec "${environment_python}" -B scripts/run_conductance_v4.py "$@"' in v4_source
+    assert '"${environment_python}" -B scripts/run_conductance_v4.py "$@"' in v4_source
+    assert "exec " not in v4_source and "exit " not in v4_source
     v4_args = run_conductance_v4.parser().parse_args(v4_command[2:])
     run_conductance_v4._validate(v4_args)
     assert v4_args.datasets == ["cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"]
@@ -418,12 +701,14 @@ def test_readme_commands_use_full_independent_protocols() -> None:
         assert len(command) == 2
         wrapper = ROOT / command[1]
         source = wrapper.read_text(encoding="utf-8")
-        dispatch = next(row for row in source.splitlines() if row.startswith("exec bash "))
+        dispatch = next(
+            row.strip() for row in source.splitlines() if row.strip().startswith("bash ")
+        )
         words = shlex.split(dispatch)
-        assert words[2] == "${project_root}/scripts/paper.sh"
+        assert words[1] == "${project_root}/scripts/paper.sh"
         assert words[-1] == "$@"
-        assert "set -euo pipefail" in source
-        parsed.append(_parser().parse_args(words[3:-1]))
+        assert "set -" not in source and "exec " not in source and "exit " not in source
+        parsed.append(_parser().parse_args(words[2:-1]))
     assert sum(args.prepare_only for args in parsed) == 1
     assert all(args.suite == "benchmark" for args in parsed)
     assert {tuple(args.tracks) for args in parsed if not args.prepare_only} == {
@@ -567,13 +852,14 @@ def test_project_docs_and_gpt_handoff_are_separated() -> None:
         path
         for path in ROOT.rglob("*.md")
         if not any(part in ignored or part.startswith(".venv") for part in path.parts)
+        and not path.relative_to(ROOT).parts[0].startswith(".pytest-tmp-")
     ]
     outside_document_folders = {
         path.relative_to(ROOT).as_posix()
         for path in markdown
         if path.parent not in {ROOT / "docs", ROOT / "gpt_handoff"}
     }
-    assert outside_document_folders == {"README.md"}
+    assert outside_document_folders == {"AGENTS.md", "README.md"}
 
     handoff_files = {path.name for path in (ROOT / "gpt_handoff").glob("*.md")}
     assert handoff_files == {

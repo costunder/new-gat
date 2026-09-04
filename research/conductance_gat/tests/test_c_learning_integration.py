@@ -97,7 +97,16 @@ def test_two_real_arms_artifacts_pass_new_runner_and_comparison(monkeypatch, tmp
         ]
     )
     assert status == 0 and len(preflights) == 1 and list(trained) == list(CONDITIONS)
-    assert len({metrics["initial_state_sha256"] for metrics in trained.values()}) == 1
+    assert len({metrics["initial_state_sha256"] for metrics in trained.values()}) == 2
+    assert (
+        len(
+            {
+                metrics["shared_backbone_initial_state_sha256"]
+                for metrics in trained.values()
+            }
+        )
+        == 1
+    )
     for condition, metrics in trained.items():
         assert metrics["status"] == "passed" and metrics["research_suite"] == SUITE
         assert metrics["configuration"]["model_seed"] == 0
@@ -112,6 +121,12 @@ def test_two_real_arms_artifacts_pass_new_runner_and_comparison(monkeypatch, tmp
         assert checkpoint["model"] == checkpoint["research_suite"] == SUITE
         assert checkpoint["gate_mode"] == metrics["gate_mode"]
         assert checkpoint["initial_state_sha256"] == metrics["initial_state_sha256"]
+        assert checkpoint["shared_backbone_initial_state_sha256"] == metrics[
+            "shared_backbone_initial_state_sha256"
+        ]
+        assert checkpoint["estimator_parameters"] == metrics["estimator_parameters"]
+        if condition == "fixed_c":
+            assert not any(".estimator." in name for name in checkpoint["state_dict"])
     root = tmp_path / "results/conductance_gat/c_learning/c-learning-integration-fixture"
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "passed" and manifest["suite"] == SUITE
@@ -126,8 +141,14 @@ def test_two_real_arms_artifacts_pass_new_runner_and_comparison(monkeypatch, tmp
     assert contrast == {"score_delta": expected, "percentage_points": expected * 100}
     rows = {row["condition"]: row for row in dataset["conditions"]}
     assert rows["learned_c"]["frozen_parameters"] == 0
-    assert rows["fixed_c"]["frozen_parameters"] > 0
+    assert rows["fixed_c"]["frozen_parameters"] == 0
+    assert rows["fixed_c"]["estimator_parameters"] == 0
+    assert rows["learned_c"]["estimator_parameters"] > 0
     assert rows["learned_c"]["trainable_parameters"] > rows["fixed_c"]["trainable_parameters"]
+    assert dataset["parameter_contract"]["verified"] is True
+    assert dataset["parameter_contract"]["total_parameter_difference"] == rows["learned_c"][
+        "estimator_parameters"
+    ]
     assert all(
         layer["conductance_cv"]["mean"] == 0.0
         for layer in rows["fixed_c"]["best_validation_diagnostics"]

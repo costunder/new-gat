@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -194,6 +196,125 @@ def test_a6000_hardware_profile_is_forwarded_to_every_track_and_bound_to_config(
     assert config["hardware_profile"] == "a6000-48gb"
 
 
+def test_explicit_batch_overrides_are_forwarded_without_claiming_measurement(
+    tmp_path: Path,
+) -> None:
+    args = runner.parser().parse_args(
+        [
+            "--conductance-versions",
+            "v1",
+            "v5",
+            "--hardware-profile",
+            "a6000-48gb",
+            "--conductance-legacy-ppi-batch-size",
+            "4",
+            "--conductance-v5-ppi-batch-size",
+            "8",
+            "--conductance-v5-sample-seed-batch-size",
+            "2048",
+            "--cycle-batch-size",
+            "64",
+            "--tree-batch-size",
+            "32",
+            "--results-root",
+            str(tmp_path),
+        ]
+    )
+    runner._validate(args)
+    conductance, cycle, tree = runner.make_jobs(args, "batch-overrides")
+    assert _option(conductance["command"], "--legacy-ppi-batch-size") == "4"
+    assert _option(conductance["command"], "--v5-ppi-batch-size") == "8"
+    assert _option(conductance["command"], "--v5-sample-seed-batch-size") == "2048"
+    assert _option(cycle["command"], "--batch-size") == "64"
+    assert _option(tree["command"], "--batch-size") == "32"
+    config = runner._config_payload(args, data_root=tmp_path / "data", results_root=tmp_path)
+    assert config["explicit_batch_overrides"] == {
+        "conductance_legacy_ppi_graphs": 4,
+        "conductance_v5_ppi_graphs": 8,
+        "conductance_v5_sample_seed_nodes": 2048,
+        "cycle_graphs": 64,
+        "tree_chart_views": 32,
+    }
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--conductance-v5-ppi-batch-size", "0"],
+        ["--conductance-legacy-ppi-batch-size", "0"],
+        ["--conductance-v5-sample-seed-batch-size", "0"],
+        ["--cycle-batch-size", "0"],
+        ["--tree-batch-size", "0"],
+    ],
+)
+def test_explicit_batch_overrides_must_be_positive(options: list[str]) -> None:
+    args = runner.parser().parse_args(options)
+    with pytest.raises(ValueError, match="must be positive"):
+        runner._validate(args)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--tracks", "cycle", "--conductance-v5-ppi-batch-size", "8"],
+        ["--tracks", "cycle", "--conductance-legacy-ppi-batch-size", "4"],
+        [
+            "--tracks",
+            "conductance",
+            "--conductance-versions",
+            "v1",
+            "--conductance-v5-sample-seed-batch-size",
+            "2048",
+        ],
+        ["--tracks", "tree", "--cycle-batch-size", "32"],
+        ["--tracks", "cycle", "--tree-batch-size", "32"],
+    ],
+)
+def test_explicit_batch_overrides_require_their_target_track(options: list[str]) -> None:
+    args = runner.parser().parse_args(options)
+    with pytest.raises(ValueError, match="require"):
+        runner._validate(args)
+
+
+def test_explicit_devices_assign_independent_tracks_round_robin(tmp_path: Path) -> None:
+    args = runner.parser().parse_args(
+        [
+            "--devices",
+            "cuda:0",
+            "cuda:1",
+            "--results-root",
+            str(tmp_path),
+        ]
+    )
+    runner._validate(args)
+    jobs = runner.make_jobs(args, "multi")
+    assert [job["device"] for job in jobs] == ["cuda:0", "cuda:1", "cuda:0"]
+    assert [_option(job["command"], "--device") for job in jobs] == [
+        "cuda:0",
+        "cuda:1",
+        "cuda:0",
+    ]
+    config = runner._config_payload(args, data_root=tmp_path / "data", results_root=tmp_path)
+    assert config["devices"] == ["cuda:0", "cuda:1"]
+    assert config["device_assignment"] == "round_robin_by_independent_track"
+    assert config["execution_classification"] == "final_research_training"
+    assert config["debug_or_smoke_mode"] is False
+
+
+@pytest.mark.parametrize(
+    "devices",
+    [
+        ["cuda:0", "cuda:0"],
+        ["cuda", "cuda:1"],
+        ["cpu", "cuda:1"],
+    ],
+)
+def test_invalid_multi_device_requests_fail_closed(devices: list[str]) -> None:
+    args = runner.parser().parse_args(["--devices", *devices])
+    with pytest.raises(ValueError):
+        runner._validate(args)
+
+
 def test_cycle_v2_basis_backend_is_forwarded_only_to_cycle_and_bound_to_config(
     tmp_path: Path,
 ) -> None:
@@ -285,7 +406,9 @@ def test_central_source_inventory_covers_imported_child_code_and_tree_config():
     assert "research/tree_augmentation/config.yaml" in snapshot
     assert "research/tree_augmentation/datasets.yaml" in snapshot
     assert "scripts/gpu_profiles.py" in snapshot
+    assert "scripts/telemetry_validation.py" in snapshot
     assert "scripts/verify_gpu_lock.py" in snapshot
+    assert "src/chartgat/observability.py" in snapshot
 
 
 def test_run_logged_appends_a_resume_attempt_to_an_existing_log(tmp_path: Path):
@@ -297,6 +420,31 @@ def test_run_logged_appends_a_resume_attempt_to_an_existing_log(tmp_path: Path):
     assert "first attempt" in content
     assert "=== resumed " in content
     assert "second attempt" in content
+
+
+def test_run_logged_honors_preexisting_stop_request_for_its_exact_child(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    command = [sys.executable, "-c", "import time; time.sleep(30)"]
+    log = tmp_path / "interrupted-child.log"
+    runner._STOP_ACTIVE_CHILDREN.set()
+    started = time.monotonic()
+    try:
+        returncode = runner._run_logged(command, log, runner._environment())
+    finally:
+        runner._STOP_ACTIVE_CHILDREN.clear()
+
+    assert returncode != 0
+    assert time.monotonic() - started < 10
+    event = json.loads(log.read_text(encoding="utf-8"))
+    assert event["event"] == "owned_child_signal"
+    assert event["command"] == command
+    assert event["signal"] == "terminate"
+    assert isinstance(event["pid"], int) and event["pid"] > 0
+    assert "coordinator already requested interruption" in event["reason"]
+    assert json.loads(capsys.readouterr().err) == event
+    with runner._ACTIVE_CHILDREN_LOCK:
+        assert not runner._ACTIVE_CHILDREN
 
 
 def test_dry_run_prints_complete_plan_without_writes_or_processes(
@@ -334,6 +482,8 @@ def test_dry_run_prints_complete_plan_without_writes_or_processes(
     assert "child profiles=['reference', 'large']" in output
     assert "--profiles reference,large" in output
     assert "--basis-backend dfs_fundamental" in output
+    assert "execution_classification=plan_only" in output
+    assert "debug_or_smoke=false" in output
     assert "no files or directories were written" in output
     assert list(tmp_path.iterdir()) == []
 
@@ -617,6 +767,93 @@ def test_success_runs_tracks_sequentially_and_certifies_all_summaries(
     assert manifest["completed_counts"]["verified_model_trainings"] == 61
     assert all(job["status"] == "passed" for job in manifest["jobs"])
     assert all(len(job["result"]["summary_sha256"]) == 64 for job in manifest["jobs"])
+    assert manifest["protocol"]["execution_classification"] == "final_research_training"
+    assert manifest["protocol"]["debug_or_smoke_mode"] is False
+    assert manifest["protocol"]["batch_selection"]["automatic_downscale"] is False
+    assert manifest["protocol"]["batch_selection"]["throughput_candidate_sweep"] is False
+
+
+def test_distinct_devices_run_independent_tracks_concurrently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    barrier = threading.Barrier(2, timeout=5)
+    calls: list[str] = []
+
+    def dispatch(command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        calls.append(_option(command, "--device"))
+        barrier.wait()
+        _write_summary(command)
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    options = [
+        "--tracks",
+        "conductance",
+        "cycle",
+        "--devices",
+        "cuda:0",
+        "cuda:1",
+        *_base_options(tmp_path),
+    ]
+    assert runner.main(options) == 0
+    assert sorted(calls) == ["cuda:0", "cuda:1"]
+    manifest = json.loads(
+        (tmp_path / "rich_scaling/unit/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["protocol"]["hardware_profile"]["cross_track_concurrency"] == 2
+    assert manifest["protocol"]["hardware_profile"]["same_device_concurrency"] == 1
+    assert [job["status"] for job in manifest["jobs"]] == ["passed", "passed"]
+
+
+def test_keyboard_interrupt_stops_children_before_executor_wait_and_records_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    child_started = threading.Event()
+    child_released = threading.Event()
+    order: list[str] = []
+
+    def dispatch(_command: list[str], _log: Path, _environment: dict[str, str]) -> int:
+        child_started.set()
+        assert child_released.wait(timeout=5)
+        order.append("child-finished")
+        return 0
+
+    def interrupt_completion(_futures: object) -> object:
+        assert child_started.wait(timeout=5)
+        raise KeyboardInterrupt("unit interruption")
+
+    signal_event = {
+        "event": "owned_child_signal",
+        "pid": 123,
+        "command": ["python", "child.py"],
+        "signal": "terminate",
+        "reason": "unit interruption",
+        "log_path": str(tmp_path / "child.log"),
+    }
+
+    def stop_children(
+        *, reason: str, original_error: BaseException | None = None
+    ) -> list[dict[str, object]]:
+        assert "KeyboardInterrupt" in reason
+        assert isinstance(original_error, KeyboardInterrupt)
+        assert str(original_error) == "unit interruption"
+        order.append("stop-children")
+        child_released.set()
+        return [signal_event]
+
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    monkeypatch.setattr(runner.concurrent.futures, "as_completed", interrupt_completion)
+    monkeypatch.setattr(runner, "_stop_active_children", stop_children)
+
+    assert runner.main(["--tracks", "conductance", *_base_options(tmp_path)]) == 130
+    assert order == ["stop-children", "child-finished"]
+    manifest = json.loads(
+        (tmp_path / "rich_scaling/unit/manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["status"] == "failed"
+    assert manifest["jobs"][0]["status"] == "failed"
+    assert manifest["interruption"]["error"] == "KeyboardInterrupt: unit interruption"
+    assert manifest["child_signal_events"] == [signal_event]
 
 
 def test_partial_version_matrix_runs_and_validates_only_selected_versions(
@@ -758,6 +995,25 @@ def test_default_failure_policy_continues_later_tracks_and_marks_overall_failed(
     assert manifest["status"] == "failed"
     assert [job["status"] for job in manifest["jobs"]] == ["failed", "passed", "passed"]
     assert manifest["jobs"][0]["returncode"] == 9
+
+
+def test_failed_manifest_write_does_not_replace_child_failure_return_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(runner, "_run_logged", lambda *_args: 9)
+    real_atomic_write = runner._atomic_write_json
+
+    def atomic_write(path: Path, payload: dict) -> None:
+        if payload.get("status") == "failed" or any(
+            job.get("status") == "failed" for job in payload.get("jobs", [])
+        ):
+            raise OSError("central manifest disk failure")
+        real_atomic_write(path, payload)
+
+    monkeypatch.setattr(runner, "_atomic_write_json", atomic_write)
+
+    assert runner.main(["--tracks", "conductance", *_base_options(tmp_path)]) == 1
+    assert "central manifest disk failure" in capsys.readouterr().err
 
 
 def test_fail_fast_leaves_later_tracks_pending(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

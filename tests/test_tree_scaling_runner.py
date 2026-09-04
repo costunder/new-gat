@@ -10,13 +10,26 @@ import threading
 from pathlib import Path
 
 import pytest
+import torch
 
+from chartgat.observability import finalize_resource_observability, runtime_resource_snapshot
 from research.tree_augmentation import paper as tree_paper
 from scripts import run_tree_scaling as runner
 
 
 def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _resource_observability() -> dict:
+    device = torch.device("cpu")
+    return finalize_resource_observability(
+        runtime_resource_snapshot(device),
+        device,
+        peak_allocated_bytes=None,
+        peak_reserved_bytes=None,
+        sample_interval_seconds=1.0,
+    )
 
 
 def test_default_matrix_trains_both_versions_across_larger_profiles() -> None:
@@ -31,6 +44,8 @@ def test_default_matrix_trains_both_versions_across_larger_profiles() -> None:
     assert args.suites == ("csl", "zinc")
     assert args.profiles == ("reference", "large")
     assert args.model_seeds == (0,)
+    assert args.batch_size == 16
+    assert args.workers == 4
     assert len(jobs) == 4
     assert sum(len(job["trained_models"]) for job in jobs) == 8
     assert len(args.suites) * len(runner.MODELS) == 4
@@ -247,6 +262,49 @@ def test_concurrent_wave_preserves_successful_peer_and_retries_only_failure(
     assert [job["status"] for job in jobs] == ["passed", "passed"]
 
 
+def test_job_wave_state_write_failure_does_not_replace_worker_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    primary = RuntimeError("scientific worker failure")
+    jobs = [
+        {
+            "status": "pending",
+            "command": ["job-0"],
+            "log_path": str(tmp_path / "job-0.log"),
+        }
+    ]
+    manifest = {"jobs": jobs, "sources": {}}
+    writes = 0
+
+    def write_state(_run_dir: Path, _manifest: dict) -> None:
+        nonlocal writes
+        writes += 1
+        if writes > 1:
+            raise OSError("state disk failure")
+
+    def fail_wave(_jobs: list[dict], _environment: dict) -> list:
+        raise primary
+
+    monkeypatch.setattr(runner, "_check_sources", lambda _manifest: None)
+    monkeypatch.setattr(runner, "_write_state", write_state)
+    monkeypatch.setattr(runner, "_run_wave", fail_wave)
+
+    with pytest.raises(RuntimeError) as caught:
+        runner._execute_job_matrix(
+            jobs,
+            concurrency=1,
+            environment={},
+            manifest=manifest,
+            run_dir=tmp_path,
+            validator=lambda _job: {},
+            describe=lambda job: job["command"][0],
+        )
+
+    assert caught.value is primary
+    assert any("state disk failure" in note for note in primary.__notes__)
+    assert "state disk failure" in capsys.readouterr().err
+
+
 def test_default_dry_run_reports_seed_zero_plan_without_writes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -266,13 +324,11 @@ def test_paper_scaling_overrides_are_opt_in_and_validated() -> None:
     assert args.optimizer_updates is None
     assert args.train_charts_per_graph is None
     assert args.eval_charts_per_graph is None
+    loaded_defaults, _ = tree_paper._load_settings()
     defaults = {
-        "hidden_dim": 64,
-        "message_layers": 2,
-        "optimizer_updates": 800,
-        "train_charts_per_graph": 8,
-        "eval_charts_per_graph": 8,
+        key: int(loaded_defaults[key]) for key in runner.PROFILE_CONFIGS["reference"]
     }
+    assert defaults == runner.PROFILE_CONFIGS["reference"]
     effective, overrides = tree_paper._apply_setting_overrides(
         defaults,
         hidden_dim=256,
@@ -392,14 +448,27 @@ def _write_child(job: dict[str, object], *, malformed: str | None = None) -> Non
         path.write_bytes(f"unit-{name}".encode())
         checkpoints[name] = str(path.resolve())
     amp = "--no-amp" not in command
+    workers = int(command[command.index("--workers") + 1])
     runtime = {
         "batch_size": int(command[command.index("--batch-size") + 1]),
-        "workers": int(command[command.index("--workers") + 1]),
+        "workers": workers,
+        "persistent_workers": False,
+        "prefetch_factor": 2 if workers > 0 else None,
+        "data_loader": {
+            "num_workers": workers,
+            "persistent_workers": False,
+            "prefetch_factor": 2 if workers > 0 else None,
+        },
         "amp_requested": amp,
         "amp_effective": amp,
         "elapsed_seconds": 1.25,
         "peak_gpu_allocated_bytes": 1_000_000,
         "peak_gpu_reserved_bytes": 2_000_000,
+        "resource_observability": _resource_observability(),
+        "throughput": {
+            "scope": "unit fixture two-model training",
+            "optimizer_updates_per_second": 10.0,
+        },
     }
     summary = {
         "suite": job["suite"],
@@ -478,14 +547,27 @@ def _write_selected_child(job: dict[str, object]) -> None:
         for name in runner.MODELS
     }
     amp = "--no-amp" not in command
+    workers = int(command[command.index("--workers") + 1])
     runtime = {
         "batch_size": int(command[command.index("--batch-size") + 1]),
-        "workers": int(command[command.index("--workers") + 1]),
+        "workers": workers,
+        "persistent_workers": False,
+        "prefetch_factor": 2 if workers > 0 else None,
+        "data_loader": {
+            "num_workers": workers,
+            "persistent_workers": False,
+            "prefetch_factor": 2 if workers > 0 else None,
+        },
         "amp_requested": amp,
         "amp_effective": amp,
         "elapsed_seconds": 0.5,
         "peak_gpu_allocated_bytes": 750_000,
         "peak_gpu_reserved_bytes": 1_500_000,
+        "resource_observability": _resource_observability(),
+        "throughput": {
+            "scope": "unit fixture selected-checkpoint evaluation",
+            "evaluated_view_model_pairs_per_second": 10.0,
+        },
     }
     summary = {
         "suite": job["suite"],
@@ -1012,6 +1094,8 @@ def test_source_snapshot_covers_tree_model_runner_and_shared_math() -> None:
         "research/tree_augmentation/config.yaml",
         "src/chartgat/algebra.py",
         "src/chartgat/graphs.py",
+        "src/chartgat/observability.py",
         "src/chartgat/seeds.py",
+        "scripts/telemetry_validation.py",
     ):
         assert name in snapshot and len(snapshot[name]) == 64

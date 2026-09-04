@@ -14,11 +14,12 @@ from typing import Any
 import torch
 
 from chartgat.cache import atomic_publish, atomic_write_json
+from chartgat.observability import RuntimeResourceMonitor, observed
 
 from ..ablation.model import state_sha256
 from ..ablation.train import _configure_fp32, _make_data, _require_cuda, training_loss
 from ..benchmark import _seed, _versions
-from ..benchmark_data import load_dataset, sha256_file
+from ..benchmark_data import load_dataset, sha256_file, tensor_hash
 from .diagnostics import (
     evaluate,
     layer_diagnostics,
@@ -43,6 +44,8 @@ from .protocol import (
 )
 from .sampling import TransductiveGraphSampler
 
+FAILURE_RESOURCE_FILENAME = "failure-resource-observability.json"
+
 ROOT = Path(__file__).resolve().parents[3]
 RESUME_SEMANTICS = (
     "epoch-boundary deterministic resume from stored model/optimizer/RNG state; "
@@ -50,6 +53,7 @@ RESUME_SEMANTICS = (
 )
 _PARAMETER_GROUPS = ("backbone", "spatial_w", "beta", "conductance")
 _SHARED_IMPLEMENTATION_SOURCES = (
+    "src/chartgat/observability.py",
     "research/conductance_gat/ablation/train.py",
     "research/conductance_gat/benchmark.py",
     "research/conductance_gat/benchmark_data.py",
@@ -78,6 +82,7 @@ def architecture_configuration(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def configuration(args: argparse.Namespace) -> dict[str, Any]:
+    loader_workers = args.workers if args.dataset == "ppi" else 0
     return {
         **COMMON,
         **architecture_configuration(args),
@@ -85,7 +90,7 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
         "epochs": args.epochs,
         "patience": args.patience,
         "batch_size": args.batch_size,
-        "workers": args.workers,
+        "workers": loader_workers,
         "device": args.device,
         "edge_chunk_size": args.edge_chunk_size,
         "sampling": args.sampling,
@@ -97,10 +102,15 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
         "amp": args.precision == "bf16",
         "tf32": args.tf32,
         "pin_memory": args.pin_memory,
-        "loader_workers": args.workers,
+        "loader_workers": loader_workers,
+        "persistent_workers": loader_workers > 0,
+        "prefetch_factor": 2 if loader_workers > 0 else None,
+        "worker_configuration_source": getattr(
+            args, "worker_configuration_source", "explicit_cli"
+        ),
         "loader_worker_policy": (
-            "zero: PPI has only 20 in-memory training graphs; subprocess IPC/startup can "
-            "cost more than collating three batch-8 steps and complicates exact resume audits"
+            "PPI uses the configured worker pool with deterministic epoch-seeded shuffling; "
+            "transductive full/sampled graphs use no DataLoader workers"
         ),
         "sample_prefetch": args.sample_prefetch,
     }
@@ -110,6 +120,11 @@ def resolve_hardware_arguments(args: argparse.Namespace) -> None:
     """Resolve explicit execution defaults before identity/config creation."""
 
     profile = HARDWARE_PROFILES[args.hardware_profile]
+    if args.workers is None:
+        args.workers = 4 if args.dataset == "ppi" else 0
+        args.worker_configuration_source = "dataset_default"
+    elif not hasattr(args, "worker_configuration_source"):
+        args.worker_configuration_source = "explicit_cli"
     if args.batch_size is None:
         args.batch_size = (
             profile["ppi_batch_size"]
@@ -177,10 +192,12 @@ def validate_hardware_runtime(args: argparse.Namespace, device: torch.device) ->
         "graph_batch_size": args.batch_size,
         "sample_prefetch": args.sample_prefetch,
         "pin_memory": args.pin_memory,
-        "loader_workers": args.workers,
+        "loader_workers": args.workers if args.dataset == "ppi" else 0,
+        "persistent_workers": args.dataset == "ppi" and args.workers > 0,
+        "prefetch_factor": 2 if args.dataset == "ppi" and args.workers > 0 else None,
         "loader_worker_policy": (
-            "zero: PPI is 20 static in-memory training graphs; multi-process IPC is not "
-            "assumed faster and would widen the exact-resume audit surface"
+            "PPI graph batches use deterministic epoch-seeded DataLoader shuffling; "
+            "transductive full/sampled graphs do not construct a DataLoader"
         ),
     }
 
@@ -323,6 +340,68 @@ def make_optimizer(model) -> torch.optim.AdamW:
     return torch.optim.AdamW(groups, lr=COMMON["lr"])
 
 
+def validate_optimizer_parameter_ownership(
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer
+) -> None:
+    expected = {
+        id(parameter): name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    owned: dict[int, str] = {}
+    duplicates: list[str] = []
+    for group in optimizer.param_groups:
+        group_name = str(group["name"])
+        for parameter in group["params"]:
+            identifier = id(parameter)
+            if identifier in owned:
+                duplicates.append(expected.get(identifier, f"unknown:{identifier}"))
+            owned[identifier] = group_name
+    missing = [name for identifier, name in expected.items() if identifier not in owned]
+    unexpected = [identifier for identifier in owned if identifier not in expected]
+    wrong_group = [
+        name
+        for identifier, name in expected.items()
+        if identifier in owned and owned[identifier] != parameter_group(name)
+    ]
+    if missing or unexpected or duplicates or wrong_group:
+        raise RuntimeError(
+            "V5 optimizer ownership mismatch; "
+            f"missing={missing}, unexpected_count={len(unexpected)}, "
+            f"duplicates={duplicates}, wrong_group={wrong_group}"
+        )
+
+
+def validate_active_gradient_connectivity(
+    model: torch.nn.Module, active_groups: list[str]
+) -> None:
+    active = set(active_groups)
+    expected = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter_group(name) in active
+    ]
+    requires_mismatch = [
+        name for name, parameter in expected if not parameter.requires_grad
+    ]
+    missing = [
+        name
+        for name, parameter in expected
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    nonfinite = [
+        name
+        for name, parameter in expected
+        if parameter.grad is not None and not torch.isfinite(parameter.grad).all()
+    ]
+    if requires_mismatch or missing or nonfinite:
+        raise RuntimeError(
+            "V5 active parameter groups are not connected to finite task gradients; "
+            f"requires_grad_mismatch={requires_mismatch}, missing={missing}, "
+            f"nonfinite={nonfinite}"
+        )
+
+
 def optimizer_metadata(optimizer) -> list[dict[str, Any]]:
     return [
         {
@@ -364,6 +443,201 @@ def merge_efficiency(
         "peak_cuda_reserved_bytes": max(
             int(previous_peak_reserved_bytes), int(current_peak_reserved_bytes)
         ),
+    }
+
+
+def _integer_distribution(values: list[int]) -> dict[str, int | float]:
+    if not values:
+        raise ValueError("cannot summarize an empty observation")
+    return {
+        "count": len(values),
+        "minimum": min(values),
+        "maximum": max(values),
+        "mean": sum(values) / len(values),
+        "total": sum(values),
+    }
+
+
+def _payload_graph_observability(payload: dict[str, Any]) -> dict[str, Any]:
+    graphs = payload.get("graphs")
+    if not isinstance(graphs, list) or not graphs:
+        raise ValueError("verified payload must contain at least one graph")
+    if any(not isinstance(graph, dict) for graph in graphs):
+        raise ValueError("verified payload graph rows must be mappings")
+    features = [graph.get("x") for graph in graphs]
+    if any(not isinstance(value, torch.Tensor) or value.ndim != 2 for value in features):
+        raise ValueError("verified payload graph features must be rank-two tensors")
+    node_counts = [int(value.shape[0]) for value in features]
+    feature_widths = sorted({int(value.shape[1]) for value in features})
+    edge_counts: list[int] = []
+    edge_fields: list[str] = []
+    for graph in graphs:
+        located = None
+        for name in ("incidence_edge_index", "incidence", "edge_index"):
+            candidate = graph.get(name)
+            if isinstance(candidate, torch.Tensor) and candidate.ndim == 2:
+                located = candidate
+                edge_fields.append(name)
+                break
+        if located is not None:
+            edge_counts.append(int(located.shape[1]))
+    if len(edge_counts) == len(graphs):
+        edge_observation: Any = _integer_distribution(edge_counts)
+        edge_reason = None
+    else:
+        edge_observation = observed(
+            None,
+            reason=(
+                f"recognized an incidence/edge tensor for {len(edge_counts)} of "
+                f"{len(graphs)} verified graphs"
+            ),
+        )
+        edge_reason = edge_observation["reason"]
+    target_shapes = sorted(
+        {
+            tuple(int(dimension) for dimension in graph["y"].shape)
+            for graph in graphs
+            if isinstance(graph.get("y"), torch.Tensor)
+        }
+    )
+    return {
+        "official_graph_count": len(graphs),
+        "nodes_per_graph": _integer_distribution(node_counts),
+        "stored_edge_columns_per_graph": edge_observation,
+        "stored_edge_tensor_fields": sorted(set(edge_fields)),
+        "stored_edge_count_limitation": edge_reason,
+        "input_tensor_shapes": {
+            "node_features": ["variable_batch_nodes", *feature_widths],
+            "feature_widths": feature_widths,
+            "target_shapes_observed": [list(shape) for shape in target_shapes],
+        },
+    }
+
+
+def _v5_data_observability(
+    payload: dict[str, Any],
+    data: Any,
+    indices: dict[str, torch.Tensor] | None,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    graph_observation = _payload_graph_observability(payload)
+    if indices is not None:
+        split_counts = {name: int(value.numel()) for name, value in indices.items()}
+        total_units = int(data.x.shape[0])
+        unit = "nodes"
+    elif isinstance(data, dict):
+        split_counts = {
+            name: len(loader.dataset)
+            for name, loader in data.items()
+            if hasattr(loader, "dataset")
+        }
+        total_units = graph_observation["official_graph_count"]
+        unit = "graphs"
+    else:
+        split_counts = {}
+        total_units = graph_observation["official_graph_count"]
+        unit = "graphs"
+    training_units = split_counts.get("train", 0)
+    validation_units = sum(
+        split_counts.get(name, 0) for name in ("validation", "valid", "val")
+    )
+    actually_used = training_units + validation_units
+    if total_units > 0:
+        used_fraction = observed(actually_used / total_units, unit="fraction")
+    else:
+        used_fraction = observed(
+            None, reason="verified full dataset count is zero", unit="fraction"
+        )
+    sampling_ratio = (
+        observed(1.0, unit="fraction")
+        if args.sampling == "full"
+        else observed(
+            None,
+            reason=(
+                "neighbor/cluster sampling has no single static edge ratio; sampler metadata "
+                "and observed batch counts define the exact execution"
+            ),
+            unit="fraction",
+        )
+    )
+    return {
+        **graph_observation,
+        "full_dataset_unit": unit,
+        "full_dataset_count": total_units,
+        "actual_split_counts": split_counts,
+        "optimization_count": training_units,
+        "validation_selection_count": validation_units,
+        "test_evaluation_count": 0,
+        "actual_used_count": actually_used,
+        "actual_used_fraction_of_full_dataset": used_fraction,
+        "sampling_ratio": sampling_ratio,
+        "sampling_mode": args.sampling,
+        "subset_or_fast_mode": False,
+        "time_window": observed(
+            None, reason="not applicable to static graph benchmarks", unit="steps"
+        ),
+        "input_resolution": observed(
+            None, reason="not applicable to graph feature tensors"
+        ),
+    }
+
+
+def _v5_batch_observability(
+    data: Any,
+    indices: dict[str, torch.Tensor] | None,
+    sampler: TransductiveGraphSampler | None,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if indices is not None and sampler is None:
+        physical_batch_size, batch_unit, batches_per_epoch = 1, "full_graph", 1
+    elif indices is not None:
+        physical_batch_size, batch_unit, batches_per_epoch = (
+            int(args.batch_size),
+            "sampler_seed_nodes_or_partitions",
+            None,
+        )
+    else:
+        physical_batch_size, batch_unit = int(args.batch_size), "graphs"
+        batches_per_epoch = len(data["train"])
+    batches_observation = (
+        observed(batches_per_epoch, unit="batches")
+        if batches_per_epoch is not None
+        else observed(
+            None,
+            reason=(
+                "the sampler can produce topology-dependent batches; actual per-epoch "
+                "counts are recorded in history"
+            ),
+            unit="batches",
+        )
+    )
+    planned_batches = (
+        observed(args.epochs * batches_per_epoch, unit="batches")
+        if batches_per_epoch is not None
+        else observed(
+            None,
+            reason="training batches per epoch are topology-dependent",
+            unit="batches",
+        )
+    )
+    return {
+        "batch_unit": batch_unit,
+        "configured_physical_batch_size": physical_batch_size,
+        "gradient_accumulation_steps": 1,
+        "data_parallel_workers": 1,
+        "effective_batch_size": physical_batch_size,
+        "effective_batch_size_formula": (
+            f"{physical_batch_size} physical x 1 accumulation x 1 data-parallel worker"
+        ),
+        "training_batches_per_epoch": batches_observation,
+        "planned_maximum_training_batches": planned_batches,
+        "dataloader_workers": args.workers if indices is None else 0,
+        "pin_memory": args.pin_memory if indices is None else False,
+        "persistent_workers": indices is None and args.workers > 0,
+        "prefetch_factor": 2 if indices is None and args.workers > 0 else None,
+        "sample_prefetch": args.sample_prefetch,
+        "cache": "verified immutable official graph cache; static topology reused",
+        "sampler": sampler.metadata() if sampler is not None else {"mode": "full"},
     }
 
 
@@ -429,7 +703,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beta-initial", type=float, default=COMMON["beta_initial"])
     parser.add_argument("--beta-min", type=float)
     parser.add_argument("--beta-max", type=float)
-    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Default: 4 for PPI graph minibatches, 0 for transductive full graphs",
+    )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--edge-chunk-size", type=int)
     parser.add_argument("--sampling", choices=SAMPLING_MODES, default="full")
@@ -474,8 +753,10 @@ def validate_args(args: argparse.Namespace) -> None:
         args.beta_min,
         args.beta_max,
     )
-    if args.workers != 0:
-        raise ValueError("V5 currently requires workers=0 for exact resumability")
+    if args.workers < 0:
+        raise ValueError("workers must be nonnegative")
+    if args.dataset != "ppi" and args.workers != 0:
+        raise ValueError("transductive V5 datasets use no DataLoader and require workers=0")
     if args.dataset != "ppi" and args.batch_size != BATCH_SIZE_BY_DATASET[args.dataset]:
         raise ValueError("transductive full/sampled graph batch-size must be 1")
     if args.dataset == "ppi" and args.hardware_profile == "portable" and args.batch_size != 2:
@@ -586,6 +867,23 @@ def _save(path: Path, payload: dict[str, Any]) -> None:
 def _canonical_sha256(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
     return hashlib.sha256(encoded).hexdigest()
+
+
+def shared_initial_state_sha256(model: torch.nn.Module) -> str:
+    """Hash only parameters and buffers that exist in both V5 comparison arms."""
+
+    digest = hashlib.sha256()
+    included = 0
+    for name, tensor in model.state_dict().items():
+        if ".operator.estimator." in name:
+            continue
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(tensor_hash(tensor).encode("ascii"))
+        included += 1
+    if included == 0:
+        raise RuntimeError("V5 model has no shared state to fingerprint")
+    return digest.hexdigest()
 
 
 def implementation_source_hashes() -> dict[str, str]:
@@ -725,12 +1023,134 @@ def validate_selected_checkpoint(
         raise ValueError("best.pt selection role is invalid")
 
 
+def _finish_resource_monitor_once(
+    state: dict[str, Any],
+    device: torch.device,
+    *,
+    peak_allocated_bytes: int | None = None,
+    peak_reserved_bytes: int | None = None,
+    preserve_primary_error: bool = False,
+) -> dict[str, Any]:
+    """Stop the sampler once, including when CUDA work raises."""
+
+    if state.get("finished"):
+        resources = state.get("resources")
+        if not isinstance(resources, dict):
+            raise RuntimeError("resource monitor finish previously failed")
+        return resources
+    monitor = state.get("monitor")
+    if monitor is None or not callable(getattr(monitor, "finish", None)):
+        raise RuntimeError("resource monitor was not started")
+    if peak_allocated_bytes is None and device.type == "cuda":
+        try:
+            peak_allocated_bytes = int(torch.cuda.max_memory_allocated(device))
+        except BaseException as exc:
+            if not preserve_primary_error and not isinstance(exc, (RuntimeError, ValueError)):
+                raise
+            state.setdefault("peak_query_errors", []).append(
+                f"max_memory_allocated failed with {type(exc).__name__}: {exc}"
+            )
+    if peak_reserved_bytes is None and device.type == "cuda":
+        try:
+            peak_reserved_bytes = int(torch.cuda.max_memory_reserved(device))
+        except BaseException as exc:
+            if not preserve_primary_error and not isinstance(exc, (RuntimeError, ValueError)):
+                raise
+            state.setdefault("peak_query_errors", []).append(
+                f"max_memory_reserved failed with {type(exc).__name__}: {exc}"
+            )
+    state["finished"] = True
+    resources = monitor.finish(
+        peak_allocated_bytes=peak_allocated_bytes,
+        peak_reserved_bytes=peak_reserved_bytes,
+    )
+    if state.get("peak_query_errors"):
+        resources["failure_peak_query_errors"] = list(state["peak_query_errors"])
+    state["resources"] = resources
+    return resources
+
+
+def _record_failure_resources(
+    output: Path,
+    args: argparse.Namespace,
+    error: BaseException,
+    state: dict[str, Any],
+    device: torch.device,
+) -> None:
+    """Best-effort failure telemetry that never replaces the training exception."""
+
+    resources = state.get("resources")
+    cleanup_error = None
+    if state.get("monitor") is not None and not state.get("finished"):
+        try:
+            resources = _finish_resource_monitor_once(
+                state,
+                device,
+                preserve_primary_error=True,
+            )
+        except BaseException as exc:  # preserve and annotate the original training failure
+            cleanup_error = f"{type(exc).__name__}: {exc}"
+    elif state.get("finished") and not isinstance(resources, dict):
+        cleanup_error = "resource monitor finish failed before telemetry was returned"
+    payload = {
+        "schema_version": 1,
+        "status": "failed",
+        "research_suite": SUITE,
+        "dataset": args.dataset,
+        "condition": args.condition,
+        "error": f"{type(error).__name__}: {error}",
+        "resource_observability": resources,
+        "resource_observability_unavailable_reason": cleanup_error,
+    }
+    try:
+        atomic_write_json(output / FAILURE_RESOURCE_FILENAME, payload)
+    except BaseException as exc:  # failure reporting must not mask the scientific failure
+        error.add_note(
+            "failure resource telemetry could not be written: "
+            f"{type(exc).__name__}: {exc}"
+        )
+    if cleanup_error is not None:
+        error.add_note(f"resource monitor cleanup failed: {cleanup_error}")
+
+
 def train_model(payload, protocol, args, device: torch.device, output: Path) -> dict[str, Any]:
+    resource_state: dict[str, Any] = {}
+    try:
+        return _train_model_impl(
+            payload,
+            protocol,
+            args,
+            device,
+            output,
+            resource_state=resource_state,
+        )
+    except BaseException as exc:
+        if resource_state.get("monitor") is not None:
+            _record_failure_resources(output, args, exc, resource_state, device)
+        raise
+
+
+def _train_model_impl(
+    payload,
+    protocol,
+    args,
+    device: torch.device,
+    output: Path,
+    *,
+    resource_state: dict[str, Any],
+) -> dict[str, Any]:
     _require_cuda(device)
     validate_args(args)
     if payload.get("dataset") != args.dataset:
         raise ValueError("requested dataset does not match the verified payload")
     hardware_runtime = validate_hardware_runtime(args, device)
+    hardware_runtime.update(
+        selected_device=str(device),
+        visible_cuda_device_count=torch.cuda.device_count(),
+    )
+    resource_monitor = RuntimeResourceMonitor(device)
+    resource_start = resource_monitor.start()
+    resource_state.update(monitor=resource_monitor, finished=False)
     configure_compute(args)
     _seed(args.model_seed)
     data, indices, sampler = _prepare_data(payload, args, device)
@@ -744,8 +1164,74 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
         edge_chunk_size=args.edge_chunk_size,
     ).to(device)
     initial_state_sha256 = state_sha256(model)
+    shared_state_sha256 = shared_initial_state_sha256(model)
     optimizer = make_optimizer(model)
+    validate_optimizer_parameter_ownership(model, optimizer)
     schedule = phase_schedule(args.epochs, list(args.phase_fractions))
+    total_parameters_at_construction = sum(value.numel() for value in model.parameters())
+    optimizer_owned_parameters = sum(
+        value.numel() for group in optimizer.param_groups for value in group["params"]
+    )
+    parameter_observability = {
+        "total_parameters": total_parameters_at_construction,
+        "trainable_parameters_at_construction": sum(
+            value.numel() for value in model.parameters() if value.requires_grad
+        ),
+        "optimizer_owned_parameters": optimizer_owned_parameters,
+        "frozen_parameters_at_construction": (
+            total_parameters_at_construction - optimizer_owned_parameters
+        ),
+        "optimizer_groups": optimizer_metadata(optimizer),
+    }
+    data_observability = _v5_data_observability(payload, data, indices, args)
+    batch_observability = _v5_batch_observability(data, indices, sampler, args)
+    pre_run_observability = {
+        "status": "pre_run_configuration",
+        "model": {
+            "name": "graph_conditioned_conductance_v5",
+            "condition": args.condition,
+            "layers": args.layers,
+            "hidden_dimension": args.hidden_channels,
+            "channels": args.hidden_channels,
+            "attention_heads": args.heads,
+            "ffn_multiplier": args.ffn_multiplier,
+            **parameter_observability,
+        },
+        "data": data_observability,
+        "batching": batch_observability,
+        "optimization": {
+            "epochs_requested": args.epochs,
+            "early_stopping_patience": args.patience,
+            "planned_maximum_optimizer_steps": batch_observability[
+                "planned_maximum_training_batches"
+            ],
+            "actual_optimizer_steps": observed(
+                None, reason="training has not started", unit="steps"
+            ),
+        },
+        "precision": {
+            "precision": args.precision,
+            "amp": args.precision == "bf16",
+            "autocast_dtype": (
+                "bfloat16"
+                if args.precision == "bf16"
+                else observed(
+                    None,
+                    reason="autocast is disabled by the fp32 execution profile",
+                )
+            ),
+            "tf32": args.tf32,
+        },
+        "hardware": hardware_runtime,
+        "resources": resource_start,
+        "modes": {
+            "debug": False,
+            "subset": False,
+            "fast_mode": False,
+            "test_evaluated": False,
+        },
+    }
+    print(json.dumps(pre_run_observability, sort_keys=True), flush=True)
     resume_identity = build_resume_identity(
         args, protocol, schedule, initial_state_sha256=initial_state_sha256
     )
@@ -766,6 +1252,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
     best_checkpoint_sha256 = None
     best_recovery_slot = "fresh"
     effective_group_steps = {name: 0 for name in _PARAMETER_GROUPS}
+    gradient_groups_validated_this_invocation: set[str] = set()
     if args.resume and last_path.exists():
         saved = torch.load(last_path, map_location=device, weights_only=False)
         if saved.get("schema_version") != 3:
@@ -833,6 +1320,16 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
                 loss, count = training_loss(logits, graph, train_indices)
             if phase_state["active_parameter_groups"]:
                 loss.backward()
+                groups_requiring_validation = set(
+                    phase_state["active_parameter_groups"]
+                ) - gradient_groups_validated_this_invocation
+                if groups_requiring_validation:
+                    validate_active_gradient_connectivity(
+                        model, sorted(groups_requiring_validation)
+                    )
+                    gradient_groups_validated_this_invocation.update(
+                        groups_requiring_validation
+                    )
                 if (
                     args.condition == "shared_dynamic_c"
                     and phase_state["coordinate"] in {"conductance", "joint"}
@@ -1043,7 +1540,37 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
         torch.cuda.max_memory_allocated(device),
         torch.cuda.max_memory_reserved(device),
     )
-    return {
+    resource_observability = _finish_resource_monitor_once(
+        resource_state,
+        device,
+        peak_allocated_bytes=int(efficiency["peak_cuda_allocated_bytes"]),
+        peak_reserved_bytes=int(efficiency["peak_cuda_reserved_bytes"]),
+    )
+    resource_observability["cuda_allocator_peak_boundary"] = (
+        "CUDA statistics reset immediately before this invocation's epoch loop; "
+        "cumulative maxima are restored from last.pt across resumed invocations"
+    )
+    observed_training_batches = sum(int(row["train_batches"]) for row in history)
+    optimization_observability = {
+        "epochs_requested": args.epochs,
+        "epochs_completed": len(history),
+        "early_stopping_patience": args.patience,
+        "planned_maximum_optimizer_steps": batch_observability[
+            "planned_maximum_training_batches"
+        ],
+        "actual_training_batches": observed_training_batches,
+        "actual_optimizer_steps": optimizer_steps,
+        "effective_optimizer_steps_by_group": effective_group_steps,
+        "gradient_accumulation_steps": 1,
+        "step_definition": (
+            "one optimizer update per physical batch when the scheduled phase has at "
+            "least one active parameter group"
+        ),
+        "optimizer_step_difference_from_training_batches": (
+            observed_training_batches - optimizer_steps
+        ),
+    }
+    result = {
         "schema_version": 1,
         "status": "passed",
         "research_suite": SUITE,
@@ -1057,22 +1584,40 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
         "epochs_run": len(history),
         "optimizer_steps": optimizer_steps,
         "effective_optimizer_steps_by_group": effective_group_steps,
+        "optimization_observability": optimization_observability,
         "comparison_design": COMPARISON_DESIGN,
         "hardware_execution": {
             **hardware_runtime,
             "timing_boundary": "CUDA synchronized before measured run and final accounting",
-            "gpu_sm_utilization": "not measured; use a time-series device monitor",
+            "gpu_sm_utilization": resource_observability["interval_series"][
+                "gpu_sm_utilization_percent"
+            ],
             "small_full_graph_limit": (
                 "Cora/Citeseer/PubMed are single small full graphs and cannot fill 48 GiB "
                 "without scientifically invalid duplicate work"
             ),
         },
+        "pre_run_observability": pre_run_observability,
+        "resource_observability": resource_observability,
+        "data_observability": data_observability,
+        "batch_observability": batch_observability,
+        "parameter_observability": parameter_observability,
         "gradient_clipping": {
             "max_norm": COMMON["gradient_clip_norm"],
             "error_if_nonfinite": "stream_ordered_async_assert_before_optimizer_step",
             "maximum_observed_preclip_norm": max(
                 row["maximum_preclip_gradient_norm"] for row in history
             ),
+        },
+        "gradient_connectivity": {
+            "validated_parameter_groups_this_invocation": sorted(
+                gradient_groups_validated_this_invocation
+            ),
+            "validation_boundary": (
+                "first actual task-loss backward that activates each parameter group; "
+                "every tensor in that active group must have a finite gradient"
+            ),
+            "optimizer_parameter_ownership": "exact identity and group match validated",
         },
         "global_best_validation": global_best_metric,
         "global_best_epoch": global_best_epoch,
@@ -1116,7 +1661,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
         "last_checkpoint_sha256": sha256_file(last_path),
         "history": str(history_path.resolve()),
         "optimizer_groups": optimizer_metadata(optimizer),
-        "total_parameters": sum(value.numel() for value in model.parameters()),
+        "total_parameters": total_parameters_at_construction,
         "trainable_parameters": sum(
             value.numel() for value in model.parameters() if value.requires_grad
         ),
@@ -1131,6 +1676,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
         "cache_sha256": protocol["data_sha256"],
         "source_sha256": resume_identity["source_sha256"],
         "initial_state_sha256": initial_state_sha256,
+        "shared_initial_state_sha256": shared_state_sha256,
         "history_sha256": sha256_file(history_path),
         "evaluation_split": "validation",
         "test_evaluated": False,
@@ -1157,6 +1703,21 @@ def train_model(payload, protocol, args, device: torch.device, output: Path) -> 
         ),
         **efficiency,
     }
+    print(
+        json.dumps(
+            {
+                "status": "post_run_observability",
+                "dataset": args.dataset,
+                "condition": args.condition,
+                "epochs_completed": len(history),
+                "optimizer_steps": optimizer_steps,
+                "resource_summary": resource_observability["summary"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1192,7 +1753,19 @@ def main(argv: list[str] | None = None) -> int:
         record.update(train_model(payload, protocol, args, device, output))
     except BaseException as exc:
         record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
-        atomic_write_json(output / "metrics.json", record)
+        failure_resources = output / FAILURE_RESOURCE_FILENAME
+        if failure_resources.is_file():
+            record.update(
+                failure_resource_observability=str(failure_resources.resolve()),
+                failure_resource_observability_sha256=sha256_file(failure_resources),
+            )
+        try:
+            atomic_write_json(output / "metrics.json", record)
+        except BaseException as reporting_error:
+            exc.add_note(
+                "failed metrics could not be written without replacing the scientific error: "
+                f"{type(reporting_error).__name__}: {reporting_error}"
+            )
         raise
     atomic_write_json(output / "metrics.json", record)
     print(f"passed: {output}", flush=True)

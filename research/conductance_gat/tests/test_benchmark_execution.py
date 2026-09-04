@@ -16,6 +16,9 @@ from research.conductance_gat.benchmark import (
     _micro_f1_from_counts,
     _prepare_split_indices,
     build_parser,
+    data_observability,
+    optimizer_ownership,
+    validate_first_optimizer_step,
 )
 
 
@@ -36,6 +39,51 @@ def _previous_conv_forward(model, state, incidence, node_graph):
     max_degree.scatter_reduce_(0, node_graph, degree, reduce="amax", include_self=True)
     step = 0.95 / max_degree.clamp_min(1e-12)
     return state - step[node_graph, None] * divergence
+
+
+def test_transductive_observability_reports_full_graph_use_and_label_split_fraction():
+    payload = {
+        "dataset": "cora",
+        "graphs": [
+            {
+                "x": torch.ones(4, 3),
+                "y": torch.arange(4),
+                "incidence_edge_index": torch.tensor([[0, 1], [1, 2]]),
+            }
+        ],
+        "splits": {
+            "train": torch.tensor([True, False, False, False]),
+            "validation": torch.tensor([False, True, True, False]),
+            "test": torch.tensor([False, False, False, True]),
+        },
+    }
+    result = data_observability(payload, used_splits=("train", "validation"))
+    assert result["full_dataset_count"] == result["actual_used_count"] == 4
+    assert result["actual_used_fraction_of_full_dataset"]["value"] == 1.0
+    assert result["requested_split_member_count"] == 3
+    assert result["requested_split_member_fraction_of_full_dataset"]["value"] == 0.75
+    assert result["subset_or_fast_mode"] is False
+
+
+def test_first_optimizer_step_integrity_is_fail_closed():
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    model(torch.ones(2, 3)).sum().backward()
+    result = validate_first_optimizer_step(model, optimizer)
+    assert result["status"] == "passed"
+    assert result["trainable_parameter_tensors"] == 2
+
+    missing_owner = torch.optim.SGD([model.weight], lr=0.1)
+    with pytest.raises(RuntimeError, match="optimizer ownership integrity failed"):
+        optimizer_ownership(model, missing_owner)
+
+    model.bias.grad = None
+    with pytest.raises(FloatingPointError, match="missing=.*bias"):
+        validate_first_optimizer_step(model, optimizer)
+
+    model.bias.grad = torch.full_like(model.bias, float("nan"))
+    with pytest.raises(FloatingPointError, match="nonfinite=.*bias"):
+        validate_first_optimizer_step(model, optimizer)
 
 
 def test_metadata_graph_count_preserves_forward_and_every_gradient():

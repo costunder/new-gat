@@ -38,8 +38,11 @@
 GPU 사전 검사만 성공한 상태가 아니라, 여덟 조건의 epoch 기록과 최종 비교표까지 확인했다.
 
 공통 설정은 hidden 64, conductance 2층, dropout 0.5, Adam lr 0.005, non-gate WD 0.0005,
-최대 200 epochs, patience 50, PPI batch size 2, workers 0이다. FP32로 실행하며
-AMP·TF32·compile은 끈다. arxiv는 full-batch다. 공식 train 정답으로 loss를 계산하고
+최대 200 epochs, patience 50, PPI batch size 2다. 이 표를 만든 과거 실행은 PPI workers
+0이었지만, 현재 재현 runner의 PPI 기본은 workers 4, prefetch factor 2, persistent workers와
+pinned/non-blocking transfer이며 arxiv full-graph는 DataLoader가 없어 workers 0이다. 이
+실행-policy 변경은 과거 artifact의 설정을 소급 변경하지 않는다. FP32로 실행하며
+AMP·TF32·compile은 끈다. 공식 train 정답으로 loss를 계산하고
 validation으로 best checkpoint를 선택했다. **Test split은 평가하지 않았다.**
 비교 실행기는 초기 state, 데이터/cache protocol, 공통 설정의 일치를 검사한다. 같은 초기 상태가
 CUDA scatter 연산의 비트 단위 동일성이나 모든 조건의 동일 종료 epoch까지 보장하지는 않는다.

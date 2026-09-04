@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from dataclasses import fields, replace
 from types import SimpleNamespace
@@ -52,10 +53,16 @@ def test_defaults_keep_paper_datasets_and_only_our_model() -> None:
     assert EXPECTED_SIZES["zinc12k"] == (10000, 1000, 1000)
     assert sum(EXPECTED_SIZES["peptides_struct"]) == 15535
     assert MODEL_NAME == "cycle_set"
+    assert args.workers == 4
+    assert args.prefetch_factor == 2
     assert not hasattr(args, "baselines")
     assert not hasattr(args, "tiny")
     with pytest.raises(SystemExit):
         benchmark.parser().parse_args(["--baselines", "signnet"])
+
+
+def test_v1_hashes_include_failure_safe_resource_monitor() -> None:
+    assert "research/cycle_pe/resource_monitor.py" in benchmark.implementation_hashes()
 
 
 def test_cpu_actual_benchmark_is_rejected() -> None:
@@ -127,12 +134,45 @@ def test_our_model_reuses_existing_layers_and_all_parameters_receive_gradients()
     output = model(batch)
     assert output.shape == (2, 1)
     (output - batch.y).abs().mean().backward()
+    benchmark._validate_first_step_gradients(model)
     assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
     model.eval()
     with torch.no_grad():
         combined = model(batch)
         separate = torch.cat([model(collate([graph])) for graph in graphs])
     torch.testing.assert_close(combined, separate, atol=3e-6, rtol=3e-6)
+
+
+def test_observability_reports_official_loaded_graph_and_batch_counts() -> None:
+    splits = {
+        "train": [_graph(4), _graph(5), _graph(6)],
+        "validation": [_graph(4)],
+    }
+    data = benchmark._data_observability("zinc12k", splits)
+    assert data["official_split_counts"] == {
+        "train": 10_000,
+        "validation": 1_000,
+        "test": 1_000,
+    }
+    assert data["loaded_graph_count"]["value"] == 4
+    assert data["loaded_split_counts"]["test"]["value"] is None
+    assert data["loaded_split_counts"]["test"]["reason"]
+    assert data["graph_statistics"]["nodes_per_graph"]["maximum"]["value"] == 6
+    args = benchmark.parser().parse_args(["--batch-size", "2", "--workers", "1"])
+    batch = benchmark._batch_observability(args, splits)
+    assert batch["maximum_effective_graphs_per_training_batch"] == 2
+    assert batch["training_steps_per_epoch"] == 2
+    assert batch["effective_batch_size"] == 2
+    assert batch["persistent_workers"] is True
+    assert batch["batch_candidate_throughput_sweep"]["value"] is None
+    assert batch["batch_candidate_throughput_sweep"]["reason"]
+
+
+def test_first_step_gradient_validation_fails_on_disconnected_parameter() -> None:
+    model = torch.nn.Linear(2, 1)
+    model.weight.sum().backward()
+    with pytest.raises(RuntimeError, match="missing=.*bias"):
+        benchmark._validate_first_step_gradients(model)
 
 
 def test_graph_readout_is_permutation_invariant_given_transported_cycle_chart() -> None:
@@ -240,3 +280,14 @@ def test_main_invokes_only_our_model_once_per_dataset(tmp_path, monkeypatch) -> 
     for dataset in DATASETS:
         assert set(metrics["datasets"][dataset]["models"]) == {"cycle_set"}
         assert "baselines" not in metrics["datasets"][dataset]
+
+
+def test_selected_test_path_reports_actual_resources_and_throughput() -> None:
+    source = inspect.getsource(benchmark._evaluate_test_checkpoint)
+    assert "FailureSafeResourceMonitor(" in source
+    assert "@resource_failure_boundary" in source
+    assert "resource_monitor.start()" in source
+    assert "resource_monitor.finish(" in source
+    assert '"throughput": throughput' in source
+    assert '"evaluation_graphs_per_second"' in source
+    assert '"optimizer_created": False' in source

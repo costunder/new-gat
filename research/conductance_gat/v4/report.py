@@ -53,7 +53,8 @@ FACTORIAL_ORDER = (
 CAVEATS = [
     "n=1; exploratory validation-only factorial. Test is not evaluated; no CI, p-value, "
     "seed standard deviation, SOTA or general optimality claim.",
-    "All four arms train freshly from a matched full initial state. PPI uses the official "
+    "All four arms train freshly from a matched shared-backbone initial state. PPI uses the "
+    "official "
     "20/2/2 inductive graph split: train 20 and validation 2 run at batch 2 with "
     "BCEWithLogits and global logit>0 node-label micro-F1; test 2 is not scored. Other "
     "datasets use their official transductive masks and accuracy. No V3 checkpoint or score "
@@ -152,18 +153,19 @@ def _validate_optimizer(child: dict[str, Any], config: dict[str, Any], condition
     active_set, frozen_set = set(active), set(frozen)
     if not active or active_set & frozen_set:
         raise ValueError("active/frozen parameter names overlap or active list is empty")
+    if frozen_set:
+        raise ValueError("V4 fixed controls must not register frozen parameters")
     layers = config["layers"]
     alpha = {f"operators.{index}.raw_alpha" for index in range(layers)}
     spatial = {f"operators.{index}.message_transform.weight" for index in range(layers)}
     estimator = {name for name in active_set | frozen_set if ".estimator." in name}
-    if not estimator or not alpha <= active_set:
-        raise ValueError("every layer requires an estimator scaffold and active alpha")
-    if (estimator <= active_set) != c_active or (estimator <= frozen_set) == c_active:
-        raise ValueError("conductance estimator active/frozen state disagrees with condition")
-    if (spatial <= active_set) != w_active or (spatial <= frozen_set) == w_active:
-        raise ValueError("spatial W active/frozen state disagrees with condition")
-    if any(name.endswith(".raw_alpha") for name in frozen_set):
-        raise ValueError("alpha must remain trainable in all four arms")
+    if not alpha <= active_set:
+        raise ValueError("every layer requires active alpha")
+    if bool(estimator) != c_active or (estimator and not estimator <= active_set):
+        raise ValueError("conductance estimator presence disagrees with condition")
+    present_spatial = spatial & active_set
+    if bool(present_spatial) != w_active or (w_active and present_spatial != spatial):
+        raise ValueError("spatial W presence disagrees with condition")
 
     expected_groups = {"backbone", "raw_scalars"}
     if c_active:
@@ -323,9 +325,22 @@ def _validate_diagnostics(child: dict[str, Any], config: dict[str, Any]) -> None
             raise ValueError("invalid selected-checkpoint layer diagnostics")
         indices.append(_integer(layer.get("layer"), "diagnostic.layer"))
         _finite_number(layer.get("alpha"), "alpha", unit_interval=True)
-        _finite_number(layer.get("gamma"), "gamma", unit_interval=True)
-        if _finite_number(layer.get("tau"), "tau") <= 0:
-            raise ValueError("tau must be positive")
+        c_active = spec["gate_mode"] == "relative"
+        if c_active:
+            _finite_number(layer.get("gamma"), "gamma", unit_interval=True)
+            if _finite_number(layer.get("tau"), "tau") <= 0:
+                raise ValueError("tau must be positive")
+            if not isinstance(layer.get("estimator_parameter_count"), int) or layer[
+                "estimator_parameter_count"
+            ] <= 0:
+                raise ValueError("active estimator parameter count is required")
+        elif (
+            layer.get("gamma") is not None
+            or layer.get("tau") is not None
+            or layer.get("estimator_parameter_count") != 0
+            or layer.get("parameter_free_fixed_control") is not True
+        ):
+            raise ValueError("fixed C diagnostics must declare a parameter-free estimator")
         for path in (
             ("score", "std"),
             ("conductance", "cv"),
@@ -341,7 +356,6 @@ def _validate_diagnostics(child: dict[str, Any], config: dict[str, Any]) -> None
         spatial = layer.get("spatial_weight")
         if not isinstance(spatial, dict):
             raise ValueError("spatial_weight diagnostics are required")
-        c_active = spec["gate_mode"] == "relative"
         if layer.get("estimator_trainable") is not c_active:
             raise ValueError("conductance estimator trainable metadata mismatch")
         if not c_active:
@@ -363,6 +377,8 @@ def _validate_diagnostics(child: dict[str, Any], config: dict[str, Any]) -> None
             spec["spatial_mode"] == "learned"
         ):
             raise ValueError("spatial_weight mode/trainable metadata mismatch")
+        if spatial.get("parameter_present") is not (spec["spatial_mode"] == "learned"):
+            raise ValueError("spatial weight parameter presence disagrees with condition")
         for key in (
             "parameter_norm",
             "identity_distance_frobenius",
@@ -561,9 +577,12 @@ def _load(
         raise ValueError("metrics SHA-256 mismatch")
     dataset = job["dataset"]
     child_config = {
-        key: value for key, value in config.items() if key != "batch_size_by_dataset"
+        key: value
+        for key, value in config.items()
+        if key not in {"batch_size_by_dataset", "workers_by_dataset"}
     }
     child_config["batch_size"] = BATCH_SIZE_BY_DATASET[dataset]
+    child_config["workers"] = config.get("workers", 0) if dataset == "ppi" else 0
     child = _load_child(root, job, child_config, suite=SUITE, conditions=CONDITIONS)
     spec = CONDITIONS[job["condition"]]
     for key, expected in (
@@ -647,9 +666,8 @@ def _load(
     frozen = _integer(child.get("frozen_parameters"), "frozen_parameters")
     if total != trainable + frozen:
         raise ValueError("total parameter count differs from trainable+frozen")
-    expected_frozen = not (spec["gate_mode"] == "relative" and spec["spatial_mode"] == "learned")
-    if bool(frozen) != expected_frozen:
-        raise ValueError("frozen parameter count disagrees with V4 condition")
+    if frozen != 0:
+        raise ValueError("V4 fixed controls must be parameter-free")
     _validate_optimizer(child, child_config, job["condition"])
     _validate_diagnostics(child, child_config)
     best_epoch = _integer(child.get("best_epoch"), "best_epoch", minimum=1)
@@ -708,7 +726,19 @@ def _load(
         raise ValueError("missing GPU identity")
     if child["protocol"].get("data_sha256") != child["cache_sha256"]:
         raise ValueError("cache_sha256 disagrees with dataset protocol")
+    shared_hash = child.get("shared_backbone_initial_state_sha256")
+    if not isinstance(shared_hash, str) or not SHA256.fullmatch(shared_hash):
+        raise ValueError("shared backbone initialization SHA-256 is required")
     return child
+
+
+def _comparison_metadata(metrics: dict[str, Any]) -> dict[str, Any]:
+    metadata = _pair_metadata(metrics)
+    metadata.pop("initial_state_sha256")
+    metadata["shared_backbone_initial_state_sha256"] = metrics[
+        "shared_backbone_initial_state_sha256"
+    ]
+    return metadata
 
 
 def _factorial(scores: dict[str, float]) -> dict[str, dict[str, float]]:
@@ -776,8 +806,13 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         }
         if not _same(batch_sizes, expected_batch_sizes):
             raise ValueError("manifest batch_size_by_dataset violates the V4 protocol")
-        if config.get("workers") != 0 or type(config.get("workers")) is not int:
-            raise ValueError("full-graph workers must be 0")
+        workers = _integer(config.get("workers"), "workers")
+        workers_by_dataset = config.get("workers_by_dataset")
+        if workers_by_dataset is not None and not _same(
+            workers_by_dataset,
+            {dataset: workers if dataset == "ppi" else 0 for dataset in datasets},
+        ):
+            raise ValueError("workers_by_dataset is inconsistent")
         if not isinstance(config.get("device"), str) or not re.fullmatch(
             r"cuda(?::[0-9]+)?", config["device"]
         ):
@@ -809,6 +844,9 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         expected_batch_size = BATCH_SIZE_BY_DATASET[dataset]
         if job.get("batch_size") != expected_batch_size:
             errors.append(f"{key}: job batch_size must be {expected_batch_size}")
+        expected_workers = config.get("workers", 0) if dataset == "ppi" else 0
+        if job.get("workers", expected_workers) != expected_workers:
+            errors.append(f"{key}: job workers must be {expected_workers}")
         if job.get("status") not in {"pending", "running", "failed", "passed"}:
             errors.append(f"{key}: invalid job status")
         try:
@@ -898,19 +936,18 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             rows.append(row)
 
         reference = next(iter(loaded.values()), None)
-        held_fixed = _pair_metadata(reference) if reference else None
+        held_fixed = _comparison_metadata(reference) if reference else None
         if reference:
             extra = (
                 "versions",
                 "gpu",
-                "total_parameters",
                 "topology",
                 "parameterization",
                 "source_sha256",
             )
             held_fixed.update({key: reference[key] for key in extra})
             for condition, child in loaded.items():
-                actual = _pair_metadata(child) | {key: child[key] for key in extra}
+                actual = _comparison_metadata(child) | {key: child[key] for key in extra}
                 for key, expected in held_fixed.items():
                     if not _same(expected, actual[key]):
                         errors.append(f"{dataset}/{condition}: held-fixed {key} mismatch")
@@ -968,7 +1005,8 @@ def _diagnostic_markdown(rows: list[dict[str, Any]]) -> list[str]:
     lines = [
         "### Selected-checkpoint C and propagation diagnostics",
         "",
-        "Layer indices are zero-based. Frozen scaffold values are not evidence of active learning.",
+        "Layer indices are zero-based. Fixed-control values are N/A because those parameters "
+        "are absent.",
         "",
         "| Condition | Layer | Score std | C CV | log-C std | alpha | gamma | tau | Conv change |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -1014,7 +1052,7 @@ def _gradient_markdown(rows: list[dict[str, Any]]) -> list[str]:
         "### Actual training gradients at the selected epoch",
         "",
         "Actual transductive full-graph or PPI first-minibatch backward, before that batch's "
-        "optimizer update; frozen entries are N/A.",
+        "optimizer update; parameter-absent fixed-control entries are N/A.",
         "",
         "| Condition | Epoch | Layer | C-gate gradient L2 | Spatial-W gradient L2 |",
         "| --- | ---: | ---: | ---: | ---: |",
@@ -1033,8 +1071,8 @@ def _gradient_markdown(rows: list[dict[str, Any]]) -> list[str]:
                         row["condition"],
                         str(record["epoch"]),
                         str(layer["layer"]),
-                        "frozen / N/A" if gate is None else _display(gate),
-                        "frozen / N/A" if spatial is None else _display(spatial),
+                        "parameter absent / N/A" if gate is None else _display(gate),
+                        "parameter absent / N/A" if spatial is None else _display(spatial),
                     )
                 )
                 + " |"

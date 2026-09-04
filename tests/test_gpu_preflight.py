@@ -41,6 +41,67 @@ def test_hardware_report_never_creates_data_or_executes_models(
     assert report["dataset_loaded"] is False
     assert report["model_executed"] is False
     assert report["gpu"]["free_bytes"] == 4 * 1024**3
+    assert report["visible_gpu_count"] == 1
+    assert report["visible_gpus"][0]["logical_index"] == 0
+    assert report["visible_gpus"][0]["mig_detected_from_name"] is False
+    assert (
+        report["environment_safety"][
+            "pytorch_nvml_based_cuda_check_removed_before_torch_import"
+        ]
+        is (preflight._INHERITED_PYTORCH_NVML_BASED_CUDA_CHECK is not None)
+    )
+    assert "MIG" in report["environment_safety"]["reason"]
+    assert {
+        "logical_cpu_count",
+        "logical_cpu_count_unavailable_reason",
+        "cpu_affinity_count",
+        "cpu_affinity_count_unavailable_reason",
+        "available_ram_bytes",
+        "available_ram_measurement",
+        "available_ram_measurement_errors",
+        "resource_environment",
+    } <= report["host_resources"].keys()
+
+
+def test_report_inventories_every_visible_gpu_and_marks_mig(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(preflight.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(preflight.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(preflight.torch.cuda, "device_count", lambda: 2)
+
+    def properties(device):
+        index = device.index
+        return SimpleNamespace(
+            name="NVIDIA A100 MIG 1g.10gb" if index == 0 else "NVIDIA RTX A6000",
+            major=8,
+            minor=0 if index == 0 else 6,
+        )
+
+    monkeypatch.setattr(preflight.torch.cuda, "get_device_properties", properties)
+    monkeypatch.setattr(
+        preflight.torch.cuda,
+        "mem_get_info",
+        lambda device: ((10 if device.index == 0 else 40) * 1024**3, 48 * 1024**3),
+    )
+    monkeypatch.setattr(
+        preflight,
+        "_host_resources",
+        lambda: {
+            "logical_cpu_count": 16,
+            "cpu_affinity_count": 8,
+            "available_ram_bytes": 32 * 1024**3,
+            "available_ram_measurement": "test",
+            "resource_environment": {},
+        },
+    )
+
+    report = preflight.build_report("cuda:1")
+    assert report["visible_gpu_count"] == 2
+    assert [row["logical_index"] for row in report["visible_gpus"]] == [0, 1]
+    assert [row["mig_detected_from_name"] for row in report["visible_gpus"]] == [True, False]
+    assert report["gpu"]["logical_index"] == 1
+    assert report["host_resources"]["cpu_affinity_count"] == 8
 
 
 @pytest.mark.parametrize("device", ["cpu", "mps", "auto", "not-a-device"])
@@ -120,7 +181,9 @@ def test_failed_cli_preserves_failure_report(tmp_path, monkeypatch: pytest.Monke
         sys, "argv", ["gpu_preflight.py", "--device", "cpu", "--json-out", str(path)]
     )
     assert preflight.main() == 2
-    assert json.loads(path.read_text(encoding="utf-8"))["status"] == "failed"
+    report = json.loads(path.read_text(encoding="utf-8"))
+    assert report["status"] == "failed"
+    assert "MIG" in report["environment_safety"]["reason"]
 
 
 @pytest.mark.parametrize("option", ["--allow-cpu", "--profile", "--nodes-per-graph"])

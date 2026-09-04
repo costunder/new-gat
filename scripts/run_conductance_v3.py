@@ -56,7 +56,12 @@ def parser() -> argparse.ArgumentParser:
         default=2,
         help="PPI graph minibatch size (must be 2); fixed-graph children always use 1",
     )
-    result.add_argument("--workers", type=int, default=0)
+    result.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="PPI graph DataLoader workers; transductive children are forced to 0",
+    )
     result.add_argument("--edge-chunk-size", type=int, default=65536)
     result.add_argument("--min-free-gb", type=float, default=8.0)
     result.add_argument("--dry-run", action="store_true", help="Print plan without GPU or writes")
@@ -69,14 +74,15 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("Unsupported V3 dataset; choose: " + ", ".join(DATASETS))
     if args.edge_chunk_size < 1:
         raise ValueError("edge chunk size must be positive")
-    if args.batch_size != 2 or args.workers != 0:
-        raise ValueError("V3 requires PPI batch-size=2 and workers=0")
+    if args.batch_size != 2:
+        raise ValueError("V3 requires PPI batch-size=2")
 
 
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     jobs = []
     for dataset in args.datasets:
         child_batch_size = args.batch_size if dataset == "ppi" else 1
+        child_workers = shared.workers_for_dataset(dataset, args.workers)
         for condition in CONDITIONS:
             output = run_dir / dataset / condition
             command = [
@@ -94,21 +100,20 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "--data-root",
                 str(args.data_root.expanduser().resolve()),
             ]
-            for key in (
-                "device",
-                "model_seed",
-                "epochs",
-                "patience",
-                "workers",
-                "edge_chunk_size",
-            ):
+            for key in ("device", "model_seed", "epochs", "patience", "edge_chunk_size"):
                 command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
-            command += ["--batch-size", str(child_batch_size)]
+            command += [
+                "--batch-size",
+                str(child_batch_size),
+                "--workers",
+                str(child_workers),
+            ]
             jobs.append(
                 {
                     "dataset": dataset,
                     "condition": condition,
                     "batch_size": child_batch_size,
+                    "workers": child_workers,
                     "status": "pending",
                     "output_dir": str(output),
                     "metrics_path": str(output / "metrics.json"),
@@ -196,6 +201,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         },
         "data_root": str(data_root),
+        "workers_by_dataset": {
+            dataset: shared.workers_for_dataset(dataset, args.workers)
+            for dataset in args.datasets
+        },
     }
     manifest = {
         "schema_version": 1,
@@ -212,12 +221,14 @@ def main(argv: list[str] | None = None) -> int:
         "protocol": {
             "selection": "best validation checkpoint per arm; same early-stopping policy",
             "test": "not evaluated; exploratory validation comparison",
-            "initialization": "same full state hash including frozen shared-gate scaffold; "
-            "alpha active in both arms",
+            "initialization": (
+                "same shared non-gate backbone state hash; full hashes differ because "
+                "fixed_c contains no gate tensors; alpha active in both arms"
+            ),
             "data": "same verified official V1 cache/split and ordered topology; no downloads",
             "contrast": "fresh relative_c minus fresh fixed_c; "
             "never reuse any V1/V2 or older score",
-            "fixed_c": "exact C=1; gate scaffold frozen/excluded from optimizer, "
+            "fixed_c": "exact C=1 through a parameter-free estimator; "
             "alpha remains trainable",
             "normalization": "symmetric in both arms; AdamW backbone WD=0.0005; gate/scalar WD=0",
             "data_modes": "Cora/CiteSeer/PubMed/arxiv use fixed-graph train/validation masks; "
@@ -290,11 +301,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         if current_job is not None:
             current_job.update(status="failed", error=manifest["error"])
-        atomic_write_json(manifest_path, manifest)
-        try:
-            _comparison(run_dir, manifest)
-        except (ValueError, OSError) as report_error:
-            print(f"Comparison integrity error: {report_error}", file=sys.stderr)
+        report_error = shared.run_failure_reporter(
+            lambda: _comparison(run_dir, manifest),
+            original_error=exc,
+            action="failed-run comparison generation",
+        )
+        if report_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(report_error)
+        manifest_error = shared.run_failure_reporter(
+            lambda: atomic_write_json(manifest_path, manifest),
+            original_error=exc,
+            action="failed-run manifest persistence",
+        )
+        if manifest_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(manifest_error)
         print(f"Failed: {manifest['error']}\nSaved partial results: {run_dir}", file=sys.stderr)
         return 130 if isinstance(exc, KeyboardInterrupt) else 1
     atomic_write_json(manifest_path, manifest)

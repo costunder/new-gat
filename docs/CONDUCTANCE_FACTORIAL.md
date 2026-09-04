@@ -39,7 +39,9 @@ Gate는 `operators.*.estimator.*`의 weight와 bias 전체다. 다른 파라미�
 coupled weight decay를 유지한다. AdamW로 바꾸는 실험이 아니다.
 
 공통 설정은 hidden 64, 2층, dropout 0.5, Adam lr 0.005, 최대 200 epochs, patience 50,
-PPI batch size 2, workers 0이다. arxiv는 기존과 동일한 full-batch다.
+PPI batch size 2다. PPI DataLoader는 기본 workers 4, prefetch factor 2,
+persistent workers와 pinned/non-blocking transfer를 사용한다. arxiv는 DataLoader가 없는
+기존 full-batch라 workers 0이다.
 FP32이며 AMP·TF32·compile은 끈다. 매 조건의 초기 state hash와 데이터 캐시 hash가 같고,
 공통 설정이 일치해야 유효한 비교로 표시한다. 같은 seed라도 CUDA scatter의 bitwise 동일성까지
 보장하지는 않는다. 동일 early stopping 정책에도 실제 epoch·optimizer step 수는 달라질 수 있다.

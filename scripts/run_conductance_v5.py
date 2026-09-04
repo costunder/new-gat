@@ -16,7 +16,6 @@ import math
 import os
 import re
 import shlex
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -77,7 +76,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--device", default="cuda")
     result.add_argument("--epochs", type=int, default=300)
     result.add_argument("--patience", type=int, default=50)
-    result.add_argument("--workers", type=int, default=0)
+    result.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="PPI graph DataLoader workers; transductive children are forced to 0",
+    )
     result.add_argument("--batch-size", type=int, default=1)
     result.add_argument("--ppi-batch-size", type=int)
     result.add_argument("--sample-seed-batch-size", type=int)
@@ -135,6 +139,7 @@ def _resolved_execution(args: argparse.Namespace, dataset: str) -> dict[str, Any
     batch_size = 1
     if dataset == "ppi":
         batch_size = args.ppi_batch_size or profile["ppi_batch_size"]
+    loader_workers = shared.workers_for_dataset(dataset, args.workers)
     return {
         "hardware_profile": args.hardware_profile,
         "precision": profile["precision"],
@@ -151,6 +156,9 @@ def _resolved_execution(args: argparse.Namespace, dataset: str) -> dict[str, Any
         ),
         "sample_prefetch": profile["sample_prefetch"],
         "pin_memory": profile["pin_memory"],
+        "dataloader_workers": loader_workers,
+        "persistent_workers": loader_workers > 0,
+        "prefetch_factor": 2 if loader_workers > 0 else None,
     }
 
 
@@ -195,14 +203,8 @@ def _validate(args: argparse.Namespace) -> None:
         )
     if args.hardware_profile == "portable" and args.ppi_batch_size not in {None, 2}:
         raise ValueError("portable PPI retains graph batch-size 2")
-    if (
-        args.workers != 0
-        or not args.num_neighbors
-        or any(value < 1 for value in args.num_neighbors)
-    ):
-        raise ValueError(
-            "V5 requires workers=0 for reproducible epoch resume and positive neighbor fanouts"
-        )
+    if args.workers < 0 or not args.num_neighbors or any(value < 1 for value in args.num_neighbors):
+        raise ValueError("V5 requires nonnegative workers and positive neighbor fanouts")
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
         raise ValueError("CUDA is required; CPU fallback is not supported")
     if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
@@ -249,7 +251,7 @@ def make_jobs(
                 "--patience",
                 str(args.patience),
                 "--workers",
-                str(args.workers),
+                str(execution["dataloader_workers"]),
                 "--batch-size",
                 str(child_batch_size),
                 "--hardware-profile",
@@ -278,6 +280,7 @@ def make_jobs(
                     "architecture": dict(architecture),
                     "sampling": sampling,
                     "batch_size": child_batch_size,
+                    "workers": execution["dataloader_workers"],
                     "num_neighbors": list(args.num_neighbors),
                     "execution": execution,
                     "status": "pending",
@@ -295,6 +298,7 @@ def _source_snapshot() -> dict[str, str]:
         Path(__file__),
         ROOT / "scripts/check_dependencies.py",
         ROOT / "scripts/gpu_preflight.py",
+        ROOT / "scripts/process_safety.py",
         ROOT / "scripts/run_conductance_factorial.py",
         ROOT / "src/chartgat/cache.py",
         ROOT / "src/chartgat/execution.py",
@@ -350,6 +354,8 @@ def _load_metrics(job: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("child sampling mode does not match the requested V5 job")
     if configuration.get("batch_size") != job["batch_size"]:
         raise RuntimeError("child graph batch size does not match the V5 dataset contract")
+    if configuration.get("workers") != job["workers"]:
+        raise RuntimeError("child DataLoader workers do not match the V5 dataset contract")
     execution = job["execution"]
     for key in ("hardware_profile", "precision", "tf32", "edge_chunk_size"):
         if configuration.get(key) != execution[key]:
@@ -365,6 +371,9 @@ def _load_metrics(job: dict[str, Any]) -> dict[str, Any]:
         "graph_batch_size": execution["batch_size"],
         "sample_prefetch": execution["sample_prefetch"],
         "pin_memory": execution["pin_memory"],
+        "loader_workers": execution["dataloader_workers"],
+        "persistent_workers": execution["persistent_workers"],
+        "prefetch_factor": execution["prefetch_factor"],
     }
     if not isinstance(hardware, dict) or any(
         hardware.get(key) != value for key, value in expected_hardware.items()
@@ -400,15 +409,32 @@ def _next_log(path: Path) -> Path:
         attempt += 1
 
 
-def _safe_clear(job: dict[str, Any], run_dir: Path) -> None:
+def _preserve_incomplete_child(job: dict[str, Any], run_dir: Path) -> None:
     lexical = Path(os.path.abspath(Path(job["output_dir"])))
     resolved = lexical.resolve()
+    run_dir = run_dir.resolve()
     if resolved != lexical or resolved == run_dir or not resolved.is_relative_to(run_dir):
-        raise RuntimeError(f"refusing to clear unsafe child output: {lexical}")
+        raise RuntimeError(f"refusing to move unsafe child output: {lexical}")
     if lexical.exists():
         if not lexical.is_dir():
             raise RuntimeError(f"child output is not a directory: {lexical}")
-        shutil.rmtree(lexical)
+        attempt = 1
+        while True:
+            preserved = lexical.with_name(f"{lexical.name}.preserved-attempt-{attempt}")
+            if not preserved.exists():
+                break
+            attempt += 1
+        if preserved.parent.resolve() != lexical.parent.resolve():
+            raise RuntimeError(f"refusing to preserve child output outside its parent: {preserved}")
+        event = {
+            "event": "preserve_incomplete_child_output",
+            "source": str(lexical),
+            "destination": str(preserved),
+            "reason": "no V5 last.pt checkpoint exists; preserve prior artifacts before retry",
+        }
+        print(json.dumps(event, ensure_ascii=False, sort_keys=True), file=sys.stderr, flush=True)
+        lexical.rename(preserved)
+        job.setdefault("preserved_incomplete_outputs", []).append(event)
 
 
 def _write_comparison(run_dir: Path, manifest: dict[str, Any]) -> None:
@@ -456,6 +482,10 @@ def main(argv: list[str] | None = None) -> int:
         "hardware_profile": args.hardware_profile,
         "resolved_execution_by_dataset": {
             dataset: _resolved_execution(args, dataset) for dataset in args.datasets
+        },
+        "workers_by_dataset": {
+            dataset: shared.workers_for_dataset(dataset, args.workers)
+            for dataset in args.datasets
         },
         "sampling": args.sampling,
         "num_neighbors": list(args.num_neighbors),
@@ -583,7 +613,7 @@ def main(argv: list[str] | None = None) -> int:
             if last_checkpoint.is_file():
                 attempt_command.append("--resume")
             else:
-                _safe_clear(job, run_dir)
+                _preserve_incomplete_child(job, run_dir)
             job["attempt_command"] = attempt_command
             job["status"] = "running"
             atomic_write_json(manifest_path, manifest)
@@ -610,8 +640,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         if current is not None:
             current.update(status="failed", error=manifest["error"])
-        atomic_write_json(manifest_path, manifest)
-        _write_comparison(run_dir, manifest)
+        report_error = shared.run_failure_reporter(
+            lambda: _write_comparison(run_dir, manifest),
+            original_error=exc,
+            action="failed-run comparison generation",
+        )
+        if report_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(report_error)
+        manifest_error = shared.run_failure_reporter(
+            lambda: atomic_write_json(manifest_path, manifest),
+            original_error=exc,
+            action="failed-run manifest persistence",
+        )
+        if manifest_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(manifest_error)
         print(f"Failed: {manifest['error']}\nSaved partial results: {run_dir}", file=sys.stderr)
         return 130 if isinstance(exc, KeyboardInterrupt) else 1
     atomic_write_json(manifest_path, manifest)

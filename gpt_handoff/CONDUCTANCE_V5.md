@@ -77,12 +77,18 @@ Conductance scaling과 rich scaling에서 같은 ablation을 선택할 때는 �
 - `shared_dynamic_c`: 위 shared graph-conditioned C를 coordinate phase에서 학습하고 나머지
   phase에서 W, beta, FFN과 classifier를 학습한다.
 
-두 arm은 동일한 데이터/split/seed/architecture/초기화/sampling을 쓰지만, 의도적으로 phase별
-parameter-group update 배분이 다르다. 따라서 이것은 **fixed-C strong recipe 대 dynamic-C
+두 arm은 동일한 데이터/split/seed/sampling과 공통 backbone·W·beta·FFN·classifier 구조 및
+초기화를 쓴다. `fixed_c`의 C=1은 parameter-free이며, `shared_dynamic_c`만 실제 forward에 쓰는
+C score network를 추가한다. 공통 state hash는 일치해야 하지만 전체 parameter 수와 전체 state
+hash를 억지로 맞추지 않으며 그 차이를 보고한다. 의도적으로 phase별 parameter-group update
+배분도 다르다. 따라서 이것은 **fixed-C strong recipe 대 dynamic-C
 coordinate recipe의 end-to-end 비교**이며 C 하나만 치환한 인과효과가 아니다. manifest에는
 `effective_optimizer_steps_by_group`을 반드시 기록한다. 같은 checkpoint의 `C=1`, mean-C,
 shuffled-C intervention과 C gradient/CV를 함께 읽고, fixed-C와의 점수 차이만으로 C의 순수
 기여를 판정하지 않는다.
+
+이 parameter-free control 변경 전 source로 만든 partial V5 checkpoint는 새 비교에 resume하거나
+재사용하지 않는다. source/resume hash가 이를 거부하므로 새 run-id로 두 arm을 모두 fresh 실행한다.
 
 Checkpoint 선택도 condition별 역할을 구분한다. `fixed_c`에는 기다려야 할 C mechanism이
 없으므로 모든 epoch 중 validation 최고점을 primary checkpoint로 고르고 그 기준으로 early
@@ -130,6 +136,18 @@ ID에서 켜는 것이 다음 방어선이다. 직접 V5/scaling runner뿐 아�
 `run_rich_scaling.py`도 이 tri-state override를 Conductance child에만 전달하고 manifest에
 기록한다.
 
+V5 child는 실제 학습 경계에서 기본 1초 주기로 GPU SM·memory-controller utilization, CUDA
+allocator allocated/reserved, process CPU·RSS/HWM과 system available RAM을 측정해
+`resource_observability`에 저장한다. 지원되지 않는 counter는 0이 아니라 `null`과 원인을
+기록한다. 이 계측이 적용된 전체 GPU run은 아직 수령하지 않았으므로 utilization 수치를
+성능 결과처럼 인용하지 않는다. 현재 1,024/2,048 seed batch와 PPI 2/8 graph batch는 등록된
+profile recipe이며, rich/V5 학습 runner가 자동 튜닝해 고른 값이 아니다. 별도
+`scripts/benchmark_speed.py --track conductance_v5 --batch-sizes ...`는 공식 train 입력에서
+명시한 seed-node/PPI graph batch 후보를 각각 측정하고, 10% 이상 projected device-memory
+headroom을 남긴 후보 중 처리량이 가장 높은 값을 **microbenchmark 권고**로 기록한다. 이 측정은
+optimizer state·전체 epoch·validation/checkpoint를 포함하지 않고 training profile 기본값도
+바꾸지 않으므로, 권고값을 최종 학습 최적값으로 해석하려면 별도 전체-run 검증이 필요하다.
+
 한 architecture profile에서 다섯 datasets × 두 arms는 10 fresh trainings다. 두
 architecture profiles의 V5만 실행하면 20 trainings이고, V1–V5 전체 reference/large
 Conductance scaling은 106 child/model trainings다.
@@ -140,7 +158,7 @@ Conductance scaling은 106 child/model trainings다.
 번호가 다르면 `CUDA_VISIBLE_DEVICES`만 바꾸고 프로세스 내부에서는 `cuda:0`을 쓴다.
 
 ```bash
-env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=6 \
+CUDA_VISIBLE_DEVICES=6 \
 python -B scripts/run_conductance_v5.py \
   --datasets cora citeseer pubmed ppi ogbn-arxiv \
   --profile reference --model-seed 0 --device cuda:0 \
@@ -152,7 +170,7 @@ python -B scripts/run_conductance_v5.py \
 ### RTX A6000 GPU 3 예시
 
 ```bash
-env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+CUDA_VISIBLE_DEVICES=3 \
 python -B scripts/run_conductance_v5.py \
   --datasets cora citeseer pubmed ppi ogbn-arxiv \
   --profile reference --model-seed 0 --device cuda:0 \
@@ -203,7 +221,7 @@ r2는 `214265c`의 dynamic edge-score checkpoint나 condition-aware checkpoint s
 [전체 scaling 문서](RICH_SCALING_EXPERIMENTS.md)의 GPU 3 명령을 사용한다.
 
 ```bash
-env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=6 \
+CUDA_VISIBLE_DEVICES=6 \
 python -B scripts/run_conductance_scaling.py \
   --versions v1 v2 v3 v4 v5 --profiles reference large \
   --model-seeds 0 --device cuda:0 --hardware-profile portable \

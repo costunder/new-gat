@@ -23,6 +23,28 @@ from .paper_data import (
 )
 
 FloatArray = NDArray[np.float64]
+DATA_LOADER_PREFETCH_FACTOR = 2
+
+
+def data_loader_configuration(workers: int) -> dict[str, int | bool | None]:
+    """Return the exact bounded worker configuration used by every Tree loader."""
+
+    if workers < 0:
+        raise ValueError("workers must be non-negative")
+    return {
+        "num_workers": workers,
+        "persistent_workers": False,
+        "prefetch_factor": DATA_LOADER_PREFETCH_FACTOR if workers > 0 else None,
+    }
+
+
+def _data_loader_arguments(workers: int) -> dict[str, int | bool]:
+    configuration = data_loader_configuration(workers)
+    return {
+        key: value
+        for key, value in configuration.items()
+        if value is not None
+    }
 
 
 @dataclass(frozen=True)
@@ -381,6 +403,41 @@ def _unique_graph_targets(views: Sequence[GraphChartView]) -> FloatArray:
     return np.asarray(list(targets.values()), dtype=np.float64)
 
 
+def _validate_first_step_gradients(model: nn.Module) -> None:
+    """Fail closed if a declared trainable parameter is disconnected or nonfinite."""
+
+    missing = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    if missing:
+        raise RuntimeError(
+            "tree model has trainable parameters disconnected from the first task loss: "
+            + ", ".join(missing)
+        )
+    nonfinite = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+        and parameter.grad is not None
+        and not bool(torch.isfinite(parameter.grad).all())
+    ]
+    if nonfinite:
+        raise FloatingPointError(
+            "tree model has nonfinite first-step task gradients: " + ", ".join(nonfinite)
+        )
+
+
+def _require_finite_loss(loss: Tensor, update: int) -> None:
+    predicate = torch.isfinite(loss)
+    assertion = getattr(torch, "_assert_async", None)
+    if loss.device.type == "cuda" and assertion is not None:
+        assertion(predicate, f"tree model produced a nonfinite loss at update {update}")
+    elif not bool(predicate):
+        raise FloatingPointError(f"tree model produced a nonfinite loss at update {update}")
+
+
 def fit_downstream_model(
     views: Sequence[GraphChartView],
     *,
@@ -443,9 +500,9 @@ def fit_downstream_model(
         list(views),
         batch_sampler=sampled_indices,
         collate_fn=collate_chart_views,
-        num_workers=workers,
         pin_memory=pin_memory and device.type == "cuda",
         generator=loader_generator,
+        **_data_loader_arguments(workers),
     )
     history: list[dict[str, float]] = []
     model.train()
@@ -463,7 +520,11 @@ def fit_downstream_model(
             else:
                 normalized = (batch.targets - mean_tensor) / scale_tensor
                 loss = nn.functional.mse_loss(prediction, normalized)
+        _require_finite_loss(loss, update)
         scaler.scale(loss).backward()
+        if update == 1:
+            scaler.unscale_(optimizer)
+            _validate_first_step_gradients(model)
         scaler.step(optimizer)
         scaler.update()
         if update == 1 or update == updates or update % max(1, updates // 10) == 0:
@@ -499,9 +560,9 @@ def _predict(
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_chart_views,
-        num_workers=workers,
         pin_memory=pin_memory and device.type == "cuda",
         generator=loader_generator,
+        **_data_loader_arguments(workers),
     )
     for cpu_batch in loader:
         batch = cpu_batch.to(
@@ -693,6 +754,7 @@ __all__ = [
     "VariableBetaCycleEncoder",
     "build_chart_views",
     "collate_chart_views",
+    "data_loader_configuration",
     "evaluate_downstream_model",
     "fit_downstream_model",
     "run_fixed_vs_multichart",

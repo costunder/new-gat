@@ -18,7 +18,6 @@ import datetime as dt
 import json
 import math
 import random
-import sys
 from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
@@ -29,8 +28,9 @@ import torch
 from torch import Tensor
 
 from chartgat.cache import atomic_write_bytes, atomic_write_json
+from chartgat.observability import RuntimeResourceMonitor, observed
 
-from ..ablation.model import FactorialNodeClassifier, state_sha256
+from ..ablation.model import FactorialNodeClassifier, is_gate_parameter, state_sha256
 from ..ablation.protocol import COMMON, CONDITIONS, DATASETS, DEFAULT_DATASETS
 from ..ablation.report import (
     _build_comparison,
@@ -66,6 +66,7 @@ AUDIT_SOURCES = C_LEARNING_MODEL_SOURCES + (
     "research/conductance_gat/ablation/report.py",
     "research/conductance_gat/c_learning/report.py",
     "src/chartgat/cache.py",
+    "src/chartgat/observability.py",
 )
 
 
@@ -207,12 +208,25 @@ def validate_checkpoint(saved: dict, metrics: dict) -> None:
         "optimizer_steps": metrics["best_checkpoint_optimizer_steps"],
     }
     if suite == C_LEARNING_SUITE:
-        for key in ("total_parameters", "trainable_parameters", "frozen_parameters"):
+        expected["shared_backbone_initial_state_sha256"] = metrics[
+            "shared_backbone_initial_state_sha256"
+        ]
+        for key in (
+            "total_parameters",
+            "estimator_parameters",
+            "non_estimator_parameters",
+            "trainable_parameters",
+            "frozen_parameters",
+        ):
             expected[key] = _integer(
                 metrics.get(key), key, minimum=0 if key == "frozen_parameters" else 1
             )
         if expected["total_parameters"] != expected["trainable_parameters"]:
             raise ValueError("Learned-C checkpoint must have zero frozen parameters")
+        if expected["total_parameters"] != (
+            expected["estimator_parameters"] + expected["non_estimator_parameters"]
+        ):
+            raise ValueError("Learned-C estimator/non-estimator counts do not sum to total")
     for key, value in expected.items():
         if not _same(saved.get(key), value):
             raise ValueError(f"Checkpoint {key} disagrees with selected source metrics")
@@ -233,6 +247,11 @@ def reconstruct_model(
     if metrics["research_suite"] == C_LEARNING_SUITE:
         counts = {
             "total_parameters": sum(parameter.numel() for parameter in model.parameters()),
+            "estimator_parameters": sum(
+                parameter.numel()
+                for name, parameter in model.named_parameters()
+                if is_gate_parameter(name)
+            ),
             "trainable_parameters": sum(
                 parameter.numel() for parameter in model.parameters() if parameter.requires_grad
             ),
@@ -240,6 +259,9 @@ def reconstruct_model(
                 parameter.numel() for parameter in model.parameters() if not parameter.requires_grad
             ),
         }
+        counts["non_estimator_parameters"] = (
+            counts["total_parameters"] - counts["estimator_parameters"]
+        )
         for key, value in counts.items():
             if not _same(saved[key], value):
                 raise ValueError(f"Reconstructed learned-C model {key} differs from checkpoint")
@@ -346,7 +368,12 @@ class MeanConductance:
         self.graphs.clear()
 
 
-def validation_data(payload: dict, metrics: dict, device: torch.device):
+def validation_data(
+    payload: dict,
+    metrics: dict,
+    device: torch.device,
+    workers: int = 4,
+):
     """Construct validation ONLY; full-graph tasks still use all graph features."""
     from torch_geometric.data import Data
     from torch_geometric.loader import DataLoader
@@ -360,8 +387,10 @@ def validation_data(payload: dict, metrics: dict, device: torch.device):
         [Data(**payload["graphs"][index]) for index in payload["splits"]["validation"]],
         batch_size=metrics["configuration"]["batch_size"],
         shuffle=False,
-        num_workers=0,
+        num_workers=workers,
         pin_memory=True,
+        persistent_workers=workers > 0,
+        prefetch_factor=2 if workers > 0 else None,
         generator=generator,
     )
     return loader, None
@@ -435,6 +464,7 @@ def evaluate(
         "intervened_layers": list(layers),
         "prediction_count": total,
         "prediction_unit": "node-label decision" if indices is None else "node class",
+        "graph_batches": len(outputs),
         "changed_predictions": changed if reference is not None else None,
         "changed_prediction_fraction": changed / total if reference is not None else None,
         "logit_mean_absolute_delta": abs_sum / logit_count if logit_count else None,
@@ -536,6 +566,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="PPI validation DataLoader workers; transductive full-graph datasets use no loader",
+    )
     return parser
 
 
@@ -545,10 +581,57 @@ def _require_cuda(device: torch.device) -> None:
     torch.cuda.get_device_properties(device)
 
 
+def _finish_resource_monitor(
+    monitor: RuntimeResourceMonitor,
+    device: torch.device,
+    primary_error: BaseException | None,
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
+    """Finish sampling once and retain an earlier audit failure when cleanup fails."""
+
+    collection_notes: list[str] = []
+    peak_allocated: int | None = None
+    peak_reserved: int | None = None
+    if device.type == "cuda":
+        try:
+            peak_allocated = int(torch.cuda.max_memory_allocated(device))
+            peak_reserved = int(torch.cuda.max_memory_reserved(device))
+        except BaseException as cleanup_error:
+            note = (
+                "CUDA allocator peak collection failed during audit cleanup: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+            collection_notes.append(note)
+            if primary_error is not None:
+                primary_error.add_note(note)
+    try:
+        resources = monitor.finish(
+            peak_allocated_bytes=peak_allocated,
+            peak_reserved_bytes=peak_reserved,
+        )
+    except BaseException as cleanup_error:
+        reason = (
+            "resource monitor cleanup failed"
+            + (
+                " without replacing the audit error"
+                if primary_error is not None
+                else ""
+            )
+            + f": {type(cleanup_error).__name__}: {cleanup_error}"
+        )
+        if primary_error is not None:
+            primary_error.add_note(reason)
+        return None, reason, collection_notes
+    if collection_notes:
+        resources["collection_notes"] = list(collection_notes)
+    return resources, None, collection_notes
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     device = torch.device(args.device)
     _require_cuda(device)
+    if args.workers < 0:
+        raise ValueError("workers must be nonnegative")
     if len(set(args.datasets)) != len(args.datasets):
         raise ValueError("Duplicate datasets are not allowed")
     source = args.source_run.expanduser().resolve(strict=True)
@@ -601,8 +684,28 @@ def main(argv: list[str] | None = None) -> int:
         "device": str(device),
         "gpu": torch.cuda.get_device_name(device),
         "baseline_tolerance": BASELINE_TOLERANCE,
+        "execution_plan": {
+            "requested_datasets": list(args.datasets),
+            "evaluation_split": "validation",
+            "training": False,
+            "optimizer_steps": 0,
+            "precision": "float32",
+            "ppi_physical_batch_size": "validated source-run configuration",
+            "ppi_dataloader_workers": args.workers,
+            "ppi_persistent_workers": args.workers > 0,
+            "ppi_prefetch_factor": 2 if args.workers > 0 else None,
+            "transductive_batching": "one complete official graph; no DataLoader",
+            "subset_or_fast_mode": False,
+        },
     }
     atomic_write_json(output / "audit.json", report)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    resource_monitor = RuntimeResourceMonitor(device)
+    resource_monitor.start()
+    completed_forward_batches = 0
+    completed_prediction_decisions = 0
+    primary_error: BaseException | None = None
     try:
         with preserved_runtime():
             for dataset in args.datasets:
@@ -624,8 +727,36 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 saved = torch.load(metrics["checkpoint"], map_location="cpu", weights_only=True)
                 model = reconstruct_model(saved, metrics, payload, device)
-                batches, indices = validation_data(payload, metrics, device)
+                parameter_counts = {
+                    "total_parameters": sum(
+                        parameter.numel() for parameter in model.parameters()
+                    ),
+                    "trainable_parameters": sum(
+                        parameter.numel()
+                        for parameter in model.parameters()
+                        if parameter.requires_grad
+                    ),
+                    "frozen_parameters": sum(
+                        parameter.numel()
+                        for parameter in model.parameters()
+                        if not parameter.requires_grad
+                    ),
+                }
+                batches, indices = validation_data(
+                    payload,
+                    metrics,
+                    device,
+                    args.workers,
+                )
                 result = audit_model(model, batches, indices, device, metrics["validation"])
+                dataset_forward_batches = int(result["original"]["graph_batches"]) + sum(
+                    int(row["graph_batches"]) for row in result["interventions"]
+                )
+                dataset_prediction_decisions = int(
+                    result["original"]["prediction_count"]
+                ) + sum(int(row["prediction_count"]) for row in result["interventions"])
+                completed_forward_batches += dataset_forward_batches
+                completed_prediction_decisions += dataset_prediction_decisions
                 report["datasets"].append(
                     {
                         "dataset": dataset,
@@ -634,6 +765,23 @@ def main(argv: list[str] | None = None) -> int:
                         "metric_name": metrics["metric_name"],
                         "checkpoint_sha256": metrics["checkpoint_sha256"],
                         "cache_sha256": metrics["cache_sha256"],
+                        "model_configuration": metrics["configuration"],
+                        "parameter_counts": parameter_counts,
+                        "evaluation_work": {
+                            "forward_batches": dataset_forward_batches,
+                            "prediction_decisions": dataset_prediction_decisions,
+                            "physical_batch_size": (
+                                1
+                                if dataset != "ppi"
+                                else metrics["configuration"]["batch_size"]
+                            ),
+                            "physical_batch_unit": (
+                                "complete_transductive_graph"
+                                if dataset != "ppi"
+                                else "graphs"
+                            ),
+                            "dataloader_workers": 0 if dataset != "ppi" else args.workers,
+                        },
                         **result,
                     }
                 )
@@ -643,10 +791,53 @@ def main(argv: list[str] | None = None) -> int:
                 del model, batches, indices, payload, saved
         report["status"] = "passed"
     except (Exception, KeyboardInterrupt) as exc:
+        primary_error = exc
         report["status"] = "invalid"
         report["error"] = f"{type(exc).__name__}: {exc}"
         # One failed provenance/baseline check invalidates the whole derived report.
         report["datasets"] = []
+    resources, unavailable_reason, collection_notes = _finish_resource_monitor(
+        resource_monitor,
+        device,
+        primary_error,
+    )
+    report["resource_observability"] = resources
+    report["resource_observability_unavailable_reason"] = unavailable_reason
+    report["resource_observability_collection_notes"] = collection_notes
+    if unavailable_reason is not None:
+        report["resource_observability_cleanup_error"] = unavailable_reason
+        if primary_error is None:
+            report["status"] = "invalid"
+            report["error"] = f"ResourceObservabilityError: {unavailable_reason}"
+    elapsed = (
+        resources["summary"]["observed_wall_seconds"]["value"]
+        if isinstance(resources, dict)
+        else None
+    )
+    rate_reason = (
+        None
+        if isinstance(elapsed, (int, float)) and elapsed > 0
+        else unavailable_reason
+        or "the monitored evaluation interval had no positive wall duration"
+    )
+    report["throughput"] = {
+        "scope": (
+            "end-to-end selected-checkpoint validation audit, including official cache reads, "
+            "checkpoint reconstruction, baseline reproduction and every mean-C intervention"
+        ),
+        "completed_forward_batches": completed_forward_batches,
+        "completed_prediction_decisions": completed_prediction_decisions,
+        "forward_batches_per_second": observed(
+            completed_forward_batches / elapsed if rate_reason is None else None,
+            reason=rate_reason,
+            unit="batches_per_second",
+        ),
+        "prediction_decisions_per_second": observed(
+            completed_prediction_decisions / elapsed if rate_reason is None else None,
+            reason=rate_reason,
+            unit="decisions_per_second",
+        ),
+    }
     atomic_write_json(output / "audit.json", report)
     atomic_write_bytes(output / "report.md", _markdown(report).encode("utf-8"))
     print(_markdown(report), flush=True)
@@ -655,4 +846,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

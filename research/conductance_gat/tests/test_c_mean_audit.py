@@ -200,10 +200,16 @@ def test_validation_data_never_constructs_training_or_test_loader(monkeypatch):
         "splits": ValidationOnly(validation=[1, 2]),
     }
     batches, indices = audit.validation_data(
-        payload, {"model_seed": 0, "configuration": {"batch_size": 2}}, torch.device("cpu")
+        payload,
+        {"model_seed": 0, "configuration": {"batch_size": 2}},
+        torch.device("cpu"),
+        workers=4,
     )
     assert indices is None and [item.id for item in batches] == [1, 2]
     assert len(created) == 1 and created[0][1]["shuffle"] is False
+    assert created[0][1]["num_workers"] == 4
+    assert created[0][1]["persistent_workers"] is True
+    assert created[0][1]["prefetch_factor"] == 2
 
 
 def source_fixture(tmp_path):
@@ -315,7 +321,7 @@ def test_invalid_source_rejected_without_writes(tmp_path, mutation):
         (root / "cora/node_degree/best.pt").write_bytes(b"changed fixture")
     elif mutation == "metrics":
         path = root / "cora/node_degree/metrics.json"
-        metrics = json.loads(path.read_text())
+        metrics = json.loads(path.read_text(encoding="utf-8"))
         metrics["configuration"]["dropout"] = 0.8
         atomic_write_json(path, metrics)
     elif mutation == "source_code":

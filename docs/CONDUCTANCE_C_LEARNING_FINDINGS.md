@@ -25,8 +25,11 @@ manifest, history 전체도 로컬로 받아 독립 재검증하지 않았다. �
 
 이 비교는 node-degree 정규화 아래에서 adaptive C만 분리한 내부 실험이다.
 구현의 공통 학습 정책은 hidden 64, conductance 2층, dropout 0.5, Adam lr 0.005,
-non-gate WD 0.0005, 최대 200 epochs, patience 50, PPI batch size 2, workers 0,
-FP32/AMP OFF/TF32 OFF/compile OFF다. Learned gate의 WD는 0.0005다.
+non-gate WD 0.0005, 최대 200 epochs, patience 50, PPI batch size 2,
+FP32/AMP OFF/TF32 OFF/compile OFF다. 이 표를 만든 과거 실행은 PPI workers 0이었지만,
+현재 재현 runner의 PPI 기본은 workers 4, prefetch factor 2, persistent workers와
+pinned/non-blocking transfer이며 arxiv full-graph는 DataLoader가 없어 workers 0이다. 이
+실행-policy 변경은 과거 artifact의 설정을 소급 변경하지 않는다. Learned gate의 WD는 0.0005다.
 Fixed 조건은 모든 물리 엣지의 C를 1로 고정하고 gate를 학습하거나 실행하지 않는다.
 두 조건을 같은 새 run에서 처음부터 학습하며 과거 2×2의 learned 점수를 재사용하지 않는다.
 

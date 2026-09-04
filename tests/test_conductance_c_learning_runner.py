@@ -16,12 +16,16 @@ def test_exact_default_plan():
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, Path("fixture"))
     assert args.model_seed == 0 and args.datasets == ["ppi", "ogbn-arxiv"]
+    assert args.workers == 4
     assert len(jobs) == 4
     assert [job["condition"] for job in jobs] == ["learned_c", "fixed_c"] * 2
     for job in jobs:
         command = job["command"]
         assert command[command.index("-m") + 1] == "research.conductance_gat.c_learning.train"
         assert command[command.index("--model-seed") + 1] == "0"
+        expected_workers = 4 if job["dataset"] == "ppi" else 0
+        assert job["workers"] == expected_workers
+        assert command[command.index("--workers") + 1] == str(expected_workers)
         assert "--amp" not in command and "--allow-download" not in command
 
 

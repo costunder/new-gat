@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from research.cycle_pe.paper import (
@@ -7,6 +8,7 @@ from research.cycle_pe.paper import (
     BREC_OFFICIAL_SEEDS,
     _aggregate_custom_brec_results,
     _aggregate_official_brec_results,
+    _brec_batches,
     _brec_reference_compatibility,
     _brec_settings,
     _effective_brec_protocol,
@@ -151,3 +153,10 @@ def test_official_reference_compatibility_does_not_claim_differential_parity() -
     custom = _brec_reference_compatibility("custom")
     assert custom["static_constants_and_control_flow_compatible"] is False
     assert custom["differential_parity_verified"] is False
+
+
+def test_brec_batch_size_must_preserve_complete_pairs_without_silent_rounding() -> None:
+    with pytest.raises(ValueError, match="even integer"):
+        _brec_batches([], torch.arange(0).numpy(), batch_size=1)
+    with pytest.raises(ValueError, match="even integer"):
+        _brec_batches([], torch.arange(0).numpy(), batch_size=3)

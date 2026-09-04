@@ -30,7 +30,8 @@ from .protocol import COMMON, CONDITIONS, DATASETS, PARAMETERIZATION, SUITE
 SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
 CAVEATS = [
     "n=1; exploratory validation comparison; test not evaluated. No CI, p-value or seed std.",
-    "Both arms train freshly with the same initial full state, official cache, topology, "
+    "Both arms train freshly with the same initial shared-backbone state, official cache, "
+    "topology, "
     "AdamW policy and early-stopping policy. No V1/V2 or historical score is reused.",
     "V3 uses a shared relative-log-conductance generator, symmetric normalization and learned "
     "propagation strength. PPI uses the official 20/2/2 graph split: train 20 and validation "
@@ -38,8 +39,8 @@ CAVEATS = [
     "scored. The other four datasets retain full-graph node splits.",
     "The contrast is relative_c minus fixed_c (percentage points), an internal V3 ablation. "
     "V2-to-V3 changes several factors and must not be called a single-factor comparison.",
-    "Fixed C=1 freezes its unused gate MLP/gamma/tau scaffold; alpha remains trainable in both "
-    "arms. Frozen gate parameter norms do not indicate active learning.",
+    "Fixed C=1 is parameter-free and registers no unused gate MLP/gamma/tau scaffold; alpha "
+    "remains trainable in both arms.",
     "Reported alpha/gamma/tau, C CV and log-C spread describe the selected checkpoint, not "
     "proof of useful weighting. Propagation strength alpha is learned in V3.",
     "Mean-C, shuffled-C, C=1 and propagation-off interventions are separate validation forwards "
@@ -98,8 +99,8 @@ def _validate_optimizer(child, config, condition):
     frozen = _names(child.get("frozen_parameter_names"), "frozen_parameter_names")
     if not active or set(active) & set(frozen):
         raise ValueError("active/frozen parameter names overlap or active list is empty")
-    if bool(frozen) != (condition == "fixed_c"):
-        raise ValueError("frozen parameter names disagree with condition")
+    if frozen:
+        raise ValueError("V3 fixed controls must not register frozen parameters")
     if any(name.endswith(".raw_alpha") for name in frozen):
         raise ValueError("alpha must remain trainable in every layer")
     groups = child.get("optimizer_groups")
@@ -177,9 +178,22 @@ def _validate_diagnostics(child, config, dataset):
             raise ValueError("invalid layer diagnostics")
         indices.append(_integer(layer.get("layer"), "diagnostic.layer"))
         _finite_number(layer.get("alpha"), "alpha", unit_interval=True)
-        _finite_number(layer.get("gamma"), "gamma", unit_interval=True)
-        if _finite_number(layer.get("tau"), "tau") <= 0:
-            raise ValueError("tau must be positive")
+        c_active = child["condition"] == "relative_c"
+        if c_active:
+            _finite_number(layer.get("gamma"), "gamma", unit_interval=True)
+            if _finite_number(layer.get("tau"), "tau") <= 0:
+                raise ValueError("tau must be positive")
+            if not isinstance(layer.get("estimator_parameter_count"), int) or layer[
+                "estimator_parameter_count"
+            ] <= 0:
+                raise ValueError("active estimator parameter count is required")
+        elif (
+            layer.get("gamma") is not None
+            or layer.get("tau") is not None
+            or layer.get("estimator_parameter_count") != 0
+            or layer.get("parameter_free_fixed_control") is not True
+        ):
+            raise ValueError("fixed C diagnostics must declare a parameter-free estimator")
         for path in (
             ("score", "std"),
             ("conductance", "cv"),
@@ -318,8 +332,8 @@ def _diagnostic_markdown(conditions):
         "### Selected-checkpoint layer diagnostics",
         "",
         "Layer indices are zero-based. Validation computes no gradients; missing values are "
-        "not evidence that training skipped backpropagation. "
-        "Fixed-arm gamma/tau and gate norms describe an unused frozen scaffold.",
+        "not evidence that training skipped backpropagation. Fixed-arm gamma/tau and gate "
+        "norms are N/A because fixed C registers no estimator parameters.",
         "",
         "| Condition | Layer | Score std | C CV | log-C std | alpha | gamma | tau |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -378,7 +392,7 @@ def _training_gradient_markdown(conditions):
             continue
         for layer in record["layers"]:
             value = layer["gate_gradient_norm"]
-            label = "frozen / not trainable" if value is None else _display(value)
+            label = "parameter absent / N/A" if value is None else _display(value)
             lines.append(
                 f"| {condition['condition']} | {record['epoch']} | {layer['layer']} | {label} |"
             )
@@ -423,7 +437,9 @@ def _load(root, job, config, source_hashes):
         raise ValueError("metrics SHA-256 mismatch")
     dataset = job["dataset"]
     child_config = dict(config)
+    child_config.pop("workers_by_dataset", None)
     child_config["batch_size"] = 2 if dataset == "ppi" else 1
+    child_config["workers"] = config.get("workers", 0) if dataset == "ppi" else 0
     child = _load_child(root, job, child_config, suite=SUITE, conditions=CONDITIONS)
     for key, expected in (
         ("gate_mode", CONDITIONS[job["condition"]]["gate_mode"]),
@@ -506,9 +522,9 @@ def _load(root, job, config, source_hashes):
     if (
         total != trainable + frozen
         or (job["condition"] == "relative_c" and frozen != 0)
-        or (job["condition"] == "fixed_c" and frozen == 0)
+        or (job["condition"] == "fixed_c" and frozen != 0)
     ):
-        raise ValueError("parameter counts disagree with relative-C/frozen-scaffold condition")
+        raise ValueError("parameter counts disagree with parameter-free fixed-C condition")
     _validate_optimizer(child, child_config, job["condition"])
     _validate_diagnostics(child, child_config, dataset)
     if not isinstance(child.get("versions"), dict) or not child["versions"]:
@@ -517,7 +533,19 @@ def _load(root, job, config, source_hashes):
         raise ValueError("Missing GPU identity")
     if child["protocol"].get("data_sha256") != child["cache_sha256"]:
         raise ValueError("cache_sha256 disagrees with dataset protocol")
+    shared_hash = child.get("shared_backbone_initial_state_sha256")
+    if not isinstance(shared_hash, str) or not SHA256.fullmatch(shared_hash):
+        raise ValueError("shared backbone initialization SHA-256 is required")
     return child
+
+
+def _comparison_metadata(metrics: dict[str, Any]) -> dict[str, Any]:
+    metadata = _pair_metadata(metrics)
+    metadata.pop("initial_state_sha256")
+    metadata["shared_backbone_initial_state_sha256"] = metrics[
+        "shared_backbone_initial_state_sha256"
+    ]
+    return metadata
 
 
 def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
@@ -556,8 +584,13 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             _integer(config.get(key), key, minimum=1)
         if config.get("batch_size") != 2 or type(config.get("batch_size")) is not int:
             raise ValueError("manifest PPI batch_size must be 2")
-        if config.get("workers") != 0 or type(config.get("workers")) is not int:
-            raise ValueError("full-graph workers must be 0")
+        workers = _integer(config.get("workers"), "workers")
+        workers_by_dataset = config.get("workers_by_dataset")
+        if workers_by_dataset is not None and not _same(
+            workers_by_dataset,
+            {dataset: workers if dataset == "ppi" else 0 for dataset in datasets},
+        ):
+            raise ValueError("workers_by_dataset is inconsistent")
         if not isinstance(config.get("device"), str) or not re.fullmatch(
             r"cuda(?::[0-9]+)?", config["device"]
         ):
@@ -593,6 +626,9 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         expected_batch_size = 2 if dataset == "ppi" else 1
         if job.get("batch_size") != expected_batch_size:
             errors.append(f"{key}: job batch_size must be {expected_batch_size}")
+        expected_workers = config.get("workers", 0) if dataset == "ppi" else 0
+        if job.get("workers", expected_workers) != expected_workers:
+            errors.append(f"{key}: job workers must be {expected_workers}")
         if job.get("status") not in {"pending", "running", "failed", "passed"}:
             errors.append(f"{key}: invalid job status")
         try:
@@ -658,7 +694,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                         "best_checkpoint_interventions"
                     ]
                     row["best_epoch_training_observation"] = _best_training_observation(
-                        child, {**config, "batch_size": 2 if dataset == "ppi" else 1}, dataset
+                        child, child["configuration"], dataset
                     )
                     row["best_validation_diagnostics"] = _best_validation_summary(
                         child.get("diagnostics")
@@ -668,19 +704,18 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                     errors.append(f"{dataset}/{condition}: {exc}")
             rows.append(row)
         reference = next(iter(loaded.values()), None)
-        metadata = _pair_metadata(reference) if reference else None
+        metadata = _comparison_metadata(reference) if reference else None
         if reference:
             extra = (
                 "versions",
                 "gpu",
-                "total_parameters",
                 "topology",
                 "parameterization",
                 "source_sha256",
             )
             metadata.update({key: reference[key] for key in extra})
             for condition, child in loaded.items():
-                actual = _pair_metadata(child) | {key: child[key] for key in extra}
+                actual = _comparison_metadata(child) | {key: child[key] for key in extra}
                 for key in metadata:
                     if not _same(metadata[key], actual[key]):
                         errors.append(f"{dataset}/{condition}: held-fixed {key} mismatch")

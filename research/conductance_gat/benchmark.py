@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import json
 import random
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ from torch.nn import functional as F
 
 from chartgat.cache import atomic_publish, atomic_write_json
 from chartgat.execution import add_execution_arguments, configure_execution
+from chartgat.observability import RuntimeResourceMonitor, observed
 
 from .benchmark_data import DATASETS, load_dataset, sha256_file
 from .sparse import SparsePositiveConductance
@@ -160,6 +162,449 @@ def _versions() -> dict[str, str]:
     return output
 
 
+def _integer_distribution(values: list[int]) -> dict[str, int | float]:
+    """Describe every observed integer without sampling or invented values."""
+
+    if not values:
+        raise ValueError("cannot summarize an empty integer observation")
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    median = (
+        float(ordered[midpoint])
+        if len(ordered) % 2
+        else (ordered[midpoint - 1] + ordered[midpoint]) / 2
+    )
+    return {
+        "count": len(values),
+        "minimum": min(values),
+        "mean": sum(values) / len(values),
+        "median": median,
+        "maximum": max(values),
+        "total": sum(values),
+    }
+
+
+def data_observability(
+    payload: dict[str, Any],
+    *,
+    used_splits: tuple[str, ...],
+    prepared_splits: dict[str, Tensor] | None = None,
+) -> dict[str, Any]:
+    """Report exact verified-payload scale while touching only requested split metadata."""
+
+    graphs = payload.get("graphs")
+    if not isinstance(graphs, list) or not graphs:
+        raise ValueError("verified payload must contain at least one graph")
+    if any(not isinstance(graph, dict) for graph in graphs):
+        raise ValueError("verified payload graph rows must be mappings")
+    node_counts: list[int] = []
+    edge_counts: list[int] = []
+    feature_widths: set[int] = set()
+    for graph in graphs:
+        features = graph.get("x")
+        incidence = graph.get("incidence_edge_index")
+        if not isinstance(features, Tensor) or features.ndim != 2:
+            raise ValueError("every verified graph requires a rank-two x tensor")
+        if not isinstance(incidence, Tensor) or incidence.ndim != 2 or incidence.shape[0] != 2:
+            raise ValueError("every verified graph requires a [2, edges] incidence tensor")
+        node_counts.append(int(features.shape[0]))
+        edge_counts.append(int(incidence.shape[1]))
+        feature_widths.add(int(features.shape[1]))
+    if len(feature_widths) != 1:
+        raise ValueError("verified graphs disagree on node-feature width")
+
+    splits = payload.get("splits")
+    if not isinstance(splits, dict):
+        if not isinstance(prepared_splits, dict):
+            raise ValueError("verified payload requires split metadata")
+        splits = prepared_splits
+        split_metadata_source = "prepared_verified_split_indices"
+    else:
+        split_metadata_source = "verified_payload"
+    missing_splits = [name for name in used_splits if name not in splits]
+    if missing_splits:
+        raise ValueError(f"verified payload is missing requested splits: {missing_splits}")
+
+    if payload.get("dataset") == "ppi":
+        selected_graphs: set[int] = set()
+        split_counts: dict[str, int] = {}
+        for name in used_splits:
+            values = splits[name]
+            indices = [int(value) for value in values]
+            if len(indices) != len(set(indices)):
+                raise ValueError(f"{name} graph split contains duplicate indices")
+            if any(index < 0 or index >= len(graphs) for index in indices):
+                raise ValueError(f"{name} graph split contains an out-of-range index")
+            if selected_graphs.intersection(indices):
+                raise ValueError("requested official graph splits overlap")
+            selected_graphs.update(indices)
+            split_counts[name] = len(indices)
+        full_count = len(graphs)
+        used_count = len(selected_graphs)
+        requested_split_member_count = used_count
+        dataset_unit = "graphs"
+        target_shapes = sorted(
+            {
+                tuple(int(dimension) for dimension in graphs[index]["y"].shape)
+                for index in selected_graphs
+                if isinstance(graphs[index].get("y"), Tensor)
+            }
+        )
+        input_shape_contract: Any = [
+            "sum(nodes in physical graph batch)",
+            next(iter(feature_widths)),
+        ]
+    else:
+        if len(graphs) != 1:
+            raise ValueError("transductive conductance data requires exactly one graph")
+        full_count = node_counts[0]
+        selected_nodes = torch.zeros(full_count, dtype=torch.bool)
+        split_counts = {}
+        for name in used_splits:
+            mask = splits[name]
+            if not isinstance(mask, Tensor):
+                raise ValueError(f"{name} must be a tensor split mask or index vector")
+            if mask.dtype == torch.bool and mask.numel() == full_count:
+                mask = mask.detach().to(device="cpu").reshape(-1)
+            elif mask.dtype in {
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+                torch.uint8,
+            }:
+                indices = mask.detach().to(device="cpu", dtype=torch.long).reshape(-1)
+                if indices.numel() and (
+                    bool((indices < 0).any()) or bool((indices >= full_count).any())
+                ):
+                    raise ValueError(f"{name} contains an out-of-range node index")
+                if indices.numel() != indices.unique().numel():
+                    raise ValueError(f"{name} contains duplicate node indices")
+                mask = torch.zeros(full_count, dtype=torch.bool)
+                mask[indices] = True
+            else:
+                raise ValueError(f"{name} must be a full-length bool mask or integer indices")
+            if bool((selected_nodes & mask).any()):
+                raise ValueError("requested official node splits overlap")
+            selected_nodes |= mask
+            split_counts[name] = int(mask.count_nonzero())
+        requested_split_member_count = int(selected_nodes.count_nonzero())
+        # Transductive message passing consumes the complete graph even though
+        # loss/metric labels are restricted to the requested official splits.
+        used_count = full_count
+        dataset_unit = "nodes"
+        target = graphs[0].get("y")
+        target_shapes = (
+            [tuple(int(dimension) for dimension in target.shape)]
+            if isinstance(target, Tensor)
+            else []
+        )
+        input_shape_contract = [node_counts[0], next(iter(feature_widths))]
+
+    return {
+        "official_graph_count": len(graphs),
+        "nodes_per_graph": _integer_distribution(node_counts),
+        "stored_edge_columns_per_graph": _integer_distribution(edge_counts),
+        "input_tensor_shape_contract": {
+            "node_features": input_shape_contract,
+            "feature_width": next(iter(feature_widths)),
+            "target_shapes_observed_for_used_splits": [list(shape) for shape in target_shapes],
+            "first_actual_training_batch": observed(
+                None,
+                reason="captured from the first real training batch after training begins",
+            ),
+        },
+        "full_dataset_unit": dataset_unit,
+        "full_dataset_count": full_count,
+        "actual_split_counts": split_counts,
+        "requested_split_member_count": requested_split_member_count,
+        "requested_split_member_fraction_of_full_dataset": observed(
+            requested_split_member_count / full_count, unit="fraction"
+        ),
+        "split_metadata_source": split_metadata_source,
+        "actual_used_count": used_count,
+        "actual_used_fraction_of_full_dataset": observed(
+            used_count / full_count, unit="fraction"
+        ),
+        "sampling_ratio": observed(1.0, unit="fraction"),
+        "sampling_mode": "full_graph_no_neighbor_sampling",
+        "subset_or_fast_mode": False,
+        "time_window": observed(
+            None, reason="not applicable to static graph benchmarks", unit="steps"
+        ),
+        "input_resolution": observed(
+            None, reason="not applicable to graph feature tensors"
+        ),
+    }
+
+
+def batch_observability(
+    data: Any,
+    *,
+    transductive: bool,
+    args: argparse.Namespace,
+    batches_per_epoch: int,
+) -> dict[str, Any]:
+    """Describe the actual loader contract without running a probe batch."""
+
+    if batches_per_epoch < 1:
+        raise ValueError("training requires at least one batch per epoch")
+    if transductive:
+        physical_batch_size = 1
+        batch_unit = "complete_transductive_graph"
+        loader_workers = 0
+        pin_memory = False
+        persistent_workers = False
+        prefetch = observed(
+            None, reason="no DataLoader is used for full-graph transductive training"
+        )
+    else:
+        loader = data["train"]
+        physical_batch_size = int(getattr(loader, "batch_size", args.batch_size))
+        batch_unit = "graphs"
+        loader_workers = int(getattr(loader, "num_workers", args.workers))
+        pin_memory = bool(getattr(loader, "pin_memory", True))
+        persistent_workers = bool(getattr(loader, "persistent_workers", False))
+        loader_prefetch = getattr(loader, "prefetch_factor", None)
+        prefetch = (
+            observed(int(loader_prefetch), unit="batches_per_worker")
+            if loader_prefetch is not None
+            else observed(
+                None,
+                reason="DataLoader prefetch is disabled because no worker process is used",
+                unit="batches_per_worker",
+            )
+        )
+    return {
+        "batch_unit": batch_unit,
+        "configured_physical_batch_size": physical_batch_size,
+        "gradient_accumulation_steps": 1,
+        "data_parallel_workers": 1,
+        "configured_effective_batch_size": physical_batch_size,
+        "effective_batch_size_formula": (
+            f"{physical_batch_size} physical x 1 accumulation x 1 data-parallel worker"
+        ),
+        "training_batches_per_epoch": batches_per_epoch,
+        "planned_maximum_optimizer_steps": args.epochs * batches_per_epoch,
+        "dataloader_workers": loader_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": persistent_workers,
+        "prefetch_factor": prefetch,
+        "non_blocking_cuda_transfer": not transductive and pin_memory,
+        "cache": "verified official graph tensors are loaded once and reused",
+        "physical_batch_candidate_measurements": observed(
+            None,
+            reason=(
+                "this legacy comparison preserves its declared batch contract; no extra "
+                "candidate-batch probe is inserted into the scientific run"
+            ),
+        ),
+    }
+
+
+def optimizer_ownership(model: nn.Module, optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+    """Fail if trainable model tensors are absent, duplicated, or replaced in the optimizer."""
+
+    named = dict(model.named_parameters())
+    model_parameter_ids = {id(parameter) for parameter in named.values()}
+    trainable = {
+        id(parameter): name
+        for name, parameter in named.items()
+        if parameter.requires_grad
+    }
+    owners: dict[int, list[int]] = {}
+    unknown: list[str] = []
+    for group_index, group in enumerate(optimizer.param_groups):
+        for parameter in group["params"]:
+            identifier = id(parameter)
+            owners.setdefault(identifier, []).append(group_index)
+            if identifier not in model_parameter_ids:
+                unknown.append(f"group_{group_index}:shape={tuple(parameter.shape)}")
+    missing = [name for identifier, name in trainable.items() if identifier not in owners]
+    duplicated = [
+        trainable.get(identifier, f"unrecognized_parameter_{identifier}")
+        for identifier, groups in owners.items()
+        if len(groups) != 1
+    ]
+    frozen_owned = [
+        name
+        for name, parameter in named.items()
+        if not parameter.requires_grad and id(parameter) in owners
+    ]
+    if missing or duplicated or unknown or frozen_owned:
+        raise RuntimeError(
+            "optimizer ownership integrity failed: "
+            f"missing={missing}, duplicated={duplicated}, unknown={unknown}, "
+            f"frozen_owned={frozen_owned}"
+        )
+    return {
+        "status": "passed",
+        "trainable_parameter_tensors": len(trainable),
+        "optimizer_owned_parameter_tensors": len(owners),
+        "trainable_parameter_elements": sum(
+            parameter.numel() for parameter in named.values() if parameter.requires_grad
+        ),
+    }
+
+
+def validate_first_optimizer_step(
+    model: nn.Module, optimizer: torch.optim.Optimizer
+) -> dict[str, Any]:
+    """Fail closed before step one unless every trainable tensor has a finite gradient."""
+
+    ownership = optimizer_ownership(model, optimizer)
+    missing_gradients: list[str] = []
+    nonfinite_gradients: list[str] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.grad is None:
+            missing_gradients.append(name)
+        elif not bool(torch.isfinite(parameter.grad.detach()).all()):
+            nonfinite_gradients.append(name)
+    if missing_gradients or nonfinite_gradients:
+        raise FloatingPointError(
+            "first optimizer step gradient integrity failed: "
+            f"missing={missing_gradients}, nonfinite={nonfinite_gradients}"
+        )
+    return {
+        **ownership,
+        "gradient_status": "all_trainable_parameter_tensors_have_finite_gradients",
+        "checked_before_optimizer_step": 1,
+    }
+
+
+def first_batch_shapes(graph: Any) -> dict[str, Any]:
+    """Capture shapes from an actual training batch, never from a synthetic probe."""
+
+    output: dict[str, Any] = {}
+    for name in ("x", "y", "incidence_edge_index"):
+        value = getattr(graph, name, None)
+        if not isinstance(value, Tensor):
+            raise ValueError(f"actual training batch is missing tensor field {name}")
+        output[name] = list(value.shape)
+    batch = getattr(graph, "batch", None)
+    output["batch_vector"] = list(batch.shape) if isinstance(batch, Tensor) else None
+    output["num_graphs"] = int(getattr(graph, "num_graphs", 1))
+    return output
+
+
+def pre_run_observability(
+    *,
+    model_name: str,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    args: argparse.Namespace,
+    data_observation: dict[str, Any],
+    batching: dict[str, Any],
+    resource_start: dict[str, Any],
+    architecture: dict[str, Any],
+    precision: str,
+    device: torch.device,
+) -> dict[str, Any]:
+    """Build the common fail-visible pre-run contract for legacy conductance models."""
+
+    parameters = optimizer_ownership(model, optimizer)
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
+    trainable_parameters = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    if device.type == "cuda":
+        properties = torch.cuda.get_device_properties(device)
+        hardware: dict[str, Any] = {
+            "selected_device": str(device),
+            "device_name": properties.name,
+            "visible_cuda_device_count": torch.cuda.device_count(),
+            "device_total_memory_bytes": int(properties.total_memory),
+            "compute_capability": list(torch.cuda.get_device_capability(device)),
+            "mig_detected_from_device_name": "MIG" in properties.name.upper(),
+            "used_cuda_devices": 1,
+        }
+    else:
+        hardware = {
+            "selected_device": str(device),
+            "device_name": observed(
+                None, reason="CPU is permitted only by bounded unit-test hardware mocks"
+            ),
+            "visible_cuda_device_count": observed(
+                None, reason="CPU is permitted only by bounded unit-test hardware mocks"
+            ),
+            "used_cuda_devices": 0,
+        }
+    return {
+        "status": "pre_run_configuration",
+        "model": {
+            "name": model_name,
+            "layers": architecture["layers"],
+            "hidden_dimension": architecture["hidden_channels"],
+            "channels": architecture["hidden_channels"],
+            "attention_heads": observed(
+                None, reason="legacy conductance operators do not use attention heads"
+            ),
+            "total_parameters": total_parameters,
+            "trainable_parameters": trainable_parameters,
+            "frozen_parameters": total_parameters - trainable_parameters,
+            "optimizer_ownership": parameters,
+            **{
+                key: value
+                for key, value in architecture.items()
+                if key not in {"layers", "hidden_channels"}
+            },
+        },
+        "data": data_observation,
+        "batching": batching,
+        "optimization": {
+            "epochs_requested": args.epochs,
+            "early_stopping_patience": args.patience,
+            "planned_maximum_optimizer_steps": batching[
+                "planned_maximum_optimizer_steps"
+            ],
+            "actual_optimizer_steps": observed(
+                None, reason="training has not started", unit="steps"
+            ),
+        },
+        "precision": precision,
+        "hardware": hardware,
+        "resources": resource_start,
+        "modes": {
+            "debug": False,
+            "subset": False,
+            "fast_mode": False,
+        },
+    }
+
+
+def finish_monitor_after_failure(
+    monitor: RuntimeResourceMonitor,
+    *,
+    output: Path,
+    device: torch.device,
+    primary_error: BaseException,
+) -> None:
+    """Stop and publish the monitor without ever replacing the training exception."""
+
+    try:
+        allocated = int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
+        reserved = int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else None
+        resources = monitor.finish(
+            peak_allocated_bytes=allocated,
+            peak_reserved_bytes=reserved,
+        )
+        atomic_write_json(
+            output / "resource_observability.failed.json",
+            {
+                "status": "failed",
+                "training_error": f"{type(primary_error).__name__}: {primary_error}",
+                "resource_observability": resources,
+            },
+        )
+    except BaseException as cleanup_error:
+        primary_error.add_note(
+            "resource monitor cleanup also failed without replacing this error: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+
+
 def _selection(values: list[str], allowed: tuple[str, ...]) -> list[str]:
     selected = [
         item.strip().lower() for value in values for item in value.split(",") if item.strip()
@@ -206,15 +651,18 @@ def _make_loaders(payload: dict[str, Any], args: argparse.Namespace, device: tor
             generator=generator,
             pin_memory=args.pin_memory,
             persistent_workers=args.workers > 0,
+            prefetch_factor=2 if args.workers > 0 else None,
         )
     return loaders, None
 
 
-def train_model(
+def _train_model_impl(
     payload: dict[str, Any],
     args: argparse.Namespace,
     device: torch.device,
     output: Path,
+    *,
+    resource_start: dict[str, Any],
 ) -> dict[str, Any]:
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("Benchmark training requires CUDA (including direct train_model calls).")
@@ -233,9 +681,46 @@ def train_model(
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and amp_dtype == torch.float16)
+    validation_only = bool(getattr(args, "validation_only", False))
+    used_splits = ("train", "validation") if validation_only else (
+        "train",
+        "validation",
+        "test",
+    )
+    batches_per_epoch = 1 if split_indices is not None else len(data["train"])
+    data_observation = data_observability(payload, used_splits=used_splits)
+    batching = batch_observability(
+        data,
+        transductive=split_indices is not None,
+        args=args,
+        batches_per_epoch=batches_per_epoch,
+    )
+    pre_run = pre_run_observability(
+        model_name="conductance_gat_v1",
+        model=model,
+        optimizer=optimizer,
+        args=args,
+        data_observation=data_observation,
+        batching=batching,
+        resource_start=resource_start,
+        architecture={
+            "hidden_channels": args.hidden_channels,
+            "layers": args.layers,
+            "dropout": args.dropout,
+        },
+        precision=(
+            f"amp_{str(amp_dtype).removeprefix('torch.')}" if args.amp else "float32"
+        ),
+        device=device,
+    )
+    print(json.dumps(pre_run, sort_keys=True), flush=True)
     checkpoint = output / "best.pt"
     history: list[dict[str, Any]] = []
     best_validation, best_epoch = -float("inf"), 0
+    optimizer_steps = 0
+    training_label_updates = 0
+    first_training_batch: dict[str, Any] | None = None
+    first_step_integrity: dict[str, Any] | None = None
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
     start_time = time.perf_counter()
@@ -272,6 +757,8 @@ def train_model(
         for graph in batches:
             if split_indices is None:
                 graph = graph.to(device, non_blocking=args.pin_memory)
+            if first_training_batch is None:
+                first_training_batch = first_batch_shapes(graph)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=amp_dtype, enabled=args.amp):
                 logits = model(graph)
@@ -289,8 +776,13 @@ def train_model(
                     f"Non-finite training loss: {payload['dataset']}/conductance, epoch {epoch}"
                 )
             scaler.scale(loss).backward()
+            if optimizer_steps == 0:
+                scaler.unscale_(optimizer)
+                first_step_integrity = validate_first_optimizer_step(model, optimizer)
             scaler.step(optimizer)
             scaler.update()
+            optimizer_steps += 1
+            training_label_updates += int(count)
             loss_sum.add_(loss.detach().to(torch.float64) * count)
             label_count += count
         validation = evaluate("validation")
@@ -337,8 +829,11 @@ def train_model(
     model.load_state_dict(saved["state_dict"])
     # Scaling/model-size exploration must not repeatedly expose test labels. The
     # historical benchmark path keeps its one post-selection test evaluation.
-    validation_only = bool(getattr(args, "validation_only", False))
     test_metric = None if validation_only else evaluate("test")
+    if first_training_batch is None or first_step_integrity is None:
+        raise RuntimeError("training completed without a validated first optimizer step")
+    elapsed_seconds = time.perf_counter() - start_time
+    measured_epoch_seconds = sum(float(row["epoch_seconds"]) for row in history)
     result = {
         "validation": best_validation,
         "test": test_metric,
@@ -347,7 +842,7 @@ def train_model(
         "trainable_parameters": sum(p.numel() for p in model.parameters()),
         "checkpoint": str(checkpoint.resolve()),
         "history": str((output / "history.json").resolve()),
-        "elapsed_seconds": time.perf_counter() - start_time,
+        "elapsed_seconds": elapsed_seconds,
         "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(device),
         "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
         "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
@@ -358,6 +853,39 @@ def train_model(
         "execution": execution,
         "epoch_timing": "cuda_synchronized_train_and_validation_excluding_checkpoint_io",
         "model_seed": args.model_seed,
+        "optimizer_steps": optimizer_steps,
+        "optimization_observability": {
+            "epochs_requested": args.epochs,
+            "epochs_completed": len(history),
+            "early_stopping_patience": args.patience,
+            "planned_maximum_optimizer_steps": batching[
+                "planned_maximum_optimizer_steps"
+            ],
+            "actual_optimizer_steps": optimizer_steps,
+            "training_label_decisions_processed": training_label_updates,
+            "gradient_accumulation_steps": 1,
+        },
+        "data_observability": {
+            **data_observation,
+            "input_tensor_shape_contract": {
+                **data_observation["input_tensor_shape_contract"],
+                "first_actual_training_batch": first_training_batch,
+            },
+        },
+        "batch_observability": batching,
+        "pre_run_observability": pre_run,
+        "first_optimizer_step_integrity": first_step_integrity,
+        "throughput": {
+            "measured_epoch_seconds": measured_epoch_seconds,
+            "optimizer_steps_per_second": optimizer_steps / measured_epoch_seconds,
+            "training_label_decisions_per_second": (
+                training_label_updates / measured_epoch_seconds
+            ),
+            "scope": (
+                "CUDA-synchronized epoch timing includes training and validation but excludes "
+                "subsequent history/checkpoint writes"
+            ),
+        },
         "test_selection": (
             "not_evaluated_scaling_selection"
             if validation_only
@@ -367,6 +895,65 @@ def train_model(
     if validation_only:
         result.pop("test")
         result.update(evaluation_split="validation", test_evaluated=False)
+    atomic_write_json(output / "metrics.json", result)
+    return result
+
+
+def train_model(
+    payload: dict[str, Any],
+    args: argparse.Namespace,
+    device: torch.device,
+    output: Path,
+) -> dict[str, Any]:
+    """Run V1 with periodic resource sampling and exception-safe monitor cleanup."""
+
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("Benchmark training requires CUDA (including direct train_model calls).")
+    torch.cuda.get_device_properties(device)
+    monitor = RuntimeResourceMonitor(device)
+    resource_start = monitor.start()
+    try:
+        result = _train_model_impl(
+            payload,
+            args,
+            device,
+            output,
+            resource_start=resource_start,
+        )
+    except BaseException as primary_error:
+        finish_monitor_after_failure(
+            monitor,
+            output=output,
+            device=device,
+            primary_error=primary_error,
+        )
+        raise
+    resources = monitor.finish(
+        peak_allocated_bytes=int(result["peak_cuda_allocated_bytes"]),
+        peak_reserved_bytes=int(result["peak_cuda_reserved_bytes"]),
+    )
+    result["resource_observability"] = resources
+    result["hardware_execution"] = {
+        "gpu_sm_utilization": resources["interval_series"][
+            "gpu_sm_utilization_percent"
+        ],
+        "gpu_memory_controller_utilization": resources["interval_series"][
+            "gpu_memory_controller_utilization_percent"
+        ],
+        "cpu_and_ram": {
+            "cpu": resources["summary"],
+            "ram": {
+                key: value
+                for key, value in resources["interval_series"].items()
+                if key
+                in {
+                    "process_resident_bytes",
+                    "process_peak_resident_bytes",
+                    "system_available_bytes",
+                }
+            },
+        },
+    }
     atomic_write_json(output / "metrics.json", result)
     return result
 
@@ -385,7 +972,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chart-seed", type=int, default=0)
     parser.add_argument("--model-seed", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--workers", "--num-workers", type=int, default=0)
+    parser.add_argument(
+        "--workers",
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Default: 4 for PPI graph minibatches, 0 when only transductive graphs run",
+    )
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=50)
     parser.add_argument("--hidden-channels", type=int, default=64)
@@ -401,9 +994,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_worker_arguments(args: argparse.Namespace) -> None:
+    """Resolve the only real DataLoader worker pool from the selected datasets."""
+
+    if args.workers is None:
+        args.workers = 4 if "ppi" in args.datasets else 0
+        args.worker_configuration_source = "dataset_default"
+    elif not hasattr(args, "worker_configuration_source"):
+        args.worker_configuration_source = "explicit_cli"
+    args.workers_by_dataset = {
+        dataset: args.workers if dataset == "ppi" else 0 for dataset in args.datasets
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     args.datasets = _selection(args.datasets, DATASETS)
+    resolve_worker_arguments(args)
     if min(args.batch_size, args.epochs, args.patience, args.layers) < 1 or args.workers < 0:
         raise ValueError(
             "batch size, epochs, patience, layers must be positive; workers nonnegative"
@@ -443,8 +1050,13 @@ def main(argv: list[str] | None = None) -> int:
         "expected": [f"{dataset}/conductance" for dataset in args.datasets],
         "sources": ["https://arxiv.org/abs/1710.10903", "https://arxiv.org/abs/2105.14491"],
         "implementation_sha256": {
-            name: sha256_file(Path(__file__).with_name(name))
-            for name in ("benchmark.py", "benchmark_data.py", "sparse.py")
+            **{
+                name: sha256_file(Path(__file__).with_name(name))
+                for name in ("benchmark.py", "benchmark_data.py", "sparse.py")
+            },
+            "src/chartgat/observability.py": sha256_file(
+                Path(__file__).resolve().parents[2] / "src/chartgat/observability.py"
+            ),
         },
         "reproducibility": (
             "Seeded runs; GPU scatter kernels can remain nondeterministic. No bitwise guarantee."
@@ -483,11 +1095,20 @@ def main(argv: list[str] | None = None) -> int:
         if not args.prepare_only and manifest["completed"] != manifest["expected"]:
             raise RuntimeError("Incomplete matched benchmark; cannot mark passed")
         manifest["status"] = metrics["status"] = "prepared" if args.prepare_only else "passed"
-    except Exception as exc:
+    except BaseException as exc:
         manifest["status"] = metrics["status"] = "failed"
         manifest["error"] = f"{type(exc).__name__}: {exc}"
-        atomic_write_json(output / "manifest.json", manifest)
-        atomic_write_json(output / "metrics.json", metrics)
+        for path, payload in (
+            (output / "manifest.json", manifest),
+            (output / "metrics.json", metrics),
+        ):
+            try:
+                atomic_write_json(path, payload)
+            except BaseException as reporting_error:
+                exc.add_note(
+                    f"{path.name} failure state could not be written without replacing this "
+                    f"error: {type(reporting_error).__name__}: {reporting_error}"
+                )
         raise
     atomic_write_json(output / "manifest.json", manifest)
     atomic_write_json(output / "metrics.json", metrics)

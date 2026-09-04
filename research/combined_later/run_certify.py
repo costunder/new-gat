@@ -124,6 +124,8 @@ def main() -> None:
     parser.add_argument("--tolerance", type=float, default=1.0e-9)
     args = parser.parse_args()
 
+    if args.output.exists():
+        raise FileExistsError(f"Certification output already exists: {args.output}")
     per_graph = [
         certify_graph(args.seed + index, args.nodes, args.extra_edges, args.depth)
         for index in range(args.graphs)
@@ -142,7 +144,10 @@ def main() -> None:
     args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(json.dumps({"passed": passed, "max_errors": maxima}, indent=2))
     if not passed:
-        raise SystemExit(1)
+        raise RuntimeError(
+            "algebraic symmetry certification exceeded the configured tolerance; "
+            f"details were preserved in {args.output}"
+        )
 
 
 if __name__ == "__main__":

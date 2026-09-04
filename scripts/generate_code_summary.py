@@ -40,7 +40,9 @@ LANGUAGES = {
 def _excluded(path: Path, *, root: Path) -> bool:
     relative = path.relative_to(root)
     return any(
-        part in EXCLUDED_PARTS or part.startswith(".venv") or part.endswith(".egg-info")
+        part in EXCLUDED_PARTS
+        or part.startswith((".venv", ".pytest-tmp-"))
+        or part.endswith(".egg-info")
         for part in relative.parts
     )
 

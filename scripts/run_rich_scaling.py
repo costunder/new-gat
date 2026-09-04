@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import hashlib
 import json
@@ -14,6 +15,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,12 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     DEFAULT_BETA_PARAMETERIZATION,
     beta_configuration,
 )
+from scripts.process_safety import (  # noqa: E402
+    close_owned_child_stdout,
+    run_failure_reporter,
+    terminate_owned_child,
+    terminate_owned_child_after_error,
+)
 
 TRACKS = ("conductance", "cycle", "tree")
 PROFILES = ("reference", "large")
@@ -35,6 +43,12 @@ HARDWARE_PROFILES = ("portable", "a6000-48gb")
 CYCLE_V2_BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
 DEFAULT_MODEL_SEEDS = (0,)
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
+
+_ACTIVE_CHILDREN_LOCK = threading.Lock()
+_ACTIVE_CHILDREN: dict[
+    subprocess.Popen[str], tuple[tuple[str, ...], Path]
+] = {}
+_STOP_ACTIVE_CHILDREN = threading.Event()
 
 # Keep the complete public matrices here instead of trusting child row counts.  The
 # central runner passes these selections explicitly and verifies the same Cartesian
@@ -106,15 +120,68 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
     result.add_argument("--run-id")
-    result.add_argument("--device", default="cuda")
+    device = result.add_mutually_exclusive_group()
+    device.add_argument(
+        "--device",
+        default="cuda",
+        help="one CUDA device (backward-compatible single-device execution)",
+    )
+    device.add_argument(
+        "--devices",
+        nargs="+",
+        help=(
+            "explicit distinct CUDA devices for concurrent independent track children; "
+            "tracks are assigned round-robin and each child remains single-device"
+        ),
+    )
     result.add_argument(
         "--hardware-profile",
         choices=HARDWARE_PROFILES,
         default="portable",
         help=(
-            "portable keeps conservative child settings; a6000-48gb enables each track's "
-            "recorded high-throughput settings and fails closed below 40 GiB visible VRAM or "
-            "compute capability 8.0"
+            "portable and a6000-48gb select preregistered child resource settings; these are "
+            "not measured throughput optima. The a6000-48gb profile fails closed below "
+            "40 GiB visible VRAM or compute capability 8.0"
+        ),
+    )
+    result.add_argument(
+        "--conductance-legacy-ppi-batch-size",
+        type=int,
+        help=(
+            "explicit V1/V3/V4 PPI graph-batch override forwarded to Conductance; use only "
+            "after exact-version/profile measurement"
+        ),
+    )
+    result.add_argument(
+        "--conductance-v5-ppi-batch-size",
+        type=int,
+        help=(
+            "explicit V5 PPI graph-batch override forwarded to Conductance; use only after an "
+            "exact-configuration measurement because it changes the optimization recipe"
+        ),
+    )
+    result.add_argument(
+        "--conductance-v5-sample-seed-batch-size",
+        type=int,
+        help=(
+            "explicit V5 sampled seed-node batch override forwarded to Conductance; use only "
+            "after an exact-configuration measurement"
+        ),
+    )
+    result.add_argument(
+        "--cycle-batch-size",
+        type=int,
+        help=(
+            "explicit physical graph-batch override forwarded to Cycle; one value applies to "
+            "every requested Cycle version/dataset/profile and is not claimed as measured"
+        ),
+    )
+    result.add_argument(
+        "--tree-batch-size",
+        type=int,
+        help=(
+            "explicit physical chart-view batch override forwarded to Tree; one value applies "
+            "to every requested Tree suite/profile and is not claimed as measured"
         ),
     )
     result.add_argument("--min-free-gb", type=float, default=8.0)
@@ -163,10 +230,49 @@ def _validate(args: argparse.Namespace) -> None:
             raise ValueError(f"{label} must be nonempty and contain no duplicates")
     if any(seed < 0 for seed in args.model_seeds):
         raise ValueError("model seeds must be nonnegative")
-    if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
-        raise ValueError("rich scaling requires CUDA; CPU fallback is not supported")
+    devices = _execution_devices(args)
+    if any(not re.fullmatch(r"cuda(?::[0-9]+)?", value) for value in devices):
+        raise ValueError("rich scaling requires CUDA devices; CPU fallback is not supported")
+    if len(set(devices)) != len(devices):
+        raise ValueError("--devices must contain distinct CUDA devices")
+    if len(devices) > 1 and any(value == "cuda" for value in devices):
+        raise ValueError("multi-device execution requires explicit indexed devices such as cuda:0")
     if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
         raise ValueError("minimum free GPU memory must be finite and nonnegative")
+    batch_overrides = {
+        "--conductance-legacy-ppi-batch-size": args.conductance_legacy_ppi_batch_size,
+        "--conductance-v5-ppi-batch-size": args.conductance_v5_ppi_batch_size,
+        "--conductance-v5-sample-seed-batch-size": (
+            args.conductance_v5_sample_seed_batch_size
+        ),
+        "--cycle-batch-size": args.cycle_batch_size,
+        "--tree-batch-size": args.tree_batch_size,
+    }
+    for option, value in batch_overrides.items():
+        if value is not None and value < 1:
+            raise ValueError(f"{option} must be positive")
+    if (
+        args.conductance_legacy_ppi_batch_size is not None
+        and (
+            "conductance" not in args.tracks
+            or not {"v1", "v3", "v4"}.intersection(args.conductance_versions)
+        )
+    ):
+        raise ValueError("legacy PPI batch override requires Conductance V1, V3, or V4")
+    if (
+        args.conductance_v5_ppi_batch_size is not None
+        or args.conductance_v5_sample_seed_batch_size is not None
+    ) and ("conductance" not in args.tracks or "v5" not in args.conductance_versions):
+        raise ValueError("Conductance V5 batch overrides require the conductance/V5 track")
+    if (
+        args.hardware_profile == "portable"
+        and args.conductance_v5_ppi_batch_size not in {None, 2}
+    ):
+        raise ValueError("portable Conductance V5 PPI retains graph batch-size 2")
+    if args.cycle_batch_size is not None and "cycle" not in args.tracks:
+        raise ValueError("--cycle-batch-size requires the cycle track")
+    if args.tree_batch_size is not None and "tree" not in args.tracks:
+        raise ValueError("--tree-batch-size requires the tree track")
     if args.run_id is not None and RUN_ID_PATTERN.fullmatch(args.run_id) is None:
         raise ValueError("run ID must be 1-120 letters, digits, underscores, or hyphens")
     if (
@@ -176,6 +282,12 @@ def _validate(args: argparse.Namespace) -> None:
     ):
         raise ValueError("nondefault Cycle basis backend requires v2 in --cycle-versions")
     _v5_beta_configuration(args)
+
+
+def _execution_devices(args: argparse.Namespace) -> list[str]:
+    """Return explicit execution devices without probing or changing visibility."""
+
+    return list(args.devices) if args.devices is not None else [args.device]
 
 
 def _default_run_id() -> str:
@@ -268,11 +380,12 @@ def _v5_beta_configuration(args: argparse.Namespace) -> dict[str, float | str]:
 
 
 def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
-    """Build one sequential child-process job per selected research track."""
+    """Build one child job per track; execution waves bind at most one track per GPU."""
     results_root = args.results_root.expanduser().resolve()
     data_root = args.data_root.expanduser().resolve()
     jobs: list[dict[str, Any]] = []
-    for track in args.tracks:
+    devices = _execution_devices(args)
+    for track_index, track in enumerate(args.tracks):
         spec = TRACK_SPECS[track]
         child_run_id = _child_run_id(run_id, track)
         child_dir = (results_root / spec["results_subdir"] / child_run_id).resolve()
@@ -298,12 +411,16 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
                 "--model-seeds",
                 ",".join(str(seed) for seed in args.model_seeds),
             ]
+            if args.tree_batch_size is not None:
+                command += ["--batch-size", str(args.tree_batch_size)]
         elif track == "cycle":
             command += ["--versions", *requested_matrix["versions"]]
             command += ["--datasets", *requested_matrix["datasets"]]
             command += ["--profiles", *profiles]
             command += ["--model-seeds", ",".join(str(seed) for seed in args.model_seeds)]
             command += ["--basis-backend", args.cycle_v2_basis_backend]
+            if args.cycle_batch_size is not None:
+                command += ["--batch-size", str(args.cycle_batch_size)]
         else:
             command += ["--versions", *requested_matrix["versions"]]
             command += ["--datasets", *requested_matrix["requested_datasets"]]
@@ -311,12 +428,28 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             command += ["--model-seeds", *(str(seed) for seed in args.model_seeds)]
             for name, value in _v5_beta_configuration(args).items():
                 command += ["--v5-" + name.replace("_", "-"), str(value)]
+            if args.conductance_legacy_ppi_batch_size is not None:
+                command += [
+                    "--legacy-ppi-batch-size",
+                    str(args.conductance_legacy_ppi_batch_size),
+                ]
+            if args.conductance_v5_ppi_batch_size is not None:
+                command += [
+                    "--v5-ppi-batch-size",
+                    str(args.conductance_v5_ppi_batch_size),
+                ]
+            if args.conductance_v5_sample_seed_batch_size is not None:
+                command += [
+                    "--v5-sample-seed-batch-size",
+                    str(args.conductance_v5_sample_seed_batch_size),
+                ]
             if args.v5_activation_checkpoint is not None:
                 command.append(
                     "--v5-activation-checkpoint"
                     if args.v5_activation_checkpoint
                     else "--no-v5-activation-checkpoint"
                 )
+        assigned_device = devices[track_index % len(devices)]
         command += [
             "--data-root",
             str(data_root),
@@ -325,7 +458,7 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             "--run-id",
             child_run_id,
             "--device",
-            args.device,
+            assigned_device,
             "--hardware-profile",
             args.hardware_profile,
             "--min-free-gb",
@@ -341,6 +474,7 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
         jobs.append(
             {
                 "track": track,
+                "device": assigned_device,
                 "child_run_id": child_run_id,
                 "status": "pending",
                 "profiles": profiles,
@@ -365,7 +499,9 @@ def _source_snapshot() -> dict[str, str]:
         ROOT / "scripts/check_dependencies.py",
         ROOT / "scripts/gpu_profiles.py",
         ROOT / "scripts/gpu_preflight.py",
+        ROOT / "scripts/process_safety.py",
         ROOT / "scripts/run_conductance_factorial.py",
+        ROOT / "scripts/telemetry_validation.py",
         ROOT / "scripts/verify_gpu_lock.py",
         ROOT / "research/tree_augmentation/config.yaml",
     ]
@@ -424,9 +560,69 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
+    except BaseException as original_error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            original_error.add_note(
+                "temporary manifest cleanup failed with "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
         raise
+
+
+def _persist_manifest_after_error(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    original_error: BaseException,
+    *,
+    action: str,
+) -> None:
+    note = run_failure_reporter(
+        lambda: _atomic_write_json(manifest_path, manifest),
+        original_error=original_error,
+        action=action,
+    )
+    if note is not None:
+        manifest.setdefault("failure_persistence_errors", []).append(note)
+
+
+def _register_active_child(
+    process: subprocess.Popen[str], command: list[str], log_path: Path
+) -> None:
+    with _ACTIVE_CHILDREN_LOCK:
+        if process in _ACTIVE_CHILDREN:
+            raise RuntimeError("child process was registered more than once")
+        _ACTIVE_CHILDREN[process] = (tuple(command), log_path)
+
+
+def _forget_active_child(process: subprocess.Popen[str]) -> None:
+    with _ACTIVE_CHILDREN_LOCK:
+        _ACTIVE_CHILDREN.pop(process, None)
+
+
+def _stop_active_children(
+    *, reason: str, original_error: BaseException | None = None
+) -> list[dict[str, object]]:
+    """Stop only exact live children created and registered by this runner."""
+
+    with _ACTIVE_CHILDREN_LOCK:
+        active = list(_ACTIVE_CHILDREN.items())
+    recorded: list[dict[str, object]] = []
+    for process, (command, log_path) in active:
+        if original_error is None:
+            events = terminate_owned_child(
+                process, command, reason=reason, log_target=log_path
+            )
+        else:
+            events = terminate_owned_child_after_error(
+                process,
+                command,
+                original_error=original_error,
+                log_target=log_path,
+            )
+        recorded.extend({**event, "log_path": str(log_path)} for event in events)
+    return recorded
 
 
 def _run_logged(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
@@ -448,24 +644,35 @@ def _run_logged(command: list[str], log_path: Path, environment: dict[str, str])
             bufsize=1,
             shell=False,
         )
+        _register_active_child(process, command, log_path)
+        primary_error: BaseException | None = None
         try:
+            if _STOP_ACTIVE_CHILDREN.is_set():
+                terminate_owned_child(
+                    process,
+                    command,
+                    reason="central rich-scaling coordinator already requested interruption",
+                    log_target=log,
+                )
+                return process.wait()
             assert process.stdout is not None
             for line in process.stdout:
                 print(line, end="", flush=True)
                 log.write(line)
                 log.flush()
             return process.wait()
-        except BaseException:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
+        except BaseException as error:
+            primary_error = error
+            terminate_owned_child_after_error(
+                process,
+                command,
+                original_error=error,
+                log_target=log,
+            )
             raise
         finally:
-            if process.stdout is not None:
-                process.stdout.close()
+            _forget_active_child(process)
+            close_owned_child_stdout(process, original_error=primary_error)
 
 
 def _integer(value: Any, label: str) -> int:
@@ -916,6 +1123,7 @@ def _validate_child_summary(job: dict[str, Any]) -> dict[str, Any]:
 
 _RESUME_JOB_FIELDS = (
     "track",
+    "device",
     "child_run_id",
     "profiles",
     "shared_profiles",
@@ -940,8 +1148,20 @@ def _config_payload(
         "shared_profiles": list(args.profiles),
         "tree_profiles": list(args.profiles),
         "model_seeds": list(args.model_seeds),
-        "device": args.device,
+        "devices": _execution_devices(args),
+        "device_assignment": "round_robin_by_independent_track",
+        "execution_classification": "final_research_training",
+        "debug_or_smoke_mode": False,
         "hardware_profile": args.hardware_profile,
+        "explicit_batch_overrides": {
+            "conductance_legacy_ppi_graphs": args.conductance_legacy_ppi_batch_size,
+            "conductance_v5_ppi_graphs": args.conductance_v5_ppi_batch_size,
+            "conductance_v5_sample_seed_nodes": (
+                args.conductance_v5_sample_seed_batch_size
+            ),
+            "cycle_graphs": args.cycle_batch_size,
+            "tree_chart_views": args.tree_batch_size,
+        },
         "min_free_gb": args.min_free_gb,
         "v5_beta": _v5_beta_configuration(args),
         "v5_activation_checkpoint": args.v5_activation_checkpoint,
@@ -1057,14 +1277,17 @@ def _print_plan(args: argparse.Namespace, run_id: str, jobs: list[dict[str, Any]
         f"conductance_versions={list(args.conductance_versions)}; "
         f"cycle_versions={list(args.cycle_versions)}"
     )
+    devices = _execution_devices(args)
+    print("execution_classification=plan_only; training_started=false; debug_or_smoke=false")
     print(
-        f"hardware_profile={args.hardware_profile}; track_concurrency=1 "
-        "(independent-job concurrency is owned by each child runner)"
+        f"hardware_profile={args.hardware_profile}; devices={devices}; "
+        f"track_concurrency={min(len(devices), len(jobs))} "
+        "(one independent track child per assigned GPU)"
     )
     for job in jobs:
         expected = job["expected_counts"]
         print(
-            f"[{job['track']}] {expected['child_runs']} child runs; "
+            f"[{job['track']}] device={job['device']}; {expected['child_runs']} child runs; "
             f"{expected['model_trainings']} fresh model trainings; "
             f"child profiles={job['profiles']}"
         )
@@ -1136,19 +1359,50 @@ def main(argv: list[str] | None = None) -> int:
             "config": config,
             "protocol": {
                 "purpose": "reference-scale training for every selected V1/V2/V3/V4/V5 track",
-                "execution": "selected track runners execute sequentially without a shell",
+                "execution_classification": "final_research_training",
+                "debug_or_smoke_mode": False,
+                "dry_run_classification": "plan_only_without_training_or_output_writes",
+                "execution": (
+                    "selected independent track runners execute concurrently only when distinct "
+                    "indexed CUDA devices are explicitly supplied; otherwise they stay sequential"
+                ),
                 "hardware_profile": {
                     "name": args.hardware_profile,
                     "portable": "conservative settings and one independent job at a time",
                     "a6000-48gb": "child runners require at least 40 GiB visible VRAM and "
                     "compute capability 8.0, then apply track-specific minibatch, AMP, worker, "
                     "and safe independent-job concurrency settings",
-                    "cross_track_concurrency": 1,
-                    "reason": "tracks stay sequential because simultaneous peak allocations "
-                    "and independent CUDA caching allocators are not bounded by this runner",
+                    "devices": _execution_devices(args),
+                    "cross_track_concurrency": min(len(_execution_devices(args)), len(jobs)),
+                    "assignment": "round_robin_by_independent_track",
+                    "same_device_concurrency": 1,
+                    "reason": (
+                        "distinct GPUs may run disjoint track children concurrently; no GPU runs "
+                        "multiple track children because their peak CUDA allocations are unbounded"
+                    ),
+                },
+                "batch_selection": {
+                    "default_policy": "preregistered_per_child_hardware_dataset_profile",
+                    "measured_throughput_optimum_claimed": False,
+                    "automatic_downscale": False,
+                    "throughput_candidate_sweep": False,
+                    "explicit_overrides": config["explicit_batch_overrides"],
+                    "override_scope": (
+                        "each non-null override is forwarded unchanged to the named child; Cycle "
+                        "and Tree overrides intentionally apply to their whole requested matrix"
+                    ),
+                    "limitation": (
+                        "this orchestrator does not alter an optimization recipe by benchmarking "
+                        "and selecting a different physical batch. Exact-configuration candidate "
+                        "measurement remains a separate run; explicit overrides are optimization "
+                        "identity, never evidence of a measured optimum. Cycle V2 performs its "
+                        "recorded pre-epoch capacity probe and fails closed instead of silently "
+                        "shrinking"
+                    ),
                 },
                 "failure_policy": (
-                    "stop after first failed track"
+                    "do not start a later device wave after any failure; already-running "
+                    "distinct-GPU peers finish and are recorded"
                     if args.fail_fast
                     else "continue remaining tracks"
                 ),
@@ -1173,52 +1427,138 @@ def main(argv: list[str] | None = None) -> int:
     environment = _environment()
     failed = False
     interrupted = False
+    primary_error: BaseException | None = None
     print(
         f"Run: {run_id}; {totals['track_runs']} tracks; "
         f"{totals['model_trainings']} planned model trainings; "
         f"resume={'yes' if resumed else 'no'}",
         flush=True,
     )
-    for index, job in enumerate(jobs, start=1):
+    concurrency = min(len(_execution_devices(args)), len(jobs))
+    for wave_start in range(0, len(jobs), concurrency):
         if failed and args.fail_fast:
             break
-        previously_passed = job["status"] == "passed"
-        job["status"] = "running"
-        job["started_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
-        _atomic_write_json(manifest_path, manifest)
-        action = "verify completed child state" if previously_passed else "resume incomplete child"
-        print(f"\n[{index}/{len(jobs)}] {job['track']} — {action}", flush=True)
-        started = time.monotonic()
-        try:
+        wave = jobs[wave_start : wave_start + concurrency]
+        starts: dict[int, float] = {}
+        for offset, job in enumerate(wave, start=wave_start + 1):
+            previously_passed = job["status"] == "passed"
+            job["status"] = "running"
+            job["started_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+            starts[id(job)] = time.monotonic()
+            action = (
+                "verify completed child state" if previously_passed else "resume incomplete child"
+            )
+            print(
+                f"\n[{offset}/{len(jobs)}] {job['track']} on {job['device']} — {action}",
+                flush=True,
+            )
+        if primary_error is None:
+            _atomic_write_json(manifest_path, manifest)
+        else:
+            _persist_manifest_after_error(
+                manifest_path,
+                manifest,
+                primary_error,
+                action="post-failure wave-start manifest persistence",
+            )
+
+        def run_child(job: dict[str, Any]) -> int:
             log_path = Path(job["log_path"])
             if not log_path.resolve().is_relative_to(run_dir):
                 raise RuntimeError("track log path resolves outside the central run directory")
-            returncode = _run_logged(job["command"], log_path, environment)
-            job["returncode"] = returncode
-            if returncode != 0:
-                raise RuntimeError(f"{job['track']} child failed with exit code {returncode}")
-            job["result"] = _validate_child_summary(job)
-            job["status"] = "passed"
+            return _run_logged(job["command"], log_path, environment)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(wave))
+        futures: dict[concurrent.futures.Future[int], dict[str, Any]] = {}
+        try:
+            futures = {executor.submit(run_child, job): job for job in wave}
+            for future in concurrent.futures.as_completed(futures):
+                job = futures[future]
+                job_error: BaseException | None = None
+                try:
+                    returncode = future.result()
+                    job["returncode"] = returncode
+                    if returncode != 0:
+                        raise RuntimeError(
+                            f"{job['track']} child failed with exit code {returncode}"
+                        )
+                    job["result"] = _validate_child_summary(job)
+                    job["status"] = "passed"
+                except Exception as error:
+                    job_error = error
+                    if primary_error is None:
+                        primary_error = error
+                    failed = True
+                    job["status"] = "failed"
+                    job["error"] = f"{type(error).__name__}: {error}"
+                    print(f"Failed {job['track']}: {job['error']}", file=sys.stderr)
+                finally:
+                    job["elapsed_seconds"] = time.monotonic() - starts[id(job)]
+                    job["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+                    persistence_error = job_error or primary_error
+                    if persistence_error is None:
+                        _atomic_write_json(manifest_path, manifest)
+                    else:
+                        _persist_manifest_after_error(
+                            manifest_path,
+                            manifest,
+                            persistence_error,
+                            action="post-child failure manifest persistence",
+                        )
         except KeyboardInterrupt as error:
+            primary_error = error
             interrupted = True
             failed = True
-            job["status"] = "failed"
-            job["error"] = f"{type(error).__name__}: {error}"
-        except Exception as error:
-            failed = True
-            job["status"] = "failed"
-            job["error"] = f"{type(error).__name__}: {error}"
-            print(f"Failed {job['track']}: {job['error']}", file=sys.stderr)
+            interruption_error = f"{type(error).__name__}: {error}"
+            interruption_reason = (
+                "central rich-scaling coordinator received KeyboardInterrupt; "
+                "stopping only its exact registered child processes before executor shutdown"
+            )
+            _STOP_ACTIVE_CHILDREN.set()
+            for future in futures:
+                future.cancel()
+            signal_events = _stop_active_children(
+                reason=interruption_reason, original_error=error
+            )
+            if signal_events:
+                manifest.setdefault("child_signal_events", []).extend(signal_events)
+            manifest["interruption"] = {
+                "error": interruption_error,
+                "reason": interruption_reason,
+                "recorded_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+            }
+            for job in wave:
+                if job["status"] == "running":
+                    job["status"] = "failed"
+                    job["error"] = interruption_error
+                    job["elapsed_seconds"] = time.monotonic() - starts[id(job)]
+                    job["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+            _persist_manifest_after_error(
+                manifest_path,
+                manifest,
+                error,
+                action="interruption manifest persistence",
+            )
         finally:
-            job["elapsed_seconds"] = time.monotonic() - started
-            job["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
-            _atomic_write_json(manifest_path, manifest)
+            if primary_error is None:
+                executor.shutdown(wait=True, cancel_futures=interrupted)
+            else:
+                run_failure_reporter(
+                    lambda executor=executor, interrupted=interrupted: executor.shutdown(
+                        wait=True, cancel_futures=interrupted
+                    ),
+                    original_error=primary_error,
+                    action="post-failure executor shutdown",
+                )
+            _STOP_ACTIVE_CHILDREN.clear()
         if interrupted:
             break
 
     try:
         _check_central_sources(manifest)
     except Exception as error:
+        if primary_error is None:
+            primary_error = error
         failed = True
         manifest["source_integrity_error"] = f"{type(error).__name__}: {error}"
         print(f"Failed source integrity: {manifest['source_integrity_error']}", file=sys.stderr)
@@ -1240,7 +1580,17 @@ def main(argv: list[str] | None = None) -> int:
             if job["status"] == "passed" and manifest["source_integrity_valid"] is True
         ),
     }
-    _atomic_write_json(manifest_path, manifest)
+    if failed:
+        if primary_error is None:
+            raise RuntimeError("failed rich-scaling run has no recorded primary error")
+        _persist_manifest_after_error(
+            manifest_path,
+            manifest,
+            primary_error,
+            action="final failed-run manifest persistence",
+        )
+    else:
+        _atomic_write_json(manifest_path, manifest)
     if failed:
         print(f"Rich scaling failed; inspect {manifest_path}", file=sys.stderr)
         return 130 if interrupted else 1

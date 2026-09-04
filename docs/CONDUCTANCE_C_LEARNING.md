@@ -91,8 +91,9 @@ bash research/conductance_gat/c_learning/reproduce.sh --run-id gat-c-learning-se
 | `fixed_c` | 정확히 1 | 하지 않음 | node-degree | 0.0005 |
 
 공통 설정은 hidden 64, conductance 2층, dropout 0.5, Adam lr 0.005,
-최대 200 epochs, patience 50, PPI batch size 2, workers 0이다.
-arxiv는 full-batch이고 FP32/AMP OFF/TF32 OFF/compile OFF다.
+최대 200 epochs, patience 50, PPI batch size 2다. PPI DataLoader는 기본 workers 4,
+prefetch factor 2, persistent workers와 pinned/non-blocking transfer를 사용한다.
+arxiv는 DataLoader가 없는 full-batch라 workers 0이고 FP32/AMP OFF/TF32 OFF/compile OFF다.
 비교 가능한 backbone 초기 상태·캐시·공통 학습 설정을 검증한다. 동일한 early stopping
 정책이어도 best epoch와 실제 실행 epoch는 달라질 수 있고 결과에 각각 기록한다.
 

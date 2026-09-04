@@ -65,10 +65,36 @@ def test_default_dataset_and_own_model_only_contract():
     assert not hasattr(args, "baselines")
     assert not hasattr(args, "heads")
     assert args.device == "cuda" and not args.amp
+    assert args.workers is None
+    benchmark.resolve_worker_arguments(args)
+    assert args.workers == 4
+    assert args.worker_configuration_source == "dataset_default"
+    assert args.workers_by_dataset == {
+        "cora": 0,
+        "citeseer": 0,
+        "pubmed": 0,
+        "ppi": 4,
+        "ogbn-arxiv": 0,
+    }
     with pytest.raises(SystemExit):
         benchmark.build_parser().parse_args(["--tiny"])
     with pytest.raises(SystemExit):
         benchmark.build_parser().parse_args(["--baselines", "gat"])
+
+
+def test_direct_benchmark_worker_resolution_is_dataset_specific():
+    transductive = benchmark.build_parser().parse_args(["--datasets", "cora"])
+    benchmark.resolve_worker_arguments(transductive)
+    assert transductive.workers == 0
+    assert transductive.workers_by_dataset == {"cora": 0}
+
+    explicit = benchmark.build_parser().parse_args(
+        ["--datasets", "cora", "ppi", "--workers", "0"]
+    )
+    benchmark.resolve_worker_arguments(explicit)
+    assert explicit.workers == 0
+    assert explicit.worker_configuration_source == "explicit_cli"
+    assert explicit.workers_by_dataset == {"cora": 0, "ppi": 0}
 
 
 def test_canonical_incidence_and_adjacency_have_same_edges():

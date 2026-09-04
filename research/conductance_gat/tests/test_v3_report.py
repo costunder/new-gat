@@ -86,7 +86,6 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
             history.write_text("[]", encoding="utf-8")
             data_hash = hashlib.sha256(dataset.encode()).hexdigest()
             relative = condition == "relative_c"
-            frozen = 0 if relative else 98
             alpha = [f"operators.{i}.raw_alpha" for i in range(2)]
             gamma_tau = [
                 f"operators.{i}.estimator.raw_{key}" for i in range(2) for key in ("gamma", "tau")
@@ -125,8 +124,10 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                 {
                     "layer": i,
                     "alpha": 0.5,
-                    "gamma": 0.25,
-                    "tau": 1.0,
+                    "gamma": 0.25 if relative else None,
+                    "tau": 1.0 if relative else None,
+                    "estimator_parameter_count": 49 if relative else 0,
+                    "parameter_free_fixed_control": not relative,
                     "score": {"mean": 0.0, "std": 0.1},
                     "conductance": {"cv": 0.05},
                     "log_conductance": {"std": 0.08},
@@ -135,7 +136,7 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                         "max_over_median": 1.5,
                     },
                     "relative_conv_change": 0.4,
-                    "gate_parameter_norm": 1.0,
+                    "gate_parameter_norm": 1.0 if relative else None,
                     "gate_gradient_norm": None,
                 }
                 for i in range(COMMON["layers"])
@@ -176,7 +177,8 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                 "configuration": child_configuration,
                 "cache_sha256": data_hash,
                 "protocol": protocol,
-                "initial_state_sha256": "a" * 64,
+                "initial_state_sha256": hashlib.sha256(condition.encode()).hexdigest(),
+                "shared_backbone_initial_state_sha256": "c" * 64,
                 "best_epoch": 10,
                 "epochs_run": 30,
                 "validation": 0.55 if condition == "relative_c" else 0.50,
@@ -191,13 +193,13 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                 "test_evaluated": False,
                 "versions": {"torch": "unit-fixture"},
                 "gpu": "unit-fixture",
-                "total_parameters": 200,
-                "trainable_parameters": 200 - frozen,
-                "frozen_parameters": frozen,
+                "total_parameters": 200 if relative else 102,
+                "trainable_parameters": 200 if relative else 102,
+                "frozen_parameters": 0,
                 "optimizer": "AdamW",
                 "optimizer_groups": groups,
                 "trainable_parameter_names": names,
-                "frozen_parameter_names": [] if relative else gate + gamma_tau,
+                "frozen_parameter_names": [],
                 "diagnostics": {
                     "best_validation": {
                         "mode": "eval",
@@ -298,7 +300,7 @@ def test_partial_results_have_no_contrast(tmp_path, status):
     "key,value",
     [
         ("cache_sha256", "b" * 64),
-        ("initial_state_sha256", "b" * 64),
+        ("shared_backbone_initial_state_sha256", "b" * 64),
         ("test_evaluated", True),
         ("model_seed", 1),
         ("normalization", "global_max"),
@@ -390,7 +392,7 @@ def test_fixed_frozen_count_must_match_optimizer(tmp_path):
         write_comparison(root, manifest)
 
 
-def test_empty_edges_do_not_remove_shared_frozen_scaffold(tmp_path):
+def test_empty_edges_preserve_parameter_free_fixed_control(tmp_path):
     root, manifest = _fixture(tmp_path, edges=0)
     assert write_comparison(root, manifest)["status"] == "passed"
 

@@ -23,6 +23,7 @@ CONDITIONS = {
 PROTOCOL_NOTE = (
     "Transductive, graph-bound per-edge parameters, not an inductive edge law. "
     "Each layer starts at C=1; direct log C has no weight decay. "
+    "The fixed-C control is parameter-free and registers no unused edge vector. "
     "Official train labels supply cross-entropy gradients; validation selects checkpoints. "
     "No test evaluation, old checkpoint reuse, graph sampling, or PPI transfer. "
     "Exact edge chunking preserves the full-graph weighted degree. "

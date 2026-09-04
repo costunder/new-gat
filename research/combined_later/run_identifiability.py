@@ -196,8 +196,12 @@ def main() -> None:
     parser.add_argument("--cycle-scale", type=float, default=1.0)
     args = parser.parse_args()
 
+    if args.output_dir.exists():
+        raise FileExistsError(
+            f"Output path already exists: {args.output_dir}; choose a new path"
+        )
     frame, summary = run(args)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=False)
     frame.to_csv(args.output_dir / "sweep.csv", index=False)
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     _write_plot(frame, args.output_dir / "identifiability.png")

@@ -25,7 +25,14 @@ from .protocol import COMMON, CONDITIONS, DATASETS
 REPORT_FILENAMES = ("comparison.json", "comparison.md", "comparison.csv")
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
 _JOB_STATUSES = {"pending", "running", "passed", "failed"}
-_CONFIG_NOT_CHILD = {"datasets", "data_root", "results_root", "run_id", "fail_fast"}
+_CONFIG_NOT_CHILD = {
+    "datasets",
+    "data_root",
+    "results_root",
+    "run_id",
+    "fail_fast",
+    "workers_by_dataset",
+}
 _FACTOR_KEYS = {"condition", "normalization", "gate_weight_decay"}
 _OUTPUT_KEYS = {"output_dir", "metrics_path", "checkpoint", "history", "log_path"}
 _EFFECTS = (
@@ -327,6 +334,16 @@ def _build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]
     try:
         _integer(config.get("model_seed"), "manifest.config.model_seed")
         _integer(config.get("epochs"), "manifest.config.epochs", minimum=1)
+        requested_workers = _integer(config.get("workers"), "manifest.config.workers")
+        workers_by_dataset = config.get("workers_by_dataset")
+        if workers_by_dataset is not None and not _same(
+            workers_by_dataset,
+            {
+                dataset: requested_workers if dataset == "ppi" else 0
+                for dataset in datasets
+            },
+        ):
+            raise ValueError("manifest.config.workers_by_dataset is inconsistent")
         for key, value in COMMON.items():
             if not _same(config.get(key), value):
                 raise ValueError(f"manifest.config.{key} must be {value!r} for this fixed 2x2")
@@ -353,6 +370,9 @@ def _build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]
             errors.append(f"{dataset}/{condition}: duplicate manifest job")
             continue
         indexed[key] = job
+        expected_workers = config.get("workers", 0) if dataset == "ppi" else 0
+        if job.get("workers", expected_workers) != expected_workers:
+            errors.append(f"{dataset}/{condition}: job workers must be {expected_workers}")
         if job.get("status") not in _JOB_STATUSES:
             errors.append(f"{dataset}/{condition}: unknown job status")
         try:
@@ -384,7 +404,10 @@ def _build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]
                 entry["error"] = str(job["error"])
             if job and job.get("status") == "passed":
                 try:
-                    child = _load_child(run_dir, job, config)
+                    child_config = dict(config)
+                    child_config.pop("workers_by_dataset", None)
+                    child_config["workers"] = config.get("workers", 0) if dataset == "ppi" else 0
+                    child = _load_child(run_dir, job, child_config)
                     loaded[condition] = child
                     entry.update(
                         validation=child["validation"],

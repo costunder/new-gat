@@ -88,6 +88,9 @@ def _installed_profile() -> str:
 
 def check_dependencies(lock_path: Path | None = None) -> dict[str, Any]:
     """Check every direct pin, runtime import, and CUDA wheel without using a GPU."""
+    inherited_nvml_cuda_check = os.environ.pop(
+        "PYTORCH_NVML_BASED_CUDA_CHECK", None
+    )
     try:
         profile_id = _installed_profile()
         cuda_tag = cuda_tag_for_profile(profile_id)
@@ -142,6 +145,7 @@ def check_dependencies(lock_path: Path | None = None) -> dict[str, Any]:
         "profile_id": profile_id,
         "lock_path": str(lock_path.resolve()),
         "lock_sha256": hashlib.sha256(lock_path.read_bytes()).hexdigest(),
+        "pytorch_nvml_based_cuda_check_removed": inherited_nvml_cuda_check is not None,
     }
 
 
@@ -155,11 +159,16 @@ def error_message(error: Exception) -> str:
             "Do not replace system libc or downgrade an environment used by another run."
         )
     setup_command = "bash scripts/setup_gpu.sh"
+    profile_detection_note = ""
     try:
         installed_profile = profile_for_torch_version(importlib.metadata.version("torch"))
-    except Exception:
+    except Exception as metadata_error:
         # Error reporting must still work with absent or damaged distribution metadata.
         installed_profile = None
+        profile_detection_note = (
+            "\nInstalled Torch profile detection was unavailable: "
+            f"{type(metadata_error).__name__}: {metadata_error}"
+        )
     if installed_profile is not None:
         setup_command += f" --profile {installed_profile}"
     return (
@@ -167,6 +176,7 @@ def error_message(error: Exception) -> str:
         "Conda activation alone does not install the research packages.\n"
         f"Run: {setup_command}\n"
         "Data preparation also installs missing dependencies automatically on a Linux GPU host."
+        f"{profile_detection_note}"
     )
 
 

@@ -1,6 +1,6 @@
 # NEW GAT 연구 프로젝트 Hand-off
 
-작성 기준일: 2026-09-03 (Asia/Seoul)
+작성 기준일: 2026-09-04 (Asia/Seoul)
 
 이 문서는 `gpt_handoff/`의 열 파일 중 전체 프로젝트 인수인계를 담당한다. 외부 ChatGPT 또는
 연구 리뷰어가 저장소를 처음 받아도 수학적 가설, 구현 경계,
@@ -26,8 +26,10 @@
   head가 공유하고, head별 W와 graph-conditioned beta가 feature/frequency 역할을 맡는다.
   beta 기본값은 hard margin 없는 sigmoid와 nominal 초기값 0.1이다. 과거
   `0.05+0.90*sigmoid`/초기 0.5는 삭제하지 않고 명시적 `margin_sigmoid` ablation으로만 남긴다.
-- V5는 `fixed_c`와 `shared_dynamic_c` 두 arm을 같은 architecture·seed·초기화에서 비교하지만
-  phase별 update allocation은 다르다. fixed arm은 C coordinate 예산까지 spatial 그룹에 쓰는
+- V5는 `fixed_c`와 `shared_dynamic_c` 두 arm의 공통 backbone·W·beta·FFN·classifier 구조와
+  초기화를 seed/hash로 맞춘다. fixed C=1은 parameter-free이고 dynamic arm만 실제 C score
+  network를 추가하므로 전체 parameter 수/전체 state hash는 다르며 그대로 보고한다. phase별
+  update allocation도 다르다. fixed arm은 C coordinate 예산까지 spatial 그룹에 쓰는
   strong recipe이고 dynamic arm은 그 예산으로 C를 calibration/alternation한다. 따라서 C 하나의
   단일-factor 인과효과가 아닌 end-to-end recipe 비교다. reference는 hidden 256/8 layers/8
   heads/FFN×4, large는 384/12/8/4다.
@@ -52,6 +54,28 @@
   batch·sample·precision을 바꾸므로 portable와 점수나 wall time을 직접 대응시켜 모델 또는 GPU
   효과로 해석하지 않는다. Conductance V1–V4 legacy FP32·batch 계약도 바꾸지 않으므로 A6000
   PPI의 V1–V5 cross-version 값은 descriptive다.
+- 통합 runner의 단일 `--device`는 세 track을 순차 실행한다. 서로 다른 indexed CUDA 장치를
+  `--devices`로 명시했을 때만 independent track을 round-robin/bounded-wave로 병렬 실행하며,
+  동일 GPU의 최상위 track concurrency는 1이다. A6000 Tree child 내부의 명시적 candidate
+  concurrency 2는 이 cross-track 계층과 별개다.
+- GPU가 없는 로컬 호스트에서 utilization을 창작하지 않는다. 실제 Linux GPU child의 preflight는
+  visible GPU/MIG·VRAM과 CPU affinity/RAM을 기록하고, 현재 Conductance V5, Cycle PE V1/V2와
+  Tree V1/V2는 학습 또는 selected-test 경계의 1초 주기 GPU SM·memory-controller, allocator
+  memory, process RSS/HWM, available RAM과 interval CPU 사용량을 `resource_observability`에
+  기록한다. 읽을 수 없는 counter는 0이 아니라 `null`과 원인을 남긴다.
+- 선택형 보조 `research.cycle_pe.paper`도 schema v2부터 같은 원칙을 따른다. Core/ZINC는 학습과
+  split 평가를 각각 monitor하고 graphs/s를, BREC는 전체 400-pair workload를 monitor하고
+  attempts/s를 기록한다. Ragged graph는 CPU collate에서 disjoint-union/raw-basis/projector packed
+  tensor로 만들며 PE·GNN·pooling에 graph별 GPU forward loop가 없다. Variant/target에서 쓰지 않는
+  parameter는 생성하지 않고 첫 actual backward의 전체 trainable gradient와 optimizer 소유권을
+  fail-closed로 검사한다. 이 구조 변경 때문에 과거 보조 schema v1 checkpoint를 재사용하지 않는다.
+- 현재 rich 학습 runner의 physical batch는 hardware/dataset/profile별 preregistered recipe이며
+  학습 중 자동으로 바꾸지 않고 manifest에도 `throughput_candidate_sweep=false`를 기록한다.
+  별도 `benchmark_speed.py --batch-sizes ...`는 공식 train cache의 fixed real batch 후보를
+  독립 측정해 GPU/VRAM/CPU/RAM·처리량과 integrity, 10% memory-headroom microbenchmark 권고를
+  남긴다. Optimizer·전체 epoch·validation/checkpoint를 제외하고 profile 기본값도 바꾸지 않으므로
+  이 권고나 Cycle V2 capacity probe, 한 학습 batch의 사후 처리량을 최종 batch 최적화 결과로
+  해석하지 않는다.
 - 새 V5와 projector V2의 성공한 전체 GPU 성능 결과는 아직 없다. 2026-09-04 A6000 r1 partial은
   V5 fixed 한 job 뒤 dynamic OOM, Cycle V2 네 job의 gradient overflow로 중단됐고 수정 근거로만
   사용한다. 아래 과거 단일-seed 값이나 폐기된 V2 결과를 새 버전 성능으로 재사용하지 않는다.
@@ -488,8 +512,12 @@ Ruff/diff 검사와 갱신 문서의 로컬 링크 34개 검사 통과다.
   기본 OFF/AMP 기본 OFF, compiler 오류를 잡아 성공으로 숨기지 않는다.
 - 정식 runner는 train 지표와 `epoch_seconds`를 기록하고 로그를 즉시 flush한다.
   `scripts/benchmark_speed.sh`는 공식 train 입력만 사용하는 CUDA forward/backward 비교이며
-  warmup·steady-state·동등성 검사·peak memory를 `runs/performance/`에 분리 기록한다.
-  optimizer update 및 전체 학습 속도/정확도 실험과 구분한다.
+  Conductance V1/V5, Cycle PE V1/V2와 Tree V1/V2에서 명시한 physical-batch 후보 각각의
+  warmup·steady-state·GPU SM/memory-controller utilization·peak memory·CPU/RAM·처리량을
+  `runs/performance/`에 분리 기록한다. 독립 execution variant가 있을 때만 수치 동등성을
+  판정하고 current-only path는 production import/finite loss·gradient/no-update integrity를
+  기록한다. 10% projected memory headroom을 남긴 후보의 처리량 기반 권고는 fixed-batch
+  microbenchmark 범위이며 optimizer update 및 전체 학습 속도/정확도 실험과 구분한다.
 - GPU 실측·전체 학습 완료·가속 배수는 확인하지 않았다. 사용법과 측정 경계는
   [실험 상태](EXPERIMENT_STATUS.md)에 있다. 구형 Singularity에서 opt-in compiler
   호환성을 보장하지 않으며 환경/드라이버/공용 라이브러리를 자동 변경하지 않는다.
@@ -571,7 +599,7 @@ Conda는 `/tools/anaconda3`의 공용 설치본이다. 이미지 선택 옵션�
   실행 manifest에 `profile_id`를 추가했다. CPU/custom Torch, 다른 pin과 runtime은 계속 거부한다.
   legacy 설치 기록은 활성 Conda prefix의 `.new-gat-environment/`에 별도로 저장한다.
 - 모델, 데이터셋, split, 학습·평가 설정은 변경하지 않았다. 새 profile의 결과는 기존 profile의
-  seed 반복으로 합치지 않는다. 기존 run을 자동 재개하거나 덮어쓰지 않는다.
+  seed 반복으로 합치지 않는다. 환경 설치 단계는 기존 실험 결과를 재개하거나 덮어쓰지 않는다.
 - 구버전 Torch에는 공개된 체크포인트 로딩 취약점이 있다. Torch 2.6뿐 아니라 2.7도 해당하며
   `weights_only=True`를 보안 보장으로 취급하지 않는다. 공식 출처가 확인된 데이터와 직접 만든
   체크포인트만 사용한다. 별도 Conda 환경은 보안 sandbox가 아니다. 최신 보안 패치가 필요하면
@@ -1025,7 +1053,14 @@ graph는 계산·선택·진단에는 미사용이고 full cache 무결성 검�
 
 기본값은 `benchmark`, CUDA FP32/AMP OFF, model seed `0` 하나, data/split/chart seed `0`,
 workers 4다. PPI batch는 2, 분자/tree batch는 32이고 Cora/CiteSeer/PubMed/arxiv는 full-batch다.
-Run ID는 실행마다 자동 생성하며 같은 ID를 덮어쓰거나 자동 resume하지 않는다.
+Run ID는 생략하면 실행마다 자동 생성한다. 명시한 동일 ID의 root paper run은 기본적으로
+same-run resume을 시도하되, resolved 설정·Python/platform·검증된 연구 의존성 report·전체
+runtime source SHA-256·정확한 child 명령/output 계획이 모두 같아야 한다. source hash map은 각
+child 전과 최종 집계 전에 다시 계산한다. `--no-resume`은 기존 ID를 즉시 거부한다. 검증된 완료 child는
+output-tree SHA-256을 재검사해 건너뛰며, 불완전 output은 `.incomplete-attempt-N` sibling으로
+보존한 뒤 새 output에서 재시도하므로 기존 완료 결과를 덮어쓰지 않는다.
+완료된 aggregate는 현재 child input hash와 aggregate output hash까지 일치할 때만 건너뛴다.
+실패했거나 현재 child 입력과 달라진 aggregate는 기존 폴더를 sibling으로 보존한 뒤 재생성한다.
 기본 data/와 트랙별 results/는 clone에 포함되고 하위 run 디렉터리는 자동 생성된다.
 트랙 실패 시 기본적으로 다른 독립 run은
 계속하며 `--fail-fast`로 전체 중단을 선택할 수 있다.
@@ -1062,8 +1097,10 @@ runs/paper/<run-id>/
 ```
 
 `--results-root`를 주면 실제 모델 결과는
-`<results-root>/<track>/<run-id>/...`에 분리된다. 중앙 runner는 모든 JSON이 parse 가능하고
-NaN/Inf가 없는지 검사하고 dependency/source/registry hash를 기록한다.
+`<results-root>/<track>/<run-id>/...`에 분리된다. 중앙 runner는 모든 JSON의 parse 가능성과
+NaN/Inf뿐 아니라 canonical passed/prepared 상태, 현재 source와 일치하는 구현 SHA-256
+provenance, 실제 학습 child의 주기적 GPU/CPU/RAM `resource_observability` 및 측정된
+`*_per_second` throughput을 fail-closed로 검사한다. dependency/source/registry hash도 기록한다.
 
 Conductance v2/v3/v4는 중앙 경로가 아니라 각각 `results/conductance_gat/v2/<run-id>/`,
 `results/conductance_gat/v3/<run-id>/`, `results/conductance_gat/v4/<run-id>/`를 쓴다.
@@ -1261,16 +1298,20 @@ fundamental basis `F_T`/`raw_basis`를 계산한다. 요청 여부에 따라 생
 projector뿐이다. 따라서 `no_pe`는 PE를 model input으로 사용하지 않지만 cycle-basis 전처리 비용까지
 없애는 순수 end-to-end timing control은 아니다.
 
-Raw width는 train split의 최대 `β`만으로 정한다. OOD graph의 `β`가 더 크면 절단하거나
-test-fit하지 않고 해당 split을 N/A로 기록하며 다른 PE variant 평가는 계속한다. Validation
-일부가 overflow면 compatible subset만 early stopping에 사용하고 full validation raw metric은
-N/A다.
+Raw width는 train split의 최대 `β`만으로 정한다. 완전한 validation/test/OOD split 중 하나라도
+그 폭보다 큰 graph를 포함하면 raw condition 전체를 N/A로 기록하고 학습, checkpoint 선택,
+metric 계산을 하지 않는다. Compatible subset 선택, 절단, validation/test-fit은 사용하지 않으며
+다른 PE variant 평가는 계속한다.
 여기의 `raw`는 새 `cycle_projector_pe_v2`가 아니다. Train-width/overflow 제약은 projector
 V2에 적용되지 않는다.
 
-공통 backbone은 variable-edge/variable-β graph list batch, node/edge encoder, symmetric endpoint
-edge update, 양방향 mean message passing, residual LayerNorm, node/edge mean-max graph pooling을
-사용한다. Edge/node/graph head는 독립 task마다 새 모델로 생성된다.
+공통 backbone은 variable-edge/variable-β graph를 CPU collate에서 lossless packed
+disjoint-union으로 만들고, node/edge encoder, symmetric endpoint edge update, 양방향 mean
+message passing, residual LayerNorm, vectorized segment mean/max graph pooling을 사용한다. Raw basis는
+batch의 실제 β까지만 pad하고 dense projector는 `sum_g E_g²` packed 값으로 유지한다. PE encoder와
+GNN은 physical minibatch당 한 번 호출하며 graph별 GPU forward loop는 없다. Edge/node/graph head는
+독립 task마다 새 모델로 생성되고, edge head는 마지막 node update도 loss에 연결되도록 최종 edge와
+양 끝 node state를 함께 읽는다.
 
 ### 5.3 CycleCount-OOD v4
 
@@ -1367,6 +1408,19 @@ python -m research.cycle_pe.paper \
 Supervised artifact는 `<suite>/<level>/<variant>/` 아래 `model.pt`, `metrics.json`,
 `history.json`, `runtime.json`을 저장한다. BREC는 `<variant>/pairs.json`과 `metrics.json`.
 
+보조 schema v2 `runtime.json`과 BREC manifest는 실제 server workload의 model/data/shape,
+physical/effective batch, worker/prefetch/cache, precision, optimizer step, 첫-backward gradient,
+CUDA-synchronized throughput과 `RuntimeResourceMonitor`의 GPU SM/memory-controller·allocator,
+CPU/RAM 시계열을 함께 저장한다. unavailable counter는 `null`과 이유다. Direct
+V1/V2/core/ZINC loader 기본은 workers 4와 prefetch 2이며 target-host 측정값에 따라 조절할 수
+있다. `workers=0`은 DataLoader가 없는 공식 BREC RPC 경로나 단위 테스트에만 기본/명시적으로
+사용하고 구조적 이유를 telemetry에 기록한다.
+모든 Cycle monitor owner는 failure-safe boundary를 사용한다. OOM/nonfinite/KeyboardInterrupt에도
+sampler를 한 번 종료하고 failure resource payload를 stderr, 원 예외 note/속성, CLI manifest에
+남기며 cleanup 오류가 원 예외를 덮지 않는다.
+Supervised runtime은 loader wait, packed H2D, forward/loss, backward, optimizer를 CUDA event/host
+wall time으로 나누며 loss는 GPU에서 epoch 단위로 누적해 매 batch CPU synchronization을 피한다.
+
 Master runner에서는 child output container에 suite 이름이 한 번 더 생긴다. 예를 들어 실제
 core manifest는 `.../model-seed-0/core/core/manifest.json`, BREC는
 `.../brec-official-10-seed/brec/...` 구조다.
@@ -1387,8 +1441,8 @@ aggregation, variant-lazy projector, ZINC fixture와 CLI collision/partial prese
 3. Suite-level `preparation_seconds`는 여러 variant 비용이 섞이고 per-variant efficiency table은
    전처리 CPU time/RSS를 포함하지 않는다. 모든 split의 dense projector를 동시에 보관하는 비용도
    별도로 계측하지 않아 현재 표로 projector overhead를 공정하게 비교할 수 없다.
-4. 네 variant의 parameter allocation은 거의 같게 생성되지만 실제 active path가 다르고 manifest에
-   exact parameter count를 기록하지 않는다.
+4. Variant마다 실제 active module만 생성하므로 parameter 수는 다를 수 있으며 exact total/trainable/
+   optimizer-owned 수를 artifact에 기록한다. 따라서 parameter-matched 비교는 별도 설계가 필요하다.
 5. Auxiliary label perturbation을 통한 직접 leakage negative test는 없다. 구조적으로 target level별
    별도 모델인 것만 테스트한다.
 6. Degree/`(n,m,β)` matched 또는 1-WL-indistinguishable이면서 C3–C6 target이 다른 known-contrast
@@ -1396,9 +1450,9 @@ aggregation, variant-lazy projector, ZINC fixture와 CLI collision/partial prese
    수 없다.
 7. Raw/set은 root-0 BFS tree와 node labeling에 의존한다. Core/ZINC에는 isomorphic relabeling이나
    spanning-tree shift robustness 평가가 없어 graph-isomorphism-invariant PE라고 주장할 수 없다.
-8. Raw는 큰-β OOD split 전체가 N/A가 될 수 있고, validation overflow 시 raw만 compatible subset으로
-   early stopping한다. 따라서 hardest OOD에서 완전한 4-way 비교와 동일 validation-distribution
-   비교가 성립하지 않을 수 있다.
+8. Raw는 큰-β validation/test/OOD graph가 하나라도 있으면 condition 전체가 N/A다. 따라서 해당
+   dataset/task에서 완전한 4-way 비교는 성립하지 않을 수 있지만, compatible subset으로
+   checkpoint를 선택하는 분포 변경은 발생하지 않는다.
 9. Upstream 호환 field는 seed별 `Correct/Fail/Real_correct`다. `global_valid`는 저장소 자체 gate이고
    `custom_pairwise_union`은 custom metric이므로 둘 다 upstream official score로 표현하면 안 된다.
 10. Official BREC의 상수/제어 흐름은 정적으로 맞췄지만 upstream differential/golden-output parity는
@@ -1666,6 +1720,33 @@ concurrency를 바꾼다. 각 arm/version 비교는 같은 hardware profile 안�
 성능·시간 차이를 모델 또는 GPU 단일 효과로 해석하지 않는다. 통합 GPU 3 명령은 free VRAM
 40GiB를 명시적으로 요구하며 정확한 값과 장치 계약은 위 scaling 문서를 따른다.
 
+통합 실행의 장치 계층도 결과 identity에 포함된다. 단일 `--device`는 Conductance→Cycle→Tree
+track runner를 순차 실행한다. 여러 GPU를 실제로 할당받은 경우에만 서로 다른 indexed CUDA
+장치를 `--devices`에 주고, track을 round-robin으로 배정해 bounded wave에서 병렬 실행한다.
+같은 GPU에서 최상위 track 두 개를 동시에 실행하지 않는다. 다만 Tree track 내부 A6000
+`job_concurrency=2`는 disjoint candidate output을 사용하는 별도 profile 동시성이라 이 규칙과
+구분한다. 이 구현은 data parallel이나 한 모델의 multi-GPU 학습이 아니라 independent track의
+process-level 분배다.
+
+자원 보고도 availability와 runtime을 분리한다. Preflight는 해당 서버에서 선택/visible GPU,
+free/total VRAM, MIG 이름 감지, CPU logical/affinity 수, available RAM과 scheduler 환경을
+snapshot으로 남긴다. Conductance V5, Cycle PE V1/V2와 Tree V1/V2의 runtime monitor는 각
+학습 또는 selected-test 경계의 start/end와 1초 주기 표본으로 GPU SM·memory-controller
+utilization, CUDA allocator memory, process RSS/HWM, system available RAM, interval 평균 CPU와
+CUDA peak를 기록한다. 지원되지 않는 counter는 `null`과 원인을 남기므로 로컬 Windows 무-GPU
+검사에서 서버 utilization을 검증했다고 주장하지 않는다. CPU/RSS는 주 학습 프로세스 기준이고
+GPU utilization은 프로세스 전용이 아닌 선택 장치 전체 기준이므로 외부 공유 부하가 포함될 수 있다.
+1초 표본은 짧은 burst를 놓칠 수 있으며, storage I/O나 단계별 loader/H2D/forward/backward
+profiler를 대신하지 않는다. 원문 시계열은 개별 child artifact를 확인한다.
+
+이 자원 계측은 rich runner 내부 batch 자동 튜닝과 다르다. Rich runner는 preregistered batch로
+실행한 뒤 그 설정의 처리량만 기록하고 profile을 바꾸지 않는다. Cycle V2의 worst-case capacity
+probe도 feasibility 검사이지 throughput 최적화가 아니다. 별도 CUDA fixed-real-batch profiler는
+명시 후보의 warm-up/steady-state 처리량, peak VRAM, CPU/RAM과 독립 variant가 있는 경로의 수치
+동등성을 측정해 10% projected memory headroom 기준 권고를 남기지만 optimizer state·전체 epoch·
+validation/checkpoint가 없다. 따라서 microbenchmark 권고를 새 profile과 전체 학습으로
+검증하기 전에는 현재 A6000/portable batch가 최적이라는 claim을 하지 않는다.
+
 ### P0 — 이미 나온 결과의 검증과 Conductance 실패 원인 분리
 
 1. 기존 run ID, source revision/dirty 상태, lock, data checksum, best checkpoint, history와
@@ -1686,11 +1767,13 @@ concurrency를 바꾼다. 각 arm/version 비교는 같은 hardware profile 안�
    GPU 가속 실측으로 과장하지 않는다.
 5. Conductance C × spatial W v4에서 v1의 5개 데이터 × 네 조건, 총 20 jobs를 seed 0으로
    fresh 실행한다. PPI는 V3와 같은 계약을 사용하고 과거 arxiv partial arm을 재사용하지 않는다.
-6. Conductance V5는 동일 architecture·seed·초기화에서 `fixed_c` strong spatial recipe와
+6. Conductance V5는 동일한 공통 architecture·seed·공통 state 초기화에서 parameter-free
+   `fixed_c` strong spatial recipe와 C score network가 추가된
    `shared_dynamic_c` coordinate recipe를 비교하고 reference/large, portable 10GB MIG와
    `a6000-48gb` 실행 profile을 각각 검증한다. phase별 effective optimizer step을 보고하며
    단일 C 인과효과나 portable↔A6000 직접 비교로 해석하지 않는다.
-   V1–V4 결과를 V5 결과로 재사용하지 않는다.
+   전체 parameter capacity 차이를 보고하고 공통 state hash만 pair integrity로 강제한다.
+   변경 전 partial V5 checkpoint 및 V1–V4 결과를 V5 결과로 재사용하지 않는다.
 7. 새 Cycle projector V2는 별도 코드·cache·run으로 GPU 검증한다. 기존 `cycle_set`이나
    폐기된 `cycle_basis_v2` 결과를 새 V2 실적으로 재분류하지 않는다. 실행 최적화 역시
    동등성·peak memory·GPU 속도를 별도로 측정한다.

@@ -9,7 +9,11 @@ import pytest
 import torch
 
 from research.conductance_gat.ablation import train as shared
-from research.conductance_gat.ablation.model import is_gate_parameter, state_sha256
+from research.conductance_gat.ablation.model import (
+    is_gate_parameter,
+    shared_backbone_state_sha256,
+    state_sha256,
+)
 from research.conductance_gat.c_learning import train
 from research.conductance_gat.c_learning.model import CLearningNodeClassifier
 from research.conductance_gat.c_learning.protocol import CONDITIONS, SUITE
@@ -72,13 +76,27 @@ def test_checkpoint_is_separate_suite_and_discloses_gate_mode_parameter_counts(t
         3,
         0.5,
         definition=train.DEFINITION,
+        shared_initial_hash=shared_backbone_state_sha256(model),
     )
     assert saved["research_suite"] == saved["model"] == SUITE
     assert saved["gate_mode"] == saved["architecture"]["gate_mode"] == model.gate_mode
     assert saved["architecture"]["normalization"] == "node_degree"
     assert saved["gate_weight_decay"] == CONDITIONS[condition]["gate_weight_decay"]
     assert saved["total_parameters"] == saved["trainable_parameters"] + saved["frozen_parameters"]
-    assert (saved["frozen_parameters"] > 0) == (condition == "fixed_c")
+    assert saved["frozen_parameters"] == 0
+    assert saved["estimator_parameters"] == (
+        sum(
+            parameter.numel()
+            for name, parameter in model.named_parameters()
+            if is_gate_parameter(name)
+        )
+    )
+    assert (saved["estimator_parameters"] > 0) == (condition == "learned_c")
+    assert saved["non_estimator_parameters"] + saved["estimator_parameters"] == saved[
+        "total_parameters"
+    ]
+    if condition == "fixed_c":
+        assert not any(".estimator." in name for name in saved["state_dict"])
     assert saved["evaluation_split"] == "validation" and saved["test_evaluated"] is False
 
 
@@ -108,7 +126,7 @@ def test_cli_offline_cache_failure_saves_new_suite_metadata(monkeypatch, tmp_pat
     assert saved["gate_mode"] == "fixed_one" and saved["test_evaluated"] is False
 
 
-def test_both_fixture_arms_same_initial_hash_fixed_scaffold_unchanged_and_no_test(
+def test_both_fixture_arms_share_backbone_fixed_is_parameter_free_and_no_test(
     monkeypatch, tmp_path
 ):
     # Only this unit fixture mocks hardware and data access. The public train
@@ -152,14 +170,20 @@ def test_both_fixture_arms_same_initial_hash_fixed_scaffold_unchanged_and_no_tes
         assert saved["model"] == SUITE and saved["condition"] == condition
         assert saved["trainable_parameters"] == result["trainable_parameters"]
         if condition == "fixed_c":
-            torch.manual_seed(args.model_seed)
-            initial = CLearningNodeClassifier(3, 2, gate_mode="fixed_one")
-            for name, parameter in initial.named_parameters():
-                if is_gate_parameter(name):
-                    torch.testing.assert_close(saved["state_dict"][name], parameter, rtol=0, atol=0)
+            assert not any(".estimator." in name for name in saved["state_dict"])
+            assert result["estimator_parameters"] == 0
+            assert result["frozen_parameters"] == 0
             for record in result["diagnostics"]["train_trajectory"]:
-                assert record["parameter_groups"]["operators.0"]["optimizer_included"] is False
+                assert "operators.0" not in record["parameter_groups"]
                 assert all(layer["conductance"]["cv"] == 0 for layer in record["layers"])
-    assert results[0]["initial_state_sha256"] == results[1]["initial_state_sha256"]
-    assert results[0]["total_parameters"] == results[1]["total_parameters"]
-    assert results[0]["trainable_parameters"] > results[1]["trainable_parameters"]
+    learned, fixed = results
+    assert learned["initial_state_sha256"] != fixed["initial_state_sha256"]
+    assert (
+        learned["shared_backbone_initial_state_sha256"]
+        == fixed["shared_backbone_initial_state_sha256"]
+    )
+    assert learned["non_estimator_parameters"] == fixed["non_estimator_parameters"]
+    assert learned["total_parameters"] - fixed["total_parameters"] == learned[
+        "estimator_parameters"
+    ]
+    assert learned["trainable_parameters"] > fixed["trainable_parameters"]

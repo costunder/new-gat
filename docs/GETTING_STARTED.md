@@ -225,8 +225,12 @@ arxiv seed-node batch 2048, 더 큰 edge chunk와 prefetch를 쓴다. 전체 blo
 dynamic-C score MLP는 gradient가 있을 때 edge chunk별로 checkpoint한다.
 
 ```bash
-env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 python -B scripts/run_conductance_v5.py --datasets cora citeseer pubmed ppi ogbn-arxiv --profile reference --model-seed 0 --device cuda:0 --sampling auto --hardware-profile a6000-48gb --min-free-gb 40 --run-id conductance-v5-a6000-gpu3-reference-seed0
+CUDA_VISIBLE_DEVICES=3 python -B scripts/run_conductance_v5.py --datasets cora citeseer pubmed ppi ogbn-arxiv --profile reference --model-seed 0 --device cuda:0 --sampling auto --hardware-profile a6000-48gb --min-free-gb 40 --run-id conductance-v5-a6000-gpu3-reference-seed0
 ```
+
+CUDA 검사 경로는 PyTorch import 전에 오래 남은 `PYTORCH_NVML_BASED_CUDA_CHECK` 값을 내부에서
+제거한다. 따라서 호출자가 `env -u ...`를 붙일 필요가 없고, 장치 매핑에는
+`CUDA_VISIBLE_DEVICES`만 명시한다.
 
 같은 implementation에서 같은 명령과 run ID를 다시 실행하면 완료 조건은 검증 후 건너뛰고, V5의 `last.pt`가 있는
 미완료 조건은 epoch·optimizer·RNG 상태부터 재개한다. 자세한 식, sampling 의미와 결과 계약은
@@ -251,6 +255,12 @@ python -B scripts/run_cycle_scaling.py --versions v2 --profiles reference --data
 bash research/tree_augmentation/reproduce.sh
 ```
 
+이 직접 paper 실행의 `full` 기본 architecture는 scaling 계약의 `reference`, 즉 hidden 128과
+message-passing 8층이다. 과거 hidden 64/2층 mechanism-probe 크기는 기본값에서 제거했다.
+`large` hidden 256/12층은 아래 scaling runner가 별도로 학습하고 validation으로 선택하는 후보이며,
+하드웨어만 보고 조용히 대체하지 않는다. Architecture와 실행 자원은 분리하므로 direct portable
+batch 16은 유지하고, A6000 batch 64/workers 4는 명시적 hardware profile에서만 적용한다.
+
 ### V1을 포함한 전체 큰 모델 scaling
 
 기본 단일 크기와 별도로 Conductance V1~V5, Cycle PE V1/새 V2, Tree fixed/multi를 모두
@@ -264,7 +274,7 @@ checkpoint만 test-only로 평가한다. 먼저
 매핑하는 RTX A6000 48GB용 전체 계획이다.
 
 ```bash
-env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 python -B scripts/run_rich_scaling.py --run-id rich-a6000-gpu3-seed0-v1 --profiles reference large --model-seeds 0 --device cuda:0 --hardware-profile a6000-48gb --min-free-gb 40 --cycle-v2-basis-backend thin_q --dry-run
+CUDA_VISIBLE_DEVICES=3 python -B scripts/run_rich_scaling.py --run-id rich-a6000-gpu3-seed0-v1 --profiles reference large --model-seeds 0 --device cuda:0 --hardware-profile a6000-48gb --min-free-gb 40 --cycle-v2-basis-backend thin_q --dry-run
 ```
 
 실제 전체 실행은 `--dry-run`을 제거한다. 한 트랙이 실패해도 나머지 트랙은 기본적으로
@@ -289,7 +299,9 @@ V5와 새 Cycle V2라면 `last.pt`부터 이어지고, checkpoint 계약이 없�
 
 기본 세 트랙 benchmark와 `portable` scaling의 공통 기본값은 CUDA, model seed `0`,
 data/split/chart seed `0`이다. 기본 benchmark의 workers는 `4`다. 별도 Conductance
-v2/v3/v4/v5는 workers `0`을 사용한다. V2와 V3/V4의 네
+V1/V3/V4/V5의 PPI graph-minibatch DataLoader도 기본 workers `4`, prefetch factor `2`,
+persistent workers와 pinned/non-blocking transfer를 사용한다. V2 및 V1/V3/V4/V5의
+transductive 데이터에는 DataLoader 자체가 없어서 workers `0`을 기록한다. V2와 V3/V4의 네
 transductive 데이터는 full-graph batch 1이고, V3/V4의 PPI는 공식 graph 전체를 보존한
 minibatch 2다. V5만 명시적으로 full/neighbor/cluster sampling을 지원하고 PPI는 full graph를
 유지한다. 기본 benchmark의 PPI batch
@@ -337,15 +349,21 @@ bash scripts/reproduce.sh
 ```
 
 실행 파일에는 전체 데이터에서 우리 모델을 실행하는 설정이 들어 있다. 학습 파일은 다운로드를 수행하지 않는다.
-누락되거나 손상된 데이터는 오류로 보고한다. 실행마다 고유한 run ID를 자동 생성하고
-기존 run을 덮어쓰거나 자동 재개하지 않는다. 한 트랙이 실패해도 다른 독립 run은 계속하며,
-첫 실패에서 중단하려면 `--fail-fast`를 추가한다.
+누락되거나 손상된 데이터는 오류로 보고한다. `--run-id`를 생략하면 고유 ID를 자동 생성한다.
+명시한 동일 ID를 다시 실행하면 기본적으로 same-run 재개를 시도하며, resolved 설정·Python/platform·
+검증된 연구 의존성 report·전체 runtime source SHA-256·정확한 child 명령/output 계획이 모두
+같을 때만 허용한다. source hash map은 각 child 전과 최종 집계 전에 다시 계산한다. 재개를 금지하려면
+`--no-resume`을 쓴다. 검증된 완료 child는 output-tree SHA-256까지 다시 확인해 건너뛰고,
+불완전한 산출물은 삭제하거나 덮어쓰지 않고 `.incomplete-attempt-N` sibling으로 보존한 뒤 재시도한다.
+완료된 `aggregate/`도 입력 child hash와 자체 output hash를 검증해 건너뛰며, 실패했거나 현재 입력과
+달라진 집계는 기존 폴더를 sibling으로 보존한 뒤 새로 만든다.
+한 트랙이 실패해도 다른 독립 run은 계속하며, 첫 실패에서 중단하려면 `--fail-fast`를 추가한다.
 
 ## 결과
 
 | 경로 | 내용 |
 |---|---|
-| `runs/paper/<run-id>/manifest.json` | 실행 상태, 명령, seed, 소스 revision |
+| `runs/paper/<run-id>/manifest.json` | 실행 상태, 명령, seed, runtime 환경, 소스·child·집계 SHA-256 |
 | `runs/paper/<run-id>/logs/` | 트랙별 실행 로그 |
 | `runs/paper/<run-id>/aggregate/` | 우리 모델 지표·효율·실패 목록, 내부 ablation의 paired 비교 |
 | `research/<track>/results/paper/<run-id>/` | 트랙별 평가·학습 산출물 |
@@ -356,7 +374,10 @@ bash scripts/reproduce.sh
 | `results/cycle_pe/scaling/<run-id>/` | V1/새 projector V2의 dataset-aware profile 선택·최종 평가 |
 | `results/rich_scaling/<run-id>/` | V1–V5, Cycle V1/V2, Tree 통합 상태와 118/122 실행 검증 |
 
-전체 성공 시 터미널에 `all requested independent paper tracks passed`와 manifest 위치가 출력된다.
+전체 성공은 child 종료 코드와 JSON 유한성만으로 판정하지 않는다. canonical child 상태,
+현재 source와 일치하는 구현 SHA-256 provenance, 실제 학습의 주기적 GPU/CPU/RAM
+`resource_observability`, 측정된 `*_per_second` throughput까지 모두 검증한 뒤 터미널에
+`all requested independent paper tracks passed`와 manifest 위치를 출력한다.
 실패하면 종료 코드는 0이 아니며, 해당 run의 로그와 `aggregate/failures.csv`를 확인한다.
 공통 환경 검사 단계에서 중단된 경우에는 집계 파일이 없을 수 있다.
 

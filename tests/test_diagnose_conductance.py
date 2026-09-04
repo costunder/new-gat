@@ -291,6 +291,30 @@ def test_extended_audit_auto_output_is_new_and_separate_from_source(diag, tmp_pa
     assert _file_snapshot(run) == source_before
 
 
+def test_diagnostic_wrapper_records_resource_and_throughput(diag, torch, tmp_path, monkeypatch):
+    args = diag.build_parser().parse_args(["--run-id", "example", "--device", "cuda"])
+    (tmp_path / "manifest.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "metrics.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(diag, "require_cuda", lambda _requested: torch.device("cpu"))
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda _device: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _device: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda _device: 0)
+
+    def bounded(_args, _run, report, device):
+        assert device.type == "cpu"
+        report["datasets"]["cora"] = {"status": "passed"}
+
+    monkeypatch.setattr(diag, "_diagnose_impl", bounded)
+    report = {"datasets": {}}
+    diag._diagnose(args, tmp_path, report)
+
+    resources = report["resource_observability"]
+    assert resources["measurement_scope"]
+    assert resources["summary"]["run_average_gpu_sm_utilization_percent"]["value"] is None
+    assert report["throughput"]["completed_dataset_audits"] == 1
+    assert report["throughput"]["dataset_audits_per_second"]["value"] > 0
+
+
 @pytest.mark.parametrize(
     "arguments",
     [

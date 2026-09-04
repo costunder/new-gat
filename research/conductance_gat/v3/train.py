@@ -18,10 +18,20 @@ from typing import Any
 import torch
 
 from chartgat.cache import atomic_publish, atomic_write_json
+from chartgat.observability import RuntimeResourceMonitor
 
-from ..ablation.model import state_sha256
+from ..ablation.model import shared_backbone_state_sha256, state_sha256
 from ..ablation.train import _configure_fp32, _make_data, _require_cuda, training_loss
-from ..benchmark import _seed, _versions
+from ..benchmark import (
+    _seed,
+    _versions,
+    batch_observability,
+    data_observability,
+    finish_monitor_after_failure,
+    first_batch_shapes,
+    pre_run_observability,
+    validate_first_optimizer_step,
+)
 from ..benchmark_data import load_dataset, sha256_file, tensor_hash
 from .diagnostics import (
     ForwardObservation,
@@ -70,6 +80,7 @@ def architecture_configuration(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def configuration(args: argparse.Namespace) -> dict[str, Any]:
+    loader_workers = args.workers if args.dataset == "ppi" else 0
     return {
         **COMMON,
         **architecture_configuration(args),
@@ -77,10 +88,15 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
         "epochs": args.epochs,
         "patience": args.patience,
         "batch_size": args.batch_size,
-        "workers": args.workers,
+        "workers": loader_workers,
         "device": args.device,
         "tf32": False,
         "pin_memory": True,
+        "persistent_workers": loader_workers > 0,
+        "prefetch_factor": 2 if loader_workers > 0 else None,
+        "worker_configuration_source": getattr(
+            args, "worker_configuration_source", "explicit_cli"
+        ),
         "edge_chunk_size": args.edge_chunk_size,
     }
 
@@ -208,6 +224,11 @@ def _require_sources(expected):
 
 
 def _validate_args(args):
+    if args.workers is None:
+        args.workers = 4 if args.dataset == "ppi" else 0
+        args.worker_configuration_source = "dataset_default"
+    elif not hasattr(args, "worker_configuration_source"):
+        args.worker_configuration_source = "explicit_cli"
     if args.dataset not in DATASETS or args.condition not in CONDITIONS:
         raise ValueError("Unsupported v3 dataset/condition")
     architecture = architecture_configuration(args)
@@ -231,10 +252,16 @@ def _validate_args(args):
     expected_batch_size = 2 if args.dataset == "ppi" else 1
     if args.batch_size is None:
         args.batch_size = expected_batch_size
-    if args.batch_size != expected_batch_size or args.workers != 0:
+    if args.batch_size < 1:
+        raise ValueError("batch size must be positive")
+    if args.workers < 0:
+        raise ValueError("workers must be nonnegative")
+    if args.dataset != "ppi" and args.batch_size != expected_batch_size:
         raise ValueError(
-            f"V3 {args.dataset} requires batch-size={expected_batch_size} and workers=0"
+            f"V3 {args.dataset} is one full graph and requires batch-size={expected_batch_size}"
         )
+    if args.dataset != "ppi" and args.workers != 0:
+        raise ValueError("transductive V3 datasets use no DataLoader and require workers=0")
 
 
 def build_parser():
@@ -256,12 +283,25 @@ def build_parser():
         default=None,
         help="Defaults by dataset: 2 for PPI, 1 for fixed-graph datasets",
     )
-    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Default: 4 for PPI graph minibatches, 0 for transductive full graphs",
+    )
     parser.add_argument("--edge-chunk-size", type=int, default=DEFAULT_EDGE_CHUNK_SIZE)
     return parser
 
 
-def train_model(payload, protocol, args, device: torch.device, output: Path):
+def _train_model_impl(
+    payload,
+    protocol,
+    args,
+    device: torch.device,
+    output: Path,
+    *,
+    resource_start: dict[str, Any],
+):
     _require_cuda(device)
     _validate_args(args)
     if payload.get("dataset") != args.dataset:
@@ -293,7 +333,37 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         edge_chunk_size=args.edge_chunk_size,
     ).to(device)
     initial_hash = state_sha256(model)
+    shared_initial_hash = shared_backbone_state_sha256(model)
     optimizer = make_optimizer(model, args.condition)
+    data_observation = data_observability(
+        payload,
+        used_splits=("train", "validation"),
+        prepared_splits=indices,
+    )
+    batching = batch_observability(
+        data,
+        transductive=not is_ppi,
+        args=args,
+        batches_per_epoch=optimizer_steps_per_epoch,
+    )
+    pre_run = pre_run_observability(
+        model_name=SUITE,
+        model=model,
+        optimizer=optimizer,
+        args=args,
+        data_observation=data_observation,
+        batching=batching,
+        resource_start=resource_start,
+        architecture={
+            **architecture,
+            "normalization": "symmetric",
+            "gate_mode": spec["gate_mode"],
+            "edge_chunk_size": args.edge_chunk_size,
+        },
+        precision="float32",
+        device=device,
+    )
+    print(json.dumps(pre_run, sort_keys=True), flush=True)
     common = {
         "schema_version": 1,
         "research_suite": SUITE,
@@ -307,6 +377,7 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         "cache_sha256": protocol["data_sha256"],
         "protocol": protocol,
         "initial_state_sha256": initial_hash,
+        "shared_backbone_initial_state_sha256": shared_initial_hash,
         "topology": topology,
         "parameterization": PARAMETERIZATION,
         "source_sha256": sources,
@@ -327,6 +398,9 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     initial_observation, _ = evaluate_validation(model, data, validation_indices, device=device)
     optimizer_steps = 0
     best_optimizer_steps = 0
+    training_label_updates = 0
+    first_training_batch: dict[str, Any] | None = None
+    first_step_integrity: dict[str, Any] | None = None
     for epoch in range(1, args.epochs + 1):
         _require_sources(sources)
         torch.cuda.synchronize(device)
@@ -339,6 +413,8 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         for batch_index, graph in enumerate(batches):
             if is_ppi:
                 graph = graph.to(device, non_blocking=True)
+            if first_training_batch is None:
+                first_training_batch = first_batch_shapes(graph)
             optimizer.zero_grad(set_to_none=True)
             if batch_index == 0:
                 with ForwardObservation(model) as observation:
@@ -390,8 +466,11 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
                     "parameter_groups": gradient_groups,
                 }
                 trajectory.append(record)
+            if optimizer_steps == 0:
+                first_step_integrity = validate_first_optimizer_step(model, optimizer)
             optimizer.step()
             optimizer_steps += 1
+            training_label_updates += int(count)
             loss_sum.add_(loss.detach().double() * count)
             label_count += count
         if record is None or not label_count:
@@ -481,6 +560,10 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
     if sha256_file(checkpoint) != checkpoint_hash or sha256_file(history_path) != history_hash:
         raise RuntimeError("Read-only interventions changed source checkpoint/history")
     torch.cuda.synchronize(device)
+    if first_training_batch is None or first_step_integrity is None:
+        raise RuntimeError("training completed without a validated first optimizer step")
+    elapsed_seconds = time.perf_counter() - started
+    measured_epoch_seconds = sum(float(row["epoch_seconds"]) for row in history)
     return {
         **common,
         "status": "passed",
@@ -502,11 +585,43 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
         "checkpoint_sha256": checkpoint_hash,
         "history": str(history_path.resolve()),
         "history_sha256": history_hash,
-        "elapsed_seconds": time.perf_counter() - started,
+        "elapsed_seconds": elapsed_seconds,
         "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(device),
         "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
         "versions": _versions(),
         "gpu": torch.cuda.get_device_name(device),
+        "optimization_observability": {
+            "epochs_requested": args.epochs,
+            "epochs_completed": len(history),
+            "early_stopping_patience": args.patience,
+            "planned_maximum_optimizer_steps": batching[
+                "planned_maximum_optimizer_steps"
+            ],
+            "actual_optimizer_steps": optimizer_steps,
+            "training_label_decisions_processed": training_label_updates,
+            "gradient_accumulation_steps": 1,
+        },
+        "data_observability": {
+            **data_observation,
+            "input_tensor_shape_contract": {
+                **data_observation["input_tensor_shape_contract"],
+                "first_actual_training_batch": first_training_batch,
+            },
+        },
+        "batch_observability": batching,
+        "pre_run_observability": pre_run,
+        "first_optimizer_step_integrity": first_step_integrity,
+        "throughput": {
+            "measured_epoch_seconds": measured_epoch_seconds,
+            "optimizer_steps_per_second": optimizer_steps / measured_epoch_seconds,
+            "training_label_decisions_per_second": (
+                training_label_updates / measured_epoch_seconds
+            ),
+            "scope": (
+                "CUDA-synchronized epoch timing includes training, validation, and training "
+                "diagnostics while subsequent history/checkpoint writes are excluded"
+            ),
+        },
         "diagnostics": {
             "initial_validation": initial_observation,
             "best_validation": selected_observation,
@@ -532,6 +647,58 @@ def train_model(payload, protocol, args, device: torch.device, output: Path):
             "and artifact IO; not an isolated kernel benchmark."
         ),
     }
+
+
+def train_model(payload, protocol, args, device: torch.device, output: Path):
+    """Run V3 with periodic GPU/CPU/RAM sampling and safe failure cleanup."""
+
+    _require_cuda(device)
+    monitor = RuntimeResourceMonitor(device)
+    resource_start = monitor.start()
+    try:
+        result = _train_model_impl(
+            payload,
+            protocol,
+            args,
+            device,
+            output,
+            resource_start=resource_start,
+        )
+    except BaseException as primary_error:
+        finish_monitor_after_failure(
+            monitor,
+            output=output,
+            device=device,
+            primary_error=primary_error,
+        )
+        raise
+    resources = monitor.finish(
+        peak_allocated_bytes=int(result["peak_cuda_allocated_bytes"]),
+        peak_reserved_bytes=int(result["peak_cuda_reserved_bytes"]),
+    )
+    result["resource_observability"] = resources
+    result["hardware_execution"] = {
+        "gpu_sm_utilization": resources["interval_series"][
+            "gpu_sm_utilization_percent"
+        ],
+        "gpu_memory_controller_utilization": resources["interval_series"][
+            "gpu_memory_controller_utilization_percent"
+        ],
+        "cpu_average": resources["summary"][
+            "average_cpu_percent_of_allocated_capacity"
+        ],
+        "ram_series": {
+            key: value
+            for key, value in resources["interval_series"].items()
+            if key
+            in {
+                "process_resident_bytes",
+                "process_peak_resident_bytes",
+                "system_available_bytes",
+            }
+        },
+    }
+    return result
 
 
 def _cache_snapshot(args):
@@ -584,7 +751,13 @@ def main(argv: list[str] | None = None):
         record.update(result, cache_files_sha256=cache_files)
     except BaseException as exc:
         record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
-        atomic_write_json(output / "metrics.json", record)
+        try:
+            atomic_write_json(output / "metrics.json", record)
+        except BaseException as reporting_error:
+            exc.add_note(
+                "failed metrics could not be written without replacing this error: "
+                f"{type(reporting_error).__name__}: {reporting_error}"
+            )
         raise
     atomic_write_json(output / "metrics.json", record)
     print(f"passed: {output}", flush=True)

@@ -52,7 +52,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--epochs", type=int, default=200)
     result.add_argument("--patience", type=int, default=50)
     result.add_argument("--batch-size", type=int, default=1, help=argparse.SUPPRESS)
-    result.add_argument("--workers", type=int, default=0)
+    result.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="PPI graph DataLoader workers; transductive children are forced to 0",
+    )
     result.add_argument("--edge-chunk-size", type=int, default=65536)
     result.add_argument("--min-free-gb", type=float, default=8.0)
     result.add_argument("--dry-run", action="store_true", help="Print plan without GPU or writes")
@@ -69,14 +74,13 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError(
             "V4 batch size is protocol-locked per dataset: PPI=2, transductive datasets=1"
         )
-    if args.workers != 0:
-        raise ValueError("V4 requires workers=0")
 
 
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     jobs = []
     for dataset in args.datasets:
         batch_size = BATCH_SIZE_BY_DATASET[dataset]
+        child_workers = shared.workers_for_dataset(dataset, args.workers)
         for condition in CONDITIONS:
             output = run_dir / dataset / condition
             command = [
@@ -94,21 +98,20 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "--data-root",
                 str(args.data_root.expanduser().resolve()),
             ]
-            for key in (
-                "device",
-                "model_seed",
-                "epochs",
-                "patience",
-                "workers",
-                "edge_chunk_size",
-            ):
+            for key in ("device", "model_seed", "epochs", "patience", "edge_chunk_size"):
                 command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
-            command += ["--batch-size", str(batch_size)]
+            command += [
+                "--batch-size",
+                str(batch_size),
+                "--workers",
+                str(child_workers),
+            ]
             jobs.append(
                 {
                     "dataset": dataset,
                     "condition": condition,
                     "batch_size": batch_size,
+                    "workers": child_workers,
                     "status": "pending",
                     "output_dir": str(output),
                     "metrics_path": str(output / "metrics.json"),
@@ -204,6 +207,10 @@ def main(argv: list[str] | None = None) -> int:
         "batch_size_by_dataset": {
             dataset: BATCH_SIZE_BY_DATASET[dataset] for dataset in args.datasets
         },
+        "workers_by_dataset": {
+            dataset: shared.workers_for_dataset(dataset, args.workers)
+            for dataset in args.datasets
+        },
         "data_root": str(data_root),
     }
     manifest = {
@@ -221,12 +228,15 @@ def main(argv: list[str] | None = None) -> int:
         "protocol": {
             "selection": "best validation checkpoint per arm; same early-stopping policy",
             "test": "not evaluated; exploratory validation comparison",
-            "initialization": "same full state hash across all four arms; C=1, W=I, alpha=.5",
+            "initialization": (
+                "same shared non-estimator/non-transform backbone state hash; full hashes "
+                "differ across parameter-free controls; C=1, W=I, alpha=.5 initially"
+            ),
             "data": "same verified official V1 cache/split and ordered topology; no downloads",
             "contrast": "four fresh V4 trainings; never reuse V3 checkpoints or scores",
             "factorial": "relative C on/off crossed with learned spatial W on/off",
-            "fixed_c": "exact C=1; estimator scaffold frozen and excluded from optimizer",
-            "identity_w": "exact W=I; message-transform scaffold frozen and excluded",
+            "fixed_c": "exact C=1 through a parameter-free estimator; no gate tensors",
+            "identity_w": "exact W=I through a parameter-free identity transform",
             "normalization": "symmetric weighted-degree in every arm; alpha remains trainable",
             "task_protocol": "Cora/CiteSeer/PubMed/ogbn-arxiv use transductive full graphs; "
             "PPI uses the official 20/2/2 inductive graph split, batch size 2, BCEWithLogits "
@@ -295,11 +305,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         if current_job is not None:
             current_job.update(status="failed", error=manifest["error"])
-        atomic_write_json(manifest_path, manifest)
-        try:
-            _comparison(run_dir, manifest)
-        except (ValueError, OSError) as report_error:
-            print(f"Comparison integrity error: {report_error}", file=sys.stderr)
+        report_error = shared.run_failure_reporter(
+            lambda: _comparison(run_dir, manifest),
+            original_error=exc,
+            action="failed-run comparison generation",
+        )
+        if report_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(report_error)
+        manifest_error = shared.run_failure_reporter(
+            lambda: atomic_write_json(manifest_path, manifest),
+            original_error=exc,
+            action="failed-run manifest persistence",
+        )
+        if manifest_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(manifest_error)
         print(f"Failed: {manifest['error']}\nSaved partial results: {run_dir}", file=sys.stderr)
         return 130 if isinstance(exc, KeyboardInterrupt) else 1
     atomic_write_json(manifest_path, manifest)

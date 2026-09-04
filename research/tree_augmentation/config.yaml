@@ -1,4 +1,8 @@
 # Independent downstream paper protocol; no reduced or demonstration profile.
+# ``full`` is the research-scale ``reference`` architecture also used by
+# scripts/run_tree_scaling.py.  The 256x12 ``large`` architecture remains an
+# explicit validation-selected scaling candidate rather than an unchecked
+# direct-run default.
 paper:
   learning_rate: 0.002
   weight_decay: 0.00001
@@ -6,8 +10,8 @@ paper:
   pin_memory: true
   non_blocking: true
   full:
-    hidden_dim: 64
-    message_layers: 2
+    hidden_dim: 128
+    message_layers: 8
     optimizer_updates: 800
     batch_size: 16
     train_charts_per_graph: 8

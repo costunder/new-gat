@@ -22,6 +22,14 @@ from torch.utils.data import DataLoader
 
 from chartgat.cache import atomic_publish, atomic_write_json
 from chartgat.execution import add_execution_arguments, configure_execution
+from chartgat.observability import observed
+from research.cycle_pe.benchmark_data import EXPECTED_SIZES
+from research.cycle_pe.resource_monitor import (
+    FailureSafeResourceMonitor,
+    persist_failure_artifacts,
+    resource_failure_boundary,
+    resource_failure_observations,
+)
 from research.cycle_pe.v2.data import (
     BASIS_BACKENDS,
     DATASETS,
@@ -43,9 +51,11 @@ IMPLEMENTATION_FILES = (
     "research/cycle_pe/benchmark_data.py",
     "research/cycle_pe/benchmark_models.py",
     "research/cycle_pe/paper_model.py",
+    "research/cycle_pe/resource_monitor.py",
     "src/chartgat/algebra.py",
     "src/chartgat/cache.py",
     "src/chartgat/execution.py",
+    "src/chartgat/observability.py",
 )
 
 
@@ -106,7 +116,7 @@ def parser() -> argparse.ArgumentParser:
     for seed in ("data", "split", "chart", "model"):
         result.add_argument(f"--{seed}-seed", type=int, default=0)
     result.add_argument("--batch-size", type=int, default=32)
-    result.add_argument("--workers", type=int, default=0)
+    result.add_argument("--workers", type=int, default=4)
     result.add_argument("--prefetch-factor", type=int, default=2)
     result.add_argument(
         "--hardware-profile",
@@ -348,6 +358,8 @@ def _hardware_report(args: argparse.Namespace, device: torch.device) -> dict[str
     free_bytes, total_bytes = torch.cuda.mem_get_info(device)
     report = {
         "profile": args.hardware_profile,
+        "selected_device": str(device),
+        "visible_cuda_device_count": torch.cuda.device_count(),
         "name": properties.name,
         "total_bytes": int(total_bytes),
         "free_bytes_at_start": int(free_bytes),
@@ -369,6 +381,203 @@ def _hardware_report(args: argparse.Namespace, device: torch.device) -> dict[str
     report["tf32_matmul"] = bool(torch.backends.cuda.matmul.allow_tf32)
     report["tf32_cudnn"] = bool(torch.backends.cudnn.allow_tf32)
     return report
+
+
+def _integer_distribution(values: list[int]) -> dict[str, int | float]:
+    if not values:
+        raise ValueError("cannot summarize an empty observation")
+    return {
+        "count": len(values),
+        "minimum": min(values),
+        "maximum": max(values),
+        "mean": sum(values) / len(values),
+        "total": sum(values),
+    }
+
+
+def _require_finite_loss(loss: torch.Tensor, label: str) -> None:
+    predicate = torch.isfinite(loss)
+    assertion = getattr(torch, "_assert_async", None)
+    if loss.device.type == "cuda" and assertion is not None:
+        assertion(predicate, label)
+    elif not bool(predicate):
+        raise FloatingPointError(label)
+
+
+def _validate_optimizer_ownership(
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer
+) -> dict[str, Any]:
+    """Require every trainable tensor to be owned exactly once by the optimizer."""
+    trainable = {
+        id(parameter): (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    if not trainable:
+        raise RuntimeError("Cycle PE V2 model has no trainable parameters")
+    owned = [parameter for group in optimizer.param_groups for parameter in group["params"]]
+    owned_ids = [id(parameter) for parameter in owned]
+    duplicate_ids = sorted(
+        parameter_id for parameter_id in set(owned_ids) if owned_ids.count(parameter_id) != 1
+    )
+    missing_ids = sorted(set(trainable) - set(owned_ids))
+    unexpected_ids = sorted(set(owned_ids) - set(trainable))
+    if duplicate_ids or missing_ids or unexpected_ids:
+        names = {parameter_id: name for parameter_id, (name, _) in trainable.items()}
+        duplicate_names = [
+            names.get(parameter_id, str(parameter_id)) for parameter_id in duplicate_ids
+        ]
+        raise RuntimeError(
+            "Cycle PE V2 optimizer ownership mismatch; "
+            f"missing={[names[parameter_id] for parameter_id in missing_ids]}, "
+            f"duplicate={duplicate_names}, "
+            f"unexpected_parameter_ids={unexpected_ids}"
+        )
+    trainable_scalars = sum(parameter.numel() for _, parameter in trainable.values())
+    return {
+        "validated": True,
+        "trainable_parameter_tensors": len(trainable),
+        "trainable_parameter_scalars": trainable_scalars,
+        "optimizer_owned_parameter_tensors": len(owned),
+        "optimizer_owned_parameter_scalars": sum(parameter.numel() for parameter in owned),
+        "optimizer_parameter_groups": [
+            {
+                "index": index,
+                "parameter_tensors": len(group["params"]),
+                "parameter_scalars": sum(parameter.numel() for parameter in group["params"]),
+            }
+            for index, group in enumerate(optimizer.param_groups)
+        ],
+    }
+
+
+def _validate_first_task_gradients(model: torch.nn.Module) -> dict[str, Any]:
+    """Fail closed on disconnected or nonfinite trainable parameters before Adam."""
+    trainable = [
+        (name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad
+    ]
+    if not trainable:
+        raise RuntimeError("Cycle PE V2 model has no trainable parameters")
+    missing = [name for name, parameter in trainable if parameter.grad is None]
+    nonfinite = [
+        name
+        for name, parameter in trainable
+        if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all())
+    ]
+    if missing:
+        raise RuntimeError(
+            "Cycle PE V2 has trainable parameters disconnected from the first task loss: "
+            + ", ".join(missing)
+        )
+    if nonfinite:
+        raise FloatingPointError(
+            "Cycle PE V2 has nonfinite first-step task gradients: " + ", ".join(nonfinite)
+        )
+    return {
+        "validated": True,
+        "stage": "after_first_task_backward_before_gradient_clipping_and_optimizer_step",
+        "trainable_parameter_tensors": len(trainable),
+        "trainable_parameter_scalars": sum(parameter.numel() for _, parameter in trainable),
+        "missing_gradient_parameters": [],
+        "nonfinite_gradient_parameters": [],
+    }
+
+
+def _cycle_data_observability(
+    dataset: str,
+    splits: dict[str, list[Graph]],
+) -> dict[str, Any]:
+    """Describe exactly the official graphs loaded and used by this invocation."""
+    graphs = [graph for split in splits.values() for graph in split]
+    if not graphs:
+        raise ValueError(f"{dataset}: no official graphs were loaded")
+    split_sizes = {name: len(rows) for name, rows in splits.items()}
+    loaded_count = sum(split_sizes.values())
+    used_count = (
+        split_sizes.get("train", 0) + split_sizes.get("validation", 0) + split_sizes.get("test", 0)
+    )
+    official_split_counts = dict(
+        zip(("train", "validation", "test"), EXPECTED_SIZES[dataset], strict=True)
+    )
+    official_total = sum(official_split_counts.values())
+    loaded_fraction = observed(loaded_count / official_total, unit="fraction")
+    node_counts = [int(graph.x.shape[0]) for graph in graphs]
+    edge_counts = [int(graph.edge_index.shape[1]) for graph in graphs]
+    cycle_ranks = [int(graph.cycle_basis.shape[1]) for graph in graphs]
+    return {
+        "dataset": dataset,
+        "source": "official benchmark adapter and immutable V2 basis cache",
+        "official_split_graph_counts": official_split_counts,
+        "loaded_split_graph_counts": split_sizes,
+        "loaded_graph_count": loaded_count,
+        "actual_used_graph_count": used_count,
+        "actual_used_fraction_of_loaded_graphs": observed(
+            used_count / loaded_count, unit="fraction"
+        ),
+        "graphs_used_by_phase": {
+            "optimization": split_sizes.get("train", 0),
+            "validation_selection": split_sizes.get("validation", 0),
+            "final_test_evaluation": split_sizes.get("test", 0),
+        },
+        "official_full_graph_count": observed(official_total, unit="graphs"),
+        "loaded_fraction_of_official_full_dataset": loaded_fraction,
+        "actual_used_fraction_of_official_full_dataset": observed(
+            used_count / official_total, unit="fraction"
+        ),
+        "sampling_ratio": observed(1.0, unit="fraction"),
+        "subset_or_fast_mode": False,
+        "nodes_per_graph": _integer_distribution(node_counts),
+        "canonical_undirected_edges_per_graph": _integer_distribution(edge_counts),
+        "cycle_rank_per_graph": _integer_distribution(cycle_ranks),
+        "input_tensor_shapes": {
+            "node_feature_widths": sorted({int(graph.x.shape[1]) for graph in graphs}),
+            "edge_feature_widths": sorted({int(graph.edge_attr.shape[1]) for graph in graphs}),
+            "target_widths": sorted({int(graph.y.numel()) for graph in graphs}),
+            "node_and_edge_axes": "ragged by graph; min/max/mean are reported above",
+        },
+        "time_window": observed(
+            None, reason="not applicable to static molecular graphs", unit="steps"
+        ),
+        "input_resolution": observed(
+            None, reason="not applicable to categorical molecular graph inputs"
+        ),
+    }
+
+
+def _cycle_batch_observability(
+    args: argparse.Namespace,
+    *,
+    effective_batch_size: int,
+    training_graphs: int,
+    batches_per_epoch: int,
+) -> dict[str, Any]:
+    last_batch = training_graphs % effective_batch_size or effective_batch_size
+    return {
+        "batch_unit": "molecular_graphs",
+        "requested_physical_batch_size": args.batch_size,
+        "configured_physical_batch_size": effective_batch_size,
+        "observed_smallest_batch_size": min(effective_batch_size, last_batch),
+        "observed_largest_batch_size": min(effective_batch_size, training_graphs),
+        "gradient_accumulation_steps": 1,
+        "data_parallel_workers": 1,
+        "effective_batch_size": effective_batch_size,
+        "effective_batch_size_formula": (
+            f"{effective_batch_size} physical x 1 accumulation x 1 data-parallel worker"
+        ),
+        "training_batches_per_epoch": batches_per_epoch,
+        "planned_maximum_training_batches": args.epochs * batches_per_epoch,
+        "dataloader_workers": args.workers,
+        "persistent_workers": args.workers > 0,
+        "prefetch_factor": args.prefetch_factor
+        if args.workers
+        else observed(
+            None,
+            reason="prefetch_factor is inactive because dataloader workers is zero",
+        ),
+        "pin_memory": True,
+        "non_blocking_transfer": True,
+        "cache": "immutable prepared graph and complete cycle-basis cache",
+    }
 
 
 def _graph_probe_cost(graph: Graph) -> int:
@@ -428,8 +637,7 @@ def _calibrate_batch_size(
             with torch.autocast("cuda", dtype=precision["dtype"], enabled=precision["enabled"]):
                 prediction = model(probe)
                 loss = (prediction.float() - probe.y).abs().mean()
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"{dataset}: nonfinite capacity-probe loss")
+            _require_finite_loss(loss, f"{dataset}: nonfinite capacity-probe loss")
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0, error_if_nonfinite=True)
             torch.cuda.synchronize(device)
@@ -486,6 +694,7 @@ def evaluate(
     return float(total / count)
 
 
+@resource_failure_boundary
 def _train_model(
     dataset: str,
     splits: dict[str, list[Graph]],
@@ -496,6 +705,8 @@ def _train_model(
     _seed(args.model_seed)
     device = torch.device(args.device)
     hardware = _hardware_report(args, device)
+    resource_monitor = FailureSafeResourceMonitor(device, workload=f"cycle_v2_{dataset}_training")
+    resource_start = resource_monitor.start()
     precision = _amp_policy(args.amp, device)
     model = CycleBasisPEModel(
         dataset=dataset,
@@ -511,6 +722,7 @@ def _train_model(
     ).to(device)
     execution = configure_execution(model, args, device)
     execution.update(basis_execution=args.basis_execution, basis_pair_budget=args.basis_pair_budget)
+    total_parameters = sum(p.numel() for p in model.parameters())
     parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if parameters > args.max_parameters:
         raise ValueError(
@@ -557,13 +769,57 @@ def _train_model(
     train_loader = _loader(splits["train"], args, train=True)
     validation_loader = _loader(splits["validation"], args, train=False)
     test_loader = None if validation_only else _loader(splits["test"], args, train=False)
+    data_observability = _cycle_data_observability(dataset, splits)
+    batch_observability = _cycle_batch_observability(
+        args,
+        effective_batch_size=effective_batch_size,
+        training_graphs=len(splits["train"]),
+        batches_per_epoch=len(train_loader),
+    )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer_ownership = _validate_optimizer_ownership(model, optimizer)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, factor=0.5, patience=25, min_lr=1e-6
     )
     # BF16 has FP32's exponent range and does not need loss scaling. Retain a
     # disabled scaler object so epoch-resume artifacts keep one stable schema.
     scaler = torch.amp.GradScaler("cuda", enabled=precision["gradient_scaler"])
+    pre_run_observability = {
+        "status": "pre_run_configuration",
+        "model": {
+            "name": MODEL_NAME,
+            "layers": args.layers,
+            "hidden_dimension": args.hidden_dim,
+            "positional_encoding_dimension": args.pe_dim,
+            "ffn_multiplier": args.ffn_multiplier,
+            "attention_heads": observed(
+                None, reason="the Cycle PE V2 architecture has no attention heads"
+            ),
+            "channels": args.hidden_dim,
+            "total_parameters": total_parameters,
+            "trainable_parameters": parameters,
+        },
+        "data": data_observability,
+        "batching": batch_observability,
+        "optimization": {
+            "epochs_requested": args.epochs,
+            "early_stopping_patience": args.patience,
+            "planned_maximum_optimizer_steps": args.epochs * len(train_loader),
+            "actual_optimizer_steps": observed(None, reason="training has not started"),
+            "optimizer": "Adam",
+            "optimizer_ownership": optimizer_ownership,
+        },
+        "precision": _precision_identity(precision),
+        "hardware": hardware,
+        "resources": resource_start,
+        "modes": {
+            "validation_only": validation_only,
+            "debug": False,
+            "subset": False,
+            "fast_mode": False,
+        },
+    }
+    print(json.dumps(pre_run_observability, sort_keys=True), flush=True)
     execution.update(
         hardware=hardware,
         precision={
@@ -587,6 +843,8 @@ def _train_model(
         },
     )
     history = []
+    optimizer_steps = 0
+    first_task_gradient_connectivity: dict[str, Any] | None = None
     best = math.inf
     best_epoch = 0
     start_epoch = 1
@@ -609,9 +867,35 @@ def _train_model(
             raise ValueError("last.pt epoch/history state is invalid")
         model.load_state_dict(state["model_state_dict"], strict=True)
         optimizer.load_state_dict(state["optimizer_state_dict"])
+        if _validate_optimizer_ownership(model, optimizer) != optimizer_ownership:
+            raise ValueError("last.pt changed Cycle PE V2 optimizer parameter ownership")
         scheduler.load_state_dict(state["scheduler_state_dict"])
         scaler.load_state_dict(state["scaler_state_dict"])
         history = saved_history
+        saved_optimizer_steps = state.get("optimizer_steps")
+        expected_optimizer_steps = len(history) * len(train_loader)
+        if (
+            isinstance(saved_optimizer_steps, bool)
+            or not isinstance(saved_optimizer_steps, int)
+            or saved_optimizer_steps != expected_optimizer_steps
+        ):
+            raise ValueError("last.pt optimizer-step count is invalid")
+        optimizer_steps = saved_optimizer_steps
+        saved_gradient_connectivity = state.get("first_task_gradient_connectivity")
+        if (
+            not isinstance(saved_gradient_connectivity, dict)
+            or saved_gradient_connectivity.get("validated") is not True
+            or saved_gradient_connectivity.get("stage")
+            != "after_first_task_backward_before_gradient_clipping_and_optimizer_step"
+            or saved_gradient_connectivity.get("trainable_parameter_tensors")
+            != optimizer_ownership["trainable_parameter_tensors"]
+            or saved_gradient_connectivity.get("trainable_parameter_scalars")
+            != optimizer_ownership["trainable_parameter_scalars"]
+            or saved_gradient_connectivity.get("missing_gradient_parameters") != []
+            or saved_gradient_connectivity.get("nonfinite_gradient_parameters") != []
+        ):
+            raise ValueError("last.pt first-task gradient-connectivity state is invalid")
+        first_task_gradient_connectivity = saved_gradient_connectivity
         best, best_epoch = float(state["best"]), int(state["best_epoch"])
         elapsed_before = float(state.get("elapsed_seconds", 0.0))
         previous_peak = int(state.get("peak_gpu_memory_bytes", 0))
@@ -632,19 +916,23 @@ def _train_model(
         train_sum = torch.zeros((), device=device, dtype=torch.float64)
         train_count = 0
         train_graph_count = 0
+        epoch_optimizer_steps = 0
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast("cuda", dtype=precision["dtype"], enabled=precision["enabled"]):
                 predicted = model(batch)
                 loss = (predicted.float() - batch.y).abs().mean()
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"{dataset}/{MODEL_NAME}: nonfinite training loss")
+            _require_finite_loss(loss, f"{dataset}/{MODEL_NAME}: nonfinite training loss")
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
+            if first_task_gradient_connectivity is None:
+                first_task_gradient_connectivity = _validate_first_task_gradients(model)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0, error_if_nonfinite=True)
             scaler.step(optimizer)
             scaler.update()
+            optimizer_steps += 1
+            epoch_optimizer_steps += 1
             train_sum += loss.detach().double() * batch.y.numel()
             train_count += batch.y.numel()
             train_graph_count += batch.y.shape[0]
@@ -666,6 +954,8 @@ def _train_model(
                 "train_cuda_synchronized_seconds": train_seconds,
                 "train_graphs": train_graph_count,
                 "train_graphs_per_second": train_graph_count / train_seconds,
+                "optimizer_steps_this_epoch": epoch_optimizer_steps,
+                "optimizer_steps": optimizer_steps,
                 "learning_rate": optimizer.param_groups[0]["lr"],
             }
         )
@@ -715,6 +1005,8 @@ def _train_model(
             "elapsed_seconds": elapsed_so_far,
             "peak_gpu_memory_bytes": peak_so_far,
             "peak_gpu_reserved_bytes": reserved_peak_so_far,
+            "optimizer_steps": optimizer_steps,
+            "first_task_gradient_connectivity": first_task_gradient_connectivity,
             "effective_batch_size": effective_batch_size,
             "batch_calibration": batch_calibration,
             "hardware": hardware,
@@ -738,26 +1030,83 @@ def _train_model(
         assert test_loader is not None
         test = evaluate(model, test_loader, device, amp=args.amp)
     torch.cuda.synchronize(device)
+    peak_gpu_memory_bytes = max(previous_peak, torch.cuda.max_memory_allocated(device))
+    peak_gpu_reserved_bytes = max(previous_reserved_peak, torch.cuda.max_memory_reserved(device))
+    if first_task_gradient_connectivity is None:
+        raise RuntimeError("training completed without first-task gradient-connectivity validation")
+    resource_observability = resource_monitor.finish(
+        peak_allocated_bytes=peak_gpu_memory_bytes,
+        peak_reserved_bytes=peak_gpu_reserved_bytes,
+    )
+    resource_observability["cuda_allocator_peak_boundary"] = (
+        "reset after the non-optimizing batch-capacity probe; cumulative maximum is "
+        "restored from last.pt across resumed invocations"
+    )
+    optimization_observability = {
+        "epochs_requested": args.epochs,
+        "epochs_completed": len(history),
+        "early_stopping_patience": args.patience,
+        "training_batches_per_epoch": len(train_loader),
+        "planned_maximum_optimizer_steps": args.epochs * len(train_loader),
+        "actual_optimizer_steps": optimizer_steps,
+        "gradient_accumulation_steps": 1,
+        "optimizer": "Adam",
+        "optimizer_ownership": optimizer_ownership,
+        "first_task_gradient_connectivity": first_task_gradient_connectivity,
+        "step_definition": "one Adam update for every complete physical minibatch",
+        "shortfall_reason": (
+            None
+            if optimizer_steps == args.epochs * len(train_loader)
+            else "validation-based early stopping ended training before the maximum epoch budget"
+        ),
+    }
+    train_graphs = sum(int(row["train_graphs"]) for row in history)
+    train_seconds = sum(float(row["train_cuda_synchronized_seconds"]) for row in history)
+    throughput = {
+        "scope": "CUDA-synchronized training forward/backward timing; validation and IO excluded",
+        "training_graphs": train_graphs,
+        "training_cuda_synchronized_seconds": train_seconds,
+        "training_graphs_per_second": observed(
+            train_graphs / train_seconds,
+            reason=None if train_seconds > 0 else "observed training duration was zero",
+            unit="graphs_per_second",
+        )
+        if train_seconds > 0
+        else observed(
+            None,
+            reason="observed training duration was zero",
+            unit="graphs_per_second",
+        ),
+    }
     result = {
         "validation": best,
         "best_epoch": best_epoch,
+        "total_parameters": total_parameters,
         "trainable_parameters": parameters,
+        "frozen_parameters": total_parameters - parameters,
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": hashlib.sha256(checkpoint.read_bytes()).hexdigest(),
         "history": str(history_path),
         "history_sha256": hashlib.sha256(history_path.read_bytes()).hexdigest(),
         "elapsed_seconds": elapsed_before + time.perf_counter() - started,
-        "peak_gpu_memory_bytes": max(previous_peak, torch.cuda.max_memory_allocated(device)),
-        "peak_gpu_reserved_bytes": max(
-            previous_reserved_peak, torch.cuda.max_memory_reserved(device)
-        ),
+        "peak_gpu_memory_bytes": peak_gpu_memory_bytes,
+        "peak_gpu_reserved_bytes": peak_gpu_reserved_bytes,
         "epochs_completed": len(history),
+        "optimizer_steps": optimizer_steps,
+        "optimizer_ownership": optimizer_ownership,
+        "first_task_gradient_connectivity": first_task_gradient_connectivity,
         "last_checkpoint": str(last_checkpoint),
         "last_checkpoint_sha256": hashlib.sha256(last_checkpoint.read_bytes()).hexdigest(),
         "execution": execution,
         "effective_batch_size": effective_batch_size,
         "batch_calibration": batch_calibration,
         "hardware": hardware,
+        "pre_run_observability": pre_run_observability,
+        "resource_observability": resource_observability,
+        "data_observability": data_observability,
+        "batch_observability": batch_observability,
+        "optimization_observability": optimization_observability,
+        "throughput": throughput,
         "training_graphs_per_epoch": len(splits["train"]),
         "epoch_timing": "cuda_synchronized_train_and_validation_excluding_checkpoint_io",
         "evaluation_splits": ["train", "validation"],
@@ -766,9 +1115,26 @@ def _train_model(
     if test is not None:
         result["test"] = test
         result["evaluation_splits"].append("test")
+    print(
+        json.dumps(
+            {
+                "status": "post_run_observability",
+                "dataset": dataset,
+                "model": MODEL_NAME,
+                "optimizer_steps": optimizer_steps,
+                "epochs_completed": len(history),
+                "optimizer_ownership_validated": optimizer_ownership["validated"],
+                "gradient_connectivity_validated": first_task_gradient_connectivity["validated"],
+                "resource_summary": resource_observability["summary"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     return result
 
 
+@resource_failure_boundary
 def _evaluate_test_checkpoint(
     dataset: str,
     test_graphs: list[Graph],
@@ -876,9 +1242,115 @@ def _evaluate_test_checkpoint(
     test_loader = _loader(test_graphs, args, train=False)
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
+    resource_monitor = FailureSafeResourceMonitor(
+        device, workload=f"cycle_v2_{dataset}_selected_test"
+    )
+    resources_at_start = resource_monitor.start()
+    data_observability = _cycle_data_observability(dataset, {"test": test_graphs})
+    batch_observability = {
+        "batch_unit": "molecular_graphs",
+        "requested_physical_batch_size": args.batch_size,
+        "checkpoint_bound_physical_batch_size": effective_batch_size,
+        "observed_largest_physical_batch_size": min(effective_batch_size, len(test_graphs)),
+        "gradient_accumulation_steps": 1,
+        "data_parallel_workers": 1,
+        "optimizer_steps": observed(
+            None, reason="selected-checkpoint test evaluation is read-only", unit="steps"
+        ),
+        "dataloader_workers": args.workers,
+        "persistent_workers": args.workers > 0,
+        "prefetch_factor": (
+            args.prefetch_factor
+            if args.workers > 0
+            else observed(
+                None,
+                reason="prefetch_factor is inactive because DataLoader workers is zero",
+            )
+        ),
+        "pin_memory": True,
+        "non_blocking_transfer": True,
+        "packed_cycle_basis_h2d_tensors_per_batch": 1,
+    }
+    print(
+        json.dumps(
+            {
+                "status": "pre_selected_test_observability",
+                "dataset": dataset,
+                "model": {
+                    "name": MODEL_NAME,
+                    "layers": args.layers,
+                    "hidden_dimension": args.hidden_dim,
+                    "positional_encoding_dimension": args.pe_dim,
+                    "ffn_multiplier": args.ffn_multiplier,
+                    "channels": args.hidden_dim,
+                    "attention_heads": observed(
+                        None,
+                        reason="the Cycle PE V2 architecture has no attention heads",
+                    ),
+                    "total_parameters": sum(parameter.numel() for parameter in model.parameters()),
+                    "trainable_parameters": parameters,
+                },
+                "data": data_observability,
+                "batching": batch_observability,
+                "precision": _precision_identity(precision),
+                "hardware": hardware,
+                "resources": resources_at_start,
+                "optimization": {
+                    "optimizer_created": False,
+                    "optimizer_steps": 0,
+                    "reason": "selected-checkpoint test evaluation is read-only",
+                },
+                "modes": {
+                    "test_only": True,
+                    "debug": False,
+                    "subset": False,
+                    "fast_mode": False,
+                },
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     started = time.perf_counter()
     test = evaluate(model, test_loader, device, amp=args.amp)
     torch.cuda.synchronize(device)
+    evaluation_seconds = time.perf_counter() - started
+    peak_allocated = torch.cuda.max_memory_allocated(device)
+    peak_reserved = torch.cuda.max_memory_reserved(device)
+    resource_observability = resource_monitor.finish(
+        peak_allocated_bytes=peak_allocated,
+        peak_reserved_bytes=peak_reserved,
+    )
+    throughput = {
+        "scope": (
+            "CUDA-synchronized selected-checkpoint test evaluation; checkpoint loading "
+            "and model construction excluded"
+        ),
+        "evaluated_graphs": len(test_graphs),
+        "evaluation_seconds": evaluation_seconds,
+        "evaluation_graphs_per_second": (
+            observed(len(test_graphs) / evaluation_seconds, unit="graphs_per_second")
+            if evaluation_seconds > 0
+            else observed(
+                None,
+                reason="observed selected-test evaluation duration was zero",
+                unit="graphs_per_second",
+            )
+        ),
+    }
+    print(
+        json.dumps(
+            {
+                "status": "post_selected_test_observability",
+                "dataset": dataset,
+                "model": MODEL_NAME,
+                "throughput": throughput,
+                "resource_summary": resource_observability["summary"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     return {
         "test": test,
         "selected_validation": float(validation),
@@ -886,12 +1358,22 @@ def _evaluate_test_checkpoint(
         "trainable_parameters": parameters,
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": checkpoint_sha256,
-        "evaluation_seconds": time.perf_counter() - started,
-        "peak_gpu_memory_bytes": torch.cuda.max_memory_allocated(device),
-        "peak_gpu_reserved_bytes": torch.cuda.max_memory_reserved(device),
+        "evaluation_seconds": evaluation_seconds,
+        "peak_gpu_memory_bytes": peak_allocated,
+        "peak_gpu_reserved_bytes": peak_reserved,
         "execution": execution,
         "effective_batch_size": effective_batch_size,
         "hardware": hardware,
+        "data_observability": data_observability,
+        "batch_observability": batch_observability,
+        "resources_at_start": resources_at_start,
+        "resource_observability": resource_observability,
+        "throughput": throughput,
+        "optimizer_observability": {
+            "optimizer_created": False,
+            "optimizer_steps": 0,
+            "reason": "selected-checkpoint test evaluation is read-only",
+        },
         "evaluation_splits": ["test"],
         "fresh_training": False,
     }
@@ -1147,11 +1629,17 @@ def main(argv: list[str] | None = None) -> int:
                 for name, data in metrics["datasets"].items()
             }
         atomic_write_json(manifest_path, manifest)
-    except Exception as exc:
+    except BaseException as exc:
         manifest["status"] = metrics["status"] = "failed"
         manifest["error"] = f"{type(exc).__name__}: {exc}"
-        atomic_write_json(manifest_path, manifest)
-        atomic_write_json(metrics_path, metrics)
+        manifest["resource_failure_observations"] = resource_failure_observations(exc)
+        persist_failure_artifacts(
+            exc,
+            (
+                ("manifest.json", lambda: atomic_write_json(manifest_path, manifest)),
+                ("metrics.json", lambda: atomic_write_json(metrics_path, metrics)),
+            ),
+        )
         raise
     print(json.dumps({"status": metrics["status"], "output_dir": str(args.output_dir)}), flush=True)
     return 0

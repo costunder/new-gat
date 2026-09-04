@@ -5,8 +5,9 @@ hidden-state-to-C function, dense C, or eigendecomposition is used. A common
 positive C scale cancels under row-degree normalization; no centering, cap or
 projection is silently applied. The runner gives log C zero weight decay.
 
-The fixed arm has the same zero-valued log-C state but it is frozen and never
-used as a trainable gate. These parameters cannot transfer to an unseen graph.
+The fixed arm is parameter-free and constructs C=1 from the actual forward
+state. Only the direct arm owns graph-bound log-C parameters; those parameters
+cannot transfer to an unseen graph.
 """
 
 from __future__ import annotations
@@ -46,11 +47,15 @@ class DirectEdgeConductance(nn.Module):
         if gate_mode not in {"direct", "fixed_one"}:
             raise ValueError(f"Unsupported direct-C gate mode: {gate_mode}")
         self.gate_mode = gate_mode
-        self.log_c = nn.Parameter(torch.zeros(num_edges), requires_grad=gate_mode == "direct")
+        self.num_edges = num_edges
+        if gate_mode == "direct":
+            self.log_c = nn.Parameter(torch.zeros(num_edges))
 
-    def forward(self) -> Tensor:
+    def forward(self, reference: Tensor | None = None) -> Tensor:
         if self.gate_mode == "fixed_one":
-            return torch.ones_like(self.log_c)
+            if reference is None:
+                return torch.ones(self.num_edges)
+            return reference.new_ones(self.num_edges)
         c = self.log_c.exp()
         if not bool(torch.isfinite(c.detach()).all()) or not bool((c.detach() > 0).all()):
             raise FloatingPointError("exp(log C) overflow/underflow; no clipping is used")
@@ -80,7 +85,7 @@ class DirectCConv(nn.Module):
         # Keep the ordinary operator hook API for read-only C/propagation reports.
         with torch.autocast(device_type=x.device.type, enabled=False):
             state = x if x.dtype == torch.float64 else x.float()
-            c = self.estimator().to(dtype=state.dtype)
+            c = self.estimator(state).to(dtype=state.dtype)
             result = chunked_normalized_propagation(
                 state, c, incidence, edge_chunk_size=self.edge_chunk_size
             )

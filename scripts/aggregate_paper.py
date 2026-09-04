@@ -380,9 +380,8 @@ def _summary(values: list[float], *, key: str, bootstrap_samples: int) -> dict[s
         low = high = None
         uncertainty_status = "insufficient_samples"
     elif bootstrap_samples == 0:
-        # Preserve the historical disabled-bootstrap point placeholders, but
-        # explicitly label them as disabled rather than estimated intervals.
-        low = high = mean
+        # No interval was estimated: do not publish the point estimate as bounds.
+        low = high = None
         uncertainty_status = "bootstrap_disabled"
     else:
         seed = int.from_bytes(hashlib.sha256(key.encode("utf-8")).digest()[:8], "big")
@@ -508,8 +507,11 @@ def aggregate_manifest(
                     log_text = Path(str(log_value)).read_text(encoding="utf-8", errors="replace")[
                         -100_000:
                     ]
-                except OSError:
-                    pass
+                except OSError as error:
+                    artifact_errors.append(
+                        f"could not read failure log {log_value}: "
+                        f"{type(error).__name__}: {error}"
+                    )
             error_text = " | ".join(str(error) for error in artifact_errors)
             searchable_error = f"{error_text}\n{log_text}".casefold()
             failures.append(
@@ -724,7 +726,7 @@ def aggregate_manifest(
             ),
             "bootstrap_disabled": (
                 "n>=2 and bootstrap_samples=0: sample_std is available; bootstrap_95 "
-                "bounds retain legacy mean placeholders and are not confidence intervals"
+                "bounds were not estimated and remain unavailable (null/empty)"
             ),
             "bootstrap_estimated": (
                 "n>=2: sample standard deviation and deterministic percentile-bootstrap "

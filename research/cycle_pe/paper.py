@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import shutil
+import os
 import sys
 import time
 from collections import defaultdict
@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
+from chartgat.observability import observed
 from chartgat.seeds import SeedAxes, resolve_seed_axes
 from research.cycle_pe.paper_adapters import (
     BREC_CATEGORIES,
@@ -42,8 +43,11 @@ from research.cycle_pe.paper_data import (
 )
 from research.cycle_pe.paper_model import (
     PE_VARIANTS,
+    BatchOutput,
     PaperCycleModel,
+    PreparedBatch,
     PreparedGraph,
+    pack_prepared_graphs,
     prepare_splits,
 )
 from research.cycle_pe.paper_train import (
@@ -52,13 +56,21 @@ from research.cycle_pe.paper_train import (
     cuda_autocast,
     evaluate_supervised,
     make_grad_scaler,
+    require_finite_loss,
     resolve_device,
     runtime_environment,
     seed_everything,
     train_supervised,
+    validate_first_step_gradients,
+    validate_optimizer_ownership,
+)
+from research.cycle_pe.resource_monitor import (
+    FailureSafeResourceMonitor,
+    resource_failure_boundary,
+    resource_failure_observations,
 )
 
-PAPER_SCHEMA_VERSION = 1
+PAPER_SCHEMA_VERSION = 2
 BREC_OFFICIAL_SEEDS = (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
 BREC_PROTOCOLS = ("official", "custom")
 BREC_OFFICIAL_BATCH_SIZE = 16
@@ -71,6 +83,7 @@ COMMAND_CONTRACT = (
     "python -m research.cycle_pe.paper --suite core|brec|zinc|all "
     "--data-root PATH --output-dir PATH --device cuda --seed N "
     "[--data-seed N --split-seed N --chart-seed N --model-seed N] [--workers N] "
+    "[--prefetch-factor N] "
     "[--prepare-only] [--allow-download] [--brec-protocol official|custom] "
     "[--brec-seeds 100,...,1000]"
 )
@@ -99,19 +112,30 @@ def _claim_empty_output(path: Path) -> None:
         path.mkdir(parents=True)
 
 
-def _clean_failed_suite_output(path: Path, suite: str | None) -> None:
-    """Remove an incomplete suite while preserving every completed suite."""
+def _preserve_failed_suite_output(
+    path: Path, suite: str | None, *, reason: str
+) -> str | None:
+    """Validate and preserve the current run's incomplete suite for diagnosis."""
 
     if suite is None:
-        return
-    root = path.resolve()
-    target = (root / suite).resolve()
-    if target.parent != root or target.name != suite:
-        raise RuntimeError(f"refusing to clean unsafe suite output target: {target}")
-    if target.is_dir() and not target.is_symlink():
-        shutil.rmtree(target)
-    elif target.exists() or target.is_symlink():
-        target.unlink(missing_ok=True)
+        return None
+    lexical_root = Path(os.path.abspath(path.expanduser()))
+    root = lexical_root.resolve()
+    if root != lexical_root or root.parent == root:
+        raise RuntimeError(f"refusing to inspect unsafe paper output root: {lexical_root}")
+    lexical_target = lexical_root / suite
+    target = lexical_target.resolve()
+    if target != lexical_target or target.parent != root or target.name != suite:
+        raise RuntimeError(f"refusing to preserve unsafe suite output target: {lexical_target}")
+    if not lexical_target.exists():
+        return None
+    event = {
+        "event": "preserve_failed_suite_output",
+        "path": str(lexical_target),
+        "reason": reason,
+    }
+    print(json.dumps(event, ensure_ascii=False, sort_keys=True), file=sys.stderr, flush=True)
+    return str(lexical_target)
 
 
 def _artifact_checksums(root: Path) -> dict[str, str]:
@@ -136,10 +160,14 @@ def _argument_manifest(args: argparse.Namespace) -> dict[str, Any]:
 
 def _implementation_hashes() -> dict[str, str]:
     module_root = Path(__file__).resolve().parent
+    repository_root = module_root.parents[1]
+    paths = [
+        *(path for path in sorted(module_root.glob("paper*.py")) if path.is_file()),
+        module_root / "resource_monitor.py",
+        repository_root / "src" / "chartgat" / "observability.py",
+    ]
     return {
-        path.name: sha256_file(path)
-        for path in sorted(module_root.glob("paper*.py"))
-        if path.is_file()
+        path.relative_to(repository_root).as_posix(): sha256_file(path) for path in paths
     }
 
 
@@ -156,6 +184,62 @@ def _split_statistics(bundle: DatasetBundle) -> dict[str, Any]:
             "families": sorted({graph.family for graph in graphs}),
         }
     return result
+
+
+def _prepared_data_observability(
+    bundle: DatasetBundle, prepared: dict[str, list[PreparedGraph]]
+) -> dict[str, Any]:
+    graphs = [graph for split in prepared.values() for graph in split]
+    if not graphs:
+        raise ValueError("prepared Cycle paper dataset cannot be empty")
+
+    def distribution(values: list[int], unit: str) -> dict[str, Any]:
+        return {
+            "minimum": observed(min(values), unit=unit),
+            "mean": observed(sum(values) / len(values), unit=unit),
+            "maximum": observed(max(values), unit=unit),
+            "total": observed(sum(values), unit=unit),
+        }
+
+    loaded = sum(len(values) for values in bundle.splits.values())
+    actual = len(graphs)
+    first = graphs[0]
+    return {
+        "dataset": bundle.name,
+        "loaded_split_graph_counts": {
+            name: len(values) for name, values in bundle.splits.items()
+        },
+        "actual_used_split_graph_counts": {
+            name: len(values) for name, values in prepared.items()
+        },
+        "loaded_graph_count": loaded,
+        "actual_used_graph_count": actual,
+        "actual_used_fraction_of_loaded_graphs": observed(actual / loaded, unit="fraction"),
+        "sampling_ratio": observed(1.0, unit="fraction"),
+        "nodes_per_graph": distribution([graph.num_nodes for graph in graphs], "nodes"),
+        "canonical_undirected_edges_per_graph": distribution(
+            [int(graph.edges.shape[0]) for graph in graphs], "edges"
+        ),
+        "cycle_rank_per_graph": distribution(
+            [graph.cycle_rank for graph in graphs], "cycles"
+        ),
+        "input_tensor_shapes": {
+            "node_features": [None, int(first.node_features.shape[1])],
+            "edge_features": [None, int(first.edge_features.shape[1])],
+            "raw_cycle_basis": [None, None],
+            "ragged_axes": "graph, node, edge, and cycle-rank axes; no truncation",
+        },
+        "time_window": observed(
+            None, reason="not applicable to static graphs", unit="not_applicable"
+        ),
+        "input_resolution": observed(
+            None, reason="not applicable to graph-structured inputs", unit="not_applicable"
+        ),
+        "preparation_cache": (
+            "all prepared graph/PE tensors are retained in RAM and reused for every epoch"
+        ),
+        "debug_subset_fast_mode": False,
+    }
 
 
 def _resolve_seed_axes(args: argparse.Namespace) -> SeedAxes:
@@ -287,6 +371,7 @@ def _settings(args: argparse.Namespace, device: torch.device, suite: str) -> Tra
         amp_requested=args.amp,
         pin_memory_requested=args.pin_memory,
         non_blocking_requested=args.non_blocking,
+        prefetch_factor=args.prefetch_factor,
     )
 
 
@@ -330,6 +415,7 @@ def _brec_settings(args: argparse.Namespace, device: torch.device, protocol: str
         amp_requested=False,
         pin_memory_requested=False,
         non_blocking_requested=False,
+        prefetch_factor=args.prefetch_factor,
     )
 
 
@@ -370,6 +456,7 @@ def _save_checkpoint(
     )
 
 
+@resource_failure_boundary
 def _run_supervised_bundle(
     bundle: DatasetBundle,
     *,
@@ -394,6 +481,7 @@ def _run_supervised_bundle(
     first = train_graphs[0]
     hidden_dim, pe_dim, layers = _model_dimensions(args)
     settings = _settings(args, device, suite)
+    data_observability = _prepared_data_observability(bundle, prepared)
     target_names = {
         "edge": bundle.edge_target_names,
         "node": bundle.node_target_names,
@@ -414,6 +502,7 @@ def _run_supervised_bundle(
         "split_statistics": _split_statistics(bundle),
         "split_sizes": {name: len(graphs) for name, graphs in bundle.splits.items()},
         "total_graphs": sum(len(graphs) for graphs in bundle.splits.values()),
+        "data_observability": data_observability,
         "target_names": target_names,
         "target_tasks": {name: list(levels) for name, levels in target_tasks.items()},
         "target_independence_policy": (
@@ -445,6 +534,16 @@ def _run_supervised_bundle(
             "epochs": settings.epochs,
             "batch_size": settings.batch_size,
             "workers": settings.workers,
+            "worker_policy": runtime_environment(settings)["worker_policy"],
+            "prefetch_factor": (
+                settings.prefetch_factor
+                if settings.workers > 0
+                else observed(
+                    None,
+                    reason="prefetch_factor is inactive because DataLoader workers is zero",
+                )
+            ),
+            "persistent_workers": settings.workers > 0,
             "learning_rate": settings.learning_rate,
             "weight_decay": settings.weight_decay,
             "amp_requested": settings.amp_requested,
@@ -467,7 +566,7 @@ def _run_supervised_bundle(
         return manifest
 
     experiment_summaries: dict[str, Any] = {}
-    peak_gpu = 0
+    peak_gpu: int | None = None
     training_wall = 0.0
     for task_name, target_levels in target_tasks.items():
         task_summary: dict[str, Any] = {}
@@ -477,29 +576,46 @@ def _run_supervised_bundle(
                 split: [graph for graph in graphs if graph.cycle_rank > raw_width]
                 for split, graphs in prepared.items()
             }
-            validation_graphs = prepared[validation_split]
-            validation_fit_note: dict[str, Any] | None = None
-            if variant == "raw" and overflow[validation_split]:
-                validation_graphs = [
-                    graph for graph in validation_graphs if graph.cycle_rank <= raw_width
-                ]
-                validation_fit_note = {
-                    "policy": "compatible_validation_subset_for_early_stopping",
-                    "full_split_reported_as": ("not_applicable_train_fitted_width_overflow"),
-                    "compatible_graphs": len(validation_graphs),
-                    "overflow_graphs": len(overflow[validation_split]),
+            incompatible_splits = {
+                split: graphs
+                for split, graphs in overflow.items()
+                if split != train_split and graphs
+            }
+            if variant == "raw" and incompatible_splits:
+                summary = {
+                    "status": "not_applicable_train_fitted_width_overflow",
+                    "reason": (
+                        "at least one complete non-training split contains a graph whose "
+                        "cycle rank exceeds the train-fitted raw width; the entire raw "
+                        "condition is not run, rather than selecting a compatible subset, "
+                        "truncating coordinates, or fitting width on validation/test data"
+                    ),
+                    "fitted_raw_width": raw_width,
+                    "incompatible_splits": {
+                        split: {
+                            "loaded_graphs": len(prepared[split]),
+                            "overflow_graphs": len(graphs),
+                            "maximum_cycle_rank": max(graph.cycle_rank for graph in graphs),
+                            "graphs_used_for_checkpoint_selection_or_metrics": 0,
+                        }
+                        for split, graphs in incompatible_splits.items()
+                    },
+                    "training_performed": False,
+                    "checkpoint_selection_performed": False,
+                    "metric_calculation_performed": False,
+                    "compatible_subset_used": False,
+                    "truncated": False,
+                    "validation_or_test_fitted": False,
                 }
-                if not validation_graphs:
-                    summary = {
-                        "status": "not_applicable_train_fitted_width_overflow",
-                        "reason": "no compatible validation graph for early stopping",
-                        "fitted_raw_width": raw_width,
-                        "overflow_graphs": len(overflow[validation_split]),
-                        "truncated": False,
-                    }
-                    task_summary[variant] = summary
-                    _write_json(suite_root / task_name / variant / "metrics.json", summary)
-                    continue
+                task_summary[variant] = summary
+                _write_json(suite_root / task_name / variant / "metrics.json", summary)
+                print(
+                    f"[{suite}] task={task_name} variant=raw status="
+                    "not_applicable_train_fitted_width_overflow",
+                    flush=True,
+                )
+                continue
+            validation_graphs = prepared[validation_split]
             seed_everything(seed_axes.model)
             enabled = set(target_levels)
             model = PaperCycleModel(
@@ -513,6 +629,7 @@ def _run_supervised_bundle(
                 hidden_dim=hidden_dim,
                 pe_dim=pe_dim,
                 layers=layers,
+                embedding_dim=0,
             )
             model, stats, history, runtime = train_supervised(
                 model,
@@ -522,39 +639,78 @@ def _run_supervised_bundle(
                 target_levels=target_levels,
             )
             if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
                 torch.cuda.synchronize(device)
+            evaluation_monitor = FailureSafeResourceMonitor(
+                device,
+                workload=f"cycle_paper_{suite}_{task_name}_{variant}_evaluation",
+            )
+            evaluation_resources_at_start = evaluation_monitor.start()
             evaluation_started = time.perf_counter()
             metrics: dict[str, Any] = {}
+            evaluated_graphs = 0
             for split, graphs in prepared.items():
-                if variant == "raw" and overflow[split]:
-                    metrics[split] = {
-                        "status": "not_applicable_train_fitted_width_overflow",
-                        "fitted_raw_width": raw_width,
-                        "overflow_graphs": len(overflow[split]),
-                        "max_cycle_rank": max(graph.cycle_rank for graph in overflow[split]),
-                        "truncated": False,
-                    }
-                else:
-                    metrics[split] = evaluate_supervised(
-                        model,
-                        graphs,
-                        stats,
-                        settings,
-                        target_names,
-                        integer_targets=integer_targets,
-                    )
+                evaluated_graphs += len(graphs)
+                metrics[split] = evaluate_supervised(
+                    model,
+                    graphs,
+                    stats,
+                    settings,
+                    target_names,
+                    integer_targets=integer_targets,
+                )
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
-                runtime["peak_gpu_memory_bytes"] = max(
-                    int(runtime["peak_gpu_memory_bytes"]),
-                    int(torch.cuda.max_memory_allocated(device)),
-                )
-            runtime["evaluation_wall_seconds"] = time.perf_counter() - evaluation_started
+                evaluation_peak = int(torch.cuda.max_memory_allocated(device))
+                evaluation_reserved_peak = int(torch.cuda.max_memory_reserved(device))
+            else:
+                evaluation_peak = None
+                evaluation_reserved_peak = None
+            evaluation_seconds = time.perf_counter() - evaluation_started
+            evaluation_resources = evaluation_monitor.finish(
+                peak_allocated_bytes=evaluation_peak,
+                peak_reserved_bytes=evaluation_reserved_peak,
+            )
+            training_peak = runtime["peak_gpu_memory_bytes"]
+            training_reserved_peak = runtime["peak_gpu_reserved_memory_bytes"]
+            runtime["peak_gpu_memory_bytes"] = (
+                max(training_peak, evaluation_peak)
+                if isinstance(training_peak, int) and isinstance(evaluation_peak, int)
+                else training_peak
+                if isinstance(training_peak, int)
+                else evaluation_peak
+            )
+            runtime["peak_gpu_reserved_memory_bytes"] = (
+                max(training_reserved_peak, evaluation_reserved_peak)
+                if isinstance(training_reserved_peak, int)
+                and isinstance(evaluation_reserved_peak, int)
+                else training_reserved_peak
+                if isinstance(training_reserved_peak, int)
+                else evaluation_reserved_peak
+            )
+            runtime["evaluation_wall_seconds"] = evaluation_seconds
+            runtime["evaluation_resources_at_start"] = evaluation_resources_at_start
+            runtime["evaluation_resource_observability"] = evaluation_resources
+            runtime["evaluation_throughput"] = {
+                "scope": (
+                    "CUDA-synchronized complete split evaluation; metric transfer and "
+                    "aggregation included"
+                ),
+                "evaluated_graphs": evaluated_graphs,
+                "evaluation_seconds": evaluation_seconds,
+                "evaluated_graphs_per_second": (
+                    observed(evaluated_graphs / evaluation_seconds, unit="graphs_per_second")
+                    if evaluation_seconds > 0
+                    else observed(
+                        None,
+                        reason="observed evaluation duration was zero",
+                        unit="graphs_per_second",
+                    )
+                ),
+            }
             runtime["total_train_evaluation_wall_seconds"] = float(runtime["wall_seconds"]) + float(
                 runtime["evaluation_wall_seconds"]
             )
-            if validation_fit_note is not None:
-                runtime["raw_validation_fit"] = validation_fit_note
             variant_root = suite_root / task_name / variant
             _write_json(variant_root / "metrics.json", metrics)
             _write_json(variant_root / "history.json", history)
@@ -567,7 +723,9 @@ def _run_supervised_bundle(
                 raw_width=raw_width,
                 model_seed=seed_axes.model,
             )
-            peak_gpu = max(peak_gpu, int(runtime["peak_gpu_memory_bytes"]))
+            runtime_peak = runtime["peak_gpu_memory_bytes"]
+            if isinstance(runtime_peak, int):
+                peak_gpu = runtime_peak if peak_gpu is None else max(peak_gpu, runtime_peak)
             training_wall += float(runtime["total_train_evaluation_wall_seconds"])
             reported_split = "test" if "test" in metrics else "id_test"
             reported = metrics[reported_split]
@@ -576,6 +734,16 @@ def _run_supervised_bundle(
                 "reported_split": reported_split,
                 "macro_normalized_mae": reported.get("macro_normalized_mae"),
                 "best_validation_loss": runtime["best_validation_loss"],
+                "total_parameters": runtime["model_observability"]["total_parameters"],
+                "trainable_parameters": runtime["model_observability"][
+                    "trainable_parameters"
+                ],
+                "optimizer_steps_completed": runtime["optimizer_steps_completed"],
+                "gradient_connectivity_validated": runtime["gradient_connectivity"][
+                    "validated_on_first_actual_backward"
+                ],
+                "training_throughput": runtime["throughput"],
+                "evaluation_throughput": runtime["evaluation_throughput"],
                 "total_train_evaluation_wall_seconds": runtime[
                     "total_train_evaluation_wall_seconds"
                 ],
@@ -662,7 +830,9 @@ def _brec_batches(
     *,
     batch_size: int,
 ) -> list[list[PreparedGraph]]:
-    pairs_per_batch = max(1, batch_size // 2)
+    if batch_size < 2 or batch_size % 2:
+        raise ValueError("BREC graph batch size must be an even integer of at least two")
+    pairs_per_batch = batch_size // 2
     result: list[list[PreparedGraph]] = []
     for start in range(0, len(order), pairs_per_batch):
         batch: list[PreparedGraph] = []
@@ -673,8 +843,12 @@ def _brec_batches(
     return result
 
 
-def _move_brec_batch(graphs: list[PreparedGraph], settings: TrainSettings) -> list[PreparedGraph]:
-    return [graph.to(settings.device, non_blocking=settings.non_blocking) for graph in graphs]
+def _move_brec_batch(
+    graphs: list[PreparedGraph], settings: TrainSettings, *, variant: str
+) -> PreparedBatch:
+    return pack_prepared_graphs(graphs, variant=variant, target_levels=()).to(
+        settings.device, non_blocking=settings.non_blocking
+    )
 
 
 @torch.no_grad()
@@ -726,10 +900,15 @@ def _brec_t2(
     embeddings: list[Tensor] = []
     order = np.arange(len(graphs) // 2)
     for cpu_batch in _brec_batches(graphs, order, batch_size=settings.batch_size):
-        batch = _move_brec_batch(cpu_batch, settings)
+        batch = _move_brec_batch(
+            cpu_batch, settings, variant=model.pe_encoder.variant
+        )
         with cuda_autocast(settings.amp):
-            embeddings.extend(output.embedding for output in model(batch))
-    return float(brec_hotelling_t2(torch.stack(embeddings)).cpu())
+            outputs = model(batch)
+        if not isinstance(outputs, BatchOutput) or outputs.embedding is None:
+            raise RuntimeError("BREC packed forward did not produce graph embeddings")
+        embeddings.append(outputs.embedding)
+    return float(brec_hotelling_t2(torch.cat(embeddings, dim=0)).cpu())
 
 
 def _train_brec_pair(
@@ -741,11 +920,13 @@ def _train_brec_pair(
     threshold: float,
     shuffle_pairs: bool,
     gradient_clip_norm: float | None,
-) -> tuple[dict[str, Any], int]:
+) -> tuple[dict[str, Any], int | None]:
     model = model.to(settings.device)
     optimizer = torch.optim.Adam(
         model.parameters(), lr=settings.learning_rate, weight_decay=settings.weight_decay
     )
+    trainable_parameters = validate_optimizer_ownership(model, optimizer)
+    total_parameters = sum(parameter.numel() for parameter in model.parameters())
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
     scaler = make_grad_scaler(settings.amp)
     cosine = nn.CosineEmbeddingLoss(margin=0.0)
@@ -758,47 +939,71 @@ def _train_brec_pair(
     started = time.perf_counter()
     final_loss = math.inf
     epochs_completed = 0
+    optimizer_steps = 0
+    processed_pairs = 0
+    observed_graph_batch_sizes: list[int] = []
+    gradient_connectivity: dict[str, Any] | None = None
+    pairs_per_epoch = len(train_test) // 2
+    batches_per_epoch = math.ceil(pairs_per_epoch / max(1, settings.batch_size // 2))
     for epoch in range(settings.epochs):
         model.train()
         if shuffle_pairs:
             order = np.random.default_rng(settings.seed + epoch).permutation(len(train_test) // 2)
         else:
             order = np.arange(len(train_test) // 2)
-        total = 0.0
+        total = torch.zeros((), device=settings.device, dtype=torch.float64)
         pairs = 0
         for cpu_batch in _brec_batches(train_test, order, batch_size=settings.batch_size):
-            batch = _move_brec_batch(cpu_batch, settings)
+            batch = _move_brec_batch(
+                cpu_batch, settings, variant=model.pe_encoder.variant
+            )
             optimizer.zero_grad(set_to_none=True)
             with cuda_autocast(settings.amp):
-                embedding = torch.stack([output.embedding for output in model(batch)])
+                outputs = model(batch)
+                if not isinstance(outputs, BatchOutput) or outputs.embedding is None:
+                    raise RuntimeError("BREC packed forward did not produce graph embeddings")
+                embedding = outputs.embedding
                 target = -torch.ones(
                     embedding.shape[0] // 2,
                     device=embedding.device,
                     dtype=embedding.dtype,
                 )
                 loss = cosine(embedding[0::2], embedding[1::2], target)
+            require_finite_loss(loss, "nonfinite BREC cosine loss")
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            if optimizer_steps == 0:
+                gradient_connectivity = validate_first_step_gradients(model)
             if gradient_clip_norm is not None:
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+                nn.utils.clip_grad_norm_(
+                    model.parameters(), gradient_clip_norm, error_if_nonfinite=True
+                )
             scaler.step(optimizer)
             scaler.update()
             pair_count = embedding.shape[0] // 2
-            total += float(loss.detach().cpu()) * pair_count
+            optimizer_steps += 1
+            processed_pairs += int(pair_count)
+            observed_graph_batch_sizes.append(batch.batch_size)
+            total += loss.detach().double() * pair_count
             pairs += pair_count
-        final_loss = total / max(1, pairs)
+        final_loss = float(total.cpu()) / max(1, pairs)
         epochs_completed = epoch + 1
         scheduler.step(final_loss)
         if final_loss < 0.2:
             break
+    if gradient_connectivity is None:
+        raise RuntimeError("BREC training performed no actual backward pass")
     train_t2 = _brec_t2(model, train_test, settings)
     reliability_t2 = _brec_t2(model, reliability, settings)
     decision = brec_rpc_decision(train_t2, reliability_t2, threshold=threshold)
     if settings.device.type == "cuda":
         torch.cuda.synchronize(settings.device)
         peak = int(torch.cuda.max_memory_allocated(settings.device))
+        peak_reserved = int(torch.cuda.max_memory_reserved(settings.device))
     else:
-        peak = 0
+        peak = None
+        peak_reserved = None
+    wall_seconds = time.perf_counter() - started
     result = {
         **decision,
         "train_test_t2": train_t2,
@@ -808,8 +1013,110 @@ def _train_brec_pair(
         "epochs_completed": epochs_completed,
         "pair_shuffle": shuffle_pairs,
         "gradient_clip_norm": gradient_clip_norm,
-        "wall_seconds": time.perf_counter() - started,
+        "wall_seconds": wall_seconds,
         "peak_gpu_memory_bytes": peak,
+        "peak_gpu_reserved_memory_bytes": peak_reserved,
+        "peak_gpu_memory_unavailable_reason": (
+            None
+            if settings.device.type == "cuda"
+            else "training device is CPU, so CUDA allocator peaks are unavailable"
+        ),
+        "model_observability": {
+            "name": type(model).__name__,
+            "pe_variant": model.pe_encoder.variant,
+            "layers": len(model.layers),
+            "hidden_dimension": model.node_encoder[0].out_features,
+            "pe_dimension": model.pe_encoder.pe_dim,
+            "attention_heads": observed(
+                None, reason="PaperCycleModel has no attention mechanism"
+            ),
+            "total_parameters": total_parameters,
+            "trainable_parameters": trainable_parameters,
+            "optimizer_owned_trainable_parameters": trainable_parameters,
+        },
+        "gradient_connectivity": gradient_connectivity,
+        "optimizer_observability": {
+            "name": "Adam",
+            "optimizer_steps_completed": optimizer_steps,
+            "planned_maximum_optimizer_steps": settings.epochs * batches_per_epoch,
+            "early_stop_criterion": "official/custom shared cosine loss < 0.2",
+            "early_stop_triggered": epochs_completed < settings.epochs,
+            "shortfall_reason": (
+                "registered cosine-loss stopping criterion was satisfied"
+                if epochs_completed < settings.epochs
+                else None
+            ),
+        },
+        "data_observability": {
+            "train_test_graphs": len(train_test),
+            "reliability_graphs": len(reliability),
+            "train_test_pairs": pairs_per_epoch,
+            "input_tensor_shapes": {
+                "node_features": [
+                    None,
+                    int(train_test[0].node_features.shape[1]),
+                ],
+                "edge_features": [
+                    None,
+                    int(train_test[0].edge_features.shape[1]),
+                ],
+                "edge_index": [None, 2],
+            },
+            "sampling_ratio": observed(1.0, unit="fraction"),
+            "actual_used_fraction_of_loaded_graphs": observed(1.0, unit="fraction"),
+            "nodes_per_graph": {
+                "minimum": min(graph.num_nodes for graph in [*train_test, *reliability]),
+                "maximum": max(graph.num_nodes for graph in [*train_test, *reliability]),
+            },
+            "edges_per_graph": {
+                "minimum": min(
+                    int(graph.edges.shape[0]) for graph in [*train_test, *reliability]
+                ),
+                "maximum": max(
+                    int(graph.edges.shape[0]) for graph in [*train_test, *reliability]
+                ),
+            },
+            "time_window": observed(
+                None, reason="BREC inputs are static graphs without a time axis"
+            ),
+            "input_resolution": observed(
+                None, reason="BREC graph inputs have no spatial raster resolution"
+            ),
+            "debug_subset_fast_mode": False,
+        },
+        "batch_observability": {
+            "batch_unit": "graphs in complete interleaved RPC pairs",
+            "configured_physical_graph_batch_size": settings.batch_size,
+            "observed_smallest_graph_batch_size": min(observed_graph_batch_sizes),
+            "observed_largest_graph_batch_size": max(observed_graph_batch_sizes),
+            "gradient_accumulation_steps": 1,
+            "data_parallel_workers": 1,
+            "effective_graph_batch_size": max(observed_graph_batch_sizes),
+            "packed_disjoint_union_forward": True,
+            "per_graph_gpu_forward_loop": False,
+            "workers": settings.workers,
+            "workers_reason": (
+                "official BREC traverses paired in-memory RPC blocks in fixed order; no "
+                "DataLoader, disk decode, or per-graph GPU forward occurs"
+            ),
+        },
+        "throughput": {
+            "scope": (
+                "CUDA-synchronized end-to-end pair training plus final train/reliability "
+                "T2 evaluation; includes CPU pair ordering and packed transfer"
+            ),
+            "processed_training_pairs": processed_pairs,
+            "elapsed_seconds": wall_seconds,
+            "training_pairs_per_second": (
+                observed(processed_pairs / wall_seconds, unit="pairs_per_second")
+                if wall_seconds > 0
+                else observed(
+                    None,
+                    reason="observed BREC duration was zero",
+                    unit="pairs_per_second",
+                )
+            ),
+        },
     }
     return result, peak
 
@@ -1045,6 +1352,7 @@ def _brec_seeded_settings(settings: TrainSettings, seed: int) -> TrainSettings:
         amp_requested=settings.amp_requested,
         pin_memory_requested=settings.pin_memory_requested,
         non_blocking_requested=settings.non_blocking_requested,
+        prefetch_factor=settings.prefetch_factor,
     )
 
 
@@ -1066,7 +1374,7 @@ def _execute_brec_attempt(
     layers: int,
     threshold: float,
     protocol: str,
-) -> tuple[dict[str, Any], int]:
+) -> tuple[dict[str, Any], int | None]:
     common = {
         "pair_index": pair_index,
         "category": category,
@@ -1089,7 +1397,7 @@ def _execute_brec_attempt(
                 "reliable": False,
                 "successful": False,
             },
-            0,
+            None,
         )
 
     first = prepared["train_test"][0]
@@ -1123,6 +1431,7 @@ def _execute_brec_attempt(
     return result, peak
 
 
+@resource_failure_boundary
 def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
     seed_axes = _resolve_seed_axes(args)
     protocol = _effective_brec_protocol(args)
@@ -1208,8 +1517,19 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
             "protocol": protocol,
             "epochs": settings.epochs,
             "batch_size_graphs": settings.batch_size,
+            "physical_batch_size_graphs": settings.batch_size,
+            "gradient_accumulation_steps": 1,
+            "data_parallel_workers": 1,
+            "effective_batch_size_formula": (
+                f"{settings.batch_size} physical x 1 accumulation x 1 data-parallel worker"
+            ),
             "workers": settings.workers,
             "workers_note": "BREC RPC preserves explicit pairs and does not use DataLoader",
+            "prefetch_factor": observed(
+                None,
+                reason="BREC uses ordered in-memory RPC pair packing, not a DataLoader",
+            ),
+            "cache": "each decoded RPC pair is prepared once and reused across its epochs",
             "learning_rate": settings.learning_rate,
             "weight_decay": settings.weight_decay,
             "amp_effective": settings.amp,
@@ -1270,7 +1590,48 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
         return manifest
 
     pair_results: dict[str, list[dict[str, Any]]] = {variant: [] for variant in args.variants}
-    peak_gpu = 0
+    peak_gpu: int | None = None
+    peak_gpu_reserved: int | None = None
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
+    resource_monitor = FailureSafeResourceMonitor(
+        device, workload="cycle_paper_brec_suite"
+    )
+    resources_at_start = resource_monitor.start()
+    print(
+        json.dumps(
+            {
+                "kind": "cycle_paper_brec_pre_run_observability",
+                "protocol": protocol,
+                "model": {
+                    "name": "PaperCycleModel",
+                    "variants": list(args.variants),
+                    "hidden_dimension": hidden_dim,
+                    "pe_dimension": pe_dim,
+                    "layers": layers,
+                    "embedding_dimension": BREC_OUTPUT_DIM,
+                    "attention_heads": observed(
+                        None, reason="PaperCycleModel has no attention mechanism"
+                    ),
+                },
+                "data": {
+                    "official_pair_count": adapter.pair_count,
+                    "selected_pair_count": len(pair_indices),
+                    "selected_fraction": observed(
+                        len(pair_indices) / adapter.pair_count, unit="fraction"
+                    ),
+                    "num_relabels": adapter.num_relabel,
+                    "sampling_ratio": observed(1.0, unit="fraction"),
+                    "debug_subset_fast_mode": False,
+                },
+                "batch": manifest["training"],
+                "resources_at_start": resources_at_start,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     run_started = time.perf_counter()
     if protocol == "official":
         for variant in args.variants:
@@ -1306,7 +1667,15 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
                         protocol=protocol,
                     )
                     pair_results[variant].append(result)
-                    peak_gpu = max(peak_gpu, pair_peak)
+                    if pair_peak is not None:
+                        peak_gpu = pair_peak if peak_gpu is None else max(peak_gpu, pair_peak)
+                    pair_reserved = result.get("peak_gpu_reserved_memory_bytes")
+                    if isinstance(pair_reserved, int):
+                        peak_gpu_reserved = (
+                            pair_reserved
+                            if peak_gpu_reserved is None
+                            else max(peak_gpu_reserved, pair_reserved)
+                        )
     else:
         for position, pair_index in enumerate(pair_indices, start=1):
             print(f"[brec:custom] pair={pair_index} ({position}/{len(pair_indices)})", flush=True)
@@ -1338,7 +1707,15 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
                         protocol=protocol,
                     )
                     pair_results[variant].append(result)
-                    peak_gpu = max(peak_gpu, pair_peak)
+                    if pair_peak is not None:
+                        peak_gpu = pair_peak if peak_gpu is None else max(peak_gpu, pair_peak)
+                    pair_reserved = result.get("peak_gpu_reserved_memory_bytes")
+                    if isinstance(pair_reserved, int):
+                        peak_gpu_reserved = (
+                            pair_reserved
+                            if peak_gpu_reserved is None
+                            else max(peak_gpu_reserved, pair_reserved)
+                        )
 
     summaries: dict[str, Any] = {}
     for variant, results in pair_results.items():
@@ -1352,11 +1729,55 @@ def run_brec(args: argparse.Namespace, device: torch.device) -> dict[str, Any]:
             )
         _write_json(suite_root / variant / "pairs.json", results)
         _write_json(suite_root / variant / "metrics.json", summaries[variant])
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    run_seconds = time.perf_counter() - run_started
+    resources = resource_monitor.finish(
+        peak_allocated_bytes=peak_gpu,
+        peak_reserved_bytes=peak_gpu_reserved,
+    )
+    recorded_attempts = sum(len(results) for results in pair_results.values())
     manifest["variants"] = summaries
     manifest["runtime_summary"] = {
-        "wall_seconds": time.perf_counter() - run_started,
+        "wall_seconds": run_seconds,
         "peak_gpu_memory_bytes_max": peak_gpu,
+        "peak_gpu_reserved_memory_bytes_max": peak_gpu_reserved,
+        "peak_gpu_memory_unavailable_reason": (
+            None
+            if device.type == "cuda"
+            else "suite device is CPU, so CUDA allocator peaks are unavailable"
+        ),
+        "resources_at_start": resources_at_start,
+        "resource_observability": resources,
+        "throughput": {
+            "scope": (
+                "CUDA-synchronized complete BREC suite including pair preparation, training, "
+                "and train/reliability T2 evaluation"
+            ),
+            "recorded_variant_seed_pair_attempts": recorded_attempts,
+            "attempts_per_second": (
+                observed(recorded_attempts / run_seconds, unit="attempts_per_second")
+                if run_seconds > 0
+                else observed(
+                    None,
+                    reason="observed BREC suite duration was zero",
+                    unit="attempts_per_second",
+                )
+            ),
+        },
     }
+    print(
+        json.dumps(
+            {
+                "kind": "cycle_paper_brec_post_run_observability",
+                "recorded_attempts": recorded_attempts,
+                "throughput": manifest["runtime_summary"]["throughput"],
+                "resource_summary": resources["summary"],
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
     manifest["artifacts"] = _artifact_checksums(suite_root)
     _write_json(suite_root / "manifest.json", manifest)
     return manifest
@@ -1409,7 +1830,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--workers", type=int, default=0, help="DataLoader workers for core/ZINC")
+    parser.add_argument("--workers", type=int, default=4, help="DataLoader workers for core/ZINC")
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="batches prefetched per DataLoader worker when --workers is positive",
+    )
     parser.add_argument("--hidden-dim", type=int)
     parser.add_argument("--pe-dim", type=int)
     parser.add_argument("--layers", type=int)
@@ -1499,6 +1926,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("--batch-size must be positive")
         if args.workers < 0:
             raise ValueError("--workers must be non-negative")
+        if args.prefetch_factor < 1:
+            raise ValueError("--prefetch-factor must be positive")
         if args.epochs is not None and args.epochs < 1:
             raise ValueError("--epochs must be positive")
         if args.hidden_dim is not None and args.hidden_dim < 4:
@@ -1577,10 +2006,15 @@ def main(argv: list[str] | None = None) -> int:
                 "cli_arguments": _argument_manifest(args),
             },
         )
-    except Exception as exc:
+    except BaseException as exc:
+        failure_observations = resource_failure_observations(exc)
         if output_owned:
             failed_suite = selected[len(completed)] if len(completed) < len(selected) else None
-            _clean_failed_suite_output(args.output_dir, failed_suite)
+            preserved_failed_output = _preserve_failed_suite_output(
+                args.output_dir,
+                failed_suite,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
             completed_manifests = {
                 suite: {
                     "path": str(args.output_dir / suite / "manifest.json"),
@@ -1599,11 +2033,15 @@ def main(argv: list[str] | None = None) -> int:
                     "completed_suites": completed,
                     "suite_manifests": completed_manifests,
                     "failed_suite": failed_suite,
+                    "preserved_failed_suite_output": preserved_failed_output,
                     "seed_axes": seed_axes.to_manifest(),
                     "error": {"type": type(exc).__name__, "message": str(exc)},
+                    "resource_failure_observations": failure_observations,
                 },
             )
-        parser.error(str(exc))
+        if isinstance(exc, Exception) and not failure_observations:
+            parser.error(str(exc))
+        raise
     summary = {
         suite: {
             "manifest": str(args.output_dir / suite / "manifest.json"),
@@ -1616,7 +2054,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
 
 
 __all__ = [

@@ -113,6 +113,24 @@ def moments(value: Tensor, *, quantiles: bool = False) -> dict[str, Any]:
 
 @torch.no_grad()
 def spatial_weight_statistics(operator) -> dict[str, Any]:
+    if operator.spatial_mode == "fixed_identity":
+        channels = operator.message_transform.in_features
+        return {
+            "spatial_mode": "fixed_identity",
+            "trainable": False,
+            "parameter_present": False,
+            "parameter_norm": None,
+            "identity_distance_frobenius": 0.0,
+            "identity_relative_distance": 0.0,
+            "singular_values": {
+                "count": channels,
+                "min": 1.0,
+                "max": 1.0,
+                "mean": 1.0,
+                "std": 0.0,
+                "condition_number": 1.0,
+            },
+        }
     weight = operator.message_transform.weight.detach().double()
     if weight.ndim != 2 or weight.shape[0] != weight.shape[1]:
         raise ValueError("V4 message transform must be a square matrix")
@@ -125,6 +143,7 @@ def spatial_weight_statistics(operator) -> dict[str, Any]:
     return {
         "spatial_mode": operator.spatial_mode,
         "trainable": any(p.requires_grad for p in operator.message_transform.parameters()),
+        "parameter_present": True,
         "parameter_norm": norm(spatial_parameters(operator)),
         "identity_distance_frobenius": distance,
         "identity_relative_distance": distance / math.sqrt(weight.shape[0]),
@@ -194,9 +213,15 @@ class ForwardObservation:
             "score": moments(scores),
             "conductance": moments(value),
             "log_conductance": moments(value.log()),
-            "gamma": float(estimator.gamma.detach()),
-            "tau": float(estimator.tau.detach()),
+            "gamma": (
+                float(estimator.gamma.detach()) if estimator.gamma is not None else None
+            ),
+            "tau": float(estimator.tau.detach()) if estimator.tau is not None else None,
             "estimator_trainable": any(p.requires_grad for p in estimator.parameters()),
+            "estimator_parameter_count": sum(
+                parameter.numel() for parameter in estimator.parameters()
+            ),
+            "parameter_free_fixed_control": estimator.gate_mode == "fixed_one",
         }
         self.conductances[index] = value
 

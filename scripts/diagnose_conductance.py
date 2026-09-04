@@ -589,7 +589,7 @@ def additional_audits(model, payload, device, args, config, item: dict) -> None:
             )
 
 
-def _diagnose(args, run: Path, report: dict) -> None:
+def _diagnose_impl(args, run: Path, report: dict, device) -> None:
     import torch
 
     from research.conductance_gat.benchmark_data import load_dataset
@@ -625,7 +625,6 @@ def _diagnose(args, run: Path, report: dict) -> None:
         raise FileNotFoundError(
             f"Recorded data root unavailable: {data_root}; supply --data-root explicitly"
         )
-    device = require_cuda(args.device)
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
     current_hashes = {
@@ -741,6 +740,61 @@ def _diagnose(args, run: Path, report: dict) -> None:
         del model, payload, checkpoint
         torch.cuda.empty_cache()
     report.pop("active_dataset", None)
+
+
+def _diagnose(args, run: Path, report: dict) -> None:
+    """Run the CUDA diagnostic inside a fail-visible resource observation boundary."""
+
+    import torch
+
+    from chartgat.observability import RuntimeResourceMonitor, observed
+
+    for required in (run / "manifest.json", run / "metrics.json"):
+        if not required.is_file():
+            raise FileNotFoundError(f"Required completed-run artifact is unavailable: {required}")
+    device = require_cuda(args.device)
+    torch.cuda.reset_peak_memory_stats(device)
+    monitor = RuntimeResourceMonitor(device)
+    monitor.start()
+    try:
+        _diagnose_impl(args, run, report, device)
+    except BaseException:
+        try:
+            report["resource_observability"] = monitor.finish(
+                peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+                peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+            )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError) as monitor_error:
+            report["resource_observability_failure"] = (
+                f"{type(monitor_error).__name__}: {monitor_error}"
+            )
+        raise
+    resources = monitor.finish(
+        peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+        peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+    )
+    report["resource_observability"] = resources
+    elapsed = resources["summary"]["observed_wall_seconds"]["value"]
+    completed_datasets = sum(
+        item.get("status") == "passed" for item in report.get("datasets", {}).values()
+    )
+    missing_rate_reason = (
+        None
+        if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool) and elapsed > 0
+        else "the monitored diagnostic interval had no positive wall duration"
+    )
+    report["throughput"] = {
+        "scope": (
+            "end-to-end read-only checkpoint diagnostic, including cache/checkpoint reads, "
+            "baseline train/validation forwards and requested interventions/backward audits"
+        ),
+        "completed_dataset_audits": completed_datasets,
+        "dataset_audits_per_second": observed(
+            completed_datasets / elapsed if missing_rate_reason is None else None,
+            reason=missing_rate_reason,
+            unit="datasets_per_second",
+        ),
+    }
 
 
 def render_report(report: dict) -> str:
@@ -991,6 +1045,13 @@ def main(argv: list[str] | None = None) -> int:
         (output / "report.md").write_text(render_report(report), encoding="utf-8")
         print(f"Diagnostic report: {output / 'report.json'}")
         print(f"Readable report: {output / 'report.md'}")
+    resources = report.get("resource_observability")
+    if isinstance(resources, dict):
+        print(
+            "Resource summary:",
+            json.dumps(resources.get("summary", {}), allow_nan=False),
+            flush=True,
+        )
     print(f"Diagnostic status: {report['status']}" + (" (stdout only)" if output is None else ""))
     return 0 if report["status"] == "passed" else 1
 

@@ -11,8 +11,10 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import hashlib
 import json
 import math
+import os
 import platform
 import random
 import time
@@ -26,6 +28,7 @@ from torch import Tensor, nn
 from torch.nn import functional as nnf
 from torch.utils.data import DataLoader
 
+from chartgat.observability import RuntimeResourceMonitor, runtime_resource_snapshot
 from chartgat.seeds import SeedAxes, resolve_seed_axes
 
 from .paper_data import nonlinear_conductance, prepare_core_cache
@@ -44,6 +47,243 @@ CORE_CLAIMS = {
     "s4": "Identification limits are mapped across contrast, excitation coverage, and SNR.",
 }
 TRAINING_OBJECTIVES = {"node_only", "flux_only", "joint"}
+SOURCE_FILES = (
+    "research/conductance_gat/paper.py",
+    "research/conductance_gat/paper_data.py",
+    "research/conductance_gat/public_data.py",
+    "research/conductance_gat/sparse.py",
+    "src/chartgat/observability.py",
+    "src/chartgat/seeds.py",
+)
+
+
+def _implementation_hashes() -> dict[str, str]:
+    root = Path(__file__).resolve().parents[2]
+    hashes: dict[str, str] = {}
+    for relative in SOURCE_FILES:
+        path = root / relative
+        if not path.is_file():
+            raise FileNotFoundError(f"required implementation source is missing: {path}")
+        hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return hashes
+
+
+def _verify_implementation_unchanged(expected: Mapping[str, str]) -> dict[str, Any]:
+    actual = _implementation_hashes()
+    if actual != dict(expected):
+        changed = sorted(
+            path
+            for path in set(expected) | set(actual)
+            if expected.get(path) != actual.get(path)
+        )
+        raise RuntimeError(
+            "conductance paper implementation changed during execution: "
+            + ", ".join(changed)
+        )
+    return {
+        "valid": True,
+        "policy": "explicit source files hashed before training and verified before artifacts",
+        "sha256": actual,
+    }
+
+
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _require_true_async(predicate: Tensor, message: str) -> None:
+    assertion = getattr(torch, "_assert_async", None)
+    if assertion is not None:
+        assertion(predicate, message)
+        return
+    if not bool(predicate):
+        raise RuntimeError(message)
+
+
+def _require_finite_async(value: Tensor, label: str) -> None:
+    _require_true_async(torch.isfinite(value).all(), f"nonfinite {label}")
+
+
+def _parameter_inventory(model: nn.Module) -> dict[str, Any]:
+    all_parameters = list(model.named_parameters())
+    trainable = [(name, parameter) for name, parameter in all_parameters if parameter.requires_grad]
+    return {
+        "total_parameters": sum(parameter.numel() for _, parameter in all_parameters),
+        "trainable_parameters": sum(parameter.numel() for _, parameter in trainable),
+        "trainable_parameter_tensors": len(trainable),
+        "frozen_parameters": sum(
+            parameter.numel() for _, parameter in all_parameters if not parameter.requires_grad
+        ),
+    }
+
+
+def _optimizer_integrity(model: nn.Module, optimizer: torch.optim.Optimizer) -> dict[str, Any]:
+    expected = {
+        id(parameter): name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    optimizer_parameters = [
+        parameter for group in optimizer.param_groups for parameter in group["params"]
+    ]
+    optimizer_ids = [id(parameter) for parameter in optimizer_parameters]
+    duplicate_ids = sorted(
+        parameter_id for parameter_id in set(optimizer_ids) if optimizer_ids.count(parameter_id) > 1
+    )
+    missing = sorted(
+        name for parameter_id, name in expected.items() if parameter_id not in optimizer_ids
+    )
+    unexpected = [
+        parameter_id for parameter_id in optimizer_ids if parameter_id not in expected
+    ]
+    if duplicate_ids or missing or unexpected:
+        raise RuntimeError(
+            "optimizer ownership mismatch: "
+            f"missing={missing}, duplicate_parameter_ids={duplicate_ids}, "
+            f"unexpected_parameter_ids={unexpected}"
+        )
+    return {
+        "verified": True,
+        "optimizer": type(optimizer).__name__,
+        "parameter_groups": len(optimizer.param_groups),
+        "owned_trainable_parameter_tensors": len(optimizer_parameters),
+        "owned_trainable_parameters": sum(parameter.numel() for parameter in optimizer_parameters),
+    }
+
+
+def _gradient_integrity(model: nn.Module) -> dict[str, Any]:
+    missing: list[str] = []
+    nonfinite: list[str] = []
+    zero: list[str] = []
+    norms: dict[str, float] = {}
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        gradient = parameter.grad
+        if gradient is None:
+            missing.append(name)
+            continue
+        if not bool(torch.isfinite(gradient).all()):
+            nonfinite.append(name)
+            continue
+        norm = float(gradient.detach().float().norm().cpu())
+        norms[name] = norm
+        if norm == 0.0:
+            zero.append(name)
+    if missing or nonfinite or not any(value > 0 for value in norms.values()):
+        raise RuntimeError(
+            "gradient connectivity failed after the actual loss backward pass: "
+            f"missing={missing}, nonfinite={nonfinite}, zero={zero}"
+        )
+    return {
+        "verified": True,
+        "all_trainable_gradients_present": not missing,
+        "all_present_gradients_finite": not nonfinite,
+        "nonzero_gradient_parameter_tensors": sum(value > 0 for value in norms.values()),
+        "zero_gradient_parameter_tensors": zero,
+        "gradient_norms": norms,
+    }
+
+
+def _first_step_profile(
+    *,
+    batch_description: Mapping[str, Any],
+    gradient: Mapping[str, Any],
+    before: Mapping[str, Tensor],
+    model: nn.Module,
+    timing_seconds: Mapping[str, float],
+) -> dict[str, Any]:
+    changed = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and not torch.equal(before[name], parameter.detach())
+    ]
+    if not changed:
+        raise RuntimeError(
+            "optimizer connectivity failed: the first finite backward pass changed no parameter"
+        )
+    return {
+        "input_to_forward_to_loss_to_backward_verified": True,
+        "optimizer_update_verified": True,
+        "changed_parameter_tensors": changed,
+        "batch": dict(batch_description),
+        "gradient": dict(gradient),
+        "timing_seconds": dict(timing_seconds),
+        "timing_scope": (
+            "first actual optimizer step with CUDA synchronization at stage boundaries; "
+            "remaining steps run without per-stage synchronization"
+        ),
+    }
+
+
+def _distribution(values: Sequence[int]) -> dict[str, float | int | None]:
+    if not values:
+        return {"count": 0, "minimum": None, "mean": None, "maximum": None, "total": 0}
+    return {
+        "count": len(values),
+        "minimum": min(values),
+        "mean": sum(values) / len(values),
+        "maximum": max(values),
+        "total": sum(values),
+    }
+
+
+def _example_statistics(examples: Sequence[Mapping[str, Any]], *, public: bool) -> dict[str, Any]:
+    node_key = "x" if public else "node_state"
+    node_counts = [int(example[node_key].shape[0]) for example in examples]
+    edge_counts = [int(example["edge_index"].shape[1]) for example in examples]
+    first = examples[0] if examples else None
+    return {
+        "examples_available": len(examples),
+        "examples_used": len(examples),
+        "used_fraction": 1.0 if examples else None,
+        "graph_nodes": _distribution(node_counts),
+        "graph_edges": _distribution(edge_counts),
+        "first_input_shapes": None
+        if first is None
+        else {
+            node_key: list(first[node_key].shape),
+            "edge_index": list(first["edge_index"].shape),
+            "edge_features": list(first["edge_features"].shape),
+            "target": list(first["y"].shape)
+            if public
+            else list(first["true_node_message"].shape),
+        },
+        "sampling_ratio": 1.0 if examples else None,
+        "subset_or_fast_mode": False,
+    }
+
+
+def _dataset_observability(
+    core: Mapping[str, Any] | None, public: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    report: dict[str, Any] = {}
+    if core is not None:
+        report["core"] = {
+            suite_name: {
+                split: _example_statistics(examples, public=False)
+                for split, examples in suite.items()
+                if isinstance(examples, Sequence)
+                and not isinstance(examples, (str, bytes))
+                and examples
+                and isinstance(examples[0], Mapping)
+                and "node_state" in examples[0]
+            }
+            for suite_name, suite in core.items()
+            if isinstance(suite, Mapping)
+        }
+    if public is not None:
+        report["public"] = {
+            dataset_name: {
+                split: _example_statistics(examples, public=True)
+                for split, examples in splits.items()
+                if isinstance(examples, Sequence)
+            }
+            for dataset_name, splits in public.items()
+            if dataset_name != "fixture" and isinstance(splits, Mapping)
+        }
+    return report
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -83,6 +323,9 @@ def runtime_metadata(
         "pin_memory": bool(pin_memory),
         "batch_size": int(batch_size),
         "device_name": torch.cuda.get_device_name(device) if cuda else "cpu",
+        "visible_cuda_device_count": torch.cuda.device_count() if cuda else 0,
+        "cpu_logical_count": os.cpu_count(),
+        "precision": "float16_autocast" if amp else "float32",
     }
     if cuda:
         properties = torch.cuda.get_device_properties(device)
@@ -90,12 +333,21 @@ def runtime_metadata(
             {
                 "cuda_capability": list(torch.cuda.get_device_capability(device)),
                 "cuda_total_memory_bytes": int(properties.total_memory),
+                "mig_detected_from_device_name": "MIG" in properties.name.upper(),
                 "cuda_peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
                 "cuda_peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
             }
         )
     else:
-        metadata.update({"cuda_peak_allocated_bytes": 0, "cuda_peak_reserved_bytes": 0})
+        metadata.update(
+            {
+                "cuda_total_memory_bytes": None,
+                "mig_detected_from_device_name": None,
+                "cuda_peak_allocated_bytes": None,
+                "cuda_peak_reserved_bytes": None,
+                "cuda_measurement_unavailable_reason": "requested device is CPU, not CUDA",
+            }
+        )
     return metadata
 
 
@@ -131,6 +383,7 @@ def _loader(
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
         collate_fn=pack_graph_examples,
     )
 
@@ -140,6 +393,7 @@ def _normalized_loss(
     batch: PackedGraphBatch,
     *,
     objective: str,
+    collect_diagnostics: bool = True,
 ) -> tuple[Tensor, dict[str, float | None]]:
     if objective not in TRAINING_OBJECTIVES:
         raise ValueError(f"unknown training objective {objective!r}")
@@ -177,6 +431,8 @@ def _normalized_loss(
         if flux_relative is None or node_relative is None:
             raise ValueError("joint training requires edge-flux and node-message targets")
         loss = flux_relative + node_relative
+    if not collect_diagnostics:
+        return loss, {}
     return loss, {
         "loss": float(loss.detach().float().cpu()),
         "flux_relative_mse": (
@@ -199,11 +455,14 @@ def _validation_loss(
     pin_memory: bool,
     num_workers: int,
     objective: str,
+    loader: DataLoader | None = None,
 ) -> float:
+    if not examples:
+        raise ValueError("validation split is empty")
     model.eval()
-    total = 0.0
+    total: Tensor | None = None
     count = 0
-    loader = _loader(
+    effective_loader = loader or _loader(
         examples,
         batch_size=batch_size,
         shuffle=False,
@@ -211,13 +470,22 @@ def _validation_loss(
         pin_memory=pin_memory,
         num_workers=num_workers,
     )
-    for batch in loader:
+    for batch in effective_loader:
         batch = batch.to(device, non_blocking=pin_memory)
         with _autocast(device, amp):
-            loss, _ = _normalized_loss(model, batch, objective=objective)
-        total += float(loss.float().cpu()) * batch.num_graphs
+            loss, _ = _normalized_loss(
+                model, batch, objective=objective, collect_diagnostics=False
+            )
+        weighted = loss.detach().float() * batch.num_graphs
+        total = weighted if total is None else total + weighted
         count += batch.num_graphs
-    return total / max(count, 1)
+    if count != len(examples):
+        raise RuntimeError(
+            f"validation loader consumed {count} graphs but {len(examples)} were required"
+        )
+    if total is None:
+        raise RuntimeError("validation produced no loss")
+    return float(total.cpu()) / count
 
 
 def train_sparse_model(
@@ -234,38 +502,129 @@ def train_sparse_model(
     num_workers: int,
     seed: int,
     objective: str,
+    execution_report: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if objective not in TRAINING_OBJECTIVES:
         raise ValueError(f"unknown training objective {objective!r}")
+    if not train_examples or not validation_examples:
+        raise ValueError("training and validation splits must both be nonempty")
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1.0e-5)
+    parameter_inventory = _parameter_inventory(model)
+    optimizer_integrity = _optimizer_integrity(model, optimizer)
     scaler = _grad_scaler(amp)
     best_validation = math.inf
     best_state: dict[str, Tensor] | None = None
     history: list[dict[str, Any]] = []
+    train_loader = _loader(
+        train_examples,
+        batch_size=batch_size,
+        shuffle=True,
+        seed=seed,
+        pin_memory=pin_memory,
+        num_workers=num_workers,
+    )
+    validation_loader = _loader(
+        validation_examples,
+        batch_size=batch_size,
+        shuffle=False,
+        seed=0,
+        pin_memory=pin_memory,
+        num_workers=num_workers,
+    )
+    optimizer_steps = 0
+    graphs_processed = 0
+    data_wait_seconds = 0.0
+    validation_seconds = 0.0
+    first_step: dict[str, Any] | None = None
+    _synchronize(device)
+    training_started = time.perf_counter()
     for epoch in range(1, epochs + 1):
         model.train()
-        total = 0.0
+        total: Tensor | None = None
         count = 0
-        loader = _loader(
-            train_examples,
-            batch_size=batch_size,
-            shuffle=True,
-            seed=seed + epoch,
-            pin_memory=pin_memory,
-            num_workers=num_workers,
-        )
-        for batch in loader:
+        if train_loader.generator is None:
+            raise RuntimeError("training DataLoader has no generator for deterministic shuffling")
+        train_loader.generator.manual_seed(seed + epoch)
+        wait_started = time.perf_counter()
+        for batch in train_loader:
+            data_wait_seconds += time.perf_counter() - wait_started
+            profile_this_step = first_step is None
+            if profile_this_step:
+                _synchronize(device)
+                transfer_started = time.perf_counter()
             batch = batch.to(device, non_blocking=pin_memory)
+            if profile_this_step:
+                _synchronize(device)
+                transfer_seconds = time.perf_counter() - transfer_started
+                forward_started = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             with _autocast(device, amp):
-                loss, _ = _normalized_loss(model, batch, objective=objective)
+                loss, _ = _normalized_loss(
+                    model, batch, objective=objective, collect_diagnostics=False
+                )
+            _require_finite_async(
+                loss.detach(),
+                f"{objective} training loss at epoch={epoch}, "
+                f"optimizer_step={optimizer_steps + 1}",
+            )
+            if profile_this_step:
+                _synchronize(device)
+                forward_seconds = time.perf_counter() - forward_started
+                backward_started = time.perf_counter()
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            gradient_integrity = _gradient_integrity(model) if profile_this_step else None
+            gradient_norm = nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            _require_finite_async(
+                gradient_norm,
+                f"clipped gradient norm at epoch={epoch}, optimizer_step={optimizer_steps + 1}",
+            )
+            if profile_this_step:
+                _synchronize(device)
+                backward_seconds = time.perf_counter() - backward_started
+                before = {
+                    name: parameter.detach().clone()
+                    for name, parameter in model.named_parameters()
+                    if parameter.requires_grad
+                }
+                optimizer_started = time.perf_counter()
             scaler.step(optimizer)
             scaler.update()
-            total += float(loss.detach().float().cpu()) * batch.num_graphs
+            optimizer_steps += 1
+            if profile_this_step:
+                _synchronize(device)
+                optimizer_seconds = time.perf_counter() - optimizer_started
+                first_step = _first_step_profile(
+                    batch_description={
+                        "graphs": batch.num_graphs,
+                        "nodes": batch.num_nodes,
+                        "edges": batch.num_edges,
+                        "node_state_shape": list(batch.node_state.shape),
+                        "edge_index_shape": list(batch.edge_index.shape),
+                        "edge_features_shape": list(batch.edge_features.shape),
+                        "loss": float(loss.detach().float().cpu()),
+                    },
+                    gradient=gradient_integrity or {},
+                    before=before,
+                    model=model,
+                    timing_seconds={
+                        "host_to_device": transfer_seconds,
+                        "forward_and_loss": forward_seconds,
+                        "backward_and_gradient_validation": backward_seconds,
+                        "optimizer": optimizer_seconds,
+                    },
+                )
+            weighted = loss.detach().float() * batch.num_graphs
+            total = weighted if total is None else total + weighted
             count += batch.num_graphs
+            graphs_processed += batch.num_graphs
+            wait_started = time.perf_counter()
+        if count != len(train_examples):
+            raise RuntimeError(
+                f"training loader consumed {count} graphs but {len(train_examples)} were required"
+            )
+        _synchronize(device)
+        validation_started = time.perf_counter()
         validation = _validation_loss(
             model,
             validation_examples,
@@ -275,8 +634,15 @@ def train_sparse_model(
             pin_memory=pin_memory,
             num_workers=num_workers,
             objective=objective,
+            loader=validation_loader,
         )
-        train_loss = total / max(count, 1)
+        _synchronize(device)
+        validation_seconds += time.perf_counter() - validation_started
+        if not math.isfinite(validation):
+            raise RuntimeError(f"nonfinite validation loss at epoch={epoch}: {validation}")
+        if total is None:
+            raise RuntimeError(f"training epoch {epoch} produced no loss")
+        train_loss = float(total.cpu()) / count
         history.append(
             {
                 "epoch": epoch,
@@ -290,8 +656,84 @@ def train_sparse_model(
             best_state = {
                 name: value.detach().cpu().clone() for name, value in model.state_dict().items()
             }
-    if best_state is not None:
-        model.load_state_dict(best_state)
+    _synchronize(device)
+    training_seconds = time.perf_counter() - training_started
+    expected_steps = epochs * math.ceil(len(train_examples) / batch_size)
+    if optimizer_steps != expected_steps:
+        raise RuntimeError(
+            f"optimizer executed {optimizer_steps} steps but {expected_steps} were required"
+        )
+    if best_state is None or first_step is None:
+        raise RuntimeError("training completed without a validated checkpoint or optimizer step")
+    model.load_state_dict(best_state)
+    if execution_report is not None:
+        execution_report.clear()
+        execution_report.update(
+            {
+                "model": {
+                    **parameter_inventory,
+                    "model_class": type(model).__name__,
+                    "conductance_layers": 1,
+                    "hidden_channels": (
+                        model.estimator.network[0].out_features
+                        if model.estimator is not None
+                        else 1
+                    ),
+                    "attention_heads": None,
+                    "attention_heads_reason": "sparse conductance operator has no attention heads",
+                },
+                "optimizer_integrity": optimizer_integrity,
+                "optimization": {
+                    "epochs": epochs,
+                    "optimizer_steps": optimizer_steps,
+                    "expected_optimizer_steps": expected_steps,
+                    "learning_rate": learning_rate,
+                    "weight_decay": 1.0e-5,
+                    "gradient_clip_norm": 5.0,
+                    "precision": "float16_autocast" if amp else "float32",
+                    "best_validation_loss": best_validation,
+                },
+                "loader": {
+                    "physical_batch_size_graphs": batch_size,
+                    "gradient_accumulation_steps": 1,
+                    "data_parallel_workers": 1,
+                    "effective_batch_size_graphs": batch_size,
+                    "num_workers": num_workers,
+                    "persistent_workers": num_workers > 0,
+                    "prefetch_factor": 2 if num_workers > 0 else None,
+                    "pin_memory": pin_memory,
+                    "non_blocking_transfer": pin_memory,
+                    "collate": "pack_graph_examples_disjoint_union",
+                    "sampling_ratio": 1.0,
+                    "drop_last": False,
+                },
+                "data": {
+                    "train": _example_statistics(train_examples, public=False),
+                    "validation": _example_statistics(validation_examples, public=False),
+                },
+                "first_optimizer_step": first_step,
+                "path_integrity": {
+                    "input_forward_loss_backward_optimizer": True,
+                    "validation_metric_evaluated": True,
+                    "checkpoint_selected_by_validation_only": True,
+                },
+                "timing_seconds": {
+                    "training_including_validation": training_seconds,
+                    "data_wait_during_training": data_wait_seconds,
+                    "validation": validation_seconds,
+                },
+                "throughput": {
+                    "training_graphs_processed": graphs_processed,
+                    "graphs_per_second_including_validation": (
+                        graphs_processed / training_seconds if training_seconds > 0 else None
+                    ),
+                    "optimizer_steps_per_second_including_validation": (
+                        optimizer_steps / training_seconds if training_seconds > 0 else None
+                    ),
+                },
+                "debug_subset_fast_mode": False,
+            }
+        )
     return history
 
 
@@ -321,6 +763,75 @@ def _rank(values: Tensor) -> Tensor:
     return ranks
 
 
+def _segment_sum(values: Tensor, index: Tensor, groups: int) -> Tensor:
+    shape = (groups, *values.shape[1:])
+    result = values.new_zeros(shape)
+    result.index_add_(0, index, values)
+    return result
+
+
+def _segment_mean(values: Tensor, index: Tensor, groups: int) -> Tensor:
+    total = _segment_sum(values, index, groups)
+    counts = torch.bincount(index, minlength=groups).to(values)
+    if bool(torch.any(counts == 0)):
+        raise ValueError("segmented metric received an empty graph")
+    return total / counts.reshape(-1, *([1] * (values.ndim - 1)))
+
+
+def _segmented_relative_l2(
+    prediction: Tensor, target: Tensor, index: Tensor, groups: int
+) -> Tensor:
+    numerator = _segment_sum((prediction - target).square(), index, groups).flatten(1).sum(1)
+    denominator = _segment_sum(target.square(), index, groups).flatten(1).sum(1)
+    epsilon = torch.finfo(prediction.dtype).eps
+    return numerator.sqrt() / denominator.clamp_min(epsilon).sqrt()
+
+
+def _segmented_pearson(
+    first: Tensor, second: Tensor, index: Tensor, groups: int
+) -> Tensor:
+    first = first.float().reshape(-1)
+    second = second.float().reshape(-1)
+    counts = torch.bincount(index, minlength=groups).to(first)
+    first_sum = _segment_sum(first, index, groups)
+    second_sum = _segment_sum(second, index, groups)
+    product_sum = _segment_sum(first * second, index, groups)
+    first_square_sum = _segment_sum(first.square(), index, groups)
+    second_square_sum = _segment_sum(second.square(), index, groups)
+    covariance = product_sum - first_sum * second_sum / counts.clamp_min(1)
+    first_variance = (first_square_sum - first_sum.square() / counts.clamp_min(1)).clamp_min(0)
+    second_variance = (
+        second_square_sum - second_sum.square() / counts.clamp_min(1)
+    ).clamp_min(0)
+    denominator = (first_variance * second_variance).sqrt()
+    defined = (counts >= 2) & (denominator > torch.finfo(first.dtype).eps)
+    result = first.new_full((groups,), torch.nan)
+    result[defined] = covariance[defined] / denominator[defined]
+    return result
+
+
+def _within_group_ranks(values: Tensor, index: Tensor, groups: int) -> Tensor:
+    value_order = torch.argsort(values.reshape(-1), stable=True)
+    grouped_order = value_order[torch.argsort(index[value_order], stable=True)]
+    counts = torch.bincount(index, minlength=groups)
+    if bool(torch.any(counts == 0)):
+        raise ValueError("rank correlation received an empty graph")
+    starts = counts.cumsum(0) - counts
+    positions = torch.arange(values.numel(), device=values.device) - torch.repeat_interleave(
+        starts, counts
+    )
+    ranks = values.new_empty(values.numel(), dtype=torch.float32)
+    ranks[grouped_order] = positions.to(torch.float32)
+    return ranks
+
+
+def _finite_mean_or_none(values: Tensor) -> float | None:
+    finite = torch.isfinite(values)
+    if not bool(finite.any()):
+        return None
+    return float(values[finite].mean())
+
+
 def _mean(values: Iterable[float | None]) -> float | None:
     selected = [
         float(value) for value in values if value is not None and math.isfinite(float(value))
@@ -340,17 +851,20 @@ def evaluate_sparse_model(
     num_workers: int,
     oracle: bool = False,
 ) -> dict[str, Any]:
+    if not examples:
+        raise ValueError("sparse evaluation split is empty")
     model.eval()
-    flux_rel: list[float] = []
-    node_rel: list[float] = []
-    next_rel: list[float] = []
-    log_c_rmse: list[float] = []
-    correlations: list[float | None] = []
-    rank_correlations: list[float | None] = []
-    coverage: list[float] = []
-    cap_active = 0
-    cap_total = 0
-    predictions_by_graph: dict[str, list[Tensor]] = {}
+    metric_batches: list[Tensor] = []
+    cap_batches: list[Tensor] = []
+    graph_id_to_index = {
+        graph_id: index
+        for index, graph_id in enumerate(sorted({str(example["graph_id"]) for example in examples}))
+    }
+    maximum_edges = max(int(example["edge_index"].shape[1]) for example in examples)
+    if maximum_edges < 1:
+        raise ValueError("sparse evaluation requires at least one edge per graph")
+    state_keys: list[Tensor] = []
+    state_values: list[Tensor] = []
     loader = _loader(
         examples,
         batch_size=batch_size,
@@ -366,67 +880,117 @@ def evaluate_sparse_model(
             predicted_next, diagnostics = model(
                 batch, conductance_override=override, return_diagnostics=True
             )
-        for graph_number, graph_id in enumerate(batch.graph_ids):
-            edge_mask = batch.edge_graph == graph_number
-            node_mask = batch.node_graph == graph_number
-            predicted_flux = diagnostics["edge_flux"][edge_mask].float()
-            predicted_c = diagnostics["conductance"][edge_mask].float()
-            true_flux = batch.true_flux[edge_mask].float()
-            true_c = batch.true_conductance[edge_mask].float()
-            true_message = batch.true_node_message[node_mask].float()
-            predicted_message = diagnostics["node_message"][node_mask].float()
-            true_next = batch.true_next_state[node_mask].float()
-            current_next = predicted_next[node_mask].float()
-            epsilon = torch.finfo(torch.float32).eps
-            flux_rel.append(
-                float((predicted_flux - true_flux).norm() / true_flux.norm().clamp_min(epsilon))
-            )
-            node_rel.append(
-                float(
-                    (predicted_message - true_message).norm()
-                    / true_message.norm().clamp_min(epsilon)
-                )
-            )
-            next_rel.append(
-                float((current_next - true_next).norm() / true_next.norm().clamp_min(epsilon))
-            )
-            log_c_rmse.append(
-                float(
-                    torch.mean(
-                        (predicted_c.clamp_min(1e-8).log() - true_c.clamp_min(1e-8).log()).square()
-                    ).sqrt()
-                )
-            )
-            correlation = _pearson(predicted_c.cpu(), true_c.cpu())
-            correlations.append(correlation)
-            rank_correlations.append(
-                None
-                if correlation is None
-                else _pearson(_rank(predicted_c.cpu()), _rank(true_c.cpu()))
-            )
-            gradient = batch.true_gradient[edge_mask]
-            coverage.append(float((gradient.abs().amax(dim=1) > 1.0e-6).float().mean()))
-            predictions_by_graph.setdefault(graph_id, []).append(predicted_c.detach().cpu())
-        cap_active += int(diagnostics["cap_active"].sum())
-        cap_total += int(diagnostics["cap_active"].numel())
-    state_variation = []
-    for values in predictions_by_graph.values():
-        if len(values) > 1 and all(value.shape == values[0].shape for value in values):
-            state_variation.append(float(torch.stack(values).std(dim=0, unbiased=False).mean()))
+        if batch.true_flux is None or batch.true_conductance is None:
+            raise ValueError("sparse evaluation requires flux and conductance targets")
+        if batch.true_node_message is None or batch.true_next_state is None:
+            raise ValueError("sparse evaluation requires node-message and next-state targets")
+        if batch.true_gradient is None:
+            raise ValueError("sparse evaluation requires gradient targets")
+        predicted_flux = diagnostics["edge_flux"].float()
+        predicted_c = diagnostics["conductance"].float()
+        true_flux = batch.true_flux.float()
+        true_c = batch.true_conductance.float()
+        predicted_message = diagnostics["node_message"].float()
+        true_message = batch.true_node_message.float()
+        current_next = predicted_next.float()
+        true_next = batch.true_next_state.float()
+        log_square = (
+            predicted_c.clamp_min(1e-8).log() - true_c.clamp_min(1e-8).log()
+        ).square()
+        conductance_pearson = _segmented_pearson(
+            predicted_c, true_c, batch.edge_graph, batch.num_graphs
+        )
+        predicted_ranks = _within_group_ranks(
+            predicted_c, batch.edge_graph, batch.num_graphs
+        )
+        true_ranks = _within_group_ranks(true_c, batch.edge_graph, batch.num_graphs)
+        rank_pearson = _segmented_pearson(
+            predicted_ranks, true_ranks, batch.edge_graph, batch.num_graphs
+        )
+        metric_batches.append(
+            torch.stack(
+                (
+                    _segmented_relative_l2(
+                        predicted_flux, true_flux, batch.edge_graph, batch.num_graphs
+                    ),
+                    _segmented_relative_l2(
+                        predicted_message,
+                        true_message,
+                        batch.node_graph,
+                        batch.num_graphs,
+                    ),
+                    _segmented_relative_l2(
+                        current_next, true_next, batch.node_graph, batch.num_graphs
+                    ),
+                    _segment_mean(log_square, batch.edge_graph, batch.num_graphs).sqrt(),
+                    conductance_pearson,
+                    rank_pearson,
+                    _segment_mean(
+                        (batch.true_gradient.abs().amax(dim=1) > 1.0e-6).float(),
+                        batch.edge_graph,
+                        batch.num_graphs,
+                    ),
+                ),
+                dim=1,
+            ).cpu()
+        )
+        cap_batches.append(diagnostics["cap_active"].float().cpu())
+
+        global_graphs = torch.tensor(
+            [graph_id_to_index[graph_id] for graph_id in batch.graph_ids],
+            dtype=torch.long,
+            device=batch.edge_graph.device,
+        )
+        global_edge_graphs = global_graphs.index_select(0, batch.edge_graph)
+        edge_counts = torch.bincount(batch.edge_graph, minlength=batch.num_graphs)
+        edge_starts = edge_counts.cumsum(0) - edge_counts
+        local_edges = torch.arange(batch.num_edges, device=batch.edge_graph.device) - (
+            edge_starts.index_select(0, batch.edge_graph)
+        )
+        state_keys.append((global_edge_graphs * maximum_edges + local_edges).cpu())
+        state_values.append(predicted_c.cpu())
+
+    metrics = torch.cat(metric_batches, dim=0)
+    if metrics.shape[0] != len(examples):
+        raise RuntimeError(
+            f"evaluation produced {metrics.shape[0]} graph metrics for {len(examples)} examples"
+        )
+    keys = torch.cat(state_keys)
+    values = torch.cat(state_values)
+    unique_keys, inverse = torch.unique(keys, sorted=True, return_inverse=True)
+    observations = torch.bincount(inverse, minlength=unique_keys.numel()).float()
+    sums = _segment_sum(values, inverse, unique_keys.numel())
+    square_sums = _segment_sum(values.square(), inverse, unique_keys.numel())
+    variances = (square_sums / observations - (sums / observations).square()).clamp_min(0)
+    repeated = observations > 1
+    if bool(repeated.any()):
+        repeated_graphs = torch.div(
+            unique_keys[repeated], maximum_edges, rounding_mode="floor"
+        )
+        graph_count = len(graph_id_to_index)
+        variation_sums = _segment_sum(variances[repeated].sqrt(), repeated_graphs, graph_count)
+        variation_counts = torch.bincount(repeated_graphs, minlength=graph_count).float()
+        graph_has_repeated = variation_counts > 0
+        state_variation = float(
+            (variation_sums[graph_has_repeated] / variation_counts[graph_has_repeated]).mean()
+        )
+    else:
+        state_variation = None
+    cap_values = torch.cat(cap_batches)
     return {
-        "graph_macro_flux_relative_l2": _mean(flux_rel),
-        "graph_macro_node_message_relative_l2": _mean(node_rel),
-        "graph_macro_next_state_relative_l2": _mean(next_rel),
-        "graph_macro_log_conductance_rmse": _mean(log_c_rmse),
-        "graph_macro_conductance_pearson": _mean(correlations),
-        "conductance_pearson_defined_fraction": sum(value is not None for value in correlations)
-        / max(len(correlations), 1),
-        "graph_macro_conductance_spearman": _mean(rank_correlations),
-        "excited_edge_fraction": _mean(coverage),
-        "mean_conductance_state_variation": _mean(state_variation),
-        "stability_cap_activation_fraction": cap_active / max(cap_total, 1),
+        "graph_macro_flux_relative_l2": float(metrics[:, 0].mean()),
+        "graph_macro_node_message_relative_l2": float(metrics[:, 1].mean()),
+        "graph_macro_next_state_relative_l2": float(metrics[:, 2].mean()),
+        "graph_macro_log_conductance_rmse": float(metrics[:, 3].mean()),
+        "graph_macro_conductance_pearson": _finite_mean_or_none(metrics[:, 4]),
+        "conductance_pearson_defined_fraction": float(torch.isfinite(metrics[:, 4]).float().mean()),
+        "graph_macro_conductance_spearman": _finite_mean_or_none(metrics[:, 5]),
+        "excited_edge_fraction": float(metrics[:, 6].mean()),
+        "mean_conductance_state_variation": state_variation,
+        "stability_cap_activation_fraction": float(cap_values.mean()),
         "num_examples": len(examples),
-        "num_graph_ids": len({str(example["graph_id"]) for example in examples}),
+        "num_graph_ids": len(graph_id_to_index),
+        "evaluation_batching": "vectorized sparse disjoint-union; no per-graph model forward",
     }
 
 
@@ -533,7 +1097,10 @@ def _projected_nnls(
         estimate = updated
         momentum = next_momentum
         scale = max(float(estimate.norm()), 1.0)
-    return estimate, max_iterations
+    raise RuntimeError(
+        "projected NNLS did not converge within the explicitly declared "
+        f"{max_iterations} iterations; refusing to report an unconverged ceiling"
+    )
 
 
 def node_message_nnls_metrics(
@@ -630,54 +1197,88 @@ def evaluate_rollout(
     amp: bool,
     oracle: bool,
 ) -> dict[str, Any]:
-    errors: dict[int, list[float]] = {int(horizon): [] for horizon in horizons}
-    growth: list[float] = []
-    dissipation_violations = 0
-    steps_total = 0
-    cap_active = 0
-    for trajectory in trajectories:
-        state = trajectory["states"][0].to(device)
-        initial_norm = float(state.norm())
-        previous_norm = initial_norm
-        edge_index = trajectory["edge_index"].to(device)
-        edge_features = trajectory["edge_features"].to(device)
-        for time_index in range(max(horizons)):
-            record = {
-                "graph_id": trajectory["graph_id"],
-                "node_state": state,
-                "edge_index": edge_index,
-                "edge_features": edge_features,
-                "step_size": float(trajectory["steps"][time_index]),
-            }
-            batch = pack_graph_examples([record]).to(device)
-            override = None
-            if oracle:
-                override = nonlinear_conductance(edge_features, edge_gradient(edge_index, state))
-            with _autocast(device, amp):
-                state, diagnostics = model(
-                    batch,
-                    node_state=state,
-                    conductance_override=override,
-                    return_diagnostics=True,
-                )
-            current_norm = float(state.float().norm())
-            dissipation_violations += int(current_norm > previous_norm + 1.0e-6)
-            previous_norm = current_norm
-            steps_total += 1
-            cap_active += int(diagnostics["cap_active"].sum())
-            horizon = time_index + 1
-            if horizon in errors:
-                truth = trajectory["states"][horizon].to(device)
-                errors[horizon].append(
-                    float((state.float() - truth).norm() / truth.norm().clamp_min(1e-12))
-                )
-        growth.append(previous_norm / max(initial_norm, 1.0e-12))
-    result = {f"horizon_{horizon}_relative_l2": _mean(values) for horizon, values in errors.items()}
+    if not trajectories or not horizons:
+        raise ValueError("rollout evaluation requires trajectories and horizons")
+    normalized_horizons = sorted({int(horizon) for horizon in horizons})
+    if normalized_horizons[0] < 1:
+        raise ValueError("rollout horizons must be positive")
+    maximum_horizon = normalized_horizons[-1]
+    if any(int(trajectory["states"].shape[0]) <= maximum_horizon for trajectory in trajectories):
+        raise ValueError("a rollout trajectory is shorter than the requested horizon")
+    if any(len(trajectory["steps"]) < maximum_horizon for trajectory in trajectories):
+        raise ValueError("a rollout trajectory has too few integration steps")
+    initial_records = [
+        {
+            "graph_id": trajectory["graph_id"],
+            "node_state": trajectory["states"][0],
+            "edge_index": trajectory["edge_index"],
+            "edge_features": trajectory["edge_features"],
+            "step_size": float(trajectory["steps"][0]),
+        }
+        for trajectory in trajectories
+    ]
+    batch = pack_graph_examples(initial_records).to(device)
+    state = batch.node_state
+    initial_norm = _segment_sum(
+        state.float().square(), batch.node_graph, batch.num_graphs
+    ).sum(dim=1).sqrt()
+    if bool(torch.any(initial_norm <= 0)):
+        raise ValueError("rollout initial states must have nonzero norm")
+    previous_norm = initial_norm
+    errors: dict[int, Tensor] = {}
+    dissipation_violations = state.new_zeros(batch.num_graphs, dtype=torch.float32)
+    cap_active = state.new_zeros(batch.num_graphs, dtype=torch.float32)
+    step_matrix = torch.tensor(
+        [
+            [float(trajectory["steps"][index]) for index in range(maximum_horizon)]
+            for trajectory in trajectories
+        ],
+        device=device,
+        dtype=state.dtype,
+    )
+    for time_index in range(maximum_horizon):
+        batch.requested_step = step_matrix[:, time_index]
+        override = None
+        if oracle:
+            override = nonlinear_conductance(
+                batch.edge_features, edge_gradient(batch.edge_index, state)
+            )
+        with _autocast(device, amp):
+            state, diagnostics = model(
+                batch,
+                node_state=state,
+                conductance_override=override,
+                return_diagnostics=True,
+            )
+        current_norm = _segment_sum(
+            state.float().square(), batch.node_graph, batch.num_graphs
+        ).sum(dim=1).sqrt()
+        dissipation_violations += (current_norm > previous_norm + 1.0e-6).float()
+        previous_norm = current_norm
+        cap_active += diagnostics["cap_active"].float()
+        horizon = time_index + 1
+        if horizon in normalized_horizons:
+            truth = torch.cat(
+                [trajectory["states"][horizon] for trajectory in trajectories], dim=0
+            ).to(device)
+            errors[horizon] = _segmented_relative_l2(
+                state.float(), truth.float(), batch.node_graph, batch.num_graphs
+            )
+    result = {
+        f"horizon_{horizon}_relative_l2": float(errors[horizon].mean())
+        for horizon in normalized_horizons
+    }
     result.update(
         {
-            "final_norm_over_initial": _mean(growth),
-            "dissipation_violation_fraction": dissipation_violations / max(steps_total, 1),
-            "stability_cap_activation_fraction": cap_active / max(steps_total, 1),
+            "final_norm_over_initial": float((previous_norm / initial_norm).mean()),
+            "dissipation_violation_fraction": float(
+                (dissipation_violations / maximum_horizon).mean()
+            ),
+            "stability_cap_activation_fraction": float((cap_active / maximum_horizon).mean()),
+            "evaluation_batching": (
+                "all independent trajectories packed into one sparse disjoint-union forward "
+                "per time step"
+            ),
         }
     )
     return result
@@ -771,6 +1372,7 @@ def run_core(
             model = _model_for_examples(train_examples, mode, hidden_channels=hidden_channels).to(
                 device
             )
+            execution: dict[str, Any] = {}
             history = train_sparse_model(
                 model,
                 train_examples,
@@ -784,6 +1386,7 @@ def run_core(
                 num_workers=num_workers,
                 seed=seed + suite_number * 1000 + initialization_offset * 100,
                 objective=objective,
+                execution_report=execution,
             )
             for row in history:
                 histories.append({"suite": suite_name, "baseline": baseline_name, **row})
@@ -800,10 +1403,13 @@ def run_core(
                 pin_memory=pin_memory,
                 num_workers=num_workers,
             )
+            execution["data"]["test"] = _example_statistics(test_examples, public=False)
+            execution["path_integrity"]["test_metric_evaluated_after_checkpoint_restore"] = True
             suite_result["baselines"][baseline_name] = {
                 "training_objective": objective,
                 "role": role,
                 "unseen_graph_test": metric,
+                "execution": execution,
             }
             if suite_name == "s1":
                 suite_result["baselines"][baseline_name]["seen_graph_new_excitation_test"] = (
@@ -826,12 +1432,16 @@ def run_core(
                     amp=amp,
                     oracle=False,
                 )
-        oracle_model = _model_for_examples(
-            train_examples, "full", hidden_channels=hidden_channels
-        ).to(device)
+        oracle_model = trained["full"][0]
         suite_result["baselines"]["oracle"] = {
             "training_objective": "analytic_oracle",
             "role": "ground-truth conductance oracle",
+            "model": (
+                "reuses the already-trained full model's sparse propagation scaffold; "
+                "ground-truth conductance overrides the estimator during oracle evaluation, "
+                "so no separate unused oracle parameters are instantiated"
+            ),
+            "optimizer": "not_applicable: evaluation-only analytic conductance override",
             "unseen_graph_test": evaluate_sparse_model(
                 oracle_model,
                 test_examples,
@@ -1106,6 +1716,7 @@ def _public_loader(
         pin_memory=pin_memory,
         num_workers=num_workers,
         persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
     )
 
 
@@ -1113,6 +1724,7 @@ def _public_loss(logits: Tensor, labels: Tensor, task: str) -> Tensor:
     if task == "node":
         return nnf.cross_entropy(logits, labels.long())
     valid = torch.isfinite(labels.reshape(-1))
+    _require_true_async(valid.any(), "graph-property batch contains no finite labels")
     return nnf.binary_cross_entropy_with_logits(logits[valid], labels.reshape(-1)[valid].float())
 
 
@@ -1133,7 +1745,9 @@ def _macro_f1(predictions: Tensor, labels: Tensor) -> float:
         denominator = 2 * true_positive + false_positive + false_negative
         if denominator > 0:
             scores.append(float(2 * true_positive / denominator))
-    return sum(scores) / max(len(scores), 1)
+    if not scores:
+        raise ValueError("macro-F1 requires at least one represented class")
+    return sum(scores) / len(scores)
 
 
 @torch.no_grad()
@@ -1147,6 +1761,8 @@ def evaluate_public(
     pin_memory: bool,
     num_workers: int,
 ) -> dict[str, Any]:
+    if not dataset:
+        raise ValueError("public evaluation split is empty")
     model.eval()
     outputs: list[Tensor] = []
     labels: list[Tensor] = []
@@ -1182,6 +1798,272 @@ def evaluate_public(
         "num_graphs": label.numel(),
         "evaluator": "ogb.graphproppred.Evaluator",
     }
+
+
+def _train_public_model(
+    model: PublicConductanceModel,
+    train_dataset: Sequence[Mapping[str, Any]],
+    validation_dataset: Sequence[Mapping[str, Any]],
+    *,
+    device: torch.device,
+    epochs: int,
+    learning_rate: float,
+    batch_size: int,
+    amp: bool,
+    pin_memory: bool,
+    num_workers: int,
+    seed: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Tensor], float]:
+    if not train_dataset or not validation_dataset:
+        raise ValueError("public training and validation splits must both be nonempty")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+    parameter_inventory = _parameter_inventory(model)
+    optimizer_integrity = _optimizer_integrity(model, optimizer)
+    scaler = _grad_scaler(amp)
+    train_loader = _public_loader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        seed=seed,
+        pin_memory=pin_memory,
+        num_workers=num_workers,
+    )
+    validation_loader = _public_loader(
+        validation_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        seed=0,
+        pin_memory=pin_memory,
+        num_workers=num_workers,
+    )
+    best_validation = math.inf
+    best_state: dict[str, Tensor] | None = None
+    history: list[dict[str, Any]] = []
+    optimizer_steps = 0
+    graphs_processed = 0
+    labels_processed = 0
+    data_wait_seconds = 0.0
+    validation_seconds = 0.0
+    first_step: dict[str, Any] | None = None
+    _synchronize(device)
+    training_started = time.perf_counter()
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total: Tensor | None = None
+        count = 0
+        epoch_graphs = 0
+        if train_loader.generator is None:
+            raise RuntimeError("public training DataLoader has no deterministic generator")
+        train_loader.generator.manual_seed(seed + epoch)
+        wait_started = time.perf_counter()
+        for batch in train_loader:
+            data_wait_seconds += time.perf_counter() - wait_started
+            loss_weight = _public_loss_weight(batch.y, model.task)
+            if loss_weight < 1:
+                raise ValueError("public training batch contains no valid target labels")
+            profile_this_step = first_step is None
+            if profile_this_step:
+                _synchronize(device)
+                transfer_started = time.perf_counter()
+            batch = batch.to(device, non_blocking=pin_memory)
+            if profile_this_step:
+                _synchronize(device)
+                transfer_seconds = time.perf_counter() - transfer_started
+                forward_started = time.perf_counter()
+            optimizer.zero_grad(set_to_none=True)
+            with _autocast(device, amp):
+                loss = _public_loss(model(batch), batch.y, model.task)
+            _require_finite_async(
+                loss.detach(),
+                f"public training loss at epoch={epoch}, optimizer_step={optimizer_steps + 1}",
+            )
+            if profile_this_step:
+                _synchronize(device)
+                forward_seconds = time.perf_counter() - forward_started
+                backward_started = time.perf_counter()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            gradient_integrity = _gradient_integrity(model) if profile_this_step else None
+            gradient_norm = nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            _require_finite_async(
+                gradient_norm,
+                f"public clipped gradient norm at epoch={epoch}, "
+                f"optimizer_step={optimizer_steps + 1}",
+            )
+            if profile_this_step:
+                _synchronize(device)
+                backward_seconds = time.perf_counter() - backward_started
+                before = {
+                    name: parameter.detach().clone()
+                    for name, parameter in model.named_parameters()
+                    if parameter.requires_grad
+                }
+                optimizer_started = time.perf_counter()
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer_steps += 1
+            if profile_this_step:
+                _synchronize(device)
+                optimizer_seconds = time.perf_counter() - optimizer_started
+                first_step = _first_step_profile(
+                    batch_description={
+                        "graphs": batch.num_graphs,
+                        "nodes": int(batch.x.shape[0]),
+                        "edges": int(batch.edge_index.shape[1]),
+                        "x_shape": list(batch.x.shape),
+                        "edge_index_shape": list(batch.edge_index.shape),
+                        "edge_features_shape": list(batch.edge_features.shape),
+                        "target_shape": list(batch.y.shape),
+                        "valid_target_labels": loss_weight,
+                        "loss": float(loss.detach().float().cpu()),
+                    },
+                    gradient=gradient_integrity or {},
+                    before=before,
+                    model=model,
+                    timing_seconds={
+                        "host_to_device": transfer_seconds,
+                        "forward_and_loss": forward_seconds,
+                        "backward_and_gradient_validation": backward_seconds,
+                        "optimizer": optimizer_seconds,
+                    },
+                )
+            weighted = loss.detach().float() * loss_weight
+            total = weighted if total is None else total + weighted
+            count += loss_weight
+            labels_processed += loss_weight
+            graphs_processed += batch.num_graphs
+            epoch_graphs += batch.num_graphs
+            wait_started = time.perf_counter()
+        if epoch_graphs != len(train_dataset):
+            raise RuntimeError(
+                f"public training loader consumed {epoch_graphs} graphs but "
+                f"{len(train_dataset)} were required"
+            )
+        if total is None or count < 1:
+            raise RuntimeError(f"public training epoch {epoch} produced no valid loss")
+
+        model.eval()
+        validation_total: Tensor | None = None
+        validation_count = 0
+        validation_graphs = 0
+        _synchronize(device)
+        validation_started = time.perf_counter()
+        with torch.no_grad():
+            for batch in validation_loader:
+                loss_weight = _public_loss_weight(batch.y, model.task)
+                if loss_weight < 1:
+                    raise ValueError("public validation batch contains no valid target labels")
+                batch = batch.to(device, non_blocking=pin_memory)
+                with _autocast(device, amp):
+                    loss = _public_loss(model(batch), batch.y, model.task)
+                _require_finite_async(loss, f"public validation loss at epoch={epoch}")
+                weighted = loss.detach().float() * loss_weight
+                validation_total = (
+                    weighted if validation_total is None else validation_total + weighted
+                )
+                validation_count += loss_weight
+                validation_graphs += batch.num_graphs
+        _synchronize(device)
+        validation_seconds += time.perf_counter() - validation_started
+        if validation_graphs != len(validation_dataset):
+            raise RuntimeError(
+                f"public validation loader consumed {validation_graphs} graphs but "
+                f"{len(validation_dataset)} were required"
+            )
+        if validation_total is None or validation_count < 1:
+            raise RuntimeError(f"public validation epoch {epoch} produced no valid loss")
+        train_loss = float(total.cpu()) / count
+        validation_loss = float(validation_total.cpu()) / validation_count
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "validation_loss": validation_loss,
+            }
+        )
+        if validation_loss < best_validation:
+            best_validation = validation_loss
+            best_state = {
+                name: value.detach().cpu().clone() for name, value in model.state_dict().items()
+            }
+    _synchronize(device)
+    training_seconds = time.perf_counter() - training_started
+    expected_steps = epochs * math.ceil(len(train_dataset) / batch_size)
+    if optimizer_steps != expected_steps:
+        raise RuntimeError(
+            f"public optimizer executed {optimizer_steps} steps but {expected_steps} were required"
+        )
+    if first_step is None or best_state is None or not math.isfinite(best_validation):
+        raise RuntimeError("public training completed without a valid update and checkpoint")
+    model.load_state_dict(best_state)
+    report = {
+        "model": {
+            **parameter_inventory,
+            "model_class": type(model).__name__,
+            "node_encoder": type(model.node_encoder).__name__,
+            "edge_encoder": type(model.edge_encoder).__name__,
+            "hidden_channels": model.head.in_features,
+            "conductance_layers": 1,
+            "attention_heads": None,
+            "attention_heads_reason": "sparse conductance operator has no attention heads",
+            "task": model.task,
+        },
+        "optimizer_integrity": optimizer_integrity,
+        "optimization": {
+            "epochs": epochs,
+            "optimizer_steps": optimizer_steps,
+            "expected_optimizer_steps": expected_steps,
+            "learning_rate": learning_rate,
+            "weight_decay": 1.0e-5,
+            "gradient_clip_norm": 5.0,
+            "precision": "float16_autocast" if amp else "float32",
+            "best_validation_loss": best_validation,
+        },
+        "loader": {
+            "physical_batch_size_graphs": batch_size,
+            "gradient_accumulation_steps": 1,
+            "data_parallel_workers": 1,
+            "effective_batch_size_graphs": batch_size,
+            "num_workers": num_workers,
+            "persistent_workers": num_workers > 0,
+            "prefetch_factor": 2 if num_workers > 0 else None,
+            "pin_memory": pin_memory,
+            "non_blocking_transfer": pin_memory,
+            "collate": "pack_public_disjoint_union",
+            "sampling_ratio": 1.0,
+            "drop_last": False,
+        },
+        "data": {
+            "train": _example_statistics(train_dataset, public=True),
+            "validation": _example_statistics(validation_dataset, public=True),
+        },
+        "first_optimizer_step": first_step,
+        "path_integrity": {
+            "input_forward_loss_backward_optimizer": True,
+            "validation_metric_evaluated": True,
+            "checkpoint_selected_by_validation_only": True,
+        },
+        "timing_seconds": {
+            "training_including_validation": training_seconds,
+            "data_wait_during_training": data_wait_seconds,
+            "validation": validation_seconds,
+        },
+        "throughput": {
+            "training_graphs_processed": graphs_processed,
+            "training_labels_processed": labels_processed,
+            "graphs_per_second_including_validation": (
+                graphs_processed / training_seconds if training_seconds > 0 else None
+            ),
+            "labels_per_second_including_validation": (
+                labels_processed / training_seconds if training_seconds > 0 else None
+            ),
+            "optimizer_steps_per_second_including_validation": (
+                optimizer_steps / training_seconds if training_seconds > 0 else None
+            ),
+        },
+        "debug_subset_fast_mode": False,
+    }
+    return history, report, best_state, best_validation
 
 
 def run_public(
@@ -1229,91 +2111,43 @@ def run_public(
                 num_classes=num_classes,
                 official_molecule=(dataset_name == "ogbg_molhiv"),
             ).to(device)
-            parameter_count = sum(
-                parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+            model_history, execution, best_state, best_validation = _train_public_model(
+                model,
+                splits["train"],
+                splits["validation"],
+                device=device,
+                epochs=epochs,
+                learning_rate=learning_rate,
+                batch_size=batch_size,
+                amp=amp,
+                pin_memory=pin_memory,
+                num_workers=num_workers,
+                seed=seed,
             )
-            optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
-            scaler = _grad_scaler(amp)
-            best_validation = math.inf
-            best_state = None
-            for epoch in range(1, epochs + 1):
-                model.train()
-                total = 0.0
-                count = 0
-                for batch in _public_loader(
-                    splits["train"],
-                    batch_size=batch_size,
-                    shuffle=True,
-                    seed=seed + epoch,
-                    pin_memory=pin_memory,
-                    num_workers=num_workers,
-                ):
-                    batch = batch.to(device, non_blocking=pin_memory)
-                    optimizer.zero_grad(set_to_none=True)
-                    with _autocast(device, amp):
-                        loss = _public_loss(model(batch), batch.y, model.task)
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    loss_weight = _public_loss_weight(batch.y, model.task)
-                    total += float(loss.detach().float().cpu()) * loss_weight
-                    count += loss_weight
-                model.eval()
-                validation_total = 0.0
-                validation_count = 0
-                with torch.no_grad():
-                    for batch in _public_loader(
-                        splits["validation"],
-                        batch_size=batch_size,
-                        shuffle=False,
-                        seed=0,
-                        pin_memory=pin_memory,
-                        num_workers=num_workers,
-                    ):
-                        batch = batch.to(device, non_blocking=pin_memory)
-                        with _autocast(device, amp):
-                            loss = _public_loss(model(batch), batch.y, model.task)
-                        loss_weight = _public_loss_weight(batch.y, model.task)
-                        validation_total += float(loss.float().cpu()) * loss_weight
-                        validation_count += loss_weight
-                validation_loss = validation_total / max(validation_count, 1)
-                histories.append(
-                    {
-                        "suite": dataset_name,
-                        "baseline": model_name,
-                        "epoch": epoch,
-                        "train_loss": total / max(count, 1),
-                        "validation_loss": validation_loss,
-                    }
-                )
-                if validation_loss < best_validation:
-                    best_validation = validation_loss
-                    best_state = {
-                        name: value.detach().cpu().clone()
-                        for name, value in model.state_dict().items()
-                    }
-            if best_state is not None:
-                model.load_state_dict(best_state)
+            histories.extend(
+                {"suite": dataset_name, "baseline": model_name, **row}
+                for row in model_history
+            )
             state_key = f"{dataset_name}_{model_name}"
-            states[state_key] = {
-                name: value.detach().cpu() for name, value in model.state_dict().items()
-            }
+            states[state_key] = best_state
+            test_metric = evaluate_public(
+                model,
+                splits["test"],
+                device=device,
+                batch_size=batch_size,
+                amp=amp,
+                pin_memory=pin_memory,
+                num_workers=num_workers,
+            )
+            execution["data"]["test"] = _example_statistics(splits["test"], public=True)
+            execution["path_integrity"]["test_metric_evaluated_after_checkpoint_restore"] = True
             results[dataset_name]["baselines"][model_name] = {
-                "parameter_count": parameter_count,
+                "parameter_count": execution["model"]["trainable_parameters"],
                 "parameter_count_policy": "trainable_active_parameters_only",
                 "uses_edge_features": model.uses_edge_features,
                 "best_validation_loss": best_validation,
-                "test": evaluate_public(
-                    model,
-                    splits["test"],
-                    device=device,
-                    batch_size=batch_size,
-                    amp=amp,
-                    pin_memory=pin_memory,
-                    num_workers=num_workers,
-                ),
+                "test": test_metric,
+                "execution": execution,
             }
     return results, histories, states
 
@@ -1336,6 +2170,142 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) ->
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _cuda_allocator_peaks(device: torch.device) -> tuple[int | None, int | None]:
+    if device.type != "cuda":
+        return None, None
+    return (
+        int(torch.cuda.max_memory_allocated(device)),
+        int(torch.cuda.max_memory_reserved(device)),
+    )
+
+
+def _finish_monitor_after_failure(
+    monitor: RuntimeResourceMonitor,
+    device: torch.device,
+    primary_error: BaseException,
+) -> tuple[dict[str, Any] | None, str | None, list[str]]:
+    """Finish resource sampling once without replacing the scientific failure."""
+
+    collection_notes: list[str] = []
+    try:
+        peak_allocated, peak_reserved = _cuda_allocator_peaks(device)
+    except BaseException as cleanup_error:
+        peak_allocated, peak_reserved = None, None
+        note = (
+            "CUDA allocator peak collection failed during error cleanup: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+        collection_notes.append(note)
+        primary_error.add_note(note)
+    try:
+        resources = monitor.finish(
+            peak_allocated_bytes=peak_allocated,
+            peak_reserved_bytes=peak_reserved,
+        )
+    except BaseException as cleanup_error:
+        reason = (
+            "resource monitor cleanup failed without replacing the scientific error: "
+            f"{type(cleanup_error).__name__}: {cleanup_error}"
+        )
+        primary_error.add_note(reason)
+        return None, reason, collection_notes
+    if collection_notes:
+        resources["collection_notes"] = list(collection_notes)
+    return resources, None, collection_notes
+
+
+def _execution_plan(
+    *,
+    suite: str,
+    epochs: int,
+    learning_rate: float,
+    batch_size: int,
+    num_workers: int,
+    amp: bool,
+    pin_memory: bool,
+    device: torch.device,
+    data: Mapping[str, Any],
+    resource_start: Mapping[str, Any],
+    implementation_sha256: Mapping[str, str],
+) -> dict[str, Any]:
+    selected_models: dict[str, Any] = {}
+    if suite in {"core", "all"}:
+        selected_models["core"] = {
+            "hidden_channels": 64,
+            "conductance_layers": 1,
+            "conductance_estimator_linear_layers": 3,
+            "attention_heads": None,
+            "conditions": [
+                "isotropic",
+                "edge_only",
+                "gradient_only",
+                "full",
+                "full_flux_supervised",
+                "full_joint",
+            ],
+            "protocol_status": "supplementary mechanistic S1-S4 suite, not headline benchmark",
+        }
+    if suite in {"public", "all"}:
+        selected_models["public"] = {
+            "hidden_channels": 96,
+            "conductance_layers": 1,
+            "attention_heads": None,
+            "datasets": ["pascalvoc_sp", "ogbg_molhiv"],
+            "protocol_status": "legacy supplementary public suite, not headline benchmark",
+        }
+    return {
+        "event": "pre_training_execution_plan",
+        "suite": suite,
+        "models": selected_models,
+        "data": dict(data),
+        "optimization": {
+            "epochs_applied_without_suite_specific_cap": epochs,
+            "learning_rate": learning_rate,
+            "weight_decay": 1.0e-5,
+            "gradient_clip_norm": 5.0,
+        },
+        "batching": {
+            "physical_batch_size_graphs": batch_size,
+            "gradient_accumulation_steps": 1,
+            "data_parallel_workers": 1,
+            "effective_batch_size_graphs": batch_size,
+            "collation": "sparse disjoint-union graph batching",
+            "sampling_ratio": 1.0,
+        },
+        "data_loader": {
+            "num_workers": num_workers,
+            "persistent_workers": num_workers > 0,
+            "prefetch_factor": 2 if num_workers > 0 else None,
+            "pin_memory": pin_memory,
+            "non_blocking_transfer": pin_memory,
+            "worker_policy": (
+                "four-worker repository paper-runner reference default"
+                if num_workers == 4
+                else "explicit CLI override; interpret with measured data-wait and throughput"
+            ),
+        },
+        "hardware": {
+            "target_device": str(device),
+            "precision": "float16_autocast" if amp else "float32",
+            "pre_training_resource_snapshot": dict(resource_start),
+            "parallelism": (
+                "one selected CUDA device per process; independent top-level tracks/runs may be "
+                "distributed by the parent runner"
+            ),
+        },
+        "implementation_sha256": dict(implementation_sha256),
+        "debug_subset_fast_mode": False,
+        "configuration_changes_from_declared_protocol": [],
+    }
 
 
 def _prepare_output_dir(path: Path) -> Path:
@@ -1427,7 +2397,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=3.0e-3)
-    parser.add_argument("--num-workers", "--workers", dest="num_workers", type=int, default=0)
+    parser.add_argument(
+        "--num-workers",
+        "--workers",
+        dest="num_workers",
+        type=int,
+        default=4,
+        help=(
+            "DataLoader processes; default 4 matches the repository paper runner and is "
+            "reported with measured data-wait/throughput"
+        ),
+    )
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None)
     return parser
@@ -1462,6 +2442,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     output_dir = _prepare_output_dir(arguments.output_dir)
+    implementation_before = _implementation_hashes()
     started = time.perf_counter()
     prepared: dict[str, Any] = {}
     core = None
@@ -1471,6 +2452,8 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         prepared["core"] = {
             "manifest": str(manifest_path),
             "cache_key": manifest["cache_key"],
+            "artifact_sha256": manifest["artifact_sha256"],
+            "content_sha256": manifest["content_sha256"],
             "data_seed": seed_axes.data,
         }
     if arguments.suite in {"public", "all"}:
@@ -1481,11 +2464,13 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
         prepared["public"] = {
             "manifest": str(marker_path),
             "fixture": manifest["fixture"],
+            "processed_sha256": manifest.get("processed_sha256"),
             "data_seed": "not_applicable",
             "split_seed": "not_applicable",
             "chart_seed": "not_applicable",
         }
     seed_applicability = _seed_axis_applicability(arguments.suite)
+    data_observability = _dataset_observability(core, public)
     if arguments.prepare_only:
         summary = {
             "status": "prepared",
@@ -1493,16 +2478,46 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
             "seed_axes": seed_axes.to_manifest(),
             "seed_axis_applicability": seed_applicability,
             "prepared": prepared,
+            "data_observability": data_observability,
+            "implementation_integrity": _verify_implementation_unchanged(
+                implementation_before
+            ),
+            "resource_snapshot": runtime_resource_snapshot(device),
+            "execution_classification": {
+                "implementation": "not_executed: prepare-only",
+                "static_checks": "not_run_by_this_command",
+                "unit_tests": "not_run_by_this_command",
+                "smoke_test": False,
+                "full_training": False,
+                "full_evaluation": False,
+                "actual_data_prepared": True,
+            },
         }
-        (output_dir / "prepare_summary.json").write_text(
-            json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-        )
+        _write_json(output_dir / "prepare_summary.json", summary)
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         return summary
     seed_everything(seed_axes.model)
     results: dict[str, Any] = {}
     histories: list[dict[str, Any]] = []
     model_states: dict[str, Any] = {}
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    resource_monitor = RuntimeResourceMonitor(device)
+    resource_start = resource_monitor.start()
+    execution_plan = _execution_plan(
+        suite=arguments.suite,
+        epochs=epochs,
+        learning_rate=arguments.learning_rate,
+        batch_size=arguments.batch_size,
+        num_workers=arguments.num_workers,
+        amp=amp,
+        pin_memory=pin_memory,
+        device=device,
+        data=data_observability,
+        resource_start=resource_start,
+        implementation_sha256=implementation_before,
+    )
+    print(json.dumps(execution_plan, indent=2, ensure_ascii=False, allow_nan=False))
     try:
         if core is not None:
             core_results, core_history, core_states = run_core(
@@ -1520,11 +2535,10 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
             histories.extend(core_history)
             model_states["core"] = core_states
         if public is not None:
-            public_epochs = min(epochs, 50)
             public_results, public_history, public_states = run_public(
                 public,
                 device=device,
-                epochs=public_epochs,
+                epochs=epochs,
                 learning_rate=arguments.learning_rate,
                 batch_size=arguments.batch_size,
                 amp=amp,
@@ -1535,37 +2549,102 @@ def main(argv: Sequence[str] | None = None) -> dict[str, Any]:
             results["public"] = public_results
             histories.extend(public_history)
             model_states["public"] = public_states
-    except torch.cuda.OutOfMemoryError as error:
-        torch.cuda.empty_cache()
-        raise RuntimeError(
-            "CUDA out of memory in the paper runner. Re-run with a smaller --batch-size "
-            "(and optionally --no-amp only for numerical diagnosis; AMP normally saves memory)."
-        ) from error
+        implementation_integrity = _verify_implementation_unchanged(implementation_before)
+    except (Exception, KeyboardInterrupt) as error:
+        resources, unavailable_reason, collection_notes = _finish_monitor_after_failure(
+            resource_monitor,
+            device,
+            error,
+        )
+        failure = {
+            "status": "failed",
+            "suite": arguments.suite,
+            "error_type": type(error).__name__,
+            "error": str(error),
+            "execution_plan": execution_plan,
+            "completed_result_scopes": sorted(results),
+            "completed_history_rows": len(histories),
+            "resources_until_failure": resources,
+            "resource_observability_unavailable_reason": unavailable_reason,
+            "resource_observability_collection_notes": collection_notes,
+            "source_sha256_before_training": implementation_before,
+            "recovery_policy": (
+                "Preserve model, graph, dataset, epochs, and sampling. Inspect measured allocator "
+                "peaks/utilization, tensor lifetimes, synchronization, loader/graph construction, "
+                "mixed precision, sparse kernels, activation checkpointing, caching, chunking, and "
+                "multi-GPU/process distribution first. Only after a physical-batch candidate "
+                "profile demonstrates insufficient VRAM should a new explicit batch size and new "
+                "output directory be selected; this runner performs no automatic reduction."
+            ),
+        }
+        try:
+            _write_json(output_dir / "failure.json", failure)
+        except BaseException as reporting_error:
+            error.add_note(
+                "failure.json could not be written without replacing this error: "
+                f"{type(reporting_error).__name__}: {reporting_error}"
+            )
+        if isinstance(error, torch.cuda.OutOfMemoryError):
+            raise RuntimeError(
+                "CUDA out of memory in the conductance paper workload. No model, dataset, epoch, "
+                "sampling, or batch setting was changed automatically. Inspect failure.json for "
+                "the exact configuration and measured resource state, then profile memory and "
+                "pipeline causes before choosing any explicit new physical batch candidate."
+            ) from error
+        raise
+    peak_allocated, peak_reserved = _cuda_allocator_peaks(device)
+    resources = resource_monitor.finish(
+        peak_allocated_bytes=peak_allocated,
+        peak_reserved_bytes=peak_reserved,
+    )
     elapsed = time.perf_counter() - started
     summary = {
+        "status": "passed",
         "scope": "independent_sparse_incidence_conductance_attention",
         "suite": arguments.suite,
         "seed_axes": seed_axes.to_manifest(),
         "seed_axis_applicability": seed_applicability,
         "prepared": prepared,
+        "implementation_integrity": implementation_integrity,
+        "execution_plan": execution_plan,
+        "data_observability": data_observability,
         "configuration": {
             "epochs": epochs,
+            "epochs_applied_to_core": epochs if core is not None else None,
+            "epochs_applied_to_public": epochs if public is not None else None,
+            "suite_specific_epoch_cap": None,
             "learning_rate": arguments.learning_rate,
-            "batch_size": arguments.batch_size,
+            "physical_batch_size_graphs": arguments.batch_size,
+            "gradient_accumulation_steps": 1,
+            "data_parallel_workers": 1,
+            "effective_batch_size_graphs": arguments.batch_size,
             "num_workers": arguments.num_workers,
+            "persistent_workers": arguments.num_workers > 0,
+            "prefetch_factor": 2 if arguments.num_workers > 0 else None,
+            "pin_memory": pin_memory,
+            "non_blocking_transfer": pin_memory,
+            "sampling_ratio": 1.0,
+            "debug_subset_fast_mode": False,
         },
         "runtime": {
             **runtime_metadata(
                 device, amp=amp, pin_memory=pin_memory, batch_size=arguments.batch_size
             ),
             "elapsed_seconds": elapsed,
+            "resource_observability": resources,
+        },
+        "execution_classification": {
+            "implementation": "completed",
+            "static_checks": "not_run_by_this_command",
+            "unit_tests": "not_run_by_this_command",
+            "smoke_test": False,
+            "full_training": True,
+            "full_evaluation": True,
+            "actual_data_used": True,
         },
         "results": results,
     }
-    (output_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
+    _write_json(output_dir / "summary.json", summary)
     metric_rows = _metric_rows(results)
     _write_csv(output_dir / "metrics.csv", metric_rows, ["path", "value"])
     _write_csv(

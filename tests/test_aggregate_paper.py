@@ -46,7 +46,9 @@ def test_disabled_bootstrap_keeps_multi_seed_statistics_but_is_explicitly_labell
 
     assert summary["n"] == 2
     assert summary["sample_std"] == pytest.approx(2**-0.5)
-    assert summary["bootstrap_95_low"] == summary["bootstrap_95_high"] == summary["mean"] == 0.5
+    assert summary["mean"] == 0.5
+    assert summary["bootstrap_95_low"] is None
+    assert summary["bootstrap_95_high"] is None
     assert summary["uncertainty_status"] == "bootstrap_disabled"
 
 
@@ -525,7 +527,7 @@ def test_aggregate_tree_schema_pairs_only_registered_downstream_metrics(
     assert payload["metric_groups"] == 3
     assert payload["paired_groups"] == 1
     assert payload["ignored_numeric_fields"] == payload["numeric_fields_seen"] - 5 * seed_count
-    assert "not confidence intervals" in payload["uncertainty_policy"]["bootstrap_disabled"]
+    assert "remain unavailable" in payload["uncertainty_policy"]["bootstrap_disabled"]
     for filename in ("metrics.csv", "paired.csv"):
         with (tmp_path / "aggregate" / filename).open(encoding="utf-8", newline="") as stream:
             summaries = list(csv.DictReader(stream))
@@ -540,7 +542,8 @@ def test_aggregate_tree_schema_pairs_only_registered_downstream_metrics(
             else:
                 assert row["uncertainty_status"] == "bootstrap_disabled"
                 assert row["sample_std"] != ""
-                assert row["bootstrap_95_low"] == row["bootstrap_95_high"] == row["mean"]
+                assert row["bootstrap_95_low"] == ""
+                assert row["bootstrap_95_high"] == ""
                 if filename == "paired.csv":
                     assert float(row["effect_size"]) == pytest.approx(
                         float(row["mean"]) / float(row["sample_std"])

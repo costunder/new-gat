@@ -1,4 +1,5 @@
 import inspect
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -6,6 +7,7 @@ import torch
 
 from research.conductance_gat.v5 import model as v5_model
 from research.conductance_gat.v5 import operator as v5_operator
+from research.conductance_gat.v5 import train as v5_train
 from research.conductance_gat.v5.train import (
     build_parser,
     merge_efficiency,
@@ -103,3 +105,47 @@ def test_model_and_operator_hot_paths_have_no_cuda_scalar_reduction_reads():
     source = inspect.getsource(v5_model) + inspect.getsource(v5_operator)
     for forbidden in (".item()", ".any()", ".all()", "torch.equal(", "int(batch.max"):
         assert forbidden not in source
+
+
+@pytest.mark.parametrize(
+    "finish_failure",
+    [None, RuntimeError("telemetry cleanup failed"), KeyboardInterrupt("cleanup interrupted")],
+)
+def test_training_failure_finishes_monitor_once_and_preserves_original_error(
+    tmp_path, monkeypatch, finish_failure
+):
+    class Monitor:
+        calls = 0
+
+        def finish(self, **_kwargs):
+            self.calls += 1
+            if finish_failure is not None:
+                raise finish_failure
+            return {"summary": {"observed_wall_seconds": {"value": 0.1}}}
+
+    monitor = Monitor()
+    original = FloatingPointError("nonfinite training loss")
+
+    def fail(*_args, resource_state, **_kwargs):
+        resource_state.update(monitor=monitor, finished=False)
+        raise original
+
+    monkeypatch.setattr(v5_train, "_train_model_impl", fail)
+    output = tmp_path / "failed-arm"
+    output.mkdir()
+    args = SimpleNamespace(dataset="ppi", condition="shared_dynamic_c")
+    with pytest.raises(FloatingPointError, match="nonfinite training loss") as caught:
+        v5_train.train_model({}, {}, args, torch.device("cpu"), output)
+    assert caught.value is original
+    assert monitor.calls == 1
+    failure = json.loads(
+        (output / v5_train.FAILURE_RESOURCE_FILENAME).read_text(encoding="utf-8")
+    )
+    assert failure["status"] == "failed"
+    assert failure["error"] == "FloatingPointError: nonfinite training loss"
+    if finish_failure is not None:
+        assert failure["resource_observability"] is None
+        assert str(finish_failure) in failure["resource_observability_unavailable_reason"]
+    else:
+        assert failure["resource_observability"]["summary"]
+        assert failure["resource_observability_unavailable_reason"] is None

@@ -104,6 +104,44 @@ def test_dynamic_c_is_shared_positive_relative_and_not_dead_at_initialization():
     assert result["passed"] and all(row["upstream_gradient_norm"] > 0 for row in result["layers"])
 
 
+def test_fixed_c_is_parameter_free_and_shared_initialization_stays_paired():
+    torch.manual_seed(31)
+    fixed = model("fixed_one")
+    torch.manual_seed(31)
+    dynamic = model("dynamic")
+
+    for operator in fixed.operators:
+        assert list(operator.estimator.parameters()) == []
+        assert operator.estimator.node_projection is None
+        assert operator.estimator.context_projection is None
+        assert operator.estimator.score_norm is None
+        assert operator.estimator.score_network is None
+    assert all(list(operator.estimator.parameters()) for operator in dynamic.operators)
+
+    fixed_shared = {
+        name: value
+        for name, value in fixed.state_dict().items()
+        if ".operator.estimator." not in name
+    }
+    dynamic_shared = {
+        name: value
+        for name, value in dynamic.state_dict().items()
+        if ".operator.estimator." not in name
+    }
+    assert fixed_shared.keys() == dynamic_shared.keys()
+    for name in fixed_shared:
+        torch.testing.assert_close(fixed_shared[name], dynamic_shared[name], rtol=0, atol=0)
+
+    fixed(graph())
+    for operator in fixed.operators:
+        torch.testing.assert_close(
+            operator.estimator.last_c,
+            torch.ones_like(operator.estimator.last_c),
+            rtol=0,
+            atol=0,
+        )
+
+
 def test_undirected_orientation_does_not_change_prediction():
     torch.manual_seed(4)
     network, data = model(), graph()

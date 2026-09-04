@@ -24,8 +24,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=Path, default=Path("data/paper"))
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--model-seed", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Defaults by dataset: 2 for PPI graph minibatches, 1 for full graphs",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Default: 4 for PPI graph minibatches, 0 for transductive full graphs",
+    )
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=50)
     parser.add_argument("--hidden-channels", type=int, default=64)
@@ -40,6 +50,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate(args: argparse.Namespace) -> None:
+    if args.workers is None:
+        args.workers = 4 if args.dataset == "ppi" else 0
+        args.worker_configuration_source = "dataset_default"
+    elif not hasattr(args, "worker_configuration_source"):
+        args.worker_configuration_source = "explicit_cli"
+    expected_batch_size = 2 if args.dataset == "ppi" else 1
+    if args.batch_size is None:
+        args.batch_size = expected_batch_size
     if (
         min(
             args.batch_size,
@@ -57,13 +75,18 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("workers and model seed must be nonnegative")
     if not 0 <= args.dropout < 1 or args.lr <= 0 or args.weight_decay < 0:
         raise ValueError("dropout/LR/weight decay configuration is invalid")
-    if args.workers != 0 or args.batch_size != 2:
-        raise ValueError("V1 scaling keeps the official PPI batch-size=2 and workers=0")
+    if args.dataset != "ppi" and args.batch_size != expected_batch_size:
+        raise ValueError(
+            f"V1 {args.dataset} is one full graph and requires batch-size={expected_batch_size}"
+        )
+    if args.dataset != "ppi" and args.workers != 0:
+        raise ValueError("transductive V1 datasets use no DataLoader and require workers=0")
     if args.amp or args.compile:
         raise ValueError("V1 scaling fixes AMP and compilation off across architecture profiles")
 
 
 def _configuration(args: argparse.Namespace) -> dict[str, Any]:
+    loader_workers = args.workers if args.dataset == "ppi" else 0
     return {
         "hidden_channels": args.hidden_channels,
         "layers": args.layers,
@@ -74,11 +97,16 @@ def _configuration(args: argparse.Namespace) -> dict[str, Any]:
         "epochs": args.epochs,
         "patience": args.patience,
         "batch_size": args.batch_size,
-        "workers": args.workers,
+        "workers": loader_workers,
         "device": args.device,
         "amp": args.amp,
         "compile": args.compile,
         "pin_memory": args.pin_memory,
+        "persistent_workers": loader_workers > 0,
+        "prefetch_factor": 2 if loader_workers > 0 else None,
+        "worker_configuration_source": getattr(
+            args, "worker_configuration_source", "explicit_cli"
+        ),
         "validation_only": True,
     }
 
@@ -124,11 +152,20 @@ def main(argv: list[str] | None = None) -> int:
             source_sha256={
                 Path(__file__).name: sha256_file(Path(__file__)),
                 "benchmark.py": sha256_file(Path(__file__).with_name("benchmark.py")),
+                "src/chartgat/observability.py": sha256_file(
+                    Path(__file__).resolve().parents[2] / "src/chartgat/observability.py"
+                ),
             },
         )
     except BaseException as exc:
         record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
-        atomic_write_json(output / "metrics.json", record)
+        try:
+            atomic_write_json(output / "metrics.json", record)
+        except BaseException as reporting_error:
+            exc.add_note(
+                "failed metrics could not be written without replacing this error: "
+                f"{type(reporting_error).__name__}: {reporting_error}"
+            )
         raise
     atomic_write_json(output / "metrics.json", record)
     print(f"passed: {output}", flush=True)

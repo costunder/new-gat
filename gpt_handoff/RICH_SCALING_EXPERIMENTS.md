@@ -52,13 +52,48 @@ CSL/ZINC × fixed-BFS/multi-chart × 두 profiles = 8 model trainings다.
 - profile 선택 후보는 train/validation만 사용한다. 기존 Cycle/Tree 계약의 selected-checkpoint
   test-only 단계는 validation 선택 이후 별도 평가이며 재학습하지 않는다.
 
+## 실행 장치와 동시성 계약
+
+최상위 `run_rich_scaling.py`의 `--device`와 `--devices`는 상호 배타적이다.
+
+- `--device cuda:0`처럼 장치 하나를 지정하면 Conductance, Cycle, Tree **track runner를
+  순차 실행**한다. 한 track의 전체 child matrix가 끝난 뒤 다음 track을 시작하며, 같은 GPU에
+  여러 최상위 track을 겹쳐 실행하지 않는다.
+- `--devices cuda:0 cuda:1 ...`처럼 서로 다른 indexed CUDA 장치를 명시한 경우에만 독립
+  track들을 병렬 실행한다. Track은 요청 순서대로 장치에 round-robin 배정되고, 장치 수보다
+  track 수가 많으면 bounded wave로 나뉜다. 한 wave에서 동일 GPU에 배정되는 최상위 track은
+  하나뿐이므로 이 계층의 same-GPU concurrency는 1이다.
+- `--devices`의 중복 장치와 다중 장치 목록의 unindexed `cuda`는 거부한다. 각 track child는
+  배정된 단일 장치만 사용하며 DDP로 한 모델을 여러 GPU에 복제하는 구현은 아니다.
+- 위 제한은 **최상위 cross-track 계층**의 계약이다. A6000 Tree runner 내부의
+  `job_concurrency=2`는 disjoint output을 가진 두 candidate/selected-test child를 같은 GPU에서
+  실행하는 별도 명시적 profile 설정이다. 이를 최상위 same-GPU track 병렬화로 세지 않는다.
+
+예를 들어 scheduler 또는 컨테이너가 물리 GPU 3, 4, 5를 노출했다면, 프로세스에서 보이는
+논리 장치 0, 1, 2를 다음처럼 세 track에 배정한다. 실제 할당받지 않은 GPU를 목록에 넣지 않는다.
+
+```bash
+CUDA_VISIBLE_DEVICES=3,4,5 \
+python -B scripts/run_rich_scaling.py \
+  --run-id rich-multigpu-seed0-v1 \
+  --profiles reference large \
+  --model-seeds 0 \
+  --devices cuda:0 cuda:1 cuda:2 \
+  --hardware-profile a6000-48gb \
+  --min-free-gb 40 \
+  --cycle-v2-basis-backend thin_q
+```
+
+GPU가 하나만 할당된 아래 예시들은 계속 `--device cuda:0`을 사용하며 최상위 track을 순차
+실행한다.
+
 다음은 과거에 사용한 물리 GPU 6의 10GB MIG slice를 그대로 지정하는 **portable 실행
 예시**다. GPU 번호는 실제 할당에 맞춰 바꾸되 프로세스 내부 장치는 항상 `cuda:0`을 쓴다.
 
 ```bash
 git pull --ff-only
 
-env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=6 \
+CUDA_VISIBLE_DEVICES=6 \
 python -B scripts/run_rich_scaling.py \
   --run-id rich-portable-gpu6-seed0-v1 \
   --profiles reference large \
@@ -85,7 +120,7 @@ worst-case pre-epoch forward/backward capacity probe를 사용한다. 어느 경
 자동 fallback하지 않는다.
 
 ```bash
-env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+CUDA_VISIBLE_DEVICES=3 \
 python -B scripts/run_rich_scaling.py \
   --run-id rich-a6000-gpu3-seed0-v1 \
   --profiles reference large \
@@ -108,7 +143,7 @@ artifact로 보존하고, 현재 통합 실행에서는 Conductance V5만 선택
 Tree까지 아직 남았다면 다음 명령은 **32 child runs / 36 fresh model trainings**만 계획한다.
 
 ```bash
-env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+CUDA_VISIBLE_DEVICES=3 \
 python -B scripts/run_rich_scaling.py \
   --run-id remaining-v5-cycle-tree-a6000-gpu3-seed0-r1 \
   --tracks conductance cycle tree \
@@ -138,13 +173,14 @@ architecture profile(`reference/large`)과 hardware profile(`portable/a6000-48gb
 | Conductance V5 | FP32, TF32 off, block checkpoint on, dynamic-C score-chunk checkpoint on, edge chunk 65,536, arxiv seed-node batch 1,024, PPI whole-graph batch 2 | dense BF16 autocast·TF32, conductance geometry FP32, block checkpoint off, dynamic-C score-chunk checkpoint on, edge chunk 131,072, arxiv seed-node batch 2,048, PPI whole-graph batch 8, sample prefetch/pinned transfer |
 | Conductance V1–V4 | 기존 FP32 계약. PPI는 V1/V3/V4 batch 2이고 V2는 PPI N/A | 같은 legacy FP32·batch 계약을 그대로 유지 |
 | Cycle V1/V2 | 모든 dataset/profile batch 32, workers 4, prefetch 2, AMP off; V2 column chunk 16, pair budget 32,768 | reference ZINC/Peptides batch 512/128, large 256/64, workers 8; V2는 BF16 지원 시 backbone BF16·미지원 시 FP32, GradScaler off, FP32 projector, prefetch 4·column chunk 32·pair budget 4,194,304; V1은 기존 AMP/loader 계약 유지 |
-| Tree V1/V2 | batch 16, workers 0, suite config의 FP16 AMP, child concurrency 1 | batch 64, workers 4, 명시적 FP16 AMP, 독립 child concurrency 2 |
+| Tree V1/V2 | batch 16, workers 4, prefetch 2, suite config의 FP16 AMP, child concurrency 1 | batch 64, workers 4, prefetch 2, 명시적 FP16 AMP, 독립 child concurrency 2 |
 
-Conductance와 Cycle child는 순차 실행한다. Tree만 서로 다른 output/log를 갖는 candidate와
-selected-test child를 최대 2개 병렬화하며 coordinator 하나만 공용 manifest를 원자적으로 쓴다.
-A6000 작업 순서는 큰 workload를 먼저 검증하도록 deterministic heavy-first다. 한 Tree child가
-실패해도 같은 wave에서 통과한 peer artifact는 보존되며 같은 run ID 재실행에서는 실패한 작업만
-새 attempt 경로에서 실행한다.
+각 **track runner 내부**에서 Conductance와 Cycle child는 순차 실행한다. Tree만 서로 다른
+output/log를 갖는 candidate와 selected-test child를 최대 2개 병렬화하며 coordinator 하나만 공용
+manifest를 원자적으로 쓴다. 이 Tree 내부 동시성은 위의 최상위 `run_rich_scaling.py`가 서로 다른
+GPU에 independent track을 배분하는 cross-track 동시성과 별개다. A6000 작업 순서는 큰 workload를
+먼저 검증하도록 deterministic heavy-first다. 한 Tree child가 실패해도 같은 wave에서 통과한 peer
+artifact는 보존되며 같은 run ID 재실행에서는 실패한 작업만 새 attempt 경로에서 실행한다.
 
 이 설정은 메모리만 더 쓰는 동치 실행 스위치가 아니다. V5는 real sample/PPI batch와 numeric
 execution이 바뀌고, Cycle은 batch와 AMP가 바뀌며, Tree는 800 optimizer updates마다 보는 graph
@@ -154,9 +190,51 @@ PPI는 batch 8/BF16이므로 V1–V5 PPI 차이는 descriptive scaling 결과일
 인과 비교가 아니다. portable와 A6000 사이의 점수나 wall time 차이를 모델 또는 GPU 하나의
 효과로 직접 해석하지 않는다.
 
+## 자원 실측과 보고 범위
+
+GPU가 없는 이 Windows 작업 공간에서는 서버 GPU utilization을 측정할 수 없다. 대신 실제 Linux
+GPU child가 시작될 때 preflight와 학습 프로세스 내부 monitor가 그 서버의 값을 측정해 artifact에
+기록한다. 로컬에서 GPU 수치를 추정하거나 0으로 채우지 않는다.
+
+Preflight report는 선택 GPU의 이름, 논리 index, free/total VRAM, compute capability와 이름 기반
+MIG 감지, 보이는 모든 GPU의 inventory, logical/affinity CPU 수, available RAM과 측정 방법,
+`CUDA_VISIBLE_DEVICES` 및 scheduler resource 환경을 기록한다. 이는 **시작 시점의 availability
+snapshot**이며 학습 전체의 utilization이나 처리량을 인증하지 않는다.
+
+현재 Conductance V5, Cycle PE V1/V2와 Tree V1/V2 경로는 `RuntimeResourceMonitor`를 직접
+연결한다. Monitor는 각 학습 또는 명시적 selected-test 실행 경계의 start/end와 기본 1초 주기
+표본을 분리해 다음을 child 결과에 기록한다.
+
+- GPU SM utilization, memory-controller utilization, CUDA allocator allocated/reserved bytes의
+  sample count와 min/mean/max.
+- 프로세스 RSS/HWM과 system available RAM의 sample count와 min/mean/max.
+- 관측 wall time과 process CPU time으로 계산한 한 logical core 대비 평균 CPU 사용률 및 할당된
+  CPU capacity 대비 평균 사용률.
+- 호출자가 정한 학습 경계의 peak CUDA allocated/reserved bytes.
+
+GPU utilization counter는 PyTorch가 제공하는 NVML-backed query를 사용하며, 프로세스 전용이
+아닌 선택된 장치 전체의 순간 사용률이다. 같은 GPU를 외부 프로세스와 공유하면 그 부하도 포함될
+수 있다. NVML, `/proc`, CPU affinity 또는 특정 counter를 읽을 수 없으면 해당 값은 `null`과
+구체적인 `reason`으로 남고 0이나
+추정값으로 대체되지 않는다. 이 시계열 원문은 각 child metrics/summary artifact의
+`resource_observability`에 있으며 Tree는 `runtime.resource_observability`에 둔다. V5와 Cycle
+V2의 `pre_run_observability`, Cycle V1/Tree의 pre-run JSON 및 구조화된 data/batch/parameter/step
+필드는 모델·파라미터·데이터·실제 batch·계획 optimization step을 가능한 실행 경계에 맞춰
+기록한다. 상위 scaling summary의 elapsed/peak 집계만 보고 원문 시계열이 있다고 간주하지 말고
+child artifact와 hash를 함께 보존한다.
+
+현재 CPU 평균과 process RSS/HWM은 주 학습 프로세스 기준이므로 DataLoader worker 각각의 CPU
+time/RSS를 합산한 값이 아니다. System available RAM은 전체 시스템 관측이고 다른 작업의 영향도
+포함한다. 1초 표본은 짧은 kernel burst를 놓칠 수 있으며 storage throughput, I/O wait,
+data-loading/H2D/forward/backward/optimizer 각 단계의 분해가 세 track에 공통으로 구현된 것은
+아니다. Cycle supervised 경로는 loader wait, packed H2D, forward/loss, backward, optimizer
+시간을 나눠 기록하지만, 별도 batch 후보 microbenchmark는 이미 준비된 한 real batch의
+forward/loss/backward만 측정하고 loader·optimizer·validation·checkpoint를 의도적으로 제외한다.
+따라서 resource 시계열만으로 전체 병목 분석이 끝났다고 해석하지 않는다.
+
 `nvidia-smi` 한 번의 390MiB/13% 화면은 CUDA context 생성, CPU 전처리, validation 또는 작은
-커널 사이의 순간일 수 있어 전체 GPU 활용률의 증거가 아니다. 학습 중 별도 터미널에서 다음처럼
-2초 시계열을 확인한다.
+커널 사이의 순간일 수 있어 전체 GPU 활용률의 증거가 아니다. 내장 시계열과 별개의 외부
+교차검사로 학습 중 다음 2초 시계열을 함께 볼 수 있다.
 
 ```bash
 nvidia-smi --id=3 \
@@ -164,11 +242,73 @@ nvidia-smi --id=3 \
   --format=csv -l 2
 ```
 
-최종 판단에는 이 시계열과 각 child summary에 상위 aggregate까지 보존되는 `runtime`,
-`elapsed_seconds`, `peak_gpu_allocated_bytes`, `peak_gpu_reserved_bytes`를 함께 사용한다. GPU
-utilization이 낮으면서 CPU core가 포화되면 loader/기저 준비 병목이고, VRAM peak가 충분히 낮고
-GPU utilization도 낮으면 다음 run ID에서 batch/concurrency 조정을 검토한다. 현재 한 장면만으로
-batch나 concurrency를 더 올리지는 않는다.
+최종 판단에는 내장 시계열, 외부 교차검사, elapsed time, CUDA peak, 처리량을 함께 사용한다. GPU
+utilization이 낮으면서 CPU가 포화되면 loader/기저 준비 병목을 조사하고, VRAM peak와 GPU
+utilization이 모두 낮으면 별도의 batch 후보 측정 run을 설계한다. 한 장면만으로 batch나
+concurrency를 바꾸지 않는다.
+
+### Rich runner의 고정 recipe와 별도 batch 후보 microbenchmark
+
+현재 runner의 physical batch는 hardware/dataset/profile별로 사전 등록된 값이다.
+`run_rich_scaling.py`는 학습 중 batch를 탐색하거나 recipe를 바꾸지 않고 manifest에도
+`throughput_candidate_sweep=false`를 기록한다. A6000 profile의 큰 batch는 명시적 연구
+recipe이지 rich runner가 자동 선택한 결과가 아니다.
+
+별도 `scripts/benchmark_speed.py --batch-sizes ...`는 이와 구분되는 CUDA
+**fixed-real-batch microbenchmark**다. Conductance V1/V5, Cycle PE V1/V2와 Tree V1/V2에서
+공식 train cache를 검증한 뒤 각 명시 후보를 동일 초기 state로 독립 실행하며, device-wide GPU
+SM·memory-controller utilization, CUDA peak allocated/reserved, process CPU/RAM과
+graphs/seed-nodes/chart-views 처리량을 기록한다. OOM/error 후보를 더 작은 값으로 조용히
+대체하지 않고 실패로 보존한다. 10% 이상 projected device-memory headroom을 남긴 후보 중
+처리량이 가장 높은 값을 report의 **microbenchmark recommendation**으로 표시한다.
+
+이 benchmark는 optimizer step·parameter update가 0이고 전체 epoch, DataLoader 처리량,
+validation/test, checkpoint와 optimizer-state memory를 포함하지 않는다. Legacy Conductance와
+Cycle V2처럼 독립 execution variant가 있는 경우에만 출력/loss/모든 gradient 수치 동등성을
+`passed`로 기록하고, V5/Cycle V1/Tree의 current-only 경로는 자기 비교를 하지 않고 production
+path identity, finite loss/모든 trainable gradient와 parameter 불변성을 검사한다. 권고는
+profile 기본값을 자동 변경하지 않으며, 실제 최종 학습 recipe로 채택하려면 새 run ID의 전체
+학습에서 optimizer lifetime memory·epoch throughput·validation을 다시 검증해야 한다.
+
+GPU 3의 A6000에서 V5/ogbn-arxiv cluster 후보를 측정하는 독립 명령은 다음과 같다. Output
+directory는 기존 결과를 덮어쓰지 않는 새 이름이어야 한다.
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python -B scripts/benchmark_speed.py \
+  --track conductance_v5 \
+  --dataset ogbn-arxiv \
+  --v5-scale-profile reference \
+  --v5-hardware-profile a6000-48gb \
+  --v5-sampling cluster \
+  --batch-sizes 1024 2048 4096 \
+  --device cuda:0 \
+  --resource-sample-interval-seconds 0.1 \
+  --output-dir runs/performance/v5-arxiv-a6000-batch-sweep-r1
+```
+
+`report.json`의 후보별 원문은
+`batch_candidates[*].variants[*].resource_observability.interval_series` 아래
+`gpu_sm_utilization_percent`, `gpu_memory_controller_utilization_percent`,
+`gpu_allocator_allocated_bytes`, `gpu_allocator_reserved_bytes`,
+`gpu_device_free_bytes`, `gpu_device_used_bytes`, `process_cpu_seconds`,
+`allocated_cpu_busy_seconds`, `allocated_cpu_total_seconds`, `process_resident_bytes`,
+`process_peak_resident_bytes`, `system_available_bytes`에 있다. coordinator-process/allocated-CPU
+평균과 caller-defined CUDA peak는 같은 resource 객체의 `summary`, 후보별 순위 적격/배제 이유는
+최상위 `batch_candidate_analysis`에 있다. 이 분석은 optimizer 상태와 update가 없는
+microbenchmark 순위만 기록하고 최종 학습 batch를 선택하지 않는다. 모든 관측치는
+`value/unit/reason` 계약이며,
+전체 track은 같은 `scripts/benchmark_speed.py` 진입점에서 `--track`
+(`conductance_gat`, `conductance_v5`, `cycle_pe_v1`, `cycle_pe_v2`,
+`tree_augmentation`)만 바꿔 실행한다. 생성되는 CSV에는 run/track/profile,
+후보 physical/effective batch size, 반복별 처리량과 지연시간, GPU·CPU·RAM 관측치,
+microbenchmark 순위 적격 여부와 배제 이유가 기록된다.
+
+Cycle V2의 pre-epoch capacity probe는 등록된 worst-case batch가 가능한지 확인하고 불가능하면
+명시적으로 실패시키는 검사다. 더 작은 batch로 자동 변경하지 않으며 throughput sweep도 아니다.
+또한 고정 batch로 완료된 학습 run의 `graphs/sec` 또는 `samples/sec`는 그 한 설정의 사후
+처리량일 뿐, 다른 후보보다 최적이라는 증거가 아니다. 별도 microbenchmark 권고와 전체 학습
+검증을 거쳐 선택 결과를 새 hardware profile과 새 run ID에 명시하기 전에는 현재 batch가
+하드웨어 최적이라고 주장하지 않는다.
 
 ## 10GB MIG 메모리 정책
 
@@ -211,7 +351,7 @@ git show -s --oneline 214265c
 위 출력이 `214265c Fix V5 and Cycle V2 GPU failures`인지 확인한 뒤 다음을 실행한다.
 
 ```bash
-env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+CUDA_VISIBLE_DEVICES=3 \
 python -B scripts/run_rich_scaling.py \
   --run-id new-v5-cyclev2-a6000-gpu3-seed0-r3 \
   --tracks conductance cycle \

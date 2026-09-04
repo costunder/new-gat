@@ -9,12 +9,25 @@ import json
 from pathlib import Path
 
 import pytest
+import torch
 
+from chartgat.observability import finalize_resource_observability, runtime_resource_snapshot
 from scripts import run_cycle_scaling as scaling
 
 
 def _args(*extra: str):
     return scaling.parser().parse_args(list(extra))
+
+
+def _resource_observability() -> dict:
+    device = torch.device("cpu")
+    return finalize_resource_observability(
+        runtime_resource_snapshot(device),
+        device,
+        peak_allocated_bytes=None,
+        peak_reserved_bytes=None,
+        sample_interval_seconds=1.0,
+    )
 
 
 def test_default_matrix_runs_both_versions_all_profiles_and_seed_zero(tmp_path):
@@ -299,9 +312,12 @@ def test_direct_runner_environment_explicitly_unsets_nvml_cuda_check(monkeypatch
     assert "research/cycle_pe/__init__.py" in scaling.SOURCE_FILES
     assert "research/cycle_pe/v2/__init__.py" in scaling.SOURCE_FILES
     assert "research/cycle_pe/paper_data.py" in scaling.SOURCE_FILES
+    assert "research/cycle_pe/resource_monitor.py" in scaling.SOURCE_FILES
     assert "src/chartgat/__init__.py" in scaling.SOURCE_FILES
     assert "scripts/gpu_profiles.py" in scaling.SOURCE_FILES
+    assert "scripts/telemetry_validation.py" in scaling.SOURCE_FILES
     assert "scripts/verify_gpu_lock.py" in scaling.SOURCE_FILES
+    assert "src/chartgat/observability.py" in scaling.SOURCE_FILES
 
 
 def _row(version: str, dataset: str, profile: str, seed: int, validation: float):
@@ -573,6 +589,11 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
                         "history_sha256": hashlib.sha256(history.read_bytes()).hexdigest(),
                         "evaluation_splits": ["train", "validation"],
                         "fresh_training": True,
+                        "resource_observability": _resource_observability(),
+                        "throughput": {
+                            "scope": "unit fixture measured training",
+                            "training_graphs_per_second": 10.0,
+                        },
                     }
                 },
             }
@@ -583,6 +604,14 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
     row = scaling.read_job_rows(job)[0]
     assert row["validation_mae"] == 0.2 and "test_mae" not in row
     assert row["trainable_parameters"] == 1234
+    assert row["resource_observability"]["total_point_sample_count"] == 2
+    assert row["throughput"]["training_graphs_per_second"] == 10.0
+    for field in ("resource_observability", "throughput"):
+        incomplete = json.loads(json.dumps(metrics))
+        del incomplete["datasets"]["zinc12k"]["models"]["cycle_projector_pe_v2"][field]
+        (output / "metrics.json").write_text(json.dumps(incomplete), encoding="utf-8")
+        with pytest.raises(ValueError, match=field):
+            scaling.read_job_rows(job)
     metrics["datasets"]["zinc12k"]["models"]["cycle_projector_pe_v2"]["test"] = 0.3
     (output / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
     with pytest.raises(ValueError, match="leaked a test metric"):

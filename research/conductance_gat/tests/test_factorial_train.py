@@ -247,6 +247,7 @@ def _install_fake_pyg(monkeypatch):
 def test_loaders_construct_only_train_validation_never_test(monkeypatch, tmp_path):
     loaders = _install_fake_pyg(monkeypatch)
     args = args_for(tmp_path)
+    args.workers = 4
     payload = {
         "dataset": "ppi",
         "graphs": [{"graph_id": i} for i in range(5)],
@@ -259,6 +260,10 @@ def test_loaders_construct_only_train_validation_never_test(monkeypatch, tmp_pat
     assert loaders[0].kwargs["shuffle"] is True
     assert loaders[1].kwargs["shuffle"] is False
     assert loaders[0].kwargs["generator"] is not loaders[1].kwargs["generator"]
+    assert all(loader.kwargs["num_workers"] == 4 for loader in loaders)
+    assert all(loader.kwargs["persistent_workers"] is True for loader in loaders)
+    assert all(loader.kwargs["prefetch_factor"] == 2 for loader in loaders)
+    assert all(loader.kwargs["pin_memory"] is True for loader in loaders)
 
 
 @pytest.mark.parametrize("condition", CONDITIONS)

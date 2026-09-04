@@ -124,6 +124,16 @@ Architecture profile과 hardware profile은 서로 다른 축이다. Scaling run
 검사한다. OOM이면 batch를 자동으로 줄이거나 중간 epoch에서 protocol을 바꾸지 않고 실패하며,
 명시적으로 더 작은 `--batch-size`와 새 run-id를 요구한다.
 
+V2 child는 실제 학습 및 validation-selected checkpoint의 test-only 경계에서 기본 1초 주기로
+GPU SM·memory-controller utilization, CUDA allocator allocated/reserved, process CPU·RSS/HWM과
+system available RAM을 측정해 `resource_observability`에 저장한다. 지원되지 않는 counter는
+`null`과 원인을 남긴다. Capacity probe는 등록 batch의 실행 가능성만 확인하며 여러 physical
+batch 후보의 throughput·peak VRAM을 비교하는 sweep이 아니다. 별도
+`scripts/benchmark_speed.py --track cycle_pe_v2 --batch-sizes ...`는 공식 train 입력의 후보를
+독립 측정하고 10% 이상 projected device-memory headroom과 처리량을 기준으로 microbenchmark
+권고를 남기지만, optimizer state·전체 epoch·validation/checkpoint를 포함하지 않고 profile
+기본값도 바꾸지 않는다. 따라서 표의 batch를 해당 GPU의 최종 학습 최적값으로 주장하지 않는다.
+
 A6000 mixed precision은 FP16을 사용하지 않는다. 2026-09-04 수령한 실제 서버 로그에서 기존
 FP16 경로는 capacity probe의 비스케일 backward는 통과했지만, 실제 학습의 GradScaler 초기
 배율 65,536에서 gradient가 overflow하여 ZINC와 Peptides-struct 모두 첫 epoch 전에 중단됐다.
@@ -136,7 +146,7 @@ FP16 경로는 capacity probe의 비스케일 backward는 통과했지만, 실�
 다음 GPU 6 명령은 과거 10GB MIG 할당 번호를 보존한 portable 예시다.
 
 ```bash
-env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=6 \
+CUDA_VISIBLE_DEVICES=6 \
 python -B scripts/run_cycle_scaling.py \
   --versions v1 v2 --profiles reference large \
   --datasets zinc12k peptides_struct --model-seeds 0 \
@@ -148,7 +158,7 @@ python -B scripts/run_cycle_scaling.py \
 profile의 장치 계약에 더해 모든 child의 일반 preflight에 free VRAM 40GiB를 요구한다.
 
 ```bash
-env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+CUDA_VISIBLE_DEVICES=3 \
 python -B scripts/run_cycle_scaling.py \
   --versions v1 v2 --profiles reference large \
   --datasets zinc12k peptides_struct --model-seeds 0 \

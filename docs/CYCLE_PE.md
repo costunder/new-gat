@@ -89,9 +89,10 @@ basis에서 학습 전에 계산된다. 보조 CLI 기본값은 `raw,set,project
 - `set`: cycle-column 부호와 순열에 불변인 edge별 cycle-set 통계
 - `projector`: cycle-space projector를 사용하는 basis-change 불변 baseline
 
-`raw`는 intrinsic 표현이 아니다. 폭은 **train split의 최대 cycle rank로만** 정하고, 더 큰
-rank가 나온 validation/test/OOD split에는
-`not_applicable_train_fitted_width_overflow`를 기록한다. 좌표 절단이나 test-fit은 하지 않는다.
+`raw`는 intrinsic 표현이 아니다. 폭은 **train split의 최대 cycle rank로만** 정한다. 완전한
+validation/test/OOD split 중 하나라도 그 폭보다 큰 graph를 포함하면 raw condition 전체를
+`not_applicable_train_fitted_width_overflow`로 기록하고 학습·checkpoint 선택·metric 계산을 하지
+않는다. Compatible subset 선택, 좌표 절단, validation/test-fit은 모두 하지 않는다.
 `set`은 column 부호/순열에는 불변이지만 spanning-tree 변경 불변성까지 보장하지 않는다.
 `projector`는 invertible basis change에 불변이며 prior-style baseline이지 이 트랙의 novelty
 주장이 아니다.
@@ -103,6 +104,16 @@ rank가 나온 validation/test/OOD split에는
 learned conductance, node potential, sample-dependent circulation, layer 간 circulation state,
 flow completion은 이 트랙에 포함하지 않는다. spanning-tree augmentation도 별도
 `research/tree_augmentation` 트랙이다.
+
+보조 paper 경로의 artifact schema v2에서는 ragged graph list를 GPU에서 graph별로 순회하지
+않는다. DataLoader collate가 CPU에서 graph들을 하나의 disjoint union으로 pack하고, raw basis는
+batch 안의 실제 최대 β까지만 zero-pad하며 projector는 `sum_g E_g²` 값으로 이어 붙인다. PE MLP,
+message passing, segment mean/max pooling은 physical minibatch당 한 번 실행된다. Edge-only
+task의 마지막 node update도 loss에 연결되도록 edge head는 최종 edge state와 양 끝 node state의
+합/절댓값 차이를 함께 읽는다. 선택하지 않은 PE encoder·target head와 supervised 실행의 BREC
+embedding head는 만들지 않고, 첫 actual backward에서 모든 trainable parameter의 finite
+gradient와 optimizer exact ownership을 검사한다. 따라서 과거 schema v1 checkpoint는 이
+schema v2 모델에 재사용하지 않는다.
 
 ## Suite와 데이터
 
@@ -179,8 +190,10 @@ PyG import가 없거나 CUDA/PyTorch 조합이
   isomorphic relabeling·spanning-tree shift robustness도 core/ZINC에서 평가하지 않았다.
 - 다른 논문의 결과는 원 출처와 데이터 split·입력·모델 규모·학습 조건 차이를 표시한
   외부 비교표에서 다룬다. 이 코드에서 경쟁 모델을 별도로 학습하지 않는다.
-- Suite-level preparation time은 variant별 비용을 분리하지 않고 CPU RSS도 기록하지 않는다.
-  Projector는 모든 split graph의 dense `m×m` tensor를 보관하므로 large-graph scaling이 미검증이다.
+- Suite-level preparation time은 variant별 비용을 분리하지 않고 **준비 단계 자체의** CPU
+  RSS/peak와 projector 처리량도 아직 계측하지 않는다. 학습·평가 단계의 CPU/RAM/GPU resource는
+  별도로 기록한다. Projector는 모든 split graph의 dense `m×m` tensor를 보관하므로 large-graph
+  scaling이 미검증이다.
 - Official BREC는 pair/seed 단위 incremental checkpoint/resume가 없고 완료 뒤 결과를 기록한다.
   중단 시 현재 child의 장시간 진행분을 같은 run-id로 재개할 수 없다.
 
@@ -231,6 +244,30 @@ CLI는 `--data-seed`, `--split-seed`, `--chart-seed`, `--model-seed`를 독립�
 BREC는 `<variant>/pairs.json`과 `<variant>/metrics.json`, ZINC는
 `graph/<variant>/...`를 쓴다. manifest에는 CLI 전체, seed, split 크기, target 분리 정책,
 raw overflow, code/cache hash, runtime, CUDA AMP 설정, peak GPU memory가 포함된다.
+
+`runtime.json`은 모델/parameter 수, 실제 split·shape·node/edge/cycle-rank 통계,
+physical/effective batch, worker/prefetch/pin/non-blocking/cache 정책, 계획/실제 optimizer step,
+첫 backward 연결성, CUDA-synchronized graphs/s, 학습과 평가 각각의
+`resource_observability`를 기록한다. Monitor는 실제 실행 서버에서 1초 간격으로 device-wide GPU
+SM·memory-controller utilization, CUDA allocator, process CPU/RSS/HWM과 system available RAM을
+읽는다. NVML counter를 읽지 못하거나 CPU/Windows 검증이면 0을 만들지 않고 `null`과 원인을
+남긴다. GPU utilization은 해당 장치 전체 값이라 같은 GPU의 다른 process 부하를 포함할 수 있다.
+학습·split 평가·BREC·V1/V2 selected-test monitor는 failure-safe boundary 안에서 동작한다.
+OOM, nonfinite 오류, `KeyboardInterrupt`를 포함한 모든 `BaseException`에서 sampler를 정확히 한 번
+종료하고 가능한 peak/resource payload를 stderr JSON, 원 예외 note/속성, CLI failure manifest에
+남긴다. Monitor cleanup 오류는 원 workload 예외를 대체하지 않는다.
+BREC는 400-pair 순서를 유지하지만 각 pair의 q graph는 packed batch forward하며 suite 전체에
+같은 resource 시계열과 attempts/s를 남긴다.
+Supervised 학습은 DataLoader wait, packed H2D, forward/loss, backward, optimizer 시간을 따로
+기록하며, CUDA 단계는 매 batch 동기화하지 않고 event를 epoch 끝에서 해석한다. Loss 합계도
+GPU에서 epoch 단위로 누적해 batch마다 `.cpu()`로 pipeline을 끊지 않는다.
+
+Core/ZINC와 V1/V2 direct CLI의 기본은 `workers=4`, `prefetch_factor=2`,
+`persistent_workers=true`, pinned-memory/non-blocking H2D다. Scaling의 portable/A6000 profile은
+각각 명시된 worker recipe(4/8)를 전달한다. `--workers 0`은 단위 테스트나 target-server 실측에서
+multiprocess serialization이 더 느린 것으로 확인된 in-memory 경로에만 명시적으로 선택하며,
+그때는 prefetch가 비활성인 이유를 telemetry에 기록한다. Scientific run은 선택한 batch/worker
+recipe를 조용히 바꾸지 않으며 단일 run의 graphs/s를 batch 최적화 결과라고 주장하지 않는다.
 
 ## 검증
 

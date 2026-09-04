@@ -204,9 +204,11 @@ def test_train_loop_to_runner_report_preserves_topology_sources_and_one_seed(mon
     manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
     report = json.loads((run / "comparison.json").read_text(encoding="utf-8"))
     assert manifest["status"] == report["status"] == "passed"
-    assert trained["direct_c"]["initial_state_sha256"] == trained["fixed_c"]["initial_state_sha256"]
-    assert trained["direct_c"]["total_parameters"] == trained["fixed_c"]["total_parameters"]
-    assert trained["fixed_c"]["frozen_parameters"] == 8
+    assert trained["direct_c"]["shared_backbone_initial_state_sha256"] == trained["fixed_c"][
+        "shared_backbone_initial_state_sha256"
+    ]
+    assert trained["direct_c"]["total_parameters"] == trained["fixed_c"]["total_parameters"] + 8
+    assert trained["fixed_c"]["frozen_parameters"] == 0
     assert trained["direct_c"]["frozen_parameters"] == 0
     for condition, result in trained.items():
         assert result["test_evaluated"] is False and result["metric_name"] == "accuracy"
@@ -216,9 +218,11 @@ def test_train_loop_to_runner_report_preserves_topology_sources_and_one_seed(mon
         for row in coverage:
             assert row["scope"] == "full_graph_train_mask"
             for layer in row["layers"]:
-                assert layer["edge_parameters"] == 4
+                assert layer["graph_edges"] == 4
+                assert layer["edge_parameters"] == (4 if condition == "direct_c" else 0)
                 assert layer["trainable"] == (condition == "direct_c")
-                assert 0 <= layer["nonzero_fraction"] <= 1
+                if condition == "direct_c":
+                    assert 0 <= layer["nonzero_fraction"] <= 1
                 if condition == "fixed_c":
                     assert layer["nonzero_task_gradient_edges"] == 0
                     assert layer["gradient_present"] is False
@@ -240,7 +244,7 @@ def test_train_loop_to_runner_report_preserves_topology_sources_and_one_seed(mon
         assert actual == result["validation"]
         alphas = [p for name, p in rebuilt.named_parameters() if is_gate_parameter(name)]
         if condition == "fixed_c":
-            assert all(torch.count_nonzero(p) == 0 and not p.requires_grad for p in alphas)
+            assert not alphas
         else:
             assert any(torch.count_nonzero(p) > 0 for p in alphas)
             assert any(

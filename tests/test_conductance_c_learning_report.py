@@ -50,7 +50,15 @@ def _fixture(tmp_path, datasets=("ppi",)):
             checkpoint.write_bytes(b"unit-fixture-no-trained-model")
             history.write_text("[]", encoding="utf-8")
             data_hash = hashlib.sha256(dataset.encode()).hexdigest()
-            frozen = 100 if condition == "fixed_c" else 0
+            estimator = 100 if condition == "learned_c" else 0
+            total = 100 + estimator
+            parameter_tensors = 8 if condition == "learned_c" else 4
+            ownership = {
+                "status": "passed",
+                "trainable_parameter_tensors": parameter_tensors,
+                "optimizer_owned_parameter_tensors": parameter_tensors,
+                "trainable_parameter_elements": total,
+            }
             metrics = {
                 "schema_version": 1,
                 "research_suite": "conductance_c_learning",
@@ -63,7 +71,10 @@ def _fixture(tmp_path, datasets=("ppi",)):
                 "configuration": copy.deepcopy(configuration),
                 "cache_sha256": data_hash,
                 "protocol": {"data_sha256": data_hash, "official": True},
-                "initial_state_sha256": "a" * 64,
+                "initial_state_sha256": (
+                    "a" * 64 if condition == "learned_c" else "b" * 64
+                ),
+                "shared_backbone_initial_state_sha256": "c" * 64,
                 "best_epoch": 10,
                 "epochs_run": 30,
                 "validation": 0.55 if condition == "learned_c" else 0.50,
@@ -75,9 +86,27 @@ def _fixture(tmp_path, datasets=("ppi",)):
                 "test_evaluated": False,
                 "versions": {"torch": "unit-fixture"},
                 "gpu": "unit-fixture",
-                "total_parameters": 200,
-                "trainable_parameters": 200 - frozen,
-                "frozen_parameters": frozen,
+                "total_parameters": total,
+                "estimator_parameters": estimator,
+                "non_estimator_parameters": 100,
+                "trainable_parameters": total,
+                "frozen_parameters": 0,
+                "pre_run_observability": {
+                    "status": "pre_run_configuration",
+                    "model": {
+                        "total_parameters": total,
+                        "trainable_parameters": total,
+                        "frozen_parameters": 0,
+                        "optimizer_ownership": ownership,
+                    },
+                },
+                "first_optimizer_step_integrity": {
+                    **ownership,
+                    "checked_before_optimizer_step": 1,
+                    "gradient_status": (
+                        "all_trainable_parameter_tensors_have_finite_gradients"
+                    ),
+                },
             }
             for name, path in (("checkpoint", checkpoint), ("history", history)):
                 metrics[name] = str(path)
@@ -114,9 +143,12 @@ def test_complete_report_contrast_units_metrics_and_readonly_children(tmp_path):
     for dataset in report["datasets"]:
         assert dataset["learned_minus_fixed"]["score_delta"] == pytest.approx(0.05)
         assert dataset["learned_minus_fixed"]["percentage_points"] == pytest.approx(5.0)
+        assert dataset["parameter_contract"]["verified"] is True
+        assert dataset["parameter_contract"]["total_parameter_difference"] == 100
     assert all(path.read_bytes() == data for path, data in before.items())
     text = (root / "comparison.md").read_text(encoding="utf-8")
-    assert "+5.000000 pp" in text and "n=1" in text and "frozen" in text
+    assert "+5.000000 pp" in text and "n=1" in text and "parameter-free" in text
+    assert "Frozen scaffold" not in text
     with (root / "comparison.csv").open(encoding="utf-8", newline="") as stream:
         rows = list(csv.DictReader(stream))
     assert len(rows) == 4 and float(rows[0]["learned_minus_fixed_pp"]) == pytest.approx(5.0)
@@ -138,7 +170,7 @@ def test_partial_results_withhold_contrast(tmp_path, status):
     "key,value",
     [
         ("cache_sha256", "b" * 64),
-        ("initial_state_sha256", "b" * 64),
+        ("shared_backbone_initial_state_sha256", "d" * 64),
         ("test_evaluated", True),
         ("model_seed", 1),
         ("normalization", "global_max"),
@@ -146,6 +178,8 @@ def test_partial_results_withhold_contrast(tmp_path, status):
         ("gate_weight_decay", 0.0),
         ("non_gate_weight_decay", 0.0),
         ("frozen_parameters", 100),
+        ("estimator_parameters", 99),
+        ("non_estimator_parameters", 101),
         ("total_parameters", 300),
         ("research_suite", "conductance_factorial"),
         ("validation", float("nan")),
@@ -209,4 +243,36 @@ def test_common_config_and_cross_arm_extra_config_cannot_drift(tmp_path):
     root, manifest = _fixture(tmp_path)
     _edit(manifest, lambda child: child["configuration"].update(unknown_training_flag=True))
     with pytest.raises(ComparisonIntegrityError, match="configuration"):
+        write_comparison(root, manifest)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("status", "missing"),
+        ("optimizer_owned_parameter_tensors", 7),
+        ("trainable_parameter_elements", 199),
+    ],
+)
+def test_optimizer_ownership_evidence_fails_closed(tmp_path, field, value):
+    root, manifest = _fixture(tmp_path)
+
+    def mutate(metrics):
+        evidence = metrics["pre_run_observability"]["model"]["optimizer_ownership"]
+        evidence[field] = value
+
+    _edit(manifest, mutate)
+    with pytest.raises(ComparisonIntegrityError, match="optimizer"):
+        write_comparison(root, manifest)
+
+
+def test_first_step_ownership_evidence_fails_closed(tmp_path):
+    root, manifest = _fixture(tmp_path)
+    _edit(
+        manifest,
+        lambda metrics: metrics["first_optimizer_step_integrity"].update(
+            checked_before_optimizer_step=0
+        ),
+    )
+    with pytest.raises(ComparisonIntegrityError, match="first optimizer step"):
         write_comparison(root, manifest)

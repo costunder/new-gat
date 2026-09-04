@@ -33,6 +33,11 @@ from scripts.check_dependencies import (  # noqa: E402
     check_dependencies,
     error_message,
 )
+from scripts.process_safety import (  # noqa: E402
+    close_owned_child_stdout,
+    run_failure_reporter,
+    terminate_owned_child_after_error,
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -48,7 +53,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--batch-size", type=int, default=2, help="PPI only; shared across conditions"
     )
-    result.add_argument("--workers", type=int, default=0)
+    result.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="PPI graph DataLoader workers; transductive children are forced to 0",
+    )
     result.add_argument("--min-free-gb", type=float, default=8.0)
     result.add_argument(
         "--dry-run", action="store_true", help="Print the plan without GPU or writes"
@@ -73,9 +83,18 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("run ID must be 1-120 letters, digits, underscores or hyphens")
 
 
+def workers_for_dataset(dataset: str, requested_workers: int) -> int:
+    """Resolve the real DataLoader worker count without pretending full graphs have a loader."""
+
+    if requested_workers < 0:
+        raise ValueError("workers must be nonnegative")
+    return requested_workers if dataset == "ppi" else 0
+
+
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     jobs = []
     for dataset in args.datasets:
+        child_workers = workers_for_dataset(dataset, args.workers)
         for condition in CONDITIONS:
             output = run_dir / dataset / condition
             command = [
@@ -103,12 +122,13 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 "--batch-size",
                 str(args.batch_size),
                 "--workers",
-                str(args.workers),
+                str(child_workers),
             ]
             jobs.append(
                 {
                     "dataset": dataset,
                     "condition": condition,
+                    "workers": child_workers,
                     "status": "pending",
                     "output_dir": str(output),
                     "metrics_path": str(output / "metrics.json"),
@@ -121,6 +141,7 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
 
 def _environment() -> dict[str, str]:
     environment = os.environ.copy()
+    environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
     entries = [str(ROOT / "src"), str(ROOT)]
     if environment.get("PYTHONPATH"):
         entries.append(environment["PYTHONPATH"])
@@ -145,6 +166,7 @@ def run_logged(command: list[str], log: Path, environment: dict[str, str]) -> in
             errors="replace",
             bufsize=1,
         )
+        primary_error: BaseException | None = None
         try:
             assert process.stdout is not None
             for line in process.stdout:
@@ -152,17 +174,17 @@ def run_logged(command: list[str], log: Path, environment: dict[str, str]) -> in
                 stream.write(line)
                 stream.flush()
             return process.wait()
-        except BaseException:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
+        except BaseException as error:
+            primary_error = error
+            terminate_owned_child_after_error(
+                process,
+                command,
+                original_error=error,
+                log_target=stream,
+            )
             raise
         finally:
-            if process.stdout is not None:
-                process.stdout.close()
+            close_owned_child_stdout(process, original_error=primary_error)
 
 
 def _source_snapshot() -> dict[str, Any]:
@@ -175,6 +197,8 @@ def _source_snapshot() -> dict[str, Any]:
         Path(__file__),
         ROOT / "scripts/check_dependencies.py",
         ROOT / "scripts/gpu_preflight.py",
+        ROOT / "scripts/process_safety.py",
+        ROOT / "src/chartgat/observability.py",
     ]
     hashes = {
         path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -247,6 +271,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         },
         "data_root": str(data_root),
+        "workers_by_dataset": {
+            dataset: workers_for_dataset(dataset, args.workers) for dataset in args.datasets
+        },
     }
     manifest: dict[str, Any] = {
         "schema_version": 1,
@@ -334,11 +361,20 @@ def main(argv: list[str] | None = None) -> int:
         if current_job is not None:
             current_job["status"] = "failed"
             current_job["error"] = manifest["error"]
-        atomic_write_json(manifest_path, manifest)
-        try:
-            _comparison(run_dir, manifest)
-        except (ValueError, OSError) as report_error:
-            print(f"Comparison integrity error: {report_error}", file=sys.stderr)
+        report_error = run_failure_reporter(
+            lambda: _comparison(run_dir, manifest),
+            original_error=exc,
+            action="failed-run comparison generation",
+        )
+        if report_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(report_error)
+        manifest_error = run_failure_reporter(
+            lambda: atomic_write_json(manifest_path, manifest),
+            original_error=exc,
+            action="failed-run manifest persistence",
+        )
+        if manifest_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(manifest_error)
         print(f"Failed: {manifest['error']}\nSaved partial results: {run_dir}", file=sys.stderr)
         return 130 if isinstance(exc, KeyboardInterrupt) else 1
     atomic_write_json(manifest_path, manifest)

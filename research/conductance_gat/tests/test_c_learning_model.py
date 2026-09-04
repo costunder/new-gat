@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +11,7 @@ from research.conductance_gat.ablation import train as shared
 from research.conductance_gat.ablation.model import (
     FactorialNodeClassifier,
     is_gate_parameter,
+    shared_backbone_state_sha256,
     state_sha256,
 )
 from research.conductance_gat.ablation.model import (
@@ -31,17 +31,24 @@ def graph_fixture():
 
 
 @pytest.mark.parametrize("gate_mode", ["learned", "fixed_one"])
-def test_same_initial_full_state_rng_and_non_gate_parameters_as_node_degree(gate_mode):
+def test_same_constructor_rng_and_non_gate_initialization_as_node_degree(gate_mode):
     torch.manual_seed(903)
     original = FactorialNodeClassifier(3, 2, hidden_channels=8, normalization="node_degree")
     reference_rng = torch.get_rng_state().clone()
     torch.manual_seed(903)
     model = CLearningNodeClassifier(3, 2, hidden_channels=8, gate_mode=gate_mode)
-    assert state_sha256(model) == state_sha256(original)
     assert torch.equal(torch.get_rng_state(), reference_rng)
-    assert list(model.state_dict()) == list(original.state_dict())
-    for name, parameter in model.named_parameters():
-        assert parameter.requires_grad == (gate_mode == "learned" or not is_gate_parameter(name))
+    assert shared_backbone_state_sha256(model) == shared_backbone_state_sha256(original)
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, original.state_dict()[name], atol=0, rtol=0)
+    if gate_mode == "learned":
+        assert state_sha256(model) == state_sha256(original)
+        assert list(model.state_dict()) == list(original.state_dict())
+    else:
+        assert state_sha256(model) != state_sha256(original)
+        assert not any(".estimator." in name for name in model.state_dict())
+    for _name, parameter in model.named_parameters():
+        assert parameter.requires_grad
 
 
 @pytest.mark.parametrize("training", [True, False])
@@ -97,14 +104,13 @@ def test_fixed_operator_is_exact_unweighted_neighbor_mean_with_isolate_and_orien
     torch.testing.assert_close(grad, ref_grad, atol=1e-6, rtol=1e-6)
 
 
-def test_fixed_gate_is_not_evaluated_and_effective_c_is_exact_one(monkeypatch):
+def test_fixed_gate_is_parameter_free_and_effective_c_is_exact_one():
     model = CLearningNodeClassifier(3, 2, hidden_channels=8, gate_mode="fixed_one").eval()
     for operator in model.operators:
-        monkeypatch.setattr(
-            operator.estimator.network,
-            "forward",
-            lambda *args: pytest.fail("Frozen gate scaffold must never be evaluated"),
-        )
+        assert list(operator.estimator.parameters()) == []
+        assert list(operator.estimator.buffers()) == []
+        assert operator.estimator.state_dict() == {}
+        assert not hasattr(operator.estimator, "network")
     with shared.ForwardObservation(model) as observation:
         model(graph_fixture())
     for layer in observation.summary():
@@ -117,19 +123,26 @@ def test_fixed_gate_is_not_evaluated_and_effective_c_is_exact_one(monkeypatch):
     assert torch.equal(c, torch.ones(5)) and not c.requires_grad
 
 
-def test_fixed_output_cannot_depend_on_frozen_scaffold_values():
-    model = CLearningNodeClassifier(3, 2, hidden_channels=8, gate_mode="fixed_one").eval()
-    graph = graph_fixture()
-    original = model(graph)
-    with torch.no_grad():
-        for name, parameter in model.named_parameters():
-            if is_gate_parameter(name):
-                parameter.fill_(float("nan"))
-    torch.testing.assert_close(model(graph), original, atol=0, rtol=0)
+def test_fixed_state_has_no_estimator_scaffold_and_exact_parameter_delta():
+    torch.manual_seed(41)
+    learned = CLearningNodeClassifier(3, 2, hidden_channels=8, gate_mode="learned")
+    torch.manual_seed(41)
+    fixed = CLearningNodeClassifier(3, 2, hidden_channels=8, gate_mode="fixed_one")
+    assert not any(is_gate_parameter(name) for name, _ in fixed.named_parameters())
+    assert not any(".estimator." in name for name in fixed.state_dict())
+    learned_gate = sum(
+        parameter.numel()
+        for name, parameter in learned.named_parameters()
+        if is_gate_parameter(name)
+    )
+    assert sum(p.numel() for p in learned.parameters()) - sum(
+        p.numel() for p in fixed.parameters()
+    ) == learned_gate
+    assert shared_backbone_state_sha256(learned) == shared_backbone_state_sha256(fixed)
 
 
 @pytest.mark.parametrize("condition", CONDITIONS)
-def test_optimizer_exactly_partitions_trainable_parameters_and_excludes_frozen(condition):
+def test_optimizer_exactly_owns_every_and_only_trainable_parameter(condition):
     model = CLearningNodeClassifier(
         3, 2, hidden_channels=8, **{"gate_mode": CONDITIONS[condition]["gate_mode"]}
     )
@@ -138,29 +151,30 @@ def test_optimizer_exactly_partitions_trainable_parameters_and_excludes_frozen(c
     included = [id(parameter) for group in optimizer.param_groups for parameter in group["params"]]
     assert len(included) == len(set(included)) == len(expected)
     assert set(included) == expected
+    assert all(parameter.requires_grad for parameter in model.parameters())
     assert all(group["weight_decay"] == 0.0005 for group in optimizer.param_groups)
     assert len(optimizer.param_groups) == (2 if condition == "learned_c" else 1)
 
 
 def test_fixed_gate_no_grad_update_or_adam_state_and_telemetry_is_explicit():
     model = CLearningNodeClassifier(3, 2, hidden_channels=8, gate_mode="fixed_one")
-    before = copy.deepcopy(model.state_dict())
+    before_encoder = model.encoder.weight.detach().clone()
     optimizer = make_optimizer(model, "fixed_c")
     graph = graph_fixture()
     loss, _ = shared.training_loss(model(graph), graph, torch.tensor([0, 1]))
     loss.backward()
     telemetry = shared.gradient_observation(model, "fixed_c", definition=DEFINITION)
     optimizer.step()
-    for name, parameter in model.named_parameters():
-        if is_gate_parameter(name):
-            assert parameter.grad is None and parameter not in optimizer.state
-            torch.testing.assert_close(parameter, before[name], atol=0, rtol=0)
-    assert not torch.equal(model.encoder.weight, before["encoder.weight"])
-    gate = telemetry["operators.0"]
-    assert gate["optimizer_included"] is False and gate["trainable_parameter_count"] == 0
-    assert gate["weight_decay"] == gate["decay_term_norm"] == gate["task_gradient_norm"] == 0
-    assert gate["task_to_decay_ratio"] is None
+    assert not any(is_gate_parameter(name) for name, _ in model.named_parameters())
+    assert not torch.equal(model.encoder.weight, before_encoder)
+    assert "operators.0" not in telemetry
     assert telemetry["non_gate"]["weight_decay"] == 0.0005
+    owned = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    assert owned == {id(parameter) for parameter in model.parameters()}
 
 
 @pytest.mark.parametrize("kwargs", [{"normalization": "global_max"}, {"gate_mode": "other"}])

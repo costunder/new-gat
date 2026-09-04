@@ -8,6 +8,7 @@ by unit tests of the pure helpers. No downloads, test evaluation or AMP fallback
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -21,10 +22,28 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from chartgat.cache import atomic_publish, atomic_write_json
+from chartgat.observability import RuntimeResourceMonitor
 
-from ..benchmark import _binary_counts, _micro_f1_from_counts, _seed, _versions
+from ..benchmark import (
+    _binary_counts,
+    _micro_f1_from_counts,
+    _seed,
+    _versions,
+    batch_observability,
+    data_observability,
+    finish_monitor_after_failure,
+    first_batch_shapes,
+    pre_run_observability,
+    validate_first_optimizer_step,
+)
 from ..benchmark_data import load_dataset, sha256_file
-from .model import FactorialNodeClassifier, is_gate_parameter, make_optimizer, state_sha256
+from .model import (
+    FactorialNodeClassifier,
+    is_gate_parameter,
+    make_optimizer,
+    shared_backbone_state_sha256,
+    state_sha256,
+)
 from .protocol import COMMON, CONDITIONS, DATASETS
 
 
@@ -86,6 +105,7 @@ def architecture_configuration(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def configuration(args: argparse.Namespace) -> dict[str, Any]:
+    loader_workers = args.workers if args.dataset == "ppi" else 0
     return {
         **COMMON,
         **architecture_configuration(args),
@@ -93,10 +113,15 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
         "epochs": args.epochs,
         "patience": args.patience,
         "batch_size": args.batch_size,
-        "workers": args.workers,
+        "workers": loader_workers,
         "device": args.device,
         "tf32": False,
         "pin_memory": True,
+        "persistent_workers": loader_workers > 0,
+        "prefetch_factor": 2 if loader_workers > 0 else None,
+        "worker_configuration_source": getattr(
+            args, "worker_configuration_source", "explicit_cli"
+        ),
     }
 
 
@@ -137,6 +162,7 @@ def _make_data(payload: dict[str, Any], args: argparse.Namespace, device: torch.
             generator=generator,
             pin_memory=True,
             persistent_workers=args.workers > 0,
+            prefetch_factor=2 if args.workers > 0 else None,
         )
     return loaders, None
 
@@ -420,11 +446,18 @@ def checkpoint_payload(
     optimizer_steps: int = 0,
     *,
     definition: TrainingDefinition | None = None,
+    shared_initial_hash: str | None = None,
 ) -> dict[str, Any]:
     experiment = _training_definition(definition)
     spec = experiment.conditions[args.condition]
     architecture = architecture_configuration(args)
     gate_metadata = {"gate_mode": spec["gate_mode"]} if "gate_mode" in spec else {}
+    total_parameters = sum(p.numel() for p in model.parameters())
+    estimator_parameters = sum(
+        parameter.numel()
+        for name, parameter in model.named_parameters()
+        if is_gate_parameter(name)
+    )
     return {
         "state_dict": {name: value.detach().cpu() for name, value in model.state_dict().items()},
         "research_suite": experiment.suite,
@@ -442,11 +475,14 @@ def checkpoint_payload(
         "configuration": configuration(args),
         "gate_weight_decay": spec["gate_weight_decay"],
         "non_gate_weight_decay": COMMON["weight_decay"],
-        "total_parameters": sum(p.numel() for p in model.parameters()),
+        "total_parameters": total_parameters,
+        "estimator_parameters": estimator_parameters,
+        "non_estimator_parameters": total_parameters - estimator_parameters,
         "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "frozen_parameters": sum(p.numel() for p in model.parameters() if not p.requires_grad),
         "cache_sha256": protocol["data_sha256"],
         "initial_state_sha256": initial_hash,
+        "shared_backbone_initial_state_sha256": shared_initial_hash or initial_hash,
         "best_epoch": epoch,
         "optimizer_steps": optimizer_steps,
         "validation": validation,
@@ -455,7 +491,7 @@ def checkpoint_payload(
     }
 
 
-def train_model(
+def _train_model_impl(
     payload: dict[str, Any],
     protocol: dict[str, Any],
     args: argparse.Namespace,
@@ -463,6 +499,7 @@ def train_model(
     output: Path,
     *,
     definition: TrainingDefinition | None = None,
+    resource_start: dict[str, Any],
 ) -> dict[str, Any]:
     _require_cuda(device)
     experiment = _training_definition(definition)
@@ -481,12 +518,45 @@ def train_model(
         **gate_kwargs,
     ).to(device)
     initial_hash = state_sha256(model)
+    shared_initial_hash = shared_backbone_state_sha256(model)
     optimizer = experiment.optimizer_factory(model, args.condition)
+    batches_per_epoch = 1 if split_indices is not None else len(data["train"])
+    data_observation = data_observability(
+        payload,
+        used_splits=("train", "validation"),
+        prepared_splits=split_indices,
+    )
+    batching = batch_observability(
+        data,
+        transductive=split_indices is not None,
+        args=args,
+        batches_per_epoch=batches_per_epoch,
+    )
+    pre_run = pre_run_observability(
+        model_name=experiment.suite,
+        model=model,
+        optimizer=optimizer,
+        args=args,
+        data_observation=data_observation,
+        batching=batching,
+        resource_start=resource_start,
+        architecture={
+            **architecture,
+            "normalization": spec["normalization"],
+            **({"gate_mode": spec["gate_mode"]} if "gate_mode" in spec else {}),
+        },
+        precision="float32",
+        device=device,
+    )
+    print(json.dumps(pre_run, sort_keys=True), flush=True)
     checkpoint = output / "best.pt"
     history: list[dict[str, Any]] = []
     trajectory: list[dict[str, Any]] = []
     best_validation, best_epoch = -math.inf, 0
     optimizer_steps, best_optimizer_steps = 0, 0
+    training_label_updates = 0
+    first_training_batch: dict[str, Any] | None = None
+    first_step_integrity: dict[str, Any] | None = None
     best_observation: dict[str, Any] | None = None
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
@@ -502,6 +572,8 @@ def train_model(
         for batch_index, graph in enumerate(batches):
             if split_indices is None:
                 graph = graph.to(device, non_blocking=True)
+            if first_training_batch is None:
+                first_training_batch = first_batch_shapes(graph)
             optimizer.zero_grad(set_to_none=True)
             if batch_index == 0:
                 with ForwardObservation(model) as training_observation:
@@ -531,8 +603,11 @@ def train_model(
                         ),
                     }
                 )
+            if optimizer_steps == 0:
+                first_step_integrity = validate_first_optimizer_step(model, optimizer)
             optimizer.step()
             optimizer_steps += 1
+            training_label_updates += int(count)
             loss_sum.add_(loss.detach().double() * count)
             label_count += count
         if not label_count:
@@ -566,6 +641,7 @@ def train_model(
                 validation,
                 optimizer_steps,
                 definition=experiment,
+                shared_initial_hash=shared_initial_hash,
             )
             atomic_publish(checkpoint, lambda path, state=saved: torch.save(state, path))
         if epoch == 1 or epoch % 10 == 0:
@@ -583,6 +659,16 @@ def train_model(
     if abs(selected_observation["metric"] - best_validation) > 1e-4:
         raise RuntimeError("Best checkpoint validation recheck disagrees with model selection")
     torch.cuda.synchronize(device)
+    if first_training_batch is None or first_step_integrity is None:
+        raise RuntimeError("training completed without a validated first optimizer step")
+    elapsed_seconds = time.perf_counter() - started
+    measured_epoch_seconds = sum(float(row["epoch_seconds"]) for row in history)
+    total_parameters = sum(p.numel() for p in model.parameters())
+    estimator_parameters = sum(
+        parameter.numel()
+        for name, parameter in model.named_parameters()
+        if is_gate_parameter(name)
+    )
     return {
         "schema_version": 1,
         "status": "passed",
@@ -596,6 +682,7 @@ def train_model(
         "cache_sha256": protocol["data_sha256"],
         "protocol": protocol,
         "initial_state_sha256": initial_hash,
+        "shared_backbone_initial_state_sha256": shared_initial_hash,
         "best_epoch": best_epoch,
         "epochs_run": len(history),
         "optimizer_steps": optimizer_steps,
@@ -609,16 +696,50 @@ def train_model(
         "checkpoint_sha256": sha256_file(checkpoint),
         "history": str((output / "history.json").resolve()),
         "history_sha256": sha256_file(output / "history.json"),
-        "elapsed_seconds": time.perf_counter() - started,
+        "elapsed_seconds": elapsed_seconds,
         "peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(device),
         "peak_cuda_reserved_bytes": torch.cuda.max_memory_reserved(device),
-        "total_parameters": sum(p.numel() for p in model.parameters()),
+        "total_parameters": total_parameters,
+        "estimator_parameters": estimator_parameters,
+        "non_estimator_parameters": total_parameters - estimator_parameters,
         "trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
         "frozen_parameters": sum(p.numel() for p in model.parameters() if not p.requires_grad),
         "evaluation_split": "validation",
         "test_evaluated": False,
         "versions": _versions(),
         "gpu": torch.cuda.get_device_name(device),
+        "optimization_observability": {
+            "epochs_requested": args.epochs,
+            "epochs_completed": len(history),
+            "early_stopping_patience": args.patience,
+            "planned_maximum_optimizer_steps": batching[
+                "planned_maximum_optimizer_steps"
+            ],
+            "actual_optimizer_steps": optimizer_steps,
+            "training_label_decisions_processed": training_label_updates,
+            "gradient_accumulation_steps": 1,
+        },
+        "data_observability": {
+            **data_observation,
+            "input_tensor_shape_contract": {
+                **data_observation["input_tensor_shape_contract"],
+                "first_actual_training_batch": first_training_batch,
+            },
+        },
+        "batch_observability": batching,
+        "pre_run_observability": pre_run,
+        "first_optimizer_step_integrity": first_step_integrity,
+        "throughput": {
+            "measured_epoch_seconds": measured_epoch_seconds,
+            "optimizer_steps_per_second": optimizer_steps / measured_epoch_seconds,
+            "training_label_decisions_per_second": (
+                training_label_updates / measured_epoch_seconds
+            ),
+            "scope": (
+                "CUDA-synchronized epoch timing includes training, validation observations, "
+                "and diagnostic summaries but excludes subsequent history/checkpoint writes"
+            ),
+        },
         "diagnostics": {
             "initial_validation": initial_observation,
             "best_validation": selected_observation,
@@ -630,6 +751,67 @@ def train_model(
         "reproducibility": "Same seeds/initialization; GPU scatter may remain nondeterministic.",
         "timing_policy": "includes training, validation observations and checkpoint/history IO",
     }
+
+
+def train_model(
+    payload: dict[str, Any],
+    protocol: dict[str, Any],
+    args: argparse.Namespace,
+    device: torch.device,
+    output: Path,
+    *,
+    definition: TrainingDefinition | None = None,
+) -> dict[str, Any]:
+    """Run the shared V1/V2 path with exception-safe periodic resource sampling."""
+
+    _require_cuda(device)
+    monitor = RuntimeResourceMonitor(device)
+    resource_start = monitor.start()
+    try:
+        result = _train_model_impl(
+            payload,
+            protocol,
+            args,
+            device,
+            output,
+            definition=definition,
+            resource_start=resource_start,
+        )
+    except BaseException as primary_error:
+        finish_monitor_after_failure(
+            monitor,
+            output=output,
+            device=device,
+            primary_error=primary_error,
+        )
+        raise
+    resources = monitor.finish(
+        peak_allocated_bytes=int(result["peak_cuda_allocated_bytes"]),
+        peak_reserved_bytes=int(result["peak_cuda_reserved_bytes"]),
+    )
+    result["resource_observability"] = resources
+    result["hardware_execution"] = {
+        "gpu_sm_utilization": resources["interval_series"][
+            "gpu_sm_utilization_percent"
+        ],
+        "gpu_memory_controller_utilization": resources["interval_series"][
+            "gpu_memory_controller_utilization_percent"
+        ],
+        "cpu_average": resources["summary"][
+            "average_cpu_percent_of_allocated_capacity"
+        ],
+        "ram_series": {
+            key: value
+            for key, value in resources["interval_series"].items()
+            if key
+            in {
+                "process_resident_bytes",
+                "process_peak_resident_bytes",
+                "system_available_bytes",
+            }
+        },
+    }
+    return result
 
 
 def build_parser(*, definition: TrainingDefinition | None = None) -> argparse.ArgumentParser:
@@ -647,13 +829,29 @@ def build_parser(*, definition: TrainingDefinition | None = None) -> argparse.Ar
     parser.add_argument("--layers", type=int, default=COMMON["layers"])
     parser.add_argument("--dropout", type=float, default=COMMON["dropout"])
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Default: 4 for PPI graph minibatches, 0 for transductive full graphs",
+    )
     return parser
+
+
+def resolve_worker_arguments(args: argparse.Namespace) -> None:
+    """Resolve workers for the PPI graph loader; full graphs have no loader."""
+
+    if args.workers is None:
+        args.workers = 4 if args.dataset == "ppi" else 0
+        args.worker_configuration_source = "dataset_default"
+    elif not hasattr(args, "worker_configuration_source"):
+        args.worker_configuration_source = "explicit_cli"
 
 
 def main(argv: list[str] | None = None, *, definition: TrainingDefinition | None = None) -> int:
     experiment = _training_definition(definition)
     args = build_parser(definition=experiment).parse_args(argv)
+    resolve_worker_arguments(args)
     if min(args.epochs, args.patience, args.batch_size, args.hidden_channels, args.layers) < 1:
         raise ValueError(
             "epochs, patience, batch size, hidden channels and layers must be positive"
@@ -662,6 +860,8 @@ def main(argv: list[str] | None = None, *, definition: TrainingDefinition | None
         raise ValueError("dropout must be in [0, 1)")
     if min(args.workers, args.model_seed) < 0:
         raise ValueError("workers and model seed must be nonnegative")
+    if args.dataset != "ppi" and args.workers != 0:
+        raise ValueError("transductive full-graph datasets use no DataLoader and require workers=0")
     device = torch.device(args.device)
     _require_cuda(device)
     output = args.output_dir.expanduser().resolve()
@@ -692,7 +892,13 @@ def main(argv: list[str] | None = None, *, definition: TrainingDefinition | None
         record.update(result)
     except BaseException as exc:
         record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
-        atomic_write_json(output / "metrics.json", record)
+        try:
+            atomic_write_json(output / "metrics.json", record)
+        except BaseException as reporting_error:
+            exc.add_note(
+                "failed metrics could not be written without replacing this error: "
+                f"{type(reporting_error).__name__}: {reporting_error}"
+            )
         raise
     atomic_write_json(output / "metrics.json", record)
     print(f"passed: {output}", flush=True)

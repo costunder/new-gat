@@ -24,7 +24,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 ROOT = Path(__file__).resolve().parents[1]
 for directory in (ROOT, ROOT / "src"):
@@ -36,6 +36,16 @@ from scripts.check_dependencies import (  # noqa: E402
     DependencyCheckError,
     check_dependencies,
     error_message,
+)
+from scripts.process_safety import (  # noqa: E402
+    close_owned_child_stdout,
+    run_failure_reporter,
+    terminate_owned_child,
+    terminate_owned_child_after_error,
+)
+from scripts.telemetry_validation import (  # noqa: E402
+    validate_resource_observability,
+    validate_throughput_observability,
 )
 
 SUITES = ("csl", "zinc")
@@ -61,7 +71,7 @@ HARDWARE_PROFILES = ("portable", "a6000-48gb")
 HARDWARE_PROFILE_DEFAULTS: dict[str, dict[str, int | bool | None]] = {
     "portable": {
         "batch_size": 16,
-        "workers": 0,
+        "workers": 4,
         "amp": None,
         "job_concurrency": 1,
     },
@@ -78,7 +88,7 @@ A6000_MIN_COMPUTE_CAPABILITY = (8, 0)
 DEFAULT_MODEL_SEEDS = (0,)
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
 _ACTIVE_PROCESS_LOCK = threading.Lock()
-_ACTIVE_PROCESSES: set[subprocess.Popen[str]] = set()
+_ACTIVE_PROCESSES: dict[subprocess.Popen[str], tuple[tuple[str, ...], Path]] = {}
 
 
 def _csv_subset(value: str, *, choices: tuple[str, ...], option: str) -> tuple[str, ...]:
@@ -136,7 +146,10 @@ def parser() -> argparse.ArgumentParser:
         "--hardware-profile",
         choices=HARDWARE_PROFILES,
         default="portable",
-        help="portable defaults or an RTX A6000-class 48 GB throughput contract",
+        help=(
+            "preregistered portable or RTX A6000-class 48 GB resource contract; neither is a "
+            "measured throughput optimum"
+        ),
     )
     result.add_argument(
         "--batch-size",
@@ -289,15 +302,19 @@ def _source_snapshot() -> dict[str, Any]:
         ROOT / "scripts/check_dependencies.py",
         ROOT / "scripts/gpu_profiles.py",
         ROOT / "scripts/gpu_preflight.py",
+        ROOT / "scripts/process_safety.py",
+        ROOT / "scripts/telemetry_validation.py",
         ROOT / "scripts/verify_gpu_lock.py",
         ROOT / "src/chartgat/algebra.py",
         ROOT / "src/chartgat/__init__.py",
         ROOT / "src/chartgat/cache.py",
         ROOT / "src/chartgat/graphs.py",
+        ROOT / "src/chartgat/observability.py",
         ROOT / "src/chartgat/seeds.py",
     ]
     hashes = {path.relative_to(ROOT).as_posix(): _sha256(path) for path in sorted(set(files))}
     revision = "unknown"
+    revision_error = None
     try:
         revision = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -305,10 +322,16 @@ def _source_snapshot() -> dict[str, Any]:
             capture_output=True,
             check=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         ).stdout.strip()
-    except (OSError, subprocess.CalledProcessError):
-        pass
-    return {"git_revision": revision, "sha256": hashes}
+    except (OSError, subprocess.CalledProcessError) as error:
+        revision_error = f"{type(error).__name__}: {error}"
+    return {
+        "git_revision": revision,
+        "git_revision_unavailable_reason": revision_error,
+        "sha256": hashes,
+    }
 
 
 def _check_sources(manifest: dict[str, Any]) -> None:
@@ -368,22 +391,38 @@ def _validate_hardware_preflight(payload: dict[str, Any], hardware_profile: str)
         raise RuntimeError("a6000-48gb requires CUDA compute capability 8.0 or newer")
 
 
-def _stop_process(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
-        return
-    process.terminate()
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=10)
+def _stop_process(
+    process: subprocess.Popen[str],
+    command: tuple[str, ...],
+    log_target: Path | TextIO,
+    *,
+    reason: str,
+    original_error: BaseException | None = None,
+) -> None:
+    if original_error is None:
+        terminate_owned_child(process, command, reason=reason, log_target=log_target)
+    else:
+        terminate_owned_child_after_error(
+            process,
+            command,
+            original_error=original_error,
+            log_target=log_target,
+        )
 
 
-def _stop_active_processes() -> None:
+def _stop_active_processes(
+    *, reason: str, original_error: BaseException | None = None
+) -> None:
     with _ACTIVE_PROCESS_LOCK:
-        active = tuple(_ACTIVE_PROCESSES)
-    for process in active:
-        _stop_process(process)
+        active = tuple(_ACTIVE_PROCESSES.items())
+    for process, (command, log_path) in active:
+        _stop_process(
+            process,
+            command,
+            log_path,
+            reason=reason,
+            original_error=original_error,
+        )
 
 
 def _run_logged(command: list[str], log_path: Path, environment: dict[str, str]) -> int:
@@ -401,7 +440,8 @@ def _run_logged(command: list[str], log_path: Path, environment: dict[str, str])
             bufsize=1,
         )
         with _ACTIVE_PROCESS_LOCK:
-            _ACTIVE_PROCESSES.add(process)
+            _ACTIVE_PROCESSES[process] = (tuple(command), log_path)
+        primary_error: BaseException | None = None
         try:
             assert process.stdout is not None
             for line in process.stdout:
@@ -409,14 +449,20 @@ def _run_logged(command: list[str], log_path: Path, environment: dict[str, str])
                 log.write(line)
                 log.flush()
             return process.wait()
-        except BaseException:
-            _stop_process(process)
+        except BaseException as error:
+            primary_error = error
+            _stop_process(
+                process,
+                tuple(command),
+                log,
+                reason=f"{type(error).__name__}: {error}",
+                original_error=error,
+            )
             raise
         finally:
             with _ACTIVE_PROCESS_LOCK:
-                _ACTIVE_PROCESSES.discard(process)
-            if process.stdout is not None:
-                process.stdout.close()
+                _ACTIVE_PROCESSES.pop(process, None)
+            close_owned_child_stdout(process, original_error=primary_error)
 
 
 def _run_wave(
@@ -451,8 +497,10 @@ def _run_wave(
         if any(result is None for result in results):
             raise RuntimeError("concurrent job wave returned an incomplete result set")
         return [result for result in results if result is not None]
-    except BaseException:
-        _stop_active_processes()
+    except BaseException as error:
+        _stop_active_processes(
+            reason=f"{type(error).__name__}: {error}", original_error=error
+        )
         for future in futures:
             future.cancel()
         raise
@@ -491,7 +539,12 @@ def _execute_job_matrix(
             for job in wave:
                 if job.get("status") == "running":
                     job.update(status="failed", error=detail)
-            _write_state(run_dir, manifest)
+            _write_failure_state(
+                run_dir,
+                manifest,
+                error,
+                action="failed job-wave state persistence",
+            )
             raise
         errors: list[str] = []
         interruption: BaseException | None = None
@@ -516,11 +569,22 @@ def _execute_job_matrix(
             else:
                 job["status"] = "passed"
                 job.pop("error", None)
-        _write_state(run_dir, manifest)
+        wave_error: BaseException | None = interruption
+        if wave_error is None and errors:
+            wave_error = RuntimeError("; ".join(errors))
+        if wave_error is None:
+            _write_state(run_dir, manifest)
+        else:
+            _write_failure_state(
+                run_dir,
+                manifest,
+                wave_error,
+                action="failed job-wave result persistence",
+            )
         if interruption is not None:
             raise interruption
-        if errors:
-            raise RuntimeError("; ".join(errors))
+        if wave_error is not None:
+            raise wave_error
 
 
 def _read_mapping(path: Path, label: str) -> dict[str, Any]:
@@ -562,6 +626,22 @@ def _validated_runtime(
     expected_workers = int(command[command.index("--workers") + 1])
     if runtime.get("batch_size") != expected_batch or runtime.get("workers") != expected_workers:
         raise RuntimeError(f"{label} runtime does not record the requested input pipeline")
+    expected_prefetch_factor = 2 if expected_workers > 0 else None
+    if (
+        runtime.get("persistent_workers") is not False
+        or runtime.get("prefetch_factor") != expected_prefetch_factor
+    ):
+        raise RuntimeError(
+            f"{label} runtime does not record the exact non-persistent/prefetch loader policy"
+        )
+    loader = runtime.get("data_loader")
+    if (
+        not isinstance(loader, dict)
+        or loader.get("num_workers") != expected_workers
+        or loader.get("persistent_workers") is not False
+        or loader.get("prefetch_factor") != expected_prefetch_factor
+    ):
+        raise RuntimeError(f"{label} detailed DataLoader telemetry is missing or inconsistent")
     for field in ("elapsed_seconds", "peak_gpu_allocated_bytes", "peak_gpu_reserved_bytes"):
         value = runtime.get(field)
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -578,7 +658,14 @@ def _validated_runtime(
         raise RuntimeError(f"{label} did not apply the requested CUDA AMP setting")
     if "--no-amp" in command and runtime["amp_requested"] is not False:
         raise RuntimeError(f"{label} did not apply the requested no-AMP setting")
-    return dict(runtime)
+    checked = dict(runtime)
+    checked["resource_observability"] = validate_resource_observability(
+        runtime.get("resource_observability"), f"{label}.resource_observability"
+    )
+    checked["throughput"] = validate_throughput_observability(
+        runtime.get("throughput"), f"{label}.throughput"
+    )
+    return checked
 
 
 def _validate_child(job: dict[str, Any]) -> dict[str, Any]:
@@ -1073,6 +1160,22 @@ def _write_state(run_dir: Path, manifest: dict[str, Any]) -> None:
     )
     atomic_write_json(manifest_path, manifest)
     atomic_write_json(summary_path, _aggregate_summary(manifest))
+
+
+def _write_failure_state(
+    run_dir: Path,
+    manifest: dict[str, Any],
+    original_error: BaseException,
+    *,
+    action: str,
+) -> None:
+    note = run_failure_reporter(
+        lambda: _write_state(run_dir, manifest),
+        original_error=original_error,
+        action=action,
+    )
+    if note is not None:
+        manifest.setdefault("failure_persistence_errors", []).append(note)
 
 
 def _run_config(args: argparse.Namespace, data_root: Path) -> dict[str, Any]:
@@ -1584,11 +1687,27 @@ def main(argv: list[str] | None = None) -> int:
                     "parallel_safety": "candidate and selected-test children have disjoint "
                     "output directories and logs; only the coordinator atomically writes the "
                     "shared manifest",
-                    "scientific_scope": "batch size is part of the immutable optimization "
-                    "protocol: a6000-48gb batch 64 exposes four times as many graph samples per "
-                    "800 optimizer updates as portable batch 16. Compare fixed_bfs against "
-                    "multi_chart within one hardware profile; do not attribute differences "
-                    "between hardware profiles to GPU speed alone",
+                    "scientific_scope": (
+                        "batch size is part of the immutable optimization protocol: a6000-48gb "
+                        "batch 64 exposes four times as many graph samples per 800 optimizer "
+                        "updates as portable batch 16. Compare fixed_bfs against multi_chart "
+                        "within one hardware profile; do not attribute differences between "
+                        "hardware profiles to GPU speed alone"
+                    ),
+                    "batch_selection": {
+                        "default_source": (
+                            "preregistered_hardware_profile_not_measured_optimum"
+                            if args.batch_size
+                            == HARDWARE_PROFILE_DEFAULTS[args.hardware_profile]["batch_size"]
+                            else "explicit_cli_override_not_measured_optimum"
+                        ),
+                        "automatic_downscale": False,
+                        "measured_throughput_optimum_claimed": False,
+                        "scope": (
+                            "the resolved batch applies verbatim to every requested suite/profile "
+                            "and is immutable run identity"
+                        ),
+                    },
                 },
             },
         }
@@ -1697,8 +1816,17 @@ def main(argv: list[str] | None = None) -> int:
             error=f"{type(error).__name__}: {error}",
             finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
         )
-        _stop_active_processes()
-        _write_state(run_dir, manifest)
+        _stop_active_processes(
+            reason=f"{type(error).__name__}: {error}", original_error=error
+        )
+        if getattr(error, "__notes__", None):
+            manifest["cleanup_notes"] = list(error.__notes__)
+        _write_failure_state(
+            run_dir,
+            manifest,
+            error,
+            action="failed-run state persistence",
+        )
         print(
             f"Failed: {manifest['error']}\nSaved partial results: {run_dir}",
             file=sys.stderr,

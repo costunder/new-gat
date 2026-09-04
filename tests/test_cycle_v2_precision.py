@@ -46,10 +46,14 @@ def test_resume_identity_binds_effective_precision(monkeypatch) -> None:
 
 def test_training_retains_strict_nonfinite_detection() -> None:
     source = inspect.getsource(benchmark._train_model)
+    finite_guard_source = inspect.getsource(benchmark._require_finite_loss)
     test_source = inspect.getsource(benchmark._evaluate_test_checkpoint)
 
     assert "dtype=torch.float16" not in source
     assert "error_if_nonfinite=True" in source
-    assert "if not torch.isfinite(loss):" in source
+    assert "_require_finite_loss(loss" in source
+    assert "predicate = torch.isfinite(loss)" in finite_guard_source
+    assert "_assert_async" in finite_guard_source
+    assert "raise FloatingPointError(label)" in finite_guard_source
     assert '"precision": _precision_identity(precision)' in source
     assert "Selected checkpoint precision policy mismatch" in test_source

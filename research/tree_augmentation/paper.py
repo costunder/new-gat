@@ -24,6 +24,7 @@ import numpy as np
 import torch
 import yaml
 
+from chartgat.observability import RuntimeResourceMonitor, observed
 from chartgat.seeds import SeedAxes, resolve_seed_axes
 
 from .paper_data import (
@@ -36,6 +37,7 @@ from .paper_model import (
     FitResult,
     VariableBetaCycleEncoder,
     build_chart_views,
+    data_loader_configuration,
     evaluate_downstream_model,
     run_fixed_vs_multichart,
 )
@@ -228,6 +230,7 @@ def _runtime_metadata(
     elapsed_seconds: float,
 ) -> dict[str, Any]:
     cuda = device.type == "cuda"
+    loader_configuration = data_loader_configuration(workers)
     metadata: dict[str, Any] = {
         "python": platform.python_version(),
         "platform": platform.platform(),
@@ -241,6 +244,15 @@ def _runtime_metadata(
         "non_blocking": bool(non_blocking and cuda),
         "batch_size": batch_size,
         "workers": workers,
+        "persistent_workers": loader_configuration["persistent_workers"],
+        "prefetch_factor": loader_configuration["prefetch_factor"],
+        "data_loader": loader_configuration
+        | {
+            "persistent_workers_reason": (
+                "each deterministic loader instance is consumed for one complete "
+                "pass and then discarded; workers remain alive for that pass only"
+            ),
+        },
         "elapsed_seconds": elapsed_seconds,
         "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
         "peak_gpu_allocated_bytes": 0,
@@ -656,17 +668,175 @@ def _headline_comparison(metrics: dict[str, Any], *, suite: str) -> dict[str, An
 def _view_stats(views: list[Any]) -> dict[str, Any]:
     sampler_counts: dict[str, int] = {}
     chart_status_counts: dict[str, int] = {}
+    graph_shapes: dict[str, tuple[int, int, int]] = {}
     for view in views:
         method = str(view.chart_name).split(":", 1)[0]
         sampler_counts[method] = sampler_counts.get(method, 0) + 1
         status = str(view.chart_status)
         chart_status_counts[status] = chart_status_counts.get(status, 0) + 1
+        shape = (int(view.num_nodes), len(view.edges), int(view.basis.shape[1]))
+        previous = graph_shapes.setdefault(str(view.graph_id), shape)
+        if previous != shape:
+            raise ValueError(f"inconsistent graph shape metadata for {view.graph_id}")
+
+    def distribution(index: int) -> dict[str, int | float]:
+        values = np.asarray([shape[index] for shape in graph_shapes.values()], dtype=np.float64)
+        if values.size == 0:
+            raise ValueError("view statistics require at least one physical graph")
+        return {
+            "minimum": int(values.min()),
+            "mean": float(values.mean()),
+            "median": float(np.median(values)),
+            "maximum": int(values.max()),
+        }
+
     return {
         "views": len(views),
-        "graphs": len({view.graph_id for view in views}),
+        "graphs": len(graph_shapes),
         "unique_graph_tree_pairs": len({(view.graph_id, view.tree_key) for view in views}),
         "sampler_counts": sampler_counts,
         "chart_status_counts": chart_status_counts,
+        "nodes_per_graph": distribution(0),
+        "edges_per_graph": distribution(1),
+        "cycle_rank_per_graph": distribution(2),
+        "collated_input_shape_contract": {
+            "basis": ["physical_batch", "max_edges_in_batch", "max_cycle_rank_in_batch"],
+            "edge_index": ["physical_batch", "max_edges_in_batch", 2],
+            "node_categories": ["physical_batch", "max_nodes_in_batch"],
+            "padding_is_excluded_by_masks": True,
+        },
+    }
+
+
+def _data_observability(
+    dataset: PreparedDataset,
+    split_counts: dict[str, int],
+    model_split_usage: dict[str, Any],
+) -> dict[str, Any]:
+    full_count = len(dataset.records)
+    used_splits = set(model_split_usage["fit_splits"]) | set(
+        model_split_usage["evaluation_splits"]
+    )
+    used_count = sum(split_counts.get(split, 0) for split in used_splits)
+    node_counts = [int(record.num_nodes) for record in dataset.records]
+    edge_counts = [len(record.edges) for record in dataset.records]
+
+    def distribution(values: list[int], unit: str) -> dict[str, Any]:
+        if not values:
+            reason = "the verified dataset contains no graph records"
+            return {
+                name: observed(None, reason=reason, unit=unit)
+                for name in ("minimum", "mean", "median", "maximum")
+            }
+        return {
+            "minimum": observed(min(values), unit=unit),
+            "mean": observed(sum(values) / len(values), unit=unit),
+            "median": observed(float(np.median(values)), unit=unit),
+            "maximum": observed(max(values), unit=unit),
+        }
+
+    return {
+        "full_dataset_graphs": full_count,
+        "cache_validated_graphs": full_count,
+        "model_consumed_graphs": used_count,
+        "model_consumed_fraction": used_count / full_count if full_count else None,
+        "model_consumed_splits": sorted(used_splits),
+        "fit_graphs": sum(
+            split_counts.get(split, 0) for split in model_split_usage["fit_splits"]
+        ),
+        "evaluation_graphs": sum(
+            split_counts.get(split, 0)
+            for split in model_split_usage["evaluation_splits"]
+        ),
+        "subset_or_fast_mode": False,
+        "sampling_ratio": {
+            "value": 1.0,
+            "reason": None,
+            "unit": "fraction_of_graphs_in_consumed_splits",
+            "scope": "physical graphs; chart draws are reported separately",
+        },
+        "graph_statistics": {
+            "nodes_per_graph": distribution(node_counts, "nodes"),
+            "edges_per_graph": distribution(edge_counts, "edges"),
+        },
+        "input_shape_contract": {
+            "graph_axis": "variable physical batch",
+            "node_axis": "padded to maximum nodes in each physical batch and masked",
+            "edge_axis": "padded to maximum edges in each physical batch and masked",
+            "target_width": len(dataset.target_names),
+        },
+        "time_window": observed(
+            None, reason="not applicable to static graph records", unit="not_applicable"
+        ),
+        "input_resolution": observed(
+            None, reason="not applicable to graph topology inputs", unit="not_applicable"
+        ),
+    }
+
+
+def _batch_observability(batch_size: int, *, workers: int) -> dict[str, Any]:
+    loader_configuration = data_loader_configuration(workers)
+    return {
+        "physical_batch_size": batch_size,
+        "gradient_accumulation_steps": 1,
+        "data_parallel_workers": 1,
+        "effective_batch_size": batch_size,
+        "effective_batch_formula": (
+            "physical_batch_size * gradient_accumulation_steps * data_parallel_workers"
+        ),
+        "data_loader": loader_configuration
+        | {
+            "persistent_workers_reason": (
+                "each seeded training/evaluation DataLoader is consumed once in full; "
+                "persistence does not span separately constructed loader instances"
+            ),
+        },
+        "batch_candidate_throughput_sweep": observed(
+            None,
+            reason=(
+                "not run automatically because changing the preregistered physical batch "
+                "would alter the optimization recipe; profile candidates separately on the "
+                "target GPU before a final run"
+            ),
+            unit="graphs_per_second",
+        ),
+    }
+
+
+def _model_observability(settings: dict[str, Any], output_dim: int) -> dict[str, Any]:
+    with torch.random.fork_rng(devices=[]):
+        model = VariableBetaCycleEncoder(
+            hidden_dim=int(settings["hidden_dim"]),
+            output_dim=output_dim,
+            message_layers=int(settings["message_layers"]),
+        )
+    return {
+        "name": type(model).__name__,
+        "hidden_dimension": int(settings["hidden_dim"]),
+        "message_passing_layers": int(settings["message_layers"]),
+        "channels": int(settings["hidden_dim"]),
+        "attention_heads": observed(
+            None, reason="the tree augmentation encoder has no attention heads"
+        ),
+        "output_dimension": output_dim,
+        "total_parameters_per_model": sum(
+            parameter.numel() for parameter in model.parameters()
+        ),
+        "trainable_parameters_per_model": sum(
+            parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+        ),
+        "models_trained": 2,
+    }
+
+
+def _optimization_observability(*, training_performed: bool, updates: int) -> dict[str, Any]:
+    per_model = updates if training_performed else 0
+    return {
+        "epoch_based": False,
+        "requested_optimizer_steps_per_model": per_model,
+        "actual_optimizer_steps_per_model": per_model,
+        "trained_models": 2 if training_performed else 0,
+        "total_actual_optimizer_steps": per_model * (2 if training_performed else 0),
     }
 
 
@@ -686,7 +856,7 @@ def run_suite(
     batch_size_override: int | None,
     pin_memory_override: bool | None,
     non_blocking_override: bool | None,
-    workers: int = 0,
+    workers: int = 4,
     allow_download: bool = False,
     hidden_dim_override: int | None = None,
     message_layers_override: int | None = None,
@@ -745,6 +915,7 @@ def run_suite(
                 Path(__file__).with_name("paper_model.py").resolve(),
                 Path(__file__).with_name("augmentation.py").resolve(),
                 Path(__file__).with_name("datasets.yaml").resolve(),
+                Path(__file__).resolve().parents[2] / "src/chartgat/observability.py",
             )
         },
         "dependencies": {
@@ -758,6 +929,8 @@ def run_suite(
         ),
     }
     _write_json(manifest_path, manifest)
+    resource_monitor: RuntimeResourceMonitor | None = None
+    resource_finished = False
     try:
         if evaluation_scope not in {"test", "validation", "selected_test"}:
             raise ValueError("evaluation_scope must be test, validation, or selected_test")
@@ -839,6 +1012,46 @@ def run_suite(
             raise ValueError("batch_size must be positive")
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
+        split_counts: dict[str, int] = {}
+        for record in dataset.records:
+            split_counts[record.split] = split_counts.get(record.split, 0) + 1
+        resource_monitor = RuntimeResourceMonitor(device)
+        resource_start = resource_monitor.start()
+        print(
+            json.dumps(
+                {
+                    "kind": "pre_run_observability",
+                    "track": "tree_augmentation",
+                    "suite": suite,
+                    "device": {
+                        "requested": requested_device,
+                        "resolved": str(device),
+                        "visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                    },
+                    "data": _data_observability(
+                        dataset, split_counts, model_split_usage
+                    ),
+                    "batch": _batch_observability(batch_size, workers=workers),
+                    "model": (
+                        {
+                            "name": "validation-selected checkpoint models",
+                            "parameters": observed(
+                                None,
+                                reason=(
+                                    "actual checkpoint architecture and parameter counts are "
+                                    "validated and printed immediately before evaluation"
+                                ),
+                            ),
+                        }
+                        if evaluation_scope == "selected_test"
+                        else _model_observability(settings, _output_dim(dataset))
+                    ),
+                    "resources_at_start": resource_start,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         if evaluation_scope == "selected_test":
             assert selected_checkpoints is not None
             evaluation = _evaluation_views(
@@ -872,6 +1085,30 @@ def run_suite(
                     raise ValueError(f"selected {name} checkpoint evaluation chart count mismatch")
                 selected_models[name] = fitted
                 selected_settings[name] = checkpoint_settings
+            parameter_counts = {
+                name: {
+                    "total": sum(parameter.numel() for parameter in fitted.model.parameters()),
+                    "trainable": sum(
+                        parameter.numel()
+                        for parameter in fitted.model.parameters()
+                        if parameter.requires_grad
+                    ),
+                }
+                for name, fitted in selected_models.items()
+            }
+            print(
+                json.dumps(
+                    {
+                        "kind": "pre_evaluation_model_observability",
+                        "track": "tree_augmentation",
+                        "suite": suite,
+                        "checkpoint_settings": selected_settings,
+                        "parameter_counts": parameter_counts,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
             started = time.perf_counter()
             metrics = _evaluate_fitted_models(
                 selected_models,
@@ -888,21 +1125,23 @@ def run_suite(
             if device.type == "cuda":
                 torch.cuda.synchronize(device)
             elapsed = time.perf_counter() - started
+            resource_observability = resource_monitor.finish(
+                peak_allocated_bytes=(
+                    int(torch.cuda.max_memory_allocated(device))
+                    if device.type == "cuda"
+                    else None
+                ),
+                peak_reserved_bytes=(
+                    int(torch.cuda.max_memory_reserved(device))
+                    if device.type == "cuda"
+                    else None
+                ),
+            )
+            resource_finished = True
             if {
                 name: _sha256(path) for name, path in checkpoint_paths.items()
             } != checkpoint_hashes:
                 raise RuntimeError("a selected checkpoint changed during test evaluation")
-            parameter_counts = {
-                name: {
-                    "total": sum(parameter.numel() for parameter in fitted.model.parameters()),
-                    "trainable": sum(
-                        parameter.numel()
-                        for parameter in fitted.model.parameters()
-                        if parameter.requires_grad
-                    ),
-                }
-                for name, fitted in selected_models.items()
-            }
             for name, counts in parameter_counts.items():
                 metrics[name]["parameters"] = counts
             runtime = _runtime_metadata(
@@ -914,9 +1153,25 @@ def run_suite(
                 workers=workers,
                 elapsed_seconds=elapsed,
             )
-            split_counts: dict[str, int] = {}
-            for record in dataset.records:
-                split_counts[record.split] = split_counts.get(record.split, 0) + 1
+            runtime["resource_observability"] = resource_observability
+            evaluated_view_model_pairs = 2 * sum(
+                len(views) for views in evaluation.values()
+            )
+            runtime["throughput"] = {
+                "scope": "selected-checkpoint evaluation including every declared quadrant",
+                "evaluated_view_model_pairs": evaluated_view_model_pairs,
+                "evaluated_view_model_pairs_per_second": observed(
+                    evaluated_view_model_pairs / elapsed,
+                    reason=None if elapsed > 0 else "observed evaluation duration was zero",
+                    unit="view_model_pairs_per_second",
+                )
+                if elapsed > 0
+                else observed(
+                    None,
+                    reason="observed evaluation duration was zero",
+                    unit="view_model_pairs_per_second",
+                ),
+            }
             summary = {
                 "track": "tree_augmentation_scaling_selected_test",
                 "suite": suite,
@@ -933,6 +1188,15 @@ def run_suite(
                 "view_counts": {
                     "evaluation": {name: _view_stats(views) for name, views in evaluation.items()}
                 },
+                "data_observability": _data_observability(
+                    dataset, split_counts, model_split_usage
+                ),
+                "batch_observability": _batch_observability(
+                    batch_size, workers=workers
+                ),
+                "optimization_observability": _optimization_observability(
+                    training_performed=False, updates=0
+                ),
                 "settings": {
                     "eval_charts_per_graph": int(settings["eval_charts_per_graph"]),
                     "batch_size": batch_size,
@@ -1013,6 +1277,19 @@ def run_suite(
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - started
+        resource_observability = resource_monitor.finish(
+            peak_allocated_bytes=(
+                int(torch.cuda.max_memory_allocated(device))
+                if device.type == "cuda"
+                else None
+            ),
+            peak_reserved_bytes=(
+                int(torch.cuda.max_memory_reserved(device))
+                if device.type == "cuda"
+                else None
+            ),
+        )
+        resource_finished = True
         runtime = _runtime_metadata(
             device=device,
             amp_requested=amp,
@@ -1022,6 +1299,36 @@ def run_suite(
             workers=workers,
             elapsed_seconds=elapsed,
         )
+        runtime["resource_observability"] = resource_observability
+        total_optimizer_updates = 2 * int(settings["optimizer_updates"])
+        sampled_training_views = total_optimizer_updates * batch_size
+        runtime["throughput"] = {
+            "scope": "two-model training plus every declared validation/test quadrant",
+            "optimizer_updates": total_optimizer_updates,
+            "sampled_training_view_equivalents": sampled_training_views,
+            "optimizer_updates_per_second": observed(
+                total_optimizer_updates / elapsed,
+                reason=None if elapsed > 0 else "observed run duration was zero",
+                unit="updates_per_second",
+            )
+            if elapsed > 0
+            else observed(
+                None,
+                reason="observed run duration was zero",
+                unit="updates_per_second",
+            ),
+            "sampled_training_view_equivalents_per_second": observed(
+                sampled_training_views / elapsed,
+                reason=None if elapsed > 0 else "observed run duration was zero",
+                unit="views_per_second",
+            )
+            if elapsed > 0
+            else observed(
+                None,
+                reason="observed run duration was zero",
+                unit="views_per_second",
+            ),
+        }
         model_paths = _save_models(
             output,
             models,
@@ -1039,9 +1346,6 @@ def run_suite(
             suite=suite,
             dataset_data_sha256=dataset.data_sha256,
         )
-        split_counts: dict[str, int] = {}
-        for record in dataset.records:
-            split_counts[record.split] = split_counts.get(record.split, 0) + 1
         summary = {
             "track": "tree_augmentation_only",
             "suite": suite,
@@ -1075,6 +1379,15 @@ def run_suite(
                 "multi_train": _view_stats(multi_train),
                 "evaluation": {name: _view_stats(views) for name, views in evaluation.items()},
             },
+            "data_observability": _data_observability(
+                dataset, split_counts, model_split_usage
+            ),
+            "batch_observability": _batch_observability(
+                batch_size, workers=workers
+            ),
+            "optimization_observability": _optimization_observability(
+                training_performed=True, updates=int(settings["optimizer_updates"])
+            ),
             "settings": settings
             | {
                 "batch_size": batch_size,
@@ -1117,12 +1430,36 @@ def run_suite(
         )
         _write_json(manifest_path, manifest)
         return summary
-    except Exception as error:
+    except (Exception, KeyboardInterrupt) as error:
+        if resource_monitor is not None and not resource_finished:
+            try:
+                manifest["resource_observability_on_failure"] = resource_monitor.finish(
+                    peak_allocated_bytes=(
+                        int(torch.cuda.max_memory_allocated(device))
+                        if device.type == "cuda"
+                        else None
+                    ),
+                    peak_reserved_bytes=(
+                        int(torch.cuda.max_memory_reserved(device))
+                        if device.type == "cuda"
+                        else None
+                    ),
+                )
+            except (Exception, KeyboardInterrupt) as monitor_error:
+                manifest["resource_observability_failure"] = (
+                    f"{type(monitor_error).__name__}: {monitor_error}"
+                )
         manifest["status"] = "failed"
         manifest["error_type"] = type(error).__name__
         manifest["error"] = str(error)
         manifest["finished_at_utc"] = datetime.now(UTC).isoformat()
-        _write_json(manifest_path, manifest)
+        try:
+            _write_json(manifest_path, manifest)
+        except (Exception, KeyboardInterrupt) as recording_error:
+            error.add_note(
+                "Tree failure-manifest recording also failed without replacing the "
+                f"original error: {type(recording_error).__name__}: {recording_error}"
+            )
         raise
 
 
@@ -1222,8 +1559,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workers",
         type=int,
-        default=0,
-        help="PyTorch DataLoader worker processes (0 loads in the main process)",
+        default=4,
+        help=(
+            "PyTorch DataLoader worker processes (default: 4; each loader uses "
+            "prefetch_factor=2 and a single complete non-persistent pass)"
+        ),
     )
     parser.add_argument(
         "--allow-download",

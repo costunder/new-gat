@@ -17,6 +17,7 @@ from chartgat.algebra import fundamental_cycle_basis, incidence_matrix, validate
 from chartgat.cache import CacheCorruptError, CacheWrongRequestError
 from chartgat.seeds import SeedAxes
 from research.tree_augmentation import paper as tree_paper
+from research.tree_augmentation import paper_model
 from research.tree_augmentation.paper import main, run_suite
 from research.tree_augmentation.paper_data import (
     GraphRecord,
@@ -35,6 +36,7 @@ from research.tree_augmentation.paper_data import (
 from research.tree_augmentation.paper_model import (
     GraphChartView,
     VariableBetaCycleEncoder,
+    _validate_first_step_gradients,
     build_chart_views,
     collate_chart_views,
 )
@@ -122,7 +124,16 @@ def test_output_dim_comes_from_declared_target_metadata() -> None:
 def test_cache_integrity_and_model_split_usage_are_separate() -> None:
     dataset = SimpleNamespace(
         suite="csl",
-        records=tuple(SimpleNamespace(split=split) for split in ("train", "validation", "test")),
+        records=tuple(
+            SimpleNamespace(
+                split=split,
+                num_nodes=4,
+                edges=((0, 1), (1, 2), (2, 3)),
+                target=(0.0,),
+            )
+            for split in ("train", "validation", "test")
+        ),
+        target_names=("target",),
     )
     assert tree_paper._dataset_cache_integrity(dataset) == {
         "full_cache_loaded": True,
@@ -145,6 +156,107 @@ def test_cache_integrity_and_model_split_usage_are_separate() -> None:
     assert selected_test["evaluation_splits"] == ["test"]
     assert selected_test["test_evaluated"] is True
     assert selected_test["test_used_for_selection"] is False
+    data_observability = tree_paper._data_observability(
+        dataset,
+        {"train": 1, "validation": 1, "test": 1},
+        tree_paper._model_split_usage(
+            dataset, evaluation_scope="validation", prepare_only=False
+        ),
+    )
+    assert data_observability["full_dataset_graphs"] == 3
+    assert data_observability["model_consumed_graphs"] == 2
+    assert data_observability["model_consumed_fraction"] == pytest.approx(2 / 3)
+    assert data_observability["subset_or_fast_mode"] is False
+    assert data_observability["sampling_ratio"]["value"] == 1.0
+    assert data_observability["graph_statistics"]["nodes_per_graph"]["mean"]["value"] == 4
+    batch_observability = tree_paper._batch_observability(64, workers=4)
+    assert batch_observability["effective_batch_size"] == 64
+    assert batch_observability["data_loader"] == {
+        "num_workers": 4,
+        "persistent_workers": False,
+        "prefetch_factor": 2,
+        "persistent_workers_reason": (
+            "each seeded training/evaluation DataLoader is consumed once in full; "
+            "persistence does not span separately constructed loader instances"
+        ),
+    }
+    assert tree_paper._optimization_observability(
+        training_performed=True, updates=800
+    )["total_actual_optimizer_steps"] == 1600
+
+
+def test_tree_default_workers_and_loader_configuration_are_explicit() -> None:
+    args = tree_paper._parser().parse_args([])
+    assert args.workers == 4
+    assert tree_paper.run_suite.__kwdefaults__["workers"] == 4
+    assert paper_model.data_loader_configuration(4) == {
+        "num_workers": 4,
+        "persistent_workers": False,
+        "prefetch_factor": 2,
+    }
+    assert paper_model.data_loader_configuration(0) == {
+        "num_workers": 0,
+        "persistent_workers": False,
+        "prefetch_factor": None,
+    }
+    with pytest.raises(ValueError, match="non-negative"):
+        paper_model.data_loader_configuration(-1)
+
+
+def test_tree_runtime_records_exact_loader_parallelism() -> None:
+    runtime = tree_paper._runtime_metadata(
+        device=torch.device("cpu"),
+        amp_requested=False,
+        pin_memory=False,
+        non_blocking=False,
+        batch_size=16,
+        workers=4,
+        elapsed_seconds=1.0,
+    )
+    assert runtime["workers"] == 4
+    assert runtime["persistent_workers"] is False
+    assert runtime["prefetch_factor"] == 2
+    assert runtime["data_loader"]["num_workers"] == 4
+    assert "one complete pass" in runtime["data_loader"][
+        "persistent_workers_reason"
+    ]
+
+
+def test_keyboard_interrupt_preserves_original_when_failure_manifest_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writes = []
+
+    def write_then_fail(path, payload):
+        writes.append((path, payload["status"]))
+        if len(writes) == 2:
+            raise OSError("unit failure recorder")
+
+    def interrupt(*_args, **_kwargs):
+        raise KeyboardInterrupt("unit original interrupt")
+
+    monkeypatch.setattr(tree_paper, "_write_json", write_then_fail)
+    monkeypatch.setattr(tree_paper, "_prepare_dataset", interrupt)
+    with pytest.raises(KeyboardInterrupt, match="unit original interrupt") as caught:
+        run_suite(
+            "core",
+            data_root=tmp_path / "data",
+            output_dir=tmp_path / "result",
+            requested_device="cpu",
+            seed=0,
+            prepare_only=True,
+            amp_override=False,
+            batch_size_override=None,
+            pin_memory_override=False,
+            non_blocking_override=False,
+            workers=0,
+        )
+    assert writes == [
+        (tmp_path / "result" / "manifest.json", "preparing"),
+        (tmp_path / "result" / "manifest.json", "failed"),
+    ]
+    notes = getattr(caught.value, "__notes__", [])
+    assert any("without replacing the original error" in note for note in notes)
 
 
 def test_variable_beta_batch_masks_tree_cycle_and_multicycle() -> None:
@@ -176,6 +288,63 @@ def test_variable_beta_batch_masks_tree_cycle_and_multicycle() -> None:
     output = VariableBetaCycleEncoder(hidden_dim=8, output_dim=2)(batch)
     assert output.shape == (3, 2)
     assert torch.isfinite(output).all()
+    stats = tree_paper._view_stats([_view(record) for record in records])
+    assert stats["nodes_per_graph"] == {
+        "minimum": 4,
+        "mean": pytest.approx(13 / 3),
+        "median": 4.0,
+        "maximum": 5,
+    }
+    assert stats["edges_per_graph"]["maximum"] == 6
+    assert stats["cycle_rank_per_graph"] == {
+        "minimum": 0,
+        "mean": 1.0,
+        "median": 1.0,
+        "maximum": 2,
+    }
+    assert stats["collated_input_shape_contract"]["padding_is_excluded_by_masks"] is True
+
+
+def test_tree_model_connects_every_trainable_parameter_to_task_loss_and_optimizer() -> None:
+    records = (
+        GraphRecord(
+            "cycle-a",
+            "fixture",
+            "train",
+            4,
+            ((0, 1), (0, 3), (1, 2), (2, 3)),
+            (1.0, -0.5),
+        ),
+        GraphRecord(
+            "cycle-b",
+            "fixture",
+            "train",
+            5,
+            ((0, 1), (0, 4), (1, 2), (1, 3), (2, 3), (3, 4)),
+            (-0.25, 0.75),
+        ),
+    )
+    batch = collate_chart_views([_view(record) for record in records])
+    model = VariableBetaCycleEncoder(hidden_dim=8, output_dim=2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    optimizer_parameter_ids = {
+        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
+    }
+    trainable = {
+        name: parameter for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    assert optimizer_parameter_ids == {id(parameter) for parameter in trainable.values()}
+
+    before = {name: parameter.detach().clone() for name, parameter in trainable.items()}
+    loss = torch.nn.functional.mse_loss(model(batch), batch.targets)
+    loss.backward()
+    _validate_first_step_gradients(model)
+    assert all(parameter.grad is not None for parameter in trainable.values())
+    optimizer.step()
+    assert any(
+        not torch.equal(parameter.detach(), before[name])
+        for name, parameter in trainable.items()
+    )
 
 
 def _gauge_fixture_view() -> GraphChartView:
@@ -474,7 +643,8 @@ def test_cli_rejects_tiny_and_keeps_full_reference_settings() -> None:
         tree_paper._parser().parse_args(["--tiny"])
     assert caught.value.code == 2
     settings, _ = tree_paper._load_settings()
-    assert settings["hidden_dim"] == 64
+    assert settings["hidden_dim"] == 128
+    assert settings["message_layers"] == 8
     assert settings["optimizer_updates"] == 800
     assert settings["batch_size"] == 16
     assert settings["train_charts_per_graph"] == settings["eval_charts_per_graph"] == 8

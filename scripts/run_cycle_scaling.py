@@ -35,6 +35,14 @@ from scripts.check_dependencies import (  # noqa: E402
     check_dependencies,
     error_message,
 )
+from scripts.process_safety import (  # noqa: E402
+    close_owned_child_stdout,
+    terminate_owned_child_after_error,
+)
+from scripts.telemetry_validation import (  # noqa: E402
+    validate_resource_observability,
+    validate_throughput_observability,
+)
 
 DATASETS = ("zinc12k", "peptides_struct")
 VERSIONS = ("v1", "v2")
@@ -95,6 +103,8 @@ SOURCE_FILES = (
     "scripts/check_dependencies.py",
     "scripts/gpu_profiles.py",
     "scripts/gpu_preflight.py",
+    "scripts/process_safety.py",
+    "scripts/telemetry_validation.py",
     "scripts/verify_gpu_lock.py",
     "research/__init__.py",
     "research/cycle_pe/__init__.py",
@@ -103,6 +113,7 @@ SOURCE_FILES = (
     "research/cycle_pe/benchmark_models.py",
     "research/cycle_pe/paper_model.py",
     "research/cycle_pe/paper_data.py",
+    "research/cycle_pe/resource_monitor.py",
     "research/cycle_pe/features.py",
     "research/cycle_pe/v2/benchmark.py",
     "research/cycle_pe/v2/__init__.py",
@@ -114,6 +125,7 @@ SOURCE_FILES = (
     "src/chartgat/cache.py",
     "src/chartgat/execution.py",
     "src/chartgat/graphs.py",
+    "src/chartgat/observability.py",
 )
 
 
@@ -470,6 +482,7 @@ def run_logged(command: list[str], log_path: Path, environment: dict[str, str]) 
             errors="replace",
             bufsize=1,
         )
+        primary_error: BaseException | None = None
         try:
             assert process.stdout is not None
             for line in process.stdout:
@@ -477,17 +490,17 @@ def run_logged(command: list[str], log_path: Path, environment: dict[str, str]) 
                 stream.write(line)
                 stream.flush()
             return process.wait()
-        except BaseException:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait(timeout=10)
+        except BaseException as error:
+            primary_error = error
+            terminate_owned_child_after_error(
+                process,
+                command,
+                original_error=error,
+                log_target=stream,
+            )
             raise
         finally:
-            if process.stdout is not None:
-                process.stdout.close()
+            close_owned_child_stdout(process, original_error=primary_error)
 
 
 def _json_object(path: Path) -> dict[str, Any]:
@@ -711,6 +724,14 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
             for epoch_row in history_payload
         ):
             raise ValueError(f"{dataset}: V2 throughput history is invalid")
+        resource_observability = validate_resource_observability(
+            result.get("resource_observability"),
+            f"{expected_version}/{dataset}.resource_observability",
+        )
+        throughput = validate_throughput_observability(
+            result.get("throughput"),
+            f"{expected_version}/{dataset}.throughput",
+        )
         rows.append(
             {
                 "version": expected_version,
@@ -726,6 +747,8 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
                 "peak_gpu_reserved_bytes": reserved_memory,
                 "effective_batch_size": result.get("effective_batch_size"),
                 "execution": result.get("execution"),
+                "resource_observability": resource_observability,
+                "throughput": throughput,
                 "best_epoch": best_epoch,
                 "epochs_completed": epochs_completed,
                 "checkpoint": checkpoint,
@@ -1605,6 +1628,16 @@ def _manifest_base(
                 "portable and a6000-48gb scores are not direct paired comparisons; compare V1/V2 "
                 "only within the same hardware profile and resolved batch policy"
             ),
+            "batch_selection": {
+                "default_source": "preregistered_hardware_dataset_profile_not_measured_optimum",
+                "explicit_global_override": args.batch_size or None,
+                "automatic_downscale": False,
+                "measured_throughput_optimum_claimed": False,
+                "scope": (
+                    "a nonzero --batch-size applies verbatim to every requested "
+                    "version/dataset/profile and becomes immutable run identity"
+                ),
+            },
         },
         "hardware_profile": args.hardware_profile,
         "resolved_resource_matrix": {job["job_id"]: job["resources"] for job in jobs},
@@ -1880,7 +1913,6 @@ def main(argv: list[str] | None = None) -> int:
         manifest["status"] = "failed"
         manifest["error"] = f"{type(exc).__name__}: {exc}"
         manifest["finished_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
-        atomic_write_json(manifest_path, manifest, sort_keys=False)
         summary = build_summary(
             rows,
             versions=list(args.versions),
@@ -1890,7 +1922,18 @@ def main(argv: list[str] | None = None) -> int:
             complete=False,
         )
         summary["error"] = manifest["error"]
-        atomic_write_json(summary_path, summary, sort_keys=False)
+        for label, path, payload in (
+            ("manifest", manifest_path, manifest),
+            ("summary", summary_path, summary),
+        ):
+            try:
+                atomic_write_json(path, payload, sort_keys=False)
+            except BaseException as reporting_error:
+                exc.add_note(
+                    f"Cycle scaling failure {label} persistence failed without "
+                    f"replacing the original error: "
+                    f"{type(reporting_error).__name__}: {reporting_error}"
+                )
         raise
     assert validation_summary is not None
     test_jobs = manifest["test_evaluation_jobs"]

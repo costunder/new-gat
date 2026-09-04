@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from chartgat.cache import atomic_publish
-from research.conductance_gat.ablation.model import state_sha256
+from research.conductance_gat.ablation.model import shared_backbone_state_sha256
 from research.conductance_gat.benchmark_data import sha256_file
 from research.conductance_gat.v3 import train
 from research.conductance_gat.v3.model import RelativeCNodeClassifier
@@ -91,7 +91,7 @@ def test_initial_hash_same_and_cpu_public_training_forbidden(tmp_path):
     for mode in ("relative", "fixed_one"):
         torch.manual_seed(2)
         models.append(RelativeCNodeClassifier(3, 2, gate_mode=mode))
-    assert state_sha256(models[0]) == state_sha256(models[1])
+    assert shared_backbone_state_sha256(models[0]) == shared_backbone_state_sha256(models[1])
     args = arguments(tmp_path)
     with pytest.raises(RuntimeError, match="CUDA GPU"):
         train.train_model({}, {}, args, torch.device("cpu"), args.output_dir)
@@ -142,10 +142,12 @@ def test_child_batch_size_defaults_resolve_by_dataset(tmp_path):
             "relative_c",
             "--output-dir",
             str(tmp_path / "ppi"),
+            "--workers",
+            "4",
         ]
     )
     train._validate_args(ppi)
-    assert ppi.batch_size == 2 and ppi.workers == 0
+    assert ppi.batch_size == 2 and ppi.workers == 4
 
 
 def test_ppi_uses_all_train_minibatches_and_all_validation_graphs(monkeypatch, tmp_path):
@@ -302,7 +304,7 @@ def test_real_two_arm_runner_training_checkpoint_and_report(monkeypatch, tmp_pat
     for condition in CONDITIONS:
         folder = root / "cora" / condition
         metrics = json.loads((folder / "metrics.json").read_text(encoding="utf-8"))
-        hashes.append(metrics["initial_state_sha256"])
+        hashes.append(metrics["shared_backbone_initial_state_sha256"])
         assert metrics["research_suite"] == SUITE and metrics["test_evaluated"] is False
         assert metrics["checkpoint_sha256"] == sha256_file(folder / "best.pt")
         assert metrics["history_sha256"] == sha256_file(folder / "history.json")

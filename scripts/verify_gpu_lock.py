@@ -148,11 +148,14 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary_name, path)
-    except BaseException:
+    except BaseException as original_error:
         try:
-            os.unlink(temporary_name)
-        except FileNotFoundError:
-            pass
+            Path(temporary_name).unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            original_error.add_note(
+                "temporary JSON cleanup failed with "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
         raise
 
 

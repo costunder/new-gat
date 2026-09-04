@@ -10,6 +10,10 @@ from research.conductance_gat.v5.diagnostics import require_finite_tensor
 from research.conductance_gat.v5.model import GraphConditionedConductanceNodeClassifier
 from research.conductance_gat.v5.train import (
     _canonical_sha256,
+    _payload_graph_observability,
+    _training_batches,
+    _v5_batch_observability,
+    _v5_data_observability,
     build_parser,
     build_resume_identity,
     configure_phase,
@@ -17,7 +21,9 @@ from research.conductance_gat.v5.train import (
     parameter_group,
     phase_schedule,
     recover_best_checkpoint,
+    validate_active_gradient_connectivity,
     validate_args,
+    validate_optimizer_parameter_ownership,
     validate_resume_identity,
     validate_selected_checkpoint,
 )
@@ -33,6 +39,90 @@ def _graph(structure=None):
         ),
         graph_structure=structure,
     )
+
+
+def test_v5_observability_reports_real_payload_usage_and_full_graph_batching():
+    graph = _graph()
+    payload = {
+        "graphs": [
+            {
+                "x": graph.x,
+                "y": graph.y,
+                "incidence_edge_index": graph.incidence_edge_index,
+            }
+        ]
+    }
+    indices = {
+        "train": torch.arange(4),
+        "validation": torch.arange(4, 6),
+        "test": torch.arange(6, 9),
+    }
+    args = SimpleNamespace(
+        sampling="full",
+        epochs=200,
+        batch_size=1024,
+        workers=0,
+        pin_memory=False,
+        sample_prefetch=False,
+    )
+
+    graph_report = _payload_graph_observability(payload)
+    assert graph_report["nodes_per_graph"]["total"] == 9
+    assert graph_report["stored_edge_columns_per_graph"]["total"] == 10
+    data_report = _v5_data_observability(payload, graph, indices, args)
+    assert data_report["full_dataset_count"] == 9
+    assert data_report["actual_used_count"] == 6
+    assert data_report["actual_used_fraction_of_full_dataset"]["value"] == pytest.approx(2 / 3)
+    batch_report = _v5_batch_observability(graph, indices, None, args)
+    assert batch_report["configured_physical_batch_size"] == 1
+    assert batch_report["effective_batch_size"] == 1
+    assert batch_report["planned_maximum_training_batches"]["value"] == 200
+
+
+def test_ppi_epoch_seed_preserves_minibatch_order_across_resume_with_workers():
+    class Batch(SimpleNamespace):
+        def to(self, _device, non_blocking=False):
+            assert non_blocking is True
+            return self
+
+    class Loader:
+        num_workers = 4
+        persistent_workers = True
+        prefetch_factor = 2
+
+        def __init__(self):
+            self.generator = torch.Generator()
+
+        def __iter__(self):
+            order = torch.randperm(8, generator=self.generator).tolist()
+            return iter([Batch(graph_id=value, num_graphs=1) for value in order])
+
+    loader = Loader()
+    args = SimpleNamespace(pin_memory=True)
+
+    def order(epoch):
+        return [
+            graph.graph_id
+            for graph, indices in _training_batches(
+                {"train": loader}, None, None, epoch, torch.device("cpu"), 17, args
+            )
+            if indices is None
+        ]
+
+    epoch_seven = order(7)
+    assert order(8) != epoch_seven
+    assert order(7) == epoch_seven
+
+
+def test_v5_optimizer_ownership_and_all_group_gradients_are_connected():
+    model = _model()
+    optimizer = make_optimizer(model)
+    validate_optimizer_parameter_ownership(model, optimizer)
+    graph = _graph()
+    phase = configure_phase(model, "joint", 0)
+    optimizer.zero_grad(set_to_none=True)
+    model(graph).sum().backward()
+    validate_active_gradient_connectivity(model, phase["active_parameter_groups"])
 
 
 def _model():
@@ -106,6 +196,12 @@ def test_resume_and_selected_best_metadata_reject_mismatches():
     stale["cache_sha256"] = "x" * 64
     with pytest.raises(ValueError, match="resume identity mismatch"):
         validate_resume_identity(stale, identity, _canonical_sha256(stale))
+    stale_workers = copy.deepcopy(identity)
+    stale_workers["configuration"]["workers"] = 4
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        validate_resume_identity(
+            stale_workers, identity, _canonical_sha256(stale_workers)
+        )
     selected = {
         "resume_identity": identity,
         "resume_identity_sha256": digest,

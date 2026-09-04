@@ -11,9 +11,11 @@ from research.cycle_pe.features import cycle_projector, static_fundamental_basis
 from research.cycle_pe.paper_data import PaperGraph, canonical_edges
 from research.cycle_pe.paper_model import (
     PE_VARIANTS,
+    BatchOutput,
     PaperCycleModel,
     RawCycleRankOverflow,
     StaticPEEncoder,
+    pack_prepared_graphs,
     prepare_splits,
 )
 
@@ -168,3 +170,63 @@ def test_projector_model_handles_connected_singleton_without_edges() -> None:
     )
     output = model(prepared["test"])[0]
     assert output.graph is not None and torch.isfinite(output.graph).all()
+
+
+@pytest.mark.parametrize("variant", PE_VARIANTS)
+@pytest.mark.parametrize("target_level", ("edge", "node", "graph"))
+def test_packed_physical_batch_connects_every_active_parameter(
+    variant: str, target_level: str
+) -> None:
+    triangle = _graph("triangle", 3, ((0, 1), (1, 2), (0, 2)))
+    square = _graph("square", 4, ((0, 1), (1, 2), (2, 3), (0, 3), (0, 2)))
+    prepared, raw_width = prepare_splits(
+        {"train": [triangle, square]},
+        fit_split="train",
+        required_variants=(variant,),
+    )
+    batch = pack_prepared_graphs(prepared["train"])
+    torch.manual_seed(41)
+    model = PaperCycleModel(
+        variant=variant,
+        raw_width=raw_width,
+        node_input_dim=2,
+        edge_input_dim=4,
+        edge_output_dim=1 if target_level == "edge" else 0,
+        node_output_dim=1 if target_level == "node" else 0,
+        graph_output_dim=1 if target_level == "graph" else 0,
+        hidden_dim=12,
+        pe_dim=6,
+        layers=2,
+        embedding_dim=0,
+    )
+    output = model(batch)
+    assert isinstance(output, BatchOutput)
+    selected = getattr(output, target_level)
+    assert selected is not None
+    selected.square().mean().backward()
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    if variant == "no_pe":
+        assert sum(parameter.numel() for parameter in model.pe_encoder.parameters()) == 0
+
+
+def test_active_variant_pack_does_not_transfer_unused_dense_representations() -> None:
+    triangle = _graph("triangle", 3, ((0, 1), (1, 2), (0, 2)))
+    prepared, _ = prepare_splits({"train": [triangle]}, fit_split="train")
+    graph = prepared["train"][0]
+    assert graph.cycle_set is not None and graph.projector is not None
+
+    no_pe = pack_prepared_graphs([graph], variant="no_pe", target_levels=("edge",))
+    assert no_pe.raw_basis.shape == (3, 0)
+    assert no_pe.cycle_set is None and no_pe.projector_values is None
+    assert no_pe.edge_targets is not None
+    assert no_pe.node_targets is None and no_pe.graph_targets is None
+
+    projector = pack_prepared_graphs([graph], variant="projector", target_levels=())
+    assert projector.raw_basis.shape == (3, 0)
+    assert projector.cycle_set is None
+    assert projector.projector_values is not None
+    assert projector.projector_values.numel() == 9

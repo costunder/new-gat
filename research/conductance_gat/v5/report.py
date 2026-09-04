@@ -82,6 +82,13 @@ def _validate_child(
         configuration.get("sampling") != job.get("sampling", configuration.get("sampling"))
         or configuration.get("batch_size") != expected_batch
         or configuration.get("model_seed") != child["model_seed"]
+        or configuration.get("workers")
+        != job.get(
+            "workers",
+            execution.get("dataloader_workers", configuration.get("workers"))
+            if isinstance(execution, dict)
+            else configuration.get("workers"),
+        )
     ):
         raise ComparisonIntegrityError(f"job/child training configuration mismatch: {path}")
     if isinstance(execution, dict):
@@ -97,6 +104,13 @@ def _validate_child(
             "sample_prefetch": execution["sample_prefetch"],
             "pin_memory": execution["pin_memory"],
         }
+        for execution_key, hardware_key in (
+            ("dataloader_workers", "loader_workers"),
+            ("persistent_workers", "persistent_workers"),
+            ("prefetch_factor", "prefetch_factor"),
+        ):
+            if execution_key in execution:
+                expected_hardware[hardware_key] = execution[execution_key]
         if not isinstance(hardware, dict) or any(
             hardware.get(key) != value for key, value in expected_hardware.items()
         ):
@@ -208,6 +222,9 @@ def _validate_child(
         for value in (capacity, trainable)
     ):
         raise ComparisonIntegrityError(f"invalid parameter capacity: {path}")
+    shared_initial_hash = child.get("shared_initial_state_sha256")
+    if not isinstance(shared_initial_hash, str) or len(shared_initial_hash) != 64:
+        raise ComparisonIntegrityError(f"invalid shared initial-state hash: {path}")
     _artifact(child, job, "checkpoint", "checkpoint_sha256", "best.pt")
     _artifact(child, job, "last_checkpoint", "last_checkpoint_sha256", "last.pt")
     _artifact(child, job, "history", "history_sha256", "history.json")
@@ -239,6 +256,7 @@ def _validate_child(
         "source_sha256": child["source_sha256"],
         "runtime_versions": child["versions"],
         "initial_state_sha256": child["initial_state_sha256"],
+        "shared_initial_state_sha256": shared_initial_hash,
         "configuration": configuration,
         "schedule": child.get("schedule"),
         "protocol": child["protocol"],
@@ -311,8 +329,7 @@ def build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             "cache_sha256",
             "source_sha256",
             "runtime_versions",
-            "allocated_parameter_capacity",
-            "initial_state_sha256",
+            "shared_initial_state_sha256",
             "configuration",
             "schedule",
             "protocol",
@@ -332,6 +349,19 @@ def build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                     dynamic["global_prediction_validation"] - fixed["validation"]
                 ),
                 "dynamic_joint_best": dynamic["joint_best_validation"],
+                "fixed_allocated_parameter_capacity": fixed[
+                    "allocated_parameter_capacity"
+                ],
+                "dynamic_allocated_parameter_capacity": dynamic[
+                    "allocated_parameter_capacity"
+                ],
+                "dynamic_minus_fixed_parameter_capacity": (
+                    dynamic["allocated_parameter_capacity"]
+                    - fixed["allocated_parameter_capacity"]
+                ),
+                "shared_initial_state_sha256": fixed[
+                    "shared_initial_state_sha256"
+                ],
                 "comparison_design": COMPARISON_DESIGN,
                 "fixed_effective_optimizer_steps_by_group": fixed[
                     "effective_optimizer_steps_by_group"

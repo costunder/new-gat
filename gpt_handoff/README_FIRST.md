@@ -29,8 +29,12 @@ Conductance v2/v3/v4/v5와 Cycle PE v2는 각각의 원문 문서를 직접 제�
 > scaling profile, 데이터·평가·실행 계약을 모두 범위에 포함해라. 문서의 주장과
 > `CODE_SUMMARY.md`의 실제 구현이
 > 일치하는지 확인하고, 수학 오류·데이터 누수·비교 불공정·재현성·artifact 무결성·검증 누락을
-> 심각도순으로 보고해라. 실제 수령한 GPU 결과와 로컬 CPU fixture, 아직 실행하지 않은 실험을
-> 반드시 구분하고, 현재 근거로 허용되는 주장과 금지해야 할 주장을 나눠라.
+> 심각도순으로 보고해라. 단일 `--device` 순차 실행과 명시적 distinct `--devices` 병렬 실행,
+> same-GPU 동시성 계층, GPU/CPU/RAM 실측 필드와 `null+reason` 처리도 코드와 대조해라. Rich
+> runner는 batch를 자동 튜닝하지 않는다는 점과 별도 fixed-real-batch 후보 profiler의
+> optimizer/전체 epoch 제외 범위를 모두 확인해라. 실제 수령한 GPU 결과와
+> 로컬 CPU fixture, 아직 실행하지 않은 실험을 반드시 구분하고, 현재 근거로 허용되는 주장과
+> 금지해야 할 주장을 나눠라.
 
 ## 근거 범위
 

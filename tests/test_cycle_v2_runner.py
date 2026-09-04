@@ -129,11 +129,11 @@ def test_registry_snapshot_describes_projector_v2_not_raw_basis_coordinates(tmp_
     assert "no raw basis coordinates" in payload
 
 
-def test_v2_manifest_records_version_and_will_not_reuse_existing_output(tmp_path, monkeypatch):
+def test_v2_manifest_records_version_and_resumes_same_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(run_paper, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(run_paper, "check_dependencies", lambda: {"profile_id": "legacy-cu118"})
     monkeypatch.setattr(run_paper, "_commands", lambda *_args: [])
-    monkeypatch.setattr(run_paper, "_source_revision", lambda: {})
+    monkeypatch.setattr(run_paper, "_source_revision", lambda: {"source_sha256": {}})
     monkeypatch.setattr(run_paper, "_environment_snapshot", lambda *_args: {})
     monkeypatch.setattr(run_paper, "_snapshot_registries", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(
@@ -153,12 +153,15 @@ def test_v2_manifest_records_version_and_will_not_reuse_existing_output(tmp_path
         ],
     )
     assert run_paper.main() == 0
-    manifest = json.loads((tmp_path / "runs/paper/version-record/manifest.json").read_text())
+    manifest_path = tmp_path / "runs/paper/version-record/manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["execution_protocol"]["cycle_pe_version"] == "v2"
     assert manifest["execution_protocol"]["basis_backend"] == "dfs_fundamental"
     assert manifest["research_environment"]["profile_id"] == "legacy-cu118"
     assert manifest["tracks"] == ["cycle_pe"]
-    assert run_paper.main() == 2
+    assert run_paper.main() == 0
+    resumed = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert resumed["resume_count"] == 1
     # Independently check the v2 track-root guard, without relying on a global run folder.
     isolated = tmp_path / "research/cycle_pe/v2/results/paper/already-exists"
     isolated.mkdir(parents=True)

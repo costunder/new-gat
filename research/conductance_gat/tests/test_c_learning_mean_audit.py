@@ -10,7 +10,10 @@ import pytest
 import torch
 
 from chartgat.cache import atomic_publish, atomic_write_json
-from research.conductance_gat.ablation.model import state_sha256
+from research.conductance_gat.ablation.model import (
+    shared_backbone_state_sha256,
+    state_sha256,
+)
 from research.conductance_gat.ablation.train import checkpoint_payload
 from research.conductance_gat.benchmark_data import sha256_file
 from research.conductance_gat.c_learning import intervene as audit
@@ -81,6 +84,7 @@ def c_learning_fixture(tmp_path):
             original["validation"],
             1,
             definition=DEFINITION,
+            shared_initial_hash=shared_backbone_state_sha256(model),
         )
         atomic_publish(output / "best.pt", lambda path, value=saved: torch.save(value, path))
         atomic_write_json(output / "history.json", [])
@@ -107,6 +111,28 @@ def c_learning_fixture(tmp_path):
             history=str(output / "history.json"),
             history_sha256=sha256_file(output / "history.json"),
         )
+        total = saved["total_parameters"]
+        parameter_tensors = sum(1 for _ in model.parameters())
+        ownership = {
+            "status": "passed",
+            "trainable_parameter_tensors": parameter_tensors,
+            "optimizer_owned_parameter_tensors": parameter_tensors,
+            "trainable_parameter_elements": total,
+        }
+        metrics["pre_run_observability"] = {
+            "status": "pre_run_configuration",
+            "model": {
+                "total_parameters": total,
+                "trainable_parameters": total,
+                "frozen_parameters": 0,
+                "optimizer_ownership": ownership,
+            },
+        }
+        metrics["first_optimizer_step_integrity"] = {
+            **ownership,
+            "gradient_status": "all_trainable_parameter_tensors_have_finite_gradients",
+            "checked_before_optimizer_step": 1,
+        }
         atomic_write_json(output / "metrics.json", metrics)
         manifest["jobs"].append(
             {
@@ -330,6 +356,42 @@ def test_new_suite_late_source_change_withholds_every_intervention(monkeypatch, 
     report = _read(output / "audit.json")
     assert report["status"] == "invalid" and report["datasets"] == []
     assert "changed during the audit" in report["error"]
+
+
+def test_monitor_cleanup_failure_keeps_primary_audit_error(monkeypatch, tmp_path):
+    root, _, payload, protocol = c_learning_fixture(tmp_path)
+    _mock_cli(monkeypatch, payload, protocol)
+
+    class FailingMonitor:
+        instances: list[FailingMonitor] = []
+
+        def __init__(self, _device):
+            self.finish_calls = 0
+            self.instances.append(self)
+
+        def start(self):
+            return {"measurement_scope": "unit monitor fixture"}
+
+        def finish(self, **_kwargs):
+            self.finish_calls += 1
+            raise RuntimeError("unit audit telemetry cleanup failure")
+
+    monkeypatch.setattr(audit, "RuntimeResourceMonitor", FailingMonitor)
+
+    def fail_audit(*_args):
+        raise ValueError("primary audit failure")
+
+    monkeypatch.setattr(audit, "audit_model", fail_audit)
+    output = tmp_path / "failed-monitor-audit"
+    assert audit.main(_arguments(tmp_path, root, output)) == 1
+    assert FailingMonitor.instances[0].finish_calls == 1
+    report = _read(output / "audit.json")
+    assert report["status"] == "invalid"
+    assert report["error"] == "ValueError: primary audit failure"
+    assert report["resource_observability"] is None
+    assert "unit audit telemetry cleanup failure" in report[
+        "resource_observability_unavailable_reason"
+    ]
 
 
 def test_new_suite_success_report_identifies_target_and_preserves_source(monkeypatch, tmp_path):

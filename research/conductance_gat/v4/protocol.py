@@ -49,9 +49,9 @@ CONDITIONS = {
 }
 PROTOCOL_NOTE = (
     "A matched 2x2 factorial separates graph-operator adaptation by relative C from a "
-    "bias-free spatial feature transform W. Every arm allocates the same estimator and W "
-    "state, starts at C=1, W=I and alpha=.5, and trains alpha. Inactive estimator or W "
-    "groups are frozen and excluded from AdamW; active W uses the ordinary backbone learning "
+    "bias-free spatial feature transform W. Every arm starts at C=1, W=I and alpha=.5, and "
+    "trains alpha. Fixed controls are parameter-free and register neither an inactive estimator "
+    "nor an identity-W tensor; active W uses the ordinary backbone learning "
     "rate and weight decay. C is computed from the pre-W state, while symmetric propagation "
     "aggregates H W. Graph means and C-dependent weighted degrees are exact full-graph "
     "quantities; edge computation is chunked and first-order only. Cora, CiteSeer, PubMed and "

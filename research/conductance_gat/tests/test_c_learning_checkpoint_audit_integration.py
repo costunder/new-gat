@@ -124,8 +124,15 @@ def test_new_training_artifacts_audit_actual_learned_checkpoint_without_input_mu
     ):
         assert manifest["sources"]["sha256"][name] == sha256_file(runner.ROOT / name)
     assert (
-        trained["learned_c"]["initial_state_sha256"] == trained["fixed_c"]["initial_state_sha256"]
+        trained["learned_c"]["shared_backbone_initial_state_sha256"]
+        == trained["fixed_c"]["shared_backbone_initial_state_sha256"]
     )
+    assert (
+        trained["learned_c"]["initial_state_sha256"]
+        != trained["fixed_c"]["initial_state_sha256"]
+    )
+    assert trained["fixed_c"]["estimator_parameters"] == 0
+    assert trained["fixed_c"]["frozen_parameters"] == 0
     saved = torch.load(trained["learned_c"]["checkpoint"], weights_only=True)
 
     monkeypatch.setattr(audit, "_require_cuda", lambda device: None)
@@ -142,9 +149,10 @@ def test_new_training_artifacts_audit_actual_learned_checkpoint_without_input_mu
             checkpoint_reads.append(Path(path))
         return original_load(path, *args, **kwargs)
 
-    def validation_fixture(data, metrics, device):
+    def validation_fixture(data, metrics, device, workers):
         assert metrics["research_suite"] == SUITE and metrics["condition"] == "learned_c"
         assert data["dataset"] == "cora"
+        assert workers == 4
         return [graph], indices["validation"]
 
     monkeypatch.setattr(audit, "load_dataset", read_cache)
@@ -175,6 +183,10 @@ def test_new_training_artifacts_audit_actual_learned_checkpoint_without_input_mu
     assert audited["source_suite"] == SUITE and audited["source_condition"] == "learned_c"
     assert audited["training_performed"] is audited["test_evaluated"] is False
     assert audited["evaluation_split"] == "validation" and audited["n_model_seeds"] == 1
+    assert audited["execution_plan"]["subset_or_fast_mode"] is False
+    assert audited["resource_observability"]["measurement_scope"]
+    assert audited["throughput"]["completed_forward_batches"] == 4
+    assert audited["throughput"]["forward_batches_per_second"]["value"] > 0
     item = audited["datasets"][0]
     assert item["source_suite"] == SUITE and item["source_condition"] == "learned_c"
     assert item["checkpoint_sha256"] == trained["learned_c"]["checkpoint_sha256"]
@@ -200,7 +212,7 @@ def test_new_training_artifacts_audit_actual_learned_checkpoint_without_input_mu
             model.load_state_dict(saved["state_dict"], strict=True)
             for layer in layers:
                 operator = model.operators[layer]
-                operator.estimator = FixedOneConductance(operator.estimator)
+                operator.estimator = FixedOneConductance()
             logits = model(graph).index_select(0, indices["validation"])
             expected_score = float(
                 (logits.argmax(-1) == graph.y[indices["validation"]]).float().mean()

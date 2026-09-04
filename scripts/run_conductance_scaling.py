@@ -11,7 +11,6 @@ import math
 import os
 import re
 import shlex
-import shutil
 import statistics
 import sys
 import time
@@ -62,6 +61,11 @@ from scripts.check_dependencies import (  # noqa: E402
     DependencyCheckError,
     check_dependencies,
     error_message,
+)
+from scripts.process_safety import run_failure_reporter  # noqa: E402
+from scripts.telemetry_validation import (  # noqa: E402
+    validate_resource_observability,
+    validate_throughput_observability,
 )
 
 V1_DATASETS = ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv")
@@ -120,8 +124,21 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--device", default="cuda")
     result.add_argument("--epochs", type=int, default=200)
     result.add_argument("--patience", type=int, default=50)
-    result.add_argument("--workers", type=int, default=0)
+    result.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="PPI graph DataLoader workers; V2/transductive children are forced to 0",
+    )
     result.add_argument("--edge-chunk-size", type=int, default=65536)
+    result.add_argument(
+        "--legacy-ppi-batch-size",
+        type=int,
+        help=(
+            "explicit PPI graph-batch override for V1/V3/V4; omission preserves the "
+            "preregistered value 2"
+        ),
+    )
     result.add_argument("--v5-edge-chunk-size", type=int)
     result.add_argument("--v5-ppi-batch-size", type=int)
     result.add_argument(
@@ -170,14 +187,15 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("datasets must contain no duplicates")
     if any(seed < 0 for seed in args.model_seeds):
         raise ValueError("model seeds must be nonnegative")
-    if min(args.epochs, args.patience, args.edge_chunk_size) < 1 or args.workers != 0:
-        raise ValueError("epochs/patience/chunk size must be positive and workers must be 0")
+    if min(args.epochs, args.patience, args.edge_chunk_size) < 1 or args.workers < 0:
+        raise ValueError("epochs/patience/chunk size must be positive and workers nonnegative")
     if (
         not args.v5_num_neighbors
         or any(value < 1 for value in args.v5_num_neighbors)
         or (args.v5_sample_seed_batch_size is not None and args.v5_sample_seed_batch_size < 1)
         or (args.v5_edge_chunk_size is not None and args.v5_edge_chunk_size < 1)
         or (args.v5_ppi_batch_size is not None and args.v5_ppi_batch_size < 1)
+        or (args.legacy_ppi_batch_size is not None and args.legacy_ppi_batch_size < 1)
     ):
         raise ValueError("V5 neighbor fanouts and sample seed batch size must be positive")
     if args.hardware_profile == "portable" and args.v5_ppi_batch_size not in {None, 2}:
@@ -204,6 +222,7 @@ def _v5_execution(args: argparse.Namespace, dataset: str) -> dict[str, Any]:
     batch_size = 1
     if dataset == "ppi":
         batch_size = args.v5_ppi_batch_size or profile["ppi_batch_size"]
+    loader_workers = shared.workers_for_dataset(dataset, args.workers)
     return {
         "hardware_profile": args.hardware_profile,
         "precision": profile["precision"],
@@ -220,6 +239,9 @@ def _v5_execution(args: argparse.Namespace, dataset: str) -> dict[str, Any]:
         ),
         "sample_prefetch": profile["sample_prefetch"],
         "pin_memory": profile["pin_memory"],
+        "dataloader_workers": loader_workers,
+        "persistent_workers": loader_workers > 0,
+        "prefetch_factor": 2 if loader_workers > 0 else None,
     }
 
 
@@ -280,6 +302,7 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                 profile.update(_v5_beta_configuration(args))
             for seed in args.model_seeds:
                 for dataset in _selected_datasets(args, version):
+                    child_workers = shared.workers_for_dataset(dataset, args.workers)
                     for condition in spec["conditions"]:
                         output = (
                             run_dir
@@ -316,9 +339,15 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             "--dropout",
                             str(profile["dropout"]),
                             "--workers",
-                            str(args.workers),
+                            str(child_workers),
                             "--batch-size",
-                            "2" if dataset == "ppi" or version == "v1" else "1",
+                            (
+                                str(args.legacy_ppi_batch_size or 2)
+                                if dataset == "ppi" and version in {"v1", "v3", "v4"}
+                                else "2"
+                                if dataset == "ppi"
+                                else "1"
+                            ),
                         ]
                         execution = None
                         if version != "v1":
@@ -379,6 +408,8 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                                 "model_seed": seed,
                                 "dataset": dataset,
                                 "condition": condition,
+                                "workers": child_workers,
+                                "batch_size": int(command[command.index("--batch-size") + 1]),
                                 "status": "pending",
                                 "output_dir": str(output),
                                 "metrics_path": str(output / "metrics.json"),
@@ -439,10 +470,13 @@ def _source_snapshot() -> dict[str, str]:
     paths += [
         ROOT / "src/chartgat/cache.py",
         ROOT / "src/chartgat/execution.py",
+        ROOT / "src/chartgat/observability.py",
         ROOT / "scripts/check_dependencies.py",
         ROOT / "scripts/gpu_profiles.py",
         ROOT / "scripts/gpu_preflight.py",
+        ROOT / "scripts/process_safety.py",
         ROOT / "scripts/run_conductance_factorial.py",
+        ROOT / "scripts/telemetry_validation.py",
         ROOT / "scripts/verify_gpu_lock.py",
     ]
     return {
@@ -664,18 +698,36 @@ def _load_resume_manifest(
     return manifest
 
 
-def _discard_incomplete_child(job: dict[str, Any], run_dir: Path) -> None:
+def _preserve_incomplete_child(job: dict[str, Any], run_dir: Path) -> None:
     lexical_output = Path(os.path.abspath(Path(job["output_dir"]).expanduser()))
     output = lexical_output.resolve()
     run_dir = run_dir.resolve()
     if output != lexical_output:
-        raise RuntimeError(f"refusing to clear an indirect child output path: {lexical_output}")
+        raise RuntimeError(f"refusing to move an indirect child output path: {lexical_output}")
     if output == run_dir or not output.is_relative_to(run_dir):
-        raise RuntimeError(f"refusing to clear child output outside run directory: {output}")
+        raise RuntimeError(f"refusing to move child output outside run directory: {output}")
     if lexical_output.exists():
         if not lexical_output.is_dir():
             raise RuntimeError(f"child output path is not a directory: {lexical_output}")
-        shutil.rmtree(lexical_output)
+        attempt = 1
+        while True:
+            preserved = lexical_output.with_name(
+                f"{lexical_output.name}.preserved-attempt-{attempt}"
+            )
+            if not preserved.exists():
+                break
+            attempt += 1
+        if preserved.parent.resolve() != lexical_output.parent.resolve():
+            raise RuntimeError(f"refusing to preserve child output outside its parent: {preserved}")
+        event = {
+            "event": "preserve_incomplete_child_output",
+            "source": str(lexical_output),
+            "destination": str(preserved),
+            "reason": "no resumable checkpoint exists; preserve prior artifacts before retry",
+        }
+        print(json.dumps(event, ensure_ascii=False, sort_keys=True), file=sys.stderr, flush=True)
+        lexical_output.rename(preserved)
+        job.setdefault("preserved_incomplete_outputs", []).append(event)
     for key in ("result", "metrics_sha256", "exit_code", "elapsed_wall_seconds", "error"):
         job.pop(key, None)
 
@@ -752,6 +804,10 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
     for key, expected in job["architecture"].items():
         if configuration.get(key) != expected:
             raise RuntimeError(f"child architecture mismatch for {key}")
+    if configuration.get("workers") != job["workers"]:
+        raise RuntimeError("child DataLoader workers do not match the dataset execution plan")
+    if configuration.get("batch_size") != job["batch_size"]:
+        raise RuntimeError("child physical batch size does not match the execution plan")
     if job["version"] == "v5":
         execution = job["execution"]
         expected_configuration = {
@@ -765,6 +821,9 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
             "sampling": job["sampling"],
             "sample_prefetch": execution["sample_prefetch"],
             "pin_memory": execution["pin_memory"],
+            "loader_workers": execution["dataloader_workers"],
+            "persistent_workers": execution["persistent_workers"],
+            "prefetch_factor": execution["prefetch_factor"],
         }
         if any(configuration.get(key) != value for key, value in expected_configuration.items()):
             raise RuntimeError("V5 child resolved execution configuration mismatch")
@@ -802,6 +861,14 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
     peak_reserved = child.get("peak_cuda_reserved_bytes", peak_memory)
     if isinstance(peak_reserved, bool) or not isinstance(peak_reserved, int) or peak_reserved < 0:
         raise RuntimeError("child peak CUDA reservation is invalid")
+    resource_observability = validate_resource_observability(
+        child.get("resource_observability"),
+        f"{job['version']}/{job['dataset']}/{job['condition']}.resource_observability",
+    )
+    throughput = validate_throughput_observability(
+        child.get("throughput"),
+        f"{job['version']}/{job['dataset']}/{job['condition']}.throughput",
+    )
     return {
         "metrics_sha256": hashlib.sha256(raw).hexdigest(),
         "validation": validation,
@@ -814,7 +881,8 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
         "peak_cuda_allocated_bytes": peak_memory,
         "peak_cuda_reserved_bytes": peak_reserved,
         "hardware_execution": hardware_execution,
-        "throughput": child.get("throughput"),
+        "resource_observability": resource_observability,
+        "throughput": throughput,
         "actual_configuration": {key: configuration[key] for key in job["architecture"]},
         "test_evaluated": False,
     }
@@ -891,6 +959,18 @@ def _summary(manifest: dict[str, Any]) -> dict[str, Any]:
         "job_counts": counts,
         "expected_model_seeds": manifest["config"]["model_seeds"],
         "exclusions": manifest["exclusions"],
+        "runs": [
+            {
+                "version": job["version"],
+                "profile": job["profile"],
+                "dataset": job["dataset"],
+                "condition": job["condition"],
+                "model_seed": job["model_seed"],
+                **job["result"],
+            }
+            for job in jobs
+            if job.get("status") == "passed" and isinstance(job.get("result"), dict)
+        ],
         "rows": _aggregate(jobs),
     }
 
@@ -966,9 +1046,17 @@ def main(argv: list[str] | None = None) -> int:
         "epochs": args.epochs,
         "patience": args.patience,
         "workers": args.workers,
+        "workers_by_version_and_dataset": {
+            version: {
+                dataset: shared.workers_for_dataset(dataset, args.workers)
+                for dataset in _selected_datasets(args, version)
+            }
+            for version in args.versions
+        },
         "device": args.device,
         "min_free_gb": args.min_free_gb,
         "edge_chunk_size": args.edge_chunk_size,
+        "legacy_ppi_batch_size": args.legacy_ppi_batch_size,
         "v5_edge_chunk_size": args.v5_edge_chunk_size,
         "v5_ppi_batch_size": args.v5_ppi_batch_size,
         "v5_beta": _v5_beta_configuration(args),
@@ -1071,6 +1159,18 @@ def main(argv: list[str] | None = None) -> int:
                     "requires the same profile. V1-V5 PPI remains descriptive because V5 uses "
                     "profile-specific real graph batches while legacy versions retain batch 2"
                 ),
+                "batch_selection": {
+                    "default_source": "preregistered_hardware_profile_not_measured_optimum",
+                    "legacy_ppi_explicit_override": args.legacy_ppi_batch_size,
+                    "v5_ppi_explicit_override": args.v5_ppi_batch_size,
+                    "v5_sample_seed_explicit_override": args.v5_sample_seed_batch_size,
+                    "automatic_downscale": False,
+                    "measured_throughput_optimum_claimed": False,
+                    "scope": (
+                        "explicit V5 overrides are applied verbatim and become immutable run "
+                        "identity; their presence alone is not evidence of a throughput sweep"
+                    ),
+                },
                 "small_graph_limit": (
                     "single Cora/Citeseer/PubMed full graphs cannot fill a 48 GiB GPU; no "
                     "duplicate examples or dummy compute are introduced"
@@ -1127,7 +1227,7 @@ def main(argv: list[str] | None = None) -> int:
             if job["version"] == "v5" and last_checkpoint.is_file():
                 attempt_command.append("--resume")
             else:
-                _discard_incomplete_child(job, run_dir)
+                _preserve_incomplete_child(job, run_dir)
             job["attempt_command"] = attempt_command
             job["status"] = "running"
             atomic_write_json(manifest_path, manifest)
@@ -1159,8 +1259,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         if current is not None:
             current.update(status="failed", error=manifest["error"])
-        atomic_write_json(manifest_path, manifest)
-        _write_summary(run_dir, manifest)
+        summary_error = run_failure_reporter(
+            lambda: _write_summary(run_dir, manifest),
+            original_error=exc,
+            action="failed-run summary persistence",
+        )
+        if summary_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(summary_error)
+        manifest_error = run_failure_reporter(
+            lambda: atomic_write_json(manifest_path, manifest),
+            original_error=exc,
+            action="failed-run manifest persistence",
+        )
+        if manifest_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(manifest_error)
         print(f"Failed: {manifest['error']}\nSaved partial results: {run_dir}", file=sys.stderr)
         return 130 if isinstance(exc, KeyboardInterrupt) else 1
     atomic_write_json(manifest_path, manifest)

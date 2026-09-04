@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ..ablation.report import (
+    _SHA256,
     REPORT_FILENAMES,
     _atomic_write,
     _best_validation_summary,
@@ -34,9 +35,9 @@ CAVEATS = [
     "Actual early-stopping epochs may differ. No previous factorial score is reused.",
     "The contrast is learned_c minus fixed_c (percentage points); positive favors learned C. "
     "This is an internal architecture ablation, not an external GCN/GAT benchmark baseline.",
-    "Fixed C=1 uses no trainable gate. Its initialized gate scaffold is frozen, excluded from "
-    "the optimizer and trainable count, but included in the full-state initialization hash. "
-    "A frozen scaffold's L2 below does not describe an active gate.",
+    "Fixed C=1 is genuinely parameter-free: no estimator tensors remain in its state or "
+    "optimizer. The learned and fixed full-state hashes and total sizes therefore differ by "
+    "design; their shared non-estimator backbone initialization fingerprint must match.",
     "Both arms use node-degree normalization. Common positive C scale cancels; rho=.95 on "
     "nonisolated nodes is imposed by the operator, not evidence that learned C is useful.",
     "This retraining contrast and a checkpoint mean-C intervention answer different questions. "
@@ -52,8 +53,61 @@ class ComparisonIntegrityError(ValueError):
         super().__init__("C-learning comparison integrity failed: " + "; ".join(report["errors"]))
 
 
+def _validate_optimizer_evidence(child: dict[str, Any], *, total: int, trainable: int) -> None:
+    pre_run = child.get("pre_run_observability")
+    if not isinstance(pre_run, dict) or pre_run.get("status") != "pre_run_configuration":
+        raise ValueError("missing passed pre-run configuration evidence")
+    model = pre_run.get("model")
+    if not isinstance(model, dict):
+        raise ValueError("pre-run model evidence is missing")
+    for key, expected in (
+        ("total_parameters", total),
+        ("trainable_parameters", trainable),
+        ("frozen_parameters", total - trainable),
+    ):
+        if model.get(key) != expected:
+            raise ValueError(f"pre-run model {key} mismatch")
+    ownership = model.get("optimizer_ownership")
+    first_step = child.get("first_optimizer_step_integrity")
+    for label, evidence in (("pre-run optimizer", ownership), ("first optimizer step", first_step)):
+        if not isinstance(evidence, dict) or evidence.get("status") != "passed":
+            raise ValueError(f"{label} ownership evidence is missing")
+        tensors = _integer(
+            evidence.get("trainable_parameter_tensors"),
+            f"{label} trainable_parameter_tensors",
+            minimum=1,
+        )
+        owned = _integer(
+            evidence.get("optimizer_owned_parameter_tensors"),
+            f"{label} optimizer_owned_parameter_tensors",
+            minimum=1,
+        )
+        elements = _integer(
+            evidence.get("trainable_parameter_elements"),
+            f"{label} trainable_parameter_elements",
+            minimum=1,
+        )
+        if tensors != owned or elements != trainable:
+            raise ValueError(f"{label} does not exactly own every trainable parameter")
+    if first_step.get("checked_before_optimizer_step") != 1:
+        raise ValueError("first optimizer step was not checked before optimizer.step")
+
+
+def _matched_metadata(child: dict[str, Any]) -> dict[str, Any]:
+    metadata = _pair_metadata(child)
+    metadata.pop("initial_state_sha256")
+    metadata["shared_backbone_initial_state_sha256"] = child[
+        "shared_backbone_initial_state_sha256"
+    ]
+    metadata.update({key: child[key] for key in ("versions", "gpu")})
+    return metadata
+
+
 def _load(run_dir, job, common):
-    child = _load_child(run_dir, job, common, suite=SUITE, conditions=CONDITIONS)
+    child_common = dict(common)
+    child_common.pop("workers_by_dataset", None)
+    child_common["workers"] = common.get("workers", 0) if job["dataset"] == "ppi" else 0
+    child = _load_child(run_dir, job, child_common, suite=SUITE, conditions=CONDITIONS)
     spec = CONDITIONS[job["condition"]]
     if child.get("gate_mode") != spec["gate_mode"]:
         raise ValueError(f"{job['dataset']}/{job['condition']}: gate_mode mismatch")
@@ -62,12 +116,24 @@ def _load(run_dir, job, common):
     total = _integer(child.get("total_parameters"), "total_parameters", minimum=1)
     trainable = _integer(child.get("trainable_parameters"), "trainable_parameters", minimum=1)
     frozen = _integer(child.get("frozen_parameters"), "frozen_parameters")
+    estimator = _integer(child.get("estimator_parameters"), "estimator_parameters")
+    non_estimator = _integer(
+        child.get("non_estimator_parameters"), "non_estimator_parameters", minimum=1
+    )
     if total != trainable + frozen:
         raise ValueError("trainable/frozen parameter counts do not sum to total")
-    if (job["condition"] == "learned_c" and frozen != 0) or (
-        job["condition"] == "fixed_c" and frozen == 0
+    if total != estimator + non_estimator:
+        raise ValueError("estimator/non-estimator parameter counts do not sum to total")
+    if frozen != 0 or trainable != total:
+        raise ValueError("C-learning arms must not retain frozen parameters")
+    if (job["condition"] == "learned_c" and estimator == 0) or (
+        job["condition"] == "fixed_c" and estimator != 0
     ):
-        raise ValueError("frozen parameter count disagrees with C-learning condition")
+        raise ValueError("estimator parameter count disagrees with C-learning condition")
+    for key in ("initial_state_sha256", "shared_backbone_initial_state_sha256"):
+        if not isinstance(child.get(key), str) or not _SHA256.fullmatch(child[key]):
+            raise ValueError(f"{key} must be a SHA-256 digest")
+    _validate_optimizer_evidence(child, total=total, trainable=trainable)
     if not child.get("versions") or not isinstance(child["versions"], dict):
         raise ValueError("Missing runtime versions")
     if not isinstance(child.get("gpu"), str) or not child["gpu"]:
@@ -107,6 +173,15 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
         for key in ("epochs", "patience", "batch_size"):
             _integer(config.get(key), key, minimum=1)
         _integer(config.get("workers"), "workers")
+        workers_by_dataset = config.get("workers_by_dataset")
+        if workers_by_dataset is not None and not _same(
+            workers_by_dataset,
+            {
+                dataset: config["workers"] if dataset == "ppi" else 0
+                for dataset in datasets
+            },
+        ):
+            raise ValueError("workers_by_dataset is inconsistent")
         for key, value in COMMON.items():
             if not _same(config.get(key), value):
                 raise ValueError(f"fixed configuration.{key} mismatch")
@@ -135,6 +210,9 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             errors.append(f"duplicate job: {key}")
             continue
         indexed[key] = job
+        expected_workers = config.get("workers", 0) if dataset == "ppi" else 0
+        if job.get("workers", expected_workers) != expected_workers:
+            errors.append(f"{dataset}/{condition}: job workers must be {expected_workers}")
         if job.get("status") not in {"pending", "running", "failed", "passed"}:
             errors.append(f"{key}: invalid job status")
         try:
@@ -158,6 +236,9 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                 "best_epoch": None,
                 "epochs_run": None,
                 "trainable_parameters": None,
+                "total_parameters": None,
+                "estimator_parameters": None,
+                "non_estimator_parameters": None,
                 "frozen_parameters": None,
                 "best_validation_diagnostics": _best_validation_summary(None),
             }
@@ -173,6 +254,8 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                         "epochs_run",
                         "train_loss",
                         "trainable_parameters",
+                        "estimator_parameters",
+                        "non_estimator_parameters",
                         "frozen_parameters",
                         "total_parameters",
                         "elapsed_seconds",
@@ -188,17 +271,39 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                     errors.append(f"{dataset}/{condition}: {exc}")
             rows.append(row)
         reference = next(iter(loaded.values()), None)
-        metadata = _pair_metadata(reference) if reference else None
+        metadata = _matched_metadata(reference) if reference else None
         if reference:
-            metadata.update(
-                {key: reference[key] for key in ("versions", "gpu", "total_parameters")}
-            )
             for condition, child in loaded.items():
-                actual = _pair_metadata(child)
-                actual.update({key: child[key] for key in ("versions", "gpu", "total_parameters")})
+                actual = _matched_metadata(child)
                 for key in metadata:
                     if not _same(metadata[key], actual[key]):
                         errors.append(f"{dataset}/{condition}: held-fixed {key} mismatch")
+        parameter_contract = None
+        if len(loaded) == len(CONDITIONS):
+            learned, fixed = loaded["learned_c"], loaded["fixed_c"]
+            learned_gate = learned["estimator_parameters"]
+            total_delta = learned["total_parameters"] - fixed["total_parameters"]
+            if learned["non_estimator_parameters"] != fixed["non_estimator_parameters"]:
+                errors.append(f"{dataset}: non-estimator parameter count mismatch")
+            if total_delta != learned_gate:
+                errors.append(
+                    f"{dataset}: total parameter difference does not equal learned estimator size"
+                )
+            if learned["initial_state_sha256"] == fixed["initial_state_sha256"]:
+                errors.append(f"{dataset}: structurally different arms share a full-state hash")
+            parameter_contract = {
+                "learned_total_parameters": learned["total_parameters"],
+                "fixed_total_parameters": fixed["total_parameters"],
+                "learned_estimator_parameters": learned_gate,
+                "fixed_estimator_parameters": fixed["estimator_parameters"],
+                "total_parameter_difference": total_delta,
+                "shared_non_estimator_parameters": fixed["non_estimator_parameters"],
+                "verified": (
+                    learned["non_estimator_parameters"] == fixed["non_estimator_parameters"]
+                    and total_delta == learned_gate
+                    and fixed["estimator_parameters"] == 0
+                ),
+            }
         reports.append(
             {
                 "dataset": dataset,
@@ -207,6 +312,7 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                 "conditions": rows,
                 "complete": len(loaded) == len(CONDITIONS),
                 "held_fixed": metadata,
+                "parameter_contract": parameter_contract,
                 "learned_minus_fixed": None,
             }
         )
@@ -265,14 +371,20 @@ def markdown(report):
             f"## {dataset['dataset']} ({dataset['metric_name']}, higher is better)",
             "",
             "| Condition | Status | Validation (%) | Best epoch | Epochs run "
-            "| Trainable parameters | Frozen scaffold |",
-            "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+            "| Total parameters | Estimator parameters | Frozen parameters |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
         for row in dataset["conditions"]:
             cells = [row["condition"], row["status"], _display(row["validation_percent"])]
             cells += [
                 str(row[key]) if row[key] is not None else "—"
-                for key in ("best_epoch", "epochs_run", "trainable_parameters", "frozen_parameters")
+                for key in (
+                    "best_epoch",
+                    "epochs_run",
+                    "total_parameters",
+                    "estimator_parameters",
+                    "frozen_parameters",
+                )
             ]
             lines += ["| " + " | ".join(cells) + " |"]
         contrast = dataset["learned_minus_fixed"]
@@ -303,6 +415,9 @@ def csv_text(report):
         "validation_percent",
         "best_epoch",
         "epochs_run",
+        "total_parameters",
+        "estimator_parameters",
+        "non_estimator_parameters",
         "trainable_parameters",
         "frozen_parameters",
         "learned_minus_fixed_pp",

@@ -49,7 +49,7 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
             checkpoint.write_bytes(b"unit-fixture-not-a-trained-model")
             history.write_text("[]", encoding="utf-8")
             data_hash = hashlib.sha256(dataset.encode()).hexdigest()
-            frozen = COMMON["layers"] * edges if condition == "fixed_c" else 0
+            direct_parameters = COMMON["layers"] * edges if condition == "direct_c" else 0
             metrics = {
                 "schema_version": 1,
                 "research_suite": SUITE,
@@ -62,7 +62,8 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                 "configuration": copy.deepcopy(configuration),
                 "cache_sha256": data_hash,
                 "protocol": {"data_sha256": data_hash, "official": True},
-                "initial_state_sha256": "a" * 64,
+                "initial_state_sha256": hashlib.sha256(condition.encode()).hexdigest(),
+                "shared_backbone_initial_state_sha256": "c" * 64,
                 "best_epoch": 10,
                 "epochs_run": 30,
                 "validation": 0.55 if condition == "direct_c" else 0.50,
@@ -74,9 +75,9 @@ def _fixture(tmp_path, datasets=("ogbn-arxiv",), edges=3):
                 "test_evaluated": False,
                 "versions": {"torch": "unit-fixture"},
                 "gpu": "unit-fixture",
-                "total_parameters": 200,
-                "trainable_parameters": 200 - frozen,
-                "frozen_parameters": frozen,
+                "total_parameters": 200 + direct_parameters,
+                "trainable_parameters": 200 + direct_parameters,
+                "frozen_parameters": 0,
                 "source_sha256": source,
                 "parameterization": PARAMETERIZATION,
                 "topology": {"num_nodes": 4, "num_edges": edges, "incidence_sha256": "2" * 64},
@@ -142,7 +143,7 @@ def test_partial_results_have_no_contrast(tmp_path, status):
     "key,value",
     [
         ("cache_sha256", "b" * 64),
-        ("initial_state_sha256", "b" * 64),
+        ("shared_backbone_initial_state_sha256", "b" * 64),
         ("test_evaluated", True),
         ("model_seed", 1),
         ("normalization", "global_max"),
@@ -225,7 +226,7 @@ def test_changed_chunk_size_or_unknown_config_rejected(tmp_path):
         write_comparison(root, manifest)
 
 
-def test_fixed_frozen_count_must_equal_layers_times_edges(tmp_path):
+def test_fixed_control_must_not_claim_frozen_parameters(tmp_path):
     root, manifest = _fixture(tmp_path)
     _edit(
         manifest, lambda child: child.update(frozen_parameters=5, trainable_parameters=195), index=1
@@ -234,6 +235,6 @@ def test_fixed_frozen_count_must_equal_layers_times_edges(tmp_path):
         write_comparison(root, manifest)
 
 
-def test_empty_edge_topology_can_have_no_frozen_parameters(tmp_path):
+def test_empty_edge_topology_preserves_parameter_free_fixed_control(tmp_path):
     root, manifest = _fixture(tmp_path, edges=0)
     assert write_comparison(root, manifest)["status"] == "passed"

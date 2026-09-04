@@ -31,8 +31,9 @@ CONDITIONS = {
 }
 PROTOCOL_NOTE = (
     "Shared graph-centered relative conductance, symmetric normalization and a separate "
-    "learnable alpha; both arms initialize C=1 and alpha=.5. Fixed C freezes the entire "
-    "estimator but keeps alpha trainable. AdamW separates backbone, gate and scalar controls. "
+    "learnable alpha; both arms initialize C=1 and alpha=.5. Fixed C is parameter-free: it "
+    "registers no estimator, while alpha remains trainable. AdamW separates backbone, gate "
+    "and scalar controls. "
     "Optimization uses official train labels only; validation labels select checkpoints, "
     "with no test evaluation. "
     "PPI uses the official 20/2/2 split: train 20 and validation 2 run in whole-graph "

@@ -24,6 +24,14 @@ available only through the explicit supplementary `core`/`all` suites.
 CSL currently uses one fixed stratified 90/30/30 partition, not a full five-fold
 published-score reproduction. ZINC preserves its official 10k/1k/1k split.
 
+The direct paper run uses the scaling suite's research-scale `reference`
+architecture: hidden dimension 128 and 8 message-passing layers. This replaces
+the former 64/2 mechanism-probe-sized default. The 256/12 `large` architecture
+remains a separately trained, validation-selected scaling candidate; it is not
+silently substituted based on hardware. Architecture and execution resources
+stay separate: the direct portable contract keeps physical batch 16, while the
+explicit A6000 scaling profile measures batch 64 with four loader workers.
+
 ## Scope
 
 For a connected graph with incidence matrix `B` and cycle rank

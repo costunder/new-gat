@@ -207,8 +207,9 @@ train-normalized MAE, graph-macro MAE, rounded exact accuracy를 보고한다.
 기본 내부 variant는 `raw`, `set`, `projector`다. `no_pe`는 명시적으로 선택할 때만 실행하는
 우리 모델의 PE 제거 ablation이다. Projector는 closest-prior formulation이며
 novelty로 주장하지 않는다. Raw 폭은 train max-beta만으로 정한다. OOD beta가 더 크면
-그 raw split만 `not_applicable_train_fitted_width_overflow`로 기록하고 절단/test-fit하지
-않으며 다른 PE 비교는 계속 평가한다.
+raw condition 전체를 `not_applicable_train_fitted_width_overflow`로 기록하고 학습·checkpoint
+선택·metric 계산을 하지 않는다. Compatible subset, 절단, validation/test-fit은 사용하지 않으며
+다른 PE variant는 계속 평가한다.
 
 모든 variant가 incidence/BFS tree/full `F_T`와 raw basis를 계산한다. Set 통계와 dense projector만
 요청 여부에 따라 조건부로 만들기 때문에 `no_pe/raw/set`만 실행하면 dense `m×m` projector는

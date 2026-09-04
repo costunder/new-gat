@@ -14,6 +14,7 @@ from torch import Tensor, nn
 
 from chartgat.algebra import fundamental_cycle_basis, incidence_matrix
 from chartgat.graphs import make_connected_graph, spanning_tree_indices
+from chartgat.observability import RuntimeResourceMonitor
 from research.combined_later.completion import (
     analytic_cycle_completion,
     hard_observation_affine,
@@ -240,14 +241,11 @@ def _evaluate(
     return prediction, metrics
 
 
-def run(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, object]]:
+def _run_impl(
+    args: argparse.Namespace, device: torch.device
+) -> tuple[pd.DataFrame, dict[str, object]]:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    device = torch.device(
-        "cuda"
-        if args.device == "auto" and torch.cuda.is_available()
-        else ("cpu" if args.device == "auto" else args.device)
-    )
     dataset, incidence_np, basis_train_np, basis_unseen_np = _build_dataset(args)
     samples = dataset.target.shape[0]
     train_end = int(0.7 * samples)
@@ -384,9 +382,82 @@ def run(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, object]]:
         "observed_edges": dataset.observed.tolist(),
         "observation_rank": int(np.linalg.matrix_rank(basis_train_np[dataset.observed])),
         "epochs": args.epochs,
+        "physical_batch_size_samples": train_end,
+        "gradient_accumulation_steps": 1,
+        "data_parallel_workers": 1,
+        "effective_batch_size_samples": train_end,
+        "optimizer_steps": args.epochs * len(models),
+        "model_parameter_counts": {
+            name: {
+                "total": sum(parameter.numel() for parameter in model.parameters()),
+                "trainable": sum(
+                    parameter.numel()
+                    for parameter in model.parameters()
+                    if parameter.requires_grad
+                ),
+            }
+            for name, model in models.items()
+        },
+        "debug_subset_fast_mode": False,
         "metrics": metrics,
     }
     return pd.DataFrame.from_records(history), summary
+
+
+def run(args: argparse.Namespace) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Execute the requested device explicitly and persist measured resource use."""
+
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA was requested for fixed-C completion training but is unavailable; "
+            "no CPU fallback was performed"
+        )
+    if device.type == "cuda":
+        torch.cuda.get_device_properties(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    monitor = RuntimeResourceMonitor(device)
+    monitor.start()
+    try:
+        history, summary = _run_impl(args, device)
+    except BaseException as primary_error:
+        try:
+            monitor.finish(
+                peak_allocated_bytes=(
+                    int(torch.cuda.max_memory_allocated(device))
+                    if device.type == "cuda"
+                    else None
+                ),
+                peak_reserved_bytes=(
+                    int(torch.cuda.max_memory_reserved(device))
+                    if device.type == "cuda"
+                    else None
+                ),
+            )
+        except (Exception, KeyboardInterrupt) as monitor_error:
+            primary_error.add_note(
+                "resource monitor cleanup also failed: "
+                f"{type(monitor_error).__name__}: {monitor_error}"
+            )
+        raise
+    resources = monitor.finish(
+        peak_allocated_bytes=(
+            int(torch.cuda.max_memory_allocated(device)) if device.type == "cuda" else None
+        ),
+        peak_reserved_bytes=(
+            int(torch.cuda.max_memory_reserved(device)) if device.type == "cuda" else None
+        ),
+    )
+    elapsed = float(resources["summary"]["observed_wall_seconds"]["value"])
+    summary["resource_observability"] = resources
+    summary["throughput"] = {
+        "scope": "two-model full-batch optimization plus final evaluation",
+        "optimizer_steps_per_second": summary["optimizer_steps"] / elapsed,
+        "training_sample_presentations_per_second": (
+            summary["optimizer_steps"] * summary["physical_batch_size_samples"] / elapsed
+        ),
+    }
+    return history, summary
 
 
 def _plot_history(history: pd.DataFrame, output: Path) -> None:
@@ -429,11 +500,20 @@ def main() -> None:
     parser.add_argument("--hidden", type=int, default=48)
     parser.add_argument("--learning-rate", type=float, default=3.0e-3)
     parser.add_argument("--ridge", type=float, default=0.01)
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    parser.add_argument(
+        "--device",
+        choices=["cpu", "cuda"],
+        default="cuda",
+        help="explicit execution device; CUDA unavailability is an error, never a CPU fallback",
+    )
     args = parser.parse_args()
 
+    if args.output_dir.exists():
+        raise FileExistsError(
+            f"Output path already exists: {args.output_dir}; choose a new path"
+        )
     history, summary = run(args)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=False)
     history.to_csv(args.output_dir / "training.csv", index=False)
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     _plot_history(history, args.output_dir / "training.png")

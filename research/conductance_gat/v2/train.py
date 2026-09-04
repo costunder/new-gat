@@ -74,7 +74,21 @@ def edge_gradient_coverage(model: DirectCNodeClassifier) -> list[dict[str, Any]]
     """
     records = []
     for index, operator in enumerate(model.operators):
-        parameter = operator.estimator.log_c
+        parameter = getattr(operator.estimator, "log_c", None)
+        if parameter is None:
+            records.append(
+                {
+                    "layer": index,
+                    "graph_edges": operator.estimator.num_edges,
+                    "edge_parameters": 0,
+                    "trainable": False,
+                    "gradient_present": False,
+                    "nonzero_task_gradient_edges": 0,
+                    "nonzero_fraction": None,
+                    "parameter_free_fixed_control": True,
+                }
+            )
+            continue
         gradient = parameter.grad
         if gradient is not None and not bool(torch.isfinite(gradient.detach()).all()):
             raise FloatingPointError("Nonfinite direct edge-C gradient before optimizer update")
@@ -83,6 +97,7 @@ def edge_gradient_coverage(model: DirectCNodeClassifier) -> list[dict[str, Any]]
         records.append(
             {
                 "layer": index,
+                "graph_edges": operator.estimator.num_edges,
                 "edge_parameters": count,
                 "trainable": parameter.requires_grad,
                 "gradient_present": gradient is not None,
@@ -216,7 +231,14 @@ def train_model(
         source_sha256=sources,
         protocol_note=PROTOCOL_NOTE,
         checkpoint_sha256=sha256_file(checkpoint),
-        graph_parameter_count=topology["num_edges"] * getattr(args, "layers", COMMON["layers"]),
+        graph_parameter_count=(
+            topology["num_edges"] * getattr(args, "layers", COMMON["layers"])
+            if args.condition == "direct_c"
+            else 0
+        ),
+        potential_direct_graph_parameter_count=(
+            topology["num_edges"] * getattr(args, "layers", COMMON["layers"])
+        ),
         execution={
             "training": "full_graph_transductive",
             "propagation": "exact_edge_chunked_autograd",
@@ -233,7 +255,7 @@ def train_model(
     result["diagnostics"]["edge_gradient_coverage_policy"] = (
         "Actual train-loss gradient immediately before each Adam step; exact nonzero count, "
         "no epsilon threshold. Full-graph computation does not imply every edge receives "
-        "a nonzero gradient. Fixed C is excluded from the optimizer."
+        "a nonzero gradient. Fixed C is parameter-free and absent from the optimizer."
     )
     if _source_hashes() != sources:
         raise RuntimeError("Direct-C v2 source changed while publishing its checkpoint")
@@ -280,7 +302,13 @@ def main(argv: list[str] | None = None) -> int:
         record.update(result)
     except BaseException as exc:
         record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
-        atomic_write_json(output / "metrics.json", record)
+        try:
+            atomic_write_json(output / "metrics.json", record)
+        except BaseException as reporting_error:
+            exc.add_note(
+                "failed metrics could not be written without replacing this error: "
+                f"{type(reporting_error).__name__}: {reporting_error}"
+            )
         raise
     atomic_write_json(output / "metrics.json", record)
     print(f"passed: {output}", flush=True)

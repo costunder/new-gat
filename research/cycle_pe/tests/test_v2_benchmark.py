@@ -25,6 +25,7 @@ def test_v2_defaults_use_deep_projector_model_on_official_data() -> None:
     assert args.column_chunk_size == 16
     assert args.basis_backend == "thin_q"
     assert args.hardware_profile == "portable" and args.prefetch_factor == 2
+    assert args.workers == 4
     assert args.output_dir == Path("results/cycle_pe_v2/benchmark")
     assert MODEL_NAME == "cycle_projector_pe_v2"
     assert not hasattr(args, "baselines")
@@ -36,6 +37,82 @@ def test_v2_defaults_use_deep_projector_model_on_official_data() -> None:
 def test_no_baseline_dummy_or_cycle_truncation_options(flag):
     with pytest.raises(SystemExit):
         benchmark.parser().parse_args([flag])
+
+
+def test_v2_observability_reports_real_graph_and_batch_counts():
+    graph = type("ObservedGraph", (), {})()
+    graph.x = torch.zeros(4, 3, dtype=torch.long)
+    graph.edge_index = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long)
+    graph.edge_attr = torch.zeros(3, 2, dtype=torch.long)
+    graph.y = torch.zeros(1)
+    graph.cycle_basis = torch.zeros(3, 1)
+    splits = {"train": [graph, graph], "validation": [graph], "test": [graph]}
+
+    data_report = benchmark._cycle_data_observability("zinc12k", splits)
+    assert data_report["loaded_graph_count"] == 4
+    assert data_report["actual_used_graph_count"] == 4
+    assert data_report["actual_used_fraction_of_loaded_graphs"]["value"] == 1.0
+    assert data_report["nodes_per_graph"]["total"] == 16
+    assert data_report["canonical_undirected_edges_per_graph"]["total"] == 12
+    assert data_report["official_full_graph_count"]["value"] == 12_000
+    assert data_report["loaded_fraction_of_official_full_dataset"]["value"] == pytest.approx(
+        4 / 12_000
+    )
+
+    args = benchmark.parser().parse_args([])
+    batch_report = benchmark._cycle_batch_observability(
+        args,
+        effective_batch_size=2,
+        training_graphs=5,
+        batches_per_epoch=3,
+    )
+    assert batch_report["configured_physical_batch_size"] == 2
+    assert batch_report["gradient_accumulation_steps"] == 1
+    assert batch_report["effective_batch_size"] == 2
+    assert batch_report["planned_maximum_training_batches"] == args.epochs * 3
+
+
+def test_v2_optimizer_ownership_and_first_task_gradients_are_fail_closed() -> None:
+    model = torch.nn.Sequential(torch.nn.Linear(3, 4), torch.nn.Linear(4, 1))
+    optimizer = torch.optim.Adam(model.parameters())
+    ownership = benchmark._validate_optimizer_ownership(model, optimizer)
+    assert ownership["validated"] is True
+    assert (
+        ownership["trainable_parameter_scalars"] == ownership["optimizer_owned_parameter_scalars"]
+    )
+
+    model(torch.ones(2, 3)).sum().backward()
+    gradients = benchmark._validate_first_task_gradients(model)
+    assert gradients["validated"] is True
+    assert gradients["missing_gradient_parameters"] == []
+    assert gradients["nonfinite_gradient_parameters"] == []
+
+    missing_owner = torch.optim.Adam(model[0].parameters())
+    with pytest.raises(RuntimeError, match="optimizer ownership mismatch"):
+        benchmark._validate_optimizer_ownership(model, missing_owner)
+
+
+def test_v2_first_task_gradient_validation_rejects_disconnected_and_nonfinite() -> None:
+    class Disconnected(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.used = torch.nn.Linear(2, 1)
+            self.unused = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            return self.used(value)
+
+    disconnected = Disconnected()
+    disconnected(torch.ones(1, 2)).sum().backward()
+    with pytest.raises(RuntimeError, match="disconnected from the first task loss"):
+        benchmark._validate_first_task_gradients(disconnected)
+
+    connected = torch.nn.Linear(2, 1)
+    connected(torch.ones(1, 2)).sum().backward()
+    assert connected.weight.grad is not None
+    connected.weight.grad.fill_(torch.inf)
+    with pytest.raises(FloatingPointError, match="nonfinite first-step task gradients"):
+        benchmark._validate_first_task_gradients(connected)
 
 
 def test_cpu_benchmark_training_and_invalid_chunk_size_are_rejected() -> None:
@@ -61,6 +138,8 @@ def test_hashes_include_basis_data_encoder_and_reused_backbone_sources() -> None
         "research/cycle_pe/benchmark_data.py",
         "research/cycle_pe/benchmark_models.py",
         "research/cycle_pe/paper_model.py",
+        "research/cycle_pe/resource_monitor.py",
+        "src/chartgat/observability.py",
     } <= set(hashes)
     root = Path(benchmark.__file__).resolve().parents[3]
     for name, value in hashes.items():
@@ -188,6 +267,17 @@ def test_runner_selects_validation_checkpoint_before_single_test_evaluation() ->
     assert "weights_only=True" in source
 
 
+def test_selected_test_path_reports_actual_resources_and_throughput() -> None:
+    source = inspect.getsource(benchmark._evaluate_test_checkpoint)
+    assert "FailureSafeResourceMonitor(" in source
+    assert "@resource_failure_boundary" in source
+    assert "resource_monitor.start()" in source
+    assert "resource_monitor.finish(" in source
+    assert '"resource_observability": resource_observability' in source
+    assert '"evaluation_graphs_per_second"' in source
+    assert '"optimizer_created": False' in source
+
+
 def test_two_slot_best_checkpoint_recovers_exact_previous_bytes(tmp_path):
     best = tmp_path / "best.pt"
     previous = tmp_path / "best.previous.pt"
@@ -242,6 +332,7 @@ def test_epoch_checkpoint_contract_contains_all_resume_state():
         "peak_gpu_reserved_bytes",
         "effective_batch_size",
         "batch_calibration",
+        "first_task_gradient_connectivity",
     ):
         assert f'"{field}"' in source
     assert "best_checkpoint_bytes" not in source

@@ -16,6 +16,7 @@ def test_default_matrix_is_two_datasets_four_conditions_one_seed(tmp_path):
     args = runner.parser().parse_args([])
     jobs = runner.make_jobs(args, tmp_path)
     assert args.datasets == ["ppi", "ogbn-arxiv"] and args.model_seed == 0
+    assert args.workers == 4
     assert len(jobs) == 8
     assert [job["condition"] for job in jobs[:4]] == list(runner.CONDITIONS)
     for job in jobs:
@@ -23,6 +24,9 @@ def test_default_matrix_is_two_datasets_four_conditions_one_seed(tmp_path):
         assert command[command.index("--model-seed") + 1] == "0"
         assert command[command.index("-m") + 1] == "research.conductance_gat.ablation.train"
         assert "--allow-download" not in command and "--amp" not in command
+        expected_workers = 4 if job["dataset"] == "ppi" else 0
+        assert job["workers"] == expected_workers
+        assert command[command.index("--workers") + 1] == str(expected_workers)
         assert Path(job["metrics_path"]).parent == Path(job["output_dir"])
     assert len({job["output_dir"] for job in jobs}) == 8
 
@@ -56,6 +60,21 @@ def test_single_seed_override_and_common_budget_apply_to_every_arm(tmp_path):
             ("--workers", "2"),
         ):
             assert command[command.index(option) + 1] == value
+
+
+def test_transductive_children_ignore_requested_ppi_worker_pool(tmp_path):
+    args = runner.parser().parse_args(["--datasets", "ogbn-arxiv", "--workers", "7"])
+    jobs = runner.make_jobs(args, tmp_path)
+    assert {job["workers"] for job in jobs} == {0}
+    assert {
+        job["command"][job["command"].index("--workers") + 1] for job in jobs
+    } == {"0"}
+
+
+def test_child_environment_unsets_nvml_based_cuda_check(monkeypatch):
+    monkeypatch.setenv("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
+    environment = runner._environment()
+    assert "PYTORCH_NVML_BASED_CUDA_CHECK" not in environment
 
 
 @pytest.mark.parametrize("arguments", [["--help"], ["--dry-run"]])
@@ -236,5 +255,7 @@ def test_integrity_error_cannot_be_marked_success(tmp_path, monkeypatch):
 def test_wrapper_uses_active_conda_and_independent_runner():
     wrapper = (runner.ROOT / "research/conductance_gat/ablation/reproduce.sh").read_text()
     assert 'source "${project_root}/scripts/conda_env.sh"' in wrapper
-    assert 'exec "${environment_python}" -B scripts/run_conductance_factorial.py "$@"' in wrapper
+    assert '"${environment_python}" -B scripts/run_conductance_factorial.py "$@"' in wrapper
+    assert "set -" not in wrapper and "exec " not in wrapper and "exit " not in wrapper
+    assert "main()" in wrapper and "must be executed, not sourced" in wrapper
     assert "setup_gpu.sh" not in wrapper and "run_paper.py" not in wrapper

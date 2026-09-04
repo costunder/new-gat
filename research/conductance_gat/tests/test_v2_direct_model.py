@@ -167,15 +167,18 @@ def graph():
 
 def test_direct_and_fixed_initial_state_counts_and_outputs_match():
     direct, fixed = model(), model("fixed_one")
-    assert direct.state_dict().keys() == fixed.state_dict().keys()
-    for name, value in direct.state_dict().items():
-        torch.testing.assert_close(value, fixed.state_dict()[name], rtol=0, atol=0)
+    from research.conductance_gat.ablation.model import shared_backbone_state_sha256
+
+    assert shared_backbone_state_sha256(direct) == shared_backbone_state_sha256(fixed)
     gates = [(name, p) for name, p in direct.named_parameters() if ".estimator." in name]
     assert [name for name, _ in gates] == [
         "operators.0.estimator.log_c",
         "operators.1.estimator.log_c",
     ]
     assert sum(p.numel() for _, p in gates) == 14
+    assert not [
+        name for name, _ in fixed.named_parameters() if ".estimator." in name
+    ]
     assert sum(p.numel() for p in direct.parameters() if p.requires_grad) - sum(
         p.numel() for p in fixed.parameters() if p.requires_grad
     ) == 14
@@ -196,8 +199,8 @@ def test_task_loss_reaches_each_direct_log_c_but_not_fixed():
         assert grad is not None and bool(torch.isfinite(grad).all())
         assert float(grad.abs().sum()) > 0
     for operator in fixed.operators:
-        assert operator.estimator.log_c.grad is None
-        assert not operator.estimator.log_c.requires_grad
+        assert list(operator.estimator.parameters()) == []
+        assert not hasattr(operator.estimator, "log_c")
 
 
 def test_c_is_direct_and_not_a_function_of_node_inputs():

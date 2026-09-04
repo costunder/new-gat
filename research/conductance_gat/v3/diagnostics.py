@@ -134,9 +134,15 @@ class ForwardObservation:
             "score": moments(scores),
             "conductance": moments(value),
             "log_conductance": moments(value.log()),
-            "gamma": float(estimator.gamma.detach()),
-            "tau": float(estimator.tau.detach()),
+            "gamma": (
+                float(estimator.gamma.detach()) if estimator.gamma is not None else None
+            ),
+            "tau": float(estimator.tau.detach()) if estimator.tau is not None else None,
             "estimator_trainable": any(p.requires_grad for p in estimator.parameters()),
+            "estimator_parameter_count": sum(
+                parameter.numel() for parameter in estimator.parameters()
+            ),
+            "parameter_free_fixed_control": estimator.gate_mode == "fixed_one",
         }
         self.conductances[index] = value
 

@@ -84,8 +84,10 @@ def test_default_runner_contract_contains_no_irrelevant_beta_margins():
 def test_ppi_auto_uses_full_graph_and_graph_batch_two(tmp_path):
     args = runner.parser().parse_args(["--datasets", "ppi"])
     jobs = runner.make_jobs(args, tmp_path / "run", runner._architecture(args))
+    assert args.workers == 4
     assert {job["sampling"] for job in jobs} == {"full"}
     assert {_value(job["command"], "--batch-size") for job in jobs} == {"2"}
+    assert {_value(job["command"], "--workers") for job in jobs} == {"4"}
     assert {job["batch_size"] for job in jobs} == {2}
 
 
@@ -107,8 +109,14 @@ def test_a6000_profile_forwards_real_larger_batches_and_numeric_policy(tmp_path)
         "activation_checkpoint": False,
         "sample_prefetch": True,
         "pin_memory": True,
+        "dataloader_workers": 0,
+        "persistent_workers": False,
+        "prefetch_factor": None,
     }
     assert ppi["batch_size"] == 8
+    assert ppi["execution"]["dataloader_workers"] == 4
+    assert ppi["execution"]["persistent_workers"] is True
+    assert ppi["execution"]["prefetch_factor"] == 2
     assert _value(ppi["command"], "--batch-size") == "8"
     assert "--no-activation-checkpoint" in ppi["command"]
 
@@ -117,6 +125,24 @@ def test_runner_rejects_batch_override_that_would_change_dataset_contract():
     args = runner.parser().parse_args(["--batch-size", "2"])
     with pytest.raises(ValueError, match="runner-level batch size must be 1"):
         runner._validate(args)
+
+
+def test_incomplete_output_without_checkpoint_is_preserved_before_retry(tmp_path, capsys):
+    run_dir = tmp_path / "run"
+    output = run_dir / "cora" / "fixed_c"
+    output.mkdir(parents=True)
+    (output / "partial.log").write_text("keep", encoding="utf-8")
+    job = {"output_dir": str(output), "status": "failed"}
+
+    runner._preserve_incomplete_child(job, run_dir)
+
+    preserved = output.with_name("fixed_c.preserved-attempt-1")
+    assert not output.exists()
+    assert (preserved / "partial.log").read_text(encoding="utf-8") == "keep"
+    assert job["preserved_incomplete_outputs"][0]["destination"] == str(preserved)
+    report = json.loads(capsys.readouterr().err)
+    assert report["source"] == str(output)
+    assert report["destination"] == str(preserved)
 
 
 def test_same_run_preserves_last_checkpoint_and_adds_resume(tmp_path, monkeypatch):
@@ -145,6 +171,7 @@ def test_same_run_preserves_last_checkpoint_and_adds_resume(tmp_path, monkeypatc
             "precision": "fp32",
             "tf32": False,
             "edge_chunk_size": int(_value(command, "--edge-chunk-size")),
+            "workers": int(_value(command, "--workers")),
         }
         hardware_execution = {
             "profile": "portable",
@@ -156,6 +183,9 @@ def test_same_run_preserves_last_checkpoint_and_adds_resume(tmp_path, monkeypatc
             "graph_batch_size": int(_value(command, "--batch-size")),
             "sample_prefetch": False,
             "pin_memory": True,
+            "loader_workers": int(_value(command, "--workers")),
+            "persistent_workers": False,
+            "prefetch_factor": None,
         }
         (output / "metrics.json").write_text(
             json.dumps(

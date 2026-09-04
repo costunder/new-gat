@@ -12,8 +12,7 @@ CONDITIONS = {
     "fixed_c": {
         "normalization": "node_degree",
         "gate_mode": "fixed_one",
-        # There is no trainable gate in this arm; its frozen initialization
-        # scaffold is excluded from the optimizer, not trained with a new WD.
+        # There is no gate parameter in this arm and therefore no gate WD.
         "gate_weight_decay": 0.0,
     },
 }

@@ -242,10 +242,11 @@ def test_paper_checks_preparation_dependencies_only_after_conda_validation() -> 
     assert "--prepare-only) prepare_only=1" in source
     assert "--help|-h|--dry-run) inspection_only=1" in source
     assert '"${prepare_only}" == "1" && "${inspection_only}" == "0"' in source
-    assert f"{dependency_check} || dependency_status=$?" in source
-    assert f"if ! {dependency_check}" not in source
+    assert dependency_check in source
+    assert "dependency_status=$?" in source
     assert 'case "${dependency_status}" in' in source
-    assert 'exit "${dependency_status}"' in source
+    assert 'return "${dependency_status}"' in source
+    assert "set -" not in source and "exit " not in source and "exec " not in source
     assert source.index("        2)") < source.index(installer) < source.index("        *)")
     assert "-m pip" not in source
 
@@ -258,30 +259,33 @@ def _shell_environment(tmp_path: Path) -> tuple[dict[str, str], Path, Path]:
     python = prefix / "bin" / "python"
     python.write_text(
         "#!/bin/sh\n"
-        'case "$1" in\n'
+        "main() {\n"
+        '  case "$1" in\n'
         "  */verify_conda_env.py)\n"
         '    printf "verify\\n" >> "$TEST_CALL_LOG"\n'
-        '    exit "${TEST_VERIFY_EXIT:-0}" ;;\n'
+        '    return "${TEST_VERIFY_EXIT:-0}" ;;\n'
         "  */check_dependencies.py)\n"
         '    printf "dependencies\\n" >> "$TEST_CALL_LOG"\n'
         '    printf "%s\\0" "$0" "$@" >> "$TEST_DEPENDENCY_ARGS"\n'
         '    if [ -f "$TEST_DEPENDENCY_READY" ]; then\n'
-        '      exit "${TEST_DEPENDENCY_AFTER_SETUP_EXIT:-0}"\n'
+        '      return "${TEST_DEPENDENCY_AFTER_SETUP_EXIT:-0}"\n'
         "    fi\n"
-        '    exit "${TEST_DEPENDENCY_EXIT:-0}" ;;\n'
+        '    return "${TEST_DEPENDENCY_EXIT:-0}" ;;\n'
         "  */gpu_profiles.py)\n"
         '    printf "profile\\n" >> "$TEST_CALL_LOG"\n'
-        '    if [ "$2" != "--installed-profile" ]; then exit 98; fi\n'
+        '    if [ "$2" != "--installed-profile" ]; then return 98; fi\n'
         '    if [ "${TEST_PROFILE_QUERY_EXIT:-0}" != "0" ]; then\n'
-        '      exit "$TEST_PROFILE_QUERY_EXIT"\n'
+        '      return "$TEST_PROFILE_QUERY_EXIT"\n'
         "    fi\n"
-        '    printf "%s\\n" "${TEST_INSTALLED_PROFILE:-auto}" ;;\n'
+        '    printf "%s\\n" "${TEST_INSTALLED_PROFILE:-auto}"; return 0 ;;\n'
         "  scripts/run_paper.py)\n"
         '    printf "paper\\n" >> "$TEST_CALL_LOG"\n'
         '    printf "%s\\0" "$@" > "$TEST_DISPATCH_ARGS"\n'
-        '    exit "${TEST_RUN_EXIT:-0}" ;;\n'
-        '  *) printf "unexpected\\n" >> "$TEST_CALL_LOG"; exit 97 ;;\n'
-        "esac\n",
+        '    return "${TEST_RUN_EXIT:-0}" ;;\n'
+        '  *) printf "unexpected\\n" >> "$TEST_CALL_LOG"; return 97 ;;\n'
+        "  esac\n"
+        "}\n"
+        'main "$@"\n',
         encoding="utf-8",
     )
     python.chmod(0o755)
@@ -321,7 +325,7 @@ def test_bash_guard_failure_stops_before_pip_or_dispatch(
 ) -> None:
     environ, call_log, dispatch_args = _shell_environment(tmp_path)
     environ.update({"TEST_VERIFY_EXIT": "23", "SKIP_DEPS": skip_deps})
-    # Setup help deliberately exits before requiring an active environment.
+    # Setup argument handling returns before requiring an active environment.
     arguments = [] if script_name == "setup_gpu.sh" else ["--help"]
     result = subprocess.run(
         [BASH, str(ROOT / "scripts" / script_name), *arguments],
@@ -438,14 +442,18 @@ def _bootstrap_project(tmp_path: Path) -> Path:
         shutil.copy2(ROOT / "scripts" / filename, scripts / filename)
     (scripts / "setup_gpu.sh").write_text(
         "#!/usr/bin/env bash\n"
-        "set -euo pipefail\n"
-        'printf "setup\\n" >> "$TEST_CALL_LOG"\n'
-        'printf "%s" "$CONDA_PREFIX" > "$TEST_SETUP_PREFIX"\n'
-        'printf "%s\\0" "$@" > "$TEST_SETUP_ARGS"\n'
-        'if [[ "${TEST_SETUP_EXIT:-0}" != "0" ]]; then exit "$TEST_SETUP_EXIT"; fi\n'
-        'if [[ "${TEST_SETUP_MARK_READY:-1}" == "1" ]]; then\n'
-        '    touch "$TEST_DEPENDENCY_READY"\n'
-        "fi\n",
+        "main() {\n"
+        '    printf "setup\\n" >> "$TEST_CALL_LOG"\n'
+        '    printf "%s" "$CONDA_PREFIX" > "$TEST_SETUP_PREFIX"\n'
+        '    printf "%s\\0" "$@" > "$TEST_SETUP_ARGS"\n'
+        '    if [[ "${TEST_SETUP_EXIT:-0}" != "0" ]]; then\n'
+        '        return "$TEST_SETUP_EXIT"\n'
+        "    fi\n"
+        '    if [[ "${TEST_SETUP_MARK_READY:-1}" == "1" ]]; then\n'
+        '        touch "$TEST_DEPENDENCY_READY"\n'
+        "    fi\n"
+        "}\n"
+        'main "$@"\n',
         encoding="utf-8",
     )
     return project

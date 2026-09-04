@@ -103,11 +103,26 @@ def make_optimizer(model: nn.Module, condition: str) -> torch.optim.Adam:
     )
 
 
-def state_sha256(model: nn.Module) -> str:
+def _named_state_sha256(items) -> str:
     """Order/name/dtype/shape/value-sensitive fingerprint, independent of torch.save."""
+
     digest = hashlib.sha256()
-    for name, tensor in model.state_dict().items():
+    for name, tensor in items:
         digest.update(name.encode("utf-8"))
         digest.update(b"\0")
         digest.update(tensor_hash(tensor).encode("ascii"))
     return digest.hexdigest()
+
+
+def state_sha256(model: nn.Module) -> str:
+    return _named_state_sha256(model.state_dict().items())
+
+
+def shared_backbone_state_sha256(model: nn.Module) -> str:
+    """Fingerprint only state shared by parameter-free controls and learned arms."""
+
+    return _named_state_sha256(
+        (name, tensor)
+        for name, tensor in model.state_dict().items()
+        if ".estimator." not in name and ".message_transform." not in name
+    )

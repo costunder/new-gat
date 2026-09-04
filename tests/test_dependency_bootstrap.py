@@ -75,6 +75,18 @@ def test_complete_stack_is_valid_without_gpu_allocation(monkeypatch: pytest.Monk
     assert report["python"] == sys.executable
 
 
+def test_dependency_import_removes_nvml_only_cuda_check_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _installed(monkeypatch)
+    monkeypatch.setenv("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
+
+    report = checker.check_dependencies()
+
+    assert report["pytorch_nvml_based_cuda_check_removed"] is True
+    assert "PYTORCH_NVML_BASED_CUDA_CHECK" not in os.environ
+
+
 @pytest.mark.parametrize("tag", CUDA_RUNTIMES)
 def test_installed_profile_is_reused_without_driver_query(
     monkeypatch: pytest.MonkeyPatch, tag: str
@@ -170,6 +182,8 @@ def test_repair_message_survives_unreadable_metadata(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(checker.importlib.metadata, "version", broken_metadata)
     message = checker.error_message(checker.DependencyCheckError("metadata damaged"))
     assert "Run: bash scripts/setup_gpu.sh\n" in message
+    assert "Installed Torch profile detection was unavailable" in message
+    assert "ValueError: unreadable metadata" in message
 
 
 def test_cu118_does_not_accept_newer_unsupported_pyg(monkeypatch: pytest.MonkeyPatch):
@@ -269,7 +283,11 @@ def test_runner_records_the_checked_profile_in_its_manifest(
     monkeypatch.setattr(run_paper, "check_dependencies", lambda: report)
     monkeypatch.setattr(run_paper, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(run_paper, "_commands", lambda *_args: [])
-    monkeypatch.setattr(run_paper, "_source_revision", lambda: {"revision": "unit-test"})
+    monkeypatch.setattr(
+        run_paper,
+        "_source_revision",
+        lambda: {"revision": "unit-test", "source_sha256": {}},
+    )
     monkeypatch.setattr(run_paper, "_environment_snapshot", lambda *_args: {})
     monkeypatch.setattr(run_paper, "_snapshot_registries", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(

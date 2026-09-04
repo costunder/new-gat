@@ -8,7 +8,9 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from research.conductance_gat.ablation.model import state_sha256  # noqa: E402
+from research.conductance_gat.ablation.model import (  # noqa: E402
+    shared_backbone_state_sha256,
+)
 from research.conductance_gat.v3.model import RelativeCNodeClassifier  # noqa: E402
 from research.conductance_gat.v4 import train as train_module  # noqa: E402
 from research.conductance_gat.v4.model import (  # noqa: E402
@@ -147,7 +149,7 @@ def test_all_factorial_arms_have_identical_initial_state_and_expected_freezing()
     for condition in CONDITIONS:
         torch.manual_seed(71)
         models[condition] = _model(condition)
-    assert len({state_sha256(model) for model in models.values()}) == 1
+    assert len({shared_backbone_state_sha256(model) for model in models.values()}) == 1
     for condition, model in models.items():
         specification = CONDITIONS[condition]
         for operator in model.operators:
@@ -156,15 +158,17 @@ def test_all_factorial_arms_have_identical_initial_state_and_expected_freezing()
                 parameter.requires_grad for parameter in operator.estimator.parameters()
             )
             assert estimator_active == (specification["gate_mode"] == "relative")
-            assert operator.message_transform.weight.requires_grad == (
-                specification["spatial_mode"] == "learned"
-            )
-            torch.testing.assert_close(
-                operator.message_transform.weight,
-                torch.eye(4),
-                rtol=0,
-                atol=0,
-            )
+            if specification["spatial_mode"] == "learned":
+                assert operator.message_transform.weight.requires_grad
+                torch.testing.assert_close(
+                    operator.message_transform.weight,
+                    torch.eye(4),
+                    rtol=0,
+                    atol=0,
+                )
+            else:
+                assert list(operator.message_transform.parameters()) == []
+                assert not hasattr(operator.message_transform, "weight")
 
 
 def test_identity_w_path_is_exact_v3_forward():
@@ -267,10 +271,10 @@ def test_ppi_topology_and_child_batch_defaults_bind_official_protocol():
         edge_chunk_size=1,
         model_seed=0,
         batch_size=None,
-        workers=0,
+        workers=4,
     )
     _validate_args(args)
-    assert args.batch_size == 2
+    assert args.batch_size == 2 and args.workers == 4
 
 
 class _PackedBatch(SimpleNamespace):

@@ -65,30 +65,29 @@ class RelativeConductance(nn.Module):
         self.channels = channels
         self.gate_mode = gate_mode
         self.edge_chunk_size = edge_chunk_size
-        self.input_norm = nn.LayerNorm(4 * channels + 2)
-        self.network = nn.Sequential(
-            nn.Linear(4 * channels + 2, channels),
-            nn.SiLU(),
-            nn.Linear(channels, channels),
-            nn.SiLU(),
-            # A common final bias is removed exactly by graph centering.
-            nn.Linear(channels, 1, bias=False),
-        )
-        nn.init.zeros_(self.network[-1].weight)
-        self.raw_gamma = nn.Parameter(torch.zeros(()))
-        self.raw_tau = nn.Parameter(torch.zeros(()))
+        if gate_mode == "relative":
+            self.input_norm = nn.LayerNorm(4 * channels + 2)
+            self.network = nn.Sequential(
+                nn.Linear(4 * channels + 2, channels),
+                nn.SiLU(),
+                nn.Linear(channels, channels),
+                nn.SiLU(),
+                # A common final bias is removed exactly by graph centering.
+                nn.Linear(channels, 1, bias=False),
+            )
+            nn.init.zeros_(self.network[-1].weight)
+            self.raw_gamma = nn.Parameter(torch.zeros(()))
+            self.raw_tau = nn.Parameter(torch.zeros(()))
         self.last_scores: Tensor | None = None
         self.last_centered_scores: Tensor | None = None
-        if gate_mode == "fixed_one":
-            self.requires_grad_(False)
 
     @property
-    def gamma(self) -> Tensor:
-        return self.raw_gamma.sigmoid()
+    def gamma(self) -> Tensor | None:
+        return self.raw_gamma.sigmoid() if self.gate_mode == "relative" else None
 
     @property
-    def tau(self) -> Tensor:
-        return 2 * self.raw_tau.sigmoid()
+    def tau(self) -> Tensor | None:
+        return 2 * self.raw_tau.sigmoid() if self.gate_mode == "relative" else None
 
     def _chunk_scores(
         self,
@@ -186,8 +185,8 @@ class RelativeConductance(nn.Module):
 class SpatialMessageTransform(nn.Module):
     """Bias-free square W, identity initialized without consuming model RNG.
 
-    In ``fixed_identity`` mode the allocated weight is frozen and the exact
-    identity path is used. In ``learned`` mode the forward is evaluated as
+    In ``fixed_identity`` mode no parameter is registered and the exact identity
+    path is used. In ``learned`` mode the forward is evaluated as
     ``H + H(W-I)``. This is algebraically the ordinary ``H W`` map, gives W the
     standard linear-map gradient, and makes W=I reduce bit-for-bit to the v3
     message state rather than depending on a matrix-multiply implementation.
@@ -202,9 +201,10 @@ class SpatialMessageTransform(nn.Module):
         self.in_features = channels
         self.out_features = channels
         self.spatial_mode = spatial_mode
-        identity = torch.eye(channels)
-        self.weight = nn.Parameter(identity.clone(), requires_grad=spatial_mode == "learned")
-        self.register_buffer("_identity", identity, persistent=False)
+        if spatial_mode == "learned":
+            identity = torch.eye(channels)
+            self.weight = nn.Parameter(identity.clone())
+            self.register_buffer("_identity", identity, persistent=False)
 
     def forward(self, state: Tensor) -> Tensor:
         if state.ndim != 2 or state.shape[1] != self.in_features:

@@ -17,7 +17,7 @@ def test_default_ten_fresh_trainings_with_dataset_specific_batch_sizes():
     jobs = runner.make_jobs(args, Path("fixture"))
     assert args.datasets == ["cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"]
     assert args.model_seed == 0
-    assert args.edge_chunk_size == 65536 and args.batch_size == 2 and args.workers == 0
+    assert args.edge_chunk_size == 65536 and args.batch_size == 2 and args.workers == 4
     assert len(jobs) == 10
     assert [job["condition"] for job in jobs] == ["relative_c", "fixed_c"] * 5
     for job in jobs:
@@ -28,6 +28,9 @@ def test_default_ten_fresh_trainings_with_dataset_specific_batch_sizes():
         expected_batch_size = 2 if job["dataset"] == "ppi" else 1
         assert job["batch_size"] == expected_batch_size
         assert command[command.index("--batch-size") + 1] == str(expected_batch_size)
+        expected_workers = 4 if job["dataset"] == "ppi" else 0
+        assert job["workers"] == expected_workers
+        assert command[command.index("--workers") + 1] == str(expected_workers)
         assert "--amp" not in command and "--allow-download" not in command
 
 
@@ -63,7 +66,7 @@ def test_stdlib_inspection_has_no_writes(tmp_path, option):
         ["--edge-chunk-size", "0"],
         ["--batch-size", "1"],
         ["--batch-size", "3"],
-        ["--workers", "1"],
+        ["--workers", "-1"],
     ],
 )
 def test_invalid_inputs_do_not_check_dependencies_or_train(monkeypatch, options):
@@ -76,6 +79,7 @@ def test_ppi_is_a_supported_two_arm_batch_two_plan():
     runner._validate(args)
     jobs = runner.make_jobs(args, Path("fixture"))
     assert len(jobs) == 2 and all(job["batch_size"] == 2 for job in jobs)
+    assert all(job["workers"] == 4 for job in jobs)
 
 
 def _stub(tmp_path, monkeypatch, failure=None, change_after=None):

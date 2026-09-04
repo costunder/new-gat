@@ -145,12 +145,34 @@ and chart axes are explicitly `not_applicable` in `summary.json`.
 The standalone module retains `--seed` as a compatibility fallback for omitted
 axes. The reproduction script passes the independent axes explicitly.
 
-If GPU memory is limited, lower `--batch-size`. CUDA defaults to AMP, pinned
-DataLoader memory, and non-blocking host-to-device transfer; all are explicit:
-`--amp/--no-amp`, `--pin-memory/--no-pin-memory`, `--batch-size`, and
-`--workers` (alias: `--num-workers`). CPU disables AMP and pinned transfer. Runtime JSON records the
-CUDA device/runtime and peak allocated/reserved memory. An OOM error reports the
-batch-size recovery command instead of silently falling back to CPU.
+CUDA defaults to AMP, pinned DataLoader memory, and non-blocking host-to-device
+transfer. `--workers` (alias `--num-workers`) defaults to the repository paper
+runner's four-worker reference setting; `--amp/--no-amp`,
+`--pin-memory/--no-pin-memory`, `--batch-size`, and `--workers` remain explicit
+overrides. CPU disables AMP and pinned transfer. The runner prints the complete
+pre-training execution plan before optimization, including model widths/layers,
+all split cardinalities and graph node/edge statistics, physical/effective batch,
+workers/prefetch/cache policy, precision, source hashes, and a pre-training resource
+snapshot.
+
+`RuntimeResourceMonitor` samples process CPU/RAM, CUDA allocator memory, and
+device-wide NVML GPU SM/memory-controller utilization throughout the actual
+training/evaluation workload. PyTorch's NVML counters are preferred and
+`nvidia-smi` is the explicit fallback; an unavailable counter is `null` with its
+reason, never a fabricated zero. `summary.json` stores start/end samples,
+min/mean/max series, sample counts, sampler errors, and peak allocated/reserved
+VRAM. Every learned baseline also stores model/parameter counts, exact optimizer
+ownership, first real backward gradient connectivity, first optimizer parameter
+change, expected/actual optimization steps, data-wait and validation time, and
+graphs/labels/steps per second.
+
+OOM handling never silently falls back to CPU and never changes model width/depth,
+data, sampling, epochs, or physical batch. It writes `failure.json` with the exact
+execution plan and resource observations. Diagnose tensor lifetimes, synchronization,
+loader/graph construction, mixed precision, sparse kernels, activation
+checkpointing, caching, chunking, and multi-GPU/process distribution first. Only
+after an explicit physical-batch candidate profile demonstrates insufficient VRAM
+should a new batch value and a new output directory be chosen.
 
 ## Supplementary synthetic datasets
 
@@ -186,9 +208,10 @@ every trained core baseline.
 
 Core ablations share the training protocol and hidden width, but they do not
 have matched parameter budgets: the isotropic model has one learned scalar and
-the edge-only, gradient-only, and full MLPs have different input widths. Core
-results currently do not emit per-baseline parameter counts, so their gaps
-cannot be interpreted as input-information effects alone.
+the edge-only, gradient-only, and full MLPs have different input widths. Every
+baseline now emits its exact total/trainable parameter counts. The count mismatch
+is therefore visible but still means gaps cannot be interpreted as
+input-information effects alone.
 
 The exact conductance oracle is evaluated everywhere. S1 and S4 additionally
 report two transductive identification ceilings on the evaluation excitations:
@@ -205,7 +228,9 @@ Reported metrics include graph-macro flux/node-message/next-state relative L2,
 log-conductance RMSE, Pearson and Spearman conductance correlation, excited-edge
 coverage, state variation of predicted conductance, stability-cap activation,
 and S3 rollout norm/dissipation diagnostics. S4 additionally writes metrics for
-every factorial cell.
+every factorial cell. Per-graph metrics use vectorized segmented reductions over
+each sparse disjoint-union batch. S3 packs every independent trajectory into one
+sparse forward per time step instead of issuing one GPU forward per graph.
 
 ## Supplementary public benchmarks (optional loader dependencies)
 
@@ -251,13 +276,19 @@ Supplementary `paper.py` training writes only to `--output-dir`. The path must b
 runner refuses a non-empty directory before data preparation and leaves its
 existing artifacts untouched:
 
-- `summary.json`: resolved seed axes and applicability, configuration,
-  manifests, claims, complete metrics, runtime, CUDA/AMP and peak-memory metadata;
+- `summary.json`: resolved seed axes and applicability, full untruncated epoch
+  configuration, manifests, source-integrity hashes, data/model/batch/gradient/
+  optimizer evidence, complete metrics, throughput, CUDA/AMP metadata, and
+  periodic CPU/RAM/GPU/VRAM observations;
 - `metrics.csv`: flattened machine-readable result metrics;
 - `history.csv`: per-suite/per-baseline objective, train loss, and validation loss;
 - `models.pt`: CPU-portable state dictionaries.
 
-Preparation-only writes `prepare_summary.json`.
+Preparation-only writes `prepare_summary.json`. Public and core suites both receive
+the exact requested `--epochs` value; there is no suite-specific hidden 50-epoch cap.
+The one-layer/96-wide public model remains the declared legacy supplementary
+protocol and is reported as such, not presented as the larger matched-benchmark or
+V5 architecture.
 
 ## Verification
 

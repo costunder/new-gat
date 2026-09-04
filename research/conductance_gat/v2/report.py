@@ -31,13 +31,14 @@ from .protocol import COMMON, CONDITIONS, DATASETS, PARAMETERIZATION, SUITE
 SHA256 = re.compile(r"[0-9a-fA-F]{64}\Z")
 CAVEATS = [
     "n=1; exploratory validation comparison; test not evaluated. No CI, p-value or seed std.",
-    "Both arms train freshly with the same initial full state, ordered graph, official cache, "
+    "Both arms train freshly with the same initial shared-backbone state, ordered graph, "
+    "official cache, "
     "nongate Adam L2 and early-stopping policy. No V1 or historical score is reused.",
     "Direct C has graph-specific edge parameters, not an edge-generator MLP. It is transductive "
     "and cannot transfer these parameters to held-out PPI graphs or unseen edges.",
     "The contrast is direct_c minus fixed_c (percentage points), not an external GCN/GAT baseline.",
-    "Fixed C=1 keeps zero edge-log parameters frozen and outside the optimizer. Its reported "
-    "edge-parameter L2 is not an active learning signal.",
+    "Fixed C=1 is parameter-free: it owns no edge-log tensor and has no inactive learning "
+    "scaffold. Only the direct-C arm adds graph-bound edge parameters.",
     "Both arms use node-degree normalization: common positive C scale cancels and rho=.95 on "
     "nonisolated nodes is imposed, not evidence of useful learned conductances.",
     "Elapsed time and peak CUDA allocation cover the training loop including diagnostic and "
@@ -105,7 +106,7 @@ def _load(root, job, config, source_hashes):
     }:
         raise ValueError("topology must contain num_nodes, num_edges and incidence_sha256")
     _integer(topology["num_nodes"], "topology.num_nodes", minimum=1)
-    edges = _integer(topology["num_edges"], "topology.num_edges")
+    _integer(topology["num_edges"], "topology.num_edges")
     if not isinstance(topology["incidence_sha256"], str) or not SHA256.fullmatch(
         topology["incidence_sha256"]
     ):
@@ -113,16 +114,27 @@ def _load(root, job, config, source_hashes):
     total = _integer(child.get("total_parameters"), "total_parameters", minimum=1)
     trainable = _integer(child.get("trainable_parameters"), "trainable_parameters", minimum=1)
     frozen = _integer(child.get("frozen_parameters"), "frozen_parameters")
-    expected_frozen = config["layers"] * edges if job["condition"] == "fixed_c" else 0
-    if total != trainable + frozen or frozen != expected_frozen:
-        raise ValueError("parameter counts disagree with direct-C/frozen-edge condition")
+    if total != trainable + frozen or frozen != 0:
+        raise ValueError("parameter counts disagree with parameter-free fixed-C contract")
     if not isinstance(child.get("versions"), dict) or not child["versions"]:
         raise ValueError("Missing runtime versions")
     if not isinstance(child.get("gpu"), str) or not child["gpu"]:
         raise ValueError("Missing GPU identity")
     if child["protocol"].get("data_sha256") != child["cache_sha256"]:
         raise ValueError("cache_sha256 disagrees with dataset protocol")
+    shared_hash = child.get("shared_backbone_initial_state_sha256")
+    if not isinstance(shared_hash, str) or not SHA256.fullmatch(shared_hash):
+        raise ValueError("shared backbone initialization SHA-256 is required")
     return child
+
+
+def _comparison_metadata(metrics: dict[str, Any]) -> dict[str, Any]:
+    metadata = _pair_metadata(metrics)
+    metadata.pop("initial_state_sha256")
+    metadata["shared_backbone_initial_state_sha256"] = metrics[
+        "shared_backbone_initial_state_sha256"
+    ]
+    return metadata
 
 
 def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
@@ -262,19 +274,18 @@ def build_comparison(root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                     errors.append(f"{dataset}/{condition}: {exc}")
             rows.append(row)
         reference = next(iter(loaded.values()), None)
-        metadata = _pair_metadata(reference) if reference else None
+        metadata = _comparison_metadata(reference) if reference else None
         if reference:
             extra = (
                 "versions",
                 "gpu",
-                "total_parameters",
                 "topology",
                 "parameterization",
                 "source_sha256",
             )
             metadata.update({key: reference[key] for key in extra})
             for condition, child in loaded.items():
-                actual = _pair_metadata(child) | {key: child[key] for key in extra}
+                actual = _comparison_metadata(child) | {key: child[key] for key in extra}
                 for key in metadata:
                     if not _same(metadata[key], actual[key]):
                         errors.append(f"{dataset}/{condition}: held-fixed {key} mismatch")

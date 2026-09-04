@@ -38,6 +38,7 @@ def parser():
 def make_jobs(args, run_dir: Path) -> list[dict[str, Any]]:
     jobs = []
     for dataset in args.datasets:
+        child_workers = shared.workers_for_dataset(dataset, args.workers)
         for condition in CONDITIONS:
             output = run_dir / dataset / condition
             command = [
@@ -55,12 +56,14 @@ def make_jobs(args, run_dir: Path) -> list[dict[str, Any]]:
                 "--data-root",
                 str(args.data_root.expanduser().resolve()),
             ]
-            for key in ("device", "model_seed", "epochs", "patience", "batch_size", "workers"):
+            for key in ("device", "model_seed", "epochs", "patience", "batch_size"):
                 command += ["--" + key.replace("_", "-"), str(getattr(args, key))]
+            command += ["--workers", str(child_workers)]
             jobs.append(
                 {
                     "dataset": dataset,
                     "condition": condition,
+                    "workers": child_workers,
                     "status": "pending",
                     "output_dir": str(output),
                     "metrics_path": str(output / "metrics.json"),
@@ -134,6 +137,10 @@ def main(argv: list[str] | None = None) -> int:
             )
         },
         "data_root": str(data_root),
+        "workers_by_dataset": {
+            dataset: shared.workers_for_dataset(dataset, args.workers)
+            for dataset in args.datasets
+        },
     }
     manifest = {
         "schema_version": 1,
@@ -150,10 +157,13 @@ def main(argv: list[str] | None = None) -> int:
         "protocol": {
             "selection": "best validation checkpoint per arm; same early-stopping policy",
             "test": "not evaluated; exploratory validation comparison",
-            "initialization": "same full state hash including unused frozen gate scaffold",
+            "initialization": (
+                "same constructor RNG and shared non-estimator backbone state hash; "
+                "full hashes differ because fixed_c has no estimator tensors"
+            ),
             "data": "same verified official cache/split per dataset; no downloads",
             "contrast": "fresh learned_c minus fresh fixed_c; never reuse an older score",
-            "fixed_c": "exact C=1; scaffold frozen and excluded from optimizer/trainable count",
+            "fixed_c": "exact C=1 through a parameter-free estimator; no unused gate tensors",
             "normalization": "node_degree in both arms; nongate Adam L2=0.0005",
             "uncertainty": "n=1; no CI, seed standard deviation or significance claim",
             "reproducibility": "same seeds; CUDA scatter need not be bitwise deterministic",
@@ -217,11 +227,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         if current_job is not None:
             current_job.update(status="failed", error=manifest["error"])
-        atomic_write_json(manifest_path, manifest)
-        try:
-            _comparison(run_dir, manifest)
-        except (ValueError, OSError) as report_error:
-            print(f"Comparison integrity error: {report_error}", file=sys.stderr)
+        report_error = shared.run_failure_reporter(
+            lambda: _comparison(run_dir, manifest),
+            original_error=exc,
+            action="failed-run comparison generation",
+        )
+        if report_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(report_error)
+        manifest_error = shared.run_failure_reporter(
+            lambda: atomic_write_json(manifest_path, manifest),
+            original_error=exc,
+            action="failed-run manifest persistence",
+        )
+        if manifest_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(manifest_error)
         print(f"Failed: {manifest['error']}\nSaved partial results: {run_dir}", file=sys.stderr)
         return 130 if isinstance(exc, KeyboardInterrupt) else 1
     atomic_write_json(manifest_path, manifest)

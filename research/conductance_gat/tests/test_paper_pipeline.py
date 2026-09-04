@@ -447,7 +447,11 @@ def test_explicit_seed_axes_route_data_and_model_randomness_independently(
 
     def fake_prepare_core(data_root, *, seed):
         captured["data_seed"] = seed
-        return {}, data_root / "unit-dispatch-manifest.json", {"cache_key": "unit-dispatch"}
+        return {}, data_root / "unit-dispatch-manifest.json", {
+            "cache_key": "unit-dispatch",
+            "artifact_sha256": "a" * 64,
+            "content_sha256": "b" * 64,
+        }
 
     monkeypatch.setattr(paper_module, "prepare_core_cache", fake_prepare_core)
     monkeypatch.setattr(paper_module, "run_core", fake_run_core)
@@ -480,6 +484,9 @@ def test_explicit_seed_axes_route_data_and_model_randomness_independently(
     assert captured["model_seed"] == 6
     assert captured["data_seed"] == 3
     assert summary["prepared"]["core"]["data_seed"] == 3
+    assert summary["configuration"]["suite_specific_epoch_cap"] is None
+    assert summary["runtime"]["resource_observability"]["measurement_scope"]
+    assert summary["implementation_integrity"]["valid"] is True
     assert summary["seed_axis_applicability"]["core"]["split"]["applicable"] is False
     assert summary["seed_axis_applicability"]["core"]["chart"]["applicable"] is False
 
@@ -491,3 +498,290 @@ def test_official_public_split_and_chart_seed_axes_are_not_applicable() -> None:
     assert "official" in applicability["split"]["use"]
     assert applicability["chart"]["applicable"] is False
     assert applicability["model"]["applicable"] is True
+
+
+def test_public_suite_receives_the_full_requested_epoch_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, int] = {}
+
+    def fake_prepare_public(_data_root, *, allow_download):
+        assert allow_download is False
+        return {"fixture": False}, tmp_path / "official-ready.json", {
+            "fixture": False,
+            "processed_sha256": {"unit": "c" * 64},
+        }
+
+    def fake_run_public(datasets, **kwargs):
+        assert datasets["fixture"] is False
+        captured["epochs"] = kwargs["epochs"]
+        return {}, [], {}
+
+    monkeypatch.setattr(paper_module, "prepare_public_data", fake_prepare_public)
+    monkeypatch.setattr(paper_module, "run_public", fake_run_public)
+    summary = paper_main(
+        [
+            "--suite",
+            "public",
+            "--device",
+            "cpu",
+            "--epochs",
+            "73",
+            "--workers",
+            "0",
+            "--data-root",
+            str(tmp_path / "data"),
+            "--output-dir",
+            str(tmp_path / "output"),
+        ]
+    )
+    assert captured["epochs"] == 73
+    assert summary["configuration"]["epochs_applied_to_public"] == 73
+    assert summary["configuration"]["suite_specific_epoch_cap"] is None
+
+
+def test_oom_is_fail_visible_and_never_changes_the_batch_or_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fake_prepare_core(data_root, *, seed):
+        assert seed == 17
+        return {}, data_root / "manifest.json", {
+            "cache_key": "unit-oom",
+            "artifact_sha256": "d" * 64,
+            "content_sha256": "e" * 64,
+        }
+
+    def fail_with_oom(_core, **_kwargs):
+        raise torch.cuda.OutOfMemoryError("unit OOM")
+
+    output = tmp_path / "output"
+    monkeypatch.setattr(paper_module, "prepare_core_cache", fake_prepare_core)
+    monkeypatch.setattr(paper_module, "run_core", fail_with_oom)
+    with pytest.raises(RuntimeError, match="No model, dataset, epoch, sampling, or batch"):
+        paper_main(
+            [
+                "--suite",
+                "core",
+                "--device",
+                "cpu",
+                "--epochs",
+                "100",
+                "--batch-size",
+                "16",
+                "--workers",
+                "0",
+                "--data-root",
+                str(tmp_path / "data"),
+                "--output-dir",
+                str(output),
+            ]
+        )
+    failure = json.loads((output / "failure.json").read_text(encoding="utf-8"))
+    assert failure["status"] == "failed"
+    assert failure["execution_plan"]["optimization"][
+        "epochs_applied_without_suite_specific_cap"
+    ] == 100
+    assert failure["execution_plan"]["batching"]["physical_batch_size_graphs"] == 16
+    assert "automatic reduction" in failure["recovery_policy"]
+    assert "smaller --batch-size" not in json.dumps(failure)
+    assert failure["resources_until_failure"] is not None
+    assert failure["resource_observability_unavailable_reason"] is None
+
+
+def test_monitor_cleanup_failure_preserves_keyboard_interrupt_and_records_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    primary_error = KeyboardInterrupt("unit training interrupt")
+
+    def fake_prepare_core(data_root, *, seed):
+        assert seed == 17
+        return {}, data_root / "manifest.json", {
+            "cache_key": "unit-interrupt",
+            "artifact_sha256": "d" * 64,
+            "content_sha256": "e" * 64,
+        }
+
+    def interrupt_training(_core, **_kwargs):
+        raise primary_error
+
+    class FailingMonitor:
+        instances: list[FailingMonitor] = []
+
+        def __init__(self, _device):
+            self.finish_calls = 0
+            self.instances.append(self)
+
+        def start(self):
+            return {"measurement_scope": "unit monitor fixture"}
+
+        def finish(self, **_kwargs):
+            self.finish_calls += 1
+            raise RuntimeError("unit monitor cleanup failure")
+
+    output = tmp_path / "interrupted-output"
+    monkeypatch.setattr(paper_module, "prepare_core_cache", fake_prepare_core)
+    monkeypatch.setattr(paper_module, "run_core", interrupt_training)
+    monkeypatch.setattr(paper_module, "RuntimeResourceMonitor", FailingMonitor)
+    with pytest.raises(KeyboardInterrupt) as captured:
+        paper_main(
+            [
+                "--suite",
+                "core",
+                "--device",
+                "cpu",
+                "--workers",
+                "0",
+                "--data-root",
+                str(tmp_path / "data"),
+                "--output-dir",
+                str(output),
+            ]
+        )
+    assert captured.value is primary_error
+    assert FailingMonitor.instances[0].finish_calls == 1
+    assert any("unit monitor cleanup failure" in note for note in primary_error.__notes__)
+    failure = json.loads((output / "failure.json").read_text(encoding="utf-8"))
+    assert failure["error_type"] == "KeyboardInterrupt"
+    assert failure["error"] == "unit training interrupt"
+    assert failure["resources_until_failure"] is None
+    assert "unit monitor cleanup failure" in failure[
+        "resource_observability_unavailable_reason"
+    ]
+
+
+def test_actual_training_verifies_gradient_optimizer_and_step_counts() -> None:
+    train_examples = [
+        make_example(
+            graph_id=f"train-{index}",
+            num_nodes=7 + index,
+            family="er",
+            graph_seed=70 + index,
+            excitation_seed=80 + index,
+        )
+        for index in range(2)
+    ]
+    validation_examples = [
+        make_example(
+            graph_id="validation",
+            num_nodes=8,
+            family="rgg",
+            graph_seed=91,
+            excitation_seed=92,
+        )
+    ]
+    model = SparseIncidenceConductanceLayer(2, 3, hidden_channels=8)
+    report: dict[str, object] = {}
+    history = paper_module.train_sparse_model(
+        model,
+        train_examples,
+        validation_examples,
+        device=torch.device("cpu"),
+        epochs=1,
+        learning_rate=0.003,
+        batch_size=2,
+        amp=False,
+        pin_memory=False,
+        num_workers=0,
+        seed=5,
+        objective="node_only",
+        execution_report=report,
+    )
+    assert len(history) == 1
+    assert report["optimizer_integrity"]["verified"] is True
+    assert report["optimization"]["optimizer_steps"] == 1
+    assert report["optimization"]["expected_optimizer_steps"] == 1
+    assert report["first_optimizer_step"]["gradient"]["verified"] is True
+    assert report["first_optimizer_step"]["changed_parameter_tensors"]
+    assert report["path_integrity"]["input_forward_loss_backward_optimizer"] is True
+
+
+def test_vectorized_sparse_evaluation_matches_individual_graph_metrics() -> None:
+    examples = [
+        make_example(
+            graph_id=f"evaluation-{index}",
+            num_nodes=8 + index,
+            family="er" if index == 0 else "rgg",
+            graph_seed=110 + index,
+            excitation_seed=120 + index,
+        )
+        for index in range(2)
+    ]
+    torch.manual_seed(15)
+    model = SparseIncidenceConductanceLayer(2, 3, hidden_channels=8)
+    options = {
+        "device": torch.device("cpu"),
+        "amp": False,
+        "pin_memory": False,
+        "num_workers": 0,
+    }
+    batched = paper_module.evaluate_sparse_model(
+        model, examples, batch_size=2, **options
+    )
+    individual = [
+        paper_module.evaluate_sparse_model(model, [example], batch_size=1, **options)
+        for example in examples
+    ]
+    for name in (
+        "graph_macro_flux_relative_l2",
+        "graph_macro_node_message_relative_l2",
+        "graph_macro_next_state_relative_l2",
+        "graph_macro_log_conductance_rmse",
+        "graph_macro_conductance_pearson",
+        "graph_macro_conductance_spearman",
+        "excited_edge_fraction",
+        "stability_cap_activation_fraction",
+    ):
+        assert batched[name] == pytest.approx(
+            sum(result[name] for result in individual) / len(individual), abs=1.0e-6
+        )
+    assert batched["evaluation_batching"].startswith("vectorized")
+
+
+def test_rollout_batches_independent_trajectories_without_metric_drift() -> None:
+    trajectories = [
+        core_data_module._make_trajectory(
+            graph_id=f"rollout-{index}",
+            num_nodes=7 + index,
+            family="er" if index == 0 else "rgg",
+            graph_seed=130 + index,
+            trajectory_seed=140 + index,
+            horizon=3,
+        )
+        for index in range(2)
+    ]
+    torch.manual_seed(21)
+    model = SparseIncidenceConductanceLayer(2, 3, hidden_channels=8)
+    batched = paper_module.evaluate_rollout(
+        model,
+        trajectories,
+        [1, 3],
+        device=torch.device("cpu"),
+        amp=False,
+        oracle=False,
+    )
+    individual = [
+        paper_module.evaluate_rollout(
+            model,
+            [trajectory],
+            [1, 3],
+            device=torch.device("cpu"),
+            amp=False,
+            oracle=False,
+        )
+        for trajectory in trajectories
+    ]
+    for name in (
+        "horizon_1_relative_l2",
+        "horizon_3_relative_l2",
+        "final_norm_over_initial",
+        "dissipation_violation_fraction",
+        "stability_cap_activation_fraction",
+    ):
+        assert batched[name] == pytest.approx(
+            sum(result[name] for result in individual) / len(individual), abs=1.0e-6
+        )
+    assert "all independent trajectories" in batched["evaluation_batching"]
+
+
+def test_direct_cli_worker_default_matches_parent_paper_runner() -> None:
+    assert paper_module.build_parser().parse_args([]).num_workers == 4

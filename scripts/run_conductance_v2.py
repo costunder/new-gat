@@ -216,10 +216,13 @@ def main(argv: list[str] | None = None) -> int:
         "protocol": {
             "selection": "best validation checkpoint per arm; same early-stopping policy",
             "test": "not evaluated; exploratory validation comparison",
-            "initialization": "same full state hash including zero frozen edge-log parameters",
+            "initialization": (
+                "same shared non-conductance backbone state hash; full hashes differ "
+                "because fixed_c contains no edge-log parameters"
+            ),
             "data": "same verified official cache/split and ordered topology; no downloads",
             "contrast": "fresh direct_c minus fresh fixed_c; never reuse any V1 or older score",
-            "fixed_c": "exact C=1; edge parameters frozen and excluded from optimizer",
+            "fixed_c": "exact C=1 through a parameter-free estimator; no edge parameters",
             "normalization": "node_degree in both arms; nongate Adam L2=0.0005; edge L2=0",
             "transductive": "edge parameters belong to this fixed graph, not unseen graphs",
             "resources": "whole training-loop runtime and peak allocation include diagnostics "
@@ -283,11 +286,20 @@ def main(argv: list[str] | None = None) -> int:
         )
         if current_job is not None:
             current_job.update(status="failed", error=manifest["error"])
-        atomic_write_json(manifest_path, manifest)
-        try:
-            _comparison(run_dir, manifest)
-        except (ValueError, OSError) as report_error:
-            print(f"Comparison integrity error: {report_error}", file=sys.stderr)
+        report_error = shared.run_failure_reporter(
+            lambda: _comparison(run_dir, manifest),
+            original_error=exc,
+            action="failed-run comparison generation",
+        )
+        if report_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(report_error)
+        manifest_error = shared.run_failure_reporter(
+            lambda: atomic_write_json(manifest_path, manifest),
+            original_error=exc,
+            action="failed-run manifest persistence",
+        )
+        if manifest_error is not None:
+            manifest.setdefault("failure_persistence_errors", []).append(manifest_error)
         print(f"Failed: {manifest['error']}\nSaved partial results: {run_dir}", file=sys.stderr)
         return 130 if isinstance(exc, KeyboardInterrupt) else 1
     atomic_write_json(manifest_path, manifest)

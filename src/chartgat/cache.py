@@ -34,16 +34,24 @@ def _fsync_directory(path: Path) -> None:
     synced as well.
     """
 
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError:
+    if os.name == "nt":
+        # Windows has no portable directory descriptor/fsync operation. This is
+        # a known platform capability, not a swallowed operation failure.
         return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
-    finally:
+    except BaseException as original_error:
+        try:
+            os.close(descriptor)
+        except OSError as cleanup_error:
+            original_error.add_note(
+                "directory descriptor cleanup failed with "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        raise
+    else:
         os.close(descriptor)
 
 
@@ -77,7 +85,16 @@ def atomic_publish(
             validator(temporary)
         os.replace(temporary, destination)
         _fsync_directory(destination.parent)
-    finally:
+    except BaseException as original_error:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            original_error.add_note(
+                "temporary cache cleanup failed with "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        raise
+    else:
         temporary.unlink(missing_ok=True)
 
 

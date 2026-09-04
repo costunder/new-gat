@@ -74,6 +74,28 @@ def test_cli_resume_and_sampling_contract():
     assert architecture["beta_initial"] == 0.1
     assert "beta_min" not in architecture and "beta_max" not in architecture
     assert "beta_min" not in configuration(args) and "beta_max" not in configuration(args)
+    assert args.workers == 0
+    assert args.worker_configuration_source == "dataset_default"
+
+
+def test_direct_ppi_cli_defaults_to_parallel_graph_loading():
+    args = build_parser().parse_args(
+        [
+            "--dataset",
+            "ppi",
+            "--condition",
+            "shared_dynamic_c",
+            "--output-dir",
+            "out",
+        ]
+    )
+    validate_args(args)
+    assert args.workers == 4
+    assert args.worker_configuration_source == "dataset_default"
+    config = configuration(args)
+    assert config["loader_workers"] == 4
+    assert config["persistent_workers"] is True
+    assert config["prefetch_factor"] == 2
 
 
 def test_cli_can_reproduce_historical_margin_beta_ablation():
@@ -147,7 +169,6 @@ def test_report_is_partial_safe_then_requires_complete_pairs(tmp_path):
 
         cache_sha256 = "c" * 64
         source_sha256 = {"implementation.py": "s" * 64}
-        initial_state_sha256 = "i" * 64
         protocol = {"data_sha256": cache_sha256, "dataset": "cora"}
         configuration = {
             **job["architecture"],
@@ -167,6 +188,8 @@ def test_report_is_partial_safe_then_requires_complete_pairs(tmp_path):
             {"name": "joint", "start_epoch": 4, "end_epoch": 4, "length": 1},
         ]
         dynamic = job["condition"] == "shared_dynamic_c"
+        initial_state_sha256 = ("d" if dynamic else "f") * 64
+        shared_initial_state_sha256 = "h" * 64
         global_validation = 0.81 if dynamic else 0.8
         global_epoch = 1 if dynamic else 4
         joint_validation = 0.8 if dynamic else None
@@ -209,9 +232,9 @@ def test_report_is_partial_safe_then_requires_complete_pairs(tmp_path):
                     "joint_best_epoch": joint_epoch,
                     "checkpoint_selection": checkpoint_selection,
                     "metric_name": "accuracy",
-                    "total_parameters": 10,
+                    "total_parameters": 12 if dynamic else 10,
                     "trainable_parameters": 8,
-                    "allocated_parameter_capacity": 10,
+                    "allocated_parameter_capacity": 12 if dynamic else 10,
                     "best_epoch": 4,
                     "configuration": configuration,
                     "schedule": schedule,
@@ -219,6 +242,7 @@ def test_report_is_partial_safe_then_requires_complete_pairs(tmp_path):
                     "source_sha256": source_sha256,
                     "versions": {"torch": "fixture"},
                     "initial_state_sha256": initial_state_sha256,
+                    "shared_initial_state_sha256": shared_initial_state_sha256,
                     "protocol": protocol,
                     "resume_identity": identity,
                     "resume_identity_sha256": identity_sha256,
@@ -250,3 +274,5 @@ def test_report_is_partial_safe_then_requires_complete_pairs(tmp_path):
     complete = build_comparison(tmp_path, manifest)
     assert complete["status"] == "passed"
     assert complete["contrasts"][0]["dynamic_minus_fixed"] == 0
+    assert complete["contrasts"][0]["dynamic_minus_fixed_parameter_capacity"] == 2
+    assert complete["contrasts"][0]["shared_initial_state_sha256"] == "h" * 64

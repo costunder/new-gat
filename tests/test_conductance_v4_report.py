@@ -71,8 +71,10 @@ def _layer(index, specification, *, gradients=False):
             "max": 0.1 if c_active else 0.0,
         },
         "alpha": 0.5,
-        "gamma": 0.5,
-        "tau": 1.0,
+        "gamma": 0.5 if c_active else None,
+        "tau": 1.0 if c_active else None,
+        "estimator_parameter_count": 49 if c_active else 0,
+        "parameter_free_fixed_control": not c_active,
         "estimator_trainable": c_active,
         "weighted_degree": {
             "quantiles": {"p50": 2.0, "p99": 4.0},
@@ -86,7 +88,8 @@ def _layer(index, specification, *, gradients=False):
         "spatial_weight": {
             "spatial_mode": specification["spatial_mode"],
             "trainable": w_active,
-            "parameter_norm": 8.0,
+            "parameter_present": w_active,
+            "parameter_norm": 8.0 if w_active else None,
             "identity_distance_frobenius": 0.1 if w_active else 0.0,
             "identity_relative_distance": 0.0125 if w_active else 0.0,
             "singular_values": {
@@ -205,6 +208,7 @@ def _fixture(tmp_path, dataset="ogbn-arxiv"):
     validation_graphs = 2 if dataset == "ppi" else 1
     validation_edges = 4 if dataset == "ppi" else 3
     args = SimpleNamespace(
+        dataset=dataset,
         model_seed=0,
         epochs=2,
         patience=1,
@@ -212,6 +216,7 @@ def _fixture(tmp_path, dataset="ogbn-arxiv"):
         workers=0,
         device="cuda",
         edge_chunk_size=65536,
+        worker_configuration_source="explicit_cli",
     )
     config = {
         **COMMON,
@@ -289,7 +294,8 @@ def _fixture(tmp_path, dataset="ogbn-arxiv"):
                     "metric": "accuracy",
                 }
             ),
-            "initial_state_sha256": "a" * 64,
+            "initial_state_sha256": hashlib.sha256(condition.encode()).hexdigest(),
+            "shared_backbone_initial_state_sha256": "c" * 64,
             "topology": (
                 {
                     "scope": "official_train_and_validation_graphs",
@@ -633,7 +639,7 @@ def test_complete_children_withhold_contrasts_until_manifest_passes(tmp_path, st
     "change",
     [
         "metric_digest",
-        "initial_hash",
+        "shared_initial_hash",
         "gate_mode",
         "spatial_mode",
         "test",
@@ -652,8 +658,11 @@ def test_tampering_or_mismatched_factor_metadata_withholds_contrasts(tmp_path, c
     root, manifest = _fixture(tmp_path)
     if change == "metric_digest":
         _edit(manifest, lambda metrics: metrics.update(validation=0.9), refresh=False)
-    elif change == "initial_hash":
-        _edit(manifest, lambda metrics: metrics.update(initial_state_sha256="b" * 64))
+    elif change == "shared_initial_hash":
+        _edit(
+            manifest,
+            lambda metrics: metrics.update(shared_backbone_initial_state_sha256="b" * 64),
+        )
     elif change == "gate_mode":
         _edit(manifest, lambda metrics: metrics.update(gate_mode="relative"))
     elif change == "spatial_mode":
