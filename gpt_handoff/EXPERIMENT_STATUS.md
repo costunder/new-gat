@@ -66,7 +66,7 @@ V5와 새 Cycle V2는 `last.pt`부터 이어지며 legacy 미완료 child만 처
 | 폐기된 구 Cycle PE v2 | `cycle-pe-v2-gpu6-seed0-v1` | 당시 runner `passed`; 새 `cycle_projector_pe_v2` 결과가 아님 |
 | 전체 scaling | 미실행 | V1–V5 포함 118-child/122-training 실행 코드만 추가; GPU 결과 없음 |
 
-### 2026-09-04 A6000 V5·Cycle V2 partial 실행
+### 2026-09-04 A6000 V5·Cycle V2 partial 실행과 old-source r2 재현
 
 Run `new-v5-cyclev2-a6000-gpu3-seed0-r1`, GPU 3 RTX A6000, model seed 0의 사용자
 terminal 로그를 수령했다. 첨부 텍스트 SHA-256은
@@ -90,6 +90,22 @@ manifest/checkpoint/history를 로컬로 받은 독립 재검증은 아니다.
 수 없고, 구 partial `last.pt`도 새 selection schema/source와 이어 붙이지 않는다. 수정판은 새
 run ID가 필요하지만 Cycle dataset/projector cache는 재사용한다. 이 partial run의 수치를
 fixed-vs-dynamic 또는 V5/Cycle V2 성능 결과로 인용하지 않는다.
+
+후속 run `new-v5-cyclev2-a6000-gpu3-seed0-r2`의 사용자 terminal 로그도 수령했다. 첨부
+`bd63fc9a-60da-4daf-9ab9-da49db7cbbe1/pasted-text.txt`의 SHA-256은
+`F797F10F2D81BF23ED269DB698817EEEA99DB3F70DEBD3D0D68119C2917431D6`다. 그러나 새 run ID만
+사용했을 뿐 수정 commit `214265c0dcc09a67ae0c9c3d09d9e2cbc26c63bb`는 서버에 적용되지
+않았다. Conductance traceback의 `train.py:785`와 `joint_best=` 단독 출력, Cycle traceback의
+`benchmark.py:589`는 모두 직전 `08d8ed6` 소스와 일치한다.
+
+r2도 r1과 같은 실패를 재현했다. Conductance는 fixed-C 한 job만 완료한 뒤 dynamic-C 최초
+calibration backward에서 다시 44.47/44.55GiB OOM이 발생했고 18개가 미실행이다. Cycle V2
+네 job도 모두 첫 epoch 전에 같은 non-finite gradient로 실패했다. 따라서 r2는 edge-score
+checkpoint, condition-aware selection, BF16/no-scaler 수정의 검증 결과가 아니며 그 수치나
+artifact를 수정판 결과로 사용하거나 r3에 resume하지 않는다. 다음 통합 실행 ID는
+`new-v5-cyclev2-a6000-gpu3-seed0-r3`다. 실행 전에 `git pull --ff-only` 후
+`git merge-base --is-ancestor 214265c HEAD || { echo "required fix 214265c is missing"; exit 1; }`로
+현재 HEAD가 source-fix commit `214265c`를 포함하는지 반드시 확인한 뒤 시작한다.
 
 V3는 graph-centered score → bounded relative C → isotropic mixture와 학습 alpha의
 대칭 정규화를 사용한다. AdamW backbone/생성기/scalar 그룹을 분리했다. 현재 기본은
@@ -504,6 +520,8 @@ GPU 가속 실측은 여전히 별도 검증 대상이다.
 | 사용자 제공 43afd63 2×2 GPU 학습·비교 stdout | 첨부 `20b4a93d-06ed-4cff-9fe5-530eacf39766`; `2C78D02BB210BF00865AB7207DF651B02B2081EE4FAE6E8A6A83665A5D331161` |
 | 사용자 제공 C-learning GPU 비교 | 2026-09-01 inline 보고서, `gat-c-learning-seed0-v1`; 별도 첨부 파일/SHA 없음, 실행 revision 미확인 |
 | 사용자 제공 C-learning 평균-C GPU 검사 | 2026-09-01 inline terminal 출력, revision 표시 `8f6b4da`, `gat-c-learning-seed0-v1`의 각 데이터셋 `learned_c`; 별도 첨부 파일/SHA 없음 |
+| 사용자 제공 A6000 V5·Cycle V2 r1 실패 stdout | 첨부 `606865d2-9e2f-4818-a7dd-b4599ab165ae`; `D6394C813EDB52DD2CE6746B531973A750A1F0AE807EC5A3410B938FAFF6F93E` |
+| 사용자 제공 A6000 V5·Cycle V2 r2 old-source 재현 stdout | 첨부 `bd63fc9a-60da-4daf-9ab9-da49db7cbbe1`; `F797F10F2D81BF23ED269DB698817EEEA99DB3F70DEBD3D0D68119C2917431D6` |
 
 이 hash는 **제공된 텍스트 파일의 hash**이며 서버의 checkpoint/원본 데이터 hash가 아니다.
 개인 서버 계정·호스트 경로와 원본 로그 전체는 이 문서에 복제하지 않았다.

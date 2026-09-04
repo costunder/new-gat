@@ -187,3 +187,13 @@ GPU 하나의 효과로 직접 해석하지 않는다.
 run의 checkpoint나 수치를 성능 결과로 쓰지 않는다. 수정 후에는 implementation/resume
 identity가 달라지므로 새 run ID가 필요하지만, 검증된 dataset/projector cache는 그대로
 재사용할 수 있다. 구 V2 실패값도 새 projector V2 결과로 재사용하거나 SOTA와 비교해서는 안 된다.
+
+후속 `new-v5-cyclev2-a6000-gpu3-seed0-r2-cycle`도 네 학습 모두 첫 epoch 전에 같은
+non-finite gradient로 실패했다. 첨부
+`bd63fc9a-60da-4daf-9ab9-da49db7cbbe1/pasted-text.txt`의 SHA-256은
+`F797F10F2D81BF23ED269DB698817EEEA99DB3F70DEBD3D0D68119C2917431D6`다. traceback의
+`benchmark.py:589`는 수정 전 `08d8ed6`의 FP16+GradScaler 경로와 정확히 일치하므로 r2는
+`214265c`의 BF16/no-scaler 정책을 검증한 실행이 아니다. r2 checkpoint를 수정판에 resume하지
+않는다. 다음 통합 run은 `new-v5-cyclev2-a6000-gpu3-seed0-r3`이며, 실행 전
+`git merge-base --is-ancestor 214265c HEAD || { echo "required fix 214265c is missing"; exit 1; }`로
+현재 HEAD가 source-fix commit `214265c`를 포함하는지 반드시 확인한다.

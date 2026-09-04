@@ -173,7 +173,7 @@ checkpoint-selection 구현이 바뀌기 전 source이므로 수정판을 같은
 않는다. 새 run ID에서 다시 실행해야 하며, 과거 `fixed_c`의 epoch 10 global-best model state는
 구 코드가 저장하지 않았기 때문에 수정된 primary checkpoint로 복구할 수 없다.
 
-## 2026-09-04 A6000 partial 실행
+## 2026-09-04 A6000 partial 실행과 old-source r2 재현
 
 Run `new-v5-cyclev2-a6000-gpu3-seed0-r1-conductance`, model seed 0에서 첫 job인
 `v5/reference/ogbn-arxiv/fixed_c`는 200 epochs를 완료했다. 로그상 전체 최고 validation은
@@ -185,6 +185,17 @@ full-graph-eval 불일치 신호가 있다. 이 결과는 corrected fixed primar
 CUDA OOM으로 중단됐다. 따라서 dynamic C 점수, fixed-vs-dynamic 비교 및 나머지 18개 V5 job은
 미완료다. GPU preflight 통과는 장치 가용성 검사였고 이 모델의 peak-memory 적합성을 인증한
 것이 아니었다. 위 partial 수치는 실패 원인과 수정 필요성의 근거이지 V5 성능 결론이 아니다.
+
+후속 `new-v5-cyclev2-a6000-gpu3-seed0-r2-conductance`도 fixed-C 하나만 완료한 뒤 dynamic-C
+최초 calibration backward에서 같은 44.47/44.55GiB OOM으로 중단되어 18개가 미실행이다.
+첨부 `bd63fc9a-60da-4daf-9ab9-da49db7cbbe1/pasted-text.txt`의 SHA-256은
+`F797F10F2D81BF23ED269DB698817EEEA99DB3F70DEBD3D0D68119C2917431D6`다. 로그의
+`train.py:785`와 `joint_best=` 단독 출력은 수정 전 `08d8ed6` 코드와 정확히 일치한다. 따라서
+r2는 `214265c`의 dynamic edge-score checkpoint나 condition-aware checkpoint selection을
+검증하지 않았다. 다음 실행은 r2를 resume하지 않고 통합 run ID
+`new-v5-cyclev2-a6000-gpu3-seed0-r3`를 사용한다. 실행 전
+`git merge-base --is-ancestor 214265c HEAD || { echo "required fix 214265c is missing"; exit 1; }`로
+현재 HEAD가 source-fix commit `214265c`를 포함하는지 반드시 확인한다.
 
 ## V1–V5 reference/large 비교
 

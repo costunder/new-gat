@@ -45,9 +45,17 @@
   batch·sample·precision을 바꾸므로 portable와 점수나 wall time을 직접 대응시켜 모델 또는 GPU
   효과로 해석하지 않는다. Conductance V1–V4 legacy FP32·batch 계약도 바꾸지 않으므로 A6000
   PPI의 V1–V5 cross-version 값은 descriptive다.
-- 새 V5와 projector V2의 성공한 전체 GPU 성능 결과는 아직 없다. 2026-09-04 A6000 partial은
+- 새 V5와 projector V2의 성공한 전체 GPU 성능 결과는 아직 없다. 2026-09-04 A6000 r1 partial은
   V5 fixed 한 job 뒤 dynamic OOM, Cycle V2 네 job의 gradient overflow로 중단됐고 수정 근거로만
   사용한다. 아래 과거 단일-seed 값이나 폐기된 V2 결과를 새 버전 성능으로 재사용하지 않는다.
+- 후속 `new-v5-cyclev2-a6000-gpu3-seed0-r2`도 r1과 같은 OOM/non-finite 실패를 재현했다. 첨부
+  `bd63fc9a-60da-4daf-9ab9-da49db7cbbe1/pasted-text.txt`의 SHA-256은
+  `F797F10F2D81BF23ED269DB698817EEEA99DB3F70DEBD3D0D68119C2917431D6`다. traceback line과
+  구 `joint_best=` 출력이 `08d8ed6`와 일치하므로 r2에는 수정 commit `214265c`가 적용되지 않았고
+  수정 검증으로 사용할 수 없다. r2를 resume하지 말고 `new-v5-cyclev2-a6000-gpu3-seed0-r3`를
+  사용한다. 실행 전 `git pull --ff-only` 후
+  `git merge-base --is-ancestor 214265c HEAD || { echo "required fix 214265c is missing"; exit 1; }`로
+  현재 HEAD가 source-fix commit `214265c`를 포함하는지 반드시 확인한다.
 
 ### 2026-09-01 추가 요청 반영: 상대 C graph operator × spatial W v4
 

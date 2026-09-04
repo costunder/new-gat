@@ -188,15 +188,28 @@ epoch-10 global best 0.692775 대신 0.680392를 골라 corrected 비교에 재�
 새 V5 또는 projector V2의 유효한 전체 성능 결과가 없다. 수정판은 source/resume identity가
 달라 새 run ID를 사용하되 V1–V4, Cycle V1과 Tree를 다시 계획할 필요는 없다.
 
+후속 `new-v5-cyclev2-a6000-gpu3-seed0-r2`도 동일하게 중단됐다. 첨부
+`bd63fc9a-60da-4daf-9ab9-da49db7cbbe1/pasted-text.txt`의 SHA-256은
+`F797F10F2D81BF23ED269DB698817EEEA99DB3F70DEBD3D0D68119C2917431D6`다. 이 로그의
+Conductance `train.py:785`·`joint_best=` 형식과 Cycle `benchmark.py:589`는 수정 전
+`08d8ed6`에 해당한다. 즉 r2에는 `214265c`의 score checkpoint/selection/BF16 수정이 적용되지
+않았고, r1의 dynamic-C OOM과 Cycle 네 non-finite gradient 실패를 old source로 다시 재현했을
+뿐이다. r2를 수정 검증으로 간주하거나 같은 output에서 수정판을 resume하지 않는다.
+
 수정판의 최소 통합 재실행은 다음 24개 job만 계획한다. V1–V4, Cycle V1과 Tree는 포함하지
 않고, 검증된 Cycle dataset/projector cache는 재사용한다. 구 fixed-C job은 실제 epoch-10
 global-best state를 저장하지 않았으므로 corrected checkpoint를 위해 V5 20개 안에서 다시
-학습한다.
+학습한다. 첫 두 명령으로 현재 HEAD가 source-fix commit `214265c`를 포함하는지 fail-closed로
+검사하며, 검사에 실패하면 학습을 시작하지 않는다. 후속 문서 commit 때문에 HEAD 자체가
+`214265c`와 같을 필요는 없다.
 
 ```bash
+git pull --ff-only
+git merge-base --is-ancestor 214265c HEAD || { echo "required fix 214265c is missing"; exit 1; }
+
 env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
 python -B scripts/run_rich_scaling.py \
-  --run-id new-v5-cyclev2-a6000-gpu3-seed0-r2 \
+  --run-id new-v5-cyclev2-a6000-gpu3-seed0-r3 \
   --tracks conductance cycle \
   --conductance-versions v5 \
   --cycle-versions v2 \
