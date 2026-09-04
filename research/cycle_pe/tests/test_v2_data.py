@@ -27,7 +27,7 @@ def _official(num_nodes=4, edges=((0, 1), (1, 2), (2, 3), (0, 3)), *, dataset="z
     )
 
 
-def _graph(*args, basis_backend="thin_q", **kwargs):
+def _graph(*args, basis_backend="dfs_fundamental", **kwargs):
     return data.prepare_graph(
         _official(*args, **kwargs),
         dataset=kwargs.get("dataset", "zinc12k"),
@@ -57,39 +57,143 @@ def test_entire_left_nullspace_is_returned_for_connected_disconnected_and_empty(
     assert actual_rank == rank
     assert values.shape == (len(edges), rank)
     assert values.dtype == np.float32
-    assert values.flags.c_contiguous
-    np.testing.assert_allclose(incidence.T @ values, 0, atol=2e-7)
-    np.testing.assert_allclose(values.T @ values, np.eye(rank), atol=3e-7)
+    assert values.format == incidence.format == "csr"
+    np.testing.assert_allclose((incidence.T @ values).toarray(), 0, atol=2e-7)
+    if rank:
+        assert np.linalg.matrix_rank(values.toarray()) == rank
     basis.validate_cycle_basis(nodes, edge_index, values)
 
 
-def test_uses_sparse_fundamental_cycles_and_thin_qr_without_svd(monkeypatch):
+def test_uses_sparse_dfs_without_any_decomposition_or_dense_materialization(monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("spectral/rank decomposition is forbidden")
 
-    for name in ("svd", "eig", "eigh", "matrix_rank"):
+    for name in ("svd", "eig", "eigh", "matrix_rank", "qr", "cholesky"):
         monkeypatch.setattr(basis.np.linalg, name, forbidden)
+    monkeypatch.setattr(basis.sparse.csr_matrix, "toarray", forbidden)
     pairs = [(u, v) for u in range(8) for v in range(u + 1, 8)]
     sparse_values = basis.sparse_left_nullspace_basis(8, _edges(pairs))
     values = basis.left_nullspace_basis(8, _edges(pairs))
     assert sparse_values.shape == (28, 21) and sparse_values.nnz < np.prod(sparse_values.shape)
     assert values.shape == (28, 21)
-    np.testing.assert_allclose(values.T @ values, np.eye(21), atol=2e-6)
+    basis.validate_cycle_basis(8, _edges(pairs), values)
 
 
-def test_dfs_fundamental_backend_returns_raw_signed_cycles_with_same_projector():
+def test_default_backend_returns_complete_raw_signed_dfs_basis():
     pairs = [(u, v) for u in range(5) for v in range(u + 1, 5)]
     edge_index = _edges(pairs)
     raw_sparse = basis.dfs_fundamental_cycle_basis(5, edge_index)
     raw = basis.build_cycle_basis(5, edge_index, backend="dfs_fundamental")
-    q = basis.build_cycle_basis(5, edge_index, backend="thin_q")
-    assert raw_sparse.shape == raw.shape == q.shape == (10, 6)
-    np.testing.assert_array_equal(raw, raw_sparse.toarray())
-    assert set(np.unique(raw)) <= {-1.0, 0.0, 1.0}
-    assert not np.allclose(raw.T @ raw, np.eye(6))
-    raw_q, _ = np.linalg.qr(raw.astype(np.float64), mode="reduced")
-    np.testing.assert_allclose(raw_q @ raw_q.T, q @ q.T, atol=2e-6)
+    default = basis.build_cycle_basis(5, edge_index)
+    assert raw_sparse.shape == raw.shape == default.shape == (10, 6)
+    np.testing.assert_array_equal(raw.toarray(), raw_sparse.toarray())
+    np.testing.assert_array_equal(raw.toarray(), default.toarray())
+    assert set(raw.data) <= {-1.0, 1.0}
+    assert basis.BASIS_BACKENDS == ("dfs_fundamental",)
     basis.validate_cycle_basis(5, edge_index, raw_sparse)
+
+
+def test_circular_positions_follow_chord_and_actual_tree_path_not_csr_row_order():
+    edges = _edges([(0, 1), (0, 4), (1, 2), (2, 3), (3, 4)])
+    values, positions = basis.build_cycle_coordinates(5, edges)
+    assert values.shape == (5, 1)
+    assert not np.array_equal(positions, np.arange(5))
+    rows = np.repeat(np.arange(5), np.diff(values.indptr))
+    ordered_edges = edges[:, rows[np.argsort(positions)]]
+    for index in range(5):
+        assert len(set(ordered_edges[:, index]) & set(ordered_edges[:, (index + 1) % 5])) == 1
+    factors = basis.cycle_position_factors(values, positions)
+    assert factors.shape == (2, values.nnz)
+    np.testing.assert_allclose(np.sum(factors * factors, axis=0), 1.0, atol=2e-7)
+    basis.validate_cycle_positions(5, edges, values, positions)
+
+
+@pytest.mark.parametrize("damage", ["duplicate", "out_of_range", "fractional", "nonadjacent"])
+def test_cycle_position_validator_rejects_fake_order_even_with_full_valid_basis(damage):
+    edges = _edges([(0, 1), (0, 4), (1, 2), (2, 3), (3, 4)])
+    values, positions = basis.build_cycle_coordinates(5, edges)
+    if damage == "duplicate":
+        positions[1] = positions[0]
+    elif damage == "out_of_range":
+        positions[0] = 5
+    elif damage == "fractional":
+        positions = positions.astype(np.float64) + 0.25
+    else:
+        first = int(np.flatnonzero(positions == 0)[0])
+        second = int(np.flatnonzero(positions == 1)[0])
+        positions[first], positions[second] = positions[second], positions[first]
+    basis.validate_cycle_basis(5, edges, values)
+    with pytest.raises(ValueError, match="position"):
+        basis.validate_cycle_positions(5, edges, values, positions)
+
+
+@pytest.mark.parametrize("shift", [0, 1, 3])
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_cached_positions_allow_cycle_origin_shift_reversal_and_independent_basis_sign(
+    shift, direction
+):
+    graph = _graph(5, [(0, 1), (0, 4), (1, 2), (2, 3), (3, 4)])
+    position_indices = (direction * graph.cycle_position_indices + shift) % 5
+    angle = 2.0 * torch.pi * position_indices.double() / 5
+    transformed = replace(
+        graph,
+        cycle_basis=-graph.cycle_basis,
+        cycle_position_indices=position_indices,
+        cycle_position_values=torch.stack((angle.cos(), angle.sin())).float(),
+    )
+    data.validate_graph(transformed, dataset="zinc12k")
+    first = graph.cycle_position_values.T @ graph.cycle_position_values
+    second = transformed.cycle_position_values.T @ transformed.cycle_position_values
+    torch.testing.assert_close(first, second)
+
+
+def test_cached_positions_and_lengths_follow_sparse_cycle_column_permutation():
+    graph = _graph(5, [(0, 1), (1, 2), (0, 2), (2, 3), (3, 4), (0, 4)])
+    indices = graph.cycle_basis.indices().numpy()
+    original = basis.sparse.coo_matrix(
+        (graph.cycle_basis.values().numpy(), (indices[0], indices[1])),
+        shape=tuple(graph.cycle_basis.shape),
+    ).tocsr()
+    order_matrix = basis.sparse.csr_matrix(
+        (graph.cycle_position_indices.numpy(), original.indices, original.indptr),
+        shape=original.shape,
+    )
+    permutation = np.arange(original.shape[1])[::-1].copy()
+    changed = original[:, permutation].tocsr()
+    changed.sort_indices()
+    changed_order = order_matrix[:, permutation].tocsr()
+    changed_order.sort_indices()
+    changed_positions = changed_order.data
+    assert changed_positions.shape == (original.nnz,)
+    changed_coo = changed.tocoo()
+    transformed = replace(
+        graph,
+        cycle_basis=torch.sparse_coo_tensor(
+            torch.from_numpy(np.vstack((changed_coo.row, changed_coo.col)).astype(np.int64)),
+            torch.from_numpy(changed_coo.data),
+            changed_coo.shape,
+            is_coalesced=True,
+            check_invariants=True,
+        ),
+        cycle_lengths=graph.cycle_lengths[torch.from_numpy(permutation)],
+        cycle_position_indices=torch.from_numpy(changed_positions),
+        cycle_position_values=torch.from_numpy(
+            basis.cycle_position_factors(changed, changed_positions)
+        ),
+    )
+    data.validate_graph(transformed, dataset="zinc12k")
+    for component in range(2):
+        original_factor = basis.sparse.csr_matrix(
+            (graph.cycle_position_values[component].numpy(), original.indices, original.indptr),
+            shape=original.shape,
+        )
+        changed_factor = basis.sparse.csr_matrix(
+            (transformed.cycle_position_values[component].numpy(), changed.indices, changed.indptr),
+            shape=changed.shape,
+        )
+        np.testing.assert_array_equal(
+            changed_factor.toarray(), original_factor[:, permutation].toarray()
+        )
 
 
 def test_unknown_basis_backend_fails_closed():
@@ -97,16 +201,26 @@ def test_unknown_basis_backend_fails_closed():
         basis.build_cycle_basis(3, _edges([(0, 1)]), backend="unknown")
     with pytest.raises(ValueError, match="basis_backend"):
         data.prepare_graph(_official(), basis_backend="unknown")
+    with pytest.raises(ValueError, match="retired"):
+        basis.build_cycle_basis(3, _edges([(0, 1)]), backend="thin_q")
 
 
-def test_generic_nonorthogonal_basis_is_valid_but_rank_deficiency_is_not():
+@pytest.mark.parametrize("scale", [1e-8, 1e-4, 1.0, 1e4, 1e8])
+def test_fundamental_basis_column_scales_and_signs_do_not_trigger_absolute_rank_threshold(scale):
     edge_index = _edges([(0, 1), (0, 2), (1, 2), (1, 3), (2, 3)])
     q = basis.left_nullspace_basis(4, edge_index)
-    changed = q @ np.asarray([[2.0, 0.5], [-1.0, 3.0]])
+    changed = q.toarray()[:, ::-1] * np.asarray([scale, -scale])
     basis.validate_cycle_basis(4, edge_index, changed)
     changed[:, 1] = changed[:, 0]
     with pytest.raises(ValueError, match="full column rank"):
         basis.validate_cycle_basis(4, edge_index, changed)
+
+
+def test_generic_mixed_basis_without_structural_witness_is_explicitly_unsupported():
+    edges = _edges([(0, 1), (0, 2), (1, 2), (1, 3), (2, 3)])
+    changed = basis.left_nullspace_basis(4, edges) @ np.asarray([[2.0, 0.5], [-1.0, 3.0]])
+    with pytest.raises(ValueError, match="arbitrary mixed bases are unsupported"):
+        basis.validate_cycle_basis(4, edges, changed)
 
 
 @pytest.mark.parametrize(
@@ -135,8 +249,8 @@ def test_arbitrary_edge_orientation_is_accepted_and_transports_projector():
     q, changed_q = basis.left_nullspace_basis(3, edges), basis.left_nullspace_basis(3, changed)
     signs = np.asarray([1.0, -1.0, 1.0])
     np.testing.assert_allclose(
-        changed_q @ changed_q.T,
-        signs[:, None] * (q @ q.T) * signs[None, :],
+        (changed_q @ changed_q.T).toarray(),
+        signs[:, None] * (q @ q.T).toarray() * signs[None, :],
         atol=2e-6,
     )
 
@@ -144,7 +258,7 @@ def test_arbitrary_edge_orientation_is_accepted_and_transports_projector():
 @pytest.mark.parametrize("kind", ["nonfinite", "wrong_width", "outside_nullspace", "rank", "half"])
 def test_basis_validation_rejects_incomplete_or_corrupt_coordinates(kind):
     edge_index = _edges([(0, 1), (0, 2), (1, 2)])
-    values = basis.left_nullspace_basis(3, edge_index)
+    values = basis.left_nullspace_basis(3, edge_index).toarray()
     if kind == "nonfinite":
         values[0, 0] = np.nan
     elif kind == "wrong_width":
@@ -161,12 +275,12 @@ def test_basis_validation_rejects_incomplete_or_corrupt_coordinates(kind):
 
 def test_edge_order_alignment_is_exact_not_assumed_lexicographic():
     pairs = _edges([(0, 1), (0, 2), (0, 3), (1, 2), (2, 3)])
-    original = basis.left_nullspace_basis(4, pairs)
+    original = basis.left_nullspace_basis(4, pairs).toarray()
     permutation = np.array([3, 0, 4, 1, 2])
-    transformed = basis.left_nullspace_basis(4, pairs[:, permutation])
+    transformed = basis.left_nullspace_basis(4, pairs[:, permutation]).toarray()
     # Different spanning forests may rotate coordinates; the spaces must agree.
     transported = original[permutation]
-    alignment = transported.T @ transformed
+    alignment = np.linalg.lstsq(transported, transformed, rcond=None)[0]
     np.testing.assert_allclose(transported @ alignment, transformed, atol=2e-7)
 
 
@@ -181,7 +295,11 @@ def test_official_chemistry_targets_preserved_and_directed_copies_sorted(dataset
         "edge_attr",
         "y",
         "cycle_basis",
-        "cycle_basis_is_orthonormal",
+        "cycle_lengths",
+        "edge_cycle_counts",
+        "edge_cycle_features",
+        "cycle_position_indices",
+        "cycle_position_values",
     }
     torch.testing.assert_close(graph.x, source.x)
     torch.testing.assert_close(graph.y, source.y)
@@ -189,9 +307,19 @@ def test_official_chemistry_targets_preserved_and_directed_copies_sorted(dataset
     torch.testing.assert_close(graph.edge_attr[:, 0], torch.tensor([3, 2, 1, 1]))
     assert graph.cycle_basis.shape == (4, 1)
     assert graph.cycle_basis.dtype == torch.float32
-    assert graph.cycle_basis_is_orthonormal.item() is True
+    assert graph.cycle_basis.layout == torch.sparse_coo and graph.cycle_basis.is_coalesced()
+    assert graph.cycle_position_indices.shape == (4,)
+    assert graph.cycle_position_values.shape == (2, 4)
+    assert sorted(graph.cycle_position_indices.tolist()) == list(range(4))
+    torch.testing.assert_close(graph.cycle_position_values.square().sum(dim=0), torch.ones(4))
+    torch.testing.assert_close(graph.cycle_lengths, torch.tensor([4.0]))
+    torch.testing.assert_close(graph.edge_cycle_counts, torch.ones(4))
+    torch.testing.assert_close(
+        graph.edge_cycle_features,
+        torch.tensor([[np.log1p(4), 0.25]], dtype=torch.float32).expand(4, 2),
+    )
     incidence, _ = basis.incidence_and_cycle_rank(4, graph.edge_index.numpy())
-    np.testing.assert_allclose(incidence.T @ graph.cycle_basis.numpy(), 0, atol=1e-7)
+    np.testing.assert_allclose(incidence.T @ graph.cycle_basis.to_dense().numpy(), 0, atol=1e-7)
 
 
 @pytest.mark.parametrize("kind", ["fractional_atom", "nonfinite_bond", "range", "copies", "loop"])
@@ -230,7 +358,7 @@ def test_dataset_categorical_and_target_schema_is_checked(kind):
         data.prepare_graph(source, dataset="zinc12k")
 
 
-def test_ragged_batch_keeps_whole_matrices_and_never_mixes_columns():
+def test_sparse_batch_keeps_every_cycle_and_never_mixes_graphs():
     graphs = [
         _graph(2, [(0, 1)]),
         _graph(4, [(0, 1), (0, 2), (0, 3), (1, 2), (2, 3)]),
@@ -238,48 +366,59 @@ def test_ragged_batch_keeps_whole_matrices_and_never_mixes_columns():
         _graph(),
     ]
     batch = data.collate(graphs)
-    assert isinstance(batch.cycle_bases, tuple)
-    assert [matrix.shape for matrix in batch.cycle_bases] == [(1, 0), (5, 2), (0, 0), (4, 1)]
+    assert batch.cycle_membership.layout == torch.sparse_coo
+    assert batch.cycle_membership.is_coalesced()
+    assert batch.cycle_membership.shape == (10, 3)
     torch.testing.assert_close(batch.ptr, torch.tensor([0, 2, 6, 7, 11]))
     torch.testing.assert_close(batch.edge_ptr, torch.tensor([0, 1, 6, 6, 10]))
     assert batch.cycle_basis_shapes == ((1, 0), (5, 2), (0, 0), (4, 1))
-    assert batch.cycle_basis_is_orthonormal == (True, True, True, True)
-    assert batch.packed_cycle_basis.is_contiguous()
-    assert batch.packed_cycle_basis.numel() == 14
+    assert batch.cycle_membership._nnz() == sum(g.cycle_basis._nnz() for g in graphs)
+    torch.testing.assert_close(
+        batch.cycle_position_values, torch.cat([g.cycle_position_values for g in graphs], dim=1)
+    )
+    matrix = batch.cycle_membership.to_dense()
+    cycle_start = 0
     for index, graph in enumerate(graphs):
-        torch.testing.assert_close(batch.cycle_bases[index], graph.cycle_basis)
-        assert batch.cycle_bases[index].untyped_storage().data_ptr() == (
-            batch.packed_cycle_basis.untyped_storage().data_ptr()
-        )
         start, end = batch.edge_ptr[index : index + 2]
+        cycle_end = cycle_start + graph.cycle_basis.shape[1]
+        torch.testing.assert_close(
+            matrix[start:end, cycle_start:cycle_end], graph.cycle_basis.to_dense().abs()
+        )
+        assert not matrix[start:end, :cycle_start].any()
+        assert not matrix[start:end, cycle_end:].any()
+        cycle_start = cycle_end
         torch.testing.assert_close(
             batch.edge_index[:, start:end] - batch.ptr[index], graph.edge_index
         )
     moved = batch.to(torch.device("cpu"))
-    assert isinstance(moved.cycle_bases, tuple)
-    for before, after in zip(batch.cycle_bases, moved.cycle_bases, strict=True):
-        torch.testing.assert_close(before, after)
+    torch.testing.assert_close(batch.cycle_membership, moved.cycle_membership)
+    row, col = batch.cycle_membership.indices()
+    torch.testing.assert_close(batch.edge_graph_index[row], batch.cycle_graph_index[col])
 
 
-def test_ragged_pin_memory_uses_one_packed_basis_tensor(monkeypatch):
+def test_sparse_pin_memory_pins_indices_and_values_not_unsupported_sparse_storage(monkeypatch):
     batch = data.collate([_graph(), _graph(1, [])])
     called = []
 
     def pin(tensor):
-        called.append(id(tensor))
+        assert tensor.layout == torch.strided
+        called.append(tensor)
         return tensor
 
     monkeypatch.setattr(torch.Tensor, "pin_memory", pin)
     pinned = batch.pin_memory()
-    assert isinstance(pinned.cycle_bases, tuple)
-    assert id(batch.packed_cycle_basis) in called
-    assert all(id(matrix) not in called for matrix in batch.cycle_bases)
-    assert len(called) == sum(
-        isinstance(getattr(batch, field.name), torch.Tensor) for field in fields(batch)
+    torch.testing.assert_close(pinned.cycle_membership, batch.cycle_membership)
+    assert any(
+        tensor.data_ptr() == batch.cycle_membership.indices().data_ptr() for tensor in called
+    )
+    assert any(tensor.data_ptr() == batch.cycle_membership.values().data_ptr() for tensor in called)
+    assert (
+        len(called)
+        == sum(isinstance(getattr(batch, field.name), torch.Tensor) for field in fields(batch)) + 1
     )
 
 
-def test_batch_to_transfers_packed_basis_once_not_once_per_graph(monkeypatch):
+def test_batch_to_transfers_one_blockdiagonal_membership_not_once_per_graph(monkeypatch):
     batch = data.collate([_graph(), _graph(), _graph(1, [])])
     transferred = []
     original = torch.Tensor.to
@@ -290,9 +429,31 @@ def test_batch_to_transfers_packed_basis_once_not_once_per_graph(monkeypatch):
 
     monkeypatch.setattr(torch.Tensor, "to", moved)
     result = batch.to("cpu")
-    assert transferred.count(id(batch.packed_cycle_basis)) == 1
-    assert all(id(matrix) not in transferred for matrix in batch.cycle_bases)
+    assert transferred.count(id(batch.cycle_membership)) == 1
+    assert transferred.count(id(batch.cycle_position_values)) == 1
+    assert not hasattr(result, "cycle_position_indices")
     assert result.cycle_basis_shapes == batch.cycle_basis_shapes
+
+
+def test_collate_does_not_repeat_static_nullspace_algebra_or_finite_scans(monkeypatch):
+    graphs = [_graph(), _graph(2, [(0, 1)])]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("fixed graph algebra must not repeat per minibatch")
+
+    monkeypatch.setattr(data, "validate_cycle_basis", forbidden)
+    monkeypatch.setattr(torch, "isfinite", forbidden)
+    for _ in range(3):
+        assert data.collate(graphs).cycle_membership._nnz() == 4
+
+
+def test_all_forest_batch_retains_empty_cycle_dimension():
+    batch = data.collate([_graph(2, [(0, 1)]), _graph(1, [])])
+    assert batch.cycle_membership.shape == (1, 0)
+    assert batch.cycle_membership._nnz() == 0
+    assert batch.cycle_lengths.shape == (0,)
+    assert batch.cycle_position_values.shape == (2, 0)
+    torch.testing.assert_close(batch.edge_cycle_counts, torch.zeros(1))
 
 
 def test_collation_rejects_empty_or_inconsistent_graph_schemas():
@@ -307,6 +468,13 @@ def test_collation_rejects_empty_or_inconsistent_graph_schemas():
 def _install_official_fixture(monkeypatch):
     official = {split: [_official(), _official(2, [])] for split in data.SPLITS}
     monkeypatch.setattr(data, "load_official_splits", lambda *args, **kwargs: official)
+    original_load = data.load_benchmark
+
+    def fixture_load(*args, **kwargs):
+        kwargs.setdefault("workers", 0)  # Explicit serial synthetic/cache fixtures only.
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(data, "load_benchmark", fixture_load)
     return official
 
 
@@ -329,11 +497,8 @@ def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_basis_rebui
     _install_official_fixture(monkeypatch)
     first, protocol = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
     assert protocol["official_splits"]
-    assert (
-        protocol["preparation"]["representation"]
-        == "coordinate_free_cycle_projector_from_cached_thin_q"
-    )
-    assert data.CACHE_NAMESPACE == "cycle_pe_v2_projector_kernel_benchmark"
+    assert protocol["preparation"]["representation"] == "ordered_sparse_dfs_cycle_coordinates"
+    assert data.CACHE_NAMESPACE == "cycle_pe_v2_ordered_dfs_benchmark"
     assert set(protocol["preparation"]["implementation_sha256"]) == {
         "v2/basis.py",
         "v2/data.py",
@@ -342,9 +507,9 @@ def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_basis_rebui
     assert not (tmp_path / "cycle_pe_benchmark").exists()
 
     def no_svd(*args, **kwargs):
-        raise AssertionError("cached thin-Q matrices must not be recomputed")
+        raise AssertionError("cached sparse DFS matrices must not be recomputed")
 
-    monkeypatch.setattr(data, "build_cycle_basis", no_svd)
+    monkeypatch.setattr(data, "build_cycle_coordinates", no_svd)
     second, restored = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
     assert restored == protocol
     for split in data.SPLITS:
@@ -355,17 +520,26 @@ def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_basis_rebui
                 )
 
 
-def test_basis_backends_use_separate_caches_and_preserve_representation_metadata(
+def test_retired_q_backend_rejected_without_creating_or_overwriting_legacy_cache(
     tmp_path, monkeypatch
 ):
     _install_official_fixture(monkeypatch)
-    thin, thin_protocol = data.load_benchmark(
-        tmp_path,
-        "zinc12k",
-        allow_download=False,
-        splits=("train",),
-        basis_backend="thin_q",
-    )
+    legacy = tmp_path / "cycle_pe_v2_projector_kernel_benchmark" / "old-cache"
+    legacy.mkdir(parents=True)
+    marker = legacy / "keep.txt"
+    marker.write_text("existing results must be preserved")
+    support_legacy = tmp_path / "cycle_pe_v2_sparse_dfs_benchmark" / "support-only-cache"
+    support_legacy.mkdir(parents=True)
+    support_marker = support_legacy / "keep.txt"
+    support_marker.write_text("existing support-only cycle SE cache must be preserved")
+    with pytest.raises(ValueError, match="basis_backend"):
+        data.load_benchmark(
+            tmp_path,
+            "zinc12k",
+            allow_download=False,
+            splits=("train",),
+            basis_backend="thin_q",
+        )
     raw, raw_protocol = data.load_benchmark(
         tmp_path,
         "zinc12k",
@@ -373,18 +547,14 @@ def test_basis_backends_use_separate_caches_and_preserve_representation_metadata
         splits=("train",),
         basis_backend="dfs_fundamental",
     )
-    assert thin_protocol["cache_directory"] != raw_protocol["cache_directory"]
-    assert thin_protocol["basis_backend"] == "thin_q"
     assert raw_protocol["basis_backend"] == "dfs_fundamental"
-    assert "not an end-to-end linear-time speedup" in raw_protocol["basis_runtime"]
-    assert all(graph.cycle_basis_is_orthonormal.item() for graph in thin["train"])
-    assert not any(graph.cycle_basis_is_orthonormal.item() for graph in raw["train"])
+    assert "no QR/SVD/projector" in raw_protocol["basis_runtime"]
+    assert "selected DFS forest can affect" in raw_protocol["basis_coordinates"]
+    assert marker.read_text() == "existing results must be preserved"
+    assert support_marker.read_text() == "existing support-only cycle SE cache must be preserved"
     raw_cycle = raw["train"][0].cycle_basis
-    assert set(raw_cycle.unique().tolist()) <= {-1.0, 0.0, 1.0}
-    assert not torch.allclose(
-        raw_cycle.T @ raw_cycle,
-        torch.eye(raw_cycle.shape[1], dtype=raw_cycle.dtype),
-    )
+    assert raw_cycle.layout == torch.sparse_coo
+    assert set(raw_cycle.values().tolist()) <= {-1.0, 1.0}
 
 
 @pytest.mark.parametrize("missing", ["payload", "metadata"])
@@ -397,7 +567,23 @@ def test_incomplete_cache_fails_closed(tmp_path, monkeypatch, missing):
         data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
 
 
-@pytest.mark.parametrize("damage", ["metadata", "checksum", "schema", "basis", "target", "count"])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "metadata",
+        "checksum",
+        "schema",
+        "basis",
+        "target",
+        "count",
+        "lengths",
+        "membership_counts",
+        "dense",
+        "structural",
+        "position_values",
+        "position_indices",
+    ],
+)
 def test_damaged_or_numeric_invalid_cache_is_rejected_not_rebuilt(tmp_path, monkeypatch, damage):
     _install_official_fixture(monkeypatch)
     _, protocol = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
@@ -414,6 +600,18 @@ def test_damaged_or_numeric_invalid_cache_is_rejected_not_rebuilt(tmp_path, monk
             rows[0]["cycle_basis"].zero_()
         elif damage == "target":
             rows[0]["y"] += 1
+        elif damage == "lengths":
+            rows[0]["cycle_lengths"] += 1
+        elif damage == "membership_counts":
+            rows[0]["edge_cycle_counts"] += 1
+        elif damage == "dense":
+            rows[0]["cycle_basis"] = rows[0]["cycle_basis"].to_dense()
+        elif damage == "structural":
+            rows[0]["edge_cycle_features"] += 1
+        elif damage == "position_values":
+            rows[0]["cycle_position_values"].zero_()
+        elif damage == "position_indices":
+            rows[0]["cycle_position_indices"].zero_()
         else:
             rows.pop()
         _rewrite_cache(cache, meta, rows)
@@ -441,3 +639,96 @@ def test_no_v1_summary_or_preparer_is_used(monkeypatch):
     monkeypatch.setattr(benchmark_data, "cycle_statistics", forbidden)
     graph = _graph()
     assert graph.cycle_basis.shape == (4, 1)
+
+
+def test_random_sparse_dfs_certifies_entire_nullspace_with_oriented_disconnected_graphs():
+    rng = np.random.default_rng(37)
+    for nodes in range(1, 17):
+        for probability in (0.08, 0.25, 0.6):
+            pairs = [
+                (u, v)
+                for u in range(nodes)
+                for v in range(u + 1, nodes)
+                if rng.random() < probability
+            ]
+            edges = _edges(pairs)
+            flips = rng.random(len(pairs)) < 0.5
+            edges[:, flips] = edges[::-1, flips]
+            incidence, rank = basis.incidence_and_cycle_rank(nodes, edges)
+            values = basis.build_cycle_basis(nodes, edges)
+            assert incidence.nnz == 2 * len(pairs)
+            assert values.shape == (len(pairs), rank)
+            assert (incidence.T @ values).nnz == 0
+            if rank:
+                assert np.linalg.matrix_rank(values.toarray()) == rank
+
+
+def test_actual_process_parallel_preparation_and_cached_validation_preserve_full_order():
+    # Explicit synthetic process-pool smoke, not official training.
+    sources = [
+        _official(),
+        _official(2, []),
+        _official(3, [(0, 1), (1, 2), (0, 2)]),
+        _official(1, []),
+    ]
+    expected = [data.prepare_graph(source, dataset="zinc12k") for source in sources]
+    actual = data._prepare_split(
+        sources,
+        dataset="zinc12k",
+        split="smoke",
+        basis_backend="dfs_fundamental",
+        workers=2,
+    )
+    rows = [{field.name: getattr(graph, field.name) for field in fields(graph)} for graph in actual]
+    restored = data._validate_cached_graphs(rows, sources, "zinc12k", workers=2)
+    for first, parallel, cached in zip(expected, actual, restored, strict=True):
+        for field in fields(first):
+            torch.testing.assert_close(getattr(first, field.name), getattr(parallel, field.name))
+            torch.testing.assert_close(getattr(first, field.name), getattr(cached, field.name))
+
+
+def test_parallel_submission_bounds_only_inflight_buffer_not_total_graph_count():
+    class Executor:
+        pending = 0
+        peak_pending = 0
+        submitted = 0
+
+        def submit(self, function, *args):
+            self.pending += 1
+            self.peak_pending = max(self.peak_pending, self.pending)
+            self.submitted += 1
+            owner = self
+
+            class Future:
+                def result(self):
+                    owner.pending -= 1
+                    return function(*args)
+
+            return Future()
+
+    executor = Executor()
+    result = list(
+        data._ordered_parallel_graphs(
+            executor,
+            lambda value: value * 3,
+            iter(range(101)),
+            workers=3,
+            chunksize=4,
+        )
+    )
+    assert result == [value * 3 for value in range(101)]
+    assert executor.peak_pending == 6
+    assert executor.pending == 0
+    assert executor.submitted == 26
+
+
+@pytest.mark.parametrize("workers,chunksize", [(0, 1), (1, 0)])
+def test_parallel_buffer_never_silently_discards_input_for_invalid_execution_settings(
+    workers, chunksize
+):
+    with pytest.raises(ValueError, match="positive"):
+        list(
+            data._ordered_parallel_graphs(
+                None, lambda value: value, [1], workers=workers, chunksize=chunksize
+            )
+        )

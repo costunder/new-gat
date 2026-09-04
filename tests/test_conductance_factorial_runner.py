@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -66,15 +67,42 @@ def test_transductive_children_ignore_requested_ppi_worker_pool(tmp_path):
     args = runner.parser().parse_args(["--datasets", "ogbn-arxiv", "--workers", "7"])
     jobs = runner.make_jobs(args, tmp_path)
     assert {job["workers"] for job in jobs} == {0}
-    assert {
-        job["command"][job["command"].index("--workers") + 1] for job in jobs
-    } == {"0"}
+    assert {job["command"][job["command"].index("--workers") + 1] for job in jobs} == {"0"}
 
 
 def test_child_environment_unsets_nvml_based_cuda_check(monkeypatch):
     monkeypatch.setenv("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
     environment = runner._environment()
     assert "PYTORCH_NVML_BASED_CUDA_CHECK" not in environment
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
+def test_source_snapshot_decodes_non_ascii_git_stderr_without_reader_thread_error(monkeypatch):
+    # Git on Windows can mix UTF-8 repository paths and a localized system
+    # diagnostic in stderr. This synthetic failed child does not run research.
+    diagnostic = "fatal: repository 프로젝트\n".encode() + "권한 진단\n".encode("cp949")
+    command_code = (
+        f"import sys; sys.stderr.buffer.write(bytes.fromhex('{diagnostic.hex()}')); "
+        "raise RuntimeError('synthetic git failure')"
+    )
+    real_run = subprocess.run
+    captured = []
+
+    def failed_git(command, **kwargs):
+        assert command == ["git", "rev-parse", "HEAD"]
+        captured.append(kwargs)
+        return real_run([sys.executable, "-c", command_code], **kwargs)
+
+    monkeypatch.setattr(runner.subprocess, "run", failed_git)
+    snapshot = runner._source_snapshot()
+    assert snapshot["git_revision"] is None
+    assert len(captured) == 1
+    assert captured[0]["encoding"] == "utf-8"
+    assert captured[0]["errors"] == "replace"
+    assert captured[0]["check"] is True
+    source_path = Path(runner.__file__)
+    relative_path = source_path.relative_to(runner.ROOT).as_posix()
+    assert snapshot["sha256"][relative_path] == hashlib.sha256(source_path.read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize("arguments", [["--help"], ["--dry-run"]])

@@ -4,6 +4,10 @@
 폐기한다. 새 계획은 파라미터를 버전 사이에 강제로 일치시키지 않으며, 각 구조가 실제 연구급
 capacity에서 성능을 낼 수 있는지를 본다. 기본 seed는 시간 제약 때문에 0 하나다.
 
+이 문서의 전체 matrix는 실험 계약 설명이며 완료한 V1–V4/Cycle V1/Tree를 다시 돌리라는
+안내가 아니다. 이번 QR-free 교체의 새 Cycle V2만 실행하는 명령은 마지막 절과
+[CYCLE_PE_V2.md](CYCLE_PE_V2.md)를 따른다. 구 source/checkpoint의 strict resume 검사는 우회하지 않는다.
+
 ## Architecture profiles
 
 ### Conductance V1–V5
@@ -30,9 +34,12 @@ dynamic-C는 그 예산을 C calibration/alternation에 쓴다. 따라서 phase�
 | `reference` | hidden/PE/layers 128/64/10 | 256/64/6 |
 | `large` | 192/96/12 | 320/96/8 |
 
-V2는 FFN×4, dropout 0.1, layer scale 0.1을 사용한다. 두 versions × 두 datasets × 두
-profiles = 8 trainings다. 현재 V2 identity는 `cycle_projector_pe_v2`이며 폐기된
-`cycle_basis_v2` 결과나 checkpoint를 혼용하지 않는다.
+V2는 FFN×4, dropout 0.1, layer scale 0.1을 사용한다. V1은 4학습,
+V2는 SE/PE 두 조건×두 datasets×두 profiles로 8학습, Cycle 전체는 12학습이다.
+V2 ID는 SE `cycle_dfs_se_v2`, PE `cycle_dfs_relative_pe_v2`다.
+PE는 동일 SE에 cycle 내부 상대 위치 residual만 추가하며 추가 trainable parameter는 없다.
+Backbone 크기는 유지했고 두 조건의 기본 ZINC 모델은 각각 7,262,785 parameters다.
+과거 raw/projector/이름만 PE였던 sparse ID의 결과와 checkpoint는 별도로 보존한다.
 
 ### Tree V1/V2
 
@@ -46,9 +53,9 @@ CSL/ZINC × fixed-BFS/multi-chart × 두 profiles = 8 model trainings다.
 ## 전체 계획
 
 - Conductance: 106 child/model trainings.
-- Cycle: 8 child/model trainings.
+- Cycle: 12 child/model trainings.
 - Tree: 4 child runs, 각 두 모델 = 8 model trainings.
-- 합계: **118 child runs, 122 fresh model trainings**.
+- 합계: **122 child runs, 126 fresh model trainings**.
 - profile 선택 후보는 train/validation만 사용한다. 기존 Cycle/Tree 계약의 selected-checkpoint
   test-only 단계는 validation 선택 이후 별도 평가이며 재학습하지 않는다.
 
@@ -81,7 +88,7 @@ python -B scripts/run_rich_scaling.py \
   --devices cuda:0 cuda:1 cuda:2 \
   --hardware-profile a6000-48gb \
   --min-free-gb 40 \
-  --cycle-v2-basis-backend thin_q
+  --cycle-v2-basis-backend dfs_fundamental
 ```
 
 GPU가 하나만 할당된 아래 예시들은 계속 `--device cuda:0`을 사용하며 최상위 track을 순차
@@ -100,7 +107,7 @@ python -B scripts/run_rich_scaling.py \
   --model-seeds 0 \
   --device cuda:0 \
   --hardware-profile portable \
-  --cycle-v2-basis-backend thin_q
+  --cycle-v2-basis-backend dfs_fundamental
 ```
 
 별도 shell fail-fast 설정 없이 각 Python runner가 subprocess return code, artifact, source
@@ -128,19 +135,21 @@ python -B scripts/run_rich_scaling.py \
   --device cuda:0 \
   --hardware-profile a6000-48gb \
   --min-free-gb 40 \
-  --cycle-v2-basis-backend thin_q
+  --cycle-v2-basis-backend dfs_fundamental
 ```
 
 최상위 `--cycle-v2-basis-backend`는 Cycle child의 V2에 전달되고 통합 manifest와 재개
-configuration에 결속된다. `thin_q`가 전체 학습용 기본값이다. DFS forest와 parent-path
-역추적 경로를 진단하려면 새 run ID에서 `dfs_fundamental`을 선택한다. 이 경로는 runtime QR을
-반복하므로 속도 개선용 설정이 아니다.
+configuration에 결속된다. 유일한 기본값은 `dfs_fundamental`이다. DFS forest와 parent-path로
+만든 전체 기저를 sparse block-diagonal edge→cycle→edge PE에 사용한다. 준비/cache/forward에
+QR/SVD/Gram inverse가 없으며 `thin_q`와 이전 rank/column tuning 옵션은 거부된다.
+DFS 탐색 O(V+E)와 기저 출력 O(nnz Z), sparse 집계 O(nnz Z*d)를 구분한다. DFS tree 선택에
+의존하므로 일반 Z→ZR 불변성이나 graph 크기에 대한 엄밀한 전체 선형시간을 주장하지 않는다.
 
 ### 완료된 구 Conductance scaling을 다시 돌리지 않는 실행
 
 이미 `base/wide/deep/large`에서 Conductance V1–V4 172회를 완료한 경우 그 결과를 별도
 artifact로 보존하고, 현재 통합 실행에서는 Conductance V5만 선택할 수 있다. Cycle V1/V2와
-Tree까지 아직 남았다면 다음 명령은 **32 child runs / 36 fresh model trainings**만 계획한다.
+Tree까지 아직 남았다면 다음 명령은 **36 child runs / 40 fresh model trainings**만 계획한다.
 
 ```bash
 CUDA_VISIBLE_DEVICES=3 \
@@ -156,13 +165,14 @@ python -B scripts/run_rich_scaling.py \
   --min-free-gb 40 \
   --v5-beta-parameterization sigmoid \
   --v5-beta-initial 0.1 \
-  --cycle-v2-basis-backend thin_q \
+  --cycle-v2-basis-backend dfs_fundamental \
   --allow-download
 ```
 
 V5와 폐기·재구현된 Cycle V2만 새로 실행할 때는 `--tracks conductance cycle
 --conductance-versions v5 --cycle-versions v2`를 사용한다. reference/large와 seed 0에서
-**24 child runs / 24 fresh model trainings**다. 선택한 버전 목록은 통합 manifest와 재개
+**28 child runs / 28 fresh model trainings**다. 기본 `--cycle-v2-encodings se pe`를
+포함한 선택 버전·조건 목록은 통합 manifest와 재개
 identity에 들어가므로, 중단 후에는 같은 run ID와 같은 목록을 그대로 사용한다.
 
 architecture profile(`reference/large`)과 hardware profile(`portable/a6000-48gb`)은 서로 다른
@@ -172,7 +182,7 @@ architecture profile(`reference/large`)과 hardware profile(`portable/a6000-48gb
 |---|---|---|
 | Conductance V5 | FP32, TF32 off, block checkpoint on, dynamic-C score-chunk checkpoint on, edge chunk 65,536, arxiv seed-node batch 1,024, PPI whole-graph batch 2 | dense BF16 autocast·TF32, conductance geometry FP32, block checkpoint off, dynamic-C score-chunk checkpoint on, edge chunk 131,072, arxiv seed-node batch 2,048, PPI whole-graph batch 8, sample prefetch/pinned transfer |
 | Conductance V1–V4 | 기존 FP32 계약. PPI는 V1/V3/V4 batch 2이고 V2는 PPI N/A | 같은 legacy FP32·batch 계약을 그대로 유지 |
-| Cycle V1/V2 | 모든 dataset/profile batch 32, workers 4, prefetch 2, AMP off; V2 column chunk 16, pair budget 32,768 | reference ZINC/Peptides batch 512/128, large 256/64, workers 8; V2는 BF16 지원 시 backbone BF16·미지원 시 FP32, GradScaler off, FP32 projector, prefetch 4·column chunk 32·pair budget 4,194,304; V1은 기존 AMP/loader 계약 유지 |
+| Cycle V1/V2 | 모든 dataset/profile batch 32, workers 4, prefetch 2, AMP off; V2 sparse COO block-diagonal 집계 | reference ZINC/Peptides batch 512/128, large 256/64, workers 8; V2 backbone BF16·sparse 집계 FP32, GradScaler off, prefetch 4; V1은 기존 AMP/loader 계약 유지 |
 | Tree V1/V2 | batch 16, workers 4, prefetch 2, suite config의 FP16 AMP, child concurrency 1 | batch 64, workers 4, prefetch 2, 명시적 FP16 AMP, 독립 child concurrency 2 |
 
 각 **track runner 내부**에서 Conductance와 Cycle child는 순차 실행한다. Tree만 서로 다른
@@ -264,7 +274,7 @@ graphs/seed-nodes/chart-views 처리량을 기록한다. OOM/error 후보를 더
 
 이 benchmark는 optimizer step·parameter update가 0이고 전체 epoch, DataLoader 처리량,
 validation/test, checkpoint와 optimizer-state memory를 포함하지 않는다. Legacy Conductance와
-Cycle V2처럼 독립 execution variant가 있는 경우에만 출력/loss/모든 gradient 수치 동등성을
+동일 연산의 독립 execution variant가 있는 경우에만 출력/loss/모든 gradient 수치 동등성을
 `passed`로 기록하고, V5/Cycle V1/Tree의 current-only 경로는 자기 비교를 하지 않고 production
 path identity, finite loss/모든 trainable gradient와 parameter 불변성을 검사한다. 권고는
 profile 기본값을 자동 변경하지 않으며, 실제 최종 학습 recipe로 채택하려면 새 run ID의 전체
@@ -316,7 +326,7 @@ Cycle V2의 pre-epoch capacity probe는 등록된 worst-case batch가 가능한�
 - ogbn-arxiv V5 train은 기본 cluster sampling, seed-node batch 1024, edge chunk 65536.
 - PPI는 공식 inductive graph split 때문에 full graph batch 2.
 - 모든 validation은 완전한 공식 graph/split에서 수행한다.
-- Cycle은 projector row pair budget과 AMP/batch를 기록하며 parameter ceiling 50M을 적용한다.
+- Cycle V2는 sparse cycle membership·AMP/batch를 기록하며 parameter ceiling 50M을 적용한다.
 - 실제 peak memory가 없는 상태에서 large가 10GB에 적합하다고 주장하지 않는다. reference부터
   실행하고 manifest의 peak allocation으로 large 실행 가능성을 판단한다.
 
@@ -325,7 +335,7 @@ Cycle V2의 pre-epoch capacity probe는 등록된 worst-case batch가 가능한�
 44.47/44.55GiB OOM, 나머지 18개는 미실행이다. 완료된 fixed-C도 구 joint-only 선택이 실제
 epoch-10 global best 0.692775 대신 0.680392를 골라 corrected 비교에 재사용할 수 없다. Cycle V2
 네 학습은 기존 FP16 GradScaler overflow로 모두 첫 epoch 전에 실패했다. 따라서 이 run에는
-새 V5 또는 projector V2의 유효한 전체 성능 결과가 없다. 수정판은 source/resume identity가
+당시 V5 또는 projector V2의 유효한 전체 성능 결과가 없다. 수정판은 source/resume identity가
 달라 새 run ID를 사용하되 V1–V4, Cycle V1과 Tree를 다시 계획할 필요는 없다.
 
 후속 `new-v5-cyclev2-a6000-gpu3-seed0-r2`도 동일하게 중단됐다. 첨부
@@ -336,39 +346,34 @@ Conductance `train.py:785`·`joint_best=` 형식과 Cycle `benchmark.py:589`는 
 않았고, r1의 dynamic-C OOM과 Cycle 네 non-finite gradient 실패를 old source로 다시 재현했을
 뿐이다. r2를 수정 검증으로 간주하거나 같은 output에서 수정판을 resume하지 않는다.
 
-수정판의 최소 통합 재실행은 다음 24개 job만 계획한다. V1–V4, Cycle V1과 Tree는 포함하지
-않고, 검증된 Cycle dataset/projector cache는 재사용한다. 구 fixed-C job은 실제 epoch-10
-global-best state를 저장하지 않았으므로 corrected checkpoint를 위해 V5 20개 안에서 다시
-학습한다. 첫 명령 블록으로 source-fix commit `214265c`를 조회하고, 출력이 정확히
-`214265c Fix V5 and Cycle V2 GPU failures`인지 눈으로 확인한 뒤 별도의 학습 명령 블록을
-실행한다. 후속 문서 commit 때문에 HEAD 자체가 `214265c`와 같을 필요는 없다.
+이후 r3의 `v5/large/ogbn-arxiv/shared_dynamic_c`는 `214265c` 수정판으로 실행됐지만
+diffusion에서 192MiB 할당 OOM이 재발했다. 현재 custom backward는 edge-feature 저장 누적을
+제거했고 관련 CPU 검사28개와 합성 저장량 약89.3% 감소를 확인했다. 이것은 새 A6000 전체 학습
+성공이나 VRAM 측정이 아니다. 상세 로그와 수정 범위는 [CONDUCTANCE_V5.md](CONDUCTANCE_V5.md)를 따른다.
+
+### 이번 QR-free Cycle V2만 새로 실행
+
+아래는 두 dataset×두 profile×SE/PE 두 조건×seed0, **8개 학습**과
+조건×dataset별 validation 선택 후 checkpoint test-only 평가4개다.
+SE와 PE를 섞어서 하나만 선택하지 않는다. 완료한 Conductance/Cycle V1/Tree를 반복하지 않는다.
+유효한 source가 게시·동기화된 후 사용하며, 단순히 과거 `214265c`가 존재하는 것은 이번
+diffusion/sparse DFS 수정판을 확보했다는 증거가 아니다.
 
 ```bash
-git pull --ff-only
-git show -s --oneline 214265c
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+python -B scripts/run_cycle_scaling.py \
+  --versions v2 --profiles reference large \
+  --encodings se pe \
+  --datasets zinc12k peptides_struct --model-seeds 0 \
+  --device cuda:0 --hardware-profile a6000-48gb --min-free-gb 40 \
+  --basis-backend dfs_fundamental \
+  --run-id cycle-se-pe-a6000-gpu3-seed0-v1
 ```
 
-위 출력이 `214265c Fix V5 and Cycle V2 GPU failures`인지 확인한 뒤 다음을 실행한다.
-
-```bash
-CUDA_VISIBLE_DEVICES=3 \
-python -B scripts/run_rich_scaling.py \
-  --run-id new-v5-cyclev2-a6000-gpu3-seed0-r3 \
-  --tracks conductance cycle \
-  --conductance-versions v5 \
-  --cycle-versions v2 \
-  --profiles reference large \
-  --model-seeds 0 \
-  --device cuda:0 \
-  --hardware-profile a6000-48gb \
-  --min-free-gb 40 \
-  --v5-beta-parameterization sigmoid \
-  --v5-beta-initial 0.1 \
-  --cycle-v2-basis-backend thin_q \
-  --allow-download
-```
-
-기본 A6000 block-checkpoint 정책은 속도를 위해 off이고, dynamic-C score-chunk checkpoint만
-항상 켜진다. 새 score 경로에서도 실제 `large` peak가 부족한 것이 확인될 때만 통합 runner에
-`--v5-activation-checkpoint`를 명시하고 **새 run ID**로 해당 V5 profile을 실행한다. 이 override는
-manifest/config/job command에 결속되며, 같은 run ID 도중에 바꿀 수 없다.
+새 공유 cache namespace는 `cycle_pe_v2_ordered_dfs_benchmark`다. 구 cache/checkpoint는
+호환되지 않는다. 같은 새 source/config/schema에서 위 명령을 반복하면 완료 child를
+hash 검증 후 건너뛰고 encoding별 모델 폴더의 `last.pt`에서 epoch 상태를 복원한다.
+두 조건은 모델 shape가 같아도 checkpoint를 교환할 수 없다.
+V5도 operator source가 바뀌었으므로 구 r3 source checkpoint를 현재 구현에 강제로 연결하지
+않는다. 실행 대상과 새 run ID를 명시적으로 선택하며 기존 artifact는 보존한다.
+Block checkpoint override나 다른 설정 변경 역시 manifest/config/job command에 결속된다.

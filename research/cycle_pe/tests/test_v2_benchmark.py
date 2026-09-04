@@ -12,28 +12,40 @@ import torch
 
 from research.cycle_pe.v2 import benchmark
 from research.cycle_pe.v2.data import DATASETS
-from research.cycle_pe.v2.model import MODEL_NAME
+from research.cycle_pe.v2.model import MODEL_NAME, MODEL_NAMES
 
 
-def test_v2_defaults_use_deep_projector_model_on_official_data() -> None:
+def test_v2_defaults_use_deep_sparse_dfs_model_on_official_data() -> None:
     args = benchmark.parser().parse_args([])
     assert tuple(args.datasets) == DATASETS == ("zinc12k", "peptides_struct")
     assert (args.hidden_dim, args.pe_dim, args.layers) == (128, 64, 10)
     assert (args.ffn_multiplier, args.dropout, args.layer_scale) == (4, 0.1, 0.1)
     assert (args.epochs, args.patience, args.lr, args.batch_size) == (300, 50, 1e-3, 32)
     assert args.max_parameters == 20_000_000
-    assert args.column_chunk_size == 16
-    assert args.basis_backend == "thin_q"
+    assert not hasattr(args, "column_chunk_size")
+    assert not hasattr(args, "basis_pair_budget")
+    assert args.basis_backend == "dfs_fundamental"
     assert args.hardware_profile == "portable" and args.prefetch_factor == 2
     assert args.workers == 4
     assert args.output_dir == Path("results/cycle_pe_v2/benchmark")
-    assert MODEL_NAME == "cycle_projector_pe_v2"
+    assert args.encoding == "se"
+    assert MODEL_NAME == "cycle_dfs_se_v2"
     assert not hasattr(args, "baselines")
     assert not hasattr(args, "tiny")
     assert not hasattr(args, "max_cycle_rank")
 
 
-@pytest.mark.parametrize("flag", ["--baselines", "--tiny", "--max-cycle-rank"])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--baselines",
+        "--tiny",
+        "--max-cycle-rank",
+        "--column-chunk-size",
+        "--basis-pair-budget",
+        "--basis-execution",
+    ],
+)
 def test_no_baseline_dummy_or_cycle_truncation_options(flag):
     with pytest.raises(SystemExit):
         benchmark.parser().parse_args([flag])
@@ -45,7 +57,7 @@ def test_v2_observability_reports_real_graph_and_batch_counts():
     graph.edge_index = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long)
     graph.edge_attr = torch.zeros(3, 2, dtype=torch.long)
     graph.y = torch.zeros(1)
-    graph.cycle_basis = torch.zeros(3, 1)
+    graph.cycle_basis = torch.ones(3, 1).to_sparse().coalesce()
     splits = {"train": [graph, graph], "validation": [graph], "test": [graph]}
 
     data_report = benchmark._cycle_data_observability("zinc12k", splits)
@@ -54,6 +66,7 @@ def test_v2_observability_reports_real_graph_and_batch_counts():
     assert data_report["actual_used_fraction_of_loaded_graphs"]["value"] == 1.0
     assert data_report["nodes_per_graph"]["total"] == 16
     assert data_report["canonical_undirected_edges_per_graph"]["total"] == 12
+    assert data_report["cycle_memberships_per_graph"]["total"] == 12
     assert data_report["official_full_graph_count"]["value"] == 12_000
     assert data_report["loaded_fraction_of_official_full_dataset"]["value"] == pytest.approx(
         4 / 12_000
@@ -115,7 +128,7 @@ def test_v2_first_task_gradient_validation_rejects_disconnected_and_nonfinite() 
         benchmark._validate_first_task_gradients(connected)
 
 
-def test_cpu_benchmark_training_and_invalid_chunk_size_are_rejected() -> None:
+def test_cpu_benchmark_training_and_invalid_batch_size_are_rejected() -> None:
     args = benchmark.parser().parse_args(["--device", "cpu"])
     with pytest.raises(RuntimeError, match="requires CUDA"):
         benchmark._validate(args)
@@ -123,8 +136,8 @@ def test_cpu_benchmark_training_and_invalid_chunk_size_are_rejected() -> None:
         benchmark._train_model("zinc12k", {}, args)
     args.prepare_only = True
     benchmark._validate(args)
-    args.column_chunk_size = 0
-    with pytest.raises(ValueError, match="column-chunk-size"):
+    args.batch_size = 0
+    with pytest.raises(ValueError, match="batch-size"):
         benchmark._validate(args)
 
 
@@ -149,8 +162,8 @@ def test_hashes_include_basis_data_encoder_and_reused_backbone_sources() -> None
 def test_prepare_only_records_separate_version_without_claiming_training(tmp_path, monkeypatch):
     loaded = []
 
-    def fake_load(root, dataset, *, allow_download, basis_backend):
-        loaded.append((dataset, allow_download, basis_backend))
+    def fake_load(root, dataset, *, allow_download, basis_backend, workers):
+        loaded.append((dataset, allow_download, basis_backend, workers))
         return {}, {"official_splits": True, "unit_fixture_only": True, "basis": "full_left_null"}
 
     monkeypatch.setattr(benchmark, "load_benchmark", fake_load)
@@ -172,7 +185,7 @@ def test_prepare_only_records_separate_version_without_claiming_training(tmp_pat
         )
         == 0
     )
-    assert loaded == [("zinc12k", False, "thin_q")]
+    assert loaded == [("zinc12k", False, "dfs_fundamental", 4)]
     metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     for document in (metrics, manifest):
@@ -180,11 +193,11 @@ def test_prepare_only_records_separate_version_without_claiming_training(tmp_pat
         assert document["track"] == "cycle_pe"
         assert document["version"] == "v2"
     assert metrics["datasets"]["zinc12k"]["models"] == {}
-    assert manifest["controls"]["model"] == "cycle_projector_pe_v2"
+    assert manifest["controls"]["model"] == "cycle_dfs_se_v2"
     assert "no truncation" in manifest["controls"]["basis_input"]
     assert manifest["controls"]["basis_rank_dependent_parameters"] is False
-    assert manifest["controls"]["basis_backend"] == "thin_q"
-    assert "projector is chart invariant" in manifest["seeds"]["chart_seed"]
+    assert manifest["controls"]["basis_backend"] == "dfs_fundamental"
+    assert "tree-dependent encoding" in manifest["seeds"]["chart_seed"]
     manifest_bytes = (output / "manifest.json").read_bytes()
     metrics_bytes = (output / "metrics.json").read_bytes()
     # A different dataset/data-root command must fail before mutating artifacts.
@@ -222,7 +235,7 @@ def test_dfs_backend_is_recorded_and_forwarded_to_data_preparation(tmp_path, mon
     assert seen == ["dfs_fundamental"]
     assert manifest["arguments"]["basis_backend"] == "dfs_fundamental"
     assert manifest["controls"]["basis_backend"] == "dfs_fundamental"
-    assert "not an end-to-end linear-time speedup" in manifest["controls"]["basis_backend_runtime"]
+    assert "no QR/SVD/Gram inverse" in manifest["controls"]["basis_backend_runtime"]
 
 
 def test_only_v2_model_is_dispatched_once_per_official_dataset(tmp_path, monkeypatch):
@@ -241,6 +254,82 @@ def test_only_v2_model_is_dispatched_once_per_official_dataset(tmp_path, monkeyp
     metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["status"] == "passed"
     assert all(set(entry["models"]) == {MODEL_NAME} for entry in metrics["datasets"].values())
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_encoding_identity_is_bound_to_dispatch_resume_and_manifest(
+    tmp_path, monkeypatch, encoding
+):
+    # Explicitly mocked protocol test: no official training is performed.
+    monkeypatch.setattr(benchmark, "_validate", lambda args: None)
+    monkeypatch.setattr(benchmark, "load_benchmark", lambda *args, **kwargs: ({}, {}))
+    observed = []
+
+    def fake_train(dataset, splits, args):
+        observed.append((dataset, args.encoding))
+        return {"validation": 0.5, "fresh_training": True}
+
+    monkeypatch.setattr(benchmark, "_train_model", fake_train)
+    output = tmp_path / encoding
+    command = ["--encoding", encoding, "--output-dir", str(output)]
+    assert benchmark.main(command) == 0
+    assert observed == [(dataset, encoding) for dataset in DATASETS]
+    metrics_path, manifest_path = output / "metrics.json", output / "manifest.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert all(
+        set(value["models"]) == {MODEL_NAMES[encoding]} for value in metrics["datasets"].values()
+    )
+    assert manifest["controls"]["encoding"] == encoding
+    assert manifest["architecture"]["model"] == MODEL_NAMES[encoding]
+    assert MODEL_NAMES[encoding] in manifest["architecture"]["reference_comparison"]
+    assert manifest["arguments"]["encoding"] == encoding
+    args = benchmark.parser().parse_args(command)
+    resume = benchmark._resume_configuration("zinc12k", args)
+    assert resume["arguments"]["encoding"] == encoding
+    assert resume["model"] == MODEL_NAMES[encoding]
+    previous = (metrics_path.read_bytes(), manifest_path.read_bytes())
+    other = "pe" if encoding == "se" else "se"
+    with pytest.raises(ValueError, match="does not match"):
+        benchmark.main(["--encoding", other, "--output-dir", str(output)])
+    assert previous == (metrics_path.read_bytes(), manifest_path.read_bytes())
+
+
+@pytest.mark.parametrize("tamper", ["model", "encoding", "source"])
+def test_selected_checkpoint_rejects_other_encoding_before_constructing_model(
+    tmp_path, monkeypatch, tamper
+):
+    checkpoint = tmp_path / "selected.pt"
+    checkpoint.write_bytes(b"explicit mocked checkpoint")
+    args = benchmark.parser().parse_args(
+        ["--encoding", "pe", "--test-checkpoint", str(checkpoint), "--datasets", "zinc12k"]
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(benchmark, "_hardware_report", lambda *args: {})
+    policy = benchmark._amp_policy(False, torch.device("cuda"))
+    saved_args = vars(args).copy()
+    saved_args["validation_only"] = True
+    saved_args["encoding"] = "se" if tamper == "encoding" else "pe"
+    payload = {
+        "state_dict": {},
+        "dataset": "zinc12k",
+        "model_seed": 0,
+        "model": MODEL_NAMES["se"] if tamper == "model" else MODEL_NAMES["pe"],
+        "arguments": saved_args,
+        "precision": benchmark._precision_identity(policy),
+        "implementation_sha256": {} if tamper == "source" else benchmark.implementation_hashes(),
+    }
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: payload)
+
+    def forbidden_model(**kwargs):
+        raise AssertionError("wrong-condition checkpoint reached model construction")
+
+    monkeypatch.setattr(benchmark, "CycleBasisPEModel", forbidden_model)
+    with pytest.raises(
+        ValueError,
+        match="model mismatch|architecture mismatch for encoding|implementation/source mismatch",
+    ):
+        benchmark._evaluate_test_checkpoint("zinc12k", [], args)
 
 
 def test_preparation_failure_is_persisted_not_reported_as_success(tmp_path, monkeypatch):

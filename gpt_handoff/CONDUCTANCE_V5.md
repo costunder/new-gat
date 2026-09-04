@@ -125,16 +125,27 @@ profile 모두 single full-graph batch 1이라 48GB GPU를 가득 채울 minibat
 8.0 이상과 BF16 지원을 child 시작 시 검사하고 조건이 맞지 않으면 자동 fallback 없이 중단한다.
 아래 명령은 더 엄격하게 `--min-free-gb 40`을 지정한다.
 
-기존 edge chunking은 forward 임시 tensor만 나눴고 autograd가 모든 chunk의 score-network
-activation을 backward까지 보존했다. 수령한 A6000 run에서는 `shared_dynamic_c`가 C를 처음
-활성화한 epoch 21에 44.47/44.55GiB를 사용한 뒤 추가 104MiB 할당에서 OOM이 발생했다. 현재는
-각 deterministic edge-score chunk를 non-reentrant checkpoint로 재계산하여 batch 크기와
-optimizer-step 수를 바꾸지 않고 saved activation을 제한한다. 합성 reference-size scorer에서
-saved activation은 285.35MiB에서 14.13MiB로 약 20.2배 줄었지만, 실제 reference/large의 CUDA
-peak는 새 실행에서 다시 측정해야 한다. 필요하면 명시적 `--v5-activation-checkpoint`를 새 run
-ID에서 켜는 것이 다음 방어선이다. 직접 V5/scaling runner뿐 아니라 통합
-`run_rich_scaling.py`도 이 tri-state override를 Conductance child에만 전달하고 manifest에
-기록한다.
+과거 `214265c`는 score-network chunk의 activation을 재계산하도록 고쳤지만, diffusion의
+edge-feature tensor를 backward까지 전부 보관하는 경로는 남아 있었다. **그 수정판이 적용된
+r3의 large/arxiv에서도 OOM이 재발했다.** 이는 구 source가 실행됐다는 이유로 설명할 수 없다.
+
+현재 `shared_head_diffusion`은 정규화된 scalar edge weight의 대칭 propagation을 custom
+autograd로 수행한다. Node message·scalar edge weight·incidence만 저장하고 backward에서
+각 edge chunk의 gather/곱셈을 재계산한다. Degree normalization은 미분 가능한 상태로 유지한다.
+일반 first-order 저장량은 `O(N*heads*width+E)`, 임시 tensor는 chunk 크기에 제한되며 모든
+edge·layer·channel·batch·sampling을 그대로 처리한다. `create_graph=True`의 2차 미분도
+지원하지만 추가 derivative graph 저장은 first-order 메모리 보장에 포함하지 않는다.
+
+합성 CPU 진단(N=128,E=1024,heads=4,width=8; frozen message, C gradient on)에서 고유
+autograd 저장량은 563,840→60,544 bytes로 약 89.3% 줄었다. Dense 독립식과의 출력 및
+C/message/beta/correction gradient, double gradcheck/gradgradcheck, BF16 FP32 geometry,
+isolates·빈 그래프와 저장량 경계 등 관련 CPU 검사 28개가 통과했다. **실제 A6000 peak VRAM이나
+전체 학습 성공·속도 개선을 검증한 결과는 아니다.**
+
+Block checkpoint 기본값은 표처럼 유지한다. 필요하면 `--v5-activation-checkpoint`를 새 실행
+계약에서 명시할 수 있지만 현재 source/config hash와 다른 partial checkpoint를 같은 run ID에
+억지로 연결하지 않는다. 직접 V5/scaling과 통합 `run_rich_scaling.py` 모두 override를
+Conductance child에만 전달하고 manifest에 기록한다.
 
 V5 child는 실제 학습 경계에서 기본 1초 주기로 GPU SM·memory-controller utilization, CUDA
 allocator allocated/reserved, process CPU·RSS/HWM과 system available RAM을 측정해
@@ -186,10 +197,11 @@ kernel까지 bitwise 동일하다고 주장하지 않는다. 다른 config/sourc
 재사용하면 fail closed한다. 재개할 때는 해당 hardware profile과 모든 인수 및 run-id를 그대로
 유지해야 한다.
 
-이 보장은 **같은 implementation hash**에만 적용된다. 아래 실패 run은 메모리와
-checkpoint-selection 구현이 바뀌기 전 source이므로 수정판을 같은 run ID에 억지로 resume하지
-않는다. 새 run ID에서 다시 실행해야 하며, 과거 `fixed_c`의 epoch 10 global-best model state는
-구 코드가 저장하지 않았기 때문에 수정된 primary checkpoint로 복구할 수 없다.
+이 보장은 **같은 implementation hash**에만 적용된다. 아래 r1/r2는 checkpoint-selection
+수정 전 source이며 r3는 그 수정 이후다. 이번 diffusion backward 변경 때문에 r3 source도 현재와
+다르므로 구 partial을 같은 run ID에 억지로 resume하지 않는다. 기존 artifact를 보존하고 필요한
+대상만 새 run ID로 선택한다. r1/r2 fixed-C의 epoch 10 global-best model state는 구 코드가
+저장하지 않았기 때문에 수정된 primary checkpoint로 복구할 수 없다.
 
 ## 2026-09-04 A6000 partial 실행과 old-source r2 재현
 
@@ -210,10 +222,26 @@ CUDA OOM으로 중단됐다. 따라서 dynamic C 점수, fixed-vs-dynamic 비교
 `F797F10F2D81BF23ED269DB698817EEEA99DB3F70DEBD3D0D68119C2917431D6`다. 로그의
 `train.py:785`와 `joint_best=` 단독 출력은 수정 전 `08d8ed6` 코드와 정확히 일치한다. 따라서
 r2는 `214265c`의 dynamic edge-score checkpoint나 condition-aware checkpoint selection을
-검증하지 않았다. 다음 실행은 r2를 resume하지 않고 통합 run ID
-`new-v5-cyclev2-a6000-gpu3-seed0-r3`를 사용한다. 실행 전
-`git show -s --oneline 214265c`를 실행해 출력이
-`214265c Fix V5 and Cycle V2 GPU failures`인지 눈으로 확인한다.
+검증하지 않았다. 이는 r2의 역사적 판정이며 아래 r3 재발에 적용하지 않는다.
+
+## r3 large OOM 재발과 현재 메모리 수정
+
+사용자 제공 `new-v5-cyclev2-a6000-gpu3-seed0-r3-conductance` 로그의 4/20번째 job은
+`v5/large/model-seed-0/ogbn-arxiv/shared_dynamic_c`다. Warm-up validation은 epoch 1
+0.599550, epoch 10 0.699822, epoch 20 0.666331, global best 0.715494였고 이후 forward의
+`shared_head_diffusion`에서 추가 192MiB 할당에 실패했다. 이는 최종 성능이나 C-active best가 아니다.
+
+Traceback의 `model.py:406/455/570`, `train.py:832/1192/1203`은 `214265c`와 정확히
+일치한다. `primary_best=pending` 출력도 해당 selection 수정판의 증거다. GPU 총 44.55GiB 중
+free 9.62MiB, 해당 프로세스 44.54GiB, PyTorch allocated 41.70GiB와 reserved-but-unallocated
+2.52GiB였다. 실패한 192MiB는 `131072 edges * 384 hidden * 4 FP32 bytes`와 일치한다.
+단순 환경변수·fragmentation 문제로만 보거나 이미 해결된 로그로 취급하지 않는다.
+
+위 custom backward가 이번 diffusion 저장 누적을 수정한 구현이다. 아직 서버의 새 full-run
+성공 결과는 없고 r3의 나머지 job 상태도 이 일부 로그로 추정하지 않는다. V5 operator source가
+변경됐으므로 r3 partial의 strict source-hash resume 거부를 우회하지 않는다. 기존 결과는
+보존하며 현재 소스로 실행할 대상만 새 run ID에서 명시적으로 선택한다. 새 Cycle V2는 별도
+[QR-free sparse DFS 실행](CYCLE_PE_V2.md)을 사용하고 완료한 V1–V4/Cycle V1/Tree를 반복하지 않는다.
 
 ## V1–V5 reference/large 비교
 

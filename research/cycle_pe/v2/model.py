@@ -1,52 +1,50 @@
-"""Coordinate-free cycle-space PE and a deep residual molecular GNN.
+"""Matched SE and relative-PE models on a complete sparse DFS cycle basis.
 
-For any full basis ``Z`` of ``ker(B.T)``, let
-
-``P_Z = Z (Z.T Z)^-1 Z.T`` and ``K_Z = P_Z * P_Z`` (Hadamard square).
-
-``P_Z`` is invariant to every invertible chart replacement ``Z -> ZR``.
-Squaring entrywise also removes independent incidence-orientation signs, while
-``K_Z X`` remains equivariant to edge permutations.  Consequently no arbitrary
-SVD/fundamental-cycle coordinate is ever presented to a learned layer.
+SE transports learned bond values through unsigned cycle membership. PE adds
+a parameter-free cycle-relative cosine-kernel residual to the same SE path.
+The relative kernel uses cyclic distance, independent of each cycle's origin
+and traversal direction. Changing the DFS tree can change either encoding.
+No projector, factorization, dense cycle matrix or edge-pair matrix is formed.
 """
 
 from __future__ import annotations
 
-import math
-from collections.abc import Sequence
-
 import torch
 from torch import Tensor, nn
-from torch.nn.utils.rnn import pad_sequence
 
 from research.cycle_pe.benchmark_models import ATOM_DIMS, BOND_DIMS, CategoricalEncoder, _pool
 from research.cycle_pe.paper_model import _message_topology
 from research.cycle_pe.v2.data import DATASETS, Batch
 
-MODEL_NAME = "cycle_projector_pe_v2"
-BASIS_EXECUTIONS = ("batched", "reference")
+ENCODINGS = ("se", "pe")
+MODEL_NAMES = {"se": "cycle_dfs_se_v2", "pe": "cycle_dfs_relative_pe_v2"}
+MODEL_NAME = MODEL_NAMES["se"]
 
 
 class LeftNullBasisEncoder(nn.Module):
-    """Bond-conditioned PE from the intrinsic cycle-space projector kernel.
+    """Learned edge -> DFS cycle -> edge PE on one sparse disjoint batch.
 
-    The historical class name is retained for import compatibility. Production
-    Production data stores orthonormal ``Q`` and marks it as such, so no
-    factorization occurs during training.  The diagnostic DFS-fundamental data
-    backend stores raw ``Z`` and therefore takes the generic graph-local QR path.
+    The historical class name remains import-compatible. The input is unsigned
+    sparse membership, not basis coordinates or a cycle-space projector.
     """
 
-    def __init__(self, bond_dim: int, pe_dim: int, *, column_chunk_size: int = 16):
+    def __init__(self, bond_dim: int, pe_dim: int, *, encoding: str = "se") -> None:
         super().__init__()
-        if min(bond_dim, pe_dim, column_chunk_size) < 1:
-            raise ValueError("bond_dim, pe_dim and column_chunk_size must be positive")
+        if min(bond_dim, pe_dim) < 1:
+            raise ValueError("bond_dim and pe_dim must be positive")
+        if encoding not in ENCODINGS:
+            raise ValueError(f"encoding must be one of {ENCODINGS}")
+        self.encoding = encoding
         self.bond_dim = bond_dim
         self.pe_dim = pe_dim
-        # Kept as a public compatibility knob; low-rank contraction cores, not
-        # arbitrary basis columns, are now the bounded execution unit.
-        self.column_chunk_size = column_chunk_size
         self.column_phi = nn.Sequential(
             nn.Linear(bond_dim, pe_dim), nn.SiLU(), nn.Linear(pe_dim, pe_dim)
+        )
+        self.cycle_mlp = nn.Sequential(
+            nn.Linear(pe_dim + 1, 2 * pe_dim),
+            nn.SiLU(),
+            nn.Linear(2 * pe_dim, pe_dim),
+            nn.SiLU(),
         )
         self.edge_psi = nn.Sequential(
             nn.Linear(2 * pe_dim + 3, 2 * pe_dim),
@@ -56,244 +54,116 @@ class LeftNullBasisEncoder(nn.Module):
         )
         self.output = nn.Sequential(nn.Linear(pe_dim, pe_dim), nn.SiLU())
 
-    def _checked_q(self, basis: Tensor, *, orthonormal_input: bool) -> Tensor:
-        if basis.ndim != 2:
-            raise ValueError("basis must have shape [num_edges, cycle_rank]")
-        if not basis.is_floating_point():
-            raise ValueError("basis must be a floating point tensor [num_edges, cycle_rank]")
-        edge_count, rank = basis.shape
-        if edge_count == 0 and rank:
-            raise ValueError("an edgeless graph cannot have nonzero cycle rank")
-        if rank > edge_count:
-            raise ValueError("cycle rank cannot exceed the edge count")
-        if rank == 0:
-            return basis.float()
-        if orthonormal_input:
-            # Cache validation certifies Q.T@Q=I. Avoid a GPU synchronization or
-            # repeated QR in the hot path.
-            return basis.float()
-        q, triangular = torch.linalg.qr(basis.float(), mode="reduced")
-        threshold = torch.finfo(q.dtype).eps * max(edge_count, rank) * 16.0
-        if bool((triangular.diagonal().abs() <= threshold).any()):
-            raise ValueError("basis must have full column rank")
-        return q
-
-    def _projector_mix(
-        self, q: Tensor, values: Tensor, *, pair_budget: int | None
-    ) -> tuple[Tensor, Tensor]:
-        # The projector contraction is the sole forced-FP32 region.  The PE
-        # MLPs and graph backbone remain eligible for the caller's autocast.
-        with torch.autocast(device_type=q.device.type, enabled=False):
-            q, values = q.float(), values.float()
-            edge_count, rank = q.shape
-            leverage = q.square().sum(dim=1)
-            if edge_count == 0 or rank == 0:
-                return values.new_zeros(values.shape), leverage
-            feature_count = values.shape[1]
-            budget = pair_budget or max(1, feature_count * rank * rank)
-            rank_block = min(rank, self.column_chunk_size, max(1, math.isqrt(budget)))
-            feature_block = max(1, min(feature_count, budget // (rank_block * rank_block)))
-            feature_parts = []
-            for feature_start in range(0, feature_count, feature_block):
-                selected = values[:, feature_start : feature_start + feature_block]
-                mixed = selected.new_zeros(selected.shape)
-                for left_start in range(0, rank, rank_block):
-                    left = q[:, left_start : left_start + rank_block]
-                    for right_start in range(0, rank, rank_block):
-                        right = q[:, right_start : right_start + rank_block]
-                        # core[d,a,b] = sum_j V[j,d] Q[j,a] Q[j,b]. This realizes
-                        # ((Q Q.T) Hadamard-square (Q Q.T)) @ V without ever
-                        # allocating an edge-by-edge matrix.
-                        core = torch.einsum("md,ma,mb->dab", selected, left, right)
-                        mixed = mixed + torch.einsum("ma,dab,mb->md", left, core, right)
-                feature_parts.append(mixed)
-            return torch.cat(feature_parts, dim=1), leverage
-
-    def _projector_mix_batch(
-        self,
-        qs: Sequence[Tensor],
-        value_parts: Sequence[Tensor],
-        *,
-        pair_budget: int,
-    ) -> tuple[list[Tensor], list[Tensor]]:
-        """Rank-grouped projector contractions without an edge-pair matrix.
-
-        Molecular graphs with equal cycle rank are edge-padded and contracted
-        together.  The temporary ``[graphs, features, r_block, r_block]`` core
-        never exceeds ``pair_budget`` elements; padding never creates an
-        ``m x m`` tensor.  Results are restored to their original graph order.
-        """
-        if len(qs) != len(value_parts):
-            raise ValueError("basis/value graph counts must agree")
-        mixed_parts: list[Tensor | None] = [None] * len(qs)
-        leverage_parts: list[Tensor | None] = [None] * len(qs)
-        by_rank: dict[int, list[int]] = {}
-        for index, (q, values) in enumerate(zip(qs, value_parts, strict=True)):
-            if q.shape[0] != values.shape[0]:
-                raise ValueError("basis rows must align with graph bond embeddings")
-            by_rank.setdefault(q.shape[1], []).append(index)
-
-        with torch.autocast(
-            device_type=value_parts[0].device.type if value_parts else "cpu", enabled=False
-        ):
-            for rank, indices in by_rank.items():
-                if rank == 0:
-                    for index in indices:
-                        values = value_parts[index].float()
-                        mixed_parts[index] = values.new_zeros(values.shape)
-                        leverage_parts[index] = values.new_zeros(values.shape[0])
-                    continue
-                feature_count = value_parts[indices[0]].shape[1]
-                initial_rank_block = min(
-                    rank, self.column_chunk_size, max(1, math.isqrt(pair_budget))
-                )
-                # Reserve at least a modest feature tile when possible.  This
-                # batches many small molecules instead of launching one kernel
-                # per graph, while the exact core limit remains enforced below.
-                graph_block = max(
-                    1,
-                    pair_budget
-                    // (initial_rank_block * initial_rank_block * min(feature_count, 8)),
-                )
-                for graph_start in range(0, len(indices), graph_block):
-                    selected_indices = indices[graph_start : graph_start + graph_block]
-                    graph_count = len(selected_indices)
-                    q_padded = pad_sequence(
-                        [qs[index].float() for index in selected_indices], batch_first=True
-                    )
-                    values_padded = pad_sequence(
-                        [value_parts[index].float() for index in selected_indices],
-                        batch_first=True,
-                    )
-                    leverage_padded = q_padded.square().sum(dim=2)
-                    mixed_padded = values_padded.new_zeros(values_padded.shape)
-                    rank_block = min(
-                        rank,
-                        self.column_chunk_size,
-                        max(1, math.isqrt(pair_budget // graph_count)),
-                    )
-                    feature_block = max(
-                        1,
-                        min(
-                            feature_count,
-                            pair_budget // (graph_count * rank_block * rank_block),
-                        ),
-                    )
-                    for feature_start in range(0, feature_count, feature_block):
-                        selected = values_padded[
-                            :, :, feature_start : feature_start + feature_block
-                        ]
-                        mixed = selected.new_zeros(selected.shape)
-                        for left_start in range(0, rank, rank_block):
-                            left = q_padded[:, :, left_start : left_start + rank_block]
-                            for right_start in range(0, rank, rank_block):
-                                right = q_padded[:, :, right_start : right_start + rank_block]
-                                core = torch.einsum("gmd,gma,gmb->gdab", selected, left, right)
-                                if core.numel() > pair_budget:
-                                    raise RuntimeError("projector core exceeded basis_pair_budget")
-                                mixed.add_(torch.einsum("gma,gdab,gmb->gmd", left, core, right))
-                        mixed_padded[:, :, feature_start : feature_start + selected.shape[2]] = (
-                            mixed
-                        )
-                    for local, index in enumerate(selected_indices):
-                        edge_count = qs[index].shape[0]
-                        mixed_parts[index] = mixed_padded[local, :edge_count]
-                        leverage_parts[index] = leverage_padded[local, :edge_count]
-        if any(part is None for part in mixed_parts + leverage_parts):
-            raise RuntimeError("incomplete rank-grouped projector result")
-        return (
-            [part for part in mixed_parts if part is not None],
-            [part for part in leverage_parts if part is not None],
-        )
-
     @staticmethod
-    def _intrinsic_features(values: Tensor, mixed: Tensor, leverage: Tensor, rank: int) -> Tensor:
-        safe = leverage.clamp_min(torch.finfo(leverage.dtype).eps)
-        rank_fraction = leverage.new_full((len(leverage), 1), rank / max(1, len(leverage)))
-        return torch.cat(
+    def _sparse_mix(membership: Tensor, values: Tensor) -> Tensor:
+        # Torch 2.7 CUDA COO mm stays FP32 while learned MLPs may use BF16.
+        with torch.autocast(device_type=values.device.type, enabled=False):
+            return torch.sparse.mm(membership.float(), values.float())
+
+    def forward(
+        self,
+        bond: Tensor,
+        cycle_membership: Tensor,
+        cycle_lengths: Tensor,
+        edge_cycle_counts: Tensor,
+        edge_cycle_features: Tensor,
+        cycle_position_values: Tensor | None = None,
+    ) -> Tensor:
+        if bond.ndim != 2 or bond.shape[1] != self.bond_dim:
+            raise ValueError("bond embeddings must have shape [num_edges, bond_dim]")
+        if (
+            cycle_membership.layout != torch.sparse_coo
+            or cycle_membership.ndim != 2
+            or not cycle_membership.is_coalesced()
+            or not cycle_membership.is_floating_point()
+        ):
+            raise ValueError("cycle_membership must be a coalesced floating sparse COO matrix")
+        edge_count, cycle_count = cycle_membership.shape
+        if edge_count != bond.shape[0]:
+            raise ValueError("cycle membership rows must align with bond embeddings")
+        if cycle_lengths.shape != (cycle_count,) or edge_cycle_counts.shape != (edge_count,):
+            raise ValueError("cycle lengths and edge cycle counts must match sparse membership")
+        if edge_cycle_features.shape != (edge_count, 2):
+            raise ValueError("edge_cycle_features must have shape [num_edges, 2]")
+        if any(
+            value.device != bond.device
+            for value in (cycle_membership, cycle_lengths, edge_cycle_counts, edge_cycle_features)
+        ):
+            raise ValueError(
+                "cycle membership and normalization tensors must share the bond device"
+            )
+        if any(
+            not value.is_floating_point()
+            for value in (cycle_lengths, edge_cycle_counts, edge_cycle_features)
+        ):
+            raise ValueError("cycle lengths, counts and edge features must be floating point")
+
+        if self.encoding == "pe":
+            if cycle_position_values is None:
+                raise ValueError(
+                    "PE requires cycle_position_values; missing positions cannot use SE"
+                )
+            if (
+                cycle_position_values.shape != (2, cycle_membership._nnz())
+                or not cycle_position_values.is_floating_point()
+                or cycle_position_values.device != bond.device
+            ):
+                raise ValueError(
+                    "cycle_position_values must be floating [2, nnz] on the bond device"
+                )
+
+        values = self.column_phi(bond)
+        lengths = cycle_lengths.float()
+        counts = edge_cycle_counts.float()
+        active = (counts > 0).float()[:, None]
+        safe_counts = counts.clamp_min(1.0)[:, None]
+        log_lengths = lengths.log1p()[:, None]
+        cycle_sum = self._sparse_mix(cycle_membership.transpose(0, 1), values)
+        cycle_mean = cycle_sum / lengths.clamp_min(1.0)[:, None]
+        cycle_hidden = self.cycle_mlp(torch.cat((cycle_mean, log_lengths), dim=1))
+
+        # Sparse block-diagonal products handle every cycle of every graph in
+        # the physical batch without a graphwise loop or dense E x beta tensor.
+        edge_cycle_mean = self._sparse_mix(cycle_membership, cycle_hidden) / safe_counts
+        if self.encoding == "pe":
+            # Shared sorted COO indices preserve the selected cycle chart. No
+            # feature tensor indexed by every edge-cycle incidence is formed.
+            indices = cycle_membership.indices()
+            cosine = torch.sparse_coo_tensor(
+                indices, cycle_position_values[0].float(), cycle_membership.shape,
+                is_coalesced=True, check_invariants=False,
+            )
+            sine = torch.sparse_coo_tensor(
+                indices, cycle_position_values[1].float(), cycle_membership.shape,
+                is_coalesced=True, check_invariants=False,
+            )
+            cosine_moment = self._sparse_mix(cosine.transpose(0, 1), values)
+            sine_moment = self._sparse_mix(sine.transpose(0, 1), values)
+            cosine_moment = cosine_moment / lengths.clamp_min(1.0)[:, None]
+            sine_moment = sine_moment / lengths.clamp_min(1.0)[:, None]
+            positional_residual = (
+                self._sparse_mix(cosine, cosine_moment)
+                + self._sparse_mix(sine, sine_moment)
+            ) / safe_counts
+            # cos(theta_e-theta_f) is reconstructed before nonlinear layers.
+            # This equals (K_[1+cos] - K_mean) @ values, averaged over each
+            # edge's cycles. The existing nonlinear SE path stays unchanged.
+            edge_cycle_mean = edge_cycle_mean + positional_residual
+        features = torch.cat(
             (
-                values.float() * leverage[:, None],
-                mixed / safe[:, None],
-                leverage[:, None],
-                leverage.sqrt()[:, None],
-                rank_fraction,
+                values.float() * active,
+                edge_cycle_mean,
+                counts.log1p()[:, None],
+                # Static mean log-length/inverse-length features come from
+                # preparation/cache rather than a third sparse product here.
+                edge_cycle_features.float(),
             ),
             dim=1,
         )
-
-    def _encode(
-        self,
-        bond: Tensor,
-        basis: Tensor,
-        *,
-        pair_budget: int | None,
-        orthonormal_input: bool,
-    ) -> Tensor:
-        if bond.ndim != 2 or bond.shape[1] != self.bond_dim:
-            raise ValueError("bond embeddings have an invalid shape")
-        if basis.ndim != 2 or basis.shape[0] != bond.shape[0]:
-            raise ValueError("basis must have shape (num_edges, cycle_rank)")
-        if basis.device != bond.device:
-            raise ValueError("basis must be on the bond embedding device")
-        edge_count, rank = basis.shape
-        if rank == 0:
-            return bond.new_zeros((edge_count, self.pe_dim))
-        q = self._checked_q(basis, orthonormal_input=orthonormal_input)
-        values = self.column_phi(bond)
-        mixed, leverage = self._projector_mix(q, values, pair_budget=pair_budget)
-        features = self._intrinsic_features(values, mixed, leverage, rank)
         encoded = self.output(self.edge_psi(features))
-        # Bridges (hence every edge in an acyclic component) have zero cycle
-        # leverage and exactly zero PE despite affine biases.
-        return encoded * leverage.sqrt()[:, None].to(encoded.dtype)
-
-    def forward(self, bond: Tensor, basis: Tensor) -> Tensor:
-        return self._encode(bond, basis, pair_budget=None, orthonormal_input=False)
-
-    def forward_batch(
-        self,
-        bond: Tensor,
-        bases: Sequence[Tensor],
-        *,
-        pair_budget: int = 32768,
-        orthonormal_input: bool | Sequence[bool] = False,
-    ) -> Tensor:
-        if pair_budget < 1:
-            raise ValueError("pair_budget must be positive")
-        counts = [basis.shape[0] for basis in bases]
-        if sum(counts) != len(bond):
-            raise ValueError("basis rows must align with concatenated bond embeddings")
-        if not bases:
-            return bond.new_zeros((0, self.pe_dim))
-        if isinstance(orthonormal_input, bool):
-            orthonormal_flags = [orthonormal_input] * len(bases)
-        else:
-            orthonormal_flags = list(orthonormal_input)
-            if len(orthonormal_flags) != len(bases) or any(
-                not isinstance(flag, bool) for flag in orthonormal_flags
-            ):
-                raise ValueError("one Boolean orthonormal-input flag is required per basis")
-        qs = [
-            self._checked_q(basis, orthonormal_input=flag)
-            for basis, flag in zip(bases, orthonormal_flags, strict=True)
-        ]
-        values = self.column_phi(bond)
-        value_parts = list(torch.split(values, counts))
-        mixed_parts, leverage_parts = self._projector_mix_batch(
-            qs, value_parts, pair_budget=pair_budget
-        )
-        features = torch.cat(
-            [
-                self._intrinsic_features(value, mixed, leverage, q.shape[1])
-                for q, value, mixed, leverage in zip(
-                    qs, value_parts, mixed_parts, leverage_parts, strict=True
-                )
-            ],
-            dim=0,
-        )
-        leverage = torch.cat(leverage_parts)
-        encoded = self.output(self.edge_psi(features))
-        return encoded * leverage.sqrt()[:, None].to(encoded.dtype)
+        # Empty-cycle sparse products retain an autograd path: forest PE is
+        # exactly zero and PE parameter gradients are zero, not disconnected.
+        return encoded * active.to(encoded.dtype)
 
 
 class _ResidualEdgeGraphBlock(nn.Module):
@@ -385,18 +255,16 @@ class _ResidualEdgeGraphBlock(nn.Module):
 
 
 class CycleBasisPEModel(nn.Module):
-    """Projector-kernel PE with a deep, stable molecular graph backbone."""
+    """Sparse DFS-cycle PE with the unchanged deep molecular graph backbone."""
 
     def __init__(
         self,
         *,
         dataset: str,
+        encoding: str = "se",
         hidden: int = 128,
         pe_dim: int = 64,
         layers: int = 10,
-        column_chunk_size: int = 16,
-        basis_execution: str = "batched",
-        basis_pair_budget: int = 32768,
         ffn_multiplier: int = 4,
         dropout: float = 0.0,
         layer_scale: float = 0.1,
@@ -408,15 +276,10 @@ class CycleBasisPEModel(nn.Module):
             raise ValueError("hidden, pe_dim, layers and ffn_multiplier must be positive")
         if not 0.0 <= dropout < 1.0 or not 0.0 < layer_scale <= 1.0:
             raise ValueError("dropout or layer_scale is outside its stable range")
-        if basis_execution not in BASIS_EXECUTIONS:
-            raise ValueError(f"basis_execution must be one of {BASIS_EXECUTIONS}")
-        if basis_pair_budget < 1:
-            raise ValueError("basis_pair_budget must be positive")
-        self.basis_execution = basis_execution
-        self.basis_pair_budget = basis_pair_budget
         self.node_encoder = CategoricalEncoder((28,) if dataset == "zinc12k" else ATOM_DIMS, hidden)
         self.bond_encoder = CategoricalEncoder((4,) if dataset == "zinc12k" else BOND_DIMS, hidden)
-        self.pe_encoder = LeftNullBasisEncoder(hidden, pe_dim, column_chunk_size=column_chunk_size)
+        self.encoding = encoding
+        self.pe_encoder = LeftNullBasisEncoder(hidden, pe_dim, encoding=encoding)
         self.edge_encoder = nn.Sequential(
             nn.Linear(hidden + pe_dim, hidden), nn.SiLU(), nn.Linear(hidden, hidden)
         )
@@ -442,43 +305,17 @@ class CycleBasisPEModel(nn.Module):
 
     def forward(self, batch: Batch) -> Tensor:
         graph_count = len(batch.ptr) - 1
-        if len(batch.cycle_bases) != graph_count:
-            raise ValueError("one cycle-space basis is required per graph")
-        if len(batch.cycle_basis_is_orthonormal) != graph_count:
-            raise ValueError("one cycle-space representation flag is required per graph")
-        counts = [basis.shape[0] for basis in batch.cycle_bases]
-        if sum(counts) != len(batch.edge_attr):
-            raise ValueError("ragged basis rows do not align with batch bonds")
         node = self.node_encoder(batch.x)
         bond = self.bond_encoder(batch.edge_attr)
-        if self.basis_execution == "reference":
-            positional = torch.cat(
-                [
-                    self.pe_encoder._encode(
-                        part,
-                        basis,
-                        pair_budget=None,
-                        orthonormal_input=is_orthonormal,
-                    )
-                    for part, basis, is_orthonormal in zip(
-                        torch.split(bond, counts),
-                        batch.cycle_bases,
-                        batch.cycle_basis_is_orthonormal,
-                        strict=True,
-                    )
-                ],
-                dim=0,
-            )
-        else:
-            positional = self.pe_encoder.forward_batch(
-                bond,
-                batch.cycle_bases,
-                pair_budget=self.basis_pair_budget,
-                orthonormal_input=batch.cycle_basis_is_orthonormal,
-            )
+        positional = self.pe_encoder(
+            bond,
+            batch.cycle_membership,
+            batch.cycle_lengths,
+            batch.edge_cycle_counts,
+            batch.edge_cycle_features,
+            batch.cycle_position_values,
+        )
         edge = self.edge_encoder(torch.cat((bond, positional), dim=1))
-        # The outer training/evaluation autocast remains active for the deep
-        # backbone.  Only the projector contractions above force FP32.
         edge_index = batch.edge_index.T
         topology = _message_topology(node, edge_index)
         for layer in self.layers:
@@ -488,55 +325,77 @@ class CycleBasisPEModel(nn.Module):
         node_mean, node_max = _pool(node, batch.batch, graph_count)
         node_sizes = (batch.ptr[1:] - batch.ptr[:-1]).to(node.dtype)[:, None]
         node_sum = node_mean * node_sizes
-        edge_graph = batch.batch[batch.edge_index[0]]
-        edge_mean, edge_max = _pool(edge, edge_graph, graph_count)
+        edge_mean, edge_max = _pool(edge, batch.edge_graph_index, graph_count)
         edge_sizes = (batch.edge_ptr[1:] - batch.edge_ptr[:-1]).to(edge.dtype)[:, None]
         edge_sum = edge_mean * edge_sizes
         pooled = torch.cat((node_sum, node_mean, node_max, edge_sum, edge_mean, edge_max), dim=1)
         return self.graph_head(self.graph_trunk(pooled))
 
 
-def architecture_protocol() -> dict[str, str]:
+def architecture_protocol(encoding: str = "se") -> dict[str, str]:
+    if encoding not in ENCODINGS:
+        raise ValueError(f"encoding must be one of {ENCODINGS}")
     return {
-        "model": MODEL_NAME,
+        "model": MODEL_NAMES[encoding],
+        "encoding": encoding,
         "cycle_space": (
-            "default thin_q caches a thin-QR orthonormalization Q of a sparse fundamental "
-            "basis Z of ker(B.T); optional dfs_fundamental caches raw DFS Z and performs "
-            "graph-local QR before projector use; beta=m-n+components; no truncation"
+            "complete signed sparse DFS fundamental basis Z of ker(B.T); "
+            "beta=m-n+components; every selected cycle retained without truncation"
         ),
         "positional_encoding": (
-            "P=Q Q.T and orientation-free K=P Hadamard-square P; learned bond values are "
-            "mixed as K phi(bond), normalized by leverage diag(P), then fused with local "
-            "cycle-weighted values and leverage"
+            "SE: unsigned sparse membership A=abs(Z); shared learned bond values "
+            "aggregate edge-to-cycle by mean, combine with log cycle length through a "
+            "shared cycle MLP, then aggregate cycle-to-edge with cycle-count normalization"
+            if encoding == "se"
+            else "PE: retain the identical SE path and add the cycle-relative residual "
+            "sum_j mean_f cos(2*pi*(t_ej-t_fj)/L_j)*phi(bond_f), averaged over edge cycles; "
+            "this is K_[1+cos] minus K_mean applied to learned bond values"
+        ),
+        "relative_position": (
+            "disabled in SE; cycle structure summaries contain no within-cycle distance"
+            if encoding == "se"
+            else "first-harmonic cosine kernel of undirected cyclic distance; origin/reversal "
+            "invariant, not general graph shortest-path distance or guaranteed unique positions; "
+            "all selected cycles and their complete supports participate"
+        ),
+        "parameter_matching": (
+            "SE and PE have identical learned modules and parameter counts; PE adds no gate "
+            "or learned parameters; nonlinear layers follow invariant harmonic reconstruction"
         ),
         "symmetry": (
-            "invariant to every invertible cycle-basis replacement Z->ZR and independent "
-            "edge-orientation flips; edge-permutation equivariant"
+            "cycle-sign, column-order and cycle-origin/reversal invariant; "
+            "edge/node permutation equivariant "
+            "only when the selected basis is transported with the graph; a different "
+            "DFS tree or arbitrary invertible Z->ZR may change this selected-cycle PE"
         ),
         "execution": (
-            "thin_q has no QR/SVD/pinv in training; dfs_fundamental is a diagnostic "
-            "correctness backend with repeated per-forward QR, not a speedup; K@V uses "
-            "pair-free rank-grouped contractions and never m-by-m storage"
+            "one sparse block-diagonal physical batch; sparse edge-to-cycle-to-edge "
+            "matrix products; no QR, SVD, eigendecomposition, Gram inverse, projector, "
+            "dense edge-by-cycle matrix or edge-by-edge matrix"
         ),
         "backbone": (
             "deep pre-norm residual edge/node message blocks; gated directed messages; "
             "separate edge and node FFNs; LayerScale and dropout for stable deep training"
         ),
-        "pe_injection": "concatenate projector-kernel PE with categorical bond embedding",
+        "pe_injection": "concatenate the selected learned DFS-cycle encoding with bond embedding",
         "pooling": "node and edge sum/mean/max followed by a two-layer graph trunk",
         "forest_policy": (
-            "bridges, including every edge of an acyclic component, have zero leverage and PE"
+            "edges outside all selected cycles, including bridges and forests, have "
+            "exactly zero PE; empty sparse paths retain zero parameter gradients"
         ),
         "numeric_policy": (
-            "projector contraction executes in FP32; PE MLPs and the deep backbone honor "
-            "outer AMP, with FP32 residual accumulation where required"
+            "sparse COO matrix products execute in FP32; learned cycle/edge MLPs and "
+            "the deep backbone honor outer AMP with FP32 residual accumulation"
         ),
-        "reference_comparison": f"external published tables only; trains only {MODEL_NAME}",
+        "reference_comparison": (
+            f"external published tables only; trains only {MODEL_NAMES[encoding]}"
+        ),
     }
 
 
 __all__ = [
-    "BASIS_EXECUTIONS",
+    "ENCODINGS",
+    "MODEL_NAMES",
     "MODEL_NAME",
     "CycleBasisPEModel",
     "LeftNullBasisEncoder",

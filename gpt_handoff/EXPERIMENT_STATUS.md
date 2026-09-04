@@ -1,6 +1,6 @@
 # 실험 결과와 구현 상태
 
-기준일: 2026-09-04 (Asia/Seoul).
+기준일: 2026-09-05 (Asia/Seoul).
 
 이 문서는 사용자가 제공한 **서버 결과 출력**과 **현재 소스 버전의 구현**을 구분한 기록이다.
 문서 작성 자체가 새 학습을 실행했다는 뜻은 아니다. 수치는 사용자 로그에서 확인했으며,
@@ -8,18 +8,32 @@
 
 ## 1. 소스 버전과 측정 범위
 
+2026-09-05 SE/PE 분리 완료 후 최신 로컬 CPU 전체 회귀는 **1,852 passed / 98 skipped /
+1 warning** (164.78초)다. Ruff 및 코드 스냅샷 일치 검사도 통과했다. 생략은 Linux/Bash,
+Windows symlink 권한, 미설치 PyG, CUDA/BF16 환경 조건이며 경고는 PyTorch multiprocessing의
+sparse tensor 재구성 경고다. 이는 실제 데이터 전체 학습·평가나 A6000 성능 검증이 아니다.
+아래 이전 구현 시점의 테스트 수치는 역사 기록으로 보존한다.
+
 현재 최상위 구조는 [Conductance V5](CONDUCTANCE_V5.md)와 새
 [Cycle PE V2](CYCLE_PE_V2.md)다. V5는 shared graph-conditioned dynamic C와 multi-head W,
 graph-conditioned beta를 분리했고, `fixed_c/shared_dynamic_c` 두 arm을 연구급 architecture에서
-비교한다. Cycle의 과거 `cycle_basis_v2`는 실패 후 폐기했으며 현재 identity는
-`cycle_projector_pe_v2`다. 두 새 구현의 A6000 partial 실패 로그는 수령했지만 유효한 전체
-성능 비교는 아직 없다.
+비교한다. Cycle의 과거 `cycle_basis_v2`와 QR 기반 `cycle_projector_pe_v2`는 현재 경로에서
+제외했다. 구조 요약을 PE라고 부르던 `cycle_dfs_sparse_pe_v2`와도 결과를 분리한다.
+현재 SE는 `cycle_dfs_se_v2`, PE는 `cycle_dfs_relative_pe_v2`다. PE는 동일 SE/backbone에
+cycle 내부 상대 위치 residual을 더하며 추가 trainable parameter는 0개다. 유일한
+`dfs_fundamental` backend의 전체 기저와 실제 cycle 순서를 sparse로 사용하고
+QR/SVD/Gram inverse를 하지 않는다. 선택된 DFS tree에 의존하며 일반 기저변환 불변성은
+주장하지 않는다. 두 조건의 실제 GPU 전체 학습·성능·가속 결과는 아직 없다.
 
 현재 [전체 scaling](RICH_SCALING_EXPERIMENTS.md)은 `reference/large` 두 architecture
-profile을 사용한다. Conductance V1–V5는 106 child/model trainings, Cycle V1/V2는 8
+profile을 사용한다. Conductance V1–V5는 106 child/model trainings, Cycle V1/V2는 12
 child/model trainings, Tree V1/V2는 4 child 안에서 8 models를 학습한다. 따라서 합계는
-**118 child runs / 122 fresh model trainings**다. 동일 run-id는 검증된 완료 child를 skip하며
-V5와 새 Cycle V2의 `last.pt`가 있으면 epoch 상태를 복원한다. 과거의
+**122 child runs / 126 fresh model trainings**다. Cycle은 V1 4학습과 V2 SE/PE 8학습이다.
+동일 run-id는 검증된 완료 child를 skip하며
+같은 새 source/config/schema의 V5와 Cycle V2 `last.pt`가 있으면 epoch 상태를 복원한다.
+현재 Cycle cache는 `cycle_pe_v2_ordered_dfs_benchmark`이며 SE/PE가 공유한다. 두 encoding의
+checkpoint는 교환할 수 없다. 구 cache/checkpoint와 수정 전 V5 source checkpoint는 호환되지 않으며 hash 검사를
+우회하지 않는다. 완료한 전체 matrix를 다시 실행하라는 의미는 아니다. 과거의
 `base/wide/deep/large` 204-training 계획은 폐기됐고 현재 실행 계약이 아니다.
 
 실행 hardware profile은 보수적인 `portable`과 opt-in `a6000-48gb`로 분리된다. A6000
@@ -59,10 +73,11 @@ runner는 각각 `passed`다. 성능 수치와 전체 원본 artifact는 수령�
 이후 단일 `hidden/layer` 설정만으로는 큰 모델에서의 적합도를 확인할 수 없다는 사용자 요청에
 따라 [전체 모델 규모 확장 실험](RICH_SCALING_EXPERIMENTS.md)을 연구급 크기로 재설계했다.
 Conductance V1–V5, Cycle PE V1/새 V2, Tree fixed/multi를 dataset-aware `reference`/`large`로
-실행한다. 기본 model seed 0 계획은 Conductance 106, Cycle 8, Tree 8 trainings로 총
-**118 child runs / 122 model trainings**이다. Tree child 하나가 fixed/multi 두 모델을
+실행한다. 기본 model seed 0 계획은 Conductance 106, Cycle 12, Tree 8 trainings로 총
+**122 child runs / 126 model trainings**이다. Tree child 하나가 fixed/multi 두 모델을
 학습하므로 두 수가 다르다. Cycle/Tree 후보는 validation-only로 비교한 뒤 선택 checkpoint만
-test-only로 평가한다. 현재 확인된 것은 runner·manifest·무결성 검사와 로컬 테스트이며 이 GPU
+test-only로 평가한다. Cycle은 encoding×dataset별 선택이므로 V1 포함 6회, V2-only 4회 test다.
+현재 확인된 것은 runner·manifest·무결성 검사와 로컬 테스트이며 이 GPU
 학습 결과는 아직 실행·수령하지 않았다. 같은 인수와 run ID 재실행은 완료 child를 검증·skip하고,
 V5와 새 Cycle V2는 `last.pt`부터 이어지며 legacy 미완료 child만 처음부터 재시도한다.
 
@@ -78,8 +93,8 @@ V5와 새 Cycle V2는 `last.pt`부터 이어지며 legacy 미완료 child만 처
 | Conductance v2 | `gat-direct-c-v2-gpu6-seed0-v1` | 과거 arxiv-only 2-job run `passed`; 현재 8-job 결과 아님 |
 | Conductance v3 | `gat-relative-c-v3-gpu6-seed0-v1` | 과거 arxiv-only 2-job run `passed`; 현재 10-job 결과 아님 |
 | Conductance v4 | `gat-hybrid-c-spatial-v4-gpu6-seed0-v1` | 과거 arxiv-only 4-arm run의 `fixed_c_identity_w`만 200 epochs·child exit 0 뒤 구 report gate 중단; 나머지 3개 pending; 현재 20-job 결과 아님 |
-| 폐기된 구 Cycle PE v2 | `cycle-pe-v2-gpu6-seed0-v1` | 당시 runner `passed`; 새 `cycle_projector_pe_v2` 결과가 아님 |
-| 전체 scaling | 미실행 | V1–V5 포함 118-child/122-training 실행 코드만 추가; GPU 결과 없음 |
+| 폐기된 구 Cycle PE v2 | `cycle-pe-v2-gpu6-seed0-v1` | 당시 runner `passed`; 현재 sparse DFS 모델 결과가 아님 |
+| 당시 전체 scaling 계획 | 미실행 | 구 118-child/122-training 계획의 기록이며 GPU 결과 없음; 현재 SE/PE 분리 계획은 위 122-child/126-training 계약 |
 
 ### 2026-09-04 A6000 V5·Cycle V2 partial 실행과 old-source r2 재현
 
@@ -98,12 +113,15 @@ manifest/checkpoint/history를 로컬로 받은 독립 재검증은 아니다.
 - Cycle V2는 Peptides-struct와 ZINC-12K의 projector cache 준비를 완료했지만 reference/large
   네 학습 모두 첫 epoch 전에 non-finite gradient로 실패해 성공 metric이 없다.
 - 원인은 각각 dynamic edge-score autograd activation 누적과 A6000 FP16+GradScaler 초기
-  scale overflow로 확인됐다. 현재 소스는 edge-score chunk checkpoint, BF16/no-scaler,
-  condition-aware V5 checkpoint selection으로 수정하고 finite 검사를 유지한다.
+  scale overflow로 확인됐다. 당시 수정은 edge-score chunk checkpoint, BF16/no-scaler,
+  condition-aware V5 checkpoint selection이었다. 이후 r3의 diffusion OOM 재발과 현재 수정은
+  아래에 별도로 기록한다.
 
 구 V5 fixed run은 실제 global-best model state를 저장하지 않아 corrected checkpoint로 복구할
 수 없고, 구 partial `last.pt`도 새 selection schema/source와 이어 붙이지 않는다. 수정판은 새
-run ID가 필요하지만 Cycle dataset/projector cache는 재사용한다. 이 partial run의 수치를
+run ID가 필요하다. 당시 동일 projector 모델의 cache 재사용과 달리 현재 sparse DFS 모델은
+`cycle_pe_v2_ordered_dfs_benchmark`를 새로 준비하며 projector 및 구 support-only cache를
+재사용하지 않는다. 이 partial run의 수치를
 fixed-vs-dynamic 또는 V5/Cycle V2 성능 결과로 인용하지 않는다.
 
 후속 run `new-v5-cyclev2-a6000-gpu3-seed0-r2`의 사용자 terminal 로그도 수령했다. 첨부
@@ -117,10 +135,29 @@ r2도 r1과 같은 실패를 재현했다. Conductance는 fixed-C 한 job만 완
 calibration backward에서 다시 44.47/44.55GiB OOM이 발생했고 18개가 미실행이다. Cycle V2
 네 job도 모두 첫 epoch 전에 같은 non-finite gradient로 실패했다. 따라서 r2는 edge-score
 checkpoint, condition-aware selection, BF16/no-scaler 수정의 검증 결과가 아니며 그 수치나
-artifact를 수정판 결과로 사용하거나 r3에 resume하지 않는다. 다음 통합 실행 ID는
-`new-v5-cyclev2-a6000-gpu3-seed0-r3`다. 실행 전에 `git pull --ff-only` 후
-`git show -s --oneline 214265c`를 실행해 출력이
-`214265c Fix V5 and Cycle V2 GPU failures`인지 눈으로 확인한 뒤 시작한다.
+artifact를 수정판 결과로 사용하지 않는다. 이것은 r2의 역사적 기록이며 r3까지 old source였다는
+뜻이 아니다.
+
+### r3 large OOM 재발과 2026-09-05 QR-free 구현
+
+사용자가 추가로 제공한 r3 로그는 4/20번째 `v5/large/ogbn-arxiv/shared_dynamic_c`에서
+warm-up 20 epoch 이후 diffusion forward가 192MiB 할당에 실패한 기록이다. GPU 44.55GiB 중
+해당 프로세스 44.54GiB, PyTorch allocated 41.70GiB였다. Traceback은 `214265c`와 정확히
+일치하므로 score checkpoint 수정판을 실행한 뒤에도 OOM이 남았음이 확인됐다. 192MiB는
+131072-edge chunk × hidden384 × FP32 4bytes다. 나머지 job의 완료 여부를 이 로그로 추정하지 않는다.
+
+현재는 V5 diffusion custom backward가 node message/scalar edge weights만 저장하고 edge
+features를 chunk별 재계산한다. 기존 규모와 sampling은 유지했다. 관련 CPU 검사 28개 통과,
+동일 합성 입력의 고유 autograd 저장량 563,840→60,544 bytes(약89.3% 감소)를 확인했으나
+실제 GPU peak나 전체 학습 성공을 검증한 것이 아니다. 상세는 [V5 문서](CONDUCTANCE_V5.md)를 따른다.
+
+Cycle 현재 조건은 QR-free sparse DFS 구조 SE와 동일 SE+cycle 상대 PE이며 backbone 크기는
+유지했다. 기본 ZINC parameter는 두 조건 모두 7,262,785개(구 projector보다 +16,704)다.
+DFS 탐색 O(V+E), 기저·실제 cycle 위치 출력 O(nnz Z), 각 sparse 집계 O(nnz Z*d)를 구분한다.
+SE는 sparse product 2회, PE는 6회이므로 PE가 SE보다 빠르다고 주장하지 않는다.
+새 V2만 실행하는 `cycle-se-pe-a6000-gpu3-seed0-v1`은 `--encodings se pe`, 두 dataset·두
+profile·seed 0의 8학습과 선택 checkpoint 4회 test다. 명령과 checkpoint/cache 비호환성은
+[CYCLE_PE_V2.md](CYCLE_PE_V2.md)에 있다. 완료한 다른 트랙이나 전체 matrix를 다시 실행하지 않는다.
 
 V3는 graph-centered score → bounded relative C → isotropic mixture와 학습 alpha의
 대칭 정규화를 사용한다. AdamW backbone/생성기/scalar 그룹을 분리했다. 현재 기본은
@@ -183,7 +220,7 @@ graph binding과 학습 루프→checkpoint→비교표 연결 및 실제 C grad
 | 이전 진단 전용 게시 commit | `ebf8cd19b80e6cd6c742b132e2bb1dadb97b019c` |
 | 이전 commit의 추가 내용 | Conductance 진단 Python/Bash, 전용 테스트, 안내 문서, 트랙 README의 5개 파일 |
 | 기존 학습 코드 | 위 진단 commit은 기존 benchmark의 모델·학습 수식을 변경하지 않음 |
-| 새 Cycle projector v2 | 2026-09-04 A6000 네 학습 모두 구 FP16 gradient overflow로 실패; BF16/no-scaler 수정과 로컬 계약 검증 완료. 성공한 GPU 성능 결과 없음 |
+| 현재 Cycle V2 SE/상대 PE | `cycle_dfs_se_v2`와 `cycle_dfs_relative_pe_v2` 구현·CPU 계약 검증; 두 조건의 새 GPU 전체 학습·성능·가속 결과 없음. 과거 projector V2의 네 FP16 실패는 별도 역사 기록 |
 | 실행 최적화·선택적 compile·속도 도구 | 이 소스 버전에 포함, 로컬 단위 검증 완료. GPU 가속 실측 미수령 |
 | 단일 seed 기본값·확장 checkpoint 검사 | 5e801c3 GPU full audit 수령, seed 0 다섯 데이터셋 passed |
 | Gate WD × normalization 2×2 | 43afd63 실제 GPU 결과 수령. PPI/arxiv × 4조건 × seed 0 모두 passed |
@@ -192,8 +229,8 @@ graph binding과 학습 루프→checkpoint→비교표 연결 및 실제 C grad
 | Conductance 직접 C v2 | 과거 arxiv-only `gat-direct-c-v2-gpu6-seed0-v1` 사용자 보고상 `passed`; 현재 4-dataset 기본 결과는 미수령 |
 | Conductance 상대 C v3 | 과거 arxiv-only `gat-relative-c-v3-gpu6-seed0-v1` 사용자 보고상 `passed`; 현재 5-dataset 기본 결과는 미수령 |
 | [Conductance C × spatial W v4](CONDUCTANCE_V4.md) | 과거 arxiv run은 첫 arm 뒤 구 report gate에서 중단. 현재 5-dataset × 4-condition = 20-arm 정식 결과 없음; 새 전체 run 필요 |
-| [Conductance graph-conditioned v5](CONDUCTANCE_V5.md) | 2026-09-04 A6000 partial: fixed 1개 구 정책 완료, dynamic OOM, 18개 미실행; 메모리·selection 수정 완료, 유효한 fixed/dynamic 비교 없음 |
-| [전체 큰 모델 scaling](RICH_SCALING_EXPERIMENTS.md) | Conductance V1–V5 106 + Cycle V1/V2 8 + Tree fixed/multi 8 = 122 trainings 계약. V5/Cycle V2 partial 실패 로그만 수령, 전체 GPU 결과 없음 |
+| [Conductance graph-conditioned v5](CONDUCTANCE_V5.md) | r1/r2 partial 및 214265c 적용 r3 large diffusion OOM 수령. 현재 custom backward CPU 검증, 새 GPU 전체 성공·유효 fixed/dynamic 비교 없음 |
+| [전체 큰 모델 scaling](RICH_SCALING_EXPERIMENTS.md) | Conductance V1–V5 106 + Cycle V1/V2 12 + Tree fixed/multi 8 = 126 trainings / 122 child 계약. V5/구 Cycle V2 partial 실패 로그만 수령, 전체 GPU 결과 없음 |
 | [CODE_SUMMARY.md](CODE_SUMMARY.md) | 이 버전의 source/test/config/script 전체를 파일별로 보존한 스냅샷 |
 
 `ebf8cd1`까지만 받은 서버에는 새 기능이 없으므로 업데이트 후 `git rev-parse HEAD`로

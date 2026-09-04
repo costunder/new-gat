@@ -12,9 +12,9 @@ GPT에는 파일을 따로 고르지 말고 이 폴더의 **10개 파일을 전�
 5. `CONDUCTANCE_V3.md`: 공유 상대 C graph operator 학습 계약
 6. `CONDUCTANCE_V4.md`: C graph operator × spatial W 2×2 실험의 정확한 계약
 7. `CONDUCTANCE_V5.md`: graph-conditioned shared dynamic C와 연구급 규모 계약
-8. `CYCLE_PE_V2.md`: 폐기된 구 V2를 대체한 좌영공간 projector PE 계약
+8. `CYCLE_PE_V2.md`: QR-free DFS 기저의 구조 SE 대 SE+cycle 상대 PE 비교 계약
 9. `RICH_SCALING_EXPERIMENTS.md`: Conductance V1–V5, Cycle PE V1/V2, Tree의
-   reference/large 전체 scaling 계약(118 child / 122 model trainings)
+   reference/large 전체 scaling 계약(122 child / 126 model trainings)
 10. `CODE_SUMMARY.md`: 현재 Python·test·config·script 전체의 원문 스냅샷
 
 Conductance v2/v3/v4/v5와 Cycle PE v2는 각각의 원문 문서를 직접 제공한다. 이 문서만 보는

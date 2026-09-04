@@ -210,6 +210,8 @@ def _source_snapshot() -> dict[str, Any]:
             cwd=ROOT,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):

@@ -33,17 +33,15 @@ def test_preparation_never_compiles():
         assert "--compile" not in command
 
 
-def test_v2_basis_execution_options_reach_child():
+def test_v2_sparse_basis_option_reaches_child():
     args = run_paper._parser().parse_args(
         [
             "--tracks",
             "cycle_pe",
             "--cycle-pe-version",
             "v2",
-            "--basis-execution",
-            "reference",
-            "--basis-pair-budget",
-            "1024",
+            "--basis-backend",
+            "dfs_fundamental",
             "--model-seeds",
             "0",
         ]
@@ -52,8 +50,9 @@ def test_v2_basis_execution_options_reach_child():
     from research.cycle_pe.v2.benchmark import parser
 
     child = parser().parse_args(command[3:])
-    assert child.basis_execution == "reference"
-    assert child.basis_pair_budget == 1024
+    assert child.basis_backend == "dfs_fundamental"
+    assert not hasattr(child, "basis_execution")
+    assert not hasattr(child, "basis_pair_budget")
 
 
 @pytest.mark.parametrize(
@@ -67,7 +66,10 @@ def test_unsupported_compilation_rejected_before_dependencies(selection, monkeyp
     assert "--compile supports" in capsys.readouterr().err
 
 
-def test_basis_budget_rejected_before_data(monkeypatch, capsys):
-    monkeypatch.setattr(sys, "argv", ["run_paper.py", "--basis-pair-budget", "0", "--dry-run"])
-    assert run_paper.main() == 2
-    assert "must be positive" in capsys.readouterr().err
+@pytest.mark.parametrize("option", ["--basis-pair-budget", "--basis-execution"])
+def test_removed_projector_options_rejected_before_data(option, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["run_paper.py", option, "0", "--dry-run"])
+    with pytest.raises(SystemExit) as error:
+        run_paper.main()
+    assert error.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err

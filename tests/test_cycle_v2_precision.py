@@ -38,7 +38,7 @@ def test_resume_identity_binds_effective_precision(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
     fp32 = benchmark._resume_configuration("zinc12k", args)
 
-    assert bf16["schema"] == fp32["schema"] == "cycle-projector-pe-v2-epoch-resume-2"
+    assert bf16["schema"] == fp32["schema"] == "cycle-dfs-se-relative-pe-v2-epoch-resume-1"
     assert bf16["precision"]["autocast_dtype"] == "bfloat16"
     assert fp32["precision"]["autocast_dtype"] == "disabled"
     assert bf16 != fp32

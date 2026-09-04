@@ -52,6 +52,60 @@ def weighted_degree(
     return degree
 
 
+class _ChunkedUndirectedPropagation(torch.autograd.Function):
+    """Exact sparse propagation with recomputed edge-feature products.
+
+    Ordinary autograd retains every chunk's gathered edge features until
+    backward. This implementation instead saves only node messages, scalar
+    edge weights and incidence indices: O(N * heads * width + E) storage.
+    Forward and first-order backward temporaries are bounded by the edge
+    chunk size; no edges or feature channels are omitted. Higher derivatives
+    are supported by differentiable backward operations, but requesting
+    create_graph=True necessarily retains that additional derivative graph
+    and is outside the first-order saved-memory bound.
+    """
+
+    @staticmethod
+    def forward(ctx, message, edge_weight, incidence, edge_chunk_size):
+        ctx.save_for_backward(message, edge_weight, incidence)
+        ctx.edge_chunk_size = edge_chunk_size
+        ctx.set_materialize_grads(False)
+        propagated = torch.zeros_like(message)
+        for start in range(0, edge_weight.numel(), edge_chunk_size):
+            stop = start + edge_chunk_size
+            tail, head = incidence[:, start:stop]
+            weight = edge_weight[start:stop, None, None]
+            propagated.index_add_(0, tail, weight * message[head])
+            propagated.index_add_(0, head, weight * message[tail])
+        return propagated
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is None:
+            return None, None, None, None
+        message, edge_weight, incidence = ctx.saved_tensors
+        need_message, need_weight = ctx.needs_input_grad[:2]
+        grad_message = torch.zeros_like(message) if need_message else None
+        weight_gradients = []
+        for start in range(0, edge_weight.numel(), ctx.edge_chunk_size):
+            stop = start + ctx.edge_chunk_size
+            tail, head = incidence[:, start:stop]
+            if need_message:
+                weight = edge_weight[start:stop, None, None]
+                grad_message.index_add_(0, tail, weight * grad_output[head])
+                grad_message.index_add_(0, head, weight * grad_output[tail])
+            if need_weight:
+                gradient = (grad_output[tail] * message[head]).sum(dim=(1, 2))
+                gradient = gradient + (grad_output[head] * message[tail]).sum(dim=(1, 2))
+                weight_gradients.append(gradient)
+        grad_weight = None
+        if need_weight:
+            grad_weight = (
+                torch.cat(weight_gradients) if weight_gradients else torch.zeros_like(edge_weight)
+            )
+        return grad_message, grad_weight, None, None
+
+
 def shared_head_diffusion(
     message: Tensor,
     relative_c: Tensor,
@@ -111,14 +165,15 @@ def shared_head_diffusion(
         effective, incidence, message.shape[0], edge_chunk_size=edge_chunk_size
     )
     active = degree > 0
-    inverse = torch.where(active, degree.rsqrt(), torch.zeros_like(degree))
-    propagated = torch.zeros_like(message_compute)
-    for start in range(0, effective.numel(), edge_chunk_size):
-        stop = start + edge_chunk_size
-        tail, head = incidence[:, start:stop]
-        weight = effective[start:stop] * inverse[tail] * inverse[head]
-        propagated.index_add_(0, tail, weight[:, None, None] * message_compute[head])
-        propagated.index_add_(0, head, weight[:, None, None] * message_compute[tail])
+    # Do not evaluate rsqrt(0) on isolates: its backward can otherwise create
+    # 0 * inf even though the forward where() selected the zero branch.
+    safe_degree = torch.where(active, degree, torch.ones_like(degree))
+    inverse = safe_degree.rsqrt() * active.to(compute_dtype)
+    tail, head = incidence
+    weight = effective * inverse[tail] * inverse[head]
+    propagated = _ChunkedUndirectedPropagation.apply(
+        message_compute, weight, incidence, edge_chunk_size
+    )
     node_beta = beta.to(compute_dtype)[node_graph].unsqueeze(-1)
     output = message_compute + node_beta * (propagated - active[:, None, None] * message_compute)
     return output.to(message.dtype)

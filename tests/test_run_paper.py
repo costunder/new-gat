@@ -918,9 +918,10 @@ def test_project_docs_and_gpt_handoff_are_separated() -> None:
 
     cycle_v2 = (ROOT / "gpt_handoff/CYCLE_PE_V2.md").read_text(encoding="utf-8")
     for required in (
-        "cycle_projector_pe_v2",
-        "cycle_basis_v2",
-        "P_{\\mathcal C}=Z(Z^\\top Z)^{-1}Z^\\top=QQ^\\top",
+        "cycle_dfs_se_v2",
+        "cycle_dfs_relative_pe_v2",
+        "dfs_fundamental",
+        "QR",
         "scripts/run_cycle_scaling.py",
         "reference",
     ):

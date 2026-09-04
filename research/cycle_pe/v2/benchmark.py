@@ -1,4 +1,4 @@
-"""Train rebuilt Cycle PE v2 from a coordinate-free cycle-space projector PE.
+"""Train Cycle PE v2 from a sparse DFS cycle basis without matrix factorization.
 
 This is an isolated experiment: it does not change or invoke the v1 cycle-set
 model, and it never trains comparison-paper models. Actual training is CUDA-only.
@@ -38,7 +38,7 @@ from research.cycle_pe.v2.data import (
     collate,
     load_benchmark,
 )
-from research.cycle_pe.v2.model import MODEL_NAME, CycleBasisPEModel, architecture_protocol
+from research.cycle_pe.v2.model import MODEL_NAMES, CycleBasisPEModel, architecture_protocol
 
 TRACK_NAME = "cycle_pe"
 HARDWARE_PROFILES = ("portable", "a6000-48gb")
@@ -106,10 +106,20 @@ def implementation_hashes() -> dict[str, str]:
     }
 
 
+def _model_name(args: argparse.Namespace) -> str:
+    return MODEL_NAMES[args.encoding]
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--suite", choices=("benchmark",), default="benchmark")
     result.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    result.add_argument(
+        "--encoding",
+        choices=tuple(MODEL_NAMES),
+        default="se",
+        help="se: cycle structure; pe: the same SE plus a relative cycle-position residual",
+    )
     result.add_argument("--data-root", type=Path, default=Path("data/paper"))
     result.add_argument("--output-dir", type=Path, default=Path("results/cycle_pe_v2/benchmark"))
     result.add_argument("--device", default="cuda")
@@ -139,26 +149,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--layer-scale", type=float, default=0.1)
     result.add_argument("--max-parameters", type=int, default=20_000_000)
     result.add_argument(
-        "--column-chunk-size",
-        type=int,
-        default=16,
-        help="legacy-compatible option; never truncates the cycle space",
-    )
-    result.add_argument(
         "--basis-backend",
         choices=BASIS_BACKENDS,
         default=DEFAULT_BASIS_BACKEND,
         help=(
-            "thin_q caches model-ready Q (default); dfs_fundamental caches raw DFS "
-            "fundamental cycles and repeats graph-local QR in every model forward"
+            "all signed DFS fundamental cycles; sparse edge-cycle message passing, "
+            "without QR, SVD, or basis truncation"
         ),
-    )
-    result.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
-    result.add_argument(
-        "--basis-pair-budget",
-        type=int,
-        default=32768,
-        help="maximum elements in a temporary feature-by-rank-by-rank contraction core",
     )
     result.add_argument(
         "--resume",
@@ -185,8 +182,6 @@ def _validate(args: argparse.Namespace) -> None:
         "layers",
         "ffn_multiplier",
         "max_parameters",
-        "column_chunk_size",
-        "basis_pair_budget",
     ):
         if getattr(args, key) < 1:
             raise ValueError(f"--{key.replace('_', '-')} must be positive")
@@ -264,19 +259,17 @@ def _resume_configuration(dataset: str, args: argparse.Namespace) -> dict[str, A
         "ffn_multiplier",
         "dropout",
         "layer_scale",
-        "column_chunk_size",
         "basis_backend",
-        "basis_execution",
-        "basis_pair_budget",
+        "encoding",
         "amp",
         "compile",
     )
     precision = _amp_policy(args.amp, torch.device(args.device))
     precision_identity = _precision_identity(precision)
     return {
-        "schema": "cycle-projector-pe-v2-epoch-resume-2",
+        "schema": "cycle-dfs-se-relative-pe-v2-epoch-resume-1",
         "dataset": dataset,
-        "model": MODEL_NAME,
+        "model": _model_name(args),
         "arguments": {name: getattr(args, name) for name in names},
         # --amp is a request, not necessarily the effective arithmetic. Bind
         # resume to the resolved policy so a checkpoint cannot silently switch
@@ -504,6 +497,7 @@ def _cycle_data_observability(
     node_counts = [int(graph.x.shape[0]) for graph in graphs]
     edge_counts = [int(graph.edge_index.shape[1]) for graph in graphs]
     cycle_ranks = [int(graph.cycle_basis.shape[1]) for graph in graphs]
+    cycle_memberships = [graph.cycle_basis._nnz() for graph in graphs]
     return {
         "dataset": dataset,
         "source": "official benchmark adapter and immutable V2 basis cache",
@@ -529,6 +523,8 @@ def _cycle_data_observability(
         "nodes_per_graph": _integer_distribution(node_counts),
         "canonical_undirected_edges_per_graph": _integer_distribution(edge_counts),
         "cycle_rank_per_graph": _integer_distribution(cycle_ranks),
+        "cycle_memberships_per_graph": _integer_distribution(cycle_memberships),
+        "cycle_basis_storage": "signed sparse COO; no E-by-cycle-rank dense allocation",
         "input_tensor_shapes": {
             "node_feature_widths": sorted({int(graph.x.shape[1]) for graph in graphs}),
             "edge_feature_widths": sorted({int(graph.edge_attr.shape[1]) for graph in graphs}),
@@ -584,7 +580,11 @@ def _graph_probe_cost(graph: Graph) -> int:
     return int(
         graph.x.numel()
         + graph.edge_attr.numel()
-        + graph.cycle_basis.numel()
+        + graph.cycle_basis._nnz() * 3
+        + graph.cycle_lengths.numel()
+        + graph.edge_cycle_counts.numel()
+        + graph.edge_cycle_features.numel()
+        + graph.cycle_position_values.numel()
         + graph.edge_index.numel()
     )
 
@@ -710,23 +710,26 @@ def _train_model(
     precision = _amp_policy(args.amp, device)
     model = CycleBasisPEModel(
         dataset=dataset,
+        encoding=args.encoding,
         hidden=args.hidden_dim,
         pe_dim=args.pe_dim,
         layers=args.layers,
-        column_chunk_size=args.column_chunk_size,
-        basis_execution=args.basis_execution,
-        basis_pair_budget=args.basis_pair_budget,
         ffn_multiplier=args.ffn_multiplier,
         dropout=args.dropout,
         layer_scale=args.layer_scale,
     ).to(device)
     execution = configure_execution(model, args, device)
-    execution.update(basis_execution=args.basis_execution, basis_pair_budget=args.basis_pair_budget)
+    execution.update(
+        encoding=args.encoding,
+        basis_execution="sparse_block_diagonal",
+        basis_backend=args.basis_backend,
+    )
     total_parameters = sum(p.numel() for p in model.parameters())
     parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if parameters > args.max_parameters:
         raise ValueError(
-            f"{dataset}/{MODEL_NAME}: {parameters} parameters exceeds budget {args.max_parameters}"
+            f"{dataset}/{_model_name(args)}: {parameters} parameters "
+            f"exceeds budget {args.max_parameters}"
         )
     validation_only = bool(getattr(args, "validation_only", False))
     expected_splits = (
@@ -734,7 +737,7 @@ def _train_model(
     )
     if set(splits) != expected_splits:
         raise ValueError(f"unexpected benchmark splits: {sorted(splits)}")
-    run = args.output_dir / dataset / MODEL_NAME
+    run = args.output_dir / dataset / _model_name(args)
     last_checkpoint = run / "last.pt"
     checkpoint = run / "best.pt"
     previous_checkpoint = run / "best.previous.pt"
@@ -787,7 +790,7 @@ def _train_model(
     pre_run_observability = {
         "status": "pre_run_configuration",
         "model": {
-            "name": MODEL_NAME,
+            "name": _model_name(args),
             "layers": args.layers,
             "hidden_dimension": args.hidden_dim,
             "positional_encoding_dimension": args.pe_dim,
@@ -828,7 +831,7 @@ def _train_model(
             "autocast_dtype": precision["dtype_name"],
             "fallback": precision["fallback"],
             "gradient_scaler": precision["gradient_scaler"],
-            "projector_contraction": "float32",
+            "cycle_sparse_aggregation": "float32",
             "backbone_autocast": precision["enabled"],
         },
         data_pipeline={
@@ -838,7 +841,8 @@ def _train_model(
             "prefetch_factor": args.prefetch_factor if args.workers else None,
             "persistent_workers": args.workers > 0,
             "pin_memory": True,
-            "packed_cycle_basis_h2d_tensors_per_batch": 1,
+            "cycle_membership_layout": "sparse_coo_block_diagonal",
+            "cycle_factorization_in_forward": False,
             "batch_calibration": batch_calibration,
         },
     )
@@ -923,7 +927,7 @@ def _train_model(
             with torch.autocast("cuda", dtype=precision["dtype"], enabled=precision["enabled"]):
                 predicted = model(batch)
                 loss = (predicted.float() - batch.y).abs().mean()
-            _require_finite_loss(loss, f"{dataset}/{MODEL_NAME}: nonfinite training loss")
+            _require_finite_loss(loss, f"{dataset}/{_model_name(args)}: nonfinite training loss")
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             if first_task_gradient_connectivity is None:
@@ -941,7 +945,9 @@ def _train_model(
         validation = evaluate(model, validation_loader, device, amp=args.amp)
         train_mae = float(train_sum / train_count)
         if not math.isfinite(train_mae):
-            raise FloatingPointError(f"{dataset}/{MODEL_NAME}: nonfinite epoch training loss")
+            raise FloatingPointError(
+                f"{dataset}/{_model_name(args)}: nonfinite epoch training loss"
+            )
         torch.cuda.synchronize(device)
         epoch_seconds = time.perf_counter() - epoch_started
         scheduler.step(validation)
@@ -964,10 +970,11 @@ def _train_model(
             best, best_epoch = validation, epoch
             payload = {
                 "state_dict": model.state_dict(),
+                "implementation_sha256": resume_configuration["implementation_sha256"],
                 "epoch": epoch,
                 "validation_mae": validation,
                 "dataset": dataset,
-                "model": MODEL_NAME,
+                "model": _model_name(args),
                 "model_seed": args.model_seed,
                 "effective_batch_size": effective_batch_size,
                 "batch_calibration": batch_calibration,
@@ -1013,7 +1020,7 @@ def _train_model(
         }
         atomic_publish(last_checkpoint, lambda path, state=last_state: torch.save(state, path))
         print(
-            f"{dataset}/{MODEL_NAME} epoch={epoch} train_mae={train_mae:.6f} "
+            f"{dataset}/{_model_name(args)} epoch={epoch} train_mae={train_mae:.6f} "
             f"validation_mae={validation:.6f} best={best:.6f} seconds={epoch_seconds:.2f}",
             flush=True,
         )
@@ -1120,7 +1127,7 @@ def _train_model(
             {
                 "status": "post_run_observability",
                 "dataset": dataset,
-                "model": MODEL_NAME,
+                "model": _model_name(args),
                 "optimizer_steps": optimizer_steps,
                 "epochs_completed": len(history),
                 "optimizer_ownership_validated": optimizer_ownership["validated"],
@@ -1155,7 +1162,7 @@ def _evaluate_test_checkpoint(
         raise ValueError("Selected checkpoint has an invalid payload schema")
     expected_metadata = {
         "dataset": dataset,
-        "model": MODEL_NAME,
+        "model": _model_name(args),
         "model_seed": args.model_seed,
     }
     for name, expected in expected_metadata.items():
@@ -1170,15 +1177,16 @@ def _evaluate_test_checkpoint(
         "hidden_dim",
         "pe_dim",
         "layers",
-        "column_chunk_size",
-        "basis_execution",
-        "basis_pair_budget",
+        "basis_backend",
+        "encoding",
         "ffn_multiplier",
         "dropout",
         "layer_scale",
     ):
         if saved_arguments.get(name) != getattr(args, name):
             raise ValueError(f"Selected checkpoint architecture mismatch for {name}")
+    if payload.get("implementation_sha256") != implementation_hashes():
+        raise ValueError("Selected checkpoint implementation/source mismatch")
     validation = payload.get("validation_mae")
     epoch = payload.get("epoch")
     effective_batch_size = payload.get("effective_batch_size")
@@ -1199,12 +1207,10 @@ def _evaluate_test_checkpoint(
     _seed(args.model_seed)
     model = CycleBasisPEModel(
         dataset=dataset,
+        encoding=args.encoding,
         hidden=args.hidden_dim,
         pe_dim=args.pe_dim,
         layers=args.layers,
-        column_chunk_size=args.column_chunk_size,
-        basis_execution=args.basis_execution,
-        basis_pair_budget=args.basis_pair_budget,
         ffn_multiplier=args.ffn_multiplier,
         dropout=args.dropout,
         layer_scale=args.layer_scale,
@@ -1212,13 +1218,15 @@ def _evaluate_test_checkpoint(
     parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if parameters > args.max_parameters:
         raise ValueError(
-            f"{dataset}/{MODEL_NAME}: {parameters} parameters exceeds budget {args.max_parameters}"
+            f"{dataset}/{_model_name(args)}: {parameters} parameters "
+            f"exceeds budget {args.max_parameters}"
         )
     model.load_state_dict(payload["state_dict"], strict=True)
     execution = configure_execution(model, args, device)
     execution.update(
-        basis_execution=args.basis_execution,
-        basis_pair_budget=args.basis_pair_budget,
+        encoding=args.encoding,
+        basis_execution="sparse_block_diagonal",
+        basis_backend=args.basis_backend,
         hardware=hardware,
         precision={
             "amp": bool(args.amp),
@@ -1226,7 +1234,7 @@ def _evaluate_test_checkpoint(
             "autocast_dtype": precision["dtype_name"],
             "fallback": precision["fallback"],
             "gradient_scaler": precision["gradient_scaler"],
-            "projector_contraction": "float32",
+            "cycle_sparse_aggregation": "float32",
             "backbone_autocast": precision["enabled"],
         },
         data_pipeline={
@@ -1236,7 +1244,8 @@ def _evaluate_test_checkpoint(
             "prefetch_factor": args.prefetch_factor if args.workers else None,
             "persistent_workers": args.workers > 0,
             "pin_memory": True,
-            "packed_cycle_basis_h2d_tensors_per_batch": 1,
+            "cycle_membership_layout": "sparse_coo_block_diagonal",
+            "cycle_factorization_in_forward": False,
         },
     )
     test_loader = _loader(test_graphs, args, train=False)
@@ -1269,7 +1278,8 @@ def _evaluate_test_checkpoint(
         ),
         "pin_memory": True,
         "non_blocking_transfer": True,
-        "packed_cycle_basis_h2d_tensors_per_batch": 1,
+        "cycle_membership_layout": "sparse_coo_block_diagonal",
+        "cycle_factorization_in_forward": False,
     }
     print(
         json.dumps(
@@ -1277,7 +1287,7 @@ def _evaluate_test_checkpoint(
                 "status": "pre_selected_test_observability",
                 "dataset": dataset,
                 "model": {
-                    "name": MODEL_NAME,
+                    "name": _model_name(args),
                     "layers": args.layers,
                     "hidden_dimension": args.hidden_dim,
                     "positional_encoding_dimension": args.pe_dim,
@@ -1343,7 +1353,7 @@ def _evaluate_test_checkpoint(
             {
                 "status": "post_selected_test_observability",
                 "dataset": dataset,
-                "model": MODEL_NAME,
+                "model": _model_name(args),
                 "throughput": throughput,
                 "resource_summary": resource_observability["summary"],
             },
@@ -1385,10 +1395,10 @@ def _completed_training_dataset(entry: Any, dataset: str, args: argparse.Namespa
         if not isinstance(entry, dict) or entry.get("metric") != "mae":
             return False
         models = entry.get("models")
-        if not isinstance(models, dict) or set(models) != {MODEL_NAME}:
+        if not isinstance(models, dict) or set(models) != {_model_name(args)}:
             return False
-        result = models[MODEL_NAME]
-        run = (args.output_dir / dataset / MODEL_NAME).resolve()
+        result = models[_model_name(args)]
+        run = (args.output_dir / dataset / _model_name(args)).resolve()
         bindings = (
             ("checkpoint", "checkpoint_sha256", run / "best.pt"),
             ("history", "history_sha256", run / "history.json"),
@@ -1449,40 +1459,38 @@ def main(argv: list[str] | None = None) -> int:
         "run_mode": run_mode,
         "arguments": arguments,
         "software": versions,
-        "architecture": architecture_protocol(),
+        "architecture": architecture_protocol(args.encoding),
         "implementation_sha256": implementation_hashes(),
         "seeds": {
             "model_seed": args.model_seed,
             "data_seed": "unused: fixed official graphs",
             "split_seed": "unused: official splits",
-            "chart_seed": "unused: selected spanning-forest chart; projector is chart invariant",
+            "chart_seed": (
+                "unused: deterministic DFS on canonical stored edge order; tree-dependent encoding"
+            ),
         },
         "controls": {
-            "model": MODEL_NAME,
+            "encoding": args.encoding,
+            "encoding_comparison": (
+                "identical SE/backbone/parameterization; pe adds a parameter-free "
+                "cycle-relative cosine-kernel residual, not a pure-PE/no-SE ablation"
+            ),
+            "model": _model_name(args),
             "external_models_trained": False,
             "test_checkpoint_selection": False,
             "parameter_budget": args.max_parameters,
             "target_policy": "official labels unchanged",
             "basis_input": (
-                "all cached thin-Q columns; learned input is only the basis-invariant "
-                "projector kernel, with no truncation"
-                if args.basis_backend == "thin_q"
-                else "all raw DFS fundamental columns, runtime-orthonormalized before the "
-                "basis-invariant projector kernel; diagnostic backend with no truncation"
+                "all signed sparse DFS fundamental cycles, with no truncation; "
+                "orientation-free membership drives learned edge-to-cycle-to-edge messages"
             ),
             "basis_backend": args.basis_backend,
             "basis_backend_runtime": (
-                "cached orthonormal Q; no factorization in model forward"
-                if args.basis_backend == "thin_q"
-                else "diagnostic only: reduced QR O(E*beta^2) repeats per graph/model forward; "
-                "not an end-to-end linear-time speedup"
+                "DFS O(V+E) plus explicit output O(nnz(Z)); batched sparse aggregation "
+                "O(nnz(Z)*PE_width), with no QR/SVD/Gram inverse or dense cycle matrix"
             ),
             "basis_rank_dependent_parameters": False,
-            "column_chunk_size": args.column_chunk_size,
-            "column_chunk_policy": (
-                "legacy CLI compatibility only; the complete projector is used and "
-                "basis-pair-budget bounds pair-free feature/rank contraction cores"
-            ),
+            "basis_selection_dependence": "selected DFS tree; not invariant to arbitrary ZR",
             "epoch_resume": "atomic last.pt plus best.pt/best.previous.pt two-slot recovery",
             "resume_determinism": (
                 "exact configuration/source/artifact binding and epoch-boundary model, "
@@ -1511,7 +1519,7 @@ def main(argv: list[str] | None = None) -> int:
         "datasets": {},
     }
     resume_identity = {
-        "schema": "cycle-projector-pe-v2-multidataset-resume-1",
+        "schema": "cycle-dfs-se-relative-pe-v2-multidataset-resume-1",
         "run_mode": run_mode,
         "arguments": {key: value for key, value in arguments.items() if key != "resume"},
         "implementation_sha256": manifest["implementation_sha256"],
@@ -1593,6 +1601,7 @@ def main(argv: list[str] | None = None) -> int:
                     dataset,
                     allow_download=args.allow_download,
                     basis_backend=args.basis_backend,
+                    workers=args.workers,
                 )
             else:
                 splits, protocol = load_benchmark(
@@ -1601,6 +1610,7 @@ def main(argv: list[str] | None = None) -> int:
                     allow_download=args.allow_download,
                     splits=requested_splits,
                     basis_backend=args.basis_backend,
+                    workers=args.workers,
                 )
             dataset_metrics: dict[str, Any] = {
                 "metric": "mae",
@@ -1610,12 +1620,12 @@ def main(argv: list[str] | None = None) -> int:
             }
             metrics["datasets"][dataset] = dataset_metrics
             if args.test_checkpoint is not None:
-                dataset_metrics["models"][MODEL_NAME] = _evaluate_test_checkpoint(
+                dataset_metrics["models"][_model_name(args)] = _evaluate_test_checkpoint(
                     dataset, splits["test"], args
                 )
                 atomic_write_json(args.output_dir / "metrics.json", metrics)
             elif not args.prepare_only:
-                dataset_metrics["models"][MODEL_NAME] = _train_model(dataset, splits, args)
+                dataset_metrics["models"][_model_name(args)] = _train_model(dataset, splits, args)
             atomic_write_json(metrics_path, metrics)
             del splits
         metrics["status"] = manifest["status"] = "prepared" if args.prepare_only else "passed"
@@ -1625,7 +1635,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         if not args.prepare_only:
             manifest["execution_by_dataset"] = {
-                name: data["models"][MODEL_NAME].get("execution")
+                name: data["models"][_model_name(args)].get("execution")
                 for name, data in metrics["datasets"].items()
             }
         atomic_write_json(manifest_path, manifest)

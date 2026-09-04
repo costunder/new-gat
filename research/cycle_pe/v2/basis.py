@@ -1,8 +1,9 @@
-"""Sparse, chart-independent construction of the graph circulation space.
+"""Sparse DFS fundamental coordinates of the graph circulation space.
 
 For edge-by-node incidence ``B``, the cycle space is ``ker(B.T)`` with exact
-dimension ``m - n + components``.  We construct a sparse fundamental basis;
-the model subsequently uses only its coordinate-free orthogonal projector.
+dimension ``m - n + components``.  No QR, SVD, dense incidence matrix, Gram
+matrix or dense projector is needed.  The PE uses the selected cycle supports;
+it is not invariant to replacing the DFS forest by a different cycle basis.
 """
 
 from __future__ import annotations
@@ -11,8 +12,8 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from scipy import sparse
 
-BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
-DEFAULT_BASIS_BACKEND = "thin_q"
+BASIS_BACKENDS = ("dfs_fundamental",)
+DEFAULT_BASIS_BACKEND = "dfs_fundamental"
 
 
 def _checked_edges(num_nodes: int, edge_index: ArrayLike) -> NDArray[np.int64]:
@@ -38,135 +39,55 @@ def _checked_edges(num_nodes: int, edge_index: ArrayLike) -> NDArray[np.int64]:
 
 def incidence_and_cycle_rank(
     num_nodes: int, edge_index: ArrayLike
-) -> tuple[NDArray[np.float64], int]:
-    """Return supplied-orientation incidence ``B[m,n]`` and exact nullity."""
+) -> tuple[sparse.csr_matrix, int]:
+    """Return sparse supplied-orientation incidence ``B[m,n]`` and nullity."""
     edges = _checked_edges(num_nodes, edge_index)
-    parent = np.arange(num_nodes, dtype=np.int64)
-    size = np.ones(num_nodes, dtype=np.int64)
-
-    def find(vertex: int) -> int:
-        while parent[vertex] != vertex:
-            parent[vertex] = parent[parent[vertex]]
-            vertex = int(parent[vertex])
-        return vertex
-
-    components = num_nodes
+    adjacency: list[list[int]] = [[] for _ in range(num_nodes)]
     for u_raw, v_raw in edges.T:
-        u, v = find(int(u_raw)), find(int(v_raw))
-        if u == v:
+        u, v = int(u_raw), int(v_raw)
+        adjacency[u].append(v)
+        adjacency[v].append(u)
+    visited = np.zeros(num_nodes, dtype=np.bool_)
+    components = 0
+    for root in range(num_nodes):
+        if visited[root]:
             continue
-        if size[u] < size[v]:
-            u, v = v, u
-        parent[v] = u
-        size[u] += size[v]
-        components -= 1
+        components += 1
+        visited[root] = True
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            for neighbor in adjacency[node]:
+                if not visited[neighbor]:
+                    visited[neighbor] = True
+                    stack.append(neighbor)
     edge_count = edges.shape[1]
-    incidence = np.zeros((edge_count, num_nodes), dtype=np.float64)
-    rows = np.arange(edge_count)
-    incidence[rows, edges[0]] = -1.0
-    incidence[rows, edges[1]] = 1.0
+    incidence = sparse.coo_matrix(
+        (
+            np.tile([-1.0, 1.0], edge_count),
+            (np.repeat(np.arange(edge_count), 2), edges.T.reshape(-1)),
+        ),
+        shape=(edge_count, num_nodes),
+        dtype=np.float64,
+    ).tocsr()
     return incidence, edge_count - num_nodes + components
 
 
 def sparse_left_nullspace_basis(num_nodes: int, edge_index: ArrayLike) -> sparse.csr_matrix:
-    """Build a sparse full basis of ``ker(B.T)`` without SVD/eigendecomposition.
-
-    Union/find selects a spanning forest.  Each chord closes one fundamental
-    cycle, so the chord rows form an identity matrix and prove full rank.
-    Complexity is linear plus the total length of the fundamental cycles.
-    """
-    edges = _checked_edges(num_nodes, edge_index)
-    edge_count = edges.shape[1]
-    union_parent = np.arange(num_nodes, dtype=np.int64)
-    union_size = np.ones(num_nodes, dtype=np.int64)
-
-    def find(vertex: int) -> int:
-        while union_parent[vertex] != vertex:
-            union_parent[vertex] = union_parent[union_parent[vertex]]
-            vertex = int(union_parent[vertex])
-        return vertex
-
-    tree_edges: list[int] = []
-    chords: list[int] = []
-    for edge, (u_raw, v_raw) in enumerate(edges.T):
-        u, v = find(int(u_raw)), find(int(v_raw))
-        if u == v:
-            chords.append(edge)
-            continue
-        if union_size[u] < union_size[v]:
-            u, v = v, u
-        union_parent[v] = u
-        union_size[u] += union_size[v]
-        tree_edges.append(edge)
-    rank = len(chords)
-    if rank == 0:
-        return sparse.csr_matrix((edge_count, 0), dtype=np.float32)
-
-    adjacency: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
-    for edge in tree_edges:
-        tail, head = map(int, edges[:, edge])
-        adjacency[tail].append((head, edge))
-        adjacency[head].append((tail, edge))
-
-    # up_sign[v] is the coefficient for traversing v -> parent[v].
-    forest_parent = np.full(num_nodes, -1, dtype=np.int64)
-    parent_edge = np.full(num_nodes, -1, dtype=np.int64)
-    up_sign = np.zeros(num_nodes, dtype=np.int8)
-    depth = np.zeros(num_nodes, dtype=np.int64)
-    for root in range(num_nodes):
-        if forest_parent[root] != -1:
-            continue
-        forest_parent[root] = root
-        stack = [root]
-        while stack:
-            node = stack.pop()
-            for neighbor, edge in adjacency[node]:
-                if forest_parent[neighbor] != -1:
-                    continue
-                forest_parent[neighbor] = node
-                parent_edge[neighbor] = edge
-                depth[neighbor] = depth[node] + 1
-                tail, head = map(int, edges[:, edge])
-                up_sign[neighbor] = 1 if (neighbor, node) == (tail, head) else -1
-                stack.append(neighbor)
-
-    rows: list[int] = []
-    columns: list[int] = []
-    values: list[float] = []
-
-    def append_up(vertex: int, column: int, multiplier: int) -> int:
-        rows.append(int(parent_edge[vertex]))
-        columns.append(column)
-        values.append(float(multiplier * int(up_sign[vertex])))
-        return int(forest_parent[vertex])
-
-    for column, chord in enumerate(chords):
-        tail, head = map(int, edges[:, chord])
-        # chord tail -> head is closed by tree path head -> tail.
-        left, right = head, tail
-        while depth[left] > depth[right]:
-            left = append_up(left, column, +1)
-        while depth[right] > depth[left]:
-            right = append_up(right, column, -1)
-        while left != right:
-            left = append_up(left, column, +1)
-            right = append_up(right, column, -1)
-        rows.append(chord)
-        columns.append(column)
-        values.append(1.0)
-
-    result = sparse.coo_matrix(
-        (np.asarray(values, dtype=np.float32), (rows, columns)),
-        shape=(edge_count, rank),
-        dtype=np.float32,
-    ).tocsr()
-    result.sum_duplicates()
-    result.sort_indices()
-    return result
+    """Compatibility spelling for the complete signed DFS fundamental basis."""
+    return dfs_fundamental_cycle_basis(num_nodes, edge_index)
 
 
 def dfs_fundamental_cycle_basis(num_nodes: int, edge_index: ArrayLike) -> sparse.csr_matrix:
-    """Return the signed fundamental-cycle basis of an iterative DFS forest.
+    """Return all signed DFS cycles; circular coordinates are available separately."""
+    return dfs_fundamental_cycle_coordinates(num_nodes, edge_index)[0]
+
+
+def dfs_fundamental_cycle_coordinates(
+    num_nodes: int,
+    edge_index: ArrayLike,
+) -> tuple[sparse.csr_matrix, NDArray[np.int64]]:
+    """Return signed DFS basis and circular edge positions aligned with CSR data.
 
     DFS chooses one spanning tree per connected component.  Every non-tree edge
     (chord) contributes that edge plus the unique parent path between its
@@ -176,6 +97,8 @@ def dfs_fundamental_cycle_basis(num_nodes: int, edge_index: ArrayLike) -> sparse
     Discovering the forest costs ``O(num_nodes + num_edges)``.  Materializing
     the explicit basis additionally costs ``O(nnz(Z))``; that output term can be
     superlinear because one tree edge may occur in many fundamental cycles.
+    Positions enumerate the actual chord plus ordered tree path, NOT CSR row
+    order.  A position shift/reversal changes the origin/direction only.
     """
     edges = _checked_edges(num_nodes, edge_index)
     edge_count = edges.shape[1]
@@ -218,19 +141,18 @@ def dfs_fundamental_cycle_basis(num_nodes: int, edge_index: ArrayLike) -> sparse
     chords = np.flatnonzero(~tree_edge)
     rank = len(chords)
     if rank == 0:
-        return sparse.csr_matrix((edge_count, 0), dtype=np.float32)
+        return sparse.csr_matrix((edge_count, 0), dtype=np.float32), np.empty(0, dtype=np.int64)
 
     rows: list[int] = []
     columns: list[int] = []
     values: list[float] = []
+    positions: list[int] = []
 
-    def append_up(vertex: int, column: int, multiplier: int) -> int:
+    def append_up(vertex: int, path: list[tuple[int, float]], multiplier: int) -> int:
         edge = int(parent_edge[vertex])
         if edge < 0:
             raise RuntimeError("DFS chord endpoints do not share a spanning-tree component")
-        rows.append(edge)
-        columns.append(column)
-        values.append(float(multiplier * int(up_sign[vertex])))
+        path.append((edge, float(multiplier * int(up_sign[vertex]))))
         return int(forest_parent[vertex])
 
     for column, chord_raw in enumerate(chords):
@@ -238,89 +160,140 @@ def dfs_fundamental_cycle_basis(num_nodes: int, edge_index: ArrayLike) -> sparse
         tail, head = map(int, edges[:, chord])
         # Traverse the chord tail -> head, then the parent path head -> tail.
         left, right = head, tail
+        left_path: list[tuple[int, float]] = []
+        right_path: list[tuple[int, float]] = []
         while depth[left] > depth[right]:
-            left = append_up(left, column, +1)
+            left = append_up(left, left_path, +1)
         while depth[right] > depth[left]:
-            right = append_up(right, column, -1)
+            right = append_up(right, right_path, -1)
         while left != right:
-            left = append_up(left, column, +1)
-            right = append_up(right, column, -1)
-        rows.append(chord)
-        columns.append(column)
-        values.append(1.0)
+            left = append_up(left, left_path, +1)
+            right = append_up(right, right_path, -1)
+        ordered_path = [(chord, 1.0), *left_path, *reversed(right_path)]
+        for position, (edge, sign) in enumerate(ordered_path):
+            rows.append(edge)
+            columns.append(column)
+            values.append(sign)
+            positions.append(position)
 
-    result = sparse.coo_matrix(
-        (np.asarray(values, dtype=np.float32), (rows, columns)),
+    # Canonicalize the sparse coordinates once and apply exactly the same
+    # permutation to signed coefficients and positions, including position 0.
+    layout = sparse.coo_matrix(
+        (np.arange(len(values), dtype=np.int64), (rows, columns)),
         shape=(edge_count, rank),
-        dtype=np.float32,
+        dtype=np.int64,
     ).tocsr()
-    result.sum_duplicates()
-    result.sort_indices()
-    return result
+    result = sparse.csr_matrix(
+        (np.asarray(values, dtype=np.float32)[layout.data], layout.indices, layout.indptr),
+        shape=layout.shape,
+    )
+    return result, np.asarray(positions, dtype=np.int64)[layout.data]
 
 
 def validate_cycle_basis(num_nodes: int, edge_index: ArrayLike, basis: ArrayLike) -> None:
-    """Certify dimension, finite values, nullness and full column rank.
+    """Certify a fundamental basis without a dense matrix or factorization.
 
-    Orthonormality is deliberately not required: a cycle space is intrinsic,
-    while a coordinate chart is not.  The downstream PE is invariant to every
-    invertible basis replacement ``Z -> ZR``.
+    Every column must have a nonzero singleton-row witness.  Those rows form a
+    nonsingular diagonal submatrix (the chord identity for constructed DFS Z),
+    proving independence.  Column scaling/sign/permutation is supported; this
+    deliberately does NOT certify arbitrary mixed coordinates ZR without that
+    witness.  Such charts are no longer inputs to the sparse cycle-support PE.
+    Null residuals are compared relative to each column, never an absolute
+    rank threshold that rejects a uniformly small but valid basis.
     """
     incidence, cycle_rank = incidence_and_cycle_rank(num_nodes, edge_index)
-    if sparse.issparse(basis):
-        raw = basis
-        shape = raw.shape
-        if not np.issubdtype(raw.dtype, np.floating) or not np.all(np.isfinite(raw.data)):
-            raise ValueError("cycle_basis must contain finite floating-point values")
-        values = raw.astype(np.float64, copy=False)
-        dense = values.toarray()
-    else:
-        raw = np.asarray(basis)
-        shape = raw.shape
-        if not np.issubdtype(raw.dtype, np.floating) or not np.all(np.isfinite(raw)):
-            raise ValueError("cycle_basis must contain finite floating-point values")
-        if raw.dtype.itemsize < 4:
-            raise ValueError("cycle_basis storage requires float32 or float64 precision")
-        dense = raw.astype(np.float64, copy=False)
-        values = dense
-    if len(shape) != 2 or shape != (len(incidence), cycle_rank):
+    raw = basis if sparse.issparse(basis) else np.asarray(basis)
+    if len(raw.shape) != 2 or raw.shape != (incidence.shape[0], cycle_rank):
         raise ValueError(
-            f"cycle_basis must have shape ({len(incidence)}, {cycle_rank}); got {shape}"
+            f"cycle_basis must have shape ({incidence.shape[0]}, {cycle_rank}); got {raw.shape}"
         )
+    if not np.issubdtype(raw.dtype, np.floating) or raw.dtype.itemsize < 4:
+        raise ValueError("cycle_basis storage requires float32 or float64 precision")
+    values = sparse.csr_matrix(raw, dtype=np.float64)
+    values.sum_duplicates()
+    values.eliminate_zeros()
+    if not np.all(np.isfinite(values.data)):
+        raise ValueError("cycle_basis must contain finite floating-point values")
     if not cycle_rank:
         return
-    epsilon = np.finfo(raw.dtype).eps
-    residual = np.linalg.norm(incidence.T @ values, ord="fro")
-    scale = max(1.0, np.linalg.norm(incidence, ord="fro")) * max(
-        1.0, np.linalg.norm(dense, ord="fro")
-    )
-    if residual > 64.0 * epsilon * scale:
+    singleton_rows = np.flatnonzero(np.diff(values.indptr) == 1)
+    witnesses = values.indices[values.indptr[singleton_rows]]
+    if not np.all(np.bincount(witnesses, minlength=cycle_rank) > 0):
+        raise ValueError(
+            "cycle_basis full column rank requires a fundamental singleton-row witness "
+            "per column; arbitrary mixed bases are unsupported"
+        )
+    column_scale = np.asarray(abs(values).sum(axis=0)).reshape(-1)
+    residual = (incidence.T @ values).tocoo()
+    # Constructed signed unit cycles cancel exactly in float64.  Do not let a
+    # long cycle's relative tolerance admit a nonzero integer residual.
+    signed_unit = np.all(np.abs(values.data) == 1.0)
+    threshold = 0.0 if signed_unit else 64.0 * np.finfo(raw.dtype).eps * column_scale[residual.col]
+    if residual.nnz and np.any(np.abs(residual.data) > threshold):
         raise ValueError("cycle_basis is not in the left nullspace: B.T @ Z != 0")
-    gram = dense.T @ dense
-    try:
-        factor = np.linalg.cholesky(gram)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError("cycle_basis must have full column rank") from exc
-    diagonal = np.diag(factor)
-    if diagonal.min() <= np.sqrt(epsilon) * max(1.0, diagonal.max()):
-        raise ValueError("cycle_basis must have numerically full column rank")
 
 
-def left_nullspace_basis(num_nodes: int, edge_index: ArrayLike) -> NDArray[np.float32]:
-    """Build sparse fundamental cycles, then cache-ready thin-QR coordinates."""
-    fundamental = sparse_left_nullspace_basis(num_nodes, edge_index)
-    validate_cycle_basis(num_nodes, edge_index, fundamental)
-    edge_count, rank = fundamental.shape
-    if rank == 0:
-        return np.empty((edge_count, 0), dtype=np.float32)
-    q, _ = np.linalg.qr(fundamental.toarray().astype(np.float64), mode="reduced")
-    for column in range(rank):
-        pivot = int(np.argmax(np.abs(q[:, column])))
-        if q[pivot, column] < 0:
-            q[:, column] *= -1.0
-    result = np.ascontiguousarray(q, dtype=np.float32)
-    validate_cycle_basis(num_nodes, edge_index, result)
-    return result
+def left_nullspace_basis(num_nodes: int, edge_index: ArrayLike) -> sparse.csr_matrix:
+    """Return the complete sparse signed DFS basis; no orthogonalization."""
+    return build_cycle_basis(num_nodes, edge_index)
+
+
+def validate_cycle_positions(
+    num_nodes: int,
+    edge_index: ArrayLike,
+    basis: sparse.csr_matrix,
+    positions: ArrayLike,
+) -> None:
+    """Certify every circular position follows one complete simple physical cycle.
+
+    The integer position metadata avoids reconstructing discrete order from
+    rounded angles.  Any cyclic origin shift or reversal is allowed; arbitrary
+    edge-order permutations are rejected.  No dense graph matrix is allocated.
+    """
+    edges = _checked_edges(num_nodes, edge_index)
+    positions = np.asarray(positions)
+    if (
+        positions.shape != (basis.nnz,)
+        or not np.issubdtype(positions.dtype, np.integer)
+        or np.issubdtype(positions.dtype, np.bool_)
+    ):
+        raise ValueError("cycle positions must be an integer vector aligned with sparse basis data")
+    columns = basis.indices
+    lengths = np.bincount(columns, minlength=basis.shape[1])
+    if np.any(lengths < 3) or np.any(positions < 0) or np.any(positions >= lengths[columns]):
+        raise ValueError("cycle positions must cover each simple cycle's complete position range")
+    if not basis.nnz:
+        return
+    offsets = np.r_[0, np.cumsum(lengths)[:-1]]
+    flat_positions = offsets[columns] + positions
+    if not np.all(np.bincount(flat_positions, minlength=basis.nnz) == 1):
+        raise ValueError("cycle positions must be a permutation of 0..length-1 for each cycle")
+    rows = np.repeat(np.arange(basis.shape[0]), np.diff(basis.indptr))
+    ordered_rows = np.empty(basis.nnz, dtype=np.int64)
+    ordered_rows[flat_positions] = rows
+    next_positions = offsets[columns] + (positions + 1) % lengths[columns]
+    current_edges = edges[:, rows]
+    next_edges = edges[:, ordered_rows[next_positions]]
+    tail_matches = (current_edges[0] == next_edges[0]) | (current_edges[0] == next_edges[1])
+    head_matches = (current_edges[1] == next_edges[0]) | (current_edges[1] == next_edges[1])
+    if not np.all(tail_matches ^ head_matches):
+        raise ValueError("cycle positions do not follow adjacent physical edges around the cycle")
+    shared_vertices = np.where(tail_matches, current_edges[0], current_edges[1])
+    ordered_vertices = np.empty(basis.nnz, dtype=np.int64)
+    ordered_vertices[flat_positions] = shared_vertices
+    for start, length in zip(offsets, lengths, strict=True):
+        if len(set(ordered_vertices[start : start + length].tolist())) != length:
+            raise ValueError("cycle positions must follow a simple cycle without repeated vertices")
+
+
+def cycle_position_factors(
+    basis: sparse.csr_matrix,
+    positions: NDArray[np.int64],
+) -> NDArray[np.float32]:
+    """Cosine/sine of actual circular edge positions, aligned with CSR nonzeros."""
+    lengths = np.bincount(basis.indices, minlength=basis.shape[1])
+    angles = 2.0 * np.pi * positions.astype(np.float64) / lengths[basis.indices]
+    return np.ascontiguousarray(np.stack((np.cos(angles), np.sin(angles))), dtype=np.float32)
 
 
 def build_cycle_basis(
@@ -328,30 +301,40 @@ def build_cycle_basis(
     edge_index: ArrayLike,
     *,
     backend: str = DEFAULT_BASIS_BACKEND,
-) -> NDArray[np.float32]:
-    """Build the selected dense cache representation of ``ker(B.T)``.
+) -> sparse.csr_matrix:
+    """Build all signed DFS cycles as sparse coordinates of ``ker(B.T)``."""
+    return build_cycle_coordinates(num_nodes, edge_index, backend=backend)[0]
 
-    ``thin_q`` preserves the production representation used by the fast model
-    path. ``dfs_fundamental`` stores raw signed fundamental cycles selected by
-    iterative DFS; the model must orthonormalize those coordinates before using
-    ``Q Q.T`` as a projector.
-    """
+
+def build_cycle_coordinates(
+    num_nodes: int,
+    edge_index: ArrayLike,
+    *,
+    backend: str = DEFAULT_BASIS_BACKEND,
+) -> tuple[sparse.csr_matrix, NDArray[np.int64]]:
+    """Build and certify complete sparse DFS cycles plus their circular positions."""
     if backend not in BASIS_BACKENDS:
-        raise ValueError(f"basis backend must be one of {BASIS_BACKENDS}")
-    if backend == "thin_q":
-        return left_nullspace_basis(num_nodes, edge_index)
-    fundamental = dfs_fundamental_cycle_basis(num_nodes, edge_index)
+        raise ValueError(
+            f"basis backend must be one of {BASIS_BACKENDS}; thin_q/projector PE is retired, "
+            "use a new sparse-DFS run/cache rather than resuming its checkpoints"
+        )
+    fundamental, positions = dfs_fundamental_cycle_coordinates(num_nodes, edge_index)
     validate_cycle_basis(num_nodes, edge_index, fundamental)
-    return np.ascontiguousarray(fundamental.toarray(), dtype=np.float32)
+    validate_cycle_positions(num_nodes, edge_index, fundamental, positions)
+    return fundamental, positions
 
 
 __all__ = [
     "BASIS_BACKENDS",
     "DEFAULT_BASIS_BACKEND",
     "build_cycle_basis",
+    "build_cycle_coordinates",
+    "cycle_position_factors",
     "dfs_fundamental_cycle_basis",
+    "dfs_fundamental_cycle_coordinates",
     "incidence_and_cycle_rank",
     "left_nullspace_basis",
     "sparse_left_nullspace_basis",
     "validate_cycle_basis",
+    "validate_cycle_positions",
 ]

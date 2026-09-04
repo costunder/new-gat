@@ -40,14 +40,12 @@ from scripts.process_safety import (  # noqa: E402
 TRACKS = ("conductance", "cycle", "tree")
 PROFILES = ("reference", "large")
 HARDWARE_PROFILES = ("portable", "a6000-48gb")
-CYCLE_V2_BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
+CYCLE_V2_BASIS_BACKENDS = ("dfs_fundamental",)
 DEFAULT_MODEL_SEEDS = (0,)
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
 
 _ACTIVE_CHILDREN_LOCK = threading.Lock()
-_ACTIVE_CHILDREN: dict[
-    subprocess.Popen[str], tuple[tuple[str, ...], Path]
-] = {}
+_ACTIVE_CHILDREN: dict[subprocess.Popen[str], tuple[tuple[str, ...], Path]] = {}
 _STOP_ACTIVE_CHILDREN = threading.Event()
 
 # Keep the complete public matrices here instead of trusting child row counts.  The
@@ -114,6 +112,9 @@ def parser() -> argparse.ArgumentParser:
         nargs="+",
         choices=CYCLE_VERSIONS,
         default=list(CYCLE_VERSIONS),
+    )
+    result.add_argument(
+        "--cycle-v2-encodings", nargs="+", choices=("se", "pe"), default=["se", "pe"]
     )
     result.add_argument("--profiles", nargs="+", choices=PROFILES, default=list(PROFILES))
     result.add_argument("--model-seeds", nargs="+", type=int, default=list(DEFAULT_MODEL_SEEDS))
@@ -205,8 +206,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--cycle-v2-basis-backend",
         choices=CYCLE_V2_BASIS_BACKENDS,
-        default="thin_q",
-        help="Cycle V2 basis construction; thin_q is the production default",
+        default="dfs_fundamental",
+        help="Cycle V2 uses all sparse DFS cycles without QR/SVD",
     )
     result.add_argument("--allow-download", action="store_true")
     result.add_argument(
@@ -223,6 +224,7 @@ def _validate(args: argparse.Namespace) -> None:
         ("tracks", args.tracks),
         ("conductance versions", args.conductance_versions),
         ("cycle versions", args.cycle_versions),
+        ("cycle V2 encodings", args.cycle_v2_encodings),
         ("profiles", args.profiles),
         ("model seeds", args.model_seeds),
     ):
@@ -242,21 +244,16 @@ def _validate(args: argparse.Namespace) -> None:
     batch_overrides = {
         "--conductance-legacy-ppi-batch-size": args.conductance_legacy_ppi_batch_size,
         "--conductance-v5-ppi-batch-size": args.conductance_v5_ppi_batch_size,
-        "--conductance-v5-sample-seed-batch-size": (
-            args.conductance_v5_sample_seed_batch_size
-        ),
+        "--conductance-v5-sample-seed-batch-size": (args.conductance_v5_sample_seed_batch_size),
         "--cycle-batch-size": args.cycle_batch_size,
         "--tree-batch-size": args.tree_batch_size,
     }
     for option, value in batch_overrides.items():
         if value is not None and value < 1:
             raise ValueError(f"{option} must be positive")
-    if (
-        args.conductance_legacy_ppi_batch_size is not None
-        and (
-            "conductance" not in args.tracks
-            or not {"v1", "v3", "v4"}.intersection(args.conductance_versions)
-        )
+    if args.conductance_legacy_ppi_batch_size is not None and (
+        "conductance" not in args.tracks
+        or not {"v1", "v3", "v4"}.intersection(args.conductance_versions)
     ):
         raise ValueError("legacy PPI batch override requires Conductance V1, V3, or V4")
     if (
@@ -264,10 +261,7 @@ def _validate(args: argparse.Namespace) -> None:
         or args.conductance_v5_sample_seed_batch_size is not None
     ) and ("conductance" not in args.tracks or "v5" not in args.conductance_versions):
         raise ValueError("Conductance V5 batch overrides require the conductance/V5 track")
-    if (
-        args.hardware_profile == "portable"
-        and args.conductance_v5_ppi_batch_size not in {None, 2}
-    ):
+    if args.hardware_profile == "portable" and args.conductance_v5_ppi_batch_size not in {None, 2}:
         raise ValueError("portable Conductance V5 PPI retains graph batch-size 2")
     if args.cycle_batch_size is not None and "cycle" not in args.tracks:
         raise ValueError("--cycle-batch-size requires the cycle track")
@@ -277,7 +271,7 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("run ID must be 1-120 letters, digits, underscores, or hyphens")
     if (
         "cycle" in args.tracks
-        and args.cycle_v2_basis_backend != "thin_q"
+        and args.cycle_v2_basis_backend != "dfs_fundamental"
         and "v2" not in args.cycle_versions
     ):
         raise ValueError("nondefault Cycle basis backend requires v2 in --cycle-versions")
@@ -314,6 +308,7 @@ def _requested_matrix(
     *,
     conductance_versions: list[str],
     cycle_versions: list[str],
+    cycle_v2_encodings: list[str] | tuple[str, ...] = ("se", "pe"),
 ) -> dict[str, Any]:
     common = {"profiles": list(profiles), "model_seeds": list(model_seeds)}
     if track == "conductance":
@@ -336,6 +331,10 @@ def _requested_matrix(
         return {
             **common,
             "versions": list(cycle_versions),
+            "encodings_by_version": {
+                version: list(cycle_v2_encodings) if version == "v2" else [None]
+                for version in cycle_versions
+            },
             "datasets": list(CYCLE_DATASETS),
         }
     return {
@@ -358,7 +357,10 @@ def _expected_counts(track: str, matrix: dict[str, Any]) -> dict[str, int]:
             "model_trainings": combinations * trainings_per_combination,
         }
     if track == "cycle":
-        child_runs = combinations * len(matrix["versions"]) * len(matrix["datasets"])
+        condition_count = sum(
+            len(matrix["encodings_by_version"][version]) for version in matrix["versions"]
+        )
+        child_runs = combinations * condition_count * len(matrix["datasets"])
         return {
             "child_runs": child_runs,
             "model_trainings": child_runs,
@@ -396,6 +398,7 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             list(args.model_seeds),
             conductance_versions=list(args.conductance_versions),
             cycle_versions=list(args.cycle_versions),
+            cycle_v2_encodings=list(args.cycle_v2_encodings),
         )
         command = [
             sys.executable,
@@ -419,6 +422,7 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             command += ["--profiles", *profiles]
             command += ["--model-seeds", ",".join(str(seed) for seed in args.model_seeds)]
             command += ["--basis-backend", args.cycle_v2_basis_backend]
+            command += ["--encodings", *args.cycle_v2_encodings]
             if args.cycle_batch_size is not None:
                 command += ["--batch-size", str(args.cycle_batch_size)]
         else:
@@ -611,9 +615,7 @@ def _stop_active_children(
     recorded: list[dict[str, object]] = []
     for process, (command, log_path) in active:
         if original_error is None:
-            events = terminate_owned_child(
-                process, command, reason=reason, log_target=log_path
-            )
+            events = terminate_owned_child(process, command, reason=reason, log_target=log_path)
         else:
             events = terminate_owned_child_after_error(
                 process,
@@ -688,6 +690,7 @@ def _exact_key_matrix(
     integer_fields: frozenset[str],
     expected: set[tuple[Any, ...]],
     label: str,
+    nullable_fields: frozenset[str] = frozenset(),
 ) -> dict[tuple[Any, ...], dict[str, Any]]:
     if not isinstance(rows, list):
         raise RuntimeError(f"{label} must be a list")
@@ -701,6 +704,8 @@ def _exact_key_matrix(
             if field in integer_fields:
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                     raise RuntimeError(f"{label}[{index}].{field} must be a nonnegative integer")
+            elif value is None and field in nullable_fields and field in row:
+                pass
             elif not isinstance(value, str):
                 raise RuntimeError(f"{label}[{index}].{field} must be a string")
             values.append(value)
@@ -805,24 +810,31 @@ def _validate_cycle_summary(payload: dict[str, Any], job: dict[str, Any]) -> dic
     if payload.get("requested_model_seeds") != matrix["model_seeds"]:
         raise RuntimeError("Cycle child summary model seeds mismatch")
     _exact_string_mapping_keys(payload.get("profiles"), matrix["profiles"], "Cycle profiles")
+    if "v2" in matrix["versions"] and (
+        payload.get("requested_encodings") != matrix["encodings_by_version"]["v2"]
+    ):
+        raise RuntimeError("Cycle child summary encoding selection mismatch")
 
     expected_runs = {
-        (version, profile, seed, dataset)
+        (version, encoding, profile, seed, dataset)
         for version in matrix["versions"]
+        for encoding in matrix["encodings_by_version"][version]
         for profile in matrix["profiles"]
         for seed in matrix["model_seeds"]
         for dataset in matrix["datasets"]
     }
     runs = _exact_key_matrix(
         payload.get("runs"),
-        fields=("version", "profile", "model_seed", "dataset"),
+        fields=("version", "encoding", "profile", "model_seed", "dataset"),
         integer_fields=frozenset({"model_seed"}),
+        nullable_fields=frozenset({"encoding"}),
         expected=expected_runs,
         label="Cycle training rows",
     )
     expected_children = {
-        (version, profile, seed, dataset)
+        (version, encoding, profile, seed, dataset)
         for version in matrix["versions"]
+        for encoding in matrix["encodings_by_version"][version]
         for profile in matrix["profiles"]
         for seed in matrix["model_seeds"]
         for dataset in matrix["datasets"]
@@ -834,15 +846,17 @@ def _validate_cycle_summary(payload: dict[str, Any], job: dict[str, Any]) -> dic
         raise RuntimeError("Cycle candidate training rows must not contain test metrics")
 
     expected_aggregates = {
-        (version, dataset, profile)
+        (version, encoding, dataset, profile)
         for version in matrix["versions"]
+        for encoding in matrix["encodings_by_version"][version]
         for dataset in matrix["datasets"]
         for profile in matrix["profiles"]
     }
     aggregates = _exact_key_matrix(
         payload.get("profile_aggregates"),
-        fields=("version", "dataset", "profile"),
+        fields=("version", "encoding", "dataset", "profile"),
         integer_fields=frozenset(),
+        nullable_fields=frozenset({"encoding"}),
         expected=expected_aggregates,
         label="Cycle profile aggregates",
     )
@@ -854,45 +868,61 @@ def _validate_cycle_summary(payload: dict[str, Any], job: dict[str, Any]) -> dic
             raise RuntimeError("Cycle validation aggregates must not contain test metrics")
 
     expected_profile_selections = {
-        (version, dataset) for version in matrix["versions"] for dataset in matrix["datasets"]
+        (version, encoding, dataset)
+        for version in matrix["versions"]
+        for encoding in matrix["encodings_by_version"][version]
+        for dataset in matrix["datasets"]
     }
     profile_selections = _exact_key_matrix(
         payload.get("profile_selections"),
-        fields=("version", "dataset"),
+        fields=("version", "encoding", "dataset"),
         integer_fields=frozenset(),
+        nullable_fields=frozenset({"encoding"}),
         expected=expected_profile_selections,
         label="Cycle validation profile selections",
     )
     for key, row in profile_selections.items():
+        version, encoding, dataset = key
+        condition_id = version if encoding is None else f"{version}:{encoding}"
+        selection_id = f"{condition_id}:{dataset}"
         if (
             row.get("selected_profile") not in matrix["profiles"]
             or row.get("model_seeds") != matrix["model_seeds"]
             or row.get("test_used_for_selection") is not False
+            or row.get("profile_selection_id") != selection_id
         ):
             raise RuntimeError(f"Cycle validation profile selection {key!r} is invalid")
 
     expected_checkpoints = {
-        (version, dataset, seed)
+        (version, encoding, dataset, seed)
         for version in matrix["versions"]
+        for encoding in matrix["encodings_by_version"][version]
         for dataset in matrix["datasets"]
         for seed in matrix["model_seeds"]
     }
     selected_checkpoints = _exact_key_matrix(
         payload.get("selected_checkpoints"),
-        fields=("version", "dataset", "model_seed"),
+        fields=("version", "encoding", "dataset", "model_seed"),
         integer_fields=frozenset({"model_seed"}),
+        nullable_fields=frozenset({"encoding"}),
         expected=expected_checkpoints,
         label="Cycle selected validation checkpoints",
     )
     for key, row in selected_checkpoints.items():
-        profile_selection = profile_selections[(key[0], key[1])]
-        if row.get("selected_profile") != profile_selection.get("selected_profile"):
+        profile_selection = profile_selections[key[:3]]
+        selection_id = profile_selection["profile_selection_id"]
+        if (
+            row.get("selected_profile") != profile_selection.get("selected_profile")
+            or row.get("profile_selection_id") != selection_id
+            or row.get("checkpoint_id") != f"{selection_id}:model-seed-{key[3]}"
+        ):
             raise RuntimeError(f"Cycle selected checkpoint {key!r} uses the wrong profile")
 
     test_rows = _exact_key_matrix(
         payload.get("test_evaluations"),
-        fields=("version", "dataset", "model_seed"),
+        fields=("version", "encoding", "dataset", "model_seed"),
         integer_fields=frozenset({"model_seed"}),
+        nullable_fields=frozenset({"encoding"}),
         expected=expected_checkpoints,
         label="Cycle selected-checkpoint test evaluations",
     )
@@ -901,6 +931,9 @@ def _validate_cycle_summary(payload: dict[str, Any], job: dict[str, Any]) -> dic
             row.get("selected_profile") != selected_checkpoints[key].get("selected_profile")
             or row.get("checkpoint") != selected_checkpoints[key].get("checkpoint")
             or row.get("checkpoint_sha256") != selected_checkpoints[key].get("checkpoint_sha256")
+            or row.get("profile_selection_id") != selected_checkpoints[key]["profile_selection_id"]
+            or row.get("checkpoint_id") != selected_checkpoints[key]["checkpoint_id"]
+            or row.get("test_evaluation_id") != f"test:{selected_checkpoints[key]['checkpoint_id']}"
             or row.get("fresh_training") is not False
         ):
             raise RuntimeError(f"Cycle selected-checkpoint test evaluation {key!r} is invalid")
@@ -912,12 +945,16 @@ def _validate_cycle_summary(payload: dict[str, Any], job: dict[str, Any]) -> dic
         raise RuntimeError("Cycle selected-checkpoint test count is incomplete")
 
     expected_final_aggregates = {
-        (version, dataset) for version in matrix["versions"] for dataset in matrix["datasets"]
+        (version, encoding, dataset)
+        for version in matrix["versions"]
+        for encoding in matrix["encodings_by_version"][version]
+        for dataset in matrix["datasets"]
     }
     final_aggregates = _exact_key_matrix(
         payload.get("final_test_aggregates"),
-        fields=("version", "dataset"),
+        fields=("version", "encoding", "dataset"),
         integer_fields=frozenset(),
+        nullable_fields=frozenset({"encoding"}),
         expected=expected_final_aggregates,
         label="Cycle final test aggregates",
     )
@@ -1145,6 +1182,7 @@ def _config_payload(
         "tracks": list(args.tracks),
         "conductance_versions": list(args.conductance_versions),
         "cycle_versions": list(args.cycle_versions),
+        "cycle_v2_encodings": list(args.cycle_v2_encodings),
         "shared_profiles": list(args.profiles),
         "tree_profiles": list(args.profiles),
         "model_seeds": list(args.model_seeds),
@@ -1156,9 +1194,7 @@ def _config_payload(
         "explicit_batch_overrides": {
             "conductance_legacy_ppi_graphs": args.conductance_legacy_ppi_batch_size,
             "conductance_v5_ppi_graphs": args.conductance_v5_ppi_batch_size,
-            "conductance_v5_sample_seed_nodes": (
-                args.conductance_v5_sample_seed_batch_size
-            ),
+            "conductance_v5_sample_seed_nodes": (args.conductance_v5_sample_seed_batch_size),
             "cycle_graphs": args.cycle_batch_size,
             "tree_chart_views": args.tree_batch_size,
         },
@@ -1408,6 +1444,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "tree_profiles": "reference/large are forwarded without renaming",
                 "cycle_v2_basis_backend": args.cycle_v2_basis_backend,
+                "cycle_v2_encodings": list(args.cycle_v2_encodings),
                 "download_policy": (
                     "allow-download is forwarded to Cycle and Tree; Conductance remains "
                     "verified-cache-only because its child contract exposes no download flag"
@@ -1517,9 +1554,7 @@ def main(argv: list[str] | None = None) -> int:
             _STOP_ACTIVE_CHILDREN.set()
             for future in futures:
                 future.cancel()
-            signal_events = _stop_active_children(
-                reason=interruption_reason, original_error=error
-            )
+            signal_events = _stop_active_children(reason=interruption_reason, original_error=error)
             if signal_events:
                 manifest.setdefault("child_signal_events", []).extend(signal_events)
             manifest["interruption"] = {

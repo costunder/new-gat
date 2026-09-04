@@ -35,8 +35,8 @@ def test_default_matrix_runs_both_versions_all_profiles_and_seed_zero(tmp_path):
     scaling._validate(args)
     jobs = scaling.make_jobs(args, scaling._run_dir(args, "matrix"))
     assert args.model_seeds == (0,)
-    assert len(jobs) == 8
-    assert len(jobs) == 8
+    assert len(jobs) == 12
+    assert args.encodings == ["se", "pe"]
     manifest = scaling._manifest_base(
         args,
         "matrix",
@@ -45,9 +45,9 @@ def test_default_matrix_runs_both_versions_all_profiles_and_seed_zero(tmp_path):
         {"status": "passed"},
         {"source": "stable"},
     )
-    assert manifest["fresh_child_runs"] == 8
-    assert manifest["fresh_dataset_trainings"] == 8
-    assert manifest["selected_test_evaluations_planned"] == 4
+    assert manifest["fresh_child_runs"] == 12
+    assert manifest["fresh_dataset_trainings"] == 12
+    assert manifest["selected_test_evaluations_planned"] == 6
     assert {(job["version"], job["profile"]) for job in jobs} == {
         (version, profile) for version in scaling.VERSIONS for profile in scaling.PROFILE_ORDER
     }
@@ -58,9 +58,11 @@ def test_default_matrix_runs_both_versions_all_profiles_and_seed_zero(tmp_path):
     assert len({job["output_dir"] for job in jobs}) == len(jobs)
 
 
-@pytest.mark.parametrize("version", scaling.VERSIONS)
+@pytest.mark.parametrize("version,encoding", [("v1", None), ("v2", "se"), ("v2", "pe")])
 @pytest.mark.parametrize("profile", scaling.PROFILE_ORDER)
-def test_child_commands_use_real_version_cli_and_exact_profile(version, profile, tmp_path):
+def test_child_commands_use_real_version_cli_and_exact_profile(
+    version, encoding, profile, tmp_path
+):
     args = _args(
         "--versions",
         version,
@@ -72,6 +74,7 @@ def test_child_commands_use_real_version_cli_and_exact_profile(version, profile,
         "cuda:0",
         "--results-root",
         str(tmp_path),
+        *(["--encodings", encoding] if encoding is not None else []),
     )
     job = scaling.make_jobs(args, scaling._run_dir(args, "commands"))[0]
     command = job["command"]
@@ -95,8 +98,12 @@ def test_child_commands_use_real_version_cli_and_exact_profile(version, profile,
     assert child.validation_only is True
     assert child.test_checkpoint is None
     if version == "v2":
-        assert child.basis_backend == "thin_q"
-        assert child.basis_execution == "batched" and child.basis_pair_budget == 32768
+        assert child.encoding == encoding == job["encoding"]
+        assert child.basis_backend == "dfs_fundamental"
+        assert job["resources"]["basis_execution"] == "sparse_block_diagonal"
+        assert not hasattr(child, "basis_execution")
+        assert not hasattr(child, "column_chunk_size")
+        assert not hasattr(child, "basis_pair_budget")
 
 
 def test_dfs_basis_backend_is_forwarded_only_to_v2_and_bound_to_run_identity(tmp_path):
@@ -115,16 +122,39 @@ def test_dfs_basis_backend_is_forwarded_only_to_v2_and_bound_to_run_identity(tmp
     )
     scaling._validate(args)
     jobs = scaling.make_jobs(args, scaling._run_dir(args, "dfs"))
-    v1, v2 = sorted(jobs, key=lambda job: job["version"])
+    v1 = next(job for job in jobs if job["version"] == "v1")
+    v2_jobs = [job for job in jobs if job["version"] == "v2"]
     assert "--basis-backend" not in v1["command"]
     assert v1["resources"]["basis_backend"] is None
-    assert v2["command"][v2["command"].index("--basis-backend") + 1] == "dfs_fundamental"
-    assert v2["resources"]["basis_backend"] == "dfs_fundamental"
+    assert v1["encoding"] is None
+    assert {job["encoding"] for job in v2_jobs} == {"se", "pe"}
+    for v2 in v2_jobs:
+        assert v2["command"][v2["command"].index("--basis-backend") + 1] == "dfs_fundamental"
+        assert v2["resources"]["basis_backend"] == "dfs_fundamental"
     assert scaling._run_configuration(args)["basis_backend"] == "dfs_fundamental"
 
     v1_only = _args("--versions", "v1", "--basis-backend", "dfs_fundamental")
-    with pytest.raises(ValueError, match="requires v2"):
-        scaling._validate(v1_only)
+    scaling._validate(v1_only)
+    v1_jobs = scaling.make_jobs(v1_only, scaling._run_dir(v1_only, "v1-only"))
+    assert all("--basis-backend" not in job["command"] for job in v1_jobs)
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("--basis-backend", "thin_q"),
+        ("--column-chunk-size", "16"),
+        ("--basis-pair-budget", "32768"),
+        ("--basis-execution", "batched"),
+    ],
+)
+def test_removed_qr_backend_and_noop_tuning_options_are_rejected(option, value):
+    from research.cycle_pe.v2.benchmark import parser
+
+    with pytest.raises(SystemExit):
+        scaling.parser().parse_args([option, value])
+    with pytest.raises(SystemExit):
+        parser().parse_args([option, value])
 
 
 def test_profiles_are_dataset_aware_reference_scale_and_large():
@@ -196,11 +226,11 @@ def test_a6000_profile_uses_static_dataset_batches_amp_and_heavy_first(tmp_path)
         assert "--amp" in command
         if job["version"] == "v2":
             assert resources["prefetch_factor"] == 4
-            assert resources["basis_pair_budget"] == 4_194_304
+            assert resources["basis_execution"] == "sparse_block_diagonal"
             assert command[command.index("--hardware-profile") + 1] == "a6000-48gb"
         else:
             assert resources["prefetch_factor"] == 2
-            assert resources["basis_pair_budget"] is None
+            assert resources["basis_execution"] is None
             assert "--prefetch-factor" not in command
 
 
@@ -212,7 +242,7 @@ def test_v2_precision_contract_accepts_only_hardware_valid_modes() -> None:
         "autocast_dtype": "disabled",
         "fallback": None,
         "gradient_scaler": False,
-        "projector_contraction": "float32",
+        "cycle_sparse_aggregation": "float32",
         "backbone_autocast": False,
     }
     portable_resources = scaling._job_resources(_args("--amp"), "v2", "reference", "zinc12k")
@@ -247,7 +277,7 @@ def test_v2_precision_contract_accepts_only_hardware_valid_modes() -> None:
         "autocast_dtype": "float16",
         "fallback": "tampered",
         "gradient_scaler": True,
-        "projector_contraction": "float16",
+        "cycle_sparse_aggregation": "float16",
         "backbone_autocast": False,
     }
     for field, value in corrupt_values.items():
@@ -291,14 +321,14 @@ def test_v2_test_only_admission_binds_every_a6000_runtime_field():
     )
     for field in (
         "ffn_multiplier",
-        "column_chunk_size",
-        "basis_pair_budget",
+        "basis_backend",
         "prefetch_factor",
         "hardware_profile",
         "effective_batch_size",
-        "packed_cycle_basis_h2d_tensors_per_batch",
+        "cycle_membership_layout",
+        "cycle_factorization_in_forward",
         "peak_gpu_reserved_bytes",
-        "projector_contraction",
+        "cycle_sparse_aggregation",
     ):
         assert field in source
 
@@ -320,10 +350,21 @@ def test_direct_runner_environment_explicitly_unsets_nvml_cuda_check(monkeypatch
     assert "src/chartgat/observability.py" in scaling.SOURCE_FILES
 
 
-def _row(version: str, dataset: str, profile: str, seed: int, validation: float):
-    prefix = f"/{version}/{dataset}/{profile}/{seed}"
+def _row(
+    version: str,
+    dataset: str,
+    profile: str,
+    seed: int,
+    validation: float,
+    *,
+    encoding: str | None = None,
+):
+    encoding = ("se" if encoding is None else encoding) if version == "v2" else None
+    condition = version if encoding is None else f"{version}/{encoding}"
+    prefix = f"/{condition}/{dataset}/{profile}/{seed}"
     return {
         "version": version,
+        "encoding": encoding,
         "profile": profile,
         "dataset": dataset,
         "model_seed": seed,
@@ -364,6 +405,92 @@ def test_profile_selection_uses_mean_validation_and_one_common_profile():
     assert summary["profile_selections"][0]["test_used_for_selection"] is False
     assert summary["test_evaluations"] == []
     assert all("test" not in key for row in summary["runs"] for key in row)
+
+
+def _two_encoding_selection_summary():
+    rows = [
+        _row("v2", "zinc12k", profile, seed, value + seed * 0.01, encoding=encoding)
+        for encoding, scores in (
+            ("se", {"reference": 0.1, "large": 0.4}),
+            ("pe", {"reference": 0.3, "large": 0.2}),
+        )
+        for profile, value in scores.items()
+        for seed in (0, 1)
+    ]
+    return scaling.build_summary(
+        rows,
+        versions=["v2"],
+        encodings=["se", "pe"],
+        datasets=["zinc12k"],
+        profiles=["reference", "large"],
+        model_seeds=(0, 1),
+        complete=True,
+    )
+
+
+def test_se_and_pe_select_profiles_independently_and_keep_checkpoint_jobs_separate(tmp_path):
+    summary = _two_encoding_selection_summary()
+    selections = {item["encoding"]: item for item in summary["profile_selections"]}
+    assert selections["se"]["selected_profile"] == "reference"
+    assert selections["pe"]["selected_profile"] == "large"
+    assert selections["se"]["profile_selection_id"] == "v2:se:zinc12k"
+    assert selections["pe"]["profile_selection_id"] == "v2:pe:zinc12k"
+    assert summary["requested_encodings"] == ["se", "pe"]
+    args = _args("--versions", "v2", "--datasets", "zinc12k", "--model-seeds", "0,1")
+    jobs = scaling.make_test_jobs(args, tmp_path, summary["selected_checkpoints"])
+    assert len(jobs) == len({job["job_id"] for job in jobs}) == 4
+    assert len({job["output_dir"] for job in jobs}) == 4
+    test_rows = []
+    for job in jobs:
+        encoding = job["encoding"]
+        assert job["resources"]["encoding"] == encoding
+        assert job["command"][job["command"].index("--encoding") + 1] == encoding
+        assert job["job_id"] == f"test:v2:{encoding}:zinc12k:model-seed-{job['model_seed']}"
+        assert job["selected_profile"] == selections[encoding]["selected_profile"]
+        test_rows.append(
+            {
+                **job,
+                "test_evaluation_id": job["job_id"],
+                "test_mae": 0.8 if encoding == "se" else 0.4,
+                "fresh_training": False,
+            }
+        )
+    final = scaling.attach_test_results(summary, test_rows, complete=True)
+    assert final["status"] == "passed"
+    assert {row["encoding"]: row["test_mae"]["mean"] for row in final["final_test_aggregates"]} == {
+        "se": 0.8,
+        "pe": 0.4,
+    }
+
+
+def test_equal_count_duplicate_encoding_candidate_matrix_withholds_all_selections():
+    rows = _two_encoding_selection_summary()["runs"]
+    rows[-1] = {**rows[-1], "encoding": "se"}
+    summary = scaling.build_summary(
+        rows,
+        versions=["v2"],
+        encodings=["se", "pe"],
+        datasets=["zinc12k"],
+        profiles=["reference", "large"],
+        model_seeds=(0, 1),
+        complete=True,
+    )
+    assert len(rows) == 8
+    assert summary["status"] == "failed"
+    assert summary["profile_selections"] == summary["selected_checkpoints"] == []
+
+
+def test_cross_encoding_test_row_cannot_attach_even_with_matching_counts_and_checkpoint_ids():
+    summary = _two_encoding_selection_summary()
+    rows = [
+        {**selected, "test_evaluation_id": f"test:{selected['checkpoint_id']}", "test_mae": 0.5}
+        for selected in summary["selected_checkpoints"]
+    ]
+    rows[0]["encoding"] = "pe"
+    result = scaling.attach_test_results(summary, rows, complete=True)
+    assert result["status"] == "failed"
+    assert result["test_evaluations"] == []
+    assert "detached" in result["test_results_withheld"]
 
 
 def test_incomplete_seed_matrix_withholds_selection_fail_closed():
@@ -416,6 +543,7 @@ def test_selected_profile_creates_one_test_only_job_per_seed_and_attaches_separa
             "checkpoint_id": job["checkpoint_id"],
             "profile_selection_id": job["profile_selection_id"],
             "version": job["version"],
+            "encoding": job.get("encoding"),
             "dataset": job["dataset"],
             "model_seed": job["model_seed"],
             "selected_profile": job["selected_profile"],
@@ -467,33 +595,39 @@ def test_validation_only_child_loads_no_test_split(module_name, tmp_path, monkey
     )
     assert loaded == [("train", "validation")]
     metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
-    assert "test" not in metrics["datasets"]["zinc12k"]["models"][benchmark.MODEL_NAME]
+    model_name = (
+        benchmark.MODEL_NAMES["se"]
+        if module_name.endswith("v2.benchmark")
+        else benchmark.MODEL_NAME
+    )
+    assert "test" not in metrics["datasets"]["zinc12k"]["models"][model_name]
 
 
-def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakage(tmp_path):
+@pytest.mark.parametrize("encoding", ("se", "pe"))
+def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakage(
+    tmp_path, encoding
+):
+    model_name = scaling._model_name("v2", encoding)
     output = tmp_path / "child"
     output.mkdir()
     job = {
         "version": "v2",
+        "encoding": encoding,
         "profile": "reference",
         "model_seed": 3,
         "datasets": ["zinc12k"],
         "config": scaling._profile_config("reference", "zinc12k", "v2"),
-        "resources": scaling._job_resources(_args(), "v2", "reference", "zinc12k"),
+        "resources": scaling._job_resources(_args(), "v2", "reference", "zinc12k", encoding),
         "output_dir": str(output),
         "command": [
             "python",
             "-m",
             "research.cycle_pe.v2.benchmark",
-            "--column-chunk-size",
-            "16",
-            "--basis-execution",
-            "batched",
-            "--basis-pair-budget",
-            "32768",
+            "--basis-backend",
+            "dfs_fundamental",
         ],
     }
-    run = output / "zinc12k/cycle_projector_pe_v2"
+    run = output / "zinc12k" / model_name
     run.mkdir(parents=True)
     checkpoint = run / "best.pt"
     checkpoint.write_bytes(b"checkpoint")
@@ -517,6 +651,7 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
         "run_mode": "validation_only",
         "version": "v2",
         "arguments": {
+            "encoding": encoding,
             "model_seed": 3,
             "hidden_dim": 128,
             "pe_dim": 64,
@@ -527,10 +662,7 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
             "datasets": ["zinc12k"],
             "validation_only": True,
             "test_checkpoint": None,
-            "column_chunk_size": 16,
-            "basis_backend": "thin_q",
-            "basis_execution": "batched",
-            "basis_pair_budget": 32768,
+            "basis_backend": "dfs_fundamental",
             "batch_size": 32,
             "workers": 4,
             "amp": False,
@@ -538,6 +670,7 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
             "hardware_profile": "portable",
         },
         "controls": {
+            "encoding": encoding,
             "test_data_access": False,
             "fresh_training": True,
             "optimizer_created": True,
@@ -556,7 +689,7 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
                     "split_content_sha256": {"train": "a", "validation": "b"},
                 },
                 "models": {
-                    "cycle_projector_pe_v2": {
+                    model_name: {
                         "validation": 0.2,
                         "trainable_parameters": 1234,
                         "elapsed_seconds": 5.0,
@@ -568,7 +701,8 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
                                 "effective_batch_size": 32,
                                 "workers": 4,
                                 "prefetch_factor": 2,
-                                "packed_cycle_basis_h2d_tensors_per_batch": 1,
+                                "cycle_membership_layout": "sparse_coo_block_diagonal",
+                                "cycle_factorization_in_forward": False,
                             },
                             "precision": {
                                 "amp": False,
@@ -576,7 +710,7 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
                                 "autocast_dtype": "disabled",
                                 "fallback": None,
                                 "gradient_scaler": False,
-                                "projector_contraction": "float32",
+                                "cycle_sparse_aggregation": "float32",
                                 "backbone_autocast": False,
                             },
                             "hardware": {"profile": "portable"},
@@ -606,13 +740,114 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
     assert row["trainable_parameters"] == 1234
     assert row["resource_observability"]["total_point_sample_count"] == 2
     assert row["throughput"]["training_graphs_per_second"] == 10.0
+    assert row["encoding"] == encoding
+    other_encoding = "pe" if encoding == "se" else "se"
+    for section_name in ("arguments", "controls"):
+        corrupt_manifest = json.loads(json.dumps(manifest))
+        corrupt_manifest[section_name]["encoding"] = other_encoding
+        (output / "manifest.json").write_text(json.dumps(corrupt_manifest), encoding="utf-8")
+        with pytest.raises(ValueError, match="encoding"):
+            scaling.read_job_rows(job)
+    (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    corrupt_job = {**job, "resources": {**job["resources"], "encoding": other_encoding}}
+    with pytest.raises(ValueError, match="encoding"):
+        scaling.read_job_rows(corrupt_job)
+    wrong_model = json.loads(json.dumps(metrics))
+    wrong_models = wrong_model["datasets"]["zinc12k"]["models"]
+    wrong_models[scaling._model_name("v2", other_encoding)] = wrong_models.pop(model_name)
+    (output / "metrics.json").write_text(json.dumps(wrong_model), encoding="utf-8")
+    with pytest.raises(ValueError, match="model"):
+        scaling.read_job_rows(job)
+
+    # The selected-test reader must reject the same cross-condition transplant,
+    # even when architecture and parameter counts are exactly matched.
+    selected_id = f"v2:{encoding}:zinc12k"
+    test_job = {
+        **job,
+        "job_id": f"test:{selected_id}:model-seed-3",
+        "checkpoint_id": f"{selected_id}:model-seed-3",
+        "profile_selection_id": selected_id,
+        "dataset": "zinc12k",
+        "selected_profile": "reference",
+        "checkpoint": str(checkpoint.resolve()),
+        "checkpoint_sha256": row["checkpoint_sha256"],
+        "selected_validation_mae": 0.2,
+        "trainable_parameters": 1234,
+    }
+    test_manifest = json.loads(json.dumps(manifest))
+    test_manifest["run_mode"] = "test_only"
+    test_manifest["arguments"].update(
+        validation_only=False, test_checkpoint=str(checkpoint.resolve())
+    )
+    test_manifest["controls"].update(
+        test_data_access=True, fresh_training=False, optimizer_created=False
+    )
+    test_metrics = json.loads(json.dumps(metrics))
+    test_metrics["run_mode"] = "test_only"
+    test_dataset = test_metrics["datasets"]["zinc12k"]
+    test_dataset["protocol"] = {
+        "loaded_splits": ["test"],
+        "split_sizes": {"test": 2},
+        "split_content_sha256": {"test": "c"},
+    }
+    test_result = test_dataset["models"][model_name]
+    for field in ("validation", "history", "epochs_completed", "best_epoch"):
+        del test_result[field]
+    test_result.update(
+        evaluation_splits=["test"],
+        fresh_training=False,
+        selected_validation=0.2,
+        test=0.3,
+        evaluation_seconds=1.0,
+    )
+    (output / "manifest.json").write_text(json.dumps(test_manifest), encoding="utf-8")
+    (output / "metrics.json").write_text(json.dumps(test_metrics), encoding="utf-8")
+    assert scaling.read_test_result(test_job)["encoding"] == encoding
+    for section_name in ("arguments", "controls"):
+        corrupt_manifest = json.loads(json.dumps(test_manifest))
+        corrupt_manifest[section_name]["encoding"] = other_encoding
+        (output / "manifest.json").write_text(json.dumps(corrupt_manifest), encoding="utf-8")
+        with pytest.raises(ValueError, match="encoding"):
+            scaling.read_test_result(test_job)
+    (output / "manifest.json").write_text(json.dumps(test_manifest), encoding="utf-8")
+    corrupt_test_job = {**test_job, "resources": {**job["resources"], "encoding": other_encoding}}
+    with pytest.raises(ValueError, match="encoding"):
+        scaling.read_test_result(corrupt_test_job)
+    wrong_test = json.loads(json.dumps(test_metrics))
+    wrong_models = wrong_test["datasets"]["zinc12k"]["models"]
+    wrong_models[scaling._model_name("v2", other_encoding)] = wrong_models.pop(model_name)
+    (output / "metrics.json").write_text(json.dumps(wrong_test), encoding="utf-8")
+    with pytest.raises(ValueError, match="model"):
+        scaling.read_test_result(test_job)
+    (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (output / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+    for field, corrupt_value in (
+        ("cycle_membership_layout", "dense"),
+        ("cycle_factorization_in_forward", True),
+    ):
+        corrupt = json.loads(json.dumps(metrics))
+        pipeline = corrupt["datasets"]["zinc12k"]["models"][model_name]["execution"][
+            "data_pipeline"
+        ]
+        pipeline[field] = corrupt_value
+        (output / "metrics.json").write_text(json.dumps(corrupt), encoding="utf-8")
+        with pytest.raises(ValueError, match="runtime/resource"):
+            scaling.read_job_rows(job)
+    legacy = json.loads(json.dumps(metrics))
+    pipeline = legacy["datasets"]["zinc12k"]["models"][model_name]["execution"]["data_pipeline"]
+    del pipeline["cycle_membership_layout"]
+    del pipeline["cycle_factorization_in_forward"]
+    pipeline["packed_cycle_basis_h2d_tensors_per_batch"] = 1
+    (output / "metrics.json").write_text(json.dumps(legacy), encoding="utf-8")
+    with pytest.raises(ValueError, match="runtime/resource"):
+        scaling.read_job_rows(job)
     for field in ("resource_observability", "throughput"):
         incomplete = json.loads(json.dumps(metrics))
-        del incomplete["datasets"]["zinc12k"]["models"]["cycle_projector_pe_v2"][field]
+        del incomplete["datasets"]["zinc12k"]["models"][model_name][field]
         (output / "metrics.json").write_text(json.dumps(incomplete), encoding="utf-8")
         with pytest.raises(ValueError, match=field):
             scaling.read_job_rows(job)
-    metrics["datasets"]["zinc12k"]["models"]["cycle_projector_pe_v2"]["test"] = 0.3
+    metrics["datasets"]["zinc12k"]["models"][model_name]["test"] = 0.3
     (output / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
     with pytest.raises(ValueError, match="leaked a test metric"):
         scaling.read_job_rows(job)
@@ -642,9 +877,9 @@ def test_dry_run_prints_full_plan_without_dependency_or_gpu_checks(tmp_path, mon
         ]
     )
     output = capsys.readouterr().out
-    assert code == 0 and "8 fresh child runs" in output and "8 fresh dataset trainings" in output
+    assert code == 0 and "12 fresh child runs" in output and "12 fresh dataset trainings" in output
     assert "train+validation only" in output
-    assert "4 selected-checkpoint test evaluations" in output
+    assert "6 selected-checkpoint test evaluations" in output
     assert not (tmp_path / "cycle_pe/scaling").exists()
 
 
@@ -794,6 +1029,7 @@ def test_same_run_id_resumes_valid_children_and_test_checkpoints(tmp_path, monke
         return [
             {
                 "version": job["version"],
+                "encoding": job.get("encoding"),
                 "profile": job["profile"],
                 "dataset": "zinc12k",
                 "model_seed": job["model_seed"],
@@ -820,6 +1056,7 @@ def test_same_run_id_resumes_valid_children_and_test_checkpoints(tmp_path, monke
             "checkpoint_id": job["checkpoint_id"],
             "profile_selection_id": job["profile_selection_id"],
             "version": job["version"],
+            "encoding": job.get("encoding"),
             "dataset": job["dataset"],
             "model_seed": job["model_seed"],
             "selected_profile": job["selected_profile"],
@@ -908,6 +1145,7 @@ def test_retrained_selected_candidate_rebinds_and_reruns_test_once(tmp_path, mon
         return [
             {
                 "version": job["version"],
+                "encoding": job.get("encoding"),
                 "profile": job["profile"],
                 "dataset": "zinc12k",
                 "model_seed": job["model_seed"],
@@ -937,6 +1175,7 @@ def test_retrained_selected_candidate_rebinds_and_reruns_test_once(tmp_path, mon
             "checkpoint_id": job["checkpoint_id"],
             "profile_selection_id": job["profile_selection_id"],
             "version": job["version"],
+            "encoding": job.get("encoding"),
             "dataset": job["dataset"],
             "model_seed": job["model_seed"],
             "selected_profile": job["selected_profile"],
@@ -1046,6 +1285,7 @@ def test_completed_run_returns_without_relaunching_preflight_or_children(tmp_pat
         return [
             {
                 "version": job["version"],
+                "encoding": job.get("encoding"),
                 "profile": job["profile"],
                 "dataset": "zinc12k",
                 "model_seed": job["model_seed"],
@@ -1072,6 +1312,7 @@ def test_completed_run_returns_without_relaunching_preflight_or_children(tmp_pat
             "checkpoint_id": job["checkpoint_id"],
             "profile_selection_id": job["profile_selection_id"],
             "version": job["version"],
+            "encoding": job.get("encoding"),
             "dataset": job["dataset"],
             "model_seed": job["model_seed"],
             "selected_profile": job["selected_profile"],
@@ -1180,7 +1421,7 @@ def test_quarantine_rejects_resume_orphans_symlink_outside_run(tmp_path):
     assert output.is_dir()
 
 
-def test_projector_v2_attempt_preserves_last_checkpoint_and_requests_resume(tmp_path):
+def test_sparse_dfs_v2_attempt_preserves_last_checkpoint_and_requests_resume(tmp_path):
     run_dir = tmp_path / "run"
     args = scaling.parser().parse_args(
         [
@@ -1195,7 +1436,7 @@ def test_projector_v2_attempt_preserves_last_checkpoint_and_requests_resume(tmp_
         ]
     )
     job = scaling.make_jobs(args, run_dir)[0]
-    checkpoint = Path(job["output_dir"]) / "zinc12k/cycle_projector_pe_v2/last.pt"
+    checkpoint = Path(job["output_dir"]) / "zinc12k/cycle_dfs_se_v2/last.pt"
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b"epoch-state")
 

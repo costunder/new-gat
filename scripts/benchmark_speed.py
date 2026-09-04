@@ -112,6 +112,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--cycle-v2-encoding",
+        choices=("se", "pe"),
+        default="se",
+        help="Cycle V2 condition: structural SE or SE plus relative positional residual.",
+    )
     parser.add_argument("--include-compile", action="store_true")
     parser.add_argument(
         "--v5-scale-profile",
@@ -159,9 +165,7 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError(f"{args.track} datasets: {DATASETS[args.track]}")
     if args.steps < 1 or args.warmup < 1 or args.seed < 0:
         raise ValueError("steps/warmup must be positive and seed nonnegative")
-    if args.minimum_measure_seconds <= 0 or not math.isfinite(
-        args.minimum_measure_seconds
-    ):
+    if args.minimum_measure_seconds <= 0 or not math.isfinite(args.minimum_measure_seconds):
         raise ValueError("minimum measure seconds must be finite and positive")
     if args.track == "conductance_v5":
         from research.conductance_gat.v5.protocol import HARDWARE_PROFILES
@@ -188,9 +192,7 @@ def _validate(args: argparse.Namespace) -> None:
         from research.tree_augmentation.paper import _load_settings
 
         tree_settings, _ = _load_settings()
-        args.tree_precision = (
-            "float16_autocast" if bool(tree_settings["amp"]) else "float32"
-        )
+        args.tree_precision = "float16_autocast" if bool(tree_settings["amp"]) else "float32"
         if args.include_compile:
             raise ValueError(
                 "the exact Tree Augmentation training path does not support torch.compile; "
@@ -263,10 +265,10 @@ def _physical_batch_size_applicable(args: argparse.Namespace) -> bool:
         return True
     if args.dataset == "ppi":
         return True
-    return (
-        args.track == "conductance_v5"
-        and getattr(args, "v5_sampling_resolved", None) in {"neighbor", "cluster"}
-    )
+    return args.track == "conductance_v5" and getattr(args, "v5_sampling_resolved", None) in {
+        "neighbor",
+        "cluster",
+    }
 
 
 def _seed(seed: int) -> None:
@@ -375,8 +377,7 @@ def _build_conductance_case(
                 None
                 if batch_applicable
                 else (
-                    "dataset is one transductive full graph; the compatibility "
-                    "value is not applied"
+                    "dataset is one transductive full graph; the compatibility value is not applied"
                 )
             ),
             "gradient_accumulation_steps": 1,
@@ -439,9 +440,7 @@ def _build_v5_case(
         batch_size=args.batch_size if args.dataset == "ppi" else 1,
         workers=0,
         model_seed=args.seed,
-        sample_seed_batch_size=(
-            args.batch_size if sampled else hardware["sample_seed_batch_size"]
-        ),
+        sample_seed_batch_size=(args.batch_size if sampled else hardware["sample_seed_batch_size"]),
         num_neighbors=list(args.v5_num_neighbors),
         sample_prefetch=hardware["sample_prefetch"],
         pin_memory=hardware["pin_memory"],
@@ -563,12 +562,10 @@ def _build_v5_case(
             "cache": "verified official dataset cache loaded once for all candidates",
             "production_path_identity": {
                 "model": (
-                    "research.conductance_gat.v5.model."
-                    "GraphConditionedConductanceNodeClassifier"
+                    "research.conductance_gat.v5.model.GraphConditionedConductanceNodeClassifier"
                 ),
                 "training_batch": (
-                    "research.conductance_gat.v5.train._prepare_data/"
-                    "_training_batches"
+                    "research.conductance_gat.v5.train._prepare_data/_training_batches"
                 ),
                 "loss": "research.conductance_gat.ablation.train.training_loss",
                 "phase": "research.conductance_gat.v5.train.configure_phase(joint, epoch=0)",
@@ -593,7 +590,7 @@ def _build_cycle_case(
     loaded: tuple[dict[str, list[Any]], dict[str, Any]] | None = None,
 ) -> SpeedCase:
     from research.cycle_pe.v2.data import collate, load_benchmark
-    from research.cycle_pe.v2.model import CycleBasisPEModel
+    from research.cycle_pe.v2.model import MODEL_NAMES, CycleBasisPEModel
 
     splits, protocol = (
         loaded
@@ -608,11 +605,8 @@ def _build_cycle_case(
     selected = splits["train"][: args.batch_size]
     batch = collate(selected).to(device)
 
-    def make_model(kind):
-        return CycleBasisPEModel(
-            dataset=args.dataset,
-            basis_execution="reference" if kind == "reference" else "batched",
-        )
+    def make_model(_kind):
+        return CycleBasisPEModel(dataset=args.dataset, encoding=args.cycle_v2_encoding)
 
     return SpeedCase(
         batch,
@@ -624,8 +618,8 @@ def _build_cycle_case(
             "nodes": batch.x.shape[0],
             "physical_edges": batch.edge_index.shape[1],
             "graphs": len(selected),
-            "basis_ranks": [basis.shape[1] for basis in batch.cycle_bases],
-            "basis_pairs": sum(basis.numel() for basis in batch.cycle_bases),
+            "basis_ranks": [shape[1] for shape in batch.cycle_basis_shapes],
+            "cycle_memberships": batch.cycle_membership._nnz(),
             "requested_physical_batch_size": args.batch_size,
             "actual_physical_batch_size": len(selected),
             "physical_batch_size_unit": "graphs",
@@ -640,19 +634,23 @@ def _build_cycle_case(
             "prefetch": "single fixed batch is collated and transferred before timing",
             "cache": "verified Cycle PE basis cache loaded once for all candidates",
             "model_configuration": {
-                "name": "cycle_basis_pe_v2",
+                "name": MODEL_NAMES[args.cycle_v2_encoding],
+                "encoding": args.cycle_v2_encoding,
+                "relative_position_residual": args.cycle_v2_encoding == "pe",
                 "hidden_channels": 128,
                 "pe_dimension": 64,
                 "layers": 10,
                 "attention_heads": 0,
                 "ffn_multiplier": 4,
                 "dropout": 0.0,
-                "basis_pair_budget": 32768,
+                "basis_backend": "dfs_fundamental",
+                "basis_execution": "sparse_block_diagonal",
             },
         },
-        "Same current Cycle PE v2 backbone/parameters; compares reference per-graph "
-        "full-basis encoder with bounded batched full-basis encoder. Excludes data "
-        "preparation/transfer, optimizer, checkpoint and validation; no basis truncation.",
+        "The explicitly selected sparse DFS Cycle V2 SE/PE condition, optionally "
+        "comparing compiled tensor MLP blocks within that condition. "
+        "No historical-projector speedup is claimed. Excludes data preparation/transfer, "
+        "optimizer, checkpoint and validation; no basis truncation or factorization.",
     )
 
 
@@ -730,8 +728,7 @@ def _build_cycle_v1_case(
             "pin_memory": True,
             "prefetch": "one deterministic real training batch is transferred before timing",
             "cache": (
-                "all verified official Cycle PE V1 splits loaded once for the "
-                "candidate sweep"
+                "all verified official Cycle PE V1 splits loaded once for the candidate sweep"
             ),
             "production_path_identity": {
                 "model": "research.cycle_pe.benchmark_models.CyclePEModel",
@@ -844,9 +841,7 @@ def _build_tree_case(
         target_mean = np.zeros(1, dtype=np.float64)
         target_scale = np.ones(1, dtype=np.float64)
     else:
-        raise ValueError(
-            f"unsupported Tree Augmentation task type: {dataset.task_type}"
-        )
+        raise ValueError(f"unsupported Tree Augmentation task type: {dataset.task_type}")
     mean_tensor = torch.as_tensor(target_mean, dtype=torch.float32, device=device)
     scale_tensor = torch.as_tensor(target_scale, dtype=torch.float32, device=device)
     output_dim = _output_dim(dataset)
@@ -881,9 +876,7 @@ def _build_tree_case(
             "dataset_cache_integrity": {
                 "full_cache_loaded": True,
                 "all_declared_splits_validated": True,
-                "loaded_and_validated_splits": sorted(
-                    {record.split for record in dataset.records}
-                ),
+                "loaded_and_validated_splits": sorted({record.split for record in dataset.records}),
             },
             "seed_axes": seed_axes.to_manifest(),
             "tree_arm": args.tree_arm,
@@ -923,20 +916,13 @@ def _build_tree_case(
                 "are loaded/constructed once for the candidate sweep"
             ),
             "production_path_identity": {
-                "model": (
-                    "research.tree_augmentation.paper_model."
-                    "VariableBetaCycleEncoder"
-                ),
-                "training_views": (
-                    "research.tree_augmentation.paper._training_views"
-                ),
+                "model": ("research.tree_augmentation.paper_model.VariableBetaCycleEncoder"),
+                "training_views": ("research.tree_augmentation.paper._training_views"),
                 "batch": (
                     "research.tree_augmentation.paper_model.collate_chart_views "
                     "with the fit_downstream_model seed+101 replacement sampler"
                 ),
-                "loss": (
-                    "fit_downstream_model CSL cross_entropy or ZINC normalized MSE"
-                ),
+                "loss": ("fit_downstream_model CSL cross_entropy or ZINC normalized MSE"),
             },
             "precision": "float16_autocast" if use_amp else "float32",
             "padded_input_shapes": {
@@ -1045,13 +1031,11 @@ def _implementation_hashes(track: str) -> dict[str, str]:
 
 
 def _planned_variants(args: argparse.Namespace) -> list[str]:
-    if args.track in {"conductance_v5", "cycle_pe_v1"}:
+    if args.track in {"conductance_v5", "cycle_pe_v1", "cycle_pe_v2"}:
         return ["current"] + (["compiled"] if args.include_compile else [])
     if args.track == "tree_augmentation":
         return ["current"]
-    return ["reference", "optimized"] + (
-        ["compiled"] if args.include_compile else []
-    )
+    return ["reference", "optimized"] + (["compiled"] if args.include_compile else [])
 
 
 def _probe(model, case: SpeedCase) -> dict[str, Any]:
@@ -1289,15 +1273,13 @@ def _add_resource_and_throughput_columns(
     physical_batch_unit = case.description["physical_batch_size_unit"]
     row["physical_batch_item_unit"] = physical_batch_unit
     if isinstance(physical_batch_size, int) and not isinstance(physical_batch_size, bool):
-        row["physical_batch_items_per_second"] = (
-            float(physical_batch_size) * steps / seconds
-        )
+        row["physical_batch_items_per_second"] = float(physical_batch_size) * steps / seconds
         row["physical_batch_throughput_unavailable_reason"] = None
     else:
         row["physical_batch_items_per_second"] = None
-        row["physical_batch_throughput_unavailable_reason"] = (
-            case.description["physical_batch_size_reason"]
-        )
+        row["physical_batch_throughput_unavailable_reason"] = case.description[
+            "physical_batch_size_reason"
+        ]
     row.update(
         gpu_sm_utilization_mean_percent=_resource_scalar(
             resource, "interval_series", "gpu_sm_utilization_percent", "mean"
@@ -1367,8 +1349,7 @@ def _finish_variant_monitor(
     }
     if errors:
         row["resource_observability_error"] = "; ".join(
-            f"{stage}: {type(error).__name__}: {error}"
-            for stage, error in errors
+            f"{stage}: {type(error).__name__}: {error}" for stage, error in errors
         )
     return peak_allocated_bytes, peak_reserved_bytes, errors
 
@@ -1442,8 +1423,8 @@ def _run_variant(args, device, case, state, variant, reference):
             device=device,
         )
         monitor_finish_attempted = True
-        peak_allocated_bytes, peak_reserved_bytes, monitor_errors = (
-            _finish_variant_monitor(monitor, device, row)
+        peak_allocated_bytes, peak_reserved_bytes, monitor_errors = _finish_variant_monitor(
+            monitor, device, row
         )
         if monitor_errors:
             primary_monitor_error = monitor_errors[0][1]
@@ -1468,15 +1449,12 @@ def _run_variant(args, device, case, state, variant, reference):
             peak_cuda_allocated_bytes=peak_allocated_bytes,
             peak_cuda_reserved_bytes=peak_reserved_bytes,
             peak_cuda_incremental_bytes=peak_allocated_bytes - baseline_bytes,
-            peak_cuda_reserved_incremental_bytes=peak_reserved_bytes
-            - baseline_reserved_bytes,
+            peak_cuda_reserved_incremental_bytes=peak_reserved_bytes - baseline_reserved_bytes,
             trainable_parameters_unchanged=True,
             production_path_integrity=probe["integrity"]
             | {
                 "trainable_parameters_unchanged_after_measurement": True,
-                "production_path_identity": case.description.get(
-                    "production_path_identity"
-                ),
+                "production_path_identity": case.description.get("production_path_identity"),
             },
         )
         _add_resource_and_throughput_columns(row, row["resource_observability"], case)
@@ -1507,9 +1485,7 @@ def _run_variant(args, device, case, state, variant, reference):
             try:
                 model.zero_grad(set_to_none=True)
             except (Exception, KeyboardInterrupt) as cleanup_error:
-                post_variant_cleanup_errors.append(
-                    ("model_zero_grad", cleanup_error)
-                )
+                post_variant_cleanup_errors.append(("model_zero_grad", cleanup_error))
             del model
         try:
             gc.collect()
@@ -1518,9 +1494,7 @@ def _run_variant(args, device, case, state, variant, reference):
         try:
             torch.cuda.empty_cache()
         except (Exception, KeyboardInterrupt) as cleanup_error:
-            post_variant_cleanup_errors.append(
-                ("cuda_empty_cache", cleanup_error)
-            )
+            post_variant_cleanup_errors.append(("cuda_empty_cache", cleanup_error))
         if post_variant_cleanup_errors:
             row["post_variant_cleanup_errors"] = [
                 {
@@ -1619,8 +1593,7 @@ def _batch_candidate_analysis(
             (
                 row
                 for row in candidate.get("variants", [])
-                if row["variant"] in {"optimized", "current"}
-                and row["status"] == "passed"
+                if row["variant"] in {"optimized", "current"} and row["status"] == "passed"
             ),
             None,
         )
@@ -1637,9 +1610,7 @@ def _batch_candidate_analysis(
         free_bytes = _resource_scalar(resource, "start", "gpu", "device_free_bytes")
         total_bytes = _resource_scalar(resource, "start", "gpu", "device_total_bytes")
         incremental = target["peak_cuda_reserved_incremental_bytes"]
-        if not isinstance(free_bytes, (int, float)) or not isinstance(
-            total_bytes, (int, float)
-        ):
+        if not isinstance(free_bytes, (int, float)) or not isinstance(total_bytes, (int, float)):
             evaluation["reason"] = "CUDA free/total memory observation was unavailable"
             evaluations.append(evaluation)
             continue
@@ -1768,8 +1739,7 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
             _seed(args.seed)
             initial = case.make_model("optimized")
             state = {
-                name: value.detach().cpu().clone()
-                for name, value in initial.state_dict().items()
+                name: value.detach().cpu().clone() for name, value in initial.state_dict().items()
             }
             fingerprint = _state_fingerprint(state)
             if common_fingerprint is None:
@@ -1780,9 +1750,7 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
                 )
             candidate["initial_state_sha256"] = fingerprint
             candidate["trainable_parameters"] = sum(
-                parameter.numel()
-                for parameter in initial.parameters()
-                if parameter.requires_grad
+                parameter.numel() for parameter in initial.parameters() if parameter.requires_grad
             )
             if len(args.batch_sizes) == 1:
                 report["trainable_parameters"] = candidate["trainable_parameters"]
@@ -1791,7 +1759,8 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
             print(
                 f"physical batch candidate {batch_size}: "
                 f"actual={case.description['actual_physical_batch_size']} "
-                f"unit={case.description['physical_batch_size_unit']}", flush=True
+                f"unit={case.description['physical_batch_size_unit']}",
+                flush=True,
             )
             print(
                 "variant       ms/step     steps/s   batch-items/s GPU SM mean/max    "
@@ -1801,9 +1770,7 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
             for variant in variants:
                 report["active_variant"] = variant
                 atomic_write_json(output / "report.json", report)
-                row, probe = _run_variant(
-                    candidate_args, device, case, state, variant, reference
-                )
+                row, probe = _run_variant(candidate_args, device, case, state, variant, reference)
                 row["candidate_index"] = candidate_index
                 candidate["variants"].append(row)
                 report["variants"].append(row)
@@ -1824,9 +1791,7 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
                 if reference is None:
                     reference = probe
                 reference_seconds = candidate["variants"][0]["seconds_per_step"]
-                row["speedup_vs_reference"] = (
-                    reference_seconds / row["seconds_per_step"]
-                )
+                row["speedup_vs_reference"] = reference_seconds / row["seconds_per_step"]
                 atomic_write_json(output / "report.json", report)
                 _write_csv(output / "summary.csv", report["variants"])
                 sm_mean = row["gpu_sm_utilization_mean_percent"]
@@ -1839,8 +1804,7 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
                 batch_rate = row["physical_batch_items_per_second"]
                 batch_rate_text = (
                     f"{batch_rate:15.2f}"
-                    if isinstance(batch_rate, (int, float))
-                    and not isinstance(batch_rate, bool)
+                    if isinstance(batch_rate, (int, float)) and not isinstance(batch_rate, bool)
                     else f"{'not-applicable':>15}"
                 )
                 print(
@@ -1896,12 +1860,8 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
     report["initial_state_sha256"] = common_fingerprint
     report["candidate_summary"] = {
         "planned": len(args.batch_sizes),
-        "passed": sum(
-            candidate["status"] == "passed" for candidate in report["batch_candidates"]
-        ),
-        "failed": sum(
-            candidate["status"] == "failed" for candidate in report["batch_candidates"]
-        ),
+        "passed": sum(candidate["status"] == "passed" for candidate in report["batch_candidates"]),
+        "failed": sum(candidate["status"] == "failed" for candidate in report["batch_candidates"]),
     }
     report["batch_candidate_analysis"] = _batch_candidate_analysis(
         report["batch_candidates"],

@@ -58,6 +58,9 @@ def test_disabled_bootstrap_keeps_multi_seed_statistics_but_is_explicitly_labell
         ("conductance_gat", "cora", "conductance"),
         ("cycle_pe", "zinc12k", "cycle_set"),
         ("cycle_pe", "zinc12k", "cycle_projector_pe_v2"),
+        ("cycle_pe", "zinc12k", "cycle_dfs_sparse_pe_v2"),
+        ("cycle_pe", "zinc12k", "cycle_dfs_se_v2"),
+        ("cycle_pe", "zinc12k", "cycle_dfs_relative_pe_v2"),
     ],
 )
 def test_benchmarks_aggregate_only_our_model_and_ignore_published_scores(

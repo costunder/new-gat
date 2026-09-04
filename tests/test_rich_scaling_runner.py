@@ -34,13 +34,14 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
     assert args.tracks == list(runner.TRACKS)
     assert args.conductance_versions == list(runner.CONDUCTANCE_MATRIX)
     assert args.cycle_versions == list(runner.CYCLE_VERSIONS)
+    assert args.cycle_v2_encodings == ["se", "pe"]
     assert args.profiles == list(runner.PROFILES)
     assert args.model_seeds == list(runner.DEFAULT_MODEL_SEEDS)
     assert [job["track"] for job in jobs] == ["conductance", "cycle", "tree"]
     assert runner._totals(jobs) == {
         "track_runs": 3,
-        "child_runs": 118,
-        "model_trainings": 122,
+        "child_runs": 122,
+        "model_trainings": 126,
     }
 
     conductance, cycle, tree = jobs
@@ -50,8 +51,10 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
         "large",
     ]
     assert _option(cycle["command"], "--model-seeds") == "0"
+    assert _options(cycle["command"], "--encodings") == ["se", "pe"]
+    assert cycle["requested_matrix"]["encodings_by_version"] == {"v1": [None], "v2": ["se", "pe"]}
     assert _options(cycle["command"], "--versions") == ["v1", "v2"]
-    assert _option(cycle["command"], "--basis-backend") == "thin_q"
+    assert _option(cycle["command"], "--basis-backend") == "dfs_fundamental"
     assert _option(tree["command"], "--profiles") == "reference,large"
     assert _option(tree["command"], "--model-seeds") == "0"
     assert _option(tree["command"], "--suites") == "csl,zinc"
@@ -96,7 +99,7 @@ def test_selection_and_download_flag_are_mapped_only_to_supported_child_clis(tmp
     )
     runner._validate(args)
     jobs = runner.make_jobs(args, "selected")
-    assert runner._totals(jobs)["model_trainings"] == (53 + 4 + 4) * 2 * 2
+    assert runner._totals(jobs)["model_trainings"] == (53 + 6 + 4) * 2 * 2
     assert "--allow-download" not in jobs[0]["command"]
     assert "--allow-download" in jobs[1]["command"]
     assert "--allow-download" in jobs[2]["command"]
@@ -124,8 +127,8 @@ def test_completed_conductance_v1_v4_can_be_excluded_from_integrated_plan(tmp_pa
     assert cycle["requested_matrix"]["versions"] == ["v1", "v2"]
     assert runner._totals([conductance, cycle, tree]) == {
         "track_runs": 3,
-        "child_runs": 32,
-        "model_trainings": 36,
+        "child_runs": 36,
+        "model_trainings": 40,
     }
     config = runner._config_payload(args, data_root=tmp_path / "data", results_root=tmp_path)
     assert config["conductance_versions"] == ["v5"]
@@ -150,8 +153,8 @@ def test_only_new_v5_and_cycle_v2_plan_has_no_legacy_trainings(tmp_path: Path):
     conductance, cycle = runner.make_jobs(args, "new-only")
     assert runner._totals([conductance, cycle]) == {
         "track_runs": 2,
-        "child_runs": 24,
-        "model_trainings": 24,
+        "child_runs": 28,
+        "model_trainings": 28,
     }
 
 
@@ -160,6 +163,7 @@ def test_only_new_v5_and_cycle_v2_plan_has_no_legacy_trainings(tmp_path: Path):
     [
         ("--conductance-versions", ["v5", "v5"], "conductance versions"),
         ("--cycle-versions", ["v2", "v2"], "cycle versions"),
+        ("--cycle-v2-encodings", ["se", "se"], "cycle V2 encodings"),
     ],
 )
 def test_duplicate_version_selection_is_rejected(option, values, message):
@@ -168,19 +172,18 @@ def test_duplicate_version_selection_is_rejected(option, values, message):
         runner._validate(args)
 
 
-def test_nondefault_cycle_v2_backend_requires_selected_v2():
-    args = runner.parser().parse_args(
-        [
-            "--tracks",
-            "cycle",
-            "--cycle-versions",
-            "v1",
-            "--cycle-v2-basis-backend",
-            "dfs_fundamental",
-        ]
-    )
-    with pytest.raises(ValueError, match="requires v2"):
-        runner._validate(args)
+def test_removed_cycle_qr_backend_is_rejected_before_planning():
+    with pytest.raises(SystemExit):
+        runner.parser().parse_args(
+            [
+                "--tracks",
+                "cycle",
+                "--cycle-versions",
+                "v1",
+                "--cycle-v2-basis-backend",
+                "thin_q",
+            ]
+        )
 
 
 def test_a6000_hardware_profile_is_forwarded_to_every_track_and_bound_to_config(
@@ -476,7 +479,7 @@ def test_dry_run_prints_complete_plan_without_writes_or_processes(
     )
     output = capsys.readouterr().out
     assert code == 0
-    assert "2 track runs; 12 child runs; 16 fresh model trainings" in output
+    assert "2 track runs; 16 child runs; 20 fresh model trainings" in output
     assert "conductance_versions=['v1', 'v2', 'v3', 'v4', 'v5']" in output
     assert "cycle_versions=['v1', 'v2']" in output
     assert "child profiles=['reference', 'large']" in output
@@ -538,17 +541,24 @@ def _write_summary(command: list[str], *, malformed: str | None = None) -> None:
         }
     elif script == "run_cycle_scaling.py":
         versions = _options(command, "--versions")
+        encodings = _options(command, "--encodings")
+        conditions = [
+            (version, encoding)
+            for version in versions
+            for encoding in (encodings if version == "v2" else [None])
+        ]
         datasets = _options(command, "--datasets")
         profiles = _options(command, "--profiles")
         seeds = [int(value) for value in _option(command, "--model-seeds").split(",")]
         rows = [
             {
                 "version": version,
+                "encoding": encoding,
                 "profile": profile,
                 "model_seed": seed,
                 "dataset": dataset,
             }
-            for version in versions
+            for version, encoding in conditions
             for profile in profiles
             for seed in seeds
             for dataset in datasets
@@ -556,45 +566,61 @@ def _write_summary(command: list[str], *, malformed: str | None = None) -> None:
         aggregates = [
             {
                 "version": version,
+                "encoding": encoding,
                 "dataset": dataset,
                 "profile": profile,
                 "model_seeds": sorted(seeds),
             }
-            for version in versions
+            for version, encoding in conditions
             for dataset in datasets
             for profile in profiles
         ]
         selections = [
             {
                 "version": version,
+                "encoding": encoding,
                 "dataset": dataset,
                 "selected_profile": profiles[0],
+                "profile_selection_id": (
+                    f"{version}:{encoding}:{dataset}"
+                    if encoding is not None
+                    else f"{version}:{dataset}"
+                ),
                 "model_seeds": seeds,
                 "test_used_for_selection": False,
             }
-            for version in versions
+            for version, encoding in conditions
             for dataset in datasets
         ]
         selected_checkpoints = [
             {
                 "version": selection["version"],
+                "encoding": selection["encoding"],
+                "profile_selection_id": selection["profile_selection_id"],
+                "checkpoint_id": f"{selection['profile_selection_id']}:model-seed-{seed}",
                 "dataset": selection["dataset"],
                 "model_seed": seed,
                 "selected_profile": selection["selected_profile"],
-                "checkpoint": f"{selection['version']}-{selection['dataset']}-{seed}.pt",
+                "checkpoint": f"{selection['profile_selection_id'].replace(':', '-')}-{seed}.pt",
                 "checkpoint_sha256": f"hash-{seed}",
             }
             for selection in selections
             for seed in seeds
         ]
         test_evaluations = [
-            {**checkpoint, "fresh_training": False} for checkpoint in selected_checkpoints
+            {
+                **checkpoint,
+                "fresh_training": False,
+                "test_evaluation_id": f"test:{checkpoint['checkpoint_id']}",
+            }
+            for checkpoint in selected_checkpoints
         ]
         output = results_root / "cycle_pe/scaling" / run_id
         payload = {
             "status": "failed" if malformed == "status" else "passed",
             "scope": "cycle_pe_v1_v2_larger_model_scaling",
             "requested_model_seeds": seeds,
+            "requested_encodings": encodings,
             "profiles": {profile: {} for profile in profiles},
             "runs": rows,
             "profile_aggregates": aggregates,
@@ -606,11 +632,12 @@ def _write_summary(command: list[str], *, malformed: str | None = None) -> None:
             "final_test_aggregates": [
                 {
                     "version": version,
+                    "encoding": encoding,
                     "dataset": dataset,
                     "model_seeds": seeds,
                     "selected_profiles": [profiles[0] for _seed in seeds],
                 }
-                for version in versions
+                for version, encoding in conditions
                 for dataset in datasets
             ],
         }
@@ -739,6 +766,95 @@ def _base_options(tmp_path: Path) -> list[str]:
     ]
 
 
+def _cycle_encoding_summary_fixture(tmp_path: Path):
+    args = runner.parser().parse_args(
+        [
+            "--tracks",
+            "cycle",
+            "--cycle-versions",
+            "v2",
+            *_base_options(tmp_path),
+        ]
+    )
+    runner._validate(args)
+    job = runner.make_jobs(args, "encoded")[0]
+    _write_summary(job["command"])
+    payload = json.loads(Path(job["summary_path"]).read_text(encoding="utf-8"))
+    assert runner._validate_cycle_summary(payload, job) == {"child_runs": 4, "model_trainings": 4}
+    return job, payload
+
+
+@pytest.mark.parametrize(
+    "section",
+    (
+        "runs",
+        "profile_aggregates",
+        "profile_selections",
+        "selected_checkpoints",
+        "test_evaluations",
+        "final_test_aggregates",
+    ),
+)
+def test_cycle_exact_matrix_rejects_equal_count_encoding_duplicates_in_every_section(
+    tmp_path, section
+):
+    job, payload = _cycle_encoding_summary_fixture(tmp_path)
+    rows = payload[section]
+    count = len(rows)
+    next(row for row in rows if row["encoding"] == "pe")["encoding"] = "se"
+    assert len(rows) == count
+    with pytest.raises(RuntimeError, match="duplicate|matrix mismatch"):
+        runner._validate_cycle_summary(payload, job)
+
+
+@pytest.mark.parametrize(
+    "section,field",
+    (
+        ("profile_selections", "profile_selection_id"),
+        ("selected_checkpoints", "profile_selection_id"),
+        ("selected_checkpoints", "checkpoint_id"),
+        ("test_evaluations", "profile_selection_id"),
+        ("test_evaluations", "checkpoint_id"),
+        ("test_evaluations", "test_evaluation_id"),
+    ),
+)
+def test_cycle_rejects_cross_encoding_selection_ids_even_with_an_exact_matrix(
+    tmp_path, section, field
+):
+    job, payload = _cycle_encoding_summary_fixture(tmp_path)
+    rows = payload[section]
+    se = next(row for row in rows if row["encoding"] == "se")
+    pe = next(row for row in rows if row["encoding"] == "pe" and row["dataset"] == se["dataset"])
+    pe[field] = se[field]
+    with pytest.raises(RuntimeError, match="invalid|wrong profile"):
+        runner._validate_cycle_summary(payload, job)
+
+
+def test_selected_pe_only_plan_does_not_schedule_or_certify_se(tmp_path):
+    args = runner.parser().parse_args(
+        [
+            "--tracks",
+            "cycle",
+            "--cycle-versions",
+            "v2",
+            "--cycle-v2-encodings",
+            "pe",
+            *_base_options(tmp_path),
+        ]
+    )
+    runner._validate(args)
+    job = runner.make_jobs(args, "pe-only")[0]
+    assert job["requested_matrix"]["encodings_by_version"] == {"v2": ["pe"]}
+    assert _options(job["command"], "--encodings") == ["pe"]
+    assert runner._totals([job]) == {"track_runs": 1, "child_runs": 2, "model_trainings": 2}
+    _write_summary(job["command"])
+    payload = json.loads(Path(job["summary_path"]).read_text(encoding="utf-8"))
+    assert runner._validate_cycle_summary(payload, job)["model_trainings"] == 2
+    payload["requested_encodings"] = ["se"]
+    with pytest.raises(RuntimeError, match="encoding selection"):
+        runner._validate_cycle_summary(payload, job)
+
+
 def test_success_runs_tracks_sequentially_and_certifies_all_summaries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -761,10 +877,10 @@ def test_success_runs_tracks_sequentially_and_certifies_all_summaries(
     assert manifest["status"] == "passed"
     assert manifest["planned_counts"] == {
         "track_runs": 3,
-        "child_runs": 59,
-        "model_trainings": 61,
+        "child_runs": 61,
+        "model_trainings": 63,
     }
-    assert manifest["completed_counts"]["verified_model_trainings"] == 61
+    assert manifest["completed_counts"]["verified_model_trainings"] == 63
     assert all(job["status"] == "passed" for job in manifest["jobs"])
     assert all(len(job["result"]["summary_sha256"]) == 64 for job in manifest["jobs"])
     assert manifest["protocol"]["execution_classification"] == "final_research_training"
@@ -884,10 +1000,10 @@ def test_partial_version_matrix_runs_and_validates_only_selected_versions(
     )
     assert manifest["planned_counts"] == {
         "track_runs": 2,
-        "child_runs": 12,
-        "model_trainings": 12,
+        "child_runs": 14,
+        "model_trainings": 14,
     }
-    assert manifest["completed_counts"]["verified_model_trainings"] == 12
+    assert manifest["completed_counts"]["verified_model_trainings"] == 14
     assert [job["requested_matrix"]["versions"] for job in manifest["jobs"]] == [
         ["v5"],
         ["v2"],
@@ -920,6 +1036,7 @@ def test_equal_count_duplicate_child_matrix_fails_closed(
         ("conductance", "condition"),
         ("conductance", "seed_set"),
         ("cycle", "version"),
+        ("cycle", "encoding"),
         ("cycle", "dataset"),
         ("cycle", "profile"),
         ("cycle", "model_seed"),
@@ -1140,6 +1257,7 @@ def test_resume_rejects_changed_config_and_source_without_launching_children(
     for changed_versions in (
         [*options, "--conductance-versions", "v5"],
         [*options, "--cycle-versions", "v2"],
+        [*options, "--cycle-v2-encodings", "pe"],
     ):
         assert runner.main(changed_versions) == 2
         assert manifest_path.read_text(encoding="utf-8") == original

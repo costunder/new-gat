@@ -96,9 +96,7 @@ def test_minibatch_tracks_accept_multiple_physical_candidates(track, dataset):
 
 
 def test_current_only_tracks_have_explicit_variant_policy_and_tree_rejects_compile():
-    cycle = speed.build_parser().parse_args(
-        ["--track", "cycle_pe_v1", "--include-compile"]
-    )
+    cycle = speed.build_parser().parse_args(["--track", "cycle_pe_v1", "--include-compile"])
     speed._validate(cycle)
     assert speed._planned_variants(cycle) == ["current", "compiled"]
 
@@ -478,10 +476,7 @@ def _run_variant_with_measured_failure(
         comparison_scope="unit failure path",
     )
     initial = case.make_model("current")
-    state = {
-        name: value.detach().clone()
-        for name, value in initial.state_dict().items()
-    }
+    state = {name: value.detach().clone() for name, value in initial.state_dict().items()}
     probe = {"integrity": {"status": "passed"}}
     monkeypatch.setattr(execution, "configure_execution", lambda *_args: {"mode": "unit"})
     monkeypatch.setattr(observability, "RuntimeResourceMonitor", UnitMonitor)
@@ -547,8 +542,7 @@ def test_variant_oom_metadata_survives_monitor_cleanup_failure(monkeypatch):
     assert monitor_type.latest.start_calls == 1
     assert monitor_type.latest.finish_calls == 1
     assert any(
-        "without replacing the primary error" in note
-        for note in getattr(oom, "__notes__", [])
+        "without replacing the primary error" in note for note in getattr(oom, "__notes__", [])
     )
 
 
@@ -599,8 +593,7 @@ def test_variant_keyboard_interrupt_finishes_monitor_once_and_reraises_same_obje
     assert RuntimeResourceMonitor.latest.start_calls == 1
     assert RuntimeResourceMonitor.latest.finish_calls == 1
     assert any(
-        "unit monitor cleanup during Ctrl-C" in note
-        for note in getattr(interrupt, "__notes__", [])
+        "unit monitor cleanup during Ctrl-C" in note for note in getattr(interrupt, "__notes__", [])
     )
 
 
@@ -696,7 +689,8 @@ def test_conductance_builder_uses_offline_loader_and_only_training_indices(monke
     assert comparison["passed"]
 
 
-def test_cycle_builder_selects_train_only_and_no_download(monkeypatch, tmp_path):
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_cycle_builder_selects_train_only_and_no_download(monkeypatch, tmp_path, encoding):
     from research.cycle_pe.v2 import data
 
     seen = {}
@@ -704,7 +698,8 @@ def test_cycle_builder_selects_train_only_and_no_download(monkeypatch, tmp_path)
     batch = SimpleNamespace(
         x=torch.zeros(4, 1, dtype=torch.long),
         edge_index=torch.tensor([[0, 1], [1, 2]]),
-        cycle_bases=(torch.ones(2, 1),),
+        cycle_basis_shapes=((2, 1),),
+        cycle_membership=torch.ones(2, 1).to_sparse().coalesce(),
         y=torch.zeros(1, 1),
     )
     batch.to = lambda _: batch
@@ -719,19 +714,25 @@ def test_cycle_builder_selects_train_only_and_no_download(monkeypatch, tmp_path)
 
     monkeypatch.setattr(data, "load_benchmark", load)
     monkeypatch.setattr(data, "collate", collate)
-    args = argparse.Namespace(dataset="zinc12k", data_root=tmp_path, batch_size=1)
+    args = argparse.Namespace(
+        dataset="zinc12k", data_root=tmp_path, batch_size=1, cycle_v2_encoding=encoding
+    )
     case = speed._build_cycle_case(args, torch.device("cpu"))
     assert seen["allow_download"] is False and seen["selected"] == train_graphs[:1]
-    assert case.description["basis_pairs"] == 2
+    assert case.description["cycle_memberships"] == 2
     assert case.description["actual_physical_batch_size"] == 1
     assert case.description["physical_batch_size_applicable"] is True
-    assert case.make_model("reference").basis_execution == "reference"
-    assert case.make_model("optimized").basis_execution == "batched"
+    assert not hasattr(case.make_model("current"), "basis_execution")
+    expected_name = {"se": "cycle_dfs_se_v2", "pe": "cycle_dfs_relative_pe_v2"}[encoding]
+    assert case.description["model_configuration"]["name"] == expected_name
+    assert case.description["model_configuration"]["encoding"] == encoding
+    assert case.make_model("current").encoding == encoding
+    assert speed._planned_variants(
+        argparse.Namespace(track="cycle_pe_v2", include_compile=True)
+    ) == ["current", "compiled"]
 
 
-def test_cycle_builder_rejects_candidate_larger_than_official_training_split(
-    monkeypatch, tmp_path
-):
+def test_cycle_builder_rejects_candidate_larger_than_official_training_split(monkeypatch, tmp_path):
     from research.cycle_pe.v2 import data
 
     monkeypatch.setattr(
@@ -744,9 +745,7 @@ def test_cycle_builder_rejects_candidate_larger_than_official_training_split(
         speed._build_cycle_case(args, torch.device("cpu"))
 
 
-def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(
-    monkeypatch, tmp_path
-):
+def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(monkeypatch, tmp_path):
     from research.conductance_gat.v5 import model, train
 
     batch = SimpleNamespace(
@@ -786,9 +785,7 @@ def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(
     monkeypatch.setattr(
         train,
         "configure_phase",
-        lambda instance, phase, phase_epoch: seen.update(
-            phase=phase, phase_epoch=phase_epoch
-        ),
+        lambda instance, phase, phase_epoch: seen.update(phase=phase, phase_epoch=phase_epoch),
     )
     monkeypatch.setattr(model, "GraphConditionedConductanceNodeClassifier", DummyV5)
     args = argparse.Namespace(
@@ -813,12 +810,8 @@ def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(
     assert seen["epoch"] == 1 and seen["seed"] == 9
     assert case.description["actual_physical_batch_size"] == 4
     assert case.description["physical_batch_size_unit"] == "seed_nodes"
-    assert "_training_batches" in case.description["production_path_identity"][
-        "training_batch"
-    ]
-    assert case.description["production_path_identity"]["loss"].endswith(
-        ".training_loss"
-    )
+    assert "_training_batches" in case.description["production_path_identity"]["training_batch"]
+    assert case.description["production_path_identity"]["loss"].endswith(".training_loss")
     assert case.description["v5_architecture"]["hidden_channels"] == 256
     candidate = case.make_model("current")
     assert seen["phase"] == "joint" and seen["phase_epoch"] == 0
@@ -926,9 +919,7 @@ def test_batch_recommendation_selects_fastest_safe_candidate_and_ignores_failure
     assert full_graph["training_batch_selection_performed"] is False
 
 
-def test_candidate_sweep_records_oom_and_continues_without_batch_fallback(
-    monkeypatch, tmp_path
-):
+def test_candidate_sweep_records_oom_and_continues_without_batch_fallback(monkeypatch, tmp_path):
     import chartgat.observability as observability
 
     resource = _resource_observation_for_test()
@@ -1027,9 +1018,7 @@ def test_candidate_sweep_records_oom_and_continues_without_batch_fallback(
     assert "unit candidate OOM" in failed["error"]
 
 
-def test_execute_persists_interrupted_candidate_and_reraises_same_object(
-    monkeypatch, tmp_path
-):
+def test_execute_persists_interrupted_candidate_and_reraises_same_object(monkeypatch, tmp_path):
     import chartgat.observability as observability
 
     interrupt = KeyboardInterrupt("unit execute Ctrl-C")
@@ -1245,15 +1234,11 @@ def test_tree_builder_uses_exact_padded_sampler_classification_loss_and_unit(tmp
     assert case.protocol["dataset_cache_integrity"]["full_cache_loaded"] is True
     assert case.protocol["constructed_training_chart_views"] == 2
     assert case.protocol["official_training_graphs"] == 2
-    assert "collate_chart_views" in case.description["production_path_identity"][
-        "batch"
-    ]
+    assert "collate_chart_views" in case.description["production_path_identity"]["batch"]
     model = case.make_model("current")
     assert model.hidden_dim == 128 and model.message_layers == 8
     predicted = torch.zeros(4, 10)
-    expected = torch.nn.functional.cross_entropy(
-        predicted, case.batch.targets[:, 0].long()
-    )
+    expected = torch.nn.functional.cross_entropy(predicted, case.batch.targets[:, 0].long())
     assert torch.equal(case.objective(predicted), expected)
     assert "chart views" in case.comparison_scope
     assert "zero parameter updates" in case.comparison_scope
@@ -1280,15 +1265,11 @@ def test_tree_builder_uses_all_arm_targets_for_exact_zinc_normalized_mse(tmp_pat
     assert normalization["mean"] == [2.0]
     assert normalization["scale"] == [1.0]
     predicted = torch.zeros_like(case.batch.targets)
-    expected = torch.nn.functional.mse_loss(
-        predicted, (case.batch.targets - 2.0) / 1.0
-    )
+    expected = torch.nn.functional.mse_loss(predicted, (case.batch.targets - 2.0) / 1.0)
     assert torch.equal(case.objective(predicted), expected)
 
 
-def test_tree_inputs_load_full_verified_cache_once_and_construct_both_arms(
-    monkeypatch, tmp_path
-):
+def test_tree_inputs_load_full_verified_cache_once_and_construct_both_arms(monkeypatch, tmp_path):
     from chartgat import seeds
     from research.tree_augmentation import paper
 

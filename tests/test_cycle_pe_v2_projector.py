@@ -1,141 +1,97 @@
-"""Mathematical and integration contracts for rebuilt Cycle PE v2."""
+"""Sparse DFS V2 integration contracts (legacy filename retained for test discovery)."""
 
 from __future__ import annotations
 
-import inspect
-
 import numpy as np
+import pytest
 import torch
 from scipy import sparse
 
+from research.cycle_pe.tests.test_v2_model import _disconnected_graph, _graph
 from research.cycle_pe.v2.basis import (
+    build_cycle_basis,
     incidence_and_cycle_rank,
-    left_nullspace_basis,
-    sparse_left_nullspace_basis,
     validate_cycle_basis,
 )
-from research.cycle_pe.v2.data import Graph, collate
-from research.cycle_pe.v2.model import CycleBasisPEModel, LeftNullBasisEncoder
+from research.cycle_pe.v2.data import collate
+from research.cycle_pe.v2.model import CycleBasisPEModel
 
 EDGES = np.asarray([(0, 1), (2, 1), (2, 0), (3, 4), (5, 4), (5, 3)], dtype=np.int64).T
 
 
-def _projector(basis: np.ndarray) -> np.ndarray:
-    q, _ = np.linalg.qr(basis.astype(np.float64), mode="reduced")
-    return q @ q.T
-
-
-def test_sparse_basis_has_exact_cycle_dimension_and_is_in_left_nullspace():
-    # Two triangles plus isolated node 6: m-n+c = 6-7+3 = 2.
+def test_sparse_basis_has_exact_cycle_dimension_and_zero_incidence_residual():
     incidence, rank = incidence_and_cycle_rank(7, EDGES)
-    basis = sparse_left_nullspace_basis(7, EDGES)
+    basis = build_cycle_basis(7, EDGES)
     assert sparse.isspmatrix_csr(basis)
     assert rank == 2 and basis.shape == (6, 2)
-    np.testing.assert_allclose(incidence.T @ basis.toarray(), 0.0, atol=0.0)
-    assert np.linalg.matrix_rank(basis.toarray()) == rank
+    residual = incidence.T @ basis
+    residual.eliminate_zeros()
+    assert residual.nnz == 0
+    assert set(np.unique(basis.data)) <= {-1.0, 1.0}
     validate_cycle_basis(7, EDGES, basis)
 
-    q = left_nullspace_basis(7, EDGES)
-    np.testing.assert_allclose(q.T @ q, np.eye(rank), atol=2e-6)
-    np.testing.assert_allclose(incidence.T @ q, 0.0, atol=2e-6)
 
-
-def test_cycle_space_projector_transforms_correctly_under_orientation_and_permutation():
-    q = left_nullspace_basis(7, EDGES)
-    projector = _projector(q)
-
-    signs = np.asarray([-1, 1, -1, 1, -1, 1], dtype=np.float64)
+def test_reversing_edge_orientation_preserves_sparse_cycle_membership():
+    basis = build_cycle_basis(7, EDGES)
+    signs = np.asarray([-1, 1, -1, 1, -1, 1], dtype=np.float32)
     flipped_edges = EDGES.copy()
-    flipped = signs < 0
-    flipped_edges[:, flipped] = flipped_edges[::-1, flipped]
-    q_flipped = left_nullspace_basis(7, flipped_edges)
-    np.testing.assert_allclose(
-        _projector(q_flipped), signs[:, None] * projector * signs[None, :], atol=2e-6
-    )
-
-    permutation = np.asarray([5, 2, 0, 4, 1, 3])
-    q_permuted = left_nullspace_basis(7, EDGES[:, permutation])
-    np.testing.assert_allclose(
-        _projector(q_permuted), projector[np.ix_(permutation, permutation)], atol=2e-6
-    )
+    flipped_edges[:, signs < 0] = flipped_edges[::-1, signs < 0]
+    changed = build_cycle_basis(7, flipped_edges)
+    # Reversing a chord may also flip the whole cycle column; both row and
+    # column signs disappear in the selected unsigned membership.
+    difference = abs(changed) - abs(basis)
+    difference.eliminate_zeros()
+    assert difference.nnz == 0
+    validate_cycle_basis(7, flipped_edges, changed)
 
 
-def test_projector_kernel_encoder_is_basis_and_orientation_invariant_and_permutation_equivariant():
-    torch.manual_seed(9)
-    q = torch.from_numpy(left_nullspace_basis(7, EDGES))
-    bond = torch.randn(6, 5)
-    encoder = LeftNullBasisEncoder(5, 7).eval()
-    reference = encoder(bond, q)
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_preparation_batch_and_forward_never_factorize_or_densify_sparse_cycles(
+    monkeypatch, encoding
+):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("sparse DFS pipeline invoked dense conversion or factorization")
 
-    change = torch.tensor([[2.0, -0.5], [0.75, 1.5]])
-    torch.testing.assert_close(encoder(bond, q @ change), reference, atol=3e-5, rtol=3e-5)
-
-    signs = torch.tensor([-1.0, 1.0, -1.0, 1.0, -1.0, 1.0])
-    torch.testing.assert_close(encoder(bond, signs[:, None] * q), reference, atol=3e-5, rtol=3e-5)
-
-    permutation = torch.tensor([5, 2, 0, 4, 1, 3])
-    actual = encoder(bond[permutation], q[permutation])
-    torch.testing.assert_close(actual, reference[permutation], atol=3e-5, rtol=3e-5)
-
-    chunked = encoder.forward_batch(bond, (q,), pair_budget=7, orthonormal_input=True)
-    torch.testing.assert_close(chunked, reference, atol=3e-5, rtol=3e-5)
-
-
-def test_pair_free_low_rank_contraction_matches_explicit_kernel_and_bounds_core(monkeypatch):
-    torch.manual_seed(19)
-    q, _ = torch.linalg.qr(torch.randn(23, 4), mode="reduced")
-    values = torch.randn(23, 6, requires_grad=True)
-    encoder = LeftNullBasisEncoder(6, 8)
-    original_einsum = torch.einsum
-    core_sizes = []
-
-    def observed(equation, *operands):
-        result = original_einsum(equation, *operands)
-        if equation == "md,ma,mb->dab":
-            core_sizes.append(result.numel())
-        return result
-
-    monkeypatch.setattr(torch, "einsum", observed)
-    actual, leverage = encoder._projector_mix(q, values, pair_budget=7)
-    projector = q @ q.T
-    expected = projector.square() @ values
-    torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
-    torch.testing.assert_close(leverage, projector.diagonal(), atol=2e-6, rtol=2e-6)
-    actual.square().sum().backward()
-    assert values.grad is not None and torch.isfinite(values.grad).all()
-    assert core_sizes and max(core_sizes) <= 7
-    source = inspect.getsource(LeftNullBasisEncoder._projector_mix)
-    assert "projector_rows" not in source and "@ q.T" not in source
-
-
-def _graph(num_nodes: int, edges: list[tuple[int, int]]) -> Graph:
-    edge_index = torch.tensor(edges, dtype=torch.long).reshape(-1, 2).T
-    q = left_nullspace_basis(num_nodes, edge_index.numpy())
-    return Graph(
-        x=torch.arange(num_nodes, dtype=torch.long).remainder(28)[:, None],
-        edge_index=edge_index,
-        edge_attr=torch.zeros(len(edges), 1, dtype=torch.long),
-        y=torch.zeros(1),
-        cycle_basis=torch.from_numpy(q),
-        cycle_basis_is_orthonormal=torch.tensor(True),
-    )
-
-
-def test_deep_residual_model_runs_forward_backward_with_cycle_forest_and_isolate():
-    cyclic = _graph(4, [(0, 1), (1, 2), (2, 3), (0, 3), (0, 2)])
-    forest = _graph(3, [(0, 1)])
-    batch = collate([cyclic, forest])
+    for name in ("qr", "svd", "eigh", "eig", "inv", "pinv", "cholesky"):
+        monkeypatch.setattr(np.linalg, name, forbidden)
+        monkeypatch.setattr(torch.linalg, name, forbidden)
+    for kind in (sparse.csr_matrix, sparse.csc_matrix, sparse.coo_matrix):
+        monkeypatch.setattr(kind, "toarray", forbidden)
+    monkeypatch.setattr(torch.Tensor, "to_dense", forbidden)
+    graphs = [_graph(7, complete=True), _graph(3, forest=True), _disconnected_graph()]
+    batch = collate(graphs)
     model = CycleBasisPEModel(
-        dataset="zinc12k",
-        hidden=16,
-        pe_dim=8,
-        layers=6,
-        ffn_multiplier=2,
-        dropout=0.0,
-        basis_pair_budget=8,
+        dataset="zinc12k", encoding=encoding, hidden=16, pe_dim=8, layers=6
     )
     prediction = model(batch)
-    assert prediction.shape == (2, 1) and torch.isfinite(prediction).all()
-    prediction.square().mean().backward()
-    gradients = [parameter.grad for parameter in model.parameters() if parameter.requires_grad]
-    assert any(gradient is not None and torch.isfinite(gradient).all() for gradient in gradients)
+    assert prediction.shape == (3, 1) and torch.isfinite(prediction).all()
+    (prediction - batch.y).abs().mean().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_disjoint_sparse_batch_retains_every_cycle_and_membership_nonzero():
+    graphs = [_graph(4), _graph(7, complete=True), _graph(4, forest=True), _disconnected_graph()]
+    batch = collate(graphs)
+    assert batch.cycle_membership.layout == torch.sparse_coo
+    assert batch.cycle_membership.shape == (
+        sum(len(graph.edge_attr) for graph in graphs),
+        sum(graph.cycle_basis.shape[1] for graph in graphs),
+    )
+    assert batch.cycle_membership._nnz() == sum(graph.cycle_basis._nnz() for graph in graphs)
+    assert batch.cycle_lengths.shape == (batch.cycle_membership.shape[1],)
+    edge_ids, cycle_ids = batch.cycle_membership.indices()
+    assert torch.equal(batch.edge_graph_index[edge_ids], batch.cycle_graph_index[cycle_ids])
+    assert torch.all(batch.cycle_membership.values() == 1)
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_deep_residual_forward_backward_handles_cycles_forests_and_isolates(encoding):
+    batch = collate([_graph(5, complete=True), _graph(3, forest=True), _graph(1, forest=True)])
+    model = CycleBasisPEModel(
+        dataset="zinc12k", encoding=encoding, hidden=16, pe_dim=8, layers=6
+    )
+    assert len(model.layers) == 6
+    prediction = model(batch)
+    assert prediction.shape == (3, 1) and torch.isfinite(prediction).all()
+    (prediction - batch.y).square().mean().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())

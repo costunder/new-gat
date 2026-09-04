@@ -15,15 +15,19 @@ import torch
 import torch._dynamo
 
 from chartgat.execution import configure_execution
+from research.cycle_pe.tests.test_v2_model import _graph
 from research.cycle_pe.v2.data import Graph, collate
 from research.cycle_pe.v2.model import CycleBasisPEModel, LeftNullBasisEncoder
 
 
 @pytest.fixture
 def fresh_dynamo_cache():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(2)
     torch._dynamo.reset()
     yield
     torch._dynamo.reset()
+    torch.set_num_threads(previous)
 
 
 def _configure_counted_cpu_blocks(model, monkeypatch):
@@ -84,38 +88,40 @@ def _compare_parameter_gradients(actual, reference):
 
 
 @pytest.mark.usefixtures("fresh_dynamo_cache")
-def test_compiled_basis_mlp_blocks_keep_ten_ragged_shapes_outside_dynamo(monkeypatch, caplog):
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_compiled_basis_mlp_blocks_keep_ten_ragged_shapes_outside_dynamo(
+    monkeypatch, caplog, encoding
+):
     torch.manual_seed(601)
-    reference = LeftNullBasisEncoder(3, 4, column_chunk_size=2)
+    reference = LeftNullBasisEncoder(3, 4, encoding=encoding)
     model = copy.deepcopy(reference)
     counts, executions, report = _configure_counted_cpu_blocks(model, monkeypatch)
-    assert set(report["compiled_modules"]) == {"column_phi", "edge_psi", "output"}
+    assert set(report["compiled_modules"]) == {"column_phi", "cycle_mlp", "edge_psi", "output"}
     assert not counts  # Module.compile is lazy.
     middle_counts = None
     for edge_count in range(4, 14):
         model.zero_grad(set_to_none=True)
         reference.zero_grad(set_to_none=True)
-        bond = torch.randn(edge_count + 3, 3, requires_grad=True)
+        batch = collate([_graph(edge_count), _graph(4, complete=True)])
+        bond = torch.randn(len(batch.edge_attr), 3, requires_grad=True)
         reference_bond = bond.detach().clone().requires_grad_(True)
-        bases = (
-            torch.randn(edge_count, 2, requires_grad=True),
-            torch.randn(3, 1, requires_grad=True),
+        sparse_inputs = (
+            batch.cycle_membership, batch.cycle_lengths,
+            batch.edge_cycle_counts, batch.edge_cycle_features,
+            batch.cycle_position_values,
         )
-        reference_bases = tuple(basis.detach().clone().requires_grad_(True) for basis in bases)
-        actual = model.forward_batch(bond, bases, pair_budget=5)
-        expected = reference.forward_batch(reference_bond, reference_bases, pair_budget=5)
+        actual = model(bond, *sparse_inputs)
+        expected = reference(reference_bond, *sparse_inputs)
         torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
         weights = torch.randn_like(actual)
         (actual.square() * weights).sum().backward()
         (expected.square() * weights).sum().backward()
         torch.testing.assert_close(bond.grad, reference_bond.grad, atol=3e-6, rtol=3e-5)
-        for basis, reference_basis in zip(bases, reference_bases, strict=True):
-            torch.testing.assert_close(basis.grad, reference_basis.grad, atol=3e-6, rtol=3e-5)
         _compare_parameter_gradients(model, reference)
         if edge_count == 8:
             middle_counts = counts.copy()
-    # Varying the ragged Python pair scheduler no longer compiles the complete
-    # encoder for each shape. Size-one dimensions may have a separate graph.
+    # Sparse assembly and sparse products stay outside Dynamo; only shared
+    # learned MLPs compile as ragged edge/cycle counts change.
     assert counts == middle_counts
     assert counts
     assert set(executions) == set(report["compiled_modules"])
@@ -125,48 +131,28 @@ def test_compiled_basis_mlp_blocks_keep_ten_ragged_shapes_outside_dynamo(monkeyp
 
 
 def _cycle_graph(nodes: int) -> Graph:
-    edges = [(node, node + 1) for node in range(nodes - 1)] + [(0, nodes - 1)]
-    basis = torch.ones(nodes, 1) / nodes**0.5
-    basis[-1] = -basis[-1]
-    return Graph(
-        x=torch.randint(28, (nodes, 1)),
-        edge_index=torch.tensor(edges, dtype=torch.long).T,
-        edge_attr=torch.randint(4, (nodes, 1)),
-        y=torch.zeros(1),
-        cycle_basis=basis,
-        cycle_basis_is_orthonormal=torch.tensor(True),
-    )
+    return _graph(nodes)
 
 
 @pytest.mark.usefixtures("fresh_dynamo_cache")
-def test_compiled_full_model_blocks_preserve_forward_backward_and_empty_graphs(monkeypatch):
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_compiled_full_model_blocks_preserve_forward_backward_and_empty_graphs(
+    monkeypatch, encoding
+):
     torch.manual_seed(702)
     reference = CycleBasisPEModel(
-        dataset="zinc12k", hidden=6, pe_dim=4, layers=2, basis_pair_budget=5
+        dataset="zinc12k", encoding=encoding, hidden=6, pe_dim=4, layers=2
     )
     model = copy.deepcopy(reference)
     counts, executions, report = _configure_counted_cpu_blocks(model, monkeypatch)
     assert "pe_encoder.column_phi" in report["compiled_modules"]
+    assert "pe_encoder.cycle_mlp" in report["compiled_modules"]
     assert "layers.0.message" in report["compiled_modules"]
     assert "graph_trunk" in report["compiled_modules"]
     assert "pe_encoder" not in report["compiled_modules"]
     assert "layers.0" not in report["compiled_modules"]
-    forest = Graph(
-        x=torch.tensor([[1], [2]]),
-        edge_index=torch.tensor([[0], [1]]),
-        edge_attr=torch.tensor([[0]]),
-        y=torch.zeros(1),
-        cycle_basis=torch.empty(1, 0),
-        cycle_basis_is_orthonormal=torch.tensor(True),
-    )
-    edgeless = Graph(
-        x=torch.tensor([[3]]),
-        edge_index=torch.empty(2, 0, dtype=torch.long),
-        edge_attr=torch.empty(0, 1, dtype=torch.long),
-        y=torch.zeros(1),
-        cycle_basis=torch.empty(0, 0),
-        cycle_basis_is_orthonormal=torch.tensor(True),
-    )
+    forest = _graph(2, forest=True)
+    edgeless = _graph(1, forest=True)
     for nodes in (4, 7):
         model.zero_grad(set_to_none=True)
         reference.zero_grad(set_to_none=True)
@@ -182,6 +168,7 @@ def test_compiled_full_model_blocks_preserve_forward_backward_and_empty_graphs(m
     # The deep backbone has more heterogeneous Sequential layouts than this
     # deliberately shared counted backend's recompile cache admits.
     assert set(executions).issubset(set(report["compiled_modules"]))
-    assert {"pe_encoder.column_phi", "layers.0.message"}.issubset(executions)
+    required = {"pe_encoder.column_phi", "pe_encoder.cycle_mlp", "layers.0.message"}
+    assert required.issubset(executions)
     assert all(count <= 3 for count in counts.values()), counts
     reference.load_state_dict(model.state_dict(), strict=True)

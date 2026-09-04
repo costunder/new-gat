@@ -27879,6 +27879,60 @@ def weighted_degree(
     return degree
 
 
+class _ChunkedUndirectedPropagation(torch.autograd.Function):
+    """Exact sparse propagation with recomputed edge-feature products.
+
+    Ordinary autograd retains every chunk's gathered edge features until
+    backward. This implementation instead saves only node messages, scalar
+    edge weights and incidence indices: O(N * heads * width + E) storage.
+    Forward and first-order backward temporaries are bounded by the edge
+    chunk size; no edges or feature channels are omitted. Higher derivatives
+    are supported by differentiable backward operations, but requesting
+    create_graph=True necessarily retains that additional derivative graph
+    and is outside the first-order saved-memory bound.
+    """
+
+    @staticmethod
+    def forward(ctx, message, edge_weight, incidence, edge_chunk_size):
+        ctx.save_for_backward(message, edge_weight, incidence)
+        ctx.edge_chunk_size = edge_chunk_size
+        ctx.set_materialize_grads(False)
+        propagated = torch.zeros_like(message)
+        for start in range(0, edge_weight.numel(), edge_chunk_size):
+            stop = start + edge_chunk_size
+            tail, head = incidence[:, start:stop]
+            weight = edge_weight[start:stop, None, None]
+            propagated.index_add_(0, tail, weight * message[head])
+            propagated.index_add_(0, head, weight * message[tail])
+        return propagated
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is None:
+            return None, None, None, None
+        message, edge_weight, incidence = ctx.saved_tensors
+        need_message, need_weight = ctx.needs_input_grad[:2]
+        grad_message = torch.zeros_like(message) if need_message else None
+        weight_gradients = []
+        for start in range(0, edge_weight.numel(), ctx.edge_chunk_size):
+            stop = start + ctx.edge_chunk_size
+            tail, head = incidence[:, start:stop]
+            if need_message:
+                weight = edge_weight[start:stop, None, None]
+                grad_message.index_add_(0, tail, weight * grad_output[head])
+                grad_message.index_add_(0, head, weight * grad_output[tail])
+            if need_weight:
+                gradient = (grad_output[tail] * message[head]).sum(dim=(1, 2))
+                gradient = gradient + (grad_output[head] * message[tail]).sum(dim=(1, 2))
+                weight_gradients.append(gradient)
+        grad_weight = None
+        if need_weight:
+            grad_weight = (
+                torch.cat(weight_gradients) if weight_gradients else torch.zeros_like(edge_weight)
+            )
+        return grad_message, grad_weight, None, None
+
+
 def shared_head_diffusion(
     message: Tensor,
     relative_c: Tensor,
@@ -27938,14 +27992,15 @@ def shared_head_diffusion(
         effective, incidence, message.shape[0], edge_chunk_size=edge_chunk_size
     )
     active = degree > 0
-    inverse = torch.where(active, degree.rsqrt(), torch.zeros_like(degree))
-    propagated = torch.zeros_like(message_compute)
-    for start in range(0, effective.numel(), edge_chunk_size):
-        stop = start + edge_chunk_size
-        tail, head = incidence[:, start:stop]
-        weight = effective[start:stop] * inverse[tail] * inverse[head]
-        propagated.index_add_(0, tail, weight[:, None, None] * message_compute[head])
-        propagated.index_add_(0, head, weight[:, None, None] * message_compute[tail])
+    # Do not evaluate rsqrt(0) on isolates: its backward can otherwise create
+    # 0 * inf even though the forward where() selected the zero branch.
+    safe_degree = torch.where(active, degree, torch.ones_like(degree))
+    inverse = safe_degree.rsqrt() * active.to(compute_dtype)
+    tail, head = incidence
+    weight = effective * inverse[tail] * inverse[head]
+    propagated = _ChunkedUndirectedPropagation.apply(
+        message_compute, weight, incidence, edge_chunk_size
+    )
     node_beta = beta.to(compute_dtype)[node_graph].unsqueeze(-1)
     output = message_compute + node_beta * (propagated - active[:, None, None] * message_compute)
     return output.to(message.dtype)
@@ -39772,28 +39827,40 @@ import torch
 
 from research.cycle_pe.v2 import benchmark
 from research.cycle_pe.v2.data import DATASETS
-from research.cycle_pe.v2.model import MODEL_NAME
+from research.cycle_pe.v2.model import MODEL_NAME, MODEL_NAMES
 
 
-def test_v2_defaults_use_deep_projector_model_on_official_data() -> None:
+def test_v2_defaults_use_deep_sparse_dfs_model_on_official_data() -> None:
     args = benchmark.parser().parse_args([])
     assert tuple(args.datasets) == DATASETS == ("zinc12k", "peptides_struct")
     assert (args.hidden_dim, args.pe_dim, args.layers) == (128, 64, 10)
     assert (args.ffn_multiplier, args.dropout, args.layer_scale) == (4, 0.1, 0.1)
     assert (args.epochs, args.patience, args.lr, args.batch_size) == (300, 50, 1e-3, 32)
     assert args.max_parameters == 20_000_000
-    assert args.column_chunk_size == 16
-    assert args.basis_backend == "thin_q"
+    assert not hasattr(args, "column_chunk_size")
+    assert not hasattr(args, "basis_pair_budget")
+    assert args.basis_backend == "dfs_fundamental"
     assert args.hardware_profile == "portable" and args.prefetch_factor == 2
     assert args.workers == 4
     assert args.output_dir == Path("results/cycle_pe_v2/benchmark")
-    assert MODEL_NAME == "cycle_projector_pe_v2"
+    assert args.encoding == "se"
+    assert MODEL_NAME == "cycle_dfs_se_v2"
     assert not hasattr(args, "baselines")
     assert not hasattr(args, "tiny")
     assert not hasattr(args, "max_cycle_rank")
 
 
-@pytest.mark.parametrize("flag", ["--baselines", "--tiny", "--max-cycle-rank"])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--baselines",
+        "--tiny",
+        "--max-cycle-rank",
+        "--column-chunk-size",
+        "--basis-pair-budget",
+        "--basis-execution",
+    ],
+)
 def test_no_baseline_dummy_or_cycle_truncation_options(flag):
     with pytest.raises(SystemExit):
         benchmark.parser().parse_args([flag])
@@ -39805,7 +39872,7 @@ def test_v2_observability_reports_real_graph_and_batch_counts():
     graph.edge_index = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long)
     graph.edge_attr = torch.zeros(3, 2, dtype=torch.long)
     graph.y = torch.zeros(1)
-    graph.cycle_basis = torch.zeros(3, 1)
+    graph.cycle_basis = torch.ones(3, 1).to_sparse().coalesce()
     splits = {"train": [graph, graph], "validation": [graph], "test": [graph]}
 
     data_report = benchmark._cycle_data_observability("zinc12k", splits)
@@ -39814,6 +39881,7 @@ def test_v2_observability_reports_real_graph_and_batch_counts():
     assert data_report["actual_used_fraction_of_loaded_graphs"]["value"] == 1.0
     assert data_report["nodes_per_graph"]["total"] == 16
     assert data_report["canonical_undirected_edges_per_graph"]["total"] == 12
+    assert data_report["cycle_memberships_per_graph"]["total"] == 12
     assert data_report["official_full_graph_count"]["value"] == 12_000
     assert data_report["loaded_fraction_of_official_full_dataset"]["value"] == pytest.approx(
         4 / 12_000
@@ -39875,7 +39943,7 @@ def test_v2_first_task_gradient_validation_rejects_disconnected_and_nonfinite() 
         benchmark._validate_first_task_gradients(connected)
 
 
-def test_cpu_benchmark_training_and_invalid_chunk_size_are_rejected() -> None:
+def test_cpu_benchmark_training_and_invalid_batch_size_are_rejected() -> None:
     args = benchmark.parser().parse_args(["--device", "cpu"])
     with pytest.raises(RuntimeError, match="requires CUDA"):
         benchmark._validate(args)
@@ -39883,8 +39951,8 @@ def test_cpu_benchmark_training_and_invalid_chunk_size_are_rejected() -> None:
         benchmark._train_model("zinc12k", {}, args)
     args.prepare_only = True
     benchmark._validate(args)
-    args.column_chunk_size = 0
-    with pytest.raises(ValueError, match="column-chunk-size"):
+    args.batch_size = 0
+    with pytest.raises(ValueError, match="batch-size"):
         benchmark._validate(args)
 
 
@@ -39909,8 +39977,8 @@ def test_hashes_include_basis_data_encoder_and_reused_backbone_sources() -> None
 def test_prepare_only_records_separate_version_without_claiming_training(tmp_path, monkeypatch):
     loaded = []
 
-    def fake_load(root, dataset, *, allow_download, basis_backend):
-        loaded.append((dataset, allow_download, basis_backend))
+    def fake_load(root, dataset, *, allow_download, basis_backend, workers):
+        loaded.append((dataset, allow_download, basis_backend, workers))
         return {}, {"official_splits": True, "unit_fixture_only": True, "basis": "full_left_null"}
 
     monkeypatch.setattr(benchmark, "load_benchmark", fake_load)
@@ -39932,7 +40000,7 @@ def test_prepare_only_records_separate_version_without_claiming_training(tmp_pat
         )
         == 0
     )
-    assert loaded == [("zinc12k", False, "thin_q")]
+    assert loaded == [("zinc12k", False, "dfs_fundamental", 4)]
     metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     for document in (metrics, manifest):
@@ -39940,11 +40008,11 @@ def test_prepare_only_records_separate_version_without_claiming_training(tmp_pat
         assert document["track"] == "cycle_pe"
         assert document["version"] == "v2"
     assert metrics["datasets"]["zinc12k"]["models"] == {}
-    assert manifest["controls"]["model"] == "cycle_projector_pe_v2"
+    assert manifest["controls"]["model"] == "cycle_dfs_se_v2"
     assert "no truncation" in manifest["controls"]["basis_input"]
     assert manifest["controls"]["basis_rank_dependent_parameters"] is False
-    assert manifest["controls"]["basis_backend"] == "thin_q"
-    assert "projector is chart invariant" in manifest["seeds"]["chart_seed"]
+    assert manifest["controls"]["basis_backend"] == "dfs_fundamental"
+    assert "tree-dependent encoding" in manifest["seeds"]["chart_seed"]
     manifest_bytes = (output / "manifest.json").read_bytes()
     metrics_bytes = (output / "metrics.json").read_bytes()
     # A different dataset/data-root command must fail before mutating artifacts.
@@ -39982,7 +40050,7 @@ def test_dfs_backend_is_recorded_and_forwarded_to_data_preparation(tmp_path, mon
     assert seen == ["dfs_fundamental"]
     assert manifest["arguments"]["basis_backend"] == "dfs_fundamental"
     assert manifest["controls"]["basis_backend"] == "dfs_fundamental"
-    assert "not an end-to-end linear-time speedup" in manifest["controls"]["basis_backend_runtime"]
+    assert "no QR/SVD/Gram inverse" in manifest["controls"]["basis_backend_runtime"]
 
 
 def test_only_v2_model_is_dispatched_once_per_official_dataset(tmp_path, monkeypatch):
@@ -40001,6 +40069,82 @@ def test_only_v2_model_is_dispatched_once_per_official_dataset(tmp_path, monkeyp
     metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["status"] == "passed"
     assert all(set(entry["models"]) == {MODEL_NAME} for entry in metrics["datasets"].values())
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_encoding_identity_is_bound_to_dispatch_resume_and_manifest(
+    tmp_path, monkeypatch, encoding
+):
+    # Explicitly mocked protocol test: no official training is performed.
+    monkeypatch.setattr(benchmark, "_validate", lambda args: None)
+    monkeypatch.setattr(benchmark, "load_benchmark", lambda *args, **kwargs: ({}, {}))
+    observed = []
+
+    def fake_train(dataset, splits, args):
+        observed.append((dataset, args.encoding))
+        return {"validation": 0.5, "fresh_training": True}
+
+    monkeypatch.setattr(benchmark, "_train_model", fake_train)
+    output = tmp_path / encoding
+    command = ["--encoding", encoding, "--output-dir", str(output)]
+    assert benchmark.main(command) == 0
+    assert observed == [(dataset, encoding) for dataset in DATASETS]
+    metrics_path, manifest_path = output / "metrics.json", output / "manifest.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert all(
+        set(value["models"]) == {MODEL_NAMES[encoding]} for value in metrics["datasets"].values()
+    )
+    assert manifest["controls"]["encoding"] == encoding
+    assert manifest["architecture"]["model"] == MODEL_NAMES[encoding]
+    assert MODEL_NAMES[encoding] in manifest["architecture"]["reference_comparison"]
+    assert manifest["arguments"]["encoding"] == encoding
+    args = benchmark.parser().parse_args(command)
+    resume = benchmark._resume_configuration("zinc12k", args)
+    assert resume["arguments"]["encoding"] == encoding
+    assert resume["model"] == MODEL_NAMES[encoding]
+    previous = (metrics_path.read_bytes(), manifest_path.read_bytes())
+    other = "pe" if encoding == "se" else "se"
+    with pytest.raises(ValueError, match="does not match"):
+        benchmark.main(["--encoding", other, "--output-dir", str(output)])
+    assert previous == (metrics_path.read_bytes(), manifest_path.read_bytes())
+
+
+@pytest.mark.parametrize("tamper", ["model", "encoding", "source"])
+def test_selected_checkpoint_rejects_other_encoding_before_constructing_model(
+    tmp_path, monkeypatch, tamper
+):
+    checkpoint = tmp_path / "selected.pt"
+    checkpoint.write_bytes(b"explicit mocked checkpoint")
+    args = benchmark.parser().parse_args(
+        ["--encoding", "pe", "--test-checkpoint", str(checkpoint), "--datasets", "zinc12k"]
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(benchmark, "_hardware_report", lambda *args: {})
+    policy = benchmark._amp_policy(False, torch.device("cuda"))
+    saved_args = vars(args).copy()
+    saved_args["validation_only"] = True
+    saved_args["encoding"] = "se" if tamper == "encoding" else "pe"
+    payload = {
+        "state_dict": {},
+        "dataset": "zinc12k",
+        "model_seed": 0,
+        "model": MODEL_NAMES["se"] if tamper == "model" else MODEL_NAMES["pe"],
+        "arguments": saved_args,
+        "precision": benchmark._precision_identity(policy),
+        "implementation_sha256": {} if tamper == "source" else benchmark.implementation_hashes(),
+    }
+    monkeypatch.setattr(torch, "load", lambda *args, **kwargs: payload)
+
+    def forbidden_model(**kwargs):
+        raise AssertionError("wrong-condition checkpoint reached model construction")
+
+    monkeypatch.setattr(benchmark, "CycleBasisPEModel", forbidden_model)
+    with pytest.raises(
+        ValueError,
+        match="model mismatch|architecture mismatch for encoding|implementation/source mismatch",
+    ):
+        benchmark._evaluate_test_checkpoint("zinc12k", [], args)
 
 
 def test_preparation_failure_is_persisted_not_reported_as_success(tmp_path, monkeypatch):
@@ -40175,7 +40319,7 @@ def _official(num_nodes=4, edges=((0, 1), (1, 2), (2, 3), (0, 3)), *, dataset="z
     )
 
 
-def _graph(*args, basis_backend="thin_q", **kwargs):
+def _graph(*args, basis_backend="dfs_fundamental", **kwargs):
     return data.prepare_graph(
         _official(*args, **kwargs),
         dataset=kwargs.get("dataset", "zinc12k"),
@@ -40205,39 +40349,143 @@ def test_entire_left_nullspace_is_returned_for_connected_disconnected_and_empty(
     assert actual_rank == rank
     assert values.shape == (len(edges), rank)
     assert values.dtype == np.float32
-    assert values.flags.c_contiguous
-    np.testing.assert_allclose(incidence.T @ values, 0, atol=2e-7)
-    np.testing.assert_allclose(values.T @ values, np.eye(rank), atol=3e-7)
+    assert values.format == incidence.format == "csr"
+    np.testing.assert_allclose((incidence.T @ values).toarray(), 0, atol=2e-7)
+    if rank:
+        assert np.linalg.matrix_rank(values.toarray()) == rank
     basis.validate_cycle_basis(nodes, edge_index, values)
 
 
-def test_uses_sparse_fundamental_cycles_and_thin_qr_without_svd(monkeypatch):
+def test_uses_sparse_dfs_without_any_decomposition_or_dense_materialization(monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError("spectral/rank decomposition is forbidden")
 
-    for name in ("svd", "eig", "eigh", "matrix_rank"):
+    for name in ("svd", "eig", "eigh", "matrix_rank", "qr", "cholesky"):
         monkeypatch.setattr(basis.np.linalg, name, forbidden)
+    monkeypatch.setattr(basis.sparse.csr_matrix, "toarray", forbidden)
     pairs = [(u, v) for u in range(8) for v in range(u + 1, 8)]
     sparse_values = basis.sparse_left_nullspace_basis(8, _edges(pairs))
     values = basis.left_nullspace_basis(8, _edges(pairs))
     assert sparse_values.shape == (28, 21) and sparse_values.nnz < np.prod(sparse_values.shape)
     assert values.shape == (28, 21)
-    np.testing.assert_allclose(values.T @ values, np.eye(21), atol=2e-6)
+    basis.validate_cycle_basis(8, _edges(pairs), values)
 
 
-def test_dfs_fundamental_backend_returns_raw_signed_cycles_with_same_projector():
+def test_default_backend_returns_complete_raw_signed_dfs_basis():
     pairs = [(u, v) for u in range(5) for v in range(u + 1, 5)]
     edge_index = _edges(pairs)
     raw_sparse = basis.dfs_fundamental_cycle_basis(5, edge_index)
     raw = basis.build_cycle_basis(5, edge_index, backend="dfs_fundamental")
-    q = basis.build_cycle_basis(5, edge_index, backend="thin_q")
-    assert raw_sparse.shape == raw.shape == q.shape == (10, 6)
-    np.testing.assert_array_equal(raw, raw_sparse.toarray())
-    assert set(np.unique(raw)) <= {-1.0, 0.0, 1.0}
-    assert not np.allclose(raw.T @ raw, np.eye(6))
-    raw_q, _ = np.linalg.qr(raw.astype(np.float64), mode="reduced")
-    np.testing.assert_allclose(raw_q @ raw_q.T, q @ q.T, atol=2e-6)
+    default = basis.build_cycle_basis(5, edge_index)
+    assert raw_sparse.shape == raw.shape == default.shape == (10, 6)
+    np.testing.assert_array_equal(raw.toarray(), raw_sparse.toarray())
+    np.testing.assert_array_equal(raw.toarray(), default.toarray())
+    assert set(raw.data) <= {-1.0, 1.0}
+    assert basis.BASIS_BACKENDS == ("dfs_fundamental",)
     basis.validate_cycle_basis(5, edge_index, raw_sparse)
+
+
+def test_circular_positions_follow_chord_and_actual_tree_path_not_csr_row_order():
+    edges = _edges([(0, 1), (0, 4), (1, 2), (2, 3), (3, 4)])
+    values, positions = basis.build_cycle_coordinates(5, edges)
+    assert values.shape == (5, 1)
+    assert not np.array_equal(positions, np.arange(5))
+    rows = np.repeat(np.arange(5), np.diff(values.indptr))
+    ordered_edges = edges[:, rows[np.argsort(positions)]]
+    for index in range(5):
+        assert len(set(ordered_edges[:, index]) & set(ordered_edges[:, (index + 1) % 5])) == 1
+    factors = basis.cycle_position_factors(values, positions)
+    assert factors.shape == (2, values.nnz)
+    np.testing.assert_allclose(np.sum(factors * factors, axis=0), 1.0, atol=2e-7)
+    basis.validate_cycle_positions(5, edges, values, positions)
+
+
+@pytest.mark.parametrize("damage", ["duplicate", "out_of_range", "fractional", "nonadjacent"])
+def test_cycle_position_validator_rejects_fake_order_even_with_full_valid_basis(damage):
+    edges = _edges([(0, 1), (0, 4), (1, 2), (2, 3), (3, 4)])
+    values, positions = basis.build_cycle_coordinates(5, edges)
+    if damage == "duplicate":
+        positions[1] = positions[0]
+    elif damage == "out_of_range":
+        positions[0] = 5
+    elif damage == "fractional":
+        positions = positions.astype(np.float64) + 0.25
+    else:
+        first = int(np.flatnonzero(positions == 0)[0])
+        second = int(np.flatnonzero(positions == 1)[0])
+        positions[first], positions[second] = positions[second], positions[first]
+    basis.validate_cycle_basis(5, edges, values)
+    with pytest.raises(ValueError, match="position"):
+        basis.validate_cycle_positions(5, edges, values, positions)
+
+
+@pytest.mark.parametrize("shift", [0, 1, 3])
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_cached_positions_allow_cycle_origin_shift_reversal_and_independent_basis_sign(
+    shift, direction
+):
+    graph = _graph(5, [(0, 1), (0, 4), (1, 2), (2, 3), (3, 4)])
+    position_indices = (direction * graph.cycle_position_indices + shift) % 5
+    angle = 2.0 * torch.pi * position_indices.double() / 5
+    transformed = replace(
+        graph,
+        cycle_basis=-graph.cycle_basis,
+        cycle_position_indices=position_indices,
+        cycle_position_values=torch.stack((angle.cos(), angle.sin())).float(),
+    )
+    data.validate_graph(transformed, dataset="zinc12k")
+    first = graph.cycle_position_values.T @ graph.cycle_position_values
+    second = transformed.cycle_position_values.T @ transformed.cycle_position_values
+    torch.testing.assert_close(first, second)
+
+
+def test_cached_positions_and_lengths_follow_sparse_cycle_column_permutation():
+    graph = _graph(5, [(0, 1), (1, 2), (0, 2), (2, 3), (3, 4), (0, 4)])
+    indices = graph.cycle_basis.indices().numpy()
+    original = basis.sparse.coo_matrix(
+        (graph.cycle_basis.values().numpy(), (indices[0], indices[1])),
+        shape=tuple(graph.cycle_basis.shape),
+    ).tocsr()
+    order_matrix = basis.sparse.csr_matrix(
+        (graph.cycle_position_indices.numpy(), original.indices, original.indptr),
+        shape=original.shape,
+    )
+    permutation = np.arange(original.shape[1])[::-1].copy()
+    changed = original[:, permutation].tocsr()
+    changed.sort_indices()
+    changed_order = order_matrix[:, permutation].tocsr()
+    changed_order.sort_indices()
+    changed_positions = changed_order.data
+    assert changed_positions.shape == (original.nnz,)
+    changed_coo = changed.tocoo()
+    transformed = replace(
+        graph,
+        cycle_basis=torch.sparse_coo_tensor(
+            torch.from_numpy(np.vstack((changed_coo.row, changed_coo.col)).astype(np.int64)),
+            torch.from_numpy(changed_coo.data),
+            changed_coo.shape,
+            is_coalesced=True,
+            check_invariants=True,
+        ),
+        cycle_lengths=graph.cycle_lengths[torch.from_numpy(permutation)],
+        cycle_position_indices=torch.from_numpy(changed_positions),
+        cycle_position_values=torch.from_numpy(
+            basis.cycle_position_factors(changed, changed_positions)
+        ),
+    )
+    data.validate_graph(transformed, dataset="zinc12k")
+    for component in range(2):
+        original_factor = basis.sparse.csr_matrix(
+            (graph.cycle_position_values[component].numpy(), original.indices, original.indptr),
+            shape=original.shape,
+        )
+        changed_factor = basis.sparse.csr_matrix(
+            (transformed.cycle_position_values[component].numpy(), changed.indices, changed.indptr),
+            shape=changed.shape,
+        )
+        np.testing.assert_array_equal(
+            changed_factor.toarray(), original_factor[:, permutation].toarray()
+        )
 
 
 def test_unknown_basis_backend_fails_closed():
@@ -40245,16 +40493,26 @@ def test_unknown_basis_backend_fails_closed():
         basis.build_cycle_basis(3, _edges([(0, 1)]), backend="unknown")
     with pytest.raises(ValueError, match="basis_backend"):
         data.prepare_graph(_official(), basis_backend="unknown")
+    with pytest.raises(ValueError, match="retired"):
+        basis.build_cycle_basis(3, _edges([(0, 1)]), backend="thin_q")
 
 
-def test_generic_nonorthogonal_basis_is_valid_but_rank_deficiency_is_not():
+@pytest.mark.parametrize("scale", [1e-8, 1e-4, 1.0, 1e4, 1e8])
+def test_fundamental_basis_column_scales_and_signs_do_not_trigger_absolute_rank_threshold(scale):
     edge_index = _edges([(0, 1), (0, 2), (1, 2), (1, 3), (2, 3)])
     q = basis.left_nullspace_basis(4, edge_index)
-    changed = q @ np.asarray([[2.0, 0.5], [-1.0, 3.0]])
+    changed = q.toarray()[:, ::-1] * np.asarray([scale, -scale])
     basis.validate_cycle_basis(4, edge_index, changed)
     changed[:, 1] = changed[:, 0]
     with pytest.raises(ValueError, match="full column rank"):
         basis.validate_cycle_basis(4, edge_index, changed)
+
+
+def test_generic_mixed_basis_without_structural_witness_is_explicitly_unsupported():
+    edges = _edges([(0, 1), (0, 2), (1, 2), (1, 3), (2, 3)])
+    changed = basis.left_nullspace_basis(4, edges) @ np.asarray([[2.0, 0.5], [-1.0, 3.0]])
+    with pytest.raises(ValueError, match="arbitrary mixed bases are unsupported"):
+        basis.validate_cycle_basis(4, edges, changed)
 
 
 @pytest.mark.parametrize(
@@ -40283,8 +40541,8 @@ def test_arbitrary_edge_orientation_is_accepted_and_transports_projector():
     q, changed_q = basis.left_nullspace_basis(3, edges), basis.left_nullspace_basis(3, changed)
     signs = np.asarray([1.0, -1.0, 1.0])
     np.testing.assert_allclose(
-        changed_q @ changed_q.T,
-        signs[:, None] * (q @ q.T) * signs[None, :],
+        (changed_q @ changed_q.T).toarray(),
+        signs[:, None] * (q @ q.T).toarray() * signs[None, :],
         atol=2e-6,
     )
 
@@ -40292,7 +40550,7 @@ def test_arbitrary_edge_orientation_is_accepted_and_transports_projector():
 @pytest.mark.parametrize("kind", ["nonfinite", "wrong_width", "outside_nullspace", "rank", "half"])
 def test_basis_validation_rejects_incomplete_or_corrupt_coordinates(kind):
     edge_index = _edges([(0, 1), (0, 2), (1, 2)])
-    values = basis.left_nullspace_basis(3, edge_index)
+    values = basis.left_nullspace_basis(3, edge_index).toarray()
     if kind == "nonfinite":
         values[0, 0] = np.nan
     elif kind == "wrong_width":
@@ -40309,12 +40567,12 @@ def test_basis_validation_rejects_incomplete_or_corrupt_coordinates(kind):
 
 def test_edge_order_alignment_is_exact_not_assumed_lexicographic():
     pairs = _edges([(0, 1), (0, 2), (0, 3), (1, 2), (2, 3)])
-    original = basis.left_nullspace_basis(4, pairs)
+    original = basis.left_nullspace_basis(4, pairs).toarray()
     permutation = np.array([3, 0, 4, 1, 2])
-    transformed = basis.left_nullspace_basis(4, pairs[:, permutation])
+    transformed = basis.left_nullspace_basis(4, pairs[:, permutation]).toarray()
     # Different spanning forests may rotate coordinates; the spaces must agree.
     transported = original[permutation]
-    alignment = transported.T @ transformed
+    alignment = np.linalg.lstsq(transported, transformed, rcond=None)[0]
     np.testing.assert_allclose(transported @ alignment, transformed, atol=2e-7)
 
 
@@ -40329,7 +40587,11 @@ def test_official_chemistry_targets_preserved_and_directed_copies_sorted(dataset
         "edge_attr",
         "y",
         "cycle_basis",
-        "cycle_basis_is_orthonormal",
+        "cycle_lengths",
+        "edge_cycle_counts",
+        "edge_cycle_features",
+        "cycle_position_indices",
+        "cycle_position_values",
     }
     torch.testing.assert_close(graph.x, source.x)
     torch.testing.assert_close(graph.y, source.y)
@@ -40337,9 +40599,19 @@ def test_official_chemistry_targets_preserved_and_directed_copies_sorted(dataset
     torch.testing.assert_close(graph.edge_attr[:, 0], torch.tensor([3, 2, 1, 1]))
     assert graph.cycle_basis.shape == (4, 1)
     assert graph.cycle_basis.dtype == torch.float32
-    assert graph.cycle_basis_is_orthonormal.item() is True
+    assert graph.cycle_basis.layout == torch.sparse_coo and graph.cycle_basis.is_coalesced()
+    assert graph.cycle_position_indices.shape == (4,)
+    assert graph.cycle_position_values.shape == (2, 4)
+    assert sorted(graph.cycle_position_indices.tolist()) == list(range(4))
+    torch.testing.assert_close(graph.cycle_position_values.square().sum(dim=0), torch.ones(4))
+    torch.testing.assert_close(graph.cycle_lengths, torch.tensor([4.0]))
+    torch.testing.assert_close(graph.edge_cycle_counts, torch.ones(4))
+    torch.testing.assert_close(
+        graph.edge_cycle_features,
+        torch.tensor([[np.log1p(4), 0.25]], dtype=torch.float32).expand(4, 2),
+    )
     incidence, _ = basis.incidence_and_cycle_rank(4, graph.edge_index.numpy())
-    np.testing.assert_allclose(incidence.T @ graph.cycle_basis.numpy(), 0, atol=1e-7)
+    np.testing.assert_allclose(incidence.T @ graph.cycle_basis.to_dense().numpy(), 0, atol=1e-7)
 
 
 @pytest.mark.parametrize("kind", ["fractional_atom", "nonfinite_bond", "range", "copies", "loop"])
@@ -40378,7 +40650,7 @@ def test_dataset_categorical_and_target_schema_is_checked(kind):
         data.prepare_graph(source, dataset="zinc12k")
 
 
-def test_ragged_batch_keeps_whole_matrices_and_never_mixes_columns():
+def test_sparse_batch_keeps_every_cycle_and_never_mixes_graphs():
     graphs = [
         _graph(2, [(0, 1)]),
         _graph(4, [(0, 1), (0, 2), (0, 3), (1, 2), (2, 3)]),
@@ -40386,48 +40658,59 @@ def test_ragged_batch_keeps_whole_matrices_and_never_mixes_columns():
         _graph(),
     ]
     batch = data.collate(graphs)
-    assert isinstance(batch.cycle_bases, tuple)
-    assert [matrix.shape for matrix in batch.cycle_bases] == [(1, 0), (5, 2), (0, 0), (4, 1)]
+    assert batch.cycle_membership.layout == torch.sparse_coo
+    assert batch.cycle_membership.is_coalesced()
+    assert batch.cycle_membership.shape == (10, 3)
     torch.testing.assert_close(batch.ptr, torch.tensor([0, 2, 6, 7, 11]))
     torch.testing.assert_close(batch.edge_ptr, torch.tensor([0, 1, 6, 6, 10]))
     assert batch.cycle_basis_shapes == ((1, 0), (5, 2), (0, 0), (4, 1))
-    assert batch.cycle_basis_is_orthonormal == (True, True, True, True)
-    assert batch.packed_cycle_basis.is_contiguous()
-    assert batch.packed_cycle_basis.numel() == 14
+    assert batch.cycle_membership._nnz() == sum(g.cycle_basis._nnz() for g in graphs)
+    torch.testing.assert_close(
+        batch.cycle_position_values, torch.cat([g.cycle_position_values for g in graphs], dim=1)
+    )
+    matrix = batch.cycle_membership.to_dense()
+    cycle_start = 0
     for index, graph in enumerate(graphs):
-        torch.testing.assert_close(batch.cycle_bases[index], graph.cycle_basis)
-        assert batch.cycle_bases[index].untyped_storage().data_ptr() == (
-            batch.packed_cycle_basis.untyped_storage().data_ptr()
-        )
         start, end = batch.edge_ptr[index : index + 2]
+        cycle_end = cycle_start + graph.cycle_basis.shape[1]
+        torch.testing.assert_close(
+            matrix[start:end, cycle_start:cycle_end], graph.cycle_basis.to_dense().abs()
+        )
+        assert not matrix[start:end, :cycle_start].any()
+        assert not matrix[start:end, cycle_end:].any()
+        cycle_start = cycle_end
         torch.testing.assert_close(
             batch.edge_index[:, start:end] - batch.ptr[index], graph.edge_index
         )
     moved = batch.to(torch.device("cpu"))
-    assert isinstance(moved.cycle_bases, tuple)
-    for before, after in zip(batch.cycle_bases, moved.cycle_bases, strict=True):
-        torch.testing.assert_close(before, after)
+    torch.testing.assert_close(batch.cycle_membership, moved.cycle_membership)
+    row, col = batch.cycle_membership.indices()
+    torch.testing.assert_close(batch.edge_graph_index[row], batch.cycle_graph_index[col])
 
 
-def test_ragged_pin_memory_uses_one_packed_basis_tensor(monkeypatch):
+def test_sparse_pin_memory_pins_indices_and_values_not_unsupported_sparse_storage(monkeypatch):
     batch = data.collate([_graph(), _graph(1, [])])
     called = []
 
     def pin(tensor):
-        called.append(id(tensor))
+        assert tensor.layout == torch.strided
+        called.append(tensor)
         return tensor
 
     monkeypatch.setattr(torch.Tensor, "pin_memory", pin)
     pinned = batch.pin_memory()
-    assert isinstance(pinned.cycle_bases, tuple)
-    assert id(batch.packed_cycle_basis) in called
-    assert all(id(matrix) not in called for matrix in batch.cycle_bases)
-    assert len(called) == sum(
-        isinstance(getattr(batch, field.name), torch.Tensor) for field in fields(batch)
+    torch.testing.assert_close(pinned.cycle_membership, batch.cycle_membership)
+    assert any(
+        tensor.data_ptr() == batch.cycle_membership.indices().data_ptr() for tensor in called
+    )
+    assert any(tensor.data_ptr() == batch.cycle_membership.values().data_ptr() for tensor in called)
+    assert (
+        len(called)
+        == sum(isinstance(getattr(batch, field.name), torch.Tensor) for field in fields(batch)) + 1
     )
 
 
-def test_batch_to_transfers_packed_basis_once_not_once_per_graph(monkeypatch):
+def test_batch_to_transfers_one_blockdiagonal_membership_not_once_per_graph(monkeypatch):
     batch = data.collate([_graph(), _graph(), _graph(1, [])])
     transferred = []
     original = torch.Tensor.to
@@ -40438,9 +40721,31 @@ def test_batch_to_transfers_packed_basis_once_not_once_per_graph(monkeypatch):
 
     monkeypatch.setattr(torch.Tensor, "to", moved)
     result = batch.to("cpu")
-    assert transferred.count(id(batch.packed_cycle_basis)) == 1
-    assert all(id(matrix) not in transferred for matrix in batch.cycle_bases)
+    assert transferred.count(id(batch.cycle_membership)) == 1
+    assert transferred.count(id(batch.cycle_position_values)) == 1
+    assert not hasattr(result, "cycle_position_indices")
     assert result.cycle_basis_shapes == batch.cycle_basis_shapes
+
+
+def test_collate_does_not_repeat_static_nullspace_algebra_or_finite_scans(monkeypatch):
+    graphs = [_graph(), _graph(2, [(0, 1)])]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("fixed graph algebra must not repeat per minibatch")
+
+    monkeypatch.setattr(data, "validate_cycle_basis", forbidden)
+    monkeypatch.setattr(torch, "isfinite", forbidden)
+    for _ in range(3):
+        assert data.collate(graphs).cycle_membership._nnz() == 4
+
+
+def test_all_forest_batch_retains_empty_cycle_dimension():
+    batch = data.collate([_graph(2, [(0, 1)]), _graph(1, [])])
+    assert batch.cycle_membership.shape == (1, 0)
+    assert batch.cycle_membership._nnz() == 0
+    assert batch.cycle_lengths.shape == (0,)
+    assert batch.cycle_position_values.shape == (2, 0)
+    torch.testing.assert_close(batch.edge_cycle_counts, torch.zeros(1))
 
 
 def test_collation_rejects_empty_or_inconsistent_graph_schemas():
@@ -40455,6 +40760,13 @@ def test_collation_rejects_empty_or_inconsistent_graph_schemas():
 def _install_official_fixture(monkeypatch):
     official = {split: [_official(), _official(2, [])] for split in data.SPLITS}
     monkeypatch.setattr(data, "load_official_splits", lambda *args, **kwargs: official)
+    original_load = data.load_benchmark
+
+    def fixture_load(*args, **kwargs):
+        kwargs.setdefault("workers", 0)  # Explicit serial synthetic/cache fixtures only.
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(data, "load_benchmark", fixture_load)
     return official
 
 
@@ -40477,11 +40789,8 @@ def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_basis_rebui
     _install_official_fixture(monkeypatch)
     first, protocol = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
     assert protocol["official_splits"]
-    assert (
-        protocol["preparation"]["representation"]
-        == "coordinate_free_cycle_projector_from_cached_thin_q"
-    )
-    assert data.CACHE_NAMESPACE == "cycle_pe_v2_projector_kernel_benchmark"
+    assert protocol["preparation"]["representation"] == "ordered_sparse_dfs_cycle_coordinates"
+    assert data.CACHE_NAMESPACE == "cycle_pe_v2_ordered_dfs_benchmark"
     assert set(protocol["preparation"]["implementation_sha256"]) == {
         "v2/basis.py",
         "v2/data.py",
@@ -40490,9 +40799,9 @@ def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_basis_rebui
     assert not (tmp_path / "cycle_pe_benchmark").exists()
 
     def no_svd(*args, **kwargs):
-        raise AssertionError("cached thin-Q matrices must not be recomputed")
+        raise AssertionError("cached sparse DFS matrices must not be recomputed")
 
-    monkeypatch.setattr(data, "build_cycle_basis", no_svd)
+    monkeypatch.setattr(data, "build_cycle_coordinates", no_svd)
     second, restored = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
     assert restored == protocol
     for split in data.SPLITS:
@@ -40503,17 +40812,26 @@ def test_cache_roundtrip_is_isolated_hashes_implementation_and_skips_basis_rebui
                 )
 
 
-def test_basis_backends_use_separate_caches_and_preserve_representation_metadata(
+def test_retired_q_backend_rejected_without_creating_or_overwriting_legacy_cache(
     tmp_path, monkeypatch
 ):
     _install_official_fixture(monkeypatch)
-    thin, thin_protocol = data.load_benchmark(
-        tmp_path,
-        "zinc12k",
-        allow_download=False,
-        splits=("train",),
-        basis_backend="thin_q",
-    )
+    legacy = tmp_path / "cycle_pe_v2_projector_kernel_benchmark" / "old-cache"
+    legacy.mkdir(parents=True)
+    marker = legacy / "keep.txt"
+    marker.write_text("existing results must be preserved")
+    support_legacy = tmp_path / "cycle_pe_v2_sparse_dfs_benchmark" / "support-only-cache"
+    support_legacy.mkdir(parents=True)
+    support_marker = support_legacy / "keep.txt"
+    support_marker.write_text("existing support-only cycle SE cache must be preserved")
+    with pytest.raises(ValueError, match="basis_backend"):
+        data.load_benchmark(
+            tmp_path,
+            "zinc12k",
+            allow_download=False,
+            splits=("train",),
+            basis_backend="thin_q",
+        )
     raw, raw_protocol = data.load_benchmark(
         tmp_path,
         "zinc12k",
@@ -40521,18 +40839,14 @@ def test_basis_backends_use_separate_caches_and_preserve_representation_metadata
         splits=("train",),
         basis_backend="dfs_fundamental",
     )
-    assert thin_protocol["cache_directory"] != raw_protocol["cache_directory"]
-    assert thin_protocol["basis_backend"] == "thin_q"
     assert raw_protocol["basis_backend"] == "dfs_fundamental"
-    assert "not an end-to-end linear-time speedup" in raw_protocol["basis_runtime"]
-    assert all(graph.cycle_basis_is_orthonormal.item() for graph in thin["train"])
-    assert not any(graph.cycle_basis_is_orthonormal.item() for graph in raw["train"])
+    assert "no QR/SVD/projector" in raw_protocol["basis_runtime"]
+    assert "selected DFS forest can affect" in raw_protocol["basis_coordinates"]
+    assert marker.read_text() == "existing results must be preserved"
+    assert support_marker.read_text() == "existing support-only cycle SE cache must be preserved"
     raw_cycle = raw["train"][0].cycle_basis
-    assert set(raw_cycle.unique().tolist()) <= {-1.0, 0.0, 1.0}
-    assert not torch.allclose(
-        raw_cycle.T @ raw_cycle,
-        torch.eye(raw_cycle.shape[1], dtype=raw_cycle.dtype),
-    )
+    assert raw_cycle.layout == torch.sparse_coo
+    assert set(raw_cycle.values().tolist()) <= {-1.0, 1.0}
 
 
 @pytest.mark.parametrize("missing", ["payload", "metadata"])
@@ -40545,7 +40859,23 @@ def test_incomplete_cache_fails_closed(tmp_path, monkeypatch, missing):
         data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
 
 
-@pytest.mark.parametrize("damage", ["metadata", "checksum", "schema", "basis", "target", "count"])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "metadata",
+        "checksum",
+        "schema",
+        "basis",
+        "target",
+        "count",
+        "lengths",
+        "membership_counts",
+        "dense",
+        "structural",
+        "position_values",
+        "position_indices",
+    ],
+)
 def test_damaged_or_numeric_invalid_cache_is_rejected_not_rebuilt(tmp_path, monkeypatch, damage):
     _install_official_fixture(monkeypatch)
     _, protocol = data.load_benchmark(tmp_path, "zinc12k", allow_download=False)
@@ -40562,6 +40892,18 @@ def test_damaged_or_numeric_invalid_cache_is_rejected_not_rebuilt(tmp_path, monk
             rows[0]["cycle_basis"].zero_()
         elif damage == "target":
             rows[0]["y"] += 1
+        elif damage == "lengths":
+            rows[0]["cycle_lengths"] += 1
+        elif damage == "membership_counts":
+            rows[0]["edge_cycle_counts"] += 1
+        elif damage == "dense":
+            rows[0]["cycle_basis"] = rows[0]["cycle_basis"].to_dense()
+        elif damage == "structural":
+            rows[0]["edge_cycle_features"] += 1
+        elif damage == "position_values":
+            rows[0]["cycle_position_values"].zero_()
+        elif damage == "position_indices":
+            rows[0]["cycle_position_indices"].zero_()
         else:
             rows.pop()
         _rewrite_cache(cache, meta, rows)
@@ -40589,12 +40931,105 @@ def test_no_v1_summary_or_preparer_is_used(monkeypatch):
     monkeypatch.setattr(benchmark_data, "cycle_statistics", forbidden)
     graph = _graph()
     assert graph.cycle_basis.shape == (4, 1)
+
+
+def test_random_sparse_dfs_certifies_entire_nullspace_with_oriented_disconnected_graphs():
+    rng = np.random.default_rng(37)
+    for nodes in range(1, 17):
+        for probability in (0.08, 0.25, 0.6):
+            pairs = [
+                (u, v)
+                for u in range(nodes)
+                for v in range(u + 1, nodes)
+                if rng.random() < probability
+            ]
+            edges = _edges(pairs)
+            flips = rng.random(len(pairs)) < 0.5
+            edges[:, flips] = edges[::-1, flips]
+            incidence, rank = basis.incidence_and_cycle_rank(nodes, edges)
+            values = basis.build_cycle_basis(nodes, edges)
+            assert incidence.nnz == 2 * len(pairs)
+            assert values.shape == (len(pairs), rank)
+            assert (incidence.T @ values).nnz == 0
+            if rank:
+                assert np.linalg.matrix_rank(values.toarray()) == rank
+
+
+def test_actual_process_parallel_preparation_and_cached_validation_preserve_full_order():
+    # Explicit synthetic process-pool smoke, not official training.
+    sources = [
+        _official(),
+        _official(2, []),
+        _official(3, [(0, 1), (1, 2), (0, 2)]),
+        _official(1, []),
+    ]
+    expected = [data.prepare_graph(source, dataset="zinc12k") for source in sources]
+    actual = data._prepare_split(
+        sources,
+        dataset="zinc12k",
+        split="smoke",
+        basis_backend="dfs_fundamental",
+        workers=2,
+    )
+    rows = [{field.name: getattr(graph, field.name) for field in fields(graph)} for graph in actual]
+    restored = data._validate_cached_graphs(rows, sources, "zinc12k", workers=2)
+    for first, parallel, cached in zip(expected, actual, restored, strict=True):
+        for field in fields(first):
+            torch.testing.assert_close(getattr(first, field.name), getattr(parallel, field.name))
+            torch.testing.assert_close(getattr(first, field.name), getattr(cached, field.name))
+
+
+def test_parallel_submission_bounds_only_inflight_buffer_not_total_graph_count():
+    class Executor:
+        pending = 0
+        peak_pending = 0
+        submitted = 0
+
+        def submit(self, function, *args):
+            self.pending += 1
+            self.peak_pending = max(self.peak_pending, self.pending)
+            self.submitted += 1
+            owner = self
+
+            class Future:
+                def result(self):
+                    owner.pending -= 1
+                    return function(*args)
+
+            return Future()
+
+    executor = Executor()
+    result = list(
+        data._ordered_parallel_graphs(
+            executor,
+            lambda value: value * 3,
+            iter(range(101)),
+            workers=3,
+            chunksize=4,
+        )
+    )
+    assert result == [value * 3 for value in range(101)]
+    assert executor.peak_pending == 6
+    assert executor.pending == 0
+    assert executor.submitted == 26
+
+
+@pytest.mark.parametrize("workers,chunksize", [(0, 1), (1, 0)])
+def test_parallel_buffer_never_silently_discards_input_for_invalid_execution_settings(
+    workers, chunksize
+):
+    with pytest.raises(ValueError, match="positive"):
+        list(
+            data._ordered_parallel_graphs(
+                None, lambda value: value, [1], workers=workers, chunksize=chunksize
+            )
+        )
 ````
 
 # research/cycle_pe/tests/test_v2_model.py
 
 ````python
-"""Bounded forward/backward unit fixtures, never benchmark training or datasets."""
+"""Synthetic CPU/CUDA unit fixtures, never benchmark training or datasets."""
 
 from __future__ import annotations
 
@@ -40608,10 +41043,19 @@ import torch
 from research.cycle_pe.v2.data import Graph, collate, prepare_graph
 from research.cycle_pe.v2.model import (
     MODEL_NAME,
+    MODEL_NAMES,
     CycleBasisPEModel,
     LeftNullBasisEncoder,
     architecture_protocol,
 )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _bounded_cpu_threads():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(2)
+    yield
+    torch.set_num_threads(previous)
 
 
 def _graph(
@@ -40619,7 +41063,7 @@ def _graph(
     *,
     complete: bool = False,
     forest: bool = False,
-    basis_backend: str = "thin_q",
+    basis_backend: str = "dfs_fundamental",
 ) -> Graph:
     if complete:
         edges = [(u, v) for u in range(n) for v in range(u + 1, n)]
@@ -40641,446 +41085,546 @@ def _graph(
     )
 
 
-def test_no_raw_basis_coordinate_reaches_a_learned_layer() -> None:
-    graph = _graph(7, complete=True)
-    basis = graph.cycle_basis
-    encoder = LeftNullBasisEncoder(5, 8, column_chunk_size=4)
-    observed = []
-    hook = encoder.column_phi[0].register_forward_pre_hook(
-        lambda _module, args: observed.append(args[0].detach().clone())
-    )
-    output = encoder(torch.randn(len(basis), 5), basis)
-    hook.remove()
-    assert basis.shape == (21, 15)
-    assert output.shape == (21, 8)
-    assert len(observed) == 1
-    assert observed[0].shape == (21, 5)
-
-
-def test_every_basis_column_participates_in_autograd_and_parameters_are_rank_independent() -> None:
-    torch.manual_seed(23)
-    encoder = LeftNullBasisEncoder(7, 11, column_chunk_size=3)
-    parameters_before = sum(p.numel() for p in encoder.parameters())
-    for graph in (_graph(3), _graph(7, complete=True)):
-        basis = graph.cycle_basis.clone().requires_grad_()
-        output = encoder(torch.randn(len(basis), 7), basis)
-        output.square().sum().backward()
-        assert basis.grad is not None and torch.isfinite(basis.grad).all()
-        assert (basis.grad.abs().sum(dim=0) > 0).all()
-        assert sum(p.numel() for p in encoder.parameters()) == parameters_before
-
-
-def test_chunk_size_changes_rank_core_allocation_not_values_or_gradients(monkeypatch) -> None:
-    torch.manual_seed(7)
-    graph = _graph(6, complete=True)
-    encoder = LeftNullBasisEncoder(5, 9, column_chunk_size=1)
-    bond = torch.randn(len(graph.edge_attr), 5)
-    basis = graph.cycle_basis.clone().requires_grad_()
-    original_einsum = torch.einsum
-    core_shapes: list[tuple[int, ...]] = []
-
-    def observed(equation, *operands):
-        result = original_einsum(equation, *operands)
-        if equation == "md,ma,mb->dab":
-            core_shapes.append(tuple(result.shape))
-        return result
-
-    monkeypatch.setattr(torch, "einsum", observed)
-    expected = encoder(bond, basis)
-    expected.sum().backward()
-    gradient = basis.grad.clone()
-    one_column_shapes = tuple(core_shapes)
-    core_shapes.clear()
-    basis.grad = None
-    encoder.column_chunk_size = 4
-    actual = encoder(bond, basis)
-    actual.sum().backward()
-    four_column_shapes = tuple(core_shapes)
-    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
-    torch.testing.assert_close(basis.grad, gradient, atol=2e-6, rtol=2e-6)
-    assert one_column_shapes and four_column_shapes
-    assert len(one_column_shapes) > len(four_column_shapes)
-    assert all(shape[1:] == (1, 1) for shape in one_column_shapes)
-    assert any(max(shape[1:]) == 4 for shape in four_column_shapes)
-
-
-def test_pair_free_private_contract_handles_nonempty_rank_zero_input() -> None:
-    encoder = LeftNullBasisEncoder(5, 8)
-    q = torch.empty(4, 0)
-    values = torch.randn(4, 8, requires_grad=True)
-    mixed, leverage = encoder._projector_mix(q, values, pair_budget=1)
-    assert torch.equal(mixed, torch.zeros_like(values))
-    assert torch.equal(leverage, torch.zeros(4))
-
-
-def test_column_sign_and_order_symmetry_after_nonlinear_column_encoding() -> None:
-    torch.manual_seed(13)
-    graph = _graph(6, complete=True)
-    encoder = LeftNullBasisEncoder(7, 11, column_chunk_size=3)
-    bond = torch.randn(len(graph.edge_attr), 7)
-    rank = graph.cycle_basis.shape[1]
-    permutation = torch.randperm(rank)
-    signs = torch.where(torch.arange(rank) % 2 == 0, 1.0, -1.0)
-    changed = graph.cycle_basis[:, permutation] * signs
-    torch.testing.assert_close(encoder(bond, graph.cycle_basis), encoder(bond, changed))
-
-
-def test_independent_edge_orientation_signs_are_unobservable() -> None:
-    torch.manual_seed(17)
-    encoder = LeftNullBasisEncoder(7, 8)
-    bond = torch.randn(4, 7)
-    basis = torch.tensor([[0.2], [-0.3], [0.4], [-0.5]])
-    changed = basis.clone()
-    changed[1] *= -1
-    torch.testing.assert_close(basis.abs(), changed.abs())
-    torch.testing.assert_close(encoder(bond, basis), encoder(bond, changed))
-
-
-def test_edge_order_equivariance_with_transported_full_basis() -> None:
-    torch.manual_seed(11)
-    graph = _graph(5, complete=True)
-    encoder = LeftNullBasisEncoder(7, 8)
-    bond = torch.randn(len(graph.edge_attr), 7)
-    order = torch.randperm(len(bond))
-    torch.testing.assert_close(
-        encoder(bond, graph.cycle_basis)[order],
-        encoder(bond[order], graph.cycle_basis[order]),
-    )
-
-
-def test_forest_has_exact_zero_pe_even_with_nonzero_mlp_biases() -> None:
-    encoder = LeftNullBasisEncoder(5, 8)
-    for parameter in encoder.parameters():
-        torch.nn.init.constant_(parameter, 0.3)
-    for edges in (0, 4):
-        value = encoder(torch.randn(edges, 5), torch.empty(edges, 0))
-        assert value.shape == (edges, 8)
-        assert torch.equal(value, torch.zeros_like(value))
-
-
-def test_full_model_ragged_batch_matches_individual_graphs_and_backpropagates() -> None:
-    torch.manual_seed(5)
-    model = CycleBasisPEModel(dataset="zinc12k", hidden=12, pe_dim=6, layers=2, column_chunk_size=2)
-    graphs = [_graph(4), _graph(5, complete=True), _graph(3, forest=True)]
-    batch = collate(graphs)
-    output = model(batch)
-    assert output.shape == (3, 1)
-    assert all(hasattr(layer, "edge_ffn") and hasattr(layer, "node_ffn") for layer in model.layers)
-    (output - batch.y).abs().mean().backward()
-    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
-    model.eval()
-    with torch.no_grad():
-        combined = model(batch)
-        separate = torch.cat([model(collate([graph])) for graph in graphs])
-    torch.testing.assert_close(combined, separate, atol=3e-6, rtol=3e-6)
-
-
-def test_full_model_is_node_permutation_invariant_only_with_transported_chart() -> None:
-    torch.manual_seed(4)
-    graph = _graph(5, complete=True)
-    model = CycleBasisPEModel(dataset="zinc12k", hidden=12, pe_dim=6, layers=2).eval()
-    permutation = torch.tensor([3, 0, 4, 1, 2])
-    inverse = torch.argsort(permutation)
-    transported = replace(graph, x=graph.x[permutation], edge_index=inverse[graph.edge_index])
-    # Keep each incidence edge's original orientation and its entire U row.
-    torch.testing.assert_close(model(collate([graph])), model(collate([transported])))
-
-
-def test_optional_amp_keeps_full_basis_and_scatter_arithmetic_valid() -> None:
-    model = CycleBasisPEModel(dataset="zinc12k", hidden=12, pe_dim=6, layers=2)
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        result = model(collate([_graph(4), _graph(5, complete=True)]))
-    assert torch.isfinite(result).all()
-
-
-@pytest.mark.parametrize("dataset,width,targets", [("zinc12k", 1, 1), ("peptides_struct", 9, 11)])
-def test_official_target_width_parameter_budget_and_edgeless_readout(dataset, width, targets):
-    model = CycleBasisPEModel(dataset=dataset)
-    graph = _graph(1, forest=True)
-    graph.x = torch.zeros((1, width), dtype=torch.long)
-    graph.edge_attr = torch.empty((0, 1 if dataset == "zinc12k" else 3), dtype=torch.long)
-    graph.y = torch.zeros(targets)
-    output = model(collate([graph]))
-    assert output.shape == (1, targets)
-    assert torch.isfinite(output).all()
-    parameters = sum(p.numel() for p in model.parameters())
-    assert 1_000_000 < parameters <= 20_000_000
-
-
-@pytest.mark.parametrize("kwargs", [{"bond_dim": 0}, {"pe_dim": 0}, {"column_chunk_size": 0}])
-def test_encoder_rejects_invalid_sizes(kwargs):
-    arguments = {"bond_dim": 5, "pe_dim": 8, **kwargs}
-    with pytest.raises(ValueError, match="positive"):
-        LeftNullBasisEncoder(**arguments)
-
-
-def test_basis_schema_errors_fail_loudly() -> None:
-    encoder = LeftNullBasisEncoder(5, 8)
-    with pytest.raises(ValueError, match="shape"):
-        encoder(torch.zeros(3, 5), torch.zeros(2, 1))
-    with pytest.raises(ValueError, match="floating point"):
-        encoder(torch.zeros(3, 5), torch.zeros(3, 1, dtype=torch.long))
-    with pytest.raises(ValueError, match="edgeless"):
-        encoder(torch.zeros(0, 5), torch.zeros(0, 1))
-
-
-def test_protocol_names_intrinsic_projector_and_deep_backbone() -> None:
-    protocol = architecture_protocol()
-    assert MODEL_NAME == "cycle_projector_pe_v2"
-    assert "P=Q Q.T" in protocol["positional_encoding"]
-    assert "invertible cycle-basis replacement" in protocol["symmetry"]
-    assert "pre-norm residual" in protocol["backbone"]
-
-
-def _disconnected_graph(*, basis_backend: str = "thin_q") -> Graph:
-    edges = [(0, 1), (0, 2), (1, 2), (3, 4), (3, 5), (4, 5)]
+def _disconnected_graph(*, basis_backend: str = "dfs_fundamental") -> Graph:
+    edges = [(0, 1), (0, 2), (1, 2), (3, 4), (3, 5), (4, 5), (5, 6)]
     return prepare_graph(
         SimpleNamespace(
-            num_nodes=6,
-            x=torch.arange(6).reshape(-1, 1),
-            edge_index=torch.tensor(edges + [(v, u) for u, v in edges], dtype=torch.long).T,
-            edge_attr=torch.ones((2 * len(edges), 1), dtype=torch.long),
-            y=torch.tensor([0.7]),
+            num_nodes=8,
+            x=torch.arange(8).reshape(-1, 1),
+            edge_index=torch.tensor(edges + [(v, u) for u, v in edges]).T.contiguous(),
+            edge_attr=torch.ones(2 * len(edges), 1, dtype=torch.long),
+            y=torch.tensor([0.4]),
         ),
         basis_backend=basis_backend,
     )
 
 
-def _assert_parameter_gradients_match(first: torch.nn.Module, second: torch.nn.Module) -> None:
-    actual = dict(first.named_parameters())
-    expected = dict(second.named_parameters())
+def _encode(encoder, bond, batch):
+    return encoder(
+        bond, batch.cycle_membership, batch.cycle_lengths,
+        batch.edge_cycle_counts, batch.edge_cycle_features,
+        batch.cycle_position_values,
+    )
+
+
+def _sparse(indices, values, shape):
+    return torch.sparse_coo_tensor(indices, values, shape, check_invariants=True).coalesce()
+
+
+def _assert_parameter_gradients_match(first, second):
+    actual, expected = dict(first.named_parameters()), dict(second.named_parameters())
     assert actual.keys() == expected.keys()
     for name, parameter in actual.items():
-        wanted = expected[name]
-        assert (parameter.grad is None) == (wanted.grad is None), name
-        if parameter.grad is not None:
-            torch.testing.assert_close(parameter.grad, wanted.grad, atol=3e-6, rtol=3e-5, msg=name)
+        assert parameter.grad is not None, name
+        assert expected[name].grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        torch.testing.assert_close(
+            parameter.grad, expected[name].grad, atol=4e-6, rtol=4e-5, msg=name
+        )
 
 
-@pytest.mark.parametrize("budget", [1, 5, 29, 32768])
-def test_batched_pair_encoder_matches_reference_outputs_and_every_gradient(budget):
-    torch.manual_seed(37)
-    graphs = [
-        _graph(4),
-        _graph(5, complete=True),
-        _graph(4, forest=True),
-        _graph(1, forest=True),
-        _disconnected_graph(),
-    ]
-    counts = [len(graph.edge_attr) for graph in graphs]
-    reference = LeftNullBasisEncoder(5, 9, column_chunk_size=3)
-    batched = copy.deepcopy(reference)
-    ref_bond = torch.randn(sum(counts), 5, requires_grad=True)
-    new_bond = ref_bond.detach().clone().requires_grad_()
-    ref_bases = tuple(graph.cycle_basis.clone().requires_grad_() for graph in graphs)
-    new_bases = tuple(basis.detach().clone().requires_grad_() for basis in ref_bases)
-    expected = torch.cat(
-        [
-            reference(part, basis)
-            for part, basis in zip(ref_bond.split(counts), ref_bases, strict=True)
-        ]
+def test_sparse_encoder_matches_explicit_edge_cycle_edge_reductions():
+    torch.manual_seed(11)
+    batch = collate([_graph(5, complete=True), _disconnected_graph(), _graph(3, forest=True)])
+    encoder = LeftNullBasisEncoder(5, 9)
+    bond = torch.randn(len(batch.edge_attr), 5)
+    actual = _encode(encoder, bond, batch)
+    edge_ids, cycle_ids = batch.cycle_membership.indices()
+    values = encoder.column_phi(bond)
+    cycle_sum = values.new_zeros((len(batch.cycle_lengths), encoder.pe_dim))
+    cycle_sum.index_add_(0, cycle_ids, values[edge_ids])
+    log_lengths = batch.cycle_lengths.log1p()[:, None]
+    cycle_hidden = encoder.cycle_mlp(
+        torch.cat((cycle_sum / batch.cycle_lengths[:, None], log_lengths), dim=1)
     )
-    actual = batched.forward_batch(new_bond, new_bases, pair_budget=budget)
+    edge_sum = values.new_zeros(values.shape)
+    edge_sum.index_add_(0, edge_ids, cycle_hidden[cycle_ids])
+    structure = torch.cat((log_lengths, batch.cycle_lengths.reciprocal()[:, None]), dim=1)
+    structural_sum = values.new_zeros((len(values), 2))
+    structural_sum.index_add_(0, edge_ids, structure[cycle_ids])
+    counts = batch.edge_cycle_counts[:, None]
+    active = (counts > 0).float()
+    features = torch.cat(
+        (
+            values * active,
+            edge_sum / counts.clamp_min(1),
+            counts.log1p(),
+            structural_sum / counts.clamp_min(1),
+        ),
+        dim=1,
+    )
+    expected = encoder.output(encoder.edge_psi(features)) * active
     torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
-    weights = torch.randn_like(expected)
-    (expected * weights).sum().backward()
-    (actual * weights).sum().backward()
-    torch.testing.assert_close(new_bond.grad, ref_bond.grad, atol=3e-6, rtol=3e-5)
-    for wanted, value in zip(ref_bases, new_bases, strict=True):
-        assert (wanted.grad is None) == (value.grad is None)
-        if wanted.grad is not None:
-            torch.testing.assert_close(value.grad, wanted.grad, atol=3e-6, rtol=3e-5)
-            assert (value.grad.abs().sum(dim=0) > 0).all()
-    _assert_parameter_gradients_match(batched, reference)
-    assert reference.state_dict().keys() == batched.state_dict().keys()
 
 
-@pytest.mark.parametrize("budget", [1, 7, 32768])
-def test_batched_encoder_keeps_graph_column_segments_signs_and_edge_order_separate(budget):
-    torch.manual_seed(31)
-    encoder = LeftNullBasisEncoder(5, 9, column_chunk_size=3)
-    bases = tuple(graph.cycle_basis for graph in [_graph(4, complete=True), _disconnected_graph()])
-    bonds = [torch.randn(len(basis), 5) for basis in bases]
-    expected = encoder.forward_batch(torch.cat(bonds), bases, pair_budget=budget)
-    changed, orders = [], []
-    for basis in bases:
-        rank = basis.shape[1]
-        columns, order = torch.randperm(rank), torch.randperm(len(basis))
-        signs = torch.where(torch.arange(rank) % 2 == 0, 1.0, -1.0)
-        changed.append(basis[order][:, columns] * signs)
-        orders.append(order)
-    actual = encoder.forward_batch(
-        torch.cat([bond[order] for bond, order in zip(bonds, orders, strict=True)]),
-        changed,
-        pair_budget=budget,
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_no_factorization_dense_cycle_matrix_or_graphwise_sparse_loop(monkeypatch, encoding):
+    batch = collate([_graph(4), _graph(5, complete=True), _disconnected_graph()])
+    model = CycleBasisPEModel(
+        dataset="zinc12k", encoding=encoding, hidden=16, pe_dim=8, layers=3
     )
-    expected_parts = expected.split([len(basis) for basis in bases])
+    calls = []
+    original_mm = torch.sparse.mm
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("factorization or sparse densification reached the model")
+
+    def observed(matrix, values, *args, **kwargs):
+        assert matrix.layout == torch.sparse_coo
+        assert matrix.dtype == values.dtype == torch.float32
+        calls.append((tuple(matrix.shape), tuple(values.shape)))
+        return original_mm(matrix, values, *args, **kwargs)
+
+    for name in ("qr", "svd", "eigh", "eig", "inv", "pinv", "cholesky"):
+        monkeypatch.setattr(torch.linalg, name, forbidden)
+    monkeypatch.setattr(torch.Tensor, "to_dense", forbidden)
+    monkeypatch.setattr(torch.sparse, "mm", observed)
+    prediction = model(batch)
+    (prediction - batch.y).abs().mean().backward()
+    edges, cycles = batch.cycle_membership.shape
+    expected_calls = [
+        ((cycles, edges), (edges, 8)),
+        ((edges, cycles), (cycles, 8)),
+    ]
+    if encoding == "pe":
+        expected_calls += [
+            ((cycles, edges), (edges, 8)),
+            ((cycles, edges), (edges, 8)),
+            ((edges, cycles), (cycles, 8)),
+            ((edges, cycles), (cycles, 8)),
+        ]
+    assert calls == expected_calls
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_every_selected_cycle_receives_task_gradient_without_rank_dependent_parameters():
+    torch.manual_seed(23)
+    encoder = LeftNullBasisEncoder(7, 11)
+    parameter_count = sum(p.numel() for p in encoder.parameters())
+    for graph in (_graph(3), _graph(7, complete=True), _disconnected_graph()):
+        batch = collate([graph])
+        cycle_outputs = []
+
+        def capture(_module, _args, output, captured=cycle_outputs):
+            output.retain_grad()
+            captured.append(output)
+
+        hook = encoder.cycle_mlp.register_forward_hook(capture)
+        output = _encode(encoder, torch.randn(len(graph.edge_attr), 7), batch)
+        output.square().sum().backward()
+        hook.remove()
+        assert len(cycle_outputs) == 1
+        hidden = cycle_outputs[0]
+        assert hidden.shape[0] == graph.cycle_basis.shape[1]
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+        assert (hidden.grad.abs().sum(dim=1) > 0).all()
+        assert parameter_count == sum(p.numel() for p in encoder.parameters())
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_cycle_sign_and_column_order_do_not_change_selected_membership_pe(encoding):
+    torch.manual_seed(19)
+    graph = _graph(6, complete=True)
+    rank = graph.cycle_basis.shape[1]
+    order = torch.randperm(rank)
+    inverse_order = torch.argsort(order)
+    indices = graph.cycle_basis.indices().clone()
+    signs = torch.where(torch.arange(rank) % 2 == 0, -1.0, 1.0)
+    values = graph.cycle_basis.values() * signs[indices[1]]
+    indices[1] = inverse_order[indices[1]]
+    transported = replace(
+        graph,
+        cycle_basis=_sparse(indices, values, graph.cycle_basis.shape),
+        cycle_lengths=graph.cycle_lengths[order],
+        cycle_position_indices=_sparse(
+            indices, graph.cycle_position_indices, graph.cycle_basis.shape
+        ).values(),
+        cycle_position_values=torch.stack([
+            _sparse(indices, row, graph.cycle_basis.shape).values()
+            for row in graph.cycle_position_values
+        ]),
+    )
+    encoder = LeftNullBasisEncoder(5, 8, encoding=encoding)
+    bond = torch.randn(len(graph.edge_attr), 5)
     torch.testing.assert_close(
-        actual,
-        torch.cat([part[order] for part, order in zip(expected_parts, orders, strict=True)]),
+        _encode(encoder, bond, collate([graph])),
+        _encode(encoder, bond, collate([transported])),
         atol=3e-6,
         rtol=3e-5,
     )
-    # A different graph's features must never change the first graph's context.
-    altered_bonds = torch.cat((bonds[0], 20.0 * bonds[1]))
-    altered = encoder.forward_batch(altered_bonds, bases, pair_budget=budget)
-    torch.testing.assert_close(altered[: len(bases[0])], expected[: len(bases[0])])
 
 
-def test_batched_encoder_keeps_raw_basis_out_of_mlps_and_pair_budget_is_exact(
-    monkeypatch,
-) -> None:
-    encoder = LeftNullBasisEncoder(5, 9, column_chunk_size=2)
-    bases = tuple(_graph(5, complete=True).cycle_basis for _ in range(3))
-    bond = torch.randn(sum(len(basis) for basis in bases), 5)
-    calls: dict[str, list[torch.Tensor]] = {"phi": [], "psi": []}
-    hooks = [
-        module.register_forward_pre_hook(
-            lambda _module, args, key=key: calls[key].append(args[0].detach().clone())
-        )
-        for key, module in (("phi", encoder.column_phi[0]), ("psi", encoder.edge_psi[0]))
-    ]
-    try:
-        expected = encoder.forward_batch(bond, bases, pair_budget=10_000)
-        assert len(calls["phi"]) == len(calls["psi"]) == 1
-        assert len(calls["phi"][0]) == len(bond)
-        assert all(value.shape[1] == 5 for value in calls["phi"])
-        for values in calls.values():
-            values.clear()
-        original_einsum = torch.einsum
-        core_sizes = []
-
-        def observed(equation, *operands):
-            result = original_einsum(equation, *operands)
-            if equation == "gmd,gma,gmb->gdab":
-                core_sizes.append(result.numel())
-            return result
-
-        monkeypatch.setattr(torch, "einsum", observed)
-        actual = encoder.forward_batch(bond, bases, pair_budget=7)
-        torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
-        assert core_sizes and max(core_sizes) <= 7
-        assert len(calls["phi"]) == len(calls["psi"]) == 1
-    finally:
-        for hook in hooks:
-            hook.remove()
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_edge_order_equivariance_with_transported_sparse_membership(encoding):
+    torch.manual_seed(29)
+    graph = _graph(5, complete=True)
+    batch = collate([graph])
+    encoder = LeftNullBasisEncoder(5, 7, encoding=encoding)
+    bond = torch.randn(len(graph.edge_attr), 5)
+    expected = _encode(encoder, bond, batch)
+    order = torch.randperm(len(bond))
+    inverse_order = torch.argsort(order)
+    indices = batch.cycle_membership.indices().clone()
+    indices[0] = inverse_order[indices[0]]
+    membership = _sparse(
+        indices, batch.cycle_membership.values(), batch.cycle_membership.shape
+    )
+    actual = encoder(
+        bond[order], membership, batch.cycle_lengths,
+        batch.edge_cycle_counts[order], batch.edge_cycle_features[order],
+        torch.stack([
+            _sparse(indices, row, membership.shape).values()
+            for row in batch.cycle_position_values
+        ]),
+    )
+    torch.testing.assert_close(actual, expected[order], atol=3e-6, rtol=3e-5)
 
 
-def test_batched_forest_and_empty_inputs_never_create_bias_pe() -> None:
-    encoder = LeftNullBasisEncoder(5, 8)
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_node_permutation_preserves_prediction_when_selected_basis_is_transported(encoding):
+    torch.manual_seed(31)
+    graph = _disconnected_graph()
+    order = torch.randperm(len(graph.x))
+    inverse_order = torch.argsort(order)
+    transported = replace(
+        graph, x=graph.x[order], edge_index=inverse_order[graph.edge_index]
+    )
+    model = CycleBasisPEModel(dataset="zinc12k", encoding=encoding, hidden=16, pe_dim=8, layers=3
+    ).eval()
+    with torch.no_grad():
+        expected = model(collate([graph]))
+        actual = model(collate([transported]))
+    torch.testing.assert_close(actual, expected, atol=4e-6, rtol=4e-5)
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+@pytest.mark.parametrize("edges", [0, 4])
+def test_empty_and_forest_encoder_pe_and_all_parameter_gradients_are_exactly_zero(edges, encoding):
+    encoder = LeftNullBasisEncoder(5, 7, encoding=encoding)
     for parameter in encoder.parameters():
         torch.nn.init.constant_(parameter, 0.3)
-    for bases in ((), (torch.empty(0, 0),), (torch.empty(4, 0), torch.empty(0, 0))):
-        edges = sum(len(basis) for basis in bases)
-        value = encoder.forward_batch(torch.randn(edges, 5), bases, pair_budget=1)
-        assert torch.equal(value, torch.zeros(edges, 8))
+    membership = _sparse(
+        torch.empty((2, 0), dtype=torch.long), torch.empty(0), (edges, 0)
+    )
+    bond = torch.randn(edges, 5, requires_grad=True)
+    actual = encoder(
+        bond, membership, torch.empty(0), torch.zeros(edges),
+        torch.zeros(edges, 2), torch.empty(2, 0),
+    )
+    assert actual.shape == (edges, 7)
+    assert torch.equal(actual, torch.zeros_like(actual))
+    actual.square().sum().backward()
+    assert bond.grad is not None and torch.count_nonzero(bond.grad) == 0
+    for name, parameter in encoder.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.count_nonzero(parameter.grad) == 0, name
 
 
-def test_full_batched_model_matches_reference_state_dict_outputs_and_gradients() -> None:
-    torch.manual_seed(47)
-    reference = CycleBasisPEModel(
-        dataset="zinc12k",
-        hidden=12,
-        pe_dim=6,
-        layers=2,
-        column_chunk_size=2,
-        basis_execution="reference",
-    )
-    batched = CycleBasisPEModel(
-        dataset="zinc12k",
-        hidden=12,
-        pe_dim=6,
-        layers=2,
-        column_chunk_size=2,
-        basis_execution="batched",
-        basis_pair_budget=7,
-    )
-    batched.load_state_dict(reference.state_dict(), strict=True)
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_bridges_have_zero_pe_with_nonzero_mlp_biases(encoding):
+    batch = collate([_disconnected_graph(), _graph(3, forest=True)])
+    encoder = LeftNullBasisEncoder(4, 8, encoding=encoding)
+    for name, parameter in encoder.named_parameters():
+        if name.endswith("bias"):
+            torch.nn.init.constant_(parameter, 0.3)
+    actual = _encode(encoder, torch.randn(len(batch.edge_attr), 4), batch)
+    inactive = batch.edge_cycle_counts == 0
+    assert inactive.any() and (~inactive).any()
+    assert torch.equal(actual[inactive], torch.zeros_like(actual[inactive]))
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_sparse_physical_batch_matches_graphwise_outputs_and_every_parameter_gradient(encoding):
+    torch.manual_seed(37)
     graphs = [_graph(4), _graph(5, complete=True), _graph(4, forest=True), _disconnected_graph()]
+    batched = CycleBasisPEModel(
+        dataset="zinc12k", encoding=encoding, hidden=16, pe_dim=8, layers=3
+    )
+    reference = copy.deepcopy(batched)
     batch = collate(graphs)
-    expected, actual = reference(batch), batched(batch)
+    actual = batched(batch)
+    expected = torch.cat([reference(collate([graph])) for graph in graphs])
+    torch.testing.assert_close(actual, expected, atol=4e-6, rtol=4e-5)
+    weights = torch.randn_like(actual)
+    (actual * weights).sum().backward()
+    (expected * weights).sum().backward()
+    _assert_parameter_gradients_match(batched, reference)
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_full_default_architecture_pe_affects_loss_and_all_pe_parameters_update(encoding):
+    torch.manual_seed(713)
+    batch = collate([_graph(5, complete=True), _graph(4, forest=True), _disconnected_graph()])
+    model = CycleBasisPEModel(dataset="zinc12k", encoding=encoding)
+    assert len(model.layers) == 10
+    assert model.pe_encoder.pe_dim == 64
+    assert model.graph_head.in_features == 128
+    assert sum(p.numel() for p in model.parameters()) == 7_262_785
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    assert {id(p) for p in model.parameters()} == {
+        id(p) for group in optimizer.param_groups for p in group["params"]
+    }
+    predicted = model(batch)
+    loss = (predicted - batch.y).abs().mean()
+    loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    before = {name: p.detach().clone() for name, p in model.pe_encoder.named_parameters()}
+    assert all(torch.count_nonzero(p.grad) > 0 for p in model.pe_encoder.parameters())
+    optimizer.step()
+    assert all(
+        not torch.equal(before[name], parameter)
+        for name, parameter in model.pe_encoder.named_parameters()
+    )
+    model.eval()
+    with torch.no_grad():
+        actual = model(batch)
+        hook = model.pe_encoder.register_forward_hook(
+            lambda _module, _args, output: torch.zeros_like(output)
+        )
+        ablated = model(batch)
+        hook.remove()
+    assert not torch.allclose(actual, ablated, atol=1e-7, rtol=1e-7)
+    assert torch.isfinite((actual - batch.y).abs().mean())
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_sparse_fp32_islands_under_bfloat16_autocast(device, encoding, monkeypatch):
+    if device == "cuda" and (
+        not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()
+    ):
+        pytest.skip("CUDA with BF16 support is required; CPU results do not validate server CUDA")
+    batch = collate([_graph(5, complete=True), _graph(4, forest=True)]).to(device)
+    model = CycleBasisPEModel(
+        dataset="zinc12k", encoding=encoding, hidden=16, pe_dim=8, layers=3
+    ).to(device)
+    original = torch.sparse.mm
+    sparse_dtypes = []
+
+    def observed(matrix, values, *args, **kwargs):
+        sparse_dtypes.append((matrix.dtype, values.dtype))
+        return original(matrix, values, *args, **kwargs)
+
+    monkeypatch.setattr(torch.sparse, "mm", observed)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        predicted = model(batch)
+        loss = (predicted.float() - batch.y).abs().mean()
+    loss.backward()
+    assert sparse_dtypes and all(
+        left == right == torch.float32 for left, right in sparse_dtypes
+    )
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+@pytest.mark.parametrize("dataset,targets", [("zinc12k", 1), ("peptides_struct", 11)])
+def test_official_target_width_is_preserved(dataset, targets):
+    model = CycleBasisPEModel(dataset=dataset)
+    assert model.graph_head.out_features == targets
+
+
+@pytest.mark.parametrize("kwargs", [{"bond_dim": 0, "pe_dim": 3}, {"bond_dim": 3, "pe_dim": 0}])
+def test_encoder_rejects_invalid_dimensions(kwargs):
+    with pytest.raises(ValueError, match="positive"):
+        LeftNullBasisEncoder(**kwargs)
+
+
+@pytest.mark.parametrize("option", ["column_chunk_size", "basis_pair_budget", "basis_execution"])
+def test_obsolete_projector_options_fail_loudly(option):
+    with pytest.raises(TypeError, match=option):
+        CycleBasisPEModel(dataset="zinc12k", **{option: 2})
+
+
+def test_encoder_rejects_dense_membership_and_inconsistent_shapes():
+    encoder = LeftNullBasisEncoder(5, 8)
+    with pytest.raises(ValueError, match="sparse COO"):
+        encoder(
+            torch.randn(4, 5), torch.zeros(4, 1), torch.ones(1),
+            torch.ones(4), torch.zeros(4, 2),
+        )
+    batch = collate([_graph(4)])
+    with pytest.raises(ValueError, match="lengths"):
+        encoder(
+            torch.randn(4, 5), batch.cycle_membership, torch.ones(2),
+            torch.ones(4), batch.edge_cycle_features,
+        )
+
+
+def test_protocol_is_explicit_about_selected_dfs_dependence_and_no_projector():
+    protocol = architecture_protocol()
+    assert protocol["model"] == MODEL_NAME == MODEL_NAMES["se"] == "cycle_dfs_se_v2"
+    assert "a different DFS tree" in protocol["symmetry"]
+    assert "may change" in protocol["symmetry"]
+    assert "no QR, SVD" in protocol["execution"]
+    assert "one sparse block-diagonal physical batch" in protocol["execution"]
+
+
+def _captured_edge_features(encoder, bond, batch):
+    captured = []
+    hook = encoder.edge_psi.register_forward_pre_hook(
+        lambda _module, args: captured.append(args[0])
+    )
+    output = _encode(encoder, bond, batch)
+    hook.remove()
+    assert len(captured) == 1
+    return output, captured[0]
+
+
+def test_pe_residual_matches_dense_cyclic_distance_kernel_on_tiny_fixture():
+    """The independent dense pair kernel exists only in this tiny unit reference."""
+    torch.manual_seed(83)
+    graph = _graph(5, complete=True)
+    batch = collate([graph])
+    pe = LeftNullBasisEncoder(5, 7, encoding="pe")
+    se = LeftNullBasisEncoder(5, 7, encoding="se")
+    se.load_state_dict(pe.state_dict(), strict=True)
+    bond = torch.randn(len(graph.edge_attr), 5)
+    _, pe_features = _captured_edge_features(pe, bond, batch)
+    _, se_features = _captured_edge_features(se, bond, batch)
+    actual = pe_features[:, 7:14] - se_features[:, 7:14]
+    values = pe.column_phi(bond)
+    expected = torch.zeros_like(values)
+    edge_ids, cycle_ids = graph.cycle_basis.indices()
+    for cycle in range(graph.cycle_basis.shape[1]):
+        selected = cycle_ids == cycle
+        edges = edge_ids[selected]
+        position = graph.cycle_position_indices[selected].float()
+        length = graph.cycle_lengths[cycle]
+        pair_angle = 2 * torch.pi * (position[:, None] - position[None, :]) / length
+        expected.index_add_(0, edges, pair_angle.cos() @ values[edges] / length)
+    expected = expected / batch.edge_cycle_counts.clamp_min(1)[:, None]
+    torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+
+
+def test_pe_is_invariant_to_independent_cycle_origin_and_reversal_with_all_gradients():
+    torch.manual_seed(89)
+    batch = collate([_graph(6, complete=True), _disconnected_graph()])
+    cycle_ids = batch.cycle_membership.indices()[1]
+    origin = torch.linspace(-2.3, 1.7, len(batch.cycle_lengths))[cycle_ids]
+    direction = torch.where(cycle_ids % 2 == 0, -1.0, 1.0)
+    cosine, sine = batch.cycle_position_values
+    transported = torch.stack((
+        cosine * origin.cos() - direction * sine * origin.sin(),
+        cosine * origin.sin() + direction * sine * origin.cos(),
+    ))
+    changed = replace(batch, cycle_position_values=transported)
+    original = LeftNullBasisEncoder(5, 7, encoding="pe")
+    modified = copy.deepcopy(original)
+    bond = torch.randn(len(batch.edge_attr), 5)
+    expected = _encode(original, bond, batch)
+    actual = _encode(modified, bond, changed)
     torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
     weights = torch.randn_like(actual)
     (expected * weights).sum().backward()
     (actual * weights).sum().backward()
-    _assert_parameter_gradients_match(batched, reference)
+    _assert_parameter_gradients_match(modified, original)
 
 
-@pytest.mark.parametrize("basis_execution", ["reference", "batched"])
-def test_raw_dfs_and_cached_thin_q_backends_give_same_projector_model_output(
-    basis_execution,
-) -> None:
-    torch.manual_seed(71)
-    model = CycleBasisPEModel(
-        dataset="zinc12k",
-        hidden=12,
-        pe_dim=6,
-        layers=2,
-        column_chunk_size=2,
-        basis_execution=basis_execution,
-        basis_pair_budget=7,
-    ).eval()
-    thin_graphs = [
-        _graph(4),
-        _graph(5, complete=True),
-        _graph(4, forest=True),
-        _disconnected_graph(),
-    ]
-    raw_graphs = [
-        _graph(4, basis_backend="dfs_fundamental"),
-        _graph(5, complete=True, basis_backend="dfs_fundamental"),
-        _graph(4, forest=True, basis_backend="dfs_fundamental"),
-        _disconnected_graph(basis_backend="dfs_fundamental"),
-    ]
-    assert all(graph.cycle_basis_is_orthonormal.item() for graph in thin_graphs)
-    assert not any(graph.cycle_basis_is_orthonormal.item() for graph in raw_graphs)
-    with torch.no_grad():
-        thin_output = model(collate(thin_graphs))
-        raw_output = model(collate(raw_graphs))
-    torch.testing.assert_close(raw_output, thin_output, atol=4e-5, rtol=4e-5)
+def test_pe_special_bond_response_depends_on_undirected_cyclic_distance():
+    torch.manual_seed(112)
+    graph = _graph(6)
+    batch = collate([graph])
+    bond = torch.ones(6, 5)
+    bond[0] = 3.0
+    se = LeftNullBasisEncoder(5, 9, encoding="se")
+    pe = LeftNullBasisEncoder(5, 9, encoding="pe")
+    pe.load_state_dict(se.state_dict(), strict=True)
+    se_output, se_features = _captured_edge_features(se, bond, batch)
+    pe_output, pe_features = _captured_edge_features(pe, bond, batch)
+    # All ordinary bonds receive the same SE even at different cyclic distances.
+    torch.testing.assert_close(
+        se_output[1:], se_output[1].expand_as(se_output[1:]), atol=2e-7, rtol=2e-6
+    )
+    position = graph.cycle_position_indices
+    distance = (position - position[0]).remainder(6)
+    distance = torch.minimum(distance, 6 - distance)
+    values = pe.column_phi(bond)
+    contrast = (values[0] - values[1]) / 6
+    expected = (2 * torch.pi * distance.float() / 6).cos()[:, None] * contrast
+    actual = pe_features[:, 9:18] - se_features[:, 9:18]
+    torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+    near = torch.nonzero(distance == 1).flatten()[0]
+    far = torch.nonzero(distance == 3).flatten()[0]
+    assert not torch.allclose(pe_output[near], pe_output[far], atol=1e-7, rtol=1e-7)
 
 
-@pytest.mark.parametrize("kwargs", [{"basis_execution": "unknown"}, {"basis_pair_budget": 0}])
-def test_full_model_rejects_invalid_execution_settings(kwargs):
-    with pytest.raises(ValueError, match="basis_"):
-        CycleBasisPEModel(dataset="zinc12k", **kwargs)
+def test_uniform_single_cycle_does_not_invent_distinct_positions():
+    torch.manual_seed(97)
+    batch = collate([_graph(6)])
+    pe = LeftNullBasisEncoder(5, 8, encoding="pe")
+    se = LeftNullBasisEncoder(5, 8, encoding="se")
+    se.load_state_dict(pe.state_dict(), strict=True)
+    bond = torch.ones(6, 5)
+    actual, expected = _encode(pe, bond, batch), _encode(se, bond, batch)
+    torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+    torch.testing.assert_close(actual, actual[0].expand_as(actual), atol=3e-6, rtol=3e-5)
 
 
-def test_batched_encoder_rejects_invalid_schema_and_budget() -> None:
-    encoder = LeftNullBasisEncoder(5, 8)
-    with pytest.raises(ValueError, match="positive"):
-        encoder.forward_batch(torch.zeros(3, 5), (torch.zeros(3, 1),), pair_budget=0)
-    with pytest.raises(ValueError, match="align"):
-        encoder.forward_batch(torch.zeros(3, 5), (torch.zeros(2, 1),))
-    with pytest.raises(ValueError, match="shape"):
-        encoder.forward_batch(torch.zeros(3, 5), (torch.zeros(3),))
-    with pytest.raises(ValueError, match="floating point"):
-        encoder.forward_batch(torch.zeros(3, 5), (torch.zeros(3, 1, dtype=torch.long),))
-    with pytest.raises(ValueError, match="edgeless"):
-        encoder.forward_batch(torch.zeros(0, 5), (torch.zeros(0, 1),))
+def test_se_and_pe_have_identical_parameters_and_zero_relative_residual_recovers_se():
+    torch.manual_seed(101)
+    batch = collate([_graph(5, complete=True), _graph(4, forest=True), _disconnected_graph()])
+    se = CycleBasisPEModel(dataset="zinc12k", encoding="se", hidden=16, pe_dim=8, layers=3)
+    pe = CycleBasisPEModel(dataset="zinc12k", encoding="pe", hidden=16, pe_dim=8, layers=3)
+    pe.load_state_dict(se.state_dict(), strict=True)
+    assert list(se.state_dict()) == list(pe.state_dict())
+    assert sum(p.numel() for p in se.parameters()) == sum(p.numel() for p in pe.parameters())
+    # Explicit unit ablation of the relative term, never a valid prepared/cache
+    # phase payload or a runtime fallback: deleting R must recover the fixed SE.
+    ablated = replace(batch, cycle_position_values=torch.zeros_like(batch.cycle_position_values))
+    actual, expected = pe(ablated), se(batch)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    (actual - batch.y).square().mean().backward()
+    (expected - batch.y).square().mean().backward()
+    _assert_parameter_gradients_match(pe, se)
+
+
+@pytest.mark.parametrize("bad", [None, torch.empty(1, 4), torch.ones(2, 4, dtype=torch.long)])
+def test_pe_requires_aligned_floating_cycle_positions(bad):
+    batch = collate([_graph(4)])
+    encoder = LeftNullBasisEncoder(5, 8, encoding="pe")
+    with pytest.raises(ValueError, match="cycle_position_values"):
+        encoder(
+            torch.ones(4, 5), batch.cycle_membership, batch.cycle_lengths,
+            batch.edge_cycle_counts, batch.edge_cycle_features, bad,
+        )
+
+
+def test_encoding_names_and_protocol_identify_relative_residual_and_matched_parameters():
+    assert MODEL_NAMES == {"se": "cycle_dfs_se_v2", "pe": "cycle_dfs_relative_pe_v2"}
+    protocol = architecture_protocol("pe")
+    assert protocol["model"] == MODEL_NAMES["pe"]
+    assert "K_[1+cos] minus K_mean" in protocol["positional_encoding"]
+    assert "not general graph shortest-path distance" in protocol["relative_position"]
+    assert "identical learned modules" in protocol["parameter_matching"]
+    with pytest.raises(ValueError, match="encoding"):
+        CycleBasisPEModel(dataset="zinc12k", encoding="unknown")
+    with pytest.raises(ValueError, match="encoding"):
+        architecture_protocol("unknown")
 ````
 
 # research/cycle_pe/v2/__init__.py
 
 ````python
-"""Cycle PE v2: coordinate-free incidence-cycle-space projector PE.
+"""Cycle V2: matched sparse DFS-cycle SE and SE-plus-relative-PE experiments.
 
 The original cycle-set summary experiment remains unchanged in the parent
-package. The production backend caches thin-Q coordinates; the optional DFS
-backend may cache raw fundamental cycles but orthonormalizes them before any
-learned layer. Both paths use the same intrinsic projector kernel and deep
-residual molecular GNN.
+package. Signed sparse DFS cycles certify the full incidence left nullspace.
+SE summarizes their membership; PE adds a cyclic-relative cosine-kernel
+residual from actual ordered cycle positions, without extra parameters, QR,
+SVD, dense projectors or edge-pair matrices. Both preserve the same deep
+residual molecular backbone and depend on the selected DFS tree, not on
+cycle ordering, origin or traversal direction.
 """
 ````
 
 # research/cycle_pe/v2/basis.py
 
 ````python
-"""Sparse, chart-independent construction of the graph circulation space.
+"""Sparse DFS fundamental coordinates of the graph circulation space.
 
 For edge-by-node incidence ``B``, the cycle space is ``ker(B.T)`` with exact
-dimension ``m - n + components``.  We construct a sparse fundamental basis;
-the model subsequently uses only its coordinate-free orthogonal projector.
+dimension ``m - n + components``.  No QR, SVD, dense incidence matrix, Gram
+matrix or dense projector is needed.  The PE uses the selected cycle supports;
+it is not invariant to replacing the DFS forest by a different cycle basis.
 """
 
 from __future__ import annotations
@@ -41089,8 +41633,8 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from scipy import sparse
 
-BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
-DEFAULT_BASIS_BACKEND = "thin_q"
+BASIS_BACKENDS = ("dfs_fundamental",)
+DEFAULT_BASIS_BACKEND = "dfs_fundamental"
 
 
 def _checked_edges(num_nodes: int, edge_index: ArrayLike) -> NDArray[np.int64]:
@@ -41116,135 +41660,55 @@ def _checked_edges(num_nodes: int, edge_index: ArrayLike) -> NDArray[np.int64]:
 
 def incidence_and_cycle_rank(
     num_nodes: int, edge_index: ArrayLike
-) -> tuple[NDArray[np.float64], int]:
-    """Return supplied-orientation incidence ``B[m,n]`` and exact nullity."""
+) -> tuple[sparse.csr_matrix, int]:
+    """Return sparse supplied-orientation incidence ``B[m,n]`` and nullity."""
     edges = _checked_edges(num_nodes, edge_index)
-    parent = np.arange(num_nodes, dtype=np.int64)
-    size = np.ones(num_nodes, dtype=np.int64)
-
-    def find(vertex: int) -> int:
-        while parent[vertex] != vertex:
-            parent[vertex] = parent[parent[vertex]]
-            vertex = int(parent[vertex])
-        return vertex
-
-    components = num_nodes
+    adjacency: list[list[int]] = [[] for _ in range(num_nodes)]
     for u_raw, v_raw in edges.T:
-        u, v = find(int(u_raw)), find(int(v_raw))
-        if u == v:
+        u, v = int(u_raw), int(v_raw)
+        adjacency[u].append(v)
+        adjacency[v].append(u)
+    visited = np.zeros(num_nodes, dtype=np.bool_)
+    components = 0
+    for root in range(num_nodes):
+        if visited[root]:
             continue
-        if size[u] < size[v]:
-            u, v = v, u
-        parent[v] = u
-        size[u] += size[v]
-        components -= 1
+        components += 1
+        visited[root] = True
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            for neighbor in adjacency[node]:
+                if not visited[neighbor]:
+                    visited[neighbor] = True
+                    stack.append(neighbor)
     edge_count = edges.shape[1]
-    incidence = np.zeros((edge_count, num_nodes), dtype=np.float64)
-    rows = np.arange(edge_count)
-    incidence[rows, edges[0]] = -1.0
-    incidence[rows, edges[1]] = 1.0
+    incidence = sparse.coo_matrix(
+        (
+            np.tile([-1.0, 1.0], edge_count),
+            (np.repeat(np.arange(edge_count), 2), edges.T.reshape(-1)),
+        ),
+        shape=(edge_count, num_nodes),
+        dtype=np.float64,
+    ).tocsr()
     return incidence, edge_count - num_nodes + components
 
 
 def sparse_left_nullspace_basis(num_nodes: int, edge_index: ArrayLike) -> sparse.csr_matrix:
-    """Build a sparse full basis of ``ker(B.T)`` without SVD/eigendecomposition.
-
-    Union/find selects a spanning forest.  Each chord closes one fundamental
-    cycle, so the chord rows form an identity matrix and prove full rank.
-    Complexity is linear plus the total length of the fundamental cycles.
-    """
-    edges = _checked_edges(num_nodes, edge_index)
-    edge_count = edges.shape[1]
-    union_parent = np.arange(num_nodes, dtype=np.int64)
-    union_size = np.ones(num_nodes, dtype=np.int64)
-
-    def find(vertex: int) -> int:
-        while union_parent[vertex] != vertex:
-            union_parent[vertex] = union_parent[union_parent[vertex]]
-            vertex = int(union_parent[vertex])
-        return vertex
-
-    tree_edges: list[int] = []
-    chords: list[int] = []
-    for edge, (u_raw, v_raw) in enumerate(edges.T):
-        u, v = find(int(u_raw)), find(int(v_raw))
-        if u == v:
-            chords.append(edge)
-            continue
-        if union_size[u] < union_size[v]:
-            u, v = v, u
-        union_parent[v] = u
-        union_size[u] += union_size[v]
-        tree_edges.append(edge)
-    rank = len(chords)
-    if rank == 0:
-        return sparse.csr_matrix((edge_count, 0), dtype=np.float32)
-
-    adjacency: list[list[tuple[int, int]]] = [[] for _ in range(num_nodes)]
-    for edge in tree_edges:
-        tail, head = map(int, edges[:, edge])
-        adjacency[tail].append((head, edge))
-        adjacency[head].append((tail, edge))
-
-    # up_sign[v] is the coefficient for traversing v -> parent[v].
-    forest_parent = np.full(num_nodes, -1, dtype=np.int64)
-    parent_edge = np.full(num_nodes, -1, dtype=np.int64)
-    up_sign = np.zeros(num_nodes, dtype=np.int8)
-    depth = np.zeros(num_nodes, dtype=np.int64)
-    for root in range(num_nodes):
-        if forest_parent[root] != -1:
-            continue
-        forest_parent[root] = root
-        stack = [root]
-        while stack:
-            node = stack.pop()
-            for neighbor, edge in adjacency[node]:
-                if forest_parent[neighbor] != -1:
-                    continue
-                forest_parent[neighbor] = node
-                parent_edge[neighbor] = edge
-                depth[neighbor] = depth[node] + 1
-                tail, head = map(int, edges[:, edge])
-                up_sign[neighbor] = 1 if (neighbor, node) == (tail, head) else -1
-                stack.append(neighbor)
-
-    rows: list[int] = []
-    columns: list[int] = []
-    values: list[float] = []
-
-    def append_up(vertex: int, column: int, multiplier: int) -> int:
-        rows.append(int(parent_edge[vertex]))
-        columns.append(column)
-        values.append(float(multiplier * int(up_sign[vertex])))
-        return int(forest_parent[vertex])
-
-    for column, chord in enumerate(chords):
-        tail, head = map(int, edges[:, chord])
-        # chord tail -> head is closed by tree path head -> tail.
-        left, right = head, tail
-        while depth[left] > depth[right]:
-            left = append_up(left, column, +1)
-        while depth[right] > depth[left]:
-            right = append_up(right, column, -1)
-        while left != right:
-            left = append_up(left, column, +1)
-            right = append_up(right, column, -1)
-        rows.append(chord)
-        columns.append(column)
-        values.append(1.0)
-
-    result = sparse.coo_matrix(
-        (np.asarray(values, dtype=np.float32), (rows, columns)),
-        shape=(edge_count, rank),
-        dtype=np.float32,
-    ).tocsr()
-    result.sum_duplicates()
-    result.sort_indices()
-    return result
+    """Compatibility spelling for the complete signed DFS fundamental basis."""
+    return dfs_fundamental_cycle_basis(num_nodes, edge_index)
 
 
 def dfs_fundamental_cycle_basis(num_nodes: int, edge_index: ArrayLike) -> sparse.csr_matrix:
-    """Return the signed fundamental-cycle basis of an iterative DFS forest.
+    """Return all signed DFS cycles; circular coordinates are available separately."""
+    return dfs_fundamental_cycle_coordinates(num_nodes, edge_index)[0]
+
+
+def dfs_fundamental_cycle_coordinates(
+    num_nodes: int,
+    edge_index: ArrayLike,
+) -> tuple[sparse.csr_matrix, NDArray[np.int64]]:
+    """Return signed DFS basis and circular edge positions aligned with CSR data.
 
     DFS chooses one spanning tree per connected component.  Every non-tree edge
     (chord) contributes that edge plus the unique parent path between its
@@ -41254,6 +41718,8 @@ def dfs_fundamental_cycle_basis(num_nodes: int, edge_index: ArrayLike) -> sparse
     Discovering the forest costs ``O(num_nodes + num_edges)``.  Materializing
     the explicit basis additionally costs ``O(nnz(Z))``; that output term can be
     superlinear because one tree edge may occur in many fundamental cycles.
+    Positions enumerate the actual chord plus ordered tree path, NOT CSR row
+    order.  A position shift/reversal changes the origin/direction only.
     """
     edges = _checked_edges(num_nodes, edge_index)
     edge_count = edges.shape[1]
@@ -41296,19 +41762,18 @@ def dfs_fundamental_cycle_basis(num_nodes: int, edge_index: ArrayLike) -> sparse
     chords = np.flatnonzero(~tree_edge)
     rank = len(chords)
     if rank == 0:
-        return sparse.csr_matrix((edge_count, 0), dtype=np.float32)
+        return sparse.csr_matrix((edge_count, 0), dtype=np.float32), np.empty(0, dtype=np.int64)
 
     rows: list[int] = []
     columns: list[int] = []
     values: list[float] = []
+    positions: list[int] = []
 
-    def append_up(vertex: int, column: int, multiplier: int) -> int:
+    def append_up(vertex: int, path: list[tuple[int, float]], multiplier: int) -> int:
         edge = int(parent_edge[vertex])
         if edge < 0:
             raise RuntimeError("DFS chord endpoints do not share a spanning-tree component")
-        rows.append(edge)
-        columns.append(column)
-        values.append(float(multiplier * int(up_sign[vertex])))
+        path.append((edge, float(multiplier * int(up_sign[vertex]))))
         return int(forest_parent[vertex])
 
     for column, chord_raw in enumerate(chords):
@@ -41316,89 +41781,140 @@ def dfs_fundamental_cycle_basis(num_nodes: int, edge_index: ArrayLike) -> sparse
         tail, head = map(int, edges[:, chord])
         # Traverse the chord tail -> head, then the parent path head -> tail.
         left, right = head, tail
+        left_path: list[tuple[int, float]] = []
+        right_path: list[tuple[int, float]] = []
         while depth[left] > depth[right]:
-            left = append_up(left, column, +1)
+            left = append_up(left, left_path, +1)
         while depth[right] > depth[left]:
-            right = append_up(right, column, -1)
+            right = append_up(right, right_path, -1)
         while left != right:
-            left = append_up(left, column, +1)
-            right = append_up(right, column, -1)
-        rows.append(chord)
-        columns.append(column)
-        values.append(1.0)
+            left = append_up(left, left_path, +1)
+            right = append_up(right, right_path, -1)
+        ordered_path = [(chord, 1.0), *left_path, *reversed(right_path)]
+        for position, (edge, sign) in enumerate(ordered_path):
+            rows.append(edge)
+            columns.append(column)
+            values.append(sign)
+            positions.append(position)
 
-    result = sparse.coo_matrix(
-        (np.asarray(values, dtype=np.float32), (rows, columns)),
+    # Canonicalize the sparse coordinates once and apply exactly the same
+    # permutation to signed coefficients and positions, including position 0.
+    layout = sparse.coo_matrix(
+        (np.arange(len(values), dtype=np.int64), (rows, columns)),
         shape=(edge_count, rank),
-        dtype=np.float32,
+        dtype=np.int64,
     ).tocsr()
-    result.sum_duplicates()
-    result.sort_indices()
-    return result
+    result = sparse.csr_matrix(
+        (np.asarray(values, dtype=np.float32)[layout.data], layout.indices, layout.indptr),
+        shape=layout.shape,
+    )
+    return result, np.asarray(positions, dtype=np.int64)[layout.data]
 
 
 def validate_cycle_basis(num_nodes: int, edge_index: ArrayLike, basis: ArrayLike) -> None:
-    """Certify dimension, finite values, nullness and full column rank.
+    """Certify a fundamental basis without a dense matrix or factorization.
 
-    Orthonormality is deliberately not required: a cycle space is intrinsic,
-    while a coordinate chart is not.  The downstream PE is invariant to every
-    invertible basis replacement ``Z -> ZR``.
+    Every column must have a nonzero singleton-row witness.  Those rows form a
+    nonsingular diagonal submatrix (the chord identity for constructed DFS Z),
+    proving independence.  Column scaling/sign/permutation is supported; this
+    deliberately does NOT certify arbitrary mixed coordinates ZR without that
+    witness.  Such charts are no longer inputs to the sparse cycle-support PE.
+    Null residuals are compared relative to each column, never an absolute
+    rank threshold that rejects a uniformly small but valid basis.
     """
     incidence, cycle_rank = incidence_and_cycle_rank(num_nodes, edge_index)
-    if sparse.issparse(basis):
-        raw = basis
-        shape = raw.shape
-        if not np.issubdtype(raw.dtype, np.floating) or not np.all(np.isfinite(raw.data)):
-            raise ValueError("cycle_basis must contain finite floating-point values")
-        values = raw.astype(np.float64, copy=False)
-        dense = values.toarray()
-    else:
-        raw = np.asarray(basis)
-        shape = raw.shape
-        if not np.issubdtype(raw.dtype, np.floating) or not np.all(np.isfinite(raw)):
-            raise ValueError("cycle_basis must contain finite floating-point values")
-        if raw.dtype.itemsize < 4:
-            raise ValueError("cycle_basis storage requires float32 or float64 precision")
-        dense = raw.astype(np.float64, copy=False)
-        values = dense
-    if len(shape) != 2 or shape != (len(incidence), cycle_rank):
+    raw = basis if sparse.issparse(basis) else np.asarray(basis)
+    if len(raw.shape) != 2 or raw.shape != (incidence.shape[0], cycle_rank):
         raise ValueError(
-            f"cycle_basis must have shape ({len(incidence)}, {cycle_rank}); got {shape}"
+            f"cycle_basis must have shape ({incidence.shape[0]}, {cycle_rank}); got {raw.shape}"
         )
+    if not np.issubdtype(raw.dtype, np.floating) or raw.dtype.itemsize < 4:
+        raise ValueError("cycle_basis storage requires float32 or float64 precision")
+    values = sparse.csr_matrix(raw, dtype=np.float64)
+    values.sum_duplicates()
+    values.eliminate_zeros()
+    if not np.all(np.isfinite(values.data)):
+        raise ValueError("cycle_basis must contain finite floating-point values")
     if not cycle_rank:
         return
-    epsilon = np.finfo(raw.dtype).eps
-    residual = np.linalg.norm(incidence.T @ values, ord="fro")
-    scale = max(1.0, np.linalg.norm(incidence, ord="fro")) * max(
-        1.0, np.linalg.norm(dense, ord="fro")
-    )
-    if residual > 64.0 * epsilon * scale:
+    singleton_rows = np.flatnonzero(np.diff(values.indptr) == 1)
+    witnesses = values.indices[values.indptr[singleton_rows]]
+    if not np.all(np.bincount(witnesses, minlength=cycle_rank) > 0):
+        raise ValueError(
+            "cycle_basis full column rank requires a fundamental singleton-row witness "
+            "per column; arbitrary mixed bases are unsupported"
+        )
+    column_scale = np.asarray(abs(values).sum(axis=0)).reshape(-1)
+    residual = (incidence.T @ values).tocoo()
+    # Constructed signed unit cycles cancel exactly in float64.  Do not let a
+    # long cycle's relative tolerance admit a nonzero integer residual.
+    signed_unit = np.all(np.abs(values.data) == 1.0)
+    threshold = 0.0 if signed_unit else 64.0 * np.finfo(raw.dtype).eps * column_scale[residual.col]
+    if residual.nnz and np.any(np.abs(residual.data) > threshold):
         raise ValueError("cycle_basis is not in the left nullspace: B.T @ Z != 0")
-    gram = dense.T @ dense
-    try:
-        factor = np.linalg.cholesky(gram)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError("cycle_basis must have full column rank") from exc
-    diagonal = np.diag(factor)
-    if diagonal.min() <= np.sqrt(epsilon) * max(1.0, diagonal.max()):
-        raise ValueError("cycle_basis must have numerically full column rank")
 
 
-def left_nullspace_basis(num_nodes: int, edge_index: ArrayLike) -> NDArray[np.float32]:
-    """Build sparse fundamental cycles, then cache-ready thin-QR coordinates."""
-    fundamental = sparse_left_nullspace_basis(num_nodes, edge_index)
-    validate_cycle_basis(num_nodes, edge_index, fundamental)
-    edge_count, rank = fundamental.shape
-    if rank == 0:
-        return np.empty((edge_count, 0), dtype=np.float32)
-    q, _ = np.linalg.qr(fundamental.toarray().astype(np.float64), mode="reduced")
-    for column in range(rank):
-        pivot = int(np.argmax(np.abs(q[:, column])))
-        if q[pivot, column] < 0:
-            q[:, column] *= -1.0
-    result = np.ascontiguousarray(q, dtype=np.float32)
-    validate_cycle_basis(num_nodes, edge_index, result)
-    return result
+def left_nullspace_basis(num_nodes: int, edge_index: ArrayLike) -> sparse.csr_matrix:
+    """Return the complete sparse signed DFS basis; no orthogonalization."""
+    return build_cycle_basis(num_nodes, edge_index)
+
+
+def validate_cycle_positions(
+    num_nodes: int,
+    edge_index: ArrayLike,
+    basis: sparse.csr_matrix,
+    positions: ArrayLike,
+) -> None:
+    """Certify every circular position follows one complete simple physical cycle.
+
+    The integer position metadata avoids reconstructing discrete order from
+    rounded angles.  Any cyclic origin shift or reversal is allowed; arbitrary
+    edge-order permutations are rejected.  No dense graph matrix is allocated.
+    """
+    edges = _checked_edges(num_nodes, edge_index)
+    positions = np.asarray(positions)
+    if (
+        positions.shape != (basis.nnz,)
+        or not np.issubdtype(positions.dtype, np.integer)
+        or np.issubdtype(positions.dtype, np.bool_)
+    ):
+        raise ValueError("cycle positions must be an integer vector aligned with sparse basis data")
+    columns = basis.indices
+    lengths = np.bincount(columns, minlength=basis.shape[1])
+    if np.any(lengths < 3) or np.any(positions < 0) or np.any(positions >= lengths[columns]):
+        raise ValueError("cycle positions must cover each simple cycle's complete position range")
+    if not basis.nnz:
+        return
+    offsets = np.r_[0, np.cumsum(lengths)[:-1]]
+    flat_positions = offsets[columns] + positions
+    if not np.all(np.bincount(flat_positions, minlength=basis.nnz) == 1):
+        raise ValueError("cycle positions must be a permutation of 0..length-1 for each cycle")
+    rows = np.repeat(np.arange(basis.shape[0]), np.diff(basis.indptr))
+    ordered_rows = np.empty(basis.nnz, dtype=np.int64)
+    ordered_rows[flat_positions] = rows
+    next_positions = offsets[columns] + (positions + 1) % lengths[columns]
+    current_edges = edges[:, rows]
+    next_edges = edges[:, ordered_rows[next_positions]]
+    tail_matches = (current_edges[0] == next_edges[0]) | (current_edges[0] == next_edges[1])
+    head_matches = (current_edges[1] == next_edges[0]) | (current_edges[1] == next_edges[1])
+    if not np.all(tail_matches ^ head_matches):
+        raise ValueError("cycle positions do not follow adjacent physical edges around the cycle")
+    shared_vertices = np.where(tail_matches, current_edges[0], current_edges[1])
+    ordered_vertices = np.empty(basis.nnz, dtype=np.int64)
+    ordered_vertices[flat_positions] = shared_vertices
+    for start, length in zip(offsets, lengths, strict=True):
+        if len(set(ordered_vertices[start : start + length].tolist())) != length:
+            raise ValueError("cycle positions must follow a simple cycle without repeated vertices")
+
+
+def cycle_position_factors(
+    basis: sparse.csr_matrix,
+    positions: NDArray[np.int64],
+) -> NDArray[np.float32]:
+    """Cosine/sine of actual circular edge positions, aligned with CSR nonzeros."""
+    lengths = np.bincount(basis.indices, minlength=basis.shape[1])
+    angles = 2.0 * np.pi * positions.astype(np.float64) / lengths[basis.indices]
+    return np.ascontiguousarray(np.stack((np.cos(angles), np.sin(angles))), dtype=np.float32)
 
 
 def build_cycle_basis(
@@ -41406,39 +41922,49 @@ def build_cycle_basis(
     edge_index: ArrayLike,
     *,
     backend: str = DEFAULT_BASIS_BACKEND,
-) -> NDArray[np.float32]:
-    """Build the selected dense cache representation of ``ker(B.T)``.
+) -> sparse.csr_matrix:
+    """Build all signed DFS cycles as sparse coordinates of ``ker(B.T)``."""
+    return build_cycle_coordinates(num_nodes, edge_index, backend=backend)[0]
 
-    ``thin_q`` preserves the production representation used by the fast model
-    path. ``dfs_fundamental`` stores raw signed fundamental cycles selected by
-    iterative DFS; the model must orthonormalize those coordinates before using
-    ``Q Q.T`` as a projector.
-    """
+
+def build_cycle_coordinates(
+    num_nodes: int,
+    edge_index: ArrayLike,
+    *,
+    backend: str = DEFAULT_BASIS_BACKEND,
+) -> tuple[sparse.csr_matrix, NDArray[np.int64]]:
+    """Build and certify complete sparse DFS cycles plus their circular positions."""
     if backend not in BASIS_BACKENDS:
-        raise ValueError(f"basis backend must be one of {BASIS_BACKENDS}")
-    if backend == "thin_q":
-        return left_nullspace_basis(num_nodes, edge_index)
-    fundamental = dfs_fundamental_cycle_basis(num_nodes, edge_index)
+        raise ValueError(
+            f"basis backend must be one of {BASIS_BACKENDS}; thin_q/projector PE is retired, "
+            "use a new sparse-DFS run/cache rather than resuming its checkpoints"
+        )
+    fundamental, positions = dfs_fundamental_cycle_coordinates(num_nodes, edge_index)
     validate_cycle_basis(num_nodes, edge_index, fundamental)
-    return np.ascontiguousarray(fundamental.toarray(), dtype=np.float32)
+    validate_cycle_positions(num_nodes, edge_index, fundamental, positions)
+    return fundamental, positions
 
 
 __all__ = [
     "BASIS_BACKENDS",
     "DEFAULT_BASIS_BACKEND",
     "build_cycle_basis",
+    "build_cycle_coordinates",
+    "cycle_position_factors",
     "dfs_fundamental_cycle_basis",
+    "dfs_fundamental_cycle_coordinates",
     "incidence_and_cycle_rank",
     "left_nullspace_basis",
     "sparse_left_nullspace_basis",
     "validate_cycle_basis",
+    "validate_cycle_positions",
 ]
 ````
 
 # research/cycle_pe/v2/benchmark.py
 
 ````python
-"""Train rebuilt Cycle PE v2 from a coordinate-free cycle-space projector PE.
+"""Train Cycle PE v2 from a sparse DFS cycle basis without matrix factorization.
 
 This is an isolated experiment: it does not change or invoke the v1 cycle-set
 model, and it never trains comparison-paper models. Actual training is CUDA-only.
@@ -41478,7 +42004,7 @@ from research.cycle_pe.v2.data import (
     collate,
     load_benchmark,
 )
-from research.cycle_pe.v2.model import MODEL_NAME, CycleBasisPEModel, architecture_protocol
+from research.cycle_pe.v2.model import MODEL_NAMES, CycleBasisPEModel, architecture_protocol
 
 TRACK_NAME = "cycle_pe"
 HARDWARE_PROFILES = ("portable", "a6000-48gb")
@@ -41546,10 +42072,20 @@ def implementation_hashes() -> dict[str, str]:
     }
 
 
+def _model_name(args: argparse.Namespace) -> str:
+    return MODEL_NAMES[args.encoding]
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--suite", choices=("benchmark",), default="benchmark")
     result.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    result.add_argument(
+        "--encoding",
+        choices=tuple(MODEL_NAMES),
+        default="se",
+        help="se: cycle structure; pe: the same SE plus a relative cycle-position residual",
+    )
     result.add_argument("--data-root", type=Path, default=Path("data/paper"))
     result.add_argument("--output-dir", type=Path, default=Path("results/cycle_pe_v2/benchmark"))
     result.add_argument("--device", default="cuda")
@@ -41579,26 +42115,13 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--layer-scale", type=float, default=0.1)
     result.add_argument("--max-parameters", type=int, default=20_000_000)
     result.add_argument(
-        "--column-chunk-size",
-        type=int,
-        default=16,
-        help="legacy-compatible option; never truncates the cycle space",
-    )
-    result.add_argument(
         "--basis-backend",
         choices=BASIS_BACKENDS,
         default=DEFAULT_BASIS_BACKEND,
         help=(
-            "thin_q caches model-ready Q (default); dfs_fundamental caches raw DFS "
-            "fundamental cycles and repeats graph-local QR in every model forward"
+            "all signed DFS fundamental cycles; sparse edge-cycle message passing, "
+            "without QR, SVD, or basis truncation"
         ),
-    )
-    result.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
-    result.add_argument(
-        "--basis-pair-budget",
-        type=int,
-        default=32768,
-        help="maximum elements in a temporary feature-by-rank-by-rank contraction core",
     )
     result.add_argument(
         "--resume",
@@ -41625,8 +42148,6 @@ def _validate(args: argparse.Namespace) -> None:
         "layers",
         "ffn_multiplier",
         "max_parameters",
-        "column_chunk_size",
-        "basis_pair_budget",
     ):
         if getattr(args, key) < 1:
             raise ValueError(f"--{key.replace('_', '-')} must be positive")
@@ -41704,19 +42225,17 @@ def _resume_configuration(dataset: str, args: argparse.Namespace) -> dict[str, A
         "ffn_multiplier",
         "dropout",
         "layer_scale",
-        "column_chunk_size",
         "basis_backend",
-        "basis_execution",
-        "basis_pair_budget",
+        "encoding",
         "amp",
         "compile",
     )
     precision = _amp_policy(args.amp, torch.device(args.device))
     precision_identity = _precision_identity(precision)
     return {
-        "schema": "cycle-projector-pe-v2-epoch-resume-2",
+        "schema": "cycle-dfs-se-relative-pe-v2-epoch-resume-1",
         "dataset": dataset,
-        "model": MODEL_NAME,
+        "model": _model_name(args),
         "arguments": {name: getattr(args, name) for name in names},
         # --amp is a request, not necessarily the effective arithmetic. Bind
         # resume to the resolved policy so a checkpoint cannot silently switch
@@ -41944,6 +42463,7 @@ def _cycle_data_observability(
     node_counts = [int(graph.x.shape[0]) for graph in graphs]
     edge_counts = [int(graph.edge_index.shape[1]) for graph in graphs]
     cycle_ranks = [int(graph.cycle_basis.shape[1]) for graph in graphs]
+    cycle_memberships = [graph.cycle_basis._nnz() for graph in graphs]
     return {
         "dataset": dataset,
         "source": "official benchmark adapter and immutable V2 basis cache",
@@ -41969,6 +42489,8 @@ def _cycle_data_observability(
         "nodes_per_graph": _integer_distribution(node_counts),
         "canonical_undirected_edges_per_graph": _integer_distribution(edge_counts),
         "cycle_rank_per_graph": _integer_distribution(cycle_ranks),
+        "cycle_memberships_per_graph": _integer_distribution(cycle_memberships),
+        "cycle_basis_storage": "signed sparse COO; no E-by-cycle-rank dense allocation",
         "input_tensor_shapes": {
             "node_feature_widths": sorted({int(graph.x.shape[1]) for graph in graphs}),
             "edge_feature_widths": sorted({int(graph.edge_attr.shape[1]) for graph in graphs}),
@@ -42024,7 +42546,11 @@ def _graph_probe_cost(graph: Graph) -> int:
     return int(
         graph.x.numel()
         + graph.edge_attr.numel()
-        + graph.cycle_basis.numel()
+        + graph.cycle_basis._nnz() * 3
+        + graph.cycle_lengths.numel()
+        + graph.edge_cycle_counts.numel()
+        + graph.edge_cycle_features.numel()
+        + graph.cycle_position_values.numel()
         + graph.edge_index.numel()
     )
 
@@ -42150,23 +42676,26 @@ def _train_model(
     precision = _amp_policy(args.amp, device)
     model = CycleBasisPEModel(
         dataset=dataset,
+        encoding=args.encoding,
         hidden=args.hidden_dim,
         pe_dim=args.pe_dim,
         layers=args.layers,
-        column_chunk_size=args.column_chunk_size,
-        basis_execution=args.basis_execution,
-        basis_pair_budget=args.basis_pair_budget,
         ffn_multiplier=args.ffn_multiplier,
         dropout=args.dropout,
         layer_scale=args.layer_scale,
     ).to(device)
     execution = configure_execution(model, args, device)
-    execution.update(basis_execution=args.basis_execution, basis_pair_budget=args.basis_pair_budget)
+    execution.update(
+        encoding=args.encoding,
+        basis_execution="sparse_block_diagonal",
+        basis_backend=args.basis_backend,
+    )
     total_parameters = sum(p.numel() for p in model.parameters())
     parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if parameters > args.max_parameters:
         raise ValueError(
-            f"{dataset}/{MODEL_NAME}: {parameters} parameters exceeds budget {args.max_parameters}"
+            f"{dataset}/{_model_name(args)}: {parameters} parameters "
+            f"exceeds budget {args.max_parameters}"
         )
     validation_only = bool(getattr(args, "validation_only", False))
     expected_splits = (
@@ -42174,7 +42703,7 @@ def _train_model(
     )
     if set(splits) != expected_splits:
         raise ValueError(f"unexpected benchmark splits: {sorted(splits)}")
-    run = args.output_dir / dataset / MODEL_NAME
+    run = args.output_dir / dataset / _model_name(args)
     last_checkpoint = run / "last.pt"
     checkpoint = run / "best.pt"
     previous_checkpoint = run / "best.previous.pt"
@@ -42227,7 +42756,7 @@ def _train_model(
     pre_run_observability = {
         "status": "pre_run_configuration",
         "model": {
-            "name": MODEL_NAME,
+            "name": _model_name(args),
             "layers": args.layers,
             "hidden_dimension": args.hidden_dim,
             "positional_encoding_dimension": args.pe_dim,
@@ -42268,7 +42797,7 @@ def _train_model(
             "autocast_dtype": precision["dtype_name"],
             "fallback": precision["fallback"],
             "gradient_scaler": precision["gradient_scaler"],
-            "projector_contraction": "float32",
+            "cycle_sparse_aggregation": "float32",
             "backbone_autocast": precision["enabled"],
         },
         data_pipeline={
@@ -42278,7 +42807,8 @@ def _train_model(
             "prefetch_factor": args.prefetch_factor if args.workers else None,
             "persistent_workers": args.workers > 0,
             "pin_memory": True,
-            "packed_cycle_basis_h2d_tensors_per_batch": 1,
+            "cycle_membership_layout": "sparse_coo_block_diagonal",
+            "cycle_factorization_in_forward": False,
             "batch_calibration": batch_calibration,
         },
     )
@@ -42363,7 +42893,7 @@ def _train_model(
             with torch.autocast("cuda", dtype=precision["dtype"], enabled=precision["enabled"]):
                 predicted = model(batch)
                 loss = (predicted.float() - batch.y).abs().mean()
-            _require_finite_loss(loss, f"{dataset}/{MODEL_NAME}: nonfinite training loss")
+            _require_finite_loss(loss, f"{dataset}/{_model_name(args)}: nonfinite training loss")
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             if first_task_gradient_connectivity is None:
@@ -42381,7 +42911,9 @@ def _train_model(
         validation = evaluate(model, validation_loader, device, amp=args.amp)
         train_mae = float(train_sum / train_count)
         if not math.isfinite(train_mae):
-            raise FloatingPointError(f"{dataset}/{MODEL_NAME}: nonfinite epoch training loss")
+            raise FloatingPointError(
+                f"{dataset}/{_model_name(args)}: nonfinite epoch training loss"
+            )
         torch.cuda.synchronize(device)
         epoch_seconds = time.perf_counter() - epoch_started
         scheduler.step(validation)
@@ -42404,10 +42936,11 @@ def _train_model(
             best, best_epoch = validation, epoch
             payload = {
                 "state_dict": model.state_dict(),
+                "implementation_sha256": resume_configuration["implementation_sha256"],
                 "epoch": epoch,
                 "validation_mae": validation,
                 "dataset": dataset,
-                "model": MODEL_NAME,
+                "model": _model_name(args),
                 "model_seed": args.model_seed,
                 "effective_batch_size": effective_batch_size,
                 "batch_calibration": batch_calibration,
@@ -42453,7 +42986,7 @@ def _train_model(
         }
         atomic_publish(last_checkpoint, lambda path, state=last_state: torch.save(state, path))
         print(
-            f"{dataset}/{MODEL_NAME} epoch={epoch} train_mae={train_mae:.6f} "
+            f"{dataset}/{_model_name(args)} epoch={epoch} train_mae={train_mae:.6f} "
             f"validation_mae={validation:.6f} best={best:.6f} seconds={epoch_seconds:.2f}",
             flush=True,
         )
@@ -42560,7 +43093,7 @@ def _train_model(
             {
                 "status": "post_run_observability",
                 "dataset": dataset,
-                "model": MODEL_NAME,
+                "model": _model_name(args),
                 "optimizer_steps": optimizer_steps,
                 "epochs_completed": len(history),
                 "optimizer_ownership_validated": optimizer_ownership["validated"],
@@ -42595,7 +43128,7 @@ def _evaluate_test_checkpoint(
         raise ValueError("Selected checkpoint has an invalid payload schema")
     expected_metadata = {
         "dataset": dataset,
-        "model": MODEL_NAME,
+        "model": _model_name(args),
         "model_seed": args.model_seed,
     }
     for name, expected in expected_metadata.items():
@@ -42610,15 +43143,16 @@ def _evaluate_test_checkpoint(
         "hidden_dim",
         "pe_dim",
         "layers",
-        "column_chunk_size",
-        "basis_execution",
-        "basis_pair_budget",
+        "basis_backend",
+        "encoding",
         "ffn_multiplier",
         "dropout",
         "layer_scale",
     ):
         if saved_arguments.get(name) != getattr(args, name):
             raise ValueError(f"Selected checkpoint architecture mismatch for {name}")
+    if payload.get("implementation_sha256") != implementation_hashes():
+        raise ValueError("Selected checkpoint implementation/source mismatch")
     validation = payload.get("validation_mae")
     epoch = payload.get("epoch")
     effective_batch_size = payload.get("effective_batch_size")
@@ -42639,12 +43173,10 @@ def _evaluate_test_checkpoint(
     _seed(args.model_seed)
     model = CycleBasisPEModel(
         dataset=dataset,
+        encoding=args.encoding,
         hidden=args.hidden_dim,
         pe_dim=args.pe_dim,
         layers=args.layers,
-        column_chunk_size=args.column_chunk_size,
-        basis_execution=args.basis_execution,
-        basis_pair_budget=args.basis_pair_budget,
         ffn_multiplier=args.ffn_multiplier,
         dropout=args.dropout,
         layer_scale=args.layer_scale,
@@ -42652,13 +43184,15 @@ def _evaluate_test_checkpoint(
     parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if parameters > args.max_parameters:
         raise ValueError(
-            f"{dataset}/{MODEL_NAME}: {parameters} parameters exceeds budget {args.max_parameters}"
+            f"{dataset}/{_model_name(args)}: {parameters} parameters "
+            f"exceeds budget {args.max_parameters}"
         )
     model.load_state_dict(payload["state_dict"], strict=True)
     execution = configure_execution(model, args, device)
     execution.update(
-        basis_execution=args.basis_execution,
-        basis_pair_budget=args.basis_pair_budget,
+        encoding=args.encoding,
+        basis_execution="sparse_block_diagonal",
+        basis_backend=args.basis_backend,
         hardware=hardware,
         precision={
             "amp": bool(args.amp),
@@ -42666,7 +43200,7 @@ def _evaluate_test_checkpoint(
             "autocast_dtype": precision["dtype_name"],
             "fallback": precision["fallback"],
             "gradient_scaler": precision["gradient_scaler"],
-            "projector_contraction": "float32",
+            "cycle_sparse_aggregation": "float32",
             "backbone_autocast": precision["enabled"],
         },
         data_pipeline={
@@ -42676,7 +43210,8 @@ def _evaluate_test_checkpoint(
             "prefetch_factor": args.prefetch_factor if args.workers else None,
             "persistent_workers": args.workers > 0,
             "pin_memory": True,
-            "packed_cycle_basis_h2d_tensors_per_batch": 1,
+            "cycle_membership_layout": "sparse_coo_block_diagonal",
+            "cycle_factorization_in_forward": False,
         },
     )
     test_loader = _loader(test_graphs, args, train=False)
@@ -42709,7 +43244,8 @@ def _evaluate_test_checkpoint(
         ),
         "pin_memory": True,
         "non_blocking_transfer": True,
-        "packed_cycle_basis_h2d_tensors_per_batch": 1,
+        "cycle_membership_layout": "sparse_coo_block_diagonal",
+        "cycle_factorization_in_forward": False,
     }
     print(
         json.dumps(
@@ -42717,7 +43253,7 @@ def _evaluate_test_checkpoint(
                 "status": "pre_selected_test_observability",
                 "dataset": dataset,
                 "model": {
-                    "name": MODEL_NAME,
+                    "name": _model_name(args),
                     "layers": args.layers,
                     "hidden_dimension": args.hidden_dim,
                     "positional_encoding_dimension": args.pe_dim,
@@ -42783,7 +43319,7 @@ def _evaluate_test_checkpoint(
             {
                 "status": "post_selected_test_observability",
                 "dataset": dataset,
-                "model": MODEL_NAME,
+                "model": _model_name(args),
                 "throughput": throughput,
                 "resource_summary": resource_observability["summary"],
             },
@@ -42825,10 +43361,10 @@ def _completed_training_dataset(entry: Any, dataset: str, args: argparse.Namespa
         if not isinstance(entry, dict) or entry.get("metric") != "mae":
             return False
         models = entry.get("models")
-        if not isinstance(models, dict) or set(models) != {MODEL_NAME}:
+        if not isinstance(models, dict) or set(models) != {_model_name(args)}:
             return False
-        result = models[MODEL_NAME]
-        run = (args.output_dir / dataset / MODEL_NAME).resolve()
+        result = models[_model_name(args)]
+        run = (args.output_dir / dataset / _model_name(args)).resolve()
         bindings = (
             ("checkpoint", "checkpoint_sha256", run / "best.pt"),
             ("history", "history_sha256", run / "history.json"),
@@ -42889,40 +43425,38 @@ def main(argv: list[str] | None = None) -> int:
         "run_mode": run_mode,
         "arguments": arguments,
         "software": versions,
-        "architecture": architecture_protocol(),
+        "architecture": architecture_protocol(args.encoding),
         "implementation_sha256": implementation_hashes(),
         "seeds": {
             "model_seed": args.model_seed,
             "data_seed": "unused: fixed official graphs",
             "split_seed": "unused: official splits",
-            "chart_seed": "unused: selected spanning-forest chart; projector is chart invariant",
+            "chart_seed": (
+                "unused: deterministic DFS on canonical stored edge order; tree-dependent encoding"
+            ),
         },
         "controls": {
-            "model": MODEL_NAME,
+            "encoding": args.encoding,
+            "encoding_comparison": (
+                "identical SE/backbone/parameterization; pe adds a parameter-free "
+                "cycle-relative cosine-kernel residual, not a pure-PE/no-SE ablation"
+            ),
+            "model": _model_name(args),
             "external_models_trained": False,
             "test_checkpoint_selection": False,
             "parameter_budget": args.max_parameters,
             "target_policy": "official labels unchanged",
             "basis_input": (
-                "all cached thin-Q columns; learned input is only the basis-invariant "
-                "projector kernel, with no truncation"
-                if args.basis_backend == "thin_q"
-                else "all raw DFS fundamental columns, runtime-orthonormalized before the "
-                "basis-invariant projector kernel; diagnostic backend with no truncation"
+                "all signed sparse DFS fundamental cycles, with no truncation; "
+                "orientation-free membership drives learned edge-to-cycle-to-edge messages"
             ),
             "basis_backend": args.basis_backend,
             "basis_backend_runtime": (
-                "cached orthonormal Q; no factorization in model forward"
-                if args.basis_backend == "thin_q"
-                else "diagnostic only: reduced QR O(E*beta^2) repeats per graph/model forward; "
-                "not an end-to-end linear-time speedup"
+                "DFS O(V+E) plus explicit output O(nnz(Z)); batched sparse aggregation "
+                "O(nnz(Z)*PE_width), with no QR/SVD/Gram inverse or dense cycle matrix"
             ),
             "basis_rank_dependent_parameters": False,
-            "column_chunk_size": args.column_chunk_size,
-            "column_chunk_policy": (
-                "legacy CLI compatibility only; the complete projector is used and "
-                "basis-pair-budget bounds pair-free feature/rank contraction cores"
-            ),
+            "basis_selection_dependence": "selected DFS tree; not invariant to arbitrary ZR",
             "epoch_resume": "atomic last.pt plus best.pt/best.previous.pt two-slot recovery",
             "resume_determinism": (
                 "exact configuration/source/artifact binding and epoch-boundary model, "
@@ -42951,7 +43485,7 @@ def main(argv: list[str] | None = None) -> int:
         "datasets": {},
     }
     resume_identity = {
-        "schema": "cycle-projector-pe-v2-multidataset-resume-1",
+        "schema": "cycle-dfs-se-relative-pe-v2-multidataset-resume-1",
         "run_mode": run_mode,
         "arguments": {key: value for key, value in arguments.items() if key != "resume"},
         "implementation_sha256": manifest["implementation_sha256"],
@@ -43033,6 +43567,7 @@ def main(argv: list[str] | None = None) -> int:
                     dataset,
                     allow_download=args.allow_download,
                     basis_backend=args.basis_backend,
+                    workers=args.workers,
                 )
             else:
                 splits, protocol = load_benchmark(
@@ -43041,6 +43576,7 @@ def main(argv: list[str] | None = None) -> int:
                     allow_download=args.allow_download,
                     splits=requested_splits,
                     basis_backend=args.basis_backend,
+                    workers=args.workers,
                 )
             dataset_metrics: dict[str, Any] = {
                 "metric": "mae",
@@ -43050,12 +43586,12 @@ def main(argv: list[str] | None = None) -> int:
             }
             metrics["datasets"][dataset] = dataset_metrics
             if args.test_checkpoint is not None:
-                dataset_metrics["models"][MODEL_NAME] = _evaluate_test_checkpoint(
+                dataset_metrics["models"][_model_name(args)] = _evaluate_test_checkpoint(
                     dataset, splits["test"], args
                 )
                 atomic_write_json(args.output_dir / "metrics.json", metrics)
             elif not args.prepare_only:
-                dataset_metrics["models"][MODEL_NAME] = _train_model(dataset, splits, args)
+                dataset_metrics["models"][_model_name(args)] = _train_model(dataset, splits, args)
             atomic_write_json(metrics_path, metrics)
             del splits
         metrics["status"] = manifest["status"] = "prepared" if args.prepare_only else "passed"
@@ -43065,7 +43601,7 @@ def main(argv: list[str] | None = None) -> int:
         }
         if not args.prepare_only:
             manifest["execution_by_dataset"] = {
-                name: data["models"][MODEL_NAME].get("execution")
+                name: data["models"][_model_name(args)].get("execution")
                 for name, data in metrics["datasets"].items()
             }
         atomic_write_json(manifest_path, manifest)
@@ -43092,24 +43628,30 @@ if __name__ == "__main__":
 # research/cycle_pe/v2/data.py
 
 ````python
-"""Official molecular splits with coordinate-free cycle-space inputs.
+"""Official molecular splits with ordered sparse DFS cycles shared by SE and PE.
 
 Only the official split adapter and source fingerprint are shared with v1.
 Neither v1 graph preparation nor cycle-set statistics are used here.  The
-production backend caches a thin-QR ``Q``; a diagnostic DFS backend can instead
-cache raw fundamental cycles and records that representation explicitly.
+production backend caches signed cycles, support counts and actual circular edge positions.
+No dense basis, QR/SVD or projector is created in preparation or minibatches.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
+from collections import deque
+from collections.abc import Callable, Iterable, Iterator
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, fields
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from scipy import sparse
 from torch import Tensor
 
 from chartgat.cache import (
@@ -43123,14 +43665,16 @@ from research.cycle_pe.benchmark_data import graph_fingerprint, load_official_sp
 from research.cycle_pe.v2.basis import (
     BASIS_BACKENDS,
     DEFAULT_BASIS_BACKEND,
-    build_cycle_basis,
+    build_cycle_coordinates,
+    cycle_position_factors,
     validate_cycle_basis,
+    validate_cycle_positions,
 )
 
 DATASETS = ("zinc12k", "peptides_struct")
 SPLITS = ("train", "validation", "test")
-CACHE_VERSION = "selectable-dfs-fundamental-projector-kernel-v2-3"
-CACHE_NAMESPACE = "cycle_pe_v2_projector_kernel_benchmark"
+CACHE_VERSION = "ordered-dfs-cycle-coordinates-v2-1"
+CACHE_NAMESPACE = "cycle_pe_v2_ordered_dfs_benchmark"
 SCHEMAS = {
     "zinc12k": {"atoms": (28,), "bonds": (4,), "targets": 1},
     "peptides_struct": {
@@ -43152,7 +43696,11 @@ class Graph:
     edge_attr: Tensor
     y: Tensor
     cycle_basis: Tensor
-    cycle_basis_is_orthonormal: Tensor
+    cycle_lengths: Tensor
+    edge_cycle_counts: Tensor
+    edge_cycle_features: Tensor
+    cycle_position_indices: Tensor
+    cycle_position_values: Tensor
 
 
 @dataclass
@@ -43163,29 +43711,15 @@ class Batch:
     y: Tensor
     batch: Tensor
     ptr: Tensor
-    packed_cycle_basis: Tensor
+    cycle_membership: Tensor
+    cycle_position_values: Tensor
+    cycle_lengths: Tensor
+    edge_cycle_counts: Tensor
+    edge_cycle_features: Tensor
     cycle_basis_shapes: tuple[tuple[int, int], ...]
-    cycle_basis_is_orthonormal: tuple[bool, ...]
+    cycle_graph_index: Tensor
+    edge_graph_index: Tensor
     edge_ptr: Tensor
-
-    @property
-    def cycle_bases(self) -> tuple[Tensor, ...]:
-        """Return zero-copy matrix views over one contiguous transfer tensor.
-
-        Keeping the ragged matrices packed means a minibatch performs one basis-data
-        host-to-device copy instead of one copy per molecular graph.  Shapes stay
-        as CPU-side Python metadata, so reconstructing the views never calls
-        ``Tensor.item()`` and cannot introduce a CUDA synchronization.
-        """
-        offset = 0
-        matrices = []
-        for rows, columns in self.cycle_basis_shapes:
-            elements = rows * columns
-            matrices.append(self.packed_cycle_basis.narrow(0, offset, elements).view(rows, columns))
-            offset += elements
-        if offset != self.packed_cycle_basis.numel():
-            raise ValueError("packed cycle-basis data disagree with shape metadata")
-        return tuple(matrices)
 
     def to(self, device: torch.device | str) -> Batch:
         return Batch(
@@ -43201,19 +43735,37 @@ class Batch:
     def pin_memory(self) -> Batch:
         return Batch(
             **{
-                field.name: current.pin_memory() if isinstance(current, Tensor) else current
+                field.name: _pin_tensor(current) if isinstance(current, Tensor) else current
                 for field in fields(self)
                 for current in (getattr(self, field.name),)
             }
         )
 
 
+def _pin_tensor(value: Tensor) -> Tensor:
+    """Pin sparse storage explicitly; sparse Tensor.pin_memory is unsupported."""
+    if value.layout == torch.sparse_coo:
+        return torch.sparse_coo_tensor(
+            value.indices().pin_memory(),
+            value.values().pin_memory(),
+            value.shape,
+            is_coalesced=True,
+            check_invariants=False,
+        )
+    return value.pin_memory()
+
+
 def collate(graphs: list[Graph]) -> Batch:
-    """Concatenate graph tensors, keeping every basis in its own coordinate chart."""
+    """Pack all graphs into one sparse block-diagonal edge/cycle membership.
+
+    Only O(1)-per-field schema checks are repeated here.  Signed nullness,
+    independence, finite values and cached support counts were certified at
+    preparation/load; no graph's fixed cycle algebra is repeated per batch.
+    """
     if not graphs:
         raise ValueError("cannot collate an empty graph list")
     for graph in graphs:
-        validate_graph(graph, check_basis=False)
+        validate_graph(graph, check_basis=False, check_values=False)
     widths = {(g.x.shape[1], g.edge_attr.shape[1], g.y.numel()) for g in graphs}
     if len(widths) != 1:
         raise ValueError("cannot collate graphs with different molecular schemas")
@@ -43222,6 +43774,24 @@ def collate(graphs: list[Graph]) -> Batch:
     edge_ptr = torch.tensor(
         [0, *np.cumsum([graph.edge_index.shape[1] for graph in graphs]).tolist()],
         dtype=torch.long,
+    )
+    cycle_counts = [graph.cycle_basis.shape[1] for graph in graphs]
+    edge_counts = [graph.edge_index.shape[1] for graph in graphs]
+    sparse_indices = []
+    edge_offset = cycle_offset = 0
+    for graph in graphs:
+        sparse_indices.append(
+            graph.cycle_basis.indices() + torch.tensor([[edge_offset], [cycle_offset]])
+        )
+        edge_offset += graph.cycle_basis.shape[0]
+        cycle_offset += graph.cycle_basis.shape[1]
+    indices = torch.cat(sparse_indices, dim=1)
+    membership = torch.sparse_coo_tensor(
+        indices,
+        torch.ones(indices.shape[1], dtype=torch.float32),
+        (edge_offset, cycle_offset),
+        is_coalesced=True,
+        check_invariants=False,
     )
     return Batch(
         x=torch.cat([graph.x for graph in graphs]),
@@ -43232,12 +43802,17 @@ def collate(graphs: list[Graph]) -> Batch:
         y=torch.stack([graph.y for graph in graphs]),
         batch=torch.repeat_interleave(torch.arange(len(graphs)), torch.tensor(counts)),
         ptr=ptr,
-        packed_cycle_basis=torch.cat(
-            [graph.cycle_basis.reshape(-1) for graph in graphs], dim=0
-        ).contiguous(),
+        cycle_membership=membership,
+        cycle_position_values=torch.cat([graph.cycle_position_values for graph in graphs], dim=1),
+        cycle_lengths=torch.cat([graph.cycle_lengths for graph in graphs]),
+        edge_cycle_counts=torch.cat([graph.edge_cycle_counts for graph in graphs]),
+        edge_cycle_features=torch.cat([graph.edge_cycle_features for graph in graphs]),
         cycle_basis_shapes=tuple(tuple(graph.cycle_basis.shape) for graph in graphs),
-        cycle_basis_is_orthonormal=tuple(
-            bool(graph.cycle_basis_is_orthonormal.item()) for graph in graphs
+        cycle_graph_index=torch.repeat_interleave(
+            torch.arange(len(graphs)), torch.tensor(cycle_counts)
+        ),
+        edge_graph_index=torch.repeat_interleave(
+            torch.arange(len(graphs)), torch.tensor(edge_counts)
         ),
         edge_ptr=edge_ptr,
     )
@@ -43300,13 +43875,29 @@ def _canonical_inputs(data: Any) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     return x, canonical_index, canonical_attr, y
 
 
-def validate_graph(graph: Graph, *, dataset: str | None = None, check_basis: bool = True) -> None:
+def validate_graph(
+    graph: Graph,
+    *,
+    dataset: str | None = None,
+    check_basis: bool = True,
+    check_values: bool = True,
+) -> None:
     """Validate prepared/cache schema and, on preparation/load, basis identities."""
     for field in fields(Graph):
         value = getattr(graph, field.name)
         if not isinstance(value, Tensor) or value.device.type != "cpu":
             raise ValueError("prepared graph fields must be CPU tensors")
-        if not torch.isfinite(value).all():
+        if field.name == "cycle_basis":
+            if value.layout != torch.sparse_coo or not value.is_coalesced():
+                raise ValueError(
+                    "invalid prepared cycle-basis schema: sparse coalesced COO required"
+                )
+        elif value.layout != torch.strided:
+            raise ValueError(f"prepared {field.name} must use strided storage")
+        stored = (
+            value.values() if value.layout == torch.sparse_coo and value.is_coalesced() else value
+        )
+        if check_values and not torch.isfinite(stored).all():
             raise ValueError(f"nonfinite prepared graph field: {field.name}")
     if graph.x.dtype != torch.long or graph.x.ndim != 2 or min(graph.x.shape) < 1:
         raise ValueError("invalid prepared atom-feature schema")
@@ -43328,16 +43919,31 @@ def validate_graph(graph: Graph, *, dataset: str | None = None, check_basis: boo
         raise ValueError("invalid prepared target schema")
     if (
         graph.cycle_basis.dtype != torch.float32
+        or graph.cycle_basis.layout != torch.sparse_coo
+        or not graph.cycle_basis.is_coalesced()
         or graph.cycle_basis.ndim != 2
         or graph.cycle_basis.shape[0] != edge_count
     ):
         raise ValueError("invalid prepared cycle-basis schema")
     if (
-        graph.cycle_basis_is_orthonormal.dtype != torch.bool
-        or graph.cycle_basis_is_orthonormal.ndim != 0
+        graph.cycle_lengths.dtype != torch.float32
+        or graph.cycle_lengths.shape != (graph.cycle_basis.shape[1],)
+        or graph.edge_cycle_counts.dtype != torch.float32
+        or graph.edge_cycle_counts.shape != (edge_count,)
+        or graph.edge_cycle_features.dtype != torch.float32
+        or graph.edge_cycle_features.shape != (edge_count, 2)
     ):
-        raise ValueError("invalid cycle-basis representation metadata")
-    if (graph.x < 0).any() or (graph.edge_attr < 0).any():
+        raise ValueError("invalid cycle-basis support-count schema")
+    if (
+        graph.cycle_position_indices.dtype != torch.long
+        or graph.cycle_position_indices.shape != (graph.cycle_basis._nnz(),)
+        or graph.cycle_position_values.dtype != torch.float32
+        or graph.cycle_position_values.shape != (2, graph.cycle_basis._nnz())
+    ):
+        raise ValueError(
+            "invalid cycle-position schema: integer order and aligned cos/sin required"
+        )
+    if check_values and ((graph.x < 0).any() or (graph.edge_attr < 0).any()):
         raise ValueError("categorical features must be nonnegative")
     if dataset is not None:
         if dataset not in DATASETS:
@@ -43349,15 +43955,57 @@ def validate_graph(graph: Graph, *, dataset: str | None = None, check_basis: boo
             cardinalities = schema[name]
             if values.shape[1] != len(cardinalities):
                 raise ValueError(f"{dataset}: unexpected {name} field count")
-            if any((values[:, i] >= size).any() for i, size in enumerate(cardinalities)):
+            if check_values and any(
+                (values[:, i] >= size).any() for i, size in enumerate(cardinalities)
+            ):
                 raise ValueError(f"{dataset}: categorical {name} index out of range")
     if check_basis:
-        validate_cycle_basis(len(graph.x), graph.edge_index.numpy(), graph.cycle_basis.numpy())
-        rank = graph.cycle_basis.shape[1]
-        if rank and bool(graph.cycle_basis_is_orthonormal.item()):
-            gram = graph.cycle_basis.double().T @ graph.cycle_basis.double()
-            if not torch.allclose(gram, torch.eye(rank, dtype=torch.float64), atol=2e-5, rtol=2e-5):
-                raise ValueError("cached cycle_basis must be thin-QR orthonormal")
+        indices, values = graph.cycle_basis.indices(), graph.cycle_basis.values()
+        if not torch.equal(values.abs(), torch.ones_like(values)):
+            raise ValueError("sparse DFS cycle_basis must contain signed unit entries")
+        scipy_basis = sparse.coo_matrix(
+            (values.numpy(), (indices[0].numpy(), indices[1].numpy())),
+            shape=tuple(graph.cycle_basis.shape),
+        ).tocsr()
+        validate_cycle_basis(len(graph.x), graph.edge_index.numpy(), scipy_basis)
+        positions = graph.cycle_position_indices.numpy()
+        validate_cycle_positions(len(graph.x), graph.edge_index.numpy(), scipy_basis, positions)
+        expected_positions = torch.from_numpy(cycle_position_factors(scipy_basis, positions))
+        if not torch.allclose(
+            graph.cycle_position_values, expected_positions, atol=2e-6, rtol=2e-6
+        ):
+            raise ValueError("cached cycle positions do not match actual ordered cycle cos/sin")
+        if not torch.allclose(
+            graph.cycle_position_values.square().sum(dim=0),
+            torch.ones(graph.cycle_basis._nnz()),
+            atol=2e-6,
+            rtol=2e-6,
+        ):
+            raise ValueError("cached cycle position cos/sin must lie on the unit circle")
+        lengths = torch.bincount(indices[1], minlength=graph.cycle_basis.shape[1]).float()
+        counts = torch.bincount(indices[0], minlength=edge_count).float()
+        if not torch.equal(lengths, graph.cycle_lengths) or not torch.equal(
+            counts, graph.edge_cycle_counts
+        ):
+            raise ValueError("cached cycle lengths/counts disagree with complete DFS basis")
+        if (lengths < 3).any():
+            raise ValueError("simple-graph fundamental cycles must contain at least three edges")
+        expected_features = _cycle_support_features(scipy_basis, lengths.numpy(), counts.numpy())
+        if not torch.equal(expected_features, graph.edge_cycle_features):
+            raise ValueError(
+                "cached edge cycle structural features disagree with complete DFS basis"
+            )
+
+
+def _cycle_support_features(
+    basis: sparse.spmatrix,
+    lengths: np.ndarray,
+    counts: np.ndarray,
+) -> Tensor:
+    """Cache graph-only mean log length and inverse length once, including trees."""
+    descriptors = np.stack((np.log1p(lengths), np.reciprocal(lengths)), axis=1)
+    values = (abs(basis) @ descriptors) / np.maximum(counts[:, None], 1.0)
+    return torch.from_numpy(np.ascontiguousarray(values, dtype=np.float32))
 
 
 def prepare_graph(
@@ -43368,17 +44016,32 @@ def prepare_graph(
 ) -> Graph:
     """Preserve official data and attach the selected cycle-space representation."""
     if basis_backend not in BASIS_BACKENDS:
-        raise ValueError(f"basis_backend must be one of {BASIS_BACKENDS}")
+        raise ValueError(
+            f"basis_backend must be one of {BASIS_BACKENDS}; old thin_q caches are retired"
+        )
     x, edge_index, edge_attr, y = _canonical_inputs(data)
+    sparse_basis, positions = build_cycle_coordinates(
+        len(x), edge_index.numpy(), backend=basis_backend
+    )
+    position_values = cycle_position_factors(sparse_basis, positions)
+    basis = sparse_basis.tocoo()
+    indices = torch.from_numpy(np.vstack((basis.row, basis.col)).astype(np.int64))
+    values = torch.from_numpy(basis.data)
+    lengths = torch.bincount(indices[1], minlength=basis.shape[1]).float()
+    counts = torch.bincount(indices[0], minlength=basis.shape[0]).float()
     graph = Graph(
         x=x,
         edge_index=edge_index,
         edge_attr=edge_attr,
         y=y,
-        cycle_basis=torch.from_numpy(
-            build_cycle_basis(len(x), edge_index.numpy(), backend=basis_backend)
+        cycle_basis=torch.sparse_coo_tensor(
+            indices, values, basis.shape, is_coalesced=True, check_invariants=True
         ),
-        cycle_basis_is_orthonormal=torch.tensor(basis_backend == "thin_q"),
+        cycle_lengths=lengths,
+        edge_cycle_counts=counts,
+        edge_cycle_features=_cycle_support_features(basis, lengths.numpy(), counts.numpy()),
+        cycle_position_indices=torch.from_numpy(positions),
+        cycle_position_values=torch.from_numpy(position_values),
     )
     validate_graph(graph, dataset=dataset)
     return graph
@@ -43392,36 +44055,35 @@ def preparation_signature(
     if basis_backend not in BASIS_BACKENDS:
         raise ValueError(f"basis_backend must be one of {BASIS_BACKENDS}")
     directory = Path(__file__).resolve().parent
-    orthonormal = basis_backend == "thin_q"
     return {
         "version": CACHE_VERSION,
         "dataset": dataset,
         "basis_backend": basis_backend,
-        "representation": (
-            "coordinate_free_cycle_projector_from_cached_thin_q"
-            if orthonormal
-            else "coordinate_free_cycle_projector_from_runtime_qr_of_dfs_fundamental"
-        ),
+        "representation": "ordered_sparse_dfs_cycle_coordinates",
         "incidence": "B[m,n], canonical sorted u<v edges, tail -1 and head +1",
         "basis": (
-            "spanning forest -> sparse fundamental Z -> thin QR Q; all beta=m-n+c "
-            "columns, no eigendecomposition"
-            if orthonormal
-            else "iterative DFS spanning forest + one parent-path fundamental cycle per "
-            "non-tree edge; all beta=m-n+c columns, no all-simple-cycle enumeration"
+            "iterative DFS forest + signed parent path per non-tree edge; all beta=m-n+c columns"
         ),
         "storage": (
-            "float32 orthonormal Q [num_edges, cycle_rank], graph-local ragged"
-            if orthonormal
-            else "float32 dense raw DFS fundamental Z [num_edges, cycle_rank], graph-local "
-            "ragged; representation flag requires runtime thin QR before projector use"
+            "float32 signed sparse COO Z [num_edges, cycle_rank], cycle lengths and edge "
+            "membership counts; cached integer circular position and cos/sin values per "
+            "nonzero; unsigned block-diagonal A and aligned cos/sin for minibatches"
         ),
         "construction_complexity": (
-            "DFS forest O(V+E); sparse explicit Z O(V+E+nnz(Z)); dense cache materialization "
-            "Omega(E*beta); reduced QR O(E*beta^2)"
-            if orthonormal
-            else "DFS forest O(V+E); sparse explicit Z O(V+E+nnz(Z)); dense cache materialization "
-            "Omega(E*beta); runtime reduced QR O(E*beta^2) per graph/model forward"
+            "DFS forest O(V+E); explicit cycle support O(V+E+nnz(Z)); sparse storage O(nnz(Z)); "
+            "no dense incidence/basis, Gram matrix, QR, SVD or projector"
+        ),
+        "basis_dependence": (
+            "cycle order/sign invariant, but choice of DFS forest is observable; "
+            "not arbitrary ZR invariant"
+        ),
+        "position_convention": (
+            "each chord tail->head followed by ordered tree path head->tail; "
+            "t=0..L-1, theta=2*pi*t/L on actual cycle edges; no CSR-row-order positions"
+        ),
+        "position_symmetry": (
+            "PE's 1+cos(theta_e-theta_f) kernel is invariant to cycle origin/reversal; "
+            "both SE and PE depend on the selected DFS forest"
         ),
         "numpy_version": np.__version__,
         "implementation_sha256": {
@@ -43434,22 +44096,138 @@ def preparation_signature(
     }
 
 
-def _validate_cached_graphs(rows: Any, official: Any, dataset: str) -> list[Graph]:
+def _validate_cached_graph_task(payload: tuple[Any, Any, str]) -> Graph:
+    row, source, dataset = payload
+    names = {field.name for field in fields(Graph)}
+    if not isinstance(row, dict) or set(row) != names:
+        raise ValueError("cached graph field schema mismatch; legacy dense/Q cache is unsupported")
+    graph = Graph(**row)
+    validate_graph(graph, dataset=dataset)
+    expected = _canonical_inputs(source)
+    for name, source_value in zip(("x", "edge_index", "edge_attr", "y"), expected, strict=True):
+        if not torch.equal(getattr(graph, name), source_value):
+            raise ValueError(f"cached {name} disagrees with official graph content/order")
+    return graph
+
+
+def _apply_graph_chunk(function: Callable[[Any], Graph], chunk: list[Any]) -> list[Graph]:
+    """Top-level spawn-picklable work item; no graph is omitted or truncated."""
+    return [function(payload) for payload in chunk]
+
+
+def _ordered_parallel_graphs(
+    executor: Any,
+    function: Callable[[Any], Graph],
+    tasks: Iterable[Any],
+    *,
+    workers: int,
+    chunksize: int,
+) -> Iterator[Graph]:
+    """Bound queued serialization while yielding every result in official order.
+
+    Python 3.11 Executor.map eagerly submits its entire input.  Keep at most two
+    chunks per worker in flight instead.  This is a buffer bound only: consumed
+    chunks are replenished until the complete source iterator is exhausted.
+    """
+    if workers < 1 or chunksize < 1:
+        raise ValueError("parallel graph buffering requires positive workers and chunksize")
+    source = iter(tasks)
+    pending = deque()
+
+    def submit_next() -> bool:
+        chunk = list(islice(source, chunksize))
+        if not chunk:
+            return False
+        pending.append(executor.submit(_apply_graph_chunk, function, chunk))
+        return True
+
+    for _ in range(2 * workers):
+        if not submit_next():
+            break
+    while pending:
+        completed = pending.popleft().result()
+        submit_next()
+        yield from completed
+
+
+def _validate_cached_graphs(
+    rows: Any,
+    official: Any,
+    dataset: str,
+    *,
+    workers: int,
+) -> list[Graph]:
     if not isinstance(rows, list) or len(rows) != len(official):
         raise ValueError("cached graph count/schema mismatch")
-    names = {field.name for field in fields(Graph)}
-    graphs = []
-    for row, source in zip(rows, official, strict=True):
-        if not isinstance(row, dict) or set(row) != names:
-            raise ValueError("cached graph field schema mismatch")
-        graph = Graph(**row)
-        validate_graph(graph, dataset=dataset)
-        expected = _canonical_inputs(source)
-        for name, source_value in zip(("x", "edge_index", "edge_attr", "y"), expected, strict=True):
-            if not torch.equal(getattr(graph, name), source_value):
-                raise ValueError(f"cached {name} disagrees with official graph content/order")
-        graphs.append(graph)
-    return graphs
+    tasks = ((row, source, dataset) for row, source in zip(rows, official, strict=True))
+    if workers <= 1 or len(rows) <= 1:
+        return list(map(_validate_cached_graph_task, tasks))
+    with ProcessPoolExecutor(
+        max_workers=min(workers, len(rows)),
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=_initialize_preparation_worker,
+    ) as executor:
+        return list(
+            _ordered_parallel_graphs(
+                executor,
+                _validate_cached_graph_task,
+                tasks,
+                workers=workers,
+                chunksize=max(1, min(16, len(rows) // (4 * workers))),
+            )
+        )
+
+
+def _initialize_preparation_worker() -> None:
+    # Graph construction is Python/NumPy work; avoid one BLAS/PyTorch thread
+    # pool per process oversubscribing the configured worker allocation.
+    torch.set_num_threads(1)
+
+
+def _prepare_task(payload: tuple[Any, str, str]) -> Graph:
+    source, dataset, backend = payload
+    return prepare_graph(source, dataset=dataset, basis_backend=backend)
+
+
+def _prepare_split(
+    official: Any,
+    *,
+    dataset: str,
+    split: str,
+    basis_backend: str,
+    workers: int,
+) -> list[Graph]:
+    """Prepare every graph in stable official order, using allocated CPU workers."""
+    tasks = ((source, dataset, basis_backend) for source in official)
+
+    def collect(prepared: Any) -> list[Graph]:
+        graphs = []
+        for index, graph in enumerate(prepared, start=1):
+            graphs.append(graph)
+            if index % 1000 == 0:
+                print(
+                    f"{dataset}/{split}: sparse DFS cycle spaces {index}/{len(official)}",
+                    flush=True,
+                )
+        return graphs
+
+    if workers <= 1 or len(official) <= 1:
+        return collect(map(_prepare_task, tasks))
+    # spawn is safe even when the parent already initialized a CUDA context.
+    with ProcessPoolExecutor(
+        max_workers=min(workers, len(official)),
+        mp_context=multiprocessing.get_context("spawn"),
+        initializer=_initialize_preparation_worker,
+    ) as executor:
+        return collect(
+            _ordered_parallel_graphs(
+                executor,
+                _prepare_task,
+                tasks,
+                workers=workers,
+                chunksize=max(1, min(16, len(official) // (4 * workers))),
+            )
+        )
 
 
 def load_benchmark(
@@ -43459,8 +44237,13 @@ def load_benchmark(
     allow_download: bool,
     splits: tuple[str, ...] = SPLITS,
     basis_backend: str = DEFAULT_BASIS_BACKEND,
+    workers: int = 4,
 ) -> tuple[dict[str, list[Graph]], dict[str, Any]]:
     """Load fixed official splits, validating immutable basis caches fail-closed."""
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 0:
+        raise ValueError(
+            "workers must be a nonnegative integer; zero is explicit serial preparation"
+        )
     if (
         not splits
         or len(set(splits)) != len(splits)
@@ -43506,21 +44289,19 @@ def load_benchmark(
                 raise CacheCorruptError(f"Corrupt cycle PE v2 cache payload: {cache}; no rebuild")
             try:
                 rows = torch.load(cache, map_location="cpu", weights_only=True)
-                graphs = _validate_cached_graphs(rows, official[split], dataset)
+                graphs = _validate_cached_graphs(rows, official[split], dataset, workers=workers)
             except Exception as exc:
                 raise CacheCorruptError(
                     f"Invalid cycle PE v2 cache content: {cache}: {exc}"
                 ) from exc
         else:
-            graphs = []
-            for index, data in enumerate(official[split]):
-                graphs.append(prepare_graph(data, dataset=dataset, basis_backend=basis_backend))
-                if (index + 1) % 1000 == 0:
-                    print(
-                        f"{dataset}/{split}: projector-ready cycle spaces "
-                        f"{index + 1}/{len(official[split])}",
-                        flush=True,
-                    )
+            graphs = _prepare_split(
+                official[split],
+                dataset=dataset,
+                split=split,
+                basis_backend=basis_backend,
+                workers=workers,
+            )
             rows = [
                 {field.name: getattr(graph, field.name) for field in fields(Graph)}
                 for graph in graphs
@@ -43551,21 +44332,18 @@ def load_benchmark(
         "preparation": signature,
         "cache_directory": str(cache_dir),
         "basis_backend": basis_backend,
+        "preparation_workers": workers,
         "basis_storage": (
-            "all beta=m-n+c thin-Q columns; no padding or truncation"
-            if basis_backend == "thin_q"
-            else "all beta=m-n+c raw DFS fundamental columns; no padding or truncation"
+            "all beta=m-n+c sparse signed DFS fundamental columns; no padding or truncation"
         ),
         "basis_coordinates": (
-            "model uses only P=Q Q.T through K=P Hadamard-square P; raw fundamental Z is "
-            "thin-QR orthonormalized before use; arbitrary basis coordinates, Q signs and "
-            "Q rotations are unobservable"
+            "model uses cycle supports A=abs(Z) with cached cycle lengths/edge membership "
+            "counts for SE, and actual circular cos/sin positions for PE; "
+            "cycle order/sign invariant, selected DFS forest can affect the PE"
         ),
         "basis_runtime": (
-            "cached Q fast path; no factorization in model forward"
-            if basis_backend == "thin_q"
-            else "diagnostic correctness path; graph-local reduced QR is repeated in model "
-            "forward, so this backend is not an end-to-end linear-time speedup"
+            "SE and positional-kernel PE use sparse block-diagonal aggregation O(nnz(Z)*d), "
+            "plus feature MLPs; no QR/SVD/projector or per-graph model forward"
         ),
     }
     return result, protocol
@@ -43590,22 +44368,27 @@ __all__ = [
 # research/cycle_pe/v2/datasets.yaml
 
 ````yaml
-registry_version: 1
+registry_version: 3
 track: cycle_pe
 version: v2
-model: cycle_projector_pe_v2
-claim: Coordinate-free cycle-space projector-kernel PE with a deep residual edge-aware GNN.
+models:
+  se: cycle_dfs_se_v2
+  pe: cycle_dfs_relative_pe_v2
+claim: Matched cycle-structural SE versus the same SE plus a cycle-relative cosine-position residual; identical parameters and deep backbone.
 gpu_training_verified: false
 representation:
-  default_backend: thin_q
-  selectable_backends: [thin_q, dfs_fundamental]
-  construction: sparse fundamental cycles; thin_q caches model-ready Q; dfs_fundamental caches raw signed cycles from iterative DFS forest plus non-tree-edge parent paths
-  complexity: DFS forest O(V+E); explicit sparse Z O(V+E+nnz(Z)); dense cache Omega(E*beta); thin QR O(E*beta^2)
-  diagnostic_warning: dfs_fundamental repeats graph-local thin QR per model forward and is not an end-to-end linear-time speedup
-  basis_contract: B.T @ Z = 0; rank(Z) = beta = m - n + components; projector receives Q with Q.T @ Q = I
+  default_backend: dfs_fundamental
+  selectable_backends: [dfs_fundamental]
+  construction: iterative DFS forest plus signed chord parent paths; sparse storage and structural full-rank certificate
+  complexity: DFS forest O(V+E); explicit sparse Z O(V+E+nnz(Z)); sparse aggregation O(nnz(Z)*PE_width) per edge-cycle pass
+  factorization: none; no QR, SVD, eigendecomposition, Gram inverse, or dense E-by-beta basis
+  basis_contract: B.T @ Z = 0; rank(Z) = beta = m - n + components; independent chord witnesses certify rank
   truncation: none
-  learned_input: K = (Q Q.T) hadamard-square (Q Q.T); no raw basis coordinates
-  symmetries: arbitrary basis-change and edge-orientation invariant; edge-permutation equivariant
+  learned_input: sparse cycle memberships and ordered cos/sin coordinates plus cycle lengths and bond features
+  se_operator: learned invariant cycle feature summary with uniform edge-cycle-edge aggregation
+  pe_operator: same SE plus C D_L^-1 C.T V and S D_L^-1 S.T V relative-position residual; no extra parameters
+  position_scope: selected-cycle relative spacing, not global coordinates or original-graph shortest distances
+  symmetries: cycle-order and orientation invariant; equivariant under transported chart permutations; depends on selected DFS tree
 datasets:
   - id: zinc12k
     name: ZINC-12K
@@ -43613,7 +44396,7 @@ datasets:
     split: official 10000/1000/1000 train/validation/test
     metrics: [mae]
     adapter: research.cycle_pe.v2.data.load_benchmark
-    cache_namespace: cycle_pe_v2_projector_kernel_benchmark/zinc12k
+    cache_namespace: cycle_pe_v2_ordered_dfs_benchmark/zinc12k
     targets: official supplied labels unchanged
   - id: peptides_struct
     name: LRGB Peptides-struct
@@ -43621,62 +44404,60 @@ datasets:
     split: official 10873/2331/2331 train/validation/test
     metrics: [mae]
     adapter: research.cycle_pe.v2.data.load_benchmark
-    cache_namespace: cycle_pe_v2_projector_kernel_benchmark/peptides_struct
+    cache_namespace: cycle_pe_v2_ordered_dfs_benchmark/peptides_struct
     targets: all 11 official supplied labels unchanged
 ````
 
 # research/cycle_pe/v2/model.py
 
 ````python
-"""Coordinate-free cycle-space PE and a deep residual molecular GNN.
+"""Matched SE and relative-PE models on a complete sparse DFS cycle basis.
 
-For any full basis ``Z`` of ``ker(B.T)``, let
-
-``P_Z = Z (Z.T Z)^-1 Z.T`` and ``K_Z = P_Z * P_Z`` (Hadamard square).
-
-``P_Z`` is invariant to every invertible chart replacement ``Z -> ZR``.
-Squaring entrywise also removes independent incidence-orientation signs, while
-``K_Z X`` remains equivariant to edge permutations.  Consequently no arbitrary
-SVD/fundamental-cycle coordinate is ever presented to a learned layer.
+SE transports learned bond values through unsigned cycle membership. PE adds
+a parameter-free cycle-relative cosine-kernel residual to the same SE path.
+The relative kernel uses cyclic distance, independent of each cycle's origin
+and traversal direction. Changing the DFS tree can change either encoding.
+No projector, factorization, dense cycle matrix or edge-pair matrix is formed.
 """
 
 from __future__ import annotations
 
-import math
-from collections.abc import Sequence
-
 import torch
 from torch import Tensor, nn
-from torch.nn.utils.rnn import pad_sequence
 
 from research.cycle_pe.benchmark_models import ATOM_DIMS, BOND_DIMS, CategoricalEncoder, _pool
 from research.cycle_pe.paper_model import _message_topology
 from research.cycle_pe.v2.data import DATASETS, Batch
 
-MODEL_NAME = "cycle_projector_pe_v2"
-BASIS_EXECUTIONS = ("batched", "reference")
+ENCODINGS = ("se", "pe")
+MODEL_NAMES = {"se": "cycle_dfs_se_v2", "pe": "cycle_dfs_relative_pe_v2"}
+MODEL_NAME = MODEL_NAMES["se"]
 
 
 class LeftNullBasisEncoder(nn.Module):
-    """Bond-conditioned PE from the intrinsic cycle-space projector kernel.
+    """Learned edge -> DFS cycle -> edge PE on one sparse disjoint batch.
 
-    The historical class name is retained for import compatibility. Production
-    Production data stores orthonormal ``Q`` and marks it as such, so no
-    factorization occurs during training.  The diagnostic DFS-fundamental data
-    backend stores raw ``Z`` and therefore takes the generic graph-local QR path.
+    The historical class name remains import-compatible. The input is unsigned
+    sparse membership, not basis coordinates or a cycle-space projector.
     """
 
-    def __init__(self, bond_dim: int, pe_dim: int, *, column_chunk_size: int = 16):
+    def __init__(self, bond_dim: int, pe_dim: int, *, encoding: str = "se") -> None:
         super().__init__()
-        if min(bond_dim, pe_dim, column_chunk_size) < 1:
-            raise ValueError("bond_dim, pe_dim and column_chunk_size must be positive")
+        if min(bond_dim, pe_dim) < 1:
+            raise ValueError("bond_dim and pe_dim must be positive")
+        if encoding not in ENCODINGS:
+            raise ValueError(f"encoding must be one of {ENCODINGS}")
+        self.encoding = encoding
         self.bond_dim = bond_dim
         self.pe_dim = pe_dim
-        # Kept as a public compatibility knob; low-rank contraction cores, not
-        # arbitrary basis columns, are now the bounded execution unit.
-        self.column_chunk_size = column_chunk_size
         self.column_phi = nn.Sequential(
             nn.Linear(bond_dim, pe_dim), nn.SiLU(), nn.Linear(pe_dim, pe_dim)
+        )
+        self.cycle_mlp = nn.Sequential(
+            nn.Linear(pe_dim + 1, 2 * pe_dim),
+            nn.SiLU(),
+            nn.Linear(2 * pe_dim, pe_dim),
+            nn.SiLU(),
         )
         self.edge_psi = nn.Sequential(
             nn.Linear(2 * pe_dim + 3, 2 * pe_dim),
@@ -43686,244 +44467,116 @@ class LeftNullBasisEncoder(nn.Module):
         )
         self.output = nn.Sequential(nn.Linear(pe_dim, pe_dim), nn.SiLU())
 
-    def _checked_q(self, basis: Tensor, *, orthonormal_input: bool) -> Tensor:
-        if basis.ndim != 2:
-            raise ValueError("basis must have shape [num_edges, cycle_rank]")
-        if not basis.is_floating_point():
-            raise ValueError("basis must be a floating point tensor [num_edges, cycle_rank]")
-        edge_count, rank = basis.shape
-        if edge_count == 0 and rank:
-            raise ValueError("an edgeless graph cannot have nonzero cycle rank")
-        if rank > edge_count:
-            raise ValueError("cycle rank cannot exceed the edge count")
-        if rank == 0:
-            return basis.float()
-        if orthonormal_input:
-            # Cache validation certifies Q.T@Q=I. Avoid a GPU synchronization or
-            # repeated QR in the hot path.
-            return basis.float()
-        q, triangular = torch.linalg.qr(basis.float(), mode="reduced")
-        threshold = torch.finfo(q.dtype).eps * max(edge_count, rank) * 16.0
-        if bool((triangular.diagonal().abs() <= threshold).any()):
-            raise ValueError("basis must have full column rank")
-        return q
-
-    def _projector_mix(
-        self, q: Tensor, values: Tensor, *, pair_budget: int | None
-    ) -> tuple[Tensor, Tensor]:
-        # The projector contraction is the sole forced-FP32 region.  The PE
-        # MLPs and graph backbone remain eligible for the caller's autocast.
-        with torch.autocast(device_type=q.device.type, enabled=False):
-            q, values = q.float(), values.float()
-            edge_count, rank = q.shape
-            leverage = q.square().sum(dim=1)
-            if edge_count == 0 or rank == 0:
-                return values.new_zeros(values.shape), leverage
-            feature_count = values.shape[1]
-            budget = pair_budget or max(1, feature_count * rank * rank)
-            rank_block = min(rank, self.column_chunk_size, max(1, math.isqrt(budget)))
-            feature_block = max(1, min(feature_count, budget // (rank_block * rank_block)))
-            feature_parts = []
-            for feature_start in range(0, feature_count, feature_block):
-                selected = values[:, feature_start : feature_start + feature_block]
-                mixed = selected.new_zeros(selected.shape)
-                for left_start in range(0, rank, rank_block):
-                    left = q[:, left_start : left_start + rank_block]
-                    for right_start in range(0, rank, rank_block):
-                        right = q[:, right_start : right_start + rank_block]
-                        # core[d,a,b] = sum_j V[j,d] Q[j,a] Q[j,b]. This realizes
-                        # ((Q Q.T) Hadamard-square (Q Q.T)) @ V without ever
-                        # allocating an edge-by-edge matrix.
-                        core = torch.einsum("md,ma,mb->dab", selected, left, right)
-                        mixed = mixed + torch.einsum("ma,dab,mb->md", left, core, right)
-                feature_parts.append(mixed)
-            return torch.cat(feature_parts, dim=1), leverage
-
-    def _projector_mix_batch(
-        self,
-        qs: Sequence[Tensor],
-        value_parts: Sequence[Tensor],
-        *,
-        pair_budget: int,
-    ) -> tuple[list[Tensor], list[Tensor]]:
-        """Rank-grouped projector contractions without an edge-pair matrix.
-
-        Molecular graphs with equal cycle rank are edge-padded and contracted
-        together.  The temporary ``[graphs, features, r_block, r_block]`` core
-        never exceeds ``pair_budget`` elements; padding never creates an
-        ``m x m`` tensor.  Results are restored to their original graph order.
-        """
-        if len(qs) != len(value_parts):
-            raise ValueError("basis/value graph counts must agree")
-        mixed_parts: list[Tensor | None] = [None] * len(qs)
-        leverage_parts: list[Tensor | None] = [None] * len(qs)
-        by_rank: dict[int, list[int]] = {}
-        for index, (q, values) in enumerate(zip(qs, value_parts, strict=True)):
-            if q.shape[0] != values.shape[0]:
-                raise ValueError("basis rows must align with graph bond embeddings")
-            by_rank.setdefault(q.shape[1], []).append(index)
-
-        with torch.autocast(
-            device_type=value_parts[0].device.type if value_parts else "cpu", enabled=False
-        ):
-            for rank, indices in by_rank.items():
-                if rank == 0:
-                    for index in indices:
-                        values = value_parts[index].float()
-                        mixed_parts[index] = values.new_zeros(values.shape)
-                        leverage_parts[index] = values.new_zeros(values.shape[0])
-                    continue
-                feature_count = value_parts[indices[0]].shape[1]
-                initial_rank_block = min(
-                    rank, self.column_chunk_size, max(1, math.isqrt(pair_budget))
-                )
-                # Reserve at least a modest feature tile when possible.  This
-                # batches many small molecules instead of launching one kernel
-                # per graph, while the exact core limit remains enforced below.
-                graph_block = max(
-                    1,
-                    pair_budget
-                    // (initial_rank_block * initial_rank_block * min(feature_count, 8)),
-                )
-                for graph_start in range(0, len(indices), graph_block):
-                    selected_indices = indices[graph_start : graph_start + graph_block]
-                    graph_count = len(selected_indices)
-                    q_padded = pad_sequence(
-                        [qs[index].float() for index in selected_indices], batch_first=True
-                    )
-                    values_padded = pad_sequence(
-                        [value_parts[index].float() for index in selected_indices],
-                        batch_first=True,
-                    )
-                    leverage_padded = q_padded.square().sum(dim=2)
-                    mixed_padded = values_padded.new_zeros(values_padded.shape)
-                    rank_block = min(
-                        rank,
-                        self.column_chunk_size,
-                        max(1, math.isqrt(pair_budget // graph_count)),
-                    )
-                    feature_block = max(
-                        1,
-                        min(
-                            feature_count,
-                            pair_budget // (graph_count * rank_block * rank_block),
-                        ),
-                    )
-                    for feature_start in range(0, feature_count, feature_block):
-                        selected = values_padded[
-                            :, :, feature_start : feature_start + feature_block
-                        ]
-                        mixed = selected.new_zeros(selected.shape)
-                        for left_start in range(0, rank, rank_block):
-                            left = q_padded[:, :, left_start : left_start + rank_block]
-                            for right_start in range(0, rank, rank_block):
-                                right = q_padded[:, :, right_start : right_start + rank_block]
-                                core = torch.einsum("gmd,gma,gmb->gdab", selected, left, right)
-                                if core.numel() > pair_budget:
-                                    raise RuntimeError("projector core exceeded basis_pair_budget")
-                                mixed.add_(torch.einsum("gma,gdab,gmb->gmd", left, core, right))
-                        mixed_padded[:, :, feature_start : feature_start + selected.shape[2]] = (
-                            mixed
-                        )
-                    for local, index in enumerate(selected_indices):
-                        edge_count = qs[index].shape[0]
-                        mixed_parts[index] = mixed_padded[local, :edge_count]
-                        leverage_parts[index] = leverage_padded[local, :edge_count]
-        if any(part is None for part in mixed_parts + leverage_parts):
-            raise RuntimeError("incomplete rank-grouped projector result")
-        return (
-            [part for part in mixed_parts if part is not None],
-            [part for part in leverage_parts if part is not None],
-        )
-
     @staticmethod
-    def _intrinsic_features(values: Tensor, mixed: Tensor, leverage: Tensor, rank: int) -> Tensor:
-        safe = leverage.clamp_min(torch.finfo(leverage.dtype).eps)
-        rank_fraction = leverage.new_full((len(leverage), 1), rank / max(1, len(leverage)))
-        return torch.cat(
+    def _sparse_mix(membership: Tensor, values: Tensor) -> Tensor:
+        # Torch 2.7 CUDA COO mm stays FP32 while learned MLPs may use BF16.
+        with torch.autocast(device_type=values.device.type, enabled=False):
+            return torch.sparse.mm(membership.float(), values.float())
+
+    def forward(
+        self,
+        bond: Tensor,
+        cycle_membership: Tensor,
+        cycle_lengths: Tensor,
+        edge_cycle_counts: Tensor,
+        edge_cycle_features: Tensor,
+        cycle_position_values: Tensor | None = None,
+    ) -> Tensor:
+        if bond.ndim != 2 or bond.shape[1] != self.bond_dim:
+            raise ValueError("bond embeddings must have shape [num_edges, bond_dim]")
+        if (
+            cycle_membership.layout != torch.sparse_coo
+            or cycle_membership.ndim != 2
+            or not cycle_membership.is_coalesced()
+            or not cycle_membership.is_floating_point()
+        ):
+            raise ValueError("cycle_membership must be a coalesced floating sparse COO matrix")
+        edge_count, cycle_count = cycle_membership.shape
+        if edge_count != bond.shape[0]:
+            raise ValueError("cycle membership rows must align with bond embeddings")
+        if cycle_lengths.shape != (cycle_count,) or edge_cycle_counts.shape != (edge_count,):
+            raise ValueError("cycle lengths and edge cycle counts must match sparse membership")
+        if edge_cycle_features.shape != (edge_count, 2):
+            raise ValueError("edge_cycle_features must have shape [num_edges, 2]")
+        if any(
+            value.device != bond.device
+            for value in (cycle_membership, cycle_lengths, edge_cycle_counts, edge_cycle_features)
+        ):
+            raise ValueError(
+                "cycle membership and normalization tensors must share the bond device"
+            )
+        if any(
+            not value.is_floating_point()
+            for value in (cycle_lengths, edge_cycle_counts, edge_cycle_features)
+        ):
+            raise ValueError("cycle lengths, counts and edge features must be floating point")
+
+        if self.encoding == "pe":
+            if cycle_position_values is None:
+                raise ValueError(
+                    "PE requires cycle_position_values; missing positions cannot use SE"
+                )
+            if (
+                cycle_position_values.shape != (2, cycle_membership._nnz())
+                or not cycle_position_values.is_floating_point()
+                or cycle_position_values.device != bond.device
+            ):
+                raise ValueError(
+                    "cycle_position_values must be floating [2, nnz] on the bond device"
+                )
+
+        values = self.column_phi(bond)
+        lengths = cycle_lengths.float()
+        counts = edge_cycle_counts.float()
+        active = (counts > 0).float()[:, None]
+        safe_counts = counts.clamp_min(1.0)[:, None]
+        log_lengths = lengths.log1p()[:, None]
+        cycle_sum = self._sparse_mix(cycle_membership.transpose(0, 1), values)
+        cycle_mean = cycle_sum / lengths.clamp_min(1.0)[:, None]
+        cycle_hidden = self.cycle_mlp(torch.cat((cycle_mean, log_lengths), dim=1))
+
+        # Sparse block-diagonal products handle every cycle of every graph in
+        # the physical batch without a graphwise loop or dense E x beta tensor.
+        edge_cycle_mean = self._sparse_mix(cycle_membership, cycle_hidden) / safe_counts
+        if self.encoding == "pe":
+            # Shared sorted COO indices preserve the selected cycle chart. No
+            # feature tensor indexed by every edge-cycle incidence is formed.
+            indices = cycle_membership.indices()
+            cosine = torch.sparse_coo_tensor(
+                indices, cycle_position_values[0].float(), cycle_membership.shape,
+                is_coalesced=True, check_invariants=False,
+            )
+            sine = torch.sparse_coo_tensor(
+                indices, cycle_position_values[1].float(), cycle_membership.shape,
+                is_coalesced=True, check_invariants=False,
+            )
+            cosine_moment = self._sparse_mix(cosine.transpose(0, 1), values)
+            sine_moment = self._sparse_mix(sine.transpose(0, 1), values)
+            cosine_moment = cosine_moment / lengths.clamp_min(1.0)[:, None]
+            sine_moment = sine_moment / lengths.clamp_min(1.0)[:, None]
+            positional_residual = (
+                self._sparse_mix(cosine, cosine_moment)
+                + self._sparse_mix(sine, sine_moment)
+            ) / safe_counts
+            # cos(theta_e-theta_f) is reconstructed before nonlinear layers.
+            # This equals (K_[1+cos] - K_mean) @ values, averaged over each
+            # edge's cycles. The existing nonlinear SE path stays unchanged.
+            edge_cycle_mean = edge_cycle_mean + positional_residual
+        features = torch.cat(
             (
-                values.float() * leverage[:, None],
-                mixed / safe[:, None],
-                leverage[:, None],
-                leverage.sqrt()[:, None],
-                rank_fraction,
+                values.float() * active,
+                edge_cycle_mean,
+                counts.log1p()[:, None],
+                # Static mean log-length/inverse-length features come from
+                # preparation/cache rather than a third sparse product here.
+                edge_cycle_features.float(),
             ),
             dim=1,
         )
-
-    def _encode(
-        self,
-        bond: Tensor,
-        basis: Tensor,
-        *,
-        pair_budget: int | None,
-        orthonormal_input: bool,
-    ) -> Tensor:
-        if bond.ndim != 2 or bond.shape[1] != self.bond_dim:
-            raise ValueError("bond embeddings have an invalid shape")
-        if basis.ndim != 2 or basis.shape[0] != bond.shape[0]:
-            raise ValueError("basis must have shape (num_edges, cycle_rank)")
-        if basis.device != bond.device:
-            raise ValueError("basis must be on the bond embedding device")
-        edge_count, rank = basis.shape
-        if rank == 0:
-            return bond.new_zeros((edge_count, self.pe_dim))
-        q = self._checked_q(basis, orthonormal_input=orthonormal_input)
-        values = self.column_phi(bond)
-        mixed, leverage = self._projector_mix(q, values, pair_budget=pair_budget)
-        features = self._intrinsic_features(values, mixed, leverage, rank)
         encoded = self.output(self.edge_psi(features))
-        # Bridges (hence every edge in an acyclic component) have zero cycle
-        # leverage and exactly zero PE despite affine biases.
-        return encoded * leverage.sqrt()[:, None].to(encoded.dtype)
-
-    def forward(self, bond: Tensor, basis: Tensor) -> Tensor:
-        return self._encode(bond, basis, pair_budget=None, orthonormal_input=False)
-
-    def forward_batch(
-        self,
-        bond: Tensor,
-        bases: Sequence[Tensor],
-        *,
-        pair_budget: int = 32768,
-        orthonormal_input: bool | Sequence[bool] = False,
-    ) -> Tensor:
-        if pair_budget < 1:
-            raise ValueError("pair_budget must be positive")
-        counts = [basis.shape[0] for basis in bases]
-        if sum(counts) != len(bond):
-            raise ValueError("basis rows must align with concatenated bond embeddings")
-        if not bases:
-            return bond.new_zeros((0, self.pe_dim))
-        if isinstance(orthonormal_input, bool):
-            orthonormal_flags = [orthonormal_input] * len(bases)
-        else:
-            orthonormal_flags = list(orthonormal_input)
-            if len(orthonormal_flags) != len(bases) or any(
-                not isinstance(flag, bool) for flag in orthonormal_flags
-            ):
-                raise ValueError("one Boolean orthonormal-input flag is required per basis")
-        qs = [
-            self._checked_q(basis, orthonormal_input=flag)
-            for basis, flag in zip(bases, orthonormal_flags, strict=True)
-        ]
-        values = self.column_phi(bond)
-        value_parts = list(torch.split(values, counts))
-        mixed_parts, leverage_parts = self._projector_mix_batch(
-            qs, value_parts, pair_budget=pair_budget
-        )
-        features = torch.cat(
-            [
-                self._intrinsic_features(value, mixed, leverage, q.shape[1])
-                for q, value, mixed, leverage in zip(
-                    qs, value_parts, mixed_parts, leverage_parts, strict=True
-                )
-            ],
-            dim=0,
-        )
-        leverage = torch.cat(leverage_parts)
-        encoded = self.output(self.edge_psi(features))
-        return encoded * leverage.sqrt()[:, None].to(encoded.dtype)
+        # Empty-cycle sparse products retain an autograd path: forest PE is
+        # exactly zero and PE parameter gradients are zero, not disconnected.
+        return encoded * active.to(encoded.dtype)
 
 
 class _ResidualEdgeGraphBlock(nn.Module):
@@ -44015,18 +44668,16 @@ class _ResidualEdgeGraphBlock(nn.Module):
 
 
 class CycleBasisPEModel(nn.Module):
-    """Projector-kernel PE with a deep, stable molecular graph backbone."""
+    """Sparse DFS-cycle PE with the unchanged deep molecular graph backbone."""
 
     def __init__(
         self,
         *,
         dataset: str,
+        encoding: str = "se",
         hidden: int = 128,
         pe_dim: int = 64,
         layers: int = 10,
-        column_chunk_size: int = 16,
-        basis_execution: str = "batched",
-        basis_pair_budget: int = 32768,
         ffn_multiplier: int = 4,
         dropout: float = 0.0,
         layer_scale: float = 0.1,
@@ -44038,15 +44689,10 @@ class CycleBasisPEModel(nn.Module):
             raise ValueError("hidden, pe_dim, layers and ffn_multiplier must be positive")
         if not 0.0 <= dropout < 1.0 or not 0.0 < layer_scale <= 1.0:
             raise ValueError("dropout or layer_scale is outside its stable range")
-        if basis_execution not in BASIS_EXECUTIONS:
-            raise ValueError(f"basis_execution must be one of {BASIS_EXECUTIONS}")
-        if basis_pair_budget < 1:
-            raise ValueError("basis_pair_budget must be positive")
-        self.basis_execution = basis_execution
-        self.basis_pair_budget = basis_pair_budget
         self.node_encoder = CategoricalEncoder((28,) if dataset == "zinc12k" else ATOM_DIMS, hidden)
         self.bond_encoder = CategoricalEncoder((4,) if dataset == "zinc12k" else BOND_DIMS, hidden)
-        self.pe_encoder = LeftNullBasisEncoder(hidden, pe_dim, column_chunk_size=column_chunk_size)
+        self.encoding = encoding
+        self.pe_encoder = LeftNullBasisEncoder(hidden, pe_dim, encoding=encoding)
         self.edge_encoder = nn.Sequential(
             nn.Linear(hidden + pe_dim, hidden), nn.SiLU(), nn.Linear(hidden, hidden)
         )
@@ -44072,43 +44718,17 @@ class CycleBasisPEModel(nn.Module):
 
     def forward(self, batch: Batch) -> Tensor:
         graph_count = len(batch.ptr) - 1
-        if len(batch.cycle_bases) != graph_count:
-            raise ValueError("one cycle-space basis is required per graph")
-        if len(batch.cycle_basis_is_orthonormal) != graph_count:
-            raise ValueError("one cycle-space representation flag is required per graph")
-        counts = [basis.shape[0] for basis in batch.cycle_bases]
-        if sum(counts) != len(batch.edge_attr):
-            raise ValueError("ragged basis rows do not align with batch bonds")
         node = self.node_encoder(batch.x)
         bond = self.bond_encoder(batch.edge_attr)
-        if self.basis_execution == "reference":
-            positional = torch.cat(
-                [
-                    self.pe_encoder._encode(
-                        part,
-                        basis,
-                        pair_budget=None,
-                        orthonormal_input=is_orthonormal,
-                    )
-                    for part, basis, is_orthonormal in zip(
-                        torch.split(bond, counts),
-                        batch.cycle_bases,
-                        batch.cycle_basis_is_orthonormal,
-                        strict=True,
-                    )
-                ],
-                dim=0,
-            )
-        else:
-            positional = self.pe_encoder.forward_batch(
-                bond,
-                batch.cycle_bases,
-                pair_budget=self.basis_pair_budget,
-                orthonormal_input=batch.cycle_basis_is_orthonormal,
-            )
+        positional = self.pe_encoder(
+            bond,
+            batch.cycle_membership,
+            batch.cycle_lengths,
+            batch.edge_cycle_counts,
+            batch.edge_cycle_features,
+            batch.cycle_position_values,
+        )
         edge = self.edge_encoder(torch.cat((bond, positional), dim=1))
-        # The outer training/evaluation autocast remains active for the deep
-        # backbone.  Only the projector contractions above force FP32.
         edge_index = batch.edge_index.T
         topology = _message_topology(node, edge_index)
         for layer in self.layers:
@@ -44118,55 +44738,77 @@ class CycleBasisPEModel(nn.Module):
         node_mean, node_max = _pool(node, batch.batch, graph_count)
         node_sizes = (batch.ptr[1:] - batch.ptr[:-1]).to(node.dtype)[:, None]
         node_sum = node_mean * node_sizes
-        edge_graph = batch.batch[batch.edge_index[0]]
-        edge_mean, edge_max = _pool(edge, edge_graph, graph_count)
+        edge_mean, edge_max = _pool(edge, batch.edge_graph_index, graph_count)
         edge_sizes = (batch.edge_ptr[1:] - batch.edge_ptr[:-1]).to(edge.dtype)[:, None]
         edge_sum = edge_mean * edge_sizes
         pooled = torch.cat((node_sum, node_mean, node_max, edge_sum, edge_mean, edge_max), dim=1)
         return self.graph_head(self.graph_trunk(pooled))
 
 
-def architecture_protocol() -> dict[str, str]:
+def architecture_protocol(encoding: str = "se") -> dict[str, str]:
+    if encoding not in ENCODINGS:
+        raise ValueError(f"encoding must be one of {ENCODINGS}")
     return {
-        "model": MODEL_NAME,
+        "model": MODEL_NAMES[encoding],
+        "encoding": encoding,
         "cycle_space": (
-            "default thin_q caches a thin-QR orthonormalization Q of a sparse fundamental "
-            "basis Z of ker(B.T); optional dfs_fundamental caches raw DFS Z and performs "
-            "graph-local QR before projector use; beta=m-n+components; no truncation"
+            "complete signed sparse DFS fundamental basis Z of ker(B.T); "
+            "beta=m-n+components; every selected cycle retained without truncation"
         ),
         "positional_encoding": (
-            "P=Q Q.T and orientation-free K=P Hadamard-square P; learned bond values are "
-            "mixed as K phi(bond), normalized by leverage diag(P), then fused with local "
-            "cycle-weighted values and leverage"
+            "SE: unsigned sparse membership A=abs(Z); shared learned bond values "
+            "aggregate edge-to-cycle by mean, combine with log cycle length through a "
+            "shared cycle MLP, then aggregate cycle-to-edge with cycle-count normalization"
+            if encoding == "se"
+            else "PE: retain the identical SE path and add the cycle-relative residual "
+            "sum_j mean_f cos(2*pi*(t_ej-t_fj)/L_j)*phi(bond_f), averaged over edge cycles; "
+            "this is K_[1+cos] minus K_mean applied to learned bond values"
+        ),
+        "relative_position": (
+            "disabled in SE; cycle structure summaries contain no within-cycle distance"
+            if encoding == "se"
+            else "first-harmonic cosine kernel of undirected cyclic distance; origin/reversal "
+            "invariant, not general graph shortest-path distance or guaranteed unique positions; "
+            "all selected cycles and their complete supports participate"
+        ),
+        "parameter_matching": (
+            "SE and PE have identical learned modules and parameter counts; PE adds no gate "
+            "or learned parameters; nonlinear layers follow invariant harmonic reconstruction"
         ),
         "symmetry": (
-            "invariant to every invertible cycle-basis replacement Z->ZR and independent "
-            "edge-orientation flips; edge-permutation equivariant"
+            "cycle-sign, column-order and cycle-origin/reversal invariant; "
+            "edge/node permutation equivariant "
+            "only when the selected basis is transported with the graph; a different "
+            "DFS tree or arbitrary invertible Z->ZR may change this selected-cycle PE"
         ),
         "execution": (
-            "thin_q has no QR/SVD/pinv in training; dfs_fundamental is a diagnostic "
-            "correctness backend with repeated per-forward QR, not a speedup; K@V uses "
-            "pair-free rank-grouped contractions and never m-by-m storage"
+            "one sparse block-diagonal physical batch; sparse edge-to-cycle-to-edge "
+            "matrix products; no QR, SVD, eigendecomposition, Gram inverse, projector, "
+            "dense edge-by-cycle matrix or edge-by-edge matrix"
         ),
         "backbone": (
             "deep pre-norm residual edge/node message blocks; gated directed messages; "
             "separate edge and node FFNs; LayerScale and dropout for stable deep training"
         ),
-        "pe_injection": "concatenate projector-kernel PE with categorical bond embedding",
+        "pe_injection": "concatenate the selected learned DFS-cycle encoding with bond embedding",
         "pooling": "node and edge sum/mean/max followed by a two-layer graph trunk",
         "forest_policy": (
-            "bridges, including every edge of an acyclic component, have zero leverage and PE"
+            "edges outside all selected cycles, including bridges and forests, have "
+            "exactly zero PE; empty sparse paths retain zero parameter gradients"
         ),
         "numeric_policy": (
-            "projector contraction executes in FP32; PE MLPs and the deep backbone honor "
-            "outer AMP, with FP32 residual accumulation where required"
+            "sparse COO matrix products execute in FP32; learned cycle/edge MLPs and "
+            "the deep backbone honor outer AMP with FP32 residual accumulation"
         ),
-        "reference_comparison": f"external published tables only; trains only {MODEL_NAME}",
+        "reference_comparison": (
+            f"external published tables only; trains only {MODEL_NAMES[encoding]}"
+        ),
     }
 
 
 __all__ = [
-    "BASIS_EXECUTIONS",
+    "ENCODINGS",
+    "MODEL_NAMES",
     "MODEL_NAME",
     "CycleBasisPEModel",
     "LeftNullBasisEncoder",
@@ -49260,6 +49902,27 @@ PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         pairable=False,
     ),
     _metric_rule(
+        "cycle.dfs_sparse_v2.test",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_dfs_sparse_pe_v2\.test",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.dfs_se_v2.test",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_dfs_se_v2\.test",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.dfs_relative_pe_v2.test",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_dfs_relative_pe_v2\.test",
+        pairable=False,
+    ),
+    _metric_rule(
         "conductance.core.prediction",
         "conductance_gat",
         r"summary\.json",
@@ -49365,6 +50028,30 @@ EFFICIENCY_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "cycle_pe",
         r"metrics\.json",
         r"datasets\.[^.]+\.models\.cycle_projector_pe_v2\."
+        r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.dfs_sparse_v2.efficiency",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_dfs_sparse_pe_v2\."
+        r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.dfs_se_v2.efficiency",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_dfs_se_v2\."
+        r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.dfs_relative_pe_v2.efficiency",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_dfs_relative_pe_v2\."
         r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
         pairable=False,
     ),
@@ -49644,8 +50331,7 @@ def aggregate_manifest(
                     ]
                 except OSError as error:
                     artifact_errors.append(
-                        f"could not read failure log {log_value}: "
-                        f"{type(error).__name__}: {error}"
+                        f"could not read failure log {log_value}: {type(error).__name__}: {error}"
                     )
             error_text = " | ".join(str(error) for error in artifact_errors)
             searchable_error = f"{error_text}\n{log_text}".casefold()
@@ -50039,6 +50725,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--cycle-v2-encoding",
+        choices=("se", "pe"),
+        default="se",
+        help="Cycle V2 condition: structural SE or SE plus relative positional residual.",
+    )
     parser.add_argument("--include-compile", action="store_true")
     parser.add_argument(
         "--v5-scale-profile",
@@ -50086,9 +50778,7 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError(f"{args.track} datasets: {DATASETS[args.track]}")
     if args.steps < 1 or args.warmup < 1 or args.seed < 0:
         raise ValueError("steps/warmup must be positive and seed nonnegative")
-    if args.minimum_measure_seconds <= 0 or not math.isfinite(
-        args.minimum_measure_seconds
-    ):
+    if args.minimum_measure_seconds <= 0 or not math.isfinite(args.minimum_measure_seconds):
         raise ValueError("minimum measure seconds must be finite and positive")
     if args.track == "conductance_v5":
         from research.conductance_gat.v5.protocol import HARDWARE_PROFILES
@@ -50115,9 +50805,7 @@ def _validate(args: argparse.Namespace) -> None:
         from research.tree_augmentation.paper import _load_settings
 
         tree_settings, _ = _load_settings()
-        args.tree_precision = (
-            "float16_autocast" if bool(tree_settings["amp"]) else "float32"
-        )
+        args.tree_precision = "float16_autocast" if bool(tree_settings["amp"]) else "float32"
         if args.include_compile:
             raise ValueError(
                 "the exact Tree Augmentation training path does not support torch.compile; "
@@ -50190,10 +50878,10 @@ def _physical_batch_size_applicable(args: argparse.Namespace) -> bool:
         return True
     if args.dataset == "ppi":
         return True
-    return (
-        args.track == "conductance_v5"
-        and getattr(args, "v5_sampling_resolved", None) in {"neighbor", "cluster"}
-    )
+    return args.track == "conductance_v5" and getattr(args, "v5_sampling_resolved", None) in {
+        "neighbor",
+        "cluster",
+    }
 
 
 def _seed(seed: int) -> None:
@@ -50302,8 +50990,7 @@ def _build_conductance_case(
                 None
                 if batch_applicable
                 else (
-                    "dataset is one transductive full graph; the compatibility "
-                    "value is not applied"
+                    "dataset is one transductive full graph; the compatibility value is not applied"
                 )
             ),
             "gradient_accumulation_steps": 1,
@@ -50366,9 +51053,7 @@ def _build_v5_case(
         batch_size=args.batch_size if args.dataset == "ppi" else 1,
         workers=0,
         model_seed=args.seed,
-        sample_seed_batch_size=(
-            args.batch_size if sampled else hardware["sample_seed_batch_size"]
-        ),
+        sample_seed_batch_size=(args.batch_size if sampled else hardware["sample_seed_batch_size"]),
         num_neighbors=list(args.v5_num_neighbors),
         sample_prefetch=hardware["sample_prefetch"],
         pin_memory=hardware["pin_memory"],
@@ -50490,12 +51175,10 @@ def _build_v5_case(
             "cache": "verified official dataset cache loaded once for all candidates",
             "production_path_identity": {
                 "model": (
-                    "research.conductance_gat.v5.model."
-                    "GraphConditionedConductanceNodeClassifier"
+                    "research.conductance_gat.v5.model.GraphConditionedConductanceNodeClassifier"
                 ),
                 "training_batch": (
-                    "research.conductance_gat.v5.train._prepare_data/"
-                    "_training_batches"
+                    "research.conductance_gat.v5.train._prepare_data/_training_batches"
                 ),
                 "loss": "research.conductance_gat.ablation.train.training_loss",
                 "phase": "research.conductance_gat.v5.train.configure_phase(joint, epoch=0)",
@@ -50520,7 +51203,7 @@ def _build_cycle_case(
     loaded: tuple[dict[str, list[Any]], dict[str, Any]] | None = None,
 ) -> SpeedCase:
     from research.cycle_pe.v2.data import collate, load_benchmark
-    from research.cycle_pe.v2.model import CycleBasisPEModel
+    from research.cycle_pe.v2.model import MODEL_NAMES, CycleBasisPEModel
 
     splits, protocol = (
         loaded
@@ -50535,11 +51218,8 @@ def _build_cycle_case(
     selected = splits["train"][: args.batch_size]
     batch = collate(selected).to(device)
 
-    def make_model(kind):
-        return CycleBasisPEModel(
-            dataset=args.dataset,
-            basis_execution="reference" if kind == "reference" else "batched",
-        )
+    def make_model(_kind):
+        return CycleBasisPEModel(dataset=args.dataset, encoding=args.cycle_v2_encoding)
 
     return SpeedCase(
         batch,
@@ -50551,8 +51231,8 @@ def _build_cycle_case(
             "nodes": batch.x.shape[0],
             "physical_edges": batch.edge_index.shape[1],
             "graphs": len(selected),
-            "basis_ranks": [basis.shape[1] for basis in batch.cycle_bases],
-            "basis_pairs": sum(basis.numel() for basis in batch.cycle_bases),
+            "basis_ranks": [shape[1] for shape in batch.cycle_basis_shapes],
+            "cycle_memberships": batch.cycle_membership._nnz(),
             "requested_physical_batch_size": args.batch_size,
             "actual_physical_batch_size": len(selected),
             "physical_batch_size_unit": "graphs",
@@ -50567,19 +51247,23 @@ def _build_cycle_case(
             "prefetch": "single fixed batch is collated and transferred before timing",
             "cache": "verified Cycle PE basis cache loaded once for all candidates",
             "model_configuration": {
-                "name": "cycle_basis_pe_v2",
+                "name": MODEL_NAMES[args.cycle_v2_encoding],
+                "encoding": args.cycle_v2_encoding,
+                "relative_position_residual": args.cycle_v2_encoding == "pe",
                 "hidden_channels": 128,
                 "pe_dimension": 64,
                 "layers": 10,
                 "attention_heads": 0,
                 "ffn_multiplier": 4,
                 "dropout": 0.0,
-                "basis_pair_budget": 32768,
+                "basis_backend": "dfs_fundamental",
+                "basis_execution": "sparse_block_diagonal",
             },
         },
-        "Same current Cycle PE v2 backbone/parameters; compares reference per-graph "
-        "full-basis encoder with bounded batched full-basis encoder. Excludes data "
-        "preparation/transfer, optimizer, checkpoint and validation; no basis truncation.",
+        "The explicitly selected sparse DFS Cycle V2 SE/PE condition, optionally "
+        "comparing compiled tensor MLP blocks within that condition. "
+        "No historical-projector speedup is claimed. Excludes data preparation/transfer, "
+        "optimizer, checkpoint and validation; no basis truncation or factorization.",
     )
 
 
@@ -50657,8 +51341,7 @@ def _build_cycle_v1_case(
             "pin_memory": True,
             "prefetch": "one deterministic real training batch is transferred before timing",
             "cache": (
-                "all verified official Cycle PE V1 splits loaded once for the "
-                "candidate sweep"
+                "all verified official Cycle PE V1 splits loaded once for the candidate sweep"
             ),
             "production_path_identity": {
                 "model": "research.cycle_pe.benchmark_models.CyclePEModel",
@@ -50771,9 +51454,7 @@ def _build_tree_case(
         target_mean = np.zeros(1, dtype=np.float64)
         target_scale = np.ones(1, dtype=np.float64)
     else:
-        raise ValueError(
-            f"unsupported Tree Augmentation task type: {dataset.task_type}"
-        )
+        raise ValueError(f"unsupported Tree Augmentation task type: {dataset.task_type}")
     mean_tensor = torch.as_tensor(target_mean, dtype=torch.float32, device=device)
     scale_tensor = torch.as_tensor(target_scale, dtype=torch.float32, device=device)
     output_dim = _output_dim(dataset)
@@ -50808,9 +51489,7 @@ def _build_tree_case(
             "dataset_cache_integrity": {
                 "full_cache_loaded": True,
                 "all_declared_splits_validated": True,
-                "loaded_and_validated_splits": sorted(
-                    {record.split for record in dataset.records}
-                ),
+                "loaded_and_validated_splits": sorted({record.split for record in dataset.records}),
             },
             "seed_axes": seed_axes.to_manifest(),
             "tree_arm": args.tree_arm,
@@ -50850,20 +51529,13 @@ def _build_tree_case(
                 "are loaded/constructed once for the candidate sweep"
             ),
             "production_path_identity": {
-                "model": (
-                    "research.tree_augmentation.paper_model."
-                    "VariableBetaCycleEncoder"
-                ),
-                "training_views": (
-                    "research.tree_augmentation.paper._training_views"
-                ),
+                "model": ("research.tree_augmentation.paper_model.VariableBetaCycleEncoder"),
+                "training_views": ("research.tree_augmentation.paper._training_views"),
                 "batch": (
                     "research.tree_augmentation.paper_model.collate_chart_views "
                     "with the fit_downstream_model seed+101 replacement sampler"
                 ),
-                "loss": (
-                    "fit_downstream_model CSL cross_entropy or ZINC normalized MSE"
-                ),
+                "loss": ("fit_downstream_model CSL cross_entropy or ZINC normalized MSE"),
             },
             "precision": "float16_autocast" if use_amp else "float32",
             "padded_input_shapes": {
@@ -50972,13 +51644,11 @@ def _implementation_hashes(track: str) -> dict[str, str]:
 
 
 def _planned_variants(args: argparse.Namespace) -> list[str]:
-    if args.track in {"conductance_v5", "cycle_pe_v1"}:
+    if args.track in {"conductance_v5", "cycle_pe_v1", "cycle_pe_v2"}:
         return ["current"] + (["compiled"] if args.include_compile else [])
     if args.track == "tree_augmentation":
         return ["current"]
-    return ["reference", "optimized"] + (
-        ["compiled"] if args.include_compile else []
-    )
+    return ["reference", "optimized"] + (["compiled"] if args.include_compile else [])
 
 
 def _probe(model, case: SpeedCase) -> dict[str, Any]:
@@ -51216,15 +51886,13 @@ def _add_resource_and_throughput_columns(
     physical_batch_unit = case.description["physical_batch_size_unit"]
     row["physical_batch_item_unit"] = physical_batch_unit
     if isinstance(physical_batch_size, int) and not isinstance(physical_batch_size, bool):
-        row["physical_batch_items_per_second"] = (
-            float(physical_batch_size) * steps / seconds
-        )
+        row["physical_batch_items_per_second"] = float(physical_batch_size) * steps / seconds
         row["physical_batch_throughput_unavailable_reason"] = None
     else:
         row["physical_batch_items_per_second"] = None
-        row["physical_batch_throughput_unavailable_reason"] = (
-            case.description["physical_batch_size_reason"]
-        )
+        row["physical_batch_throughput_unavailable_reason"] = case.description[
+            "physical_batch_size_reason"
+        ]
     row.update(
         gpu_sm_utilization_mean_percent=_resource_scalar(
             resource, "interval_series", "gpu_sm_utilization_percent", "mean"
@@ -51294,8 +51962,7 @@ def _finish_variant_monitor(
     }
     if errors:
         row["resource_observability_error"] = "; ".join(
-            f"{stage}: {type(error).__name__}: {error}"
-            for stage, error in errors
+            f"{stage}: {type(error).__name__}: {error}" for stage, error in errors
         )
     return peak_allocated_bytes, peak_reserved_bytes, errors
 
@@ -51369,8 +52036,8 @@ def _run_variant(args, device, case, state, variant, reference):
             device=device,
         )
         monitor_finish_attempted = True
-        peak_allocated_bytes, peak_reserved_bytes, monitor_errors = (
-            _finish_variant_monitor(monitor, device, row)
+        peak_allocated_bytes, peak_reserved_bytes, monitor_errors = _finish_variant_monitor(
+            monitor, device, row
         )
         if monitor_errors:
             primary_monitor_error = monitor_errors[0][1]
@@ -51395,15 +52062,12 @@ def _run_variant(args, device, case, state, variant, reference):
             peak_cuda_allocated_bytes=peak_allocated_bytes,
             peak_cuda_reserved_bytes=peak_reserved_bytes,
             peak_cuda_incremental_bytes=peak_allocated_bytes - baseline_bytes,
-            peak_cuda_reserved_incremental_bytes=peak_reserved_bytes
-            - baseline_reserved_bytes,
+            peak_cuda_reserved_incremental_bytes=peak_reserved_bytes - baseline_reserved_bytes,
             trainable_parameters_unchanged=True,
             production_path_integrity=probe["integrity"]
             | {
                 "trainable_parameters_unchanged_after_measurement": True,
-                "production_path_identity": case.description.get(
-                    "production_path_identity"
-                ),
+                "production_path_identity": case.description.get("production_path_identity"),
             },
         )
         _add_resource_and_throughput_columns(row, row["resource_observability"], case)
@@ -51434,9 +52098,7 @@ def _run_variant(args, device, case, state, variant, reference):
             try:
                 model.zero_grad(set_to_none=True)
             except (Exception, KeyboardInterrupt) as cleanup_error:
-                post_variant_cleanup_errors.append(
-                    ("model_zero_grad", cleanup_error)
-                )
+                post_variant_cleanup_errors.append(("model_zero_grad", cleanup_error))
             del model
         try:
             gc.collect()
@@ -51445,9 +52107,7 @@ def _run_variant(args, device, case, state, variant, reference):
         try:
             torch.cuda.empty_cache()
         except (Exception, KeyboardInterrupt) as cleanup_error:
-            post_variant_cleanup_errors.append(
-                ("cuda_empty_cache", cleanup_error)
-            )
+            post_variant_cleanup_errors.append(("cuda_empty_cache", cleanup_error))
         if post_variant_cleanup_errors:
             row["post_variant_cleanup_errors"] = [
                 {
@@ -51546,8 +52206,7 @@ def _batch_candidate_analysis(
             (
                 row
                 for row in candidate.get("variants", [])
-                if row["variant"] in {"optimized", "current"}
-                and row["status"] == "passed"
+                if row["variant"] in {"optimized", "current"} and row["status"] == "passed"
             ),
             None,
         )
@@ -51564,9 +52223,7 @@ def _batch_candidate_analysis(
         free_bytes = _resource_scalar(resource, "start", "gpu", "device_free_bytes")
         total_bytes = _resource_scalar(resource, "start", "gpu", "device_total_bytes")
         incremental = target["peak_cuda_reserved_incremental_bytes"]
-        if not isinstance(free_bytes, (int, float)) or not isinstance(
-            total_bytes, (int, float)
-        ):
+        if not isinstance(free_bytes, (int, float)) or not isinstance(total_bytes, (int, float)):
             evaluation["reason"] = "CUDA free/total memory observation was unavailable"
             evaluations.append(evaluation)
             continue
@@ -51695,8 +52352,7 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
             _seed(args.seed)
             initial = case.make_model("optimized")
             state = {
-                name: value.detach().cpu().clone()
-                for name, value in initial.state_dict().items()
+                name: value.detach().cpu().clone() for name, value in initial.state_dict().items()
             }
             fingerprint = _state_fingerprint(state)
             if common_fingerprint is None:
@@ -51707,9 +52363,7 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
                 )
             candidate["initial_state_sha256"] = fingerprint
             candidate["trainable_parameters"] = sum(
-                parameter.numel()
-                for parameter in initial.parameters()
-                if parameter.requires_grad
+                parameter.numel() for parameter in initial.parameters() if parameter.requires_grad
             )
             if len(args.batch_sizes) == 1:
                 report["trainable_parameters"] = candidate["trainable_parameters"]
@@ -51718,7 +52372,8 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
             print(
                 f"physical batch candidate {batch_size}: "
                 f"actual={case.description['actual_physical_batch_size']} "
-                f"unit={case.description['physical_batch_size_unit']}", flush=True
+                f"unit={case.description['physical_batch_size_unit']}",
+                flush=True,
             )
             print(
                 "variant       ms/step     steps/s   batch-items/s GPU SM mean/max    "
@@ -51728,9 +52383,7 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
             for variant in variants:
                 report["active_variant"] = variant
                 atomic_write_json(output / "report.json", report)
-                row, probe = _run_variant(
-                    candidate_args, device, case, state, variant, reference
-                )
+                row, probe = _run_variant(candidate_args, device, case, state, variant, reference)
                 row["candidate_index"] = candidate_index
                 candidate["variants"].append(row)
                 report["variants"].append(row)
@@ -51751,9 +52404,7 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
                 if reference is None:
                     reference = probe
                 reference_seconds = candidate["variants"][0]["seconds_per_step"]
-                row["speedup_vs_reference"] = (
-                    reference_seconds / row["seconds_per_step"]
-                )
+                row["speedup_vs_reference"] = reference_seconds / row["seconds_per_step"]
                 atomic_write_json(output / "report.json", report)
                 _write_csv(output / "summary.csv", report["variants"])
                 sm_mean = row["gpu_sm_utilization_mean_percent"]
@@ -51766,8 +52417,7 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
                 batch_rate = row["physical_batch_items_per_second"]
                 batch_rate_text = (
                     f"{batch_rate:15.2f}"
-                    if isinstance(batch_rate, (int, float))
-                    and not isinstance(batch_rate, bool)
+                    if isinstance(batch_rate, (int, float)) and not isinstance(batch_rate, bool)
                     else f"{'not-applicable':>15}"
                 )
                 print(
@@ -51823,12 +52473,8 @@ def _execute(args, report: dict[str, Any], output: Path) -> None:
     report["initial_state_sha256"] = common_fingerprint
     report["candidate_summary"] = {
         "planned": len(args.batch_sizes),
-        "passed": sum(
-            candidate["status"] == "passed" for candidate in report["batch_candidates"]
-        ),
-        "failed": sum(
-            candidate["status"] == "failed" for candidate in report["batch_candidates"]
-        ),
+        "passed": sum(candidate["status"] == "passed" for candidate in report["batch_candidates"]),
+        "failed": sum(candidate["status"] == "failed" for candidate in report["batch_candidates"]),
     }
     report["batch_candidate_analysis"] = _batch_candidate_analysis(
         report["batch_candidates"],
@@ -56214,6 +56860,8 @@ def _source_snapshot() -> dict[str, Any]:
             cwd=ROOT,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=True,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
@@ -59345,7 +59993,7 @@ if __name__ == "__main__":
 """Run larger-model scaling experiments for both Cycle PE V1 and V2.
 
 Every candidate uses only the official train/validation splits.  One common
-profile per version and dataset is selected by mean validation MAE across all
+profile per version, encoding and dataset is selected by mean validation MAE across all
 requested model seeds; each seed's checkpoint at that profile is then evaluated
 once on test without retraining.  Candidate artifacts and final test evaluations
 are kept in disjoint result sections.
@@ -59391,7 +60039,7 @@ DATASETS = ("zinc12k", "peptides_struct")
 VERSIONS = ("v1", "v2")
 PROFILE_ORDER = ("reference", "large")
 HARDWARE_PROFILES = ("portable", "a6000-48gb")
-BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
+BASIS_BACKENDS = ("dfs_fundamental",)
 A6000_MIN_TOTAL_BYTES = 40 * 1024**3
 A6000_BATCH_SIZE = {
     "reference": {"zinc12k": 512, "peptides_struct": 128},
@@ -59435,7 +60083,37 @@ PROFILES: dict[str, dict[str, dict[str, float | int]]] = {
         },
     },
 }
-MODEL_NAMES = {"v1": "cycle_set", "v2": "cycle_projector_pe_v2"}
+ENCODINGS = ("se", "pe")
+MODEL_NAMES = {"se": "cycle_dfs_se_v2", "pe": "cycle_dfs_relative_pe_v2"}
+
+
+def _conditions(versions: list[str], encodings: list[str] | tuple[str, ...]):
+    return [
+        (version, encoding)
+        for version in versions
+        for encoding in (encodings if version == "v2" else (None,))
+    ]
+
+
+def _condition_id(version: str, encoding: str | None) -> str:
+    if version == "v1" and encoding is None:
+        return version
+    if version == "v2" and encoding in ENCODINGS:
+        return f"{version}:{encoding}"
+    raise ValueError(f"invalid cycle version/encoding: {version}/{encoding}")
+
+
+def _model_name(version: str, encoding: str | None) -> str:
+    _condition_id(version, encoding)
+    return "cycle_set" if version == "v1" else MODEL_NAMES[encoding]
+
+
+def _selected_test_count(args: argparse.Namespace) -> int:
+    return (
+        len(_conditions(args.versions, args.encodings)) * len(args.datasets) * len(args.model_seeds)
+    )
+
+
 MODULES = {
     "v1": "research.cycle_pe.benchmark",
     "v2": "research.cycle_pe.v2.benchmark",
@@ -59493,6 +60171,13 @@ def _seeds(value: str) -> tuple[int, ...]:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--versions", nargs="+", choices=VERSIONS, default=list(VERSIONS))
+    result.add_argument(
+        "--encodings",
+        nargs="+",
+        choices=ENCODINGS,
+        default=list(ENCODINGS),
+        help="independent V2 SE/PE conditions; V1 remains unchanged",
+    )
     result.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
     result.add_argument("--profiles", nargs="+", choices=PROFILE_ORDER, default=list(PROFILE_ORDER))
     result.add_argument(
@@ -59534,10 +60219,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--allow-download", action="store_true")
     result.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     result.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
-    result.add_argument("--column-chunk-size", type=int, default=0)
-    result.add_argument("--basis-backend", choices=BASIS_BACKENDS, default="thin_q")
-    result.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
-    result.add_argument("--basis-pair-budget", type=int, default=0)
+    result.add_argument("--basis-backend", choices=BASIS_BACKENDS, default="dfs_fundamental")
     result.add_argument("--min-free-gb", type=float, default=8.0)
     result.add_argument("--fail-fast", action="store_true")
     result.add_argument("--dry-run", action="store_true")
@@ -59545,12 +60227,10 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _validate(args: argparse.Namespace) -> None:
-    for name in ("versions", "datasets", "profiles"):
+    for name in ("versions", "encodings", "datasets", "profiles"):
         values = getattr(args, name)
         if not values or len(set(values)) != len(values):
             raise ValueError(f"--{name} must be nonempty and contain no duplicates")
-    if args.basis_backend != "thin_q" and "v2" not in args.versions:
-        raise ValueError("nondefault --basis-backend requires v2 in --versions")
     for name in (
         "epochs",
         "patience",
@@ -59562,8 +60242,6 @@ def _validate(args: argparse.Namespace) -> None:
         args.batch_size < 0
         or args.workers < -1
         or args.prefetch_factor < 0
-        or args.column_chunk_size < 0
-        or args.basis_pair_budget < 0
         or args.lr <= 0
         or args.weight_decay < 0
         or args.min_free_gb < 0
@@ -59589,7 +60267,7 @@ def _profile_config(profile: str, dataset: str, version: str) -> dict[str, float
 
 
 def _job_resources(
-    args: argparse.Namespace, version: str, profile: str, dataset: str
+    args: argparse.Namespace, version: str, profile: str, dataset: str, encoding: str | None = None
 ) -> dict[str, Any]:
     accelerated = args.hardware_profile == "a6000-48gb"
     is_v2 = version == "v2"
@@ -59602,18 +60280,13 @@ def _job_resources(
         # DataLoader default (2); never claim the V2-only override for V1.
         "prefetch_factor": (args.prefetch_factor or (4 if accelerated else 2) if is_v2 else 2),
         "amp": accelerated if args.amp is None else args.amp,
-        "column_chunk_size": (
-            args.column_chunk_size or (32 if accelerated else 16) if is_v2 else None
-        ),
-        "basis_pair_budget": (
-            args.basis_pair_budget or (4_194_304 if accelerated else 32768) if is_v2 else None
-        ),
-        "basis_execution": args.basis_execution if is_v2 else None,
+        "basis_execution": "sparse_block_diagonal" if is_v2 else None,
         "basis_backend": args.basis_backend if is_v2 else None,
         "precision_scope": (
-            "projector_fp32_backbone_amp" if version == "v2" else "legacy_v1_partial_amp"
+            "sparse_cycles_fp32_backbone_amp" if version == "v2" else "legacy_v1_partial_amp"
         ),
         "version": version,
+        "encoding": encoding,
     }
 
 
@@ -59625,7 +60298,7 @@ def _v2_precision_matches(resources: dict[str, Any], precision: Any) -> bool:
         "autocast_dtype",
         "fallback",
         "gradient_scaler",
-        "projector_contraction",
+        "cycle_sparse_aggregation",
         "backbone_autocast",
     }
     requested = resources.get("amp")
@@ -59635,7 +60308,7 @@ def _v2_precision_matches(resources: dict[str, Any], precision: Any) -> bool:
         or not isinstance(requested, bool)
         or precision.get("amp") is not requested
         or precision.get("gradient_scaler") is not False
-        or precision.get("projector_contraction") != "float32"
+        or precision.get("cycle_sparse_aggregation") != "float32"
     ):
         return False
     if not requested:
@@ -59665,16 +60338,23 @@ def _v2_precision_matches(resources: dict[str, Any], precision: Any) -> bool:
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     data_root = args.data_root.expanduser().resolve()
-    for version in args.versions:
+    for version, encoding in _conditions(args.versions, args.encodings):
         for profile in args.profiles:
             for seed in args.model_seeds:
                 for dataset in args.datasets:
                     config = _profile_config(profile, dataset, version)
-                    resources = _job_resources(args, version, profile, dataset)
+                    resources = _job_resources(args, version, profile, dataset, encoding)
+                    condition = _condition_id(version, encoding)
+                    log_condition = condition.replace(":", "--")
                     output = (
-                        run_dir / "results" / version / profile / dataset / f"model-seed-{seed}"
+                        run_dir
+                        / "results"
+                        / Path(*condition.split(":"))
+                        / profile
+                        / dataset
+                        / f"model-seed-{seed}"
                     )
-                    job_id = f"{version}:{profile}:{dataset}:model-seed-{seed}"
+                    job_id = f"{condition}:{profile}:{dataset}:model-seed-{seed}"
                     command = [
                         sys.executable,
                         "-B",
@@ -59721,20 +60401,16 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                         command.append("--allow-download")
                     if version == "v2":
                         command += [
+                            "--encoding",
+                            encoding,
                             "--ffn-multiplier",
                             str(config["ffn_multiplier"]),
                             "--dropout",
                             str(config["dropout"]),
                             "--layer-scale",
                             str(config["layer_scale"]),
-                            "--column-chunk-size",
-                            str(resources["column_chunk_size"]),
                             "--basis-backend",
                             args.basis_backend,
-                            "--basis-execution",
-                            args.basis_execution,
-                            "--basis-pair-budget",
-                            str(resources["basis_pair_budget"]),
                             "--prefetch-factor",
                             str(resources["prefetch_factor"]),
                             "--hardware-profile",
@@ -59744,6 +60420,7 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                         {
                             "job_id": job_id,
                             "version": version,
+                            "encoding": encoding,
                             "profile": profile,
                             "model_seed": seed,
                             "datasets": [dataset],
@@ -59755,7 +60432,7 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             "log_path": str(
                                 run_dir
                                 / "logs"
-                                / f"{version}--{profile}--{dataset}--seed-{seed}.log"
+                                / f"{log_condition}--{profile}--{dataset}--seed-{seed}.log"
                             ),
                             "returncode": None,
                             "artifact_errors": [],
@@ -59894,6 +60571,9 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
     ):
         raise ValueError("candidate child must identify as validation_only")
     expected_version = job["version"]
+    _condition_id(expected_version, job.get("encoding"))
+    if job["resources"].get("encoding") != job.get("encoding"):
+        raise ValueError("child encoding/resource binding mismatch")
     if expected_version == "v2" and manifest.get("version") != "v2":
         raise ValueError("V2 child did not identify itself as version v2")
     if expected_version == "v1" and manifest.get("version") not in (None, "v1"):
@@ -59918,28 +60598,14 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
             raise ValueError(f"child argument mismatch for {name}: {actual} != {expected}")
     if expected_version == "v2":
         expected_v2 = {
+            "encoding": job["encoding"],
             "ffn_multiplier": job["config"]["ffn_multiplier"],
             "dropout": job["config"]["dropout"],
             "layer_scale": job["config"]["layer_scale"],
-            "column_chunk_size": 16,
             "basis_backend": job["resources"]["basis_backend"],
-            "basis_execution": "batched",
-            "basis_pair_budget": 32768,
             "prefetch_factor": job["resources"]["prefetch_factor"],
             "hardware_profile": job["resources"]["hardware_profile"],
         }
-        command = job.get("command", [])
-        for flag, name in (
-            ("--column-chunk-size", "column_chunk_size"),
-            ("--basis-backend", "basis_backend"),
-            ("--basis-execution", "basis_execution"),
-            ("--basis-pair-budget", "basis_pair_budget"),
-        ):
-            if flag in command:
-                value = command[command.index(flag) + 1]
-                expected_v2[name] = (
-                    int(value) if name not in {"basis_backend", "basis_execution"} else value
-                )
         for name, expected in expected_v2.items():
             if arguments.get(name) != expected:
                 raise ValueError(f"child argument mismatch for {name}")
@@ -59955,6 +60621,8 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
         or controls.get("optimizer_created") is not True
     ):
         raise ValueError("candidate child test/training controls are invalid")
+    if expected_version == "v2" and controls.get("encoding") != job["encoding"]:
+        raise ValueError("candidate child encoding control mismatch")
     datasets = metrics.get("datasets")
     if not isinstance(datasets, dict) or set(datasets) != set(job["datasets"]):
         raise ValueError("child metrics do not contain exactly the requested datasets")
@@ -59972,7 +60640,7 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
         ):
             raise ValueError(f"{dataset}: candidate protocol exposed or loaded a test split")
         models = dataset_metrics.get("models")
-        model_name = MODEL_NAMES[expected_version]
+        model_name = _model_name(expected_version, job.get("encoding"))
         if not isinstance(models, dict) or set(models) != {model_name}:
             raise ValueError(f"{dataset}: expected only model {model_name}")
         result = models[model_name]
@@ -60013,7 +60681,8 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
                 or pipeline.get("effective_batch_size") != job["resources"]["batch_size"]
                 or pipeline.get("workers") != job["resources"]["workers"]
                 or pipeline.get("prefetch_factor") != job["resources"]["prefetch_factor"]
-                or pipeline.get("packed_cycle_basis_h2d_tensors_per_batch") != 1
+                or pipeline.get("cycle_membership_layout") != "sparse_coo_block_diagonal"
+                or pipeline.get("cycle_factorization_in_forward") is not False
                 or not _v2_precision_matches(job["resources"], precision)
                 or not isinstance(hardware, dict)
                 or hardware.get("profile") != job["resources"]["hardware_profile"]
@@ -60078,6 +60747,7 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
         rows.append(
             {
                 "version": expected_version,
+                "encoding": job.get("encoding"),
                 "profile": job["profile"],
                 "dataset": dataset,
                 "model_seed": job["model_seed"],
@@ -60124,8 +60794,9 @@ def build_summary(
     profiles: list[str],
     model_seeds: tuple[int, ...],
     complete: bool,
+    encodings: list[str] | tuple[str, ...] = ENCODINGS,
 ) -> dict[str, Any]:
-    """Select one common profile per version/dataset without any test input."""
+    """Select a profile within each version/encoding/dataset without test input."""
     summary: dict[str, Any] = {
         "schema_version": 2,
         "status": "pending_test_evaluation" if complete else "failed",
@@ -60133,13 +60804,14 @@ def build_summary(
         "metric": "mae_lower_is_better",
         "selection_policy": {
             "profile_selection_input": "mean validation MAE across requested model seeds",
-            "selection_unit": "version x dataset",
+            "selection_unit": "version x encoding x dataset",
             "test_used_for_profile_selection": False,
             "checkpoint_selection": "validation MAE only inside each candidate training",
             "final_test_report": "separate test_evaluations rows after selection",
         },
         "profiles": {name: PROFILES[name] for name in profiles},
         "requested_model_seeds": list(model_seeds),
+        "requested_encodings": list(encodings),
         "runs": rows,
         "profile_aggregates": [],
         "profile_selections": [],
@@ -60148,26 +60820,28 @@ def build_summary(
         "fresh_dataset_trainings": len(rows),
     }
     expected_keys = {
-        (version, dataset, profile, seed)
-        for version in versions
+        (version, encoding, dataset, profile, seed)
+        for version, encoding in _conditions(versions, encodings)
         for dataset in datasets
         for profile in profiles
         for seed in model_seeds
     }
     actual_keys = [
-        (row["version"], row["dataset"], row["profile"], row["model_seed"]) for row in rows
+        (row["version"], row.get("encoding"), row["dataset"], row["profile"], row["model_seed"])
+        for row in rows
     ]
     if len(actual_keys) != len(set(actual_keys)) or set(actual_keys) != expected_keys:
         complete = False
         summary["status"] = "failed"
     aggregates: list[dict[str, Any]] = []
-    for version in versions:
+    for version, encoding in _conditions(versions, encodings):
         for dataset in datasets:
             for profile in profiles:
                 group = [
                     row
                     for row in rows
                     if row["version"] == version
+                    and row.get("encoding") == encoding
                     and row["dataset"] == dataset
                     and row["profile"] == profile
                 ]
@@ -60180,6 +60854,7 @@ def build_summary(
                 aggregates.append(
                     {
                         "version": version,
+                        "encoding": encoding,
                         "dataset": dataset,
                         "profile": profile,
                         "config": dict(group[0]["config"]),
@@ -60204,12 +60879,14 @@ def build_summary(
             "no checkpoint is selected and test remains untouched."
         )
         return summary
-    for version in versions:
+    for version, encoding in _conditions(versions, encodings):
         for dataset in datasets:
             candidates = [
                 item
                 for item in aggregates
-                if item["version"] == version and item["dataset"] == dataset
+                if item["version"] == version
+                and item.get("encoding") == encoding
+                and item["dataset"] == dataset
             ]
             if len(candidates) != len(profiles):
                 summary["status"] = "failed"
@@ -60224,11 +60901,12 @@ def build_summary(
                     profiles.index(item["profile"]),
                 ),
             )
-            profile_selection_id = f"{version}:{dataset}"
+            profile_selection_id = f"{_condition_id(version, encoding)}:{dataset}"
             summary["profile_selections"].append(
                 {
                     "profile_selection_id": profile_selection_id,
                     "version": version,
+                    "encoding": encoding,
                     "dataset": dataset,
                     "selected_profile": selected_profile["profile"],
                     "config": dict(selected_profile["config"]),
@@ -60242,6 +60920,7 @@ def build_summary(
                 row
                 for row in rows
                 if row["version"] == version
+                and row.get("encoding") == encoding
                 and row["dataset"] == dataset
                 and row["profile"] == selected_profile["profile"]
             ]
@@ -60256,9 +60935,10 @@ def build_summary(
                 selected = selected_by_seed[seed]
                 summary["selected_checkpoints"].append(
                     {
-                        "checkpoint_id": f"{version}:{dataset}:model-seed-{seed}",
+                        "checkpoint_id": f"{profile_selection_id}:model-seed-{seed}",
                         "profile_selection_id": profile_selection_id,
                         "version": version,
+                        "encoding": encoding,
                         "dataset": dataset,
                         "model_seed": seed,
                         "selected_profile": selected["profile"],
@@ -60284,13 +60964,22 @@ def make_test_jobs(
     data_root = args.data_root.expanduser().resolve()
     for selection in selections:
         version = selection["version"]
+        encoding = selection.get("encoding")
+        condition = _condition_id(version, encoding)
+        log_condition = condition.replace(":", "--")
         dataset = selection["dataset"]
         seed = selection["model_seed"]
         profile = selection["selected_profile"]
         config = _profile_config(profile, dataset, version)
-        resources = _job_resources(args, version, profile, dataset)
-        output = run_dir / "test-evaluations" / version / dataset / f"model-seed-{seed}"
-        job_id = f"test:{version}:{dataset}:model-seed-{seed}"
+        resources = _job_resources(args, version, profile, dataset, encoding)
+        output = (
+            run_dir
+            / "test-evaluations"
+            / Path(*condition.split(":"))
+            / dataset
+            / f"model-seed-{seed}"
+        )
+        job_id = f"test:{condition}:{dataset}:model-seed-{seed}"
         command = [
             sys.executable,
             "-B",
@@ -60330,20 +61019,16 @@ def make_test_jobs(
             command.append("--allow-download")
         if version == "v2":
             command += [
+                "--encoding",
+                encoding,
                 "--ffn-multiplier",
                 str(config["ffn_multiplier"]),
                 "--dropout",
                 str(config["dropout"]),
                 "--layer-scale",
                 str(config["layer_scale"]),
-                "--column-chunk-size",
-                str(resources["column_chunk_size"]),
                 "--basis-backend",
                 args.basis_backend,
-                "--basis-execution",
-                args.basis_execution,
-                "--basis-pair-budget",
-                str(resources["basis_pair_budget"]),
                 "--prefetch-factor",
                 str(resources["prefetch_factor"]),
                 "--hardware-profile",
@@ -60355,6 +61040,7 @@ def make_test_jobs(
                 "checkpoint_id": selection["checkpoint_id"],
                 "profile_selection_id": selection["profile_selection_id"],
                 "version": version,
+                "encoding": encoding,
                 "dataset": dataset,
                 "model_seed": seed,
                 "selected_profile": profile,
@@ -60368,7 +61054,7 @@ def make_test_jobs(
                 "command": command,
                 "output_dir": str(output),
                 "log_path": str(
-                    run_dir / "logs" / "test" / f"{version}--{dataset}--seed-{seed}.log"
+                    run_dir / "logs" / "test" / f"{log_condition}--{dataset}--seed-{seed}.log"
                 ),
                 "returncode": None,
                 "artifact_errors": [],
@@ -60389,6 +61075,9 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
     if manifest.get("run_mode") != "test_only" or metrics.get("run_mode") != "test_only":
         raise ValueError("selected checkpoint evaluation must identify as test_only")
     version = job["version"]
+    _condition_id(version, job.get("encoding"))
+    if job["resources"].get("encoding") != job.get("encoding"):
+        raise ValueError("test-only encoding/resource binding mismatch")
     if version == "v2" and manifest.get("version") != "v2":
         raise ValueError("V2 test-only child did not identify itself as version v2")
     if version == "v1" and manifest.get("version") not in (None, "v1"):
@@ -60413,13 +61102,11 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"test-only argument mismatch for {name}")
     if version == "v2":
         expected_v2_arguments = {
+            "encoding": job["encoding"],
             "ffn_multiplier": job["config"]["ffn_multiplier"],
             "dropout": job["config"]["dropout"],
             "layer_scale": job["config"]["layer_scale"],
-            "column_chunk_size": job["resources"]["column_chunk_size"],
             "basis_backend": job["resources"]["basis_backend"],
-            "basis_execution": job["resources"]["basis_execution"],
-            "basis_pair_budget": job["resources"]["basis_pair_budget"],
             "prefetch_factor": job["resources"]["prefetch_factor"],
             "hardware_profile": job["resources"]["hardware_profile"],
         }
@@ -60434,6 +61121,8 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
         or controls.get("optimizer_created") is not False
     ):
         raise ValueError("test-only controls do not prove evaluation without retraining")
+    if version == "v2" and controls.get("encoding") != job["encoding"]:
+        raise ValueError("test-only encoding control mismatch")
     datasets = metrics.get("datasets")
     if not isinstance(datasets, dict) or set(datasets) != {job["dataset"]}:
         raise ValueError("test-only metrics must contain exactly the selected dataset")
@@ -60448,7 +61137,7 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
         or set(protocol.get("split_content_sha256", {})) != {"test"}
     ):
         raise ValueError("test-only child must load exactly the official test split")
-    model_name = MODEL_NAMES[version]
+    model_name = _model_name(version, job.get("encoding"))
     models = dataset_metrics.get("models")
     if not isinstance(models, dict) or set(models) != {model_name}:
         raise ValueError(f"test-only child must contain only model {model_name}")
@@ -60477,7 +61166,8 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
             or pipeline.get("effective_batch_size") != job["resources"]["batch_size"]
             or pipeline.get("workers") != job["resources"]["workers"]
             or pipeline.get("prefetch_factor") != job["resources"]["prefetch_factor"]
-            or pipeline.get("packed_cycle_basis_h2d_tensors_per_batch") != 1
+            or pipeline.get("cycle_membership_layout") != "sparse_coo_block_diagonal"
+            or pipeline.get("cycle_factorization_in_forward") is not False
             or not _v2_precision_matches(job["resources"], precision)
             or not isinstance(hardware, dict)
             or hardware.get("profile") != job["resources"]["hardware_profile"]
@@ -60507,6 +61197,7 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
         "checkpoint_id": job["checkpoint_id"],
         "profile_selection_id": job["profile_selection_id"],
         "version": version,
+        "encoding": job.get("encoding"),
         "dataset": job["dataset"],
         "model_seed": job["model_seed"],
         "selected_profile": job["selected_profile"],
@@ -60557,6 +61248,10 @@ def attach_test_results(
         selected = expected[row["checkpoint_id"]]
         if (
             row["profile_selection_id"] != selected["profile_selection_id"]
+            or row.get("encoding") != selected.get("encoding")
+            or row["version"] != selected["version"]
+            or row["dataset"] != selected["dataset"]
+            or row["model_seed"] != selected["model_seed"]
             or row["selected_profile"] != selected["selected_profile"]
             or row["checkpoint"] != selected["checkpoint"]
             or row["checkpoint_sha256"] != selected["checkpoint_sha256"]
@@ -60568,33 +61263,28 @@ def attach_test_results(
         selected["test_evaluation_id"] = row["test_evaluation_id"]
     summary["test_evaluations"] = test_rows
     summary["selected_test_evaluations"] = len(test_rows)
-    ordered_versions = list(
-        dict.fromkeys(item["version"] for item in summary["profile_selections"])
-    )
-    ordered_datasets = list(
-        dict.fromkeys(item["dataset"] for item in summary["profile_selections"])
-    )
-    summary["final_test_aggregates"] = [
-        {
-            "version": version,
-            "dataset": dataset,
-            "model_seeds": list(summary["requested_model_seeds"]),
-            "selected_profiles": [
-                row["selected_profile"]
-                for row in test_rows
-                if row["version"] == version and row["dataset"] == dataset
-            ],
-            "test_mae": _stats(
-                [
-                    row["test_mae"]
-                    for row in test_rows
-                    if row["version"] == version and row["dataset"] == dataset
-                ]
-            ),
-        }
-        for version in ordered_versions
-        for dataset in ordered_datasets
-    ]
+    summary["final_test_aggregates"] = []
+    for selection in summary["profile_selections"]:
+        version, encoding, dataset = (
+            selection["version"],
+            selection.get("encoding"),
+            selection["dataset"],
+        )
+        group = [
+            row
+            for row in test_rows
+            if (row["version"], row.get("encoding"), row["dataset"]) == (version, encoding, dataset)
+        ]
+        summary["final_test_aggregates"].append(
+            {
+                "version": version,
+                "encoding": encoding,
+                "dataset": dataset,
+                "model_seeds": list(summary["requested_model_seeds"]),
+                "selected_profiles": [row["selected_profile"] for row in group],
+                "test_mae": _stats([row["test_mae"] for row in group]),
+            }
+        )
     summary["status"] = "passed"
     return summary
 
@@ -60621,6 +61311,7 @@ _TEST_JOB_STABLE_FIELDS = (
     "checkpoint_id",
     "profile_selection_id",
     "version",
+    "encoding",
     "dataset",
     "model_seed",
     "output_dir",
@@ -60632,6 +61323,7 @@ def _run_configuration(args: argparse.Namespace) -> dict[str, Any]:
     """Return the complete execution contract that must match on resume."""
     return {
         "versions": list(args.versions),
+        "encodings": list(args.encodings),
         "datasets": list(args.datasets),
         "profiles": list(args.profiles),
         "model_seeds": list(args.model_seeds),
@@ -60649,10 +61341,7 @@ def _run_configuration(args: argparse.Namespace) -> dict[str, Any]:
         "allow_download": args.allow_download,
         "amp": args.amp,
         "compile": args.compile,
-        "column_chunk_size": args.column_chunk_size,
         "basis_backend": args.basis_backend,
-        "basis_execution": args.basis_execution,
-        "basis_pair_budget": args.basis_pair_budget,
         "min_free_gb": args.min_free_gb,
     }
 
@@ -60882,10 +61571,15 @@ def _quarantine_incomplete_output(job: dict[str, Any], run_dir: Path) -> None:
 
 
 def _candidate_attempt_command(job: dict[str, Any], run_dir: Path) -> list[str]:
-    """Keep a resumable projector checkpoint; quarantine every other partial child."""
+    """Keep a resumable sparse DFS checkpoint; preserve every other partial child."""
     command = list(job["command"])
     dataset = job["datasets"][0]
-    checkpoint = Path(job["output_dir"]) / dataset / MODEL_NAMES[job["version"]] / "last.pt"
+    checkpoint = (
+        Path(job["output_dir"])
+        / dataset
+        / _model_name(job["version"], job.get("encoding"))
+        / "last.pt"
+    )
     if job["version"] == "v2" and checkpoint.is_file():
         command.append("--resume")
     else:
@@ -60946,17 +61640,16 @@ def _manifest_base(
         "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
         "output_dir": str(run_dir),
         "versions": list(args.versions),
+        "encodings": list(args.encodings),
         "datasets": list(args.datasets),
         "profiles": {name: PROFILES[name] for name in args.profiles},
         "model_seeds": list(args.model_seeds),
         "fresh_child_runs": len(jobs),
         "fresh_dataset_trainings": len(jobs),
-        "selected_test_evaluations_planned": len(args.versions)
-        * len(args.datasets)
-        * len(args.model_seeds),
+        "selected_test_evaluations_planned": _selected_test_count(args),
         "selection_protocol": {
             "profile_selection": (
-                "one common profile per version/dataset by mean validation MAE "
+                "one common profile per version/encoding/dataset by mean validation MAE "
                 "across all requested model seeds"
             ),
             "checkpoint_selection": "validation only inside each candidate child",
@@ -61025,7 +61718,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"{len(jobs)} fresh child runs; {len(jobs)} fresh dataset "
             "trainings (train+validation only); "
-            f"{len(args.versions) * len(args.datasets) * len(args.model_seeds)} "
+            f"{_selected_test_count(args)} "
             "selected-checkpoint test evaluations are deferred until validation selection"
         )
         for job in jobs:
@@ -61080,6 +61773,7 @@ def main(argv: list[str] | None = None) -> int:
             verified_validation = build_summary(
                 rows,
                 versions=list(args.versions),
+                encodings=list(args.encodings),
                 datasets=list(args.datasets),
                 profiles=list(args.profiles),
                 model_seeds=args.model_seeds,
@@ -61099,8 +61793,7 @@ def main(argv: list[str] | None = None) -> int:
             verified_test_rows = _recover_test_rows(verified_test_jobs)
             verified_complete = (
                 len(verified_test_rows) == len(verified_test_jobs)
-                and len(verified_test_jobs)
-                == len(args.versions) * len(args.datasets) * len(args.model_seeds)
+                and len(verified_test_jobs) == _selected_test_count(args)
                 and all(job["status"] == "passed" for job in verified_test_jobs)
             )
             verified_summary = attach_test_results(
@@ -61195,6 +61888,7 @@ def main(argv: list[str] | None = None) -> int:
         validation_summary = build_summary(
             rows,
             versions=list(args.versions),
+            encodings=list(args.encodings),
             datasets=list(args.datasets),
             profiles=list(args.profiles),
             model_seeds=args.model_seeds,
@@ -61259,6 +61953,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = build_summary(
             rows,
             versions=list(args.versions),
+            encodings=list(args.encodings),
             datasets=list(args.datasets),
             profiles=list(args.profiles),
             model_seeds=args.model_seeds,
@@ -61283,7 +61978,7 @@ def main(argv: list[str] | None = None) -> int:
     test_complete = (
         not failed
         and len(test_rows) == len(test_jobs)
-        and len(test_jobs) == len(args.versions) * len(args.datasets) * len(args.model_seeds)
+        and len(test_jobs) == _selected_test_count(args)
         and all(job["status"] == "passed" for job in test_jobs)
     )
     summary = attach_test_results(validation_summary, test_rows, complete=test_complete)
@@ -61368,7 +62063,7 @@ CYCLE_BREC_OFFICIAL_SEEDS = (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
 CYCLE_VARIANTS = ("no_pe", "raw", "set", "projector")
 DEFAULT_CYCLE_VARIANTS = ("raw", "set", "projector")
 CYCLE_CORE_TARGETS = ("edge", "node", "graph")
-CYCLE_BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
+CYCLE_BASIS_BACKENDS = ("dfs_fundamental",)
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SOURCE_SUFFIXES = {".py", ".yaml", ".yml", ".toml", ".sh", ".ps1"}
 SOURCE_ROOTS = ("scripts", "src", "research")
@@ -61565,29 +62260,23 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
             for model_seed in executed_model_seeds:
                 for suite in suites:
                     cycle_v2 = track == "cycle_pe" and args.cycle_pe_version == "v2"
-                    label = "benchmark-v2" if cycle_v2 else suite
-                    overrides: list[str] = []
-                    if cycle_v2:
-                        overrides.extend(
-                            (
-                                "--basis-backend",
-                                args.basis_backend,
-                                "--basis-execution",
-                                args.basis_execution,
-                                "--basis-pair-budget",
-                                str(args.basis_pair_budget),
+                    encodings = args.cycle_v2_encodings if cycle_v2 else [None]
+                    # Both encodings share topology caches: prepare them once,
+                    # but every training condition owns disjoint child artifacts.
+                    if args.prepare_only:
+                        encodings = encodings[:1]
+                    for encoding in encodings:
+                        label = f"benchmark-v2:{encoding}" if cycle_v2 else suite
+                        overrides: list[str] = []
+                        if cycle_v2:
+                            overrides.extend(
+                                ("--encoding", encoding, "--basis-backend", args.basis_backend)
                             )
-                        )
-                        if args.cycle_epochs is not None:
-                            overrides.extend(("--epochs", str(args.cycle_epochs)))
-                        if args.cycle_learning_rate is not None:
-                            overrides.extend(("--lr", str(args.cycle_learning_rate)))
-                    add_child(
-                        track=track,
-                        suite=suite,
-                        model_seed=model_seed,
-                        name=f"{track}:{label}:model-seed-{model_seed}",
-                        output_dir=(
+                            if args.cycle_epochs is not None:
+                                overrides.extend(("--epochs", str(args.cycle_epochs)))
+                            if args.cycle_learning_rate is not None:
+                                overrides.extend(("--lr", str(args.cycle_learning_rate)))
+                        output = (
                             _output_dir(
                                 track,
                                 run_id,
@@ -61596,9 +62285,17 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
                                 cycle_pe_version=args.cycle_pe_version,
                             )
                             / suite
-                        ),
-                        extra_arguments=tuple(overrides),
-                    )
+                        )
+                        if cycle_v2:
+                            output /= encoding
+                        add_child(
+                            track=track,
+                            suite=suite,
+                            model_seed=model_seed,
+                            name=f"{track}:{label}:model-seed-{model_seed}",
+                            output_dir=output,
+                            extra_arguments=tuple(overrides),
+                        )
             continue
 
         # BREC already performs its official ten model-search seeds internally.
@@ -61884,6 +62581,35 @@ def _validate_child_status(
         metrics_path = (output / "metrics.json").resolve()
         if metrics_path in payloads and payloads[metrics_path].get("status") != expected:
             errors.append(f"child metrics must have status={expected}")
+        if module == "research.cycle_pe.v2.benchmark":
+            encoding = _flag(command, "--encoding")
+            model_names = {"se": "cycle_dfs_se_v2", "pe": "cycle_dfs_relative_pe_v2"}
+            arguments = manifest.get("arguments")
+            controls = manifest.get("controls")
+            if (
+                encoding not in model_names
+                or manifest.get("version") != "v2"
+                or not isinstance(arguments, dict)
+                or arguments.get("encoding") != encoding
+                or not isinstance(controls, dict)
+                or controls.get("encoding") != encoding
+                or controls.get("model") != model_names.get(encoding)
+            ):
+                errors.append("Cycle V2 child encoding/model binding differs from the command")
+            if not prepare_only:
+                datasets = payloads.get(metrics_path, {}).get("datasets")
+                if not isinstance(datasets, dict) or set(datasets) != {
+                    "zinc12k",
+                    "peptides_struct",
+                }:
+                    errors.append("Cycle V2 child is missing a requested official dataset")
+                else:
+                    for dataset, result in datasets.items():
+                        models = result.get("models") if isinstance(result, dict) else None
+                        if not isinstance(models, dict) or set(models) != {
+                            model_names.get(encoding)
+                        }:
+                            errors.append(f"Cycle V2 {dataset} model/encoding matrix mismatch")
     return errors
 
 
@@ -62270,11 +62996,12 @@ def _parser() -> argparse.ArgumentParser:
         default=CYCLE_CORE_TARGETS,
         help="comma-separated CycleCount target levels forwarded to cycle core runs",
     )
+    parser.add_argument(
+        "--cycle-v2-encodings", nargs="+", choices=("se", "pe"), default=["se", "pe"]
+    )
     parser.add_argument("--cycle-epochs", type=int)
     parser.add_argument("--cycle-learning-rate", type=float)
-    parser.add_argument("--basis-backend", choices=CYCLE_BASIS_BACKENDS, default="thin_q")
-    parser.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
-    parser.add_argument("--basis-pair-budget", type=int, default=32768)
+    parser.add_argument("--basis-backend", choices=CYCLE_BASIS_BACKENDS, default="dfs_fundamental")
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -62322,16 +63049,13 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
+    if len(set(args.cycle_v2_encodings)) != len(args.cycle_v2_encodings):
+        print("--cycle-v2-encodings must contain no duplicates", file=sys.stderr)
+        return 2
     if args.compile and (
         args.suite != "benchmark" or "tree_augmentation" in _selected_tracks(args.tracks)
     ):
         print("--compile supports conductance_gat/cycle_pe benchmark tracks only", file=sys.stderr)
-        return 2
-    if args.basis_pair_budget < 1:
-        print("--basis-pair-budget must be positive", file=sys.stderr)
-        return 2
-    if args.basis_backend != "thin_q" and args.cycle_pe_version != "v2":
-        print("nondefault --basis-backend requires --cycle-pe-version v2", file=sys.stderr)
         return 2
     if args.cycle_pe_version == "v2" and (
         args.suite != "benchmark" or _selected_tracks(args.tracks) != ("cycle_pe",)
@@ -62471,11 +63195,15 @@ def main() -> int:
             "execution_protocol": {
                 "torch_compile": args.compile and not args.prepare_only,
                 "basis_backend": args.basis_backend if args.cycle_pe_version == "v2" else None,
-                "basis_execution": args.basis_execution if args.cycle_pe_version == "v2" else None,
-                "basis_pair_budget": (
-                    args.basis_pair_budget if args.cycle_pe_version == "v2" else None
+                "basis_execution": (
+                    "sparse_block_diagonal" if args.cycle_pe_version == "v2" else None
                 ),
                 "cycle_pe_version": args.cycle_pe_version if "cycle_pe" in tracks else None,
+                "cycle_v2_encodings": (
+                    list(args.cycle_v2_encodings)
+                    if "cycle_pe" in tracks and args.cycle_pe_version == "v2"
+                    else None
+                ),
                 "outer_model_seeds": list(args.model_seeds),
                 "prepare_once_for_fixed_non_model_axes": args.prepare_only,
                 "cycle_selection": (
@@ -62804,14 +63532,12 @@ from scripts.process_safety import (  # noqa: E402
 TRACKS = ("conductance", "cycle", "tree")
 PROFILES = ("reference", "large")
 HARDWARE_PROFILES = ("portable", "a6000-48gb")
-CYCLE_V2_BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
+CYCLE_V2_BASIS_BACKENDS = ("dfs_fundamental",)
 DEFAULT_MODEL_SEEDS = (0,)
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
 
 _ACTIVE_CHILDREN_LOCK = threading.Lock()
-_ACTIVE_CHILDREN: dict[
-    subprocess.Popen[str], tuple[tuple[str, ...], Path]
-] = {}
+_ACTIVE_CHILDREN: dict[subprocess.Popen[str], tuple[tuple[str, ...], Path]] = {}
 _STOP_ACTIVE_CHILDREN = threading.Event()
 
 # Keep the complete public matrices here instead of trusting child row counts.  The
@@ -62878,6 +63604,9 @@ def parser() -> argparse.ArgumentParser:
         nargs="+",
         choices=CYCLE_VERSIONS,
         default=list(CYCLE_VERSIONS),
+    )
+    result.add_argument(
+        "--cycle-v2-encodings", nargs="+", choices=("se", "pe"), default=["se", "pe"]
     )
     result.add_argument("--profiles", nargs="+", choices=PROFILES, default=list(PROFILES))
     result.add_argument("--model-seeds", nargs="+", type=int, default=list(DEFAULT_MODEL_SEEDS))
@@ -62969,8 +63698,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--cycle-v2-basis-backend",
         choices=CYCLE_V2_BASIS_BACKENDS,
-        default="thin_q",
-        help="Cycle V2 basis construction; thin_q is the production default",
+        default="dfs_fundamental",
+        help="Cycle V2 uses all sparse DFS cycles without QR/SVD",
     )
     result.add_argument("--allow-download", action="store_true")
     result.add_argument(
@@ -62987,6 +63716,7 @@ def _validate(args: argparse.Namespace) -> None:
         ("tracks", args.tracks),
         ("conductance versions", args.conductance_versions),
         ("cycle versions", args.cycle_versions),
+        ("cycle V2 encodings", args.cycle_v2_encodings),
         ("profiles", args.profiles),
         ("model seeds", args.model_seeds),
     ):
@@ -63006,21 +63736,16 @@ def _validate(args: argparse.Namespace) -> None:
     batch_overrides = {
         "--conductance-legacy-ppi-batch-size": args.conductance_legacy_ppi_batch_size,
         "--conductance-v5-ppi-batch-size": args.conductance_v5_ppi_batch_size,
-        "--conductance-v5-sample-seed-batch-size": (
-            args.conductance_v5_sample_seed_batch_size
-        ),
+        "--conductance-v5-sample-seed-batch-size": (args.conductance_v5_sample_seed_batch_size),
         "--cycle-batch-size": args.cycle_batch_size,
         "--tree-batch-size": args.tree_batch_size,
     }
     for option, value in batch_overrides.items():
         if value is not None and value < 1:
             raise ValueError(f"{option} must be positive")
-    if (
-        args.conductance_legacy_ppi_batch_size is not None
-        and (
-            "conductance" not in args.tracks
-            or not {"v1", "v3", "v4"}.intersection(args.conductance_versions)
-        )
+    if args.conductance_legacy_ppi_batch_size is not None and (
+        "conductance" not in args.tracks
+        or not {"v1", "v3", "v4"}.intersection(args.conductance_versions)
     ):
         raise ValueError("legacy PPI batch override requires Conductance V1, V3, or V4")
     if (
@@ -63028,10 +63753,7 @@ def _validate(args: argparse.Namespace) -> None:
         or args.conductance_v5_sample_seed_batch_size is not None
     ) and ("conductance" not in args.tracks or "v5" not in args.conductance_versions):
         raise ValueError("Conductance V5 batch overrides require the conductance/V5 track")
-    if (
-        args.hardware_profile == "portable"
-        and args.conductance_v5_ppi_batch_size not in {None, 2}
-    ):
+    if args.hardware_profile == "portable" and args.conductance_v5_ppi_batch_size not in {None, 2}:
         raise ValueError("portable Conductance V5 PPI retains graph batch-size 2")
     if args.cycle_batch_size is not None and "cycle" not in args.tracks:
         raise ValueError("--cycle-batch-size requires the cycle track")
@@ -63041,7 +63763,7 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("run ID must be 1-120 letters, digits, underscores, or hyphens")
     if (
         "cycle" in args.tracks
-        and args.cycle_v2_basis_backend != "thin_q"
+        and args.cycle_v2_basis_backend != "dfs_fundamental"
         and "v2" not in args.cycle_versions
     ):
         raise ValueError("nondefault Cycle basis backend requires v2 in --cycle-versions")
@@ -63078,6 +63800,7 @@ def _requested_matrix(
     *,
     conductance_versions: list[str],
     cycle_versions: list[str],
+    cycle_v2_encodings: list[str] | tuple[str, ...] = ("se", "pe"),
 ) -> dict[str, Any]:
     common = {"profiles": list(profiles), "model_seeds": list(model_seeds)}
     if track == "conductance":
@@ -63100,6 +63823,10 @@ def _requested_matrix(
         return {
             **common,
             "versions": list(cycle_versions),
+            "encodings_by_version": {
+                version: list(cycle_v2_encodings) if version == "v2" else [None]
+                for version in cycle_versions
+            },
             "datasets": list(CYCLE_DATASETS),
         }
     return {
@@ -63122,7 +63849,10 @@ def _expected_counts(track: str, matrix: dict[str, Any]) -> dict[str, int]:
             "model_trainings": combinations * trainings_per_combination,
         }
     if track == "cycle":
-        child_runs = combinations * len(matrix["versions"]) * len(matrix["datasets"])
+        condition_count = sum(
+            len(matrix["encodings_by_version"][version]) for version in matrix["versions"]
+        )
+        child_runs = combinations * condition_count * len(matrix["datasets"])
         return {
             "child_runs": child_runs,
             "model_trainings": child_runs,
@@ -63160,6 +63890,7 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             list(args.model_seeds),
             conductance_versions=list(args.conductance_versions),
             cycle_versions=list(args.cycle_versions),
+            cycle_v2_encodings=list(args.cycle_v2_encodings),
         )
         command = [
             sys.executable,
@@ -63183,6 +63914,7 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             command += ["--profiles", *profiles]
             command += ["--model-seeds", ",".join(str(seed) for seed in args.model_seeds)]
             command += ["--basis-backend", args.cycle_v2_basis_backend]
+            command += ["--encodings", *args.cycle_v2_encodings]
             if args.cycle_batch_size is not None:
                 command += ["--batch-size", str(args.cycle_batch_size)]
         else:
@@ -63375,9 +64107,7 @@ def _stop_active_children(
     recorded: list[dict[str, object]] = []
     for process, (command, log_path) in active:
         if original_error is None:
-            events = terminate_owned_child(
-                process, command, reason=reason, log_target=log_path
-            )
+            events = terminate_owned_child(process, command, reason=reason, log_target=log_path)
         else:
             events = terminate_owned_child_after_error(
                 process,
@@ -63452,6 +64182,7 @@ def _exact_key_matrix(
     integer_fields: frozenset[str],
     expected: set[tuple[Any, ...]],
     label: str,
+    nullable_fields: frozenset[str] = frozenset(),
 ) -> dict[tuple[Any, ...], dict[str, Any]]:
     if not isinstance(rows, list):
         raise RuntimeError(f"{label} must be a list")
@@ -63465,6 +64196,8 @@ def _exact_key_matrix(
             if field in integer_fields:
                 if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                     raise RuntimeError(f"{label}[{index}].{field} must be a nonnegative integer")
+            elif value is None and field in nullable_fields and field in row:
+                pass
             elif not isinstance(value, str):
                 raise RuntimeError(f"{label}[{index}].{field} must be a string")
             values.append(value)
@@ -63569,24 +64302,31 @@ def _validate_cycle_summary(payload: dict[str, Any], job: dict[str, Any]) -> dic
     if payload.get("requested_model_seeds") != matrix["model_seeds"]:
         raise RuntimeError("Cycle child summary model seeds mismatch")
     _exact_string_mapping_keys(payload.get("profiles"), matrix["profiles"], "Cycle profiles")
+    if "v2" in matrix["versions"] and (
+        payload.get("requested_encodings") != matrix["encodings_by_version"]["v2"]
+    ):
+        raise RuntimeError("Cycle child summary encoding selection mismatch")
 
     expected_runs = {
-        (version, profile, seed, dataset)
+        (version, encoding, profile, seed, dataset)
         for version in matrix["versions"]
+        for encoding in matrix["encodings_by_version"][version]
         for profile in matrix["profiles"]
         for seed in matrix["model_seeds"]
         for dataset in matrix["datasets"]
     }
     runs = _exact_key_matrix(
         payload.get("runs"),
-        fields=("version", "profile", "model_seed", "dataset"),
+        fields=("version", "encoding", "profile", "model_seed", "dataset"),
         integer_fields=frozenset({"model_seed"}),
+        nullable_fields=frozenset({"encoding"}),
         expected=expected_runs,
         label="Cycle training rows",
     )
     expected_children = {
-        (version, profile, seed, dataset)
+        (version, encoding, profile, seed, dataset)
         for version in matrix["versions"]
+        for encoding in matrix["encodings_by_version"][version]
         for profile in matrix["profiles"]
         for seed in matrix["model_seeds"]
         for dataset in matrix["datasets"]
@@ -63598,15 +64338,17 @@ def _validate_cycle_summary(payload: dict[str, Any], job: dict[str, Any]) -> dic
         raise RuntimeError("Cycle candidate training rows must not contain test metrics")
 
     expected_aggregates = {
-        (version, dataset, profile)
+        (version, encoding, dataset, profile)
         for version in matrix["versions"]
+        for encoding in matrix["encodings_by_version"][version]
         for dataset in matrix["datasets"]
         for profile in matrix["profiles"]
     }
     aggregates = _exact_key_matrix(
         payload.get("profile_aggregates"),
-        fields=("version", "dataset", "profile"),
+        fields=("version", "encoding", "dataset", "profile"),
         integer_fields=frozenset(),
+        nullable_fields=frozenset({"encoding"}),
         expected=expected_aggregates,
         label="Cycle profile aggregates",
     )
@@ -63618,45 +64360,61 @@ def _validate_cycle_summary(payload: dict[str, Any], job: dict[str, Any]) -> dic
             raise RuntimeError("Cycle validation aggregates must not contain test metrics")
 
     expected_profile_selections = {
-        (version, dataset) for version in matrix["versions"] for dataset in matrix["datasets"]
+        (version, encoding, dataset)
+        for version in matrix["versions"]
+        for encoding in matrix["encodings_by_version"][version]
+        for dataset in matrix["datasets"]
     }
     profile_selections = _exact_key_matrix(
         payload.get("profile_selections"),
-        fields=("version", "dataset"),
+        fields=("version", "encoding", "dataset"),
         integer_fields=frozenset(),
+        nullable_fields=frozenset({"encoding"}),
         expected=expected_profile_selections,
         label="Cycle validation profile selections",
     )
     for key, row in profile_selections.items():
+        version, encoding, dataset = key
+        condition_id = version if encoding is None else f"{version}:{encoding}"
+        selection_id = f"{condition_id}:{dataset}"
         if (
             row.get("selected_profile") not in matrix["profiles"]
             or row.get("model_seeds") != matrix["model_seeds"]
             or row.get("test_used_for_selection") is not False
+            or row.get("profile_selection_id") != selection_id
         ):
             raise RuntimeError(f"Cycle validation profile selection {key!r} is invalid")
 
     expected_checkpoints = {
-        (version, dataset, seed)
+        (version, encoding, dataset, seed)
         for version in matrix["versions"]
+        for encoding in matrix["encodings_by_version"][version]
         for dataset in matrix["datasets"]
         for seed in matrix["model_seeds"]
     }
     selected_checkpoints = _exact_key_matrix(
         payload.get("selected_checkpoints"),
-        fields=("version", "dataset", "model_seed"),
+        fields=("version", "encoding", "dataset", "model_seed"),
         integer_fields=frozenset({"model_seed"}),
+        nullable_fields=frozenset({"encoding"}),
         expected=expected_checkpoints,
         label="Cycle selected validation checkpoints",
     )
     for key, row in selected_checkpoints.items():
-        profile_selection = profile_selections[(key[0], key[1])]
-        if row.get("selected_profile") != profile_selection.get("selected_profile"):
+        profile_selection = profile_selections[key[:3]]
+        selection_id = profile_selection["profile_selection_id"]
+        if (
+            row.get("selected_profile") != profile_selection.get("selected_profile")
+            or row.get("profile_selection_id") != selection_id
+            or row.get("checkpoint_id") != f"{selection_id}:model-seed-{key[3]}"
+        ):
             raise RuntimeError(f"Cycle selected checkpoint {key!r} uses the wrong profile")
 
     test_rows = _exact_key_matrix(
         payload.get("test_evaluations"),
-        fields=("version", "dataset", "model_seed"),
+        fields=("version", "encoding", "dataset", "model_seed"),
         integer_fields=frozenset({"model_seed"}),
+        nullable_fields=frozenset({"encoding"}),
         expected=expected_checkpoints,
         label="Cycle selected-checkpoint test evaluations",
     )
@@ -63665,6 +64423,9 @@ def _validate_cycle_summary(payload: dict[str, Any], job: dict[str, Any]) -> dic
             row.get("selected_profile") != selected_checkpoints[key].get("selected_profile")
             or row.get("checkpoint") != selected_checkpoints[key].get("checkpoint")
             or row.get("checkpoint_sha256") != selected_checkpoints[key].get("checkpoint_sha256")
+            or row.get("profile_selection_id") != selected_checkpoints[key]["profile_selection_id"]
+            or row.get("checkpoint_id") != selected_checkpoints[key]["checkpoint_id"]
+            or row.get("test_evaluation_id") != f"test:{selected_checkpoints[key]['checkpoint_id']}"
             or row.get("fresh_training") is not False
         ):
             raise RuntimeError(f"Cycle selected-checkpoint test evaluation {key!r} is invalid")
@@ -63676,12 +64437,16 @@ def _validate_cycle_summary(payload: dict[str, Any], job: dict[str, Any]) -> dic
         raise RuntimeError("Cycle selected-checkpoint test count is incomplete")
 
     expected_final_aggregates = {
-        (version, dataset) for version in matrix["versions"] for dataset in matrix["datasets"]
+        (version, encoding, dataset)
+        for version in matrix["versions"]
+        for encoding in matrix["encodings_by_version"][version]
+        for dataset in matrix["datasets"]
     }
     final_aggregates = _exact_key_matrix(
         payload.get("final_test_aggregates"),
-        fields=("version", "dataset"),
+        fields=("version", "encoding", "dataset"),
         integer_fields=frozenset(),
+        nullable_fields=frozenset({"encoding"}),
         expected=expected_final_aggregates,
         label="Cycle final test aggregates",
     )
@@ -63909,6 +64674,7 @@ def _config_payload(
         "tracks": list(args.tracks),
         "conductance_versions": list(args.conductance_versions),
         "cycle_versions": list(args.cycle_versions),
+        "cycle_v2_encodings": list(args.cycle_v2_encodings),
         "shared_profiles": list(args.profiles),
         "tree_profiles": list(args.profiles),
         "model_seeds": list(args.model_seeds),
@@ -63920,9 +64686,7 @@ def _config_payload(
         "explicit_batch_overrides": {
             "conductance_legacy_ppi_graphs": args.conductance_legacy_ppi_batch_size,
             "conductance_v5_ppi_graphs": args.conductance_v5_ppi_batch_size,
-            "conductance_v5_sample_seed_nodes": (
-                args.conductance_v5_sample_seed_batch_size
-            ),
+            "conductance_v5_sample_seed_nodes": (args.conductance_v5_sample_seed_batch_size),
             "cycle_graphs": args.cycle_batch_size,
             "tree_chart_views": args.tree_batch_size,
         },
@@ -64172,6 +64936,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
                 "tree_profiles": "reference/large are forwarded without renaming",
                 "cycle_v2_basis_backend": args.cycle_v2_basis_backend,
+                "cycle_v2_encodings": list(args.cycle_v2_encodings),
                 "download_policy": (
                     "allow-download is forwarded to Cycle and Tree; Conductance remains "
                     "verified-cache-only because its child contract exposes no download flag"
@@ -64281,9 +65046,7 @@ def main(argv: list[str] | None = None) -> int:
             _STOP_ACTIVE_CHILDREN.set()
             for future in futures:
                 future.cancel()
-            signal_events = _stop_active_children(
-                reason=interruption_reason, original_error=error
-            )
+            signal_events = _stop_active_children(reason=interruption_reason, original_error=error)
             if signal_events:
                 manifest.setdefault("child_signal_events", []).extend(signal_events)
             manifest["interruption"] = {
@@ -68649,6 +69412,9 @@ def test_disabled_bootstrap_keeps_multi_seed_statistics_but_is_explicitly_labell
         ("conductance_gat", "cora", "conductance"),
         ("cycle_pe", "zinc12k", "cycle_set"),
         ("cycle_pe", "zinc12k", "cycle_projector_pe_v2"),
+        ("cycle_pe", "zinc12k", "cycle_dfs_sparse_pe_v2"),
+        ("cycle_pe", "zinc12k", "cycle_dfs_se_v2"),
+        ("cycle_pe", "zinc12k", "cycle_dfs_relative_pe_v2"),
     ],
 )
 def test_benchmarks_aggregate_only_our_model_and_ignore_published_scores(
@@ -69368,9 +70134,7 @@ def test_minibatch_tracks_accept_multiple_physical_candidates(track, dataset):
 
 
 def test_current_only_tracks_have_explicit_variant_policy_and_tree_rejects_compile():
-    cycle = speed.build_parser().parse_args(
-        ["--track", "cycle_pe_v1", "--include-compile"]
-    )
+    cycle = speed.build_parser().parse_args(["--track", "cycle_pe_v1", "--include-compile"])
     speed._validate(cycle)
     assert speed._planned_variants(cycle) == ["current", "compiled"]
 
@@ -69750,10 +70514,7 @@ def _run_variant_with_measured_failure(
         comparison_scope="unit failure path",
     )
     initial = case.make_model("current")
-    state = {
-        name: value.detach().clone()
-        for name, value in initial.state_dict().items()
-    }
+    state = {name: value.detach().clone() for name, value in initial.state_dict().items()}
     probe = {"integrity": {"status": "passed"}}
     monkeypatch.setattr(execution, "configure_execution", lambda *_args: {"mode": "unit"})
     monkeypatch.setattr(observability, "RuntimeResourceMonitor", UnitMonitor)
@@ -69819,8 +70580,7 @@ def test_variant_oom_metadata_survives_monitor_cleanup_failure(monkeypatch):
     assert monitor_type.latest.start_calls == 1
     assert monitor_type.latest.finish_calls == 1
     assert any(
-        "without replacing the primary error" in note
-        for note in getattr(oom, "__notes__", [])
+        "without replacing the primary error" in note for note in getattr(oom, "__notes__", [])
     )
 
 
@@ -69871,8 +70631,7 @@ def test_variant_keyboard_interrupt_finishes_monitor_once_and_reraises_same_obje
     assert RuntimeResourceMonitor.latest.start_calls == 1
     assert RuntimeResourceMonitor.latest.finish_calls == 1
     assert any(
-        "unit monitor cleanup during Ctrl-C" in note
-        for note in getattr(interrupt, "__notes__", [])
+        "unit monitor cleanup during Ctrl-C" in note for note in getattr(interrupt, "__notes__", [])
     )
 
 
@@ -69968,7 +70727,8 @@ def test_conductance_builder_uses_offline_loader_and_only_training_indices(monke
     assert comparison["passed"]
 
 
-def test_cycle_builder_selects_train_only_and_no_download(monkeypatch, tmp_path):
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_cycle_builder_selects_train_only_and_no_download(monkeypatch, tmp_path, encoding):
     from research.cycle_pe.v2 import data
 
     seen = {}
@@ -69976,7 +70736,8 @@ def test_cycle_builder_selects_train_only_and_no_download(monkeypatch, tmp_path)
     batch = SimpleNamespace(
         x=torch.zeros(4, 1, dtype=torch.long),
         edge_index=torch.tensor([[0, 1], [1, 2]]),
-        cycle_bases=(torch.ones(2, 1),),
+        cycle_basis_shapes=((2, 1),),
+        cycle_membership=torch.ones(2, 1).to_sparse().coalesce(),
         y=torch.zeros(1, 1),
     )
     batch.to = lambda _: batch
@@ -69991,19 +70752,25 @@ def test_cycle_builder_selects_train_only_and_no_download(monkeypatch, tmp_path)
 
     monkeypatch.setattr(data, "load_benchmark", load)
     monkeypatch.setattr(data, "collate", collate)
-    args = argparse.Namespace(dataset="zinc12k", data_root=tmp_path, batch_size=1)
+    args = argparse.Namespace(
+        dataset="zinc12k", data_root=tmp_path, batch_size=1, cycle_v2_encoding=encoding
+    )
     case = speed._build_cycle_case(args, torch.device("cpu"))
     assert seen["allow_download"] is False and seen["selected"] == train_graphs[:1]
-    assert case.description["basis_pairs"] == 2
+    assert case.description["cycle_memberships"] == 2
     assert case.description["actual_physical_batch_size"] == 1
     assert case.description["physical_batch_size_applicable"] is True
-    assert case.make_model("reference").basis_execution == "reference"
-    assert case.make_model("optimized").basis_execution == "batched"
+    assert not hasattr(case.make_model("current"), "basis_execution")
+    expected_name = {"se": "cycle_dfs_se_v2", "pe": "cycle_dfs_relative_pe_v2"}[encoding]
+    assert case.description["model_configuration"]["name"] == expected_name
+    assert case.description["model_configuration"]["encoding"] == encoding
+    assert case.make_model("current").encoding == encoding
+    assert speed._planned_variants(
+        argparse.Namespace(track="cycle_pe_v2", include_compile=True)
+    ) == ["current", "compiled"]
 
 
-def test_cycle_builder_rejects_candidate_larger_than_official_training_split(
-    monkeypatch, tmp_path
-):
+def test_cycle_builder_rejects_candidate_larger_than_official_training_split(monkeypatch, tmp_path):
     from research.cycle_pe.v2 import data
 
     monkeypatch.setattr(
@@ -70016,9 +70783,7 @@ def test_cycle_builder_rejects_candidate_larger_than_official_training_split(
         speed._build_cycle_case(args, torch.device("cpu"))
 
 
-def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(
-    monkeypatch, tmp_path
-):
+def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(monkeypatch, tmp_path):
     from research.conductance_gat.v5 import model, train
 
     batch = SimpleNamespace(
@@ -70058,9 +70823,7 @@ def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(
     monkeypatch.setattr(
         train,
         "configure_phase",
-        lambda instance, phase, phase_epoch: seen.update(
-            phase=phase, phase_epoch=phase_epoch
-        ),
+        lambda instance, phase, phase_epoch: seen.update(phase=phase, phase_epoch=phase_epoch),
     )
     monkeypatch.setattr(model, "GraphConditionedConductanceNodeClassifier", DummyV5)
     args = argparse.Namespace(
@@ -70085,12 +70848,8 @@ def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(
     assert seen["epoch"] == 1 and seen["seed"] == 9
     assert case.description["actual_physical_batch_size"] == 4
     assert case.description["physical_batch_size_unit"] == "seed_nodes"
-    assert "_training_batches" in case.description["production_path_identity"][
-        "training_batch"
-    ]
-    assert case.description["production_path_identity"]["loss"].endswith(
-        ".training_loss"
-    )
+    assert "_training_batches" in case.description["production_path_identity"]["training_batch"]
+    assert case.description["production_path_identity"]["loss"].endswith(".training_loss")
     assert case.description["v5_architecture"]["hidden_channels"] == 256
     candidate = case.make_model("current")
     assert seen["phase"] == "joint" and seen["phase_epoch"] == 0
@@ -70198,9 +70957,7 @@ def test_batch_recommendation_selects_fastest_safe_candidate_and_ignores_failure
     assert full_graph["training_batch_selection_performed"] is False
 
 
-def test_candidate_sweep_records_oom_and_continues_without_batch_fallback(
-    monkeypatch, tmp_path
-):
+def test_candidate_sweep_records_oom_and_continues_without_batch_fallback(monkeypatch, tmp_path):
     import chartgat.observability as observability
 
     resource = _resource_observation_for_test()
@@ -70299,9 +71056,7 @@ def test_candidate_sweep_records_oom_and_continues_without_batch_fallback(
     assert "unit candidate OOM" in failed["error"]
 
 
-def test_execute_persists_interrupted_candidate_and_reraises_same_object(
-    monkeypatch, tmp_path
-):
+def test_execute_persists_interrupted_candidate_and_reraises_same_object(monkeypatch, tmp_path):
     import chartgat.observability as observability
 
     interrupt = KeyboardInterrupt("unit execute Ctrl-C")
@@ -70517,15 +71272,11 @@ def test_tree_builder_uses_exact_padded_sampler_classification_loss_and_unit(tmp
     assert case.protocol["dataset_cache_integrity"]["full_cache_loaded"] is True
     assert case.protocol["constructed_training_chart_views"] == 2
     assert case.protocol["official_training_graphs"] == 2
-    assert "collate_chart_views" in case.description["production_path_identity"][
-        "batch"
-    ]
+    assert "collate_chart_views" in case.description["production_path_identity"]["batch"]
     model = case.make_model("current")
     assert model.hidden_dim == 128 and model.message_layers == 8
     predicted = torch.zeros(4, 10)
-    expected = torch.nn.functional.cross_entropy(
-        predicted, case.batch.targets[:, 0].long()
-    )
+    expected = torch.nn.functional.cross_entropy(predicted, case.batch.targets[:, 0].long())
     assert torch.equal(case.objective(predicted), expected)
     assert "chart views" in case.comparison_scope
     assert "zero parameter updates" in case.comparison_scope
@@ -70552,15 +71303,11 @@ def test_tree_builder_uses_all_arm_targets_for_exact_zinc_normalized_mse(tmp_pat
     assert normalization["mean"] == [2.0]
     assert normalization["scale"] == [1.0]
     predicted = torch.zeros_like(case.batch.targets)
-    expected = torch.nn.functional.mse_loss(
-        predicted, (case.batch.targets - 2.0) / 1.0
-    )
+    expected = torch.nn.functional.mse_loss(predicted, (case.batch.targets - 2.0) / 1.0)
     assert torch.equal(case.objective(predicted), expected)
 
 
-def test_tree_inputs_load_full_verified_cache_once_and_construct_both_arms(
-    monkeypatch, tmp_path
-):
+def test_tree_inputs_load_full_verified_cache_once_and_construct_both_arms(monkeypatch, tmp_path):
     from chartgat import seeds
     from research.tree_augmentation import paper
 
@@ -70731,15 +71478,19 @@ import torch
 import torch._dynamo
 
 from chartgat.execution import configure_execution
+from research.cycle_pe.tests.test_v2_model import _graph
 from research.cycle_pe.v2.data import Graph, collate
 from research.cycle_pe.v2.model import CycleBasisPEModel, LeftNullBasisEncoder
 
 
 @pytest.fixture
 def fresh_dynamo_cache():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(2)
     torch._dynamo.reset()
     yield
     torch._dynamo.reset()
+    torch.set_num_threads(previous)
 
 
 def _configure_counted_cpu_blocks(model, monkeypatch):
@@ -70800,38 +71551,40 @@ def _compare_parameter_gradients(actual, reference):
 
 
 @pytest.mark.usefixtures("fresh_dynamo_cache")
-def test_compiled_basis_mlp_blocks_keep_ten_ragged_shapes_outside_dynamo(monkeypatch, caplog):
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_compiled_basis_mlp_blocks_keep_ten_ragged_shapes_outside_dynamo(
+    monkeypatch, caplog, encoding
+):
     torch.manual_seed(601)
-    reference = LeftNullBasisEncoder(3, 4, column_chunk_size=2)
+    reference = LeftNullBasisEncoder(3, 4, encoding=encoding)
     model = copy.deepcopy(reference)
     counts, executions, report = _configure_counted_cpu_blocks(model, monkeypatch)
-    assert set(report["compiled_modules"]) == {"column_phi", "edge_psi", "output"}
+    assert set(report["compiled_modules"]) == {"column_phi", "cycle_mlp", "edge_psi", "output"}
     assert not counts  # Module.compile is lazy.
     middle_counts = None
     for edge_count in range(4, 14):
         model.zero_grad(set_to_none=True)
         reference.zero_grad(set_to_none=True)
-        bond = torch.randn(edge_count + 3, 3, requires_grad=True)
+        batch = collate([_graph(edge_count), _graph(4, complete=True)])
+        bond = torch.randn(len(batch.edge_attr), 3, requires_grad=True)
         reference_bond = bond.detach().clone().requires_grad_(True)
-        bases = (
-            torch.randn(edge_count, 2, requires_grad=True),
-            torch.randn(3, 1, requires_grad=True),
+        sparse_inputs = (
+            batch.cycle_membership, batch.cycle_lengths,
+            batch.edge_cycle_counts, batch.edge_cycle_features,
+            batch.cycle_position_values,
         )
-        reference_bases = tuple(basis.detach().clone().requires_grad_(True) for basis in bases)
-        actual = model.forward_batch(bond, bases, pair_budget=5)
-        expected = reference.forward_batch(reference_bond, reference_bases, pair_budget=5)
+        actual = model(bond, *sparse_inputs)
+        expected = reference(reference_bond, *sparse_inputs)
         torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
         weights = torch.randn_like(actual)
         (actual.square() * weights).sum().backward()
         (expected.square() * weights).sum().backward()
         torch.testing.assert_close(bond.grad, reference_bond.grad, atol=3e-6, rtol=3e-5)
-        for basis, reference_basis in zip(bases, reference_bases, strict=True):
-            torch.testing.assert_close(basis.grad, reference_basis.grad, atol=3e-6, rtol=3e-5)
         _compare_parameter_gradients(model, reference)
         if edge_count == 8:
             middle_counts = counts.copy()
-    # Varying the ragged Python pair scheduler no longer compiles the complete
-    # encoder for each shape. Size-one dimensions may have a separate graph.
+    # Sparse assembly and sparse products stay outside Dynamo; only shared
+    # learned MLPs compile as ragged edge/cycle counts change.
     assert counts == middle_counts
     assert counts
     assert set(executions) == set(report["compiled_modules"])
@@ -70841,48 +71594,28 @@ def test_compiled_basis_mlp_blocks_keep_ten_ragged_shapes_outside_dynamo(monkeyp
 
 
 def _cycle_graph(nodes: int) -> Graph:
-    edges = [(node, node + 1) for node in range(nodes - 1)] + [(0, nodes - 1)]
-    basis = torch.ones(nodes, 1) / nodes**0.5
-    basis[-1] = -basis[-1]
-    return Graph(
-        x=torch.randint(28, (nodes, 1)),
-        edge_index=torch.tensor(edges, dtype=torch.long).T,
-        edge_attr=torch.randint(4, (nodes, 1)),
-        y=torch.zeros(1),
-        cycle_basis=basis,
-        cycle_basis_is_orthonormal=torch.tensor(True),
-    )
+    return _graph(nodes)
 
 
 @pytest.mark.usefixtures("fresh_dynamo_cache")
-def test_compiled_full_model_blocks_preserve_forward_backward_and_empty_graphs(monkeypatch):
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_compiled_full_model_blocks_preserve_forward_backward_and_empty_graphs(
+    monkeypatch, encoding
+):
     torch.manual_seed(702)
     reference = CycleBasisPEModel(
-        dataset="zinc12k", hidden=6, pe_dim=4, layers=2, basis_pair_budget=5
+        dataset="zinc12k", encoding=encoding, hidden=6, pe_dim=4, layers=2
     )
     model = copy.deepcopy(reference)
     counts, executions, report = _configure_counted_cpu_blocks(model, monkeypatch)
     assert "pe_encoder.column_phi" in report["compiled_modules"]
+    assert "pe_encoder.cycle_mlp" in report["compiled_modules"]
     assert "layers.0.message" in report["compiled_modules"]
     assert "graph_trunk" in report["compiled_modules"]
     assert "pe_encoder" not in report["compiled_modules"]
     assert "layers.0" not in report["compiled_modules"]
-    forest = Graph(
-        x=torch.tensor([[1], [2]]),
-        edge_index=torch.tensor([[0], [1]]),
-        edge_attr=torch.tensor([[0]]),
-        y=torch.zeros(1),
-        cycle_basis=torch.empty(1, 0),
-        cycle_basis_is_orthonormal=torch.tensor(True),
-    )
-    edgeless = Graph(
-        x=torch.tensor([[3]]),
-        edge_index=torch.empty(2, 0, dtype=torch.long),
-        edge_attr=torch.empty(0, 1, dtype=torch.long),
-        y=torch.zeros(1),
-        cycle_basis=torch.empty(0, 0),
-        cycle_basis_is_orthonormal=torch.tensor(True),
-    )
+    forest = _graph(2, forest=True)
+    edgeless = _graph(1, forest=True)
     for nodes in (4, 7):
         model.zero_grad(set_to_none=True)
         reference.zero_grad(set_to_none=True)
@@ -70898,7 +71631,8 @@ def test_compiled_full_model_blocks_preserve_forward_backward_and_empty_graphs(m
     # The deep backbone has more heterogeneous Sequential layouts than this
     # deliberately shared counted backend's recompile cache admits.
     assert set(executions).issubset(set(report["compiled_modules"]))
-    assert {"pe_encoder.column_phi", "layers.0.message"}.issubset(executions)
+    required = {"pe_encoder.column_phi", "pe_encoder.cycle_mlp", "layers.0.message"}
+    assert required.issubset(executions)
     assert all(count <= 3 for count in counts.values()), counts
     reference.load_state_dict(model.state_dict(), strict=True)
 ````
@@ -72551,6 +73285,7 @@ def test_missing_optional_diagnostics_are_unknown_not_zero_or_an_integrity_error
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -72615,15 +73350,42 @@ def test_transductive_children_ignore_requested_ppi_worker_pool(tmp_path):
     args = runner.parser().parse_args(["--datasets", "ogbn-arxiv", "--workers", "7"])
     jobs = runner.make_jobs(args, tmp_path)
     assert {job["workers"] for job in jobs} == {0}
-    assert {
-        job["command"][job["command"].index("--workers") + 1] for job in jobs
-    } == {"0"}
+    assert {job["command"][job["command"].index("--workers") + 1] for job in jobs} == {"0"}
 
 
 def test_child_environment_unsets_nvml_based_cuda_check(monkeypatch):
     monkeypatch.setenv("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
     environment = runner._environment()
     assert "PYTORCH_NVML_BASED_CUDA_CHECK" not in environment
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
+def test_source_snapshot_decodes_non_ascii_git_stderr_without_reader_thread_error(monkeypatch):
+    # Git on Windows can mix UTF-8 repository paths and a localized system
+    # diagnostic in stderr. This synthetic failed child does not run research.
+    diagnostic = "fatal: repository 프로젝트\n".encode() + "권한 진단\n".encode("cp949")
+    command_code = (
+        f"import sys; sys.stderr.buffer.write(bytes.fromhex('{diagnostic.hex()}')); "
+        "raise RuntimeError('synthetic git failure')"
+    )
+    real_run = subprocess.run
+    captured = []
+
+    def failed_git(command, **kwargs):
+        assert command == ["git", "rev-parse", "HEAD"]
+        captured.append(kwargs)
+        return real_run([sys.executable, "-c", command_code], **kwargs)
+
+    monkeypatch.setattr(runner.subprocess, "run", failed_git)
+    snapshot = runner._source_snapshot()
+    assert snapshot["git_revision"] is None
+    assert len(captured) == 1
+    assert captured[0]["encoding"] == "utf-8"
+    assert captured[0]["errors"] == "replace"
+    assert captured[0]["check"] is True
+    source_path = Path(runner.__file__)
+    relative_path = source_path.relative_to(runner.ROOT).as_posix()
+    assert snapshot["sha256"][relative_path] == hashlib.sha256(source_path.read_bytes()).hexdigest()
 
 
 @pytest.mark.parametrize("arguments", [["--help"], ["--dry-run"]])
@@ -76747,6 +77509,213 @@ def test_source_snapshot_covers_all_v4_and_shared_execution_code():
         assert name in snapshot and len(snapshot[name]) == 64
 ````
 
+# tests/test_conductance_v5_diffusion_memory.py
+
+````python
+"""Synthetic CPU regression tests; these are not GPU/full-training results."""
+
+from __future__ import annotations
+
+from itertools import product
+
+import pytest
+import torch
+
+from research.conductance_gat.v5.operator import shared_head_diffusion
+
+
+def _inputs(dtype=torch.float64):
+    generator = torch.Generator().manual_seed(519)
+    # A triangle, a separate edge and two isolates, across two batched graphs.
+    incidence = torch.tensor([[0, 1, 2, 3], [1, 2, 0, 4]])
+    node_graph = torch.tensor([0, 0, 0, 1, 1, 1, 1])
+    message = torch.randn(7, 2, 3, generator=generator, dtype=dtype)
+    conductance = torch.tensor([0.7, 1.3, 0.9, 1.1], dtype=dtype)
+    beta = torch.tensor([[0.2, 0.8], [0.4, 0.6]], dtype=dtype)
+    correction = torch.tensor([1.4, 0.6, 1.0, 1.2], dtype=dtype)
+    return (message, conductance, beta, correction), incidence, node_graph
+
+
+def _dense_reference(message, conductance, beta, correction, incidence, node_graph):
+    """Independent dense definition, intentionally used only on tiny test graphs."""
+    compute_dtype = (
+        torch.float32 if message.dtype in {torch.bfloat16, torch.float16} else message.dtype
+    )
+    values = message.to(compute_dtype)
+    edge_weight = conductance.to(compute_dtype) * correction.to(compute_dtype)
+    tail, head = incidence
+    adjacency = values.new_zeros((message.shape[0], message.shape[0]))
+    adjacency = adjacency.index_put((tail, head), edge_weight, accumulate=True)
+    adjacency = adjacency.index_put((head, tail), edge_weight, accumulate=True)
+    degree = adjacency.sum(dim=1)
+    active = degree > 0
+    safe_degree = torch.where(active, degree, torch.ones_like(degree))
+    inverse = safe_degree.rsqrt() * active.to(compute_dtype)
+    transition = inverse[:, None] * adjacency * inverse[None, :]
+    propagated = (transition @ values.flatten(1)).reshape_as(values)
+    output = values + beta.to(compute_dtype)[node_graph, :, None] * (
+        propagated - active[:, None, None] * values
+    )
+    return output.to(message.dtype)
+
+
+def _actual(arguments, incidence, node_graph, chunk):
+    message, conductance, beta, correction = arguments
+    return shared_head_diffusion(
+        message,
+        conductance,
+        incidence,
+        node_graph,
+        beta,
+        sampling_correction=correction,
+        edge_chunk_size=chunk,
+    )
+
+
+@pytest.mark.parametrize("chunk", [1, 3, 100])
+@pytest.mark.parametrize(
+    "requires_grad",
+    [
+        (True, True, True, True),
+        (False, True, False, True),
+        (True, False, True, False),
+        (False, True, False, False),
+        (True, False, False, False),
+    ],
+)
+def test_diffusion_matches_dense_forward_and_all_active_gradients(chunk, requires_grad):
+    inputs, incidence, node_graph = _inputs()
+    actual_inputs = tuple(
+        value.clone().requires_grad_(enabled)
+        for value, enabled in zip(inputs, requires_grad, strict=True)
+    )
+    expected_inputs = tuple(
+        value.clone().requires_grad_(enabled)
+        for value, enabled in zip(inputs, requires_grad, strict=True)
+    )
+    actual = _actual(actual_inputs, incidence, node_graph, chunk)
+    expected = _dense_reference(*expected_inputs, incidence, node_graph)
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    torch.testing.assert_close(actual[5:], actual_inputs[0][5:], rtol=0, atol=0)
+    probe = torch.linspace(-1.0, 1.0, actual.numel(), dtype=actual.dtype).reshape_as(actual)
+    actual_grads = torch.autograd.grad(
+        (actual * probe).sum() + actual.square().mean(),
+        [value for value in actual_inputs if value.requires_grad],
+    )
+    expected_grads = torch.autograd.grad(
+        (expected * probe).sum() + expected.square().mean(),
+        [value for value in expected_inputs if value.requires_grad],
+    )
+    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-11, atol=1e-12)
+        assert torch.isfinite(actual_grad).all()
+
+
+def test_diffusion_double_precision_gradcheck_and_gradgradcheck():
+    inputs, incidence, node_graph = _inputs()
+    inputs = tuple(value.requires_grad_(True) for value in inputs)
+
+    def function(*arguments):
+        return _actual(arguments, incidence, node_graph, 3)
+
+    assert torch.autograd.gradcheck(function, inputs, fast_mode=True)
+    # Second-order derivatives are deliberately supported, not silently detached.
+    assert torch.autograd.gradgradcheck(function, inputs, fast_mode=True)
+
+
+@pytest.mark.parametrize("empty_edges", [False, True])
+def test_zero_degree_and_edgeless_graphs_have_finite_exact_identity_gradients(empty_edges):
+    inputs, incidence, node_graph = _inputs()
+    message, conductance, beta, correction = inputs
+    if empty_edges:
+        incidence = incidence[:, :0]
+        conductance, correction = conductance[:0], correction[:0]
+    else:
+        conductance = torch.zeros_like(conductance)
+    inputs = tuple(value.requires_grad_(True) for value in (message, conductance, beta, correction))
+    actual = _actual(inputs, incidence, node_graph, 3)
+    torch.testing.assert_close(actual, message, rtol=0, atol=0)
+    gradients = torch.autograd.grad(actual.sum(), inputs)
+    torch.testing.assert_close(gradients[0], torch.ones_like(message), rtol=0, atol=0)
+    for gradient in gradients[1:]:
+        torch.testing.assert_close(gradient, torch.zeros_like(gradient), rtol=0, atol=0)
+        assert torch.isfinite(gradient).all()
+
+
+def test_bfloat16_uses_fp32_geometry_and_preserves_input_gradient_dtypes():
+    inputs, incidence, node_graph = _inputs(torch.float32)
+    inputs = tuple(value.to(torch.bfloat16).requires_grad_(True) for value in inputs)
+    saved = []
+
+    def pack(tensor):
+        saved.append((tensor.shape, tensor.dtype))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            actual = _actual(inputs, incidence, node_graph, 3)
+    # The dense reference is evaluated outside autocast to retain FP32 geometry.
+    expected = _dense_reference(*inputs, incidence, node_graph)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.dtype == torch.bfloat16
+    saved_features = [dtype for shape, dtype in saved if tuple(shape) == (7, 2, 3)]
+    assert saved_features and all(dtype == torch.float32 for dtype in saved_features)
+    gradients = torch.autograd.grad(actual.float().square().sum(), inputs)
+    expected_gradients = torch.autograd.grad(expected.float().square().sum(), inputs)
+    assert all(gradient.dtype == torch.bfloat16 for gradient in gradients)
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    for gradient, expected_gradient in zip(gradients, expected_gradients, strict=True):
+        torch.testing.assert_close(gradient, expected_gradient, rtol=1e-2, atol=1e-3)
+
+
+@pytest.mark.parametrize("chunk,c_requires_grad", list(product([11, 37, 500], [False, True])))
+def test_first_order_saved_feature_tensors_are_nodes_not_accumulated_edge_chunks(
+    chunk, c_requires_grad
+):
+    generator = torch.Generator().manual_seed(321)
+    nodes, edges, heads, width = 23, 173, 3, 5
+    incidence = torch.randint(nodes, (2, edges), generator=generator)
+    message = torch.randn(nodes, heads, width, generator=generator, requires_grad=True)
+    conductance = torch.linspace(0.7, 1.3, edges, requires_grad=c_requires_grad)
+    beta = torch.full((1, heads), 0.3, requires_grad=True)
+    correction = torch.linspace(1.0, 1.5, edges, requires_grad=True)
+    saved = []
+
+    def pack(tensor):
+        saved.append((tuple(tensor.shape), tensor.numel()))
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        actual = _actual(
+            (message, conductance, beta, correction),
+            incidence,
+            torch.zeros(nodes, dtype=torch.long),
+            chunk,
+        )
+    feature_tensors = [shape for shape, _ in saved if len(shape) == 3 and shape[-1] == width]
+    assert feature_tensors
+    assert all(shape == (nodes, heads, width) for shape in feature_tensors)
+    # Storage is node-feature tensors plus scalar/index edge data, independent
+    # of E * heads * width and without an accumulated per-chunk feature graph.
+    assert sum(numel for _, numel in saved) < 8 * nodes * heads * width + 24 * edges
+    actual.square().mean().backward()
+    assert message.grad is not None and torch.isfinite(message.grad).all()
+    if c_requires_grad:
+        assert conductance.grad is not None and torch.isfinite(conductance.grad).all()
+
+
+def test_calibration_frozen_message_still_receives_conductance_gradient():
+    inputs, incidence, node_graph = _inputs()
+    message, conductance, beta, correction = inputs
+    conductance.requires_grad_(True)
+    output = _actual((message, conductance, beta, correction), incidence, node_graph, 3)
+    output.square().mean().backward()
+    assert conductance.grad is not None
+    assert torch.isfinite(conductance.grad).all()
+    assert conductance.grad[:3].abs().sum() > 0
+    assert message.grad is None
+````
+
 # tests/test_conductance_v5_model.py
 
 ````python
@@ -77231,147 +78200,103 @@ def test_report_labels_primary_and_auxiliary_dynamic_metrics():
 # tests/test_cycle_pe_v2_projector.py
 
 ````python
-"""Mathematical and integration contracts for rebuilt Cycle PE v2."""
+"""Sparse DFS V2 integration contracts (legacy filename retained for test discovery)."""
 
 from __future__ import annotations
 
-import inspect
-
 import numpy as np
+import pytest
 import torch
 from scipy import sparse
 
+from research.cycle_pe.tests.test_v2_model import _disconnected_graph, _graph
 from research.cycle_pe.v2.basis import (
+    build_cycle_basis,
     incidence_and_cycle_rank,
-    left_nullspace_basis,
-    sparse_left_nullspace_basis,
     validate_cycle_basis,
 )
-from research.cycle_pe.v2.data import Graph, collate
-from research.cycle_pe.v2.model import CycleBasisPEModel, LeftNullBasisEncoder
+from research.cycle_pe.v2.data import collate
+from research.cycle_pe.v2.model import CycleBasisPEModel
 
 EDGES = np.asarray([(0, 1), (2, 1), (2, 0), (3, 4), (5, 4), (5, 3)], dtype=np.int64).T
 
 
-def _projector(basis: np.ndarray) -> np.ndarray:
-    q, _ = np.linalg.qr(basis.astype(np.float64), mode="reduced")
-    return q @ q.T
-
-
-def test_sparse_basis_has_exact_cycle_dimension_and_is_in_left_nullspace():
-    # Two triangles plus isolated node 6: m-n+c = 6-7+3 = 2.
+def test_sparse_basis_has_exact_cycle_dimension_and_zero_incidence_residual():
     incidence, rank = incidence_and_cycle_rank(7, EDGES)
-    basis = sparse_left_nullspace_basis(7, EDGES)
+    basis = build_cycle_basis(7, EDGES)
     assert sparse.isspmatrix_csr(basis)
     assert rank == 2 and basis.shape == (6, 2)
-    np.testing.assert_allclose(incidence.T @ basis.toarray(), 0.0, atol=0.0)
-    assert np.linalg.matrix_rank(basis.toarray()) == rank
+    residual = incidence.T @ basis
+    residual.eliminate_zeros()
+    assert residual.nnz == 0
+    assert set(np.unique(basis.data)) <= {-1.0, 1.0}
     validate_cycle_basis(7, EDGES, basis)
 
-    q = left_nullspace_basis(7, EDGES)
-    np.testing.assert_allclose(q.T @ q, np.eye(rank), atol=2e-6)
-    np.testing.assert_allclose(incidence.T @ q, 0.0, atol=2e-6)
 
-
-def test_cycle_space_projector_transforms_correctly_under_orientation_and_permutation():
-    q = left_nullspace_basis(7, EDGES)
-    projector = _projector(q)
-
-    signs = np.asarray([-1, 1, -1, 1, -1, 1], dtype=np.float64)
+def test_reversing_edge_orientation_preserves_sparse_cycle_membership():
+    basis = build_cycle_basis(7, EDGES)
+    signs = np.asarray([-1, 1, -1, 1, -1, 1], dtype=np.float32)
     flipped_edges = EDGES.copy()
-    flipped = signs < 0
-    flipped_edges[:, flipped] = flipped_edges[::-1, flipped]
-    q_flipped = left_nullspace_basis(7, flipped_edges)
-    np.testing.assert_allclose(
-        _projector(q_flipped), signs[:, None] * projector * signs[None, :], atol=2e-6
-    )
-
-    permutation = np.asarray([5, 2, 0, 4, 1, 3])
-    q_permuted = left_nullspace_basis(7, EDGES[:, permutation])
-    np.testing.assert_allclose(
-        _projector(q_permuted), projector[np.ix_(permutation, permutation)], atol=2e-6
-    )
+    flipped_edges[:, signs < 0] = flipped_edges[::-1, signs < 0]
+    changed = build_cycle_basis(7, flipped_edges)
+    # Reversing a chord may also flip the whole cycle column; both row and
+    # column signs disappear in the selected unsigned membership.
+    difference = abs(changed) - abs(basis)
+    difference.eliminate_zeros()
+    assert difference.nnz == 0
+    validate_cycle_basis(7, flipped_edges, changed)
 
 
-def test_projector_kernel_encoder_is_basis_and_orientation_invariant_and_permutation_equivariant():
-    torch.manual_seed(9)
-    q = torch.from_numpy(left_nullspace_basis(7, EDGES))
-    bond = torch.randn(6, 5)
-    encoder = LeftNullBasisEncoder(5, 7).eval()
-    reference = encoder(bond, q)
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_preparation_batch_and_forward_never_factorize_or_densify_sparse_cycles(
+    monkeypatch, encoding
+):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("sparse DFS pipeline invoked dense conversion or factorization")
 
-    change = torch.tensor([[2.0, -0.5], [0.75, 1.5]])
-    torch.testing.assert_close(encoder(bond, q @ change), reference, atol=3e-5, rtol=3e-5)
-
-    signs = torch.tensor([-1.0, 1.0, -1.0, 1.0, -1.0, 1.0])
-    torch.testing.assert_close(encoder(bond, signs[:, None] * q), reference, atol=3e-5, rtol=3e-5)
-
-    permutation = torch.tensor([5, 2, 0, 4, 1, 3])
-    actual = encoder(bond[permutation], q[permutation])
-    torch.testing.assert_close(actual, reference[permutation], atol=3e-5, rtol=3e-5)
-
-    chunked = encoder.forward_batch(bond, (q,), pair_budget=7, orthonormal_input=True)
-    torch.testing.assert_close(chunked, reference, atol=3e-5, rtol=3e-5)
-
-
-def test_pair_free_low_rank_contraction_matches_explicit_kernel_and_bounds_core(monkeypatch):
-    torch.manual_seed(19)
-    q, _ = torch.linalg.qr(torch.randn(23, 4), mode="reduced")
-    values = torch.randn(23, 6, requires_grad=True)
-    encoder = LeftNullBasisEncoder(6, 8)
-    original_einsum = torch.einsum
-    core_sizes = []
-
-    def observed(equation, *operands):
-        result = original_einsum(equation, *operands)
-        if equation == "md,ma,mb->dab":
-            core_sizes.append(result.numel())
-        return result
-
-    monkeypatch.setattr(torch, "einsum", observed)
-    actual, leverage = encoder._projector_mix(q, values, pair_budget=7)
-    projector = q @ q.T
-    expected = projector.square() @ values
-    torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
-    torch.testing.assert_close(leverage, projector.diagonal(), atol=2e-6, rtol=2e-6)
-    actual.square().sum().backward()
-    assert values.grad is not None and torch.isfinite(values.grad).all()
-    assert core_sizes and max(core_sizes) <= 7
-    source = inspect.getsource(LeftNullBasisEncoder._projector_mix)
-    assert "projector_rows" not in source and "@ q.T" not in source
-
-
-def _graph(num_nodes: int, edges: list[tuple[int, int]]) -> Graph:
-    edge_index = torch.tensor(edges, dtype=torch.long).reshape(-1, 2).T
-    q = left_nullspace_basis(num_nodes, edge_index.numpy())
-    return Graph(
-        x=torch.arange(num_nodes, dtype=torch.long).remainder(28)[:, None],
-        edge_index=edge_index,
-        edge_attr=torch.zeros(len(edges), 1, dtype=torch.long),
-        y=torch.zeros(1),
-        cycle_basis=torch.from_numpy(q),
-        cycle_basis_is_orthonormal=torch.tensor(True),
-    )
-
-
-def test_deep_residual_model_runs_forward_backward_with_cycle_forest_and_isolate():
-    cyclic = _graph(4, [(0, 1), (1, 2), (2, 3), (0, 3), (0, 2)])
-    forest = _graph(3, [(0, 1)])
-    batch = collate([cyclic, forest])
+    for name in ("qr", "svd", "eigh", "eig", "inv", "pinv", "cholesky"):
+        monkeypatch.setattr(np.linalg, name, forbidden)
+        monkeypatch.setattr(torch.linalg, name, forbidden)
+    for kind in (sparse.csr_matrix, sparse.csc_matrix, sparse.coo_matrix):
+        monkeypatch.setattr(kind, "toarray", forbidden)
+    monkeypatch.setattr(torch.Tensor, "to_dense", forbidden)
+    graphs = [_graph(7, complete=True), _graph(3, forest=True), _disconnected_graph()]
+    batch = collate(graphs)
     model = CycleBasisPEModel(
-        dataset="zinc12k",
-        hidden=16,
-        pe_dim=8,
-        layers=6,
-        ffn_multiplier=2,
-        dropout=0.0,
-        basis_pair_budget=8,
+        dataset="zinc12k", encoding=encoding, hidden=16, pe_dim=8, layers=6
     )
     prediction = model(batch)
-    assert prediction.shape == (2, 1) and torch.isfinite(prediction).all()
-    prediction.square().mean().backward()
-    gradients = [parameter.grad for parameter in model.parameters() if parameter.requires_grad]
-    assert any(gradient is not None and torch.isfinite(gradient).all() for gradient in gradients)
+    assert prediction.shape == (3, 1) and torch.isfinite(prediction).all()
+    (prediction - batch.y).abs().mean().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_disjoint_sparse_batch_retains_every_cycle_and_membership_nonzero():
+    graphs = [_graph(4), _graph(7, complete=True), _graph(4, forest=True), _disconnected_graph()]
+    batch = collate(graphs)
+    assert batch.cycle_membership.layout == torch.sparse_coo
+    assert batch.cycle_membership.shape == (
+        sum(len(graph.edge_attr) for graph in graphs),
+        sum(graph.cycle_basis.shape[1] for graph in graphs),
+    )
+    assert batch.cycle_membership._nnz() == sum(graph.cycle_basis._nnz() for graph in graphs)
+    assert batch.cycle_lengths.shape == (batch.cycle_membership.shape[1],)
+    edge_ids, cycle_ids = batch.cycle_membership.indices()
+    assert torch.equal(batch.edge_graph_index[edge_ids], batch.cycle_graph_index[cycle_ids])
+    assert torch.all(batch.cycle_membership.values() == 1)
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_deep_residual_forward_backward_handles_cycles_forests_and_isolates(encoding):
+    batch = collate([_graph(5, complete=True), _graph(3, forest=True), _graph(1, forest=True)])
+    model = CycleBasisPEModel(
+        dataset="zinc12k", encoding=encoding, hidden=16, pe_dim=8, layers=6
+    )
+    assert len(model.layers) == 6
+    prediction = model(batch)
+    assert prediction.shape == (3, 1) and torch.isfinite(prediction).all()
+    (prediction - batch.y).square().mean().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
 ````
 
 # tests/test_cycle_scaling_runner.py
@@ -77414,8 +78339,8 @@ def test_default_matrix_runs_both_versions_all_profiles_and_seed_zero(tmp_path):
     scaling._validate(args)
     jobs = scaling.make_jobs(args, scaling._run_dir(args, "matrix"))
     assert args.model_seeds == (0,)
-    assert len(jobs) == 8
-    assert len(jobs) == 8
+    assert len(jobs) == 12
+    assert args.encodings == ["se", "pe"]
     manifest = scaling._manifest_base(
         args,
         "matrix",
@@ -77424,9 +78349,9 @@ def test_default_matrix_runs_both_versions_all_profiles_and_seed_zero(tmp_path):
         {"status": "passed"},
         {"source": "stable"},
     )
-    assert manifest["fresh_child_runs"] == 8
-    assert manifest["fresh_dataset_trainings"] == 8
-    assert manifest["selected_test_evaluations_planned"] == 4
+    assert manifest["fresh_child_runs"] == 12
+    assert manifest["fresh_dataset_trainings"] == 12
+    assert manifest["selected_test_evaluations_planned"] == 6
     assert {(job["version"], job["profile"]) for job in jobs} == {
         (version, profile) for version in scaling.VERSIONS for profile in scaling.PROFILE_ORDER
     }
@@ -77437,9 +78362,11 @@ def test_default_matrix_runs_both_versions_all_profiles_and_seed_zero(tmp_path):
     assert len({job["output_dir"] for job in jobs}) == len(jobs)
 
 
-@pytest.mark.parametrize("version", scaling.VERSIONS)
+@pytest.mark.parametrize("version,encoding", [("v1", None), ("v2", "se"), ("v2", "pe")])
 @pytest.mark.parametrize("profile", scaling.PROFILE_ORDER)
-def test_child_commands_use_real_version_cli_and_exact_profile(version, profile, tmp_path):
+def test_child_commands_use_real_version_cli_and_exact_profile(
+    version, encoding, profile, tmp_path
+):
     args = _args(
         "--versions",
         version,
@@ -77451,6 +78378,7 @@ def test_child_commands_use_real_version_cli_and_exact_profile(version, profile,
         "cuda:0",
         "--results-root",
         str(tmp_path),
+        *(["--encodings", encoding] if encoding is not None else []),
     )
     job = scaling.make_jobs(args, scaling._run_dir(args, "commands"))[0]
     command = job["command"]
@@ -77474,8 +78402,12 @@ def test_child_commands_use_real_version_cli_and_exact_profile(version, profile,
     assert child.validation_only is True
     assert child.test_checkpoint is None
     if version == "v2":
-        assert child.basis_backend == "thin_q"
-        assert child.basis_execution == "batched" and child.basis_pair_budget == 32768
+        assert child.encoding == encoding == job["encoding"]
+        assert child.basis_backend == "dfs_fundamental"
+        assert job["resources"]["basis_execution"] == "sparse_block_diagonal"
+        assert not hasattr(child, "basis_execution")
+        assert not hasattr(child, "column_chunk_size")
+        assert not hasattr(child, "basis_pair_budget")
 
 
 def test_dfs_basis_backend_is_forwarded_only_to_v2_and_bound_to_run_identity(tmp_path):
@@ -77494,16 +78426,39 @@ def test_dfs_basis_backend_is_forwarded_only_to_v2_and_bound_to_run_identity(tmp
     )
     scaling._validate(args)
     jobs = scaling.make_jobs(args, scaling._run_dir(args, "dfs"))
-    v1, v2 = sorted(jobs, key=lambda job: job["version"])
+    v1 = next(job for job in jobs if job["version"] == "v1")
+    v2_jobs = [job for job in jobs if job["version"] == "v2"]
     assert "--basis-backend" not in v1["command"]
     assert v1["resources"]["basis_backend"] is None
-    assert v2["command"][v2["command"].index("--basis-backend") + 1] == "dfs_fundamental"
-    assert v2["resources"]["basis_backend"] == "dfs_fundamental"
+    assert v1["encoding"] is None
+    assert {job["encoding"] for job in v2_jobs} == {"se", "pe"}
+    for v2 in v2_jobs:
+        assert v2["command"][v2["command"].index("--basis-backend") + 1] == "dfs_fundamental"
+        assert v2["resources"]["basis_backend"] == "dfs_fundamental"
     assert scaling._run_configuration(args)["basis_backend"] == "dfs_fundamental"
 
     v1_only = _args("--versions", "v1", "--basis-backend", "dfs_fundamental")
-    with pytest.raises(ValueError, match="requires v2"):
-        scaling._validate(v1_only)
+    scaling._validate(v1_only)
+    v1_jobs = scaling.make_jobs(v1_only, scaling._run_dir(v1_only, "v1-only"))
+    assert all("--basis-backend" not in job["command"] for job in v1_jobs)
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("--basis-backend", "thin_q"),
+        ("--column-chunk-size", "16"),
+        ("--basis-pair-budget", "32768"),
+        ("--basis-execution", "batched"),
+    ],
+)
+def test_removed_qr_backend_and_noop_tuning_options_are_rejected(option, value):
+    from research.cycle_pe.v2.benchmark import parser
+
+    with pytest.raises(SystemExit):
+        scaling.parser().parse_args([option, value])
+    with pytest.raises(SystemExit):
+        parser().parse_args([option, value])
 
 
 def test_profiles_are_dataset_aware_reference_scale_and_large():
@@ -77575,11 +78530,11 @@ def test_a6000_profile_uses_static_dataset_batches_amp_and_heavy_first(tmp_path)
         assert "--amp" in command
         if job["version"] == "v2":
             assert resources["prefetch_factor"] == 4
-            assert resources["basis_pair_budget"] == 4_194_304
+            assert resources["basis_execution"] == "sparse_block_diagonal"
             assert command[command.index("--hardware-profile") + 1] == "a6000-48gb"
         else:
             assert resources["prefetch_factor"] == 2
-            assert resources["basis_pair_budget"] is None
+            assert resources["basis_execution"] is None
             assert "--prefetch-factor" not in command
 
 
@@ -77591,7 +78546,7 @@ def test_v2_precision_contract_accepts_only_hardware_valid_modes() -> None:
         "autocast_dtype": "disabled",
         "fallback": None,
         "gradient_scaler": False,
-        "projector_contraction": "float32",
+        "cycle_sparse_aggregation": "float32",
         "backbone_autocast": False,
     }
     portable_resources = scaling._job_resources(_args("--amp"), "v2", "reference", "zinc12k")
@@ -77626,7 +78581,7 @@ def test_v2_precision_contract_accepts_only_hardware_valid_modes() -> None:
         "autocast_dtype": "float16",
         "fallback": "tampered",
         "gradient_scaler": True,
-        "projector_contraction": "float16",
+        "cycle_sparse_aggregation": "float16",
         "backbone_autocast": False,
     }
     for field, value in corrupt_values.items():
@@ -77670,14 +78625,14 @@ def test_v2_test_only_admission_binds_every_a6000_runtime_field():
     )
     for field in (
         "ffn_multiplier",
-        "column_chunk_size",
-        "basis_pair_budget",
+        "basis_backend",
         "prefetch_factor",
         "hardware_profile",
         "effective_batch_size",
-        "packed_cycle_basis_h2d_tensors_per_batch",
+        "cycle_membership_layout",
+        "cycle_factorization_in_forward",
         "peak_gpu_reserved_bytes",
-        "projector_contraction",
+        "cycle_sparse_aggregation",
     ):
         assert field in source
 
@@ -77699,10 +78654,21 @@ def test_direct_runner_environment_explicitly_unsets_nvml_cuda_check(monkeypatch
     assert "src/chartgat/observability.py" in scaling.SOURCE_FILES
 
 
-def _row(version: str, dataset: str, profile: str, seed: int, validation: float):
-    prefix = f"/{version}/{dataset}/{profile}/{seed}"
+def _row(
+    version: str,
+    dataset: str,
+    profile: str,
+    seed: int,
+    validation: float,
+    *,
+    encoding: str | None = None,
+):
+    encoding = ("se" if encoding is None else encoding) if version == "v2" else None
+    condition = version if encoding is None else f"{version}/{encoding}"
+    prefix = f"/{condition}/{dataset}/{profile}/{seed}"
     return {
         "version": version,
+        "encoding": encoding,
         "profile": profile,
         "dataset": dataset,
         "model_seed": seed,
@@ -77743,6 +78709,92 @@ def test_profile_selection_uses_mean_validation_and_one_common_profile():
     assert summary["profile_selections"][0]["test_used_for_selection"] is False
     assert summary["test_evaluations"] == []
     assert all("test" not in key for row in summary["runs"] for key in row)
+
+
+def _two_encoding_selection_summary():
+    rows = [
+        _row("v2", "zinc12k", profile, seed, value + seed * 0.01, encoding=encoding)
+        for encoding, scores in (
+            ("se", {"reference": 0.1, "large": 0.4}),
+            ("pe", {"reference": 0.3, "large": 0.2}),
+        )
+        for profile, value in scores.items()
+        for seed in (0, 1)
+    ]
+    return scaling.build_summary(
+        rows,
+        versions=["v2"],
+        encodings=["se", "pe"],
+        datasets=["zinc12k"],
+        profiles=["reference", "large"],
+        model_seeds=(0, 1),
+        complete=True,
+    )
+
+
+def test_se_and_pe_select_profiles_independently_and_keep_checkpoint_jobs_separate(tmp_path):
+    summary = _two_encoding_selection_summary()
+    selections = {item["encoding"]: item for item in summary["profile_selections"]}
+    assert selections["se"]["selected_profile"] == "reference"
+    assert selections["pe"]["selected_profile"] == "large"
+    assert selections["se"]["profile_selection_id"] == "v2:se:zinc12k"
+    assert selections["pe"]["profile_selection_id"] == "v2:pe:zinc12k"
+    assert summary["requested_encodings"] == ["se", "pe"]
+    args = _args("--versions", "v2", "--datasets", "zinc12k", "--model-seeds", "0,1")
+    jobs = scaling.make_test_jobs(args, tmp_path, summary["selected_checkpoints"])
+    assert len(jobs) == len({job["job_id"] for job in jobs}) == 4
+    assert len({job["output_dir"] for job in jobs}) == 4
+    test_rows = []
+    for job in jobs:
+        encoding = job["encoding"]
+        assert job["resources"]["encoding"] == encoding
+        assert job["command"][job["command"].index("--encoding") + 1] == encoding
+        assert job["job_id"] == f"test:v2:{encoding}:zinc12k:model-seed-{job['model_seed']}"
+        assert job["selected_profile"] == selections[encoding]["selected_profile"]
+        test_rows.append(
+            {
+                **job,
+                "test_evaluation_id": job["job_id"],
+                "test_mae": 0.8 if encoding == "se" else 0.4,
+                "fresh_training": False,
+            }
+        )
+    final = scaling.attach_test_results(summary, test_rows, complete=True)
+    assert final["status"] == "passed"
+    assert {row["encoding"]: row["test_mae"]["mean"] for row in final["final_test_aggregates"]} == {
+        "se": 0.8,
+        "pe": 0.4,
+    }
+
+
+def test_equal_count_duplicate_encoding_candidate_matrix_withholds_all_selections():
+    rows = _two_encoding_selection_summary()["runs"]
+    rows[-1] = {**rows[-1], "encoding": "se"}
+    summary = scaling.build_summary(
+        rows,
+        versions=["v2"],
+        encodings=["se", "pe"],
+        datasets=["zinc12k"],
+        profiles=["reference", "large"],
+        model_seeds=(0, 1),
+        complete=True,
+    )
+    assert len(rows) == 8
+    assert summary["status"] == "failed"
+    assert summary["profile_selections"] == summary["selected_checkpoints"] == []
+
+
+def test_cross_encoding_test_row_cannot_attach_even_with_matching_counts_and_checkpoint_ids():
+    summary = _two_encoding_selection_summary()
+    rows = [
+        {**selected, "test_evaluation_id": f"test:{selected['checkpoint_id']}", "test_mae": 0.5}
+        for selected in summary["selected_checkpoints"]
+    ]
+    rows[0]["encoding"] = "pe"
+    result = scaling.attach_test_results(summary, rows, complete=True)
+    assert result["status"] == "failed"
+    assert result["test_evaluations"] == []
+    assert "detached" in result["test_results_withheld"]
 
 
 def test_incomplete_seed_matrix_withholds_selection_fail_closed():
@@ -77795,6 +78847,7 @@ def test_selected_profile_creates_one_test_only_job_per_seed_and_attaches_separa
             "checkpoint_id": job["checkpoint_id"],
             "profile_selection_id": job["profile_selection_id"],
             "version": job["version"],
+            "encoding": job.get("encoding"),
             "dataset": job["dataset"],
             "model_seed": job["model_seed"],
             "selected_profile": job["selected_profile"],
@@ -77846,33 +78899,39 @@ def test_validation_only_child_loads_no_test_split(module_name, tmp_path, monkey
     )
     assert loaded == [("train", "validation")]
     metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
-    assert "test" not in metrics["datasets"]["zinc12k"]["models"][benchmark.MODEL_NAME]
+    model_name = (
+        benchmark.MODEL_NAMES["se"]
+        if module_name.endswith("v2.benchmark")
+        else benchmark.MODEL_NAME
+    )
+    assert "test" not in metrics["datasets"]["zinc12k"]["models"][model_name]
 
 
-def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakage(tmp_path):
+@pytest.mark.parametrize("encoding", ("se", "pe"))
+def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakage(
+    tmp_path, encoding
+):
+    model_name = scaling._model_name("v2", encoding)
     output = tmp_path / "child"
     output.mkdir()
     job = {
         "version": "v2",
+        "encoding": encoding,
         "profile": "reference",
         "model_seed": 3,
         "datasets": ["zinc12k"],
         "config": scaling._profile_config("reference", "zinc12k", "v2"),
-        "resources": scaling._job_resources(_args(), "v2", "reference", "zinc12k"),
+        "resources": scaling._job_resources(_args(), "v2", "reference", "zinc12k", encoding),
         "output_dir": str(output),
         "command": [
             "python",
             "-m",
             "research.cycle_pe.v2.benchmark",
-            "--column-chunk-size",
-            "16",
-            "--basis-execution",
-            "batched",
-            "--basis-pair-budget",
-            "32768",
+            "--basis-backend",
+            "dfs_fundamental",
         ],
     }
-    run = output / "zinc12k/cycle_projector_pe_v2"
+    run = output / "zinc12k" / model_name
     run.mkdir(parents=True)
     checkpoint = run / "best.pt"
     checkpoint.write_bytes(b"checkpoint")
@@ -77896,6 +78955,7 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
         "run_mode": "validation_only",
         "version": "v2",
         "arguments": {
+            "encoding": encoding,
             "model_seed": 3,
             "hidden_dim": 128,
             "pe_dim": 64,
@@ -77906,10 +78966,7 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
             "datasets": ["zinc12k"],
             "validation_only": True,
             "test_checkpoint": None,
-            "column_chunk_size": 16,
-            "basis_backend": "thin_q",
-            "basis_execution": "batched",
-            "basis_pair_budget": 32768,
+            "basis_backend": "dfs_fundamental",
             "batch_size": 32,
             "workers": 4,
             "amp": False,
@@ -77917,6 +78974,7 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
             "hardware_profile": "portable",
         },
         "controls": {
+            "encoding": encoding,
             "test_data_access": False,
             "fresh_training": True,
             "optimizer_created": True,
@@ -77935,7 +78993,7 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
                     "split_content_sha256": {"train": "a", "validation": "b"},
                 },
                 "models": {
-                    "cycle_projector_pe_v2": {
+                    model_name: {
                         "validation": 0.2,
                         "trainable_parameters": 1234,
                         "elapsed_seconds": 5.0,
@@ -77947,7 +79005,8 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
                                 "effective_batch_size": 32,
                                 "workers": 4,
                                 "prefetch_factor": 2,
-                                "packed_cycle_basis_h2d_tensors_per_batch": 1,
+                                "cycle_membership_layout": "sparse_coo_block_diagonal",
+                                "cycle_factorization_in_forward": False,
                             },
                             "precision": {
                                 "amp": False,
@@ -77955,7 +79014,7 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
                                 "autocast_dtype": "disabled",
                                 "fallback": None,
                                 "gradient_scaler": False,
-                                "projector_contraction": "float32",
+                                "cycle_sparse_aggregation": "float32",
                                 "backbone_autocast": False,
                             },
                             "hardware": {"profile": "portable"},
@@ -77985,13 +79044,114 @@ def test_read_job_rows_accepts_only_validation_artifacts_and_rejects_test_leakag
     assert row["trainable_parameters"] == 1234
     assert row["resource_observability"]["total_point_sample_count"] == 2
     assert row["throughput"]["training_graphs_per_second"] == 10.0
+    assert row["encoding"] == encoding
+    other_encoding = "pe" if encoding == "se" else "se"
+    for section_name in ("arguments", "controls"):
+        corrupt_manifest = json.loads(json.dumps(manifest))
+        corrupt_manifest[section_name]["encoding"] = other_encoding
+        (output / "manifest.json").write_text(json.dumps(corrupt_manifest), encoding="utf-8")
+        with pytest.raises(ValueError, match="encoding"):
+            scaling.read_job_rows(job)
+    (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    corrupt_job = {**job, "resources": {**job["resources"], "encoding": other_encoding}}
+    with pytest.raises(ValueError, match="encoding"):
+        scaling.read_job_rows(corrupt_job)
+    wrong_model = json.loads(json.dumps(metrics))
+    wrong_models = wrong_model["datasets"]["zinc12k"]["models"]
+    wrong_models[scaling._model_name("v2", other_encoding)] = wrong_models.pop(model_name)
+    (output / "metrics.json").write_text(json.dumps(wrong_model), encoding="utf-8")
+    with pytest.raises(ValueError, match="model"):
+        scaling.read_job_rows(job)
+
+    # The selected-test reader must reject the same cross-condition transplant,
+    # even when architecture and parameter counts are exactly matched.
+    selected_id = f"v2:{encoding}:zinc12k"
+    test_job = {
+        **job,
+        "job_id": f"test:{selected_id}:model-seed-3",
+        "checkpoint_id": f"{selected_id}:model-seed-3",
+        "profile_selection_id": selected_id,
+        "dataset": "zinc12k",
+        "selected_profile": "reference",
+        "checkpoint": str(checkpoint.resolve()),
+        "checkpoint_sha256": row["checkpoint_sha256"],
+        "selected_validation_mae": 0.2,
+        "trainable_parameters": 1234,
+    }
+    test_manifest = json.loads(json.dumps(manifest))
+    test_manifest["run_mode"] = "test_only"
+    test_manifest["arguments"].update(
+        validation_only=False, test_checkpoint=str(checkpoint.resolve())
+    )
+    test_manifest["controls"].update(
+        test_data_access=True, fresh_training=False, optimizer_created=False
+    )
+    test_metrics = json.loads(json.dumps(metrics))
+    test_metrics["run_mode"] = "test_only"
+    test_dataset = test_metrics["datasets"]["zinc12k"]
+    test_dataset["protocol"] = {
+        "loaded_splits": ["test"],
+        "split_sizes": {"test": 2},
+        "split_content_sha256": {"test": "c"},
+    }
+    test_result = test_dataset["models"][model_name]
+    for field in ("validation", "history", "epochs_completed", "best_epoch"):
+        del test_result[field]
+    test_result.update(
+        evaluation_splits=["test"],
+        fresh_training=False,
+        selected_validation=0.2,
+        test=0.3,
+        evaluation_seconds=1.0,
+    )
+    (output / "manifest.json").write_text(json.dumps(test_manifest), encoding="utf-8")
+    (output / "metrics.json").write_text(json.dumps(test_metrics), encoding="utf-8")
+    assert scaling.read_test_result(test_job)["encoding"] == encoding
+    for section_name in ("arguments", "controls"):
+        corrupt_manifest = json.loads(json.dumps(test_manifest))
+        corrupt_manifest[section_name]["encoding"] = other_encoding
+        (output / "manifest.json").write_text(json.dumps(corrupt_manifest), encoding="utf-8")
+        with pytest.raises(ValueError, match="encoding"):
+            scaling.read_test_result(test_job)
+    (output / "manifest.json").write_text(json.dumps(test_manifest), encoding="utf-8")
+    corrupt_test_job = {**test_job, "resources": {**job["resources"], "encoding": other_encoding}}
+    with pytest.raises(ValueError, match="encoding"):
+        scaling.read_test_result(corrupt_test_job)
+    wrong_test = json.loads(json.dumps(test_metrics))
+    wrong_models = wrong_test["datasets"]["zinc12k"]["models"]
+    wrong_models[scaling._model_name("v2", other_encoding)] = wrong_models.pop(model_name)
+    (output / "metrics.json").write_text(json.dumps(wrong_test), encoding="utf-8")
+    with pytest.raises(ValueError, match="model"):
+        scaling.read_test_result(test_job)
+    (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (output / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+    for field, corrupt_value in (
+        ("cycle_membership_layout", "dense"),
+        ("cycle_factorization_in_forward", True),
+    ):
+        corrupt = json.loads(json.dumps(metrics))
+        pipeline = corrupt["datasets"]["zinc12k"]["models"][model_name]["execution"][
+            "data_pipeline"
+        ]
+        pipeline[field] = corrupt_value
+        (output / "metrics.json").write_text(json.dumps(corrupt), encoding="utf-8")
+        with pytest.raises(ValueError, match="runtime/resource"):
+            scaling.read_job_rows(job)
+    legacy = json.loads(json.dumps(metrics))
+    pipeline = legacy["datasets"]["zinc12k"]["models"][model_name]["execution"]["data_pipeline"]
+    del pipeline["cycle_membership_layout"]
+    del pipeline["cycle_factorization_in_forward"]
+    pipeline["packed_cycle_basis_h2d_tensors_per_batch"] = 1
+    (output / "metrics.json").write_text(json.dumps(legacy), encoding="utf-8")
+    with pytest.raises(ValueError, match="runtime/resource"):
+        scaling.read_job_rows(job)
     for field in ("resource_observability", "throughput"):
         incomplete = json.loads(json.dumps(metrics))
-        del incomplete["datasets"]["zinc12k"]["models"]["cycle_projector_pe_v2"][field]
+        del incomplete["datasets"]["zinc12k"]["models"][model_name][field]
         (output / "metrics.json").write_text(json.dumps(incomplete), encoding="utf-8")
         with pytest.raises(ValueError, match=field):
             scaling.read_job_rows(job)
-    metrics["datasets"]["zinc12k"]["models"]["cycle_projector_pe_v2"]["test"] = 0.3
+    metrics["datasets"]["zinc12k"]["models"][model_name]["test"] = 0.3
     (output / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
     with pytest.raises(ValueError, match="leaked a test metric"):
         scaling.read_job_rows(job)
@@ -78021,9 +79181,9 @@ def test_dry_run_prints_full_plan_without_dependency_or_gpu_checks(tmp_path, mon
         ]
     )
     output = capsys.readouterr().out
-    assert code == 0 and "8 fresh child runs" in output and "8 fresh dataset trainings" in output
+    assert code == 0 and "12 fresh child runs" in output and "12 fresh dataset trainings" in output
     assert "train+validation only" in output
-    assert "4 selected-checkpoint test evaluations" in output
+    assert "6 selected-checkpoint test evaluations" in output
     assert not (tmp_path / "cycle_pe/scaling").exists()
 
 
@@ -78173,6 +79333,7 @@ def test_same_run_id_resumes_valid_children_and_test_checkpoints(tmp_path, monke
         return [
             {
                 "version": job["version"],
+                "encoding": job.get("encoding"),
                 "profile": job["profile"],
                 "dataset": "zinc12k",
                 "model_seed": job["model_seed"],
@@ -78199,6 +79360,7 @@ def test_same_run_id_resumes_valid_children_and_test_checkpoints(tmp_path, monke
             "checkpoint_id": job["checkpoint_id"],
             "profile_selection_id": job["profile_selection_id"],
             "version": job["version"],
+            "encoding": job.get("encoding"),
             "dataset": job["dataset"],
             "model_seed": job["model_seed"],
             "selected_profile": job["selected_profile"],
@@ -78287,6 +79449,7 @@ def test_retrained_selected_candidate_rebinds_and_reruns_test_once(tmp_path, mon
         return [
             {
                 "version": job["version"],
+                "encoding": job.get("encoding"),
                 "profile": job["profile"],
                 "dataset": "zinc12k",
                 "model_seed": job["model_seed"],
@@ -78316,6 +79479,7 @@ def test_retrained_selected_candidate_rebinds_and_reruns_test_once(tmp_path, mon
             "checkpoint_id": job["checkpoint_id"],
             "profile_selection_id": job["profile_selection_id"],
             "version": job["version"],
+            "encoding": job.get("encoding"),
             "dataset": job["dataset"],
             "model_seed": job["model_seed"],
             "selected_profile": job["selected_profile"],
@@ -78425,6 +79589,7 @@ def test_completed_run_returns_without_relaunching_preflight_or_children(tmp_pat
         return [
             {
                 "version": job["version"],
+                "encoding": job.get("encoding"),
                 "profile": job["profile"],
                 "dataset": "zinc12k",
                 "model_seed": job["model_seed"],
@@ -78451,6 +79616,7 @@ def test_completed_run_returns_without_relaunching_preflight_or_children(tmp_pat
             "checkpoint_id": job["checkpoint_id"],
             "profile_selection_id": job["profile_selection_id"],
             "version": job["version"],
+            "encoding": job.get("encoding"),
             "dataset": job["dataset"],
             "model_seed": job["model_seed"],
             "selected_profile": job["selected_profile"],
@@ -78559,7 +79725,7 @@ def test_quarantine_rejects_resume_orphans_symlink_outside_run(tmp_path):
     assert output.is_dir()
 
 
-def test_projector_v2_attempt_preserves_last_checkpoint_and_requests_resume(tmp_path):
+def test_sparse_dfs_v2_attempt_preserves_last_checkpoint_and_requests_resume(tmp_path):
     run_dir = tmp_path / "run"
     args = scaling.parser().parse_args(
         [
@@ -78574,7 +79740,7 @@ def test_projector_v2_attempt_preserves_last_checkpoint_and_requests_resume(tmp_
         ]
     )
     job = scaling.make_jobs(args, run_dir)[0]
-    checkpoint = Path(job["output_dir"]) / "zinc12k/cycle_projector_pe_v2/last.pt"
+    checkpoint = Path(job["output_dir"]) / "zinc12k/cycle_dfs_se_v2/last.pt"
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b"epoch-state")
 
@@ -78628,7 +79794,7 @@ def test_resume_identity_binds_effective_precision(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda: False)
     fp32 = benchmark._resume_configuration("zinc12k", args)
 
-    assert bf16["schema"] == fp32["schema"] == "cycle-projector-pe-v2-epoch-resume-2"
+    assert bf16["schema"] == fp32["schema"] == "cycle-dfs-se-relative-pe-v2-epoch-resume-1"
     assert bf16["precision"]["autocast_dtype"] == "bfloat16"
     assert fp32["precision"]["autocast_dtype"] == "disabled"
     assert bf16 != fp32
@@ -78661,6 +79827,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts import run_paper
 
@@ -78686,13 +79853,19 @@ def test_v2_dispatch_is_only_basis_model_and_keeps_requested_seeds(
     commands = run_paper._commands(args, "v2-unit-contract")
     children = [entry for entry in commands if entry[0] != "gpu_preflight"]
     executed_seeds = expected_seeds[:1] if prepare else expected_seeds
-    assert len(children) == len(executed_seeds)
-    for seed, (name, command, output) in zip(executed_seeds, children, strict=True):
-        assert name == f"cycle_pe:benchmark-v2:model-seed-{seed}"
+    expected = [
+        (seed, encoding)
+        for seed in executed_seeds
+        for encoding in (["se"] if prepare else ["se", "pe"])
+    ]
+    assert len(children) == len(expected)
+    for (seed, encoding), (name, command, output) in zip(expected, children, strict=True):
+        assert name == f"cycle_pe:benchmark-v2:{encoding}:model-seed-{seed}"
         assert command[2] == "research.cycle_pe.v2.benchmark"
         child = parser().parse_args(command[3:])
         assert child.model_seed == seed
-        assert child.basis_backend == "thin_q"
+        assert child.encoding == encoding
+        assert child.basis_backend == "dfs_fundamental"
         assert child.prepare_only is prepare
         assert child.allow_download is prepare
         assert child.batch_size == 32 and child.workers == 4
@@ -78700,7 +79873,7 @@ def test_v2_dispatch_is_only_basis_model_and_keeps_requested_seeds(
         assert output == (
             ROOT
             / "research/cycle_pe/v2/results/paper/v2-unit-contract"
-            / f"model-seed-{seed}/benchmark"
+            / f"model-seed-{seed}/benchmark/{encoding}"
         )
     assert sum(name == "gpu_preflight" for name, _, _ in commands) == (0 if prepare else 1)
 
@@ -78710,13 +79883,63 @@ def test_root_runner_forwards_dfs_basis_backend_only_for_v2():
 
     args = _args("--basis-backend", "dfs_fundamental")
     children = [entry for entry in run_paper._commands(args, "dfs") if entry[0] != "gpu_preflight"]
-    assert len(children) == 1
-    child = parser().parse_args(children[0][1][3:])
-    assert child.basis_backend == "dfs_fundamental"
+    assert len(children) == 2
+    for encoding, child_entry in zip(("se", "pe"), children, strict=True):
+        child = parser().parse_args(child_entry[1][3:])
+        assert child.basis_backend == "dfs_fundamental"
+        assert child.encoding == encoding
 
     v1 = run_paper._parser().parse_args(["--tracks", "cycle_pe"])
     v1_command = run_paper._commands(v1, "v1-default")[-1][1]
     assert "--basis-backend" not in v1_command
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_requested_single_encoding_owns_its_artifacts_and_resume_identity(encoding):
+    args = _args("--cycle-v2-encodings", encoding)
+    children = [item for item in run_paper._commands(args, "one") if item[0] != "gpu_preflight"]
+    assert len(children) == 1
+    name, command, output = children[0]
+    assert command[command.index("--encoding") + 1] == encoding
+    assert f"benchmark-v2:{encoding}:" in name
+    assert output.name == encoding
+    opposite = _args("--cycle-v2-encodings", "pe" if encoding == "se" else "se")
+    assert run_paper._run_configuration(args, "one") != run_paper._run_configuration(
+        opposite, "one"
+    )
+
+
+def test_duplicate_encoding_rejected_before_dependencies(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["run_paper.py", "--cycle-v2-encodings", "se", "se"])
+    monkeypatch.setattr(run_paper, "check_dependencies", lambda: pytest.fail("must reject first"))
+    assert run_paper.main() == 2
+    assert "duplicates" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("wrong_encoding", [False, True])
+@pytest.mark.parametrize("missing_dataset", [False, True])
+def test_child_admission_checks_encoding_and_full_dataset_matrix(
+    tmp_path, wrong_encoding, missing_dataset
+):
+    args = _args("--cycle-v2-encodings", "se")
+    name, command, _ = run_paper._commands(args, "admission")[-1]
+    encoding = "pe" if wrong_encoding else "se"
+    model_name = f"cycle_dfs_{'relative_pe' if encoding == 'pe' else 'se'}_v2"
+    manifest = {
+        "status": "passed",
+        "version": "v2",
+        "arguments": {"encoding": encoding},
+        "controls": {"encoding": encoding, "model": model_name},
+    }
+    datasets = {dataset: {"models": {model_name: {}}} for dataset in ("zinc12k", "peptides_struct")}
+    if missing_dataset:
+        datasets.pop("peptides_struct")
+    payloads = {
+        (tmp_path / "manifest.json").resolve(): manifest,
+        (tmp_path / "metrics.json").resolve(): {"status": "passed", "datasets": datasets},
+    }
+    errors = run_paper._validate_child_status(name, command, tmp_path, payloads, prepare_only=False)
+    assert bool(errors) == (wrong_encoding or missing_dataset)
 
 
 def test_v1_default_dispatch_and_paths_remain_unchanged():
@@ -78741,7 +79964,7 @@ def test_v2_custom_output_and_optimizer_overrides_are_version_specific(tmp_path)
     )
     name, command, output = run_paper._commands(args, "same-id")[-1]
     assert name.endswith("model-seed-7")
-    assert output == tmp_path / "cycle_pe_v2/same-id/model-seed-7/benchmark"
+    assert output == tmp_path / "cycle_pe_v2/same-id/model-seed-7/benchmark/pe"
     assert command[command.index("--epochs") + 1] == "123"
     assert command[command.index("--lr") + 1] == "0.002"
     assert run_paper._track_run_root("cycle_pe", "same-id", tmp_path) != (
@@ -78775,12 +79998,15 @@ def test_v2_wrappers_use_direct_python_without_shell_set_flags(script):
         assert "--prepare-only --allow-download --device cpu" in source
 
 
-def test_registry_snapshot_describes_projector_v2_not_raw_basis_coordinates(tmp_path):
+def test_registry_snapshot_describes_sparse_dfs_v2_without_qr_backend(tmp_path):
     snapshot = run_paper._snapshot_registries(tmp_path, ("cycle_pe",), cycle_pe_version="v2")
     payload = Path(snapshot["cycle_pe"]["path"]).read_text(encoding="utf-8")
-    assert "model: cycle_projector_pe_v2" in payload and "version: v2" in payload
-    assert "sparse fundamental" in payload and "truncation: none" in payload
-    assert "no raw basis coordinates" in payload
+    registry = yaml.safe_load(payload)
+    assert registry["models"] == {"se": "cycle_dfs_se_v2", "pe": "cycle_dfs_relative_pe_v2"}
+    assert registry["version"] == "v2"
+    assert registry["representation"]["default_backend"] == "dfs_fundamental"
+    assert registry["representation"]["selectable_backends"] == ["dfs_fundamental"]
+    assert registry["representation"]["truncation"] == "none"
 
 
 def test_v2_manifest_records_version_and_resumes_same_identity(tmp_path, monkeypatch):
@@ -78811,6 +80037,7 @@ def test_v2_manifest_records_version_and_resumes_same_identity(tmp_path, monkeyp
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["execution_protocol"]["cycle_pe_version"] == "v2"
     assert manifest["execution_protocol"]["basis_backend"] == "dfs_fundamental"
+    assert manifest["execution_protocol"]["cycle_v2_encodings"] == ["se", "pe"]
     assert manifest["research_environment"]["profile_id"] == "legacy-cu118"
     assert manifest["tracks"] == ["cycle_pe"]
     assert run_paper.main() == 0
@@ -81780,17 +83007,15 @@ def test_preparation_never_compiles():
         assert "--compile" not in command
 
 
-def test_v2_basis_execution_options_reach_child():
+def test_v2_sparse_basis_option_reaches_child():
     args = run_paper._parser().parse_args(
         [
             "--tracks",
             "cycle_pe",
             "--cycle-pe-version",
             "v2",
-            "--basis-execution",
-            "reference",
-            "--basis-pair-budget",
-            "1024",
+            "--basis-backend",
+            "dfs_fundamental",
             "--model-seeds",
             "0",
         ]
@@ -81799,8 +83024,9 @@ def test_v2_basis_execution_options_reach_child():
     from research.cycle_pe.v2.benchmark import parser
 
     child = parser().parse_args(command[3:])
-    assert child.basis_execution == "reference"
-    assert child.basis_pair_budget == 1024
+    assert child.basis_backend == "dfs_fundamental"
+    assert not hasattr(child, "basis_execution")
+    assert not hasattr(child, "basis_pair_budget")
 
 
 @pytest.mark.parametrize(
@@ -81814,10 +83040,13 @@ def test_unsupported_compilation_rejected_before_dependencies(selection, monkeyp
     assert "--compile supports" in capsys.readouterr().err
 
 
-def test_basis_budget_rejected_before_data(monkeypatch, capsys):
-    monkeypatch.setattr(sys, "argv", ["run_paper.py", "--basis-pair-budget", "0", "--dry-run"])
-    assert run_paper.main() == 2
-    assert "must be positive" in capsys.readouterr().err
+@pytest.mark.parametrize("option", ["--basis-pair-budget", "--basis-execution"])
+def test_removed_projector_options_rejected_before_data(option, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["run_paper.py", option, "0", "--dry-run"])
+    with pytest.raises(SystemExit) as error:
+        run_paper.main()
+    assert error.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
 ````
 
 # tests/test_process_safety.py
@@ -82165,13 +83394,14 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
     assert args.tracks == list(runner.TRACKS)
     assert args.conductance_versions == list(runner.CONDUCTANCE_MATRIX)
     assert args.cycle_versions == list(runner.CYCLE_VERSIONS)
+    assert args.cycle_v2_encodings == ["se", "pe"]
     assert args.profiles == list(runner.PROFILES)
     assert args.model_seeds == list(runner.DEFAULT_MODEL_SEEDS)
     assert [job["track"] for job in jobs] == ["conductance", "cycle", "tree"]
     assert runner._totals(jobs) == {
         "track_runs": 3,
-        "child_runs": 118,
-        "model_trainings": 122,
+        "child_runs": 122,
+        "model_trainings": 126,
     }
 
     conductance, cycle, tree = jobs
@@ -82181,8 +83411,10 @@ def test_default_plan_includes_every_track_profile_seed_and_true_tree_deep(tmp_p
         "large",
     ]
     assert _option(cycle["command"], "--model-seeds") == "0"
+    assert _options(cycle["command"], "--encodings") == ["se", "pe"]
+    assert cycle["requested_matrix"]["encodings_by_version"] == {"v1": [None], "v2": ["se", "pe"]}
     assert _options(cycle["command"], "--versions") == ["v1", "v2"]
-    assert _option(cycle["command"], "--basis-backend") == "thin_q"
+    assert _option(cycle["command"], "--basis-backend") == "dfs_fundamental"
     assert _option(tree["command"], "--profiles") == "reference,large"
     assert _option(tree["command"], "--model-seeds") == "0"
     assert _option(tree["command"], "--suites") == "csl,zinc"
@@ -82227,7 +83459,7 @@ def test_selection_and_download_flag_are_mapped_only_to_supported_child_clis(tmp
     )
     runner._validate(args)
     jobs = runner.make_jobs(args, "selected")
-    assert runner._totals(jobs)["model_trainings"] == (53 + 4 + 4) * 2 * 2
+    assert runner._totals(jobs)["model_trainings"] == (53 + 6 + 4) * 2 * 2
     assert "--allow-download" not in jobs[0]["command"]
     assert "--allow-download" in jobs[1]["command"]
     assert "--allow-download" in jobs[2]["command"]
@@ -82255,8 +83487,8 @@ def test_completed_conductance_v1_v4_can_be_excluded_from_integrated_plan(tmp_pa
     assert cycle["requested_matrix"]["versions"] == ["v1", "v2"]
     assert runner._totals([conductance, cycle, tree]) == {
         "track_runs": 3,
-        "child_runs": 32,
-        "model_trainings": 36,
+        "child_runs": 36,
+        "model_trainings": 40,
     }
     config = runner._config_payload(args, data_root=tmp_path / "data", results_root=tmp_path)
     assert config["conductance_versions"] == ["v5"]
@@ -82281,8 +83513,8 @@ def test_only_new_v5_and_cycle_v2_plan_has_no_legacy_trainings(tmp_path: Path):
     conductance, cycle = runner.make_jobs(args, "new-only")
     assert runner._totals([conductance, cycle]) == {
         "track_runs": 2,
-        "child_runs": 24,
-        "model_trainings": 24,
+        "child_runs": 28,
+        "model_trainings": 28,
     }
 
 
@@ -82291,6 +83523,7 @@ def test_only_new_v5_and_cycle_v2_plan_has_no_legacy_trainings(tmp_path: Path):
     [
         ("--conductance-versions", ["v5", "v5"], "conductance versions"),
         ("--cycle-versions", ["v2", "v2"], "cycle versions"),
+        ("--cycle-v2-encodings", ["se", "se"], "cycle V2 encodings"),
     ],
 )
 def test_duplicate_version_selection_is_rejected(option, values, message):
@@ -82299,19 +83532,18 @@ def test_duplicate_version_selection_is_rejected(option, values, message):
         runner._validate(args)
 
 
-def test_nondefault_cycle_v2_backend_requires_selected_v2():
-    args = runner.parser().parse_args(
-        [
-            "--tracks",
-            "cycle",
-            "--cycle-versions",
-            "v1",
-            "--cycle-v2-basis-backend",
-            "dfs_fundamental",
-        ]
-    )
-    with pytest.raises(ValueError, match="requires v2"):
-        runner._validate(args)
+def test_removed_cycle_qr_backend_is_rejected_before_planning():
+    with pytest.raises(SystemExit):
+        runner.parser().parse_args(
+            [
+                "--tracks",
+                "cycle",
+                "--cycle-versions",
+                "v1",
+                "--cycle-v2-basis-backend",
+                "thin_q",
+            ]
+        )
 
 
 def test_a6000_hardware_profile_is_forwarded_to_every_track_and_bound_to_config(
@@ -82607,7 +83839,7 @@ def test_dry_run_prints_complete_plan_without_writes_or_processes(
     )
     output = capsys.readouterr().out
     assert code == 0
-    assert "2 track runs; 12 child runs; 16 fresh model trainings" in output
+    assert "2 track runs; 16 child runs; 20 fresh model trainings" in output
     assert "conductance_versions=['v1', 'v2', 'v3', 'v4', 'v5']" in output
     assert "cycle_versions=['v1', 'v2']" in output
     assert "child profiles=['reference', 'large']" in output
@@ -82669,17 +83901,24 @@ def _write_summary(command: list[str], *, malformed: str | None = None) -> None:
         }
     elif script == "run_cycle_scaling.py":
         versions = _options(command, "--versions")
+        encodings = _options(command, "--encodings")
+        conditions = [
+            (version, encoding)
+            for version in versions
+            for encoding in (encodings if version == "v2" else [None])
+        ]
         datasets = _options(command, "--datasets")
         profiles = _options(command, "--profiles")
         seeds = [int(value) for value in _option(command, "--model-seeds").split(",")]
         rows = [
             {
                 "version": version,
+                "encoding": encoding,
                 "profile": profile,
                 "model_seed": seed,
                 "dataset": dataset,
             }
-            for version in versions
+            for version, encoding in conditions
             for profile in profiles
             for seed in seeds
             for dataset in datasets
@@ -82687,45 +83926,61 @@ def _write_summary(command: list[str], *, malformed: str | None = None) -> None:
         aggregates = [
             {
                 "version": version,
+                "encoding": encoding,
                 "dataset": dataset,
                 "profile": profile,
                 "model_seeds": sorted(seeds),
             }
-            for version in versions
+            for version, encoding in conditions
             for dataset in datasets
             for profile in profiles
         ]
         selections = [
             {
                 "version": version,
+                "encoding": encoding,
                 "dataset": dataset,
                 "selected_profile": profiles[0],
+                "profile_selection_id": (
+                    f"{version}:{encoding}:{dataset}"
+                    if encoding is not None
+                    else f"{version}:{dataset}"
+                ),
                 "model_seeds": seeds,
                 "test_used_for_selection": False,
             }
-            for version in versions
+            for version, encoding in conditions
             for dataset in datasets
         ]
         selected_checkpoints = [
             {
                 "version": selection["version"],
+                "encoding": selection["encoding"],
+                "profile_selection_id": selection["profile_selection_id"],
+                "checkpoint_id": f"{selection['profile_selection_id']}:model-seed-{seed}",
                 "dataset": selection["dataset"],
                 "model_seed": seed,
                 "selected_profile": selection["selected_profile"],
-                "checkpoint": f"{selection['version']}-{selection['dataset']}-{seed}.pt",
+                "checkpoint": f"{selection['profile_selection_id'].replace(':', '-')}-{seed}.pt",
                 "checkpoint_sha256": f"hash-{seed}",
             }
             for selection in selections
             for seed in seeds
         ]
         test_evaluations = [
-            {**checkpoint, "fresh_training": False} for checkpoint in selected_checkpoints
+            {
+                **checkpoint,
+                "fresh_training": False,
+                "test_evaluation_id": f"test:{checkpoint['checkpoint_id']}",
+            }
+            for checkpoint in selected_checkpoints
         ]
         output = results_root / "cycle_pe/scaling" / run_id
         payload = {
             "status": "failed" if malformed == "status" else "passed",
             "scope": "cycle_pe_v1_v2_larger_model_scaling",
             "requested_model_seeds": seeds,
+            "requested_encodings": encodings,
             "profiles": {profile: {} for profile in profiles},
             "runs": rows,
             "profile_aggregates": aggregates,
@@ -82737,11 +83992,12 @@ def _write_summary(command: list[str], *, malformed: str | None = None) -> None:
             "final_test_aggregates": [
                 {
                     "version": version,
+                    "encoding": encoding,
                     "dataset": dataset,
                     "model_seeds": seeds,
                     "selected_profiles": [profiles[0] for _seed in seeds],
                 }
-                for version in versions
+                for version, encoding in conditions
                 for dataset in datasets
             ],
         }
@@ -82870,6 +84126,95 @@ def _base_options(tmp_path: Path) -> list[str]:
     ]
 
 
+def _cycle_encoding_summary_fixture(tmp_path: Path):
+    args = runner.parser().parse_args(
+        [
+            "--tracks",
+            "cycle",
+            "--cycle-versions",
+            "v2",
+            *_base_options(tmp_path),
+        ]
+    )
+    runner._validate(args)
+    job = runner.make_jobs(args, "encoded")[0]
+    _write_summary(job["command"])
+    payload = json.loads(Path(job["summary_path"]).read_text(encoding="utf-8"))
+    assert runner._validate_cycle_summary(payload, job) == {"child_runs": 4, "model_trainings": 4}
+    return job, payload
+
+
+@pytest.mark.parametrize(
+    "section",
+    (
+        "runs",
+        "profile_aggregates",
+        "profile_selections",
+        "selected_checkpoints",
+        "test_evaluations",
+        "final_test_aggregates",
+    ),
+)
+def test_cycle_exact_matrix_rejects_equal_count_encoding_duplicates_in_every_section(
+    tmp_path, section
+):
+    job, payload = _cycle_encoding_summary_fixture(tmp_path)
+    rows = payload[section]
+    count = len(rows)
+    next(row for row in rows if row["encoding"] == "pe")["encoding"] = "se"
+    assert len(rows) == count
+    with pytest.raises(RuntimeError, match="duplicate|matrix mismatch"):
+        runner._validate_cycle_summary(payload, job)
+
+
+@pytest.mark.parametrize(
+    "section,field",
+    (
+        ("profile_selections", "profile_selection_id"),
+        ("selected_checkpoints", "profile_selection_id"),
+        ("selected_checkpoints", "checkpoint_id"),
+        ("test_evaluations", "profile_selection_id"),
+        ("test_evaluations", "checkpoint_id"),
+        ("test_evaluations", "test_evaluation_id"),
+    ),
+)
+def test_cycle_rejects_cross_encoding_selection_ids_even_with_an_exact_matrix(
+    tmp_path, section, field
+):
+    job, payload = _cycle_encoding_summary_fixture(tmp_path)
+    rows = payload[section]
+    se = next(row for row in rows if row["encoding"] == "se")
+    pe = next(row for row in rows if row["encoding"] == "pe" and row["dataset"] == se["dataset"])
+    pe[field] = se[field]
+    with pytest.raises(RuntimeError, match="invalid|wrong profile"):
+        runner._validate_cycle_summary(payload, job)
+
+
+def test_selected_pe_only_plan_does_not_schedule_or_certify_se(tmp_path):
+    args = runner.parser().parse_args(
+        [
+            "--tracks",
+            "cycle",
+            "--cycle-versions",
+            "v2",
+            "--cycle-v2-encodings",
+            "pe",
+            *_base_options(tmp_path),
+        ]
+    )
+    runner._validate(args)
+    job = runner.make_jobs(args, "pe-only")[0]
+    assert job["requested_matrix"]["encodings_by_version"] == {"v2": ["pe"]}
+    assert _options(job["command"], "--encodings") == ["pe"]
+    assert runner._totals([job]) == {"track_runs": 1, "child_runs": 2, "model_trainings": 2}
+    _write_summary(job["command"])
+    payload = json.loads(Path(job["summary_path"]).read_text(encoding="utf-8"))
+    assert runner._validate_cycle_summary(payload, job)["model_trainings"] == 2
+    payload["requested_encodings"] = ["se"]
+    with pytest.raises(RuntimeError, match="encoding selection"):
+        runner._validate_cycle_summary(payload, job)
+
+
 def test_success_runs_tracks_sequentially_and_certifies_all_summaries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -82892,10 +84237,10 @@ def test_success_runs_tracks_sequentially_and_certifies_all_summaries(
     assert manifest["status"] == "passed"
     assert manifest["planned_counts"] == {
         "track_runs": 3,
-        "child_runs": 59,
-        "model_trainings": 61,
+        "child_runs": 61,
+        "model_trainings": 63,
     }
-    assert manifest["completed_counts"]["verified_model_trainings"] == 61
+    assert manifest["completed_counts"]["verified_model_trainings"] == 63
     assert all(job["status"] == "passed" for job in manifest["jobs"])
     assert all(len(job["result"]["summary_sha256"]) == 64 for job in manifest["jobs"])
     assert manifest["protocol"]["execution_classification"] == "final_research_training"
@@ -83015,10 +84360,10 @@ def test_partial_version_matrix_runs_and_validates_only_selected_versions(
     )
     assert manifest["planned_counts"] == {
         "track_runs": 2,
-        "child_runs": 12,
-        "model_trainings": 12,
+        "child_runs": 14,
+        "model_trainings": 14,
     }
-    assert manifest["completed_counts"]["verified_model_trainings"] == 12
+    assert manifest["completed_counts"]["verified_model_trainings"] == 14
     assert [job["requested_matrix"]["versions"] for job in manifest["jobs"]] == [
         ["v5"],
         ["v2"],
@@ -83051,6 +84396,7 @@ def test_equal_count_duplicate_child_matrix_fails_closed(
         ("conductance", "condition"),
         ("conductance", "seed_set"),
         ("cycle", "version"),
+        ("cycle", "encoding"),
         ("cycle", "dataset"),
         ("cycle", "profile"),
         ("cycle", "model_seed"),
@@ -83271,6 +84617,7 @@ def test_resume_rejects_changed_config_and_source_without_launching_children(
     for changed_versions in (
         [*options, "--conductance-versions", "v5"],
         [*options, "--cycle-versions", "v2"],
+        [*options, "--cycle-v2-encodings", "pe"],
     ):
         assert runner.main(changed_versions) == 2
         assert manifest_path.read_text(encoding="utf-8") == original
@@ -84209,9 +85556,10 @@ def test_project_docs_and_gpt_handoff_are_separated() -> None:
 
     cycle_v2 = (ROOT / "gpt_handoff/CYCLE_PE_V2.md").read_text(encoding="utf-8")
     for required in (
-        "cycle_projector_pe_v2",
-        "cycle_basis_v2",
-        "P_{\\mathcal C}=Z(Z^\\top Z)^{-1}Z^\\top=QQ^\\top",
+        "cycle_dfs_se_v2",
+        "cycle_dfs_relative_pe_v2",
+        "dfs_fundamental",
+        "QR",
         "scripts/run_cycle_scaling.py",
         "reference",
     ):

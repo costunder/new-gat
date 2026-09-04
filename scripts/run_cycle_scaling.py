@@ -2,7 +2,7 @@
 """Run larger-model scaling experiments for both Cycle PE V1 and V2.
 
 Every candidate uses only the official train/validation splits.  One common
-profile per version and dataset is selected by mean validation MAE across all
+profile per version, encoding and dataset is selected by mean validation MAE across all
 requested model seeds; each seed's checkpoint at that profile is then evaluated
 once on test without retraining.  Candidate artifacts and final test evaluations
 are kept in disjoint result sections.
@@ -48,7 +48,7 @@ DATASETS = ("zinc12k", "peptides_struct")
 VERSIONS = ("v1", "v2")
 PROFILE_ORDER = ("reference", "large")
 HARDWARE_PROFILES = ("portable", "a6000-48gb")
-BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
+BASIS_BACKENDS = ("dfs_fundamental",)
 A6000_MIN_TOTAL_BYTES = 40 * 1024**3
 A6000_BATCH_SIZE = {
     "reference": {"zinc12k": 512, "peptides_struct": 128},
@@ -92,7 +92,37 @@ PROFILES: dict[str, dict[str, dict[str, float | int]]] = {
         },
     },
 }
-MODEL_NAMES = {"v1": "cycle_set", "v2": "cycle_projector_pe_v2"}
+ENCODINGS = ("se", "pe")
+MODEL_NAMES = {"se": "cycle_dfs_se_v2", "pe": "cycle_dfs_relative_pe_v2"}
+
+
+def _conditions(versions: list[str], encodings: list[str] | tuple[str, ...]):
+    return [
+        (version, encoding)
+        for version in versions
+        for encoding in (encodings if version == "v2" else (None,))
+    ]
+
+
+def _condition_id(version: str, encoding: str | None) -> str:
+    if version == "v1" and encoding is None:
+        return version
+    if version == "v2" and encoding in ENCODINGS:
+        return f"{version}:{encoding}"
+    raise ValueError(f"invalid cycle version/encoding: {version}/{encoding}")
+
+
+def _model_name(version: str, encoding: str | None) -> str:
+    _condition_id(version, encoding)
+    return "cycle_set" if version == "v1" else MODEL_NAMES[encoding]
+
+
+def _selected_test_count(args: argparse.Namespace) -> int:
+    return (
+        len(_conditions(args.versions, args.encodings)) * len(args.datasets) * len(args.model_seeds)
+    )
+
+
 MODULES = {
     "v1": "research.cycle_pe.benchmark",
     "v2": "research.cycle_pe.v2.benchmark",
@@ -150,6 +180,13 @@ def _seeds(value: str) -> tuple[int, ...]:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--versions", nargs="+", choices=VERSIONS, default=list(VERSIONS))
+    result.add_argument(
+        "--encodings",
+        nargs="+",
+        choices=ENCODINGS,
+        default=list(ENCODINGS),
+        help="independent V2 SE/PE conditions; V1 remains unchanged",
+    )
     result.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
     result.add_argument("--profiles", nargs="+", choices=PROFILE_ORDER, default=list(PROFILE_ORDER))
     result.add_argument(
@@ -191,10 +228,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--allow-download", action="store_true")
     result.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None)
     result.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False)
-    result.add_argument("--column-chunk-size", type=int, default=0)
-    result.add_argument("--basis-backend", choices=BASIS_BACKENDS, default="thin_q")
-    result.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
-    result.add_argument("--basis-pair-budget", type=int, default=0)
+    result.add_argument("--basis-backend", choices=BASIS_BACKENDS, default="dfs_fundamental")
     result.add_argument("--min-free-gb", type=float, default=8.0)
     result.add_argument("--fail-fast", action="store_true")
     result.add_argument("--dry-run", action="store_true")
@@ -202,12 +236,10 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _validate(args: argparse.Namespace) -> None:
-    for name in ("versions", "datasets", "profiles"):
+    for name in ("versions", "encodings", "datasets", "profiles"):
         values = getattr(args, name)
         if not values or len(set(values)) != len(values):
             raise ValueError(f"--{name} must be nonempty and contain no duplicates")
-    if args.basis_backend != "thin_q" and "v2" not in args.versions:
-        raise ValueError("nondefault --basis-backend requires v2 in --versions")
     for name in (
         "epochs",
         "patience",
@@ -219,8 +251,6 @@ def _validate(args: argparse.Namespace) -> None:
         args.batch_size < 0
         or args.workers < -1
         or args.prefetch_factor < 0
-        or args.column_chunk_size < 0
-        or args.basis_pair_budget < 0
         or args.lr <= 0
         or args.weight_decay < 0
         or args.min_free_gb < 0
@@ -246,7 +276,7 @@ def _profile_config(profile: str, dataset: str, version: str) -> dict[str, float
 
 
 def _job_resources(
-    args: argparse.Namespace, version: str, profile: str, dataset: str
+    args: argparse.Namespace, version: str, profile: str, dataset: str, encoding: str | None = None
 ) -> dict[str, Any]:
     accelerated = args.hardware_profile == "a6000-48gb"
     is_v2 = version == "v2"
@@ -259,18 +289,13 @@ def _job_resources(
         # DataLoader default (2); never claim the V2-only override for V1.
         "prefetch_factor": (args.prefetch_factor or (4 if accelerated else 2) if is_v2 else 2),
         "amp": accelerated if args.amp is None else args.amp,
-        "column_chunk_size": (
-            args.column_chunk_size or (32 if accelerated else 16) if is_v2 else None
-        ),
-        "basis_pair_budget": (
-            args.basis_pair_budget or (4_194_304 if accelerated else 32768) if is_v2 else None
-        ),
-        "basis_execution": args.basis_execution if is_v2 else None,
+        "basis_execution": "sparse_block_diagonal" if is_v2 else None,
         "basis_backend": args.basis_backend if is_v2 else None,
         "precision_scope": (
-            "projector_fp32_backbone_amp" if version == "v2" else "legacy_v1_partial_amp"
+            "sparse_cycles_fp32_backbone_amp" if version == "v2" else "legacy_v1_partial_amp"
         ),
         "version": version,
+        "encoding": encoding,
     }
 
 
@@ -282,7 +307,7 @@ def _v2_precision_matches(resources: dict[str, Any], precision: Any) -> bool:
         "autocast_dtype",
         "fallback",
         "gradient_scaler",
-        "projector_contraction",
+        "cycle_sparse_aggregation",
         "backbone_autocast",
     }
     requested = resources.get("amp")
@@ -292,7 +317,7 @@ def _v2_precision_matches(resources: dict[str, Any], precision: Any) -> bool:
         or not isinstance(requested, bool)
         or precision.get("amp") is not requested
         or precision.get("gradient_scaler") is not False
-        or precision.get("projector_contraction") != "float32"
+        or precision.get("cycle_sparse_aggregation") != "float32"
     ):
         return False
     if not requested:
@@ -322,16 +347,23 @@ def _v2_precision_matches(resources: dict[str, Any], precision: Any) -> bool:
 def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     data_root = args.data_root.expanduser().resolve()
-    for version in args.versions:
+    for version, encoding in _conditions(args.versions, args.encodings):
         for profile in args.profiles:
             for seed in args.model_seeds:
                 for dataset in args.datasets:
                     config = _profile_config(profile, dataset, version)
-                    resources = _job_resources(args, version, profile, dataset)
+                    resources = _job_resources(args, version, profile, dataset, encoding)
+                    condition = _condition_id(version, encoding)
+                    log_condition = condition.replace(":", "--")
                     output = (
-                        run_dir / "results" / version / profile / dataset / f"model-seed-{seed}"
+                        run_dir
+                        / "results"
+                        / Path(*condition.split(":"))
+                        / profile
+                        / dataset
+                        / f"model-seed-{seed}"
                     )
-                    job_id = f"{version}:{profile}:{dataset}:model-seed-{seed}"
+                    job_id = f"{condition}:{profile}:{dataset}:model-seed-{seed}"
                     command = [
                         sys.executable,
                         "-B",
@@ -378,20 +410,16 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                         command.append("--allow-download")
                     if version == "v2":
                         command += [
+                            "--encoding",
+                            encoding,
                             "--ffn-multiplier",
                             str(config["ffn_multiplier"]),
                             "--dropout",
                             str(config["dropout"]),
                             "--layer-scale",
                             str(config["layer_scale"]),
-                            "--column-chunk-size",
-                            str(resources["column_chunk_size"]),
                             "--basis-backend",
                             args.basis_backend,
-                            "--basis-execution",
-                            args.basis_execution,
-                            "--basis-pair-budget",
-                            str(resources["basis_pair_budget"]),
                             "--prefetch-factor",
                             str(resources["prefetch_factor"]),
                             "--hardware-profile",
@@ -401,6 +429,7 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                         {
                             "job_id": job_id,
                             "version": version,
+                            "encoding": encoding,
                             "profile": profile,
                             "model_seed": seed,
                             "datasets": [dataset],
@@ -412,7 +441,7 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             "log_path": str(
                                 run_dir
                                 / "logs"
-                                / f"{version}--{profile}--{dataset}--seed-{seed}.log"
+                                / f"{log_condition}--{profile}--{dataset}--seed-{seed}.log"
                             ),
                             "returncode": None,
                             "artifact_errors": [],
@@ -551,6 +580,9 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
     ):
         raise ValueError("candidate child must identify as validation_only")
     expected_version = job["version"]
+    _condition_id(expected_version, job.get("encoding"))
+    if job["resources"].get("encoding") != job.get("encoding"):
+        raise ValueError("child encoding/resource binding mismatch")
     if expected_version == "v2" and manifest.get("version") != "v2":
         raise ValueError("V2 child did not identify itself as version v2")
     if expected_version == "v1" and manifest.get("version") not in (None, "v1"):
@@ -575,28 +607,14 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
             raise ValueError(f"child argument mismatch for {name}: {actual} != {expected}")
     if expected_version == "v2":
         expected_v2 = {
+            "encoding": job["encoding"],
             "ffn_multiplier": job["config"]["ffn_multiplier"],
             "dropout": job["config"]["dropout"],
             "layer_scale": job["config"]["layer_scale"],
-            "column_chunk_size": 16,
             "basis_backend": job["resources"]["basis_backend"],
-            "basis_execution": "batched",
-            "basis_pair_budget": 32768,
             "prefetch_factor": job["resources"]["prefetch_factor"],
             "hardware_profile": job["resources"]["hardware_profile"],
         }
-        command = job.get("command", [])
-        for flag, name in (
-            ("--column-chunk-size", "column_chunk_size"),
-            ("--basis-backend", "basis_backend"),
-            ("--basis-execution", "basis_execution"),
-            ("--basis-pair-budget", "basis_pair_budget"),
-        ):
-            if flag in command:
-                value = command[command.index(flag) + 1]
-                expected_v2[name] = (
-                    int(value) if name not in {"basis_backend", "basis_execution"} else value
-                )
         for name, expected in expected_v2.items():
             if arguments.get(name) != expected:
                 raise ValueError(f"child argument mismatch for {name}")
@@ -612,6 +630,8 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
         or controls.get("optimizer_created") is not True
     ):
         raise ValueError("candidate child test/training controls are invalid")
+    if expected_version == "v2" and controls.get("encoding") != job["encoding"]:
+        raise ValueError("candidate child encoding control mismatch")
     datasets = metrics.get("datasets")
     if not isinstance(datasets, dict) or set(datasets) != set(job["datasets"]):
         raise ValueError("child metrics do not contain exactly the requested datasets")
@@ -629,7 +649,7 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
         ):
             raise ValueError(f"{dataset}: candidate protocol exposed or loaded a test split")
         models = dataset_metrics.get("models")
-        model_name = MODEL_NAMES[expected_version]
+        model_name = _model_name(expected_version, job.get("encoding"))
         if not isinstance(models, dict) or set(models) != {model_name}:
             raise ValueError(f"{dataset}: expected only model {model_name}")
         result = models[model_name]
@@ -670,7 +690,8 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
                 or pipeline.get("effective_batch_size") != job["resources"]["batch_size"]
                 or pipeline.get("workers") != job["resources"]["workers"]
                 or pipeline.get("prefetch_factor") != job["resources"]["prefetch_factor"]
-                or pipeline.get("packed_cycle_basis_h2d_tensors_per_batch") != 1
+                or pipeline.get("cycle_membership_layout") != "sparse_coo_block_diagonal"
+                or pipeline.get("cycle_factorization_in_forward") is not False
                 or not _v2_precision_matches(job["resources"], precision)
                 or not isinstance(hardware, dict)
                 or hardware.get("profile") != job["resources"]["hardware_profile"]
@@ -735,6 +756,7 @@ def read_job_rows(job: dict[str, Any]) -> list[dict[str, Any]]:
         rows.append(
             {
                 "version": expected_version,
+                "encoding": job.get("encoding"),
                 "profile": job["profile"],
                 "dataset": dataset,
                 "model_seed": job["model_seed"],
@@ -781,8 +803,9 @@ def build_summary(
     profiles: list[str],
     model_seeds: tuple[int, ...],
     complete: bool,
+    encodings: list[str] | tuple[str, ...] = ENCODINGS,
 ) -> dict[str, Any]:
-    """Select one common profile per version/dataset without any test input."""
+    """Select a profile within each version/encoding/dataset without test input."""
     summary: dict[str, Any] = {
         "schema_version": 2,
         "status": "pending_test_evaluation" if complete else "failed",
@@ -790,13 +813,14 @@ def build_summary(
         "metric": "mae_lower_is_better",
         "selection_policy": {
             "profile_selection_input": "mean validation MAE across requested model seeds",
-            "selection_unit": "version x dataset",
+            "selection_unit": "version x encoding x dataset",
             "test_used_for_profile_selection": False,
             "checkpoint_selection": "validation MAE only inside each candidate training",
             "final_test_report": "separate test_evaluations rows after selection",
         },
         "profiles": {name: PROFILES[name] for name in profiles},
         "requested_model_seeds": list(model_seeds),
+        "requested_encodings": list(encodings),
         "runs": rows,
         "profile_aggregates": [],
         "profile_selections": [],
@@ -805,26 +829,28 @@ def build_summary(
         "fresh_dataset_trainings": len(rows),
     }
     expected_keys = {
-        (version, dataset, profile, seed)
-        for version in versions
+        (version, encoding, dataset, profile, seed)
+        for version, encoding in _conditions(versions, encodings)
         for dataset in datasets
         for profile in profiles
         for seed in model_seeds
     }
     actual_keys = [
-        (row["version"], row["dataset"], row["profile"], row["model_seed"]) for row in rows
+        (row["version"], row.get("encoding"), row["dataset"], row["profile"], row["model_seed"])
+        for row in rows
     ]
     if len(actual_keys) != len(set(actual_keys)) or set(actual_keys) != expected_keys:
         complete = False
         summary["status"] = "failed"
     aggregates: list[dict[str, Any]] = []
-    for version in versions:
+    for version, encoding in _conditions(versions, encodings):
         for dataset in datasets:
             for profile in profiles:
                 group = [
                     row
                     for row in rows
                     if row["version"] == version
+                    and row.get("encoding") == encoding
                     and row["dataset"] == dataset
                     and row["profile"] == profile
                 ]
@@ -837,6 +863,7 @@ def build_summary(
                 aggregates.append(
                     {
                         "version": version,
+                        "encoding": encoding,
                         "dataset": dataset,
                         "profile": profile,
                         "config": dict(group[0]["config"]),
@@ -861,12 +888,14 @@ def build_summary(
             "no checkpoint is selected and test remains untouched."
         )
         return summary
-    for version in versions:
+    for version, encoding in _conditions(versions, encodings):
         for dataset in datasets:
             candidates = [
                 item
                 for item in aggregates
-                if item["version"] == version and item["dataset"] == dataset
+                if item["version"] == version
+                and item.get("encoding") == encoding
+                and item["dataset"] == dataset
             ]
             if len(candidates) != len(profiles):
                 summary["status"] = "failed"
@@ -881,11 +910,12 @@ def build_summary(
                     profiles.index(item["profile"]),
                 ),
             )
-            profile_selection_id = f"{version}:{dataset}"
+            profile_selection_id = f"{_condition_id(version, encoding)}:{dataset}"
             summary["profile_selections"].append(
                 {
                     "profile_selection_id": profile_selection_id,
                     "version": version,
+                    "encoding": encoding,
                     "dataset": dataset,
                     "selected_profile": selected_profile["profile"],
                     "config": dict(selected_profile["config"]),
@@ -899,6 +929,7 @@ def build_summary(
                 row
                 for row in rows
                 if row["version"] == version
+                and row.get("encoding") == encoding
                 and row["dataset"] == dataset
                 and row["profile"] == selected_profile["profile"]
             ]
@@ -913,9 +944,10 @@ def build_summary(
                 selected = selected_by_seed[seed]
                 summary["selected_checkpoints"].append(
                     {
-                        "checkpoint_id": f"{version}:{dataset}:model-seed-{seed}",
+                        "checkpoint_id": f"{profile_selection_id}:model-seed-{seed}",
                         "profile_selection_id": profile_selection_id,
                         "version": version,
+                        "encoding": encoding,
                         "dataset": dataset,
                         "model_seed": seed,
                         "selected_profile": selected["profile"],
@@ -941,13 +973,22 @@ def make_test_jobs(
     data_root = args.data_root.expanduser().resolve()
     for selection in selections:
         version = selection["version"]
+        encoding = selection.get("encoding")
+        condition = _condition_id(version, encoding)
+        log_condition = condition.replace(":", "--")
         dataset = selection["dataset"]
         seed = selection["model_seed"]
         profile = selection["selected_profile"]
         config = _profile_config(profile, dataset, version)
-        resources = _job_resources(args, version, profile, dataset)
-        output = run_dir / "test-evaluations" / version / dataset / f"model-seed-{seed}"
-        job_id = f"test:{version}:{dataset}:model-seed-{seed}"
+        resources = _job_resources(args, version, profile, dataset, encoding)
+        output = (
+            run_dir
+            / "test-evaluations"
+            / Path(*condition.split(":"))
+            / dataset
+            / f"model-seed-{seed}"
+        )
+        job_id = f"test:{condition}:{dataset}:model-seed-{seed}"
         command = [
             sys.executable,
             "-B",
@@ -987,20 +1028,16 @@ def make_test_jobs(
             command.append("--allow-download")
         if version == "v2":
             command += [
+                "--encoding",
+                encoding,
                 "--ffn-multiplier",
                 str(config["ffn_multiplier"]),
                 "--dropout",
                 str(config["dropout"]),
                 "--layer-scale",
                 str(config["layer_scale"]),
-                "--column-chunk-size",
-                str(resources["column_chunk_size"]),
                 "--basis-backend",
                 args.basis_backend,
-                "--basis-execution",
-                args.basis_execution,
-                "--basis-pair-budget",
-                str(resources["basis_pair_budget"]),
                 "--prefetch-factor",
                 str(resources["prefetch_factor"]),
                 "--hardware-profile",
@@ -1012,6 +1049,7 @@ def make_test_jobs(
                 "checkpoint_id": selection["checkpoint_id"],
                 "profile_selection_id": selection["profile_selection_id"],
                 "version": version,
+                "encoding": encoding,
                 "dataset": dataset,
                 "model_seed": seed,
                 "selected_profile": profile,
@@ -1025,7 +1063,7 @@ def make_test_jobs(
                 "command": command,
                 "output_dir": str(output),
                 "log_path": str(
-                    run_dir / "logs" / "test" / f"{version}--{dataset}--seed-{seed}.log"
+                    run_dir / "logs" / "test" / f"{log_condition}--{dataset}--seed-{seed}.log"
                 ),
                 "returncode": None,
                 "artifact_errors": [],
@@ -1046,6 +1084,9 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
     if manifest.get("run_mode") != "test_only" or metrics.get("run_mode") != "test_only":
         raise ValueError("selected checkpoint evaluation must identify as test_only")
     version = job["version"]
+    _condition_id(version, job.get("encoding"))
+    if job["resources"].get("encoding") != job.get("encoding"):
+        raise ValueError("test-only encoding/resource binding mismatch")
     if version == "v2" and manifest.get("version") != "v2":
         raise ValueError("V2 test-only child did not identify itself as version v2")
     if version == "v1" and manifest.get("version") not in (None, "v1"):
@@ -1070,13 +1111,11 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(f"test-only argument mismatch for {name}")
     if version == "v2":
         expected_v2_arguments = {
+            "encoding": job["encoding"],
             "ffn_multiplier": job["config"]["ffn_multiplier"],
             "dropout": job["config"]["dropout"],
             "layer_scale": job["config"]["layer_scale"],
-            "column_chunk_size": job["resources"]["column_chunk_size"],
             "basis_backend": job["resources"]["basis_backend"],
-            "basis_execution": job["resources"]["basis_execution"],
-            "basis_pair_budget": job["resources"]["basis_pair_budget"],
             "prefetch_factor": job["resources"]["prefetch_factor"],
             "hardware_profile": job["resources"]["hardware_profile"],
         }
@@ -1091,6 +1130,8 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
         or controls.get("optimizer_created") is not False
     ):
         raise ValueError("test-only controls do not prove evaluation without retraining")
+    if version == "v2" and controls.get("encoding") != job["encoding"]:
+        raise ValueError("test-only encoding control mismatch")
     datasets = metrics.get("datasets")
     if not isinstance(datasets, dict) or set(datasets) != {job["dataset"]}:
         raise ValueError("test-only metrics must contain exactly the selected dataset")
@@ -1105,7 +1146,7 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
         or set(protocol.get("split_content_sha256", {})) != {"test"}
     ):
         raise ValueError("test-only child must load exactly the official test split")
-    model_name = MODEL_NAMES[version]
+    model_name = _model_name(version, job.get("encoding"))
     models = dataset_metrics.get("models")
     if not isinstance(models, dict) or set(models) != {model_name}:
         raise ValueError(f"test-only child must contain only model {model_name}")
@@ -1134,7 +1175,8 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
             or pipeline.get("effective_batch_size") != job["resources"]["batch_size"]
             or pipeline.get("workers") != job["resources"]["workers"]
             or pipeline.get("prefetch_factor") != job["resources"]["prefetch_factor"]
-            or pipeline.get("packed_cycle_basis_h2d_tensors_per_batch") != 1
+            or pipeline.get("cycle_membership_layout") != "sparse_coo_block_diagonal"
+            or pipeline.get("cycle_factorization_in_forward") is not False
             or not _v2_precision_matches(job["resources"], precision)
             or not isinstance(hardware, dict)
             or hardware.get("profile") != job["resources"]["hardware_profile"]
@@ -1164,6 +1206,7 @@ def read_test_result(job: dict[str, Any]) -> dict[str, Any]:
         "checkpoint_id": job["checkpoint_id"],
         "profile_selection_id": job["profile_selection_id"],
         "version": version,
+        "encoding": job.get("encoding"),
         "dataset": job["dataset"],
         "model_seed": job["model_seed"],
         "selected_profile": job["selected_profile"],
@@ -1214,6 +1257,10 @@ def attach_test_results(
         selected = expected[row["checkpoint_id"]]
         if (
             row["profile_selection_id"] != selected["profile_selection_id"]
+            or row.get("encoding") != selected.get("encoding")
+            or row["version"] != selected["version"]
+            or row["dataset"] != selected["dataset"]
+            or row["model_seed"] != selected["model_seed"]
             or row["selected_profile"] != selected["selected_profile"]
             or row["checkpoint"] != selected["checkpoint"]
             or row["checkpoint_sha256"] != selected["checkpoint_sha256"]
@@ -1225,33 +1272,28 @@ def attach_test_results(
         selected["test_evaluation_id"] = row["test_evaluation_id"]
     summary["test_evaluations"] = test_rows
     summary["selected_test_evaluations"] = len(test_rows)
-    ordered_versions = list(
-        dict.fromkeys(item["version"] for item in summary["profile_selections"])
-    )
-    ordered_datasets = list(
-        dict.fromkeys(item["dataset"] for item in summary["profile_selections"])
-    )
-    summary["final_test_aggregates"] = [
-        {
-            "version": version,
-            "dataset": dataset,
-            "model_seeds": list(summary["requested_model_seeds"]),
-            "selected_profiles": [
-                row["selected_profile"]
-                for row in test_rows
-                if row["version"] == version and row["dataset"] == dataset
-            ],
-            "test_mae": _stats(
-                [
-                    row["test_mae"]
-                    for row in test_rows
-                    if row["version"] == version and row["dataset"] == dataset
-                ]
-            ),
-        }
-        for version in ordered_versions
-        for dataset in ordered_datasets
-    ]
+    summary["final_test_aggregates"] = []
+    for selection in summary["profile_selections"]:
+        version, encoding, dataset = (
+            selection["version"],
+            selection.get("encoding"),
+            selection["dataset"],
+        )
+        group = [
+            row
+            for row in test_rows
+            if (row["version"], row.get("encoding"), row["dataset"]) == (version, encoding, dataset)
+        ]
+        summary["final_test_aggregates"].append(
+            {
+                "version": version,
+                "encoding": encoding,
+                "dataset": dataset,
+                "model_seeds": list(summary["requested_model_seeds"]),
+                "selected_profiles": [row["selected_profile"] for row in group],
+                "test_mae": _stats([row["test_mae"] for row in group]),
+            }
+        )
     summary["status"] = "passed"
     return summary
 
@@ -1278,6 +1320,7 @@ _TEST_JOB_STABLE_FIELDS = (
     "checkpoint_id",
     "profile_selection_id",
     "version",
+    "encoding",
     "dataset",
     "model_seed",
     "output_dir",
@@ -1289,6 +1332,7 @@ def _run_configuration(args: argparse.Namespace) -> dict[str, Any]:
     """Return the complete execution contract that must match on resume."""
     return {
         "versions": list(args.versions),
+        "encodings": list(args.encodings),
         "datasets": list(args.datasets),
         "profiles": list(args.profiles),
         "model_seeds": list(args.model_seeds),
@@ -1306,10 +1350,7 @@ def _run_configuration(args: argparse.Namespace) -> dict[str, Any]:
         "allow_download": args.allow_download,
         "amp": args.amp,
         "compile": args.compile,
-        "column_chunk_size": args.column_chunk_size,
         "basis_backend": args.basis_backend,
-        "basis_execution": args.basis_execution,
-        "basis_pair_budget": args.basis_pair_budget,
         "min_free_gb": args.min_free_gb,
     }
 
@@ -1539,10 +1580,15 @@ def _quarantine_incomplete_output(job: dict[str, Any], run_dir: Path) -> None:
 
 
 def _candidate_attempt_command(job: dict[str, Any], run_dir: Path) -> list[str]:
-    """Keep a resumable projector checkpoint; quarantine every other partial child."""
+    """Keep a resumable sparse DFS checkpoint; preserve every other partial child."""
     command = list(job["command"])
     dataset = job["datasets"][0]
-    checkpoint = Path(job["output_dir"]) / dataset / MODEL_NAMES[job["version"]] / "last.pt"
+    checkpoint = (
+        Path(job["output_dir"])
+        / dataset
+        / _model_name(job["version"], job.get("encoding"))
+        / "last.pt"
+    )
     if job["version"] == "v2" and checkpoint.is_file():
         command.append("--resume")
     else:
@@ -1603,17 +1649,16 @@ def _manifest_base(
         "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
         "output_dir": str(run_dir),
         "versions": list(args.versions),
+        "encodings": list(args.encodings),
         "datasets": list(args.datasets),
         "profiles": {name: PROFILES[name] for name in args.profiles},
         "model_seeds": list(args.model_seeds),
         "fresh_child_runs": len(jobs),
         "fresh_dataset_trainings": len(jobs),
-        "selected_test_evaluations_planned": len(args.versions)
-        * len(args.datasets)
-        * len(args.model_seeds),
+        "selected_test_evaluations_planned": _selected_test_count(args),
         "selection_protocol": {
             "profile_selection": (
-                "one common profile per version/dataset by mean validation MAE "
+                "one common profile per version/encoding/dataset by mean validation MAE "
                 "across all requested model seeds"
             ),
             "checkpoint_selection": "validation only inside each candidate child",
@@ -1682,7 +1727,7 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"{len(jobs)} fresh child runs; {len(jobs)} fresh dataset "
             "trainings (train+validation only); "
-            f"{len(args.versions) * len(args.datasets) * len(args.model_seeds)} "
+            f"{_selected_test_count(args)} "
             "selected-checkpoint test evaluations are deferred until validation selection"
         )
         for job in jobs:
@@ -1737,6 +1782,7 @@ def main(argv: list[str] | None = None) -> int:
             verified_validation = build_summary(
                 rows,
                 versions=list(args.versions),
+                encodings=list(args.encodings),
                 datasets=list(args.datasets),
                 profiles=list(args.profiles),
                 model_seeds=args.model_seeds,
@@ -1756,8 +1802,7 @@ def main(argv: list[str] | None = None) -> int:
             verified_test_rows = _recover_test_rows(verified_test_jobs)
             verified_complete = (
                 len(verified_test_rows) == len(verified_test_jobs)
-                and len(verified_test_jobs)
-                == len(args.versions) * len(args.datasets) * len(args.model_seeds)
+                and len(verified_test_jobs) == _selected_test_count(args)
                 and all(job["status"] == "passed" for job in verified_test_jobs)
             )
             verified_summary = attach_test_results(
@@ -1852,6 +1897,7 @@ def main(argv: list[str] | None = None) -> int:
         validation_summary = build_summary(
             rows,
             versions=list(args.versions),
+            encodings=list(args.encodings),
             datasets=list(args.datasets),
             profiles=list(args.profiles),
             model_seeds=args.model_seeds,
@@ -1916,6 +1962,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = build_summary(
             rows,
             versions=list(args.versions),
+            encodings=list(args.encodings),
             datasets=list(args.datasets),
             profiles=list(args.profiles),
             model_seeds=args.model_seeds,
@@ -1940,7 +1987,7 @@ def main(argv: list[str] | None = None) -> int:
     test_complete = (
         not failed
         and len(test_rows) == len(test_jobs)
-        and len(test_jobs) == len(args.versions) * len(args.datasets) * len(args.model_seeds)
+        and len(test_jobs) == _selected_test_count(args)
         and all(job["status"] == "passed" for job in test_jobs)
     )
     summary = attach_test_results(validation_summary, test_rows, complete=test_complete)

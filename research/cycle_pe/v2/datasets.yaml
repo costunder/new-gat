@@ -1,19 +1,24 @@
-registry_version: 1
+registry_version: 3
 track: cycle_pe
 version: v2
-model: cycle_projector_pe_v2
-claim: Coordinate-free cycle-space projector-kernel PE with a deep residual edge-aware GNN.
+models:
+  se: cycle_dfs_se_v2
+  pe: cycle_dfs_relative_pe_v2
+claim: Matched cycle-structural SE versus the same SE plus a cycle-relative cosine-position residual; identical parameters and deep backbone.
 gpu_training_verified: false
 representation:
-  default_backend: thin_q
-  selectable_backends: [thin_q, dfs_fundamental]
-  construction: sparse fundamental cycles; thin_q caches model-ready Q; dfs_fundamental caches raw signed cycles from iterative DFS forest plus non-tree-edge parent paths
-  complexity: DFS forest O(V+E); explicit sparse Z O(V+E+nnz(Z)); dense cache Omega(E*beta); thin QR O(E*beta^2)
-  diagnostic_warning: dfs_fundamental repeats graph-local thin QR per model forward and is not an end-to-end linear-time speedup
-  basis_contract: B.T @ Z = 0; rank(Z) = beta = m - n + components; projector receives Q with Q.T @ Q = I
+  default_backend: dfs_fundamental
+  selectable_backends: [dfs_fundamental]
+  construction: iterative DFS forest plus signed chord parent paths; sparse storage and structural full-rank certificate
+  complexity: DFS forest O(V+E); explicit sparse Z O(V+E+nnz(Z)); sparse aggregation O(nnz(Z)*PE_width) per edge-cycle pass
+  factorization: none; no QR, SVD, eigendecomposition, Gram inverse, or dense E-by-beta basis
+  basis_contract: B.T @ Z = 0; rank(Z) = beta = m - n + components; independent chord witnesses certify rank
   truncation: none
-  learned_input: K = (Q Q.T) hadamard-square (Q Q.T); no raw basis coordinates
-  symmetries: arbitrary basis-change and edge-orientation invariant; edge-permutation equivariant
+  learned_input: sparse cycle memberships and ordered cos/sin coordinates plus cycle lengths and bond features
+  se_operator: learned invariant cycle feature summary with uniform edge-cycle-edge aggregation
+  pe_operator: same SE plus C D_L^-1 C.T V and S D_L^-1 S.T V relative-position residual; no extra parameters
+  position_scope: selected-cycle relative spacing, not global coordinates or original-graph shortest distances
+  symmetries: cycle-order and orientation invariant; equivariant under transported chart permutations; depends on selected DFS tree
 datasets:
   - id: zinc12k
     name: ZINC-12K
@@ -21,7 +26,7 @@ datasets:
     split: official 10000/1000/1000 train/validation/test
     metrics: [mae]
     adapter: research.cycle_pe.v2.data.load_benchmark
-    cache_namespace: cycle_pe_v2_projector_kernel_benchmark/zinc12k
+    cache_namespace: cycle_pe_v2_ordered_dfs_benchmark/zinc12k
     targets: official supplied labels unchanged
   - id: peptides_struct
     name: LRGB Peptides-struct
@@ -29,5 +34,5 @@ datasets:
     split: official 10873/2331/2331 train/validation/test
     metrics: [mae]
     adapter: research.cycle_pe.v2.data.load_benchmark
-    cache_namespace: cycle_pe_v2_projector_kernel_benchmark/peptides_struct
+    cache_namespace: cycle_pe_v2_ordered_dfs_benchmark/peptides_struct
     targets: all 11 official supplied labels unchanged

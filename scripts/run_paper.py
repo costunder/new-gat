@@ -55,7 +55,7 @@ CYCLE_BREC_OFFICIAL_SEEDS = (100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
 CYCLE_VARIANTS = ("no_pe", "raw", "set", "projector")
 DEFAULT_CYCLE_VARIANTS = ("raw", "set", "projector")
 CYCLE_CORE_TARGETS = ("edge", "node", "graph")
-CYCLE_BASIS_BACKENDS = ("thin_q", "dfs_fundamental")
+CYCLE_BASIS_BACKENDS = ("dfs_fundamental",)
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 SOURCE_SUFFIXES = {".py", ".yaml", ".yml", ".toml", ".sh", ".ps1"}
 SOURCE_ROOTS = ("scripts", "src", "research")
@@ -252,29 +252,23 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
             for model_seed in executed_model_seeds:
                 for suite in suites:
                     cycle_v2 = track == "cycle_pe" and args.cycle_pe_version == "v2"
-                    label = "benchmark-v2" if cycle_v2 else suite
-                    overrides: list[str] = []
-                    if cycle_v2:
-                        overrides.extend(
-                            (
-                                "--basis-backend",
-                                args.basis_backend,
-                                "--basis-execution",
-                                args.basis_execution,
-                                "--basis-pair-budget",
-                                str(args.basis_pair_budget),
+                    encodings = args.cycle_v2_encodings if cycle_v2 else [None]
+                    # Both encodings share topology caches: prepare them once,
+                    # but every training condition owns disjoint child artifacts.
+                    if args.prepare_only:
+                        encodings = encodings[:1]
+                    for encoding in encodings:
+                        label = f"benchmark-v2:{encoding}" if cycle_v2 else suite
+                        overrides: list[str] = []
+                        if cycle_v2:
+                            overrides.extend(
+                                ("--encoding", encoding, "--basis-backend", args.basis_backend)
                             )
-                        )
-                        if args.cycle_epochs is not None:
-                            overrides.extend(("--epochs", str(args.cycle_epochs)))
-                        if args.cycle_learning_rate is not None:
-                            overrides.extend(("--lr", str(args.cycle_learning_rate)))
-                    add_child(
-                        track=track,
-                        suite=suite,
-                        model_seed=model_seed,
-                        name=f"{track}:{label}:model-seed-{model_seed}",
-                        output_dir=(
+                            if args.cycle_epochs is not None:
+                                overrides.extend(("--epochs", str(args.cycle_epochs)))
+                            if args.cycle_learning_rate is not None:
+                                overrides.extend(("--lr", str(args.cycle_learning_rate)))
+                        output = (
                             _output_dir(
                                 track,
                                 run_id,
@@ -283,9 +277,17 @@ def _commands(args: argparse.Namespace, run_id: str) -> list[tuple[str, list[str
                                 cycle_pe_version=args.cycle_pe_version,
                             )
                             / suite
-                        ),
-                        extra_arguments=tuple(overrides),
-                    )
+                        )
+                        if cycle_v2:
+                            output /= encoding
+                        add_child(
+                            track=track,
+                            suite=suite,
+                            model_seed=model_seed,
+                            name=f"{track}:{label}:model-seed-{model_seed}",
+                            output_dir=output,
+                            extra_arguments=tuple(overrides),
+                        )
             continue
 
         # BREC already performs its official ten model-search seeds internally.
@@ -571,6 +573,35 @@ def _validate_child_status(
         metrics_path = (output / "metrics.json").resolve()
         if metrics_path in payloads and payloads[metrics_path].get("status") != expected:
             errors.append(f"child metrics must have status={expected}")
+        if module == "research.cycle_pe.v2.benchmark":
+            encoding = _flag(command, "--encoding")
+            model_names = {"se": "cycle_dfs_se_v2", "pe": "cycle_dfs_relative_pe_v2"}
+            arguments = manifest.get("arguments")
+            controls = manifest.get("controls")
+            if (
+                encoding not in model_names
+                or manifest.get("version") != "v2"
+                or not isinstance(arguments, dict)
+                or arguments.get("encoding") != encoding
+                or not isinstance(controls, dict)
+                or controls.get("encoding") != encoding
+                or controls.get("model") != model_names.get(encoding)
+            ):
+                errors.append("Cycle V2 child encoding/model binding differs from the command")
+            if not prepare_only:
+                datasets = payloads.get(metrics_path, {}).get("datasets")
+                if not isinstance(datasets, dict) or set(datasets) != {
+                    "zinc12k",
+                    "peptides_struct",
+                }:
+                    errors.append("Cycle V2 child is missing a requested official dataset")
+                else:
+                    for dataset, result in datasets.items():
+                        models = result.get("models") if isinstance(result, dict) else None
+                        if not isinstance(models, dict) or set(models) != {
+                            model_names.get(encoding)
+                        }:
+                            errors.append(f"Cycle V2 {dataset} model/encoding matrix mismatch")
     return errors
 
 
@@ -957,11 +988,12 @@ def _parser() -> argparse.ArgumentParser:
         default=CYCLE_CORE_TARGETS,
         help="comma-separated CycleCount target levels forwarded to cycle core runs",
     )
+    parser.add_argument(
+        "--cycle-v2-encodings", nargs="+", choices=("se", "pe"), default=["se", "pe"]
+    )
     parser.add_argument("--cycle-epochs", type=int)
     parser.add_argument("--cycle-learning-rate", type=float)
-    parser.add_argument("--basis-backend", choices=CYCLE_BASIS_BACKENDS, default="thin_q")
-    parser.add_argument("--basis-execution", choices=("batched", "reference"), default="batched")
-    parser.add_argument("--basis-pair-budget", type=int, default=32768)
+    parser.add_argument("--basis-backend", choices=CYCLE_BASIS_BACKENDS, default="dfs_fundamental")
     parser.add_argument(
         "--batch-size",
         type=int,
@@ -1009,16 +1041,13 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
+    if len(set(args.cycle_v2_encodings)) != len(args.cycle_v2_encodings):
+        print("--cycle-v2-encodings must contain no duplicates", file=sys.stderr)
+        return 2
     if args.compile and (
         args.suite != "benchmark" or "tree_augmentation" in _selected_tracks(args.tracks)
     ):
         print("--compile supports conductance_gat/cycle_pe benchmark tracks only", file=sys.stderr)
-        return 2
-    if args.basis_pair_budget < 1:
-        print("--basis-pair-budget must be positive", file=sys.stderr)
-        return 2
-    if args.basis_backend != "thin_q" and args.cycle_pe_version != "v2":
-        print("nondefault --basis-backend requires --cycle-pe-version v2", file=sys.stderr)
         return 2
     if args.cycle_pe_version == "v2" and (
         args.suite != "benchmark" or _selected_tracks(args.tracks) != ("cycle_pe",)
@@ -1158,11 +1187,15 @@ def main() -> int:
             "execution_protocol": {
                 "torch_compile": args.compile and not args.prepare_only,
                 "basis_backend": args.basis_backend if args.cycle_pe_version == "v2" else None,
-                "basis_execution": args.basis_execution if args.cycle_pe_version == "v2" else None,
-                "basis_pair_budget": (
-                    args.basis_pair_budget if args.cycle_pe_version == "v2" else None
+                "basis_execution": (
+                    "sparse_block_diagonal" if args.cycle_pe_version == "v2" else None
                 ),
                 "cycle_pe_version": args.cycle_pe_version if "cycle_pe" in tracks else None,
+                "cycle_v2_encodings": (
+                    list(args.cycle_v2_encodings)
+                    if "cycle_pe" in tracks and args.cycle_pe_version == "v2"
+                    else None
+                ),
                 "outer_model_seeds": list(args.model_seeds),
                 "prepare_once_for_fixed_non_model_axes": args.prepare_only,
                 "cycle_selection": (

@@ -125,6 +125,27 @@ PAPER_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         pairable=False,
     ),
     _metric_rule(
+        "cycle.dfs_sparse_v2.test",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_dfs_sparse_pe_v2\.test",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.dfs_se_v2.test",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_dfs_se_v2\.test",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.dfs_relative_pe_v2.test",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_dfs_relative_pe_v2\.test",
+        pairable=False,
+    ),
+    _metric_rule(
         "conductance.core.prediction",
         "conductance_gat",
         r"summary\.json",
@@ -230,6 +251,30 @@ EFFICIENCY_METRIC_SCHEMA: tuple[AggregateMetricRule, ...] = (
         "cycle_pe",
         r"metrics\.json",
         r"datasets\.[^.]+\.models\.cycle_projector_pe_v2\."
+        r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.dfs_sparse_v2.efficiency",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_dfs_sparse_pe_v2\."
+        r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.dfs_se_v2.efficiency",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_dfs_se_v2\."
+        r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
+        pairable=False,
+    ),
+    _metric_rule(
+        "cycle.dfs_relative_pe_v2.efficiency",
+        "cycle_pe",
+        r"metrics\.json",
+        r"datasets\.[^.]+\.models\.cycle_dfs_relative_pe_v2\."
         r"(?:trainable_parameters|elapsed_seconds|peak_gpu_memory_bytes)",
         pairable=False,
     ),
@@ -509,8 +554,7 @@ def aggregate_manifest(
                     ]
                 except OSError as error:
                     artifact_errors.append(
-                        f"could not read failure log {log_value}: "
-                        f"{type(error).__name__}: {error}"
+                        f"could not read failure log {log_value}: {type(error).__name__}: {error}"
                     )
             error_text = " | ".join(str(error) for error in artifact_errors)
             searchable_error = f"{error_text}\n{log_text}".casefold()

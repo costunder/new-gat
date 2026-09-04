@@ -1,4 +1,4 @@
-"""Bounded forward/backward unit fixtures, never benchmark training or datasets."""
+"""Synthetic CPU/CUDA unit fixtures, never benchmark training or datasets."""
 
 from __future__ import annotations
 
@@ -12,10 +12,19 @@ import torch
 from research.cycle_pe.v2.data import Graph, collate, prepare_graph
 from research.cycle_pe.v2.model import (
     MODEL_NAME,
+    MODEL_NAMES,
     CycleBasisPEModel,
     LeftNullBasisEncoder,
     architecture_protocol,
 )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _bounded_cpu_threads():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(2)
+    yield
+    torch.set_num_threads(previous)
 
 
 def _graph(
@@ -23,7 +32,7 @@ def _graph(
     *,
     complete: bool = False,
     forest: bool = False,
-    basis_backend: str = "thin_q",
+    basis_backend: str = "dfs_fundamental",
 ) -> Graph:
     if complete:
         edges = [(u, v) for u in range(n) for v in range(u + 1, n)]
@@ -45,420 +54,517 @@ def _graph(
     )
 
 
-def test_no_raw_basis_coordinate_reaches_a_learned_layer() -> None:
-    graph = _graph(7, complete=True)
-    basis = graph.cycle_basis
-    encoder = LeftNullBasisEncoder(5, 8, column_chunk_size=4)
-    observed = []
-    hook = encoder.column_phi[0].register_forward_pre_hook(
-        lambda _module, args: observed.append(args[0].detach().clone())
-    )
-    output = encoder(torch.randn(len(basis), 5), basis)
-    hook.remove()
-    assert basis.shape == (21, 15)
-    assert output.shape == (21, 8)
-    assert len(observed) == 1
-    assert observed[0].shape == (21, 5)
-
-
-def test_every_basis_column_participates_in_autograd_and_parameters_are_rank_independent() -> None:
-    torch.manual_seed(23)
-    encoder = LeftNullBasisEncoder(7, 11, column_chunk_size=3)
-    parameters_before = sum(p.numel() for p in encoder.parameters())
-    for graph in (_graph(3), _graph(7, complete=True)):
-        basis = graph.cycle_basis.clone().requires_grad_()
-        output = encoder(torch.randn(len(basis), 7), basis)
-        output.square().sum().backward()
-        assert basis.grad is not None and torch.isfinite(basis.grad).all()
-        assert (basis.grad.abs().sum(dim=0) > 0).all()
-        assert sum(p.numel() for p in encoder.parameters()) == parameters_before
-
-
-def test_chunk_size_changes_rank_core_allocation_not_values_or_gradients(monkeypatch) -> None:
-    torch.manual_seed(7)
-    graph = _graph(6, complete=True)
-    encoder = LeftNullBasisEncoder(5, 9, column_chunk_size=1)
-    bond = torch.randn(len(graph.edge_attr), 5)
-    basis = graph.cycle_basis.clone().requires_grad_()
-    original_einsum = torch.einsum
-    core_shapes: list[tuple[int, ...]] = []
-
-    def observed(equation, *operands):
-        result = original_einsum(equation, *operands)
-        if equation == "md,ma,mb->dab":
-            core_shapes.append(tuple(result.shape))
-        return result
-
-    monkeypatch.setattr(torch, "einsum", observed)
-    expected = encoder(bond, basis)
-    expected.sum().backward()
-    gradient = basis.grad.clone()
-    one_column_shapes = tuple(core_shapes)
-    core_shapes.clear()
-    basis.grad = None
-    encoder.column_chunk_size = 4
-    actual = encoder(bond, basis)
-    actual.sum().backward()
-    four_column_shapes = tuple(core_shapes)
-    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
-    torch.testing.assert_close(basis.grad, gradient, atol=2e-6, rtol=2e-6)
-    assert one_column_shapes and four_column_shapes
-    assert len(one_column_shapes) > len(four_column_shapes)
-    assert all(shape[1:] == (1, 1) for shape in one_column_shapes)
-    assert any(max(shape[1:]) == 4 for shape in four_column_shapes)
-
-
-def test_pair_free_private_contract_handles_nonempty_rank_zero_input() -> None:
-    encoder = LeftNullBasisEncoder(5, 8)
-    q = torch.empty(4, 0)
-    values = torch.randn(4, 8, requires_grad=True)
-    mixed, leverage = encoder._projector_mix(q, values, pair_budget=1)
-    assert torch.equal(mixed, torch.zeros_like(values))
-    assert torch.equal(leverage, torch.zeros(4))
-
-
-def test_column_sign_and_order_symmetry_after_nonlinear_column_encoding() -> None:
-    torch.manual_seed(13)
-    graph = _graph(6, complete=True)
-    encoder = LeftNullBasisEncoder(7, 11, column_chunk_size=3)
-    bond = torch.randn(len(graph.edge_attr), 7)
-    rank = graph.cycle_basis.shape[1]
-    permutation = torch.randperm(rank)
-    signs = torch.where(torch.arange(rank) % 2 == 0, 1.0, -1.0)
-    changed = graph.cycle_basis[:, permutation] * signs
-    torch.testing.assert_close(encoder(bond, graph.cycle_basis), encoder(bond, changed))
-
-
-def test_independent_edge_orientation_signs_are_unobservable() -> None:
-    torch.manual_seed(17)
-    encoder = LeftNullBasisEncoder(7, 8)
-    bond = torch.randn(4, 7)
-    basis = torch.tensor([[0.2], [-0.3], [0.4], [-0.5]])
-    changed = basis.clone()
-    changed[1] *= -1
-    torch.testing.assert_close(basis.abs(), changed.abs())
-    torch.testing.assert_close(encoder(bond, basis), encoder(bond, changed))
-
-
-def test_edge_order_equivariance_with_transported_full_basis() -> None:
-    torch.manual_seed(11)
-    graph = _graph(5, complete=True)
-    encoder = LeftNullBasisEncoder(7, 8)
-    bond = torch.randn(len(graph.edge_attr), 7)
-    order = torch.randperm(len(bond))
-    torch.testing.assert_close(
-        encoder(bond, graph.cycle_basis)[order],
-        encoder(bond[order], graph.cycle_basis[order]),
-    )
-
-
-def test_forest_has_exact_zero_pe_even_with_nonzero_mlp_biases() -> None:
-    encoder = LeftNullBasisEncoder(5, 8)
-    for parameter in encoder.parameters():
-        torch.nn.init.constant_(parameter, 0.3)
-    for edges in (0, 4):
-        value = encoder(torch.randn(edges, 5), torch.empty(edges, 0))
-        assert value.shape == (edges, 8)
-        assert torch.equal(value, torch.zeros_like(value))
-
-
-def test_full_model_ragged_batch_matches_individual_graphs_and_backpropagates() -> None:
-    torch.manual_seed(5)
-    model = CycleBasisPEModel(dataset="zinc12k", hidden=12, pe_dim=6, layers=2, column_chunk_size=2)
-    graphs = [_graph(4), _graph(5, complete=True), _graph(3, forest=True)]
-    batch = collate(graphs)
-    output = model(batch)
-    assert output.shape == (3, 1)
-    assert all(hasattr(layer, "edge_ffn") and hasattr(layer, "node_ffn") for layer in model.layers)
-    (output - batch.y).abs().mean().backward()
-    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
-    model.eval()
-    with torch.no_grad():
-        combined = model(batch)
-        separate = torch.cat([model(collate([graph])) for graph in graphs])
-    torch.testing.assert_close(combined, separate, atol=3e-6, rtol=3e-6)
-
-
-def test_full_model_is_node_permutation_invariant_only_with_transported_chart() -> None:
-    torch.manual_seed(4)
-    graph = _graph(5, complete=True)
-    model = CycleBasisPEModel(dataset="zinc12k", hidden=12, pe_dim=6, layers=2).eval()
-    permutation = torch.tensor([3, 0, 4, 1, 2])
-    inverse = torch.argsort(permutation)
-    transported = replace(graph, x=graph.x[permutation], edge_index=inverse[graph.edge_index])
-    # Keep each incidence edge's original orientation and its entire U row.
-    torch.testing.assert_close(model(collate([graph])), model(collate([transported])))
-
-
-def test_optional_amp_keeps_full_basis_and_scatter_arithmetic_valid() -> None:
-    model = CycleBasisPEModel(dataset="zinc12k", hidden=12, pe_dim=6, layers=2)
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        result = model(collate([_graph(4), _graph(5, complete=True)]))
-    assert torch.isfinite(result).all()
-
-
-@pytest.mark.parametrize("dataset,width,targets", [("zinc12k", 1, 1), ("peptides_struct", 9, 11)])
-def test_official_target_width_parameter_budget_and_edgeless_readout(dataset, width, targets):
-    model = CycleBasisPEModel(dataset=dataset)
-    graph = _graph(1, forest=True)
-    graph.x = torch.zeros((1, width), dtype=torch.long)
-    graph.edge_attr = torch.empty((0, 1 if dataset == "zinc12k" else 3), dtype=torch.long)
-    graph.y = torch.zeros(targets)
-    output = model(collate([graph]))
-    assert output.shape == (1, targets)
-    assert torch.isfinite(output).all()
-    parameters = sum(p.numel() for p in model.parameters())
-    assert 1_000_000 < parameters <= 20_000_000
-
-
-@pytest.mark.parametrize("kwargs", [{"bond_dim": 0}, {"pe_dim": 0}, {"column_chunk_size": 0}])
-def test_encoder_rejects_invalid_sizes(kwargs):
-    arguments = {"bond_dim": 5, "pe_dim": 8, **kwargs}
-    with pytest.raises(ValueError, match="positive"):
-        LeftNullBasisEncoder(**arguments)
-
-
-def test_basis_schema_errors_fail_loudly() -> None:
-    encoder = LeftNullBasisEncoder(5, 8)
-    with pytest.raises(ValueError, match="shape"):
-        encoder(torch.zeros(3, 5), torch.zeros(2, 1))
-    with pytest.raises(ValueError, match="floating point"):
-        encoder(torch.zeros(3, 5), torch.zeros(3, 1, dtype=torch.long))
-    with pytest.raises(ValueError, match="edgeless"):
-        encoder(torch.zeros(0, 5), torch.zeros(0, 1))
-
-
-def test_protocol_names_intrinsic_projector_and_deep_backbone() -> None:
-    protocol = architecture_protocol()
-    assert MODEL_NAME == "cycle_projector_pe_v2"
-    assert "P=Q Q.T" in protocol["positional_encoding"]
-    assert "invertible cycle-basis replacement" in protocol["symmetry"]
-    assert "pre-norm residual" in protocol["backbone"]
-
-
-def _disconnected_graph(*, basis_backend: str = "thin_q") -> Graph:
-    edges = [(0, 1), (0, 2), (1, 2), (3, 4), (3, 5), (4, 5)]
+def _disconnected_graph(*, basis_backend: str = "dfs_fundamental") -> Graph:
+    edges = [(0, 1), (0, 2), (1, 2), (3, 4), (3, 5), (4, 5), (5, 6)]
     return prepare_graph(
         SimpleNamespace(
-            num_nodes=6,
-            x=torch.arange(6).reshape(-1, 1),
-            edge_index=torch.tensor(edges + [(v, u) for u, v in edges], dtype=torch.long).T,
-            edge_attr=torch.ones((2 * len(edges), 1), dtype=torch.long),
-            y=torch.tensor([0.7]),
+            num_nodes=8,
+            x=torch.arange(8).reshape(-1, 1),
+            edge_index=torch.tensor(edges + [(v, u) for u, v in edges]).T.contiguous(),
+            edge_attr=torch.ones(2 * len(edges), 1, dtype=torch.long),
+            y=torch.tensor([0.4]),
         ),
         basis_backend=basis_backend,
     )
 
 
-def _assert_parameter_gradients_match(first: torch.nn.Module, second: torch.nn.Module) -> None:
-    actual = dict(first.named_parameters())
-    expected = dict(second.named_parameters())
+def _encode(encoder, bond, batch):
+    return encoder(
+        bond, batch.cycle_membership, batch.cycle_lengths,
+        batch.edge_cycle_counts, batch.edge_cycle_features,
+        batch.cycle_position_values,
+    )
+
+
+def _sparse(indices, values, shape):
+    return torch.sparse_coo_tensor(indices, values, shape, check_invariants=True).coalesce()
+
+
+def _assert_parameter_gradients_match(first, second):
+    actual, expected = dict(first.named_parameters()), dict(second.named_parameters())
     assert actual.keys() == expected.keys()
     for name, parameter in actual.items():
-        wanted = expected[name]
-        assert (parameter.grad is None) == (wanted.grad is None), name
-        if parameter.grad is not None:
-            torch.testing.assert_close(parameter.grad, wanted.grad, atol=3e-6, rtol=3e-5, msg=name)
+        assert parameter.grad is not None, name
+        assert expected[name].grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        torch.testing.assert_close(
+            parameter.grad, expected[name].grad, atol=4e-6, rtol=4e-5, msg=name
+        )
 
 
-@pytest.mark.parametrize("budget", [1, 5, 29, 32768])
-def test_batched_pair_encoder_matches_reference_outputs_and_every_gradient(budget):
-    torch.manual_seed(37)
-    graphs = [
-        _graph(4),
-        _graph(5, complete=True),
-        _graph(4, forest=True),
-        _graph(1, forest=True),
-        _disconnected_graph(),
-    ]
-    counts = [len(graph.edge_attr) for graph in graphs]
-    reference = LeftNullBasisEncoder(5, 9, column_chunk_size=3)
-    batched = copy.deepcopy(reference)
-    ref_bond = torch.randn(sum(counts), 5, requires_grad=True)
-    new_bond = ref_bond.detach().clone().requires_grad_()
-    ref_bases = tuple(graph.cycle_basis.clone().requires_grad_() for graph in graphs)
-    new_bases = tuple(basis.detach().clone().requires_grad_() for basis in ref_bases)
-    expected = torch.cat(
-        [
-            reference(part, basis)
-            for part, basis in zip(ref_bond.split(counts), ref_bases, strict=True)
-        ]
+def test_sparse_encoder_matches_explicit_edge_cycle_edge_reductions():
+    torch.manual_seed(11)
+    batch = collate([_graph(5, complete=True), _disconnected_graph(), _graph(3, forest=True)])
+    encoder = LeftNullBasisEncoder(5, 9)
+    bond = torch.randn(len(batch.edge_attr), 5)
+    actual = _encode(encoder, bond, batch)
+    edge_ids, cycle_ids = batch.cycle_membership.indices()
+    values = encoder.column_phi(bond)
+    cycle_sum = values.new_zeros((len(batch.cycle_lengths), encoder.pe_dim))
+    cycle_sum.index_add_(0, cycle_ids, values[edge_ids])
+    log_lengths = batch.cycle_lengths.log1p()[:, None]
+    cycle_hidden = encoder.cycle_mlp(
+        torch.cat((cycle_sum / batch.cycle_lengths[:, None], log_lengths), dim=1)
     )
-    actual = batched.forward_batch(new_bond, new_bases, pair_budget=budget)
+    edge_sum = values.new_zeros(values.shape)
+    edge_sum.index_add_(0, edge_ids, cycle_hidden[cycle_ids])
+    structure = torch.cat((log_lengths, batch.cycle_lengths.reciprocal()[:, None]), dim=1)
+    structural_sum = values.new_zeros((len(values), 2))
+    structural_sum.index_add_(0, edge_ids, structure[cycle_ids])
+    counts = batch.edge_cycle_counts[:, None]
+    active = (counts > 0).float()
+    features = torch.cat(
+        (
+            values * active,
+            edge_sum / counts.clamp_min(1),
+            counts.log1p(),
+            structural_sum / counts.clamp_min(1),
+        ),
+        dim=1,
+    )
+    expected = encoder.output(encoder.edge_psi(features)) * active
     torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
-    weights = torch.randn_like(expected)
-    (expected * weights).sum().backward()
-    (actual * weights).sum().backward()
-    torch.testing.assert_close(new_bond.grad, ref_bond.grad, atol=3e-6, rtol=3e-5)
-    for wanted, value in zip(ref_bases, new_bases, strict=True):
-        assert (wanted.grad is None) == (value.grad is None)
-        if wanted.grad is not None:
-            torch.testing.assert_close(value.grad, wanted.grad, atol=3e-6, rtol=3e-5)
-            assert (value.grad.abs().sum(dim=0) > 0).all()
-    _assert_parameter_gradients_match(batched, reference)
-    assert reference.state_dict().keys() == batched.state_dict().keys()
 
 
-@pytest.mark.parametrize("budget", [1, 7, 32768])
-def test_batched_encoder_keeps_graph_column_segments_signs_and_edge_order_separate(budget):
-    torch.manual_seed(31)
-    encoder = LeftNullBasisEncoder(5, 9, column_chunk_size=3)
-    bases = tuple(graph.cycle_basis for graph in [_graph(4, complete=True), _disconnected_graph()])
-    bonds = [torch.randn(len(basis), 5) for basis in bases]
-    expected = encoder.forward_batch(torch.cat(bonds), bases, pair_budget=budget)
-    changed, orders = [], []
-    for basis in bases:
-        rank = basis.shape[1]
-        columns, order = torch.randperm(rank), torch.randperm(len(basis))
-        signs = torch.where(torch.arange(rank) % 2 == 0, 1.0, -1.0)
-        changed.append(basis[order][:, columns] * signs)
-        orders.append(order)
-    actual = encoder.forward_batch(
-        torch.cat([bond[order] for bond, order in zip(bonds, orders, strict=True)]),
-        changed,
-        pair_budget=budget,
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_no_factorization_dense_cycle_matrix_or_graphwise_sparse_loop(monkeypatch, encoding):
+    batch = collate([_graph(4), _graph(5, complete=True), _disconnected_graph()])
+    model = CycleBasisPEModel(
+        dataset="zinc12k", encoding=encoding, hidden=16, pe_dim=8, layers=3
     )
-    expected_parts = expected.split([len(basis) for basis in bases])
+    calls = []
+    original_mm = torch.sparse.mm
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("factorization or sparse densification reached the model")
+
+    def observed(matrix, values, *args, **kwargs):
+        assert matrix.layout == torch.sparse_coo
+        assert matrix.dtype == values.dtype == torch.float32
+        calls.append((tuple(matrix.shape), tuple(values.shape)))
+        return original_mm(matrix, values, *args, **kwargs)
+
+    for name in ("qr", "svd", "eigh", "eig", "inv", "pinv", "cholesky"):
+        monkeypatch.setattr(torch.linalg, name, forbidden)
+    monkeypatch.setattr(torch.Tensor, "to_dense", forbidden)
+    monkeypatch.setattr(torch.sparse, "mm", observed)
+    prediction = model(batch)
+    (prediction - batch.y).abs().mean().backward()
+    edges, cycles = batch.cycle_membership.shape
+    expected_calls = [
+        ((cycles, edges), (edges, 8)),
+        ((edges, cycles), (cycles, 8)),
+    ]
+    if encoding == "pe":
+        expected_calls += [
+            ((cycles, edges), (edges, 8)),
+            ((cycles, edges), (edges, 8)),
+            ((edges, cycles), (cycles, 8)),
+            ((edges, cycles), (cycles, 8)),
+        ]
+    assert calls == expected_calls
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_every_selected_cycle_receives_task_gradient_without_rank_dependent_parameters():
+    torch.manual_seed(23)
+    encoder = LeftNullBasisEncoder(7, 11)
+    parameter_count = sum(p.numel() for p in encoder.parameters())
+    for graph in (_graph(3), _graph(7, complete=True), _disconnected_graph()):
+        batch = collate([graph])
+        cycle_outputs = []
+
+        def capture(_module, _args, output, captured=cycle_outputs):
+            output.retain_grad()
+            captured.append(output)
+
+        hook = encoder.cycle_mlp.register_forward_hook(capture)
+        output = _encode(encoder, torch.randn(len(graph.edge_attr), 7), batch)
+        output.square().sum().backward()
+        hook.remove()
+        assert len(cycle_outputs) == 1
+        hidden = cycle_outputs[0]
+        assert hidden.shape[0] == graph.cycle_basis.shape[1]
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+        assert (hidden.grad.abs().sum(dim=1) > 0).all()
+        assert parameter_count == sum(p.numel() for p in encoder.parameters())
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_cycle_sign_and_column_order_do_not_change_selected_membership_pe(encoding):
+    torch.manual_seed(19)
+    graph = _graph(6, complete=True)
+    rank = graph.cycle_basis.shape[1]
+    order = torch.randperm(rank)
+    inverse_order = torch.argsort(order)
+    indices = graph.cycle_basis.indices().clone()
+    signs = torch.where(torch.arange(rank) % 2 == 0, -1.0, 1.0)
+    values = graph.cycle_basis.values() * signs[indices[1]]
+    indices[1] = inverse_order[indices[1]]
+    transported = replace(
+        graph,
+        cycle_basis=_sparse(indices, values, graph.cycle_basis.shape),
+        cycle_lengths=graph.cycle_lengths[order],
+        cycle_position_indices=_sparse(
+            indices, graph.cycle_position_indices, graph.cycle_basis.shape
+        ).values(),
+        cycle_position_values=torch.stack([
+            _sparse(indices, row, graph.cycle_basis.shape).values()
+            for row in graph.cycle_position_values
+        ]),
+    )
+    encoder = LeftNullBasisEncoder(5, 8, encoding=encoding)
+    bond = torch.randn(len(graph.edge_attr), 5)
     torch.testing.assert_close(
-        actual,
-        torch.cat([part[order] for part, order in zip(expected_parts, orders, strict=True)]),
+        _encode(encoder, bond, collate([graph])),
+        _encode(encoder, bond, collate([transported])),
         atol=3e-6,
         rtol=3e-5,
     )
-    # A different graph's features must never change the first graph's context.
-    altered_bonds = torch.cat((bonds[0], 20.0 * bonds[1]))
-    altered = encoder.forward_batch(altered_bonds, bases, pair_budget=budget)
-    torch.testing.assert_close(altered[: len(bases[0])], expected[: len(bases[0])])
 
 
-def test_batched_encoder_keeps_raw_basis_out_of_mlps_and_pair_budget_is_exact(
-    monkeypatch,
-) -> None:
-    encoder = LeftNullBasisEncoder(5, 9, column_chunk_size=2)
-    bases = tuple(_graph(5, complete=True).cycle_basis for _ in range(3))
-    bond = torch.randn(sum(len(basis) for basis in bases), 5)
-    calls: dict[str, list[torch.Tensor]] = {"phi": [], "psi": []}
-    hooks = [
-        module.register_forward_pre_hook(
-            lambda _module, args, key=key: calls[key].append(args[0].detach().clone())
-        )
-        for key, module in (("phi", encoder.column_phi[0]), ("psi", encoder.edge_psi[0]))
-    ]
-    try:
-        expected = encoder.forward_batch(bond, bases, pair_budget=10_000)
-        assert len(calls["phi"]) == len(calls["psi"]) == 1
-        assert len(calls["phi"][0]) == len(bond)
-        assert all(value.shape[1] == 5 for value in calls["phi"])
-        for values in calls.values():
-            values.clear()
-        original_einsum = torch.einsum
-        core_sizes = []
-
-        def observed(equation, *operands):
-            result = original_einsum(equation, *operands)
-            if equation == "gmd,gma,gmb->gdab":
-                core_sizes.append(result.numel())
-            return result
-
-        monkeypatch.setattr(torch, "einsum", observed)
-        actual = encoder.forward_batch(bond, bases, pair_budget=7)
-        torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
-        assert core_sizes and max(core_sizes) <= 7
-        assert len(calls["phi"]) == len(calls["psi"]) == 1
-    finally:
-        for hook in hooks:
-            hook.remove()
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_edge_order_equivariance_with_transported_sparse_membership(encoding):
+    torch.manual_seed(29)
+    graph = _graph(5, complete=True)
+    batch = collate([graph])
+    encoder = LeftNullBasisEncoder(5, 7, encoding=encoding)
+    bond = torch.randn(len(graph.edge_attr), 5)
+    expected = _encode(encoder, bond, batch)
+    order = torch.randperm(len(bond))
+    inverse_order = torch.argsort(order)
+    indices = batch.cycle_membership.indices().clone()
+    indices[0] = inverse_order[indices[0]]
+    membership = _sparse(
+        indices, batch.cycle_membership.values(), batch.cycle_membership.shape
+    )
+    actual = encoder(
+        bond[order], membership, batch.cycle_lengths,
+        batch.edge_cycle_counts[order], batch.edge_cycle_features[order],
+        torch.stack([
+            _sparse(indices, row, membership.shape).values()
+            for row in batch.cycle_position_values
+        ]),
+    )
+    torch.testing.assert_close(actual, expected[order], atol=3e-6, rtol=3e-5)
 
 
-def test_batched_forest_and_empty_inputs_never_create_bias_pe() -> None:
-    encoder = LeftNullBasisEncoder(5, 8)
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_node_permutation_preserves_prediction_when_selected_basis_is_transported(encoding):
+    torch.manual_seed(31)
+    graph = _disconnected_graph()
+    order = torch.randperm(len(graph.x))
+    inverse_order = torch.argsort(order)
+    transported = replace(
+        graph, x=graph.x[order], edge_index=inverse_order[graph.edge_index]
+    )
+    model = CycleBasisPEModel(dataset="zinc12k", encoding=encoding, hidden=16, pe_dim=8, layers=3
+    ).eval()
+    with torch.no_grad():
+        expected = model(collate([graph]))
+        actual = model(collate([transported]))
+    torch.testing.assert_close(actual, expected, atol=4e-6, rtol=4e-5)
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+@pytest.mark.parametrize("edges", [0, 4])
+def test_empty_and_forest_encoder_pe_and_all_parameter_gradients_are_exactly_zero(edges, encoding):
+    encoder = LeftNullBasisEncoder(5, 7, encoding=encoding)
     for parameter in encoder.parameters():
         torch.nn.init.constant_(parameter, 0.3)
-    for bases in ((), (torch.empty(0, 0),), (torch.empty(4, 0), torch.empty(0, 0))):
-        edges = sum(len(basis) for basis in bases)
-        value = encoder.forward_batch(torch.randn(edges, 5), bases, pair_budget=1)
-        assert torch.equal(value, torch.zeros(edges, 8))
+    membership = _sparse(
+        torch.empty((2, 0), dtype=torch.long), torch.empty(0), (edges, 0)
+    )
+    bond = torch.randn(edges, 5, requires_grad=True)
+    actual = encoder(
+        bond, membership, torch.empty(0), torch.zeros(edges),
+        torch.zeros(edges, 2), torch.empty(2, 0),
+    )
+    assert actual.shape == (edges, 7)
+    assert torch.equal(actual, torch.zeros_like(actual))
+    actual.square().sum().backward()
+    assert bond.grad is not None and torch.count_nonzero(bond.grad) == 0
+    for name, parameter in encoder.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.count_nonzero(parameter.grad) == 0, name
 
 
-def test_full_batched_model_matches_reference_state_dict_outputs_and_gradients() -> None:
-    torch.manual_seed(47)
-    reference = CycleBasisPEModel(
-        dataset="zinc12k",
-        hidden=12,
-        pe_dim=6,
-        layers=2,
-        column_chunk_size=2,
-        basis_execution="reference",
-    )
-    batched = CycleBasisPEModel(
-        dataset="zinc12k",
-        hidden=12,
-        pe_dim=6,
-        layers=2,
-        column_chunk_size=2,
-        basis_execution="batched",
-        basis_pair_budget=7,
-    )
-    batched.load_state_dict(reference.state_dict(), strict=True)
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_bridges_have_zero_pe_with_nonzero_mlp_biases(encoding):
+    batch = collate([_disconnected_graph(), _graph(3, forest=True)])
+    encoder = LeftNullBasisEncoder(4, 8, encoding=encoding)
+    for name, parameter in encoder.named_parameters():
+        if name.endswith("bias"):
+            torch.nn.init.constant_(parameter, 0.3)
+    actual = _encode(encoder, torch.randn(len(batch.edge_attr), 4), batch)
+    inactive = batch.edge_cycle_counts == 0
+    assert inactive.any() and (~inactive).any()
+    assert torch.equal(actual[inactive], torch.zeros_like(actual[inactive]))
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_sparse_physical_batch_matches_graphwise_outputs_and_every_parameter_gradient(encoding):
+    torch.manual_seed(37)
     graphs = [_graph(4), _graph(5, complete=True), _graph(4, forest=True), _disconnected_graph()]
+    batched = CycleBasisPEModel(
+        dataset="zinc12k", encoding=encoding, hidden=16, pe_dim=8, layers=3
+    )
+    reference = copy.deepcopy(batched)
     batch = collate(graphs)
-    expected, actual = reference(batch), batched(batch)
+    actual = batched(batch)
+    expected = torch.cat([reference(collate([graph])) for graph in graphs])
+    torch.testing.assert_close(actual, expected, atol=4e-6, rtol=4e-5)
+    weights = torch.randn_like(actual)
+    (actual * weights).sum().backward()
+    (expected * weights).sum().backward()
+    _assert_parameter_gradients_match(batched, reference)
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_full_default_architecture_pe_affects_loss_and_all_pe_parameters_update(encoding):
+    torch.manual_seed(713)
+    batch = collate([_graph(5, complete=True), _graph(4, forest=True), _disconnected_graph()])
+    model = CycleBasisPEModel(dataset="zinc12k", encoding=encoding)
+    assert len(model.layers) == 10
+    assert model.pe_encoder.pe_dim == 64
+    assert model.graph_head.in_features == 128
+    assert sum(p.numel() for p in model.parameters()) == 7_262_785
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    assert {id(p) for p in model.parameters()} == {
+        id(p) for group in optimizer.param_groups for p in group["params"]
+    }
+    predicted = model(batch)
+    loss = (predicted - batch.y).abs().mean()
+    loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    before = {name: p.detach().clone() for name, p in model.pe_encoder.named_parameters()}
+    assert all(torch.count_nonzero(p.grad) > 0 for p in model.pe_encoder.parameters())
+    optimizer.step()
+    assert all(
+        not torch.equal(before[name], parameter)
+        for name, parameter in model.pe_encoder.named_parameters()
+    )
+    model.eval()
+    with torch.no_grad():
+        actual = model(batch)
+        hook = model.pe_encoder.register_forward_hook(
+            lambda _module, _args, output: torch.zeros_like(output)
+        )
+        ablated = model(batch)
+        hook.remove()
+    assert not torch.allclose(actual, ablated, atol=1e-7, rtol=1e-7)
+    assert torch.isfinite((actual - batch.y).abs().mean())
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_sparse_fp32_islands_under_bfloat16_autocast(device, encoding, monkeypatch):
+    if device == "cuda" and (
+        not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()
+    ):
+        pytest.skip("CUDA with BF16 support is required; CPU results do not validate server CUDA")
+    batch = collate([_graph(5, complete=True), _graph(4, forest=True)]).to(device)
+    model = CycleBasisPEModel(
+        dataset="zinc12k", encoding=encoding, hidden=16, pe_dim=8, layers=3
+    ).to(device)
+    original = torch.sparse.mm
+    sparse_dtypes = []
+
+    def observed(matrix, values, *args, **kwargs):
+        sparse_dtypes.append((matrix.dtype, values.dtype))
+        return original(matrix, values, *args, **kwargs)
+
+    monkeypatch.setattr(torch.sparse, "mm", observed)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        predicted = model(batch)
+        loss = (predicted.float() - batch.y).abs().mean()
+    loss.backward()
+    assert sparse_dtypes and all(
+        left == right == torch.float32 for left, right in sparse_dtypes
+    )
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+@pytest.mark.parametrize("dataset,targets", [("zinc12k", 1), ("peptides_struct", 11)])
+def test_official_target_width_is_preserved(dataset, targets):
+    model = CycleBasisPEModel(dataset=dataset)
+    assert model.graph_head.out_features == targets
+
+
+@pytest.mark.parametrize("kwargs", [{"bond_dim": 0, "pe_dim": 3}, {"bond_dim": 3, "pe_dim": 0}])
+def test_encoder_rejects_invalid_dimensions(kwargs):
+    with pytest.raises(ValueError, match="positive"):
+        LeftNullBasisEncoder(**kwargs)
+
+
+@pytest.mark.parametrize("option", ["column_chunk_size", "basis_pair_budget", "basis_execution"])
+def test_obsolete_projector_options_fail_loudly(option):
+    with pytest.raises(TypeError, match=option):
+        CycleBasisPEModel(dataset="zinc12k", **{option: 2})
+
+
+def test_encoder_rejects_dense_membership_and_inconsistent_shapes():
+    encoder = LeftNullBasisEncoder(5, 8)
+    with pytest.raises(ValueError, match="sparse COO"):
+        encoder(
+            torch.randn(4, 5), torch.zeros(4, 1), torch.ones(1),
+            torch.ones(4), torch.zeros(4, 2),
+        )
+    batch = collate([_graph(4)])
+    with pytest.raises(ValueError, match="lengths"):
+        encoder(
+            torch.randn(4, 5), batch.cycle_membership, torch.ones(2),
+            torch.ones(4), batch.edge_cycle_features,
+        )
+
+
+def test_protocol_is_explicit_about_selected_dfs_dependence_and_no_projector():
+    protocol = architecture_protocol()
+    assert protocol["model"] == MODEL_NAME == MODEL_NAMES["se"] == "cycle_dfs_se_v2"
+    assert "a different DFS tree" in protocol["symmetry"]
+    assert "may change" in protocol["symmetry"]
+    assert "no QR, SVD" in protocol["execution"]
+    assert "one sparse block-diagonal physical batch" in protocol["execution"]
+
+
+def _captured_edge_features(encoder, bond, batch):
+    captured = []
+    hook = encoder.edge_psi.register_forward_pre_hook(
+        lambda _module, args: captured.append(args[0])
+    )
+    output = _encode(encoder, bond, batch)
+    hook.remove()
+    assert len(captured) == 1
+    return output, captured[0]
+
+
+def test_pe_residual_matches_dense_cyclic_distance_kernel_on_tiny_fixture():
+    """The independent dense pair kernel exists only in this tiny unit reference."""
+    torch.manual_seed(83)
+    graph = _graph(5, complete=True)
+    batch = collate([graph])
+    pe = LeftNullBasisEncoder(5, 7, encoding="pe")
+    se = LeftNullBasisEncoder(5, 7, encoding="se")
+    se.load_state_dict(pe.state_dict(), strict=True)
+    bond = torch.randn(len(graph.edge_attr), 5)
+    _, pe_features = _captured_edge_features(pe, bond, batch)
+    _, se_features = _captured_edge_features(se, bond, batch)
+    actual = pe_features[:, 7:14] - se_features[:, 7:14]
+    values = pe.column_phi(bond)
+    expected = torch.zeros_like(values)
+    edge_ids, cycle_ids = graph.cycle_basis.indices()
+    for cycle in range(graph.cycle_basis.shape[1]):
+        selected = cycle_ids == cycle
+        edges = edge_ids[selected]
+        position = graph.cycle_position_indices[selected].float()
+        length = graph.cycle_lengths[cycle]
+        pair_angle = 2 * torch.pi * (position[:, None] - position[None, :]) / length
+        expected.index_add_(0, edges, pair_angle.cos() @ values[edges] / length)
+    expected = expected / batch.edge_cycle_counts.clamp_min(1)[:, None]
+    torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+
+
+def test_pe_is_invariant_to_independent_cycle_origin_and_reversal_with_all_gradients():
+    torch.manual_seed(89)
+    batch = collate([_graph(6, complete=True), _disconnected_graph()])
+    cycle_ids = batch.cycle_membership.indices()[1]
+    origin = torch.linspace(-2.3, 1.7, len(batch.cycle_lengths))[cycle_ids]
+    direction = torch.where(cycle_ids % 2 == 0, -1.0, 1.0)
+    cosine, sine = batch.cycle_position_values
+    transported = torch.stack((
+        cosine * origin.cos() - direction * sine * origin.sin(),
+        cosine * origin.sin() + direction * sine * origin.cos(),
+    ))
+    changed = replace(batch, cycle_position_values=transported)
+    original = LeftNullBasisEncoder(5, 7, encoding="pe")
+    modified = copy.deepcopy(original)
+    bond = torch.randn(len(batch.edge_attr), 5)
+    expected = _encode(original, bond, batch)
+    actual = _encode(modified, bond, changed)
     torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
     weights = torch.randn_like(actual)
     (expected * weights).sum().backward()
     (actual * weights).sum().backward()
-    _assert_parameter_gradients_match(batched, reference)
+    _assert_parameter_gradients_match(modified, original)
 
 
-@pytest.mark.parametrize("basis_execution", ["reference", "batched"])
-def test_raw_dfs_and_cached_thin_q_backends_give_same_projector_model_output(
-    basis_execution,
-) -> None:
-    torch.manual_seed(71)
-    model = CycleBasisPEModel(
-        dataset="zinc12k",
-        hidden=12,
-        pe_dim=6,
-        layers=2,
-        column_chunk_size=2,
-        basis_execution=basis_execution,
-        basis_pair_budget=7,
-    ).eval()
-    thin_graphs = [
-        _graph(4),
-        _graph(5, complete=True),
-        _graph(4, forest=True),
-        _disconnected_graph(),
-    ]
-    raw_graphs = [
-        _graph(4, basis_backend="dfs_fundamental"),
-        _graph(5, complete=True, basis_backend="dfs_fundamental"),
-        _graph(4, forest=True, basis_backend="dfs_fundamental"),
-        _disconnected_graph(basis_backend="dfs_fundamental"),
-    ]
-    assert all(graph.cycle_basis_is_orthonormal.item() for graph in thin_graphs)
-    assert not any(graph.cycle_basis_is_orthonormal.item() for graph in raw_graphs)
-    with torch.no_grad():
-        thin_output = model(collate(thin_graphs))
-        raw_output = model(collate(raw_graphs))
-    torch.testing.assert_close(raw_output, thin_output, atol=4e-5, rtol=4e-5)
+def test_pe_special_bond_response_depends_on_undirected_cyclic_distance():
+    torch.manual_seed(112)
+    graph = _graph(6)
+    batch = collate([graph])
+    bond = torch.ones(6, 5)
+    bond[0] = 3.0
+    se = LeftNullBasisEncoder(5, 9, encoding="se")
+    pe = LeftNullBasisEncoder(5, 9, encoding="pe")
+    pe.load_state_dict(se.state_dict(), strict=True)
+    se_output, se_features = _captured_edge_features(se, bond, batch)
+    pe_output, pe_features = _captured_edge_features(pe, bond, batch)
+    # All ordinary bonds receive the same SE even at different cyclic distances.
+    torch.testing.assert_close(
+        se_output[1:], se_output[1].expand_as(se_output[1:]), atol=2e-7, rtol=2e-6
+    )
+    position = graph.cycle_position_indices
+    distance = (position - position[0]).remainder(6)
+    distance = torch.minimum(distance, 6 - distance)
+    values = pe.column_phi(bond)
+    contrast = (values[0] - values[1]) / 6
+    expected = (2 * torch.pi * distance.float() / 6).cos()[:, None] * contrast
+    actual = pe_features[:, 9:18] - se_features[:, 9:18]
+    torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+    near = torch.nonzero(distance == 1).flatten()[0]
+    far = torch.nonzero(distance == 3).flatten()[0]
+    assert not torch.allclose(pe_output[near], pe_output[far], atol=1e-7, rtol=1e-7)
 
 
-@pytest.mark.parametrize("kwargs", [{"basis_execution": "unknown"}, {"basis_pair_budget": 0}])
-def test_full_model_rejects_invalid_execution_settings(kwargs):
-    with pytest.raises(ValueError, match="basis_"):
-        CycleBasisPEModel(dataset="zinc12k", **kwargs)
+def test_uniform_single_cycle_does_not_invent_distinct_positions():
+    torch.manual_seed(97)
+    batch = collate([_graph(6)])
+    pe = LeftNullBasisEncoder(5, 8, encoding="pe")
+    se = LeftNullBasisEncoder(5, 8, encoding="se")
+    se.load_state_dict(pe.state_dict(), strict=True)
+    bond = torch.ones(6, 5)
+    actual, expected = _encode(pe, bond, batch), _encode(se, bond, batch)
+    torch.testing.assert_close(actual, expected, atol=3e-6, rtol=3e-5)
+    torch.testing.assert_close(actual, actual[0].expand_as(actual), atol=3e-6, rtol=3e-5)
 
 
-def test_batched_encoder_rejects_invalid_schema_and_budget() -> None:
-    encoder = LeftNullBasisEncoder(5, 8)
-    with pytest.raises(ValueError, match="positive"):
-        encoder.forward_batch(torch.zeros(3, 5), (torch.zeros(3, 1),), pair_budget=0)
-    with pytest.raises(ValueError, match="align"):
-        encoder.forward_batch(torch.zeros(3, 5), (torch.zeros(2, 1),))
-    with pytest.raises(ValueError, match="shape"):
-        encoder.forward_batch(torch.zeros(3, 5), (torch.zeros(3),))
-    with pytest.raises(ValueError, match="floating point"):
-        encoder.forward_batch(torch.zeros(3, 5), (torch.zeros(3, 1, dtype=torch.long),))
-    with pytest.raises(ValueError, match="edgeless"):
-        encoder.forward_batch(torch.zeros(0, 5), (torch.zeros(0, 1),))
+def test_se_and_pe_have_identical_parameters_and_zero_relative_residual_recovers_se():
+    torch.manual_seed(101)
+    batch = collate([_graph(5, complete=True), _graph(4, forest=True), _disconnected_graph()])
+    se = CycleBasisPEModel(dataset="zinc12k", encoding="se", hidden=16, pe_dim=8, layers=3)
+    pe = CycleBasisPEModel(dataset="zinc12k", encoding="pe", hidden=16, pe_dim=8, layers=3)
+    pe.load_state_dict(se.state_dict(), strict=True)
+    assert list(se.state_dict()) == list(pe.state_dict())
+    assert sum(p.numel() for p in se.parameters()) == sum(p.numel() for p in pe.parameters())
+    # Explicit unit ablation of the relative term, never a valid prepared/cache
+    # phase payload or a runtime fallback: deleting R must recover the fixed SE.
+    ablated = replace(batch, cycle_position_values=torch.zeros_like(batch.cycle_position_values))
+    actual, expected = pe(ablated), se(batch)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    (actual - batch.y).square().mean().backward()
+    (expected - batch.y).square().mean().backward()
+    _assert_parameter_gradients_match(pe, se)
+
+
+@pytest.mark.parametrize("bad", [None, torch.empty(1, 4), torch.ones(2, 4, dtype=torch.long)])
+def test_pe_requires_aligned_floating_cycle_positions(bad):
+    batch = collate([_graph(4)])
+    encoder = LeftNullBasisEncoder(5, 8, encoding="pe")
+    with pytest.raises(ValueError, match="cycle_position_values"):
+        encoder(
+            torch.ones(4, 5), batch.cycle_membership, batch.cycle_lengths,
+            batch.edge_cycle_counts, batch.edge_cycle_features, bad,
+        )
+
+
+def test_encoding_names_and_protocol_identify_relative_residual_and_matched_parameters():
+    assert MODEL_NAMES == {"se": "cycle_dfs_se_v2", "pe": "cycle_dfs_relative_pe_v2"}
+    protocol = architecture_protocol("pe")
+    assert protocol["model"] == MODEL_NAMES["pe"]
+    assert "K_[1+cos] minus K_mean" in protocol["positional_encoding"]
+    assert "not general graph shortest-path distance" in protocol["relative_position"]
+    assert "identical learned modules" in protocol["parameter_matching"]
+    with pytest.raises(ValueError, match="encoding"):
+        CycleBasisPEModel(dataset="zinc12k", encoding="unknown")
+    with pytest.raises(ValueError, match="encoding"):
+        architecture_protocol("unknown")
