@@ -195,5 +195,5 @@ non-finite gradient로 실패했다. 첨부
 `benchmark.py:589`는 수정 전 `08d8ed6`의 FP16+GradScaler 경로와 정확히 일치하므로 r2는
 `214265c`의 BF16/no-scaler 정책을 검증한 실행이 아니다. r2 checkpoint를 수정판에 resume하지
 않는다. 다음 통합 run은 `new-v5-cyclev2-a6000-gpu3-seed0-r3`이며, 실행 전
-`git merge-base --is-ancestor 214265c HEAD || { echo "required fix 214265c is missing"; exit 1; }`로
-현재 HEAD가 source-fix commit `214265c`를 포함하는지 반드시 확인한다.
+`git show -s --oneline 214265c`를 실행해 출력이
+`214265c Fix V5 and Cycle V2 GPU failures`인지 눈으로 확인한다.

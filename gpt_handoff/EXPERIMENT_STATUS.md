@@ -104,8 +104,8 @@ calibration backward에서 다시 44.47/44.55GiB OOM이 발생했고 18개가 �
 checkpoint, condition-aware selection, BF16/no-scaler 수정의 검증 결과가 아니며 그 수치나
 artifact를 수정판 결과로 사용하거나 r3에 resume하지 않는다. 다음 통합 실행 ID는
 `new-v5-cyclev2-a6000-gpu3-seed0-r3`다. 실행 전에 `git pull --ff-only` 후
-`git merge-base --is-ancestor 214265c HEAD || { echo "required fix 214265c is missing"; exit 1; }`로
-현재 HEAD가 source-fix commit `214265c`를 포함하는지 반드시 확인한 뒤 시작한다.
+`git show -s --oneline 214265c`를 실행해 출력이
+`214265c Fix V5 and Cycle V2 GPU failures`인지 눈으로 확인한 뒤 시작한다.
 
 V3는 graph-centered score → bounded relative C → isotropic mixture와 학습 alpha의
 대칭 정규화를 사용한다. AdamW backbone/생성기/scalar 그룹을 분리했다. 현재 기본은

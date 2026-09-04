@@ -10,6 +10,13 @@
 설치 문서는 GPT 기본 전달 묶음에는 필요하지 않다.
 이 문서는 실행 입문서가 아니라 연구·구현 교차검토용이다.
 
+## 사용자용 interactive shell 명령 규칙
+
+사용자에게 복사해 주는 interactive shell 명령에는 `exit` 계열이나 `set -e`, `set -u`,
+`set -o pipefail`을 넣지 않는다. 검사 명령과 실제 학습 명령은 반드시 별도 코드 블록으로
+제공한다. 검사는 셸을 종료하지 않는 읽기 전용 명령으로 하고, 사용자가 예상 출력을 눈으로
+확인한 뒤 별도 학습 블록을 실행하도록 명시한다.
+
 ## 0. 리뷰어가 먼저 알아야 할 판정
 
 ### 2026-09-03 V5와 새 Cycle PE V2 — 이 항목이 아래 과거 V2/V4/scaling 기록보다 우선한다
@@ -54,8 +61,8 @@
   구 `joint_best=` 출력이 `08d8ed6`와 일치하므로 r2에는 수정 commit `214265c`가 적용되지 않았고
   수정 검증으로 사용할 수 없다. r2를 resume하지 말고 `new-v5-cyclev2-a6000-gpu3-seed0-r3`를
   사용한다. 실행 전 `git pull --ff-only` 후
-  `git merge-base --is-ancestor 214265c HEAD || { echo "required fix 214265c is missing"; exit 1; }`로
-  현재 HEAD가 source-fix commit `214265c`를 포함하는지 반드시 확인한다.
+  `git show -s --oneline 214265c`를 실행해 출력이
+  `214265c Fix V5 and Cycle V2 GPU failures`인지 눈으로 확인한다.
 
 ### 2026-09-01 추가 요청 반영: 상대 C graph operator × spatial W v4
 

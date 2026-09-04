@@ -194,8 +194,8 @@ CUDA OOM으로 중단됐다. 따라서 dynamic C 점수, fixed-vs-dynamic 비교
 r2는 `214265c`의 dynamic edge-score checkpoint나 condition-aware checkpoint selection을
 검증하지 않았다. 다음 실행은 r2를 resume하지 않고 통합 run ID
 `new-v5-cyclev2-a6000-gpu3-seed0-r3`를 사용한다. 실행 전
-`git merge-base --is-ancestor 214265c HEAD || { echo "required fix 214265c is missing"; exit 1; }`로
-현재 HEAD가 source-fix commit `214265c`를 포함하는지 반드시 확인한다.
+`git show -s --oneline 214265c`를 실행해 출력이
+`214265c Fix V5 and Cycle V2 GPU failures`인지 눈으로 확인한다.
 
 ## V1–V5 reference/large 비교
 

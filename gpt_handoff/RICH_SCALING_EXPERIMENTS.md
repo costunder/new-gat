@@ -199,14 +199,18 @@ Conductance `train.py:785`·`joint_best=` 형식과 Cycle `benchmark.py:589`는 
 수정판의 최소 통합 재실행은 다음 24개 job만 계획한다. V1–V4, Cycle V1과 Tree는 포함하지
 않고, 검증된 Cycle dataset/projector cache는 재사용한다. 구 fixed-C job은 실제 epoch-10
 global-best state를 저장하지 않았으므로 corrected checkpoint를 위해 V5 20개 안에서 다시
-학습한다. 첫 두 명령으로 현재 HEAD가 source-fix commit `214265c`를 포함하는지 fail-closed로
-검사하며, 검사에 실패하면 학습을 시작하지 않는다. 후속 문서 commit 때문에 HEAD 자체가
-`214265c`와 같을 필요는 없다.
+학습한다. 첫 명령 블록으로 source-fix commit `214265c`를 조회하고, 출력이 정확히
+`214265c Fix V5 and Cycle V2 GPU failures`인지 눈으로 확인한 뒤 별도의 학습 명령 블록을
+실행한다. 후속 문서 commit 때문에 HEAD 자체가 `214265c`와 같을 필요는 없다.
 
 ```bash
 git pull --ff-only
-git merge-base --is-ancestor 214265c HEAD || { echo "required fix 214265c is missing"; exit 1; }
+git show -s --oneline 214265c
+```
 
+위 출력이 `214265c Fix V5 and Cycle V2 GPU failures`인지 확인한 뒤 다음을 실행한다.
+
+```bash
 env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
 python -B scripts/run_rich_scaling.py \
   --run-id new-v5-cyclev2-a6000-gpu3-seed0-r3 \
