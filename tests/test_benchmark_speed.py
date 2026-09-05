@@ -745,7 +745,12 @@ def test_cycle_builder_rejects_candidate_larger_than_official_training_split(mon
         speed._build_cycle_case(args, torch.device("cpu"))
 
 
-def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "backend, solver_steps", [("optimization", 8), ("optimization", 12), ("mlp", 8)]
+)
+def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(
+    monkeypatch, tmp_path, backend, solver_steps
+):
     from research.conductance_gat.v5 import model, train
 
     batch = SimpleNamespace(
@@ -798,6 +803,12 @@ def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(monkeypa
         v5_num_neighbors=[15, 10],
         v5_scale_profile="reference",
         v5_condition="shared_dynamic_c",
+        v5_conductance_backend=backend,
+        v5_solver_steps=solver_steps,
+        v5_solver_step_size=0.125,
+        v5_solver_entropy=0.75,
+        v5_solver_degree_barrier=0.2,
+        v5_training_schedule="staged",
     )
     payload = {"dataset": "ogbn-arxiv", "classes": 2, "graphs": [{"x": batch.x}]}
     case = speed._build_v5_case(
@@ -814,6 +825,16 @@ def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(monkeypa
     assert case.description["production_path_identity"]["loss"].endswith(".training_loss")
     assert case.description["v5_architecture"]["hidden_channels"] == 256
     candidate = case.make_model("current")
+    assert case.description["v5_architecture"]["conductance_backend"] == backend
+    assert case.description["v5_architecture"]["solver_steps"] == solver_steps
+    assert case.description["v5_requested_training_schedule"] == "staged"
+    assert case.description["v5_measured_phase"] == "joint"
+    assert seen["model_kwargs"]["conductance_backend"] == backend
+    assert seen["model_kwargs"]["solver_steps"] == solver_steps
+    assert seen["model_kwargs"]["solver_step_size"] == 0.125
+    assert seen["model_kwargs"]["solver_entropy"] == 0.75
+    assert seen["model_kwargs"]["solver_degree_barrier"] == 0.2
+    assert "training_schedule" not in seen["model_kwargs"]
     assert seen["phase"] == "joint" and seen["phase_epoch"] == 0
     assert candidate.conductance_mode == "dynamic"
     expected = torch.nn.functional.cross_entropy(

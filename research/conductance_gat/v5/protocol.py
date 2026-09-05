@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 import math
+from typing import Any
 
 SUITE = "conductance_graph_conditioned_v5"
-PARAMETERIZATION = "shared_dynamic_relative_c_with_multihead_w_and_graph_beta"
+PARAMETERIZATION = "shared_unrolled_optimized_relative_c_with_multihead_w_and_graph_beta_v1"
+CONDUCTANCE_BACKENDS = ("optimization", "mlp")
+DEFAULT_CONDUCTANCE_BACKEND = "optimization"
+DEFAULT_SOLVER_STEPS = 8
+DEFAULT_SOLVER_STEP_SIZE = 0.25
+DEFAULT_SOLVER_ENTROPY = 1.0
+DEFAULT_SOLVER_DEGREE_BARRIER = 0.1
+TRAINING_SCHEDULES = ("joint", "staged")
+DEFAULT_TRAINING_SCHEDULE = "joint"
 BETA_PARAMETERIZATIONS = ("sigmoid", "margin_sigmoid")
 DEFAULT_BETA_PARAMETERIZATION = "sigmoid"
 DEFAULT_BETA_INITIAL = 0.1
@@ -16,6 +25,77 @@ METRIC_BY_DATASET = {
 }
 BATCH_SIZE_BY_DATASET = {dataset: 2 if dataset == "ppi" else 1 for dataset in DATASETS}
 DEFAULT_EDGE_CHUNK_SIZE = 65536
+
+
+def conductance_configuration(
+    conductance_backend: str = DEFAULT_CONDUCTANCE_BACKEND,
+    solver_steps: int = DEFAULT_SOLVER_STEPS,
+    solver_step_size: float = DEFAULT_SOLVER_STEP_SIZE,
+    solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
+    solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
+) -> dict[str, int | float | str]:
+    """Canonical architecture identity; solver fields are inactive for the MLP ablation."""
+
+    if conductance_backend not in CONDUCTANCE_BACKENDS:
+        raise ValueError(f"unsupported conductance backend: {conductance_backend}")
+    if isinstance(solver_steps, bool) or not isinstance(solver_steps, int) or solver_steps < 1:
+        raise ValueError("solver_steps must be a positive integer")
+    values = {
+        "solver_step_size": solver_step_size,
+        "solver_entropy": solver_entropy,
+        "solver_degree_barrier": solver_degree_barrier,
+    }
+    for name, value in values.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or (value <= 0 if name != "solver_degree_barrier" else value < 0)
+        ):
+            raise ValueError(
+                f"{name} must be finite and "
+                + ("nonnegative" if name == "solver_degree_barrier" else "positive")
+            )
+    return {
+        "conductance_backend": conductance_backend,
+        "solver_steps": solver_steps,
+        **{name: float(value) for name, value in values.items()},
+    }
+
+
+def add_conductance_arguments(parser, *, prefix: str = "") -> None:
+    """Share explicit architecture CLI options across standalone and nested runners."""
+
+    parser.add_argument(
+        f"--{prefix}conductance-backend",
+        choices=CONDUCTANCE_BACKENDS,
+        default=DEFAULT_CONDUCTANCE_BACKEND,
+        help="optimization unrolls C updates; mlp explicitly selects the legacy ablation",
+    )
+    parser.add_argument(f"--{prefix}solver-steps", type=int, default=DEFAULT_SOLVER_STEPS)
+    parser.add_argument(f"--{prefix}solver-step-size", type=float, default=DEFAULT_SOLVER_STEP_SIZE)
+    parser.add_argument(f"--{prefix}solver-entropy", type=float, default=DEFAULT_SOLVER_ENTROPY)
+    parser.add_argument(
+        f"--{prefix}solver-degree-barrier", type=float, default=DEFAULT_SOLVER_DEGREE_BARRIER
+    )
+    parser.add_argument(
+        f"--{prefix}training-schedule",
+        choices=TRAINING_SCHEDULES,
+        default=DEFAULT_TRAINING_SCHEDULE,
+        help="joint learns C/W from epoch one; staged is the explicit historical ablation",
+    )
+
+
+def conductance_arguments_configuration(args, *, prefix: str = "") -> dict[str, Any]:
+    """Validate both solver architecture and schedule from a parsed namespace."""
+
+    configuration = conductance_configuration(
+        **{name: getattr(args, prefix + name) for name in conductance_configuration()}
+    )
+    schedule = getattr(args, prefix + "training_schedule")
+    if schedule not in TRAINING_SCHEDULES:
+        raise ValueError(f"unsupported training schedule: {schedule}")
+    return {**configuration, "training_schedule": schedule}
 
 
 def beta_configuration(
@@ -115,6 +195,8 @@ SCALE_PROFILES = {
 }
 COMMON = {
     **SCALE_PROFILES["reference"],
+    **conductance_configuration(),
+    "training_schedule": DEFAULT_TRAINING_SCHEDULE,
     "lr": 0.0005,
     "conductance_lr_multiplier": 1.0,
     "beta_lr_multiplier": 1.0,
@@ -138,25 +220,27 @@ CONDITIONS = {
 SAMPLING_MODES = ("full", "neighbor", "cluster")
 TRAINING_PHASES = ("spatial_warmup", "conductance_calibration", "alternating", "joint")
 
-# This is deliberately an end-to-end recipe comparison.  The fixed arm spends
-# dynamic-C calibration/alternation turns updating its spatial model, whereas
-# the dynamic arm spends those turns on C.  Effective group step counts are
-# therefore mandatory output metadata and the contrast is not a one-variable
-# causal estimate of merely replacing C=1.
+# The default joint schedule updates every active group from epoch one. The
+# historical staged ablation allocates different C/backbone steps across arms.
+# Capacity and actual optimizer-step counts remain mandatory audit metadata.
 COMPARISON_DESIGN = {
     "estimand": "fixed-C training recipe versus shared-dynamic-C training recipe",
     "single_factor_causal_effect_of_c": False,
-    "unequal_parameter_group_update_allocation": True,
+    "unequal_parameter_group_update_allocation": {"joint": False, "staged": True},
+    "default_training_schedule": DEFAULT_TRAINING_SCHEDULE,
     "required_audit_field": "effective_optimizer_steps_by_group",
     "parameterization": (
-        "fixed C=1 is parameter-free; dynamic C adds only its active score network. "
+        "fixed C=1 is parameter-free; dynamic C adds the active optimizer-cost parameters "
+        "or the explicitly selected legacy MLP scorer. C is optimized by a finite unrolled "
+        "inner solver in the default backend, not stored as a per-edge parameter table. "
         "Shared backbone/W/beta initialization is paired and hash-verified, while total "
         "parameter capacity is reported separately rather than padded with unused weights"
     ),
     "checkpoint_selection": {
         "primary": (
-            "fixed_c selects its all-epoch validation best; shared_dynamic_c selects its "
-            "C-active validation best from calibration, alternating, or joint phases"
+            "joint: both arms select their all-epoch validation best because C is active "
+            "from epoch one; staged: fixed_c selects all-epoch best and shared_dynamic_c "
+            "selects C-active best from calibration, alternating, or joint phases"
         ),
         "auxiliary_prediction": "all-epoch validation best is reported for both arms",
         "early_stopping": (
@@ -179,12 +263,15 @@ PROTOCOL_NOTE = (
     "per layer. Both arms learn identical multi-head W_h and graph-conditioned beta_h. "
     "The default beta is an un-margined sigmoid with nominal beta_0=0.1; the historical "
     "bounded-margin sigmoid remains an explicit ablation. "
-    "Dynamic C is symmetric, positive, bounded and relative; beta carries identifiable "
+    "Default dynamic C is a symmetric positive mean-one field computed by finite unrolled "
+    "optimization; legacy MLP-C remains an explicit ablation. Solver steps do not certify "
+    "convergence, so residuals are recorded. beta carries identifiable "
     "diffusion magnitude. Transductive datasets may train on dependency-free samples that "
     "retain original degrees and apply explicit boundary correction; validation remains the "
     "complete official graph. PPI retains its official 20/2/2 split. No test labels are used."
-    " The two arms use intentionally different phase-wise parameter-group update allocations, "
-    "so their reported contrast is a recipe comparison, not a single-C causal effect."
+    " Default training jointly learns all active groups from epoch one; the explicit staged "
+    "ablation retains historical phase allocations. Parameter capacity and actual group "
+    "updates are reported rather than claiming a pure single-C causal effect."
     " The a6000-48gb profile changes real batch/sample size and numeric execution, so it must "
     "not be pooled with or directly contrasted against portable-profile metrics."
 )

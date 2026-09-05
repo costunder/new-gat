@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.utils.checkpoint
 
@@ -78,7 +79,8 @@ def test_score_chunk_checkpoint_is_eval_safe_and_preserves_gradients(monkeypatch
         torch.testing.assert_close(actual[2][name], expected[2][name], rtol=1e-5, atol=1e-7)
 
 
-def test_block_checkpoint_is_not_disabled_by_calibration_eval_mode(monkeypatch):
+@pytest.mark.parametrize("backend", ["optimization", "mlp"])
+def test_block_checkpoint_is_not_disabled_by_calibration_eval_mode(monkeypatch, backend):
     from research.conductance_gat.v5.train import configure_phase, parameter_group
 
     model = GraphConditionedConductanceNodeClassifier(
@@ -90,6 +92,7 @@ def test_block_checkpoint_is_not_disabled_by_calibration_eval_mode(monkeypatch):
         ffn_multiplier=2,
         dropout=0.2,
         conductance_mode="dynamic",
+        conductance_backend=backend,
         edge_chunk_size=3,
         activation_checkpoint=True,
     )
@@ -124,7 +127,17 @@ def test_block_checkpoint_is_not_disabled_by_calibration_eval_mode(monkeypatch):
         else:
             assert not parameter.requires_grad
             assert parameter.grad is None
-    assert all(
-        operator.estimator.score_network[-1].weight.grad.abs().sum() > 0
-        for operator in model.operators
-    )
+    if backend == "mlp":
+        assert all(
+            operator.estimator.score_network[-1].weight.grad.abs().sum() > 0
+            for operator in model.operators
+        )
+    else:
+        assert all(
+            operator.estimator.node_projection.weight.grad.abs().sum() > 0
+            for operator in model.operators
+        )
+        assert all(
+            operator.estimator.last_solver_diagnostics["executed_steps"] == 8
+            for operator in model.operators
+        )

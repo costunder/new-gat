@@ -38,7 +38,9 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     HARDWARE_PROFILES,
     SCALE_PROFILES,
     SUITE,
+    add_conductance_arguments,
     beta_configuration,
+    conductance_arguments_configuration,
 )
 from scripts import run_conductance_factorial as shared  # noqa: E402
 from scripts.check_dependencies import (  # noqa: E402
@@ -69,6 +71,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--beta-initial", type=float, default=DEFAULT_BETA_INITIAL)
     result.add_argument("--beta-min", type=float)
     result.add_argument("--beta-max", type=float)
+    add_conductance_arguments(result)
     result.add_argument("--model-seed", type=int, default=0)
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
@@ -125,6 +128,7 @@ def _architecture(args: argparse.Namespace) -> dict[str, Any]:
             args.beta_max,
         )
     )
+    architecture.update(conductance_arguments_configuration(args))
     return architecture
 
 
@@ -484,8 +488,7 @@ def main(argv: list[str] | None = None) -> int:
             dataset: _resolved_execution(args, dataset) for dataset in args.datasets
         },
         "workers_by_dataset": {
-            dataset: shared.workers_for_dataset(dataset, args.workers)
-            for dataset in args.datasets
+            dataset: shared.workers_for_dataset(dataset, args.workers) for dataset in args.datasets
         },
         "sampling": args.sampling,
         "num_neighbors": list(args.num_neighbors),
@@ -522,7 +525,10 @@ def main(argv: list[str] | None = None) -> int:
                 "dependencies": dependencies,
             }
             if any(manifest.get(key) != value for key, value in expected.items()):
-                raise RuntimeError("existing run contract differs from this invocation")
+                raise RuntimeError(
+                    "existing run contract differs from this invocation; changed C backend, "
+                    "solver, or schedule requires a new run ID; old results are preserved"
+                )
             if [_identity(job) for job in manifest.get("jobs", [])] != [
                 _identity(job) for job in jobs
             ]:

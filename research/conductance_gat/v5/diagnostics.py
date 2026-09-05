@@ -41,6 +41,26 @@ def parameter_norm(parameters, *, gradient: bool = False) -> float | None:
     return float(torch.stack(values).sum().sqrt()) if values else None
 
 
+def solver_diagnostics(estimator: nn.Module) -> dict[str, Any]:
+    """Serialize the last forward's solver audit only at an existing log boundary."""
+
+    values = getattr(estimator, "last_solver_diagnostics", None)
+    if values is None:
+        return {"applicable": False, "reason": "MLP backend has no inner C optimization"}
+
+    def convert(value):
+        if isinstance(value, Tensor):
+            require_finite_tensor(value, "C solver diagnostic")
+            return value.detach().cpu().tolist()
+        if isinstance(value, dict):
+            return {key: convert(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [convert(item) for item in value]
+        return value
+
+    return {"scope": "last forward graph or disjoint graph batch", **convert(values)}
+
+
 def layer_diagnostics(model: nn.Module, *, gradients: bool = False) -> list[dict[str, Any]]:
     rows = []
     for layer, operator in enumerate(model.operators):
@@ -52,6 +72,8 @@ def layer_diagnostics(model: nn.Module, *, gradients: bool = False) -> list[dict
                 "conductance": tensor_moments(operator.estimator.last_c),
                 "log_conductance": tensor_moments(operator.estimator.last_log_c),
                 "score": tensor_moments(operator.estimator.last_scores),
+                "conductance_backend": operator.conductance_backend,
+                "c_optimization": solver_diagnostics(operator.estimator),
                 "beta": tensor_moments(operator.last_beta),
                 "sampling_correction": tensor_moments(operator.last_sampling_correction),
                 "conductance_parameter_norm": parameter_norm(estimator_parameters),
@@ -76,8 +98,14 @@ def require_first_step_conductance_gradient(model: nn.Module) -> dict[str, Any]:
     for layer, operator in enumerate(model.operators):
         named = list(operator.estimator.named_parameters())
         total = parameter_norm((value for _, value in named), gradient=True)
+        optimization = operator.conductance_backend == "optimization"
         upstream = parameter_norm(
-            (value for name, value in named if "score_network.4" not in name), gradient=True
+            (
+                value
+                for name, value in named
+                if ("projection" in name if optimization else "score_network.4" not in name)
+            ),
+            gradient=True,
         )
         passed = total is not None and total > 0 and upstream is not None and upstream > 0
         rows.append(
@@ -85,6 +113,12 @@ def require_first_step_conductance_gradient(model: nn.Module) -> dict[str, Any]:
                 "layer": layer,
                 "total_gradient_norm": total,
                 "upstream_gradient_norm": upstream,
+                "conductance_backend": operator.conductance_backend,
+                "upstream_definition": (
+                    "compatibility projection parameters through unrolled C updates"
+                    if optimization
+                    else "MLP parameters excluding its final score weight"
+                ),
                 "passed": passed,
             }
         )

@@ -53,7 +53,9 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     DEFAULT_BETA_PARAMETERIZATION,
     HARDWARE_PROFILES,
     SCALE_PROFILES,
+    add_conductance_arguments,
     beta_configuration,
+    conductance_arguments_configuration,
 )
 from research.conductance_gat.v5.protocol import (  # noqa: E402
     CONDITIONS as V5_CONDITIONS,
@@ -162,6 +164,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--v5-beta-initial", type=float, default=DEFAULT_BETA_INITIAL)
     result.add_argument("--v5-beta-min", type=float)
     result.add_argument("--v5-beta-max", type=float)
+    add_conductance_arguments(result, prefix="v5-")
     result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
     result.add_argument(
         "--resource-plan", type=Path, help="Immutable measured V5 batch/worker plan"
@@ -221,6 +224,7 @@ def _validate(args: argparse.Namespace) -> None:
     ):
         raise ValueError("portable V5 PPI requires graph batch-size at least 2")
     _v5_beta_configuration(args)
+    _v5_conductance_configuration(args)
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
         raise ValueError("CUDA is required; CPU training/fallback is not supported")
     if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
@@ -313,6 +317,10 @@ def _effective_min_free_gb(args: argparse.Namespace) -> float:
     )
 
 
+def _v5_conductance_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return conductance_arguments_configuration(args, prefix="v5_")
+
+
 def _exclusions(args: argparse.Namespace) -> list[dict[str, str]]:
     if args.datasets is None:
         return []
@@ -352,6 +360,7 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             profile = {key: full_profile[key] for key in profile_fields}
             if version == "v5":
                 profile.update(_v5_beta_configuration(args))
+                profile.update(_v5_conductance_configuration(args))
             for seed in args.model_seeds:
                 for dataset in _selected_datasets(args, version):
                     child_workers = shared.workers_for_dataset(dataset, args.workers)
@@ -444,6 +453,8 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                                 *(str(value) for value in args.v5_num_neighbors),
                             ]
                             for name, value in _v5_beta_configuration(args).items():
+                                command += ["--" + name.replace("_", "-"), str(value)]
+                            for name, value in _v5_conductance_configuration(args).items():
                                 command += ["--" + name.replace("_", "-"), str(value)]
                             validate_job_plan(
                                 getattr(args, "resolved_resource_plan", None),
@@ -725,7 +736,10 @@ def _load_resume_manifest(
         ("dependencies", dependencies),
     ):
         if manifest.get(key) != expected:
-            raise RuntimeError(f"existing manifest {key} does not match this invocation")
+            raise RuntimeError(
+                f"existing manifest {key} does not match this invocation; changed V5 C "
+                "backend/solver/schedule requires a new run ID; old results are preserved"
+            )
     if not snapshots_match(manifest.get("source_sha256"), source_sha256):
         raise RuntimeError("existing manifest source_sha256 does not match this invocation")
     existing_jobs = manifest.get("jobs")
@@ -1143,6 +1157,7 @@ def main(argv: list[str] | None = None) -> int:
         "v5_edge_chunk_size": args.v5_edge_chunk_size,
         "v5_ppi_batch_size": args.v5_ppi_batch_size,
         "v5_beta": _v5_beta_configuration(args),
+        "v5_conductance": (_v5_conductance_configuration(args) if "v5" in args.versions else None),
         "hardware_profile": args.hardware_profile,
         "resource_plan": (
             resource_plan_identity(args.resolved_resource_plan)

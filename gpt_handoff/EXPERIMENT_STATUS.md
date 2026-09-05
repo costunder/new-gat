@@ -1,6 +1,6 @@
 # 실험 결과와 구현 상태
 
-기준일: 2026-09-05 (Asia/Seoul).
+기준일: 2026-09-06 (Asia/Seoul).
 
 이 문서는 사용자가 제공한 **서버 결과 출력**과 **현재 소스 버전의 구현**을 구분한 기록이다.
 문서 작성 자체가 새 학습을 실행했다는 뜻은 아니다. 수치는 사용자 로그에서 확인했으며,
@@ -8,7 +8,26 @@
 
 ## 1. 소스 버전과 측정 범위
 
-### 현재: measured run 재개 오류 수령과 복구
+### 현재: V5 C 최적화 계층으로 구조 변경
+
+기본 V5를 입력 그래프별 K회 C 최적화 후 가중 라플라시안으로 전파하는 구조로 변경했다.
+기존 MLP-C는 명시적 비교 옵션으로 보존한다. Reference/large 모델 규모, 공식 데이터셋,
+seed 0, 전체 epoch와 실험 범위는 유지하며 기본 학습은 첫 epoch부터 joint다.
+이 변경은 이전 RNG 복구 패치와 달리 모델/학습 계약 변경이다. 과거 MLP checkpoint와
+새 optimization checkpoint를 섞지 않으며 기존 호환 registry도 확장하지 않는다.
+새 solver의 설정·에너지·잔차와 실제 반복 수를 기록하고 자원 calibration에도 같은 모델을 사용한다.
+구현과 로컬 CPU 회귀 검증을 완료했다. 최종 전체 회귀는 **2,242 passed / 103 skipped**
+(153.82초)다. 새 C solver 44개 및 학습/재개/calibration 연결 13개 시험을 포함한다.
+과제 loss에서 C 계층의 모든 학습 파라미터로 전달되는 gradient와 실제 optimizer update,
+미분 수치 검사, 라벨 없는 추론, C 양수·가중 평균 1, CPU 다음 학습 step의 정확한 재개,
+이전 구조 checkpoint 거부와 기존 artifact 보존을 검사했다. Ruff 정적 검사와 코드 스냅샷
+일치 검사도 통과했다. 생략 항목은 CUDA/BF16, 미설치 PyG, Linux/Bash 및 native Linux 기능,
+Windows symlink 권한, 별도 opt-in IPC stress 등이다.
+A6000 실측·실제 데이터 전체 학습/평가는 미실행이다. CPU debug/단위 테스트는 GPU smoke
+test나 실제 데이터 성능 증거가 아니다. K=8은 유한 반복 설계 기본값이며 수렴 완료나
+SOTA 성능을 주장하지 않는다. 아래 회귀 개수는 이전 소스의 역사 기록이다.
+
+### 이전: measured run 재개 오류 수령과 복구
 
 사용자 첨부 `d735747a-bea6-4e6b-9a8e-c5b2b14b537d/pasted-text.txt`에서
 `measured-v5-cycle-se-pe-a6000-gpu3-seed0-v1`의 다음 상태를 확인했다.

@@ -1,4 +1,4 @@
-"""CPU/file-fixture recovery integration only; never real GPU training or metrics."""
+"""Archived repair fixtures and current-source rejection; no real GPU measurements."""
 
 from __future__ import annotations
 
@@ -19,22 +19,26 @@ from scripts import run_rich_scaling as rich
 from scripts import training_resource_plan as resources
 
 
-def _legacy_snapshot(current):
-    """Reconstruct the reviewed predecessor from the actual checked-in registry."""
+def _archived_reviewed_snapshots(source_paths):
+    """Reconstruct only the historical before/after SHA records, not live sources.
+
+    Tests below explicitly stub source providers to these archived records when
+    exercising the old numerical repair. They do not certify today's model as
+    compatible with that repair. Unchanged historical files are not fabricated.
+    """
     registry = json.loads(resume_compat.REGISTRY_PATH.read_bytes())
-    previous = dict(current)
+    previous, repaired = {}, {}
     for name, change in registry["changes"].items():
-        if name not in previous:
+        if name not in source_paths:
             continue
-        assert previous[name] == change["after"]
-        if change["before"] is None:
-            previous.pop(name)
-        else:
+        repaired[name] = change["after"]
+        if change["before"] is not None:
             previous[name] = change["before"]
-    previous.pop(resume_compat.REGISTRY_SOURCE)
-    assert previous != current
-    assert resume_compat.require_source_compatibility(previous, current) is not None
-    return previous
+    repaired[resume_compat.REGISTRY_SOURCE] = hashlib.sha256(
+        resume_compat.REGISTRY_PATH.read_bytes()
+    ).hexdigest()
+    assert resume_compat.require_source_compatibility(previous, repaired) is not None
+    return previous, repaired
 
 
 def _fixture_module(name):
@@ -49,13 +53,30 @@ def _fixture_module(name):
 
 
 def _rich_args(tmp_path):
-    args = rich.parser().parse_args([
-        "--tracks", "conductance", "cycle", "--conductance-versions", "v5",
-        "--cycle-versions", "v2", "--profiles", "reference", "large",
-        "--model-seeds", "0", "--hardware-profile", "a6000-48gb",
-        "--data-root", str(tmp_path / "data"), "--results-root", str(tmp_path / "results"),
-        "--run-id", "debug-reviewed-recovery",
-    ])
+    args = rich.parser().parse_args(
+        [
+            "--tracks",
+            "conductance",
+            "cycle",
+            "--conductance-versions",
+            "v5",
+            "--cycle-versions",
+            "v2",
+            "--profiles",
+            "reference",
+            "large",
+            "--model-seeds",
+            "0",
+            "--hardware-profile",
+            "a6000-48gb",
+            "--data-root",
+            str(tmp_path / "data"),
+            "--results-root",
+            str(tmp_path / "results"),
+            "--run-id",
+            "debug-reviewed-recovery",
+        ]
+    )
     rich._validate(args)
     return args
 
@@ -66,7 +87,11 @@ def test_existing_measured_plan_keeps_original_request_and_certificate_bytes(
 ):
     args = _rich_args(tmp_path)
     request = rich._calibration_request(args, args.run_id)
-    request["source_sha256"] = _legacy_snapshot(request["source_sha256"])
+    previous, archived_repaired = _archived_reviewed_snapshots(request["source_sha256"])
+    request["source_sha256"] = previous
+    # These are explicitly archived source providers, not current-code evidence.
+    monkeypatch.setattr(rich, "calibration_source_snapshot", lambda: archived_repaired)
+    monkeypatch.setattr(calibration, "source_snapshot", lambda: archived_repaired)
     if drift == "source":
         request["source_sha256"]["research/cycle_pe/v2/model.py"] = "0" * 64
     directory = args.results_root / "resource_calibration" / args.run_id
@@ -77,11 +102,14 @@ def test_existing_measured_plan_keeps_original_request_and_certificate_bytes(
     request_before, plan_before = request_path.read_bytes(), plan_path.read_bytes()
     hardware = {"debug_only": True}
     plan = {
-        "_sha256": hashlib.sha256(plan_before).hexdigest(), "entries": [],
-        "request_sha256": resources.digest(request), "source_sha256": request["source_sha256"],
+        "_sha256": hashlib.sha256(plan_before).hexdigest(),
+        "entries": [],
+        "request_sha256": resources.digest(request),
+        "source_sha256": request["source_sha256"],
         "hardware": {job["device"]: hardware for job in request["jobs"]},
         "runtime": {
-            "python": platform.python_version(), "torch": torch.__version__,
+            "python": platform.python_version(),
+            "torch": torch.__version__,
             "cuda": torch.version.cuda,
         },
     }
@@ -109,7 +137,9 @@ def test_existing_measured_plan_keeps_original_request_and_certificate_bytes(
     if drift is None:
         rich._ensure_measured_plan(args, args.run_id, run_dir)
         assert events == [
-            "official_input_validation", "existing_plan_returned_without_measurement", "runtime"
+            "official_input_validation",
+            "existing_plan_returned_without_measurement",
+            "runtime",
         ]
         assert args.resolved_resource_plan["_sha256"] == hashlib.sha256(plan_before).hexdigest()
     else:
@@ -124,8 +154,7 @@ def test_existing_measured_plan_keeps_original_request_and_certificate_bytes(
 def test_conductance_legacy_manifest_recovery_revalidates_and_skips_completed_children(
     tmp_path, monkeypatch, case
 ):
-    current = conductance._source_snapshot()
-    previous = _legacy_snapshot(current)
+    previous, current = _archived_reviewed_snapshots(conductance._source_snapshot())
     fixture = _fixture_module("test_conductance_scaling_runner")
     options, calls = fixture._stub(tmp_path, monkeypatch)
     options += ["--versions", "v5", "--model-seeds", "0"]
@@ -168,16 +197,31 @@ def test_conductance_legacy_manifest_recovery_revalidates_and_skips_completed_ch
 def test_cycle_legacy_failed_manifest_adoption_does_not_trust_passed_candidate_status(
     tmp_path, monkeypatch, artifact_changed
 ):
-    args = cycle.parser().parse_args([
-        "--versions", "v2", "--encodings", "se", "pe", "--profiles", "reference",
-        "--datasets", "zinc12k", "--model-seeds", "0", "--data-root", str(tmp_path / "data"),
-        "--results-root", str(tmp_path), "--run-id", "debug-cycle-recovery",
-    ])
+    args = cycle.parser().parse_args(
+        [
+            "--versions",
+            "v2",
+            "--encodings",
+            "se",
+            "pe",
+            "--profiles",
+            "reference",
+            "--datasets",
+            "zinc12k",
+            "--model-seeds",
+            "0",
+            "--data-root",
+            str(tmp_path / "data"),
+            "--results-root",
+            str(tmp_path),
+            "--run-id",
+            "debug-cycle-recovery",
+        ]
+    )
     cycle._validate(args)
     run_dir = tmp_path / "cycle_pe/scaling" / args.run_id
     run_dir.mkdir(parents=True)
-    current = cycle._source_snapshot()
-    previous = _legacy_snapshot(current)
+    previous, current = _archived_reviewed_snapshots(cycle._source_snapshot())
     jobs = cycle.make_jobs(args, run_dir)
     manifest = cycle._manifest_base(args, args.run_id, run_dir, jobs, {"debug": True}, previous)
     accepted = [{"debug_certificate": "unchanged"}]
@@ -211,8 +255,8 @@ def test_rich_legacy_failed_manifest_revalidates_completed_track_and_continues_o
     tmp_path, monkeypatch
 ):
     fixture = _fixture_module("test_rich_scaling_runner")
-    current, calls = rich._source_snapshot(), []
-    previous = _legacy_snapshot(current)
+    previous, current = _archived_reviewed_snapshots(rich._source_snapshot())
+    calls = []
     monkeypatch.setattr(rich, "_ensure_measured_plan", lambda *_args: None)
     monkeypatch.setattr(rich, "_source_snapshot", lambda: previous)
     options = ["--tracks", "conductance", "cycle", *fixture._base_options(tmp_path)]
@@ -248,12 +292,11 @@ def test_rich_legacy_failed_manifest_revalidates_completed_track_and_continues_o
     assert completed_path.read_bytes() == completed_before
 
 
-@pytest.mark.parametrize("runner,check", [
-    (conductance, "_check_sources"), (rich, "_check_central_sources")
-])
+@pytest.mark.parametrize(
+    "runner,check", [(conductance, "_check_sources"), (rich, "_check_central_sources")]
+)
 def test_reviewed_resume_does_not_allow_any_source_change_mid_run(monkeypatch, runner, check):
-    current = runner._source_snapshot()
-    previous = _legacy_snapshot(current)
+    previous, current = _archived_reviewed_snapshots(runner._source_snapshot())
     manifest = {"source_sha256": previous, "source_integrity_valid": True}
     resume_compat.adopt_source_snapshot(manifest, current)
     monkeypatch.setattr(runner, "_source_snapshot", lambda: current)
@@ -263,3 +306,31 @@ def test_reviewed_resume_does_not_allow_any_source_change_mid_run(monkeypatch, r
     with pytest.raises(RuntimeError, match="source changed"):
         getattr(runner, check)(manifest)
     assert manifest["source_integrity_valid"] is False
+
+
+def test_current_optimization_source_rejects_archived_repair_without_touching_run(
+    tmp_path,
+    monkeypatch,
+):
+    actual_current = conductance._source_snapshot()
+    previous, archived_repaired = _archived_reviewed_snapshots(actual_current)
+    assert (
+        actual_current["research/conductance_gat/v5/train.py"]
+        != (archived_repaired["research/conductance_gat/v5/train.py"])
+    )
+    assert not resume_compat.snapshots_match(previous, actual_current)
+    assert not resume_compat.snapshots_match(archived_repaired, actual_current)
+    fixture = _fixture_module("test_conductance_scaling_runner")
+    options, calls = fixture._stub(tmp_path, monkeypatch)
+    options += ["--versions", "v5", "--model-seeds", "0"]
+    # Build explicit mock-child artifacts, with the prior repair's archived SHA
+    # provider. This is neither a historical training run nor live GPU evidence.
+    monkeypatch.setattr(conductance, "_source_snapshot", lambda: archived_repaired)
+    assert conductance.main(options) == 0
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    calls.clear()
+    monkeypatch.setattr(conductance, "_source_snapshot", lambda: actual_current)
+    assert conductance.main(options) == 1
+    assert calls == []
+    after = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    assert after == before

@@ -35,7 +35,9 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     BETA_PARAMETERIZATIONS,
     DEFAULT_BETA_INITIAL,
     DEFAULT_BETA_PARAMETERIZATION,
+    add_conductance_arguments,
     beta_configuration,
+    conductance_arguments_configuration,
 )
 from scripts.process_safety import (  # noqa: E402
     close_owned_child_stdout,
@@ -216,6 +218,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--v5-beta-initial", type=float, default=DEFAULT_BETA_INITIAL)
     result.add_argument("--v5-beta-min", type=float)
     result.add_argument("--v5-beta-max", type=float)
+    add_conductance_arguments(result, prefix="v5-")
     result.add_argument(
         "--v5-activation-checkpoint",
         action=argparse.BooleanOptionalAction,
@@ -302,6 +305,7 @@ def _validate(args: argparse.Namespace) -> None:
     ):
         raise ValueError("nondefault Cycle basis backend requires v2 in --cycle-versions")
     _v5_beta_configuration(args)
+    _v5_conductance_configuration(args)
 
 
 def _execution_devices(args: argparse.Namespace) -> list[str]:
@@ -407,6 +411,10 @@ def _v5_beta_configuration(args: argparse.Namespace) -> dict[str, float | str]:
     )
 
 
+def _v5_conductance_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return conductance_arguments_configuration(args, prefix="v5_")
+
+
 def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
     """Build one child job per track; execution waves bind at most one track per GPU."""
     results_root = args.results_root.expanduser().resolve()
@@ -463,6 +471,9 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             command += ["--model-seeds", *(str(seed) for seed in args.model_seeds)]
             for name, value in _v5_beta_configuration(args).items():
                 command += ["--v5-" + name.replace("_", "-"), str(value)]
+            if "v5" in args.conductance_versions:
+                for name, value in _v5_conductance_configuration(args).items():
+                    command += ["--v5-" + name.replace("_", "-"), str(value)]
             if args.conductance_legacy_ppi_batch_size is not None:
                 command += [
                     "--legacy-ppi-batch-size",
@@ -1247,6 +1258,11 @@ def _config_payload(
         },
         "min_free_gb": args.min_free_gb,
         "v5_beta": _v5_beta_configuration(args),
+        "v5_conductance": (
+            _v5_conductance_configuration(args)
+            if "conductance" in args.tracks and "v5" in args.conductance_versions
+            else None
+        ),
         "v5_activation_checkpoint": args.v5_activation_checkpoint,
         "cycle_v2_basis_backend": args.cycle_v2_basis_backend,
         "allow_download": args.allow_download,
@@ -1279,7 +1295,12 @@ def _resume_manifest(
     ):
         raise ValueError("existing run manifest identity does not match this runner")
     if payload.get("config") != expected_config:
-        raise ValueError("existing run configuration differs; use its original arguments")
+        raise ValueError(
+            "existing run configuration differs; use its original arguments only for the "
+            "same architecture. Changed V5 C backend/solver/schedule requires a new run ID; "
+            "preserve the old results and request --tracks conductance to avoid rerunning "
+            "completed cycle/tree tracks"
+        )
     if payload.get("planned_counts") != expected_totals:
         raise ValueError("existing run count contract differs from the requested plan")
     if not snapshots_match(payload.get("source_sha256"), expected_sources):

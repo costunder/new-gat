@@ -46,7 +46,10 @@ from .protocol import (
     SAMPLING_MODES,
     SUITE,
     TRAINING_PHASES,
+    add_conductance_arguments,
     beta_configuration,
+    conductance_arguments_configuration,
+    conductance_configuration,
 )
 from .sampling import TransductiveGraphSampler
 
@@ -85,6 +88,9 @@ def architecture_configuration(args: argparse.Namespace) -> dict[str, Any]:
             args.beta_max,
         )
     )
+    selected_conductance = conductance_arguments_configuration(args)
+    selected_conductance.pop("training_schedule")
+    result.update(selected_conductance)
     return result
 
 
@@ -104,6 +110,7 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
         "num_neighbors": list(args.num_neighbors),
         "sample_seed_batch_size": args.sample_seed_batch_size,
         "phase_fractions": list(args.phase_fractions),
+        "training_schedule": args.training_schedule,
         "hardware_profile": args.hardware_profile,
         "precision": args.precision,
         "amp": args.precision == "bf16",
@@ -232,12 +239,18 @@ def require_finite_gradient_norm_async(value: torch.Tensor) -> None:
     assertion(predicate, "nonfinite gradient norm")
 
 
-def phase_schedule(epochs: int, fractions: list[float]) -> list[dict[str, Any]]:
+def phase_schedule(
+    epochs: int, fractions: list[float], training_schedule: str = "staged"
+) -> list[dict[str, Any]]:
+    if training_schedule not in {"joint", "staged"}:
+        raise ValueError("training_schedule must be joint or staged")
     if epochs < 4 or len(fractions) != 4 or any(value <= 0 for value in fractions):
         raise ValueError("epochs must be >=4 and all four phase fractions must be positive")
     total = sum(fractions)
     if not math.isfinite(total):
         raise ValueError("phase fractions must be finite")
+    if training_schedule == "joint":
+        return [{"name": "joint", "start_epoch": 1, "end_epoch": epochs, "length": epochs}]
     raw = [epochs * value / total for value in fractions]
     lengths = [max(1, int(math.floor(value))) for value in raw]
     while sum(lengths) < epochs:
@@ -754,6 +767,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beta-initial", type=float, default=COMMON["beta_initial"])
     parser.add_argument("--beta-min", type=float)
     parser.add_argument("--beta-max", type=float)
+    add_conductance_arguments(parser)
     parser.add_argument(
         "--workers",
         type=int,
@@ -782,6 +796,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_args(args: argparse.Namespace) -> None:
     resolve_hardware_arguments(args)
+    conductance_arguments_configuration(args)
     integers = (
         args.epochs,
         args.patience,
@@ -818,7 +833,7 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.sampling != "full" and args.sample_seed_batch_size < 32:
         raise ValueError("sample-seed-batch-size below 32 is forbidden as accidentally tiny")
-    phase_schedule(args.epochs, list(args.phase_fractions))
+    phase_schedule(args.epochs, list(args.phase_fractions), args.training_schedule)
 
 
 def validate_cached_graphs_once(payload: dict[str, Any]) -> None:
@@ -1268,7 +1283,7 @@ def _train_model_impl(
     shared_state_sha256 = shared_initial_state_sha256(model)
     optimizer = make_optimizer(model)
     validate_optimizer_parameter_ownership(model, optimizer)
-    schedule = phase_schedule(args.epochs, list(args.phase_fractions))
+    schedule = phase_schedule(args.epochs, list(args.phase_fractions), args.training_schedule)
     total_parameters_at_construction = sum(value.numel() for value in model.parameters())
     optimizer_owned_parameters = sum(
         value.numel() for group in optimizer.param_groups for value in group["params"]
@@ -1296,11 +1311,20 @@ def _train_model_impl(
             "channels": args.hidden_channels,
             "attention_heads": args.heads,
             "ffn_multiplier": args.ffn_multiplier,
+            **conductance_configuration(
+                args.conductance_backend,
+                args.solver_steps,
+                args.solver_step_size,
+                args.solver_entropy,
+                args.solver_degree_barrier,
+            ),
             **parameter_observability,
         },
         "data": data_observability,
         "batching": batch_observability,
         "optimization": {
+            "training_schedule": args.training_schedule,
+            "phase_schedule": schedule,
             "epochs_requested": args.epochs,
             "early_stopping_patience": args.patience,
             "planned_maximum_optimizer_steps": batch_observability[

@@ -46,10 +46,10 @@ Conductance의 **상대 C graph operator + spatial message transform v4**에 필
 **[V4 통합 문서](../gpt_handoff/CONDUCTANCE_V4.md)** 한 곳에 모았다. 정확한 의도, 수식, 네 조건, 실행 명령, 결과 위치,
 진단과 현재 검증 상태를 다른 문서에서 찾을 필요 없이 여기서 확인한다.
 
-Conductance V5는 graph-conditioned **shared dynamic C**와 multi-head spatial W·head별
-전파 강도 beta를 분리해 학습한다. fixed-C와 dynamic-C는 같은 architecture·초기화를 쓰지만
-phase별 optimizer update 배분이 다른 strong-recipe 비교이며, sampling과 10GB MIG용 activation
-checkpoint를 지원한다. beta 기본값은 hard margin 없는 sigmoid와 nominal 초기값 0.1이고,
+Conductance V5는 기본적으로 **입력 그래프별 K회 C 최적화**와 multi-head spatial W·head별
+전파 강도 beta를 함께 학습한다. fixed-C와 dynamic-C의 공통 backbone·초기화는 정렬하며
+기본 joint 학습은 첫 epoch부터 C를 활성화한다. 이전 MLP와 staged 학습은 명시적 비교 옵션이다.
+Sampling 및 activation checkpoint를 지원한다. beta 기본값은 hard margin 없는 sigmoid와 nominal 초기값 0.1이고,
 과거 `0.05+0.90*sigmoid`는 명시적으로 선택하는 ablation으로만 남는다. 수식과 계약은
 [V5 통합 문서](../gpt_handoff/CONDUCTANCE_V5.md)를 기준으로 한다.
 
@@ -216,25 +216,29 @@ cat results/conductance_gat/v4/gat-hybrid-c-spatial-v4-seed0-v1/comparison.md
 기본 실행은 v1의 5개 데이터 × 네 조건 × seed 0 = 20회다. PPI는 v3와 같은 공식
 inductive 계약을 사용하며, 나머지 네 데이터는 full-graph transductive 학습이다.
 
-### Conductance v5: graph-conditioned shared dynamic C
+### Conductance v5: graph-specific optimized C
 
-V5의 핵심 비교는 동일 architecture·seed·초기화에서 `fixed_c` strong spatial recipe와
-`shared_dynamic_c` coordinate recipe를 학습하는 두 조건이다. phase별 update allocation이 달라
-C 하나의 인과효과로 해석하지 않는다. `reference`는 hidden 256, 8 layers, 8 heads,
+V5의 핵심 비교는 공통 backbone·seed·초기화를 정렬한 `fixed_c`와 `shared_dynamic_c`다.
+기본값은 `--conductance-backend optimization --training-schedule joint`이며 MLP/staged는
+명시적 비교 옵션이다. C 모듈의 추가 parameter capacity도 보고하므로 순수 단일-C 인과효과를
+보장하지 않는다. `reference`는 hidden 256, 8 layers, 8 heads,
 FFN multiplier 4이고, `large`는 384, 12 layers, 8 heads다. 아래는 FP32, PPI batch 2,
-ogbn-arxiv seed-node batch 1024와 activation checkpoint를 쓰는 `portable` 실행이다.
+ogbn-arxiv seed-node batch 1024와 activation checkpoint를 쓰는 `portable` 직접 실행 예시다.
+아래 직접 실행은 batch 최적화 측정의 대체물이 아니다. 본 실험은
+[최신 rich 실행](../gpt_handoff/RICH_SCALING_EXPERIMENTS.md)의 optimizer-inclusive calibration을
+사용하며, 아래는 검증된 physical batch를 명시하는 통제 실행용이다. 과거 MLP run ID와 섞지 않는다.
 
 ```bash
-python -B scripts/run_conductance_v5.py --datasets cora citeseer pubmed ppi ogbn-arxiv --profile reference --sampling auto --sample-seed-batch-size 1024 --model-seed 0 --device cuda:0 --hardware-profile portable --run-id conductance-v5-portable-reference-seed0
+python -B scripts/run_conductance_v5.py --datasets cora citeseer pubmed ppi ogbn-arxiv --profile reference --sampling auto --sample-seed-batch-size 1024 --model-seed 0 --device cuda:0 --hardware-profile portable --conductance-backend optimization --training-schedule joint --run-id conductance-v5-optimization-portable-reference-seed0
 ```
 
 물리 GPU 3의 RTX A6000을 쓰는 직접 V5 실행은 다음과 같다. 프로세스 안에서는 이 장치가
 `cuda:0`이다. 이 profile은 dense BF16/TF32, FP32 conductance geometry, PPI batch 8,
 arxiv seed-node batch 2048, 더 큰 edge chunk와 prefetch를 쓴다. 전체 block checkpoint는 끄지만
-dynamic-C score MLP는 gradient가 있을 때 edge chunk별로 checkpoint한다.
+dynamic-C compatibility 계산은 edge chunk별로, C 최적화는 반복 step별로 checkpoint한다.
 
 ```bash
-CUDA_VISIBLE_DEVICES=3 python -B scripts/run_conductance_v5.py --datasets cora citeseer pubmed ppi ogbn-arxiv --profile reference --model-seed 0 --device cuda:0 --sampling auto --hardware-profile a6000-48gb --min-free-gb 40 --run-id conductance-v5-a6000-gpu3-reference-seed0
+CUDA_VISIBLE_DEVICES=3 python -B scripts/run_conductance_v5.py --datasets cora citeseer pubmed ppi ogbn-arxiv --profile reference --model-seed 0 --device cuda:0 --sampling auto --hardware-profile a6000-48gb --min-free-gb 40 --conductance-backend optimization --training-schedule joint --run-id conductance-v5-optimization-a6000-gpu3-reference-seed0
 ```
 
 CUDA 검사 경로는 PyTorch import 전에 오래 남은 `PYTORCH_NVML_BASED_CUDA_CHECK` 값을 내부에서

@@ -11,7 +11,7 @@ GPT에는 파일을 따로 고르지 말고 이 폴더의 **10개 파일을 전�
 4. `CONDUCTANCE_V2.md`: 고정 그래프의 엣지별 C 직접 학습 계약
 5. `CONDUCTANCE_V3.md`: 공유 상대 C graph operator 학습 계약
 6. `CONDUCTANCE_V4.md`: C graph operator × spatial W 2×2 실험의 정확한 계약
-7. `CONDUCTANCE_V5.md`: graph-conditioned shared dynamic C와 연구급 규모 계약
+7. `CONDUCTANCE_V5.md`: 입력 그래프별 C 최적화 계층·가중 라플라시안 전파와 연구급 규모 계약
 8. `CYCLE_PE_V2.md`: QR-free DFS 기저의 구조 SE 대 SE+cycle 상대 PE 비교 계약
 9. `RICH_SCALING_EXPERIMENTS.md`: Conductance V1–V5, Cycle PE V1/V2, Tree의
    reference/large 전체 scaling 계약(122 child / 126 model trainings)
@@ -39,6 +39,9 @@ Conductance v2/v3/v4/v5와 Cycle PE v2는 각각의 원문 문서를 직접 제�
 
 ## 근거 범위
 
+- 2026-09-06 V5 기본은 `optimization`/`joint`다. MLP-C는 명시적 비교 옵션이다.
+  새 구조의 C 반복 최적화와 task loss 역전파를 검토하고, 과거 MLP checkpoint의 재개 허용을
+  새 구조까지 확대하지 않았는지 확인한다. K회 수행은 수렴 보증이 아니다.
 - 최신 실행·calibration·재개 명령은 `RICH_SCALING_EXPERIMENTS.md` 첫 절을 따른다.
   A6000 48GB의 약 9GB 사용/100% utilization 화면을 batch 최적화 완료 근거로 쓰지 않는다.
 - ad041e2 서버 실행의 V5 집계 실패와 Cycle IPC 실패, 후속 교정 및 기존 결과 격리는

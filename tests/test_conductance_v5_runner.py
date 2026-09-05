@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from research.conductance_gat.v5 import train
+from research.conductance_gat.v5.protocol import conductance_configuration
 from scripts import run_conductance_v5 as runner
 
 
@@ -28,6 +29,8 @@ def test_reference_plan_parses_with_real_child_cli_and_memory_controls(tmp_path)
         "dropout": 0.2,
         "beta_parameterization": "sigmoid",
         "beta_initial": 0.1,
+        **conductance_configuration(),
+        "training_schedule": "joint",
     }
     assert len(jobs) == 2
     assert {job["condition"] for job in jobs} == {"fixed_c", "shared_dynamic_c"}

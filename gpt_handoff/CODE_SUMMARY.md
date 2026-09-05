@@ -19040,7 +19040,7 @@ def graph():
     )
 
 
-def model(mode="dynamic"):
+def model(mode="dynamic", backend="optimization"):
     return GraphConditionedConductanceNodeClassifier(
         5,
         3,
@@ -19050,6 +19050,7 @@ def model(mode="dynamic"):
         ffn_multiplier=2,
         dropout=0.0,
         conductance_mode=mode,
+        conductance_backend=backend,
         activation_checkpoint=False,
     )
 
@@ -19122,18 +19123,23 @@ def test_dynamic_c_is_shared_positive_relative_and_not_dead_at_initialization():
     assert result["passed"] and all(row["upstream_gradient_norm"] > 0 for row in result["layers"])
 
 
-def test_fixed_c_is_parameter_free_and_shared_initialization_stays_paired():
+@pytest.mark.parametrize("backend", ["optimization", "mlp"])
+def test_fixed_c_is_parameter_free_and_shared_initialization_stays_paired(backend):
     torch.manual_seed(31)
-    fixed = model("fixed_one")
+    fixed = model("fixed_one", backend)
     torch.manual_seed(31)
-    dynamic = model("dynamic")
+    dynamic = model("dynamic", backend)
 
     for operator in fixed.operators:
         assert list(operator.estimator.parameters()) == []
         assert operator.estimator.node_projection is None
-        assert operator.estimator.context_projection is None
-        assert operator.estimator.score_norm is None
-        assert operator.estimator.score_network is None
+        if backend == "mlp":
+            assert operator.estimator.context_projection is None
+            assert operator.estimator.score_norm is None
+            assert operator.estimator.score_network is None
+        else:
+            assert operator.estimator.context_metric is None
+            assert operator.estimator.structure_metric is None
     assert all(list(operator.estimator.parameters()) for operator in dynamic.operators)
 
     fixed_shared = {
@@ -27469,6 +27475,26 @@ def parameter_norm(parameters, *, gradient: bool = False) -> float | None:
     return float(torch.stack(values).sum().sqrt()) if values else None
 
 
+def solver_diagnostics(estimator: nn.Module) -> dict[str, Any]:
+    """Serialize the last forward's solver audit only at an existing log boundary."""
+
+    values = getattr(estimator, "last_solver_diagnostics", None)
+    if values is None:
+        return {"applicable": False, "reason": "MLP backend has no inner C optimization"}
+
+    def convert(value):
+        if isinstance(value, Tensor):
+            require_finite_tensor(value, "C solver diagnostic")
+            return value.detach().cpu().tolist()
+        if isinstance(value, dict):
+            return {key: convert(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [convert(item) for item in value]
+        return value
+
+    return {"scope": "last forward graph or disjoint graph batch", **convert(values)}
+
+
 def layer_diagnostics(model: nn.Module, *, gradients: bool = False) -> list[dict[str, Any]]:
     rows = []
     for layer, operator in enumerate(model.operators):
@@ -27480,6 +27506,8 @@ def layer_diagnostics(model: nn.Module, *, gradients: bool = False) -> list[dict
                 "conductance": tensor_moments(operator.estimator.last_c),
                 "log_conductance": tensor_moments(operator.estimator.last_log_c),
                 "score": tensor_moments(operator.estimator.last_scores),
+                "conductance_backend": operator.conductance_backend,
+                "c_optimization": solver_diagnostics(operator.estimator),
                 "beta": tensor_moments(operator.last_beta),
                 "sampling_correction": tensor_moments(operator.last_sampling_correction),
                 "conductance_parameter_norm": parameter_norm(estimator_parameters),
@@ -27504,8 +27532,14 @@ def require_first_step_conductance_gradient(model: nn.Module) -> dict[str, Any]:
     for layer, operator in enumerate(model.operators):
         named = list(operator.estimator.named_parameters())
         total = parameter_norm((value for _, value in named), gradient=True)
+        optimization = operator.conductance_backend == "optimization"
         upstream = parameter_norm(
-            (value for name, value in named if "score_network.4" not in name), gradient=True
+            (
+                value
+                for name, value in named
+                if ("projection" in name if optimization else "score_network.4" not in name)
+            ),
+            gradient=True,
         )
         passed = total is not None and total > 0 and upstream is not None and upstream > 0
         rows.append(
@@ -27513,6 +27547,12 @@ def require_first_step_conductance_gradient(model: nn.Module) -> dict[str, Any]:
                 "layer": layer,
                 "total_gradient_norm": total,
                 "upstream_gradient_norm": upstream,
+                "conductance_backend": operator.conductance_backend,
+                "upstream_definition": (
+                    "compatibility projection parameters through unrolled C updates"
+                    if optimization
+                    else "MLP parameters excluding its final score weight"
+                ),
                 "passed": passed,
             }
         )
@@ -27628,10 +27668,17 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .operator import graph_weighted_mean, shared_head_diffusion
+from .optimization import GraphOptimizedConductance
 from .protocol import (
     DEFAULT_BETA_INITIAL,
     DEFAULT_BETA_PARAMETERIZATION,
+    DEFAULT_CONDUCTANCE_BACKEND,
+    DEFAULT_SOLVER_DEGREE_BARRIER,
+    DEFAULT_SOLVER_ENTROPY,
+    DEFAULT_SOLVER_STEP_SIZE,
+    DEFAULT_SOLVER_STEPS,
     beta_configuration,
+    conductance_configuration,
 )
 
 
@@ -27747,9 +27794,7 @@ class GraphConditionedConductance(nn.Module):
         self.edge_chunk_size = edge_chunk_size
         if mode == "dynamic":
             self.node_projection: nn.Linear | None = nn.Linear(channels, score_channels)
-            self.context_projection: nn.Linear | None = nn.Linear(
-                2 * channels + 8, score_channels
-            )
+            self.context_projection: nn.Linear | None = nn.Linear(2 * channels + 8, score_channels)
             edge_width = 4 * score_channels + 8
             self.score_norm: nn.LayerNorm | None = nn.LayerNorm(edge_width)
             self.score_network: nn.Sequential | None = nn.Sequential(
@@ -27975,21 +28020,41 @@ class SharedConductanceMultihead(nn.Module):
         beta_min: float | None,
         beta_max: float | None,
         edge_chunk_size: int,
+        conductance_backend: str = DEFAULT_CONDUCTANCE_BACKEND,
+        solver_steps: int = DEFAULT_SOLVER_STEPS,
+        solver_step_size: float = DEFAULT_SOLVER_STEP_SIZE,
+        solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
+        solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
     ) -> None:
         super().__init__()
         if channels % heads:
             raise ValueError("hidden channels must be divisible by heads")
         self.channels, self.heads, self.head_width = channels, heads, channels // heads
         self.conductance_mode = conductance_mode
+        self.conductance_backend = conductance_backend
         # Dynamic-only initialization must not shift the RNG stream used by W, beta,
         # FFNs or later blocks; those shared parameters remain exactly paired by seed.
         with torch.random.fork_rng(devices=[]):
-            self.estimator = GraphConditionedConductance(
-                channels,
-                mode=conductance_mode,
-                max_log_conductance=max_log_conductance,
-                edge_chunk_size=edge_chunk_size,
-            )
+            if conductance_backend == "optimization":
+                self.estimator = GraphOptimizedConductance(
+                    channels,
+                    mode=conductance_mode,
+                    solver_steps=solver_steps,
+                    solver_step_size=solver_step_size,
+                    solver_entropy=solver_entropy,
+                    solver_degree_barrier=solver_degree_barrier,
+                    cost_bound=max_log_conductance,
+                    edge_chunk_size=edge_chunk_size,
+                )
+            elif conductance_backend == "mlp":
+                self.estimator = GraphConditionedConductance(
+                    channels,
+                    mode=conductance_mode,
+                    max_log_conductance=max_log_conductance,
+                    edge_chunk_size=edge_chunk_size,
+                )
+            else:
+                raise ValueError(f"unsupported conductance backend: {conductance_backend}")
         self.value_weight = nn.Parameter(torch.empty(heads, channels, self.head_width))
         nn.init.xavier_uniform_(self.value_weight.reshape(channels, channels))
         self.output_projection = nn.Linear(channels, channels, bias=False)
@@ -28111,6 +28176,11 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
         beta_max: float | None = None,
         edge_chunk_size: int = 65536,
         activation_checkpoint: bool = True,
+        conductance_backend: str = DEFAULT_CONDUCTANCE_BACKEND,
+        solver_steps: int = DEFAULT_SOLVER_STEPS,
+        solver_step_size: float = DEFAULT_SOLVER_STEP_SIZE,
+        solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
+        solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
     ) -> None:
         super().__init__()
         for name, value in (
@@ -28135,10 +28205,19 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
         self.hidden_channels, self.layers, self.heads = hidden_channels, layers, heads
         self.ffn_multiplier, self.dropout = ffn_multiplier, float(dropout)
         self.conductance_mode = conductance_mode
+        self.conductance_configuration = conductance_configuration(
+            conductance_backend,
+            solver_steps,
+            solver_step_size,
+            solver_entropy,
+            solver_degree_barrier,
+        )
+        self.conductance_backend = conductance_backend
         self.activation_checkpoint = bool(activation_checkpoint)
         self.input_norm = nn.LayerNorm(in_channels)
         self.encoder = nn.Linear(in_channels, hidden_channels)
         operator_kwargs = {
+            **self.conductance_configuration,
             "conductance_mode": conductance_mode,
             "max_log_conductance": max_log_conductance,
             "beta_parameterization": beta_parameterization,
@@ -28392,6 +28471,484 @@ def shared_head_diffusion(
     return output.to(message.dtype)
 ````
 
+# research/conductance_gat/v5/optimization.py
+
+````python
+"""Differentiable graph-specific C optimization, without an edge-output MLP.
+
+A signed quadratic compatibility parameterizes an energy. Its positive edge
+variables are optimized afresh on each graph. Exactly K updates are unrolled;
+this is a finite approximation, not a claim that the optimum was reached.
+No targets, dense adjacency, eigendecomposition or autograd.grad are needed.
+"""
+
+from __future__ import annotations
+
+import math
+from numbers import Real
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from .operator import graph_weighted_mean
+
+
+def _degree(c: Tensor, incidence: Tensor, num_nodes: int) -> Tensor:
+    return c.new_zeros(num_nodes).index_add(0, incidence[0], c).index_add(0, incidence[1], c)
+
+
+def _graph_max(values: Tensor, edge_graph: Tensor, num_graphs: int) -> Tensor:
+    return values.new_zeros(num_graphs).scatter_reduce(
+        0, edge_graph, values, reduce="amax", include_self=True
+    )
+
+
+def _normalize_log_c(log_c: Tensor, edge_graph: Tensor, num_graphs: int, omega: Tensor) -> Tensor:
+    # Numerical shift only: no edge or C value is truncated.
+    maxima = log_c.new_full((num_graphs,), -torch.inf).scatter_reduce(
+        0, edge_graph, log_c, reduce="amax", include_self=True
+    )
+    shifted = log_c - maxima[edge_graph]
+    mean = graph_weighted_mean(shifted.exp(), edge_graph, num_graphs, omega)
+    return shifted - mean[edge_graph].log()
+
+
+def conductance_energy(
+    c: Tensor,
+    delta: Tensor,
+    incidence: Tensor,
+    node_graph: Tensor,
+    num_graphs: int,
+    omega: Tensor,
+    *,
+    entropy: float,
+    degree_barrier: float,
+) -> Tensor:
+    """Return E per graph; degree-zero isolates have no barrier term.
+
+    E = mean_omega(c*delta + entropy*(c*log(c)-c+1))
+        - degree_barrier*mean_active_nodes(log(d_c/d_reference)).
+
+    The caller maintains mean_omega(c)=1. Scaling all omega in one graph
+    by a positive constant leaves both the objective and constraint unchanged.
+    """
+    edge_graph = node_graph[incidence[0]]
+    degree = _degree(omega * c, incidence, node_graph.numel())
+    reference = _degree(omega, incidence, node_graph.numel())
+    active = reference > 0
+    safe_degree = torch.where(active, degree, torch.ones_like(degree))
+    safe_reference = torch.where(active, reference, torch.ones_like(reference))
+    counts = c.new_zeros(num_graphs).index_add(0, node_graph, active.to(c.dtype))
+    log_ratio_sum = c.new_zeros(num_graphs).index_add(
+        0, node_graph, (safe_degree / safe_reference).log()
+    )
+    return graph_weighted_mean(
+        c * delta + entropy * (c * c.log() - c + 1), edge_graph, num_graphs, omega
+    ) - degree_barrier * log_ratio_sum / counts.clamp_min(1)
+
+
+class GraphOptimizedConductance(nn.Module):
+    """Shared signed compatibility, followed by K differentiable C updates.
+
+    Uses every feature channel, a graph-conditioned signed diagonal quadratic
+    metric, and symmetric structural features. There is no edge MLP or
+    edge-specific parameter table. C is shared across all feature heads.
+
+    The configured step size is an upper bound. Each graph gets a
+    differentiable relative-curvature/log-displacement-bounded step. This
+    preserves K and all edges without host-synchronized line search or
+    conductance clipping. See _step for the bound.
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        *,
+        mode: str = "dynamic",
+        solver_steps: int = 8,
+        solver_step_size: float = 0.25,
+        solver_entropy: float = 1.0,
+        solver_degree_barrier: float = 0.1,
+        cost_bound: float = 2.0,
+        edge_chunk_size: int = 65536,
+    ) -> None:
+        super().__init__()
+        for name, value in (
+            ("channels", channels),
+            ("solver_steps", solver_steps),
+            ("edge_chunk_size", edge_chunk_size),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        for name, value in (
+            ("solver_step_size", solver_step_size),
+            ("solver_entropy", solver_entropy),
+            ("cost_bound", cost_bound),
+        ):
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise ValueError(f"{name} must be finite and positive")
+        if (
+            isinstance(solver_degree_barrier, bool)
+            or not isinstance(solver_degree_barrier, Real)
+            or not math.isfinite(solver_degree_barrier)
+            or solver_degree_barrier < 0
+        ):
+            raise ValueError("solver_degree_barrier must be finite and nonnegative")
+        if mode not in {"dynamic", "fixed_one"}:
+            raise ValueError(f"unsupported conductance mode: {mode}")
+        self.channels = channels
+        self.mode = mode
+        self.solver_steps = solver_steps
+        self.solver_step_size = float(solver_step_size)
+        self.solver_entropy = float(solver_entropy)
+        self.solver_degree_barrier = float(solver_degree_barrier)
+        self.cost_bound = float(cost_bound)
+        self.edge_chunk_size = edge_chunk_size
+        if mode == "dynamic":
+            self.node_projection: nn.Linear | None = nn.Linear(channels, channels, bias=False)
+            self.context_metric: nn.Linear | None = nn.Linear(2 * channels + 8, channels)
+            self.structure_metric: nn.Parameter | None = nn.Parameter(torch.empty(8))
+            nn.init.normal_(self.structure_metric, std=0.01)
+        else:
+            # A true parameter-free C=1 control, not frozen unused modules.
+            self.node_projection = None
+            self.context_metric = None
+            self.register_parameter("structure_metric", None)
+        self.override: str | None = None
+        self.last_scores: Tensor | None = None
+        self.last_log_c: Tensor | None = None
+        self.last_c: Tensor | None = None
+        self.last_solver_diagnostics: dict[str, Tensor | int | float | bool | str] = {}
+
+    def _compatibility_chunk(
+        self,
+        projected: Tensor,
+        metric: Tensor,
+        tail: Tensor,
+        head: Tensor,
+        sample_degree: Tensor,
+        full_degree: Tensor,
+        edge_graph: Tensor,
+    ) -> Tensor:
+        if self.structure_metric is None:
+            raise RuntimeError("fixed C has no compatibility parameters")
+        left, right = projected[tail], projected[head]
+        coverage = (
+            torch.stack(
+                (
+                    sample_degree[tail] / full_degree[tail].clamp_min(1),
+                    sample_degree[head] / full_degree[head].clamp_min(1),
+                ),
+                dim=1,
+            )
+            .sort(dim=1)
+            .values
+        )
+        inverse = (
+            torch.stack(
+                (
+                    full_degree[tail].clamp_min(1).reciprocal(),
+                    full_degree[head].clamp_min(1).reciprocal(),
+                ),
+                dim=1,
+            )
+            .sort(dim=1)
+            .values
+        )
+        local = torch.cat(
+            (
+                torch.stack(
+                    (
+                        (sample_degree[tail] + sample_degree[head]).log1p(),
+                        (sample_degree[tail] - sample_degree[head]).abs().log1p(),
+                        (full_degree[tail] + full_degree[head]).log1p(),
+                        (full_degree[tail] - full_degree[head]).abs().log1p(),
+                    ),
+                    dim=1,
+                ),
+                coverage,
+                inverse,
+            ),
+            dim=1,
+        )
+        quadratic = ((left - right).square() * metric[edge_graph]).sum(dim=1)
+        structural = (local.tanh() * self.structure_metric.to(projected.dtype)).sum(dim=1)
+        return self.cost_bound * torch.tanh((quadratic + structural) / self.cost_bound)
+
+    def _scaled_gradient(
+        self,
+        log_c: Tensor,
+        delta: Tensor,
+        incidence: Tensor,
+        edge_graph: Tensor,
+        omega: Tensor,
+        graph_mass: Tensor,
+        active_counts: Tensor,
+        num_nodes: int,
+    ) -> tuple[Tensor, Tensor]:
+        degree = _degree(omega * log_c.exp(), incidence, num_nodes)
+        inverse_sum = degree[incidence[0]].reciprocal() + degree[incidence[1]].reciprocal()
+        barrier = (
+            self.solver_degree_barrier
+            * (graph_mass / active_counts.clamp_min(1))[edge_graph]
+            * inverse_sum
+        )
+        return delta + self.solver_entropy * log_c - barrier, barrier
+
+    def _step(
+        self,
+        log_c: Tensor,
+        delta: Tensor,
+        incidence: Tensor,
+        edge_graph: Tensor,
+        num_graphs: int,
+        omega: Tensor,
+        graph_mass: Tensor,
+        active_counts: Tensor,
+        num_nodes: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        gradient, barrier = self._scaled_gradient(
+            log_c, delta, incidence, edge_graph, omega, graph_mass, active_counts, num_nodes
+        )
+        centered = (
+            gradient - graph_weighted_mean(gradient, edge_graph, num_graphs, omega)[edge_graph]
+        )
+        curvature = _graph_max(barrier, edge_graph, num_graphs)
+        magnitude = _graph_max(centered.abs(), edge_graph, num_graphs)
+        # Relative entropy Hessian is diag(omega/(S*c)). Cauchy-Schwarz
+        # bounds the barrier Hessian by L times this, with
+        # L=max_e rho*S/n*(1/d_u+1/d_v).
+        # eta <= 1/(2*max|centered_gradient|) gives |log(c_new/c_old)|<=1,
+        # including the gauge normalization. Degrees along this path stay
+        # >=exp(-1)*old degrees, hence curvature stays <=exp(1)*L.
+        # eta<=exp(-1)/L supplies a valid majorizer; entropy is proximal.
+        # Clamp denominators at the threshold for the configured upper
+        # bound: unlike 1/clamp(tiny), this has finite inactive derivatives
+        # when curvature or gradient vanish (including rho=0).
+        curvature_step = math.exp(-1) / curvature.clamp_min(math.exp(-1) / self.solver_step_size)
+        displacement_step = 0.5 / magnitude.clamp_min(0.5 / self.solver_step_size)
+        step = torch.minimum(curvature_step, displacement_step)
+        proposal = log_c - step[edge_graph] * centered / (
+            1 + step[edge_graph] * self.solver_entropy
+        )
+        updated = _normalize_log_c(proposal, edge_graph, num_graphs, omega)
+        return updated, step, centered
+
+    def forward(
+        self,
+        state: Tensor,
+        incidence: Tensor,
+        node_graph: Tensor,
+        num_graphs: int,
+        *,
+        graph_context: Tensor,
+        sample_degree: Tensor,
+        full_degree: Tensor,
+        edge_normalization_weight: Tensor | None = None,
+    ) -> Tensor:
+        if state.ndim != 2 or state.shape[1] != self.channels or not state.is_floating_point():
+            raise ValueError("state must be an N x channels floating tensor")
+        if incidence.dtype != torch.long or incidence.ndim != 2 or incidence.shape[0] != 2:
+            raise ValueError("incidence must be a 2 x E int64 tensor")
+        if node_graph.shape != (state.shape[0],) or node_graph.dtype != torch.long:
+            raise ValueError("node_graph must contain one int64 graph index per node")
+        if isinstance(num_graphs, bool) or not isinstance(num_graphs, int) or num_graphs < 1:
+            raise ValueError("num_graphs must be a positive integer")
+        if graph_context.shape != (num_graphs, 2 * self.channels + 8):
+            raise ValueError("graph_context must be num_graphs x (2*channels+8)")
+        if sample_degree.shape != node_graph.shape or full_degree.shape != node_graph.shape:
+            raise ValueError("sample_degree and full_degree must contain one value per node")
+        inputs = (incidence, node_graph, graph_context, sample_degree, full_degree)
+        if any(value.device != state.device for value in inputs):
+            raise ValueError("all conductance inputs must share a device")
+        if self.override not in {None, "ones", "mean", "shuffle"}:
+            raise ValueError(f"unsupported C intervention: {self.override}")
+        compute_dtype = (
+            torch.float32 if state.dtype in {torch.float16, torch.bfloat16} else state.dtype
+        )
+        tail, head = incidence
+        edge_graph = node_graph[tail]
+        omega = torch.ones(tail.numel(), device=state.device, dtype=compute_dtype)
+        if edge_normalization_weight is not None:
+            if (
+                edge_normalization_weight.shape != omega.shape
+                or edge_normalization_weight.device != state.device
+            ):
+                raise ValueError("edge_normalization_weight must match same-device edges")
+            omega = edge_normalization_weight.to(compute_dtype)
+        torch._assert_async(
+            torch.isfinite(omega).all() & (omega > 0).all(),
+            "C solver needs finite positive sampling weights",
+        )
+        if self.mode == "fixed_one" or self.override == "ones" or tail.numel() == 0:
+            c = torch.ones_like(omega)
+            self.last_scores = torch.zeros_like(c)
+            self.last_log_c = torch.zeros_like(c)
+            self.last_c = c.detach()
+            self.last_solver_diagnostics = {
+                "enabled": False,
+                "executed_steps": 0,
+                "reason": "edgeless_graph" if tail.numel() == 0 else "fixed_one_intervention",
+                "finite_step_approximation": False,
+            }
+            return c
+        if self.node_projection is None or self.context_metric is None:
+            raise RuntimeError("dynamic compatibility parameters are unavailable")
+        projected = F.normalize(self.node_projection(state).to(compute_dtype), dim=1, eps=1e-6)
+        normalized_context = F.layer_norm(graph_context, (graph_context.shape[1],))
+        metric = self.context_metric(normalized_context).to(compute_dtype).tanh()
+        sample_degree = sample_degree.to(compute_dtype)
+        full_degree = full_degree.to(compute_dtype)
+        chunks = []
+        for start in range(0, tail.numel(), self.edge_chunk_size):
+            stop = start + self.edge_chunk_size
+            arguments = (
+                projected,
+                metric,
+                tail[start:stop],
+                head[start:stop],
+                sample_degree,
+                full_degree,
+                edge_graph[start:stop],
+            )
+            if torch.is_grad_enabled():
+                from torch.utils.checkpoint import checkpoint
+
+                delta = checkpoint(
+                    self._compatibility_chunk,
+                    *arguments,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                delta = self._compatibility_chunk(*arguments)
+            chunks.append(delta)
+        delta = torch.cat(chunks)
+        graph_mass = delta.new_zeros(num_graphs).index_add(0, edge_graph, omega)
+        reference_degree = _degree(omega, incidence, state.shape[0])
+        active_counts = delta.new_zeros(num_graphs).index_add(
+            0, node_graph, (reference_degree > 0).to(compute_dtype)
+        )
+        log_c = torch.zeros_like(delta)
+        steps = []
+        initial_residual = None
+        previous_log_c = log_c
+        for _ in range(self.solver_steps):
+            previous_log_c = log_c
+            arguments = (
+                log_c,
+                delta,
+                incidence,
+                edge_graph,
+                num_graphs,
+                omega,
+                graph_mass,
+                active_counts,
+                state.shape[0],
+            )
+            if torch.is_grad_enabled():
+                from torch.utils.checkpoint import checkpoint
+
+                # Keep scalar iterates, not every degree/curvature/normalizer
+                # intermediate from every solver step. This also applies when
+                # the outer backbone checkpoint is disabled during calibration.
+                log_c, step, centered = checkpoint(
+                    self._step, *arguments, use_reentrant=False, preserve_rng_state=False
+                )
+            else:
+                log_c, step, centered = self._step(*arguments)
+            steps.append(step.detach())
+            if initial_residual is None:
+                initial_residual = graph_weighted_mean(
+                    centered.detach().square(), edge_graph, num_graphs, omega
+                ).sqrt()
+        c = log_c.exp()
+        with torch.no_grad():
+            energy_arguments = (incidence, node_graph, num_graphs, omega)
+            initial_energy = conductance_energy(
+                torch.ones_like(c),
+                delta.detach(),
+                *energy_arguments,
+                entropy=self.solver_entropy,
+                degree_barrier=self.solver_degree_barrier,
+            )
+            final_energy = conductance_energy(
+                c.detach(),
+                delta.detach(),
+                *energy_arguments,
+                entropy=self.solver_entropy,
+                degree_barrier=self.solver_degree_barrier,
+            )
+            gradient, _ = self._scaled_gradient(
+                log_c.detach(),
+                delta.detach(),
+                incidence,
+                edge_graph,
+                omega,
+                graph_mass,
+                active_counts,
+                state.shape[0],
+            )
+            centered = (
+                gradient - graph_weighted_mean(gradient, edge_graph, num_graphs, omega)[edge_graph]
+            )
+            residual = graph_weighted_mean(centered.square(), edge_graph, num_graphs, omega).sqrt()
+            update = graph_weighted_mean(
+                (log_c.detach() - previous_log_c.detach()).square(),
+                edge_graph,
+                num_graphs,
+                omega,
+            ).sqrt()
+            tolerance = 128 * torch.finfo(compute_dtype).eps * (1 + initial_energy.abs())
+            valid = (
+                torch.isfinite(c).all()
+                & (c > 0).all()
+                & torch.isfinite(final_energy).all()
+                & torch.isfinite(residual).all()
+                & (final_energy <= initial_energy + tolerance).all()
+            )
+            torch._assert_async(
+                valid, "C optimization produced nonfinite values or increased its objective"
+            )
+            step_history = torch.stack(steps)
+            self.last_solver_diagnostics = {
+                "enabled": True,
+                "method": "curvature_bounded_kl_proximal",
+                "executed_steps": self.solver_steps,
+                "finite_step_approximation": True,
+                "objective_initial": initial_energy,
+                "objective_final": final_energy,
+                "projected_gradient_rms_initial": initial_residual,
+                "projected_gradient_rms_final": residual,
+                "last_log_update_rms": update,
+                "step_size_requested": self.solver_step_size,
+                "step_size_min": step_history.amin(dim=0),
+                "step_size_max": step_history.amax(dim=0),
+                "mean_c": graph_weighted_mean(c.detach(), edge_graph, num_graphs, omega),
+                "active_nodes": active_counts.detach(),
+            }
+        if self.override == "mean":
+            c = graph_weighted_mean(c, edge_graph, num_graphs, omega)[edge_graph]
+        elif self.override == "shuffle" and c.numel() > 1:
+            # Reverse within each graph with no Python graph loop.
+            order = torch.argsort(edge_graph, stable=True)
+            counts = torch.bincount(edge_graph, minlength=num_graphs)
+            starts = counts.cumsum(0) - counts
+            position = torch.arange(c.numel(), device=c.device)
+            reverse = 2 * starts[edge_graph[order]] + counts[edge_graph[order]] - 1 - position
+            c = torch.empty_like(c).scatter(0, order, c[order[reverse]])
+        self.last_scores = delta.detach()
+        self.last_log_c = log_c.detach()
+        self.last_c = c.detach()
+        return c
+````
+
 # research/conductance_gat/v5/protocol.py
 
 ````python
@@ -28400,9 +28957,18 @@ def shared_head_diffusion(
 from __future__ import annotations
 
 import math
+from typing import Any
 
 SUITE = "conductance_graph_conditioned_v5"
-PARAMETERIZATION = "shared_dynamic_relative_c_with_multihead_w_and_graph_beta"
+PARAMETERIZATION = "shared_unrolled_optimized_relative_c_with_multihead_w_and_graph_beta_v1"
+CONDUCTANCE_BACKENDS = ("optimization", "mlp")
+DEFAULT_CONDUCTANCE_BACKEND = "optimization"
+DEFAULT_SOLVER_STEPS = 8
+DEFAULT_SOLVER_STEP_SIZE = 0.25
+DEFAULT_SOLVER_ENTROPY = 1.0
+DEFAULT_SOLVER_DEGREE_BARRIER = 0.1
+TRAINING_SCHEDULES = ("joint", "staged")
+DEFAULT_TRAINING_SCHEDULE = "joint"
 BETA_PARAMETERIZATIONS = ("sigmoid", "margin_sigmoid")
 DEFAULT_BETA_PARAMETERIZATION = "sigmoid"
 DEFAULT_BETA_INITIAL = 0.1
@@ -28413,6 +28979,77 @@ METRIC_BY_DATASET = {
 }
 BATCH_SIZE_BY_DATASET = {dataset: 2 if dataset == "ppi" else 1 for dataset in DATASETS}
 DEFAULT_EDGE_CHUNK_SIZE = 65536
+
+
+def conductance_configuration(
+    conductance_backend: str = DEFAULT_CONDUCTANCE_BACKEND,
+    solver_steps: int = DEFAULT_SOLVER_STEPS,
+    solver_step_size: float = DEFAULT_SOLVER_STEP_SIZE,
+    solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
+    solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
+) -> dict[str, int | float | str]:
+    """Canonical architecture identity; solver fields are inactive for the MLP ablation."""
+
+    if conductance_backend not in CONDUCTANCE_BACKENDS:
+        raise ValueError(f"unsupported conductance backend: {conductance_backend}")
+    if isinstance(solver_steps, bool) or not isinstance(solver_steps, int) or solver_steps < 1:
+        raise ValueError("solver_steps must be a positive integer")
+    values = {
+        "solver_step_size": solver_step_size,
+        "solver_entropy": solver_entropy,
+        "solver_degree_barrier": solver_degree_barrier,
+    }
+    for name, value in values.items():
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or (value <= 0 if name != "solver_degree_barrier" else value < 0)
+        ):
+            raise ValueError(
+                f"{name} must be finite and "
+                + ("nonnegative" if name == "solver_degree_barrier" else "positive")
+            )
+    return {
+        "conductance_backend": conductance_backend,
+        "solver_steps": solver_steps,
+        **{name: float(value) for name, value in values.items()},
+    }
+
+
+def add_conductance_arguments(parser, *, prefix: str = "") -> None:
+    """Share explicit architecture CLI options across standalone and nested runners."""
+
+    parser.add_argument(
+        f"--{prefix}conductance-backend",
+        choices=CONDUCTANCE_BACKENDS,
+        default=DEFAULT_CONDUCTANCE_BACKEND,
+        help="optimization unrolls C updates; mlp explicitly selects the legacy ablation",
+    )
+    parser.add_argument(f"--{prefix}solver-steps", type=int, default=DEFAULT_SOLVER_STEPS)
+    parser.add_argument(f"--{prefix}solver-step-size", type=float, default=DEFAULT_SOLVER_STEP_SIZE)
+    parser.add_argument(f"--{prefix}solver-entropy", type=float, default=DEFAULT_SOLVER_ENTROPY)
+    parser.add_argument(
+        f"--{prefix}solver-degree-barrier", type=float, default=DEFAULT_SOLVER_DEGREE_BARRIER
+    )
+    parser.add_argument(
+        f"--{prefix}training-schedule",
+        choices=TRAINING_SCHEDULES,
+        default=DEFAULT_TRAINING_SCHEDULE,
+        help="joint learns C/W from epoch one; staged is the explicit historical ablation",
+    )
+
+
+def conductance_arguments_configuration(args, *, prefix: str = "") -> dict[str, Any]:
+    """Validate both solver architecture and schedule from a parsed namespace."""
+
+    configuration = conductance_configuration(
+        **{name: getattr(args, prefix + name) for name in conductance_configuration()}
+    )
+    schedule = getattr(args, prefix + "training_schedule")
+    if schedule not in TRAINING_SCHEDULES:
+        raise ValueError(f"unsupported training schedule: {schedule}")
+    return {**configuration, "training_schedule": schedule}
 
 
 def beta_configuration(
@@ -28512,6 +29149,8 @@ SCALE_PROFILES = {
 }
 COMMON = {
     **SCALE_PROFILES["reference"],
+    **conductance_configuration(),
+    "training_schedule": DEFAULT_TRAINING_SCHEDULE,
     "lr": 0.0005,
     "conductance_lr_multiplier": 1.0,
     "beta_lr_multiplier": 1.0,
@@ -28535,25 +29174,27 @@ CONDITIONS = {
 SAMPLING_MODES = ("full", "neighbor", "cluster")
 TRAINING_PHASES = ("spatial_warmup", "conductance_calibration", "alternating", "joint")
 
-# This is deliberately an end-to-end recipe comparison.  The fixed arm spends
-# dynamic-C calibration/alternation turns updating its spatial model, whereas
-# the dynamic arm spends those turns on C.  Effective group step counts are
-# therefore mandatory output metadata and the contrast is not a one-variable
-# causal estimate of merely replacing C=1.
+# The default joint schedule updates every active group from epoch one. The
+# historical staged ablation allocates different C/backbone steps across arms.
+# Capacity and actual optimizer-step counts remain mandatory audit metadata.
 COMPARISON_DESIGN = {
     "estimand": "fixed-C training recipe versus shared-dynamic-C training recipe",
     "single_factor_causal_effect_of_c": False,
-    "unequal_parameter_group_update_allocation": True,
+    "unequal_parameter_group_update_allocation": {"joint": False, "staged": True},
+    "default_training_schedule": DEFAULT_TRAINING_SCHEDULE,
     "required_audit_field": "effective_optimizer_steps_by_group",
     "parameterization": (
-        "fixed C=1 is parameter-free; dynamic C adds only its active score network. "
+        "fixed C=1 is parameter-free; dynamic C adds the active optimizer-cost parameters "
+        "or the explicitly selected legacy MLP scorer. C is optimized by a finite unrolled "
+        "inner solver in the default backend, not stored as a per-edge parameter table. "
         "Shared backbone/W/beta initialization is paired and hash-verified, while total "
         "parameter capacity is reported separately rather than padded with unused weights"
     ),
     "checkpoint_selection": {
         "primary": (
-            "fixed_c selects its all-epoch validation best; shared_dynamic_c selects its "
-            "C-active validation best from calibration, alternating, or joint phases"
+            "joint: both arms select their all-epoch validation best because C is active "
+            "from epoch one; staged: fixed_c selects all-epoch best and shared_dynamic_c "
+            "selects C-active best from calibration, alternating, or joint phases"
         ),
         "auxiliary_prediction": "all-epoch validation best is reported for both arms",
         "early_stopping": (
@@ -28576,12 +29217,15 @@ PROTOCOL_NOTE = (
     "per layer. Both arms learn identical multi-head W_h and graph-conditioned beta_h. "
     "The default beta is an un-margined sigmoid with nominal beta_0=0.1; the historical "
     "bounded-margin sigmoid remains an explicit ablation. "
-    "Dynamic C is symmetric, positive, bounded and relative; beta carries identifiable "
+    "Default dynamic C is a symmetric positive mean-one field computed by finite unrolled "
+    "optimization; legacy MLP-C remains an explicit ablation. Solver steps do not certify "
+    "convergence, so residuals are recorded. beta carries identifiable "
     "diffusion magnitude. Transductive datasets may train on dependency-free samples that "
     "retain original degrees and apply explicit boundary correction; validation remains the "
     "complete official graph. PPI retains its official 20/2/2 split. No test labels are used."
-    " The two arms use intentionally different phase-wise parameter-group update allocations, "
-    "so their reported contrast is a recipe comparison, not a single-C causal effect."
+    " Default training jointly learns all active groups from epoch one; the explicit staged "
+    "ablation retains historical phase allocations. Parameter capacity and actual group "
+    "updates are reported rather than claiming a pure single-C causal effect."
     " The a6000-48gb profile changes real batch/sample size and numeric execution, so it must "
     "not be pooled with or directly contrasted against portable-profile metrics."
 )
@@ -29368,7 +30012,10 @@ from .protocol import (
     SAMPLING_MODES,
     SUITE,
     TRAINING_PHASES,
+    add_conductance_arguments,
     beta_configuration,
+    conductance_arguments_configuration,
+    conductance_configuration,
 )
 from .sampling import TransductiveGraphSampler
 
@@ -29407,6 +30054,9 @@ def architecture_configuration(args: argparse.Namespace) -> dict[str, Any]:
             args.beta_max,
         )
     )
+    selected_conductance = conductance_arguments_configuration(args)
+    selected_conductance.pop("training_schedule")
+    result.update(selected_conductance)
     return result
 
 
@@ -29426,6 +30076,7 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
         "num_neighbors": list(args.num_neighbors),
         "sample_seed_batch_size": args.sample_seed_batch_size,
         "phase_fractions": list(args.phase_fractions),
+        "training_schedule": args.training_schedule,
         "hardware_profile": args.hardware_profile,
         "precision": args.precision,
         "amp": args.precision == "bf16",
@@ -29554,12 +30205,18 @@ def require_finite_gradient_norm_async(value: torch.Tensor) -> None:
     assertion(predicate, "nonfinite gradient norm")
 
 
-def phase_schedule(epochs: int, fractions: list[float]) -> list[dict[str, Any]]:
+def phase_schedule(
+    epochs: int, fractions: list[float], training_schedule: str = "staged"
+) -> list[dict[str, Any]]:
+    if training_schedule not in {"joint", "staged"}:
+        raise ValueError("training_schedule must be joint or staged")
     if epochs < 4 or len(fractions) != 4 or any(value <= 0 for value in fractions):
         raise ValueError("epochs must be >=4 and all four phase fractions must be positive")
     total = sum(fractions)
     if not math.isfinite(total):
         raise ValueError("phase fractions must be finite")
+    if training_schedule == "joint":
+        return [{"name": "joint", "start_epoch": 1, "end_epoch": epochs, "length": epochs}]
     raw = [epochs * value / total for value in fractions]
     lengths = [max(1, int(math.floor(value))) for value in raw]
     while sum(lengths) < epochs:
@@ -30076,6 +30733,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beta-initial", type=float, default=COMMON["beta_initial"])
     parser.add_argument("--beta-min", type=float)
     parser.add_argument("--beta-max", type=float)
+    add_conductance_arguments(parser)
     parser.add_argument(
         "--workers",
         type=int,
@@ -30104,6 +30762,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_args(args: argparse.Namespace) -> None:
     resolve_hardware_arguments(args)
+    conductance_arguments_configuration(args)
     integers = (
         args.epochs,
         args.patience,
@@ -30140,7 +30799,7 @@ def validate_args(args: argparse.Namespace) -> None:
         )
     if args.sampling != "full" and args.sample_seed_batch_size < 32:
         raise ValueError("sample-seed-batch-size below 32 is forbidden as accidentally tiny")
-    phase_schedule(args.epochs, list(args.phase_fractions))
+    phase_schedule(args.epochs, list(args.phase_fractions), args.training_schedule)
 
 
 def validate_cached_graphs_once(payload: dict[str, Any]) -> None:
@@ -30590,7 +31249,7 @@ def _train_model_impl(
     shared_state_sha256 = shared_initial_state_sha256(model)
     optimizer = make_optimizer(model)
     validate_optimizer_parameter_ownership(model, optimizer)
-    schedule = phase_schedule(args.epochs, list(args.phase_fractions))
+    schedule = phase_schedule(args.epochs, list(args.phase_fractions), args.training_schedule)
     total_parameters_at_construction = sum(value.numel() for value in model.parameters())
     optimizer_owned_parameters = sum(
         value.numel() for group in optimizer.param_groups for value in group["params"]
@@ -30618,11 +31277,20 @@ def _train_model_impl(
             "channels": args.hidden_channels,
             "attention_heads": args.heads,
             "ffn_multiplier": args.ffn_multiplier,
+            **conductance_configuration(
+                args.conductance_backend,
+                args.solver_steps,
+                args.solver_step_size,
+                args.solver_entropy,
+                args.solver_degree_barrier,
+            ),
             **parameter_observability,
         },
         "data": data_observability,
         "batching": batch_observability,
         "optimization": {
+            "training_schedule": args.training_schedule,
+            "phase_schedule": schedule,
             "epochs_requested": args.epochs,
             "early_stopping_patience": args.patience,
             "planned_maximum_optimizer_steps": batch_observability[
@@ -52638,7 +53306,10 @@ class SpeedCase:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from research.conductance_gat.v5.protocol import add_conductance_arguments
+
     parser = argparse.ArgumentParser(description=__doc__)
+    add_conductance_arguments(parser, prefix="v5-")
     parser.add_argument(
         "--track",
         choices=tuple(DATASETS),
@@ -52749,7 +53420,12 @@ def _validate(args: argparse.Namespace) -> None:
     if args.minimum_measure_seconds <= 0 or not math.isfinite(args.minimum_measure_seconds):
         raise ValueError("minimum measure seconds must be finite and positive")
     if args.track == "conductance_v5":
-        from research.conductance_gat.v5.protocol import HARDWARE_PROFILES
+        from research.conductance_gat.v5.protocol import (
+            HARDWARE_PROFILES,
+            conductance_arguments_configuration,
+        )
+
+        conductance_arguments_configuration(args, prefix="v5_")
 
         args.v5_sampling_resolved = (
             "cluster"
@@ -53000,6 +53676,7 @@ def _build_v5_case(
         HARDWARE_PROFILES,
         SCALE_PROFILES,
         beta_configuration,
+        conductance_arguments_configuration,
     )
     from research.conductance_gat.v5.train import (
         _prepare_data,
@@ -53074,6 +53751,10 @@ def _build_v5_case(
         )
     )
 
+    solver_configuration = conductance_arguments_configuration(args, prefix="v5_")
+    requested_schedule = solver_configuration.pop("training_schedule")
+    architecture.update(solver_configuration)
+
     def make_model(_kind):
         model = GraphConditionedConductanceNodeClassifier(
             payload["graphs"][0]["x"].shape[1],
@@ -53120,6 +53801,8 @@ def _build_v5_case(
             ),
             "v5_scale_profile": args.v5_scale_profile,
             "v5_architecture": architecture,
+            "v5_requested_training_schedule": requested_schedule,
+            "v5_measured_phase": "joint",
             "v5_condition": args.v5_condition,
             "v5_sampling": args.v5_sampling_resolved,
             "v5_num_neighbors": list(args.v5_num_neighbors),
@@ -59819,7 +60502,9 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     DEFAULT_BETA_PARAMETERIZATION,
     HARDWARE_PROFILES,
     SCALE_PROFILES,
+    add_conductance_arguments,
     beta_configuration,
+    conductance_arguments_configuration,
 )
 from research.conductance_gat.v5.protocol import (  # noqa: E402
     CONDITIONS as V5_CONDITIONS,
@@ -59928,6 +60613,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--v5-beta-initial", type=float, default=DEFAULT_BETA_INITIAL)
     result.add_argument("--v5-beta-min", type=float)
     result.add_argument("--v5-beta-max", type=float)
+    add_conductance_arguments(result, prefix="v5-")
     result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
     result.add_argument(
         "--resource-plan", type=Path, help="Immutable measured V5 batch/worker plan"
@@ -59987,6 +60673,7 @@ def _validate(args: argparse.Namespace) -> None:
     ):
         raise ValueError("portable V5 PPI requires graph batch-size at least 2")
     _v5_beta_configuration(args)
+    _v5_conductance_configuration(args)
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
         raise ValueError("CUDA is required; CPU training/fallback is not supported")
     if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
@@ -60079,6 +60766,10 @@ def _effective_min_free_gb(args: argparse.Namespace) -> float:
     )
 
 
+def _v5_conductance_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return conductance_arguments_configuration(args, prefix="v5_")
+
+
 def _exclusions(args: argparse.Namespace) -> list[dict[str, str]]:
     if args.datasets is None:
         return []
@@ -60118,6 +60809,7 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
             profile = {key: full_profile[key] for key in profile_fields}
             if version == "v5":
                 profile.update(_v5_beta_configuration(args))
+                profile.update(_v5_conductance_configuration(args))
             for seed in args.model_seeds:
                 for dataset in _selected_datasets(args, version):
                     child_workers = shared.workers_for_dataset(dataset, args.workers)
@@ -60210,6 +60902,8 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                                 *(str(value) for value in args.v5_num_neighbors),
                             ]
                             for name, value in _v5_beta_configuration(args).items():
+                                command += ["--" + name.replace("_", "-"), str(value)]
+                            for name, value in _v5_conductance_configuration(args).items():
                                 command += ["--" + name.replace("_", "-"), str(value)]
                             validate_job_plan(
                                 getattr(args, "resolved_resource_plan", None),
@@ -60491,7 +61185,10 @@ def _load_resume_manifest(
         ("dependencies", dependencies),
     ):
         if manifest.get(key) != expected:
-            raise RuntimeError(f"existing manifest {key} does not match this invocation")
+            raise RuntimeError(
+                f"existing manifest {key} does not match this invocation; changed V5 C "
+                "backend/solver/schedule requires a new run ID; old results are preserved"
+            )
     if not snapshots_match(manifest.get("source_sha256"), source_sha256):
         raise RuntimeError("existing manifest source_sha256 does not match this invocation")
     existing_jobs = manifest.get("jobs")
@@ -60909,6 +61606,7 @@ def main(argv: list[str] | None = None) -> int:
         "v5_edge_chunk_size": args.v5_edge_chunk_size,
         "v5_ppi_batch_size": args.v5_ppi_batch_size,
         "v5_beta": _v5_beta_configuration(args),
+        "v5_conductance": (_v5_conductance_configuration(args) if "v5" in args.versions else None),
         "hardware_profile": args.hardware_profile,
         "resource_plan": (
             resource_plan_identity(args.resolved_resource_plan)
@@ -62182,7 +62880,9 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     HARDWARE_PROFILES,
     SCALE_PROFILES,
     SUITE,
+    add_conductance_arguments,
     beta_configuration,
+    conductance_arguments_configuration,
 )
 from scripts import run_conductance_factorial as shared  # noqa: E402
 from scripts.check_dependencies import (  # noqa: E402
@@ -62213,6 +62913,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--beta-initial", type=float, default=DEFAULT_BETA_INITIAL)
     result.add_argument("--beta-min", type=float)
     result.add_argument("--beta-max", type=float)
+    add_conductance_arguments(result)
     result.add_argument("--model-seed", type=int, default=0)
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
@@ -62269,6 +62970,7 @@ def _architecture(args: argparse.Namespace) -> dict[str, Any]:
             args.beta_max,
         )
     )
+    architecture.update(conductance_arguments_configuration(args))
     return architecture
 
 
@@ -62628,8 +63330,7 @@ def main(argv: list[str] | None = None) -> int:
             dataset: _resolved_execution(args, dataset) for dataset in args.datasets
         },
         "workers_by_dataset": {
-            dataset: shared.workers_for_dataset(dataset, args.workers)
-            for dataset in args.datasets
+            dataset: shared.workers_for_dataset(dataset, args.workers) for dataset in args.datasets
         },
         "sampling": args.sampling,
         "num_neighbors": list(args.num_neighbors),
@@ -62666,7 +63367,10 @@ def main(argv: list[str] | None = None) -> int:
                 "dependencies": dependencies,
             }
             if any(manifest.get(key) != value for key, value in expected.items()):
-                raise RuntimeError("existing run contract differs from this invocation")
+                raise RuntimeError(
+                    "existing run contract differs from this invocation; changed C backend, "
+                    "solver, or schedule requires a new run ID; old results are preserved"
+                )
             if [_identity(job) for job in manifest.get("jobs", [])] != [
                 _identity(job) for job in jobs
             ]:
@@ -66438,7 +67142,9 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     BETA_PARAMETERIZATIONS,
     DEFAULT_BETA_INITIAL,
     DEFAULT_BETA_PARAMETERIZATION,
+    add_conductance_arguments,
     beta_configuration,
+    conductance_arguments_configuration,
 )
 from scripts.process_safety import (  # noqa: E402
     close_owned_child_stdout,
@@ -66619,6 +67325,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--v5-beta-initial", type=float, default=DEFAULT_BETA_INITIAL)
     result.add_argument("--v5-beta-min", type=float)
     result.add_argument("--v5-beta-max", type=float)
+    add_conductance_arguments(result, prefix="v5-")
     result.add_argument(
         "--v5-activation-checkpoint",
         action=argparse.BooleanOptionalAction,
@@ -66705,6 +67412,7 @@ def _validate(args: argparse.Namespace) -> None:
     ):
         raise ValueError("nondefault Cycle basis backend requires v2 in --cycle-versions")
     _v5_beta_configuration(args)
+    _v5_conductance_configuration(args)
 
 
 def _execution_devices(args: argparse.Namespace) -> list[str]:
@@ -66810,6 +67518,10 @@ def _v5_beta_configuration(args: argparse.Namespace) -> dict[str, float | str]:
     )
 
 
+def _v5_conductance_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return conductance_arguments_configuration(args, prefix="v5_")
+
+
 def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
     """Build one child job per track; execution waves bind at most one track per GPU."""
     results_root = args.results_root.expanduser().resolve()
@@ -66866,6 +67578,9 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             command += ["--model-seeds", *(str(seed) for seed in args.model_seeds)]
             for name, value in _v5_beta_configuration(args).items():
                 command += ["--v5-" + name.replace("_", "-"), str(value)]
+            if "v5" in args.conductance_versions:
+                for name, value in _v5_conductance_configuration(args).items():
+                    command += ["--v5-" + name.replace("_", "-"), str(value)]
             if args.conductance_legacy_ppi_batch_size is not None:
                 command += [
                     "--legacy-ppi-batch-size",
@@ -67650,6 +68365,11 @@ def _config_payload(
         },
         "min_free_gb": args.min_free_gb,
         "v5_beta": _v5_beta_configuration(args),
+        "v5_conductance": (
+            _v5_conductance_configuration(args)
+            if "conductance" in args.tracks and "v5" in args.conductance_versions
+            else None
+        ),
         "v5_activation_checkpoint": args.v5_activation_checkpoint,
         "cycle_v2_basis_backend": args.cycle_v2_basis_backend,
         "allow_download": args.allow_download,
@@ -67682,7 +68402,12 @@ def _resume_manifest(
     ):
         raise ValueError("existing run manifest identity does not match this runner")
     if payload.get("config") != expected_config:
-        raise ValueError("existing run configuration differs; use its original arguments")
+        raise ValueError(
+            "existing run configuration differs; use its original arguments only for the "
+            "same architecture. Changed V5 C backend/solver/schedule requires a new run ID; "
+            "preserve the old results and request --tracks conductance to avoid rerunning "
+            "completed cycle/tree tracks"
+        )
     if payload.get("planned_counts") != expected_totals:
         raise ValueError("existing run count contract differs from the requested plan")
     if not snapshots_match(payload.get("source_sha256"), expected_sources):
@@ -75171,7 +75896,12 @@ def test_cycle_builder_rejects_candidate_larger_than_official_training_split(mon
         speed._build_cycle_case(args, torch.device("cpu"))
 
 
-def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "backend, solver_steps", [("optimization", 8), ("optimization", 12), ("mlp", 8)]
+)
+def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(
+    monkeypatch, tmp_path, backend, solver_steps
+):
     from research.conductance_gat.v5 import model, train
 
     batch = SimpleNamespace(
@@ -75224,6 +75954,12 @@ def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(monkeypa
         v5_num_neighbors=[15, 10],
         v5_scale_profile="reference",
         v5_condition="shared_dynamic_c",
+        v5_conductance_backend=backend,
+        v5_solver_steps=solver_steps,
+        v5_solver_step_size=0.125,
+        v5_solver_entropy=0.75,
+        v5_solver_degree_barrier=0.2,
+        v5_training_schedule="staged",
     )
     payload = {"dataset": "ogbn-arxiv", "classes": 2, "graphs": [{"x": batch.x}]}
     case = speed._build_v5_case(
@@ -75240,6 +75976,16 @@ def test_v5_builder_reuses_exact_sampled_training_batch_and_joint_phase(monkeypa
     assert case.description["production_path_identity"]["loss"].endswith(".training_loss")
     assert case.description["v5_architecture"]["hidden_channels"] == 256
     candidate = case.make_model("current")
+    assert case.description["v5_architecture"]["conductance_backend"] == backend
+    assert case.description["v5_architecture"]["solver_steps"] == solver_steps
+    assert case.description["v5_requested_training_schedule"] == "staged"
+    assert case.description["v5_measured_phase"] == "joint"
+    assert seen["model_kwargs"]["conductance_backend"] == backend
+    assert seen["model_kwargs"]["solver_steps"] == solver_steps
+    assert seen["model_kwargs"]["solver_step_size"] == 0.125
+    assert seen["model_kwargs"]["solver_entropy"] == 0.75
+    assert seen["model_kwargs"]["solver_degree_barrier"] == 0.2
+    assert "training_schedule" not in seen["model_kwargs"]
     assert seen["phase"] == "joint" and seen["phase_epoch"] == 0
     assert candidate.conductance_mode == "dynamic"
     expected = torch.nn.functional.cross_entropy(
@@ -79430,6 +80176,7 @@ from research.conductance_gat.v2 import train as v2_train
 from research.conductance_gat.v3 import train as v3_train
 from research.conductance_gat.v4 import train as v4_train
 from research.conductance_gat.v5 import train as v5_train
+from research.conductance_gat.v5.protocol import conductance_configuration
 from scripts import run_conductance_scaling as runner
 
 
@@ -79474,9 +80221,7 @@ def test_default_plan_covers_all_versions_profiles_seed_zero_and_supported_datas
 
 
 def test_legacy_ppi_batch_override_reaches_v1_v3_v4_but_not_v5() -> None:
-    args = runner.parser().parse_args(
-        ["--datasets", "ppi", "--legacy-ppi-batch-size", "5"]
-    )
+    args = runner.parser().parse_args(["--datasets", "ppi", "--legacy-ppi-batch-size", "5"])
     runner._validate(args)
     jobs = runner.make_jobs(args, Path("fixture"))
     for job in jobs:
@@ -79552,6 +80297,8 @@ def test_large_profile_is_forwarded_to_every_child_and_outputs_are_unique():
                 ffn_multiplier=4,
                 beta_parameterization="sigmoid",
                 beta_initial=0.1,
+                **conductance_configuration(),
+                training_schedule="joint",
             )
         assert job["architecture"] == expected_architecture
         module = _argument(job["command"], "-m")
@@ -79795,16 +80542,12 @@ def test_v1_validation_only_path_does_not_construct_a_test_loader(monkeypatch):
 
 
 def test_v1_child_worker_contract_is_dataset_specific():
-    ppi = scaling_v1.build_parser().parse_args(
-        ["--dataset", "ppi", "--output-dir", "out"]
-    )
+    ppi = scaling_v1.build_parser().parse_args(["--dataset", "ppi", "--output-dir", "out"])
     scaling_v1._validate(ppi)
     assert ppi.workers == 4
     assert ppi.batch_size == 2
     assert ppi.worker_configuration_source == "dataset_default"
-    cora = scaling_v1.build_parser().parse_args(
-        ["--dataset", "cora", "--output-dir", "out"]
-    )
+    cora = scaling_v1.build_parser().parse_args(["--dataset", "cora", "--output-dir", "out"])
     scaling_v1._validate(cora)
     assert cora.workers == 0
     assert cora.batch_size == 1
@@ -80039,8 +80782,12 @@ def test_v5_production_throughput_reaches_real_scaling_aggregation(
 
     options, calls = _stub(tmp_path, monkeypatch)
     options += [
-        "--versions", "v5", "--model-seeds", "0",
-        "--hardware-profile", hardware_profile,
+        "--versions",
+        "v5",
+        "--model-seeds",
+        "0",
+        "--hardware-profile",
+        hardware_profile,
     ]
     assert runner.main(options) == 0
     root = tmp_path / "conductance_gat/scaling/unit-fixture"
@@ -80048,12 +80795,8 @@ def test_v5_production_throughput_reaches_real_scaling_aggregation(
     summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
     assert len(calls) == 3  # Preflight plus both V5 conditions, never actual subprocesses.
     assert manifest["status"] == "passed"
-    assert {job["condition"] for job in manifest["jobs"]} == {
-        "fixed_c", "shared_dynamic_c"
-    }
-    expected = v5_train.training_throughput(
-        [{"train_label_count": 120, "train_batches": 3}], 1.5
-    )
+    assert {job["condition"] for job in manifest["jobs"]} == {"fixed_c", "shared_dynamic_c"}
+    expected = v5_train.training_throughput([{"train_label_count": 120, "train_batches": 3}], 1.5)
     for job in manifest["jobs"]:
         assert job["result"]["throughput"] == expected
         assert runner._load_child(job)["throughput"] == expected
@@ -83211,6 +83954,7 @@ from __future__ import annotations
 import copy
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.utils.checkpoint
 
@@ -83284,7 +84028,8 @@ def test_score_chunk_checkpoint_is_eval_safe_and_preserves_gradients(monkeypatch
         torch.testing.assert_close(actual[2][name], expected[2][name], rtol=1e-5, atol=1e-7)
 
 
-def test_block_checkpoint_is_not_disabled_by_calibration_eval_mode(monkeypatch):
+@pytest.mark.parametrize("backend", ["optimization", "mlp"])
+def test_block_checkpoint_is_not_disabled_by_calibration_eval_mode(monkeypatch, backend):
     from research.conductance_gat.v5.train import configure_phase, parameter_group
 
     model = GraphConditionedConductanceNodeClassifier(
@@ -83296,6 +84041,7 @@ def test_block_checkpoint_is_not_disabled_by_calibration_eval_mode(monkeypatch):
         ffn_multiplier=2,
         dropout=0.2,
         conductance_mode="dynamic",
+        conductance_backend=backend,
         edge_chunk_size=3,
         activation_checkpoint=True,
     )
@@ -83330,10 +84076,876 @@ def test_block_checkpoint_is_not_disabled_by_calibration_eval_mode(monkeypatch):
         else:
             assert not parameter.requires_grad
             assert parameter.grad is None
-    assert all(
-        operator.estimator.score_network[-1].weight.grad.abs().sum() > 0
-        for operator in model.operators
+    if backend == "mlp":
+        assert all(
+            operator.estimator.score_network[-1].weight.grad.abs().sum() > 0
+            for operator in model.operators
+        )
+    else:
+        assert all(
+            operator.estimator.node_projection.weight.grad.abs().sum() > 0
+            for operator in model.operators
+        )
+        assert all(
+            operator.estimator.last_solver_diagnostics["executed_steps"] == 8
+            for operator in model.operators
+        )
+````
+
+# tests/test_conductance_v5_optimization.py
+
+````python
+"""Explicit CPU debug graphs for the finite-step C optimization contract."""
+
+from __future__ import annotations
+
+import copy
+
+import pytest
+import torch
+
+from research.conductance_gat.v5.operator import graph_weighted_mean, shared_head_diffusion
+from research.conductance_gat.v5.optimization import (
+    GraphOptimizedConductance,
+    _degree,
+    conductance_energy,
+)
+
+
+def _debug_inputs(*, dtype=torch.float64, channels=5):
+    generator = torch.Generator().manual_seed(731)
+    state = torch.randn(9, channels, generator=generator, dtype=dtype)
+    # Graph 0 has heterogeneous degree, graph 1 a path, graph 2 an isolate.
+    incidence = torch.tensor([[0, 0, 0, 1, 2, 4, 5, 5], [1, 2, 3, 2, 3, 5, 6, 7]], dtype=torch.long)
+    node_graph = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1, 2], dtype=torch.long)
+    degree = torch.bincount(incidence.flatten(), minlength=9).to(dtype)
+    full_degree = degree + torch.arange(9, dtype=dtype) % 3
+    context = torch.randn(3, 2 * channels + 8, generator=generator, dtype=dtype)
+    omega = torch.tensor([1.0, 2.5, 0.7, 1.3, 3.0, 1.2, 0.8, 2.1], dtype=dtype)
+    return state, incidence, node_graph, degree, full_degree, context, omega
+
+
+def _run(model, inputs, *, state=None, context=None):
+    x, incidence, node_graph, degree, full_degree, z, omega = inputs
+    return model(
+        x if state is None else state,
+        incidence,
+        node_graph,
+        z.shape[0],
+        graph_context=z if context is None else context,
+        sample_degree=degree,
+        full_degree=full_degree,
+        edge_normalization_weight=omega,
     )
+
+
+def test_positive_weighted_gauge_and_detached_finite_step_diagnostics():
+    torch.manual_seed(51)
+    inputs = _debug_inputs()
+    model = GraphOptimizedConductance(5).double()
+    c = _run(model, inputs)
+    assert torch.isfinite(c).all() and (c > 0).all()
+    assert not torch.allclose(c, torch.ones_like(c))
+    mean = graph_weighted_mean(c, inputs[2][inputs[1][0]], 3, inputs[-1])
+    torch.testing.assert_close(mean, torch.tensor([1.0, 1.0, 0.0], dtype=c.dtype))
+    diagnostics = model.last_solver_diagnostics
+    assert diagnostics["executed_steps"] == 8
+    assert diagnostics["finite_step_approximation"] is True
+    assert diagnostics["objective_final"].le(diagnostics["objective_initial"] + 1e-12).all()
+    assert diagnostics["step_size_min"].gt(0).all()
+    assert diagnostics["step_size_max"].le(0.25).all()
+    for value in diagnostics.values():
+        if isinstance(value, torch.Tensor):
+            assert value.grad_fn is None and not value.requires_grad
+            assert torch.isfinite(value).all()
+    assert c.grad_fn is not None
+    for cached in (model.last_scores, model.last_log_c, model.last_c):
+        assert cached.grad_fn is None and not cached.requires_grad
+
+
+def test_orientation_and_node_edge_permutation_equivariance():
+    torch.manual_seed(41)
+    inputs = _debug_inputs()
+    model = GraphOptimizedConductance(5).double()
+    expected = _run(model, inputs)
+    reversed_inputs = list(inputs)
+    reversed_inputs[1] = inputs[1].flip(0)
+    torch.testing.assert_close(_run(model, reversed_inputs), expected, rtol=1e-11, atol=1e-12)
+    permutation = torch.tensor([8, 4, 1, 6, 0, 3, 7, 2, 5])
+    inverse = permutation.argsort()
+    edge_permutation = torch.tensor([7, 3, 0, 5, 1, 6, 4, 2])
+    changed = list(inputs)
+    changed[0] = inputs[0][permutation]
+    changed[1] = inverse[inputs[1][:, edge_permutation]]
+    changed[2] = inputs[2][permutation]
+    changed[3] = inputs[3][permutation]
+    changed[4] = inputs[4][permutation]
+    changed[6] = inputs[6][edge_permutation]
+    actual = _run(model, changed)
+    torch.testing.assert_close(actual, expected[edge_permutation], rtol=1e-10, atol=1e-11)
+
+
+def test_disjoint_batch_independence_and_importance_scale_invariance():
+    torch.manual_seed(73)
+    inputs = _debug_inputs()
+    model = GraphOptimizedConductance(5).double()
+    expected = _run(model, inputs)
+    single = [
+        inputs[0][:4],
+        inputs[1][:, :5],
+        torch.zeros(4, dtype=torch.long),
+        inputs[3][:4],
+        inputs[4][:4],
+        inputs[5][:1],
+        inputs[6][:5],
+    ]
+    torch.testing.assert_close(_run(model, single), expected[:5], rtol=1e-10, atol=1e-12)
+    changed = list(inputs)
+    changed[-1] = inputs[-1] * torch.tensor(
+        [1e3, 1e3, 1e3, 1e3, 1e3, 0.03, 0.03, 0.03], dtype=inputs[0].dtype
+    )
+    torch.testing.assert_close(_run(model, changed), expected, rtol=1e-10, atol=1e-12)
+
+
+def test_fixed_one_has_no_parameters_and_interventions_are_explicit():
+    inputs = _debug_inputs()
+    control = GraphOptimizedConductance(5, mode="fixed_one").double()
+    assert list(control.parameters()) == []
+    torch.testing.assert_close(_run(control, inputs), torch.ones_like(inputs[-1]))
+    assert control.last_solver_diagnostics["executed_steps"] == 0
+    dynamic = GraphOptimizedConductance(5).double()
+    original = _run(dynamic, inputs)
+    dynamic.override = "mean"
+    torch.testing.assert_close(_run(dynamic, inputs), torch.ones_like(original))
+    dynamic.override = "ones"
+    torch.testing.assert_close(_run(dynamic, inputs), torch.ones_like(original))
+    assert dynamic.last_solver_diagnostics["executed_steps"] == 0
+    dynamic.override = "shuffle"
+    shuffled = _run(dynamic, inputs)
+    torch.testing.assert_close(shuffled[:5], original[:5].flip(0))
+    torch.testing.assert_close(shuffled[5:], original[5:].flip(0))
+    dynamic.override = "unknown"
+    with pytest.raises(ValueError, match="intervention"):
+        _run(dynamic, inputs)
+
+
+def test_edgeless_and_single_edge_graphs_have_mathematically_defined_results():
+    state = torch.randn(3, 5, dtype=torch.float64)
+    model = GraphOptimizedConductance(5).double()
+    empty = model(
+        state,
+        torch.empty(2, 0, dtype=torch.long),
+        torch.zeros(3, dtype=torch.long),
+        1,
+        graph_context=torch.randn(1, 18, dtype=torch.float64),
+        sample_degree=torch.zeros(3, dtype=torch.float64),
+        full_degree=torch.zeros(3, dtype=torch.float64),
+    )
+    assert empty.shape == (0,)
+    assert model.last_solver_diagnostics["reason"] == "edgeless_graph"
+    incidence = torch.tensor([[0], [1]])
+    one = model(
+        state,
+        incidence,
+        torch.zeros(3, dtype=torch.long),
+        1,
+        graph_context=torch.randn(1, 18, dtype=torch.float64),
+        sample_degree=torch.tensor([1, 1, 0], dtype=torch.float64),
+        full_degree=torch.tensor([1, 1, 0], dtype=torch.float64),
+    )
+    torch.testing.assert_close(one, torch.ones_like(one))
+    assert model.last_solver_diagnostics["executed_steps"] == 8
+    assert model.last_solver_diagnostics["active_nodes"].tolist() == [2.0]
+    one.sum().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+@pytest.mark.parametrize("rho", [0.0, 0.1, 10.0])
+def test_analytic_energy_gradient_matches_dense_autograd(rho):
+    inputs = _debug_inputs()
+    state, incidence, node_graph, _, _, _, omega = inputs
+    generator = torch.Generator().manual_seed(54)
+    c = (torch.rand(8, generator=generator, dtype=torch.float64) + 0.4).requires_grad_(True)
+    delta = torch.randn(8, generator=generator, dtype=torch.float64)
+    entropy = 0.7
+    model = GraphOptimizedConductance(5, solver_entropy=entropy, solver_degree_barrier=rho).double()
+    energy = conductance_energy(
+        c, delta, incidence, node_graph, 3, omega, entropy=entropy, degree_barrier=rho
+    )
+    grad = torch.autograd.grad(energy.sum(), c)[0]
+    edge_graph = node_graph[incidence[0]]
+    mass = c.new_zeros(3).index_add(0, edge_graph, omega)
+    reference = _degree(omega, incidence, state.shape[0])
+    counts = c.new_zeros(3).index_add(0, node_graph, (reference > 0).to(c.dtype))
+    analytic, _ = model._scaled_gradient(
+        c.log(), delta, incidence, edge_graph, omega, mass, counts, state.shape[0]
+    )
+    torch.testing.assert_close(grad, omega / mass[edge_graph] * analytic, rtol=1e-11, atol=1e-12)
+    # Independent dense unsigned incidence gives the same degree-barrier objective.
+    unsigned = c.new_zeros((state.shape[0], c.numel()))
+    edges = torch.arange(c.numel())
+    unsigned[incidence[0], edges] = 1
+    unsigned[incidence[1], edges] = 1
+    dense_degree, dense_reference = unsigned @ (omega * c), unsigned @ omega
+    active = dense_reference > 0
+    dense_barrier = c.new_zeros(3).index_add(
+        0, node_graph[active], (dense_degree[active] / dense_reference[active]).log()
+    ) / counts.clamp_min(1)
+    dense = (
+        graph_weighted_mean(c * delta + entropy * (c * c.log() - c + 1), edge_graph, 3, omega)
+        - rho * dense_barrier
+    )
+    torch.testing.assert_close(energy, dense)
+
+
+def test_task_loss_reaches_every_dynamic_parameter_and_changes_them():
+    torch.manual_seed(14)
+    inputs = _debug_inputs()
+    state = inputs[0].clone().requires_grad_(True)
+    context = inputs[5].clone().requires_grad_(True)
+    model = GraphOptimizedConductance(5, edge_chunk_size=2).double()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    before = {name: value.detach().clone() for name, value in model.named_parameters()}
+    c = _run(model, inputs, state=state, context=context)
+    message = torch.randn(9, 2, 4, dtype=torch.float64, requires_grad=True)
+    propagated = shared_head_diffusion(
+        message,
+        c,
+        inputs[1],
+        inputs[2],
+        torch.full((3, 2), 0.5, dtype=torch.float64),
+        sampling_correction=inputs[-1],
+        edge_chunk_size=2,
+    )
+    task_target = torch.randn_like(propagated)
+    loss = (propagated - task_target).square().mean()
+    loss.backward()
+    for name, parameter in model.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        assert parameter.grad.abs().sum() > 0, name
+    assert state.grad is not None and torch.isfinite(state.grad).all()
+    assert context.grad is not None and torch.isfinite(context.grad).all()
+    assert message.grad is not None and torch.isfinite(message.grad).all()
+    optimizer.step()
+    assert all(not torch.equal(before[name], value) for name, value in model.named_parameters())
+
+
+def test_no_label_inference_and_zero_barrier_are_autograd_grad_free(monkeypatch):
+    inputs = _debug_inputs()
+    model = GraphOptimizedConductance(5, solver_degree_barrier=0).double().eval()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("The analytic solver must not call autograd.grad")
+
+    monkeypatch.setattr(torch.autograd, "grad", forbidden)
+    with torch.no_grad():
+        c = _run(model, inputs)
+    assert (c > 0).all() and torch.isfinite(c).all()
+    c = _run(model, inputs)
+    (c * torch.arange(8, dtype=c.dtype)).sum().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_float64_gradcheck_includes_the_unrolled_state_and_context_path():
+    torch.manual_seed(13)
+    inputs = _debug_inputs(channels=3)
+    model = GraphOptimizedConductance(3, solver_steps=3, edge_chunk_size=64).double()
+    assert torch.autograd.gradcheck(
+        lambda state, context: _run(model, inputs, state=state, context=context),
+        (inputs[0].requires_grad_(True), inputs[5].requires_grad_(True)),
+        eps=1e-6,
+        atol=1e-5,
+        rtol=2e-4,
+        fast_mode=True,
+    )
+
+
+@pytest.mark.parametrize("rho", [0.0, 0.1, 20.0])
+def test_k_sweep_monotone_energy_and_finite_high_degree_weight_skew(rho):
+    torch.manual_seed(3)
+    count = 30
+    # Clique connected to leaves: heterogeneous degrees and importance weights.
+    clique = torch.combinations(torch.arange(12), r=2).T
+    leaves = torch.stack((torch.zeros(count - 12, dtype=torch.long), torch.arange(12, count)))
+    incidence = torch.cat((clique, leaves), dim=1)
+    degree = torch.bincount(incidence.flatten(), minlength=count).double()
+    inputs = (
+        torch.randn(count, 5, dtype=torch.float64),
+        incidence,
+        torch.zeros(count, dtype=torch.long),
+        degree,
+        degree * 2,
+        torch.randn(1, 18, dtype=torch.float64),
+        torch.logspace(-2, 2, incidence.shape[1], dtype=torch.float64),
+    )
+    model = GraphOptimizedConductance(5, solver_degree_barrier=rho, edge_chunk_size=19).double()
+    previous_energy = None
+    initial_residual = None
+    for steps in (1, 2, 4, 8, 16, 32):
+        model.solver_steps = steps
+        with torch.no_grad():
+            c = _run(model, inputs)
+        diagnostics = model.last_solver_diagnostics
+        energy = diagnostics["objective_final"]
+        if previous_energy is not None:
+            assert energy.le(previous_energy + 1e-11).all()
+        assert (c > 0).all() and torch.isfinite(c).all()
+        assert diagnostics["executed_steps"] == steps
+        if initial_residual is None:
+            initial_residual = diagnostics["projected_gradient_rms_initial"]
+        previous_energy = energy
+    assert diagnostics["projected_gradient_rms_final"].lt(initial_residual).all()
+
+
+def test_exact_chunking_preserves_values_and_gradients(monkeypatch):
+    torch.manual_seed(17)
+    inputs = _debug_inputs()
+    checkpointed = GraphOptimizedConductance(5, edge_chunk_size=2).double()
+    direct = copy.deepcopy(checkpointed)
+    c1 = _run(checkpointed, inputs)
+    (c1 * torch.arange(8, dtype=c1.dtype)).sum().backward()
+    monkeypatch.setattr(
+        torch.utils.checkpoint, "checkpoint", lambda function, *args, **_kwargs: function(*args)
+    )
+    direct.edge_chunk_size = 65536
+    c2 = _run(direct, inputs)
+    (c2 * torch.arange(8, dtype=c2.dtype)).sum().backward()
+    torch.testing.assert_close(c1, c2, rtol=1e-10, atol=1e-12)
+    for first, second in zip(checkpointed.parameters(), direct.parameters(), strict=True):
+        torch.testing.assert_close(first.grad, second.grad, rtol=1e-9, atol=1e-12)
+
+
+@pytest.mark.parametrize("weight", [0.0, -1.0, float("nan"), float("inf")])
+def test_invalid_importance_weights_fail_instead_of_falling_back(weight):
+    inputs = list(_debug_inputs())
+    inputs[-1] = inputs[-1].clone()
+    inputs[-1][0] = weight
+    model = GraphOptimizedConductance(5).double()
+    with pytest.raises(RuntimeError, match="positive sampling weights"):
+        _run(model, inputs)
+
+
+def test_nonfinite_compatibility_fails_explicitly():
+    inputs = list(_debug_inputs())
+    inputs[0] = torch.full_like(inputs[0], float("nan"))
+    with pytest.raises(RuntimeError, match="nonfinite"):
+        _run(GraphOptimizedConductance(5).double(), inputs)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "solver_step_size",
+        "solver_entropy",
+        "solver_degree_barrier",
+        "cost_bound",
+    ],
+)
+@pytest.mark.parametrize("value", [True, "0.25", None, float("nan"), float("inf")])
+def test_invalid_real_solver_configuration_fails_clearly(name, value):
+    with pytest.raises(ValueError, match=name):
+        GraphOptimizedConductance(5, **{name: value})
+
+
+def test_step_checkpoint_reduces_saved_cpu_debug_tensor_storage(monkeypatch):
+    torch.manual_seed(32)
+    inputs = _debug_inputs()
+    model = GraphOptimizedConductance(5, solver_steps=8).double()
+    original_checkpoint = torch.utils.checkpoint.checkpoint
+    calls = []
+
+    def recording(function, *arguments, **kwargs):
+        calls.append(function.__name__)
+        return original_checkpoint(function, *arguments, **kwargs)
+
+    def saved_storage_bytes():
+        storages = {}
+
+        def remember(tensor):
+            storage = tensor.untyped_storage()
+            storages[storage.data_ptr()] = storage.nbytes()
+            return tensor
+
+        with torch.autograd.graph.saved_tensors_hooks(remember, lambda tensor: tensor):
+            output = _run(model, inputs)
+        assert output.grad_fn is not None
+        return sum(storages.values())
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", recording)
+    checkpoint_bytes = saved_storage_bytes()
+    assert calls.count("_step") == 8
+    monkeypatch.setattr(
+        torch.utils.checkpoint,
+        "checkpoint",
+        lambda function, *arguments, **_kwargs: function(*arguments),
+    )
+    direct_bytes = saved_storage_bytes()
+    assert checkpoint_bytes < direct_bytes
+
+
+def test_bfloat16_autocast_keeps_solver_geometry_float32_and_finite_gradients():
+    torch.manual_seed(2)
+    inputs = _debug_inputs(dtype=torch.float32)
+    model = GraphOptimizedConductance(5, edge_chunk_size=3)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        c = _run(model, inputs)
+        loss = (c * torch.arange(8, dtype=c.dtype)).sum()
+    assert c.dtype == torch.float32
+    loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_zero_barrier_converges_toward_analytic_entropy_minimizer():
+    torch.manual_seed(15)
+    inputs = _debug_inputs()
+    model = GraphOptimizedConductance(5, solver_degree_barrier=0, solver_steps=128).double()
+    with torch.no_grad():
+        actual = _run(model, inputs)
+    delta = model.last_scores
+    edge_graph = inputs[2][inputs[1][0]]
+    raw = (-delta / model.solver_entropy).exp()
+    expected = raw / graph_weighted_mean(raw, edge_graph, 3, inputs[-1])[edge_graph]
+    torch.testing.assert_close(actual, expected, rtol=1e-9, atol=1e-11)
+    assert model.last_solver_diagnostics["projected_gradient_rms_final"].max() < 1e-9
+
+
+def test_signed_metric_can_prefer_either_similar_or_dissimilar_endpoints():
+    # The same endpoints receive opposite costs when the learned metric flips.
+    # This would fail for a hard-coded positive distance/homophily energy.
+    model = GraphOptimizedConductance(3).double()
+    projected = torch.eye(3, dtype=torch.float64)
+    tail, head = torch.tensor([0, 0]), torch.tensor([0, 1])
+    degree = torch.ones(3, dtype=torch.float64)
+    edge_graph = torch.zeros(2, dtype=torch.long)
+    with torch.no_grad():
+        model.structure_metric.zero_()
+        positive = model._compatibility_chunk(
+            projected,
+            torch.ones(1, 3, dtype=torch.float64),
+            tail,
+            head,
+            degree,
+            degree,
+            edge_graph,
+        )
+        negative = model._compatibility_chunk(
+            projected,
+            -torch.ones(1, 3, dtype=torch.float64),
+            tail,
+            head,
+            degree,
+            degree,
+            edge_graph,
+        )
+    assert positive[1] > positive[0]
+    assert negative[1] < negative[0]
+````
+
+# tests/test_conductance_v5_optimization_integration.py
+
+````python
+"""CPU debug integration fixtures, never GPU performance or final-training evidence."""
+
+from __future__ import annotations
+
+import copy
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.v5 import batch_calibration, train
+from research.conductance_gat.v5.model import GraphConditionedConductanceNodeClassifier
+from research.conductance_gat.v5.optimization import GraphOptimizedConductance
+from research.conductance_gat.v5.protocol import conductance_configuration
+
+
+@pytest.fixture(autouse=True)
+def preserve_debug_rng():
+    with torch.random.fork_rng(devices=[]):
+        yield
+
+
+def _args(*extra):
+    args = train.build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            "shared_dynamic_c",
+            "--output-dir",
+            "unused-debug-optimization",
+            "--hidden-channels",
+            "16",
+            "--layers",
+            "2",
+            "--heads",
+            "4",
+            "--ffn-multiplier",
+            "2",
+            "--epochs",
+            "12",
+            "--dropout",
+            "0.2",
+            "--no-activation-checkpoint",
+            *extra,
+        ]
+    )
+    train.validate_args(args)
+    return args
+
+
+def _debug_graph(*, labels=True):
+    generator = torch.Generator().manual_seed(109)
+    values = {
+        "x": torch.randn(9, 6, generator=generator),
+        "incidence_edge_index": torch.tensor(
+            [[0, 0, 0, 1, 2, 2, 3, 4, 5, 5, 6, 7], [1, 2, 3, 2, 3, 4, 4, 5, 6, 7, 7, 8]],
+            dtype=torch.long,
+        ),
+    }
+    if labels:
+        values["y"] = torch.arange(9) % 3
+    return SimpleNamespace(**values)
+
+
+def _model(args):
+    return GraphConditionedConductanceNodeClassifier(
+        6,
+        3,
+        **train.architecture_configuration(args),
+        conductance_mode=train.CONDITIONS[args.condition]["conductance_mode"],
+        max_log_conductance=train.COMMON["max_log_conductance"],
+        edge_chunk_size=args.edge_chunk_size,
+    )
+
+
+def _identity(args):
+    return train.build_resume_identity(
+        args,
+        {"data_sha256": "d" * 64, "classification": "synthetic_debug_fixture"},
+        train.phase_schedule(args.epochs, list(args.phase_fractions), args.training_schedule),
+        initial_state_sha256="a" * 64,
+        source_sha256={"debug_fixture.py": "b" * 64},
+        runtime_versions={"torch": str(torch.__version__)},
+    )
+
+
+def _step(model, optimizer, graph):
+    phase = train.configure_phase(model, "joint", 0)
+    optimizer.zero_grad(set_to_none=True)
+    loss, count = train.training_loss(model(graph), graph, torch.arange(6))
+    loss.backward()
+    train.validate_active_gradient_connectivity(model, phase["active_parameter_groups"])
+    gradient = train.require_first_step_conductance_gradient(model)
+    assert gradient["passed"] and count == 6
+    optimizer.step()
+    return loss.detach().clone()
+
+
+def _assert_tree_equal(actual, expected):
+    if isinstance(expected, torch.Tensor):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    elif isinstance(expected, dict):
+        assert set(actual) == set(expected)
+        for key in expected:
+            _assert_tree_equal(actual[key], expected[key])
+    elif isinstance(expected, (list, tuple)):
+        assert type(actual) is type(expected) and len(actual) == len(expected)
+        for value, reference in zip(actual, expected, strict=True):
+            _assert_tree_equal(value, reference)
+    else:
+        assert actual == expected
+
+
+def test_default_cli_uses_optimization_and_joint_for_every_requested_epoch():
+    args = train.build_parser().parse_args(
+        ["--dataset", "cora", "--condition", "shared_dynamic_c", "--output-dir", "unused"]
+    )
+    train.validate_args(args)
+    assert args.conductance_backend == "optimization"
+    assert args.training_schedule == "joint"
+    assert (
+        args.solver_steps,
+        args.solver_step_size,
+        args.solver_entropy,
+        args.solver_degree_barrier,
+    ) == (8, 0.25, 1.0, 0.1)
+    schedule = train.phase_schedule(args.epochs, list(args.phase_fractions), args.training_schedule)
+    assert schedule == [
+        {"name": "joint", "start_epoch": 1, "end_epoch": args.epochs, "length": args.epochs}
+    ]
+    assert [train.phase_at(schedule, epoch)[0] for epoch in range(1, args.epochs + 1)] == (
+        ["joint"] * args.epochs
+    )
+
+
+def test_fixed_solver_is_parameter_free_and_shared_initial_state_is_paired():
+    args = _args()
+    torch.manual_seed(311)
+    dynamic = _model(args)
+    fixed_args = copy.deepcopy(args)
+    fixed_args.condition = "fixed_c"
+    torch.manual_seed(311)
+    fixed = _model(fixed_args)
+    assert dynamic.conductance_backend == fixed.conductance_backend == "optimization"
+    for operator in fixed.operators:
+        assert isinstance(operator.estimator, GraphOptimizedConductance)
+        assert list(operator.estimator.parameters()) == []
+        assert not hasattr(operator.estimator, "score_network")
+    assert all(list(operator.estimator.parameters()) for operator in dynamic.operators)
+    assert train.shared_initial_state_sha256(fixed) == train.shared_initial_state_sha256(dynamic)
+    for name, value in fixed.state_dict().items():
+        if ".operator.estimator." not in name:
+            torch.testing.assert_close(value, dynamic.state_dict()[name], rtol=0, atol=0)
+
+
+def test_real_joint_task_backward_updates_each_solver_and_owns_all_parameters():
+    torch.manual_seed(23)
+    model = _model(_args())
+    optimizer = train.make_optimizer(model)
+    train.validate_optimizer_parameter_ownership(model, optimizer)
+    before = [copy.deepcopy(operator.estimator.state_dict()) for operator in model.operators]
+    loss = _step(model, optimizer, _debug_graph())
+    assert torch.isfinite(loss)
+    conductance_group = next(
+        group for group in optimizer.param_groups if group["name"] == "conductance"
+    )
+    expected = {
+        id(value) for operator in model.operators for value in operator.estimator.parameters()
+    }
+    assert {id(value) for value in conductance_group["params"]} == expected
+    for operator, old in zip(model.operators, before, strict=True):
+        solver = operator.estimator
+        assert isinstance(solver, GraphOptimizedConductance) and not hasattr(
+            solver, "score_network"
+        )
+        assert solver.override is None
+        assert solver.last_c.shape == (_debug_graph().incidence_edge_index.shape[1],)
+        assert torch.isfinite(solver.last_c).all() and (solver.last_c > 0).all()
+        assert torch.std(solver.last_c, correction=0) > 0
+        assert all(
+            value.grad is not None and torch.isfinite(value.grad).all()
+            for value in solver.parameters()
+        )
+        assert sum(float(value.grad.square().sum()) for value in solver.parameters()) > 0
+        assert any(not torch.equal(value, old[name]) for name, value in solver.state_dict().items())
+    diagnostics = train.layer_diagnostics(model, gradients=True)
+    assert all(row["conductance_backend"] == "optimization" for row in diagnostics)
+
+
+def test_label_free_eval_is_deterministic_and_does_not_mutate_model_state_or_rng():
+    torch.manual_seed(41)
+    model = _model(_args()).eval()
+    graph = _debug_graph(labels=False)
+    assert not hasattr(graph, "y")
+    state, rng = copy.deepcopy(model.state_dict()), torch.get_rng_state().clone()
+    with torch.no_grad():
+        first = model(graph)
+        first_c = [operator.estimator.last_c.clone() for operator in model.operators]
+        second = model(graph)
+    torch.testing.assert_close(first, second, rtol=0, atol=0)
+    _assert_tree_equal(model.state_dict(), state)
+    torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+    for operator, expected in zip(model.operators, first_c, strict=True):
+        torch.testing.assert_close(operator.estimator.last_c, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("conductance_backend", "mlp"),
+        ("solver_steps", 9),
+        ("solver_step_size", 0.125),
+        ("solver_entropy", 0.5),
+        ("solver_degree_barrier", 0.2),
+        ("training_schedule", "staged"),
+    ],
+)
+def test_changed_solver_or_schedule_is_not_eligible_for_source_repair_waiver(
+    monkeypatch,
+    field,
+    replacement,
+):
+    args = _args()
+    original = _identity(args)
+    changed_args = copy.deepcopy(args)
+    setattr(changed_args, field, replacement)
+    train.validate_args(changed_args)
+    changed = _identity(changed_args)
+
+    def forbid_source_waiver(*_args):
+        raise AssertionError("architecture/schedule changes must not consult a source waiver")
+
+    monkeypatch.setattr(train, "snapshots_match", forbid_source_waiver)
+    train.validate_resume_identity(original, original, train._canonical_sha256(original))
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        train.validate_resume_identity(original, changed, train._canonical_sha256(original))
+    selected = {
+        "resume_identity": original,
+        "resume_identity_sha256": train._canonical_sha256(original),
+        "epoch": 1,
+        "validation": 0.5,
+        "selection_role": "primary",
+    }
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        train.validate_selected_checkpoint(
+            selected,
+            expected_identity=changed,
+            expected_identity_sha256=train._canonical_sha256(changed),
+            expected_epoch=1,
+            expected_metric=0.5,
+        )
+
+
+def test_legacy_identity_without_solver_contract_cannot_resume_new_architecture(monkeypatch):
+    current = _identity(_args())
+    historical = copy.deepcopy(current)
+    for name in (*conductance_configuration(), "training_schedule"):
+        historical["configuration"].pop(name)
+    historical["schedule"] = train.phase_schedule(12, [0.1, 0.1, 0.4, 0.4], "staged")
+
+    def forbid_source_waiver(*_args):
+        raise AssertionError("legacy model identity is not a numerical bugfix")
+
+    monkeypatch.setattr(train, "snapshots_match", forbid_source_waiver)
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        train.validate_resume_identity(historical, current, train._canonical_sha256(historical))
+
+
+def test_new_solver_cpu_epoch_boundary_resume_matches_next_task_update(tmp_path, monkeypatch):
+    args, graph = _args(), _debug_graph()
+    torch.manual_seed(97)
+    model = _model(args)
+    optimizer = train.make_optimizer(model)
+    _step(model, optimizer, graph)
+    identity = _identity(args)
+    checkpoint = tmp_path / "debug-last.pt"
+    train._save(
+        checkpoint,
+        {
+            "schema_version": 3,
+            "epoch": 1,
+            "resume_identity": identity,
+            "resume_identity_sha256": train._canonical_sha256(identity),
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "cpu_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.get_rng_state(),
+        },
+    )
+    original_bytes = checkpoint.read_bytes()
+    expected_loss = _step(model, optimizer, graph)
+    expected_model, expected_optimizer = (
+        copy.deepcopy(model.state_dict()),
+        copy.deepcopy(optimizer.state_dict()),
+    )
+    expected_draw = torch.rand(9)
+    resumed = _model(args)
+    resumed_optimizer = train.make_optimizer(resumed)
+    saved = train.load_checkpoint_on_cpu(checkpoint)
+    train.validate_resume_identity(
+        saved["resume_identity"], _identity(args), saved["resume_identity_sha256"]
+    )
+    resumed.load_state_dict(saved["model_state"])
+    resumed_optimizer.load_state_dict(saved["optimizer_state"])
+    restored_devices = []
+
+    def record_cuda_rng(state, device):
+        assert state.device.type == "cpu" and state.dtype == torch.uint8
+        restored_devices.append(device)
+
+    monkeypatch.setattr(torch.cuda, "set_rng_state", record_cuda_rng)
+    train.restore_checkpoint_rng(saved, torch.device("cpu"))
+    actual_loss = _step(resumed, resumed_optimizer, graph)
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=0, atol=0)
+    _assert_tree_equal(resumed.state_dict(), expected_model)
+    _assert_tree_equal(resumed_optimizer.state_dict(), expected_optimizer)
+    torch.testing.assert_close(torch.rand(9), expected_draw, rtol=0, atol=0)
+    assert restored_devices == [torch.device("cpu")]
+    assert checkpoint.read_bytes() == original_bytes
+
+
+def test_debug_calibration_forwards_solver_arguments_and_runs_real_joint_updates(monkeypatch):
+    args = _args(
+        "--sampling",
+        "neighbor",
+        "--sample-seed-batch-size",
+        "32",
+        "--solver-steps",
+        "5",
+        "--solver-step-size",
+        "0.2",
+        "--solver-entropy",
+        "0.8",
+        "--solver-degree-barrier",
+        "0.15",
+    )
+    original_args = copy.deepcopy(vars(args))
+    graph = _debug_graph()
+    indices = {"train": torch.arange(6), "validation": torch.arange(6, 9)}
+    payload = {"dataset": args.dataset, "graphs": [vars(graph)], "classes": 3}
+    sampler = SimpleNamespace(metadata=lambda: {"mode": "neighbor", "scope": "debug"})
+    created_models, epochs = [], []
+    constructor = train.GraphConditionedConductanceNodeClassifier
+
+    def make_model(*positional, **kwargs):
+        model = constructor(*positional, **kwargs)
+        created_models.append(model)
+        assert {key: kwargs[key] for key in conductance_configuration()} == {
+            key: getattr(args, key) for key in conductance_configuration()
+        }
+        return model
+
+    def batches(data, split, actual_sampler, epoch, device, seed, candidate, *, timing):
+        assert candidate.sample_seed_batch_size == 64 and actual_sampler is sampler
+        epochs.append(epoch)
+        yield graph, torch.arange(6)
+
+    class DebugMonitor:
+        def __init__(self, device):
+            assert device.type == "cpu"
+
+        def start(self):
+            return {"debug_fixture": True}
+
+        def finish(self, **kwargs):
+            return {"debug_fixture": True, **kwargs}
+
+    monkeypatch.setattr(train, "GraphConditionedConductanceNodeClassifier", make_model)
+    monkeypatch.setattr(train, "_require_cuda", lambda _device: None)
+    monkeypatch.setattr(train, "validate_hardware_runtime", lambda *_args: {"debug_fixture": True})
+    monkeypatch.setattr(train, "_prepare_data", lambda *_args: (graph, indices, sampler))
+    monkeypatch.setattr(train, "_training_batches", batches)
+    monkeypatch.setattr(batch_calibration, "RuntimeResourceMonitor", DebugMonitor)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _device: (10000, 20000))
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda _device: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _device: 1000)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda _device: 2000)
+    report = batch_calibration.run_training_candidate(
+        payload,
+        args,
+        torch.device("cpu"),
+        physical_batch_size=64,
+        workers=0,
+        warmup_steps=1,
+        measurement_steps=1,
+        minimum_measure_seconds=0.000001,
+    )
+    assert report["status"] == "passed" and report["calibration_not_final"] is True
+    assert report["parameter_update_verified"] is True and report["optimizer_state_bytes"] > 0
+    assert report["model_phase"] == "joint_all_condition_parameter_groups_active"
+    assert report["configuration"]["training_schedule"] == "joint"
+    assert report["configuration"]["solver_steps"] == 5
+    assert epochs == [1, 2] and len(created_models) == 1
+    assert all(
+        isinstance(op.estimator, GraphOptimizedConductance) and op.estimator.override is None
+        for op in created_models[0].operators
+    )
+    assert vars(args) == original_args
 ````
 
 # tests/test_conductance_v5_rng_resume.py
@@ -83525,6 +85137,7 @@ from pathlib import Path
 import pytest
 
 from research.conductance_gat.v5 import train
+from research.conductance_gat.v5.protocol import conductance_configuration
 from scripts import run_conductance_v5 as runner
 
 
@@ -83545,6 +85158,8 @@ def test_reference_plan_parses_with_real_child_cli_and_memory_controls(tmp_path)
         "dropout": 0.2,
         "beta_parameterization": "sigmoid",
         "beta_initial": 0.1,
+        **conductance_configuration(),
+        "training_schedule": "joint",
     }
     assert len(jobs) == 2
     assert {job["condition"] for job in jobs} == {"fixed_c", "shared_dynamic_c"}
@@ -92077,7 +93692,7 @@ def test_conductance_main_tracks_explicit_worker_conflict(
 # tests/test_scaling_recovery_compatibility.py
 
 ````python
-"""CPU/file-fixture recovery integration only; never real GPU training or metrics."""
+"""Archived repair fixtures and current-source rejection; no real GPU measurements."""
 
 from __future__ import annotations
 
@@ -92098,22 +93713,26 @@ from scripts import run_rich_scaling as rich
 from scripts import training_resource_plan as resources
 
 
-def _legacy_snapshot(current):
-    """Reconstruct the reviewed predecessor from the actual checked-in registry."""
+def _archived_reviewed_snapshots(source_paths):
+    """Reconstruct only the historical before/after SHA records, not live sources.
+
+    Tests below explicitly stub source providers to these archived records when
+    exercising the old numerical repair. They do not certify today's model as
+    compatible with that repair. Unchanged historical files are not fabricated.
+    """
     registry = json.loads(resume_compat.REGISTRY_PATH.read_bytes())
-    previous = dict(current)
+    previous, repaired = {}, {}
     for name, change in registry["changes"].items():
-        if name not in previous:
+        if name not in source_paths:
             continue
-        assert previous[name] == change["after"]
-        if change["before"] is None:
-            previous.pop(name)
-        else:
+        repaired[name] = change["after"]
+        if change["before"] is not None:
             previous[name] = change["before"]
-    previous.pop(resume_compat.REGISTRY_SOURCE)
-    assert previous != current
-    assert resume_compat.require_source_compatibility(previous, current) is not None
-    return previous
+    repaired[resume_compat.REGISTRY_SOURCE] = hashlib.sha256(
+        resume_compat.REGISTRY_PATH.read_bytes()
+    ).hexdigest()
+    assert resume_compat.require_source_compatibility(previous, repaired) is not None
+    return previous, repaired
 
 
 def _fixture_module(name):
@@ -92128,13 +93747,30 @@ def _fixture_module(name):
 
 
 def _rich_args(tmp_path):
-    args = rich.parser().parse_args([
-        "--tracks", "conductance", "cycle", "--conductance-versions", "v5",
-        "--cycle-versions", "v2", "--profiles", "reference", "large",
-        "--model-seeds", "0", "--hardware-profile", "a6000-48gb",
-        "--data-root", str(tmp_path / "data"), "--results-root", str(tmp_path / "results"),
-        "--run-id", "debug-reviewed-recovery",
-    ])
+    args = rich.parser().parse_args(
+        [
+            "--tracks",
+            "conductance",
+            "cycle",
+            "--conductance-versions",
+            "v5",
+            "--cycle-versions",
+            "v2",
+            "--profiles",
+            "reference",
+            "large",
+            "--model-seeds",
+            "0",
+            "--hardware-profile",
+            "a6000-48gb",
+            "--data-root",
+            str(tmp_path / "data"),
+            "--results-root",
+            str(tmp_path / "results"),
+            "--run-id",
+            "debug-reviewed-recovery",
+        ]
+    )
     rich._validate(args)
     return args
 
@@ -92145,7 +93781,11 @@ def test_existing_measured_plan_keeps_original_request_and_certificate_bytes(
 ):
     args = _rich_args(tmp_path)
     request = rich._calibration_request(args, args.run_id)
-    request["source_sha256"] = _legacy_snapshot(request["source_sha256"])
+    previous, archived_repaired = _archived_reviewed_snapshots(request["source_sha256"])
+    request["source_sha256"] = previous
+    # These are explicitly archived source providers, not current-code evidence.
+    monkeypatch.setattr(rich, "calibration_source_snapshot", lambda: archived_repaired)
+    monkeypatch.setattr(calibration, "source_snapshot", lambda: archived_repaired)
     if drift == "source":
         request["source_sha256"]["research/cycle_pe/v2/model.py"] = "0" * 64
     directory = args.results_root / "resource_calibration" / args.run_id
@@ -92156,11 +93796,14 @@ def test_existing_measured_plan_keeps_original_request_and_certificate_bytes(
     request_before, plan_before = request_path.read_bytes(), plan_path.read_bytes()
     hardware = {"debug_only": True}
     plan = {
-        "_sha256": hashlib.sha256(plan_before).hexdigest(), "entries": [],
-        "request_sha256": resources.digest(request), "source_sha256": request["source_sha256"],
+        "_sha256": hashlib.sha256(plan_before).hexdigest(),
+        "entries": [],
+        "request_sha256": resources.digest(request),
+        "source_sha256": request["source_sha256"],
         "hardware": {job["device"]: hardware for job in request["jobs"]},
         "runtime": {
-            "python": platform.python_version(), "torch": torch.__version__,
+            "python": platform.python_version(),
+            "torch": torch.__version__,
             "cuda": torch.version.cuda,
         },
     }
@@ -92188,7 +93831,9 @@ def test_existing_measured_plan_keeps_original_request_and_certificate_bytes(
     if drift is None:
         rich._ensure_measured_plan(args, args.run_id, run_dir)
         assert events == [
-            "official_input_validation", "existing_plan_returned_without_measurement", "runtime"
+            "official_input_validation",
+            "existing_plan_returned_without_measurement",
+            "runtime",
         ]
         assert args.resolved_resource_plan["_sha256"] == hashlib.sha256(plan_before).hexdigest()
     else:
@@ -92203,8 +93848,7 @@ def test_existing_measured_plan_keeps_original_request_and_certificate_bytes(
 def test_conductance_legacy_manifest_recovery_revalidates_and_skips_completed_children(
     tmp_path, monkeypatch, case
 ):
-    current = conductance._source_snapshot()
-    previous = _legacy_snapshot(current)
+    previous, current = _archived_reviewed_snapshots(conductance._source_snapshot())
     fixture = _fixture_module("test_conductance_scaling_runner")
     options, calls = fixture._stub(tmp_path, monkeypatch)
     options += ["--versions", "v5", "--model-seeds", "0"]
@@ -92247,16 +93891,31 @@ def test_conductance_legacy_manifest_recovery_revalidates_and_skips_completed_ch
 def test_cycle_legacy_failed_manifest_adoption_does_not_trust_passed_candidate_status(
     tmp_path, monkeypatch, artifact_changed
 ):
-    args = cycle.parser().parse_args([
-        "--versions", "v2", "--encodings", "se", "pe", "--profiles", "reference",
-        "--datasets", "zinc12k", "--model-seeds", "0", "--data-root", str(tmp_path / "data"),
-        "--results-root", str(tmp_path), "--run-id", "debug-cycle-recovery",
-    ])
+    args = cycle.parser().parse_args(
+        [
+            "--versions",
+            "v2",
+            "--encodings",
+            "se",
+            "pe",
+            "--profiles",
+            "reference",
+            "--datasets",
+            "zinc12k",
+            "--model-seeds",
+            "0",
+            "--data-root",
+            str(tmp_path / "data"),
+            "--results-root",
+            str(tmp_path),
+            "--run-id",
+            "debug-cycle-recovery",
+        ]
+    )
     cycle._validate(args)
     run_dir = tmp_path / "cycle_pe/scaling" / args.run_id
     run_dir.mkdir(parents=True)
-    current = cycle._source_snapshot()
-    previous = _legacy_snapshot(current)
+    previous, current = _archived_reviewed_snapshots(cycle._source_snapshot())
     jobs = cycle.make_jobs(args, run_dir)
     manifest = cycle._manifest_base(args, args.run_id, run_dir, jobs, {"debug": True}, previous)
     accepted = [{"debug_certificate": "unchanged"}]
@@ -92290,8 +93949,8 @@ def test_rich_legacy_failed_manifest_revalidates_completed_track_and_continues_o
     tmp_path, monkeypatch
 ):
     fixture = _fixture_module("test_rich_scaling_runner")
-    current, calls = rich._source_snapshot(), []
-    previous = _legacy_snapshot(current)
+    previous, current = _archived_reviewed_snapshots(rich._source_snapshot())
+    calls = []
     monkeypatch.setattr(rich, "_ensure_measured_plan", lambda *_args: None)
     monkeypatch.setattr(rich, "_source_snapshot", lambda: previous)
     options = ["--tracks", "conductance", "cycle", *fixture._base_options(tmp_path)]
@@ -92327,12 +93986,11 @@ def test_rich_legacy_failed_manifest_revalidates_completed_track_and_continues_o
     assert completed_path.read_bytes() == completed_before
 
 
-@pytest.mark.parametrize("runner,check", [
-    (conductance, "_check_sources"), (rich, "_check_central_sources")
-])
+@pytest.mark.parametrize(
+    "runner,check", [(conductance, "_check_sources"), (rich, "_check_central_sources")]
+)
 def test_reviewed_resume_does_not_allow_any_source_change_mid_run(monkeypatch, runner, check):
-    current = runner._source_snapshot()
-    previous = _legacy_snapshot(current)
+    previous, current = _archived_reviewed_snapshots(runner._source_snapshot())
     manifest = {"source_sha256": previous, "source_integrity_valid": True}
     resume_compat.adopt_source_snapshot(manifest, current)
     monkeypatch.setattr(runner, "_source_snapshot", lambda: current)
@@ -92342,6 +94000,34 @@ def test_reviewed_resume_does_not_allow_any_source_change_mid_run(monkeypatch, r
     with pytest.raises(RuntimeError, match="source changed"):
         getattr(runner, check)(manifest)
     assert manifest["source_integrity_valid"] is False
+
+
+def test_current_optimization_source_rejects_archived_repair_without_touching_run(
+    tmp_path,
+    monkeypatch,
+):
+    actual_current = conductance._source_snapshot()
+    previous, archived_repaired = _archived_reviewed_snapshots(actual_current)
+    assert (
+        actual_current["research/conductance_gat/v5/train.py"]
+        != (archived_repaired["research/conductance_gat/v5/train.py"])
+    )
+    assert not resume_compat.snapshots_match(previous, actual_current)
+    assert not resume_compat.snapshots_match(archived_repaired, actual_current)
+    fixture = _fixture_module("test_conductance_scaling_runner")
+    options, calls = fixture._stub(tmp_path, monkeypatch)
+    options += ["--versions", "v5", "--model-seeds", "0"]
+    # Build explicit mock-child artifacts, with the prior repair's archived SHA
+    # provider. This is neither a historical training run nor live GPU evidence.
+    monkeypatch.setattr(conductance, "_source_snapshot", lambda: archived_repaired)
+    assert conductance.main(options) == 0
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    calls.clear()
+    monkeypatch.setattr(conductance, "_source_snapshot", lambda: actual_current)
+    assert conductance.main(options) == 1
+    assert calls == []
+    after = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    assert after == before
 ````
 
 # tests/test_seed_protocol.py
@@ -93929,14 +95615,171 @@ def test_source_snapshot_covers_tree_model_runner_and_shared_math() -> None:
         assert name in snapshot and len(snapshot[name]) == 64
 ````
 
+# tests/test_v5_optimizer_runner_contract.py
+
+````python
+"""CPU-only configuration/identity tests; no model training or GPU measurement."""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from research.conductance_gat.v5.protocol import conductance_configuration
+from scripts import run_conductance_scaling as scaling
+from scripts import run_conductance_v5 as standalone
+from scripts import run_rich_scaling as rich
+
+
+def _option(command, option):
+    return command[command.index(option) + 1]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"conductance_backend": "implicit_fallback"},
+        {"solver_steps": 0},
+        {"solver_steps": True},
+        {"solver_steps": 2.5},
+        {"solver_step_size": 0},
+        {"solver_step_size": float("nan")},
+        {"solver_entropy": 0},
+        {"solver_entropy": float("inf")},
+        {"solver_degree_barrier": -0.1},
+    ],
+)
+def test_invalid_solver_contract_is_rejected(override):
+    with pytest.raises(ValueError):
+        conductance_configuration(**override)
+
+
+def test_default_standalone_keeps_large_backbone_and_records_solver(tmp_path):
+    args = standalone.parser().parse_args(["--profile", "large", "--datasets", "cora"])
+    standalone._validate(args)
+    architecture = standalone._architecture(args)
+    assert (architecture["hidden_channels"], architecture["layers"], architecture["heads"]) == (
+        384,
+        12,
+        8,
+    )
+    assert architecture["conductance_backend"] == "optimization"
+    assert architecture["training_schedule"] == "joint"
+    assert args.epochs == 300
+    jobs = standalone.make_jobs(args, tmp_path, architecture)
+    assert len(jobs) == 2
+    for job in jobs:
+        for name, value in conductance_configuration().items():
+            assert job["architecture"][name] == value
+            assert _option(job["command"], "--" + name.replace("_", "-")) == str(value)
+        assert _option(job["command"], "--training-schedule") == "joint"
+
+
+def test_explicit_mlp_staged_ablation_is_distinct_and_forwarded(tmp_path):
+    base_options = ["--versions", "v5", "--datasets", "cora", "--profiles", "reference"]
+    default = scaling.parser().parse_args(base_options)
+    legacy = scaling.parser().parse_args(
+        [*base_options, "--v5-conductance-backend", "mlp", "--v5-training-schedule", "staged"]
+    )
+    new_jobs = scaling.make_jobs(default, tmp_path)
+    old_jobs = scaling.make_jobs(legacy, tmp_path)
+    assert len(new_jobs) == len(old_jobs) == 2
+    assert default.epochs == legacy.epochs == 200
+    assert scaling._job_identity(new_jobs[0]) != scaling._job_identity(old_jobs[0])
+    for job in old_jobs:
+        assert job["architecture"]["conductance_backend"] == "mlp"
+        assert job["architecture"]["training_schedule"] == "staged"
+        assert _option(job["command"], "--conductance-backend") == "mlp"
+        assert _option(job["command"], "--training-schedule") == "staged"
+
+
+def test_custom_solver_configuration_reaches_nested_training_child(tmp_path):
+    options = [
+        "--tracks",
+        "conductance",
+        "--conductance-versions",
+        "v5",
+        "--v5-solver-steps",
+        "12",
+        "--v5-solver-step-size",
+        "0.125",
+        "--v5-solver-entropy",
+        "0.75",
+        "--v5-solver-degree-barrier",
+        "0.2",
+    ]
+    args = rich.parser().parse_args(options)
+    rich._validate(args)
+    jobs = rich.make_jobs(args, "optimizer-check")
+    assert len(jobs) == 1
+    child_args = scaling.parser().parse_args(jobs[0]["command"][3:])
+    child_jobs = scaling.make_jobs(child_args, tmp_path)
+    assert len(child_jobs) == 20
+    for job in child_jobs:
+        assert job["architecture"]["solver_steps"] == 12
+        assert job["architecture"]["solver_step_size"] == 0.125
+        assert job["architecture"]["solver_entropy"] == 0.75
+        assert job["architecture"]["solver_degree_barrier"] == 0.2
+        assert _option(job["command"], "--solver-steps") == "12"
+
+
+def test_c_options_do_not_change_cycle_or_tree_child_identity(tmp_path):
+    first = rich.parser().parse_args(["--tracks", "cycle", "tree"])
+    second = rich.parser().parse_args(
+        [
+            "--tracks",
+            "cycle",
+            "tree",
+            "--v5-conductance-backend",
+            "mlp",
+            "--v5-training-schedule",
+            "staged",
+            "--v5-solver-steps",
+            "17",
+        ]
+    )
+    assert rich.make_jobs(first, "unchanged") == rich.make_jobs(second, "unchanged")
+    first_config = rich._config_payload(first, data_root=tmp_path, results_root=tmp_path)
+    second_config = rich._config_payload(second, data_root=tmp_path, results_root=tmp_path)
+    assert first_config == second_config
+    assert first_config["v5_conductance"] is None
+
+
+def test_old_rich_config_cannot_resume_as_new_optimizer_and_file_is_preserved(tmp_path):
+    args = rich.parser().parse_args(["--tracks", "conductance", "--conductance-versions", "v5"])
+    new_config = rich._config_payload(args, data_root=tmp_path, results_root=tmp_path)
+    old_config = {key: value for key, value in new_config.items() if key != "v5_conductance"}
+    payload = {
+        "schema_version": 1,
+        "suite": "rich_scaling",
+        "run_id": "existing",
+        "config": old_config,
+    }
+    manifest_path = tmp_path / "manifest.json"
+    original = json.dumps(payload).encode()
+    manifest_path.write_bytes(original)
+    with pytest.raises(ValueError, match="new run ID.*tracks conductance"):
+        rich._resume_manifest(
+            manifest_path,
+            run_id="existing",
+            expected_config=new_config,
+            expected_jobs=[],
+            expected_totals={},
+            expected_sources={},
+        )
+    assert manifest_path.read_bytes() == original
+````
+
 # tests/test_v5_recovery_compatibility.py
 
 ````python
-"""CPU-only recovery boundaries plus unstubbed, checked-in registry integration."""
+"""Archived numerical-repair boundaries and rejection of today's changed V5 model."""
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 
 import pytest
@@ -93949,17 +95792,31 @@ from research.conductance_gat.tests.test_v5_p0_integrity import _identity
 from research.conductance_gat.v5 import report, train
 
 
+def _archived_source_pair():
+    """Historical SHA-only fixture, never a snapshot of currently executing code."""
+    registry = json.loads(resume_compat.REGISTRY_PATH.read_bytes())
+    names = {
+        "research/conductance_gat/v5/train.py",
+        "research/conductance_gat/v5/report.py",
+        resume_compat.HELPER_SOURCE,
+    }
+    before, after = {}, {}
+    for name in names:
+        change = registry["changes"][name]
+        after[name] = change["after"]
+        if change["before"] is not None:
+            before[name] = change["before"]
+    after[resume_compat.REGISTRY_SOURCE] = hashlib.sha256(
+        resume_compat.REGISTRY_PATH.read_bytes()
+    ).hexdigest()
+    return before, after
+
+
 @pytest.fixture
-def reviewed_sources(monkeypatch):
-    """Boundary-only stub; the real-registry test below does not use this fixture."""
-    before = {"research/conductance_gat/v5/train.py": "a" * 64}
-    after = {"research/conductance_gat/v5/train.py": "b" * 64}
-
-    def one_reviewed_transition(previous, current):
-        return previous == current or (previous == before and current == after)
-
-    monkeypatch.setattr(train, "snapshots_match", one_reviewed_transition)
-    monkeypatch.setattr(report, "snapshots_match", one_reviewed_transition)
+def reviewed_sources():
+    """Use archived registry SHA records with the actual compatibility checker."""
+    before, after = _archived_source_pair()
+    assert resume_compat.require_source_compatibility(before, after) is not None
     return before, after
 
 
@@ -94129,26 +95986,44 @@ def test_mixed_pair_keeps_non_source_and_unreviewed_source_mismatch_guards(
         report.build_comparison(tmp_path, manifest)
 
 
-def test_real_registry_preserves_old_checkpoint_contracts_and_completed_pair(tmp_path):
-    # No snapshots_match/require_source_compatibility mocks in this test.
-    registry = json.loads(resume_compat.REGISTRY_PATH.read_text(encoding="utf-8"))
-    current_sources = train.implementation_source_hashes()
-    previous_sources = copy.deepcopy(current_sources)
-    previous_sources.pop(resume_compat.REGISTRY_SOURCE)
-    for name, change in registry["changes"].items():
-        if name not in previous_sources:
-            continue
-        if change["before"] is None:
-            previous_sources.pop(name)
-        else:
-            previous_sources[name] = change["before"]
-    evidence = resume_compat.require_source_compatibility(previous_sources, current_sources)
+def test_real_registry_preserves_archived_repair_contracts_not_current_optimization(tmp_path):
+    # No mocks and no current-file SHA substitution into historical after values.
+    previous_sources, repaired_sources = _archived_source_pair()
+    evidence = resume_compat.require_source_compatibility(previous_sources, repaired_sources)
     assert evidence["patch_id"] == "v5-rng-cycle-workers-v1"
-    assert resume_compat.snapshots_match(previous_sources, current_sources)
-    assert not resume_compat.snapshots_match(current_sources, previous_sources)
-    previous, current = _identities((previous_sources, current_sources))
+    assert resume_compat.snapshots_match(previous_sources, repaired_sources)
+    assert not resume_compat.snapshots_match(repaired_sources, previous_sources)
+    previous, current = _identities((previous_sources, repaired_sources))
     train.validate_resume_identity(previous, current, train._canonical_sha256(previous))
     _validate_best(_best(previous), current)
-    manifest = _write_pair(tmp_path, (previous_sources, current_sources))
+    manifest = _write_pair(tmp_path, (previous_sources, repaired_sources))
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
     assert report.build_comparison(tmp_path, manifest)["status"] == "passed"
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
+
+
+def test_actual_optimization_sources_reject_archived_checkpoint_and_pair_without_writes(tmp_path):
+    previous_sources, repaired_sources = _archived_source_pair()
+    current_sources = train.implementation_source_hashes()
+    assert (
+        current_sources["research/conductance_gat/v5/train.py"]
+        != (repaired_sources["research/conductance_gat/v5/train.py"])
+    )
+    for historical_sources in (previous_sources, repaired_sources):
+        assert not resume_compat.snapshots_match(historical_sources, current_sources)
+        previous, current = _identities((historical_sources, current_sources))
+        selected = _best(previous)
+        unchanged = copy.deepcopy((previous, current, selected))
+        with pytest.raises(ValueError, match="source_sha256"):
+            train.validate_resume_identity(previous, current, train._canonical_sha256(previous))
+        with pytest.raises(ValueError, match="source_sha256"):
+            _validate_best(selected, current)
+        assert (previous, current, selected) == unchanged
+    manifest = _write_pair(tmp_path, (repaired_sources, current_sources))
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    with pytest.raises(
+        report.ComparisonIntegrityError, match="fixed/dynamic source_sha256 mismatch"
+    ):
+        report.build_comparison(tmp_path, manifest)
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
 ````

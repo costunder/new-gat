@@ -22,7 +22,7 @@ def graph():
     )
 
 
-def model(mode="dynamic"):
+def model(mode="dynamic", backend="optimization"):
     return GraphConditionedConductanceNodeClassifier(
         5,
         3,
@@ -32,6 +32,7 @@ def model(mode="dynamic"):
         ffn_multiplier=2,
         dropout=0.0,
         conductance_mode=mode,
+        conductance_backend=backend,
         activation_checkpoint=False,
     )
 
@@ -104,18 +105,23 @@ def test_dynamic_c_is_shared_positive_relative_and_not_dead_at_initialization():
     assert result["passed"] and all(row["upstream_gradient_norm"] > 0 for row in result["layers"])
 
 
-def test_fixed_c_is_parameter_free_and_shared_initialization_stays_paired():
+@pytest.mark.parametrize("backend", ["optimization", "mlp"])
+def test_fixed_c_is_parameter_free_and_shared_initialization_stays_paired(backend):
     torch.manual_seed(31)
-    fixed = model("fixed_one")
+    fixed = model("fixed_one", backend)
     torch.manual_seed(31)
-    dynamic = model("dynamic")
+    dynamic = model("dynamic", backend)
 
     for operator in fixed.operators:
         assert list(operator.estimator.parameters()) == []
         assert operator.estimator.node_projection is None
-        assert operator.estimator.context_projection is None
-        assert operator.estimator.score_norm is None
-        assert operator.estimator.score_network is None
+        if backend == "mlp":
+            assert operator.estimator.context_projection is None
+            assert operator.estimator.score_norm is None
+            assert operator.estimator.score_network is None
+        else:
+            assert operator.estimator.context_metric is None
+            assert operator.estimator.structure_metric is None
     assert all(list(operator.estimator.parameters()) for operator in dynamic.operators)
 
     fixed_shared = {

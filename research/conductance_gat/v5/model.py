@@ -10,10 +10,17 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .operator import graph_weighted_mean, shared_head_diffusion
+from .optimization import GraphOptimizedConductance
 from .protocol import (
     DEFAULT_BETA_INITIAL,
     DEFAULT_BETA_PARAMETERIZATION,
+    DEFAULT_CONDUCTANCE_BACKEND,
+    DEFAULT_SOLVER_DEGREE_BARRIER,
+    DEFAULT_SOLVER_ENTROPY,
+    DEFAULT_SOLVER_STEP_SIZE,
+    DEFAULT_SOLVER_STEPS,
     beta_configuration,
+    conductance_configuration,
 )
 
 
@@ -129,9 +136,7 @@ class GraphConditionedConductance(nn.Module):
         self.edge_chunk_size = edge_chunk_size
         if mode == "dynamic":
             self.node_projection: nn.Linear | None = nn.Linear(channels, score_channels)
-            self.context_projection: nn.Linear | None = nn.Linear(
-                2 * channels + 8, score_channels
-            )
+            self.context_projection: nn.Linear | None = nn.Linear(2 * channels + 8, score_channels)
             edge_width = 4 * score_channels + 8
             self.score_norm: nn.LayerNorm | None = nn.LayerNorm(edge_width)
             self.score_network: nn.Sequential | None = nn.Sequential(
@@ -357,21 +362,41 @@ class SharedConductanceMultihead(nn.Module):
         beta_min: float | None,
         beta_max: float | None,
         edge_chunk_size: int,
+        conductance_backend: str = DEFAULT_CONDUCTANCE_BACKEND,
+        solver_steps: int = DEFAULT_SOLVER_STEPS,
+        solver_step_size: float = DEFAULT_SOLVER_STEP_SIZE,
+        solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
+        solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
     ) -> None:
         super().__init__()
         if channels % heads:
             raise ValueError("hidden channels must be divisible by heads")
         self.channels, self.heads, self.head_width = channels, heads, channels // heads
         self.conductance_mode = conductance_mode
+        self.conductance_backend = conductance_backend
         # Dynamic-only initialization must not shift the RNG stream used by W, beta,
         # FFNs or later blocks; those shared parameters remain exactly paired by seed.
         with torch.random.fork_rng(devices=[]):
-            self.estimator = GraphConditionedConductance(
-                channels,
-                mode=conductance_mode,
-                max_log_conductance=max_log_conductance,
-                edge_chunk_size=edge_chunk_size,
-            )
+            if conductance_backend == "optimization":
+                self.estimator = GraphOptimizedConductance(
+                    channels,
+                    mode=conductance_mode,
+                    solver_steps=solver_steps,
+                    solver_step_size=solver_step_size,
+                    solver_entropy=solver_entropy,
+                    solver_degree_barrier=solver_degree_barrier,
+                    cost_bound=max_log_conductance,
+                    edge_chunk_size=edge_chunk_size,
+                )
+            elif conductance_backend == "mlp":
+                self.estimator = GraphConditionedConductance(
+                    channels,
+                    mode=conductance_mode,
+                    max_log_conductance=max_log_conductance,
+                    edge_chunk_size=edge_chunk_size,
+                )
+            else:
+                raise ValueError(f"unsupported conductance backend: {conductance_backend}")
         self.value_weight = nn.Parameter(torch.empty(heads, channels, self.head_width))
         nn.init.xavier_uniform_(self.value_weight.reshape(channels, channels))
         self.output_projection = nn.Linear(channels, channels, bias=False)
@@ -493,6 +518,11 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
         beta_max: float | None = None,
         edge_chunk_size: int = 65536,
         activation_checkpoint: bool = True,
+        conductance_backend: str = DEFAULT_CONDUCTANCE_BACKEND,
+        solver_steps: int = DEFAULT_SOLVER_STEPS,
+        solver_step_size: float = DEFAULT_SOLVER_STEP_SIZE,
+        solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
+        solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
     ) -> None:
         super().__init__()
         for name, value in (
@@ -517,10 +547,19 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
         self.hidden_channels, self.layers, self.heads = hidden_channels, layers, heads
         self.ffn_multiplier, self.dropout = ffn_multiplier, float(dropout)
         self.conductance_mode = conductance_mode
+        self.conductance_configuration = conductance_configuration(
+            conductance_backend,
+            solver_steps,
+            solver_step_size,
+            solver_entropy,
+            solver_degree_barrier,
+        )
+        self.conductance_backend = conductance_backend
         self.activation_checkpoint = bool(activation_checkpoint)
         self.input_norm = nn.LayerNorm(in_channels)
         self.encoder = nn.Linear(in_channels, hidden_channels)
         operator_kwargs = {
+            **self.conductance_configuration,
             "conductance_mode": conductance_mode,
             "max_log_conductance": max_log_conductance,
             "beta_parameterization": beta_parameterization,

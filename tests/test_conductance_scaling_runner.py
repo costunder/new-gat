@@ -18,6 +18,7 @@ from research.conductance_gat.v2 import train as v2_train
 from research.conductance_gat.v3 import train as v3_train
 from research.conductance_gat.v4 import train as v4_train
 from research.conductance_gat.v5 import train as v5_train
+from research.conductance_gat.v5.protocol import conductance_configuration
 from scripts import run_conductance_scaling as runner
 
 
@@ -62,9 +63,7 @@ def test_default_plan_covers_all_versions_profiles_seed_zero_and_supported_datas
 
 
 def test_legacy_ppi_batch_override_reaches_v1_v3_v4_but_not_v5() -> None:
-    args = runner.parser().parse_args(
-        ["--datasets", "ppi", "--legacy-ppi-batch-size", "5"]
-    )
+    args = runner.parser().parse_args(["--datasets", "ppi", "--legacy-ppi-batch-size", "5"])
     runner._validate(args)
     jobs = runner.make_jobs(args, Path("fixture"))
     for job in jobs:
@@ -140,6 +139,8 @@ def test_large_profile_is_forwarded_to_every_child_and_outputs_are_unique():
                 ffn_multiplier=4,
                 beta_parameterization="sigmoid",
                 beta_initial=0.1,
+                **conductance_configuration(),
+                training_schedule="joint",
             )
         assert job["architecture"] == expected_architecture
         module = _argument(job["command"], "-m")
@@ -383,16 +384,12 @@ def test_v1_validation_only_path_does_not_construct_a_test_loader(monkeypatch):
 
 
 def test_v1_child_worker_contract_is_dataset_specific():
-    ppi = scaling_v1.build_parser().parse_args(
-        ["--dataset", "ppi", "--output-dir", "out"]
-    )
+    ppi = scaling_v1.build_parser().parse_args(["--dataset", "ppi", "--output-dir", "out"])
     scaling_v1._validate(ppi)
     assert ppi.workers == 4
     assert ppi.batch_size == 2
     assert ppi.worker_configuration_source == "dataset_default"
-    cora = scaling_v1.build_parser().parse_args(
-        ["--dataset", "cora", "--output-dir", "out"]
-    )
+    cora = scaling_v1.build_parser().parse_args(["--dataset", "cora", "--output-dir", "out"])
     scaling_v1._validate(cora)
     assert cora.workers == 0
     assert cora.batch_size == 1
@@ -627,8 +624,12 @@ def test_v5_production_throughput_reaches_real_scaling_aggregation(
 
     options, calls = _stub(tmp_path, monkeypatch)
     options += [
-        "--versions", "v5", "--model-seeds", "0",
-        "--hardware-profile", hardware_profile,
+        "--versions",
+        "v5",
+        "--model-seeds",
+        "0",
+        "--hardware-profile",
+        hardware_profile,
     ]
     assert runner.main(options) == 0
     root = tmp_path / "conductance_gat/scaling/unit-fixture"
@@ -636,12 +637,8 @@ def test_v5_production_throughput_reaches_real_scaling_aggregation(
     summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
     assert len(calls) == 3  # Preflight plus both V5 conditions, never actual subprocesses.
     assert manifest["status"] == "passed"
-    assert {job["condition"] for job in manifest["jobs"]} == {
-        "fixed_c", "shared_dynamic_c"
-    }
-    expected = v5_train.training_throughput(
-        [{"train_label_count": 120, "train_batches": 3}], 1.5
-    )
+    assert {job["condition"] for job in manifest["jobs"]} == {"fixed_c", "shared_dynamic_c"}
+    expected = v5_train.training_throughput([{"train_label_count": 120, "train_batches": 3}], 1.5)
     for job in manifest["jobs"]:
         assert job["result"]["throughput"] == expected
         assert runner._load_child(job)["throughput"] == expected

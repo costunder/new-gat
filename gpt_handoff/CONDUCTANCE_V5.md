@@ -1,4 +1,84 @@
-# Conductance GAT V5 — graph-conditioned shared dynamic C
+# Conductance GAT V5 — graph-specific C optimization and weighted-Laplacian propagation
+
+## 현재 기본 구조: 2026-09-06 C 최적화 계층
+
+현재 V5의 기본 `conductance_backend`는 `optimization`이다. 이전 endpoint MLP가 C를
+한 번 출력하던 방식은 `--conductance-backend mlp`로 명시하는 비교 옵션으로 남긴다.
+이는 실제 모델 구조 변경이며 이전 MLP V5 checkpoint/결과/실측 plan과 호환되지 않는다.
+기존 결과를 삭제하거나 source hash를 고쳐 새 구조에 이어 붙이지 않는다.
+
+### 학습되는 대상과 forward
+
+각 레이어에서 C는 모든 feature head에 공유되는 양수 엣지 변수다. 입력 그래프별로 C=1에서
+시작하여 정확히 K회의 미분 가능한 KL-proximal mirror update를 수행한다. 학습되는 공유
+파라미터 phi는 대칭 signed quadratic compatibility와 구조 비용을 정의한다. 전체 채널의
+노드 projection, 그래프 문맥에 따른 signed metric, endpoint 교환 불변 degree/coverage
+특징을 쓰며, edge-output MLP 또는 고정된 엣지별 파라미터 테이블은 기본 경로에 없다.
+Signed metric은 같은 특징끼리만 연결해야 한다는 homophily 제약을 강제하지 않는다.
+
+그래프별 샘플링 보정 omega, 가중 degree d(c), 기준 degree d(1)에 대해 최적화 에너지는
+
+\[
+E_\phi(c)=\operatorname{mean}_\omega[c\delta_\phi]
++\tau\operatorname{mean}_\omega[c\log c-c+1]
+-\rho\operatorname{mean}_{i:d_i(1)>0}\log\frac{d_i(c)}{d_i(1)},
+\qquad c>0,\quad\operatorname{mean}_\omega(c)=1.
+\]
+
+Entropy는 집중을 제어하고 degree 항은 가중 degree 붕괴를 억제한다. 계수는 task에 대해
+최적이라고 검증된 값이 아니다. 그래프의 상대 곡률과 log-C 변위에 근거한 adaptive step을
+사용하며 K나 엣지 수를 조용히 줄이지 않는다. 학습 loss는 K회 계산 전체를 거쳐 compatibility
+파라미터와 W에 역전파된다. 평가에서도 G와 X만 사용하며 validation/test 정답으로 C를
+최적화하지 않는다. 유한 K 결과를 최적해 또는 수렴 완료라고 표현하지 않는다.
+
+\[
+L_C=B^\top\operatorname{diag}(c)B,\quad
+\mathcal L_C=D_C^{-1/2}L_CD_C^{-1/2},\quad
+M_h=(I-\beta_h\mathcal L_C)HW_h.
+\]
+
+샘플 경로에서는 실제 edge weight가 omega*c다. C뿐 아니라 D_C도 미분 경로에 남긴다.
+구현은 edge difference, scalar-C multiplication, node aggregation으로 이 연산을 계산한다.
+Dense 발생/라플라시안 행렬, QR/SVD/EVD는 사용하지 않는다. C=1은 같은 backbone의
+고정 엣지 전파 대조군이며, self-loop 처리와 beta/residual/FFN이 달라 표준 GCN 그 자체는 아니다.
+
+### 설정·학습·자원 계약
+
+- 기본 K=8, step 상한=0.25, entropy=1.0, degree barrier=0.1. 각각 `--solver-steps`,
+  `--solver-step-size`, `--solver-entropy`, `--solver-degree-barrier`로 명시 변경할 수 있다.
+  K=8은 유한 반복 연구 설정이며 수렴/최적 처리량을 보증하지 않는다. 초기/최종 에너지,
+  projected-gradient RMS, 마지막 log-C update, 실제 adaptive step 범위를 레이어별 기록한다.
+- 기존 `max_log_conductance=2.0`은 optimization backend에서 compatibility cost의 tanh
+  범위로 사용된다. 최종 log-C의 고정 범위라는 뜻이 아니다. MLP backend에서는 과거 의미를 유지한다.
+- 기본 `training_schedule=joint`: 첫 epoch부터 C/W/backbone/beta 공동 학습. 기존 staged
+  warmup/calibration/alternating/joint는 명시적 `--training-schedule staged` 비교 옵션이다.
+  총 200 epochs / patience 50 계약, 별도 optimizer parameter group은 유지한다.
+- Reference 256 channels x 8 layers x 8 heads, large 384 x 12 x 8, FFN multiplier 4,
+  dropout 0.2, model seed 0과 전체 공식 데이터/split을 유지한다. C=1은 C 파라미터가 없고
+  두 조건의 backbone/W/beta 초기 state는 같은 seed로 정렬한다.
+- 호환되지 않는 모델/solver/schedule은 다른 run ID로 실행한다. 같은 새 설정에서는
+  CPU-staged checkpoint와 model/optimizer/RNG를 사용한 epoch-boundary resume를 유지한다.
+- 실제 batch calibration과 benchmark_speed도 요청된 backend/K/계수를 적용한 joint 모델을
+  사용한다. 모델이나 데이터를 줄이지 않고 실제 optimizer state까지 포함해 측정한다.
+- C 기하/정규화는 FP32, dense 부분은 기존 hardware profile의 precision을 유지한다.
+  모든 edge/head를 처리하며 chunk/recompute/checkpoint는 정확한 메모리 절약 수단이다.
+
+### 샘플링과 미검증 범위
+
+현재 sampler의 degree-ratio boundary correction은 휴리스틱이며 inclusion probability의
+역수가 아니다. 샘플 그래프에서 C와 degree를 다시 계산하므로 전체 그래프 연산의 정확하거나
+불편인 추정량이라고 주장하지 않는다. 전체 공식 그래프 validation을 유지하고, sample/full
+연산 차이는 별도 진단 대상으로 둔다. 새 최적화 계층의 서버 A6000 성능, 실제 데이터 전체
+학습/평가 및 기존 MLP-C 대비 정확도 개선은 아직 검증하지 않았다.
+
+원리 참고: [Laplacian edge-weight optimization](https://proceedings.mlr.press/v51/kalofolias16.html),
+[GRAND neural diffusion](https://proceedings.mlr.press/v139/chamberlain21a.html).
+위 task-trained 유한 반복 계층은 이 프로젝트의 설계 후보이며 두 논문의 그대로인 구현은 아니다.
+
+## 아래 내용은 2026-09-05까지의 MLP V5 및 실행 수정 기록
+
+아래의 이전 현재/후속/재개 표현은 당시 소스를 가리킨다. 새 optimization V5의 구조와
+호환 규칙은 위 절과 RICH_SCALING_EXPERIMENTS.md의 2026-09-06 절을 우선한다.
 
 ## 판정
 

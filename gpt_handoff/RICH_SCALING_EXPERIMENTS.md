@@ -5,8 +5,38 @@
 capacity에서 성능을 낼 수 있는지를 본다. 기본 seed는 시간 제약 때문에 0 하나다.
 
 이 문서의 전체 matrix는 실험 계약 설명이며 완료한 V1–V4/Cycle V1/Tree를 다시 돌리라는
-안내가 아니다. 현재 V5·Cycle V2의 실행은 바로 아래 실측 calibration 절을 우선한다.
+안내가 아니다. 현재 V5는 바로 아래 2026-09-06 구조 변경 절을 우선한다.
 구 source/checkpoint의 strict resume 검사는 우회하지 않는다.
+
+## 현재 V5: 2026-09-06 C 최적화 계층 — 새로운 실행 ID, conductance만
+
+V5 기본값을 `optimization` backend와 `joint` 학습으로 변경했다. 기존 MLP V5와 모델 및
+학습 계약이 다르므로 과거 measured run ID/checkpoint/resource plan을 이어 쓰지 않는다.
+과거 완료한 V5 결과는 삭제하지 않고 MLP 구조의 결과로 보존하며 Cycle/Tree는 다시 실행하지 않는다.
+아래 명령은 **수정한 소스를 서버에 반영한 뒤** 사용하는 예시다. 문서 갱신은 GitHub push나
+원격 학습 실행을 의미하지 않는다. 활성 학습과 같은 checkout의 소스를 도중에 바꾸지 않는다.
+
+```bash
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+python -B scripts/run_rich_scaling.py \
+  --run-id optimized-c-v5-a6000-gpu3-seed0-v1 \
+  --tracks conductance --conductance-versions v5 \
+  --profiles reference large --model-seeds 0 \
+  --v5-conductance-backend optimization --v5-training-schedule joint \
+  --v5-solver-steps 8 --v5-solver-step-size 0.25 \
+  --v5-solver-entropy 1.0 --v5-solver-degree-barrier 0.1 \
+  --hardware-profile a6000-48gb --min-free-gb 40 --device cuda:0
+```
+
+이 계획은 V5의 5 datasets x 2 profiles x 2 conditions x seed 0 = 20 trainings를 유지한다.
+새 구조의 실제 joint forward/loss/backward/AdamW를 사용해 batch/worker를 다시 측정한다.
+기존 MLP 측정값을 새 solver의 최적 배치로 재사용하지 않는다. 같은 새 설정/소스/runtime으로
+중단되면 같은 새 ID로 재개하며, solver/backend/schedule을 바꾸면 다른 ID가 필요하다.
+MLP/staged 비교는 별도 ID와 명시적 `--v5-conductance-backend mlp`,
+`--v5-training-schedule staged`를 사용한다. 과거 소스의 완전 재현을 보장하는 옵션은 아니다.
+
+모델 상세와 finite-K/샘플링 한계는 [CONDUCTANCE_V5.md](CONDUCTANCE_V5.md) 첫 절을 본다.
+아래 2026-09-05 같은 ID 재개 안내는 당시 MLP 소스용 역사 기록으로, 새 구조에 적용하지 않는다.
 
 ## 2026-09-05 재개 오류 복구: 기존 measured run ID 유지
 
@@ -27,7 +57,7 @@ artifact와 checkpoint의 해시는 고쳐 쓰지 않고 검증한다. 재개 ma
 epoch 경계에서 재개한다. 결과 폴더·`last.pt`·실측 plan을 삭제하거나 새 run ID로 바꾸지 않는다.
 원격 A6000에서 수정판을 재실행한 결과는 아직 없으며 로컬 CPU 회귀만으로 성공을 주장하지 않는다.
 
-## 현재 실행: 실제 학습 batch/worker 측정 후 V5·Cycle V2 시작
+## 이전 MLP 실행 기록: 실제 학습 batch/worker 측정 후 V5·Cycle V2 시작
 
 `a6000-48gb`라는 이름이나 GPU 사용률 100%만으로 batch가 최적이라고 판단하지 않는다.
 사용자가 제공한 A6000 GPU 3 화면은 `9,311/46,068 MiB`, GPU utilization 100%였다.

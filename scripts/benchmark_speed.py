@@ -57,7 +57,10 @@ class SpeedCase:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    from research.conductance_gat.v5.protocol import add_conductance_arguments
+
     parser = argparse.ArgumentParser(description=__doc__)
+    add_conductance_arguments(parser, prefix="v5-")
     parser.add_argument(
         "--track",
         choices=tuple(DATASETS),
@@ -168,7 +171,12 @@ def _validate(args: argparse.Namespace) -> None:
     if args.minimum_measure_seconds <= 0 or not math.isfinite(args.minimum_measure_seconds):
         raise ValueError("minimum measure seconds must be finite and positive")
     if args.track == "conductance_v5":
-        from research.conductance_gat.v5.protocol import HARDWARE_PROFILES
+        from research.conductance_gat.v5.protocol import (
+            HARDWARE_PROFILES,
+            conductance_arguments_configuration,
+        )
+
+        conductance_arguments_configuration(args, prefix="v5_")
 
         args.v5_sampling_resolved = (
             "cluster"
@@ -419,6 +427,7 @@ def _build_v5_case(
         HARDWARE_PROFILES,
         SCALE_PROFILES,
         beta_configuration,
+        conductance_arguments_configuration,
     )
     from research.conductance_gat.v5.train import (
         _prepare_data,
@@ -493,6 +502,10 @@ def _build_v5_case(
         )
     )
 
+    solver_configuration = conductance_arguments_configuration(args, prefix="v5_")
+    requested_schedule = solver_configuration.pop("training_schedule")
+    architecture.update(solver_configuration)
+
     def make_model(_kind):
         model = GraphConditionedConductanceNodeClassifier(
             payload["graphs"][0]["x"].shape[1],
@@ -539,6 +552,8 @@ def _build_v5_case(
             ),
             "v5_scale_profile": args.v5_scale_profile,
             "v5_architecture": architecture,
+            "v5_requested_training_schedule": requested_schedule,
+            "v5_measured_phase": "joint",
             "v5_condition": args.v5_condition,
             "v5_sampling": args.v5_sampling_resolved,
             "v5_num_neighbors": list(args.v5_num_neighbors),

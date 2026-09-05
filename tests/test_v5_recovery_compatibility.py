@@ -1,8 +1,9 @@
-"""CPU-only recovery boundaries plus unstubbed, checked-in registry integration."""
+"""Archived numerical-repair boundaries and rejection of today's changed V5 model."""
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 
 import pytest
@@ -15,17 +16,31 @@ from research.conductance_gat.tests.test_v5_p0_integrity import _identity
 from research.conductance_gat.v5 import report, train
 
 
+def _archived_source_pair():
+    """Historical SHA-only fixture, never a snapshot of currently executing code."""
+    registry = json.loads(resume_compat.REGISTRY_PATH.read_bytes())
+    names = {
+        "research/conductance_gat/v5/train.py",
+        "research/conductance_gat/v5/report.py",
+        resume_compat.HELPER_SOURCE,
+    }
+    before, after = {}, {}
+    for name in names:
+        change = registry["changes"][name]
+        after[name] = change["after"]
+        if change["before"] is not None:
+            before[name] = change["before"]
+    after[resume_compat.REGISTRY_SOURCE] = hashlib.sha256(
+        resume_compat.REGISTRY_PATH.read_bytes()
+    ).hexdigest()
+    return before, after
+
+
 @pytest.fixture
-def reviewed_sources(monkeypatch):
-    """Boundary-only stub; the real-registry test below does not use this fixture."""
-    before = {"research/conductance_gat/v5/train.py": "a" * 64}
-    after = {"research/conductance_gat/v5/train.py": "b" * 64}
-
-    def one_reviewed_transition(previous, current):
-        return previous == current or (previous == before and current == after)
-
-    monkeypatch.setattr(train, "snapshots_match", one_reviewed_transition)
-    monkeypatch.setattr(report, "snapshots_match", one_reviewed_transition)
+def reviewed_sources():
+    """Use archived registry SHA records with the actual compatibility checker."""
+    before, after = _archived_source_pair()
+    assert resume_compat.require_source_compatibility(before, after) is not None
     return before, after
 
 
@@ -195,25 +210,43 @@ def test_mixed_pair_keeps_non_source_and_unreviewed_source_mismatch_guards(
         report.build_comparison(tmp_path, manifest)
 
 
-def test_real_registry_preserves_old_checkpoint_contracts_and_completed_pair(tmp_path):
-    # No snapshots_match/require_source_compatibility mocks in this test.
-    registry = json.loads(resume_compat.REGISTRY_PATH.read_text(encoding="utf-8"))
-    current_sources = train.implementation_source_hashes()
-    previous_sources = copy.deepcopy(current_sources)
-    previous_sources.pop(resume_compat.REGISTRY_SOURCE)
-    for name, change in registry["changes"].items():
-        if name not in previous_sources:
-            continue
-        if change["before"] is None:
-            previous_sources.pop(name)
-        else:
-            previous_sources[name] = change["before"]
-    evidence = resume_compat.require_source_compatibility(previous_sources, current_sources)
+def test_real_registry_preserves_archived_repair_contracts_not_current_optimization(tmp_path):
+    # No mocks and no current-file SHA substitution into historical after values.
+    previous_sources, repaired_sources = _archived_source_pair()
+    evidence = resume_compat.require_source_compatibility(previous_sources, repaired_sources)
     assert evidence["patch_id"] == "v5-rng-cycle-workers-v1"
-    assert resume_compat.snapshots_match(previous_sources, current_sources)
-    assert not resume_compat.snapshots_match(current_sources, previous_sources)
-    previous, current = _identities((previous_sources, current_sources))
+    assert resume_compat.snapshots_match(previous_sources, repaired_sources)
+    assert not resume_compat.snapshots_match(repaired_sources, previous_sources)
+    previous, current = _identities((previous_sources, repaired_sources))
     train.validate_resume_identity(previous, current, train._canonical_sha256(previous))
     _validate_best(_best(previous), current)
-    manifest = _write_pair(tmp_path, (previous_sources, current_sources))
+    manifest = _write_pair(tmp_path, (previous_sources, repaired_sources))
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
     assert report.build_comparison(tmp_path, manifest)["status"] == "passed"
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
+
+
+def test_actual_optimization_sources_reject_archived_checkpoint_and_pair_without_writes(tmp_path):
+    previous_sources, repaired_sources = _archived_source_pair()
+    current_sources = train.implementation_source_hashes()
+    assert (
+        current_sources["research/conductance_gat/v5/train.py"]
+        != (repaired_sources["research/conductance_gat/v5/train.py"])
+    )
+    for historical_sources in (previous_sources, repaired_sources):
+        assert not resume_compat.snapshots_match(historical_sources, current_sources)
+        previous, current = _identities((historical_sources, current_sources))
+        selected = _best(previous)
+        unchanged = copy.deepcopy((previous, current, selected))
+        with pytest.raises(ValueError, match="source_sha256"):
+            train.validate_resume_identity(previous, current, train._canonical_sha256(previous))
+        with pytest.raises(ValueError, match="source_sha256"):
+            _validate_best(selected, current)
+        assert (previous, current, selected) == unchanged
+    manifest = _write_pair(tmp_path, (repaired_sources, current_sources))
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    with pytest.raises(
+        report.ComparisonIntegrityError, match="fixed/dynamic source_sha256 mismatch"
+    ):
+        report.build_comparison(tmp_path, manifest)
+    assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
