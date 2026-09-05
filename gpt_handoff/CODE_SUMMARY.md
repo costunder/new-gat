@@ -27037,6 +27037,392 @@ without importing PyTorch or PyG.  Model/training modules are opt-in imports.
 """
 ````
 
+# research/conductance_gat/v5/batch_calibration.py
+
+````python
+"""Disposable real-training V5 measurements; never a final training run.
+
+The caller compares multiple candidates before publishing an immutable batch
+plan. This module does not silently alter a training recipe or write checkpoints.
+Every candidate retains the exact architecture, precision, fanouts and data.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import gc
+import math
+import random
+import time
+from contextlib import contextmanager
+from typing import Any
+
+import numpy as np
+import torch
+
+from chartgat.observability import RuntimeResourceMonitor
+
+from . import train
+
+
+class _StageTimer:
+    """CPU wall time plus asynchronous CUDA events; no per-stage synchronization."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self.cpu_seconds: dict[str, float] = {}
+        self.events: list[tuple[str, Any, Any]] = []
+
+    @contextmanager
+    def stage(self, name: str):
+        cuda = self.device.type == "cuda" and name != "sampling_and_loader_wait"
+        start_event = end_event = None
+        if cuda:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record(torch.cuda.current_stream(self.device))
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.cpu_seconds[name] = self.cpu_seconds.get(name, 0.0) + (
+                time.perf_counter() - started
+            )
+            if cuda:
+                end_event.record(torch.cuda.current_stream(self.device))
+                self.events.append((name, start_event, end_event))
+
+    def report(self) -> dict[str, Any]:
+        # Caller synchronizes once at the complete-epoch measurement boundary.
+        gpu_seconds: dict[str, float] = {}
+        for name, started, ended in self.events:
+            gpu_seconds[name] = gpu_seconds.get(name, 0.0) + started.elapsed_time(ended) / 1000
+        return {
+            "cpu_wall_seconds": dict(self.cpu_seconds),
+            "cuda_event_seconds": gpu_seconds,
+            "interpretation": (
+                "CUDA event durations and CPU submission/wait durations overlap; do not add "
+                "them as an end-to-end step time. Sampling includes exposed prefetch wait."
+            ),
+        }
+
+
+@contextmanager
+def _isolated_execution_state(device: torch.device):
+    """Preserve caller RNG and global precision flags even after candidate OOM."""
+    python_state, numpy_state = random.getstate(), np.random.get_state()
+    float32_precision = torch.get_float32_matmul_precision()
+    matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    cudnn_benchmark = torch.backends.cudnn.benchmark
+    devices = []
+    if device.type == "cuda":
+        # The production _seed uses manual_seed_all; preserve every visible generator.
+        devices = list(range(torch.cuda.device_count()))
+    try:
+        with torch.random.fork_rng(devices=devices):
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.set_float32_matmul_precision(float32_precision)
+        torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+        torch.backends.cudnn.allow_tf32 = cudnn_tf32
+        torch.backends.cudnn.benchmark = cudnn_benchmark
+
+
+def load_calibration_payload(args: argparse.Namespace):
+    """Reuse the production verified V1 cache; downloading and test evaluation disabled."""
+    return train.load_dataset(args.dataset, args.data_root, allow_download=False)
+
+
+def _candidate_args(args, physical_batch_size: int, workers: int):
+    candidate = copy.deepcopy(args)
+    train.validate_args(candidate)
+    if isinstance(physical_batch_size, bool) or not isinstance(physical_batch_size, int):
+        raise ValueError("physical_batch_size must be a positive integer")
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 0:
+        raise ValueError("workers must be a nonnegative integer")
+    if candidate.dataset == "ppi":
+        minimum = candidate.batch_size
+        candidate.batch_size = physical_batch_size
+        candidate.workers = workers
+        candidate.worker_configuration_source = "measured_batch_calibration_candidate"
+    elif candidate.sampling != "full":
+        minimum = candidate.sample_seed_batch_size
+        candidate.sample_seed_batch_size = physical_batch_size
+        if workers != 0:
+            raise ValueError("transductive sampling uses CPU CSR/prefetch, not DataLoader workers")
+    else:
+        minimum = 1
+        if physical_batch_size != 1 or workers != 0:
+            raise ValueError("a full transductive graph cannot be replicated to inflate batch size")
+    if physical_batch_size < minimum:
+        raise ValueError("calibration cannot reduce the currently requested physical batch size")
+    return candidate
+
+
+def _optimizer_state_bytes(optimizer: torch.optim.Optimizer) -> int:
+    return sum(
+        value.numel() * value.element_size()
+        for state in optimizer.state.values()
+        for value in state.values()
+        if isinstance(value, torch.Tensor)
+    )
+
+
+def _update(model, optimizer, graph, indices, args, phase, timing, *, validate: bool):
+    with timing.stage("zero_grad"):
+        optimizer.zero_grad(set_to_none=True)
+    with timing.stage("forward_and_loss"):
+        with train.autocast_context(args):
+            logits = model(graph)
+            loss, label_count = train.training_loss(logits, graph, indices)
+    with timing.stage("backward"):
+        loss.backward()
+    if validate:
+        train.validate_active_gradient_connectivity(model, phase["active_parameter_groups"])
+        if args.condition == "shared_dynamic_c":
+            train.require_first_step_conductance_gradient(model)
+    with timing.stage("gradient_clipping"):
+        norm = torch.nn.utils.clip_grad_norm_(
+            (value for value in model.parameters() if value.requires_grad),
+            train.COMMON["gradient_clip_norm"],
+            error_if_nonfinite=False,
+            foreach=True,
+        )
+        train.require_finite_gradient_norm_async(norm)
+    with timing.stage("optimizer"):
+        optimizer.step()
+    return label_count
+
+
+def _run_epoch(model, optimizer, data, indices, sampler, args, device, epoch, timing):
+    phase = train.configure_phase(model, "joint", 0)
+    processed_units = optimizer_steps = supervised_labels = 0
+    largest_nodes = largest_edges = largest_graph_batch = 0
+    for graph, selected in train._training_batches(
+        data, indices, sampler, epoch, device, args.model_seed, args, timing=timing
+    ):
+        label_count = _update(
+            model, optimizer, graph, selected, args, phase, timing,
+            validate=not optimizer.state,
+        )
+        supervised_labels += label_count
+        processed_units += int(graph.num_graphs) if indices is None else label_count
+        optimizer_steps += 1
+        largest_nodes = max(largest_nodes, int(graph.x.shape[0]))
+        largest_edges = max(largest_edges, int(graph.incidence_edge_index.shape[1]))
+        largest_graph_batch = max(
+            largest_graph_batch, int(graph.num_graphs) if indices is None else 1
+        )
+    if not optimizer_steps or not processed_units:
+        raise RuntimeError("calibration full training epoch produced no supervised updates")
+    return {
+        "processed_units": processed_units,
+        "optimizer_steps": optimizer_steps,
+        "supervised_labels": supervised_labels,
+        "largest_measured_nodes": largest_nodes,
+        "largest_measured_physical_edges": largest_edges,
+        "largest_measured_graph_batch": largest_graph_batch,
+    }
+
+
+def _ppi_stress_update(payload, args, device, model, optimizer):
+    """Fit-check the largest real training graphs together without changing final ordering."""
+    from torch_geometric.data import Batch, Data
+
+    order = sorted(
+        payload["splits"]["train"],
+        key=lambda index: (
+            payload["graphs"][index]["incidence_edge_index"].shape[1]
+            + payload["graphs"][index]["x"].shape[0]
+        ),
+        reverse=True,
+    )
+    selected = order[:args.batch_size]
+    graph = Batch.from_data_list([Data(**payload["graphs"][index]) for index in selected])
+    graph._v5_num_graphs = int(graph.num_graphs)
+    if args.pin_memory:
+        graph = graph.pin_memory()
+    graph = graph.to(device, non_blocking=args.pin_memory)
+    phase = train.configure_phase(model, "joint", 0)
+    _update(model, optimizer, graph, None, args, phase, _StageTimer(device), validate=True)
+    return {
+        "scope": "largest real training graphs ranked by physical edges plus nodes",
+        "graphs": len(selected),
+        "nodes": int(graph.x.shape[0]),
+        "physical_edges": int(graph.incidence_edge_index.shape[1]),
+        "optimizer_updated": True,
+        "not_final_training": True,
+    }
+
+
+def run_training_candidate(
+    payload, args, device: torch.device, *, physical_batch_size: int, workers: int,
+    warmup_steps: int = 2, measurement_steps: int = 5,
+    minimum_measure_seconds: float = 3.0,
+) -> dict[str, Any]:
+    """Measure a disposable joint-phase model, including real AdamW state and IO.
+
+    Warmup/measurement budgets are minima, not dataset caps: each round finishes
+    an entire official training epoch. No final epoch budget/checkpoint is touched.
+    The full-epoch sweep exposes every seed/graph, not just a small easy batch.
+    """
+    train._require_cuda(device)
+    if (
+        any(isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in (warmup_steps, measurement_steps))
+        or isinstance(minimum_measure_seconds, bool)
+        or not isinstance(minimum_measure_seconds, (int, float))
+        or not math.isfinite(minimum_measure_seconds)
+        or minimum_measure_seconds <= 0
+    ):
+        raise ValueError("calibration step and duration minima must be positive")
+    candidate = _candidate_args(args, physical_batch_size, workers)
+    if payload.get("dataset") != candidate.dataset:
+        raise ValueError("calibration dataset does not match the verified cache payload")
+    model = optimizer = data = indices = sampler = None
+    monitor = None
+    report = None
+    with _isolated_execution_state(device):
+        try:
+            gc.collect()
+            torch.cuda.empty_cache()
+            hardware = train.validate_hardware_runtime(candidate, device)
+            free_before, total = torch.cuda.mem_get_info(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            monitor = RuntimeResourceMonitor(device)
+            monitor.start()
+            train.configure_compute(candidate)
+            train._seed(candidate.model_seed)
+            setup_started = time.perf_counter()
+            data, indices, sampler = train._prepare_data(payload, candidate, device)
+            model = train.GraphConditionedConductanceNodeClassifier(
+                payload["graphs"][0]["x"].shape[1], payload["classes"],
+                **train.architecture_configuration(candidate),
+                conductance_mode=train.CONDITIONS[candidate.condition]["conductance_mode"],
+                max_log_conductance=train.COMMON["max_log_conductance"],
+                edge_chunk_size=candidate.edge_chunk_size,
+            ).to(device)
+            optimizer = train.make_optimizer(model)
+            train.validate_optimizer_parameter_ownership(model, optimizer)
+            initial_hash = train.state_sha256(model)
+            torch.cuda.synchronize(device)
+            setup_seconds = time.perf_counter() - setup_started
+            stress = (
+                _ppi_stress_update(payload, candidate, device, model, optimizer)
+                if candidate.dataset == "ppi" else {
+                    "scope": "every training seed covered by full warmup and measurement epochs",
+                    "sampling": candidate.sampling,
+                    "fanouts": list(candidate.num_neighbors),
+                    "limitation": (
+                        "sampled topology can vary in later epochs; no universal OOM guarantee"
+                    ),
+                }
+            )
+            warmup_updates = 0
+            warmup_epoch = 0
+            while warmup_updates < warmup_steps:
+                warmup_epoch += 1
+                warmup = _run_epoch(
+                    model, optimizer, data, indices, sampler, candidate, device,
+                    warmup_epoch, _StageTimer(device),
+                )
+                warmup_updates += warmup["optimizer_steps"]
+            if not optimizer.state or _optimizer_state_bytes(optimizer) <= 0:
+                raise RuntimeError("calibration did not materialize real AdamW optimizer state")
+            torch.cuda.synchronize(device)
+            timing = _StageTimer(device)
+            started = time.perf_counter()
+            measured_epochs = measured_steps = units = labels = 0
+            largest_nodes = largest_edges = largest_graph_batch = 0
+            elapsed = 0.0
+            while measured_steps < measurement_steps or elapsed < minimum_measure_seconds:
+                measured_epochs += 1
+                values = _run_epoch(
+                    model, optimizer, data, indices, sampler, candidate, device,
+                    warmup_epoch + measured_epochs, timing,
+                )
+                measured_steps += values["optimizer_steps"]
+                units += values["processed_units"]
+                labels += values["supervised_labels"]
+                largest_nodes = max(largest_nodes, values["largest_measured_nodes"])
+                largest_edges = max(largest_edges, values["largest_measured_physical_edges"])
+                largest_graph_batch = max(
+                    largest_graph_batch, values["largest_measured_graph_batch"]
+                )
+                torch.cuda.synchronize(device)
+                elapsed = time.perf_counter() - started
+            peak_allocated = int(torch.cuda.max_memory_allocated(device))
+            peak_reserved = int(torch.cuda.max_memory_reserved(device))
+            free_after, _ = torch.cuda.mem_get_info(device)
+            report = {
+                "status": "passed", "calibration_not_final": True,
+                "elapsed_seconds": elapsed, "processed_units": units,
+                "unit": "graphs" if indices is None else "supervised_seed_nodes",
+                "optimizer_steps": measured_steps, "samples_per_second": units / elapsed,
+                "measurement_steps_requested": measurement_steps,
+                "minimum_measure_seconds_requested": minimum_measure_seconds,
+                "warmup_steps_requested": warmup_steps,
+                "stage_seconds": timing.report(), "setup_seconds": setup_seconds,
+                "peak_allocated_bytes": peak_allocated, "peak_reserved_bytes": peak_reserved,
+                "free_bytes_before": int(free_before), "free_bytes_after": int(free_after),
+                "total_memory_bytes": int(total), "batch_size": physical_batch_size,
+                "workers": workers, "optimizer_state_bytes": _optimizer_state_bytes(optimizer),
+                "model_parameter_count": sum(value.numel() for value in model.parameters()),
+                "initial_model_sha256": initial_hash,
+                "parameter_update_verified": initial_hash != train.state_sha256(model),
+                "warmup_optimizer_steps": warmup_updates,
+                "complete_measurement_epochs": measured_epochs,
+                "complete_warmup_epochs": warmup_epoch,
+                "supervised_labels": labels,
+                "largest_measured_nodes": largest_nodes,
+                "largest_measured_physical_edges": largest_edges,
+                "largest_measured_graph_batch": largest_graph_batch,
+                "stress_observation": stress,
+                "model_phase": "joint_all_condition_parameter_groups_active",
+                "sampling": sampler.metadata() if sampler is not None else {"mode": "full"},
+                "configuration": train.configuration(candidate), "hardware": hardware,
+                "scope": (
+                    "fresh real training batches, full training epochs; "
+                    "no validation/test/checkpoints"
+                ),
+                "gradient_accumulation_steps": 1, "data_parallel_workers": 1,
+                "effective_batch_size": physical_batch_size,
+            }
+            if not report["parameter_update_verified"]:
+                raise RuntimeError("disposable calibration model parameters did not update")
+        except BaseException as error:
+            if monitor is not None:
+                failed_monitor, monitor = monitor, None
+                try:
+                    error.calibration_resource_observability = failed_monitor.finish(
+                        peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+                        peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+                    )
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        f"calibration resource finalization also failed: {cleanup_error}"
+                    )
+            raise
+        finally:
+            try:
+                if monitor is not None:
+                    resources = monitor.finish(
+                        peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+                        peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+                    )
+                    if report is not None:
+                        report["resource_observability"] = resources
+            finally:
+                model = optimizer = data = indices = sampler = None
+                gc.collect()
+                torch.cuda.empty_cache()
+    return report
+````
+
 # research/conductance_gat/v5/diagnostics.py
 
 ````python
@@ -28945,6 +29331,7 @@ import hashlib
 import json
 import math
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -29591,9 +29978,9 @@ def _v5_batch_observability(
         physical_batch_size, batch_unit, batches_per_epoch = 1, "full_graph", 1
     elif indices is not None:
         physical_batch_size, batch_unit, batches_per_epoch = (
-            int(args.batch_size),
-            "sampler_seed_nodes_or_partitions",
-            None,
+            int(args.sample_seed_batch_size),
+            "supervised_seed_nodes",
+            len(sampler),
         )
     else:
         physical_batch_size, batch_unit = int(args.batch_size), "graphs"
@@ -29758,8 +30145,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("transductive V5 datasets use no DataLoader and require workers=0")
     if args.dataset != "ppi" and args.batch_size != BATCH_SIZE_BY_DATASET[args.dataset]:
         raise ValueError("transductive full/sampled graph batch-size must be 1")
-    if args.dataset == "ppi" and args.hardware_profile == "portable" and args.batch_size != 2:
-        raise ValueError("portable PPI retains the V1 graph batch-size of 2")
+    if args.dataset == "ppi" and args.batch_size < 2:
+        raise ValueError("PPI graph batch-size must not be reduced below the V1 minimum of 2")
     if args.dataset == "ppi" and args.sampling != "full":
         raise ValueError(
             "PPI already supplies inductive graph minibatches; sampling is transductive-only"
@@ -29836,23 +30223,42 @@ def _prefetched_samples(iterator, *, pin_memory: bool):
             yield graph
 
 
-def _training_batches(data, indices, sampler, epoch, device, model_seed, args):
+def _training_batches(data, indices, sampler, epoch, device, model_seed, args, *, timing=None):
+    def stage(name):
+        return nullcontext() if timing is None else timing.stage(name)
+
     if sampler is not None:
         samples = sampler.iter_epoch(epoch)
         if args.sample_prefetch:
             samples = _prefetched_samples(samples, pin_memory=args.pin_memory)
-        for graph in samples:
-            graph = graph.to(device, non_blocking=args.pin_memory)
-            yield graph, graph.train_mask.nonzero(as_tuple=False).flatten()
+        samples = iter(samples)
+        while True:
+            with stage("sampling_and_loader_wait"):
+                try:
+                    graph = next(samples)
+                except StopIteration:
+                    return
+            with stage("host_to_device"):
+                graph = graph.to(device, non_blocking=args.pin_memory)
+                train_indices = graph.train_mask.nonzero(as_tuple=False).flatten()
+            yield graph, train_indices
     elif indices is not None:
         yield data, indices["train"]
     else:
         # Re-seeding by epoch makes PPI minibatch order identical after resume.
         if getattr(data["train"], "generator", None) is not None:
             data["train"].generator.manual_seed(model_seed + 1_000_003 * epoch)
-        for graph in data["train"]:
+        source = iter(data["train"])
+        while True:
+            with stage("sampling_and_loader_wait"):
+                try:
+                    graph = next(source)
+                except StopIteration:
+                    return
             graph._v5_num_graphs = int(graph.num_graphs)
-            yield graph.to(device, non_blocking=True), None
+            with stage("host_to_device"):
+                graph = graph.to(device, non_blocking=True)
+            yield graph, None
 
 
 def _validation_source(data, sampler):
@@ -40337,6 +40743,332 @@ def test_completed_dataset_skip_requires_exact_artifact_hashes_and_complete_last
     assert not benchmark._completed_training_dataset(entry, "zinc12k", args)
 ````
 
+# research/cycle_pe/tests/test_v2_calibration.py
+
+````python
+"""Explicit synthetic CPU fixtures for calibration mechanics, not GPU measurements."""
+
+from __future__ import annotations
+
+import copy
+import gc
+import random
+import weakref
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from research.cycle_pe.v2 import benchmark, calibration
+from research.cycle_pe.v2.data import collate, prepare_graph
+
+
+@pytest.fixture(autouse=True)
+def bounded_debug_cpu_threads():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(2)
+    yield
+    torch.set_num_threads(previous)
+
+
+def debug_args(encoding="se"):
+    args = benchmark.parser().parse_args([])
+    args.dataset = "zinc12k"
+    args.encoding = encoding
+    # Explicit CPU unit-fixture architecture; production defaults are untouched.
+    args.hidden_dim, args.pe_dim, args.layers = 16, 8, 2
+    args.batch_size = 2
+    return args
+
+
+def debug_graph():
+    return prepare_graph(
+        SimpleNamespace(
+            num_nodes=3,
+            x=torch.tensor([[0], [1], [2]]),
+            edge_index=torch.tensor([[0, 1, 1, 2, 0, 2], [1, 0, 2, 1, 2, 0]]),
+            edge_attr=torch.ones(6, 1, dtype=torch.long),
+            y=torch.tensor([0.7]),
+        ),
+        basis_backend="dfs_fundamental",
+    )
+
+
+@pytest.mark.parametrize("encoding", ["se", "pe"])
+def test_debug_real_training_step_updates_exact_probe_model_and_adam(encoding):
+    args = debug_args(encoding)
+    unchanged = copy.deepcopy(vars(args))
+    device = torch.device("cpu")
+    with calibration._isolated_rng(args.model_seed, device):
+        model = calibration._probe_model(args.dataset, args, device)
+        reference = benchmark.CycleBasisPEModel(
+            dataset=args.dataset, encoding=args.encoding, hidden=args.hidden_dim,
+            pe_dim=args.pe_dim, layers=args.layers, ffn_multiplier=args.ffn_multiplier,
+            dropout=args.dropout, layer_scale=args.layer_scale,
+        )
+        assert {
+            key: value.shape for key, value in model.state_dict().items()
+        } == {key: value.shape for key, value in reference.state_dict().items()}
+        initial = {key: value.clone() for key, value in model.state_dict().items()}
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        batch = collate([debug_graph(), debug_graph()])
+        precision = benchmark._amp_policy(False, device)
+        assert calibration._optimizer_tensor_bytes(optimizer) == 0
+        report = calibration._training_step(
+            model, optimizer, batch, device, precision, check_gradients=True
+        )
+        assert report["validated"] is True
+        assert calibration._optimizer_tensor_bytes(optimizer) > 0
+        assert all(state["step"].item() == 1 for state in optimizer.state.values())
+        assert any(
+            not torch.equal(initial[key], value) for key, value in model.state_dict().items()
+        )
+    assert vars(args) == unchanged
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_debug_rng_restored_even_when_probe_raises(fail):
+    random.seed(123)
+    np.random.seed(123)
+    torch.manual_seed(123)
+    state = (random.getstate(), np.random.get_state(), torch.get_rng_state().clone())
+    previous = torch.backends.cudnn.benchmark
+    try:
+        with calibration._isolated_rng(77, torch.device("cpu")):
+            random.random()
+            np.random.rand()
+            torch.rand(4)
+            if fail:
+                raise RuntimeError("debug probe failure")
+    except RuntimeError as error:
+        assert fail and str(error) == "debug probe failure"
+    assert random.getstate() == state[0]
+    restored = np.random.get_state()
+    assert restored[0] == state[1][0] and np.array_equal(restored[1], state[1][1])
+    assert restored[2:] == state[1][2:]
+    assert torch.equal(torch.get_rng_state(), state[2])
+    assert torch.backends.cudnn.benchmark == previous
+
+
+@pytest.mark.parametrize("batch,workers", [(1, 2), (11, 2), (True, 2), (2, -1), (2, True)])
+def test_candidates_cannot_reduce_batch_or_use_invalid_values(batch, workers):
+    with pytest.raises(ValueError):
+        calibration._candidate_arguments(debug_args(), batch, workers, 10)
+
+
+def test_candidate_arguments_are_independent_and_preserve_full_profile():
+    args = debug_args()
+    original = copy.deepcopy(vars(args))
+    candidate = calibration._candidate_arguments(args, 8, 6, 10)
+    assert (candidate.batch_size, candidate.effective_batch_size, candidate.workers) == (8, 8, 6)
+    assert vars(args) == original
+    for key, value in original.items():
+        if key not in {"batch_size", "workers"}:
+            assert getattr(candidate, key) == value
+
+
+def test_candidate_preserves_configured_floor_larger_than_complete_training_split():
+    args = debug_args()
+    args.batch_size = 8
+    candidate = calibration._candidate_arguments(args, 8, 4, 3)
+    assert candidate.batch_size == candidate.effective_batch_size == 8
+    with pytest.raises(ValueError, match="configured batch floor"):
+        calibration._candidate_arguments(args, 3, 4, 3)
+
+
+def test_calibration_api_has_no_cpu_fallback():
+    with pytest.raises(RuntimeError, match="requires CUDA; no CPU fallback"):
+        calibration.run_training_candidate(
+            [], debug_args(), torch.device("cpu"), physical_batch_size=2, workers=4
+        )
+
+
+def test_load_calibration_graphs_requires_entire_official_train_split(monkeypatch):
+    calls = []
+    graphs = [object()] * 10000  # Mock identity only, never passed as real training data.
+    identity = {
+        "official_splits": True,
+        "split_sizes": {"train": 10000},
+        "split_content_sha256": {"train": "a" * 64},
+    }
+
+    def load(root, dataset, **kwargs):
+        calls.append((root, dataset, kwargs))
+        return {"train": graphs}, identity
+
+    monkeypatch.setattr(calibration, "load_benchmark", load)
+    args = debug_args()
+    result, provenance = calibration.load_calibration_graphs(args)
+    assert result is graphs and provenance is identity
+    assert calls[0][2] == {
+        "allow_download": False, "splits": ("train",),
+        "basis_backend": "dfs_fundamental", "workers": 4,
+    }
+    graphs.pop()
+    with pytest.raises(ValueError, match="complete verified official train split"):
+        calibration.load_calibration_graphs(args)
+
+
+def test_full_model_parameter_budget_still_enforced():
+    args = debug_args()
+    args.max_parameters = 1
+    with pytest.raises(ValueError, match="above the declared budget"):
+        calibration._probe_model(args.dataset, args, torch.device("cpu"))
+
+
+def test_main_training_scope_no_longer_mislabels_loader_and_optimizer_as_excluded():
+    import inspect
+
+    source = inspect.getsource(benchmark._train_model)
+    assert "DataLoader wait, sparse collate" in source
+    assert "gradient clip and Adam included" in source
+    assert "validation and IO excluded" not in source
+    assert "research/cycle_pe/v2/calibration.py" in benchmark.IMPLEMENTATION_FILES
+
+
+def test_debug_mock_cuda_control_flow_measures_loader_h2d_backward_and_adam(monkeypatch):
+    """Mock CUDA counters only; real CPU Adam verifies all eight update calls."""
+    args = debug_args()
+    args.workers = 3
+    graphs = [SimpleNamespace(cost=cost) for cost in (1, 4, 2, 5, 3)]
+    calls, loader_refs, selected_costs = [], [], []
+
+    class DebugBatch:
+        def __init__(self, count):
+            self.x = torch.arange(count, dtype=torch.float32).reshape(-1, 1)
+            self.y = torch.ones(count, 1)
+            self.edge_index = torch.empty(2, count, dtype=torch.long)
+
+        def pin_memory(self):
+            calls.append("pin")
+            return self
+
+        def to(self, _device):
+            calls.append("h2d")
+            return self
+
+    class DebugModel(torch.nn.Linear):
+        def forward(self, batch):
+            return super().forward(batch.x)
+
+    class DebugLoader:
+        def __iter__(self):
+            yield DebugBatch(2)
+            yield DebugBatch(2)
+            yield DebugBatch(1)
+
+    def loader(all_graphs, chosen, *, train):
+        assert all_graphs is graphs and train
+        assert (chosen.batch_size, chosen.workers) == (2, 3)
+        instance = DebugLoader()
+        loader_refs.append(weakref.ref(instance))
+        return instance
+
+    def stress_collate(selected):
+        selected_costs.extend(graph.cost for graph in selected)
+        return DebugBatch(len(selected))
+
+    class DebugEvent:
+        def __init__(self, **_kwargs):
+            pass
+
+        def record(self):
+            calls.append("event")
+
+        def elapsed_time(self, _next):
+            return 1.0
+
+    original_step = calibration._training_step
+
+    def cpu_step(model, optimizer, batch, _device, precision, **kwargs):
+        calls.append("adam_step")
+        return original_step(model, optimizer, batch, torch.device("cpu"), precision, **kwargs)
+
+    monkeypatch.setattr(calibration, "_probe_model", lambda *_args: DebugModel(1, 1))
+    monkeypatch.setattr(calibration, "_training_step", cpu_step)
+    monkeypatch.setattr(calibration, "collate", stress_collate)
+    monkeypatch.setattr(benchmark, "_graph_probe_cost", lambda graph: graph.cost)
+    monkeypatch.setattr(benchmark, "_loader", loader)
+    monkeypatch.setattr(
+        benchmark, "_amp_policy",
+        lambda *_args: {
+            "enabled": False, "dtype": torch.float32, "dtype_name": "disabled",
+            "fallback": None, "gradient_scaler": False,
+        },
+    )
+    monkeypatch.setattr(torch.cuda, "Event", DebugEvent)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *_args: 12345)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *_args: (100000, 200000))
+    report = calibration._run_candidate(
+        graphs, args, torch.device("cuda:0"), warmup_steps=2,
+        measurement_steps=5, minimum_measure_seconds=1e-9,
+    )
+    assert selected_costs == [5, 4]
+    assert calls.count("adam_step") == report["optimizer_steps"] == 8
+    assert calls.count("h2d") == 8
+    assert report["processed_units"] == 8
+    assert report["observed_batch_sizes"] == [1, 2, 2, 1, 2]
+    assert report["dataset_graph_count"] == 5 and report["training_dataset_reduced"] is False
+    assert report["optimizer_state_bytes"] > 0
+    assert report["first_task_gradient_connectivity"]["validated"] is True
+    assert report["stage_seconds"]["h2d"] == pytest.approx(0.005)
+    assert report["stage_seconds"]["optimizer"] == pytest.approx(0.005)
+    assert report["samples_per_second"] == 8 / report["elapsed_seconds"]
+    gc.collect()
+    assert loader_refs[0]() is None
+
+
+def test_debug_cuda_oom_is_explicit_measurement_and_cleans_own_monitor(monkeypatch):
+    args = debug_args()
+    calls = []
+
+    class DebugMonitor:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            calls.append("monitor_start")
+            return {"debug_mock": True}
+
+        def finish(self, **kwargs):
+            calls.append(("monitor_finish", kwargs))
+            return {"debug_mock": True}
+
+    def fail(*_args, **_kwargs):
+        raise torch.cuda.OutOfMemoryError("explicit debug OOM fixture")
+
+    monkeypatch.setattr(calibration, "FailureSafeResourceMonitor", DebugMonitor)
+    monkeypatch.setattr(calibration, "_run_candidate", fail)
+    # RNG restoration has independent real-CPU tests above; this test isolates OOM cleanup.
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(calibration, "_isolated_rng", lambda *_args: nullcontext())
+    monkeypatch.setattr(torch.cuda, "device", lambda *_args: nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda *_args: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *_args: 12345)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda *_args: 23456)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *_args: (100000, 200000))
+    original = copy.deepcopy(vars(args))
+    report = calibration.run_training_candidate(
+        [object(), object()], args, torch.device("cuda:0"), physical_batch_size=2, workers=4
+    )
+    assert report["status"] == "oom"
+    assert "explicit debug OOM fixture" in report["error"]
+    assert report["calibration_only"] is True and report["final_training_performed"] is False
+    assert report["automatic_downsize"] is False
+    assert report["measurement_steps_requested"] == 5
+    assert report["warmup_steps_requested"] == 2
+    assert report["minimum_measure_seconds_requested"] == 3.0
+    assert report["peak_allocated_bytes"] == 12345
+    assert sum(isinstance(call, tuple) and call[0] == "monitor_finish" for call in calls) == 1
+    assert calls.count("empty_cache") == 2
+    assert vars(args) == original
+````
+
 # research/cycle_pe/tests/test_v2_data.py
 
 ````python
@@ -42248,6 +42980,7 @@ HARDWARE_PROFILES = ("portable", "a6000-48gb")
 A6000_MIN_TOTAL_BYTES = 40 * 1024**3
 IMPLEMENTATION_FILES = (
     "research/cycle_pe/v2/benchmark.py",
+    "research/cycle_pe/v2/calibration.py",
     "research/cycle_pe/v2/basis.py",
     "research/cycle_pe/v2/data.py",
     "research/cycle_pe/v2/model.py",
@@ -43273,7 +44006,11 @@ def _train_model(
     train_graphs = sum(int(row["train_graphs"]) for row in history)
     train_seconds = sum(float(row["train_cuda_synchronized_seconds"]) for row in history)
     throughput = {
-        "scope": "CUDA-synchronized training forward/backward timing; validation and IO excluded",
+        "scope": (
+            "CUDA-synchronized complete training loop: DataLoader wait, sparse collate, "
+            "H2D, forward, backward, gradient clip and Adam included; validation, "
+            "initial dataset preparation and checkpoint IO excluded"
+        ),
         "training_graphs": train_graphs,
         "training_cuda_synchronized_seconds": train_seconds,
         "training_graphs_per_second": observed(
@@ -43860,6 +44597,375 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+````
+
+# research/cycle_pe/v2/calibration.py
+
+````python
+"""Disposable Cycle V2 real-training batch/worker probes, not final training.
+
+The complete official training split and exact model profile are retained. A
+candidate measures production loading, sparse collation, transfer, forward,
+backward, clipping and an actual Adam update. No candidate writes a checkpoint
+or changes the caller's arguments, model or RNG. Selection is a caller policy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import gc
+import heapq
+import math
+import random
+import time
+from contextlib import contextmanager
+from typing import Any
+
+import numpy as np
+import torch
+
+from chartgat.execution import configure_execution
+from research.cycle_pe.benchmark_data import EXPECTED_SIZES
+from research.cycle_pe.resource_monitor import (
+    FailureSafeResourceMonitor,
+    resource_failure_boundary,
+)
+from research.cycle_pe.v2.data import Graph, collate, load_benchmark
+from research.cycle_pe.v2.model import CycleBasisPEModel
+
+
+def load_calibration_graphs(args: argparse.Namespace) -> tuple[list[Graph], dict[str, Any]]:
+    """Prepare/cache/validate the complete official train split, without test access."""
+    splits, identity = load_benchmark(
+        args.data_root,
+        args.dataset,
+        allow_download=args.allow_download,
+        splits=("train",),
+        basis_backend=args.basis_backend,
+        workers=args.workers,
+    )
+    expected = EXPECTED_SIZES[args.dataset][0]
+    if (
+        set(splits) != {"train"}
+        or len(splits["train"]) != expected
+        or identity.get("official_splits") is not True
+        or identity.get("split_sizes") != {"train": expected}
+        or not identity.get("split_content_sha256", {}).get("train")
+    ):
+        raise ValueError("Cycle calibration requires the complete verified official train split")
+    return splits["train"], identity
+
+
+@contextmanager
+def _isolated_rng(seed: int, device: torch.device):
+    """Restore RNG streams and the backend flag touched by benchmark._seed."""
+    from research.cycle_pe.v2.benchmark import _seed
+
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    cudnn_benchmark = torch.backends.cudnn.benchmark
+    devices = [] if device.type != "cuda" else list(range(torch.cuda.device_count()))
+    try:
+        with torch.random.fork_rng(devices=devices):
+            _seed(seed)
+            yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.backends.cudnn.benchmark = cudnn_benchmark
+
+
+def _probe_model(dataset: str, args: argparse.Namespace, device: torch.device):
+    """Construct exactly the architecture used by benchmark._train_model."""
+    model = CycleBasisPEModel(
+        dataset=dataset,
+        encoding=args.encoding,
+        hidden=args.hidden_dim,
+        pe_dim=args.pe_dim,
+        layers=args.layers,
+        ffn_multiplier=args.ffn_multiplier,
+        dropout=args.dropout,
+        layer_scale=args.layer_scale,
+    ).to(device)
+    parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if parameters > args.max_parameters:
+        raise ValueError(
+            f"calibration model has {parameters} parameters, above the declared budget"
+        )
+    configure_execution(model, args, device)
+    model.train()
+    return model
+
+
+def _optimizer_tensor_bytes(optimizer: torch.optim.Optimizer) -> int:
+    return sum(
+        item.numel() * item.element_size()
+        for state in optimizer.state.values()
+        for item in state.values()
+        if isinstance(item, torch.Tensor)
+    )
+
+
+def _training_step(
+    model, optimizer, batch, device, precision, *, check_gradients=False, events=None
+):
+    """Actual MAE/backward/clip/Adam path; explicit CPU fixtures test this path."""
+    from research.cycle_pe.v2.benchmark import (
+        _require_finite_loss,
+        _validate_first_task_gradients,
+    )
+
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast(device.type, dtype=precision["dtype"], enabled=precision["enabled"]):
+        predicted = model(batch)
+        loss = (predicted.float() - batch.y).abs().mean()
+    _require_finite_loss(loss, "Cycle calibration: nonfinite task loss")
+    if events is not None:
+        events[0].record()
+    loss.backward()
+    gradients = _validate_first_task_gradients(model) if check_gradients else None
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0, error_if_nonfinite=True)
+    if events is not None:
+        events[1].record()
+    # Production Cycle precision is BF16 or FP32 with disabled GradScaler.
+    # Actual Adam updates deliberately allocate both moments and step state.
+    optimizer.step()
+    if events is not None:
+        events[2].record()
+    return gradients
+
+
+def _candidate_arguments(args, batch_size, workers, graph_count):
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError("physical batch candidate must be a positive integer")
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 0:
+        raise ValueError("worker candidate must be a nonnegative integer")
+    if graph_count < 1:
+        raise ValueError("official training split is empty")
+    floor = args.batch_size
+    natural_maximum = max(floor, graph_count)
+    if not floor <= batch_size <= natural_maximum:
+        raise ValueError("candidate must preserve the configured batch floor and natural boundary")
+    candidate = copy.copy(args)
+    candidate.batch_size = batch_size
+    candidate.effective_batch_size = batch_size
+    candidate.workers = workers
+    return candidate
+
+
+def _run_candidate(
+    graphs, args, device, *, warmup_steps, measurement_steps, minimum_measure_seconds
+):
+    from research.cycle_pe.v2.benchmark import (
+        _amp_policy,
+        _graph_probe_cost,
+        _loader,
+        _precision_identity,
+        _validate_optimizer_ownership,
+    )
+
+    model = _probe_model(args.dataset, args, device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    ownership = _validate_optimizer_ownership(model, optimizer)
+    precision = _amp_policy(args.amp, device)
+    stress_cpu = collate(heapq.nlargest(args.batch_size, graphs, key=_graph_probe_cost))
+    stress = stress_cpu.pin_memory().to(device)
+    gradients = _training_step(model, optimizer, stress, device, precision, check_gradients=True)
+    torch.cuda.synchronize(device)
+    stress_peak = int(torch.cuda.max_memory_allocated(device))
+    del stress_cpu, stress
+    loader = _loader(graphs, args, train=True)
+    iterator = iter(loader)
+
+    def next_batch():
+        nonlocal iterator
+        try:
+            return next(iterator)
+        except StopIteration:
+            iterator = iter(loader)
+            return next(iterator)
+
+    try:
+        for _ in range(warmup_steps):
+            batch = next_batch().to(device)
+            _training_step(model, optimizer, batch, device, precision)
+            del batch
+        torch.cuda.synchronize(device)
+        batch_sizes, nodes, edges, step_events = [], [], [], []
+        loader_seconds = 0.0
+        elapsed = 0.0
+        started = time.perf_counter()
+        # Explicit calibration measurement window, never a final-training cap.
+        while len(batch_sizes) < measurement_steps or elapsed < minimum_measure_seconds:
+            for _ in range(measurement_steps):
+                before_load = time.perf_counter()
+                batch_cpu = next_batch()
+                loader_seconds += time.perf_counter() - before_load
+                batch_sizes.append(int(batch_cpu.y.shape[0]))
+                nodes.append(int(batch_cpu.x.shape[0]))
+                edges.append(int(batch_cpu.edge_index.shape[1]))
+                events = tuple(torch.cuda.Event(enable_timing=True) for _ in range(5))
+                events[0].record()
+                batch = batch_cpu.to(device)
+                events[1].record()
+                _training_step(model, optimizer, batch, device, precision, events=events[2:])
+                step_events.append(events)
+                del batch_cpu, batch
+            torch.cuda.synchronize(device)
+            elapsed = time.perf_counter() - started
+        measured_count = sum(batch_sizes)
+        if elapsed <= 0 or measured_count <= 0:
+            raise RuntimeError("calibration observed no positive duration or real graphs")
+        state_bytes = _optimizer_tensor_bytes(optimizer)
+        if state_bytes <= 0 or not optimizer.state:
+            raise RuntimeError("calibration never allocated Adam state")
+        free_after, _ = torch.cuda.mem_get_info(device)
+        stage_seconds = {
+            "loader_wait": loader_seconds,
+            "h2d": sum(e[0].elapsed_time(e[1]) for e in step_events) / 1000,
+            "forward_loss": sum(e[1].elapsed_time(e[2]) for e in step_events) / 1000,
+            "backward_clip": sum(e[2].elapsed_time(e[3]) for e in step_events) / 1000,
+            "optimizer": sum(e[3].elapsed_time(e[4]) for e in step_events) / 1000,
+        }
+        return {
+            "status": "passed",
+            "samples_per_second": measured_count / elapsed,
+            "elapsed_seconds": elapsed,
+            "processed_units": measured_count,
+            "unit": "molecular_graphs",
+            "measurement_steps": len(batch_sizes),
+            "warmup_steps": warmup_steps,
+            "optimizer_steps": 1 + warmup_steps + len(batch_sizes),
+            "optimizer_state_bytes": state_bytes,
+            "optimizer_ownership": ownership,
+            "first_task_gradient_connectivity": gradients,
+            "scope": (
+                "calibration-only real loader wait, sparse collate, H2D, forward, MAE, "
+                "backward, gradient clip and Adam; not final predictive performance"
+            ),
+            "timer_boundary": (
+                "CUDA synchronized after warmup and each measured chunk; initial dataset "
+                "preparation, loader startup, capacity stress and warmup excluded"
+            ),
+            "dataset_graph_count": len(graphs),
+            "training_dataset_reduced": False,
+            "observed_batch_sizes": batch_sizes,
+            "observed_nodes_per_batch": nodes,
+            "observed_edges_per_batch": edges,
+            "largest_graph_capacity_batch_size": args.batch_size,
+            "capacity_batch_selection": (
+                "highest _graph_probe_cost over the complete train split; a static tensor-size "
+                "proxy, not a guarantee against every future minibatch OOM"
+            ),
+            "capacity_probe_peak_allocated_bytes": stress_peak,
+            "stage_seconds": stage_seconds,
+            "stage_timing": "CUDA events except CPU loader wait; stages may overlap",
+            "free_bytes_after": int(free_after),
+            "total_parameters": sum(p.numel() for p in model.parameters()),
+            "architecture": {
+                key: getattr(args, key)
+                for key in (
+                    "encoding", "hidden_dim", "pe_dim", "layers", "ffn_multiplier",
+                    "dropout", "layer_scale",
+                )
+            },
+            "precision": _precision_identity(precision),
+            "loader": {
+                "workers": args.workers,
+                "prefetch_factor": args.prefetch_factor if args.workers else None,
+                "persistent_workers": args.workers > 0,
+                "pin_memory": True,
+                "non_blocking_transfer": True,
+                "sampler": "production shuffled full training split; no drop_last",
+            },
+        }
+    finally:
+        # Only owned loader workers are reclaimed by PyTorch iterator teardown.
+        # No process signal or session/server management command is used.
+        iterator = None
+        loader = None
+
+
+@resource_failure_boundary
+def run_training_candidate(
+    train_graphs: list[Graph],
+    args: argparse.Namespace,
+    device: torch.device,
+    *,
+    physical_batch_size: int,
+    workers: int,
+    warmup_steps: int = 2,
+    measurement_steps: int = 5,
+    minimum_measure_seconds: float = 3.0,
+) -> dict[str, Any]:
+    """Measure one exact batch/worker candidate on CUDA, without training artifacts.
+
+    OOM is an explicit unsuccessful measurement, not a CPU or smaller-model
+    fallback. Other failures propagate with resource-monitor failure evidence.
+    args.dataset is the official dataset name; use load_calibration_graphs once
+    per dataset to bind full-data provenance before testing multiple candidates.
+    """
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("Cycle training calibration requires CUDA; no CPU fallback")
+    for name, value in (("warmup_steps", warmup_steps), ("measurement_steps", measurement_steps)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be a positive calibration-only step count")
+    if (
+        isinstance(minimum_measure_seconds, bool)
+        or not math.isfinite(minimum_measure_seconds)
+        or minimum_measure_seconds <= 0
+    ):
+        raise ValueError("minimum_measure_seconds must be finite and positive")
+    candidate = _candidate_arguments(args, physical_batch_size, workers, len(train_graphs))
+    monitor = FailureSafeResourceMonitor(
+        device, workload=f"cycle_v2_{args.dataset}_batch_calibration"
+    )
+    resources_before = monitor.start()
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    free_before, total_bytes = torch.cuda.mem_get_info(device)
+    # CUDA Event.record uses the current device, not the model tensor's device.
+    # Bind it explicitly so cuda:1+ probes cannot time a different GPU stream.
+    with torch.cuda.device(device), _isolated_rng(args.model_seed, device):
+        try:
+            report = _run_candidate(
+                train_graphs, candidate, device, warmup_steps=warmup_steps,
+                measurement_steps=measurement_steps,
+                minimum_measure_seconds=minimum_measure_seconds,
+            )
+        except torch.cuda.OutOfMemoryError as error:
+            report = {"status": "oom", "error": f"{type(error).__name__}: {error}"}
+        peak_allocated = int(torch.cuda.max_memory_allocated(device))
+        peak_reserved = int(torch.cuda.max_memory_reserved(device))
+    resources = monitor.finish(
+        peak_allocated_bytes=peak_allocated, peak_reserved_bytes=peak_reserved
+    )
+    report.update(
+        dataset=args.dataset,
+        batch_size=physical_batch_size,
+        workers=workers,
+        peak_allocated_bytes=peak_allocated,
+        peak_reserved_bytes=peak_reserved,
+        free_bytes_before=int(free_before),
+        total_memory_bytes=int(total_bytes),
+        resource_start=resources_before,
+        resource_observability=resources,
+        measurement_steps_requested=measurement_steps,
+        warmup_steps_requested=warmup_steps,
+        minimum_measure_seconds_requested=minimum_measure_seconds,
+        calibration_only=True,
+        final_training_performed=False,
+        automatic_downsize=False,
+        rng_restored=True,
+    )
+    if report["status"] == "oom":
+        report["free_bytes_after"] = int(torch.cuda.mem_get_info(device)[0])
+    gc.collect()
+    torch.cuda.empty_cache()
+    return report
 ````
 
 # research/cycle_pe/v2/data.py
@@ -53485,6 +54591,639 @@ fi
 main "$@"
 ````
 
+# scripts/calibrate_training_resources.py
+
+````python
+#!/usr/bin/env python3
+"""Measure real training resources before V5/Cycle V2 final research training.
+
+The separate probe models execute real optimizer updates but never publish an
+accuracy result or checkpoint. Existing training runs are neither opened nor changed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import gc
+import json
+import os
+import platform
+import sys
+import traceback
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_json  # noqa: E402
+from scripts.training_resource_plan import (  # noqa: E402
+    SCHEMA_VERSION,
+    allocated_cpu_count,
+    candidate_score,
+    choose_candidate,
+    command_identity,
+    completed_candidate_status,
+    digest,
+    load_resource_plan,
+    source_snapshot,
+    validate_resource_plan,
+    worker_candidates,
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--request", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    return parser
+
+
+def _group_key(job: dict[str, Any]) -> str:
+    return "/".join(job[key] for key in ("track", "profile", "dataset"))
+
+
+def _training_args(job: dict[str, Any]):
+    command = job["command"]
+    module_index = command.index("-m") + 1
+    if job["track"] == "conductance":
+        if command[module_index] != "research.conductance_gat.v5.train":
+            raise ValueError("resource calibration refuses non-V5 training commands")
+        from research.conductance_gat.v5.train import build_parser, validate_args
+
+        args = build_parser().parse_args(command[module_index + 1 :])
+        validate_args(args)
+    elif job["track"] == "cycle":
+        if command[module_index] != "research.cycle_pe.v2.benchmark":
+            raise ValueError("resource calibration refuses non-Cycle-V2 training commands")
+        from research.cycle_pe.v2.benchmark import _validate, parser
+
+        args = parser().parse_args(command[module_index + 1 :])
+        _validate(args)
+        args.dataset = job["dataset"]
+    else:
+        raise ValueError("only the requested V5 and Cycle V2 tracks are calibrated")
+    return args
+
+
+def _hardware(device_name: str) -> dict[str, Any]:
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is required for measured resource selection; CPU fallback is forbidden"
+        )
+    device = torch.device(device_name)
+    if device.type != "cuda":
+        raise ValueError("resource calibration requires CUDA")
+    prop = torch.cuda.get_device_properties(device)
+    uuid = getattr(prop, "uuid", None)
+    return {
+        "device": str(device),
+        "uuid": str(uuid) if uuid is not None else None,
+        "uuid_unavailable_reason": None if uuid is not None else "Torch does not expose a GPU UUID",
+        "name": prop.name,
+        "total_memory_bytes": prop.total_memory,
+        "compute_capability": [prop.major, prop.minor],
+        "allocated_cpu_count": allocated_cpu_count(),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+    }
+
+
+def _load_group(job: dict[str, Any], args):
+    if job["track"] == "conductance":
+        from research.conductance_gat.v5.batch_calibration import load_calibration_payload
+
+        payload, protocol = load_calibration_payload(args)
+        if args.dataset == "ppi":
+            maximum = len(payload["splits"]["train"])
+            axis = "graphs"
+        elif args.sampling != "full":
+            maximum = int(payload["splits"]["train"].count_nonzero())
+            axis = "sampled_seed_nodes"
+        else:
+            maximum, axis = 1, "full_graph"
+        identity = {
+            "dataset": args.dataset,
+            "data_sha256": protocol["data_sha256"],
+            "split_sha256": protocol["split_sha256"],
+            "protocol": protocol,
+        }
+        return payload, identity, maximum, axis
+    from research.cycle_pe.v2.calibration import load_calibration_graphs
+
+    graphs, identity = load_calibration_graphs(args)
+    return graphs, identity, len(graphs), "graphs"
+
+
+def _measure(job, loaded, args, *, batch_size: int, workers: int) -> dict[str, Any]:
+    import torch
+
+    if job["track"] == "conductance":
+        from research.conductance_gat.v5.batch_calibration import run_training_candidate
+    else:
+        from research.cycle_pe.v2.calibration import run_training_candidate
+    torch.cuda.empty_cache()
+    try:
+        measured = run_training_candidate(
+            loaded,
+            copy.deepcopy(args),
+            torch.device(args.device),
+            physical_batch_size=batch_size,
+            workers=workers,
+            warmup_steps=2,
+            measurement_steps=5,
+            minimum_measure_seconds=3.0,
+        )
+    except torch.OutOfMemoryError as error:
+        measured = {
+            "status": "oom",
+            "error": f"{type(error).__name__}: {error}",
+            "resource_observability": getattr(error, "calibration_resource_observability", None),
+        }
+        # Our disposable probe's traceback must not retain CUDA tensors into the next probe.
+        traceback.clear_frames(error.__traceback__)
+    measured.update(condition=job["condition"], model_seed=job["model_seed"])
+    gc.collect()
+    torch.cuda.empty_cache()
+    return measured
+
+
+def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist) -> None:
+    primary = jobs[0]
+    parsed = [_training_args(job) for job in jobs]
+    loaded, identity, maximum, axis = _load_group(primary, parsed[0])
+    if entry.get("input_identity") is not None and entry["input_identity"] != identity:
+        raise ValueError(
+            "verified dataset changed since partial calibration; previous evidence preserved"
+        )
+    baseline = (
+        parsed[0].sample_seed_batch_size if axis == "sampled_seed_nodes" else parsed[0].batch_size
+    )
+    baseline = 1 if axis == "full_graph" else baseline
+    if maximum < 1:
+        raise ValueError("the official training split is empty")
+    # A configured batch larger than the complete split is never silently reduced.
+    natural_maximum = max(maximum, baseline)
+    workers = worker_candidates(
+        parsed[0].workers, allocated_cpu_count(), applicable=axis == "graphs"
+    )
+    # Explore neighbouring loader policies, rather than launching hundreds of workers at once.
+    workers = [value for value in workers if value <= max(2, parsed[0].workers * 2)]
+    entry.update(
+        track=primary["track"],
+        profile=primary["profile"],
+        dataset=primary["dataset"],
+        baseline_physical_batch_size=baseline,
+        batch_axis=axis,
+        natural_training_split_size=maximum,
+        input_identity=identity,
+        job_contracts=[
+            {
+                "condition": job["condition"],
+                "model_seed": job["model_seed"],
+                "argv_sha256": command_identity(job["command"]),
+            }
+            for job in jobs
+        ],
+        worker_candidates=workers,
+        worker_search_scope=(
+            "requested and neighbouring powers of two up to 2x requested, bounded by CPU affinity; "
+            "finite measured search, not a global optimum"
+        ),
+    )
+    entry.setdefault("candidates", [])
+    current, plateau, best_score = baseline, 0, None
+    while True:
+        size_has_safe_candidate = False
+        size_best = None
+        for count in workers:
+            candidate = next(
+                (
+                    item
+                    for item in entry["candidates"]
+                    if item["batch_size"] == current and item["workers"] == count
+                ),
+                None,
+            )
+            if candidate is None:
+                candidate = {
+                    "batch_size": current,
+                    "workers": count,
+                    "status": "running",
+                    "measurements": [],
+                }
+                entry["candidates"].append(candidate)
+            if candidate.get("status") == "running":
+                for job, args in zip(jobs, parsed, strict=True):
+                    existing = next(
+                        (
+                            item
+                            for item in candidate["measurements"]
+                            if (item["condition"], item["model_seed"])
+                            == (job["condition"], job["model_seed"])
+                        ),
+                        None,
+                    )
+                    if existing is None:
+                        print(
+                            f"[calibration] {_group_key(job)}/{job['condition']} "
+                            f"seed={job['model_seed']} batch={current} workers={count}",
+                            flush=True,
+                        )
+                        report = _measure(job, loaded, args, batch_size=current, workers=count)
+                        candidate["measurements"].append(report)
+                        persist()
+                candidate["status"] = completed_candidate_status(candidate["measurements"])
+                persist()
+            score = candidate_score(candidate)
+            if score is not None:
+                size_has_safe_candidate = True
+                size_best = score if size_best is None else max(size_best, score)
+        if not size_has_safe_candidate:
+            entry["stop_reason"] = "memory_headroom_boundary"
+            break
+        if axis == "full_graph" or current >= natural_maximum:
+            entry["stop_reason"] = (
+                "full_graph_no_batch_axis"
+                if axis == "full_graph"
+                else "complete_training_split_boundary"
+            )
+            break
+        if best_score is not None and size_best <= best_score * 1.05:
+            plateau += 1
+        else:
+            plateau = 0
+        best_score = size_best if best_score is None else max(best_score, size_best)
+        if plateau >= 2:
+            entry["stop_reason"] = "measured_throughput_plateau"
+            break
+        current = min(current * 2, natural_maximum)
+    chosen = choose_candidate(entry["candidates"], baseline)
+    selected = {"batch_size": parsed[0].batch_size, "workers": chosen["workers"]}
+    if primary["track"] == "conductance":
+        selected["sample_seed_batch_size"] = parsed[0].sample_seed_batch_size
+    selected["sample_seed_batch_size" if axis == "sampled_seed_nodes" else "batch_size"] = chosen[
+        "batch_size"
+    ]
+    entry.update(
+        status="passed",
+        selected=selected,
+        selection={
+            "algorithm": "highest minimum paired throughput among safe measured candidates",
+            "memory_margin": "max(2 GiB, 10% visible capacity), including optimizer peak reserve",
+            "minimum_requested_batch_preserved": True,
+            "global_optimum_claimed": False,
+            "paired_resources_identical": True,
+            "optimization_recipe_change": (
+                "larger physical batches change updates per epoch and trajectory; "
+                "selected resources are immutable and shared by paired arms"
+            ),
+        },
+    )
+    persist()
+    print(
+        f"[calibration selected] {_group_key(primary)} {selected}; boundary={entry['stop_reason']}",
+        flush=True,
+    )
+
+
+def verify_plan_inputs(
+    plan: dict[str, Any], jobs: list[dict[str, Any]], *, allow_unrequested_entries: bool = False
+) -> None:
+    """Reverify requested floors/recipes and actual official cache hashes."""
+    for entry in plan["entries"]:
+        if entry.get("status") != "passed":
+            continue
+        matching = [item for item in jobs if _group_key(item) == _group_key(entry)]
+        if not matching:
+            if allow_unrequested_entries:
+                continue
+            raise ValueError("resource plan contains an unrequested dataset/profile")
+        parsed = []
+        for job in matching:
+            contract = {
+                "condition": job["condition"],
+                "model_seed": job["model_seed"],
+                "argv_sha256": command_identity(job["command"]),
+            }
+            if contract not in entry["job_contracts"]:
+                raise ValueError("resource plan training recipe or measured device differs")
+            args = _training_args(job)
+            key = (
+                "sample_seed_batch_size"
+                if entry["batch_axis"] == "sampled_seed_nodes"
+                else "batch_size"
+            )
+            requested = 1 if entry["batch_axis"] == "full_graph" else getattr(args, key)
+            if entry["selected"][key] < requested:
+                raise ValueError(
+                    f"resource plan selected physical batch for {_group_key(job)} is below "
+                    f"the current requested floor {requested}; recalibrate with a new run ID; "
+                    "previous measurements preserved"
+                )
+            parsed.append(args)
+        loaded, identity, maximum, axis = _load_group(matching[0], parsed[0])
+        if (
+            entry["input_identity"] != identity
+            or entry["natural_training_split_size"] != maximum
+            or entry["batch_axis"] != axis
+        ):
+            raise ValueError(
+                "resource plan verified dataset identity changed; no stale measurement reuse"
+            )
+        del loaded
+        gc.collect()
+
+
+def _run_locked(request_path: Path, output: Path) -> Path:
+    import torch
+
+    request = json.loads(request_path.read_bytes())
+    expected_sources = source_snapshot()
+    if request.get("source_sha256") != expected_sources:
+        raise ValueError("calibration request source identity differs")
+    jobs = request.get("jobs", [])
+    if not jobs:
+        raise ValueError("calibration request contains no supported jobs")
+    runtime = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+    }
+    devices = {job["device"]: _hardware(job["device"]) for job in jobs}
+    request_hash = digest(request)
+    output.mkdir(parents=True, exist_ok=True)
+    progress_path, plan_path = output / "progress.json", output / "resource-plan.json"
+    if any(path.is_symlink() for path in (output, progress_path, plan_path)):
+        raise ValueError("calibration artifacts must not be symlinks")
+    if plan_path.exists():
+        plan = load_resource_plan(
+            plan_path,
+            hardware_profile=request["hardware_profile"],
+            profiles=request["profiles"],
+            model_seeds=request["model_seeds"],
+        )
+        if (
+            plan["request_sha256"] != request_hash
+            or plan["hardware"] != devices
+            or plan["runtime"] != runtime
+        ):
+            raise ValueError(
+                "completed resource plan request/hardware/runtime differs; refusing reuse"
+            )
+        verify_plan_inputs(plan, jobs)
+        return plan_path
+    minimum_free = float(request.get("minimum_free_gb", 0.0))
+    if request["hardware_profile"] == "a6000-48gb":
+        minimum_free = max(minimum_free, 32.0)
+    for device, hardware in devices.items():
+        if request["hardware_profile"] == "a6000-48gb" and (
+            hardware["total_memory_bytes"] < 40 * 1024**3 or hardware["compute_capability"][0] < 8
+        ):
+            raise RuntimeError(
+                "A6000 profile requires >=40 GiB visible memory and capability 8.0; no downscale"
+            )
+        free, _ = torch.cuda.mem_get_info(torch.device(device))
+        if free < minimum_free * 1024**3:
+            raise RuntimeError(
+                f"{device} has {free / 1024**3:.2f} GiB free; "
+                f"calibration requires {minimum_free:.2f} GiB. Existing processes are not changed"
+            )
+    if progress_path.exists():
+        progress = json.loads(progress_path.read_bytes())
+        if (
+            progress.get("request_sha256") != request_hash
+            or progress.get("hardware") != devices
+            or progress.get("runtime") != runtime
+        ):
+            raise ValueError(
+                "partial calibration identity differs; no previous evidence overwritten"
+            )
+        verify_plan_inputs(progress, jobs)
+    else:
+        progress = {
+            "schema_version": SCHEMA_VERSION,
+            "kind": "measured_training_resource_plan",
+            "status": "calibrating",
+            "classification": "resource_calibration_not_final_training",
+            "request_sha256": request_hash,
+            "source_sha256": expected_sources,
+            "hardware_profile": request["hardware_profile"],
+            "profiles": request["profiles"],
+            "model_seeds": request["model_seeds"],
+            "hardware": devices,
+            "runtime": runtime,
+            "entries": [],
+            "final_training_started": False,
+        }
+
+    def persist():
+        atomic_write_json(progress_path, progress)
+
+    persist()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for job in jobs:
+        grouped.setdefault(_group_key(job), []).append(job)
+    try:
+        for key, paired in grouped.items():
+            entry = next((item for item in progress["entries"] if _group_key(item) == key), None)
+            if entry is None:
+                entry = {name: paired[0][name] for name in ("track", "profile", "dataset")}
+                progress["entries"].append(entry)
+            if entry.get("status") != "passed":
+                _calibrate_group(paired, entry, persist)
+            gc.collect()
+            torch.cuda.empty_cache()
+        if source_snapshot() != expected_sources:
+            raise ValueError("source changed during calibration")
+        progress["status"] = "passed"
+        progress.pop("error", None)
+        validate_resource_plan(
+            progress,
+            hardware_profile=request["hardware_profile"],
+            profiles=request["profiles"],
+            model_seeds=request["model_seeds"],
+        )
+        persist()
+        atomic_write_json(plan_path, progress)
+    except BaseException as error:
+        progress.update(
+            status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+            error=f"{type(error).__name__}: {error}",
+        )
+        persist()
+        raise
+    return plan_path
+
+
+def run(request_path: Path, output: Path) -> Path:
+    from scripts.calibration_lock import calibration_lock
+
+    with calibration_lock(output) as validated_output:
+        return _run_locked(request_path, validated_output)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        path = run(args.request, args.output_dir)
+    except (Exception, KeyboardInterrupt) as error:
+        print(
+            f"Resource calibration failed: {type(error).__name__}: {error}; "
+            "no final training started and no batch downscale applied",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
+    print(f"Measured resource plan: {path}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# scripts/calibration_lock.py
+
+````python
+"""Crash-released, process-exclusive ownership of one calibration output directory.
+
+The persistent one-byte lock file is not a stale-PID marker. Only the operating
+system's current file lock decides ownership, so process completion/crash releases
+it without deleting anything or signalling any process.
+"""
+
+from __future__ import annotations
+
+import errno
+import os
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+
+LOCK_FILENAME = ".calibration.lock"
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _reparse(metadata: os.stat_result) -> bool:
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _direct_output(output: Path) -> Path:
+    path = Path(output).expanduser()
+    if ".." in path.parts:
+        raise ValueError("calibration output must not contain parent traversal")
+    path = Path(os.path.abspath(path))
+    if path in {Path(path.anchor), Path.home().resolve(), ROOT}:
+        raise ValueError("calibration output must be a dedicated directory, not a broad root")
+    for component in (*reversed(path.parents), path):
+        try:
+            metadata = component.lstat()
+        except FileNotFoundError:
+            continue
+        if _reparse(metadata):
+            raise ValueError(f"calibration output symlink/reparse path is forbidden: {component}")
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError(f"calibration output component is not a directory: {component}")
+    if path.resolve() != path:
+        raise ValueError("calibration output must resolve directly without indirection")
+    return path
+
+
+def _regular_lock(metadata: os.stat_result) -> None:
+    if _reparse(metadata) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("calibration lock must be a regular non-symlink file")
+    if metadata.st_nlink != 1:
+        raise ValueError("calibration lock must not be hard-linked to another file")
+    if metadata.st_size not in {0, 1}:
+        raise ValueError("calibration lock has unexpected existing contents; file preserved")
+
+
+def _acquire(descriptor: int, output: Path) -> None:
+    try:
+        if os.name == "posix":
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        elif os.name == "nt":
+            import msvcrt
+
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        else:
+            raise RuntimeError("calibration locking is supported only on POSIX and Windows")
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+            raise RuntimeError(
+                f"another calibration is already active for {output}; "
+                "wait for that run to finish, then retry the same command. "
+                "Do not delete the lock file or interrupt unrelated processes"
+            ) from error
+        raise
+
+
+@contextmanager
+def calibration_lock(output: Path) -> Iterator[Path]:
+    """Own exactly one calibration directory until context/process completion.
+
+    Call this before mutating progress/request artifacts. The yielded absolute
+    path is the validated output directory. This context does not touch manifests,
+    probes, checkpoints or other experiment directories.
+    """
+    directory = _direct_output(output)
+    directory.mkdir(parents=True, exist_ok=True)
+    directory = _direct_output(directory)
+    lock_path = directory / LOCK_FILENAME
+    try:
+        existing = lock_path.lstat()
+    except FileNotFoundError:
+        existing = None
+    if existing is not None:
+        _regular_lock(existing)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(lock_path, flags, 0o600)
+    primary_error = None
+    try:
+        os.set_inheritable(descriptor, False)
+        metadata = os.fstat(descriptor)
+        _regular_lock(metadata)
+        _direct_output(directory)
+        current = lock_path.lstat()
+        _regular_lock(current)
+        if not os.path.samestat(metadata, current):
+            raise ValueError("calibration lock path changed while opening it")
+        _acquire(descriptor, directory)
+        # Locking a byte past EOF is supported by both OS lock implementations.
+        # Only the owner initializes the sentinel; a competing process writes nothing.
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if os.fstat(descriptor).st_size == 0:
+            os.write(descriptor, b"0")
+        elif os.read(descriptor, 1) != b"0":
+            raise ValueError("calibration lock has unexpected existing contents; file preserved")
+        yield directory
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            # Closing the exact owned descriptor releases either OS lock. We never
+            # unlink it: unlinking a held lock could allow a second independent owner.
+            os.close(descriptor)
+        except OSError as close_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(f"closing calibration lock also failed: {close_error}")
+````
+
 # scripts/check_datasets.py
 
 ````python
@@ -57940,6 +59679,14 @@ from scripts.telemetry_validation import (  # noqa: E402
     validate_resource_observability,
     validate_throughput_observability,
 )
+from scripts.training_resource_plan import (  # noqa: E402
+    load_resource_plan,
+    resource_plan_identity,
+    selected_resources,
+    validate_job_plan,
+    validate_plan_data,
+    validate_plan_runtime,
+)
 
 V1_DATASETS = ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv")
 # V5 owns these profiles. Legacy versions receive only their supported
@@ -58024,6 +59771,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--v5-beta-max", type=float)
     result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
     result.add_argument(
+        "--resource-plan", type=Path, help="Immutable measured V5 batch/worker plan"
+    )
+    result.add_argument(
         "--v5-sampling",
         choices=("auto", "full", "neighbor", "cluster"),
         default="auto",
@@ -58071,8 +59821,12 @@ def _validate(args: argparse.Namespace) -> None:
         or (args.legacy_ppi_batch_size is not None and args.legacy_ppi_batch_size < 1)
     ):
         raise ValueError("V5 neighbor fanouts and sample seed batch size must be positive")
-    if args.hardware_profile == "portable" and args.v5_ppi_batch_size not in {None, 2}:
-        raise ValueError("portable V5 PPI retains graph batch-size 2")
+    if (
+        args.hardware_profile == "portable"
+        and args.v5_ppi_batch_size is not None
+        and args.v5_ppi_batch_size < 2
+    ):
+        raise ValueError("portable V5 PPI requires graph batch-size at least 2")
     _v5_beta_configuration(args)
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
         raise ValueError("CUDA is required; CPU training/fallback is not supported")
@@ -58090,20 +59844,52 @@ def _selected_datasets(args: argparse.Namespace, version: str) -> list[str]:
     return [dataset for dataset in requested if dataset in supported]
 
 
-def _v5_execution(args: argparse.Namespace, dataset: str) -> dict[str, Any]:
+def _v5_execution(
+    args: argparse.Namespace, dataset: str, profile_name: str | None = None
+) -> dict[str, Any]:
     profile = HARDWARE_PROFILES[args.hardware_profile]
     batch_size = 1
     if dataset == "ppi":
         batch_size = args.v5_ppi_batch_size or profile["ppi_batch_size"]
     loader_workers = shared.workers_for_dataset(dataset, args.workers)
+    sample_seed_batch_size = args.v5_sample_seed_batch_size or profile["sample_seed_batch_size"]
+    plan = getattr(args, "resolved_resource_plan", None)
+    if plan is not None:
+        if profile_name is None:
+            raise ValueError("measured V5 resource selection requires an architecture profile")
+        measured = selected_resources(
+            plan, track="conductance", profile=profile_name, dataset=dataset
+        )
+        if measured is None:
+            raise ValueError(f"resource plan is missing conductance/{profile_name}/{dataset}")
+        for option, explicit, selected in (
+            (
+                "--v5-ppi-batch-size",
+                args.v5_ppi_batch_size if dataset == "ppi" else None,
+                measured["batch_size"],
+            ),
+            (
+                "--v5-sample-seed-batch-size",
+                args.v5_sample_seed_batch_size,
+                measured["sample_seed_batch_size"],
+            ),
+            (
+                "--workers",
+                args.workers if getattr(args, "workers_explicit", False) else None,
+                measured["workers"],
+            ),
+        ):
+            if explicit is not None and explicit != selected:
+                raise ValueError(f"{option} conflicts with the immutable measured resource plan")
+        batch_size = measured["batch_size"]
+        sample_seed_batch_size = measured["sample_seed_batch_size"]
+        loader_workers = measured["workers"]
     return {
         "hardware_profile": args.hardware_profile,
         "precision": profile["precision"],
         "tf32": profile["tf32"],
         "batch_size": batch_size,
-        "sample_seed_batch_size": (
-            args.v5_sample_seed_batch_size or profile["sample_seed_batch_size"]
-        ),
+        "sample_seed_batch_size": sample_seed_batch_size,
         "edge_chunk_size": args.v5_edge_chunk_size or profile["edge_chunk_size"],
         "activation_checkpoint": (
             profile["activation_checkpoint"]
@@ -58229,7 +60015,9 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             command += ["--edge-chunk-size", str(args.edge_chunk_size)]
                         sampling = None
                         if version == "v5":
-                            execution = _v5_execution(args, dataset)
+                            execution = _v5_execution(args, dataset, profile_name)
+                            child_workers = execution["dataloader_workers"]
+                            command[command.index("--workers") + 1] = str(child_workers)
                             batch_position = command.index("--batch-size") + 1
                             command[batch_position] = str(execution["batch_size"])
                             sampling = (
@@ -58264,6 +60052,15 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             ]
                             for name, value in _v5_beta_configuration(args).items():
                                 command += ["--" + name.replace("_", "-"), str(value)]
+                            validate_job_plan(
+                                getattr(args, "resolved_resource_plan", None),
+                                track="conductance",
+                                profile=profile_name,
+                                dataset=dataset,
+                                condition=condition,
+                                model_seed=seed,
+                                command=command,
+                            )
                         job_id = f"{version}/{profile_name}/model-seed-{seed}/{dataset}/{condition}"
                         jobs.append(
                             {
@@ -58350,6 +60147,9 @@ def _source_snapshot() -> dict[str, str]:
         ROOT / "scripts/process_safety.py",
         ROOT / "scripts/run_conductance_factorial.py",
         ROOT / "scripts/telemetry_validation.py",
+        ROOT / "scripts/training_resource_plan.py",
+        ROOT / "scripts/calibrate_training_resources.py",
+        ROOT / "scripts/calibration_lock.py",
         ROOT / "scripts/verify_gpu_lock.py",
     ]
     return {
@@ -58883,9 +60683,23 @@ def _write_summary(run_dir: Path, manifest: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    arguments = sys.argv[1:] if argv is None else argv
+    args.workers_explicit = any(
+        argument == "--workers" or argument.startswith("--workers=") for argument in arguments
+    )
     try:
         _validate(args)
-    except ValueError as exc:
+        args.resolved_resource_plan = (
+            load_resource_plan(
+                args.resource_plan,
+                hardware_profile=args.hardware_profile,
+                profiles=args.profiles,
+                model_seeds=args.model_seeds,
+            )
+            if args.resource_plan is not None
+            else None
+        )
+    except (ValueError, OSError, UnicodeError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     run_id = args.run_id or "scaling-v1-v5-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
@@ -58934,14 +60748,22 @@ def main(argv: list[str] | None = None) -> int:
         "v5_ppi_batch_size": args.v5_ppi_batch_size,
         "v5_beta": _v5_beta_configuration(args),
         "hardware_profile": args.hardware_profile,
+        "resource_plan": (
+            resource_plan_identity(args.resolved_resource_plan)
+            if args.resolved_resource_plan is not None
+            else None
+        ),
         "effective_min_free_gb": _effective_min_free_gb(args),
         "v5_sampling": args.v5_sampling,
         "v5_num_neighbors": list(args.v5_num_neighbors),
         "v5_sample_seed_batch_size": args.v5_sample_seed_batch_size,
         "v5_activation_checkpoint": args.v5_activation_checkpoint,
-        "v5_resolved_execution_by_dataset": {
-            dataset: _v5_execution(args, dataset)
-            for dataset in (_selected_datasets(args, "v5") if "v5" in args.versions else [])
+        "v5_resolved_execution_by_profile_and_dataset": {
+            profile_name: {
+                dataset: _v5_execution(args, dataset, profile_name)
+                for dataset in (_selected_datasets(args, "v5") if "v5" in args.versions else [])
+            }
+            for profile_name in args.profiles
         },
         "data_root": str(data_root),
     }
@@ -59033,12 +60855,18 @@ def main(argv: list[str] | None = None) -> int:
                     "profile-specific real graph batches while legacy versions retain batch 2"
                 ),
                 "batch_selection": {
-                    "default_source": "preregistered_hardware_profile_not_measured_optimum",
+                    "default_source": (
+                        "measured_paired_training_resource_plan"
+                        if args.resolved_resource_plan is not None
+                        else "preregistered_hardware_profile_not_measured_optimum"
+                    ),
                     "legacy_ppi_explicit_override": args.legacy_ppi_batch_size,
                     "v5_ppi_explicit_override": args.v5_ppi_batch_size,
                     "v5_sample_seed_explicit_override": args.v5_sample_seed_batch_size,
                     "automatic_downscale": False,
                     "measured_throughput_optimum_claimed": False,
+                    "measured_candidate_selection": args.resolved_resource_plan is not None,
+                    "resource_plan": config["resource_plan"],
                     "scope": (
                         "explicit V5 overrides are applied verbatim and become immutable run "
                         "identity; their presence alone is not evidence of a throughput sweep"
@@ -59083,6 +60911,11 @@ def main(argv: list[str] | None = None) -> int:
         manifest["gpu_preflight"] = _accepted_hardware_preflight(
             preflight_output, args.hardware_profile
         )
+        if args.resolved_resource_plan is not None:
+            manifest["measured_resource_runtime"] = validate_plan_runtime(
+                args.resolved_resource_plan, device_names=[args.device]
+            )
+            validate_plan_data(args.resolved_resource_plan, jobs, track="conductance")
         atomic_write_json(manifest_path, manifest)
         remaining = sum(job["status"] != "passed" for job in jobs)
         print(
@@ -60863,6 +62696,14 @@ from scripts.telemetry_validation import (  # noqa: E402
     validate_resource_observability,
     validate_throughput_observability,
 )
+from scripts.training_resource_plan import (  # noqa: E402
+    load_resource_plan,
+    resource_plan_identity,
+    selected_resources,
+    validate_job_plan,
+    validate_plan_data,
+    validate_plan_runtime,
+)
 
 DATASETS = ("zinc12k", "peptides_struct")
 VERSIONS = ("v1", "v2")
@@ -60955,6 +62796,9 @@ SOURCE_FILES = (
     "scripts/gpu_preflight.py",
     "scripts/process_safety.py",
     "scripts/telemetry_validation.py",
+    "scripts/training_resource_plan.py",
+    "scripts/calibrate_training_resources.py",
+    "scripts/calibration_lock.py",
     "scripts/verify_gpu_lock.py",
     "research/__init__.py",
     "research/cycle_pe/__init__.py",
@@ -61021,6 +62865,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--device", default="cuda")
     result.add_argument("--hardware-profile", choices=HARDWARE_PROFILES, default="portable")
     result.add_argument(
+        "--resource-plan", type=Path, help="Immutable measured Cycle V2 batch/worker plan"
+    )
+    result.add_argument(
         "--batch-size",
         type=int,
         default=0,
@@ -61028,6 +62875,11 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument(
         "--workers", type=int, default=-1, help="explicit override; -1 selects by hardware profile"
+    )
+    result.add_argument(
+        "--legacy-batch-size",
+        type=int,
+        help="preserve a separate explicit Cycle V1 batch when V2 uses measured resources",
     )
     result.add_argument(
         "--prefetch-factor",
@@ -61056,6 +62908,10 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _validate(args: argparse.Namespace) -> None:
+    if getattr(args, "legacy_batch_size", None) is not None and (
+        args.legacy_batch_size < 1 or "v1" not in args.versions
+    ):
+        raise ValueError("--legacy-batch-size requires V1 and a positive batch")
     for name in ("versions", "encodings", "datasets", "profiles"):
         values = getattr(args, name)
         if not values or len(set(values)) != len(values):
@@ -61100,11 +62956,24 @@ def _job_resources(
 ) -> dict[str, Any]:
     accelerated = args.hardware_profile == "a6000-48gb"
     is_v2 = version == "v2"
+    batch_size = args.batch_size or (A6000_BATCH_SIZE[profile][dataset] if accelerated else 32)
+    if version == "v1" and getattr(args, "legacy_batch_size", None) is not None:
+        batch_size = args.legacy_batch_size
+    workers = args.workers if args.workers >= 0 else (8 if accelerated else 4)
+    plan = getattr(args, "resolved_resource_plan", None)
+    if is_v2 and plan is not None:
+        measured = selected_resources(plan, track="cycle", profile=profile, dataset=dataset)
+        if measured is None:
+            raise ValueError(f"resource plan is missing cycle/{profile}/{dataset}")
+        if args.batch_size and args.batch_size != measured["batch_size"]:
+            raise ValueError("--batch-size conflicts with the immutable measured resource plan")
+        if args.workers >= 0 and args.workers != measured["workers"]:
+            raise ValueError("--workers conflicts with the immutable measured resource plan")
+        batch_size, workers = measured["batch_size"], measured["workers"]
     return {
         "hardware_profile": args.hardware_profile,
-        "batch_size": args.batch_size
-        or (A6000_BATCH_SIZE[profile][dataset] if accelerated else 32),
-        "workers": args.workers if args.workers >= 0 else (8 if accelerated else 4),
+        "batch_size": batch_size,
+        "workers": workers,
         # V1's frozen loader exposes no prefetch CLI and therefore uses the
         # DataLoader default (2); never claim the V2-only override for V1.
         "prefetch_factor": (args.prefetch_factor or (4 if accelerated else 2) if is_v2 else 2),
@@ -61245,6 +63114,15 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             "--hardware-profile",
                             args.hardware_profile,
                         ]
+                        validate_job_plan(
+                            getattr(args, "resolved_resource_plan", None),
+                            track="cycle",
+                            profile=profile,
+                            dataset=dataset,
+                            condition=encoding,
+                            model_seed=seed,
+                            command=command,
+                        )
                     jobs.append(
                         {
                             "job_id": job_id,
@@ -62159,7 +64037,13 @@ def _run_configuration(args: argparse.Namespace) -> dict[str, Any]:
         "data_root": str(args.data_root.expanduser().resolve()),
         "device": args.device,
         "hardware_profile": args.hardware_profile,
+        "resource_plan": (
+            resource_plan_identity(args.resolved_resource_plan)
+            if getattr(args, "resolved_resource_plan", None) is not None
+            else None
+        ),
         "batch_size": args.batch_size,
+        "legacy_batch_size": getattr(args, "legacy_batch_size", None),
         "workers": args.workers,
         "prefetch_factor": args.prefetch_factor,
         "epochs": args.epochs,
@@ -62494,10 +64378,17 @@ def _manifest_base(
                 "only within the same hardware profile and resolved batch policy"
             ),
             "batch_selection": {
-                "default_source": "preregistered_hardware_dataset_profile_not_measured_optimum",
+                "default_source": (
+                    "measured_paired_training_resource_plan"
+                    if getattr(args, "resolved_resource_plan", None) is not None
+                    else "preregistered_hardware_dataset_profile_not_measured_optimum"
+                ),
                 "explicit_global_override": args.batch_size or None,
                 "automatic_downscale": False,
                 "measured_throughput_optimum_claimed": False,
+                "measured_candidate_selection": getattr(args, "resolved_resource_plan", None)
+                is not None,
+                "resource_plan": _run_configuration(args)["resource_plan"],
                 "scope": (
                     "a nonzero --batch-size applies verbatim to every requested "
                     "version/dataset/profile and becomes immutable run identity"
@@ -62524,7 +64415,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         _validate(args)
-    except ValueError as exc:
+        args.resolved_resource_plan = (
+            load_resource_plan(
+                args.resource_plan,
+                hardware_profile=args.hardware_profile,
+                profiles=args.profiles,
+                model_seeds=args.model_seeds,
+            )
+            if args.resource_plan is not None
+            else None
+        )
+    except (ValueError, OSError, UnicodeError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     run_id = args.run_id or _default_run_id()
@@ -62542,7 +64443,11 @@ def main(argv: list[str] | None = None) -> int:
     if paths_overlap:
         print("Experiment outputs and dataset directories must not overlap", file=sys.stderr)
         return 2
-    jobs = make_jobs(args, run_dir)
+    try:
+        jobs = make_jobs(args, run_dir)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if args.dry_run:
         print(
             f"{len(jobs)} fresh child runs; {len(jobs)} fresh dataset "
@@ -62683,6 +64588,11 @@ def main(argv: list[str] | None = None) -> int:
         }
         if manifest["preflight"]["status"] != "passed":
             failed = True
+        elif args.resolved_resource_plan is not None:
+            manifest["measured_resource_runtime"] = validate_plan_runtime(
+                args.resolved_resource_plan, device_names=[args.device]
+            )
+            validate_plan_data(args.resolved_resource_plan, jobs, track="cycle")
         atomic_write_json(manifest_path, manifest, sort_keys=False)
         if not failed:
             for job in jobs:
@@ -64326,6 +66236,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -64356,6 +66267,16 @@ from scripts.process_safety import (  # noqa: E402
     run_failure_reporter,
     terminate_owned_child,
     terminate_owned_child_after_error,
+)
+from scripts.training_resource_plan import (  # noqa: E402
+    digest as resource_digest,
+)
+from scripts.training_resource_plan import (  # noqa: E402
+    load_resource_plan,
+    resource_plan_identity,
+)
+from scripts.training_resource_plan import (  # noqa: E402
+    source_snapshot as calibration_source_snapshot,
 )
 
 TRACKS = ("conductance", "cycle", "tree")
@@ -64508,6 +66429,14 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--min-free-gb", type=float, default=8.0)
     result.add_argument(
+        "--resource-plan",
+        type=Path,
+        help=(
+            "reuse an exact measured V5/Cycle V2 resource plan; "
+            "omission calibrates before new training"
+        ),
+    )
+    result.add_argument(
         "--v5-beta-parameterization",
         choices=BETA_PARAMETERIZATIONS,
         default=DEFAULT_BETA_PARAMETERIZATION,
@@ -64582,8 +66511,12 @@ def _validate(args: argparse.Namespace) -> None:
         or args.conductance_v5_sample_seed_batch_size is not None
     ) and ("conductance" not in args.tracks or "v5" not in args.conductance_versions):
         raise ValueError("Conductance V5 batch overrides require the conductance/V5 track")
-    if args.hardware_profile == "portable" and args.conductance_v5_ppi_batch_size not in {None, 2}:
-        raise ValueError("portable Conductance V5 PPI retains graph batch-size 2")
+    if (
+        args.hardware_profile == "portable"
+        and args.conductance_v5_ppi_batch_size is not None
+        and args.conductance_v5_ppi_batch_size < 2
+    ):
+        raise ValueError("portable Conductance V5 PPI cannot shrink below graph batch-size 2")
     if args.cycle_batch_size is not None and "cycle" not in args.tracks:
         raise ValueError("--cycle-batch-size requires the cycle track")
     if args.tree_batch_size is not None and "tree" not in args.tracks:
@@ -64744,8 +66677,13 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             command += ["--model-seeds", ",".join(str(seed) for seed in args.model_seeds)]
             command += ["--basis-backend", args.cycle_v2_basis_backend]
             command += ["--encodings", *args.cycle_v2_encodings]
-            if args.cycle_batch_size is not None:
+            if (
+                args.cycle_batch_size is not None
+                and getattr(args, "resolved_resource_plan", None) is None
+            ):
                 command += ["--batch-size", str(args.cycle_batch_size)]
+            elif args.cycle_batch_size is not None and "v1" in args.cycle_versions:
+                command += ["--legacy-batch-size", str(args.cycle_batch_size)]
         else:
             command += ["--versions", *requested_matrix["versions"]]
             command += ["--datasets", *requested_matrix["requested_datasets"]]
@@ -64758,12 +66696,18 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
                     "--legacy-ppi-batch-size",
                     str(args.conductance_legacy_ppi_batch_size),
                 ]
-            if args.conductance_v5_ppi_batch_size is not None:
+            if (
+                args.conductance_v5_ppi_batch_size is not None
+                and getattr(args, "resolved_resource_plan", None) is None
+            ):
                 command += [
                     "--v5-ppi-batch-size",
                     str(args.conductance_v5_ppi_batch_size),
                 ]
-            if args.conductance_v5_sample_seed_batch_size is not None:
+            if (
+                args.conductance_v5_sample_seed_batch_size is not None
+                and getattr(args, "resolved_resource_plan", None) is None
+            ):
                 command += [
                     "--v5-sample-seed-batch-size",
                     str(args.conductance_v5_sample_seed_batch_size),
@@ -64794,6 +66738,11 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
         download_forwarded = args.allow_download and track in {"cycle", "tree"}
         if download_forwarded:
             command.append("--allow-download")
+        if getattr(args, "resolved_resource_plan", None) is not None and (
+            (track == "conductance" and "v5" in args.conductance_versions)
+            or (track == "cycle" and "v2" in args.cycle_versions)
+        ):
+            command += ["--resource-plan", str(args.resource_plan)]
         if args.dry_run:
             command.append("--dry-run")
         jobs.append(
@@ -64820,6 +66769,9 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
 def _source_snapshot() -> dict[str, str]:
     paths = [
         Path(__file__).resolve(),
+        ROOT / "scripts/training_resource_plan.py",
+        ROOT / "scripts/calibrate_training_resources.py",
+        ROOT / "scripts/calibration_lock.py",
         ROOT / "research/__init__.py",
         ROOT / "scripts/check_dependencies.py",
         ROOT / "scripts/gpu_profiles.py",
@@ -65512,6 +67464,7 @@ def _config_payload(
         "execution_classification": "final_research_training",
         "debug_or_smoke_mode": False,
         "hardware_profile": args.hardware_profile,
+        "resource_plan": resource_plan_identity(getattr(args, "resolved_resource_plan", None)),
         "explicit_batch_overrides": {
             "conductance_legacy_ppi_graphs": args.conductance_legacy_ppi_batch_size,
             "conductance_v5_ppi_graphs": args.conductance_v5_ppi_batch_size,
@@ -65636,6 +67589,11 @@ def _print_plan(args: argparse.Namespace, run_id: str, jobs: list[dict[str, Any]
     )
     devices = _execution_devices(args)
     print("execution_classification=plan_only; training_started=false; debug_or_smoke=false")
+    if _needs_resource_calibration(args):
+        print(
+            "V5/Cycle V2: optimizer-inclusive paired batch/worker calibration precedes training; "
+            "shown batches are requested floors, not measured selections"
+        )
     print(
         f"hardware_profile={args.hardware_profile}; devices={devices}; "
         f"track_concurrency={min(len(devices), len(jobs))} "
@@ -65652,6 +67610,136 @@ def _print_plan(args: argparse.Namespace, run_id: str, jobs: list[dict[str, Any]
         print(f"  summary: {job['summary_path']}")
     results_root = args.results_root.expanduser().resolve()
     print(f"central manifest: {results_root / 'rich_scaling' / run_id / 'manifest.json'}")
+
+
+def _needs_resource_calibration(args: argparse.Namespace) -> bool:
+    return ("conductance" in args.tracks and "v5" in args.conductance_versions) or (
+        "cycle" in args.tracks and "v2" in args.cycle_versions
+    )
+
+
+def _calibration_request(args: argparse.Namespace, run_id: str) -> dict[str, Any]:
+    from scripts import run_conductance_scaling, run_cycle_scaling
+
+    baseline = copy.deepcopy(args)
+    baseline.resource_plan = None
+    baseline.resolved_resource_plan = None
+    baseline.dry_run = False
+    # Both mechanisms must fit the same selected resources, even for a one-arm final selection.
+    baseline.cycle_v2_encodings = ["se", "pe"]
+    paired_jobs = []
+    for track_job in make_jobs(baseline, run_id):
+        track = track_job["track"]
+        if track == "tree":
+            continue
+        module = run_conductance_scaling if track == "conductance" else run_cycle_scaling
+        child_args = module.parser().parse_args(track_job["command"][3:])
+        module._validate(child_args)
+        child_args.resolved_resource_plan = None
+        for job in module.make_jobs(child_args, Path(track_job["output_dir"])):
+            if job["version"] != ("v5" if track == "conductance" else "v2"):
+                continue
+            paired_jobs.append(
+                {
+                    "track": track,
+                    "profile": job["profile"],
+                    "dataset": job["dataset"] if track == "conductance" else job["datasets"][0],
+                    "condition": job["condition"] if track == "conductance" else job["encoding"],
+                    "model_seed": job["model_seed"],
+                    "device": track_job["device"],
+                    "command": job["command"],
+                }
+            )
+    return {
+        "schema_version": 1,
+        "kind": "training_resource_calibration_request",
+        "hardware_profile": args.hardware_profile,
+        "profiles": list(args.profiles),
+        "model_seeds": list(args.model_seeds),
+        "minimum_free_gb": args.min_free_gb,
+        "source_sha256": calibration_source_snapshot(),
+        "jobs": paired_jobs,
+    }
+
+
+def _ensure_measured_plan(args: argparse.Namespace, run_id: str, run_dir: Path) -> None:
+    if not _needs_resource_calibration(args):
+        if args.resource_plan is not None:
+            raise ValueError("resource plan requires a selected V5 or Cycle V2 track")
+        return
+    from scripts.training_resource_plan import validate_plan_runtime
+
+    if args.resource_plan is not None:
+        args.resource_plan = args.resource_plan.expanduser().resolve()
+        args.resolved_resource_plan = load_resource_plan(
+            args.resource_plan,
+            hardware_profile=args.hardware_profile,
+            profiles=list(args.profiles),
+            model_seeds=list(args.model_seeds),
+        )
+        validate_plan_runtime(args.resolved_resource_plan)
+        from scripts.calibrate_training_resources import verify_plan_inputs
+
+        verify_plan_inputs(args.resolved_resource_plan, _calibration_request(args, run_id)["jobs"])
+        return
+    if (run_dir / "manifest.json").exists():
+        existing = json.loads((run_dir / "manifest.json").read_bytes())
+        if not existing.get("config", {}).get("resource_plan"):
+            raise ValueError(
+                "existing run has no measured resource plan; it is preserved and cannot be "
+                "silently reconfigured. Use a separate new run ID"
+            )
+    directory = args.results_root.expanduser().resolve() / "resource_calibration" / run_id
+    if directory.is_symlink() or not directory.resolve().is_relative_to(
+        args.results_root.expanduser().resolve()
+    ):
+        raise ValueError("calibration output escapes results root")
+    if _paths_overlap(directory, args.data_root.expanduser().resolve()):
+        raise ValueError("calibration outputs must not overlap dataset caches")
+    request = _calibration_request(args, run_id)
+    request_path = directory / "request.json"
+    if directory.exists():
+        if not request_path.is_file() or request_path.is_symlink():
+            raise ValueError("existing calibration directory is not owned by this request")
+        if resource_digest(json.loads(request_path.read_bytes())) != resource_digest(request):
+            raise ValueError(
+                "calibration source/configuration differs; previous measurements preserved; "
+                "use a new run ID"
+            )
+    else:
+        directory.mkdir(parents=True, exist_ok=False)
+        _atomic_write_json(request_path, request)
+    logs = directory / "logs"
+    logs.mkdir(exist_ok=True)
+    attempt = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    print(
+        "Measuring real training batch/worker candidates before final training; "
+        "completed measurements resume; model/data size unchanged",
+        flush=True,
+    )
+    command = [
+        sys.executable,
+        "-B",
+        str(ROOT / "scripts/calibrate_training_resources.py"),
+        "--request",
+        str(request_path),
+        "--output-dir",
+        str(directory),
+    ]
+    code = _run_logged(command, logs / f"calibration-{attempt}.log", _environment())
+    if code:
+        raise RuntimeError(
+            f"resource calibration failed with code {code}; no final training launched; "
+            f"inspect {directory / 'progress.json'}"
+        )
+    args.resource_plan = directory / "resource-plan.json"
+    args.resolved_resource_plan = load_resource_plan(
+        args.resource_plan,
+        hardware_profile=args.hardware_profile,
+        profiles=list(args.profiles),
+        model_seeds=list(args.model_seeds),
+    )
+    validate_plan_runtime(args.resolved_resource_plan)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -65685,6 +67773,16 @@ def main(argv: list[str] | None = None) -> int:
         _print_plan(args, run_id, jobs)
         print("dry run only; no files or directories were written")
         return 0
+    try:
+        _STOP_ACTIVE_CHILDREN.clear()
+        _ensure_measured_plan(args, run_id, run_dir)
+        jobs = make_jobs(args, run_id)
+    except KeyboardInterrupt:
+        print("resource calibration interrupted; partial measurements preserved", flush=True)
+        return 130
+    except (ValueError, RuntimeError, OSError, UnicodeError) as error:
+        print(f"cannot start final training: {error}", file=sys.stderr, flush=True)
+        return 2
     totals = _totals(jobs)
     manifest_path = run_dir / "manifest.json"
     sources = _source_snapshot()
@@ -65739,22 +67837,28 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                 },
                 "batch_selection": {
-                    "default_policy": "preregistered_per_child_hardware_dataset_profile",
+                    "default_policy": (
+                        "measured_paired_training_resources_for_v5_cycle_v2; "
+                        "legacy_requested_resources_unchanged"
+                    ),
                     "measured_throughput_optimum_claimed": False,
                     "automatic_downscale": False,
-                    "throughput_candidate_sweep": False,
+                    "throughput_candidate_sweep": getattr(args, "resolved_resource_plan", None)
+                    is not None,
+                    "measured_resource_plan": resource_plan_identity(
+                        getattr(args, "resolved_resource_plan", None)
+                    ),
                     "explicit_overrides": config["explicit_batch_overrides"],
                     "override_scope": (
-                        "each non-null override is forwarded unchanged to the named child; Cycle "
-                        "and Tree overrides intentionally apply to their whole requested matrix"
+                        "V5/Cycle V2 overrides set measured batch floors; the immutable plan "
+                        "supplies final selections. Legacy and Tree overrides are unchanged"
                     ),
                     "limitation": (
-                        "this orchestrator does not alter an optimization recipe by benchmarking "
-                        "and selecting a different physical batch. Exact-configuration candidate "
-                        "measurement remains a separate run; explicit overrides are optimization "
-                        "identity, never evidence of a measured optimum. Cycle V2 performs its "
-                        "recorded pre-epoch capacity probe and fails closed instead of silently "
-                        "shrinking"
+                        "V5/Cycle V2 measure optimizer-inclusive paired batch/worker candidates "
+                        "before final training. Selection maximizes measured worst-arm throughput "
+                        "within memory headroom, never below requested batch floors. The selected "
+                        "recipe is immutable on resume; finite candidate results are not a global "
+                        "optimum claim. Legacy versions retain their requested configurations"
                     ),
                 },
                 "failure_policy": (
@@ -68276,6 +70380,645 @@ def validate_throughput_observability(
 
 
 __all__ = ["validate_resource_observability", "validate_throughput_observability"]
+````
+
+# scripts/training_resource_plan.py
+
+````python
+"""Immutable, measured resources shared by paired research conditions.
+
+This is a calibration certificate, not evidence of final training or accuracy.
+No value below the requested physical batch is selected automatically.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import platform
+import re
+import stat
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+SCHEMA_VERSION = 1
+IGNORED_COMMAND_OPTIONS = {
+    "--output-dir",
+    "--batch-size",
+    "--workers",
+    "--sample-seed-batch-size",
+    "--resource-plan",
+}
+
+
+def digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+def source_snapshot() -> dict[str, str]:
+    paths = [ROOT / "AGENTS.md", ROOT / "pyproject.toml"]
+    for directory in ("research", "src/chartgat", "scripts"):
+        paths.extend((ROOT / directory).rglob("*.py"))
+    paths.extend((ROOT / "research").rglob("*.yaml"))
+    return {
+        path.relative_to(ROOT).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(set(paths))
+        if path.is_file()
+    }
+
+
+def command_identity(command: list[str]) -> str:
+    """Bind the scientific recipe and measured GPU assignment, not output/resource values."""
+    if "-m" not in command:
+        raise ValueError("calibration requires a module training command")
+    remaining = command[command.index("-m") + 1 :]
+    canonical: list[str] = []
+    index = 0
+    while index < len(remaining):
+        token = remaining[index]
+        if token in IGNORED_COMMAND_OPTIONS:
+            if index + 1 >= len(remaining):
+                raise ValueError(f"missing command value for {token}")
+            index += 2
+        elif token == "--resume":
+            index += 1
+        else:
+            canonical.append(token)
+            index += 1
+    return digest(canonical)
+
+
+def _positive(value: Any, label: str, *, zero: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < (0 if zero else 1):
+        raise ValueError(f"{label} must be a {'nonnegative' if zero else 'positive'} integer")
+    return value
+
+
+def _number(value: Any, label: str, *, zero: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (float, int)):
+        raise ValueError(f"{label} must be numeric")
+    if not math.isfinite(value) or value < 0 or (not zero and value == 0):
+        raise ValueError(f"{label} is invalid")
+    return float(value)
+
+
+def worker_candidates(requested: int, allocated_cpus: int, *, applicable: bool) -> list[int]:
+    """Test real loader parallelism; GPU-resident samplers have no worker axis."""
+    _positive(allocated_cpus, "allocated CPUs")
+    _positive(requested, "requested workers", zero=True)
+    if not applicable:
+        return [0]
+    # Include the requested policy and all distinct powers of two allowed by affinity.
+    values = {requested}
+    count = 2
+    while count <= allocated_cpus:
+        values.add(count)
+        count *= 2
+    if allocated_cpus < 2:
+        values.add(allocated_cpus)
+    return sorted(values)
+
+
+def allocated_cpu_count() -> int:
+    affinity = getattr(os, "sched_getaffinity", None)
+    return len(affinity(0)) if affinity is not None else (os.cpu_count() or 1)
+
+
+def measurement_is_safe(report: dict[str, Any], *, memory_margin_fraction: float = 0.10) -> bool:
+    """Use peak reserve including optimizer state, not a screenshot or model-only size."""
+    if not isinstance(report, dict):
+        raise ValueError("measurement must be an object")
+    status = report.get("status")
+    if status == "oom":
+        if not isinstance(report.get("error"), str) or not report["error"].strip():
+            raise ValueError("OOM measurement must preserve the actual error")
+        return False
+    if status != "passed":
+        raise ValueError("measurement is not a completed pass or explicit OOM; errors are not OOM")
+    throughput = _number(report.get("samples_per_second"), "measured throughput")
+    elapsed = _number(report.get("elapsed_seconds"), "measured elapsed seconds")
+    units = _positive(report.get("processed_units"), "real processed units")
+    if not math.isclose(throughput, units / elapsed, rel_tol=1e-8, abs_tol=1e-10):
+        raise ValueError("measured throughput does not match real units and elapsed time")
+    steps = _positive(report.get("optimizer_steps"), "measured optimizer steps")
+    requested_steps = _positive(
+        report.get("measurement_steps_requested"), "requested measurement steps"
+    )
+    _positive(report.get("warmup_steps_requested"), "requested warmup steps")
+    requested_seconds = _number(
+        report.get("minimum_measure_seconds_requested"), "requested measurement duration"
+    )
+    measured_steps = report.get("measurement_steps", steps)
+    if _positive(measured_steps, "measured steps") < requested_steps or elapsed < requested_seconds:
+        raise ValueError("candidate did not complete its requested steady-state measurement window")
+    if "measurement_steps" in report and steps < _positive(
+        report["measurement_steps"], "measurement steps"
+    ):
+        raise ValueError("optimizer steps do not cover the measured training steps")
+    state = _positive(report.get("optimizer_state_bytes"), "optimizer state bytes")
+    peak = _positive(report.get("peak_reserved_bytes"), "peak CUDA reserve")
+    total = _positive(report.get("total_memory_bytes"), "visible memory")
+    free = _positive(report.get("free_bytes_before"), "free memory before candidate")
+    allocated = _positive(report.get("peak_allocated_bytes"), "peak CUDA allocation")
+    if (
+        free > total
+        or allocated > peak
+        or peak > total
+        or state > allocated
+        or isinstance(memory_margin_fraction, bool)
+        or not isinstance(memory_margin_fraction, (float, int))
+        or not math.isfinite(memory_margin_fraction)
+        or not 0 < memory_margin_fraction < 1
+    ):
+        raise ValueError("invalid memory capacity or safety margin")
+    if not isinstance(report.get("unit"), str) or not report["unit"].strip():
+        raise ValueError("measured throughput unit is missing")
+    margin = max(2 * 1024**3, math.ceil(total * memory_margin_fraction))
+    return peak + margin <= free
+
+
+def completed_candidate_status(reports: list[dict[str, Any]]) -> str:
+    """Never turn a generic error, partial result or empty probe into an OOM."""
+    if not isinstance(reports, list) or not reports:
+        raise ValueError("completed candidate has no measurements")
+    statuses = []
+    for report in reports:
+        measurement_is_safe(report)
+        statuses.append(report["status"])
+    return "oom" if "oom" in statuses else "passed"
+
+
+def candidate_score(candidate: dict[str, Any]) -> float | None:
+    if not isinstance(candidate, dict):
+        raise ValueError("candidate must be an object")
+    _positive(candidate.get("batch_size"), "candidate batch")
+    _positive(candidate.get("workers"), "candidate workers", zero=True)
+    reports = candidate.get("measurements", [])
+    status = completed_candidate_status(reports)
+    if candidate.get("status") != status:
+        raise ValueError("candidate status contradicts its completed measurements")
+    if status == "oom":
+        return None
+    if not all(measurement_is_safe(item) for item in reports):
+        return None
+    # Same dataset and supervised-unit definition within a group; optimize its slowest arm.
+    units = {item["unit"] for item in reports}
+    if len(units) != 1:
+        raise ValueError("paired calibration reports use different throughput units")
+    return min(float(item["samples_per_second"]) for item in reports)
+
+
+def choose_candidate(candidates: list[dict[str, Any]], baseline: int) -> dict[str, Any]:
+    _positive(baseline, "baseline batch")
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError("candidate selection requires actual measurements")
+    eligible: list[tuple[float, dict[str, Any]]] = []
+    for candidate in candidates:
+        if _positive(candidate.get("batch_size"), "candidate batch") < baseline:
+            raise ValueError("calibration cannot shrink the requested batch")
+        score = candidate_score(candidate)
+        if score is not None:
+            eligible.append((score, candidate))
+    if not eligible:
+        raise RuntimeError(
+            "no measured candidate has safe optimizer-inclusive memory headroom; "
+            "no downscale applied"
+        )
+    # Prefer less worker/memory overhead only when measured throughput is exactly tied.
+    return max(eligible, key=lambda item: (item[0], -item[1]["workers"], -item[1]["batch_size"]))[1]
+
+
+def _validate_entry(
+    entry: dict[str, Any], seeds: list[int], *, allocated_cpus: int | None = None
+) -> None:
+    if not isinstance(entry, dict) or entry.get("status") != "passed":
+        raise ValueError("resource plan entry is not complete")
+    if entry.get("track") not in {"conductance", "cycle"}:
+        raise ValueError("resource plan supports only Conductance V5 and Cycle V2")
+    contracts = entry.get("job_contracts")
+    if not isinstance(contracts, list) or not contracts:
+        raise ValueError("resource plan is missing exact job contracts")
+    expected_conditions = (
+        {"fixed_c", "shared_dynamic_c"} if entry["track"] == "conductance" else {"se", "pe"}
+    )
+    for item in contracts:
+        if not isinstance(item, dict):
+            raise ValueError("job contract must be an object")
+        _positive(item.get("model_seed"), "model seed", zero=True)
+        if not isinstance(item.get("condition"), str) or not _is_sha256(item.get("argv_sha256")):
+            raise ValueError("job contract has no valid condition/command digest")
+    identities = {(item.get("condition"), item.get("model_seed")) for item in contracts}
+    if identities != {
+        (condition, seed) for condition in expected_conditions for seed in seeds
+    } or len(identities) != len(contracts):
+        raise ValueError("every paired condition and requested seed must be measured")
+    baseline = _positive(entry.get("baseline_physical_batch_size"), "baseline batch")
+    axis = entry.get("batch_axis")
+    if axis not in {"graphs", "sampled_seed_nodes", "full_graph"}:
+        raise ValueError("resource plan has no valid physical batch axis")
+    if entry["track"] == "cycle" and axis != "graphs":
+        raise ValueError("Cycle V2 uses physical graph batches")
+    if entry["track"] == "conductance" and (entry.get("dataset") == "ppi") != (axis == "graphs"):
+        raise ValueError("only inductive PPI has a Conductance graph-batch axis")
+    split_size = _positive(entry.get("natural_training_split_size"), "full training split size")
+    worker_options = entry.get("worker_candidates")
+    if not isinstance(worker_options, list) or not worker_options:
+        raise ValueError("resource plan has no measured worker candidates")
+    for count in worker_options:
+        _positive(count, "worker candidate", zero=True)
+    if len(set(worker_options)) != len(worker_options):
+        raise ValueError("worker candidates must be unique")
+    if (
+        axis == "graphs"
+        and allocated_cpus is not None
+        and allocated_cpus > 1
+        and len(worker_options) < 2
+    ):
+        raise ValueError("graph loading needs multiple measured worker candidates")
+    if axis != "graphs" and worker_options != [0]:
+        raise ValueError("GPU-resident/full graph execution has no DataLoader worker axis")
+    candidates = entry.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        raise ValueError("resource plan has no measured candidates")
+    seen: set[tuple[int, int]] = set()
+    scores_by_batch: dict[int, list[float | None]] = {}
+    for candidate in candidates:
+        score = candidate_score(candidate)
+        key = candidate["batch_size"], candidate["workers"]
+        if key in seen or key[1] not in worker_options:
+            raise ValueError("duplicate candidate or unrequested worker setting")
+        seen.add(key)
+        scores_by_batch.setdefault(key[0], []).append(score)
+        measured = set()
+        for item in candidate["measurements"]:
+            seed = _positive(item.get("model_seed"), "measurement model seed", zero=True)
+            condition = item.get("condition")
+            if not isinstance(condition, str):
+                raise ValueError("measurement condition is missing")
+            measured.add((condition, seed))
+            if item["status"] == "passed":
+                if (
+                    _positive(item.get("batch_size"), "measured batch") != key[0]
+                    or _positive(item.get("workers"), "measured workers", zero=True) != key[1]
+                ):
+                    raise ValueError("measurement batch/worker setting differs from its candidate")
+        if measured != identities or len(candidate["measurements"]) != len(identities):
+            raise ValueError("candidate is missing paired measurements")
+    batches = sorted(scores_by_batch)
+    if batches[0] != baseline:
+        raise ValueError("requested baseline batch was not measured")
+    if seen != {(batch, count) for batch in batches for count in worker_options}:
+        raise ValueError("a measured batch is missing a worker candidate")
+    if axis != "full_graph" and baseline < split_size and len(batches) < 2:
+        raise ValueError("batch selection requires at least two distinct measured physical batches")
+    best = choose_candidate(candidates, baseline)
+    selected = entry.get("selected", {})
+    if not isinstance(selected, dict):
+        raise ValueError("selected resources must be an object")
+    expected_fields = {"batch_size", "workers"}
+    if entry["track"] == "conductance":
+        expected_fields.add("sample_seed_batch_size")
+    if set(selected) != expected_fields:
+        raise ValueError("selected resource fields are incomplete or unknown")
+    for field, value in selected.items():
+        _positive(value, f"selected {field}", zero=field == "workers")
+    if axis in {"sampled_seed_nodes", "full_graph"} and selected["batch_size"] != 1:
+        raise ValueError("a transductive graph cannot be duplicated to fill a graph batch")
+    physical_key = (
+        "sample_seed_batch_size"
+        if entry.get("batch_axis") == "sampled_seed_nodes"
+        else "batch_size"
+    )
+    if (
+        selected.get(physical_key) != best["batch_size"]
+        or selected.get("workers") != best["workers"]
+    ):
+        raise ValueError("selected resources do not match the best safe measured candidate")
+    reason = entry.get("stop_reason")
+    last_safe = [score for score in scores_by_batch[batches[-1]] if score is not None]
+    if axis == "full_graph":
+        if (
+            baseline != 1
+            or batches != [1]
+            or split_size != 1
+            or reason != "full_graph_no_batch_axis"
+        ):
+            raise ValueError("full graph no-batch-axis certificate is inconsistent")
+    elif reason == "memory_headroom_boundary":
+        if last_safe:
+            raise ValueError("claimed memory boundary still has a safe measured candidate")
+    elif reason == "complete_training_split_boundary":
+        if batches[-1] != max(split_size, baseline) or not last_safe:
+            raise ValueError("claimed natural boundary did not measure the full training split")
+    elif reason == "measured_throughput_plateau":
+        plateau, maximum = 0, None
+        for batch in batches:
+            safe = [score for score in scores_by_batch[batch] if score is not None]
+            if not safe:
+                raise ValueError("throughput plateau cannot hide a failed capacity boundary")
+            score = max(safe)
+            plateau = plateau + 1 if maximum is not None and score <= maximum * 1.05 else 0
+            maximum = score if maximum is None else max(maximum, score)
+        if plateau < 2:
+            raise ValueError("claimed throughput plateau lacks two measured non-improvements")
+    else:
+        raise ValueError("batch search has no measured or natural termination boundary")
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def validate_resource_plan(
+    plan: dict[str, Any],
+    *,
+    hardware_profile: str,
+    profiles: list[str],
+    model_seeds: list[int],
+    check_sources: bool = True,
+) -> None:
+    """Validate an in-memory draft before publishing a completed certificate."""
+    if (
+        not isinstance(plan, dict)
+        or isinstance(plan.get("schema_version"), bool)
+        or not isinstance(plan.get("schema_version"), int)
+        or plan.get("schema_version") != SCHEMA_VERSION
+        or plan.get("kind") != "measured_training_resource_plan"
+        or plan.get("status") != "passed"
+    ):
+        raise ValueError("resource plan is not a completed measured certificate")
+    if (
+        plan.get("classification") != "resource_calibration_not_final_training"
+        or plan.get("final_training_started") is not False
+    ):
+        raise ValueError("calibration must be separate from final training")
+    if not _is_sha256(plan.get("request_sha256")):
+        raise ValueError("resource plan has no exact calibration request digest")
+    seeds = plan.get("model_seeds")
+    if not isinstance(seeds, list) or not seeds:
+        raise ValueError("resource plan requires model seeds")
+    for seed in seeds:
+        _positive(seed, "model seed", zero=True)
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("model seeds must be unique")
+    if (
+        plan.get("hardware_profile") != hardware_profile
+        or plan.get("profiles") != list(profiles)
+        or seeds != list(model_seeds)
+    ):
+        raise ValueError("resource plan profile/seed identity differs")
+    if check_sources and plan.get("source_sha256") != source_snapshot():
+        raise ValueError(
+            "resource plan source identity differs; recalibration requires a separate new run"
+        )
+    hardware = plan.get("hardware")
+    runtime = plan.get("runtime")
+    if (
+        not isinstance(hardware, dict)
+        or not hardware
+        or not isinstance(runtime, dict)
+        or set(runtime) != {"python", "torch", "cuda"}
+        or any(not isinstance(value, str) or not value for value in runtime.values())
+    ):
+        raise ValueError("resource plan requires real CUDA hardware and runtime fingerprints")
+    for device, record in hardware.items():
+        if (
+            not isinstance(device, str)
+            or not re.fullmatch(r"cuda(?::[0-9]+)?", device)
+            or not isinstance(record, dict)
+            or record.get("device") != device
+        ):
+            raise ValueError("invalid measured CUDA device identity")
+        _positive(record.get("total_memory_bytes"), "measured GPU capacity")
+        _positive(record.get("allocated_cpu_count"), "allocated CPU count")
+        if not isinstance(record.get("name"), str) or not record["name"]:
+            raise ValueError("measured GPU name is missing")
+        capability = record.get("compute_capability")
+        if not isinstance(capability, list) or len(capability) != 2:
+            raise ValueError("measured GPU compute capability is missing")
+        _positive(capability[0], "compute capability major")
+        _positive(capability[1], "compute capability minor", zero=True)
+        uuid = record.get("uuid")
+        if uuid is None:
+            if (
+                not isinstance(record.get("uuid_unavailable_reason"), str)
+                or not record["uuid_unavailable_reason"]
+            ):
+                raise ValueError("unavailable GPU UUID requires an explicit reason")
+        elif (
+            not isinstance(uuid, str)
+            or not uuid
+            or record.get("uuid_unavailable_reason") is not None
+        ):
+            raise ValueError("GPU UUID evidence is inconsistent")
+        if record.get("cuda_visible_devices") is not None and not isinstance(
+            record["cuda_visible_devices"], str
+        ):
+            raise ValueError("visible GPU allocation must be recorded without guessing")
+    entries = plan.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("resource plan has no entries")
+    keys: set[tuple[str, str, str]] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("resource plan entry must be an object")
+        key = (entry.get("track"), entry.get("profile"), entry.get("dataset"))
+        if (
+            any(not isinstance(value, str) or not value for value in key)
+            or key in keys
+            or key[1] not in profiles
+        ):
+            raise ValueError("duplicate, malformed or unrequested resource plan entry")
+        keys.add(key)
+        _validate_entry(
+            entry,
+            list(model_seeds),
+            allocated_cpus=max(record["allocated_cpu_count"] for record in hardware.values()),
+        )
+        capacities = {record["total_memory_bytes"] for record in hardware.values()}
+        for candidate in entry["candidates"]:
+            for report in candidate["measurements"]:
+                if report["status"] == "passed" and report["total_memory_bytes"] not in capacities:
+                    raise ValueError("measured candidate memory differs from the certified GPU")
+
+
+def _json_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("resource plan JSON contains duplicate keys")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"resource plan JSON contains nonfinite constant {value}")
+
+
+def load_resource_plan(
+    path: Path | str, *, hardware_profile: str, profiles: list[str], model_seeds: list[int]
+) -> dict[str, Any]:
+    path = Path(path)
+    metadata = path.lstat()
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    ):
+        raise ValueError("resource plan must be a regular file, not a symlink")
+    raw = path.read_bytes()
+    plan = json.loads(
+        raw, object_pairs_hook=_json_object_pairs, parse_constant=_reject_json_constant
+    )
+    validate_resource_plan(
+        plan, hardware_profile=hardware_profile, profiles=profiles, model_seeds=model_seeds
+    )
+    plan["_sha256"] = hashlib.sha256(raw).hexdigest()
+    return plan
+
+
+def validate_plan_runtime(
+    plan: dict[str, Any] | None,
+    device_names: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Verify the actual visible GPU allocation and runtime, never a CPU substitute."""
+    if plan is None:
+        return None
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "CUDA is required to reuse a measured resource plan; CPU fallback is forbidden"
+        )
+    runtime = {
+        "python": platform.python_version(),
+        "torch": str(torch.__version__),
+        "cuda": torch.version.cuda,
+    }
+    if runtime != plan.get("runtime"):
+        raise ValueError("resource plan runtime changed; a separate recalibration is required")
+    expected_hardware = plan.get("hardware")
+    if not isinstance(expected_hardware, dict) or not expected_hardware:
+        raise ValueError("resource plan has no measured hardware identity")
+    names = list(expected_hardware) if device_names is None else list(device_names)
+    if not names or len(set(names)) != len(names):
+        raise ValueError("runtime validation needs unique CUDA devices")
+    hardware = {}
+    for name in names:
+        if name not in expected_hardware:
+            raise ValueError("requested CUDA device was not measured")
+        device = torch.device(name)
+        if device.type != "cuda":
+            raise ValueError("measured resource plan requires CUDA")
+        prop = torch.cuda.get_device_properties(device)
+        uuid = getattr(prop, "uuid", None)
+        actual = {
+            "device": str(device),
+            "uuid": str(uuid) if uuid is not None else None,
+            "uuid_unavailable_reason": None
+            if uuid is not None
+            else "Torch does not expose a GPU UUID",
+            "name": prop.name,
+            "total_memory_bytes": prop.total_memory,
+            "compute_capability": [prop.major, prop.minor],
+            "allocated_cpu_count": allocated_cpu_count(),
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        }
+        if actual != expected_hardware[name]:
+            raise ValueError(
+                "resource plan GPU/CPU allocation differs; a separate recalibration is required"
+            )
+        hardware[name] = actual
+    return {"runtime": runtime, "hardware": hardware}
+
+
+def resource_plan_identity(plan: dict[str, Any] | None) -> dict[str, Any] | None:
+    if plan is None:
+        return None
+    return {
+        "sha256": plan["_sha256"],
+        "selections": [
+            {key: entry[key] for key in ("track", "profile", "dataset", "selected")}
+            for entry in plan["entries"]
+        ],
+    }
+
+
+def validate_plan_data(
+    plan: dict[str, Any] | None, jobs: list[dict[str, Any]], *, track: str
+) -> None:
+    """Revalidate the actual official dataset cache before standalone child training."""
+    if plan is None:
+        return
+    if track not in {"conductance", "cycle"}:
+        raise ValueError("measured data validation supports only V5 and Cycle V2")
+    from scripts.calibrate_training_resources import verify_plan_inputs
+
+    version = "v5" if track == "conductance" else "v2"
+    selected = []
+    for job in jobs:
+        if job.get("version") != version:
+            continue
+        selected.append(
+            {
+                "track": track,
+                "profile": job["profile"],
+                "dataset": job["dataset"] if track == "conductance" else job["datasets"][0],
+                "condition": job["condition"] if track == "conductance" else job["encoding"],
+                "model_seed": job["model_seed"],
+                "command": list(job["command"]),
+            }
+        )
+    if selected:
+        verify_plan_inputs(plan, selected, allow_unrequested_entries=True)
+
+
+def selected_resources(
+    plan: dict[str, Any] | None, *, track: str, profile: str, dataset: str
+) -> dict[str, Any] | None:
+    if plan is None:
+        return None
+    for entry in plan["entries"]:
+        if (entry["track"], entry["profile"], entry["dataset"]) == (track, profile, dataset):
+            return dict(entry["selected"])
+    raise ValueError(f"missing measured resource plan entry: {track}/{profile}/{dataset}")
+
+
+def validate_job_plan(
+    plan: dict[str, Any] | None,
+    *,
+    track: str,
+    profile: str,
+    dataset: str,
+    condition: str,
+    model_seed: int,
+    command: list[str],
+) -> None:
+    if plan is None:
+        return
+    expected = {
+        "condition": condition,
+        "model_seed": model_seed,
+        "argv_sha256": command_identity(command),
+    }
+    for entry in plan["entries"]:
+        if (entry["track"], entry["profile"], entry["dataset"]) == (track, profile, dataset):
+            if expected not in entry["job_contracts"]:
+                raise ValueError("training command differs from the measured scientific recipe")
+            for key, value in entry["selected"].items():
+                option = "--" + key.replace("_", "-")
+                if command.count(option) != 1:
+                    raise ValueError("training command has missing or duplicate measured resources")
+                index = command.index(option) + 1
+                if index >= len(command) or command[index] != str(value):
+                    raise ValueError(
+                        "training command resources differ from the measured selection"
+                    )
+            return
+    raise ValueError("training job has no measured resource plan")
 ````
 
 # scripts/verify_conda_env.py
@@ -72752,6 +75495,505 @@ def test_temporary_cleanup_error_does_not_replace_writer_error(
 
     assert caught.value is original_error
     assert any("temporary cache cleanup failed" in note for note in original_error.__notes__)
+````
+
+# tests/test_calibrate_training_resources.py
+
+````python
+"""Explicit mocked calibration control-flow tests; no real GPU throughput claims."""
+
+from __future__ import annotations
+
+import copy
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from scripts import calibrate_training_resources as calibration
+from scripts.training_resource_plan import command_identity
+
+GIB = 1024**3
+
+
+def debug_report(job, batch_size, workers, *, rate=100.0, unsafe=False, oom=False):
+    report = {
+        "condition": job["condition"], "model_seed": job["model_seed"],
+        "batch_size": batch_size, "workers": workers,
+    }
+    if oom:
+        return {**report, "status": "oom", "error": "explicit synthetic CUDA OOM test fixture"}
+    # Synthetic timing evidence only; long enough for the requested window.
+    processed = batch_size * 1000
+    return {
+        **report,
+        "status": "passed", "unit": "debug_fixture_graphs",
+        "processed_units": processed, "elapsed_seconds": processed / rate,
+        "samples_per_second": rate, "optimizer_steps": 1003,
+        "optimizer_state_bytes": 1024, "measurement_steps": 1000, "warmup_steps": 2,
+        "measurement_steps_requested": 5, "warmup_steps_requested": 2,
+        "minimum_measure_seconds_requested": 3.0,
+        "peak_allocated_bytes": (44 if unsafe else 3) * GIB,
+        "peak_reserved_bytes": (45 if unsafe else 4) * GIB,
+        "total_memory_bytes": 48 * GIB,
+        "free_bytes_before": 47 * GIB,
+        "free_bytes_after": (2 if unsafe else 43) * GIB,
+        "resource_observability": {"debug_mock_only": True},
+        "calibration_only": True, "final_training_performed": False,
+    }
+
+
+def debug_harness(
+    monkeypatch, *, axis="graphs", baseline=4, maximum=64,
+    workers=(2, 4), seeds=(0,), report_factory=None,
+):
+    track = "conductance" if axis != "graphs" else "cycle"
+    conditions = ("fixed_c", "shared_dynamic_c") if track == "conductance" else ("se", "pe")
+    module = (
+        "research.conductance_gat.v5.train"
+        if track == "conductance" else "research.cycle_pe.v2.benchmark"
+    )
+    jobs = [
+        {
+            "track": track, "profile": "large", "dataset": "debug_official_fixture",
+            "condition": condition, "model_seed": seed, "device": "cuda:0",
+            "command": ["python", "-B", "-m", module, "--debug-fixture-identity", condition,
+                        "--model-seed", str(seed)],
+        }
+        for condition in conditions for seed in seeds
+    ]
+    parsed = SimpleNamespace(
+        batch_size=baseline, sample_seed_batch_size=baseline,
+        workers=4, device="cuda:0", dataset=jobs[0]["dataset"],
+    )
+    loaded = object()
+    identity = {"debug_mock_only": True, "full_split_sha256": "a" * 64}
+    calls, snapshots = [], []
+    monkeypatch.setattr(calibration, "_training_args", lambda _job: copy.copy(parsed))
+    monkeypatch.setattr(
+        calibration, "_load_group", lambda _job, _args: (loaded, identity, maximum, axis)
+    )
+    monkeypatch.setattr(calibration, "allocated_cpu_count", lambda: 8)
+    monkeypatch.setattr(
+        calibration, "worker_candidates", lambda *_args, **_kwargs: list(workers)
+    )
+
+    def measure(job, payload, _args, *, batch_size, workers):
+        assert payload is loaded
+        calls.append((batch_size, workers, job["condition"], job["model_seed"]))
+        factory = report_factory or (
+            lambda selected, size, count: debug_report(
+                selected, size, count, rate=float(size * max(count, 1))
+            )
+        )
+        return factory(job, batch_size, workers)
+
+    monkeypatch.setattr(calibration, "_measure", measure)
+    entry = {}
+
+    def persist():
+        snapshots.append(copy.deepcopy(entry))
+
+    return jobs, entry, persist, calls, snapshots, identity
+
+
+@pytest.mark.parametrize(
+    "track,axis", [("cycle", "graphs"), ("conductance", "graphs"),
+                   ("conductance", "sampled_seed_nodes")],
+)
+def test_explicit_reuse_rejects_a_new_floor_above_the_measured_selection(monkeypatch, track, axis):
+    jobs, entry, persist, _, _, _ = debug_harness(monkeypatch, axis=axis, maximum=8)
+    for job in jobs:
+        job["track"] = track
+    calibration._calibrate_group(jobs, entry, persist)
+    key = "sample_seed_batch_size" if axis == "sampled_seed_nodes" else "batch_size"
+    assert entry["selected"][key] == 8
+    original_parse = calibration._training_args
+
+    def increased_floor(job):
+        args = original_parse(job)
+        setattr(args, key, 16)
+        return args
+
+    monkeypatch.setattr(calibration, "_training_args", increased_floor)
+    monkeypatch.setattr(
+        calibration, "_load_group", lambda *_args: pytest.fail("reject before loading data")
+    )
+    with pytest.raises(ValueError, match="below the current requested floor 16"):
+        calibration.verify_plan_inputs({"entries": [entry]}, jobs)
+
+
+def test_explicit_reuse_accepts_a_selection_above_the_requested_floor(monkeypatch):
+    jobs, entry, persist, _, _, _ = debug_harness(monkeypatch, maximum=8)
+    calibration._calibrate_group(jobs, entry, persist)
+    calibration.verify_plan_inputs({"entries": [entry]}, jobs)
+
+
+def test_explicit_reuse_checks_every_paired_command_before_data_loading(monkeypatch):
+    jobs, entry, persist, _, _, _ = debug_harness(monkeypatch, maximum=8)
+    calibration._calibrate_group(jobs, entry, persist)
+    jobs[-1]["command"].extend(["--device", "cuda:1"])
+    monkeypatch.setattr(
+        calibration, "_load_group", lambda *_args: pytest.fail("reject before loading data")
+    )
+    with pytest.raises(ValueError, match="recipe or measured device differs"):
+        calibration.verify_plan_inputs({"entries": [entry]}, jobs)
+
+
+def test_real_group_algorithm_selects_one_measured_policy_for_all_paired_arms(monkeypatch):
+    rates = {4: 40.0, 8: 80.0, 16: 160.0, 32: 161.0, 64: 159.0}
+
+    def report(job, batch, workers):
+        # The faster SE arm cannot conceal the slower PE arm's actual throughput.
+        rate = rates[batch] * (2 if job["condition"] == "se" else 1)
+        rate *= 1.0 if workers == 4 else 0.8
+        return debug_report(job, batch, workers, rate=rate)
+
+    jobs, entry, persist, calls, snapshots, _ = debug_harness(
+        monkeypatch, maximum=128, seeds=(0, 7), report_factory=report
+    )
+    calibration._calibrate_group(jobs, entry, persist)
+    assert entry["status"] == "passed"
+    assert entry["selected"] == {"batch_size": 32, "workers": 4}
+    assert entry["selection"]["paired_resources_identical"] is True
+    assert entry["selection"]["minimum_requested_batch_preserved"] is True
+    assert entry["stop_reason"] == "measured_throughput_plateau"
+    assert sorted({call[0] for call in calls}) == [4, 8, 16, 32, 64]
+    assert len(calls) == 5 * 2 * 4
+    for candidate in entry["candidates"]:
+        assert {(row["condition"], row["model_seed"]) for row in candidate["measurements"]} == {
+            (condition, seed) for condition in ("se", "pe") for seed in (0, 7)
+        }
+    assert all(contract["argv_sha256"] == command_identity(job["command"])
+               for contract, job in zip(entry["job_contracts"], jobs, strict=True))
+    assert snapshots[-1]["status"] == "passed"
+
+
+def test_growth_reaches_natural_full_split_without_arbitrary_cap(monkeypatch):
+    jobs, entry, persist, calls, _, _ = debug_harness(monkeypatch, maximum=20)
+    calibration._calibrate_group(jobs, entry, persist)
+    assert sorted({call[0] for call in calls}) == [4, 8, 16, 20]
+    assert entry["selected"]["batch_size"] == 20
+    assert entry["stop_reason"] == "complete_training_split_boundary"
+
+
+def test_unsafe_reserved_memory_boundary_never_accepted_as_candidate(monkeypatch):
+    jobs, entry, persist, calls, _, _ = debug_harness(
+        monkeypatch, maximum=64,
+        report_factory=lambda job, batch, workers: debug_report(
+            job, batch, workers, rate=float(batch * workers), unsafe=batch >= 16
+        ),
+    )
+    calibration._calibrate_group(jobs, entry, persist)
+    assert entry["selected"] == {"batch_size": 8, "workers": 4}
+    assert entry["stop_reason"] == "memory_headroom_boundary"
+    assert sorted({call[0] for call in calls}) == [4, 8, 16]
+    assert entry["baseline_physical_batch_size"] == 4
+
+
+def test_oom_in_either_paired_arm_rejects_whole_resource_candidate(monkeypatch):
+    def report(job, batch, workers):
+        return debug_report(
+            job, batch, workers, rate=float(batch * workers),
+            oom=batch >= 8 and job["condition"] == "pe",
+        )
+
+    jobs, entry, persist, calls, _, _ = debug_harness(monkeypatch, report_factory=report)
+    calibration._calibrate_group(jobs, entry, persist)
+    assert entry["selected"] == {"batch_size": 4, "workers": 4}
+    failed = [candidate for candidate in entry["candidates"] if candidate["batch_size"] == 8]
+    assert all(candidate["status"] == "oom" for candidate in failed)
+    assert all(len(candidate["measurements"]) == 2 for candidate in failed)
+    assert sorted({call[0] for call in calls}) == [4, 8]
+
+
+@pytest.mark.parametrize("failure", ["oom", "unsafe"])
+def test_no_safe_baseline_fails_without_trying_a_smaller_batch(monkeypatch, failure):
+    jobs, entry, persist, calls, _, _ = debug_harness(
+        monkeypatch,
+        report_factory=lambda job, batch, workers: debug_report(
+            job, batch, workers, oom=failure == "oom", unsafe=failure == "unsafe"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="no.*candidate|no downscale"):
+        calibration._calibrate_group(jobs, entry, persist)
+    assert {call[0] for call in calls} == {4}
+    assert "selected" not in entry
+    assert entry.get("status") != "passed"
+
+
+def test_resume_skips_completed_candidates_and_completed_partial_members(monkeypatch):
+    interrupted = False
+
+    def report(job, batch, workers):
+        nonlocal interrupted
+        if not interrupted and (batch, workers, job["condition"]) == (8, 2, "pe"):
+            interrupted = True
+            raise KeyboardInterrupt("explicit debug interrupted calibration")
+        return debug_report(job, batch, workers, rate=float(batch * workers), unsafe=batch >= 16)
+
+    jobs, entry, persist, calls, snapshots, _ = debug_harness(monkeypatch, report_factory=report)
+    with pytest.raises(KeyboardInterrupt, match="explicit debug"):
+        calibration._calibrate_group(jobs, entry, persist)
+    assert snapshots[-1]["candidates"][-1]["status"] == "running"
+    assert len(snapshots[-1]["candidates"][-1]["measurements"]) == 1
+    completed = set(calls[:-1])
+    before = len(calls)
+    calibration._calibrate_group(jobs, entry, persist)
+    resumed = set(calls[before:])
+    assert completed.isdisjoint(resumed)
+    assert (8, 2, "pe", 0) in resumed
+    assert entry["selected"] == {"batch_size": 8, "workers": 4}
+    before = len(calls)
+    calibration._calibrate_group(jobs, entry, persist)
+    assert len(calls) == before
+
+
+def test_floor_larger_than_whole_split_is_kept_as_configured(monkeypatch):
+    jobs, entry, persist, calls, _, _ = debug_harness(monkeypatch, baseline=4, maximum=2)
+    calibration._calibrate_group(jobs, entry, persist)
+    assert {call[0] for call in calls} == {4}
+    assert entry["selected"]["batch_size"] == 4
+    assert entry["natural_training_split_size"] == 2
+    assert entry["stop_reason"] == "complete_training_split_boundary"
+
+
+def test_full_graph_has_no_artificial_minibatch_axis(monkeypatch):
+    jobs, entry, persist, calls, _, _ = debug_harness(
+        monkeypatch, axis="full_graph", baseline=1, maximum=1, workers=(0,)
+    )
+    calibration._calibrate_group(jobs, entry, persist)
+    assert {call[:2] for call in calls} == {(1, 0)}
+    assert len(calls) == 2
+    assert entry["batch_axis"] == "full_graph"
+    assert entry["stop_reason"] == "full_graph_no_batch_axis"
+    assert entry["selected"]["batch_size"] == 1
+
+
+def test_sampled_v5_selection_updates_seed_batch_not_graph_batch(monkeypatch):
+    jobs, entry, persist, calls, _, _ = debug_harness(
+        monkeypatch, axis="sampled_seed_nodes", baseline=4, maximum=10, workers=(0,)
+    )
+    calibration._calibrate_group(jobs, entry, persist)
+    assert sorted({call[0] for call in calls}) == [4, 8, 10]
+    assert entry["selected"] == {"batch_size": 4, "workers": 0, "sample_seed_batch_size": 10}
+
+
+def test_training_args_accept_actual_generated_cycle_se_pe_commands(monkeypatch, tmp_path):
+    from scripts import run_cycle_scaling
+
+    # Parsing only: mocks CUDA availability for existing parser validation,
+    # never allocates a CUDA tensor or invokes a model.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    args = run_cycle_scaling.parser().parse_args([
+        "--versions", "v2", "--encodings", "se", "pe",
+        "--profiles", "reference", "large", "--model-seeds", "0",
+        "--hardware-profile", "a6000-48gb", "--min-free-gb", "40",
+        "--device", "cuda:0",
+    ])
+    jobs = run_cycle_scaling.make_jobs(args, tmp_path / "debug-command-generation-only")
+    assert len(jobs) == 8
+    for job in jobs:
+        normalized = {
+            **job, "track": "cycle", "dataset": job["datasets"][0],
+            "condition": job["encoding"],
+        }
+        parsed = calibration._training_args(normalized)
+        assert parsed.dataset == job["datasets"][0]
+        assert parsed.datasets == job["datasets"]
+        assert parsed.encoding == job["encoding"]
+        assert parsed.hidden_dim == job["config"]["hidden_dim"]
+        assert parsed.layers == job["config"]["layers"]
+        assert parsed.pe_dim == job["config"]["pe_dim"]
+        assert parsed.batch_size == job["resources"]["batch_size"]
+        assert parsed.workers == job["resources"]["workers"]
+````
+
+# tests/test_calibration_lock.py
+
+````python
+"""Local filesystem/process lock tests; never launch training or signal a process."""
+
+from __future__ import annotations
+
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from scripts.calibration_lock import LOCK_FILENAME, ROOT, calibration_lock
+
+
+def _child(source: str, output: Path):
+    return subprocess.run(
+        [sys.executable, "-B", "-c", source, str(output)],
+        cwd=ROOT, text=True, capture_output=True, check=False,
+    )
+
+
+TRY_LOCK = """
+import sys
+from pathlib import Path
+from scripts.calibration_lock import calibration_lock
+try:
+    with calibration_lock(Path(sys.argv[1])):
+        print('acquired', flush=True)
+except RuntimeError as error:
+    print('blocked: ' + str(error), flush=True)
+"""
+
+
+def test_lock_is_exclusive_across_independent_processes_and_released_without_deletion(tmp_path):
+    output = tmp_path / "calibration"
+    with calibration_lock(output) as actual:
+        assert actual == output.resolve()
+        contested = _child(TRY_LOCK, output)
+        assert contested.returncode == 0, contested.stderr
+        assert contested.stdout.startswith("blocked: another calibration is already active")
+        if os.name != "nt":
+            assert (output / LOCK_FILENAME).read_bytes() == b"0"
+    sentinel = (output / LOCK_FILENAME).read_bytes()
+    assert sentinel == b"0"
+    accepted = _child(TRY_LOCK, output)
+    assert accepted.returncode == 0, accepted.stderr
+    assert accepted.stdout.strip() == "acquired"
+    assert (output / LOCK_FILENAME).read_bytes() == sentinel
+
+
+def test_independent_holder_releases_on_normal_process_completion(tmp_path):
+    output = tmp_path / "calibration"
+    source = """
+import sys
+from pathlib import Path
+from scripts.calibration_lock import calibration_lock
+with calibration_lock(Path(sys.argv[1])):
+    print('holding', flush=True)
+    sys.stdin.readline()
+"""
+    process = subprocess.Popen(
+        [sys.executable, "-B", "-c", source, str(output)], cwd=ROOT,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        assert process.stdout.readline().strip() == "holding"
+        attempt = _child(TRY_LOCK, output)
+        assert attempt.returncode == 0, attempt.stderr
+        assert attempt.stdout.startswith("blocked:")
+    finally:
+        # The child completes its own read and context; no PID management or signals.
+        _, errors = process.communicate("release\n")
+    assert process.returncode == 0, errors
+    with calibration_lock(output):
+        pass
+
+
+def test_failed_child_process_does_not_leave_stale_lock_ownership(tmp_path):
+    output = tmp_path / "calibration"
+    source = """
+import sys
+from pathlib import Path
+from scripts.calibration_lock import calibration_lock
+guard = calibration_lock(Path(sys.argv[1]))
+guard.__enter__()
+raise RuntimeError('intentional local process test failure')
+"""
+    completed = _child(source, output)
+    assert completed.returncode != 0
+    assert "intentional local process test failure" in completed.stderr
+    assert (output / LOCK_FILENAME).is_file()
+    with calibration_lock(output):
+        pass
+
+
+def test_lock_body_failure_releases_ownership_and_preserves_progress_bytes(tmp_path):
+    output = tmp_path / "calibration"
+    output.mkdir()
+    progress = output / "progress.json"
+    progress.write_bytes(b'{"existing": "untouched"}\n')
+    with pytest.raises(RuntimeError, match="body failure"):
+        with calibration_lock(output):
+            raise RuntimeError("body failure")
+    with calibration_lock(output):
+        pass
+    assert progress.read_bytes() == b'{"existing": "untouched"}\n'
+
+
+@pytest.mark.parametrize("target", [ROOT, Path.home(), Path(Path.cwd().anchor)])
+def test_broad_roots_are_refused(target):
+    with pytest.raises(ValueError, match="broad root"):
+        with calibration_lock(target):
+            raise AssertionError("unsafe context must never start")
+
+
+def test_parent_traversal_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="parent traversal"):
+        with calibration_lock(tmp_path / "child" / ".." / "other"):
+            raise AssertionError("unsafe context must never start")
+
+
+@pytest.mark.parametrize("content", [b"not a lock file", b"x"])
+def test_existing_unexpected_lock_file_is_preserved(tmp_path, content):
+    output = tmp_path / "calibration"
+    output.mkdir()
+    lock = output / LOCK_FILENAME
+    lock.write_bytes(content)
+    with pytest.raises(ValueError, match="unexpected existing contents"):
+        with calibration_lock(output):
+            raise AssertionError("unexpected file must not be overwritten")
+    assert lock.read_bytes() == content
+
+
+def test_lock_directory_is_not_opened_as_a_regular_file(tmp_path):
+    output = tmp_path / "calibration"
+    (output / LOCK_FILENAME).mkdir(parents=True)
+    with pytest.raises(ValueError, match="regular"):
+        with calibration_lock(output):
+            raise AssertionError("special target must not be opened")
+
+
+def test_hardlinked_lock_is_refused_without_modifying_original(tmp_path):
+    output = tmp_path / "calibration"
+    output.mkdir()
+    original = tmp_path / "original"
+    original.write_bytes(b"0")
+    os.link(original, output / LOCK_FILENAME)
+    with pytest.raises(ValueError, match="hard-linked"):
+        with calibration_lock(output):
+            raise AssertionError("linked user data must remain untouched")
+    assert original.read_bytes() == b"0"
+
+
+def test_symlink_output_is_refused(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"creating a symlink is not available: {error}")
+    with pytest.raises(ValueError, match="symlink/reparse"):
+        with calibration_lock(link / "output"):
+            raise AssertionError("indirect output must never be created")
+    assert not (target / "output").exists()
+
+
+def test_reparse_directory_metadata_is_refused(tmp_path, monkeypatch):
+    output = tmp_path / "calibration"
+    original = Path.lstat
+
+    def metadata(path, *args, **kwargs):
+        if path == output:
+            return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=0x400)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", metadata)
+    with pytest.raises(ValueError, match="symlink/reparse"):
+        with calibration_lock(output):
+            raise AssertionError("reparse output must not be followed")
 ````
 
 # tests/test_compile_blocks.py
@@ -78882,6 +82124,296 @@ def test_source_snapshot_covers_all_v4_and_shared_execution_code():
         assert name in snapshot and len(snapshot[name]) == 64
 ````
 
+# tests/test_conductance_v5_batch_calibration.py
+
+````python
+"""Explicit CPU synthetic calibration tests, not GPU throughput/performance evidence."""
+
+from __future__ import annotations
+
+import random
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from research.conductance_gat.v5 import batch_calibration as calibration
+from research.conductance_gat.v5 import train
+
+
+def _args(dataset="ogbn-arxiv", sampling="neighbor"):
+    result = train.build_parser().parse_args([
+        "--dataset", dataset, "--condition", "shared_dynamic_c", "--output-dir", "unused",
+        "--sampling", sampling, "--sample-seed-batch-size", "32", "--hidden-channels", "32",
+        "--layers", "2", "--heads", "4", "--ffn-multiplier", "2", "--epochs", "4",
+        "--no-activation-checkpoint",
+    ])
+    train.validate_args(result)
+    return result
+
+
+def _graph():
+    return SimpleNamespace(
+        x=torch.randn(9, 6), y=torch.arange(9) % 3,
+        incidence_edge_index=torch.tensor(
+            [[0, 0, 1, 2, 2, 3, 4, 5, 6, 7], [1, 2, 2, 3, 4, 4, 5, 6, 7, 8]]
+        ),
+    )
+
+
+def test_sampled_physical_batch_report_is_supervised_seeds_not_one_graph():
+    args = _args()
+    sampler_type = type("Sampler", (), {
+        "__len__": lambda self: 7, "metadata": lambda self: {"mode": "neighbor"}
+    })
+    report = train._v5_batch_observability(
+        _graph(), {"train": torch.arange(9)}, sampler_type(), args
+    )
+    assert report["configured_physical_batch_size"] == 32
+    assert report["effective_batch_size"] == 32
+    assert report["batch_unit"] == "supervised_seed_nodes"
+    assert report["training_batches_per_epoch"]["value"] == 7
+
+
+def test_candidate_grows_only_requested_physical_axis_and_does_not_mutate_args():
+    args = _args()
+    original = vars(args).copy()
+    candidate = calibration._candidate_args(args, 64, 0)
+    assert candidate.sample_seed_batch_size == 64
+    assert candidate.batch_size == 1
+    assert candidate.num_neighbors == args.num_neighbors
+    assert candidate.hidden_channels == args.hidden_channels
+    assert candidate.layers == args.layers
+    assert vars(args) == original
+    with pytest.raises(ValueError, match="cannot reduce"):
+        calibration._candidate_args(args, 16, 0)
+    with pytest.raises(ValueError, match="not DataLoader"):
+        calibration._candidate_args(args, 64, 4)
+
+
+def test_fullgraph_must_not_fake_larger_batch_through_replication():
+    args = _args("cora", "full")
+    assert calibration._candidate_args(args, 1, 0).batch_size == 1
+    with pytest.raises(ValueError, match="cannot be replicated"):
+        calibration._candidate_args(args, 2, 0)
+
+
+def test_ppi_larger_measured_batch_is_allowed_but_current_floor_is_retained():
+    args = _args("ppi", "full")
+    args.batch_size = 8
+    candidate = calibration._candidate_args(args, 16, 4)
+    train.validate_args(candidate)
+    assert candidate.batch_size == 16
+    assert candidate.sample_seed_batch_size == args.sample_seed_batch_size
+    with pytest.raises(ValueError, match="cannot reduce"):
+        calibration._candidate_args(args, 4, 4)
+    candidate.batch_size = 1
+    with pytest.raises(ValueError, match="V1 minimum"):
+        train.validate_args(candidate)
+
+
+def test_isolation_restores_python_numpy_torch_rng_and_precision_after_error():
+    random.seed(10)
+    np.random.seed(11)
+    torch.manual_seed(12)
+    python_state, numpy_state, torch_state = (
+        random.getstate(), np.random.get_state(), torch.get_rng_state().clone()
+    )
+    precision = torch.get_float32_matmul_precision()
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    with pytest.raises(RuntimeError, match="synthetic"):
+        with calibration._isolated_execution_state(torch.device("cpu")):
+            random.random()
+            np.random.random()
+            torch.rand(2)
+            torch.set_float32_matmul_precision("high")
+            raise RuntimeError("synthetic candidate failure")
+    assert random.getstate() == python_state
+    actual_numpy = np.random.get_state()
+    assert actual_numpy[0] == numpy_state[0]
+    assert np.array_equal(actual_numpy[1], numpy_state[1])
+    assert actual_numpy[2:] == numpy_state[2:]
+    assert torch.equal(torch.get_rng_state(), torch_state)
+    assert torch.get_float32_matmul_precision() == precision
+    assert torch.backends.cuda.matmul.allow_tf32 == tf32
+
+
+def _cpu_fixture(monkeypatch):
+    args = _args()
+    graph = _graph()
+    indices = {"train": torch.arange(6), "validation": torch.arange(6, 9)}
+    payload = {"dataset": args.dataset, "graphs": [vars(graph)], "classes": 3}
+    sampler = SimpleNamespace(metadata=lambda: {"mode": "neighbor", "seed_batch_size": 64})
+    calls = []
+
+    def batches(data, split, actual_sampler, epoch, device, model_seed, actual_args, *, timing):
+        assert actual_args.sample_seed_batch_size == 64
+        assert actual_sampler is sampler
+        calls.append(epoch)
+        for selected in (torch.arange(3), torch.arange(3, 6)):
+            with timing.stage("sampling_and_loader_wait"):
+                prepared = graph
+            with timing.stage("host_to_device"):
+                yield_graph = prepared
+            yield yield_graph, selected
+
+    class Monitor:
+        def __init__(self, device):
+            self.device = device
+
+        def start(self):
+            return {"debug_fixture": True}
+
+        def finish(self, **kwargs):
+            return {"debug_fixture": True, **kwargs}
+
+    monkeypatch.setattr(train, "_require_cuda", lambda device: None)
+    monkeypatch.setattr(train, "validate_hardware_runtime", lambda args, device: {"debug": True})
+    monkeypatch.setattr(train, "_prepare_data", lambda *args: (graph, indices, sampler))
+    monkeypatch.setattr(train, "_training_batches", batches)
+    monkeypatch.setattr(calibration, "RuntimeResourceMonitor", Monitor)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (10000, 20000))
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device: 1000)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device: 2000)
+    return args, payload, calls
+
+
+def test_debug_cpu_smoke_runs_production_joint_model_loss_backward_optimizer_and_full_epochs(
+    monkeypatch,
+):
+    args, payload, calls = _cpu_fixture(monkeypatch)
+    before = torch.get_rng_state().clone()
+    report = calibration.run_training_candidate(
+        payload, args, torch.device("cpu"), physical_batch_size=64, workers=0,
+        warmup_steps=2, measurement_steps=3, minimum_measure_seconds=0.000001,
+    )
+    assert report["status"] == "passed"
+    assert report["calibration_not_final"] is True
+    assert report["complete_warmup_epochs"] == 1
+    assert report["complete_measurement_epochs"] == 2
+    assert report["optimizer_steps"] == 4
+    assert report["processed_units"] == 12
+    assert calls == [1, 2, 3]
+    assert report["optimizer_state_bytes"] > 0
+    assert report["parameter_update_verified"] is True
+    assert report["model_phase"] == "joint_all_condition_parameter_groups_active"
+    assert report["configuration"]["layers"] == args.layers
+    assert report["configuration"]["num_neighbors"] == args.num_neighbors
+    assert report["samples_per_second"] > 0
+    assert set(report["stage_seconds"]["cpu_wall_seconds"]) >= {
+        "sampling_and_loader_wait", "host_to_device", "forward_and_loss", "backward",
+        "gradient_clipping", "optimizer",
+    }
+    assert report["stage_seconds"]["cuda_event_seconds"] == {}
+    assert torch.equal(torch.get_rng_state(), before)
+
+
+def test_candidate_failure_is_reraised_with_observation_not_small_model_fallback(monkeypatch):
+    args, payload, _ = _cpu_fixture(monkeypatch)
+    before = torch.get_rng_state().clone()
+    original_error = torch.OutOfMemoryError("synthetic oom; not a CUDA measurement")
+
+    def fail(*args, **kwargs):
+        raise original_error
+
+    monkeypatch.setattr(calibration, "_run_epoch", fail)
+    with pytest.raises(torch.OutOfMemoryError) as failure:
+        calibration.run_training_candidate(
+            payload, args, torch.device("cpu"), physical_batch_size=64, workers=0,
+        )
+    assert failure.value is original_error
+    assert failure.value.calibration_resource_observability["debug_fixture"] is True
+    assert torch.equal(torch.get_rng_state(), before)
+
+
+def test_production_candidate_refuses_cpu_even_when_payload_would_be_available():
+    with pytest.raises(RuntimeError, match="CUDA"):
+        calibration.run_training_candidate(
+            {}, _args(), torch.device("cpu"), physical_batch_size=64, workers=0,
+        )
+
+
+def test_stage_cuda_events_use_the_requested_device_stream(monkeypatch):
+    requested = torch.device("cuda:2")
+    records = []
+    selected_stream = object()
+
+    class Event:
+        def __init__(self, *, enable_timing):
+            assert enable_timing is True
+
+        def record(self, stream):
+            records.append(stream)
+
+        def elapsed_time(self, ended):
+            assert isinstance(ended, Event)
+            return 250.0
+
+    def current_stream(device):
+        assert device == requested
+        return selected_stream
+
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+    timing = calibration._StageTimer(requested)
+    with timing.stage("forward_and_loss"):
+        pass
+    assert records == [selected_stream, selected_stream]
+    assert timing.report()["cuda_event_seconds"]["forward_and_loss"] == 0.25
+
+
+def test_monitor_cleanup_error_does_not_replace_primary_candidate_failure(monkeypatch):
+    args, payload, _ = _cpu_fixture(monkeypatch)
+    finish_calls = []
+    original_error = RuntimeError("primary model failure")
+
+    def fail(*args, **kwargs):
+        raise original_error
+
+    def fail_finish(self, **kwargs):
+        finish_calls.append(kwargs)
+        raise RuntimeError("secondary monitor failure")
+
+    monkeypatch.setattr(calibration, "_run_epoch", fail)
+    monkeypatch.setattr(calibration.RuntimeResourceMonitor, "finish", fail_finish)
+    with pytest.raises(RuntimeError, match="primary model failure") as failure:
+        calibration.run_training_candidate(
+            payload, args, torch.device("cpu"), physical_batch_size=64, workers=0,
+        )
+    assert failure.value is original_error
+    assert len(finish_calls) == 1
+    assert "secondary monitor failure" in " ".join(failure.value.__notes__)
+
+
+@pytest.mark.parametrize("dataset,sampling,split,expected,axis", [
+    ("ppi", "full", [0, 2, 3], 3, "graphs"),
+    ("ogbn-arxiv", "neighbor", torch.tensor([True, False, True, True]),
+     3, "sampled_seed_nodes"),
+    ("cora", "full", torch.tensor([True, False, True]), 1, "full_graph"),
+])
+def test_calibration_group_uses_verified_payload_splits_not_guessed_graph_fields(
+    monkeypatch, dataset, sampling, split, expected, axis,
+):
+    from scripts.calibrate_training_resources import _load_group
+
+    args = _args(dataset, sampling)
+    payload = {"splits": {"train": split}, "graphs": [{}]}
+    protocol = {"data_sha256": "a" * 64, "split_sha256": {"train": "b" * 64}}
+    monkeypatch.setattr(
+        calibration, "load_calibration_payload", lambda actual: (payload, protocol)
+    )
+    actual_payload, identity, maximum, actual_axis = _load_group({"track": "conductance"}, args)
+    assert actual_payload is payload
+    assert maximum == expected
+    assert actual_axis == axis
+    assert identity["data_sha256"] == protocol["data_sha256"]
+    assert identity["split_sha256"] == protocol["split_sha256"]
+````
+
 # tests/test_conductance_v5_diffusion_memory.py
 
 ````python
@@ -84807,6 +88339,167 @@ def test_tree_augmentation_depends_on_neither_conductance_nor_combined_track() -
     )
 ````
 
+# tests/test_rich_resource_calibration.py
+
+````python
+"""CPU/debug orchestration contracts: no real GPU or research training."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from scripts import run_rich_scaling as runner
+from scripts import training_resource_plan as resources
+
+
+def _args(tmp_path, *extra):
+    args = runner.parser().parse_args(
+        [
+            "--tracks",
+            "conductance",
+            "cycle",
+            "--conductance-versions",
+            "v5",
+            "--cycle-versions",
+            "v2",
+            "--profiles",
+            "reference",
+            "large",
+            "--model-seeds",
+            "0",
+            "--hardware-profile",
+            "a6000-48gb",
+            "--data-root",
+            str(tmp_path / "data"),
+            "--results-root",
+            str(tmp_path / "results"),
+            "--run-id",
+            "debug-contract",
+            *extra,
+        ]
+    )
+    runner._validate(args)
+    return args
+
+
+def test_request_uses_actual_28_job_commands_and_paired_resources(tmp_path):
+    args = _args(tmp_path)
+    request = runner._calibration_request(args, args.run_id)
+    assert len(request["jobs"]) == 28
+    assert request["source_sha256"] == resources.source_snapshot()
+    groups = {}
+    for job in request["jobs"]:
+        key = job["track"], job["profile"], job["dataset"]
+        groups.setdefault(key, set()).add(job["condition"])
+        assert job["model_seed"] == 0
+        assert "--epochs" in job["command"]
+        assert "--resource-plan" not in job["command"]
+    assert len(groups) == 14
+    for key, conditions in groups.items():
+        assert conditions == (
+            {"fixed_c", "shared_dynamic_c"} if key[0] == "conductance" else {"se", "pe"}
+        )
+
+
+def test_single_cycle_arm_still_measures_paired_cost_without_extra_final_jobs(tmp_path):
+    args = _args(tmp_path, "--cycle-v2-encodings", "se")
+    request = runner._calibration_request(args, args.run_id)
+    assert len(request["jobs"]) == 28
+    assert runner._totals(runner.make_jobs(args, args.run_id))["model_trainings"] == 24
+
+
+def test_failed_calibration_prevents_all_final_training(tmp_path, monkeypatch):
+    args = _args(tmp_path)
+    calls = []
+
+    def failed_probe(command, log, env):
+        calls.append(command)
+        return 1
+
+    monkeypatch.setattr(runner, "_run_logged", failed_probe)
+    run_dir = args.results_root / "rich_scaling" / args.run_id
+    with pytest.raises(RuntimeError, match="no final training launched"):
+        runner._ensure_measured_plan(args, args.run_id, run_dir)
+    assert len(calls) == 1
+    assert Path(calls[0][2]).name == "calibrate_training_resources.py"
+    assert not run_dir.exists()
+    assert (args.results_root / "resource_calibration" / args.run_id / "request.json").is_file()
+
+
+def test_request_source_change_refuses_overwrite_before_any_probe(tmp_path, monkeypatch):
+    args = _args(tmp_path)
+    directory = args.results_root / "resource_calibration" / args.run_id
+    directory.mkdir(parents=True)
+    request = directory / "request.json"
+    request.write_text('{"source_sha256": {"old": "source"}}')
+    before = request.read_bytes()
+    monkeypatch.setattr(runner, "_run_logged", lambda *args: pytest.fail("must not launch"))
+    with pytest.raises(ValueError, match="previous measurements preserved"):
+        runner._ensure_measured_plan(
+            args, args.run_id, args.results_root / "rich_scaling" / args.run_id
+        )
+    assert request.read_bytes() == before
+
+
+def test_existing_uncalibrated_training_run_is_not_reconfigured(tmp_path, monkeypatch):
+    args = _args(tmp_path)
+    directory = args.results_root / "rich_scaling" / args.run_id
+    directory.mkdir(parents=True)
+    manifest = directory / "manifest.json"
+    manifest.write_text('{"config": {}}')
+    monkeypatch.setattr(runner, "_run_logged", lambda *args: pytest.fail("must not launch"))
+    with pytest.raises(ValueError, match="existing run has no measured resource plan"):
+        runner._ensure_measured_plan(args, args.run_id, directory)
+    assert json.loads(manifest.read_text()) == {"config": {}}
+
+
+def test_explicit_plan_checks_runtime_and_actual_dataset(tmp_path, monkeypatch):
+    from scripts import calibrate_training_resources as calibration
+
+    args = _args(tmp_path, "--resource-plan", str(tmp_path / "plan.json"))
+    plan = {"_sha256": "debug", "entries": []}
+    observed = []
+    monkeypatch.setattr(runner, "load_resource_plan", lambda *args, **kwargs: plan)
+    monkeypatch.setattr(
+        resources, "validate_plan_runtime", lambda value: observed.append("runtime")
+    )
+
+    def check_data(value, jobs):
+        assert value is plan and len(jobs) == 28
+        observed.append("verified_data")
+
+    monkeypatch.setattr(calibration, "verify_plan_inputs", check_data)
+    runner._ensure_measured_plan(args, args.run_id, tmp_path / "run")
+    assert observed == ["runtime", "verified_data"]
+
+
+def test_resolved_plan_is_forwarded_and_baseline_overrides_are_not_reapplied(tmp_path):
+    args = _args(tmp_path, "--conductance-v5-ppi-batch-size", "8", "--cycle-batch-size", "64")
+    args.resource_plan = tmp_path / "plan.json"
+    args.resolved_resource_plan = {"_sha256": "debug", "entries": []}
+    jobs = runner.make_jobs(args, args.run_id)
+    assert all("--resource-plan" in job["command"] for job in jobs)
+    assert "--v5-ppi-batch-size" not in jobs[0]["command"]
+    assert "--batch-size" not in jobs[1]["command"]
+    assert (
+        runner._config_payload(args, data_root=args.data_root, results_root=args.results_root)[
+            "resource_plan"
+        ]["sha256"]
+        == "debug"
+    )
+
+
+def test_dry_run_does_not_write_or_measure(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        runner, "_ensure_measured_plan", lambda *args: pytest.fail("dry run must not probe")
+    )
+    assert runner.main(["--dry-run", "--results-root", str(tmp_path / "results")]) == 0
+    assert not (tmp_path / "results").exists()
+````
+
 # tests/test_rich_scaling_runner.py
 
 ````python
@@ -84823,6 +88516,16 @@ from pathlib import Path
 import pytest
 
 from scripts import run_rich_scaling as runner
+
+
+@pytest.fixture(autouse=True)
+def _isolate_post_calibration_runner_contracts(monkeypatch):
+    """These pre-existing tests mock training children, not GPU resource probes.
+
+    The actual calibration gate is exercised separately in
+    test_rich_resource_calibration.py; it must never start GPU work in this suite.
+    """
+    monkeypatch.setattr(runner, "_ensure_measured_plan", lambda *args: None)
 
 
 def _option(command: list[str], name: str) -> str:
@@ -87057,6 +90760,358 @@ def test_gpt_handoff_markdown_links_are_self_contained() -> None:
             assert resolved.parent == package, (document, destination)
 ````
 
+# tests/test_scaling_measured_resources.py
+
+````python
+"""CPU-only unit contracts for immutable, paired measured resource integration."""
+
+from __future__ import annotations
+
+import copy
+
+import pytest
+
+from scripts import run_conductance_scaling as conductance
+from scripts import run_cycle_scaling as cycle
+from scripts.training_resource_plan import command_identity
+
+
+def _value(command, option):
+    return command[command.index(option) + 1]
+
+
+@pytest.fixture
+def resource_fixture(monkeypatch):
+    """Test only runner plumbing; shared plan validation has its own tests."""
+    plan = {"fixture_identity": "measured-v1"}
+    rows = {}
+    bindings = []
+
+    def selected(actual, *, track, profile, dataset):
+        assert actual is plan
+        return copy.deepcopy(rows.get((track, profile, dataset)))
+
+    def validate(actual, **contract):
+        if actual is not None:
+            assert actual is plan
+            bindings.append(contract)
+
+    for runner in (conductance, cycle):
+        monkeypatch.setattr(runner, "selected_resources", selected)
+        monkeypatch.setattr(runner, "validate_job_plan", validate)
+        monkeypatch.setattr(runner, "resource_plan_identity", lambda value: dict(value))
+    return plan, rows, bindings
+
+
+def test_v5_pairs_share_measured_resources_per_profile_and_dataset(tmp_path, resource_fixture):
+    plan, rows, bindings = resource_fixture
+    args = conductance.parser().parse_args(
+        [
+            "--versions",
+            "v4",
+            "v5",
+            "--datasets",
+            "ppi",
+            "ogbn-arxiv",
+            "--hardware-profile",
+            "a6000-48gb",
+        ]
+    )
+    args.resolved_resource_plan = plan
+    for profile, ppi_batch, seed_batch in (("reference", 12, 8192), ("large", 8, 4096)):
+        for dataset in args.datasets:
+            rows["conductance", profile, dataset] = {
+                "batch_size": ppi_batch if dataset == "ppi" else 1,
+                "sample_seed_batch_size": seed_batch,
+                "workers": 8 if dataset == "ppi" else 0,
+            }
+    jobs = conductance.make_jobs(args, tmp_path)
+    v5_jobs = [job for job in jobs if job["version"] == "v5"]
+    assert len(v5_jobs) == len(bindings) == 8
+    assert {binding["condition"] for binding in bindings} == {"fixed_c", "shared_dynamic_c"}
+    for job in v5_jobs:
+        measured = rows["conductance", job["profile"], job["dataset"]]
+        assert job["workers"] == job["execution"]["dataloader_workers"] == measured["workers"]
+        assert job["batch_size"] == job["execution"]["batch_size"] == measured["batch_size"]
+        for option, key in (
+            ("--workers", "workers"),
+            ("--batch-size", "batch_size"),
+            ("--sample-seed-batch-size", "sample_seed_batch_size"),
+        ):
+            assert int(_value(job["command"], option)) == measured[key]
+    for job in jobs:
+        if job["version"] == "v4" and job["dataset"] == "ppi":
+            assert job["workers"] == 4
+            assert job["batch_size"] == 2
+
+
+def test_legacy_cycle_explicit_batch_remains_independent_of_measured_v2(resource_fixture):
+    plan, rows, _ = resource_fixture
+    args = cycle.parser().parse_args(
+        [
+            "--versions",
+            "v1",
+            "v2",
+            "--profiles",
+            "reference",
+            "--datasets",
+            "zinc12k",
+            "--legacy-batch-size",
+            "64",
+        ]
+    )
+    args.resolved_resource_plan = plan
+    rows["cycle", "reference", "zinc12k"] = {"batch_size": 128, "workers": 2}
+    cycle._validate(args)
+    assert cycle._job_resources(args, "v1", "reference", "zinc12k")["batch_size"] == 64
+    assert cycle._job_resources(args, "v2", "reference", "zinc12k", "se")["batch_size"] == 128
+    assert cycle._run_configuration(args)["legacy_batch_size"] == 64
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("--v5-ppi-batch-size", "3"),
+        ("--v5-sample-seed-batch-size", "64"),
+        ("--workers", "4"),
+    ],
+)
+def test_v5_conflicting_explicit_resource_override_rejected(
+    tmp_path, resource_fixture, option, value
+):
+    plan, rows, _ = resource_fixture
+    args = conductance.parser().parse_args(
+        ["--versions", "v5", "--profiles", "reference", "--datasets", "ppi", option, value]
+    )
+    args.resolved_resource_plan = plan
+    args.workers_explicit = option == "--workers"
+    rows["conductance", "reference", "ppi"] = {
+        "batch_size": 8,
+        "sample_seed_batch_size": 4096,
+        "workers": 8,
+    }
+    with pytest.raises(ValueError, match="conflicts"):
+        conductance.make_jobs(args, tmp_path)
+
+
+def test_v5_matching_explicit_resources_are_accepted(tmp_path, resource_fixture):
+    plan, rows, _ = resource_fixture
+    args = conductance.parser().parse_args(
+        [
+            "--versions",
+            "v5",
+            "--profiles",
+            "reference",
+            "--datasets",
+            "ppi",
+            "--v5-ppi-batch-size",
+            "8",
+            "--v5-sample-seed-batch-size",
+            "4096",
+            "--workers",
+            "8",
+        ]
+    )
+    args.resolved_resource_plan = plan
+    args.workers_explicit = True
+    rows["conductance", "reference", "ppi"] = {
+        "batch_size": 8,
+        "sample_seed_batch_size": 4096,
+        "workers": 8,
+    }
+    conductance._validate(args)
+    assert len(conductance.make_jobs(args, tmp_path)) == 2
+
+
+def test_cycle_se_pe_and_selected_tests_share_measured_profile_resources(
+    tmp_path, resource_fixture
+):
+    plan, rows, bindings = resource_fixture
+    args = cycle.parser().parse_args(["--versions", "v1", "v2", "--datasets", "zinc12k"])
+    args.resolved_resource_plan = plan
+    rows["cycle", "reference", "zinc12k"] = {"batch_size": 1024, "workers": 8}
+    rows["cycle", "large", "zinc12k"] = {"batch_size": 512, "workers": 4}
+    jobs = cycle.make_jobs(args, tmp_path)
+    assert len(bindings) == 4
+    assert {binding["condition"] for binding in bindings} == {"se", "pe"}
+    selections = []
+    for job in jobs:
+        if job["version"] == "v1":
+            assert job["resources"]["batch_size"] == 32
+            continue
+        measured = rows["cycle", job["profile"], "zinc12k"]
+        for key in ("batch_size", "workers"):
+            assert job["resources"][key] == measured[key]
+            assert int(_value(job["command"], "--" + key.replace("_", "-"))) == measured[key]
+        selections.append(
+            {
+                "version": "v2",
+                "encoding": job["encoding"],
+                "dataset": "zinc12k",
+                "model_seed": 0,
+                "selected_profile": job["profile"],
+                "checkpoint": str(tmp_path / "fixture.pt"),
+                "checkpoint_id": job["job_id"],
+                "profile_selection_id": job["job_id"],
+                "checkpoint_sha256": "0" * 64,
+                "selected_validation_mae": 0.1,
+                "trainable_parameters": 100,
+            }
+        )
+    for job in cycle.make_test_jobs(args, tmp_path, selections):
+        measured = rows["cycle", job["selected_profile"], "zinc12k"]
+        assert job["resources"]["batch_size"] == measured["batch_size"]
+        assert job["resources"]["workers"] == measured["workers"]
+
+
+@pytest.mark.parametrize("option,value", [("--batch-size", "32"), ("--workers", "4")])
+def test_cycle_conflicting_resources_rejected(tmp_path, resource_fixture, option, value):
+    plan, rows, _ = resource_fixture
+    args = cycle.parser().parse_args(
+        ["--versions", "v2", "--profiles", "reference", "--datasets", "zinc12k", option, value]
+    )
+    args.resolved_resource_plan = plan
+    rows["cycle", "reference", "zinc12k"] = {"batch_size": 64, "workers": 8}
+    with pytest.raises(ValueError, match="conflicts"):
+        cycle.make_jobs(args, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "runner,version,dataset",
+    [
+        (conductance, "v5", "ppi"),
+        (cycle, "v2", "zinc12k"),
+    ],
+)
+def test_missing_required_plan_row_fails_before_training(
+    tmp_path, resource_fixture, runner, version, dataset
+):
+    plan, _, _ = resource_fixture
+    args = runner.parser().parse_args(
+        ["--versions", version, "--profiles", "reference", "--datasets", dataset]
+    )
+    args.resolved_resource_plan = plan
+    with pytest.raises(ValueError, match="missing"):
+        runner.make_jobs(args, tmp_path)
+
+
+def test_cycle_resume_identity_contains_measured_plan_digest(resource_fixture):
+    plan, _, _ = resource_fixture
+    args = cycle.parser().parse_args([])
+    baseline = cycle._run_configuration(args)
+    args.resolved_resource_plan = plan
+    measured = cycle._run_configuration(args)
+    assert baseline["resource_plan"] is None
+    assert measured["resource_plan"] == plan
+    assert measured != baseline
+
+
+@pytest.mark.parametrize("batch,allowed", [(1, False), (2, True), (8, True)])
+def test_portable_v5_ppi_batch_has_floor_not_measurement_blocking_ceiling(batch, allowed):
+    args = conductance.parser().parse_args(["--v5-ppi-batch-size", str(batch)])
+    if allowed:
+        conductance._validate(args)
+    else:
+        with pytest.raises(ValueError, match="at least 2"):
+            conductance._validate(args)
+
+
+@pytest.mark.parametrize(
+    "runner,version,dataset,mutation",
+    [
+        (conductance, "v5", "ppi", "epochs"),
+        (conductance, "v5", "ppi", "v5_beta_initial"),
+        (cycle, "v2", "zinc12k", "epochs"),
+        (cycle, "v2", "zinc12k", "lr"),
+    ],
+)
+def test_real_command_binding_rejects_changed_recipe(tmp_path, runner, version, dataset, mutation):
+    args = runner.parser().parse_args(
+        ["--versions", version, "--profiles", "reference", "--datasets", dataset]
+    )
+    baseline = runner.make_jobs(args, tmp_path / "original")
+    track = "conductance" if runner is conductance else "cycle"
+    selected = (
+        {"batch_size": 4, "sample_seed_batch_size": 4096, "workers": 8}
+        if runner is conductance
+        else {"batch_size": 64, "workers": 8}
+    )
+    args.resolved_resource_plan = {
+        "entries": [
+            {
+                "track": track,
+                "profile": "reference",
+                "dataset": dataset,
+                "selected": selected,
+                "job_contracts": [
+                    {
+                        "condition": job["condition"] if runner is conductance else job["encoding"],
+                        "model_seed": job["model_seed"],
+                        "argv_sha256": command_identity(job["command"]),
+                    }
+                    for job in baseline
+                ],
+            }
+        ]
+    }
+    measured_jobs = runner.make_jobs(args, tmp_path / "measured")
+    assert len(measured_jobs) == len(baseline)
+    assert all(
+        int(_value(job["command"], "--batch-size")) == selected["batch_size"]
+        for job in measured_jobs
+    )
+    setattr(args, mutation, getattr(args, mutation) * 2)
+    with pytest.raises(ValueError, match="scientific recipe"):
+        runner.make_jobs(args, tmp_path / "changed")
+
+
+@pytest.mark.parametrize("runner", [conductance, cycle])
+def test_unreadable_plan_returns_safe_error_without_creating_results(tmp_path, runner, capsys):
+    results = tmp_path / "outputs"
+    result = runner.main(
+        [
+            "--resource-plan",
+            str(tmp_path / "missing-plan.json"),
+            "--results-root",
+            str(results),
+            "--dry-run",
+        ]
+    )
+    assert result == 2
+    assert not results.exists()
+    assert "missing-plan.json" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("worker_argument", [["--workers", "4"], ["--workers=4"]])
+def test_conductance_main_tracks_explicit_worker_conflict(
+    tmp_path, monkeypatch, resource_fixture, worker_argument
+):
+    plan, rows, _ = resource_fixture
+    rows["conductance", "reference", "ppi"] = {
+        "batch_size": 8,
+        "sample_seed_batch_size": 4096,
+        "workers": 8,
+    }
+    monkeypatch.setattr(conductance, "load_resource_plan", lambda *a, **kw: plan)
+    assert (
+        conductance.main(
+            [
+                "--versions",
+                "v5",
+                "--profiles",
+                "reference",
+                "--datasets",
+                "ppi",
+                "--resource-plan",
+                str(tmp_path / "fixture.json"),
+                "--dry-run",
+                *worker_argument,
+            ]
+        )
+        == 2
+    )
+````
+
 # tests/test_seed_protocol.py
 
 ````python
@@ -87258,6 +91313,282 @@ def test_whole_payload_unavailability_is_allowed_only_when_explicitly_authorized
         validate_throughput_observability(unavailable, "unit", allow_unavailable=True)
         == unavailable
     )
+````
+
+# tests/test_training_resource_plan.py
+
+````python
+"""Explicit CPU fixtures for certificate validation; not measured GPU results."""
+
+from __future__ import annotations
+
+import copy
+import json
+
+import pytest
+
+from scripts import training_resource_plan as plans
+
+
+def _measurement(condition, batch, *, rate=None):
+    rate = batch if rate is None else rate
+    return {
+        "status": "passed",
+        "condition": condition,
+        "model_seed": 0,
+        "batch_size": batch,
+        "workers": 0,
+        "unit": "supervised_seed_nodes",
+        "elapsed_seconds": 3.0,
+        "processed_units": rate * 3,
+        "samples_per_second": rate,
+        "optimizer_steps": 5,
+        "optimizer_state_bytes": 1024,
+        "measurement_steps_requested": 5,
+        "warmup_steps_requested": 2,
+        "minimum_measure_seconds_requested": 3.0,
+        "peak_allocated_bytes": 8 * 1024**3,
+        "peak_reserved_bytes": 10 * 1024**3,
+        "total_memory_bytes": 48 * 1024**3,
+        "free_bytes_before": 46 * 1024**3,
+    }
+
+
+def _candidate(batch):
+    return {
+        "status": "passed",
+        "batch_size": batch,
+        "workers": 0,
+        "measurements": [
+            _measurement(condition, batch) for condition in ("fixed_c", "shared_dynamic_c")
+        ],
+    }
+
+
+def _plan():
+    return {
+        "schema_version": 1,
+        "kind": "measured_training_resource_plan",
+        "status": "passed",
+        "classification": "resource_calibration_not_final_training",
+        "final_training_started": False,
+        "request_sha256": "a" * 64,
+        "source_sha256": {"debug": "fixture"},
+        "hardware_profile": "a6000-48gb",
+        "profiles": ["reference"],
+        "model_seeds": [0],
+        "runtime": {"python": "3.11", "torch": "debug", "cuda": "11.8"},
+        "hardware": {
+            "cuda:0": {
+                "device": "cuda:0",
+                "name": "explicit debug fixture",
+                "uuid": "debug-fixture",
+                "uuid_unavailable_reason": None,
+                "total_memory_bytes": 48 * 1024**3,
+                "compute_capability": [8, 6],
+                "allocated_cpu_count": 8,
+                "cuda_visible_devices": "3",
+            }
+        },
+        "entries": [
+            {
+                "status": "passed",
+                "track": "conductance",
+                "profile": "reference",
+                "dataset": "ogbn-arxiv",
+                "baseline_physical_batch_size": 2,
+                "batch_axis": "sampled_seed_nodes",
+                "natural_training_split_size": 4,
+                "worker_candidates": [0],
+                "job_contracts": [
+                    {"condition": condition, "model_seed": 0, "argv_sha256": "b" * 64}
+                    for condition in ("fixed_c", "shared_dynamic_c")
+                ],
+                "candidates": [_candidate(2), _candidate(4)],
+                "selected": {"batch_size": 1, "sample_seed_batch_size": 4, "workers": 0},
+                "stop_reason": "complete_training_split_boundary",
+            }
+        ],
+    }
+
+
+def _validate(plan):
+    plans.validate_resource_plan(
+        plan,
+        hardware_profile="a6000-48gb",
+        profiles=["reference"],
+        model_seeds=[0],
+        check_sources=False,
+    )
+
+
+def test_complete_real_path_certificate_schema():
+    _validate(_plan())
+
+
+@pytest.mark.parametrize(
+    "module",
+    ["research.conductance_gat.v5.train", "research.cycle_pe.v2.benchmark"],
+)
+def test_command_identity_binds_measured_gpu_assignment(module):
+    measured = ["python", "-B", "-m", module, "--device", "cuda:0"]
+    reassigned = [*measured[:-1], "cuda:1"]
+    assert plans.command_identity(measured) != plans.command_identity(reassigned)
+    assert plans.command_identity(measured) == plans.command_identity(
+        [*measured, "--output-dir", "new-run", "--batch-size", "8", "--workers", "2", "--resume"]
+    )
+
+
+def test_job_plan_rejects_track_reassigned_to_an_unmeasured_gpu():
+    plan = _plan()
+    measured = [
+        "python",
+        "-B",
+        "-m",
+        "research.conductance_gat.v5.train",
+        "--device",
+        "cuda:0",
+        "--batch-size",
+        "1",
+        "--sample-seed-batch-size",
+        "4",
+        "--workers",
+        "0",
+    ]
+    plan["entries"][0]["job_contracts"][0]["argv_sha256"] = plans.command_identity(measured)
+    arguments = {
+        "track": "conductance",
+        "profile": "reference",
+        "dataset": "ogbn-arxiv",
+        "condition": "fixed_c",
+        "model_seed": 0,
+    }
+    plans.validate_job_plan(plan, command=measured, **arguments)
+    reassigned = list(measured)
+    reassigned[reassigned.index("--device") + 1] = "cuda:1"
+    with pytest.raises(ValueError, match="measured scientific recipe"):
+        plans.validate_job_plan(plan, command=reassigned, **arguments)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("samples_per_second", float("nan")),
+        ("elapsed_seconds", 0),
+        ("processed_units", True),
+        ("optimizer_steps", 0),
+        ("optimizer_state_bytes", 0),
+        ("measurement_steps_requested", 6),
+        ("minimum_measure_seconds_requested", 4.0),
+        ("peak_allocated_bytes", 49 * 1024**3),
+        ("free_bytes_before", 49 * 1024**3),
+        ("batch_size", 8),
+        ("workers", 2),
+    ],
+)
+def test_unmeasured_or_inconsistent_gpu_evidence_is_rejected(field, value):
+    plan = _plan()
+    plan["entries"][0]["candidates"][0]["measurements"][0][field] = value
+    with pytest.raises(ValueError):
+        _validate(plan)
+
+
+def test_missing_pair_is_not_an_acceptable_resource_plan():
+    plan = _plan()
+    plan["entries"][0]["candidates"][1]["measurements"].pop()
+    with pytest.raises(ValueError, match="paired measurements"):
+        _validate(plan)
+
+
+def test_unmeasured_baseline_and_unselected_best_rejected():
+    plan = _plan()
+    plan["entries"][0]["candidates"].pop(0)
+    with pytest.raises(ValueError, match="baseline"):
+        _validate(plan)
+    plan = _plan()
+    plan["entries"][0]["selected"]["sample_seed_batch_size"] = 2
+    with pytest.raises(ValueError, match="best safe"):
+        _validate(plan)
+
+
+def test_unsafe_larger_batch_is_not_selected_and_is_a_measured_boundary():
+    plan = _plan()
+    entry = plan["entries"][0]
+    for report in entry["candidates"][1]["measurements"]:
+        report["peak_reserved_bytes"] = 44 * 1024**3
+    entry["selected"]["sample_seed_batch_size"] = 2
+    entry["stop_reason"] = "memory_headroom_boundary"
+    _validate(plan)
+
+
+def test_oom_error_is_kept_but_generic_failure_is_not_relabelled():
+    plan = _plan()
+    entry = plan["entries"][0]
+    entry["candidates"][1] = {
+        "status": "oom",
+        "batch_size": 4,
+        "workers": 0,
+        "measurements": [
+            {"status": "oom", "error": "debug CUDA OOM fixture", "condition": c, "model_seed": 0}
+            for c in ("fixed_c", "shared_dynamic_c")
+        ],
+    }
+    entry["selected"]["sample_seed_batch_size"] = 2
+    entry["stop_reason"] = "memory_headroom_boundary"
+    _validate(plan)
+    entry["candidates"][1]["measurements"][0]["status"] = "failed"
+    with pytest.raises(ValueError, match="errors are not OOM"):
+        _validate(plan)
+
+
+def test_transductive_graph_cannot_be_replicated_as_physical_batch():
+    plan = _plan()
+    plan["entries"][0]["selected"]["batch_size"] = 4
+    with pytest.raises(ValueError, match="duplicated"):
+        _validate(plan)
+
+
+def test_false_plateau_and_false_capacity_boundaries_rejected():
+    plan = _plan()
+    for reason in ("measured_throughput_plateau", "memory_headroom_boundary"):
+        plan["entries"][0]["stop_reason"] = reason
+        with pytest.raises(ValueError):
+            _validate(plan)
+
+
+def test_file_load_hashes_exact_bytes_and_rejects_changed_source(tmp_path, monkeypatch):
+    path = tmp_path / "debug-plan.json"
+    path.write_text(json.dumps(_plan()), encoding="utf-8")
+    monkeypatch.setattr(plans, "source_snapshot", lambda: {"debug": "fixture"})
+    loaded = plans.load_resource_plan(
+        path, hardware_profile="a6000-48gb", profiles=["reference"], model_seeds=[0]
+    )
+    assert len(loaded["_sha256"]) == 64
+    changed = copy.deepcopy(loaded)
+    changed["entries"][0]["selected"]["sample_seed_batch_size"] = 2
+    assert plans.resource_plan_identity(changed) != plans.resource_plan_identity(loaded)
+    monkeypatch.setattr(plans, "source_snapshot", lambda: {"changed": "source"})
+    with pytest.raises(ValueError, match="source identity differs"):
+        plans.load_resource_plan(
+            path, hardware_profile="a6000-48gb", profiles=["reference"], model_seeds=[0]
+        )
+
+
+def test_duplicate_json_keys_fail_before_any_training(tmp_path):
+    path = tmp_path / "debug-duplicate.json"
+    path.write_text('{"schema_version": 1, "schema_version": 1}')
+    with pytest.raises(ValueError, match="duplicate keys"):
+        plans.load_resource_plan(
+            path, hardware_profile="a6000-48gb", profiles=["reference"], model_seeds=[0]
+        )
+
+
+def test_runtime_gate_never_substitutes_cpu(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CPU fallback is forbidden"):
+        plans.validate_plan_runtime(_plan())
 ````
 
 # tests/test_tree_scaling_runner.py

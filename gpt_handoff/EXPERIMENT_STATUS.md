@@ -8,7 +8,30 @@
 
 ## 1. 소스 버전과 측정 범위
 
-throughput/IPC/격리 교정 후 최신 전체 로컬 CPU 회귀는 **1,940 passed / 99 skipped**
+### 현재: 실제 학습 자원 calibration 도입, 서버 측정 결과는 아직 없음
+
+사용자 A6000 GPU 3 화면은 9,311/46,068MiB와 utilization 100%였다. GPU 실행 중이라는
+관측이며 최적 batch·처리량·전체 학습 완료 근거는 아니다. 이전 `a6000-48gb` profile에는
+여러 후보의 실측 선택이 연결되지 않았으며 그 누락을 수정한다.
+
+현재 rich 실행은 V5/Cycle V2 본 학습 전 실제 optimizer update/state를 포함한 batch/worker
+probe를 실행하고 paired 조건에 같은 선택을 적용한다. 모델/데이터 축소 없이 최소 요청
+batch부터 탐색하며 실패를 작은 값으로 숨기지 않는다. Probe와 본 학습·평가를 분리하고
+source/GPU/runtime/data identity에 묶인 계획 및 진행 상태를 보존한다. 자세한 정책과 명령은
+[RICH_SCALING_EXPERIMENTS.md](RICH_SCALING_EXPERIMENTS.md) 첫 절에 있다.
+실제 A6000 calibration 결과·최적 선택값·가속률·전체 새 학습 결과는 아직 수령하지 않았다.
+
+이번 calibration 변경 후 전체 로컬 회귀는 **2,053 passed / 101 skipped** (156.76초)다.
+Ruff 정적 검사, diff 공백 검사와 코드 스냅샷 일치 검사도 통과했다. 생략 항목은 실제
+CUDA/BF16, 미설치 PyG, Linux/Bash 및 native Linux 기능, Windows symlink 권한,
+별도 opt-in IPC stress 등이다. CPU 단위 테스트와 GPU 호출 모의 검증을 실제 GPU smoke
+test로 간주하지 않는다. 이번 작업에서 실제 A6000 측정·전체 실제 데이터 학습·전체 평가는
+실행하지 않았다. 모델·연산자·데이터 설정은 축소하지 않았고 기존 서버 작업·결과는 보존했다.
+아래 역사적 회귀 수치는 이번 검증 수와 구분한다.
+
+### 역사적 로컬 검증
+
+throughput/IPC/격리 교정 당시 전체 로컬 CPU 회귀는 **1,940 passed / 99 skipped**
 (189.74초)다. `CYCLE_V2_IPC_STRESS_GRAPHS=10000`으로 실제 2-worker의 1만 합성
 그래프 준비·캐시 검증까지 이 전체 실행에 포함했다. Ruff·코드 스냅샷 일치 검사도 통과했다.
 생략은 Linux/Bash, native Linux renameat2, Windows symlink 권한, 미설치 PyG, CUDA/BF16
@@ -79,12 +102,13 @@ concurrency는 1이며, Tree A6000 child 내부의 명시적 candidate concurren
 SM/메모리 utilization, CUDA allocator, process CPU·RSS/HWM과 system available RAM을
 주기적으로 기록하고, 미지원 측정은 `null`과 원인을 남긴다. 그러나 이 계측이 적용된 수정판의
 완료 GPU artifact는 아직 수령하지 않았으므로 현재 문서에 새 utilization 수치를 제시하지 않는다.
-Rich 학습 runner 자체는 여러 physical batch 후보를 자동 튜닝하지 않으며 manifest에도
-`throughput_candidate_sweep=false`를 기록한다. 별도 CUDA microbenchmark는 현재
+당시 Rich runner는 여러 physical batch 후보를 자동 튜닝하지 않았고 manifest에도
+`throughput_candidate_sweep=false`를 기록했다. 현재는 첫 절의 optimizer-inclusive calibration이
+이 누락을 보완하며 본 학습 중에는 선택값을 고정한다. 별도 CUDA microbenchmark는
 Conductance V1/V5, Cycle PE V1/V2, Tree V1/V2의 명시 후보마다 device-wide GPU
 utilization·peak VRAM·CPU/RAM·처리량과 수치/gradient integrity를 측정하고 10% memory headroom
 기준의 권고를 낸다. 다만 optimizer state·전체 epoch·validation/checkpoint가 없는 고정 real-batch
-측정이고 profile 기본값을 자동 변경하지 않으므로, 현재 profile batch를 최종 학습 최적값으로
+측정이고 profile 기본값을 자동 변경하지 않으므로, 이를 새 calibration의 대체 근거로
 주장할 수는 없다.
 
 후속 사용자 요청으로 현재 기본 실행은 model seed **0 하나**다. 기존 5-seed 측정값은 아래에

@@ -45,6 +45,7 @@ HARDWARE_PROFILES = ("portable", "a6000-48gb")
 A6000_MIN_TOTAL_BYTES = 40 * 1024**3
 IMPLEMENTATION_FILES = (
     "research/cycle_pe/v2/benchmark.py",
+    "research/cycle_pe/v2/calibration.py",
     "research/cycle_pe/v2/basis.py",
     "research/cycle_pe/v2/data.py",
     "research/cycle_pe/v2/model.py",
@@ -1070,7 +1071,11 @@ def _train_model(
     train_graphs = sum(int(row["train_graphs"]) for row in history)
     train_seconds = sum(float(row["train_cuda_synchronized_seconds"]) for row in history)
     throughput = {
-        "scope": "CUDA-synchronized training forward/backward timing; validation and IO excluded",
+        "scope": (
+            "CUDA-synchronized complete training loop: DataLoader wait, sparse collate, "
+            "H2D, forward, backward, gradient clip and Adam included; validation, "
+            "initial dataset preparation and checkpoint IO excluded"
+        ),
         "training_graphs": train_graphs,
         "training_cuda_synchronized_seconds": train_seconds,
         "training_graphs_per_second": observed(

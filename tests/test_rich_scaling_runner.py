@@ -13,6 +13,16 @@ import pytest
 from scripts import run_rich_scaling as runner
 
 
+@pytest.fixture(autouse=True)
+def _isolate_post_calibration_runner_contracts(monkeypatch):
+    """These pre-existing tests mock training children, not GPU resource probes.
+
+    The actual calibration gate is exercised separately in
+    test_rich_resource_calibration.py; it must never start GPU work in this suite.
+    """
+    monkeypatch.setattr(runner, "_ensure_measured_plan", lambda *args: None)
+
+
 def _option(command: list[str], name: str) -> str:
     return command[command.index(name) + 1]
 

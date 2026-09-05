@@ -2,6 +2,14 @@
 
 기준일: 2026-09-05. 현재 V2는 같은 DFS 기저와 backbone을 사용하는 두 조건이다.
 
+현재 rich 통합 실행은 본 학습 전에 실제 공식 train graph로 batch/worker 후보를 측정한다.
+Sparse collate·전송·loss/backward·clipping·Adam update와 optimizer state 및 큰 실제 그래프
+batch의 메모리를 포함하며 SE/PE에 공통으로 안전한 측정 설정을 적용한다. 기존 단일 capacity
+probe만으로 batch 선택을 끝내지 않는다. 이 변경은 DFS 기저·PE 수학·모델 크기를 바꾸지 않으며
+QR/SVD를 추가하지 않는다. 실행·재개 계약은
+[RICH_SCALING_EXPERIMENTS.md](RICH_SCALING_EXPERIMENTS.md) 첫 절에 모았다.
+실제 A6000 측정·전체 새 학습 결과는 아직 없으며 CPU 회귀와 구분한다.
+
 | 조건 | 모델 ID | 역할 |
 |---|---|---|
 | `se` | `cycle_dfs_se_v2` | 기존 cycle 소속·길이·결합 문맥의 구조 인코딩 |

@@ -5,10 +5,83 @@
 capacity에서 성능을 낼 수 있는지를 본다. 기본 seed는 시간 제약 때문에 0 하나다.
 
 이 문서의 전체 matrix는 실험 계약 설명이며 완료한 V1–V4/Cycle V1/Tree를 다시 돌리라는
-안내가 아니다. 이번 QR-free 교체의 새 Cycle V2만 실행하는 명령은 마지막 절과
-[CYCLE_PE_V2.md](CYCLE_PE_V2.md)를 따른다. 구 source/checkpoint의 strict resume 검사는 우회하지 않는다.
+안내가 아니다. 현재 V5·Cycle V2의 실행은 바로 아래 실측 calibration 절을 우선한다.
+구 source/checkpoint의 strict resume 검사는 우회하지 않는다.
 
-## ad041e2 실패 실행 격리와 수정판 재실행
+## 현재 실행: 실제 학습 batch/worker 측정 후 V5·Cycle V2 시작
+
+`a6000-48gb`라는 이름이나 GPU 사용률 100%만으로 batch가 최적이라고 판단하지 않는다.
+사용자가 제공한 A6000 GPU 3 화면은 `9,311/46,068 MiB`, GPU utilization 100%였다.
+이 화면은 실제 연산 중이라는 관측이지 최대 처리량·최적 physical batch의 증거가 아니다.
+48GB A6000을 10GB 장치로 간주한 설정도 아니다. 기존 profile에 등록된 batch는
+실측으로 선택한 값이 아니었으며, 아래 절차에서는 **탐색을 시작하는 요청 하한**이다.
+
+현재 `run_rich_scaling.py`는 V5 또는 Cycle V2를 포함하면 본 학습 전에 별도
+`calibrate_training_resources.py`를 실행한다. 기존 단일-batch 적합성 검사나 optimizer가 없는
+`benchmark_speed.py`를 이 필수 단계의 대체물로 사용하지 않는다.
+
+- 모델·레이어·hidden·head·전체 데이터·fanout·epoch·seed는 유지한다. Physical batch는
+  현재 요청 값에서 시작해 2배씩 늘리며, 마지막 후보는 전체 train split의 자연 경계다.
+  요청 batch가 전체 split보다 큰 경우 설정을 몰래 낮추거나 그래프를 복제하지 않는다.
+- 실제 DataLoader worker 후보도 요청 값과 이웃의 2배수들을 비교한다. 탐색은 CPU affinity와
+  요청 worker의 2배 범위로 제한된 명시적 자원 탐색이며 전역 최적값을 보장하지 않는다.
+  V5 transductive graph는 CPU CSR sampler/prefetch를 사용하며 DataLoader worker 축은 없다.
+- V5는 disposable joint-phase 모델에서 C/W가 모두 활성화된 forward/loss/backward,
+  gradient clipping, **실제 AdamW update와 optimizer state**를 측정한다. Warmup과 측정은
+  전체 train epoch를 완료하며 모든 학습 seed/graph를 포함한다. PPI의 큰 실제 그래프들을
+  묶는 추가 fit 검사를 한다. Full-graph citation 데이터는 batch 축을 만들려고 그래프를
+  복제하지 않으며 두 arm의 실제 학습 비용을 측정하고 batch=1의 비적용 사유를 남긴다.
+- Cycle V2도 실제 공식 train graph, production sparse collate/transfer, loss/backward/clipping,
+  **Adam update와 optimizer state**, 큰 그래프 batch를 사용한다. SE와 PE를 모두 측정한다.
+- 각 probe는 최소 warmup 2 updates, 측정 5 updates와 3초를 요구한다. 실제 수행한 양과
+  데이터 범위는 개별 report에 기록한다. 로딩·sampling·H2D·forward·backward·optimizer
+  단계 시간, CUDA allocated/reserved peak, GPU/CPU/RAM 관측을 남긴다. 겹치는 CPU/CUDA
+  시간을 단순 합산하지 않으며 읽을 수 없는 counter는 원인을 표시한다.
+- 같은 dataset/profile에서 **두 조건과 요청한 모든 seed에 공통으로 안전한 batch/worker**를
+  선택한다. 여유 메모리는 `max(2 GiB, visible capacity의 10%)` 이상이어야 하며 optimizer를
+  포함한 peak reserved를 사용한다. 공통 후보 중 가장 느린 arm의 처리량을 가장 높이는 후보를
+  선택한다. OOM·여유 메모리 경계, 전체 train split 경계, 또는 연속 두 크기에서 5% 이하의
+  처리량 개선이 관측되면 탐색을 끝낸다. 요청 하한도 불가능하면 실패하며 자동 축소하지 않는다.
+
+추가 probe는 정확도 결과나 본 학습 checkpoint를 만들지 않는다. 실제 update는 별도 모델에서
+수행하고 RNG/실행 상태를 복원한다. **본 학습은 V5 20회 + Cycle SE/PE 8회 = 28회**로
+동일하지만, 별도 자원 측정 시간이 추가된다. Calibration 성능은 최종 정확도나 학습 완료
+결과가 아니다. Batch가 커지면 epoch당 update 수와 학습 궤적이 달라질 수 있으므로 선택된
+recipe를 두 arm에 공통으로 고정하고 과거 고정-batch 결과와 동일 recipe라고 묶지 않는다.
+
+수정 소스가 실제로 서버에 반영된 뒤, 활성 `new-gat` 환경의 저장소 루트에서 사용하는
+**새 실행 ID** 예시는 다음과 같다. 완료한 V1–V4·Cycle V1·Tree는 포함하지 않는다.
+
+```bash
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+python -B scripts/run_rich_scaling.py \
+  --run-id measured-v5-cycle-se-pe-a6000-gpu3-seed0-v1 \
+  --tracks conductance cycle \
+  --conductance-versions v5 --cycle-versions v2 \
+  --cycle-v2-encodings se pe \
+  --profiles reference large --model-seeds 0 \
+  --hardware-profile a6000-48gb --min-free-gb 40 \
+  --cycle-v2-basis-backend dfs_fundamental --device cuda:0
+```
+
+`results/resource_calibration/<run-id>/`에 요청·진행 상태·후보 로그·`resource-plan.json`을
+보존한다. Source, GPU/CPU 할당·UUID, runtime, 공식 데이터/split hash와 비교 recipe가
+일치해야 재사용한다. 완료한 probe는 보존하고 미완료 후보를 재개하며, 본 학습 시작 뒤에는
+같은 선택을 유지한다. 프로세스 lock은 동시 실행의 덮어쓰기를 거부하고 프로세스 종료 시 OS가
+해제한다. `.calibration.lock` 파일을 직접 지우는 방식으로 동시성 검사를 우회하지 않는다.
+명시적으로 `--resource-plan`을 재사용할 때도 이번 요청의 physical batch 하한보다 작은 선택은
+거부한다. 학습 명령의 GPU 배정도 측정 계약에 포함하므로 트랙을 다른 GPU로 옮겨 기존 측정값을
+적용하지 않는다. 이 경우 기존 계획을 고치는 대신 새 run ID로 해당 자원을 다시 측정한다.
+
+이 변경은 **현재 서버에서 이미 실행 중인 학습을 중단·변경하지 않는다.** 측정 계획이 없는
+기존 run이나 source가 다른 checkpoint를 새 source에 강제 resume하지 않는다. GPU에 이미
+작업이 있으면 free-memory 검사를 통과하지 못할 수 있으며 다른 프로세스를 자동 종료하지 않는다.
+같은 저장소 폴더에서 학습이 진행 중이면 `git pull`로 소스를 바꾸지 않는다. 현재 작업 종료 후
+업데이트하거나 별도 checkout을 사용한다. 실행 중인 작업의 source 무결성을 보존하기 위함이다.
+로컬 CPU 테스트는 구현 회귀 검증이고 실제 A6000 후보 측정·전체 학습·가속 결과는 별도 확인이
+필요하다. 아래 ad041e2/ae808da 시점 기록은 이 실측 단계 도입 전의 역사다.
+
+## 역사: ad041e2 실패 실행 격리와 당시 수정판 재실행
 
 `v5-cycle-se-pe-a6000-gpu3-seed0-v1`은 첫 V5 fixed-C 학습 후 throughput 집계 오류,
 Cycle 8개는 CPU IPC mmap 누적으로 학습 전 실패했다. 이번 수정은 기록/전달 방식 수정이지
@@ -247,7 +320,8 @@ V5와 폐기·재구현된 Cycle V2만 새로 실행할 때는 `--tracks conduct
 identity에 들어가므로, 중단 후에는 같은 run ID와 같은 목록을 그대로 사용한다.
 
 architecture profile(`reference/large`)과 hardware profile(`portable/a6000-48gb`)은 서로 다른
-축이다. A6000 profile의 실제 실행 차이는 다음과 같다.
+축이다. 아래 batch/worker는 profile의 등록값이며 현재 V5/Cycle V2 rich 실행에서는
+calibration의 시작 요청값이다. 최종 적용값은 `resource-plan.json`의 선택과 다를 수 없다.
 
 | 트랙 | `portable` | `a6000-48gb` |
 |---|---|---|
@@ -267,7 +341,7 @@ artifact는 보존되며 같은 run ID 재실행에서는 실패한 작업만 �
 execution이 바뀌고, Cycle은 batch와 AMP가 바뀌며, Tree는 800 optimizer updates마다 보는 graph
 수가 달라진다. 따라서 fixed/dynamic C, Cycle V1/V2, Tree fixed/multi 비교는 같은 hardware
 profile 안에서만 해석한다. 특히 legacy Conductance V1/V3/V4 PPI는 batch 2/FP32이고 V5 A6000
-PPI는 batch 8/BF16이므로 V1–V5 PPI 차이는 descriptive scaling 결과일 뿐 단일 구조 요인의
+PPI는 batch 8 이상에서 실측 선택/BF16이므로 V1–V5 PPI 차이는 descriptive scaling 결과일 뿐 단일 구조 요인의
 인과 비교가 아니다. portable와 A6000 사이의 점수나 wall time 차이를 모델 또는 GPU 하나의
 효과로 직접 해석하지 않는다.
 
@@ -328,12 +402,12 @@ utilization이 낮으면서 CPU가 포화되면 loader/기저 준비 병목을 �
 utilization이 모두 낮으면 별도의 batch 후보 측정 run을 설계한다. 한 장면만으로 batch나
 concurrency를 바꾸지 않는다.
 
-### Rich runner의 고정 recipe와 별도 batch 후보 microbenchmark
+### 역사적 고정 recipe와 지금도 별개인 microbenchmark
 
-현재 runner의 physical batch는 hardware/dataset/profile별로 사전 등록된 값이다.
-`run_rich_scaling.py`는 학습 중 batch를 탐색하거나 recipe를 바꾸지 않고 manifest에도
-`throughput_candidate_sweep=false`를 기록한다. A6000 profile의 큰 batch는 명시적 연구
-recipe이지 rich runner가 자동 선택한 결과가 아니다.
+실측 calibration 도입 전 runner의 physical batch는 hardware/dataset/profile별 사전 등록값이며
+당시 manifest는 `throughput_candidate_sweep=false`였다. 이는 이전 실행의 사실로 보존한다.
+현재 V5/Cycle V2 rich 실행은 이 문서 첫 절처럼 **본 학습 전** 후보를 측정해 선택하고,
+본 학습 중에는 recipe를 바꾸지 않는다. 측정 계획이 적용된 manifest에만 sweep 근거를 기록한다.
 
 별도 `scripts/benchmark_speed.py --batch-sizes ...`는 이와 구분되는 CUDA
 **fixed-real-batch microbenchmark**다. Conductance V1/V5, Cycle PE V1/V2와 Tree V1/V2에서
@@ -384,12 +458,11 @@ microbenchmark 순위만 기록하고 최종 학습 batch를 선택하지 않는
 후보 physical/effective batch size, 반복별 처리량과 지연시간, GPU·CPU·RAM 관측치,
 microbenchmark 순위 적격 여부와 배제 이유가 기록된다.
 
-Cycle V2의 pre-epoch capacity probe는 등록된 worst-case batch가 가능한지 확인하고 불가능하면
+Cycle V2의 기존 pre-epoch capacity probe는 등록된 worst-case batch가 가능한지 확인하고 불가능하면
 명시적으로 실패시키는 검사다. 더 작은 batch로 자동 변경하지 않으며 throughput sweep도 아니다.
 또한 고정 batch로 완료된 학습 run의 `graphs/sec` 또는 `samples/sec`는 그 한 설정의 사후
-처리량일 뿐, 다른 후보보다 최적이라는 증거가 아니다. 별도 microbenchmark 권고와 전체 학습
-검증을 거쳐 선택 결과를 새 hardware profile과 새 run ID에 명시하기 전에는 현재 batch가
-하드웨어 최적이라고 주장하지 않는다.
+처리량일 뿐, 다른 후보보다 최적이라는 증거가 아니다. 현재 rich 실행의 별도 optimizer-inclusive
+calibration 선택도 측정한 후보 내의 결과이며 전역적인 하드웨어 최적값이라고 주장하지 않는다.
 
 ## 10GB MIG 메모리 정책
 

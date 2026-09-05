@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -654,9 +655,9 @@ def _v5_batch_observability(
         physical_batch_size, batch_unit, batches_per_epoch = 1, "full_graph", 1
     elif indices is not None:
         physical_batch_size, batch_unit, batches_per_epoch = (
-            int(args.batch_size),
-            "sampler_seed_nodes_or_partitions",
-            None,
+            int(args.sample_seed_batch_size),
+            "supervised_seed_nodes",
+            len(sampler),
         )
     else:
         physical_batch_size, batch_unit = int(args.batch_size), "graphs"
@@ -821,8 +822,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("transductive V5 datasets use no DataLoader and require workers=0")
     if args.dataset != "ppi" and args.batch_size != BATCH_SIZE_BY_DATASET[args.dataset]:
         raise ValueError("transductive full/sampled graph batch-size must be 1")
-    if args.dataset == "ppi" and args.hardware_profile == "portable" and args.batch_size != 2:
-        raise ValueError("portable PPI retains the V1 graph batch-size of 2")
+    if args.dataset == "ppi" and args.batch_size < 2:
+        raise ValueError("PPI graph batch-size must not be reduced below the V1 minimum of 2")
     if args.dataset == "ppi" and args.sampling != "full":
         raise ValueError(
             "PPI already supplies inductive graph minibatches; sampling is transductive-only"
@@ -899,23 +900,42 @@ def _prefetched_samples(iterator, *, pin_memory: bool):
             yield graph
 
 
-def _training_batches(data, indices, sampler, epoch, device, model_seed, args):
+def _training_batches(data, indices, sampler, epoch, device, model_seed, args, *, timing=None):
+    def stage(name):
+        return nullcontext() if timing is None else timing.stage(name)
+
     if sampler is not None:
         samples = sampler.iter_epoch(epoch)
         if args.sample_prefetch:
             samples = _prefetched_samples(samples, pin_memory=args.pin_memory)
-        for graph in samples:
-            graph = graph.to(device, non_blocking=args.pin_memory)
-            yield graph, graph.train_mask.nonzero(as_tuple=False).flatten()
+        samples = iter(samples)
+        while True:
+            with stage("sampling_and_loader_wait"):
+                try:
+                    graph = next(samples)
+                except StopIteration:
+                    return
+            with stage("host_to_device"):
+                graph = graph.to(device, non_blocking=args.pin_memory)
+                train_indices = graph.train_mask.nonzero(as_tuple=False).flatten()
+            yield graph, train_indices
     elif indices is not None:
         yield data, indices["train"]
     else:
         # Re-seeding by epoch makes PPI minibatch order identical after resume.
         if getattr(data["train"], "generator", None) is not None:
             data["train"].generator.manual_seed(model_seed + 1_000_003 * epoch)
-        for graph in data["train"]:
+        source = iter(data["train"])
+        while True:
+            with stage("sampling_and_loader_wait"):
+                try:
+                    graph = next(source)
+                except StopIteration:
+                    return
             graph._v5_num_graphs = int(graph.num_graphs)
-            yield graph.to(device, non_blocking=True), None
+            with stage("host_to_device"):
+                graph = graph.to(device, non_blocking=True)
+            yield graph, None
 
 
 def _validation_source(data, sampler):

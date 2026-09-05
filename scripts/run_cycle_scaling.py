@@ -43,6 +43,14 @@ from scripts.telemetry_validation import (  # noqa: E402
     validate_resource_observability,
     validate_throughput_observability,
 )
+from scripts.training_resource_plan import (  # noqa: E402
+    load_resource_plan,
+    resource_plan_identity,
+    selected_resources,
+    validate_job_plan,
+    validate_plan_data,
+    validate_plan_runtime,
+)
 
 DATASETS = ("zinc12k", "peptides_struct")
 VERSIONS = ("v1", "v2")
@@ -135,6 +143,9 @@ SOURCE_FILES = (
     "scripts/gpu_preflight.py",
     "scripts/process_safety.py",
     "scripts/telemetry_validation.py",
+    "scripts/training_resource_plan.py",
+    "scripts/calibrate_training_resources.py",
+    "scripts/calibration_lock.py",
     "scripts/verify_gpu_lock.py",
     "research/__init__.py",
     "research/cycle_pe/__init__.py",
@@ -201,6 +212,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--device", default="cuda")
     result.add_argument("--hardware-profile", choices=HARDWARE_PROFILES, default="portable")
     result.add_argument(
+        "--resource-plan", type=Path, help="Immutable measured Cycle V2 batch/worker plan"
+    )
+    result.add_argument(
         "--batch-size",
         type=int,
         default=0,
@@ -208,6 +222,11 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument(
         "--workers", type=int, default=-1, help="explicit override; -1 selects by hardware profile"
+    )
+    result.add_argument(
+        "--legacy-batch-size",
+        type=int,
+        help="preserve a separate explicit Cycle V1 batch when V2 uses measured resources",
     )
     result.add_argument(
         "--prefetch-factor",
@@ -236,6 +255,10 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _validate(args: argparse.Namespace) -> None:
+    if getattr(args, "legacy_batch_size", None) is not None and (
+        args.legacy_batch_size < 1 or "v1" not in args.versions
+    ):
+        raise ValueError("--legacy-batch-size requires V1 and a positive batch")
     for name in ("versions", "encodings", "datasets", "profiles"):
         values = getattr(args, name)
         if not values or len(set(values)) != len(values):
@@ -280,11 +303,24 @@ def _job_resources(
 ) -> dict[str, Any]:
     accelerated = args.hardware_profile == "a6000-48gb"
     is_v2 = version == "v2"
+    batch_size = args.batch_size or (A6000_BATCH_SIZE[profile][dataset] if accelerated else 32)
+    if version == "v1" and getattr(args, "legacy_batch_size", None) is not None:
+        batch_size = args.legacy_batch_size
+    workers = args.workers if args.workers >= 0 else (8 if accelerated else 4)
+    plan = getattr(args, "resolved_resource_plan", None)
+    if is_v2 and plan is not None:
+        measured = selected_resources(plan, track="cycle", profile=profile, dataset=dataset)
+        if measured is None:
+            raise ValueError(f"resource plan is missing cycle/{profile}/{dataset}")
+        if args.batch_size and args.batch_size != measured["batch_size"]:
+            raise ValueError("--batch-size conflicts with the immutable measured resource plan")
+        if args.workers >= 0 and args.workers != measured["workers"]:
+            raise ValueError("--workers conflicts with the immutable measured resource plan")
+        batch_size, workers = measured["batch_size"], measured["workers"]
     return {
         "hardware_profile": args.hardware_profile,
-        "batch_size": args.batch_size
-        or (A6000_BATCH_SIZE[profile][dataset] if accelerated else 32),
-        "workers": args.workers if args.workers >= 0 else (8 if accelerated else 4),
+        "batch_size": batch_size,
+        "workers": workers,
         # V1's frozen loader exposes no prefetch CLI and therefore uses the
         # DataLoader default (2); never claim the V2-only override for V1.
         "prefetch_factor": (args.prefetch_factor or (4 if accelerated else 2) if is_v2 else 2),
@@ -425,6 +461,15 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             "--hardware-profile",
                             args.hardware_profile,
                         ]
+                        validate_job_plan(
+                            getattr(args, "resolved_resource_plan", None),
+                            track="cycle",
+                            profile=profile,
+                            dataset=dataset,
+                            condition=encoding,
+                            model_seed=seed,
+                            command=command,
+                        )
                     jobs.append(
                         {
                             "job_id": job_id,
@@ -1339,7 +1384,13 @@ def _run_configuration(args: argparse.Namespace) -> dict[str, Any]:
         "data_root": str(args.data_root.expanduser().resolve()),
         "device": args.device,
         "hardware_profile": args.hardware_profile,
+        "resource_plan": (
+            resource_plan_identity(args.resolved_resource_plan)
+            if getattr(args, "resolved_resource_plan", None) is not None
+            else None
+        ),
         "batch_size": args.batch_size,
+        "legacy_batch_size": getattr(args, "legacy_batch_size", None),
         "workers": args.workers,
         "prefetch_factor": args.prefetch_factor,
         "epochs": args.epochs,
@@ -1674,10 +1725,17 @@ def _manifest_base(
                 "only within the same hardware profile and resolved batch policy"
             ),
             "batch_selection": {
-                "default_source": "preregistered_hardware_dataset_profile_not_measured_optimum",
+                "default_source": (
+                    "measured_paired_training_resource_plan"
+                    if getattr(args, "resolved_resource_plan", None) is not None
+                    else "preregistered_hardware_dataset_profile_not_measured_optimum"
+                ),
                 "explicit_global_override": args.batch_size or None,
                 "automatic_downscale": False,
                 "measured_throughput_optimum_claimed": False,
+                "measured_candidate_selection": getattr(args, "resolved_resource_plan", None)
+                is not None,
+                "resource_plan": _run_configuration(args)["resource_plan"],
                 "scope": (
                     "a nonzero --batch-size applies verbatim to every requested "
                     "version/dataset/profile and becomes immutable run identity"
@@ -1704,7 +1762,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
         _validate(args)
-    except ValueError as exc:
+        args.resolved_resource_plan = (
+            load_resource_plan(
+                args.resource_plan,
+                hardware_profile=args.hardware_profile,
+                profiles=args.profiles,
+                model_seeds=args.model_seeds,
+            )
+            if args.resource_plan is not None
+            else None
+        )
+    except (ValueError, OSError, UnicodeError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     run_id = args.run_id or _default_run_id()
@@ -1722,7 +1790,11 @@ def main(argv: list[str] | None = None) -> int:
     if paths_overlap:
         print("Experiment outputs and dataset directories must not overlap", file=sys.stderr)
         return 2
-    jobs = make_jobs(args, run_dir)
+    try:
+        jobs = make_jobs(args, run_dir)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if args.dry_run:
         print(
             f"{len(jobs)} fresh child runs; {len(jobs)} fresh dataset "
@@ -1863,6 +1935,11 @@ def main(argv: list[str] | None = None) -> int:
         }
         if manifest["preflight"]["status"] != "passed":
             failed = True
+        elif args.resolved_resource_plan is not None:
+            manifest["measured_resource_runtime"] = validate_plan_runtime(
+                args.resolved_resource_plan, device_names=[args.device]
+            )
+            validate_plan_data(args.resolved_resource_plan, jobs, track="cycle")
         atomic_write_json(manifest_path, manifest, sort_keys=False)
         if not failed:
             for job in jobs:

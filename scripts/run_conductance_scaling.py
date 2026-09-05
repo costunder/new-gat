@@ -67,6 +67,14 @@ from scripts.telemetry_validation import (  # noqa: E402
     validate_resource_observability,
     validate_throughput_observability,
 )
+from scripts.training_resource_plan import (  # noqa: E402
+    load_resource_plan,
+    resource_plan_identity,
+    selected_resources,
+    validate_job_plan,
+    validate_plan_data,
+    validate_plan_runtime,
+)
 
 V1_DATASETS = ("cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv")
 # V5 owns these profiles. Legacy versions receive only their supported
@@ -151,6 +159,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--v5-beta-max", type=float)
     result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
     result.add_argument(
+        "--resource-plan", type=Path, help="Immutable measured V5 batch/worker plan"
+    )
+    result.add_argument(
         "--v5-sampling",
         choices=("auto", "full", "neighbor", "cluster"),
         default="auto",
@@ -198,8 +209,12 @@ def _validate(args: argparse.Namespace) -> None:
         or (args.legacy_ppi_batch_size is not None and args.legacy_ppi_batch_size < 1)
     ):
         raise ValueError("V5 neighbor fanouts and sample seed batch size must be positive")
-    if args.hardware_profile == "portable" and args.v5_ppi_batch_size not in {None, 2}:
-        raise ValueError("portable V5 PPI retains graph batch-size 2")
+    if (
+        args.hardware_profile == "portable"
+        and args.v5_ppi_batch_size is not None
+        and args.v5_ppi_batch_size < 2
+    ):
+        raise ValueError("portable V5 PPI requires graph batch-size at least 2")
     _v5_beta_configuration(args)
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
         raise ValueError("CUDA is required; CPU training/fallback is not supported")
@@ -217,20 +232,52 @@ def _selected_datasets(args: argparse.Namespace, version: str) -> list[str]:
     return [dataset for dataset in requested if dataset in supported]
 
 
-def _v5_execution(args: argparse.Namespace, dataset: str) -> dict[str, Any]:
+def _v5_execution(
+    args: argparse.Namespace, dataset: str, profile_name: str | None = None
+) -> dict[str, Any]:
     profile = HARDWARE_PROFILES[args.hardware_profile]
     batch_size = 1
     if dataset == "ppi":
         batch_size = args.v5_ppi_batch_size or profile["ppi_batch_size"]
     loader_workers = shared.workers_for_dataset(dataset, args.workers)
+    sample_seed_batch_size = args.v5_sample_seed_batch_size or profile["sample_seed_batch_size"]
+    plan = getattr(args, "resolved_resource_plan", None)
+    if plan is not None:
+        if profile_name is None:
+            raise ValueError("measured V5 resource selection requires an architecture profile")
+        measured = selected_resources(
+            plan, track="conductance", profile=profile_name, dataset=dataset
+        )
+        if measured is None:
+            raise ValueError(f"resource plan is missing conductance/{profile_name}/{dataset}")
+        for option, explicit, selected in (
+            (
+                "--v5-ppi-batch-size",
+                args.v5_ppi_batch_size if dataset == "ppi" else None,
+                measured["batch_size"],
+            ),
+            (
+                "--v5-sample-seed-batch-size",
+                args.v5_sample_seed_batch_size,
+                measured["sample_seed_batch_size"],
+            ),
+            (
+                "--workers",
+                args.workers if getattr(args, "workers_explicit", False) else None,
+                measured["workers"],
+            ),
+        ):
+            if explicit is not None and explicit != selected:
+                raise ValueError(f"{option} conflicts with the immutable measured resource plan")
+        batch_size = measured["batch_size"]
+        sample_seed_batch_size = measured["sample_seed_batch_size"]
+        loader_workers = measured["workers"]
     return {
         "hardware_profile": args.hardware_profile,
         "precision": profile["precision"],
         "tf32": profile["tf32"],
         "batch_size": batch_size,
-        "sample_seed_batch_size": (
-            args.v5_sample_seed_batch_size or profile["sample_seed_batch_size"]
-        ),
+        "sample_seed_batch_size": sample_seed_batch_size,
         "edge_chunk_size": args.v5_edge_chunk_size or profile["edge_chunk_size"],
         "activation_checkpoint": (
             profile["activation_checkpoint"]
@@ -356,7 +403,9 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             command += ["--edge-chunk-size", str(args.edge_chunk_size)]
                         sampling = None
                         if version == "v5":
-                            execution = _v5_execution(args, dataset)
+                            execution = _v5_execution(args, dataset, profile_name)
+                            child_workers = execution["dataloader_workers"]
+                            command[command.index("--workers") + 1] = str(child_workers)
                             batch_position = command.index("--batch-size") + 1
                             command[batch_position] = str(execution["batch_size"])
                             sampling = (
@@ -391,6 +440,15 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             ]
                             for name, value in _v5_beta_configuration(args).items():
                                 command += ["--" + name.replace("_", "-"), str(value)]
+                            validate_job_plan(
+                                getattr(args, "resolved_resource_plan", None),
+                                track="conductance",
+                                profile=profile_name,
+                                dataset=dataset,
+                                condition=condition,
+                                model_seed=seed,
+                                command=command,
+                            )
                         job_id = f"{version}/{profile_name}/model-seed-{seed}/{dataset}/{condition}"
                         jobs.append(
                             {
@@ -477,6 +535,9 @@ def _source_snapshot() -> dict[str, str]:
         ROOT / "scripts/process_safety.py",
         ROOT / "scripts/run_conductance_factorial.py",
         ROOT / "scripts/telemetry_validation.py",
+        ROOT / "scripts/training_resource_plan.py",
+        ROOT / "scripts/calibrate_training_resources.py",
+        ROOT / "scripts/calibration_lock.py",
         ROOT / "scripts/verify_gpu_lock.py",
     ]
     return {
@@ -1010,9 +1071,23 @@ def _write_summary(run_dir: Path, manifest: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    arguments = sys.argv[1:] if argv is None else argv
+    args.workers_explicit = any(
+        argument == "--workers" or argument.startswith("--workers=") for argument in arguments
+    )
     try:
         _validate(args)
-    except ValueError as exc:
+        args.resolved_resource_plan = (
+            load_resource_plan(
+                args.resource_plan,
+                hardware_profile=args.hardware_profile,
+                profiles=args.profiles,
+                model_seeds=args.model_seeds,
+            )
+            if args.resource_plan is not None
+            else None
+        )
+    except (ValueError, OSError, UnicodeError) as exc:
         print(str(exc), file=sys.stderr)
         return 2
     run_id = args.run_id or "scaling-v1-v5-" + dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
@@ -1061,14 +1136,22 @@ def main(argv: list[str] | None = None) -> int:
         "v5_ppi_batch_size": args.v5_ppi_batch_size,
         "v5_beta": _v5_beta_configuration(args),
         "hardware_profile": args.hardware_profile,
+        "resource_plan": (
+            resource_plan_identity(args.resolved_resource_plan)
+            if args.resolved_resource_plan is not None
+            else None
+        ),
         "effective_min_free_gb": _effective_min_free_gb(args),
         "v5_sampling": args.v5_sampling,
         "v5_num_neighbors": list(args.v5_num_neighbors),
         "v5_sample_seed_batch_size": args.v5_sample_seed_batch_size,
         "v5_activation_checkpoint": args.v5_activation_checkpoint,
-        "v5_resolved_execution_by_dataset": {
-            dataset: _v5_execution(args, dataset)
-            for dataset in (_selected_datasets(args, "v5") if "v5" in args.versions else [])
+        "v5_resolved_execution_by_profile_and_dataset": {
+            profile_name: {
+                dataset: _v5_execution(args, dataset, profile_name)
+                for dataset in (_selected_datasets(args, "v5") if "v5" in args.versions else [])
+            }
+            for profile_name in args.profiles
         },
         "data_root": str(data_root),
     }
@@ -1160,12 +1243,18 @@ def main(argv: list[str] | None = None) -> int:
                     "profile-specific real graph batches while legacy versions retain batch 2"
                 ),
                 "batch_selection": {
-                    "default_source": "preregistered_hardware_profile_not_measured_optimum",
+                    "default_source": (
+                        "measured_paired_training_resource_plan"
+                        if args.resolved_resource_plan is not None
+                        else "preregistered_hardware_profile_not_measured_optimum"
+                    ),
                     "legacy_ppi_explicit_override": args.legacy_ppi_batch_size,
                     "v5_ppi_explicit_override": args.v5_ppi_batch_size,
                     "v5_sample_seed_explicit_override": args.v5_sample_seed_batch_size,
                     "automatic_downscale": False,
                     "measured_throughput_optimum_claimed": False,
+                    "measured_candidate_selection": args.resolved_resource_plan is not None,
+                    "resource_plan": config["resource_plan"],
                     "scope": (
                         "explicit V5 overrides are applied verbatim and become immutable run "
                         "identity; their presence alone is not evidence of a throughput sweep"
@@ -1210,6 +1299,11 @@ def main(argv: list[str] | None = None) -> int:
         manifest["gpu_preflight"] = _accepted_hardware_preflight(
             preflight_output, args.hardware_profile
         )
+        if args.resolved_resource_plan is not None:
+            manifest["measured_resource_runtime"] = validate_plan_runtime(
+                args.resolved_resource_plan, device_names=[args.device]
+            )
+            validate_plan_data(args.resolved_resource_plan, jobs, track="conductance")
         atomic_write_json(manifest_path, manifest)
         remaining = sum(job["status"] != "passed" for job in jobs)
         print(

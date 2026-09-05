@@ -19,9 +19,23 @@
 
 ## 0. 리뷰어가 먼저 알아야 할 판정
 
-### 2026-09-05 ad041e2 서버 실행 후 추가 교정
+### 현재 우선 계약: 본 학습 전 optimizer-inclusive 자원 calibration
 
-최신 전체 CPU 회귀는 **1,940 passed / 99 skipped** (189.74초)이며 1만 합성 그래프의
+V5/Cycle V2를 포함하는 rich 실행은 등록 batch를 최적값으로 간주하지 않는다. 실제 서버에서
+현재 요청 physical batch 이상인 여러 후보와 loader worker를 측정한 뒤 두 조건·요청 seed에
+공통으로 안전하고 처리량이 높은 자원을 선택한다. V5 joint C/W와 실제 AdamW state,
+Cycle SE/PE와 실제 Adam state, 큰 실제 graph batch까지 포함한다. 모델·전체 데이터·fanout·
+epoch·seed는 줄이지 않고 probe 모델과 본 학습 checkpoint/RNG를 분리한다.
+
+계획은 source/GPU/runtime/data hash에 묶여 `results/resource_calibration/<run-id>/`에
+저장되고 중단한 probe만 이어간다. 기존 실행 중 학습이나 구 checkpoint는 건드리지 않는다.
+본문의 1,940 등 과거 테스트 수는 이 신규 calibration의 검증 수가 아니다. 로컬 CPU 검사와
+실제 A6000 측정·전체 학습을 구분한다. 현재 실행명령·28회 본 학습 범위·선택 기준·제약은
+[RICH_SCALING_EXPERIMENTS.md](RICH_SCALING_EXPERIMENTS.md) 첫 절을 우선한다.
+
+### 역사: 2026-09-05 ad041e2 서버 실행 후 추가 교정
+
+당시 전체 CPU 회귀는 **1,940 passed / 99 skipped** (189.74초)이며 1만 합성 그래프의
 실제 병렬 준비·cache 재검증을 포함한다. Ruff·코드 스냅샷 검증도 통과했다.
 Linux/CUDA 조건 및 실제 서버 전체 학습은 미검증이고 실제 결과의 이동/삭제는 하지 않았다.
 
@@ -99,13 +113,13 @@ owned-memory IPC다. C/W/beta, SE/PE 수식, 모델 크기, batch와 전체 데�
   tensor로 만들며 PE·GNN·pooling에 graph별 GPU forward loop가 없다. Variant/target에서 쓰지 않는
   parameter는 생성하지 않고 첫 actual backward의 전체 trainable gradient와 optimizer 소유권을
   fail-closed로 검사한다. 이 구조 변경 때문에 과거 보조 schema v1 checkpoint를 재사용하지 않는다.
-- 현재 rich 학습 runner의 physical batch는 hardware/dataset/profile별 preregistered recipe이며
-  학습 중 자동으로 바꾸지 않고 manifest에도 `throughput_candidate_sweep=false`를 기록한다.
-  별도 `benchmark_speed.py --batch-sizes ...`는 공식 train cache의 fixed real batch 후보를
-  독립 측정해 GPU/VRAM/CPU/RAM·처리량과 integrity, 10% memory-headroom microbenchmark 권고를
-  남긴다. Optimizer·전체 epoch·validation/checkpoint를 제외하고 profile 기본값도 바꾸지 않으므로
-  이 권고나 Cycle V2 capacity probe, 한 학습 batch의 사후 처리량을 최종 batch 최적화 결과로
-  해석하지 않는다.
+- 현재 rich runner는 V5/Cycle V2 본 학습 전에 실제 optimizer update/state를 포함해
+  여러 physical batch와 worker 후보를 측정한다. 등록 recipe는 탐색 하한이며, paired 조건에
+  공통으로 안전한 측정 후보를 선택해 본 학습 동안 고정한다. Source·할당 자원·runtime·데이터
+  identity에 묶인 계획과 후보별 진행 상태를 보존한다. 현재 정책은
+  [RICH_SCALING_EXPERIMENTS.md](RICH_SCALING_EXPERIMENTS.md) 첫 절을 따른다.
+  별도 `benchmark_speed.py`의 optimizer 없는 fixed-batch microbenchmark와 Cycle V2의
+  단일 capacity probe는 이 실측 선택을 대신하지 않는다. 실제 A6000 측정 결과는 아직 없다.
 - 현재 수정 V5와 sparse DFS V2의 성공한 전체 GPU 성능 결과는 아직 없다. 과거 A6000 r1 partial은
   V5 fixed 한 job 뒤 dynamic OOM, Cycle V2 네 job의 gradient overflow로 중단됐고 수정 근거로만
   사용한다. 아래 과거 단일-seed 값이나 폐기된 V2 결과를 새 버전 성능으로 재사용하지 않는다.
@@ -1783,13 +1797,13 @@ GPU utilization은 프로세스 전용이 아닌 선택 장치 전체 기준이�
 1초 표본은 짧은 burst를 놓칠 수 있으며, storage I/O나 단계별 loader/H2D/forward/backward
 profiler를 대신하지 않는다. 원문 시계열은 개별 child artifact를 확인한다.
 
-이 자원 계측은 rich runner 내부 batch 자동 튜닝과 다르다. Rich runner는 preregistered batch로
-실행한 뒤 그 설정의 처리량만 기록하고 profile을 바꾸지 않는다. Cycle V2의 worst-case capacity
-probe도 feasibility 검사이지 throughput 최적화가 아니다. 별도 CUDA fixed-real-batch profiler는
-명시 후보의 warm-up/steady-state 처리량, peak VRAM, CPU/RAM과 독립 variant가 있는 경로의 수치
-동등성을 측정해 10% projected memory headroom 기준 권고를 남기지만 optimizer state·전체 epoch·
-validation/checkpoint가 없다. 따라서 microbenchmark 권고를 새 profile과 전체 학습으로
-검증하기 전에는 현재 A6000/portable batch가 최적이라는 claim을 하지 않는다.
+과거 rich runner는 등록 batch로 실행한 처리량만 기록했으며 이것으로 최적화를 입증하지 못했다.
+현재 V5/Cycle V2 rich 경로는 본 학습 전에 실제 optimizer update/state, loader·전송·연산 시간과
+CUDA peak를 포함해 batch/worker 후보를 측정한다. 요청 하한을 낮추지 않고 paired 조건에
+공통으로 안전한 후보 중 가장 느린 조건의 처리량을 가장 높이는 설정을 고른다. 유한 후보 탐색이므로
+전역 최적값을 보장하지 않는다. 별도 fixed-real-batch microbenchmark와 Cycle V2 capacity probe는
+이 단계의 대체물이 아니다. 실제 서버 calibration·전체 학습 결과가 아직 없으므로 현재 문서에서
+A6000의 최적 batch나 가속률을 주장하지 않는다.
 
 ### P0 — 이미 나온 결과의 검증과 Conductance 실패 원인 분리
 

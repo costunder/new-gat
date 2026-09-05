@@ -177,8 +177,14 @@ V5 child는 실제 학습 경계에서 기본 1초 주기로 GPU SM·memory-cont
 allocator allocated/reserved, process CPU·RSS/HWM과 system available RAM을 측정해
 `resource_observability`에 저장한다. 지원되지 않는 counter는 0이 아니라 `null`과 원인을
 기록한다. 이 계측이 적용된 전체 GPU run은 아직 수령하지 않았으므로 utilization 수치를
-성능 결과처럼 인용하지 않는다. 현재 1,024/2,048 seed batch와 PPI 2/8 graph batch는 등록된
-profile recipe이며, rich/V5 학습 runner가 자동 튜닝해 고른 값이 아니다. 별도
+성능 결과처럼 인용하지 않는다. 1,024/2,048 seed batch와 PPI 2/8 graph batch는 등록된
+profile recipe이며, 현재 rich 경로에서는 실측 탐색의 요청 하한이다. 본 학습 전에 별도 joint-phase
+모델의 실제 loss/backward/clipping/AdamW update와 optimizer state를 포함해 여러 batch와
+worker 후보를 측정한다. V5 probe는 전체 train epoch를 완료하며 fixed/dynamic 조건에 공통으로
+안전한 값을 선택해 본 학습 동안 고정한다. 모델 크기·fanout·데이터·epoch를 줄이지 않는다.
+Full-graph citation 데이터는 별도 batch 축이 없는 사유를 기록하며 그래프를 복제하지 않는다.
+현재 통합 실행과 재개 계약은 [RICH_SCALING_EXPERIMENTS.md](RICH_SCALING_EXPERIMENTS.md)
+첫 절을 따른다. 실제 A6000 후보 측정 결과는 아직 없다. 이 경로와 별개로
 `scripts/benchmark_speed.py --track conductance_v5 --batch-sizes ...`는 공식 train 입력에서
 명시한 seed-node/PPI graph batch 후보를 각각 측정하고, 10% 이상 projected device-memory
 headroom을 남긴 후보 중 처리량이 가장 높은 값을 **microbenchmark 권고**로 기록한다. 이 측정은

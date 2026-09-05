@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import copy
 import datetime as dt
 import hashlib
 import json
@@ -35,6 +36,16 @@ from scripts.process_safety import (  # noqa: E402
     run_failure_reporter,
     terminate_owned_child,
     terminate_owned_child_after_error,
+)
+from scripts.training_resource_plan import (  # noqa: E402
+    digest as resource_digest,
+)
+from scripts.training_resource_plan import (  # noqa: E402
+    load_resource_plan,
+    resource_plan_identity,
+)
+from scripts.training_resource_plan import (  # noqa: E402
+    source_snapshot as calibration_source_snapshot,
 )
 
 TRACKS = ("conductance", "cycle", "tree")
@@ -187,6 +198,14 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--min-free-gb", type=float, default=8.0)
     result.add_argument(
+        "--resource-plan",
+        type=Path,
+        help=(
+            "reuse an exact measured V5/Cycle V2 resource plan; "
+            "omission calibrates before new training"
+        ),
+    )
+    result.add_argument(
         "--v5-beta-parameterization",
         choices=BETA_PARAMETERIZATIONS,
         default=DEFAULT_BETA_PARAMETERIZATION,
@@ -261,8 +280,12 @@ def _validate(args: argparse.Namespace) -> None:
         or args.conductance_v5_sample_seed_batch_size is not None
     ) and ("conductance" not in args.tracks or "v5" not in args.conductance_versions):
         raise ValueError("Conductance V5 batch overrides require the conductance/V5 track")
-    if args.hardware_profile == "portable" and args.conductance_v5_ppi_batch_size not in {None, 2}:
-        raise ValueError("portable Conductance V5 PPI retains graph batch-size 2")
+    if (
+        args.hardware_profile == "portable"
+        and args.conductance_v5_ppi_batch_size is not None
+        and args.conductance_v5_ppi_batch_size < 2
+    ):
+        raise ValueError("portable Conductance V5 PPI cannot shrink below graph batch-size 2")
     if args.cycle_batch_size is not None and "cycle" not in args.tracks:
         raise ValueError("--cycle-batch-size requires the cycle track")
     if args.tree_batch_size is not None and "tree" not in args.tracks:
@@ -423,8 +446,13 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             command += ["--model-seeds", ",".join(str(seed) for seed in args.model_seeds)]
             command += ["--basis-backend", args.cycle_v2_basis_backend]
             command += ["--encodings", *args.cycle_v2_encodings]
-            if args.cycle_batch_size is not None:
+            if (
+                args.cycle_batch_size is not None
+                and getattr(args, "resolved_resource_plan", None) is None
+            ):
                 command += ["--batch-size", str(args.cycle_batch_size)]
+            elif args.cycle_batch_size is not None and "v1" in args.cycle_versions:
+                command += ["--legacy-batch-size", str(args.cycle_batch_size)]
         else:
             command += ["--versions", *requested_matrix["versions"]]
             command += ["--datasets", *requested_matrix["requested_datasets"]]
@@ -437,12 +465,18 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
                     "--legacy-ppi-batch-size",
                     str(args.conductance_legacy_ppi_batch_size),
                 ]
-            if args.conductance_v5_ppi_batch_size is not None:
+            if (
+                args.conductance_v5_ppi_batch_size is not None
+                and getattr(args, "resolved_resource_plan", None) is None
+            ):
                 command += [
                     "--v5-ppi-batch-size",
                     str(args.conductance_v5_ppi_batch_size),
                 ]
-            if args.conductance_v5_sample_seed_batch_size is not None:
+            if (
+                args.conductance_v5_sample_seed_batch_size is not None
+                and getattr(args, "resolved_resource_plan", None) is None
+            ):
                 command += [
                     "--v5-sample-seed-batch-size",
                     str(args.conductance_v5_sample_seed_batch_size),
@@ -473,6 +507,11 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
         download_forwarded = args.allow_download and track in {"cycle", "tree"}
         if download_forwarded:
             command.append("--allow-download")
+        if getattr(args, "resolved_resource_plan", None) is not None and (
+            (track == "conductance" and "v5" in args.conductance_versions)
+            or (track == "cycle" and "v2" in args.cycle_versions)
+        ):
+            command += ["--resource-plan", str(args.resource_plan)]
         if args.dry_run:
             command.append("--dry-run")
         jobs.append(
@@ -499,6 +538,9 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
 def _source_snapshot() -> dict[str, str]:
     paths = [
         Path(__file__).resolve(),
+        ROOT / "scripts/training_resource_plan.py",
+        ROOT / "scripts/calibrate_training_resources.py",
+        ROOT / "scripts/calibration_lock.py",
         ROOT / "research/__init__.py",
         ROOT / "scripts/check_dependencies.py",
         ROOT / "scripts/gpu_profiles.py",
@@ -1191,6 +1233,7 @@ def _config_payload(
         "execution_classification": "final_research_training",
         "debug_or_smoke_mode": False,
         "hardware_profile": args.hardware_profile,
+        "resource_plan": resource_plan_identity(getattr(args, "resolved_resource_plan", None)),
         "explicit_batch_overrides": {
             "conductance_legacy_ppi_graphs": args.conductance_legacy_ppi_batch_size,
             "conductance_v5_ppi_graphs": args.conductance_v5_ppi_batch_size,
@@ -1315,6 +1358,11 @@ def _print_plan(args: argparse.Namespace, run_id: str, jobs: list[dict[str, Any]
     )
     devices = _execution_devices(args)
     print("execution_classification=plan_only; training_started=false; debug_or_smoke=false")
+    if _needs_resource_calibration(args):
+        print(
+            "V5/Cycle V2: optimizer-inclusive paired batch/worker calibration precedes training; "
+            "shown batches are requested floors, not measured selections"
+        )
     print(
         f"hardware_profile={args.hardware_profile}; devices={devices}; "
         f"track_concurrency={min(len(devices), len(jobs))} "
@@ -1331,6 +1379,136 @@ def _print_plan(args: argparse.Namespace, run_id: str, jobs: list[dict[str, Any]
         print(f"  summary: {job['summary_path']}")
     results_root = args.results_root.expanduser().resolve()
     print(f"central manifest: {results_root / 'rich_scaling' / run_id / 'manifest.json'}")
+
+
+def _needs_resource_calibration(args: argparse.Namespace) -> bool:
+    return ("conductance" in args.tracks and "v5" in args.conductance_versions) or (
+        "cycle" in args.tracks and "v2" in args.cycle_versions
+    )
+
+
+def _calibration_request(args: argparse.Namespace, run_id: str) -> dict[str, Any]:
+    from scripts import run_conductance_scaling, run_cycle_scaling
+
+    baseline = copy.deepcopy(args)
+    baseline.resource_plan = None
+    baseline.resolved_resource_plan = None
+    baseline.dry_run = False
+    # Both mechanisms must fit the same selected resources, even for a one-arm final selection.
+    baseline.cycle_v2_encodings = ["se", "pe"]
+    paired_jobs = []
+    for track_job in make_jobs(baseline, run_id):
+        track = track_job["track"]
+        if track == "tree":
+            continue
+        module = run_conductance_scaling if track == "conductance" else run_cycle_scaling
+        child_args = module.parser().parse_args(track_job["command"][3:])
+        module._validate(child_args)
+        child_args.resolved_resource_plan = None
+        for job in module.make_jobs(child_args, Path(track_job["output_dir"])):
+            if job["version"] != ("v5" if track == "conductance" else "v2"):
+                continue
+            paired_jobs.append(
+                {
+                    "track": track,
+                    "profile": job["profile"],
+                    "dataset": job["dataset"] if track == "conductance" else job["datasets"][0],
+                    "condition": job["condition"] if track == "conductance" else job["encoding"],
+                    "model_seed": job["model_seed"],
+                    "device": track_job["device"],
+                    "command": job["command"],
+                }
+            )
+    return {
+        "schema_version": 1,
+        "kind": "training_resource_calibration_request",
+        "hardware_profile": args.hardware_profile,
+        "profiles": list(args.profiles),
+        "model_seeds": list(args.model_seeds),
+        "minimum_free_gb": args.min_free_gb,
+        "source_sha256": calibration_source_snapshot(),
+        "jobs": paired_jobs,
+    }
+
+
+def _ensure_measured_plan(args: argparse.Namespace, run_id: str, run_dir: Path) -> None:
+    if not _needs_resource_calibration(args):
+        if args.resource_plan is not None:
+            raise ValueError("resource plan requires a selected V5 or Cycle V2 track")
+        return
+    from scripts.training_resource_plan import validate_plan_runtime
+
+    if args.resource_plan is not None:
+        args.resource_plan = args.resource_plan.expanduser().resolve()
+        args.resolved_resource_plan = load_resource_plan(
+            args.resource_plan,
+            hardware_profile=args.hardware_profile,
+            profiles=list(args.profiles),
+            model_seeds=list(args.model_seeds),
+        )
+        validate_plan_runtime(args.resolved_resource_plan)
+        from scripts.calibrate_training_resources import verify_plan_inputs
+
+        verify_plan_inputs(args.resolved_resource_plan, _calibration_request(args, run_id)["jobs"])
+        return
+    if (run_dir / "manifest.json").exists():
+        existing = json.loads((run_dir / "manifest.json").read_bytes())
+        if not existing.get("config", {}).get("resource_plan"):
+            raise ValueError(
+                "existing run has no measured resource plan; it is preserved and cannot be "
+                "silently reconfigured. Use a separate new run ID"
+            )
+    directory = args.results_root.expanduser().resolve() / "resource_calibration" / run_id
+    if directory.is_symlink() or not directory.resolve().is_relative_to(
+        args.results_root.expanduser().resolve()
+    ):
+        raise ValueError("calibration output escapes results root")
+    if _paths_overlap(directory, args.data_root.expanduser().resolve()):
+        raise ValueError("calibration outputs must not overlap dataset caches")
+    request = _calibration_request(args, run_id)
+    request_path = directory / "request.json"
+    if directory.exists():
+        if not request_path.is_file() or request_path.is_symlink():
+            raise ValueError("existing calibration directory is not owned by this request")
+        if resource_digest(json.loads(request_path.read_bytes())) != resource_digest(request):
+            raise ValueError(
+                "calibration source/configuration differs; previous measurements preserved; "
+                "use a new run ID"
+            )
+    else:
+        directory.mkdir(parents=True, exist_ok=False)
+        _atomic_write_json(request_path, request)
+    logs = directory / "logs"
+    logs.mkdir(exist_ok=True)
+    attempt = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    print(
+        "Measuring real training batch/worker candidates before final training; "
+        "completed measurements resume; model/data size unchanged",
+        flush=True,
+    )
+    command = [
+        sys.executable,
+        "-B",
+        str(ROOT / "scripts/calibrate_training_resources.py"),
+        "--request",
+        str(request_path),
+        "--output-dir",
+        str(directory),
+    ]
+    code = _run_logged(command, logs / f"calibration-{attempt}.log", _environment())
+    if code:
+        raise RuntimeError(
+            f"resource calibration failed with code {code}; no final training launched; "
+            f"inspect {directory / 'progress.json'}"
+        )
+    args.resource_plan = directory / "resource-plan.json"
+    args.resolved_resource_plan = load_resource_plan(
+        args.resource_plan,
+        hardware_profile=args.hardware_profile,
+        profiles=list(args.profiles),
+        model_seeds=list(args.model_seeds),
+    )
+    validate_plan_runtime(args.resolved_resource_plan)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1364,6 +1542,16 @@ def main(argv: list[str] | None = None) -> int:
         _print_plan(args, run_id, jobs)
         print("dry run only; no files or directories were written")
         return 0
+    try:
+        _STOP_ACTIVE_CHILDREN.clear()
+        _ensure_measured_plan(args, run_id, run_dir)
+        jobs = make_jobs(args, run_id)
+    except KeyboardInterrupt:
+        print("resource calibration interrupted; partial measurements preserved", flush=True)
+        return 130
+    except (ValueError, RuntimeError, OSError, UnicodeError) as error:
+        print(f"cannot start final training: {error}", file=sys.stderr, flush=True)
+        return 2
     totals = _totals(jobs)
     manifest_path = run_dir / "manifest.json"
     sources = _source_snapshot()
@@ -1418,22 +1606,28 @@ def main(argv: list[str] | None = None) -> int:
                     ),
                 },
                 "batch_selection": {
-                    "default_policy": "preregistered_per_child_hardware_dataset_profile",
+                    "default_policy": (
+                        "measured_paired_training_resources_for_v5_cycle_v2; "
+                        "legacy_requested_resources_unchanged"
+                    ),
                     "measured_throughput_optimum_claimed": False,
                     "automatic_downscale": False,
-                    "throughput_candidate_sweep": False,
+                    "throughput_candidate_sweep": getattr(args, "resolved_resource_plan", None)
+                    is not None,
+                    "measured_resource_plan": resource_plan_identity(
+                        getattr(args, "resolved_resource_plan", None)
+                    ),
                     "explicit_overrides": config["explicit_batch_overrides"],
                     "override_scope": (
-                        "each non-null override is forwarded unchanged to the named child; Cycle "
-                        "and Tree overrides intentionally apply to their whole requested matrix"
+                        "V5/Cycle V2 overrides set measured batch floors; the immutable plan "
+                        "supplies final selections. Legacy and Tree overrides are unchanged"
                     ),
                     "limitation": (
-                        "this orchestrator does not alter an optimization recipe by benchmarking "
-                        "and selecting a different physical batch. Exact-configuration candidate "
-                        "measurement remains a separate run; explicit overrides are optimization "
-                        "identity, never evidence of a measured optimum. Cycle V2 performs its "
-                        "recorded pre-epoch capacity probe and fails closed instead of silently "
-                        "shrinking"
+                        "V5/Cycle V2 measure optimizer-inclusive paired batch/worker candidates "
+                        "before final training. Selection maximizes measured worst-arm throughput "
+                        "within memory headroom, never below requested batch floors. The selected "
+                        "recipe is immutable on resume; finite candidate results are not a global "
+                        "optimum claim. Legacy versions retain their requested configurations"
                     ),
                 },
                 "failure_policy": (

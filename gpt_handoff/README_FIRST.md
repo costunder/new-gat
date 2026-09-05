@@ -31,13 +31,16 @@ Conductance v2/v3/v4/v5와 Cycle PE v2는 각각의 원문 문서를 직접 제�
 > 일치하는지 확인하고, 수학 오류·데이터 누수·비교 불공정·재현성·artifact 무결성·검증 누락을
 > 심각도순으로 보고해라. 단일 `--device` 순차 실행과 명시적 distinct `--devices` 병렬 실행,
 > same-GPU 동시성 계층, GPU/CPU/RAM 실측 필드와 `null+reason` 처리도 코드와 대조해라. Rich
-> runner는 batch를 자동 튜닝하지 않는다는 점과 별도 fixed-real-batch 후보 profiler의
-> optimizer/전체 epoch 제외 범위를 모두 확인해라. 실제 수령한 GPU 결과와
+> runner가 V5/Cycle V2의 본 학습 전 실제 optimizer-inclusive batch/worker 후보를 측정하고
+> paired arm에 공통 자원 계획을 고정하는지 확인해라. 이전 fixed-real-batch profiler의
+> optimizer/전체 epoch 제외 범위를 이 새 측정과 혼동하지 마라. 실제 수령한 GPU 결과와
 > 로컬 CPU fixture, 아직 실행하지 않은 실험을 반드시 구분하고, 현재 근거로 허용되는 주장과
 > 금지해야 할 주장을 나눠라.
 
 ## 근거 범위
 
+- 최신 실행·calibration·재개 명령은 `RICH_SCALING_EXPERIMENTS.md` 첫 절을 따른다.
+  A6000 48GB의 약 9GB 사용/100% utilization 화면을 batch 최적화 완료 근거로 쓰지 않는다.
 - ad041e2 서버 실행의 V5 집계 실패와 Cycle IPC 실패, 후속 교정 및 기존 결과 격리는
   `EXPERIMENT_STATUS.md`와 `RICH_SCALING_EXPERIMENTS.md`에 함께 기록한다.
   로컬 테스트 통과를 Linux 전체 데이터 전처리나 GPU 전체 학습 성공으로 해석하지 않는다.
