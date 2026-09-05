@@ -7,6 +7,32 @@ V5는 V4 점수의 후속 반복이 아니라, V3/V4에서 상대 C가 거의 `C
 fixed/dynamic 전체 비교는 아직 없으며 SOTA 주장을 하지 않는다.
 외부 suite identity는 `conductance_graph_conditioned_v5`다.
 
+### 2026-09-05 ad041e2 실행의 집계 오류 수정
+
+사용자 run `v5-cycle-se-pe-a6000-gpu3-seed0-v1`에서 첫
+`reference/ogbn-arxiv/fixed_c`는 54 epochs·2,430 optimizer steps를 완료하고
+최고 validation 0.719621을 저장한 뒤 child `passed`를 출력했다. 이후 scaling 집계가
+`throughput.scope` 누락으로 실패해 나머지 V5 19개는 시작하지 않았다.
+첫 fixed-C의 allocator peak는 7,505,515,008 bytes였다. 이는 dynamic-C/large의
+OOM 해결 또는 전체 V5 비교 성공을 증명하지 않는다.
+
+원인은 V5 writer와 공통 telemetry validator의 계약 불일치다. scope 누락뿐 아니라
+`*_per_elapsed_second` 이름과 raw boolean도 validator가 요구하는 형식과 달랐다.
+현재 writer는 명시적 scope, `*_per_second` 관측값 및 누적 history/elapsed 분모를
+기록하며 실제 writer 결과를 scaling 소비 경로에 전달하는 회귀 검사를 추가했다.
+분모에 validation/checkpoint/intervention 등이 포함된 기존 타이머 경계를 보존하며,
+이를 순수 GPU forward 처리량 또는 배치 최적값으로 바꾸어 해석하지 않는다.
+
+**이 수정은 V5 모델 구조 변경이 아니다.** V5 소스는 같은 경로에서 갱신되므로
+이전 V5 소스 폴더를 따로 지울 필요도 없다. ad041e2의 C/W/beta, reference/large 크기,
+optimizer, sampling, physical batch, 학습/선택 규칙과 checkpoint state 구조를 유지한다.
+다만 train.py의 source fingerprint가 바뀌므로 이전 실패 run에 새 소스를 강제로 resume하지
+않는다. 기존 checkpoint를 삭제하거나 hash를 바꿔 끼우지 않고, 실패 run 전체를 복구 가능한
+격리 폴더에 보존하는 선택지를 [실행 문서](RICH_SCALING_EXPERIMENTS.md)에 제공한다.
+
+더 오래된 214265c까지 전부 동일하다는 뜻은 아니다. 이후 사용되지 않는 fixed-C scorer 제거와
+공통 파라미터 초기화 정렬이 있었으므로 구 parameter key/초기 state와 현재 결과를 혼합하지 않는다.
+
 ## 모델 계약
 
 그래프 \(G=(V,E,X)\), layer \(l\)에서 하나의 shared conductance field를 만든다.

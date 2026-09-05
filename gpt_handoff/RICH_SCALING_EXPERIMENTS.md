@@ -8,6 +8,77 @@ capacity에서 성능을 낼 수 있는지를 본다. 기본 seed는 시간 제�
 안내가 아니다. 이번 QR-free 교체의 새 Cycle V2만 실행하는 명령은 마지막 절과
 [CYCLE_PE_V2.md](CYCLE_PE_V2.md)를 따른다. 구 source/checkpoint의 strict resume 검사는 우회하지 않는다.
 
+## ad041e2 실패 실행 격리와 수정판 재실행
+
+`v5-cycle-se-pe-a6000-gpu3-seed0-v1`은 첫 V5 fixed-C 학습 후 throughput 집계 오류,
+Cycle 8개는 CPU IPC mmap 누적으로 학습 전 실패했다. 이번 수정은 기록/전달 방식 수정이지
+ad041e2 대비 V5 또는 SE/PE 모델 구조 교체가 아니다. 과거 214265c의 unused fixed-C scorer와
+공통 초기화 계약은 달랐으므로 그 더 오래된 결과까지 동일 모델 실행으로 묶지 않는다.
+
+소스 무결성 계약은 유지한다. 이전 실패 run의 hash/checkpoint/manifest를 고쳐 새 run으로
+가장하지 않는다. 첫 fixed-C 54-epoch 결과는 역사적 partial artifact로 남고, 아래 새 source
+run은 별도 학습이다. 이전 결과를 반드시 지워야 새 모델이 작동하는 것은 아니며, **격리는
+선택 사항**이다. 새 run ID만으로도 기존 결과와 분리된다.
+
+사용자가 이전 V5 결과를 현재 결과 폴더에서 치우려는 경우, 서버에서 해당 run이 완전히
+끝난 뒤 저장소 루트의 `new-gat` 환경에서 먼저 **읽기 전용 계획**을 확인한다.
+
+```bash
+python -B scripts/archive_failed_rich_run.py --run-id v5-cycle-se-pe-a6000-gpu3-seed0-v1
+```
+
+출력에 나오는 원본은 아래 **지정한 실행의 세 폴더만**이어야 한다. 참조되지 않은 경로나
+다른 run, 원본 dataset/cache, V1–V4/Cycle V1/Tree를 자동 탐색해 이동하지 않는다.
+
+- `results/rich_scaling/v5-cycle-se-pe-a6000-gpu3-seed0-v1`
+- `results/conductance_gat/scaling/v5-cycle-se-pe-a6000-gpu3-seed0-v1-conductance`
+- `results/cycle_pe/scaling/v5-cycle-se-pe-a6000-gpu3-seed0-v1-cycle`
+
+계획이 맞을 때만 별도로 적용한다. 이 명령은 **영구 삭제가 아니라 같은 filesystem의
+rename**이다. 적용 시 Linux `/proc`에서 현재 사용자 소유 활성 작업을 확인하며, 동일
+run/output을 사용하는 작업이나 불명확한 상태·링크·경로 이탈·기존 대상이 있으면 거부한다.
+같은 run을 다른 터미널에서 새로 실행하면서 동시에 격리하지 않는다.
+
+```bash
+python -B scripts/archive_failed_rich_run.py --run-id v5-cycle-se-pe-a6000-gpu3-seed0-v1 --apply
+```
+
+원본 manifest/checkpoint 내용은 고치지 않고
+`results/_archived_failed_runs/<run-id>-<UTC>-<unique>/`에 보관하며 이동 기록에
+원래 위치와 격리 위치를 남긴다. 중간 이동 실패도 숨기지 않으며 기록된 경로로 복구할 수 있다.
+이미 passed인 전체 실행, legacy version이 섞인 실행, 실행 중인 작업은 이 도구의 대상이 아니다.
+이 문서는 사용자의 서버에서 실제로 격리를 실행했다는 보고가 아니다.
+
+수정판 source가 게시되고 서버에서 동기화된 뒤, **새 run ID**로 V5와 Cycle V2 SE/PE만
+실행하는 GPU 3/A6000 명령은 다음과 같다. V5 20학습 + Cycle 8학습 = **28학습**이며
+Cycle의 encoding×dataset별 선택 checkpoint test 평가4회는 추가 학습이 아니다.
+이후 동일 source/config/run ID의 재실행만 epoch checkpoint부터 resume한다.
+
+```bash
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+python -B scripts/run_rich_scaling.py \
+  --run-id v5-cycle-se-pe-a6000-gpu3-seed0-v2 \
+  --tracks conductance cycle \
+  --conductance-versions v5 --cycle-versions v2 \
+  --cycle-v2-encodings se pe \
+  --profiles reference large --model-seeds 0 \
+  --hardware-profile a6000-48gb --min-free-gb 40 \
+  --cycle-v2-basis-backend dfs_fundamental --device cuda:0
+```
+
+### CPU 대량 IPC 회귀와 실제 GPU 학습의 구분
+
+기존 7천 그래프 실패 구간을 넘는 1만 합성 그래프의 실제 process-pool 준비와 cache 검증은
+별도 opt-in debug 검사로 수행한다. Linux에서는 `/proc/self/maps` 및 fd 수가 그래프 수에
+비례해 누적되지 않는지도 검사한다. Windows 로컬 검사에서는 이 Linux 관측을 unavailable로
+기록하며 CUDA/실제 데이터 성능을 검증한 것처럼 보고하지 않는다.
+
+```bash
+CYCLE_V2_IPC_STRESS_GRAPHS=10000 python -B -m pytest -q -s research/cycle_pe/tests/test_v2_data.py::test_debug_large_synthetic_preparation_and_cache_ipc_have_bounded_os_handles
+```
+
+이 환경변수는 위 테스트 전용이며 실제 dataset/worker/batch 설정을 변경하지 않는다.
+
 ## Architecture profiles
 
 ### Conductance V1–V5

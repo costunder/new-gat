@@ -205,7 +205,9 @@ def test_same_run_preserves_last_checkpoint_and_adds_resume(tmp_path, monkeypatc
                     "peak_cuda_allocated_bytes": 1024,
                     "peak_cuda_reserved_bytes": 2048,
                     "hardware_execution": hardware_execution,
-                    "throughput": {"training_batches_per_elapsed_second": 1.0},
+                    "throughput": train.training_throughput(
+                        [{"train_label_count": 12, "train_batches": 3}], 3.0
+                    ),
                 }
             ),
             encoding="utf-8",

@@ -198,10 +198,35 @@ V5도 diffusion source가 변경되었으므로 구 source checkpoint의 resume 
 
 ## 검증 범위와 역사적 GPU 실패
 
-2026-09-05 SE/PE 분리 후 전체 로컬 CPU 회귀는 **1,852 passed / 98 skipped / 1 warning**
+IPC 수정 후 전체 로컬 CPU 회귀는 **1,940 passed / 99 skipped** (189.74초)다.
+이 실행에는 1만 합성 그래프의 실제 병렬 준비와 cache 재검증도 포함됐다.
+Windows 호스트에서 private storage·값·순서 보존은 확인했지만 Linux mmap/FD 수 실측과
+native renameat2, 실제 PyG 데이터 학습·GPU 성능은 확인하지 못했다.
+
+2026-09-05 SE/PE 분리 당시 전체 로컬 CPU 회귀는 **1,852 passed / 98 skipped / 1 warning**
 (164.78초)이며 Ruff와 코드 스냅샷 일치 검사도 통과했다. 생략은 Linux/Bash, Windows
 symlink 권한, 미설치 PyG 및 CUDA/BF16 환경 조건 때문이다. 경고는 PyTorch multiprocessing의
 sparse tensor 재구성 시 내부 invariant-check 정책 경고이며, 저장 데이터의 불변식은 별도로 검사한다.
+
+그 뒤 ad041e2 서버 실행은 GPU 학습 전에 두 dataset 모두 약 7천 그래프에서
+`rebuild_storage_fd -> _new_shared_fd_cpu -> mmap ENOMEM`으로 실패했다.
+작업자가 반환한 Graph의 작은 Tensor storage들을 부모가 split 전체 동안 유지해
+공유 mmap/FD가 누적된 경로였다. 정확한 서버의 OS 한도는 측정하지 않았지만
+4~732 bytes 매핑도 실패하는 양상은 `vm.max_map_count` 고갈과 잘 맞는다.
+이전 소규모 process-pool smoke는 이 누적을 검증하지 못했다.
+
+현재는 pool에 보내는 공식 graph/cache 입력과 돌아오는 결과 모두 Tensor-free owned
+NumPy byte payload로 전달하고 부모의 일반 CPU storage로 복원한다. Sparse indices/values,
+dtype, shape, 모든 cycle/위치/샘플 및 순서를 유지하며 cache 검증에도 같은 경로를 적용한다.
+Pool workers, bounded chunks, 모델, 기저 알고리즘, batch 및 dataset을 줄이지 않는다.
+공식 InMemoryDataset의 큰 backing storage를 샘플마다 복제하지 않도록 필요한 graph slice만
+보낸다. Serial/parallel 값 동치, 양방향 IPC에서 torch storage reducer가 호출되지 않는 계약,
+복원 결과가 shared storage가 아닌지 검사하며 10,000-graph 합성 stress는 별도 opt-in debug다.
+이는 실제 Linux kernel 한도나 서버 GPU 전체 학습 검증을 대신하지 않는다.
+
+현재도 cache는 split 전체를 완성한 뒤 저장하므로 전처리 중 중단된 미완성 split은 다시 준비한다.
+epoch checkpoint 재개와 전처리 중간 재개를 혼동하지 않는다. 모델/PE/cache 내용 형식은
+ad041e2와 같지만 실행 source identity는 달라 이전 실패 run에 강제로 이어 붙이지 않는다.
 
 현재 구현은 CPU에서 좌영공간·기저 독립성·실제 cycle 순서·sparse SE/PE·gradient·배치·재개
 계약을 검증한다. 위치 항의 explicit cosine-kernel 동치, 시작점/방향 불변성, 표식 결합까지의

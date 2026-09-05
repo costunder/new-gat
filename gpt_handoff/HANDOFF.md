@@ -19,9 +19,24 @@
 
 ## 0. 리뷰어가 먼저 알아야 할 판정
 
+### 2026-09-05 ad041e2 서버 실행 후 추가 교정
+
+최신 전체 CPU 회귀는 **1,940 passed / 99 skipped** (189.74초)이며 1만 합성 그래프의
+실제 병렬 준비·cache 재검증을 포함한다. Ruff·코드 스냅샷 검증도 통과했다.
+Linux/CUDA 조건 및 실제 서버 전체 학습은 미검증이고 실제 결과의 이동/삭제는 하지 않았다.
+
+`v5-cycle-se-pe-a6000-gpu3-seed0-v1`의 V5 첫 fixed-C는 54 epochs·최고 validation
+0.719621을 저장했지만 throughput 출력과 집계 schema 불일치로 전체 track이 실패했다.
+Cycle 8개는 약 7천 graph부터 CPU IPC shared-storage mmap ENOMEM으로 전처리에서 실패했다.
+현재 교정은 V5의 telemetry 계약 통일과 Cycle 새 준비/캐시 검증 양방향의 Tensor-free
+owned-memory IPC다. C/W/beta, SE/PE 수식, 모델 크기, batch와 전체 데이터는 그대로다.
+수정 source를 구 checkpoint에 강제 연결하지 않으며 구 실행은 삭제 대신 명시적 whole-run
+격리 도구로 보존할 수 있다. 상세 실패·검증 한계는 [EXPERIMENT_STATUS.md](EXPERIMENT_STATUS.md),
+새 실행 및 격리는 [RICH_SCALING_EXPERIMENTS.md](RICH_SCALING_EXPERIMENTS.md)를 따른다.
+
 ### 2026-09-05 V5 메모리 수정과 Cycle V2 SE/상대 PE 분리 — 아래 과거 기록보다 우선한다
 
-- 최신 로컬 CPU 전체 회귀는 **1,852 passed / 98 skipped / 1 warning** (164.78초)이며
+- 이 분리 시점의 로컬 CPU 전체 회귀는 **1,852 passed / 98 skipped / 1 warning** (164.78초)이며
   Ruff·코드 스냅샷 일치 검사도 통과했다. Linux/Bash·Windows symlink 권한·미설치 PyG·
   CUDA/BF16 조건 때문에 일부 검사는 생략됐다. PyTorch multiprocessing sparse 재구성 경고
   1개를 숨기지 않았으며 실제 데이터 전체 학습·평가·A6000 성능 검증은 아직 수행하지 않았다.
@@ -1657,7 +1672,7 @@ roundtrip/invariance/sensitivity, collision과 suite partial failure를 검사�
 
 ## 8. 자동 검증 상태
 
-현재 전체 scaling runner까지 포함한 구현은 `PYTHONUTF8=1` 전체 로컬 회귀에서
+이전 전체 scaling runner 추가 시점의 구현은 `PYTHONUTF8=1` 전체 로컬 회귀에서
 **1418 passed / 77 skipped** (80.24 s, exit 0)를 통과했다. 버전별 전용 결과는 V2
 **118 passed**, V3 **141 passed / 2 skipped**, V4 **131 passed**다. Ruff·compileall과
 재생성한 `code_summary --check`도 통과했다. 생략은 Linux/Bash 계약, Windows symlink 권한,

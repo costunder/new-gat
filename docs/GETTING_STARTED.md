@@ -311,6 +311,14 @@ V5와 새 Cycle V2라면 `last.pt`부터 이어지고, checkpoint 계약이 없�
 프로필별 크기, 정확한 횟수, portable/10GB MIG와 GPU 3/A6000 실행 예시 및 결과 경로는
 [전체 scaling 문서](../gpt_handoff/RICH_SCALING_EXPERIMENTS.md)에 있다.
 
+ad041e2의 `v5-cycle-se-pe-a6000-gpu3-seed0-v1` 실행 후 수정은 V5 throughput 기록
+형식과 Cycle 병렬 IPC의 메모리 소유권만 바꾼다. 모델 구조/크기/학습 설정은 그대로지만
+source identity는 바뀌므로 해당 실패 run에 수정판을 강제로 resume하지 않는다.
+기존 결과는 지워야만 하는 것이 아니며 새 run ID로 분리할 수 있다. 치우려면
+`scripts/archive_failed_rich_run.py`의 기본 읽기 전용 계획을 확인한 뒤
+`--apply`로 실패한 V5/CycleV2 연결 결과만 복구 가능한 폴더로 격리한다.
+정확한 대상과 수정판 28-training 명령은 위 전체 scaling 문서의 첫 절을 따른다.
+
 기본 세 트랙 benchmark와 `portable` scaling의 공통 기본값은 CUDA, model seed `0`,
 data/split/chart seed `0`이다. 기본 benchmark의 workers는 `4`다. 별도 Conductance
 V1/V3/V4/V5의 PPI graph-minibatch DataLoader도 기본 workers `4`, prefetch factor `2`,

@@ -446,6 +446,68 @@ def merge_efficiency(
     }
 
 
+def training_throughput(
+    history: list[dict[str, Any]], elapsed_seconds: float
+) -> dict[str, Any]:
+    """Report retained training work over the existing cumulative wall-time interval.
+
+    History and elapsed time both include restored checkpoint state. This is not
+    a training-kernel benchmark: validation/checkpoint IO and final interventions
+    within the timed interval remain in the denominator.
+    """
+
+    if (
+        isinstance(elapsed_seconds, bool)
+        or not isinstance(elapsed_seconds, (int, float))
+        or not math.isfinite(elapsed_seconds)
+        or elapsed_seconds < 0
+    ):
+        raise ValueError("throughput elapsed_seconds must be finite and nonnegative")
+    if not isinstance(history, list) or not history:
+        raise ValueError("throughput requires nonempty completed epoch history")
+    counts = {"train_label_count": 0, "train_batches": 0}
+    for epoch, row in enumerate(history, start=1):
+        for field in counts:
+            value = row.get(field) if isinstance(row, dict) else None
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(
+                    f"throughput history epoch {epoch} {field} must be a positive integer"
+                )
+            counts[field] += value
+    elapsed_seconds = float(elapsed_seconds)
+
+    def rate(count: int, unit: str) -> dict[str, Any]:
+        return (
+            observed(count / elapsed_seconds, unit=unit)
+            if elapsed_seconds > 0
+            else observed(
+                None, reason="observed cumulative wall duration was zero", unit=unit
+            )
+        )
+
+    return {
+        "scope": (
+            "Cumulative retained epoch-loop wall time plus selected-checkpoint intervention "
+            "evaluation; includes training, validation and checkpoint IO within timed intervals"
+        ),
+        "timer_boundary": (
+            "CUDA-synchronized immediately before the epoch loop and after selected-checkpoint "
+            "interventions; model/data setup and final metrics serialization are excluded"
+        ),
+        "resume_accounting": (
+            "Complete restored history counts divided by restored elapsed time plus this "
+            "invocation's measured duration; interrupted work after the last checkpoint and "
+            "checkpoint serialization after its saved timer snapshot are not reconstructible"
+        ),
+        "completed_epochs": len(history),
+        "supervised_training_labels": counts["train_label_count"],
+        "training_batches": counts["train_batches"],
+        "elapsed_seconds": elapsed_seconds,
+        "supervised_labels_per_second": rate(counts["train_label_count"], "labels_per_second"),
+        "training_batches_per_second": rate(counts["train_batches"], "batches_per_second"),
+    }
+
+
 def _integer_distribution(values: list[int]) -> dict[str, int | float]:
     if not values:
         raise ValueError("cannot summarize an empty observation")
@@ -1682,19 +1744,7 @@ def _train_model_impl(
         "test_evaluated": False,
         "versions": _versions(),
         "gpu": torch.cuda.get_device_name(device),
-        "throughput": {
-            "supervised_labels_per_elapsed_second": (
-                sum(row["train_label_count"] for row in history) / efficiency["elapsed_seconds"]
-                if efficiency["elapsed_seconds"] > 0
-                else None
-            ),
-            "training_batches_per_elapsed_second": (
-                sum(row["train_batches"] for row in history) / efficiency["elapsed_seconds"]
-                if efficiency["elapsed_seconds"] > 0
-                else None
-            ),
-            "elapsed_includes_validation_checkpointing_and_interventions": True,
-        },
+        "throughput": training_throughput(history, float(efficiency["elapsed_seconds"])),
         "peak_cuda_allocated_fraction_of_visible_capacity": (
             efficiency["peak_cuda_allocated_bytes"] / hardware_runtime["total_memory_bytes"]
         ),

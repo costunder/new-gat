@@ -38,6 +38,9 @@ Conductance v2/v3/v4/v5와 Cycle PE v2는 각각의 원문 문서를 직접 제�
 
 ## 근거 범위
 
+- ad041e2 서버 실행의 V5 집계 실패와 Cycle IPC 실패, 후속 교정 및 기존 결과 격리는
+  `EXPERIMENT_STATUS.md`와 `RICH_SCALING_EXPERIMENTS.md`에 함께 기록한다.
+  로컬 테스트 통과를 Linux 전체 데이터 전처리나 GPU 전체 학습 성공으로 해석하지 않는다.
 - `CODE_SUMMARY.md`는 source/test/config/script를 담지만 데이터와 실제 run artifact는 포함하지 않는다.
 - GPU 성능을 독립 재검증하려면 서버의 manifest, checkpoint, history와 결과 파일을 별도로 첨부해야 한다.
 - 폴더 밖의 `docs/`는 설치·실행과 개별 과거 실험을 사람이 찾아보는 프로젝트 문서이며 기본 GPT

@@ -8,11 +8,42 @@
 
 ## 1. 소스 버전과 측정 범위
 
-2026-09-05 SE/PE 분리 완료 후 최신 로컬 CPU 전체 회귀는 **1,852 passed / 98 skipped /
+throughput/IPC/격리 교정 후 최신 전체 로컬 CPU 회귀는 **1,940 passed / 99 skipped**
+(189.74초)다. `CYCLE_V2_IPC_STRESS_GRAPHS=10000`으로 실제 2-worker의 1만 합성
+그래프 준비·캐시 검증까지 이 전체 실행에 포함했다. Ruff·코드 스냅샷 일치 검사도 통과했다.
+생략은 Linux/Bash, native Linux renameat2, Windows symlink 권한, 미설치 PyG, CUDA/BF16
+조건이다. 실제 서버의 mmap/FD 한도와 GPU 전체 학습·평가를 검증한 결과는 아니다.
+실제 이전 결과의 격리/삭제도 실행하지 않았으며 격리 테스트는 합성 디렉터리만 사용했다.
+
+2026-09-05 SE/PE 분리 완료 당시 로컬 CPU 전체 회귀는 **1,852 passed / 98 skipped /
 1 warning** (164.78초)다. Ruff 및 코드 스냅샷 일치 검사도 통과했다. 생략은 Linux/Bash,
 Windows symlink 권한, 미설치 PyG, CUDA/BF16 환경 조건이며 경고는 PyTorch multiprocessing의
 sparse tensor 재구성 경고다. 이는 실제 데이터 전체 학습·평가나 A6000 성능 검증이 아니다.
 아래 이전 구현 시점의 테스트 수치는 역사 기록으로 보존한다.
+
+### ad041e2 이후 수령한 실제 실패와 후속 수정
+
+사용자 첨부 `9e790812-518b-4369-9745-88f1fc46d76e/pasted-text.txt`의 SHA-256은
+`BE7433E5C4C5570B26C83F301845EA0DF557829C0DC45F77163C9307B5EC3E63`다.
+run ID는 `v5-cycle-se-pe-a6000-gpu3-seed0-v1`, A6000 GPU 3,
+Torch 2.7.1+cu118, model seed 0, 계획은 V5 20학습과 Cycle SE/PE 8학습이었다.
+전체 checkpoint/manifest를 로컬로 수령한 독립 재검증은 아니다.
+
+- V5 첫 reference/ogbn-arxiv/fixed-C가 54 epochs·2,430 steps를 완료하고
+  최고 validation 0.719621, allocator peak 7,505,515,008 bytes를 기록했다.
+  child 저장 후 `passed`를 출력했지만 집계의 `throughput.scope` 검사에서 실패했다.
+  나머지 19개 V5는 미실행이며 이 값으로 fixed/dynamic 또는 reference/large 비교를 하지 않는다.
+- Cycle 8개 조건은 모두 전처리 중 공유 storage mmap 실패로 학습을 시작하지 못했다.
+  약 7천 그래프 이후 몇 bytes 매핑도 ENOMEM인 현상은 mapping-count 누적과 맞지만
+  서버의 실제 `vm.max_map_count`/cgroup/주소공간 한도는 확인하지 못했다.
+- GPU utilization은 `pynvml` 미설치와 UUID 없는 numeric-device mapping 거부로 null이다.
+  이를 GPU 사용률 0%로 해석하지 않는다. 이 계측 부재가 위 두 실패를 일으킨 원인은 아니다.
+
+후속 수정은 V5 telemetry writer/consumer 계약 정합화와 Cycle 양방향 Tensor-free IPC다.
+V5/Cycle 모델 구조·파라미터·데이터·batch는 ad041e2 대비 바뀌지 않는다. 이전 테스트는
+실제 writer→집계 연결과 Linux 대량 IPC 누적을 놓쳤으므로 그 테스트 수를 전체 GPU 검증으로
+인용하지 않는다. 이전 실패 결과는 삭제/수정하지 않고 선택적으로 whole-run 격리하며
+새 source run과 혼합하거나 hash 검사를 우회하지 않는다.
 
 현재 최상위 구조는 [Conductance V5](CONDUCTANCE_V5.md)와 새
 [Cycle PE V2](CYCLE_PE_V2.md)다. V5는 shared graph-conditioned dynamic C와 multi-head W,
@@ -190,7 +221,7 @@ child exit 0까지 완료됐지만 구 numeric hard gate에서 중단되어 나�
 성능 수치는 수령하지 않았고 이 partial arm은 재사용하지 않으므로, 정식 V4 결과에는 새
 run의 5개 데이터 × 네 fresh arm, 총 20 jobs가 모두 필요하다.
 
-현재 전체 scaling runner까지 포함한 구현은 `PYTHONUTF8=1` 전체 로컬 회귀에서
+이전 전체 scaling runner 추가 시점의 구현은 `PYTHONUTF8=1` 전체 로컬 회귀에서
 **1418 passed / 77 skipped** (80.24 s, exit 0)를 통과했다. V2/V3/V4 전용 결과는 각각
 **118 passed**, **141 passed / 2 skipped**, **131 passed**다. Ruff·compileall과 재생성한
 `code_summary --check`도 통과했다. 생략은 Linux/Bash·Windows symlink 권한·로컬 PyG 미설치·

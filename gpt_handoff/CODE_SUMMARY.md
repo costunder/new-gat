@@ -29383,6 +29383,68 @@ def merge_efficiency(
     }
 
 
+def training_throughput(
+    history: list[dict[str, Any]], elapsed_seconds: float
+) -> dict[str, Any]:
+    """Report retained training work over the existing cumulative wall-time interval.
+
+    History and elapsed time both include restored checkpoint state. This is not
+    a training-kernel benchmark: validation/checkpoint IO and final interventions
+    within the timed interval remain in the denominator.
+    """
+
+    if (
+        isinstance(elapsed_seconds, bool)
+        or not isinstance(elapsed_seconds, (int, float))
+        or not math.isfinite(elapsed_seconds)
+        or elapsed_seconds < 0
+    ):
+        raise ValueError("throughput elapsed_seconds must be finite and nonnegative")
+    if not isinstance(history, list) or not history:
+        raise ValueError("throughput requires nonempty completed epoch history")
+    counts = {"train_label_count": 0, "train_batches": 0}
+    for epoch, row in enumerate(history, start=1):
+        for field in counts:
+            value = row.get(field) if isinstance(row, dict) else None
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(
+                    f"throughput history epoch {epoch} {field} must be a positive integer"
+                )
+            counts[field] += value
+    elapsed_seconds = float(elapsed_seconds)
+
+    def rate(count: int, unit: str) -> dict[str, Any]:
+        return (
+            observed(count / elapsed_seconds, unit=unit)
+            if elapsed_seconds > 0
+            else observed(
+                None, reason="observed cumulative wall duration was zero", unit=unit
+            )
+        )
+
+    return {
+        "scope": (
+            "Cumulative retained epoch-loop wall time plus selected-checkpoint intervention "
+            "evaluation; includes training, validation and checkpoint IO within timed intervals"
+        ),
+        "timer_boundary": (
+            "CUDA-synchronized immediately before the epoch loop and after selected-checkpoint "
+            "interventions; model/data setup and final metrics serialization are excluded"
+        ),
+        "resume_accounting": (
+            "Complete restored history counts divided by restored elapsed time plus this "
+            "invocation's measured duration; interrupted work after the last checkpoint and "
+            "checkpoint serialization after its saved timer snapshot are not reconstructible"
+        ),
+        "completed_epochs": len(history),
+        "supervised_training_labels": counts["train_label_count"],
+        "training_batches": counts["train_batches"],
+        "elapsed_seconds": elapsed_seconds,
+        "supervised_labels_per_second": rate(counts["train_label_count"], "labels_per_second"),
+        "training_batches_per_second": rate(counts["train_batches"], "batches_per_second"),
+    }
+
+
 def _integer_distribution(values: list[int]) -> dict[str, int | float]:
     if not values:
         raise ValueError("cannot summarize an empty observation")
@@ -30619,19 +30681,7 @@ def _train_model_impl(
         "test_evaluated": False,
         "versions": _versions(),
         "gpu": torch.cuda.get_device_name(device),
-        "throughput": {
-            "supervised_labels_per_elapsed_second": (
-                sum(row["train_label_count"] for row in history) / efficiency["elapsed_seconds"]
-                if efficiency["elapsed_seconds"] > 0
-                else None
-            ),
-            "training_batches_per_elapsed_second": (
-                sum(row["train_batches"] for row in history) / efficiency["elapsed_seconds"]
-                if efficiency["elapsed_seconds"] > 0
-                else None
-            ),
-            "elapsed_includes_validation_checkpointing_and_interventions": True,
-        },
+        "throughput": training_throughput(history, float(efficiency["elapsed_seconds"])),
         "peak_cuda_allocated_fraction_of_visible_capacity": (
             efficiency["peak_cuda_allocated_bytes"] / hardware_runtime["total_memory_bytes"]
         ),
@@ -40296,7 +40346,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import fields, replace
+import os
+import sys
+import time
+from dataclasses import fields, is_dataclass, replace
+from multiprocessing.reduction import ForkingPickler
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -40977,6 +41032,188 @@ def test_actual_process_parallel_preparation_and_cached_validation_preserve_full
         for field in fields(first):
             torch.testing.assert_close(getattr(first, field.name), getattr(parallel, field.name))
             torch.testing.assert_close(getattr(first, field.name), getattr(cached, field.name))
+        _assert_graph_has_private_storage(parallel)
+        _assert_graph_has_private_storage(cached)
+    for source in sources:
+        assert all(
+            not getattr(source, name).is_shared() for name in ("x", "edge_index", "edge_attr", "y")
+        )
+
+
+def _assert_graph_has_private_storage(graph):
+    for field in fields(graph):
+        value = getattr(graph, field.name)
+        storage_tensors = (
+            (value._indices(), value._values()) if value.layout == torch.sparse_coo else (value,)
+        )
+        assert all(not part.is_shared() for part in storage_tensors), field.name
+
+
+def _assert_tensor_free_ipc(value):
+    assert not isinstance(value, torch.Tensor)
+    if is_dataclass(value):
+        for field in fields(value):
+            _assert_tensor_free_ipc(getattr(value, field.name))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _assert_tensor_free_ipc(key)
+            _assert_tensor_free_ipc(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _assert_tensor_free_ipc(item)
+    elif isinstance(value, np.ndarray):
+        assert value.dtype == np.uint8
+        assert value.flags.owndata and value.flags.c_contiguous
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.long, torch.float32, torch.float64, torch.bfloat16, torch.bool, torch.complex64]
+)
+@pytest.mark.parametrize("empty", [False, True])
+def test_owned_wire_preserves_dense_dtype_shape_and_values_without_tensor_reducers(dtype, empty):
+    values = torch.arange(80).reshape(8, 10).to(dtype)
+    view = values[::2, :0] if empty else values[::2, 2:5]
+    encoded = data._encode_graph_ipc(view)
+    _assert_tensor_free_ipc(encoded)
+    assert encoded.buffer.nbytes == view.numel() * view.element_size()
+    actual = data._decode_graph_ipc(encoded)
+    assert actual.dtype == dtype and actual.shape == view.shape
+    assert not actual.is_shared()
+    torch.testing.assert_close(actual, view)
+    if not empty:
+        values.fill_(0)
+        assert actual.any()  # The payload must not alias the source's backing allocation.
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_preparation_and_validation_ipc_never_serialize_torch_shared_storage(monkeypatch, cached):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Tensor storage crossed the process queue")
+
+    monkeypatch.setattr(torch.UntypedStorage, "_share_fd_cpu_", forbidden)
+    monkeypatch.setattr(torch.UntypedStorage, "_share_filename_cpu_", forbidden)
+    source = _official()
+    expected = data.prepare_graph(source, dataset="zinc12k")
+    if cached:
+        row = {field.name: getattr(expected, field.name) for field in fields(expected)}
+        function, task = data._validate_cached_graph_task, (row, source, "zinc12k")
+    else:
+        function, task = data._prepare_task, (source, "zinc12k", "dfs_fundamental")
+    request = data._encode_graph_ipc([task])
+    _assert_tensor_free_ipc(request)
+    # Exercise exactly the pickler used by multiprocessing, in both directions.
+    incoming = ForkingPickler.loads(ForkingPickler.dumps(request))
+    response = data._apply_graph_chunk(function, incoming)
+    _assert_tensor_free_ipc(response)
+    outgoing = ForkingPickler.loads(ForkingPickler.dumps(response))
+    actual = data._decode_graph_ipc(outgoing[0])
+    for field in fields(expected):
+        torch.testing.assert_close(getattr(actual, field.name), getattr(expected, field.name))
+    _assert_graph_has_private_storage(actual)
+
+
+def test_owned_wire_copies_only_logical_official_views_not_entire_dataset_storage():
+    source = _official()
+    backing = torch.arange(200_000).reshape(-1, 1)
+    source.x = backing[100:104]
+    encoded = data._encode_graph_ipc(source)
+    _assert_tensor_free_ipc(encoded)
+    assert encoded.attributes["x"].buffer.nbytes == 4 * source.x.element_size()
+    restored = data._decode_graph_ipc(encoded)
+    assert restored.x.untyped_storage().nbytes() == 4 * source.x.element_size()
+    torch.testing.assert_close(restored.x, source.x)
+
+
+@pytest.mark.parametrize("scalar", [False, True])
+def test_owned_wire_handles_scalars_and_zero_stride_singleton_views(scalar):
+    value = torch.tensor(3.25) if scalar else torch.tensor([3.25]).as_strided((1,), (0,))
+    actual = data._decode_graph_ipc(data._encode_graph_ipc(value))
+    torch.testing.assert_close(actual, value)
+    assert actual.shape == value.shape and not actual.is_shared()
+
+
+def test_graph_wire_rejects_tensor_keys_and_non_cpu_tensors_before_process_submission():
+    with pytest.raises(TypeError, match="string field names"):
+        data._encode_graph_ipc({torch.tensor(1): "invalid field"})
+    with pytest.raises(ValueError, match="CPU tensors; no device fallback"):
+        data._encode_graph_ipc(torch.empty(3, device="meta"))
+    with pytest.raises(TypeError, match="unsupported graph preparation IPC value"):
+        data._encode_graph_ipc(object())
+
+
+def test_empty_wire_cannot_replace_missing_nonempty_data():
+    wire = data._DenseTensorWire(np.empty(0, dtype=np.uint8), torch.float32, (2,))
+    with pytest.raises(ValueError, match="cannot encode a nonempty tensor"):
+        data._decode_graph_ipc(wire)
+
+
+def _linux_ipc_snapshot():
+    if not sys.platform.startswith("linux"):
+        return {"available": False, "reason": "Linux /proc is unavailable on this test host"}
+    return {
+        "available": True,
+        "maps": len(Path("/proc/self/maps").read_text().splitlines()),
+        "open_fds": len(list(Path("/proc/self/fd").iterdir())),
+        "max_map_count": int(Path("/proc/sys/vm/max_map_count").read_text()),
+    }
+
+
+@pytest.mark.skipif(
+    "CYCLE_V2_IPC_STRESS_GRAPHS" not in os.environ,
+    reason="opt-in 10k+ synthetic IPC stress, separate from default unit/smoke tests",
+)
+def test_debug_large_synthetic_preparation_and_cache_ipc_have_bounded_os_handles():
+    """No real data/training: retain 10k+ full cycle Graphs across both IPC paths.
+
+    Run this test with CYCLE_V2_IPC_STRESS_GRAPHS=10000. On Linux it also checks
+    process mmap/FD growth while all prepared and validated graphs remain alive.
+    """
+    count = int(os.environ["CYCLE_V2_IPC_STRESS_GRAPHS"])
+    assert count >= 10_000, "this explicit regression stress must cover at least 10k graphs"
+    started = time.perf_counter()
+    before = _linux_ipc_snapshot()
+    sources = [_official() for _ in range(count)]
+    for index, source in enumerate(sources):
+        source.y.fill_(index)
+    prepared = data._prepare_split(
+        sources,
+        dataset="zinc12k",
+        split="debug_ipc_stress",
+        basis_backend="dfs_fundamental",
+        workers=2,
+    )
+    after_preparation = _linux_ipc_snapshot()
+    rows = [
+        {field.name: getattr(graph, field.name) for field in fields(graph)} for graph in prepared
+    ]
+    restored = data._validate_cached_graphs(rows, sources, "zinc12k", workers=2)
+    assert len(prepared) == len(restored) == count
+    for index, (first, second) in enumerate(zip(prepared, restored, strict=True)):
+        assert first.y.item() == second.y.item() == index
+        _assert_graph_has_private_storage(first)
+        _assert_graph_has_private_storage(second)
+        for field in fields(first):
+            torch.testing.assert_close(getattr(first, field.name), getattr(second, field.name))
+    after_validation = _linux_ipc_snapshot()
+    if before["available"]:
+        for snapshot in (after_preparation, after_validation):
+            assert snapshot["maps"] - before["maps"] < 2048
+            assert snapshot["open_fds"] - before["open_fds"] < 256
+    print(
+        json.dumps(
+            {
+                "kind": "debug_synthetic_cpu_ipc_stress",
+                "graphs": count,
+                "workers": 2,
+                "seconds": time.perf_counter() - started,
+                "before": before,
+                "after_preparation": after_preparation,
+                "after_validation": after_validation,
+                "real_data_or_gpu_training": False,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def test_parallel_submission_bounds_only_inflight_buffer_not_total_graph_count():
@@ -43647,6 +43884,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, fields
 from itertools import islice
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -44110,9 +44348,116 @@ def _validate_cached_graph_task(payload: tuple[Any, Any, str]) -> Graph:
     return graph
 
 
-def _apply_graph_chunk(function: Callable[[Any], Graph], chunk: list[Any]) -> list[Graph]:
-    """Top-level spawn-picklable work item; no graph is omitted or truncated."""
-    return [function(payload) for payload in chunk]
+@dataclass(frozen=True)
+class _DenseTensorWire:
+    """An owning NumPy allocation, never a PyTorch shared-storage IPC handle."""
+
+    buffer: np.ndarray
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _SparseTensorWire:
+    indices: _DenseTensorWire
+    values: _DenseTensorWire
+    shape: tuple[int, ...]
+    is_coalesced: bool
+
+
+@dataclass(frozen=True)
+class _GraphObjectWire:
+    kind: str
+    attributes: dict[str, Any]
+
+
+def _encode_graph_ipc(value: Any) -> Any:
+    """Copy only logical CPU tensor contents into tensor-free process payloads.
+
+    Sending a Tensor through ProcessPoolExecutor invokes PyTorch's registered
+    shared-storage reducers. Retaining thousands of returned Graph objects then
+    retains thousands of file descriptors/mmap regions even with bounded queues.
+    NumPy owns these payload bytes instead. Explicitly copying logical contents
+    also avoids serializing the full backing storage of PyG dataset tensor views.
+    """
+    if isinstance(value, Tensor):
+        if value.device.type != "cpu":
+            raise ValueError("graph preparation IPC requires CPU tensors; no device fallback")
+        if value.layout == torch.sparse_coo:
+            return _SparseTensorWire(
+                _encode_graph_ipc(value._indices()),
+                _encode_graph_ipc(value._values()),
+                tuple(value.shape),
+                value.is_coalesced(),
+            )
+        if value.layout != torch.strided:
+            raise ValueError("graph preparation IPC supports strided and sparse COO tensors")
+        # Byte storage preserves all dtypes, including bfloat16, without casting.
+        raw = value.detach().resolve_conj().resolve_neg().contiguous().reshape(-1)
+        if raw.numel() and raw.stride(0) != 1:
+            # A one-element expanded view can report contiguous with stride 0.
+            raw = raw.clone(memory_format=torch.contiguous_format)
+        return _DenseTensorWire(
+            raw.view(torch.uint8).numpy().copy() if raw.numel() else np.empty(0, dtype=np.uint8),
+            value.dtype,
+            tuple(value.shape),
+        )
+    if isinstance(value, Graph):
+        return _GraphObjectWire(
+            "prepared",
+            {field.name: _encode_graph_ipc(getattr(value, field.name)) for field in fields(Graph)},
+        )
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("graph preparation IPC dictionaries require string field names")
+        return {key: _encode_graph_ipc(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_encode_graph_ipc(item) for item in value)
+    if value is None or isinstance(value, (str, bool, int, float, np.integer)):
+        return value
+    source_fields = ("num_nodes", "x", "edge_index", "edge_attr", "y")
+    if all(hasattr(value, name) for name in source_fields):
+        return _GraphObjectWire(
+            "official", {name: _encode_graph_ipc(getattr(value, name)) for name in source_fields}
+        )
+    raise TypeError(f"unsupported graph preparation IPC value: {type(value).__name__}")
+
+
+def _decode_graph_ipc(value: Any) -> Any:
+    """Rebuild process-local tensors whose lifetimes do not retain IPC mappings."""
+    if isinstance(value, _DenseTensorWire):
+        if not value.buffer.size:
+            if 0 not in value.shape:
+                raise ValueError("empty graph IPC buffer cannot encode a nonempty tensor")
+            # NumPy gives empty arrays stride zero, which cannot be dtype-viewed.
+            # Reconstruct the genuine zero-element field (e.g. a tree's basis).
+            return torch.empty(value.shape, dtype=value.dtype)
+        return torch.from_numpy(value.buffer).view(value.dtype).reshape(value.shape)
+    if isinstance(value, _SparseTensorWire):
+        return torch.sparse_coo_tensor(
+            _decode_graph_ipc(value.indices),
+            _decode_graph_ipc(value.values),
+            value.shape,
+            is_coalesced=value.is_coalesced,
+            check_invariants=True,
+        )
+    if isinstance(value, _GraphObjectWire):
+        attributes = {key: _decode_graph_ipc(item) for key, item in value.attributes.items()}
+        if value.kind == "prepared":
+            return Graph(**attributes)
+        if value.kind == "official":
+            return SimpleNamespace(**attributes)
+        raise ValueError(f"unknown graph IPC object kind: {value.kind}")
+    if isinstance(value, dict):
+        return {key: _decode_graph_ipc(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_decode_graph_ipc(item) for item in value)
+    return value
+
+
+def _apply_graph_chunk(function: Callable[[Any], Graph], chunk: list[Any]) -> list[Any]:
+    """Spawn-picklable work item; neither direction transports Tensor storage."""
+    return [_encode_graph_ipc(function(_decode_graph_ipc(payload))) for payload in chunk]
 
 
 def _ordered_parallel_graphs(
@@ -44138,7 +44483,7 @@ def _ordered_parallel_graphs(
         chunk = list(islice(source, chunksize))
         if not chunk:
             return False
-        pending.append(executor.submit(_apply_graph_chunk, function, chunk))
+        pending.append(executor.submit(_apply_graph_chunk, function, _encode_graph_ipc(chunk)))
         return True
 
     for _ in range(2 * workers):
@@ -44147,7 +44492,7 @@ def _ordered_parallel_graphs(
     while pending:
         completed = pending.popleft().result()
         submit_next()
-        yield from completed
+        yield from (_decode_graph_ipc(graph) for graph in completed)
 
 
 def _validate_cached_graphs(
@@ -50601,6 +50946,490 @@ def main() -> int:
         bootstrap_samples=args.bootstrap_samples,
     )
     print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# scripts/archive_failed_rich_run.py
+
+````python
+#!/usr/bin/env python3
+"""Preserve one failed V5/Cycle-V2 rich run without deleting or rewriting artifacts.
+
+The default is a read-only plan. --apply requires Linux process verification and
+renames only the explicitly bound run directories. Archived manifests retain
+their original paths and hashes: this is historical preservation, not resume or
+checkpoint migration. Use a new run ID after changing experiment source.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes
+import ctypes.util
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import uuid
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.run_rich_scaling import TRACK_SPECS, _child_run_id  # noqa: E402
+
+ARCHIVE_DIRECTORY = "_archived_failed_runs"
+RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
+TERMINAL = ("passed", "failed", "interrupted")
+ALLOWED_TRACKS = {"conductance": "v5", "cycle": "v2"}
+OUTPUT_FLAGS = {"--output-dir", "--output", "--results-dir"}
+
+
+class ArchiveError(RuntimeError):
+    """The exact archive boundary could not be verified."""
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--run-id", required=True)
+    result.add_argument("--results-root", type=Path, default=ROOT / "results")
+    result.add_argument("--apply", action="store_true", help="perform verified Linux-only renames")
+    return result
+
+
+def _direct_path(value: Path | str, *, within: Path | None = None) -> Path:
+    path = Path(value).expanduser()
+    if ".." in path.parts:
+        raise ArchiveError(f"parent traversal is forbidden: {path}")
+    path = Path(os.path.abspath(path))
+    for component in (*reversed(path.parents), path):
+        try:
+            metadata = component.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(metadata.st_mode) or (
+            getattr(metadata, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        ):
+            raise ArchiveError(f"symlink/reparse path is forbidden: {component}")
+    if path.resolve() != path:
+        raise ArchiveError(f"indirect path is forbidden: {path}")
+    if within is not None and (path == within or not path.is_relative_to(within)):
+        raise ArchiveError(f"path is outside the exact results root: {path}")
+    return path
+
+
+def _json_object(path: Path) -> dict[str, Any]:
+    path = _direct_path(path)
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise ArchiveError(f"manifest is not a regular file: {path}")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ArchiveError(f"cannot read manifest {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise ArchiveError(f"manifest is not an object: {path}")
+    return payload
+
+
+def _assert_safe_tree(path: Path) -> None:
+    """Inspect directory entries only; never read model tensor/checkpoint bytes."""
+    if not path.is_dir():
+        raise ArchiveError(f"run directory is missing or not a directory: {path}")
+
+    def fail_walk(error: OSError) -> None:
+        raise ArchiveError(f"cannot verify artifact directory entries: {error}") from error
+
+    for directory, subdirectories, files in os.walk(path, followlinks=False, onerror=fail_walk):
+        for name in (*subdirectories, *files):
+            candidate = Path(directory) / name
+            metadata = candidate.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or (
+                getattr(metadata, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            ):
+                raise ArchiveError(f"symlink/reparse artifact is forbidden: {candidate}")
+
+
+def _metadata_hashes(directory: Path) -> dict[str, str]:
+    result = {}
+    for name in ("manifest.json", "summary.json"):
+        path = _direct_path(directory / name, within=directory)
+        if path.exists():
+            if not path.is_file():
+                raise ArchiveError(f"metadata is not a regular file: {path}")
+            result[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return result
+
+
+def _version_selection(config: Any, field: str, expected: str, label: str) -> None:
+    if not isinstance(config, dict) or config.get(field) != [expected]:
+        raise ArchiveError(
+            f"{label} must select only {expected}; legacy experiments stay untouched"
+        )
+
+
+def plan_archive(run_id: str, results_root: Path) -> dict[str, Any]:
+    if not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id):
+        raise ArchiveError("run ID must be 1-120 letters, digits, underscores or hyphens")
+    results_root = _direct_path(results_root)
+    if results_root in {Path(results_root.anchor), Path.home().resolve(), ROOT}:
+        raise ArchiveError("a filesystem, home or repository root is not a results directory")
+    parent = _direct_path(results_root / "rich_scaling" / run_id, within=results_root)
+    root_manifest = _json_object(parent / "manifest.json")
+    if (
+        root_manifest.get("schema_version") != 1
+        or root_manifest.get("suite") != "rich_scaling"
+        or root_manifest.get("run_id") != run_id
+        or root_manifest.get("status") not in ("failed", "interrupted")
+    ):
+        raise ArchiveError("only an explicitly failed/interrupted rich run can be archived")
+    config = root_manifest.get("config")
+    jobs = root_manifest.get("jobs")
+    if not isinstance(config, dict) or not isinstance(jobs, list) or not jobs:
+        raise ArchiveError("rich run configuration or child job list is missing")
+    if (
+        not isinstance(config.get("results_root"), str)
+        or _direct_path(config["results_root"]) != results_root
+    ):
+        raise ArchiveError("rich configuration results root differs from this exact directory")
+    tracks = [job.get("track") if isinstance(job, dict) else None for job in jobs]
+    if (
+        any(not isinstance(track, str) for track in tracks)
+        or len(set(tracks)) != len(tracks)
+        or any(track not in ALLOWED_TRACKS for track in tracks)
+        or config.get("tracks") != tracks
+    ):
+        raise ArchiveError(
+            "only distinct explicitly bound conductance/V5 and cycle/V2 tracks apply"
+        )
+    targets = [{"track": "rich", "run_id": run_id, "original": str(parent)}]
+    for job in jobs:
+        track = job["track"]
+        expected_version = ALLOWED_TRACKS[track]
+        _version_selection(config, f"{track}_versions", expected_version, "rich config")
+        _version_selection(job.get("requested_matrix"), "versions", expected_version, track)
+        expected_id = _child_run_id(run_id, track)
+        expected_path = _direct_path(
+            results_root / TRACK_SPECS[track]["results_subdir"] / expected_id,
+            within=results_root,
+        )
+        if (
+            job.get("child_run_id") != expected_id
+            or job.get("status") not in TERMINAL
+            or not isinstance(job.get("output_dir"), str)
+            or _direct_path(job["output_dir"], within=results_root) != expected_path
+            or job.get("summary_path") != str(expected_path / "summary.json")
+        ):
+            raise ArchiveError(f"{track} child identity/path/terminal-status binding is invalid")
+        child = _json_object(expected_path / "manifest.json")
+        if child.get("run_id") != expected_id or child.get("status") not in TERMINAL:
+            raise ArchiveError(f"{track} child manifest is not a terminal matching run")
+        if track == "conductance":
+            if child.get("schema_version") != 1 or child.get("suite") not in (
+                "conductance_architecture_scaling_v1_v4",
+                "conductance_architecture_scaling_v1_v5",
+            ):
+                raise ArchiveError("unrecognized Conductance scaling manifest schema")
+            _version_selection(child.get("config"), "versions", "v5", "Conductance child")
+        else:
+            if (
+                child.get("schema_version") != 2
+                or child.get("scope") != "cycle_pe_v1_v2_larger_model_scaling"
+                or child.get("output_dir") != str(expected_path)
+            ):
+                raise ArchiveError("unrecognized Cycle scaling manifest schema/path")
+            _version_selection(child, "versions", "v2", "Cycle child")
+        # Pending leaf jobs can be unstarted work after a terminal parent failure.
+        # A recorded running leaf, however, is ambiguous even without a live PID.
+        job_sections = ("jobs", "test_evaluation_jobs") if track == "cycle" else ("jobs",)
+        for section in job_sections:
+            leaves = child.get(section)
+            if not isinstance(leaves, list) or any(
+                not isinstance(leaf, dict)
+                or leaf.get("status") not in TERMINAL + ("pending",)
+                or leaf.get("version") != expected_version
+                for leaf in leaves
+            ):
+                raise ArchiveError(
+                    f"{track}/{section} contains a running/ambiguous or legacy-version leaf job"
+                )
+        legacy_roots = (
+            [expected_path / version for version in ("v1", "v2", "v3", "v4")]
+            if track == "conductance"
+            else [expected_path / section / "v1" for section in ("results", "test-evaluations")]
+        )
+        if any(path.exists() for path in legacy_roots):
+            raise ArchiveError(f"{track} contains legacy-version directories; nothing will move")
+        targets.append({"track": track, "run_id": expected_id, "original": str(expected_path)})
+    paths = [Path(target["original"]) for target in targets]
+    if any(
+        first == second or first.is_relative_to(second) or second.is_relative_to(first)
+        for index, first in enumerate(paths)
+        for second in paths[index + 1 :]
+    ):
+        raise ArchiveError("archive targets overlap or duplicate one another")
+    for target in targets:
+        path = Path(target["original"])
+        _assert_safe_tree(path)
+        target["metadata_sha256"] = _metadata_hashes(path)
+    return {
+        "schema_version": 1,
+        "run_id": run_id,
+        "results_root": str(results_root),
+        "source_status": root_manifest["status"],
+        "targets": targets,
+        "policy": (
+            "preserve artifact bytes and original metadata; never resume under changed source"
+        ),
+        "next_run": "use a new run ID after source changes; do not copy old checkpoints into it",
+    }
+
+
+def _flag_values(arguments: list[str], names: set[str]) -> list[str]:
+    values = []
+    for index, argument in enumerate(arguments):
+        if argument in names:
+            if index + 1 >= len(arguments):
+                raise ArchiveError(f"live process has a flag without a value: {argument}")
+            values.append(arguments[index + 1])
+        else:
+            key, separator, value = argument.partition("=")
+            if separator and key in names:
+                values.append(value)
+    return values
+
+
+def active_processes(
+    plan: dict[str, Any],
+    *,
+    proc_root: Path = Path("/proc"),
+    uid: int | None = None,
+    own_pid: int | None = None,
+) -> list[dict[str, Any]]:
+    """Inspect same-UID Linux command arguments; no signals or process changes."""
+    if uid is None:
+        uid = os.getuid()
+    if own_pid is None:
+        own_pid = os.getpid()
+    if not proc_root.is_dir():
+        raise ArchiveError("Linux /proc is unavailable; active-process verification is required")
+    run_ids = {target["run_id"] for target in plan["targets"]}
+    targets = [Path(target["original"]) for target in plan["targets"]]
+    matches = []
+    for process in proc_root.iterdir():
+        if not process.name.isdecimal() or int(process.name) == own_pid:
+            continue
+        try:
+            status = (process / "status").read_text(encoding="utf-8")
+        except FileNotFoundError as error:
+            if not process.exists():
+                continue
+            raise ArchiveError(f"cannot verify UID of live process {process.name}") from error
+        except (OSError, UnicodeError) as error:
+            raise ArchiveError(
+                f"cannot verify UID of live process {process.name}: {error}"
+            ) from error
+        match = re.search(r"(?m)^Uid:\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s*$", status)
+        if match is None:
+            raise ArchiveError(f"live process {process.name} has no verifiable UID")
+        if uid not in {int(value) for value in match.groups()}:
+            continue
+        try:
+            command = [
+                os.fsdecode(value)
+                for value in (process / "cmdline").read_bytes().split(b"\0")
+                if value
+            ]
+        except FileNotFoundError as error:
+            if not process.exists():
+                continue
+            raise ArchiveError(f"cannot read same-UID live process {process.name}") from error
+        except OSError as error:
+            raise ArchiveError(
+                f"cannot read same-UID live process {process.name}: {error}"
+            ) from error
+        reasons = []
+        if run_ids.intersection(_flag_values(command, {"--run-id"})):
+            reasons.append("exact root/child run ID")
+        for value in _flag_values(command, OUTPUT_FLAGS):
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                try:
+                    candidate = (process / "cwd").resolve(strict=True) / candidate
+                except OSError as error:
+                    raise ArchiveError(
+                        f"cannot resolve same-UID process {process.name} output: {error}"
+                    ) from error
+            candidate = candidate.resolve()
+            if any(candidate == target or candidate.is_relative_to(target) for target in targets):
+                reasons.append("output inside an archive target")
+        if reasons:
+            matches.append({"pid": int(process.name), "reasons": reasons, "command": command})
+    return matches
+
+
+def _require_inactive(plan: dict[str, Any]) -> None:
+    matches = active_processes(plan)
+    if matches:
+        raise ArchiveError("active matching processes; no signals sent: " + json.dumps(matches))
+
+
+def _append_event(journal, event: dict[str, Any]) -> None:
+    journal.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    journal.flush()
+    os.fsync(journal.fileno())
+
+
+def _rename_no_replace(source: Path, destination: Path) -> None:
+    """Linux atomic same-filesystem rename which never replaces an existing path."""
+    library_name = ctypes.util.find_library("c")
+    if library_name is None:
+        raise ArchiveError("cannot locate libc for atomic no-replace rename")
+    library = ctypes.CDLL(library_name, use_errno=True)
+    rename = getattr(library, "renameat2", None)
+    if rename is None:
+        raise ArchiveError("renameat2 is unavailable; no overwrite-capable fallback is permitted")
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    # AT_FDCWD=-100, RENAME_NOREPLACE=1; EXDEV/unsupported calls fail without moving.
+    if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(source), None, str(destination))
+
+
+def apply_archive(plan: dict[str, Any]) -> dict[str, Any]:
+    if not sys.platform.startswith("linux"):
+        raise ArchiveError("--apply requires Linux /proc verification; dry-run is available here")
+    # Re-read every binding immediately before mutation instead of trusting a stale plan.
+    current = plan_archive(plan["run_id"], Path(plan["results_root"]))
+    if current != plan:
+        raise ArchiveError("run metadata changed after planning; no outputs moved")
+    _require_inactive(plan)
+    results_root = Path(plan["results_root"])
+    archive_parent = _direct_path(results_root / ARCHIVE_DIRECTORY, within=results_root)
+    archive_parent.mkdir(exist_ok=True)
+    locks = _direct_path(archive_parent / "_locks", within=archive_parent)
+    locks.mkdir(exist_ok=True)
+    lock_path = _direct_path(locks / f"{plan['run_id']}.lock", within=locks)
+    try:
+        lock = lock_path.open("x", encoding="utf-8")
+    except FileExistsError as error:
+        raise ArchiveError(
+            f"archive lock already exists; inspect its owner: {lock_path}"
+        ) from error
+    moves: list[dict[str, Any]] = []
+    original_error: BaseException | None = None
+    try:
+        with lock:
+            json.dump({"pid": os.getpid(), "run_id": plan["run_id"]}, lock)
+            lock.flush()
+            suffix = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex
+            archive = _direct_path(
+                archive_parent / f"{plan['run_id']}-{suffix}", within=archive_parent
+            )
+            archive.mkdir(mode=0o700, exist_ok=False)
+            journal_path = archive / "archive_manifest.jsonl"
+            with journal_path.open("x", encoding="utf-8") as journal:
+                _append_event(journal, {"event": "archive_planned", **plan})
+                try:
+                    for target in plan["targets"]:
+                        _require_inactive(plan)
+                        source = _direct_path(target["original"], within=results_root)
+                        if _metadata_hashes(source) != target["metadata_sha256"]:
+                            raise ArchiveError(f"run metadata changed before rename: {source}")
+                        destination = _direct_path(archive / target["track"], within=archive)
+                        if destination.exists() or source.stat().st_dev != archive.stat().st_dev:
+                            raise ArchiveError(
+                                "archive destination exists or is on another filesystem"
+                            )
+                        move = {
+                            "track": target["track"],
+                            "original": str(source),
+                            "destination": str(destination),
+                            "metadata_sha256": target["metadata_sha256"],
+                        }
+                        _append_event(journal, {"event": "move_started", **move})
+                        _rename_no_replace(source, destination)
+                        moves.append(move)
+                        _append_event(journal, {"event": "move_completed", **move})
+                    result = {
+                        "status": "archived",
+                        "archive": str(archive),
+                        "journal": str(journal_path),
+                        "moves": moves,
+                        "next_run": plan["next_run"],
+                    }
+                    _append_event(journal, {"event": "archive_completed", **result})
+                    return result
+                except BaseException as error:
+                    failure = {
+                        "event": "archive_failed",
+                        "error": f"{type(error).__name__}: {error}",
+                        "archive": str(archive),
+                        "completed_moves": moves,
+                        "unmoved": [
+                            target
+                            for target in plan["targets"]
+                            if target["track"] not in {move["track"] for move in moves}
+                        ],
+                        "recovery": (
+                            "No automatic rollback or deletion. Preserve this journal. "
+                            "Restore each "
+                            "destination to its recorded original only after checking no active "
+                            "process and that the original is absent; never overwrite either path."
+                        ),
+                    }
+                    print(json.dumps(failure, ensure_ascii=False), file=sys.stderr, flush=True)
+                    try:
+                        _append_event(journal, failure)
+                    except OSError as reporting_error:
+                        print(
+                            f"Could not append failure journal: {reporting_error}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    raise
+    except BaseException as error:
+        original_error = error
+        raise
+    finally:
+        # This is only the exclusive lock created by this invocation, never user artifacts.
+        try:
+            lock_path.unlink()
+        except OSError as cleanup_error:
+            if original_error is None:
+                raise
+            print(f"Archive lock cleanup also failed: {cleanup_error}", file=sys.stderr, flush=True)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        plan = plan_archive(args.run_id, args.results_root)
+        result = (
+            apply_archive(plan)
+            if args.apply
+            else {
+                "status": "dry_run",
+                **plan,
+                "active_process_check": "required before --apply",
+                "apply_supported_on_this_host": sys.platform.startswith("linux"),
+            }
+        )
+    except (ArchiveError, OSError, ValueError) as error:
+        print(f"Archive refused/failed: {type(error).__name__}: {error}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -70033,6 +70862,473 @@ def test_orientation_flips_preserve_physical_relations(B):
     np.testing.assert_allclose(F_flipped @ a, flip_edge_quantity(F @ a, signs))
 ````
 
+# tests/test_archive_failed_rich_run.py
+
+````python
+"""Archive safety on synthetic directories only; no research results or GPUs."""
+
+from __future__ import annotations
+
+import errno
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from scripts import archive_failed_rich_run as archive
+
+RUN_ID = "v5-cycle-se-pe-a6000-gpu3-seed0-v1"
+
+
+def _write(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+@pytest.fixture
+def failed_run(tmp_path_factory):
+    # Short fixture names keep Windows mocked-Linux journal paths under MAX_PATH.
+    tmp_path = tmp_path_factory.mktemp("a")
+    results = tmp_path / "results"
+    parent = results / "rich_scaling" / RUN_ID
+    paths = {"rich": parent}
+    jobs = []
+    for track, version in (("conductance", "v5"), ("cycle", "v2")):
+        child_id = archive._child_run_id(RUN_ID, track)
+        child = results / archive.TRACK_SPECS[track]["results_subdir"] / child_id
+        paths[track] = child
+        manifest = {
+            "schema_version": 1 if track == "conductance" else 2,
+            "run_id": child_id,
+            "status": "failed",
+            "jobs": [
+                {"version": version, "status": "failed"},
+                {"version": version, "status": "pending"},
+            ],
+        }
+        if track == "conductance":
+            manifest.update(
+                suite="conductance_architecture_scaling_v1_v5", config={"versions": ["v5"]}
+            )
+        else:
+            manifest.update(
+                scope="cycle_pe_v1_v2_larger_model_scaling",
+                versions=["v2"],
+                output_dir=str(child),
+                test_evaluation_jobs=[],
+            )
+        _write(child / "manifest.json", manifest)
+        _write(child / "summary.json", {"status": "failed"})
+        checkpoint = child / "test-fixture-only.pt"
+        checkpoint.write_bytes(b"synthetic checkpoint bytes: never model training")
+        jobs.append(
+            {
+                "track": track,
+                "status": "failed",
+                "child_run_id": child_id,
+                "output_dir": str(child),
+                "summary_path": str(child / "summary.json"),
+                "requested_matrix": {"versions": [version]},
+            }
+        )
+    _write(
+        parent / "manifest.json",
+        {
+            "schema_version": 1,
+            "suite": "rich_scaling",
+            "status": "failed",
+            "run_id": RUN_ID,
+            "config": {
+                "tracks": ["conductance", "cycle"],
+                "conductance_versions": ["v5"],
+                "cycle_versions": ["v2"],
+                "results_root": str(results),
+            },
+            "jobs": jobs,
+        },
+    )
+    _write(parent / "summary.json", {"status": "failed"})
+    untouched = tmp_path / "data" / "verified-cache.pt"
+    untouched.parent.mkdir()
+    untouched.write_bytes(b"untouched cached dataset")
+    other = results / "conductance_gat" / "scaling" / "unrelated-v1-run" / "best.pt"
+    other.parent.mkdir(parents=True)
+    other.write_bytes(b"unrelated V1 unchanged")
+    return results, paths
+
+
+def _mutate(path, change):
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    change(payload)
+    _write(path, payload)
+
+
+@pytest.fixture
+def mock_linux(monkeypatch):
+    monkeypatch.setattr(archive.sys, "platform", "linux")
+    monkeypatch.setattr(archive, "active_processes", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(archive.uuid, "uuid4", lambda: SimpleNamespace(hex="fixture-uuid"))
+
+    def rename(source, destination):
+        assert not destination.exists()
+        source.rename(destination)
+
+    monkeypatch.setattr(archive, "_rename_no_replace", rename)
+
+
+def test_default_is_read_only_plan_and_does_not_hash_checkpoints(failed_run, monkeypatch, capsys):
+    results, paths = failed_run
+    original = {track: (path / "manifest.json").read_bytes() for track, path in paths.items()}
+    read_bytes = Path.read_bytes
+
+    def metadata_only(path):
+        assert path.suffix != ".pt", "planning must not read tensor/checkpoint contents"
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", metadata_only)
+    assert archive.main(["--run-id", RUN_ID, "--results-root", str(results)]) == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["status"] == "dry_run"
+    assert len(output["targets"]) == 3
+    assert not (results / archive.ARCHIVE_DIRECTORY).exists()
+    assert all(
+        read_bytes(paths[track] / "manifest.json") == value for track, value in original.items()
+    )
+
+
+def test_apply_preserves_all_bytes_and_only_moves_bound_directories(failed_run, mock_linux):
+    results, paths = failed_run
+    originals = {
+        track: {
+            file.relative_to(path): file.read_bytes() for file in path.rglob("*") if file.is_file()
+        }
+        for track, path in paths.items()
+    }
+    result = archive.apply_archive(archive.plan_archive(RUN_ID, results))
+    assert result["status"] == "archived"
+    assert len(result["moves"]) == 3
+    for move in result["moves"]:
+        assert not Path(move["original"]).exists()
+        destination = Path(move["destination"])
+        assert {
+            file.relative_to(destination): file.read_bytes()
+            for file in destination.rglob("*")
+            if file.is_file()
+        } == originals[move["track"]]
+    assert (results.parent / "data/verified-cache.pt").read_bytes() == b"untouched cached dataset"
+    assert (
+        results / "conductance_gat/scaling/unrelated-v1-run/best.pt"
+    ).read_bytes() == b"unrelated V1 unchanged"
+    events = [
+        json.loads(line)
+        for line in Path(result["journal"]).read_text(encoding="utf-8").splitlines()
+    ]
+    assert [event["event"] for event in events].count("move_completed") == 3
+    assert events[-1]["event"] == "archive_completed"
+    assert not (results / archive.ARCHIVE_DIRECTORY / "_locks" / f"{RUN_ID}.lock").exists()
+    with pytest.raises(archive.ArchiveError, match="cannot read manifest"):
+        archive.plan_archive(RUN_ID, results)
+
+
+@pytest.mark.parametrize("status", ["running", "passed", "pending", None])
+def test_nonfailed_root_refused(failed_run, status):
+    results, paths = failed_run
+    _mutate(paths["rich"] / "manifest.json", lambda obj: obj.update(status=status))
+    with pytest.raises(archive.ArchiveError, match="failed/interrupted"):
+        archive.plan_archive(RUN_ID, results)
+
+
+@pytest.mark.parametrize("site", ["root_job", "child", "leaf"])
+def test_running_or_ambiguous_children_refused(failed_run, site):
+    results, paths = failed_run
+    path = paths["rich" if site == "root_job" else "conductance"] / "manifest.json"
+
+    def change(obj):
+        if site == "child":
+            obj["status"] = "running"
+        else:
+            obj["jobs"][0]["status"] = "running"
+
+    _mutate(path, change)
+    with pytest.raises(archive.ArchiveError, match="terminal|running"):
+        archive.plan_archive(RUN_ID, results)
+
+
+def test_failed_root_may_include_a_passed_track(failed_run):
+    results, paths = failed_run
+    _mutate(paths["rich"] / "manifest.json", lambda obj: obj["jobs"][0].update(status="passed"))
+    _mutate(paths["conductance"] / "manifest.json", lambda obj: obj.update(status="passed"))
+    assert len(archive.plan_archive(RUN_ID, results)["targets"]) == 3
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda obj: obj["config"].update(conductance_versions=["v1", "v5"]),
+        lambda obj: obj["jobs"][0]["requested_matrix"].update(versions=["v1", "v5"]),
+        lambda obj: obj["jobs"][0].update(track="tree"),
+        lambda obj: obj["jobs"].append(obj["jobs"][0].copy()),
+        lambda obj: obj["config"].update(results_root="/unrelated"),
+    ],
+)
+def test_legacy_tree_duplicate_or_wrong_root_refused(failed_run, change):
+    results, paths = failed_run
+    _mutate(paths["rich"] / "manifest.json", change)
+    with pytest.raises(archive.ArchiveError):
+        archive.plan_archive(RUN_ID, results)
+    assert all(path.is_dir() for path in paths.values())
+
+
+@pytest.mark.parametrize("case", ["outside", "root", "parent", "other_child", "traversal"])
+def test_manifest_output_path_boundary_refused(failed_run, case):
+    results, paths = failed_run
+    values = {
+        "outside": results.parent / "data",
+        "root": results,
+        "parent": paths["rich"],
+        "other_child": paths["cycle"],
+        "traversal": paths["conductance"] / ".." / "elsewhere",
+    }
+    _mutate(
+        paths["rich"] / "manifest.json",
+        lambda obj: obj["jobs"][0].update(output_dir=str(values[case])),
+    )
+    with pytest.raises(archive.ArchiveError):
+        archive.plan_archive(RUN_ID, results)
+
+
+@pytest.mark.parametrize("run_id", ["../other", "/absolute", ".", "bad/id", "bad\\id", ""])
+def test_invalid_run_ids_cannot_escape_results_root(failed_run, run_id):
+    with pytest.raises(archive.ArchiveError, match="run ID"):
+        archive.plan_archive(run_id, failed_run[0])
+
+
+def test_legacy_directory_hidden_inside_v5_is_not_moved(failed_run):
+    results, paths = failed_run
+    (paths["conductance"] / "v4").mkdir()
+    with pytest.raises(archive.ArchiveError, match="legacy-version directories"):
+        archive.plan_archive(RUN_ID, results)
+
+
+def test_unreferenced_child_is_not_inferred(failed_run):
+    results, paths = failed_run
+
+    def only_conductance(obj):
+        obj["jobs"] = obj["jobs"][:1]
+        obj["config"]["tracks"] = ["conductance"]
+
+    _mutate(paths["rich"] / "manifest.json", only_conductance)
+    plan = archive.plan_archive(RUN_ID, results)
+    assert [target["track"] for target in plan["targets"]] == ["rich", "conductance"]
+
+
+def test_reparse_target_is_refused_without_following_it(failed_run, monkeypatch):
+    results, paths = failed_run
+    original = Path.lstat
+
+    def metadata(path):
+        if path == paths["conductance"]:
+            return SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=0x400)
+        return original(path)
+
+    monkeypatch.setattr(Path, "lstat", metadata)
+    with pytest.raises(archive.ArchiveError, match="reparse"):
+        archive.plan_archive(RUN_ID, results)
+
+
+def test_apply_without_linux_process_evidence_refused(failed_run, monkeypatch):
+    results, _ = failed_run
+    plan = archive.plan_archive(RUN_ID, results)
+    monkeypatch.setattr(archive.sys, "platform", "win32")
+    with pytest.raises(archive.ArchiveError, match="Linux /proc"):
+        archive.apply_archive(plan)
+    assert not (results / archive.ARCHIVE_DIRECTORY).exists()
+
+
+def test_live_matching_process_prevents_any_rename(failed_run, mock_linux, monkeypatch):
+    results, paths = failed_run
+    monkeypatch.setattr(
+        archive, "active_processes", lambda *_: [{"pid": 123, "command": ["python"]}]
+    )
+    with pytest.raises(archive.ArchiveError, match="active matching"):
+        archive.apply_archive(archive.plan_archive(RUN_ID, results))
+    assert all(path.exists() for path in paths.values())
+    assert not (results / archive.ARCHIVE_DIRECTORY).exists()
+
+
+def test_metadata_change_after_plan_refused(failed_run, mock_linux):
+    results, paths = failed_run
+    plan = archive.plan_archive(RUN_ID, results)
+    _mutate(paths["cycle"] / "manifest.json", lambda obj: obj.update(extra="changed"))
+    with pytest.raises(archive.ArchiveError, match="changed after planning"):
+        archive.apply_archive(plan)
+    assert all(path.exists() for path in paths.values())
+
+
+def test_partial_move_failure_preserves_journal_and_exact_remaining_paths(
+    failed_run, mock_linux, monkeypatch, capsys
+):
+    results, paths = failed_run
+    calls = []
+
+    def fail_second(source, destination):
+        calls.append(source)
+        if len(calls) == 2:
+            raise OSError(errno.EACCES, "synthetic rename denial")
+        source.rename(destination)
+
+    monkeypatch.setattr(archive, "_rename_no_replace", fail_second)
+    with pytest.raises(OSError, match="synthetic rename denial"):
+        archive.apply_archive(archive.plan_archive(RUN_ID, results))
+    failure = json.loads(capsys.readouterr().err)
+    assert len(failure["completed_moves"]) == 1
+    assert {entry["track"] for entry in failure["unmoved"]} == {"conductance", "cycle"}
+    assert not paths["rich"].exists()
+    assert paths["conductance"].exists() and paths["cycle"].exists()
+    archive_dir = Path(failure["archive"])
+    assert (archive_dir / "rich/manifest.json").is_file()
+    events = [
+        json.loads(line)
+        for line in (archive_dir / "archive_manifest.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert events[-1]["event"] == "archive_failed"
+
+
+def _process(proc, pid, command, uid=123):
+    directory = proc / str(pid)
+    directory.mkdir(parents=True)
+    (directory / "status").write_text(
+        f"Name:\tpython\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n", encoding="utf-8"
+    )
+    (directory / "cmdline").write_bytes(b"\0".join(os.fsencode(value) for value in command) + b"\0")
+    return directory
+
+
+def test_proc_detects_exact_run_ids_and_nested_output_not_prefix_or_other_uid(failed_run, tmp_path):
+    results, paths = failed_run
+    plan = archive.plan_archive(RUN_ID, results)
+    proc = tmp_path / "proc"
+    _process(proc, 101, ["python", "--run-id", RUN_ID])
+    _process(proc, 102, ["python", f"--run-id={RUN_ID}-cycle"])
+    _process(proc, 103, ["python", "--output-dir", str(paths["conductance"] / "v5/large")])
+    _process(proc, 104, ["python", "--run-id", RUN_ID + "-unrelated"])
+    _process(proc, 105, ["python", "--run-id", RUN_ID], uid=999)
+    _process(proc, 106, ["archive", "--run-id", RUN_ID])
+    matches = archive.active_processes(plan, proc_root=proc, uid=123, own_pid=106)
+    assert {match["pid"] for match in matches} == {101, 102, 103}
+
+
+def test_inaccessible_same_uid_cmdline_fails_closed(failed_run, tmp_path, monkeypatch):
+    plan = archive.plan_archive(RUN_ID, failed_run[0])
+    proc = tmp_path / "proc"
+    process = _process(proc, 101, ["python", "unknown"])
+    original = Path.read_bytes
+
+    def deny(path):
+        if path == process / "cmdline":
+            raise PermissionError("synthetic same UID restriction")
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", deny)
+    with pytest.raises(archive.ArchiveError, match="same-UID"):
+        archive.active_processes(plan, proc_root=proc, uid=123, own_pid=999)
+
+
+def test_atomic_rename_uses_no_replace_and_preserves_existing_target_on_error(
+    monkeypatch, tmp_path
+):
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    calls = []
+
+    class Rename:
+        def __call__(self, *args):
+            calls.append(args)
+            return -1
+
+    monkeypatch.setattr(archive.ctypes.util, "find_library", lambda _: "libc-fixture")
+    monkeypatch.setattr(
+        archive.ctypes, "CDLL", lambda *_args, **_kwargs: SimpleNamespace(renameat2=Rename())
+    )
+    monkeypatch.setattr(archive.ctypes, "get_errno", lambda: errno.EEXIST)
+    with pytest.raises(FileExistsError):
+        archive._rename_no_replace(source, destination)
+    assert calls[0][0] == calls[0][2] == -100
+    assert calls[0][-1] == 1
+    assert source.is_dir() and destination.is_dir()
+
+
+@pytest.mark.parametrize("bad_track", [[], {}, None, 5])
+def test_malformed_track_metadata_has_clear_archive_error(failed_run, bad_track):
+    results, paths = failed_run
+    _mutate(paths["rich"] / "manifest.json", lambda obj: obj["jobs"][0].update(track=bad_track))
+    with pytest.raises(archive.ArchiveError, match="distinct explicitly"):
+        archive.plan_archive(RUN_ID, results)
+
+
+@pytest.mark.parametrize("status,version", [("running", "v2"), ("unknown", "v2"), ("passed", "v1")])
+def test_cycle_test_evaluation_jobs_must_be_safe_terminal_or_unstarted(failed_run, status, version):
+    results, paths = failed_run
+    _mutate(
+        paths["cycle"] / "manifest.json",
+        lambda obj: obj.update(test_evaluation_jobs=[{"status": status, "version": version}]),
+    )
+    with pytest.raises(archive.ArchiveError, match="test_evaluation_jobs"):
+        archive.plan_archive(RUN_ID, results)
+
+
+@pytest.mark.parametrize("mode,attributes", [(stat.S_IFIFO, 0), (stat.S_IFREG, 0x400)])
+def test_manifest_special_file_is_rejected_before_any_content_read(
+    failed_run, monkeypatch, mode, attributes
+):
+    results, paths = failed_run
+    target = paths["rich"] / "manifest.json"
+    original_stat, original_read = Path.lstat, Path.read_text
+
+    def metadata(path):
+        if path == target:
+            return SimpleNamespace(st_mode=mode, st_file_attributes=attributes)
+        return original_stat(path)
+
+    def read(path, *args, **kwargs):
+        assert path != target, "must not read or block on a special/indirect manifest"
+        return original_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", metadata)
+    monkeypatch.setattr(Path, "read_text", read)
+    with pytest.raises(archive.ArchiveError, match="regular file|reparse"):
+        archive.plan_archive(RUN_ID, results)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="native Linux renameat2 contract")
+def test_native_linux_rename_success_and_no_replace(tmp_path):
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.mkdir()
+    (source / "checkpoint.pt").write_bytes(b"synthetic native rename fixture")
+    archive._rename_no_replace(source, destination)
+    assert not source.exists()
+    assert (destination / "checkpoint.pt").read_bytes() == b"synthetic native rename fixture"
+    source.mkdir()
+    with pytest.raises(FileExistsError):
+        archive._rename_no_replace(source, destination)
+    assert source.is_dir()
+    assert (destination / "checkpoint.pt").read_bytes() == b"synthetic native rename fixture"
+    empty_destination = tmp_path / "empty-destination"
+    empty_destination.mkdir()
+    (source / "another.pt").write_bytes(b"must not replace an existing empty directory")
+    with pytest.raises(FileExistsError):
+        archive._rename_no_replace(source, empty_destination)
+    assert (source / "another.pt").is_file()
+    assert empty_destination.is_dir() and not list(empty_destination.iterdir())
+````
+
 # tests/test_benchmark_speed.py
 
 ````python
@@ -74841,6 +76137,29 @@ def _stub(
                 "optimizer_steps_per_second": 2.0,
             },
         }
+        if "research.conductance_gat.v5.train" in command:
+            # No GPU training: use the production CLI/config/throughput producer
+            # with explicitly synthetic completed-history counters. This catches
+            # writer/consumer schema drift that hand-written telemetry missed.
+            child_args = v5_train.build_parser().parse_args(command[5:])
+            v5_train.validate_args(child_args)
+            config = v5_train.configuration(child_args)
+            record["configuration"] = config
+            record["hardware_execution"] = {
+                "profile": config["hardware_profile"],
+                "precision": config["precision"],
+                "tf32": config["tf32"],
+                "activation_checkpoint": config["activation_checkpoint"],
+                "edge_chunk_size": config["edge_chunk_size"],
+                "sample_seed_batch_size": config["sample_seed_batch_size"],
+                "graph_batch_size": config["batch_size"],
+                "sample_prefetch": config["sample_prefetch"],
+                "pin_memory": config["pin_memory"],
+            }
+            record["throughput"] = v5_train.training_throughput(
+                [{"train_label_count": 120, "train_batches": 3}],
+                record["elapsed_seconds"],
+            )
         if expose_test:
             record["test"] = 0.9
         (output / "metrics.json").write_text(json.dumps(record), encoding="utf-8")
@@ -74888,6 +76207,60 @@ def test_success_is_released_only_after_every_child_metric_is_valid(tmp_path, mo
     assert len(summary["runs"]) == 10
     assert all("resource_observability" in row for row in summary["runs"])
     assert all("throughput" in row for row in summary["runs"])
+
+
+@pytest.mark.parametrize("hardware_profile", ["portable", "a6000-48gb"])
+def test_v5_production_throughput_reaches_real_scaling_aggregation(
+    tmp_path, monkeypatch, hardware_profile
+):
+    """CPU contract integration only; resource fixtures do not certify CUDA training."""
+
+    options, calls = _stub(tmp_path, monkeypatch)
+    options += [
+        "--versions", "v5", "--model-seeds", "0",
+        "--hardware-profile", hardware_profile,
+    ]
+    assert runner.main(options) == 0
+    root = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+    assert len(calls) == 3  # Preflight plus both V5 conditions, never actual subprocesses.
+    assert manifest["status"] == "passed"
+    assert {job["condition"] for job in manifest["jobs"]} == {
+        "fixed_c", "shared_dynamic_c"
+    }
+    expected = v5_train.training_throughput(
+        [{"train_label_count": 120, "train_batches": 3}], 1.5
+    )
+    for job in manifest["jobs"]:
+        assert job["result"]["throughput"] == expected
+        assert runner._load_child(job)["throughput"] == expected
+    assert len(summary["runs"]) == 2
+    assert all(row["throughput"] == expected for row in summary["runs"])
+
+
+@pytest.mark.parametrize("malformation", ["missing_scope", "old_rate_names", "boolean_metadata"])
+def test_v5_scaling_still_rejects_the_reported_throughput_defects(
+    tmp_path, monkeypatch, malformation
+):
+    options, _calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options + ["--versions", "v5", "--model-seeds", "0"]) == 0
+    root = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    job = manifest["jobs"][0]
+    metrics_path = Path(job["metrics_path"])
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    report = metrics["throughput"]
+    if malformation == "missing_scope":
+        report.pop("scope")
+    elif malformation == "old_rate_names":
+        for key in ("supervised_labels_per_second", "training_batches_per_second"):
+            report[key.replace("_per_second", "_per_elapsed_second")] = report.pop(key)
+    else:
+        report["elapsed_includes_validation_checkpointing_and_interventions"] = True
+    metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+    with pytest.raises(ValueError, match="throughput"):
+        runner._load_child(job)
 
 
 @pytest.mark.parametrize("field", ["resource_observability", "throughput"])
@@ -78061,7 +79434,9 @@ def test_same_run_preserves_last_checkpoint_and_adds_resume(tmp_path, monkeypatc
                     "peak_cuda_allocated_bytes": 1024,
                     "peak_cuda_reserved_bytes": 2048,
                     "hardware_execution": hardware_execution,
-                    "throughput": {"training_batches_per_elapsed_second": 1.0},
+                    "throughput": train.training_throughput(
+                        [{"train_label_count": 12, "train_batches": 3}], 3.0
+                    ),
                 }
             ),
             encoding="utf-8",
@@ -78195,6 +79570,83 @@ def test_report_labels_primary_and_auxiliary_dynamic_metrics():
     assert "Dynamic C-active" in rendered
     assert "Dynamic global (aux)" in rendered
     assert "0.710000" in rendered and "0.720000" in rendered
+````
+
+# tests/test_conductance_v5_throughput.py
+
+````python
+"""CPU-only V5 telemetry contract regressions; no training/performance claims."""
+
+from __future__ import annotations
+
+import json
+import math
+
+import pytest
+
+from research.conductance_gat.v5.train import merge_efficiency, training_throughput
+from scripts.telemetry_validation import validate_throughput_observability
+
+
+def test_cumulative_history_and_elapsed_use_the_same_resume_boundary():
+    # Synthetic unit counters deliberately have different per-segment rates.
+    restored_history = [{"train_label_count": 100, "train_batches": 2}]
+    current_history = [{"train_label_count": 300, "train_batches": 6}]
+    efficiency = merge_efficiency(12.5, 1024, 2048, 7.5, 2048, 4096)
+    report = training_throughput(
+        restored_history + current_history, efficiency["elapsed_seconds"]
+    )
+    persisted = json.loads(json.dumps(report, allow_nan=False))
+    assert validate_throughput_observability(persisted, "v5.throughput") == report
+    assert report["completed_epochs"] == 2
+    assert report["supervised_training_labels"] == 400
+    assert report["training_batches"] == 8
+    assert report["elapsed_seconds"] == 20.0
+    assert report["supervised_labels_per_second"] == {
+        "value": 20.0, "reason": None, "unit": "labels_per_second"
+    }
+    assert report["training_batches_per_second"] == {
+        "value": 0.4, "reason": None, "unit": "batches_per_second"
+    }
+    assert "validation" in report["scope"]
+    assert "checkpoint IO" in report["scope"]
+    assert "intervention" in report["scope"]
+    assert "setup" in report["timer_boundary"]
+    assert "interrupted work" in report["resume_accounting"]
+
+
+def test_zero_timer_is_explicitly_unavailable_not_zero_rate_or_bare_null():
+    report = training_throughput([{"train_label_count": 100, "train_batches": 2}], 0.0)
+    assert validate_throughput_observability(report, "v5.throughput") == report
+    for key in ("supervised_labels_per_second", "training_batches_per_second"):
+        assert report[key]["value"] is None
+        assert "duration was zero" in report[key]["reason"]
+        assert report[key]["unit"].endswith("_per_second")
+
+
+@pytest.mark.parametrize("elapsed", [True, False, None, "1", -1, math.nan, math.inf])
+def test_invalid_elapsed_is_not_published(elapsed):
+    with pytest.raises(ValueError, match="elapsed_seconds"):
+        training_throughput([{"train_label_count": 100, "train_batches": 2}], elapsed)
+
+
+@pytest.mark.parametrize(
+    "history",
+    [
+        None,
+        [],
+        [{}],
+        [None],
+        [{"train_label_count": True, "train_batches": 2}],
+        [{"train_label_count": 100, "train_batches": False}],
+        [{"train_label_count": 100.0, "train_batches": 2}],
+        [{"train_label_count": -1, "train_batches": 2}],
+        [{"train_label_count": 100, "train_batches": 0}],
+    ],
+)
+def test_missing_or_invalid_history_cannot_fabricate_processed_work(history):
+    with pytest.raises(ValueError, match="history"):
+        training_throughput(history, 20.0)
 ````
 
 # tests/test_cycle_pe_v2_projector.py

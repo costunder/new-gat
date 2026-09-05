@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import fields, replace
+import os
+import sys
+import time
+from dataclasses import fields, is_dataclass, replace
+from multiprocessing.reduction import ForkingPickler
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -685,6 +690,188 @@ def test_actual_process_parallel_preparation_and_cached_validation_preserve_full
         for field in fields(first):
             torch.testing.assert_close(getattr(first, field.name), getattr(parallel, field.name))
             torch.testing.assert_close(getattr(first, field.name), getattr(cached, field.name))
+        _assert_graph_has_private_storage(parallel)
+        _assert_graph_has_private_storage(cached)
+    for source in sources:
+        assert all(
+            not getattr(source, name).is_shared() for name in ("x", "edge_index", "edge_attr", "y")
+        )
+
+
+def _assert_graph_has_private_storage(graph):
+    for field in fields(graph):
+        value = getattr(graph, field.name)
+        storage_tensors = (
+            (value._indices(), value._values()) if value.layout == torch.sparse_coo else (value,)
+        )
+        assert all(not part.is_shared() for part in storage_tensors), field.name
+
+
+def _assert_tensor_free_ipc(value):
+    assert not isinstance(value, torch.Tensor)
+    if is_dataclass(value):
+        for field in fields(value):
+            _assert_tensor_free_ipc(getattr(value, field.name))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            _assert_tensor_free_ipc(key)
+            _assert_tensor_free_ipc(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _assert_tensor_free_ipc(item)
+    elif isinstance(value, np.ndarray):
+        assert value.dtype == np.uint8
+        assert value.flags.owndata and value.flags.c_contiguous
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.long, torch.float32, torch.float64, torch.bfloat16, torch.bool, torch.complex64]
+)
+@pytest.mark.parametrize("empty", [False, True])
+def test_owned_wire_preserves_dense_dtype_shape_and_values_without_tensor_reducers(dtype, empty):
+    values = torch.arange(80).reshape(8, 10).to(dtype)
+    view = values[::2, :0] if empty else values[::2, 2:5]
+    encoded = data._encode_graph_ipc(view)
+    _assert_tensor_free_ipc(encoded)
+    assert encoded.buffer.nbytes == view.numel() * view.element_size()
+    actual = data._decode_graph_ipc(encoded)
+    assert actual.dtype == dtype and actual.shape == view.shape
+    assert not actual.is_shared()
+    torch.testing.assert_close(actual, view)
+    if not empty:
+        values.fill_(0)
+        assert actual.any()  # The payload must not alias the source's backing allocation.
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_preparation_and_validation_ipc_never_serialize_torch_shared_storage(monkeypatch, cached):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Tensor storage crossed the process queue")
+
+    monkeypatch.setattr(torch.UntypedStorage, "_share_fd_cpu_", forbidden)
+    monkeypatch.setattr(torch.UntypedStorage, "_share_filename_cpu_", forbidden)
+    source = _official()
+    expected = data.prepare_graph(source, dataset="zinc12k")
+    if cached:
+        row = {field.name: getattr(expected, field.name) for field in fields(expected)}
+        function, task = data._validate_cached_graph_task, (row, source, "zinc12k")
+    else:
+        function, task = data._prepare_task, (source, "zinc12k", "dfs_fundamental")
+    request = data._encode_graph_ipc([task])
+    _assert_tensor_free_ipc(request)
+    # Exercise exactly the pickler used by multiprocessing, in both directions.
+    incoming = ForkingPickler.loads(ForkingPickler.dumps(request))
+    response = data._apply_graph_chunk(function, incoming)
+    _assert_tensor_free_ipc(response)
+    outgoing = ForkingPickler.loads(ForkingPickler.dumps(response))
+    actual = data._decode_graph_ipc(outgoing[0])
+    for field in fields(expected):
+        torch.testing.assert_close(getattr(actual, field.name), getattr(expected, field.name))
+    _assert_graph_has_private_storage(actual)
+
+
+def test_owned_wire_copies_only_logical_official_views_not_entire_dataset_storage():
+    source = _official()
+    backing = torch.arange(200_000).reshape(-1, 1)
+    source.x = backing[100:104]
+    encoded = data._encode_graph_ipc(source)
+    _assert_tensor_free_ipc(encoded)
+    assert encoded.attributes["x"].buffer.nbytes == 4 * source.x.element_size()
+    restored = data._decode_graph_ipc(encoded)
+    assert restored.x.untyped_storage().nbytes() == 4 * source.x.element_size()
+    torch.testing.assert_close(restored.x, source.x)
+
+
+@pytest.mark.parametrize("scalar", [False, True])
+def test_owned_wire_handles_scalars_and_zero_stride_singleton_views(scalar):
+    value = torch.tensor(3.25) if scalar else torch.tensor([3.25]).as_strided((1,), (0,))
+    actual = data._decode_graph_ipc(data._encode_graph_ipc(value))
+    torch.testing.assert_close(actual, value)
+    assert actual.shape == value.shape and not actual.is_shared()
+
+
+def test_graph_wire_rejects_tensor_keys_and_non_cpu_tensors_before_process_submission():
+    with pytest.raises(TypeError, match="string field names"):
+        data._encode_graph_ipc({torch.tensor(1): "invalid field"})
+    with pytest.raises(ValueError, match="CPU tensors; no device fallback"):
+        data._encode_graph_ipc(torch.empty(3, device="meta"))
+    with pytest.raises(TypeError, match="unsupported graph preparation IPC value"):
+        data._encode_graph_ipc(object())
+
+
+def test_empty_wire_cannot_replace_missing_nonempty_data():
+    wire = data._DenseTensorWire(np.empty(0, dtype=np.uint8), torch.float32, (2,))
+    with pytest.raises(ValueError, match="cannot encode a nonempty tensor"):
+        data._decode_graph_ipc(wire)
+
+
+def _linux_ipc_snapshot():
+    if not sys.platform.startswith("linux"):
+        return {"available": False, "reason": "Linux /proc is unavailable on this test host"}
+    return {
+        "available": True,
+        "maps": len(Path("/proc/self/maps").read_text().splitlines()),
+        "open_fds": len(list(Path("/proc/self/fd").iterdir())),
+        "max_map_count": int(Path("/proc/sys/vm/max_map_count").read_text()),
+    }
+
+
+@pytest.mark.skipif(
+    "CYCLE_V2_IPC_STRESS_GRAPHS" not in os.environ,
+    reason="opt-in 10k+ synthetic IPC stress, separate from default unit/smoke tests",
+)
+def test_debug_large_synthetic_preparation_and_cache_ipc_have_bounded_os_handles():
+    """No real data/training: retain 10k+ full cycle Graphs across both IPC paths.
+
+    Run this test with CYCLE_V2_IPC_STRESS_GRAPHS=10000. On Linux it also checks
+    process mmap/FD growth while all prepared and validated graphs remain alive.
+    """
+    count = int(os.environ["CYCLE_V2_IPC_STRESS_GRAPHS"])
+    assert count >= 10_000, "this explicit regression stress must cover at least 10k graphs"
+    started = time.perf_counter()
+    before = _linux_ipc_snapshot()
+    sources = [_official() for _ in range(count)]
+    for index, source in enumerate(sources):
+        source.y.fill_(index)
+    prepared = data._prepare_split(
+        sources,
+        dataset="zinc12k",
+        split="debug_ipc_stress",
+        basis_backend="dfs_fundamental",
+        workers=2,
+    )
+    after_preparation = _linux_ipc_snapshot()
+    rows = [
+        {field.name: getattr(graph, field.name) for field in fields(graph)} for graph in prepared
+    ]
+    restored = data._validate_cached_graphs(rows, sources, "zinc12k", workers=2)
+    assert len(prepared) == len(restored) == count
+    for index, (first, second) in enumerate(zip(prepared, restored, strict=True)):
+        assert first.y.item() == second.y.item() == index
+        _assert_graph_has_private_storage(first)
+        _assert_graph_has_private_storage(second)
+        for field in fields(first):
+            torch.testing.assert_close(getattr(first, field.name), getattr(second, field.name))
+    after_validation = _linux_ipc_snapshot()
+    if before["available"]:
+        for snapshot in (after_preparation, after_validation):
+            assert snapshot["maps"] - before["maps"] < 2048
+            assert snapshot["open_fds"] - before["open_fds"] < 256
+    print(
+        json.dumps(
+            {
+                "kind": "debug_synthetic_cpu_ipc_stress",
+                "graphs": count,
+                "workers": 2,
+                "seconds": time.perf_counter() - started,
+                "before": before,
+                "after_preparation": after_preparation,
+                "after_validation": after_validation,
+                "real_data_or_gpu_training": False,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def test_parallel_submission_bounds_only_inflight_buffer_not_total_graph_count():

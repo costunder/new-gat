@@ -17,6 +17,7 @@ from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, fields
 from itertools import islice
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -480,9 +481,116 @@ def _validate_cached_graph_task(payload: tuple[Any, Any, str]) -> Graph:
     return graph
 
 
-def _apply_graph_chunk(function: Callable[[Any], Graph], chunk: list[Any]) -> list[Graph]:
-    """Top-level spawn-picklable work item; no graph is omitted or truncated."""
-    return [function(payload) for payload in chunk]
+@dataclass(frozen=True)
+class _DenseTensorWire:
+    """An owning NumPy allocation, never a PyTorch shared-storage IPC handle."""
+
+    buffer: np.ndarray
+    dtype: torch.dtype
+    shape: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class _SparseTensorWire:
+    indices: _DenseTensorWire
+    values: _DenseTensorWire
+    shape: tuple[int, ...]
+    is_coalesced: bool
+
+
+@dataclass(frozen=True)
+class _GraphObjectWire:
+    kind: str
+    attributes: dict[str, Any]
+
+
+def _encode_graph_ipc(value: Any) -> Any:
+    """Copy only logical CPU tensor contents into tensor-free process payloads.
+
+    Sending a Tensor through ProcessPoolExecutor invokes PyTorch's registered
+    shared-storage reducers. Retaining thousands of returned Graph objects then
+    retains thousands of file descriptors/mmap regions even with bounded queues.
+    NumPy owns these payload bytes instead. Explicitly copying logical contents
+    also avoids serializing the full backing storage of PyG dataset tensor views.
+    """
+    if isinstance(value, Tensor):
+        if value.device.type != "cpu":
+            raise ValueError("graph preparation IPC requires CPU tensors; no device fallback")
+        if value.layout == torch.sparse_coo:
+            return _SparseTensorWire(
+                _encode_graph_ipc(value._indices()),
+                _encode_graph_ipc(value._values()),
+                tuple(value.shape),
+                value.is_coalesced(),
+            )
+        if value.layout != torch.strided:
+            raise ValueError("graph preparation IPC supports strided and sparse COO tensors")
+        # Byte storage preserves all dtypes, including bfloat16, without casting.
+        raw = value.detach().resolve_conj().resolve_neg().contiguous().reshape(-1)
+        if raw.numel() and raw.stride(0) != 1:
+            # A one-element expanded view can report contiguous with stride 0.
+            raw = raw.clone(memory_format=torch.contiguous_format)
+        return _DenseTensorWire(
+            raw.view(torch.uint8).numpy().copy() if raw.numel() else np.empty(0, dtype=np.uint8),
+            value.dtype,
+            tuple(value.shape),
+        )
+    if isinstance(value, Graph):
+        return _GraphObjectWire(
+            "prepared",
+            {field.name: _encode_graph_ipc(getattr(value, field.name)) for field in fields(Graph)},
+        )
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("graph preparation IPC dictionaries require string field names")
+        return {key: _encode_graph_ipc(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_encode_graph_ipc(item) for item in value)
+    if value is None or isinstance(value, (str, bool, int, float, np.integer)):
+        return value
+    source_fields = ("num_nodes", "x", "edge_index", "edge_attr", "y")
+    if all(hasattr(value, name) for name in source_fields):
+        return _GraphObjectWire(
+            "official", {name: _encode_graph_ipc(getattr(value, name)) for name in source_fields}
+        )
+    raise TypeError(f"unsupported graph preparation IPC value: {type(value).__name__}")
+
+
+def _decode_graph_ipc(value: Any) -> Any:
+    """Rebuild process-local tensors whose lifetimes do not retain IPC mappings."""
+    if isinstance(value, _DenseTensorWire):
+        if not value.buffer.size:
+            if 0 not in value.shape:
+                raise ValueError("empty graph IPC buffer cannot encode a nonempty tensor")
+            # NumPy gives empty arrays stride zero, which cannot be dtype-viewed.
+            # Reconstruct the genuine zero-element field (e.g. a tree's basis).
+            return torch.empty(value.shape, dtype=value.dtype)
+        return torch.from_numpy(value.buffer).view(value.dtype).reshape(value.shape)
+    if isinstance(value, _SparseTensorWire):
+        return torch.sparse_coo_tensor(
+            _decode_graph_ipc(value.indices),
+            _decode_graph_ipc(value.values),
+            value.shape,
+            is_coalesced=value.is_coalesced,
+            check_invariants=True,
+        )
+    if isinstance(value, _GraphObjectWire):
+        attributes = {key: _decode_graph_ipc(item) for key, item in value.attributes.items()}
+        if value.kind == "prepared":
+            return Graph(**attributes)
+        if value.kind == "official":
+            return SimpleNamespace(**attributes)
+        raise ValueError(f"unknown graph IPC object kind: {value.kind}")
+    if isinstance(value, dict):
+        return {key: _decode_graph_ipc(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_decode_graph_ipc(item) for item in value)
+    return value
+
+
+def _apply_graph_chunk(function: Callable[[Any], Graph], chunk: list[Any]) -> list[Any]:
+    """Spawn-picklable work item; neither direction transports Tensor storage."""
+    return [_encode_graph_ipc(function(_decode_graph_ipc(payload))) for payload in chunk]
 
 
 def _ordered_parallel_graphs(
@@ -508,7 +616,7 @@ def _ordered_parallel_graphs(
         chunk = list(islice(source, chunksize))
         if not chunk:
             return False
-        pending.append(executor.submit(_apply_graph_chunk, function, chunk))
+        pending.append(executor.submit(_apply_graph_chunk, function, _encode_graph_ipc(chunk)))
         return True
 
     for _ in range(2 * workers):
@@ -517,7 +625,7 @@ def _ordered_parallel_graphs(
     while pending:
         completed = pending.popleft().result()
         submit_next()
-        yield from completed
+        yield from (_decode_graph_ipc(graph) for graph in completed)
 
 
 def _validate_cached_graphs(

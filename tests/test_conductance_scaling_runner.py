@@ -547,6 +547,29 @@ def _stub(
                 "optimizer_steps_per_second": 2.0,
             },
         }
+        if "research.conductance_gat.v5.train" in command:
+            # No GPU training: use the production CLI/config/throughput producer
+            # with explicitly synthetic completed-history counters. This catches
+            # writer/consumer schema drift that hand-written telemetry missed.
+            child_args = v5_train.build_parser().parse_args(command[5:])
+            v5_train.validate_args(child_args)
+            config = v5_train.configuration(child_args)
+            record["configuration"] = config
+            record["hardware_execution"] = {
+                "profile": config["hardware_profile"],
+                "precision": config["precision"],
+                "tf32": config["tf32"],
+                "activation_checkpoint": config["activation_checkpoint"],
+                "edge_chunk_size": config["edge_chunk_size"],
+                "sample_seed_batch_size": config["sample_seed_batch_size"],
+                "graph_batch_size": config["batch_size"],
+                "sample_prefetch": config["sample_prefetch"],
+                "pin_memory": config["pin_memory"],
+            }
+            record["throughput"] = v5_train.training_throughput(
+                [{"train_label_count": 120, "train_batches": 3}],
+                record["elapsed_seconds"],
+            )
         if expose_test:
             record["test"] = 0.9
         (output / "metrics.json").write_text(json.dumps(record), encoding="utf-8")
@@ -594,6 +617,60 @@ def test_success_is_released_only_after_every_child_metric_is_valid(tmp_path, mo
     assert len(summary["runs"]) == 10
     assert all("resource_observability" in row for row in summary["runs"])
     assert all("throughput" in row for row in summary["runs"])
+
+
+@pytest.mark.parametrize("hardware_profile", ["portable", "a6000-48gb"])
+def test_v5_production_throughput_reaches_real_scaling_aggregation(
+    tmp_path, monkeypatch, hardware_profile
+):
+    """CPU contract integration only; resource fixtures do not certify CUDA training."""
+
+    options, calls = _stub(tmp_path, monkeypatch)
+    options += [
+        "--versions", "v5", "--model-seeds", "0",
+        "--hardware-profile", hardware_profile,
+    ]
+    assert runner.main(options) == 0
+    root = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    summary = json.loads((root / "summary.json").read_text(encoding="utf-8"))
+    assert len(calls) == 3  # Preflight plus both V5 conditions, never actual subprocesses.
+    assert manifest["status"] == "passed"
+    assert {job["condition"] for job in manifest["jobs"]} == {
+        "fixed_c", "shared_dynamic_c"
+    }
+    expected = v5_train.training_throughput(
+        [{"train_label_count": 120, "train_batches": 3}], 1.5
+    )
+    for job in manifest["jobs"]:
+        assert job["result"]["throughput"] == expected
+        assert runner._load_child(job)["throughput"] == expected
+    assert len(summary["runs"]) == 2
+    assert all(row["throughput"] == expected for row in summary["runs"])
+
+
+@pytest.mark.parametrize("malformation", ["missing_scope", "old_rate_names", "boolean_metadata"])
+def test_v5_scaling_still_rejects_the_reported_throughput_defects(
+    tmp_path, monkeypatch, malformation
+):
+    options, _calls = _stub(tmp_path, monkeypatch)
+    assert runner.main(options + ["--versions", "v5", "--model-seeds", "0"]) == 0
+    root = tmp_path / "conductance_gat/scaling/unit-fixture"
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    job = manifest["jobs"][0]
+    metrics_path = Path(job["metrics_path"])
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    report = metrics["throughput"]
+    if malformation == "missing_scope":
+        report.pop("scope")
+    elif malformation == "old_rate_names":
+        for key in ("supervised_labels_per_second", "training_batches_per_second"):
+            report[key.replace("_per_second", "_per_elapsed_second")] = report.pop(key)
+    else:
+        report["elapsed_includes_validation_checkpointing_and_interventions"] = True
+    metrics_path.write_text(json.dumps(metrics), encoding="utf-8")
+    with pytest.raises(ValueError, match="throughput"):
+        runner._load_child(job)
 
 
 @pytest.mark.parametrize("field", ["resource_observability", "throughput"])
