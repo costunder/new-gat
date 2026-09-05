@@ -8,7 +8,28 @@
 
 ## 1. 소스 버전과 측정 범위
 
-### 현재: V5 C 최적화 계층으로 구조 변경
+### 현재: V5 기존 학습 상태를 유지하는 선택적 전환 구현
+
+추가 사용자 로그 `204d5998-9283-424e-a79b-c7b8f94aaf0f/pasted-text.txt`에는 reference/arxiv의
+fixed·dynamic과 large/arxiv fixed, 총 3개 완료 조건을 검증 후 건너뛴 기록이 있다.
+4번째 large/arxiv dynamic은 RNG 복구 예외를 적용한 뒤 누적 epoch 160까지 진행했다.
+384 channels/12 layers/8 heads, 총 29,917,064 parameters 중 공통 backbone/W/beta
+26,122,952개가 유지 대상이고 기존 MLP C 3,794,112개가 교체 대상이다.
+이는 로그에 나타난 상태이며 실제 서버 last.pt의 최신 epoch·SHA를 확보한 것은 아니다.
+
+전환 기능은 공통 가중치·AdamW moment/step·누적 epoch를 유지하고 C만 초기화한다.
+완료 fixed 결과는 읽기 전용 검증 후 보존하며, 완료 dynamic에 새 C 학습 예산이 없으면
+추가 예산 필요 상태로 구분한다. 새 초기값의 비교 실험이나 정확한 동일 모델 재개로 위장하지 않는다.
+구현·정적 검사·로컬 CPU 회귀를 완료했다. 전체 검사는 **2,419 passed / 103 skipped**
+(186.61초)이며, 전환 관련 177개 검사를 포함한다. 공통 tensor/AdamW 상태 유지, 실제 CPU
+forward/backward/update, source epoch 이후 재개, 초기화 5개 중단 지점 복구, 원본 bytes 보존,
+완료 결과 재사용, 조건별 추가 예산과 mixed-source journal 검증을 포함한다.
+생략 항목은 CUDA/BF16, 미설치 PyG, Linux/Bash/native Linux 기능, Windows symlink 권한,
+별도 opt-in IPC stress다. GPU 측정 증명서 테스트는 명시적인 CPU fixture이며 실제 측정이 아니다.
+실제 서버 checkpoint 이식·A6000 실측·실제 데이터 전체 학습/평가는 미실행이다.
+아래 2,242개 회귀는 전환 기능 추가 이전 소스의 검증 기록이다.
+
+### 이전: V5 C 최적화 계층으로 구조 변경
 
 기본 V5를 입력 그래프별 K회 C 최적화 후 가중 라플라시안으로 전파하는 구조로 변경했다.
 기존 MLP-C는 명시적 비교 옵션으로 보존한다. Reference/large 모델 규모, 공식 데이터셋,

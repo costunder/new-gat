@@ -4,8 +4,46 @@
 
 현재 V5의 기본 `conductance_backend`는 `optimization`이다. 이전 endpoint MLP가 C를
 한 번 출력하던 방식은 `--conductance-backend mlp`로 명시하는 비교 옵션으로 남긴다.
-이는 실제 모델 구조 변경이며 이전 MLP V5 checkpoint/결과/실측 plan과 호환되지 않는다.
-기존 결과를 삭제하거나 source hash를 고쳐 새 구조에 이어 붙이지 않는다.
+이는 C 모듈과 학습 방식의 변경이지 backbone 전체의 폐기가 아니다. Backbone, multi-head W,
+beta, residual/FFN, 출력층, 전파 연산자와 샘플러는 유지했다. 이전 checkpoint를 일반 resume로
+읽는 것은 허용하지 않지만, 아래의 명시적 전환으로 공통 가중치와 AdamW 상태를 재사용한다.
+기존 결과를 삭제하거나 source hash를 고쳐 새 구조의 결과인 것처럼 이어 붙이지 않는다.
+
+### 진행 중인 MLP V5를 보존하는 선택적 전환
+
+`scripts/run_v5_transition.py`는 기존 scaling/rich manifest를 읽고 조건별 처리를 나눈다.
+원본은 읽기 전용이고 결과는 별도 전환 디렉터리에 기록한다. 일반 resume guard나 이전
+numerical-repair 호환 registry를 완화하지 않는다.
+
+- 완료 fixed C: metrics/last/best/history와 데이터·설정·소스 해시를 검증하고 역사적 대조군으로
+  보존한다. 다시 학습하지 않으며 새 solver로 새로 학습한 결과라고 표시하지 않는다.
+- 미완료 fixed C: 모든 모델·optimizer·RNG·history/선택 상태와 기존 단계별 학습 설정을 유지한다.
+- Dynamic C: 공통 backbone/W/beta/FFN/출력 가중치를 이름·shape·dtype 단위로 모두 이식하고,
+  해당 AdamW moment/step도 보존한다. C estimator namespace만 교체하고 새 C optimizer 상태만
+  초기화한다. 이전 C의 최고 점수를 새 C best/early-stopping 기준으로 가져오지 않는다.
+- 학습 누적 epoch와 원래 총 예산을 유지한다. 예를 들어 실제 last.pt가 160/200이면 다음은
+  누적 161이며 기본적으로 200까지 남은 40 epochs다. 새 C가 200 epochs 학습됐다고 주장하지 않는다.
+  추가 학습은 명시적인 `--extra-epochs` 또는 조건별 `--extra-epochs-for JOB_ID=N`으로만 승인한다.
+- 완료 dynamic에서 남은 예산이 없다면 이전 결과는 보존하고 새 C 조건을 `pending_extra_budget`로
+  남긴다. 다른 진행 가능한 조건까지 버리거나 이미 학습한 모델을 조용히 처음부터 돌리지 않는다.
+- 시작하지 않은 조건만 새 초기화한다. V1–V4/Cycle/Tree는 전환 실행기의 대상이 아니다.
+
+전환 후 첫 update 전에 source-epoch boundary checkpoint(schema 4)를 저장한다. 새 C의
+history는 전환 이후만 기록하며 `epoch_offset`으로 누적 epoch와 연결하고, 원본 history는 별도
+보존한다. 같은 전환 명령의 재개는 model/optimizer/RNG와 전환 provenance를 함께 검증한다.
+초기 boundary 저장 자체가 중단된 경우에도 동일 요청에 묶인 초기화 마커를 검증해 재시도한다.
+검증된 source history와 fixed best는 덮어쓰지 않으며, 무관한 파일이나 이미 학습된 결과가
+섞인 디렉터리는 초기화 재시도 대상으로 받아들이지 않는다.
+공통 부분의 새 초기값도 실제로 이식된 state의 hash이며 무작위 초기화를 학습 재사용으로 속이지 않는다.
+
+신형 C의 physical batch 후보는 원래 값보다 작게 줄이지 않고 실제 optimizer-inclusive
+probe로 다시 측정한다. 같은 수치 학습을 유지하는 fixed continuation은 원래 실행 구성을
+보존하고 그 구성에서 probe한다. 변경된 실행 값과 실제 GPU/data/runtime/source에 묶인
+인증서를 기록한다. 원본 resource plan을 새 C의 실측인 것처럼 재사용하지 않는다.
+
+이전 fixed/reference 결과와 사전학습 상태에서 시작한 새 C 결과는 같은 초기값의 fresh paired
+실험이 아니다. 전환 전후 학습량·원본 artifact·재사용/초기화 내역을 분리한 보고서로 비교한다.
+CPU 전환 검증과 실제 서버 checkpoint 이식·A6000 측정·전체 학습은 구분한다.
 
 ### 학습되는 대상과 forward
 

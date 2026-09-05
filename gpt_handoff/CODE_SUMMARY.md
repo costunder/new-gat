@@ -30018,6 +30018,21 @@ from .protocol import (
     conductance_configuration,
 )
 from .sampling import TransductiveGraphSampler
+from .transition_initialization import ensure_transition_initialization
+from .transition_training import (
+    prepare_training_origin,
+    publish_transition_boundary,
+    validate_transition_resume,
+)
+from .transition_training import (
+    request_from_args as transition_request_from_args,
+)
+from .transition_training import (
+    validate_arguments as validate_transition_arguments,
+)
+from .transition_training import (
+    validate_output_boundary as validate_transition_output,
+)
 
 FAILURE_RESOURCE_FILENAME = "failure-resource-observability.json"
 
@@ -30757,12 +30772,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--activation-checkpoint", action=argparse.BooleanOptionalAction, default=None
     )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--transition-from-checkpoint", type=Path)
+    parser.add_argument("--transition-source-sha256")
+    parser.add_argument("--transition-mode", choices=("replace_c", "continue_fixed"))
+    parser.add_argument("--transition-extra-epochs", type=int, default=0)
+    parser.add_argument("--transition-resource-certificate", type=Path)
+    parser.add_argument("--transition-resource-sha256")
     return parser
 
 
 def validate_args(args: argparse.Namespace) -> None:
     resolve_hardware_arguments(args)
     conductance_arguments_configuration(args)
+    validate_transition_arguments(args)
     integers = (
         args.epochs,
         args.patience,
@@ -30964,7 +30986,7 @@ def build_resume_identity(
         raise ValueError("official dataset protocol has no valid data_sha256")
     if len(initial_state_sha256) != 64:
         raise ValueError("initial model state fingerprint is invalid")
-    return {
+    identity = {
         "schema_version": 1,
         "research_suite": SUITE,
         "dataset": args.dataset,
@@ -30979,6 +31001,10 @@ def build_resume_identity(
         "runtime_versions": runtime_versions or _versions(),
         "resume_semantics": RESUME_SEMANTICS,
     }
+    request = transition_request_from_args(args)
+    if request is not None:
+        identity["transition_request"] = request
+    return identity
 
 
 def validate_resume_identity(actual: Any, expected: dict[str, Any], stored_sha256: Any) -> None:
@@ -31250,6 +31276,12 @@ def _train_model_impl(
     optimizer = make_optimizer(model)
     validate_optimizer_parameter_ownership(model, optimizer)
     schedule = phase_schedule(args.epochs, list(args.phase_fractions), args.training_schedule)
+    origin = None
+    if getattr(args, "transition_from_checkpoint", None) is not None:
+        origin = prepare_training_origin(args, model, optimizer, protocol, output)
+        schedule = origin["schedule"]
+        initial_state_sha256 = origin["initial_state_sha256"]
+        shared_state_sha256 = origin["shared_initial_state_sha256"]
     total_parameters_at_construction = sum(value.numel() for value in model.parameters())
     optimizer_owned_parameters = sum(
         value.numel() for group in optimizer.param_groups for value in group["params"]
@@ -31322,9 +31354,20 @@ def _train_model_impl(
             "test_evaluated": False,
         },
     }
+    if origin is not None:
+        pre_run_observability["transition_provenance"] = origin["provenance"]
+        pre_run_observability["optimization"].update(
+            source_epochs_completed=origin["provenance"]["source_epoch"],
+            post_transition_epoch_budget=args.epochs - origin["provenance"]["source_epoch"],
+            prior_epoch_progress_discarded=False,
+        )
     print(json.dumps(pre_run_observability, sort_keys=True), flush=True)
-    resume_identity = build_resume_identity(
-        args, protocol, schedule, initial_state_sha256=initial_state_sha256
+    resume_identity = (
+        origin["resume_identity"]
+        if origin is not None
+        else build_resume_identity(
+            args, protocol, schedule, initial_state_sha256=initial_state_sha256
+        )
     )
     resume_identity_sha256 = _canonical_sha256(resume_identity)
     checkpoint, previous_checkpoint, last_path, history_path = (
@@ -31345,15 +31388,25 @@ def _train_model_impl(
     effective_group_steps = {name: 0 for name in _PARAMETER_GROUPS}
     gradient_groups_validated_this_invocation: set[str] = set()
     resume_source_compatibility: list[dict[str, Any]] = []
+    epoch_offset = origin["epoch_offset"] if origin is not None else 0
+    optimizer_steps_before_transition = (
+        origin["provenance"]["source_optimizer_steps"]
+        if origin is not None and origin["provenance"]["mode"] == "replace_c"
+        else 0
+    )
+    if origin is not None:
+        publish_transition_boundary(origin, args, output, architecture)
     if args.resume and last_path.exists():
         saved = load_checkpoint_on_cpu(last_path)
-        if saved.get("schema_version") != 3:
+        if saved.get("schema_version") != (4 if origin is not None else 3):
             raise ValueError("last.pt uses an incompatible V5 selection-state schema")
         validate_resume_identity(
             saved.get("resume_identity"),
             resume_identity,
             saved.get("resume_identity_sha256"),
         )
+        if origin is not None:
+            validate_transition_resume(saved, origin, output)
         stored_transitions = saved.get("resume_source_compatibility", [])
         if not isinstance(stored_transitions, list) or any(
             not isinstance(item, dict) for item in stored_transitions
@@ -31373,7 +31426,7 @@ def _train_model_impl(
             not isinstance(saved_history, list)
             or isinstance(saved_epoch, bool)
             or not isinstance(saved_epoch, int)
-            or saved_epoch != len(saved_history)
+            or saved_epoch != epoch_offset + len(saved_history)
             or saved_epoch < 1
         ):
             raise ValueError("last.pt epoch/history state is invalid")
@@ -31405,6 +31458,11 @@ def _train_model_impl(
         )
         restore_checkpoint_rng(saved, device)
         del saved
+    if origin is not None:
+        # Only immutable metadata is needed after loading. Release the staged
+        # CPU model/moments/RNG/history copies before the first GPU update.
+        for key in ("model_state", "optimizer_state", "rng_state", "source_history"):
+            del origin[key]
     validation_indices = indices["validation"] if indices is not None else None
     validation_data = _validation_source(data, sampler)
     torch.cuda.reset_peak_memory_stats(device)
@@ -31488,6 +31546,8 @@ def _train_model_impl(
             "validation": metric,
             "layers": layer_diagnostics(model),
         }
+        if origin is not None:
+            row["transition_stage_epoch"] = epoch - origin["provenance"]["source_epoch"]
         history.append(row)
         eligibility = selection_eligibility(args.condition, phase)
         if metric > global_best_metric:
@@ -31515,6 +31575,11 @@ def _train_model_impl(
                         "all_epochs" if args.condition == "fixed_c" else "c_active_epochs"
                     ),
                     "phase": phase,
+                    **(
+                        {"transition_provenance": origin["provenance"]}
+                        if origin is not None
+                        else {}
+                    ),
                 },
             )
         if eligibility["joint_early_stopping"] and metric > joint_best_metric:
@@ -31551,7 +31616,7 @@ def _train_model_impl(
         _save(
             last_path,
             {
-                "schema_version": 3,
+                "schema_version": 4 if origin is not None else 3,
                 "complete": stop_after_epoch,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
@@ -31573,10 +31638,18 @@ def _train_model_impl(
                 "cpu_rng_state": torch.get_rng_state(),
                 "cuda_rng_state": torch.cuda.get_rng_state(device),
                 "resume_source_compatibility": resume_source_compatibility,
+                **(
+                    {
+                        "epoch_offset": epoch_offset,
+                        "transition_provenance": origin["provenance"],
+                    }
+                    if origin is not None
+                    else {}
+                ),
                 **efficiency,
             },
         )
-        if epoch == 1 or epoch % 10 == 0:
+        if epoch == start_epoch or epoch % 10 == 0:
             primary_best_text = f"{best_metric:.6f}" if math.isfinite(best_metric) else "pending"
             joint_best_text = (
                 "n/a"
@@ -31664,7 +31737,8 @@ def _train_model_impl(
         "early_stopping_patience": args.patience,
         "planned_maximum_optimizer_steps": batch_observability["planned_maximum_training_batches"],
         "actual_training_batches": observed_training_batches,
-        "actual_optimizer_steps": optimizer_steps,
+        "actual_optimizer_steps": optimizer_steps - optimizer_steps_before_transition,
+        "lifetime_optimizer_steps": optimizer_steps,
         "effective_optimizer_steps_by_group": effective_group_steps,
         "gradient_accumulation_steps": 1,
         "step_definition": (
@@ -31672,7 +31746,7 @@ def _train_model_impl(
             "least one active parameter group"
         ),
         "optimizer_step_difference_from_training_batches": (
-            observed_training_batches - optimizer_steps
+            observed_training_batches - (optimizer_steps - optimizer_steps_before_transition)
         ),
     }
     result = {
@@ -31797,6 +31871,26 @@ def _train_model_impl(
         ),
         **efficiency,
     }
+    if origin is not None:
+        result.update(
+            transition_provenance=origin["provenance"],
+            epoch_offset=epoch_offset,
+            lifetime_epochs_completed=epoch_offset + len(history),
+            post_transition_optimizer_steps=optimizer_steps
+            - origin["provenance"]["source_optimizer_steps"],
+            post_transition_epochs_completed=epoch_offset
+            + len(history)
+            - origin["provenance"]["source_epoch"],
+            source_history=str((output / "source-history.json").resolve()),
+            source_history_sha256=sha256_file(output / "source-history.json"),
+            comparison_design={
+                "kind": "explicit_v5_checkpoint_transition",
+                "fresh_paired_initialization": False,
+                "single_factor_causal_effect_of_c": False,
+                "historical_metrics_are_new_c_metrics": False,
+                "source_provenance_sha256": resume_identity["transition_provenance_sha256"],
+            },
+        )
     print(
         json.dumps(
             {
@@ -31823,11 +31917,24 @@ def main(argv: list[str] | None = None) -> int:
         args.output_dir.expanduser().resolve(),
         args.data_root.expanduser().resolve(),
     )
+    validate_transition_output(args, output)
     if output == data_root or output.is_relative_to(data_root) or data_root.is_relative_to(output):
         raise ValueError("V5 output and V1 dataset cache must not overlap")
+    initializing_transition = (
+        ensure_transition_initialization(
+            args,
+            output,
+            configuration=configuration(args),
+            source_sha256=implementation_source_hashes(),
+            runtime_versions=_versions(),
+        )
+        if args.transition_from_checkpoint is not None
+        else False
+    )
     if (
         output.exists()
         and any(output.iterdir())
+        and not initializing_transition
         and not (args.resume and (output / "last.pt").exists())
     ):
         raise FileExistsError("nonempty output has no resumable V5 last.pt")
@@ -31868,6 +31975,2103 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+````
+
+# research/conductance_gat/v5/transition.py
+
+````python
+"""Explicit, read-only transition from reviewed legacy V5 checkpoints.
+
+This is deliberately separate from normal resume. Only the C-estimator
+namespace may be replaced; shared tensors and AdamW state are retained by
+exact parameter names. Source files are never modified and loading uses
+PyTorch's weights-only unpickler. An externally pinned SHA is mandatory when
+preparing a transition, not merely inspecting a source for a new plan.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+import re
+from pathlib import Path
+from typing import Any
+
+import torch
+
+TRANSITION_SCHEMA = 1
+C_NAMESPACE = re.compile(r"^blocks\.[0-9]+\.operator\.estimator\.")
+# SHA-256 of canonical full implementation_source_hashes() maps, computed
+# from immutable Git blobs, not from the current working tree.
+_LEGACY_REVISIONS = (
+    "76e514a8bf444ef82a323f18ff31982908cf2d8f",
+    "89638212e2188746905abe92de9d8545dd624915",
+)
+LEGACY_SOURCE_SNAPSHOTS = {
+    "837c29151d8bfb4165a3a01792c15ce3f45567dce931ce75b07bf044f34e4c9a": _LEGACY_REVISIONS[0],
+    "8c0c678e314ef37c663db07f2f7b75a6e34d2bbac392c45979817950f90b8a2f": _LEGACY_REVISIONS[1],
+}
+_C_CONFIGURATION = {
+    "conductance_backend",
+    "solver_steps",
+    "solver_step_size",
+    "solver_entropy",
+    "solver_degree_barrier",
+    "training_schedule",
+}
+_UNCHANGED_SOURCES = (
+    "research/conductance_gat/v5/operator.py",
+    "research/conductance_gat/v5/sampling.py",
+    "research/conductance_gat/benchmark_data.py",
+    "src/chartgat/cache.py",
+)
+_GROUPS = ("backbone", "spatial_w", "beta", "conductance")
+_SELECTION = (
+    "best_metric",
+    "best_epoch",
+    "best_checkpoint_sha256",
+    "global_best_metric",
+    "global_best_epoch",
+    "joint_best_metric",
+    "joint_best_epoch",
+    "first_c_gradient",
+)
+_EXECUTION_FIELDS = {
+    "batch_size",
+    "sample_seed_batch_size",
+    "workers",
+    "loader_workers",
+    "persistent_workers",
+    "prefetch_factor",
+    "worker_configuration_source",
+}
+
+
+def canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def _digest(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _integer(value: Any, *, minimum: int = 0) -> bool:
+    return type(value) is int and value >= minimum
+
+
+def _group(name: str) -> str:
+    if C_NAMESPACE.match(name):
+        return "conductance"
+    if ".operator.beta_estimator." in name:
+        return "beta"
+    if ".operator.value_weight" in name or ".operator.output_projection." in name:
+        return "spatial_w"
+    return "backbone"
+
+
+def _stream_sha256(stream) -> str:
+    digest = hashlib.sha256()
+    stream.seek(0)
+    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _tensor(value: Any, name: str) -> torch.Tensor:
+    if not isinstance(value, torch.Tensor) or value.device.type != "cpu":
+        raise ValueError(f"transition {name} must be a CPU tensor")
+    if value.is_floating_point() and not torch.isfinite(value).all():
+        raise ValueError(f"transition {name} is nonfinite")
+    if value.is_complex() or value.layout != torch.strided:
+        raise ValueError(f"transition {name} has an unsupported tensor representation")
+    return value
+
+
+def _optimizer_names(state: Any, model_state: dict[str, torch.Tensor]) -> dict[str, int]:
+    if not isinstance(state, dict) or set(state) != {"state", "param_groups"}:
+        raise ValueError("transition optimizer_state must be a named AdamW state dict")
+    if not isinstance(state["state"], dict) or not isinstance(state["param_groups"], list):
+        raise ValueError("transition optimizer state/groups are malformed")
+    names, identifiers, group_names = {}, set(), set()
+    for group in state["param_groups"]:
+        if not isinstance(group, dict) or group.get("name") not in _GROUPS:
+            raise ValueError("transition optimizer group name is invalid")
+        group_name = group["name"]
+        if group_name in group_names:
+            raise ValueError("transition duplicate optimizer group")
+        group_names.add(group_name)
+        parameters, parameter_names = group.get("params"), group.get("parameter_names")
+        if (
+            not isinstance(parameters, list)
+            or not isinstance(parameter_names, list)
+            or not parameters
+            or len(parameters) != len(parameter_names)
+        ):
+            raise ValueError("transition optimizer parameter_names do not align")
+        for identifier, name in zip(parameters, parameter_names, strict=True):
+            if (
+                not _integer(identifier)
+                or identifier in identifiers
+                or not isinstance(name, str)
+                or name in names
+                or name not in model_state
+                or _group(name) != group_name
+            ):
+                raise ValueError("transition optimizer parameter ownership is invalid")
+            identifiers.add(identifier)
+            names[name] = identifier
+            moments = state["state"].get(identifier)
+            if moments is None:
+                continue  # A legitimately never-updated parameter has no Adam state.
+            expected = {"step", "exp_avg", "exp_avg_sq"}
+            if group.get("amsgrad", False):
+                expected.add("max_exp_avg_sq")
+            if not isinstance(moments, dict) or set(moments) != expected:
+                raise ValueError(f"transition AdamW moments are incomplete: {name}")
+            step = _tensor(moments["step"], f"{name}.step")
+            if step.numel() != 1 or not torch.isfinite(step).all():
+                raise ValueError(f"transition AdamW step is invalid: {name}")
+            numeric_step = float(step)
+            if numeric_step < 0 or not numeric_step.is_integer():
+                raise ValueError(f"transition AdamW step is invalid: {name}")
+            for key in expected - {"step"}:
+                moment = _tensor(moments[key], f"{name}.{key}")
+                if (
+                    moment.shape != model_state[name].shape
+                    or moment.dtype != model_state[name].dtype
+                ):
+                    raise ValueError(f"transition AdamW moment shape/dtype mismatch: {name}.{key}")
+                if key.endswith("avg_sq") and (moment < 0).any():
+                    raise ValueError(f"transition AdamW squared moment is negative: {name}.{key}")
+        for key in ("lr", "weight_decay", "eps"):
+            value = group.get(key)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"transition optimizer hyperparameter is invalid: {key}")
+            if value < 0 or (key == "eps" and value == 0):
+                raise ValueError(f"transition optimizer hyperparameter is invalid: {key}")
+        betas = group.get("betas")
+        if (
+            not isinstance(betas, (list, tuple))
+            or len(betas) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, (float, int)) or not 0 <= value < 1
+                for value in betas
+            )
+        ):
+            raise ValueError("transition optimizer betas are invalid")
+    if set(state["state"]) - identifiers:
+        raise ValueError("transition optimizer has orphan moment state")
+    if set(names) != set(model_state):
+        raise ValueError("transition optimizer does not own every model parameter")
+    return names
+
+
+def _validate_legacy_c(state: dict, identity: dict) -> None:
+    configuration = identity["configuration"]
+    hidden, layers = configuration.get("hidden_channels"), configuration.get("layers")
+    if not _integer(hidden, minimum=1) or not _integer(layers, minimum=1):
+        raise ValueError("transition legacy hidden/layers configuration is invalid")
+    score = max(32, min(128, hidden // 2))
+    edge_width = 4 * score + 8
+    shapes = {
+        "node_projection.weight": (score, hidden),
+        "node_projection.bias": (score,),
+        "context_projection.weight": (score, 2 * hidden + 8),
+        "context_projection.bias": (score,),
+        "score_norm.weight": (edge_width,),
+        "score_norm.bias": (edge_width,),
+        "score_network.0.weight": (2 * score, edge_width),
+        "score_network.0.bias": (2 * score,),
+        "score_network.2.weight": (score, 2 * score),
+        "score_network.2.bias": (score,),
+        "score_network.4.weight": (1, score),
+    }
+    expected = (
+        {
+            f"blocks.{layer}.operator.estimator.{suffix}": shape
+            for layer in range(layers)
+            for suffix, shape in shapes.items()
+        }
+        if identity["condition"] == "shared_dynamic_c"
+        else {}
+    )
+    actual = {name: tuple(value.shape) for name, value in state.items() if C_NAMESPACE.match(name)}
+    if actual != expected:
+        raise ValueError(
+            "transition source C estimator names/shapes are not the reviewed legacy MLP"
+        )
+
+
+def _execution_changes(original: dict, target: dict, declared: Any, mode: str) -> dict:
+    if not isinstance(declared, dict) or set(declared) - _EXECUTION_FIELDS:
+        raise ValueError("transition declared execution changes are invalid")
+    if mode == "continue_fixed" and declared:
+        raise ValueError("fixed continuation cannot change execution settings")
+    for name, change in declared.items():
+        if (
+            not isinstance(change, dict)
+            or set(change) != {"before", "after"}
+            or change["before"] != original.get(name)
+            or change["after"] != target.get(name)
+            or change["before"] == change["after"]
+        ):
+            raise ValueError(f"transition execution change does not match identities: {name}")
+        if name in {"batch_size", "sample_seed_batch_size", "workers", "loader_workers"}:
+            minimum = 0 if "workers" in name else 1
+            if (
+                not _integer(change["before"], minimum=minimum)
+                or not _integer(change["after"], minimum=minimum)
+                or change["after"] < change["before"]
+            ):
+                raise ValueError(f"transition cannot reduce physical batches/workers: {name}")
+    if declared:
+        workers = target.get("loader_workers")
+        if (
+            not _integer(workers)
+            or target.get("workers") != workers
+            or target.get("persistent_workers") is not (workers > 0)
+            or target.get("prefetch_factor") != (2 if workers else None)
+        ):
+            raise ValueError("transition changed worker metadata inconsistently")
+    return copy.deepcopy(declared)
+
+
+def _validate_identity(identity: Any, stored_hash: Any) -> str:
+    try:
+        json.dumps(identity, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError("transition identity must contain finite plain JSON metadata") from error
+    if not isinstance(identity, dict) or stored_hash != canonical_sha256(identity):
+        raise ValueError("transition resume identity hash mismatch")
+    if (
+        identity.get("schema_version") != 1
+        or identity.get("research_suite") != "conductance_graph_conditioned_v5"
+    ):
+        raise ValueError("transition resume identity schema/suite is invalid")
+    protocol = identity.get("dataset_protocol")
+    if (
+        not isinstance(protocol, dict)
+        or identity.get("dataset_protocol_sha256") != canonical_sha256(protocol)
+        or not _digest(protocol.get("data_sha256"))
+        or identity.get("cache_sha256") != protocol["data_sha256"]
+        or not _digest(identity.get("initial_state_sha256"))
+    ):
+        raise ValueError("transition official data identity is invalid")
+    source = identity.get("source_sha256")
+    if not isinstance(source, dict) or any(not _digest(value) for value in source.values()):
+        raise ValueError("transition implementation source map is invalid")
+    revision = LEGACY_SOURCE_SNAPSHOTS.get(canonical_sha256(source))
+    if revision is None:
+        raise ValueError("transition source is not an exactly reviewed legacy V5 snapshot")
+    configuration = identity.get("configuration")
+    if (
+        not isinstance(configuration, dict)
+        or configuration.get("conductance_backend", "mlp") != "mlp"
+        or configuration.get("training_schedule", "staged") != "staged"
+        or configuration.get("optimizer") != "AdamW"
+        or not _integer(configuration.get("model_seed"))
+        or not _integer(configuration.get("epochs"), minimum=1)
+    ):
+        raise ValueError("transition source is not a legacy MLP/staged AdamW recipe")
+    if identity.get("condition") not in {"fixed_c", "shared_dynamic_c"}:
+        raise ValueError("transition source condition is invalid")
+    if not isinstance(identity.get("runtime_versions"), dict) or not identity["runtime_versions"]:
+        raise ValueError("transition runtime identity is missing")
+    return revision
+
+
+def inspect_transition_source(
+    path: str | Path, *, expected_sha256: str | None = None
+) -> dict[str, Any]:
+    """Inspect a trusted user-selected legacy source without modifying it.
+
+    The optional expected hash permits initial plan construction; execution
+    must call prepare_transition_state with the plan-pinned SHA.
+    """
+    source_path = Path(path)
+    if source_path.is_symlink() or not source_path.is_file():
+        raise ValueError("transition source must be a regular, non-symlink checkpoint")
+    if expected_sha256 is not None and not _digest(expected_sha256):
+        raise ValueError("transition expected SHA-256 is invalid")
+    with source_path.open("rb") as stream:
+        digest = _stream_sha256(stream)
+        if expected_sha256 is not None and digest != expected_sha256:
+            raise ValueError("transition source checkpoint SHA-256 mismatch")
+        stream.seek(0)
+        saved = torch.load(stream, map_location="cpu", weights_only=True)
+        if _stream_sha256(stream) != digest:
+            raise ValueError("transition source changed while it was being inspected")
+    if not isinstance(saved, dict) or saved.get("schema_version") != 3:
+        raise ValueError("transition requires last.pt selection-state schema 3")
+    revision = _validate_identity(saved.get("resume_identity"), saved.get("resume_identity_sha256"))
+    identity = saved["resume_identity"]
+    epoch, history = saved.get("epoch"), saved.get("history")
+    if (
+        not _integer(epoch, minimum=1)
+        or not isinstance(history, list)
+        or len(history) != epoch
+        or epoch > identity["configuration"]["epochs"]
+        or any(
+            not isinstance(row, dict) or row.get("epoch") != index
+            for index, row in enumerate(history, 1)
+        )
+        or type(saved.get("complete")) is not bool
+    ):
+        raise ValueError("transition source epoch/history budget is invalid")
+    state = saved.get("model_state")
+    if not isinstance(state, dict) or not state or any(not isinstance(key, str) for key in state):
+        raise ValueError("transition source model_state is malformed")
+    for name, value in state.items():
+        _tensor(value, name)
+    _validate_legacy_c(state, identity)
+    _optimizer_names(saved.get("optimizer_state"), state)
+    for name in ("cpu_rng_state", "cuda_rng_state"):
+        value = _tensor(saved.get(name), name)
+        if value.dtype != torch.uint8 or value.ndim != 1 or value.numel() == 0:
+            raise ValueError(f"transition {name} must be a nonempty uint8 vector")
+    try:
+        torch.Generator(device="cpu").set_state(saved["cpu_rng_state"])
+    except RuntimeError as error:
+        raise ValueError("transition CPU RNG state is invalid") from error
+    counters = saved.get("effective_optimizer_steps_by_group")
+    if (
+        not _integer(saved.get("optimizer_steps"))
+        or not isinstance(counters, dict)
+        or set(counters) != set(_GROUPS)
+        or any(not _integer(counters[name]) for name in _GROUPS)
+    ):
+        raise ValueError("transition optimizer step counters are invalid")
+    for name in ("elapsed_seconds", "peak_cuda_allocated_bytes", "peak_cuda_reserved_bytes"):
+        value = saved.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+            or (name != "elapsed_seconds" and not _integer(value))
+        ):
+            raise ValueError(f"transition cumulative resource counter is invalid: {name}")
+    for moment in saved["optimizer_state"]["state"].values():
+        if float(moment["step"]) > saved["optimizer_steps"]:
+            raise ValueError(
+                "transition per-parameter steps exceed the cumulative optimizer counter"
+            )
+    for group in saved["optimizer_state"]["param_groups"]:
+        expected_steps = counters[group["name"]]
+        if expected_steps > saved["optimizer_steps"]:
+            raise ValueError("transition group steps exceed the cumulative optimizer counter")
+        for identifier in group["params"]:
+            moment = saved["optimizer_state"]["state"].get(identifier)
+            # Connectivity is checked on the first active batch, not every
+            # subsequent batch. A later sampled/edgeless branch may omit a
+            # parameter gradient while the scheduled group counter advances.
+            # Retain each actual Adam step; do not assume group-step equality.
+            if (expected_steps == 0 and moment is not None) or (
+                expected_steps > 0
+                and (moment is None or not 0 < float(moment["step"]) <= expected_steps)
+            ):
+                raise ValueError(
+                    "transition AdamW moments/steps disagree with effective group steps"
+                )
+    for metric_name, epoch_name in (
+        ("best_metric", "best_epoch"),
+        ("global_best_metric", "global_best_epoch"),
+        ("joint_best_metric", "joint_best_epoch"),
+    ):
+        metric, selected_epoch = saved.get(metric_name), saved.get(epoch_name)
+        if (
+            isinstance(metric, bool)
+            or not isinstance(metric, (int, float))
+            or math.isnan(metric)
+            or metric == math.inf
+            or not _integer(selected_epoch)
+            or selected_epoch > epoch
+            or ((selected_epoch == 0) != (metric == -math.inf))
+        ):
+            raise ValueError(f"transition selection state is invalid: {metric_name}")
+    best_hash = saved.get("best_checkpoint_sha256")
+    if (saved["best_epoch"] == 0 and best_hash is not None) or (
+        saved["best_epoch"] > 0 and not _digest(best_hash)
+    ):
+        raise ValueError("transition best-checkpoint hash is invalid")
+    return {
+        "saved": saved,
+        "sha256": digest,
+        "identity": identity,
+        "source_epoch": epoch,
+        "source_complete": saved["complete"],
+        "legacy_revision": revision,
+        "path": str(source_path.resolve()),
+    }
+
+
+def prepare_transition_state(
+    path: str | Path,
+    *,
+    expected_sha256: str,
+    target_model: torch.nn.Module,
+    target_optimizer: torch.optim.Optimizer,
+    target_identity: dict[str, Any],
+    mode: str = "replace_c",
+    additional_epochs: int = 0,
+    declared_execution_changes: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Validate everything before returning transplant states; mutate nothing.
+
+    Replace-C starts post-transition selection history at source_epoch+1 and
+    archives all source selections/history. Fixed continuation retains them.
+    Epoch budgets are cumulative, never restarted or silently extended.
+    """
+    if not _digest(expected_sha256):
+        raise ValueError("transition execution requires a plan-pinned source SHA-256")
+    if mode not in {"replace_c", "continue_fixed"}:
+        raise ValueError("transition mode must be replace_c or continue_fixed")
+    if not _integer(additional_epochs):
+        raise ValueError("transition additional_epochs must be an explicit nonnegative integer")
+    inspected = inspect_transition_source(path, expected_sha256=expected_sha256)
+    saved, source_identity = inspected["saved"], inspected["identity"]
+    condition = "shared_dynamic_c" if mode == "replace_c" else "fixed_c"
+    if source_identity["condition"] != condition or target_identity.get("condition") != condition:
+        raise ValueError("transition mode/source/target conditions disagree")
+    original = source_identity["configuration"]
+    target = target_identity.get("configuration")
+    if not isinstance(target, dict):
+        raise ValueError("transition target configuration is missing")
+    if target.get("conductance_backend") != ("optimization" if mode == "replace_c" else "mlp"):
+        raise ValueError("transition target conductance backend is invalid")
+    if target.get("training_schedule") != ("joint" if mode == "replace_c" else "staged"):
+        raise ValueError("transition target training schedule is invalid")
+    if target.get("epochs") != original["epochs"] + additional_epochs:
+        raise ValueError(
+            "transition target epoch budget differs from source plus explicit addition"
+        )
+    execution_changes = _execution_changes(original, target, declared_execution_changes or {}, mode)
+    expected_request = {
+        "source_checkpoint_sha256": expected_sha256,
+        "mode": mode,
+        "additional_epochs": additional_epochs,
+        "declared_execution_changes": execution_changes,
+    }
+    request = copy.deepcopy(target_identity.get("transition_request", expected_request))
+    request_path = request.pop("source_path", None)
+    certificate_hash = request.pop("resource_certificate_sha256", None)
+    certificate_path = request.pop("resource_certificate_path", None)
+    if (certificate_hash is not None and not _digest(certificate_hash)) or (
+        certificate_path is not None and not isinstance(certificate_path, str)
+    ):
+        raise ValueError("transition resource certificate request is malformed")
+    if request != expected_request or (
+        request_path is not None and str(Path(request_path).resolve()) != inspected["path"]
+    ):
+        raise ValueError("transition target request does not match the verified source/action")
+    if "transition_request" in source_identity:
+        raise ValueError("transition source cannot itself be a migrated experiment")
+    allowed_identity = {
+        "configuration",
+        "source_sha256",
+        "schedule",
+        "initial_state_sha256",
+        "transition_request",
+    }
+    mismatches = [
+        key
+        for key in set(source_identity) | set(target_identity)
+        if key not in allowed_identity and source_identity.get(key) != target_identity.get(key)
+    ]
+    allowed_config = _C_CONFIGURATION | {"epochs"} | set(execution_changes)
+    mismatches.extend(
+        "configuration." + key
+        for key in set(original) | set(target)
+        if key not in allowed_config and original.get(key) != target.get(key)
+    )
+    if mismatches:
+        raise ValueError("transition shared identity changed: " + ", ".join(sorted(mismatches)))
+    if mode == "continue_fixed":
+        expected_schedule = copy.deepcopy(source_identity["schedule"])
+        if additional_epochs:
+            expected_schedule[-1]["end_epoch"] += additional_epochs
+            expected_schedule[-1]["length"] += additional_epochs
+        if expected_schedule != target_identity.get("schedule"):
+            raise ValueError(
+                "fixed continuation must retain phases and extend only its final phase"
+            )
+    for source in _UNCHANGED_SOURCES:
+        if source_identity["source_sha256"].get(source) != target_identity.get(
+            "source_sha256", {}
+        ).get(source):
+            raise ValueError(f"transition changed a shared operator/data implementation: {source}")
+    source_epoch = saved["epoch"]
+    if source_epoch >= target["epochs"]:
+        raise ValueError(
+            "transition has no remaining epochs; explicitly authorize additional epochs"
+        )
+    if mode == "continue_fixed" and saved["complete"]:
+        raise ValueError(
+            "completed fixed C must be reused as a historical reference, not continued"
+        )
+    if not isinstance(target_optimizer, torch.optim.AdamW):
+        raise ValueError("transition target optimizer must be AdamW")
+    current = target_model.state_dict()
+    source = saved["model_state"]
+    shared_source = {name for name in source if not C_NAMESPACE.match(name)}
+    shared_target = {name for name in current if not C_NAMESPACE.match(name)}
+    if shared_source != shared_target:
+        raise ValueError("transition shared model tensor names do not match exactly")
+    if mode == "continue_fixed" and set(source) != set(current):
+        raise ValueError("fixed continuation cannot change model tensor namespaces")
+    new_state = {}
+    for name, value in current.items():
+        chosen = value.detach().cpu()
+        if name in shared_source:
+            old = source[name]
+            if old.shape != value.shape or old.dtype != value.dtype:
+                raise ValueError(f"transition shared tensor shape/dtype mismatch: {name}")
+            chosen = old
+        _tensor(chosen, f"target.{name}")
+        new_state[name] = chosen.clone()
+    source_names = _optimizer_names(saved["optimizer_state"], source)
+    target_optim = copy.deepcopy(target_optimizer.state_dict())
+    actual_parameter_names = {id(value): name for name, value in target_model.named_parameters()}
+    for group in target_optimizer.param_groups:
+        if any(
+            actual_parameter_names.get(id(parameter)) != name
+            for parameter, name in zip(group["params"], group["parameter_names"], strict=True)
+        ):
+            raise ValueError("transition target optimizer does not own the target model parameters")
+    if target_optim["state"]:
+        raise ValueError("transition target optimizer must be fresh before transplantation")
+    target_names = _optimizer_names(
+        target_optim,
+        {name: value.detach().cpu() for name, value in target_model.named_parameters()},
+    )
+    if {name for name in source_names if not C_NAMESPACE.match(name)} != {
+        name for name in target_names if not C_NAMESPACE.match(name)
+    }:
+        raise ValueError("transition shared optimizer parameter names differ")
+    source_groups = {group["name"]: group for group in saved["optimizer_state"]["param_groups"]}
+    for index, group in enumerate(target_optim["param_groups"]):
+        if group["name"] == "conductance" and mode == "replace_c":
+            continue
+        old_group = source_groups.get(group["name"])
+        if old_group is None or set(old_group["parameter_names"]) != set(group["parameter_names"]):
+            raise ValueError("transition shared optimizer groups differ")
+        replacement = copy.deepcopy(old_group)
+        replacement["params"] = list(group["params"])
+        replacement["parameter_names"] = list(group["parameter_names"])
+        target_optim["param_groups"][index] = replacement
+    retained_moments = []
+    for name in shared_source:
+        old_identifier, new_identifier = source_names[name], target_names[name]
+        if old_identifier in saved["optimizer_state"]["state"]:
+            target_optim["state"][new_identifier] = copy.deepcopy(
+                saved["optimizer_state"]["state"][old_identifier]
+            )
+            retained_moments.append(name)
+    counters = {
+        "optimizer_steps": saved["optimizer_steps"],
+        "effective_optimizer_steps_by_group": copy.deepcopy(
+            saved["effective_optimizer_steps_by_group"]
+        ),
+        "elapsed_seconds": saved.get("elapsed_seconds", 0.0),
+        "peak_cuda_allocated_bytes": saved.get("peak_cuda_allocated_bytes", 0),
+        "peak_cuda_reserved_bytes": saved.get("peak_cuda_reserved_bytes", 0),
+    }
+    selection = {key: copy.deepcopy(saved[key]) for key in _SELECTION}
+    if mode == "replace_c":
+        counters["effective_optimizer_steps_by_group"]["conductance"] = 0
+        selection = {
+            "best_metric": -math.inf,
+            "best_epoch": 0,
+            "best_checkpoint_sha256": None,
+            "global_best_metric": -math.inf,
+            "global_best_epoch": 0,
+            "joint_best_metric": -math.inf,
+            "joint_best_epoch": 0,
+            "first_c_gradient": None,
+        }
+    dropped = sorted(name for name in source if C_NAMESPACE.match(name))
+    initialized = sorted(name for name in current if C_NAMESPACE.match(name))
+    archived_selection = {key: copy.deepcopy(saved[key]) for key in _SELECTION}
+    applicability = {}
+    for name in ("best_metric", "global_best_metric", "joint_best_metric"):
+        if not math.isfinite(archived_selection[name]):
+            archived_selection[name] = None
+            applicability[name] = "not_yet_eligible_or_no_checkpoint_selected"
+        else:
+            applicability[name] = "observed_historical_validation_metric"
+    provenance = {
+        "schema_version": TRANSITION_SCHEMA,
+        "mode": mode,
+        "source_path": inspected["path"],
+        "source_sha256": inspected["sha256"],
+        "source_legacy_revision": inspected["legacy_revision"],
+        "source_checkpoint_sha256": inspected["sha256"],
+        "source_identity": copy.deepcopy(source_identity),
+        "source_identity_sha256": saved["resume_identity_sha256"],
+        "source_epoch": source_epoch,
+        "source_complete": saved["complete"],
+        "source_total_epochs": original["epochs"],
+        "target_total_epochs": target["epochs"],
+        "source_epochs_requested": original["epochs"],
+        "epoch_offset": source_epoch if mode == "replace_c" else 0,
+        "declared_execution_changes": execution_changes,
+        "additional_epochs": additional_epochs,
+        "retained_source_initial_state_sha256": source_identity["initial_state_sha256"],
+        "retained_shared_tensor_names": sorted(shared_source),
+        "retained_shared_tensor_count": len(shared_source),
+        "retained_shared_parameter_elements": sum(source[name].numel() for name in shared_source),
+        "retained_optimizer_state_names": sorted(retained_moments),
+        "dropped_c_tensor_names": dropped,
+        "initialized_c_tensor_names": initialized,
+        "source_optimizer_steps": saved["optimizer_steps"],
+        "source_effective_optimizer_steps_by_group": copy.deepcopy(
+            saved["effective_optimizer_steps_by_group"]
+        ),
+        "source_selection_state": archived_selection,
+        "source_selection_applicability": applicability,
+        "historical_metrics_are_new_c_metrics": False,
+        "test_labels_used": False,
+    }
+    try:
+        json.dumps(provenance, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError("transition provenance must contain finite plain JSON metadata") from error
+    return {
+        "model_state": new_state,
+        "optimizer_state": target_optim,
+        "rng_state": {name: saved[name].clone() for name in ("cpu_rng_state", "cuda_rng_state")},
+        "history": [] if mode == "replace_c" else copy.deepcopy(saved["history"]),
+        "source_history": copy.deepcopy(saved["history"]),
+        "epoch_offset": source_epoch if mode == "replace_c" else 0,
+        "start_epoch": source_epoch + 1,
+        "total_epochs": target["epochs"],
+        "selection_state": selection,
+        "counters": counters,
+        "provenance": provenance,
+    }
+````
+
+# research/conductance_gat/v5/transition_initialization.py
+
+````python
+"""Immutable ownership journal for retrying V5 transition initialization only.
+
+An interrupted initialization is not an ordinary resume. This marker permits
+retrying only the exact request in the directory that this invocation claimed
+while it was empty. It never authorizes overwriting unrelated/trained results.
+Once last.pt exists, normal strict transition-resume validation takes over.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from chartgat.cache import atomic_write_json
+
+from .transition import canonical_sha256
+
+MARKER_FILENAME = "transition-initialization.json"
+_INITIALIZATION_FILES = {
+    MARKER_FILENAME,
+    "metrics.json",
+    "source-history.json",
+    "best.pt",
+    "failure-resource-observability.json",
+}
+
+
+def _regular_file(path: Path) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"transition initialization artifact must be a regular file: {path.name}")
+
+
+def _sha256(path: Path) -> str:
+    _regular_file(path)
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _json(path: Path) -> Any:
+    _regular_file(path)
+    try:
+        result = json.loads(path.read_text(encoding="utf-8"))
+        json.dumps(result, allow_nan=False)
+    except (OSError, UnicodeError, ValueError, TypeError) as error:
+        raise ValueError(f"transition initialization JSON is invalid: {path.name}") from error
+    return result
+
+
+def _identity(args, output, configuration, source_sha256, runtime_versions):
+    from .transition_training import request_from_args
+
+    return {
+        "schema_version": 1,
+        "kind": "v5_transition_initialization_ownership",
+        "dataset": args.dataset,
+        "condition": args.condition,
+        "request": request_from_args(args),
+        "configuration": configuration,
+        "source_sha256": source_sha256,
+        "runtime_versions": runtime_versions,
+        "output_directory": str(output.resolve()),
+        "data_root": str(args.data_root.expanduser().resolve()),
+    }
+
+
+def _validate_marker(path: Path, identity: dict) -> None:
+    marker = _json(path)
+    if (
+        not isinstance(marker, dict)
+        or set(marker) != {"identity", "identity_sha256"}
+        or marker["identity"] != identity
+        or marker["identity_sha256"] != canonical_sha256(identity)
+    ):
+        raise ValueError("transition initialization marker request/config/source identity mismatch")
+
+
+def _validate_partial_files(args, output: Path, configuration: dict) -> None:
+    for artifact in output.iterdir():
+        if artifact.name not in _INITIALIZATION_FILES:
+            raise FileExistsError(
+                "transition initialization cannot adopt unrelated or trained artifact: "
+                f"{artifact.name}"
+            )
+        _regular_file(artifact)
+    metrics = output / "metrics.json"
+    if metrics.exists():
+        record = _json(metrics)
+        expected = {
+            "schema_version": 1,
+            "research_suite": "conductance_graph_conditioned_v5",
+            "dataset": args.dataset,
+            "condition": args.condition,
+            "configuration": configuration,
+            "test_evaluated": False,
+        }
+        allowed = set(expected) | {
+            "status",
+            "error",
+            "failure_resource_observability",
+            "failure_resource_observability_sha256",
+        }
+        if (
+            not isinstance(record, dict)
+            or record.get("status") not in {"running", "failed"}
+            or set(record) - allowed
+            or any(record.get(key) != value for key, value in expected.items())
+        ):
+            raise ValueError(
+                "transition initialization metrics are completed, trained or mismatched"
+            )
+    failure = output / "failure-resource-observability.json"
+    if failure.exists():
+        record = _json(failure)
+        if (
+            not isinstance(record, dict)
+            or record.get("status") != "failed"
+            or record.get("dataset") != args.dataset
+            or record.get("condition") != args.condition
+            or record.get("research_suite") != "conductance_graph_conditioned_v5"
+        ):
+            raise ValueError("transition initialization failure telemetry belongs to another run")
+    if (output / "source-history.json").exists():
+        if not isinstance(_json(output / "source-history.json"), list):
+            raise ValueError("transition initialization source history is malformed")
+    if (output / "best.pt").exists() and args.transition_mode != "continue_fixed":
+        raise ValueError("new-C initialization cannot contain a pre-training best checkpoint")
+
+
+def ensure_transition_initialization(
+    args, output: Path, *, configuration: dict, source_sha256: dict, runtime_versions: dict
+) -> bool:
+    """Claim an empty transition output or validate its exact initialization retry.
+
+    Call before main's nonempty-output gate and metrics.running publication.
+    True permits ONLY this journaled initialization to pass that gate. False
+    means no transition, or last.pt already exists and ordinary resume applies.
+    """
+    if getattr(args, "transition_from_checkpoint", None) is None:
+        return False
+    raw_output = args.output_dir.expanduser()
+    for path in (raw_output, *raw_output.parents):
+        if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+            raise ValueError("transition initialization output may not traverse symlinks/junctions")
+    if not args.resume:
+        raise ValueError("transition initialization requires resume enabled")
+    output = Path(output)
+    if output.is_symlink():
+        raise ValueError("transition initialization output may not be a symlink")
+    identity = _identity(args, output, configuration, source_sha256, runtime_versions)
+    json.dumps(identity, allow_nan=False)
+    marker_path = output / MARKER_FILENAME
+    last_path = output / "last.pt"
+    if last_path.exists() or last_path.is_symlink():
+        _regular_file(last_path)
+        if marker_path.exists() or marker_path.is_symlink():
+            _validate_marker(marker_path, identity)
+        return False
+    if output.exists() and not output.is_dir():
+        raise ValueError("transition initialization output must be a directory")
+    if marker_path.exists() or marker_path.is_symlink():
+        _validate_marker(marker_path, identity)
+        _validate_partial_files(args, output, configuration)
+        return True
+    if output.exists() and any(output.iterdir()):
+        raise FileExistsError("nonempty transition output has no matching initialization marker")
+    # Validate the immutable source bytes before creating ownership metadata.
+    if _sha256(args.transition_from_checkpoint) != args.transition_source_sha256:
+        raise ValueError("transition initialization source checkpoint SHA mismatch")
+    output.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        marker_path,
+        {
+            "identity": identity,
+            "identity_sha256": canonical_sha256(identity),
+        },
+    )
+    return True
+
+
+def _equal(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, torch.Tensor):
+        return (
+            isinstance(actual, torch.Tensor)
+            and actual.shape == expected.shape
+            and actual.dtype == expected.dtype
+            and torch.equal(actual, expected)
+        )
+    if isinstance(expected, dict):
+        return (
+            isinstance(actual, dict)
+            and set(actual) == set(expected)
+            and all(_equal(actual[key], value) for key, value in expected.items())
+        )
+    if isinstance(expected, (list, tuple)):
+        return (
+            isinstance(actual, type(expected))
+            and len(actual) == len(expected)
+            and all(_equal(a, b) for a, b in zip(actual, expected, strict=True))
+        )
+    return type(actual) is type(expected) and actual == expected
+
+
+def reuse_initialization_artifacts(
+    prepared: dict, args, output: Path, architecture: dict
+) -> dict[str, Any]:
+    """Validate owned pre-last history/fixed-best artifacts; never overwrite them.
+
+    Direct internal train tests may start with an empty directory. Reusing any
+    partial publication requires the durable marker from the public main path.
+    """
+    output = Path(output)
+    history_path, best_path = output / "source-history.json", output / "best.pt"
+    has_partial = any(path.exists() or path.is_symlink() for path in (history_path, best_path))
+    marker_path = output / MARKER_FILENAME
+    if marker_path.exists() or marker_path.is_symlink():
+        identity = prepared["resume_identity"]
+        _validate_marker(
+            marker_path,
+            _identity(
+                args,
+                output,
+                identity["configuration"],
+                identity["source_sha256"],
+                identity["runtime_versions"],
+            ),
+        )
+        _validate_partial_files(args, output, identity["configuration"])
+    elif has_partial:
+        raise ValueError(
+            "transition partial boundary artifacts have no initialization ownership marker"
+        )
+    result = {"best_checkpoint_sha256": None, "source_history_exists": False}
+    if history_path.exists() or history_path.is_symlink():
+        if _json(history_path) != prepared["source_history"]:
+            raise ValueError(
+                "transition initialization source history differs from verified source"
+            )
+        result["source_history_exists"] = True
+    if best_path.exists() or best_path.is_symlink():
+        if args.transition_mode != "continue_fixed":
+            raise ValueError("new C may not reuse an initialization best checkpoint")
+        _regular_file(best_path)
+        provenance = prepared["provenance"]
+        expected_source_hash = prepared["selection_state"]["best_checkpoint_sha256"]
+        source_dir = args.transition_from_checkpoint.parent
+        source_best = None
+        for path in (source_dir / "best.pt", source_dir / "best.previous.pt"):
+            if path.is_file() and not path.is_symlink() and _sha256(path) == expected_source_hash:
+                source_best = path
+                break
+        if source_best is None:
+            raise ValueError("transition initialization source best has no verified recovery slot")
+        with source_best.open("rb") as stream:
+            expected = torch.load(stream, map_location="cpu", weights_only=True)
+        if _sha256(source_best) != expected_source_hash:
+            raise ValueError("source best changed while checking initialization reuse")
+        from . import train
+
+        train.validate_selected_checkpoint(
+            expected,
+            expected_identity=provenance["source_identity"],
+            expected_identity_sha256=provenance["source_identity_sha256"],
+            expected_epoch=prepared["selection_state"]["best_epoch"],
+            expected_metric=prepared["selection_state"]["best_metric"],
+            expected_selection_role="primary",
+        )
+        expected.update(
+            resume_identity=prepared["resume_identity"],
+            resume_identity_sha256=prepared["resume_identity_sha256"],
+            architecture=architecture,
+            configuration=train.configuration(args),
+            schedule=prepared["schedule"],
+            transition_provenance=provenance,
+            source_selected_checkpoint_sha256=expected_source_hash,
+        )
+        before = _sha256(best_path)
+        with best_path.open("rb") as stream:
+            actual = torch.load(stream, map_location="cpu", weights_only=True)
+        if _sha256(best_path) != before or not _equal(actual, expected):
+            raise ValueError(
+                "transition initialization best checkpoint does not match retained source"
+            )
+        result["best_checkpoint_sha256"] = before
+    return result
+````
+
+# research/conductance_gat/v5/transition_report.py
+
+````python
+"""Read-only artifact checks and provenance-separated selective-transition reports.
+
+Historical scores are archival references, never newly completed solver runs or
+fresh same-initialization controls. This module neither rewrites source artifacts
+nor relaxes the ordinary V5 comparison/resume contract.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+from pathlib import Path
+from typing import Any
+
+from chartgat.resume_compat import snapshots_match
+
+from .protocol import CONDITIONS, METRIC_BY_DATASET, SUITE
+
+
+class TransitionReportIntegrityError(ValueError):
+    """An artifact or its declared transition lineage cannot be verified."""
+
+
+def _digest(path: Path) -> str:
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
+
+
+def _canonical(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise TransitionReportIntegrityError(message)
+
+
+def _sha(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _integer(value: Any, minimum: int = 0) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
+
+
+def _metric(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and 0 <= value <= 1
+    )
+
+
+def _source_map(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and bool(value)
+        and all(
+            isinstance(name, str) and bool(name) and _sha(digest) for name, digest in value.items()
+        )
+    )
+
+
+def _json(path: Path) -> dict[str, Any]:
+    value = json.loads(path.read_bytes())
+    _require(isinstance(value, dict), f"expected JSON object: {path}")
+    return value
+
+
+def _identity(record: dict[str, Any], expected: dict[str, Any] | None = None) -> dict[str, Any]:
+    identity = record.get("resume_identity")
+    _require(isinstance(identity, dict), "missing resume identity")
+    _require(record.get("resume_identity_sha256") == _canonical(identity), "identity hash mismatch")
+    if expected is not None and identity != expected:
+        changed = {
+            key
+            for key in identity.keys() | expected.keys()
+            if identity.get(key) != expected.get(key)
+        }
+        _require(
+            changed == {"source_sha256"}
+            and snapshots_match(identity["source_sha256"], expected["source_sha256"]),
+            "checkpoint/metrics identity mismatch",
+        )
+    return identity
+
+
+def _artifact(child: dict[str, Any], output: Path, key: str, filename: str) -> dict[str, str]:
+    path_value, expected = child.get(key), child.get(f"{key}_sha256")
+    _require(isinstance(path_value, str) and _sha(expected), f"missing {key} path/hash")
+    path = Path(path_value).expanduser().resolve()
+    _require(path == output / filename and path.is_file(), f"{key} path mismatch")
+    _require(_digest(path) == expected, f"{key} hash mismatch")
+    return {"path": str(path), "sha256": expected}
+
+
+def _verified_child(
+    job: dict[str, Any], *, epoch_offset: int = 0
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Verify file bindings and internally recorded contracts, not today's recipe."""
+    from scripts.telemetry_validation import (
+        validate_resource_observability,
+        validate_throughput_observability,
+    )
+
+    from .train import load_checkpoint_on_cpu
+
+    output = Path(job["output_dir"]).expanduser().resolve()
+    path = Path(job.get("metrics_path", output / "metrics.json")).expanduser().resolve()
+    _require(path == output / "metrics.json" and path.is_file(), "metrics path mismatch")
+    digest = _digest(path)
+    declared_digest = job.get("metrics_sha256", job.get("result", {}).get("metrics_sha256"))
+    if declared_digest is not None:
+        _require(_sha(declared_digest) and declared_digest == digest, "metrics hash mismatch")
+    child = _json(path)
+    for key, value in (
+        ("status", "passed"),
+        ("research_suite", SUITE),
+        ("dataset", job["dataset"]),
+        ("condition", job["condition"]),
+        ("model_seed", job["model_seed"]),
+        ("evaluation_split", "validation"),
+        ("test_evaluated", False),
+    ):
+        _require(child.get(key) == value, f"job/metrics {key} mismatch")
+    _require(
+        child["condition"] in CONDITIONS and "test" not in child,
+        "invalid validation-only condition",
+    )
+    _require(
+        child.get("metric_name") == METRIC_BY_DATASET.get(child["dataset"]), "metric name mismatch"
+    )
+    identity = _identity(child)
+    _require(identity.get("schema_version") == 1, "unsupported identity schema")
+    for key in (
+        "research_suite",
+        "dataset",
+        "condition",
+        "configuration",
+        "schedule",
+        "cache_sha256",
+        "source_sha256",
+        "initial_state_sha256",
+    ):
+        _require(identity.get(key) == child.get(key), f"identity/metrics {key} mismatch")
+    config, protocol = child.get("configuration"), child.get("protocol")
+    _require(
+        isinstance(config, dict) and config.get("model_seed") == child["model_seed"],
+        "configuration seed mismatch",
+    )
+    _require(
+        isinstance(protocol, dict) and protocol == identity.get("dataset_protocol"),
+        "dataset/split protocol mismatch",
+    )
+    _require(
+        identity.get("dataset_protocol_sha256") == _canonical(protocol),
+        "dataset/split protocol hash mismatch",
+    )
+    _require(
+        _sha(child.get("cache_sha256")) and protocol.get("data_sha256") == child["cache_sha256"],
+        "dataset cache hash mismatch",
+    )
+    _require(_source_map(child.get("source_sha256")), "invalid source hash inventory")
+    _require(
+        isinstance(child.get("versions"), dict)
+        and bool(child["versions"])
+        and child["versions"] == identity.get("runtime_versions"),
+        "runtime identity mismatch",
+    )
+    _require(
+        _sha(child.get("initial_state_sha256")) and _sha(child.get("shared_initial_state_sha256")),
+        "missing initialization hashes",
+    )
+    for key, value in job.get("architecture", {}).items():
+        _require(config.get(key) == value, f"job/metrics architecture mismatch: {key}")
+    for key in ("workers", "batch_size", "sampling"):
+        if key in job:
+            _require(config.get(key) == job[key], f"job/metrics configuration mismatch: {key}")
+    design = child.get("comparison_design")
+    _require(isinstance(design, dict) and bool(design), "missing historical comparison design")
+    _require(
+        design.get("single_factor_causal_effect_of_c") is False, "invalid causal comparison claim"
+    )
+    resource = validate_resource_observability(
+        child.get("resource_observability"), "transition.resource_observability"
+    )
+    throughput = validate_throughput_observability(child.get("throughput"), "transition.throughput")
+    hardware = child.get("hardware_execution")
+    _require(isinstance(hardware, dict), "missing hardware execution")
+    for hardware_key, config_key in (
+        ("profile", "hardware_profile"),
+        ("precision", "precision"),
+        ("tf32", "tf32"),
+        ("activation_checkpoint", "activation_checkpoint"),
+        ("edge_chunk_size", "edge_chunk_size"),
+        ("sample_seed_batch_size", "sample_seed_batch_size"),
+        ("graph_batch_size", "batch_size"),
+        ("sample_prefetch", "sample_prefetch"),
+        ("pin_memory", "pin_memory"),
+    ):
+        _require(
+            hardware.get(hardware_key) == config.get(config_key), "hardware/configuration mismatch"
+        )
+    artifacts = {
+        key: _artifact(child, output, key, filename)
+        for key, filename in (
+            ("checkpoint", "best.pt"),
+            ("last_checkpoint", "last.pt"),
+            ("history", "history.json"),
+        )
+    }
+    last = load_checkpoint_on_cpu(Path(artifacts["last_checkpoint"]["path"]))
+    best = load_checkpoint_on_cpu(Path(artifacts["checkpoint"]["path"]))
+    _identity(last, identity)
+    _identity(best, identity)
+    _require(
+        last.get("schema_version") == (4 if child.get("transition_provenance") is not None else 3)
+        and last.get("complete") is True,
+        "completed result has incomplete/unsupported last.pt",
+    )
+    if child.get("transition_provenance") is not None:
+        _require(last.get("epoch_offset") == epoch_offset, "last checkpoint epoch offset mismatch")
+        _require(
+            identity.get("transition_provenance_sha256")
+            == _canonical(child["transition_provenance"]),
+            "transition provenance identity hash mismatch",
+        )
+        artifacts["source_history"] = _artifact(
+            child, output, "source_history", "source-history.json"
+        )
+        original_history = json.loads(Path(artifacts["source_history"]["path"]).read_bytes())
+        _require(
+            isinstance(original_history, list)
+            and _canonical(original_history)
+            == child["transition_provenance"].get("source_history_sha256")
+            and len(original_history) == child["transition_provenance"].get("source_epoch"),
+            "original source history provenance mismatch",
+        )
+    history = json.loads(Path(artifacts["history"]["path"]).read_bytes())
+    _require(
+        isinstance(history, list) and bool(history) and history == last.get("history"),
+        "checkpoint/history mismatch",
+    )
+    _require(
+        _integer(epoch_offset)
+        and [row.get("epoch") for row in history if isinstance(row, dict)]
+        == list(range(epoch_offset + 1, epoch_offset + len(history) + 1)),
+        "history epoch sequence mismatch",
+    )
+    _require(
+        child.get("epochs_run") == len(history)
+        and last.get("epoch") == epoch_offset + len(history),
+        "completed epoch count mismatch",
+    )
+    _require(
+        _integer(config.get("epochs"), 1) and last["epoch"] <= config["epochs"],
+        "epoch budget exceeded",
+    )
+    for row in history:
+        _require(_metric(row.get("validation")), "invalid history validation")
+    value, epoch = child.get("validation"), child.get("best_epoch")
+    _require(
+        _metric(value) and _integer(epoch, epoch_offset + 1) and epoch <= last["epoch"],
+        "invalid selected metric/epoch",
+    )
+    _require(
+        last.get("best_metric") == value
+        and last.get("best_epoch") == epoch
+        and last.get("best_checkpoint_sha256") == artifacts["checkpoint"]["sha256"],
+        "last/best selection mismatch",
+    )
+    _require(
+        best.get("validation") == value
+        and best.get("epoch") == epoch
+        and best.get("selection_role") == "primary",
+        "best checkpoint selection mismatch",
+    )
+    _require(
+        best.get("configuration") == config
+        and best.get("schedule") == child["schedule"]
+        and best.get("condition") == child["condition"],
+        "best checkpoint recipe mismatch",
+    )
+    _require(
+        history[epoch - epoch_offset - 1]["validation"] == value,
+        "selected metric is absent from history",
+    )
+    selection = child.get("checkpoint_selection")
+    _require(
+        isinstance(selection, dict)
+        and selection.get("test_used") is False
+        and selection.get("primary_validation") == value
+        and selection.get("primary_epoch") == epoch,
+        "checkpoint selection metadata mismatch",
+    )
+    fixed = child["condition"] == "fixed_c"
+    _require(
+        selection.get("primary_role")
+        == ("all_epoch_prediction_best" if fixed else "c_active_mechanism_best"),
+        "primary selection role mismatch",
+    )
+    global_metric, global_epoch = (
+        child.get("global_best_validation"),
+        child.get("global_best_epoch"),
+    )
+    _require(
+        _metric(global_metric)
+        and global_metric >= value
+        and _integer(global_epoch, epoch_offset + 1)
+        and global_epoch <= last["epoch"],
+        "global selection mismatch",
+    )
+    _require(
+        last.get("global_best_metric") == global_metric
+        and last.get("global_best_epoch") == global_epoch
+        and history[global_epoch - epoch_offset - 1]["validation"] == global_metric,
+        "global checkpoint/history mismatch",
+    )
+    _require(
+        selection.get("global_prediction_validation") == global_metric
+        and selection.get("global_prediction_epoch") == global_epoch,
+        "global selection metadata mismatch",
+    )
+    if fixed:
+        _require(
+            global_metric == value
+            and global_epoch == epoch
+            and child.get("joint_best_validation") is None
+            and child.get("joint_best_epoch") is None,
+            "fixed-C selection mismatch",
+        )
+    else:
+        joint_metric, joint_epoch = (
+            child.get("joint_best_validation"),
+            child.get("joint_best_epoch"),
+        )
+        _require(
+            _metric(joint_metric)
+            and _integer(joint_epoch, epoch_offset + 1)
+            and joint_epoch <= last["epoch"],
+            "joint selection mismatch",
+        )
+        _require(
+            last.get("joint_best_metric") == joint_metric
+            and last.get("joint_best_epoch") == joint_epoch
+            and history[joint_epoch - epoch_offset - 1]["validation"] == joint_metric,
+            "joint checkpoint/history mismatch",
+        )
+    for record in (last, best):
+        _require(
+            record.get("transition_provenance") == child.get("transition_provenance"),
+            "checkpoint transition provenance mismatch",
+        )
+    previous = output / "best.previous.pt"
+    if previous.exists():
+        _require(previous.is_file(), "invalid previous checkpoint path")
+        artifacts["best_previous_checkpoint"] = {"path": str(previous), "sha256": _digest(previous)}
+    _require(_digest(path) == digest, "metrics changed during verification")
+    for artifact in artifacts.values():
+        _require(
+            _digest(Path(artifact["path"])) == artifact["sha256"],
+            "artifact changed during verification",
+        )
+    summary = {
+        "status": "verified",
+        "dataset": child["dataset"],
+        "condition": child["condition"],
+        "model_seed": child["model_seed"],
+        "metrics_path": str(path),
+        "metrics_sha256": digest,
+        "artifacts": artifacts,
+        "validation": value,
+        "metric_name": child["metric_name"],
+        "best_epoch": epoch,
+        "epochs_completed": last["epoch"],
+        "epochs_in_history": len(history),
+        "configuration": config,
+        "schedule": child["schedule"],
+        "protocol": protocol,
+        "cache_sha256": child["cache_sha256"],
+        "source_sha256": child["source_sha256"],
+        "runtime_versions": child["versions"],
+        "comparison_design": design,
+        "initial_state_sha256": child["initial_state_sha256"],
+        "shared_initial_state_sha256": child["shared_initial_state_sha256"],
+        "resume_identity_sha256": child["resume_identity_sha256"],
+        "hardware_execution": hardware,
+        "resource_observability": resource,
+        "throughput": throughput,
+        "fresh_same_initialization_comparison": False,
+        "test_evaluated": False,
+    }
+    return copy.deepcopy(child), copy.deepcopy(summary)
+
+
+def validate_historical_reference(
+    source_job: dict[str, Any], source_manifest: dict[str, Any], *, source_manifest_path: Path
+) -> dict[str, Any]:
+    """Verify a completed original result without treating it as a new training."""
+    from scripts.run_conductance_scaling import _load_child
+
+    manifest_path = Path(source_manifest_path).expanduser().resolve()
+    raw = manifest_path.read_bytes()
+    _require(
+        json.loads(raw) == source_manifest,
+        "source manifest changed or differs from supplied manifest",
+    )
+    _require(
+        source_job in source_manifest.get("jobs", []),
+        "historical job is absent from source manifest",
+    )
+    _require(
+        source_job.get("status") == "passed", "historical reference requires a completed passed job"
+    )
+    _require(_sha(source_job.get("metrics_sha256")), "historical metrics hash is missing")
+    # This validates the *stored* architecture/execution contract and telemetry;
+    # it does not apply today's comparison-design or default-backend constants.
+    actual_result = _load_child(source_job)
+    _require(source_job.get("result") == actual_result, "historical saved result mismatch")
+    child, reference = _verified_child(source_job)
+    _require(
+        child.get("transition_provenance") is None, "historical source is already a transition"
+    )
+    snapshot = source_manifest.get("source_sha256")
+    _require(_source_map(snapshot), "missing source manifest hash inventory")
+    candidates = [snapshot]
+    evidence = source_manifest.get("source_compatibility", [])
+    _require(isinstance(evidence, list), "invalid historical source compatibility evidence")
+    for item in evidence:
+        _require(isinstance(item, dict), "invalid historical source compatibility evidence")
+        previous, current = item.get("previous_source_sha256"), item.get("current_source_sha256")
+        _require(
+            _source_map(previous) and _source_map(current) and snapshots_match(previous, current),
+            "unverified historical source compatibility evidence",
+        )
+        if all(snapshot.get(name) == value for name, value in current.items()):
+            candidates.append(previous)
+    _require(
+        any(
+            all(candidate.get(name) == value for name, value in child["source_sha256"].items())
+            for candidate in candidates
+        ),
+        "historical child/source manifest mismatch",
+    )
+    reference.update(
+        role="historical_reference",
+        original_condition=child["condition"],
+        source_job_id=source_job.get("job_id"),
+        source_manifest_path=str(manifest_path),
+        source_manifest_sha256=hashlib.sha256(raw).hexdigest(),
+        newly_trained_epochs=0,
+        counts_as_new_solver_completion=False,
+        verification_scope=(
+            "original artifact hashes and recorded data/split/recipe/source/runtime identity; "
+            "no rerun"
+        ),
+    )
+    _require(manifest_path.read_bytes() == raw, "source manifest changed during verification")
+    return reference
+
+
+def validate_transition_child(job: dict[str, Any]) -> dict[str, Any]:
+    """Validate a completed new-output child without inventing a paired contrast."""
+    from .train import build_parser, configuration, validate_args
+
+    action = job.get("action")
+    _require(
+        action in {"transition_dynamic", "resume_incomplete_fixed", "fresh_dynamic", "fresh_fixed"},
+        "invalid training action",
+    )
+    command = job.get("resolved_command", job.get("command"))
+    _require(
+        isinstance(command, list)
+        and "-m" in command
+        and command[command.index("-m") + 1] == "research.conductance_gat.v5.train",
+        "missing resolved V5 training command",
+    )
+    args = build_parser().parse_args(command[command.index("-m") + 2 :])
+    validate_args(args)
+    epoch_offset = job.get("source_epoch", 0) if action == "transition_dynamic" else 0
+    child, result = _verified_child(job, epoch_offset=epoch_offset)
+    _require(
+        child["configuration"] == configuration(args), "resolved command/configuration mismatch"
+    )
+    _require(
+        Path(args.output_dir).expanduser().resolve()
+        == Path(job["output_dir"]).expanduser().resolve(),
+        "resolved command output mismatch",
+    )
+    provenance = child.get("transition_provenance")
+    if action in {"transition_dynamic", "resume_incomplete_fixed"}:
+        _require(isinstance(provenance, dict), "missing transition provenance")
+        mode = "replace_c" if action == "transition_dynamic" else "continue_fixed"
+        _require(provenance.get("mode") == mode, "transition mode mismatch")
+        _require(
+            provenance.get("source_checkpoint_sha256") == job.get("source_checkpoint_sha256")
+            and _sha(job.get("source_checkpoint_sha256")),
+            "transition source checkpoint hash mismatch",
+        )
+        _require(
+            provenance.get("source_epoch") == job.get("source_epoch"),
+            "transition source epoch mismatch",
+        )
+        _require(provenance.get("epoch_offset") == epoch_offset, "transition epoch offset mismatch")
+        _require(
+            provenance.get("target_total_epochs") == child["configuration"]["epochs"],
+            "transition epoch budget mismatch",
+        )
+        source_identity = provenance.get("source_identity")
+        _require(
+            isinstance(source_identity, dict)
+            and provenance.get("source_identity_sha256") == _canonical(source_identity),
+            "transition source identity hash mismatch",
+        )
+        for source_key, child_key in (
+            ("dataset", "dataset"),
+            ("condition", "condition"),
+            ("dataset_protocol", "protocol"),
+            ("cache_sha256", "cache_sha256"),
+            ("runtime_versions", "versions"),
+        ):
+            _require(
+                source_identity.get(source_key) == child[child_key],
+                "transition data/split/runtime mismatch",
+            )
+        source_config = source_identity.get("configuration", {})
+        original_budget, extra_budget = (
+            provenance.get("source_epochs_requested"),
+            provenance.get("additional_epochs"),
+        )
+        _require(
+            _integer(original_budget, 1)
+            and _integer(extra_budget)
+            and original_budget == source_config.get("epochs")
+            and original_budget + extra_budget == child["configuration"]["epochs"],
+            "transition original/additional epoch budget mismatch",
+        )
+        _require(
+            provenance.get("historical_metrics_are_new_c_metrics") is False
+            and provenance.get("test_labels_used") is False,
+            "invalid transition metric provenance claims",
+        )
+        source_path_value = job.get("source_checkpoint")
+        _require(isinstance(source_path_value, str), "missing transition source checkpoint path")
+        source_path = Path(source_path_value).expanduser().resolve()
+        _require(
+            source_path.is_file()
+            and _digest(source_path) == provenance["source_checkpoint_sha256"]
+            and str(source_path) == provenance.get("source_path"),
+            "transition source checkpoint path/hash changed",
+        )
+        if action == "resume_incomplete_fixed":
+            _require(
+                provenance.get("source_complete") is False,
+                "completed fixed-C must not be retrained",
+            )
+            _require(
+                child["condition"] == "fixed_c"
+                and child["configuration"].get("conductance_backend") == "mlp"
+                and child["configuration"].get("training_schedule") == "staged",
+                "fixed continuation must preserve the historical recipe",
+            )
+        _require(
+            result["epochs_completed"] > job["source_epoch"],
+            "transition has no newly completed epoch",
+        )
+        if action == "transition_dynamic":
+            _require(
+                child["condition"] == "shared_dynamic_c"
+                and child["configuration"].get("conductance_backend") == "optimization"
+                and child["configuration"].get("training_schedule") == "joint",
+                "transition must train new joint optimization C",
+            )
+    else:
+        _require(provenance is None, "fresh training has transition provenance")
+    result.update(
+        role="transitioned_training" if provenance is not None else "fresh_training",
+        action=action,
+        transition_provenance=copy.deepcopy(provenance),
+        pre_transition_epochs=job.get("source_epoch", 0),
+        post_transition_epochs=result["epochs_completed"] - job.get("source_epoch", 0),
+        counts_as_new_solver_completion=child["condition"] == "shared_dynamic_c"
+        and child["configuration"].get("conductance_backend") == "optimization",
+    )
+    return result
+
+
+def build_transition_report(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Summarize distinct histories; deliberately provide no causal paired delta."""
+    rows, pending = [], []
+    jobs = manifest.get("jobs")
+    _require(isinstance(jobs, list), "transition manifest jobs are missing")
+    for job in jobs:
+        action = job.get("action")
+        if action in {"reuse_completed_fixed", "preserve_legacy_dynamic"}:
+            reference = job.get("historical_reference")
+            _require(
+                isinstance(reference, dict)
+                and reference.get("role") == "historical_reference"
+                and reference.get("status") == "verified",
+                "missing verified historical reference",
+            )
+            source_path = Path(reference["source_manifest_path"])
+            _require(
+                _digest(source_path) == reference.get("source_manifest_sha256"),
+                "source manifest hash changed",
+            )
+            source = _json(source_path)
+            source_job = job.get("source_job")
+            if not isinstance(source_job, dict):
+                matches = [
+                    item
+                    for item in source.get("jobs", [])
+                    if item.get("job_id") == reference.get("source_job_id")
+                ]
+                _require(len(matches) == 1, "historical source job is ambiguous")
+                source_job = matches[0]
+            actual = validate_historical_reference(
+                source_job, source, source_manifest_path=source_path
+            )
+            _require(actual == reference, "historical reference changed")
+            expected_condition = (
+                "fixed_c" if action == "reuse_completed_fixed" else "shared_dynamic_c"
+            )
+            _require(
+                actual["condition"] == expected_condition, "historical action/condition mismatch"
+            )
+            rows.append({**actual, "action": action, "profile": job.get("profile")})
+            if action == "preserve_legacy_dynamic":
+                pending.append(
+                    {
+                        "job_id": job.get("job_id"),
+                        "reason": (
+                            "new C has not trained; explicit additional epoch budget required"
+                        ),
+                    }
+                )
+        elif job.get("status") == "passed":
+            rows.append({**validate_transition_child(job), "profile": job.get("profile")})
+        else:
+            pending.append(
+                {
+                    "job_id": job.get("job_id"),
+                    "action": action,
+                    "status": job.get("status"),
+                    "reason": job.get("error"),
+                }
+            )
+    return {
+        "schema_version": 1,
+        "research_suite": SUITE,
+        "report_kind": "selective_transition_provenance",
+        "status": "partial" if pending else "passed",
+        "rows": rows,
+        "incomplete_new_training": pending,
+        "comparison_design": {
+            "historical_references_are_new_solver_results": False,
+            "fresh_same_initialization_paired_comparison": False,
+            "single_factor_causal_effect_of_c": False,
+            "sota_claim": False,
+            "test_evaluated": False,
+            "interpretation": (
+                "historical references and continued/warm-start training have different "
+                "optimization histories and budgets; validation scores are descriptive, "
+                "not a fresh paired causal comparison"
+            ),
+        },
+        "new_solver_completions": sum(
+            bool(row.get("counts_as_new_solver_completion")) for row in rows
+        ),
+    }
+````
+
+# research/conductance_gat/v5/transition_training.py
+
+````python
+"""Training integration for explicit checkpoint transitions, never implicit resume.
+
+Old artifacts remain read-only. A new, provenance-bound epoch-boundary checkpoint
+is published before the first update, so interruption does not restart retained W.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import re
+from pathlib import Path
+from typing import Any
+
+import torch
+
+from chartgat.cache import atomic_write_json
+
+from .transition import inspect_transition_source, prepare_transition_state
+from .transition_initialization import reuse_initialization_artifacts
+
+
+def request_from_args(args) -> dict[str, Any] | None:
+    path = getattr(args, "transition_from_checkpoint", None)
+    if path is None:
+        return None
+    return {
+        "source_path": str(path.expanduser().resolve()),
+        "source_checkpoint_sha256": args.transition_source_sha256,
+        "mode": args.transition_mode,
+        "additional_epochs": args.transition_extra_epochs,
+        "resource_certificate_path": str(
+            args.transition_resource_certificate.expanduser().resolve()
+        ),
+        "resource_certificate_sha256": args.transition_resource_sha256,
+    }
+
+
+def validate_arguments(args) -> None:
+    source = getattr(args, "transition_from_checkpoint", None)
+    other = (
+        getattr(args, "transition_source_sha256", None),
+        getattr(args, "transition_mode", None),
+        getattr(args, "transition_resource_certificate", None),
+        getattr(args, "transition_resource_sha256", None),
+    )
+    extra = getattr(args, "transition_extra_epochs", 0)
+    if type(extra) is not int or extra < 0:
+        raise ValueError("transition-extra-epochs must be an explicit nonnegative integer")
+    if source is None:
+        if any(value is not None for value in other) or extra:
+            raise ValueError("transition options require --transition-from-checkpoint")
+        return
+    if any(value is None for value in other):
+        raise ValueError(
+            "transition requires source SHA, mode, and a measured resource certificate/SHA"
+        )
+    if args.resume is not True:
+        raise ValueError(
+            "transition requires epoch-boundary resume; --no-resume would discard progress"
+        )
+    if any(
+        not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in (other[0], other[3])
+    ):
+        raise ValueError("transition SHA values must be lowercase SHA-256 digests")
+    if args.transition_mode == "replace_c":
+        if (args.condition, args.conductance_backend, args.training_schedule) != (
+            "shared_dynamic_c",
+            "optimization",
+            "joint",
+        ):
+            raise ValueError("replace_c requires shared_dynamic_c, optimization, and joint")
+    elif args.transition_mode == "continue_fixed":
+        if (args.condition, args.conductance_backend, args.training_schedule) != (
+            "fixed_c",
+            "mlp",
+            "staged",
+        ):
+            raise ValueError("continue_fixed must retain fixed_c, mlp, and staged")
+    else:
+        raise ValueError("unsupported transition mode")
+
+
+def validate_output_boundary(args, output: Path) -> None:
+    request = request_from_args(args)
+    if request is None:
+        return
+    source = Path(request["source_path"])
+    if (
+        output == source.parent
+        or output.is_relative_to(source.parent)
+        or source.is_relative_to(output)
+    ):
+        raise ValueError("transition output must be separate from the source checkpoint directory")
+    original_output = args.output_dir.expanduser().absolute()
+    if any(path.is_symlink() for path in (original_output, *original_output.parents, output)):
+        raise ValueError("transition output may not be a symlink")
+
+
+def _read_certificate(args, inspected, protocol, target_configuration) -> tuple[dict, dict]:
+    from scripts.calibrate_training_resources import _hardware
+    from scripts.training_resource_plan import candidate_score, choose_candidate, source_snapshot
+
+    from . import train
+
+    path = args.transition_resource_certificate
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or train.sha256_file(path) != args.transition_resource_sha256
+    ):
+        raise ValueError("transition resource certificate path/SHA mismatch")
+    certificate = json.loads(path.read_text(encoding="utf-8"))
+    expected = {
+        "schema_version": 1,
+        "kind": "v5_transition_resource_certificate",
+        "status": "passed",
+        "classification": "resource_calibration_not_final_training",
+        "source_checkpoint_sha256": inspected["sha256"],
+        "transition_mode": args.transition_mode,
+        "source_epoch": inspected["source_epoch"],
+        "runtime_versions": train._versions(),
+        "dataset_protocol_sha256": train._canonical_sha256(protocol),
+        "cache_sha256": protocol["data_sha256"],
+        "source_sha256": source_snapshot(),
+        "hardware": _hardware(args.device),
+        "selected_configuration": target_configuration,
+    }
+    if not isinstance(certificate, dict) or any(
+        certificate.get(key) != value for key, value in expected.items()
+    ):
+        raise ValueError("transition resource certificate source/data/runtime contract mismatch")
+    original = inspected["identity"]["configuration"]
+    for key, configuration in (
+        ("baseline_execution", original),
+        ("selected_execution", target_configuration),
+    ):
+        expected_execution = {
+            name: configuration[name]
+            for name in ("batch_size", "workers", "sample_seed_batch_size")
+        }
+        if certificate.get(key) != expected_execution:
+            raise ValueError(f"transition resource certificate {key} mismatch")
+    policy = certificate.get("selection", {})
+    expected_policy = (
+        "preserve_fixed_execution"
+        if args.transition_mode == "continue_fixed"
+        else "measured_transition_candidates"
+    )
+    if policy.get("no_downscale") is not True or policy.get("policy") != expected_policy:
+        raise ValueError("transition resource certificate selection policy mismatch")
+    selected = certificate.get("selected_candidate")
+    candidates = certificate.get("candidates")
+    if not isinstance(selected, dict) or not isinstance(candidates, list) or not candidates:
+        raise ValueError("transition certificate is missing actual candidate measurements")
+    expected_axis = (
+        "graphs"
+        if args.dataset == "ppi"
+        else "full_graph"
+        if args.sampling == "full"
+        else "sampled_seed_nodes"
+    )
+    if certificate.get("batch_axis") != expected_axis:
+        raise ValueError("transition certificate physical batch axis differs from the dataset")
+    natural = certificate.get("natural_training_split_size")
+    baseline_physical = (
+        original["batch_size"]
+        if expected_axis == "graphs"
+        else original["sample_seed_batch_size"]
+        if expected_axis == "sampled_seed_nodes"
+        else 1
+    )
+    selected_physical = (
+        target_configuration["batch_size"]
+        if expected_axis == "graphs"
+        else target_configuration["sample_seed_batch_size"]
+        if expected_axis == "sampled_seed_nodes"
+        else 1
+    )
+    expected_natural = 1 if expected_axis == "full_graph" else protocol["split_counts"]["train"]
+    if type(natural) is not int or natural < 1 or natural != expected_natural:
+        raise ValueError("transition certificate natural split size is invalid")
+    if selected != {"batch_size": selected_physical, "workers": target_configuration["workers"]}:
+        raise ValueError("transition certificate selected physical resources mismatch")
+    seen = set()
+    for candidate in candidates:
+        candidate_score(candidate)
+        key = candidate["batch_size"], candidate["workers"]
+        if (
+            key in seen
+            or key[0] < baseline_physical
+            or key[0] > max(natural, baseline_physical)
+            or key[1] < original["workers"]
+        ):
+            raise ValueError("transition certificate has duplicate/out-of-contract candidates")
+        seen.add(key)
+        for measurement in candidate["measurements"]:
+            if (
+                measurement.get("status") == "passed"
+                and measurement.get("total_memory_bytes")
+                != certificate["hardware"]["total_memory_bytes"]
+            ):
+                raise ValueError("transition measurement GPU capacity contradicts bound hardware")
+            if measurement.get("batch_size") != key[0] or measurement.get("workers") != key[1]:
+                raise ValueError("transition measurement batch/workers contradict its candidate")
+            if (
+                measurement.get("condition") != args.condition
+                or measurement.get("model_seed") != args.model_seed
+            ):
+                raise ValueError(
+                    "transition certificate measured a different condition or model seed"
+                )
+    if (baseline_physical, original["workers"]) not in seen:
+        raise ValueError("transition certificate is missing an actual baseline measurement")
+    if (
+        args.transition_mode == "replace_c"
+        and baseline_physical < natural
+        and len({key[0] for key in seen}) < 2
+    ):
+        raise ValueError("new C resource selection requires multiple measured physical batches")
+    best = choose_candidate(candidates, baseline_physical)
+    if selected != {"batch_size": best["batch_size"], "workers": best["workers"]}:
+        raise ValueError("transition resources differ from the measured safe throughput selection")
+    change_names = {
+        "batch_size",
+        "workers",
+        "loader_workers",
+        "persistent_workers",
+        "prefetch_factor",
+        "worker_configuration_source",
+        "sample_seed_batch_size",
+    }
+    changes = {
+        name: {"before": original.get(name), "after": target_configuration.get(name)}
+        for name in change_names
+        if original.get(name) != target_configuration.get(name)
+    }
+    if args.transition_mode == "continue_fixed" and changes:
+        raise ValueError("fixed continuation cannot change its measured execution configuration")
+    if train.sha256_file(path) != args.transition_resource_sha256:
+        raise ValueError("transition resource certificate changed during validation")
+    return certificate, changes
+
+
+def prepare_training_origin(args, model, optimizer, protocol, output: Path) -> dict[str, Any]:
+    """Construct reproducible transferred initialization and bind its provenance."""
+    from . import train
+
+    validate_output_boundary(args, output)
+    inspected = inspect_transition_source(
+        args.transition_from_checkpoint, expected_sha256=args.transition_source_sha256
+    )
+    certificate, changes = _read_certificate(args, inspected, protocol, train.configuration(args))
+    if args.transition_mode == "continue_fixed":
+        schedule = copy.deepcopy(inspected["identity"]["schedule"])
+        schedule[-1]["end_epoch"] += args.transition_extra_epochs
+        schedule[-1]["length"] += args.transition_extra_epochs
+    else:
+        schedule = train.phase_schedule(
+            args.epochs, list(args.phase_fractions), args.training_schedule
+        )
+    identity = train.build_resume_identity(
+        args, protocol, schedule, initial_state_sha256=train.state_sha256(model)
+    )
+    request = request_from_args(args)
+    request["declared_execution_changes"] = changes
+    identity["transition_request"] = request
+    prepared = prepare_transition_state(
+        args.transition_from_checkpoint,
+        expected_sha256=args.transition_source_sha256,
+        target_model=model,
+        target_optimizer=optimizer,
+        target_identity=identity,
+        mode=args.transition_mode,
+        additional_epochs=args.transition_extra_epochs,
+        declared_execution_changes=changes,
+    )
+    model.load_state_dict(prepared["model_state"], strict=True)
+    optimizer.load_state_dict(prepared["optimizer_state"])
+    train.validate_optimizer_parameter_ownership(model, optimizer)
+    identity["initial_state_sha256"] = train.state_sha256(model)
+    shared_initial = train.shared_initial_state_sha256(model)
+    provenance = prepared["provenance"]
+    provenance.update(
+        source_checkpoint_sha256=inspected["sha256"],
+        source_epochs_requested=inspected["identity"]["configuration"]["epochs"],
+        epoch_offset=prepared["epoch_offset"],
+        source_history_sha256=train._canonical_sha256(prepared["source_history"]),
+        resource_certificate_sha256=args.transition_resource_sha256,
+        execution_changes=changes,
+        same_experiment_resume=False,
+        initialization="retained_shared_weights_and_adamw_state_with_new_c"
+        if args.transition_mode == "replace_c"
+        else "retained_fixed_c_training_state",
+        source_elapsed_seconds=prepared["counters"]["elapsed_seconds"],
+    )
+    identity["transition_provenance_sha256"] = train._canonical_sha256(provenance)
+    prepared.update(
+        resume_identity=identity,
+        resume_identity_sha256=train._canonical_sha256(identity),
+        initial_state_sha256=identity["initial_state_sha256"],
+        shared_initial_state_sha256=shared_initial,
+        schedule=schedule,
+        resource_certificate=certificate,
+    )
+    if args.transition_mode == "replace_c":
+        # New-stage throughput must not divide new batches by old-model wall time.
+        prepared["counters"].update(
+            elapsed_seconds=0.0, peak_cuda_allocated_bytes=0, peak_cuda_reserved_bytes=0
+        )
+    return prepared
+
+
+def publish_transition_boundary(prepared, args, output: Path, architecture) -> None:
+    """Publish an explicit source-epoch boundary in the new output directory only."""
+    from . import train
+
+    if (output / "last.pt").exists():
+        return
+    identity, identity_hash = prepared["resume_identity"], prepared["resume_identity_sha256"]
+    selection = copy.deepcopy(prepared["selection_state"])
+    provenance = prepared["provenance"]
+    existing = reuse_initialization_artifacts(prepared, args, output, architecture)
+    if existing["best_checkpoint_sha256"] is not None:
+        selection["best_checkpoint_sha256"] = existing["best_checkpoint_sha256"]
+    if args.transition_mode == "continue_fixed" and existing["best_checkpoint_sha256"] is None:
+        expected_hash = selection["best_checkpoint_sha256"]
+        source_dir = args.transition_from_checkpoint.parent
+        source_best = next(
+            (
+                path
+                for path in (source_dir / "best.pt", source_dir / "best.previous.pt")
+                if not path.is_symlink()
+                and path.is_file()
+                and train.sha256_file(path) == expected_hash
+            ),
+            None,
+        )
+        if source_best is None:
+            raise ValueError(
+                "fixed continuation source best checkpoint has no valid read-only recovery slot"
+            )
+        with source_best.open("rb") as stream:
+            selected = torch.load(stream, map_location="cpu", weights_only=True)
+        train.validate_selected_checkpoint(
+            selected,
+            expected_identity=provenance["source_identity"],
+            expected_identity_sha256=provenance["source_identity_sha256"],
+            expected_epoch=selection["best_epoch"],
+            expected_metric=selection["best_metric"],
+            expected_selection_role="primary",
+        )
+        if train.sha256_file(source_best) != expected_hash:
+            raise ValueError("source best checkpoint changed during transition validation")
+        selected.update(
+            resume_identity=identity,
+            resume_identity_sha256=identity_hash,
+            architecture=architecture,
+            configuration=train.configuration(args),
+            schedule=prepared["schedule"],
+            transition_provenance=provenance,
+            source_selected_checkpoint_sha256=expected_hash,
+        )
+        selection["best_checkpoint_sha256"] = train.publish_best_checkpoint(
+            output / "best.pt",
+            output / "best.previous.pt",
+            selected,
+        )
+    if not existing["source_history_exists"]:
+        atomic_write_json(output / "source-history.json", prepared["source_history"])
+    train._save(
+        output / "last.pt",
+        {
+            "schema_version": 4,
+            "complete": False,
+            "model_state": prepared["model_state"],
+            "optimizer_state": prepared["optimizer_state"],
+            "resume_identity": identity,
+            "resume_identity_sha256": identity_hash,
+            "epoch": provenance["source_epoch"],
+            "epoch_offset": prepared["epoch_offset"],
+            "phase": {"coordinate": "explicit_transition_boundary"},
+            "history": prepared["history"],
+            "transition_provenance": provenance,
+            "resume_source_compatibility": [],
+            **selection,
+            **prepared["counters"],
+            **prepared["rng_state"],
+        },
+    )
+
+
+def validate_transition_resume(saved, prepared, output: Path) -> None:
+    from . import train
+
+    if (
+        saved.get("schema_version") != 4
+        or saved.get("transition_provenance") != prepared["provenance"]
+    ):
+        raise ValueError("transition last.pt provenance/schema mismatch")
+    if saved.get("epoch_offset") != prepared["epoch_offset"]:
+        raise ValueError("transition last.pt epoch offset mismatch")
+    source_history = output / "source-history.json"
+    if source_history.is_symlink() or not source_history.is_file():
+        raise ValueError("transition archived source history is missing or unsafe")
+    history_payload = json.loads(source_history.read_text(encoding="utf-8"))
+    if train._canonical_sha256(history_payload) != prepared["provenance"]["source_history_sha256"]:
+        raise ValueError("transition archived source history was changed")
+    if train._canonical_sha256(saved["transition_provenance"]) != saved["resume_identity"].get(
+        "transition_provenance_sha256"
+    ):
+        raise ValueError("transition last.pt provenance hash mismatch")
+    history, offset = saved.get("history"), prepared["epoch_offset"]
+    if not isinstance(history, list) or any(
+        not isinstance(row, dict) or row.get("epoch") != offset + index
+        for index, row in enumerate(history, 1)
+    ):
+        raise ValueError("transition last.pt history does not match its cumulative epoch range")
+    if prepared["provenance"]["mode"] == "replace_c":
+        for key in ("best_epoch", "global_best_epoch", "joint_best_epoch"):
+            value = saved.get(key)
+            if type(value) is not int or (
+                value != 0 and not offset < value <= saved.get("epoch", -1)
+            ):
+                raise ValueError("transition last.pt reused an old-C selection epoch")
 ````
 
 # research/cycle_pe/__init__.py
@@ -70818,6 +73022,1136 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ````
 
+# scripts/run_v5_transition.py
+
+````python
+#!/usr/bin/env python3
+"""Preserve completed V5 controls and transition only remaining V5 work.
+
+This is an explicit architecture transition, never a relaxed normal resume.
+The source tree is read-only. A distinct destination owns all new checkpoints,
+resource measurements and progress. Cycle/Tree/V1--V4 are never dispatched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shlex
+import sys
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_json  # noqa: E402
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    add_conductance_arguments,
+    conductance_arguments_configuration,
+)
+from scripts.training_resource_plan import (  # noqa: E402
+    allocated_cpu_count,
+    candidate_score,
+    choose_candidate,
+    completed_candidate_status,
+    digest,
+    source_snapshot,
+    worker_candidates,
+)
+
+SUITE = "v5_preserved_state_transition_v1"
+TRAINING_ACTIONS = {"transition_dynamic", "resume_incomplete_fixed", "fresh_dynamic", "fresh_fixed"}
+TRANSITION_MODES = {"transition_dynamic": "replace_c", "resume_incomplete_fixed": "continue_fixed"}
+EXECUTION_FIELDS = ("batch_size", "workers", "sample_seed_batch_size")
+TRANSITION_OPTIONS = (
+    "--transition-from-checkpoint",
+    "--transition-source-sha256",
+    "--transition-mode",
+    "--transition-extra-epochs",
+    "--transition-resource-certificate",
+    "--transition-resource-sha256",
+)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    source = result.add_mutually_exclusive_group(required=True)
+    source.add_argument("--source-manifest", type=Path)
+    source.add_argument("--probe-job", type=Path, help=argparse.SUPPRESS)
+    result.add_argument("--output-dir", type=Path)
+    result.add_argument("--plan-only", action="store_true")
+    result.add_argument("--confirm-source-stopped", action="store_true")
+    budget = result.add_mutually_exclusive_group()
+    budget.add_argument("--extra-epochs", type=int, default=0)
+    budget.add_argument(
+        "--extra-epochs-for",
+        action="append",
+        default=[],
+        metavar="JOB_ID=N",
+        help="extend only this exact V5 job; repeatable, incompatible with global extra epochs",
+    )
+    add_conductance_arguments(result)
+    return result
+
+
+def _regular(path: Path) -> Path:
+    if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+        raise ValueError(f"transition artifacts must not traverse symlinks: {path}")
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        raise ValueError(f"required transition artifact is missing: {resolved}")
+    return resolved
+
+
+def _sha(path: Path) -> str:
+    path = _regular(path)
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
+
+
+def _read(path: Path) -> dict[str, Any]:
+    value = json.loads(_regular(path).read_bytes())
+    if not isinstance(value, dict):
+        raise ValueError(f"expected a JSON object: {path}")
+    return value
+
+
+def _overlap(first: Path, second: Path) -> bool:
+    return first == second or first.is_relative_to(second) or second.is_relative_to(first)
+
+
+def _set_option(arguments: list[str], option: str, value: Any) -> list[str]:
+    result = list(arguments)
+    positions = [i for i, token in enumerate(result) if token == option]
+    if len(positions) > 1:
+        raise ValueError(f"duplicate source command option: {option}")
+    if positions:
+        position = positions[0]
+        if position + 1 == len(result) or result[position + 1].startswith("--"):
+            raise ValueError(f"source command option has no value: {option}")
+        result[position + 1] = str(value)
+    else:
+        result += [option, str(value)]
+    return result
+
+
+def _without_transition(arguments: list[str]) -> list[str]:
+    result, index = [], 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value in TRANSITION_OPTIONS:
+            if index + 1 >= len(arguments):
+                raise ValueError(f"missing value for {value}")
+            index += 2
+        elif value in {"--resume", "--no-resume"}:
+            index += 1
+        else:
+            result.append(value)
+            index += 1
+    return result
+
+
+def _training_arguments(command: list[str], *, legacy: bool = False):
+    from research.conductance_gat.v5 import train
+
+    if (
+        not isinstance(command, list)
+        or not all(isinstance(value, str) for value in command)
+        or command.count("-m") != 1
+    ):
+        raise ValueError("source job must carry an exact V5 module argv")
+    position = command.index("-m")
+    if command[position + 1] != "research.conductance_gat.v5.train":
+        raise ValueError("transition refuses any child other than Conductance V5")
+    arguments = _without_transition(command[position + 2 :])
+    if legacy:
+        for option, value in (("--conductance-backend", "mlp"), ("--training-schedule", "staged")):
+            if option not in arguments:
+                arguments += [option, value]
+    try:
+        args = train.build_parser().parse_args(arguments)
+    except SystemExit as error:
+        raise ValueError("source V5 command does not parse with its preserved options") from error
+    train.validate_args(args)
+    return args, arguments
+
+
+def _resolve_source(path: Path):
+    path = _regular(path)
+    initial = _read(path)
+    manifests = {str(path): _sha(path)}
+    if initial.get("suite") == "rich_scaling":
+        jobs = [job for job in initial.get("jobs", []) if job.get("track") == "conductance"]
+        if len(jobs) != 1:
+            raise ValueError("rich source must contain exactly one conductance child")
+        directory = Path(jobs[0]["output_dir"])
+        if not directory.is_absolute():
+            directory = path.parent / directory
+        path = _regular(directory / "manifest.json")
+        manifests[str(path)] = _sha(path)
+        initial = _read(path)
+    if initial.get("suite") != "conductance_architecture_scaling_v1_v5":
+        raise ValueError("source must be a Conductance scaling or rich-scaling manifest")
+    if initial.get("schema_version") != 1 or not isinstance(initial.get("jobs"), list):
+        raise ValueError("source scaling manifest schema is invalid")
+    return path, initial, manifests
+
+
+def _inspect_checkpoint(path: Path):
+    from research.conductance_gat.v5.transition import inspect_transition_source
+
+    return inspect_transition_source(path, expected_sha256=_sha(path))
+
+
+def _historical_reference(job, manifest, path):
+    from research.conductance_gat.v5.transition_report import validate_historical_reference
+
+    return validate_historical_reference(job, manifest, source_manifest_path=path)
+
+
+def build_plan(args: argparse.Namespace) -> dict[str, Any]:
+    """Read and validate every source child before any destination write or GPU work."""
+    from research.conductance_gat.v5 import train
+
+    if args.output_dir is None or args.extra_epochs < 0:
+        raise ValueError("a distinct --output-dir and nonnegative --extra-epochs are required")
+    requested = conductance_arguments_configuration(args)
+    if (
+        requested["conductance_backend"] != "optimization"
+        or requested["training_schedule"] != "joint"
+    ):
+        raise ValueError("this transition replaces legacy C with optimization and joint training")
+    source_path, manifest, sources = _resolve_source(args.source_manifest)
+    extra_by_job = {}
+    for item in args.extra_epochs_for:
+        if "=" not in item:
+            raise ValueError("--extra-epochs-for must be JOB_ID=N")
+        job_id, amount = item.rsplit("=", 1)
+        if not re.fullmatch(r"[0-9]+", amount) or job_id in extra_by_job:
+            raise ValueError("extra epoch overrides must be unique nonnegative integers")
+        extra_by_job[job_id] = int(amount)
+    known_jobs = {job.get("job_id") for job in manifest["jobs"] if job.get("version") == "v5"}
+    if set(extra_by_job) - known_jobs:
+        raise ValueError("--extra-epochs-for names an unknown V5 job")
+    output = args.output_dir.expanduser().resolve()
+    if output == Path(output.anchor) or _overlap(output, source_path.parent):
+        raise ValueError("transition output must be distinct from and outside the source run")
+    if args.output_dir.is_symlink() or any(
+        parent.is_symlink() for parent in args.output_dir.parents
+    ):
+        raise ValueError("transition output must not traverse symlinks")
+    jobs, seen = [], set()
+    for source_job in manifest["jobs"]:
+        if source_job.get("version") != "v5":
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", str(source_job.get("profile", ""))):
+            raise ValueError("source V5 profile is not a safe path component")
+        expected_id = (
+            f"v5/{source_job['profile']}/model-seed-{source_job['model_seed']}/"
+            f"{source_job['dataset']}/{source_job['condition']}"
+        )
+        if source_job.get("job_id") != expected_id or expected_id in seen:
+            raise ValueError("source V5 job IDs are missing, duplicated or inconsistent")
+        seen.add(expected_id)
+        if source_job["condition"] not in {"fixed_c", "shared_dynamic_c"}:
+            raise ValueError("source V5 condition is unsupported")
+        old_output = Path(source_job["output_dir"])
+        if not old_output.is_absolute():
+            old_output = source_path.parent / old_output
+        if old_output.is_symlink() or any(parent.is_symlink() for parent in old_output.parents):
+            raise ValueError("source output must not traverse symlinks")
+        old_output = old_output.resolve()
+        if not old_output.is_relative_to(source_path.parent):
+            raise ValueError("source child output escapes its conductance run")
+        for filename in ("metrics.json", "last.pt", "best.pt", "best.previous.pt", "history.json"):
+            artifact = old_output / filename
+            sources[str(artifact)] = (
+                _sha(artifact) if artifact.exists() or artifact.is_symlink() else None
+            )
+        last = old_output / "last.pt"
+        inspected = _inspect_checkpoint(last) if last.is_file() else None
+        identity = inspected["identity"] if inspected else None
+        source_config = identity["configuration"] if identity else None
+        old_args, arguments = _training_arguments(source_job["command"], legacy=True)
+        parsed_config = train.configuration(old_args)
+        if source_config is not None:
+            for key, value in source_config.items():
+                if key in parsed_config and value != parsed_config[key]:
+                    raise ValueError(
+                        f"checkpoint/source command configuration differs: {expected_id}/{key}"
+                    )
+            if (identity.get("dataset"), identity.get("condition")) != (
+                source_job["dataset"],
+                source_job["condition"],
+            ):
+                raise ValueError("source checkpoint dataset/condition differs from its job")
+        else:
+            source_config = parsed_config
+        if (old_args.dataset, old_args.condition, old_args.model_seed) != (
+            source_job["dataset"],
+            source_job["condition"],
+            source_job["model_seed"],
+        ):
+            raise ValueError("source job and argv dataset/condition/seed differ")
+        for name, value in source_job.get("architecture", {}).items():
+            if parsed_config.get(name) != value:
+                raise ValueError(f"source job architecture differs from argv: {name}")
+        if Path(old_args.output_dir).resolve() != old_output:
+            raise ValueError("source command output differs from its source job")
+        data_root = old_args.data_root.expanduser().resolve()
+        if _overlap(output, data_root):
+            raise ValueError("transition outputs must not overlap the dataset cache")
+        epoch = int(inspected["source_epoch"]) if inspected else 0
+        extra_epochs = extra_by_job.get(expected_id, args.extra_epochs)
+        total = old_args.epochs + extra_epochs
+        fixed = old_args.condition == "fixed_c"
+        historical = None
+        if source_job.get("status") == "passed":
+            historical = _historical_reference(source_job, manifest, source_path)
+            if inspected is None:
+                raise ValueError("completed source child has no verified last checkpoint")
+        if fixed and source_job.get("status") == "passed":
+            if extra_by_job.get(expected_id, 0):
+                raise ValueError(
+                    "completed fixed controls are preserved, not extended by a transition"
+                )
+            action = "reuse_completed_fixed"
+            total, extra_epochs = old_args.epochs, 0
+        elif inspected is not None:
+            if fixed and (inspected["source_complete"] or total <= epoch):
+                raise ValueError(
+                    "fixed source checkpoint is finished but its parent result is not verified; "
+                    "finalize/recover the original result before migrating, without retraining it"
+                )
+            action = "resume_incomplete_fixed" if fixed else "transition_dynamic"
+            if not fixed and total <= epoch:
+                action = "preserve_legacy_dynamic"
+        else:
+            action = "fresh_fixed" if fixed else "fresh_dynamic"
+        target = output / "children" / expected_id
+        command_args = _set_option(arguments, "--output-dir", target)
+        command_args = _set_option(command_args, "--epochs", total)
+        if not fixed or inspected is None:
+            for name, value in requested.items():
+                command_args = _set_option(command_args, "--" + name.replace("_", "-"), value)
+        else:
+            command_args = _set_option(
+                command_args, "--conductance-backend", old_args.conductance_backend
+            )
+            command_args = _set_option(
+                command_args, "--training-schedule", old_args.training_schedule
+            )
+        if action in TRANSITION_MODES:
+            command_args += [
+                "--transition-from-checkpoint",
+                str(last),
+                "--transition-source-sha256",
+                inspected["sha256"],
+                "--transition-mode",
+                TRANSITION_MODES[action],
+                "--transition-extra-epochs",
+                str(extra_epochs),
+            ]
+        command = [
+            sys.executable,
+            "-B",
+            "-u",
+            "-m",
+            "research.conductance_gat.v5.train",
+            *command_args,
+        ]
+        jobs.append(
+            {
+                "job_id": expected_id,
+                "profile": source_job["profile"],
+                "dataset": old_args.dataset,
+                "condition": old_args.condition,
+                "model_seed": old_args.model_seed,
+                "action": action,
+                "source_job": source_job,
+                "source_output_dir": str(old_output),
+                "source_configuration": source_config,
+                "source_epoch": epoch,
+                "source_complete": inspected["source_complete"] if inspected else False,
+                "source_checkpoint": str(last) if inspected else None,
+                "source_checkpoint_sha256": inspected["sha256"] if inspected else None,
+                "source_epochs_requested": old_args.epochs,
+                "target_total_epochs": total,
+                "extra_epochs": extra_epochs,
+                "remaining_epochs": 0
+                if action == "reuse_completed_fixed"
+                else max(0, total - epoch),
+                "requires_extra_epoch_budget": action == "preserve_legacy_dynamic",
+                "historical_reference": historical,
+                "source_dataset_protocol": identity.get("dataset_protocol") if identity else None,
+                "source_runtime_versions": identity.get("runtime_versions") if identity else None,
+                "source_legacy_revision": inspected["legacy_revision"] if inspected else None,
+                "baseline_execution": {name: getattr(old_args, name) for name in EXECUTION_FIELDS},
+                "output_dir": str(target),
+                "command": command,
+                "resource_directory": str(output / "resource_calibration" / expected_id),
+                "source_resource_plan_reference": manifest.get("config", {}).get("resource_plan"),
+                "source_resource_plan_is_new_model_measurement": False,
+                "minimum_free_gb": manifest.get("config", {}).get("min_free_gb", 8.0),
+            }
+        )
+    if not jobs:
+        raise ValueError("source manifest contains no Conductance V5 jobs")
+    plan = {
+        "schema_version": 1,
+        "suite": SUITE,
+        "source_manifest": str(source_path),
+        "requested_source_manifest": str(args.source_manifest.expanduser().resolve()),
+        "source_artifact_sha256": sources,
+        "output_dir": str(output),
+        "extra_epochs": args.extra_epochs,
+        "extra_epochs_by_job": extra_by_job,
+        "new_conductance": requested,
+        "source_sha256": source_snapshot(),
+        "jobs": jobs,
+        "scope": "V5 only; old artifacts and all Cycle/Tree/V1-V4 are preserved",
+        "classification": "explicit_architecture_transition_not_fresh_paired_comparison",
+    }
+    _verify_sources(plan)
+    return plan
+
+
+def _verify_sources(plan: dict[str, Any]) -> None:
+    for name, expected in plan["source_artifact_sha256"].items():
+        path = Path(name)
+        actual = _sha(path) if path.exists() or path.is_symlink() else None
+        if actual != expected:
+            raise ValueError(
+                f"source artifact changed; stop original work before transitioning: {path}"
+            )
+    if source_snapshot() != plan["source_sha256"]:
+        raise ValueError("implementation source changed during transition; no further jobs started")
+
+
+def _active_source_processes(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read-only Linux process check; never signal the original experiment."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return []
+    outputs = {job["source_output_dir"] for job in plan["jobs"]}
+    run_ids = {
+        _read(Path(path)).get("run_id")
+        for path in plan["source_artifact_sha256"]
+        if Path(path).name == "manifest.json"
+    }
+    found = []
+    for directory in proc.iterdir():
+        if not directory.name.isdigit() or int(directory.name) == os.getpid():
+            continue
+        try:
+            command = [
+                part.decode(errors="replace")
+                for part in (directory / "cmdline").read_bytes().split(b"\0")
+                if part
+            ]
+        except (PermissionError, FileNotFoundError, ProcessLookupError):
+            continue
+        if "research.conductance_gat.v5.train" in command and "--output-dir" in command:
+            index = command.index("--output-dir") + 1
+            if index < len(command) and str(Path(command[index]).resolve()) in outputs:
+                found.append({"pid": int(directory.name), "command": command})
+        elif (
+            any(
+                Path(token).name
+                in {"run_rich_scaling.py", "run_conductance_scaling.py", "run_conductance_v5.py"}
+                for token in command
+            )
+            and "--run-id" in command
+        ):
+            index = command.index("--run-id") + 1
+            if index < len(command) and command[index] in run_ids:
+                found.append({"pid": int(directory.name), "command": command})
+    return found
+
+
+def _print_plan(plan: dict[str, Any]) -> None:
+    print(plan["classification"], flush=True)
+    for job in plan["jobs"]:
+        print(
+            f"{job['job_id']}: {job['action']}; source_epoch={job['source_epoch']}; "
+            f"target_total={job['target_total_epochs']}; remaining={job['remaining_epochs']}",
+            flush=True,
+        )
+    print(
+        "Completed fixed controls remain historical references, not new paired controls.",
+        flush=True,
+    )
+    print(
+        "Budget-exhausted legacy dynamic results are retained and explicitly pending extra budget.",
+        flush=True,
+    )
+    print(
+        "Source work must be stopped explicitly; this runner never stops the source session.",
+        flush=True,
+    )
+
+
+def _probe_runtime(job: dict[str, Any]):
+    from research.conductance_gat.v5 import train
+    from scripts.calibrate_training_resources import _hardware
+
+    args, _ = _training_arguments(job["command"])
+    runtime = train._versions()
+    if job.get("source_runtime_versions") is not None and runtime != job["source_runtime_versions"]:
+        raise ValueError("transition runtime differs from the source checkpoint")
+    hardware = _hardware(args.device)
+    return args, runtime, hardware
+
+
+def _probe(job_path: Path) -> int:
+    """Run isolated disposable measurements; never save a model or accuracy checkpoint."""
+    from research.conductance_gat.v5 import batch_calibration, train
+    from scripts.calibrate_training_resources import _measure
+
+    job = _read(job_path)
+    directory = Path(job["resource_directory"]).resolve()
+    if job_path.resolve().parent != directory:
+        raise ValueError("probe job must belong to its explicitly owned resource directory")
+    args, runtime, hardware = _probe_runtime(job)
+    import torch
+
+    free, _ = torch.cuda.mem_get_info(torch.device(args.device))
+    if free < float(job.get("minimum_free_gb", 8.0)) * 1024**3:
+        raise ValueError(
+            "current free GPU memory is below the preserved source preflight requirement"
+        )
+    payload, protocol = batch_calibration.load_calibration_payload(args)
+    expected_protocol = job.get("source_dataset_protocol")
+    if expected_protocol is not None and protocol != expected_protocol:
+        raise ValueError("transition calibration dataset/protocol differs from the source")
+    if args.dataset == "ppi":
+        maximum, axis = len(payload["splits"]["train"]), "graphs"
+    elif args.sampling != "full":
+        maximum, axis = int(payload["splits"]["train"].count_nonzero()), "sampled_seed_nodes"
+    else:
+        maximum, axis = 1, "full_graph"
+    baseline = (
+        1
+        if axis == "full_graph"
+        else args.sample_seed_batch_size
+        if axis == "sampled_seed_nodes"
+        else args.batch_size
+    )
+    natural_maximum = max(maximum, baseline)
+    preserve = job["action"] == "resume_incomplete_fixed"
+    worker_options = (
+        [args.workers]
+        if preserve
+        else [
+            value
+            for value in worker_candidates(
+                args.workers, allocated_cpu_count(), applicable=axis == "graphs"
+            )
+            if args.workers <= value <= max(2, 2 * args.workers)
+        ]
+    )
+    if not worker_options:
+        raise ValueError("no worker candidate preserves the old worker allocation")
+    identity = {
+        "job_contract_sha256": digest(job["command"]),
+        "runtime_versions": runtime,
+        "hardware": hardware,
+        "source_sha256": source_snapshot(),
+        "dataset_protocol_sha256": train._canonical_sha256(protocol),
+        "cache_sha256": protocol["data_sha256"],
+        "source_checkpoint_sha256": job["source_checkpoint_sha256"],
+        "transition_mode": TRANSITION_MODES.get(job["action"]),
+        "source_epoch": job["source_epoch"],
+        "baseline_execution": job["baseline_execution"],
+        "worker_candidates": worker_options,
+        "natural_training_split_size": maximum,
+        "batch_axis": axis,
+    }
+    progress_path = directory / "resource-progress.json"
+    if progress_path.exists():
+        progress = _read(progress_path)
+        if progress.get("identity") != identity:
+            raise ValueError("partial resource measurements have a different transition identity")
+    else:
+        progress = {"identity": identity, "candidates": [], "status": "measuring"}
+
+    def persist():
+        atomic_write_json(progress_path, progress)
+
+    persist()
+    size, plateau, best_score = baseline, 0, None
+    while True:
+        size_scores = []
+        for workers in worker_options:
+            candidate = next(
+                (
+                    item
+                    for item in progress["candidates"]
+                    if (item["batch_size"], item["workers"]) == (size, workers)
+                ),
+                None,
+            )
+            if candidate is None:
+                print(
+                    f"[transition resource probe] {job['job_id']} batch={size} workers={workers}",
+                    flush=True,
+                )
+                report = _measure(
+                    {
+                        "track": "conductance",
+                        "condition": job["condition"],
+                        "model_seed": job["model_seed"],
+                    },
+                    payload,
+                    args,
+                    batch_size=size,
+                    workers=workers,
+                )
+                # OOM reports omit these fields upstream; record the actual attempted
+                # candidate, not a fabricated success or resource measurement.
+                report.update(batch_size=size, workers=workers)
+                candidate = {
+                    "batch_size": size,
+                    "workers": workers,
+                    "status": completed_candidate_status([report]),
+                    "measurements": [report],
+                }
+                progress["candidates"].append(candidate)
+                persist()
+            score = candidate_score(candidate)
+            if score is not None:
+                size_scores.append(score)
+        if not size_scores or preserve or axis == "full_graph" or size >= natural_maximum:
+            break
+        score = max(size_scores)
+        plateau = plateau + 1 if best_score is not None and score <= best_score * 1.05 else 0
+        best_score = score if best_score is None else max(best_score, score)
+        if plateau >= 2:
+            break
+        size = min(2 * size, natural_maximum)
+    selected = choose_candidate(progress["candidates"], baseline)
+    execution = dict(job["baseline_execution"])
+    if axis != "full_graph":
+        execution["sample_seed_batch_size" if axis == "sampled_seed_nodes" else "batch_size"] = (
+            selected["batch_size"]
+        )
+    execution["workers"] = selected["workers"]
+    if preserve and execution != job["baseline_execution"]:
+        raise ValueError("fixed continuation measurement must preserve its exact execution")
+    if source_snapshot() != identity["source_sha256"]:
+        raise ValueError("source changed during transition calibration")
+    selected_command = list(job["command"])
+    for field, value in execution.items():
+        selected_command = _set_option(selected_command, "--" + field.replace("_", "-"), value)
+    selected_args, _ = _training_arguments(selected_command)
+    certificate = {
+        "schema_version": 1,
+        "kind": "v5_transition_resource_certificate",
+        "status": "passed",
+        "classification": "resource_calibration_not_final_training",
+        **identity,
+        "selected_execution": execution,
+        "selected_configuration": train.configuration(selected_args),
+        "candidates": progress["candidates"],
+        "selected_candidate": {
+            "batch_size": selected["batch_size"],
+            "workers": selected["workers"],
+        },
+        "selection": {
+            "policy": "preserve_fixed_execution" if preserve else "measured_transition_candidates",
+            "no_downscale": True,
+            "global_optimum_claimed": False,
+            "paired_control_retrained": False,
+            "optimization_recipe_change": execution != job["baseline_execution"],
+        },
+        "source_resource_plan_reference": job.get("source_resource_plan_reference"),
+        "source_resource_plan_is_new_model_measurement": False,
+    }
+    certificate_path = directory / "resource-certificate.json"
+    if certificate_path.exists() and _read(certificate_path) != certificate:
+        raise ValueError("completed transition resource certificate is immutable")
+    atomic_write_json(certificate_path, certificate)
+    progress["status"] = "passed"
+    persist()
+    print(f"Measured transition resources: {execution}", flush=True)
+    return 0
+
+
+def _validate_certificate(job: dict[str, Any], path: Path) -> dict[str, Any]:
+    from research.conductance_gat.v5 import batch_calibration, train
+
+    certificate = _read(path)
+    if any(
+        certificate.get(name) != expected
+        for name, expected in {
+            "schema_version": 1,
+            "kind": "v5_transition_resource_certificate",
+            "status": "passed",
+            "classification": "resource_calibration_not_final_training",
+            "job_contract_sha256": digest(job["command"]),
+            "source_checkpoint_sha256": job["source_checkpoint_sha256"],
+            "transition_mode": TRANSITION_MODES.get(job["action"]),
+            "source_epoch": job["source_epoch"],
+            "baseline_execution": job["baseline_execution"],
+            "source_sha256": source_snapshot(),
+        }.items()
+    ):
+        raise ValueError("resource certificate does not match this transition")
+    args, runtime, hardware = _probe_runtime(job)
+    if certificate.get("runtime_versions") != runtime or certificate.get("hardware") != hardware:
+        raise ValueError("resource certificate runtime or allocated GPU changed")
+    axis = certificate["batch_axis"]
+    # This also protects fresh pending jobs, whose trainer has no transition flags.
+    payload, protocol = batch_calibration.load_calibration_payload(args)
+    if args.dataset == "ppi":
+        natural, expected_axis = len(payload["splits"]["train"]), "graphs"
+    elif args.sampling != "full":
+        natural, expected_axis = (
+            int(payload["splits"]["train"].count_nonzero()),
+            "sampled_seed_nodes",
+        )
+    else:
+        natural, expected_axis = 1, "full_graph"
+    if (
+        axis != expected_axis
+        or certificate.get("natural_training_split_size") != natural
+        or certificate.get("dataset_protocol_sha256") != train._canonical_sha256(protocol)
+        or certificate.get("cache_sha256") != protocol["data_sha256"]
+        or (
+            job.get("source_dataset_protocol") is not None
+            and protocol != job["source_dataset_protocol"]
+        )
+    ):
+        raise ValueError("resource certificate dataset or natural training split differs")
+    del payload
+    baseline = (
+        1
+        if axis == "full_graph"
+        else job["baseline_execution"][
+            "sample_seed_batch_size" if axis == "sampled_seed_nodes" else "batch_size"
+        ]
+    )
+    workers = certificate.get("worker_candidates")
+    preserve = job["action"] == "resume_incomplete_fixed"
+    expected_workers = (
+        [args.workers]
+        if preserve
+        else [
+            value
+            for value in worker_candidates(
+                args.workers, allocated_cpu_count(), applicable=axis == "graphs"
+            )
+            if args.workers <= value <= max(2, 2 * args.workers)
+        ]
+    )
+    if (
+        workers != expected_workers
+        or certificate.get("selection", {}).get("no_downscale") is not True
+    ):
+        raise ValueError("resource certificate worker allocation or no-downscale policy differs")
+    seen = set()
+    for candidate in certificate["candidates"]:
+        key = candidate.get("batch_size"), candidate.get("workers")
+        if key in seen or key[1] not in workers or len(candidate.get("measurements", [])) != 1:
+            raise ValueError("resource certificate has duplicate or incomplete candidates")
+        seen.add(key)
+        for measurement in candidate.get("measurements", []):
+            if (measurement.get("condition"), measurement.get("model_seed")) != (
+                job["condition"],
+                job["model_seed"],
+            ):
+                raise ValueError("resource measurement belongs to another condition or seed")
+            if (measurement.get("batch_size"), measurement.get("workers")) != (
+                candidate.get("batch_size"),
+                candidate.get("workers"),
+            ):
+                raise ValueError("resource measurement execution differs from its candidate")
+            if measurement.get("status") == "passed" and measurement.get(
+                "total_memory_bytes"
+            ) != hardware.get("total_memory_bytes"):
+                raise ValueError("resource measurement capacity differs from its actual GPU")
+    sizes = sorted({size for size, _ in seen})
+    if (
+        not sizes
+        or sizes[0] != baseline
+        or any((size, worker) not in seen for size in sizes for worker in workers)
+    ):
+        raise ValueError("resource certificate omitted baseline or worker candidates")
+    if preserve and sizes != [baseline]:
+        raise ValueError("fixed continuation must measure only its original execution")
+    if not preserve and axis != "full_graph" and natural > baseline and len(sizes) < 2:
+        raise ValueError("resource certificate requires multiple physical batch measurements")
+    if any(
+        right != min(2 * left, max(natural, baseline))
+        for left, right in zip(sizes, sizes[1:], strict=False)
+    ):
+        raise ValueError("resource certificate skipped a required physical batch candidate")
+    selected = choose_candidate(certificate["candidates"], baseline)
+    if certificate.get("selected_candidate") != {
+        "batch_size": selected["batch_size"],
+        "workers": selected["workers"],
+    }:
+        raise ValueError("resource certificate did not select its measured safe candidate")
+    execution = certificate.get("selected_execution")
+    if not isinstance(execution, dict) or set(execution) != set(EXECUTION_FIELDS):
+        raise ValueError("resource certificate execution fields are invalid")
+    expected_execution = dict(job["baseline_execution"])
+    if axis != "full_graph":
+        expected_execution[
+            "sample_seed_batch_size" if axis == "sampled_seed_nodes" else "batch_size"
+        ] = selected["batch_size"]
+    expected_execution["workers"] = selected["workers"]
+    if execution != expected_execution:
+        raise ValueError("resource certificate execution does not match its measured selection")
+    if any(execution[name] < job["baseline_execution"][name] for name in EXECUTION_FIELDS):
+        raise ValueError("transition resource certificate must not downscale execution")
+    if job["action"] == "resume_incomplete_fixed" and execution != job["baseline_execution"]:
+        raise ValueError("fixed continuation cannot change execution")
+    selected_command = list(job["command"])
+    for field, value in execution.items():
+        selected_command = _set_option(selected_command, "--" + field.replace("_", "-"), value)
+    selected_args, _ = _training_arguments(selected_command)
+    if certificate.get("selected_configuration") != train.configuration(selected_args):
+        raise ValueError("resource certificate measured a different V5 model or training recipe")
+    return certificate
+
+
+def _owned(path: Path, root: Path) -> None:
+    if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+        raise ValueError(f"transition output must not traverse symlinks: {path}")
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise ValueError(f"transition artifact escapes its destination: {path}")
+
+
+def _run_logged(command: list[str], log: Path) -> int:
+    from scripts.run_conductance_factorial import run_logged
+
+    if log.is_symlink() or any(parent.is_symlink() for parent in log.parents):
+        raise ValueError("transition log must not traverse symlinks")
+    environment = os.environ.copy()
+    environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+    return run_logged(command, log, environment)
+
+
+def _completed(job: dict[str, Any]) -> dict[str, Any]:
+    from research.conductance_gat.v5.transition_report import validate_transition_child
+
+    return validate_transition_child(job)
+
+
+def _write_report(manifest: dict[str, Any], output: Path) -> None:
+    from research.conductance_gat.v5.transition_report import build_transition_report
+
+    _owned(output / "summary.json", output)
+    atomic_write_json(output / "summary.json", build_transition_report(manifest))
+
+
+def _resume_or_extend_budget(manifest: dict[str, Any], plan: dict[str, Any]) -> None:
+    """Only explicitly budget previously unstarted pending jobs; never rebase trained jobs."""
+    old = manifest.get("plan")
+    if (
+        manifest.get("suite") != SUITE
+        or not isinstance(old, dict)
+        or manifest.get("plan_sha256") != digest(old)
+    ):
+        raise ValueError("existing transition destination has an invalid immutable plan")
+    stored_jobs = manifest.get("jobs")
+    if not isinstance(stored_jobs, list) or len(stored_jobs) != len(old["jobs"]):
+        raise ValueError("existing transition job matrix is incomplete")
+    for stored, original in zip(stored_jobs, old["jobs"], strict=True):
+        if any(stored.get(key) != value for key, value in original.items()):
+            raise ValueError("existing transition job contract changed")
+        allowed_statuses = (
+            {"historical_reference"}
+            if original["action"] == "reuse_completed_fixed"
+            else {"pending_extra_budget"}
+            if original["action"] == "preserve_legacy_dynamic"
+            else {"pending", "running", "failed", "passed"}
+        )
+        if stored.get("status") not in allowed_statuses:
+            raise ValueError("existing transition job status contradicts its action")
+    if old == plan:
+        return
+    ignored = {"extra_epochs_by_job", "jobs"}
+    if {key: value for key, value in old.items() if key not in ignored} != {
+        key: value for key, value in plan.items() if key not in ignored
+    }:
+        raise ValueError("existing transition destination has a different immutable plan")
+    if len(plan["jobs"]) != len(old["jobs"]):
+        raise ValueError("budget revision cannot add or remove jobs")
+    old_budgets, new_budgets = (
+        old.get("extra_epochs_by_job", {}),
+        plan.get("extra_epochs_by_job", {}),
+    )
+    if any(new_budgets.get(key) != value for key, value in old_budgets.items()):
+        raise ValueError("budget revision cannot change or remove prior explicit budgets")
+    changed = []
+    for stored, original, revised in zip(stored_jobs, old["jobs"], plan["jobs"], strict=True):
+        if original == revised:
+            continue
+        job_id = original["job_id"]
+        extra = new_budgets.get(job_id)
+        if (
+            stored["status"] != "pending_extra_budget"
+            or original["action"] != "preserve_legacy_dynamic"
+            or revised["action"] != "transition_dynamic"
+            or isinstance(extra, bool)
+            or not isinstance(extra, int)
+            or extra <= 0
+            or revised["source_epochs_requested"] + extra <= revised["source_epoch"]
+        ):
+            raise ValueError("extra budget may only activate an unstarted pending-extra-budget job")
+        expected = copy.deepcopy(original)
+        total = original["source_epochs_requested"] + extra
+        command = _set_option(original["command"], "--epochs", total)
+        command += [
+            "--transition-from-checkpoint",
+            original["source_checkpoint"],
+            "--transition-source-sha256",
+            original["source_checkpoint_sha256"],
+            "--transition-mode",
+            "replace_c",
+            "--transition-extra-epochs",
+            str(extra),
+        ]
+        expected.update(
+            action="transition_dynamic",
+            target_total_epochs=total,
+            extra_epochs=extra,
+            remaining_epochs=total - original["source_epoch"],
+            requires_extra_epoch_budget=False,
+            command=command,
+        )
+        if revised != expected:
+            raise ValueError(
+                "budget revision changed more than the pending job's explicit epoch budget"
+            )
+        target = Path(original["output_dir"])
+        _owned(target, Path(plan["output_dir"]))
+        if target.exists() and (any(target.rglob("*.pt")) or (target / "metrics.json").exists()):
+            raise ValueError("budget revision target already has checkpoint or metric artifacts")
+        changed.append(job_id)
+    if not changed or set(new_budgets) - set(old_budgets) != set(changed):
+        raise ValueError("budget revision must name exactly the newly activated pending jobs")
+    manifest.setdefault("plan_revisions", []).append(
+        {
+            "old_plan_sha256": manifest["plan_sha256"],
+            "new_plan_sha256": digest(plan),
+            "changed_job_ids": changed,
+            "previous_plan": old,
+            "reason": "explicit per-job additional epoch budget; all trained jobs unchanged",
+            "at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        }
+    )
+    manifest["plan"], manifest["plan_sha256"] = copy.deepcopy(plan), digest(plan)
+    for stored, revised in zip(stored_jobs, plan["jobs"], strict=True):
+        if stored["job_id"] in changed:
+            stored.update(copy.deepcopy(revised), status="pending")
+
+
+def execute(plan: dict[str, Any], *, confirm_source_stopped: bool) -> int:
+    if not confirm_source_stopped:
+        raise ValueError(
+            "stop the original work first, then pass --confirm-source-stopped; "
+            "no process is stopped here"
+        )
+    active = _active_source_processes(plan)
+    if active:
+        raise ValueError(f"original V5 training is still active; no signals sent: {active}")
+    _verify_sources(plan)
+    output = Path(plan["output_dir"])
+    manifest_path = output / "manifest.json"
+    contract_sha = digest(plan)
+    if output.exists():
+        manifest = _read(manifest_path)
+        _resume_or_extend_budget(manifest, plan)
+    else:
+        output.mkdir(parents=True, exist_ok=False)
+        manifest = {
+            "schema_version": 1,
+            "suite": SUITE,
+            "status": "running",
+            "plan": plan,
+            "plan_sha256": contract_sha,
+            "jobs": copy.deepcopy(plan["jobs"]),
+            "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        }
+        for job in manifest["jobs"]:
+            job["status"] = (
+                "historical_reference"
+                if job["action"] == "reuse_completed_fixed"
+                else "pending_extra_budget"
+                if job["requires_extra_epoch_budget"]
+                else "pending"
+            )
+    _owned(output / "logs", output)
+    (output / "logs").mkdir(exist_ok=True)
+    try:
+        # Recheck every claimed completed target before any new probe or training.
+        for job in manifest["jobs"]:
+            if job["status"] == "passed" and _completed(job) != job.get("result"):
+                raise ValueError("completed transition child changed; refusing silent retraining")
+        atomic_write_json(manifest_path, manifest)
+        for index, job in enumerate(manifest["jobs"], 1):
+            _verify_sources(plan)
+            if job["status"] in {"passed", "historical_reference", "pending_extra_budget"}:
+                print(
+                    f"[{index}/{len(manifest['jobs'])}] {job['status']}: {job['job_id']}",
+                    flush=True,
+                )
+                continue
+            directory = Path(job["resource_directory"])
+            _owned(directory, output)
+            _owned(Path(job["output_dir"]), output)
+            directory.mkdir(parents=True, exist_ok=True)
+            probe_job_path = directory / "job.json"
+            source_job = next(item for item in plan["jobs"] if item["job_id"] == job["job_id"])
+            if probe_job_path.exists() and _read(probe_job_path) != source_job:
+                raise ValueError("existing probe request differs; evidence preserved")
+            if not probe_job_path.exists():
+                atomic_write_json(probe_job_path, source_job)
+            certificate_path = directory / "resource-certificate.json"
+            if not certificate_path.exists():
+                code = _run_logged(
+                    [
+                        sys.executable,
+                        "-B",
+                        str(Path(__file__).resolve()),
+                        "--probe-job",
+                        str(probe_job_path),
+                    ],
+                    output / "logs" / f"probe-{index}.log",
+                )
+                if code:
+                    raise RuntimeError(
+                        f"transition resource probe failed with code {code}: {job['job_id']}"
+                    )
+            certificate = _validate_certificate(source_job, certificate_path)
+            command = list(job["command"])
+            for field, value in certificate["selected_execution"].items():
+                command = _set_option(command, "--" + field.replace("_", "-"), value)
+            if job["action"] in TRANSITION_MODES:
+                command += [
+                    "--transition-resource-certificate",
+                    str(certificate_path),
+                    "--transition-resource-sha256",
+                    _sha(certificate_path),
+                ]
+            command += ["--resume"]
+            job.update(
+                resolved_command=command,
+                resource_certificate=str(certificate_path),
+                resource_certificate_sha256=_sha(certificate_path),
+                selected_execution=certificate["selected_execution"],
+                status="running",
+            )
+            atomic_write_json(manifest_path, manifest)
+            _verify_sources(plan)
+            print(f"[{index}/{len(manifest['jobs'])}] {job['action']}: {job['job_id']}", flush=True)
+            print(shlex.join(command), flush=True)
+            code = _run_logged(command, output / "logs" / f"train-{index}.log")
+            _verify_sources(plan)
+            if code:
+                job.update(status="failed", returncode=code)
+                raise RuntimeError(f"transition child failed with code {code}: {job['job_id']}")
+            result = _completed(job)
+            job.update(status="passed", returncode=0, result=result)
+            atomic_write_json(manifest_path, manifest)
+        waiting = any(job["status"] == "pending_extra_budget" for job in manifest["jobs"])
+        manifest.update(
+            status="pending_extra_budget" if waiting else "passed",
+            finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+        )
+        atomic_write_json(manifest_path, manifest)
+        _write_report(manifest, output)
+        if waiting:
+            print(
+                "Remaining eligible V5 work finished; some legacy dynamic results still "
+                "need explicit extra epoch budget.",
+                flush=True,
+            )
+        return 3 if waiting else 0
+    except BaseException as error:
+        manifest.update(
+            status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+            error=f"{type(error).__name__}: {error}",
+        )
+        try:
+            atomic_write_json(manifest_path, manifest)
+        except OSError as reporting_error:
+            print(f"Could not save transition failure status: {reporting_error}", file=sys.stderr)
+        raise
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    try:
+        if args.probe_job is not None:
+            return _probe(args.probe_job)
+        plan = build_plan(args)
+        if args.plan_only:
+            print(
+                json.dumps(
+                    {
+                        "suite": SUITE,
+                        "read_only": True,
+                        "gpu_work_launched": False,
+                        "source_manifest": plan["source_manifest"],
+                        "output_dir": plan["output_dir"],
+                        "plan_sha256": digest(plan),
+                        "classification": plan["classification"],
+                        "jobs": [
+                            {
+                                name: job[name]
+                                for name in (
+                                    "job_id",
+                                    "action",
+                                    "source_epoch",
+                                    "source_checkpoint_sha256",
+                                    "target_total_epochs",
+                                    "extra_epochs",
+                                    "remaining_epochs",
+                                    "requires_extra_epoch_budget",
+                                    "baseline_execution",
+                                    "command",
+                                )
+                            }
+                            for job in plan["jobs"]
+                        ],
+                    },
+                    sort_keys=True,
+                    indent=2,
+                )
+            )
+            return 0
+        _print_plan(plan)
+        return execute(plan, confirm_source_stopped=args.confirm_source_stopped)
+    except KeyboardInterrupt:
+        print(
+            "Transition interrupted; source and destination checkpoints are preserved.",
+            file=sys.stderr,
+        )
+        return 130
+    except (ValueError, RuntimeError, OSError, KeyError) as error:
+        print(f"V5 transition refused/failed: {type(error).__name__}: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # scripts/setup_gpu.sh
 
 ````bash
@@ -96026,4 +99360,2945 @@ def test_actual_optimization_sources_reject_archived_checkpoint_and_pair_without
     ):
         report.build_comparison(tmp_path, manifest)
     assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
+````
+
+# tests/test_v5_transition_report.py
+
+````python
+"""Synthetic CPU artifact-contract fixtures, not actual training or GPU results."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+import torch
+
+from chartgat.observability import finalize_resource_observability, runtime_resource_snapshot
+from research.conductance_gat.v5 import train
+from research.conductance_gat.v5 import transition_report as report
+from research.conductance_gat.v5.protocol import SUITE
+from scripts import run_conductance_scaling as scaling
+
+
+def _write_json(path, value):
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def _sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _fixtures(tmp_path, *, condition="fixed_c", source_epoch=0, transitioned=False):
+    """Serialize clearly synthetic records with production configuration writers."""
+    options = scaling.parser().parse_args(
+        ["--versions", "v5", "--profiles", "reference", "--datasets", "cora"]
+    )
+    job = next(
+        item
+        for item in scaling.make_jobs(options, tmp_path / "debug-artifacts")
+        if item["condition"] == condition
+    )
+    output = Path(job["output_dir"])
+    output.mkdir(parents=True)
+    args = train.build_parser().parse_args(job["command"][5:])
+    train.validate_args(args)
+    config = train.configuration(args)
+    if not transitioned:
+        # A historical record genuinely lacks the new options; do not normalize
+        # it using the current optimization/joint defaults.
+        for key in (
+            "conductance_backend",
+            "solver_steps",
+            "solver_step_size",
+            "solver_entropy",
+            "solver_degree_barrier",
+            "training_schedule",
+        ):
+            config.pop(key, None)
+            job["architecture"].pop(key, None)
+    epochs = config["epochs"]
+    history = [
+        {"epoch": epoch, "validation": 0.75, "train_batches": 3, "train_label_count": 120}
+        for epoch in range(source_epoch + 1, epochs + 1)
+    ]
+    sources = {"explicit-debug-fixture/v5.py": "a" * 64}
+    protocol = {"data_sha256": "b" * 64, "split": "explicit synthetic unit fixture"}
+    schedule = [{"phase": "joint" if transitioned else "staged-fixture", "start": 1, "end": epochs}]
+    identity = {
+        "schema_version": 1,
+        "research_suite": SUITE,
+        "dataset": "cora",
+        "condition": condition,
+        "configuration": config,
+        "schedule": schedule,
+        "dataset_protocol": protocol,
+        "dataset_protocol_sha256": report._canonical(protocol),
+        "cache_sha256": "b" * 64,
+        "initial_state_sha256": "c" * 64,
+        "source_sha256": sources,
+        "runtime_versions": {"torch": "explicit CPU fixture, no experiment"},
+    }
+    provenance = None
+    if transitioned:
+        source_path = tmp_path / "explicit-debug-source.pt"
+        torch.save({"explicit_cpu_fixture_only": torch.ones(1)}, source_path)
+        source_identity = copy.deepcopy(identity)
+        original_history = [
+            {"epoch": value, "validation": 0.95} for value in range(1, source_epoch + 1)
+        ]
+        _write_json(output / "source-history.json", original_history)
+        provenance = {
+            "source_checkpoint_sha256": _sha(source_path),
+            "source_path": str(source_path.resolve()),
+            "source_identity": source_identity,
+            "source_identity_sha256": report._canonical(source_identity),
+            "source_history_sha256": report._canonical(original_history),
+            "source_epoch": source_epoch,
+            "source_epochs_requested": epochs,
+            "target_total_epochs": epochs,
+            "epoch_offset": source_epoch,
+            "mode": "replace_c",
+            "additional_epochs": 0,
+            "source_complete": False,
+            "historical_metrics_are_new_c_metrics": False,
+            "test_labels_used": False,
+            "common_optimizer_state": "reused",
+            "conductance_optimizer_state": "reset",
+        }
+        identity["transition_provenance_sha256"] = report._canonical(provenance)
+        job.update(
+            source_checkpoint=str(source_path.resolve()), source_checkpoint_sha256=_sha(source_path)
+        )
+    common = {
+        "resume_identity": identity,
+        "resume_identity_sha256": report._canonical(identity),
+        "model_state": {"explicit_cpu_fixture_only": torch.ones(1)},
+    }
+    if provenance is not None:
+        common["transition_provenance"] = provenance
+    best = {
+        **common,
+        "epoch": epochs,
+        "validation": 0.75,
+        "selection_role": "primary",
+        "configuration": config,
+        "schedule": schedule,
+        "condition": condition,
+    }
+    torch.save(best, output / "best.pt")
+    last = {
+        **common,
+        "schema_version": 4 if transitioned else 3,
+        "epoch_offset": source_epoch,
+        "complete": True,
+        "epoch": epochs,
+        "history": history,
+        "best_metric": 0.75,
+        "best_epoch": epochs,
+        "global_best_metric": 0.75,
+        "global_best_epoch": epochs,
+        "joint_best_metric": 0.75,
+        "joint_best_epoch": epochs,
+        "best_checkpoint_sha256": _sha(output / "best.pt"),
+    }
+    torch.save(last, output / "last.pt")
+    _write_json(output / "history.json", history)
+    hardware = {
+        "profile": config["hardware_profile"],
+        "precision": config["precision"],
+        "tf32": config["tf32"],
+        "activation_checkpoint": config["activation_checkpoint"],
+        "edge_chunk_size": config["edge_chunk_size"],
+        "sample_seed_batch_size": config["sample_seed_batch_size"],
+        "graph_batch_size": config["batch_size"],
+        "sample_prefetch": config["sample_prefetch"],
+        "pin_memory": config["pin_memory"],
+    }
+    device = torch.device("cpu")
+    metrics = {
+        "status": "passed",
+        "research_suite": SUITE,
+        "dataset": "cora",
+        "condition": condition,
+        "model_seed": 0,
+        "configuration": config,
+        "schedule": schedule,
+        "protocol": protocol,
+        "cache_sha256": "b" * 64,
+        "source_sha256": sources,
+        "initial_state_sha256": "c" * 64,
+        "shared_initial_state_sha256": "d" * 64,
+        "versions": identity["runtime_versions"],
+        "resume_identity": identity,
+        "resume_identity_sha256": report._canonical(identity),
+        "comparison_design": {
+            "single_factor_causal_effect_of_c": False,
+            "historical_recipe": "explicit fixture",
+        },
+        "validation": 0.75,
+        "best_epoch": epochs,
+        "epochs_run": len(history),
+        "global_best_validation": 0.75,
+        "global_best_epoch": epochs,
+        "joint_best_validation": None if condition == "fixed_c" else 0.75,
+        "joint_best_epoch": None if condition == "fixed_c" else epochs,
+        "checkpoint_selection": {
+            "test_used": False,
+            "primary_validation": 0.75,
+            "primary_epoch": epochs,
+            "primary_role": "all_epoch_prediction_best"
+            if condition == "fixed_c"
+            else "c_active_mechanism_best",
+            "global_prediction_validation": 0.75,
+            "global_prediction_epoch": epochs,
+        },
+        "metric_name": "accuracy",
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+        "trainable_parameters": 1234,
+        "total_parameters": 1300,
+        "elapsed_seconds": 1.5,
+        "peak_cuda_allocated_bytes": 0,
+        "hardware_execution": hardware,
+        "resource_observability": finalize_resource_observability(
+            runtime_resource_snapshot(device),
+            device,
+            peak_allocated_bytes=None,
+            peak_reserved_bytes=None,
+            sample_interval_seconds=1.0,
+        ),
+        "throughput": train.training_throughput(history, 1.5),
+    }
+    if provenance is not None:
+        metrics["transition_provenance"] = provenance
+        metrics["source_history"] = str((output / "source-history.json").resolve())
+        metrics["source_history_sha256"] = _sha(output / "source-history.json")
+    for key, filename in (
+        ("checkpoint", "best.pt"),
+        ("last_checkpoint", "last.pt"),
+        ("history", "history.json"),
+    ):
+        metrics[key] = str((output / filename).resolve())
+        metrics[f"{key}_sha256"] = _sha(output / filename)
+    _write_json(output / "metrics.json", metrics)
+    job.update(status="passed", metrics_sha256=_sha(output / "metrics.json"))
+    job["result"] = scaling._load_child(job)
+    manifest = {"status": "passed", "source_sha256": sources, "jobs": [job]}
+    manifest_path = tmp_path / "source-manifest.json"
+    _write_json(manifest_path, manifest)
+    return job, manifest, manifest_path
+
+
+def _snapshot(root):
+    return {str(path): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+def test_historical_fixed_is_verified_without_retraining_or_rewriting(tmp_path):
+    job, manifest, path = _fixtures(tmp_path)
+    before = _snapshot(tmp_path)
+    reference = report.validate_historical_reference(job, manifest, source_manifest_path=path)
+    assert reference["role"] == "historical_reference"
+    assert reference["newly_trained_epochs"] == 0
+    assert reference["counts_as_new_solver_completion"] is False
+    assert "conductance_backend" not in reference["configuration"]
+    assert reference["source_manifest_sha256"] == _sha(path)
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("artifact", ["metrics.json", "best.pt", "last.pt", "history.json"])
+def test_historical_tampered_artifact_is_rejected_without_writes(tmp_path, artifact):
+    job, manifest, path = _fixtures(tmp_path)
+    target = Path(job["output_dir"]) / artifact
+    target.write_bytes(target.read_bytes() + b" ")
+    before = _snapshot(tmp_path)
+    with pytest.raises((ValueError, RuntimeError), match="hash|result"):
+        report.validate_historical_reference(job, manifest, source_manifest_path=path)
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("status", ["pending", "running", "failed"])
+def test_incomplete_fixed_is_not_a_completed_historical_reference(tmp_path, status):
+    job, manifest, path = _fixtures(tmp_path)
+    job["status"] = status
+    _write_json(path, manifest)
+    with pytest.raises(ValueError, match="completed passed"):
+        report.validate_historical_reference(job, manifest, source_manifest_path=path)
+
+
+@pytest.mark.parametrize(
+    "field", ["source_sha256", "runtime_versions", "dataset_protocol", "configuration"]
+)
+def test_self_consistent_identity_rehash_does_not_allow_metric_contract_mismatch(tmp_path, field):
+    job, manifest, path = _fixtures(tmp_path)
+    metrics_path = Path(job["metrics_path"])
+    metrics = json.loads(metrics_path.read_bytes())
+    metrics["resume_identity"][field]["unexpected"] = "changed"
+    metrics["resume_identity_sha256"] = report._canonical(metrics["resume_identity"])
+    _write_json(metrics_path, metrics)
+    job["metrics_sha256"] = _sha(metrics_path)
+    job["result"] = scaling._load_child(job)
+    _write_json(path, manifest)
+    before = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match="mismatch"):
+        report.validate_historical_reference(job, manifest, source_manifest_path=path)
+    assert _snapshot(tmp_path) == before
+
+
+def test_changed_source_manifest_and_saved_summary_are_rejected(tmp_path):
+    job, manifest, path = _fixtures(tmp_path)
+    altered = copy.deepcopy(manifest)
+    altered["status"] = "changed"
+    with pytest.raises(ValueError, match="source manifest changed"):
+        report.validate_historical_reference(job, altered, source_manifest_path=path)
+    job["result"]["validation"] = 0.99
+    _write_json(path, manifest)
+    with pytest.raises(ValueError, match="saved result"):
+        report.validate_historical_reference(job, manifest, source_manifest_path=path)
+
+
+def test_source_manifest_must_bind_recorded_child_sources(tmp_path):
+    job, manifest, path = _fixtures(tmp_path)
+    manifest["source_sha256"] = {"different-source.py": "f" * 64}
+    _write_json(path, manifest)
+    with pytest.raises(ValueError, match="child/source manifest"):
+        report.validate_historical_reference(job, manifest, source_manifest_path=path)
+
+
+def test_completed_legacy_dynamic_is_preserved_but_never_counted_as_new_c(tmp_path):
+    job, source, path = _fixtures(tmp_path, condition="shared_dynamic_c")
+    reference = report.validate_historical_reference(job, source, source_manifest_path=path)
+    manifest = {
+        "jobs": [
+            {
+                "action": "preserve_legacy_dynamic",
+                "status": "blocked",
+                "source_job": job,
+                "historical_reference": reference,
+            }
+        ]
+    }
+    before = _snapshot(tmp_path)
+    result = report.build_transition_report(manifest)
+    assert result["status"] == "partial"
+    assert result["new_solver_completions"] == 0
+    assert result["rows"][0]["validation"] == 0.75
+    assert result["comparison_design"]["fresh_same_initialization_paired_comparison"] is False
+    assert result["comparison_design"]["sota_claim"] is False
+    assert _snapshot(tmp_path) == before
+
+
+def test_report_revalidates_historical_reference_instead_of_trusting_cached_verified(tmp_path):
+    job, source, path = _fixtures(tmp_path)
+    reference = report.validate_historical_reference(job, source, source_manifest_path=path)
+    reference["validation"] = 0.99
+    manifest = {"jobs": [{"action": "reuse_completed_fixed", "historical_reference": reference}]}
+    with pytest.raises(ValueError, match="reference changed"):
+        report.build_transition_report(manifest)
+
+
+def test_new_solver_only_selects_post_transition_history(tmp_path):
+    job, _, _ = _fixtures(
+        tmp_path, condition="shared_dynamic_c", source_epoch=40, transitioned=True
+    )
+    job.update(action="transition_dynamic", source_epoch=40)
+    result = report.validate_transition_child(job)
+    assert result["role"] == "transitioned_training"
+    assert result["pre_transition_epochs"] == 40
+    assert result["post_transition_epochs"] == result["configuration"]["epochs"] - 40
+    assert result["counts_as_new_solver_completion"] is True
+    assert result["fresh_same_initialization_comparison"] is False
+
+
+@pytest.mark.parametrize(
+    "field,value", [("source_epoch", 39), ("source_checkpoint_sha256", "f" * 64)]
+)
+def test_transition_lineage_mismatch_is_rejected(tmp_path, field, value):
+    job, _, _ = _fixtures(
+        tmp_path, condition="shared_dynamic_c", source_epoch=40, transitioned=True
+    )
+    job.update(action="transition_dynamic", source_epoch=40)
+    job[field] = value
+    before = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match="epoch|hash"):
+        report.validate_transition_child(job)
+    assert _snapshot(tmp_path) == before
+
+
+def test_resolved_training_command_is_checked_not_only_baseline(tmp_path):
+    job, _, _ = _fixtures(
+        tmp_path, condition="shared_dynamic_c", source_epoch=40, transitioned=True
+    )
+    job.update(action="transition_dynamic", source_epoch=40)
+    job["resolved_command"] = list(job["command"])
+    index = job["resolved_command"].index("--hidden-channels") + 1
+    job["resolved_command"][index] = "512"
+    with pytest.raises(ValueError, match="resolved command/configuration"):
+        report.validate_transition_child(job)
+
+
+def test_ordinary_v5_report_contract_is_not_replaced(tmp_path):
+    from research.conductance_gat.v5 import report as ordinary
+
+    job, _, _ = _fixtures(tmp_path)
+    metrics = json.loads(Path(job["metrics_path"]).read_bytes())
+    assert metrics["comparison_design"] != ordinary.COMPARISON_DESIGN
+    assert "sota_claim" not in ordinary.COMPARISON_DESIGN
+
+
+def _rebind_transition_fixture(job, mutation):
+    """Rehash edited synthetic fixtures to test semantic, not only hash, guards."""
+    output = Path(job["output_dir"])
+    metrics = json.loads((output / "metrics.json").read_bytes())
+    mutation(metrics)
+    provenance = metrics["transition_provenance"]
+    metrics["resume_identity"]["transition_provenance_sha256"] = report._canonical(provenance)
+    metrics["resume_identity_sha256"] = report._canonical(metrics["resume_identity"])
+    for filename in ("best.pt", "last.pt"):
+        value = torch.load(output / filename, map_location="cpu", weights_only=True)
+        value.update(
+            transition_provenance=provenance,
+            resume_identity=metrics["resume_identity"],
+            resume_identity_sha256=metrics["resume_identity_sha256"],
+        )
+        if filename == "last.pt":
+            value["best_checkpoint_sha256"] = _sha(output / "best.pt")
+        torch.save(value, output / filename)
+    metrics["checkpoint_sha256"] = _sha(output / "best.pt")
+    metrics["last_checkpoint_sha256"] = _sha(output / "last.pt")
+    _write_json(output / "metrics.json", metrics)
+    job["metrics_sha256"] = _sha(output / "metrics.json")
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("mode", "continue_fixed", "mode mismatch"),
+        ("additional_epochs", 1, "epoch budget mismatch"),
+        ("historical_metrics_are_new_c_metrics", True, "metric provenance claims"),
+        ("test_labels_used", True, "metric provenance claims"),
+    ],
+)
+def test_rehashed_provenance_still_cannot_change_transition_policy(tmp_path, field, value, message):
+    job, _, _ = _fixtures(
+        tmp_path, condition="shared_dynamic_c", source_epoch=40, transitioned=True
+    )
+    job.update(action="transition_dynamic", source_epoch=40)
+    _rebind_transition_fixture(
+        job, lambda child: child["transition_provenance"].update({field: value})
+    )
+    before = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match=message):
+        report.validate_transition_child(job)
+    assert _snapshot(tmp_path) == before
+
+
+def test_new_c_cannot_select_the_better_pre_transition_score(tmp_path):
+    job, _, _ = _fixtures(
+        tmp_path, condition="shared_dynamic_c", source_epoch=40, transitioned=True
+    )
+    job.update(action="transition_dynamic", source_epoch=40)
+    _rebind_transition_fixture(job, lambda child: child.update(best_epoch=20, validation=0.95))
+    with pytest.raises(ValueError, match="selected metric/epoch"):
+        report.validate_transition_child(job)
+
+
+def test_new_source_history_is_required_and_hash_verified(tmp_path):
+    job, _, _ = _fixtures(
+        tmp_path, condition="shared_dynamic_c", source_epoch=40, transitioned=True
+    )
+    job.update(action="transition_dynamic", source_epoch=40)
+    path = Path(job["output_dir"]) / "source-history.json"
+    path.write_bytes(path.read_bytes() + b" ")
+    before = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match="source_history hash"):
+        report.validate_transition_child(job)
+    assert _snapshot(tmp_path) == before
+
+
+def test_source_checkpoint_change_after_training_is_rejected(tmp_path):
+    job, _, _ = _fixtures(
+        tmp_path, condition="shared_dynamic_c", source_epoch=40, transitioned=True
+    )
+    job.update(action="transition_dynamic", source_epoch=40)
+    path = Path(job["source_checkpoint"])
+    path.write_bytes(path.read_bytes() + b" ")
+    with pytest.raises(ValueError, match="source checkpoint path/hash changed"):
+        report.validate_transition_child(job)
+
+
+def test_historical_and_new_dynamic_scores_are_never_reported_as_a_fresh_pair(tmp_path):
+    old_job, source, path = _fixtures(tmp_path / "old")
+    reference = report.validate_historical_reference(old_job, source, source_manifest_path=path)
+    new_job, _, _ = _fixtures(
+        tmp_path / "new", condition="shared_dynamic_c", source_epoch=40, transitioned=True
+    )
+    new_job.update(action="transition_dynamic", source_epoch=40)
+    manifest = {
+        "jobs": [
+            {
+                "action": "reuse_completed_fixed",
+                "status": "passed",
+                "historical_reference": reference,
+            },
+            new_job,
+        ]
+    }
+    result = report.build_transition_report(manifest)
+    assert result["status"] == "passed"
+    assert {row["role"] for row in result["rows"]} == {
+        "historical_reference",
+        "transitioned_training",
+    }
+    assert result["new_solver_completions"] == 1
+    assert "contrasts" not in result
+    assert result["comparison_design"]["fresh_same_initialization_paired_comparison"] is False
+
+
+def _reviewed_legacy_sources():
+    """Immutable archival hashes, not today's changed V5 implementation."""
+    from chartgat import resume_compat
+    from research.conductance_gat.v5.transition import LEGACY_SOURCE_SNAPSHOTS
+    from tests.test_v5_transition_state import LEGACY_SOURCE
+
+    before = copy.deepcopy(LEGACY_SOURCE)
+    registry = json.loads(resume_compat.REGISTRY_PATH.read_bytes())
+    after = {
+        name: registry["changes"].get(name, {}).get("after", value)
+        for name, value in before.items()
+    }
+    after[resume_compat.HELPER_SOURCE] = registry["changes"][resume_compat.HELPER_SOURCE]["after"]
+    after[resume_compat.REGISTRY_SOURCE] = _sha(resume_compat.REGISTRY_PATH)
+    assert LEGACY_SOURCE_SNAPSHOTS[report._canonical(before)].startswith("76e514a")
+    assert LEGACY_SOURCE_SNAPSHOTS[report._canonical(after)].startswith("8963821")
+    evidence = resume_compat.require_source_compatibility(before, after)
+    assert evidence["patch_id"] == "v5-rng-cycle-workers-v1"
+    return before, after, evidence
+
+
+def _historical_journal_fixture(tmp_path, *, resumed_after_repair):
+    job, manifest, path = _fixtures(tmp_path)
+    before, after, evidence = _reviewed_legacy_sources()
+    output = Path(job["output_dir"])
+    metrics = json.loads((output / "metrics.json").read_bytes())
+    metric_sources = after if resumed_after_repair else before
+    metrics["source_sha256"] = metric_sources
+    metrics["resume_identity"]["source_sha256"] = metric_sources
+    metrics["resume_identity_sha256"] = report._canonical(metrics["resume_identity"])
+    best = torch.load(output / "best.pt", map_location="cpu", weights_only=True)
+    best["resume_identity"]["source_sha256"] = before
+    best["resume_identity_sha256"] = report._canonical(best["resume_identity"])
+    torch.save(best, output / "best.pt")
+    # The numerical repair may leave an original journal slot on disk. Its
+    # hashes and identity stay archival instead of being rewritten to new C.
+    torch.save(best, output / "best.previous.pt")
+    last = torch.load(output / "last.pt", map_location="cpu", weights_only=True)
+    last["resume_identity"]["source_sha256"] = metric_sources
+    last["resume_identity_sha256"] = report._canonical(last["resume_identity"])
+    last["best_checkpoint_sha256"] = _sha(output / "best.pt")
+    torch.save(last, output / "last.pt")
+    metrics["checkpoint_sha256"] = _sha(output / "best.pt")
+    metrics["last_checkpoint_sha256"] = _sha(output / "last.pt")
+    _write_json(output / "metrics.json", metrics)
+    job["metrics_sha256"] = _sha(output / "metrics.json")
+    job["result"] = scaling._load_child(job)
+    manifest["source_sha256"] = after
+    manifest["source_compatibility"] = [evidence]
+    _write_json(path, manifest)
+    return job, manifest, path
+
+
+@pytest.mark.parametrize("resumed_after_repair", [False, True])
+def test_reviewed_76_best_and_896_manifest_or_last_remain_historical_read_only(
+    tmp_path, resumed_after_repair
+):
+    job, manifest, path = _historical_journal_fixture(
+        tmp_path, resumed_after_repair=resumed_after_repair
+    )
+    before = _snapshot(tmp_path)
+    reference = report.validate_historical_reference(job, manifest, source_manifest_path=path)
+    assert reference["role"] == "historical_reference"
+    assert reference["counts_as_new_solver_completion"] is False
+    assert "best_previous_checkpoint" in reference["artifacts"]
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("change", ["unreviewed_source", "changed_recipe"])
+def test_archived_mixed_journal_never_waives_unreviewed_code_or_recipe(tmp_path, change):
+    job, manifest, path = _historical_journal_fixture(tmp_path, resumed_after_repair=True)
+    output = Path(job["output_dir"])
+    best = torch.load(output / "best.pt", map_location="cpu", weights_only=True)
+    if change == "unreviewed_source":
+        best["resume_identity"]["source_sha256"]["research/conductance_gat/v5/train.py"] = "f" * 64
+    else:
+        best["resume_identity"]["configuration"]["dropout"] = 0.99
+    best["resume_identity_sha256"] = report._canonical(best["resume_identity"])
+    torch.save(best, output / "best.pt")
+    last = torch.load(output / "last.pt", map_location="cpu", weights_only=True)
+    last["best_checkpoint_sha256"] = _sha(output / "best.pt")
+    torch.save(last, output / "last.pt")
+    metrics = json.loads((output / "metrics.json").read_bytes())
+    metrics["checkpoint_sha256"] = _sha(output / "best.pt")
+    metrics["last_checkpoint_sha256"] = _sha(output / "last.pt")
+    _write_json(output / "metrics.json", metrics)
+    job["metrics_sha256"] = _sha(output / "metrics.json")
+    job["result"] = scaling._load_child(job)
+    _write_json(path, manifest)
+    before = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match="checkpoint/metrics identity mismatch"):
+        report.validate_historical_reference(job, manifest, source_manifest_path=path)
+    assert _snapshot(tmp_path) == before
+````
+
+# tests/test_v5_transition_resource_contract.py
+
+````python
+"""CPU-only synthetic certificate tests; no GPU measurement or training is claimed."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+from research.conductance_gat.v5 import train
+from research.conductance_gat.v5 import transition_training as transition
+from scripts import calibrate_training_resources as calibration
+from scripts import training_resource_plan as plans
+
+GIB = 1024**3
+
+
+def _measurement(batch, *, workers=0, condition="shared_dynamic_c", rate=100):
+    return {
+        "status": "passed",
+        "condition": condition,
+        "model_seed": 0,
+        "batch_size": batch,
+        "workers": workers,
+        "unit": "supervised_seed_nodes",
+        "elapsed_seconds": 3.0,
+        "processed_units": rate * 3,
+        "samples_per_second": rate,
+        "optimizer_steps": 5,
+        "optimizer_state_bytes": 1024,
+        "measurement_steps_requested": 5,
+        "warmup_steps_requested": 2,
+        "minimum_measure_seconds_requested": 3.0,
+        "peak_allocated_bytes": 8 * GIB,
+        "peak_reserved_bytes": 10 * GIB,
+        "total_memory_bytes": 48 * GIB,
+        "free_bytes_before": 46 * GIB,
+    }
+
+
+def _candidate(batch, *, condition="shared_dynamic_c", rate=100):
+    return {
+        "status": "passed",
+        "batch_size": batch,
+        "workers": 0,
+        "measurements": [_measurement(batch, condition=condition, rate=rate)],
+    }
+
+
+def _fixture(tmp_path, monkeypatch, *, mode="replace_c"):
+    """Real parsing/score/selection, explicitly mocked hardware/runtime and evidence."""
+    source = tmp_path / "original" / "last.pt"
+    source.parent.mkdir()
+    source.write_bytes(b"explicit CPU certificate fixture, not a trained checkpoint")
+    path = tmp_path / "resource-certificate.json"
+    fixed = mode == "continue_fixed"
+    args = train.build_parser().parse_args(
+        [
+            "--dataset",
+            "ogbn-arxiv",
+            "--condition",
+            "fixed_c" if fixed else "shared_dynamic_c",
+            "--output-dir",
+            str(tmp_path / "new-output"),
+            "--device",
+            "cuda:0",
+            "--conductance-backend",
+            "mlp" if fixed else "optimization",
+            "--training-schedule",
+            "staged" if fixed else "joint",
+            "--sampling",
+            "neighbor",
+            "--sample-seed-batch-size",
+            "2048" if fixed else "4096",
+            "--workers",
+            "0",
+            "--transition-from-checkpoint",
+            str(source),
+            "--transition-source-sha256",
+            "a" * 64,
+            "--transition-mode",
+            mode,
+            "--transition-resource-certificate",
+            str(path),
+            "--transition-resource-sha256",
+            "b" * 64,
+        ]
+    )
+    train.validate_args(args)
+    target = train.configuration(args)
+    original = copy.deepcopy(target)
+    original["sample_seed_batch_size"] = 2048
+    protocol = {
+        "data_sha256": "c" * 64,
+        "split": "explicit synthetic CPU fixture",
+        "split_counts": {"train": 4096, "validation": 1024, "test": 1024},
+    }
+    runtime = {"torch": "synthetic CPU contract fixture", "cuda": "not measured"}
+    sources = {"explicit-unit-fixture.py": "d" * 64}
+    hardware = {
+        "device": "cuda:0",
+        "name": "explicit CPU mock, NOT actual GPU measurement",
+        "uuid": "unit-fixture",
+        "total_memory_bytes": 48 * GIB,
+        "allocated_cpu_count": 8,
+    }
+    monkeypatch.setattr(train, "_versions", lambda: copy.deepcopy(runtime))
+    monkeypatch.setattr(plans, "source_snapshot", lambda: copy.deepcopy(sources))
+    monkeypatch.setattr(calibration, "_hardware", lambda device: copy.deepcopy(hardware))
+    inspected = {
+        "sha256": "a" * 64,
+        "source_epoch": 40,
+        "identity": {"configuration": original},
+    }
+    certificate = {
+        "schema_version": 1,
+        "kind": "v5_transition_resource_certificate",
+        "status": "passed",
+        "classification": "resource_calibration_not_final_training",
+        "source_checkpoint_sha256": inspected["sha256"],
+        "transition_mode": mode,
+        "source_epoch": inspected["source_epoch"],
+        "runtime_versions": runtime,
+        "dataset_protocol_sha256": train._canonical_sha256(protocol),
+        "cache_sha256": protocol["data_sha256"],
+        "source_sha256": sources,
+        "hardware": hardware,
+        "selected_configuration": copy.deepcopy(target),
+        "baseline_execution": {
+            key: original[key] for key in ("batch_size", "workers", "sample_seed_batch_size")
+        },
+        "selected_execution": {
+            key: target[key] for key in ("batch_size", "workers", "sample_seed_batch_size")
+        },
+        "selection": {
+            "policy": "preserve_fixed_execution" if fixed else "measured_transition_candidates",
+            "no_downscale": True,
+            "global_optimum_claimed": False,
+        },
+        "batch_axis": "sampled_seed_nodes",
+        "natural_training_split_size": 4096,
+        "selected_candidate": {"batch_size": target["sample_seed_batch_size"], "workers": 0},
+        "candidates": [_candidate(2048, condition=args.condition, rate=100)],
+    }
+    if not fixed:
+        certificate["candidates"].append(_candidate(4096, condition=args.condition, rate=150))
+    _publish(args, certificate)
+    return args, inspected, protocol, target, certificate
+
+
+def _publish(args, certificate):
+    args.transition_resource_certificate.write_text(json.dumps(certificate), encoding="utf-8")
+    args.transition_resource_sha256 = hashlib.sha256(
+        args.transition_resource_certificate.read_bytes()
+    ).hexdigest()
+
+
+def _read(fixture):
+    args, inspected, protocol, target, _ = fixture
+    return transition._read_certificate(args, inspected, protocol, target)
+
+
+def _snapshot(root):
+    return {str(path): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+def test_valid_cpu_contract_fixture_uses_real_safety_score_and_selection(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch)
+    args, _, _, _, certificate = fixture
+    before = _snapshot(tmp_path)
+    validated, changes = _read(fixture)
+    assert validated == certificate
+    assert changes == {"sample_seed_batch_size": {"before": 2048, "after": 4096}}
+    assert plans.choose_candidate(certificate["candidates"], 2048)["batch_size"] == 4096
+    assert (
+        transition.request_from_args(args)["resource_certificate_sha256"]
+        == args.transition_resource_sha256
+    )
+    assert _snapshot(tmp_path) == before
+
+
+def test_bad_certificate_file_hash_rejected_without_writes(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch)
+    fixture[0].transition_resource_sha256 = "f" * 64
+    before = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match="path/SHA"):
+        _read(fixture)
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("source_checkpoint_sha256", "f" * 64),
+        ("source_epoch", 39),
+        ("runtime_versions", {"torch": "different"}),
+        ("source_sha256", {"changed.py": "f" * 64}),
+        ("hardware", {"device": "cuda:1"}),
+        ("dataset_protocol_sha256", "f" * 64),
+        ("cache_sha256", "f" * 64),
+        ("transition_mode", "continue_fixed"),
+        ("status", "running"),
+        ("classification", "final_training"),
+    ],
+)
+def test_certificate_is_bound_to_source_split_runtime_code_and_hardware(
+    tmp_path, monkeypatch, field, value
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    fixture[4][field] = value
+    _publish(fixture[0], fixture[4])
+    with pytest.raises(ValueError, match="contract mismatch"):
+        _read(fixture)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("condition", "fixed_c"),
+        ("model_seed", 1),
+        ("batch_size", 17),
+        ("workers", 3),
+        ("samples_per_second", float("nan")),
+        ("optimizer_state_bytes", 0),
+        ("measurement_steps_requested", 6),
+        ("minimum_measure_seconds_requested", 4.0),
+    ],
+)
+def test_each_measurement_has_exact_condition_seed_batch_workers_and_real_window(
+    tmp_path, monkeypatch, field, value
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    fixture[4]["candidates"][1]["measurements"][0][field] = value
+    _publish(fixture[0], fixture[4])
+    with pytest.raises(ValueError):
+        _read(fixture)
+
+
+@pytest.mark.parametrize("replacement", [[], None])
+def test_missing_measurement_is_never_accepted_as_calibration(tmp_path, monkeypatch, replacement):
+    fixture = _fixture(tmp_path, monkeypatch)
+    fixture[4]["candidates"][1]["measurements"] = replacement
+    _publish(fixture[0], fixture[4])
+    with pytest.raises(ValueError, match="no measurements"):
+        _read(fixture)
+
+
+def test_unsafe_memory_headroom_is_rejected_even_when_throughput_is_best(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch)
+    fixture[4]["candidates"][1]["measurements"][0]["peak_reserved_bytes"] = 45 * GIB
+    _publish(fixture[0], fixture[4])
+    with pytest.raises(ValueError, match="safe throughput"):
+        _read(fixture)
+
+
+def test_picking_slower_candidate_is_rejected(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch)
+    args, _, _, target, certificate = fixture
+    args.sample_seed_batch_size = target["sample_seed_batch_size"] = 2048
+    certificate["selected_execution"]["sample_seed_batch_size"] = 2048
+    certificate["selected_configuration"] = copy.deepcopy(target)
+    certificate["selected_candidate"]["batch_size"] = 2048
+    _publish(args, certificate)
+    with pytest.raises(ValueError, match="safe throughput"):
+        _read(fixture)
+
+
+def test_batch_downscale_is_rejected(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch)
+    fixture[4]["candidates"].insert(0, _candidate(1024))
+    _publish(fixture[0], fixture[4])
+    with pytest.raises(ValueError, match="out-of-contract"):
+        _read(fixture)
+
+
+def test_only_one_batch_candidate_rejected_when_graph_can_grow(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch)
+    args, _, _, target, certificate = fixture
+    args.sample_seed_batch_size = target["sample_seed_batch_size"] = 2048
+    certificate["selected_configuration"] = copy.deepcopy(target)
+    certificate["selected_execution"]["sample_seed_batch_size"] = 2048
+    certificate["selected_candidate"]["batch_size"] = 2048
+    certificate["candidates"] = certificate["candidates"][:1]
+    _publish(args, certificate)
+    with pytest.raises(ValueError, match="multiple measured"):
+        _read(fixture)
+
+
+@pytest.mark.parametrize("axis", ["graphs", "full_graph", None])
+def test_wrong_physical_batch_axis_rejected(tmp_path, monkeypatch, axis):
+    fixture = _fixture(tmp_path, monkeypatch)
+    fixture[4]["batch_axis"] = axis
+    _publish(fixture[0], fixture[4])
+    with pytest.raises(ValueError, match="physical batch axis"):
+        _read(fixture)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("solver_steps", 80),
+        ("solver_entropy", 2.0),
+        ("hidden_channels", 512),
+        ("precision", "fp32"),
+        ("num_neighbors", [25, 20]),
+    ],
+)
+def test_certificate_cannot_be_reused_for_unmeasured_scientific_configuration(
+    tmp_path, monkeypatch, field, value
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    target = fixture[3]
+    if target.get(field) == value:
+        value = "bf16" if field == "precision" else value
+    target[field] = value
+    with pytest.raises(ValueError, match="contract mismatch"):
+        _read(fixture)
+
+
+def test_fixed_continuation_preserves_execution_with_one_measured_batch(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch, mode="continue_fixed")
+    _, changes = _read(fixture)
+    assert changes == {}
+
+
+def test_fixed_continuation_cannot_adopt_changed_workers(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch, mode="continue_fixed")
+    args, _, _, target, certificate = fixture
+    args.workers = target["workers"] = target["loader_workers"] = 2
+    certificate["selected_configuration"] = copy.deepcopy(target)
+    certificate["selected_execution"]["workers"] = 2
+    certificate["selected_candidate"]["workers"] = 2
+    baseline = copy.deepcopy(certificate["candidates"][0])
+    candidate = certificate["candidates"][0]
+    candidate["workers"] = candidate["measurements"][0]["workers"] = 2
+    candidate["measurements"][0].update(samples_per_second=200, processed_units=600)
+    certificate["candidates"].append(baseline)
+    _publish(args, certificate)
+    with pytest.raises(ValueError, match="fixed continuation cannot change"):
+        _read(fixture)
+
+
+def test_certificate_change_during_validation_detected(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch)
+    original = train.sha256_file
+    count = 0
+
+    def changed_second_read(path):
+        nonlocal count
+        count += 1
+        return original(path) if count == 1 else "f" * 64
+
+    monkeypatch.setattr(train, "sha256_file", changed_second_read)
+    with pytest.raises(ValueError, match="changed during validation"):
+        _read(fixture)
+
+
+def test_no_resume_and_incomplete_transition_options_rejected(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)[0]
+    args.resume = False
+    with pytest.raises(ValueError, match="no-resume"):
+        transition.validate_arguments(args)
+    args.resume = True
+    args.transition_resource_certificate = None
+    with pytest.raises(ValueError, match="requires source SHA"):
+        transition.validate_arguments(args)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("transition_extra_epochs", -1),
+        ("transition_extra_epochs", True),
+        ("transition_source_sha256", "A" * 64),
+        ("transition_mode", "unknown"),
+        ("condition", "fixed_c"),
+        ("conductance_backend", "mlp"),
+        ("training_schedule", "staged"),
+    ],
+)
+def test_invalid_transition_arguments_fail_before_training(tmp_path, monkeypatch, field, value):
+    args = _fixture(tmp_path, monkeypatch)[0]
+    setattr(args, field, value)
+    with pytest.raises(ValueError):
+        transition.validate_arguments(args)
+
+
+def test_transition_flags_without_source_rejected(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)[0]
+    args.transition_from_checkpoint = None
+    with pytest.raises(ValueError, match="require --transition-from"):
+        transition.validate_arguments(args)
+
+
+@pytest.mark.parametrize("location", ["same", "descendant", "ancestor"])
+def test_output_overlap_with_source_rejected_without_artifact_writes(
+    tmp_path, monkeypatch, location
+):
+    args = _fixture(tmp_path, monkeypatch)[0]
+    source = args.transition_from_checkpoint
+    output = {"same": source.parent, "descendant": source.parent / "nested", "ancestor": tmp_path}[
+        location
+    ]
+    before = _snapshot(tmp_path)
+    with pytest.raises(ValueError, match="separate from the source"):
+        transition.validate_output_boundary(args, output)
+    assert _snapshot(tmp_path) == before
+
+
+def test_separate_new_output_is_allowed_without_creating_it(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)[0]
+    transition.validate_output_boundary(args, args.output_dir)
+    assert not args.output_dir.exists()
+
+
+def test_output_symlink_rejected_without_creating_real_windows_symlinks(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)[0]
+    original = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda path: path == args.output_dir or original(path))
+    with pytest.raises(ValueError, match="symlink"):
+        transition.validate_output_boundary(args, args.output_dir)
+
+
+def test_measurement_cannot_claim_a_larger_gpu_than_the_bound_hardware(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch)
+    measurement = fixture[4]["candidates"][1]["measurements"][0]
+    measurement.update(
+        total_memory_bytes=96 * GIB, free_bytes_before=90 * GIB, peak_reserved_bytes=80 * GIB
+    )
+    assert plans.measurement_is_safe(measurement)  # Safe only for its *incorrect* 96 GiB claim.
+    _publish(fixture[0], fixture[4])
+    with pytest.raises(ValueError):
+        _read(fixture)
+
+
+def test_natural_split_size_cannot_be_shrunk_to_skip_multiple_candidate_measurement(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    args, _, _, target, certificate = fixture
+    args.sample_seed_batch_size = target["sample_seed_batch_size"] = 2048
+    certificate["selected_configuration"] = copy.deepcopy(target)
+    certificate["selected_execution"]["sample_seed_batch_size"] = 2048
+    certificate["selected_candidate"]["batch_size"] = 2048
+    certificate["natural_training_split_size"] = 2048
+    certificate["candidates"] = certificate["candidates"][:1]
+    _publish(args, certificate)
+    with pytest.raises(ValueError):
+        _read(fixture)
+
+
+def test_original_baseline_must_have_an_actual_measurement(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch)
+    args, _, protocol, target, certificate = fixture
+    protocol["split_counts"]["train"] = 8192
+    certificate["dataset_protocol_sha256"] = train._canonical_sha256(protocol)
+    certificate["natural_training_split_size"] = 8192
+    args.sample_seed_batch_size = target["sample_seed_batch_size"] = 8192
+    certificate["selected_configuration"] = copy.deepcopy(target)
+    certificate["selected_execution"]["sample_seed_batch_size"] = 8192
+    certificate["selected_candidate"]["batch_size"] = 8192
+    certificate["candidates"] = [_candidate(4096, rate=100), _candidate(8192, rate=150)]
+    _publish(args, certificate)
+    with pytest.raises(ValueError):
+        _read(fixture)
+
+
+def test_real_oom_boundary_preserved_and_safe_baseline_selected(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch)
+    args, _, _, target, certificate = fixture
+    args.sample_seed_batch_size = target["sample_seed_batch_size"] = 2048
+    certificate["selected_configuration"] = copy.deepcopy(target)
+    certificate["selected_execution"]["sample_seed_batch_size"] = 2048
+    certificate["selected_candidate"]["batch_size"] = 2048
+    certificate["candidates"][1] = {
+        "status": "oom",
+        "batch_size": 4096,
+        "workers": 0,
+        "measurements": [
+            {
+                "status": "oom",
+                "error": "explicit CPU fixture of a CUDA OOM exception",
+                "condition": "shared_dynamic_c",
+                "model_seed": 0,
+                "batch_size": 4096,
+                "workers": 0,
+            }
+        ],
+    }
+    _publish(args, certificate)
+    validated, changes = _read(fixture)
+    assert validated["candidates"][1]["measurements"][0]["error"]
+    assert changes == {}
+
+
+def test_output_symlink_is_rejected_even_after_main_resolves_the_target(tmp_path, monkeypatch):
+    args = _fixture(tmp_path, monkeypatch)[0]
+    resolved_target = tmp_path / "resolved-new-output"
+    original = Path.is_symlink
+    monkeypatch.setattr(Path, "is_symlink", lambda path: path == args.output_dir or original(path))
+    with pytest.raises(ValueError, match="symlink"):
+        transition.validate_output_boundary(args, resolved_target)
+
+
+def test_configured_batch_larger_than_natural_split_is_preserved_without_fake_split_size(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture(tmp_path, monkeypatch)
+    args, _, protocol, target, certificate = fixture
+    protocol["split_counts"]["train"] = 1024
+    certificate["dataset_protocol_sha256"] = train._canonical_sha256(protocol)
+    certificate["natural_training_split_size"] = 1024
+    args.sample_seed_batch_size = target["sample_seed_batch_size"] = 2048
+    certificate["selected_configuration"] = copy.deepcopy(target)
+    certificate["selected_execution"]["sample_seed_batch_size"] = 2048
+    certificate["selected_candidate"]["batch_size"] = 2048
+    certificate["candidates"] = certificate["candidates"][:1]
+    _publish(args, certificate)
+    validated, changes = _read(fixture)
+    assert validated["natural_training_split_size"] == 1024
+    assert validated["selected_candidate"]["batch_size"] == 2048
+    assert changes == {}
+````
+
+# tests/test_v5_transition_runner.py
+
+````python
+"""CPU-only migration orchestration fixtures; no GPU or research training."""
+
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+
+import pytest
+
+from research.conductance_gat.v5 import train
+from research.conductance_gat.v5.protocol import conductance_configuration
+from scripts import run_conductance_scaling as scaling
+from scripts import run_v5_transition as runner
+
+
+def _value(command, name):
+    return command[command.index(name) + 1]
+
+
+@pytest.fixture
+def source_run(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    args = scaling.parser().parse_args(
+        [
+            "--versions",
+            "v5",
+            "--profiles",
+            "reference",
+            "large",
+            "--datasets",
+            "ogbn-arxiv",
+            "cora",
+            "--hardware-profile",
+            "a6000-48gb",
+            "--data-root",
+            str(tmp_path / "data"),
+        ]
+    )
+    jobs = scaling.make_jobs(args, source)
+    infos = {}
+    for job in jobs:
+        legacy_command = list(job["command"])
+        for name in (*conductance_configuration(), "training_schedule"):
+            option = "--" + name.replace("_", "-")
+            index = legacy_command.index(option)
+            del legacy_command[index : index + 2]
+            job["architecture"].pop(name)
+        job["command"] = legacy_command
+        output = Path(job["output_dir"])
+        output.mkdir(parents=True)
+        arxiv = job["dataset"] == "ogbn-arxiv"
+        job["status"] = "passed" if arxiv else "pending"
+        if arxiv:
+            epoch = (
+                160 if (job["profile"], job["condition"]) == ("large", "shared_dynamic_c") else 200
+            )
+            if epoch == 160:
+                job["status"] = "failed"
+            checkpoint = output / "last.pt"
+            checkpoint.write_bytes(("CPU-debug-" + job["job_id"]).encode())
+            source_args, _ = runner._training_arguments(legacy_command, legacy=True)
+            config = train.configuration(source_args)
+            for name in (*conductance_configuration(), "training_schedule"):
+                config.pop(name)
+            infos[str(checkpoint)] = {
+                "saved": {},
+                "sha256": runner._sha(checkpoint),
+                "source_epoch": epoch,
+                "source_complete": epoch == 200,
+                "legacy_revision": "8963821",
+                "identity": {
+                    "dataset": job["dataset"],
+                    "condition": job["condition"],
+                    "configuration": config,
+                    "dataset_protocol": {"data_sha256": "a" * 64},
+                    "runtime_versions": {"test": "CPU debug fixture"},
+                },
+            }
+            (output / "metrics.json").write_text(json.dumps({"status": job["status"]}))
+    manifest = {
+        "schema_version": 1,
+        "suite": "conductance_architecture_scaling_v1_v5",
+        "run_id": "source",
+        "status": "failed",
+        "config": {"min_free_gb": 40.0},
+        "jobs": jobs,
+    }
+    path = source / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(runner, "source_snapshot", lambda: {"debug_fixture.py": "b" * 64})
+    monkeypatch.setattr(runner, "_inspect_checkpoint", lambda path: copy.deepcopy(infos[str(path)]))
+
+    def verify(job, manifest, path):
+        assert job["status"] == "passed"
+        return {"role": "historical_reference", "status": "verified", "job_id": job["job_id"]}
+
+    monkeypatch.setattr(runner, "_historical_reference", verify)
+    return path, manifest, infos
+
+
+def _args(source_run, tmp_path, *extra):
+    return runner.parser().parse_args(
+        [
+            "--source-manifest",
+            str(source_run[0]),
+            "--output-dir",
+            str(tmp_path / "transition"),
+            *extra,
+        ]
+    )
+
+
+def test_complete_controls_preserved_large160_transitions_only_remaining40(source_run, tmp_path):
+    plan = runner.build_plan(_args(source_run, tmp_path))
+    assert len(plan["jobs"]) == 8
+    jobs = {job["job_id"]: job for job in plan["jobs"]}
+    dynamic = jobs["v5/large/model-seed-0/ogbn-arxiv/shared_dynamic_c"]
+    assert dynamic["action"] == "transition_dynamic"
+    assert dynamic["source_epoch"] == 160 and dynamic["remaining_epochs"] == 40
+    assert _value(dynamic["command"], "--epochs") == "200"
+    assert _value(dynamic["command"], "--hidden-channels") == "384"
+    assert _value(dynamic["command"], "--layers") == "12"
+    assert _value(dynamic["command"], "--sample-seed-batch-size") == "2048"
+    assert _value(dynamic["command"], "--transition-mode") == "replace_c"
+    assert _value(dynamic["command"], "--conductance-backend") == "optimization"
+    assert _value(dynamic["command"], "--training-schedule") == "joint"
+    control = jobs["v5/large/model-seed-0/ogbn-arxiv/fixed_c"]
+    assert control["action"] == "reuse_completed_fixed" and control["remaining_epochs"] == 0
+    assert control["historical_reference"]["status"] == "verified"
+    old_dynamic = jobs["v5/reference/model-seed-0/ogbn-arxiv/shared_dynamic_c"]
+    assert old_dynamic["action"] == "preserve_legacy_dynamic"
+    assert old_dynamic["requires_extra_epoch_budget"] is True
+    assert sum(job["action"].startswith("fresh_") for job in plan["jobs"]) == 4
+    assert not (tmp_path / "transition").exists()
+
+
+def test_per_job_extra_budget_does_not_extend_other_large_job(source_run, tmp_path):
+    reference = "v5/reference/model-seed-0/ogbn-arxiv/shared_dynamic_c"
+    plan = runner.build_plan(_args(source_run, tmp_path, "--extra-epochs-for", reference + "=30"))
+    jobs = {job["job_id"]: job for job in plan["jobs"]}
+    assert jobs[reference]["action"] == "transition_dynamic"
+    assert jobs[reference]["target_total_epochs"] == 230
+    assert _value(jobs[reference]["command"], "--transition-extra-epochs") == "30"
+    assert jobs["v5/large/model-seed-0/ogbn-arxiv/shared_dynamic_c"]["target_total_epochs"] == 200
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        ["unknown=10"],
+        ["v5/reference/model-seed-0/ogbn-arxiv/shared_dynamic_c=-2"],
+        ["v5/reference/model-seed-0/ogbn-arxiv/shared_dynamic_c=1.5"],
+        ["malformed"],
+        ["v5/reference/model-seed-0/ogbn-arxiv/shared_dynamic_c=10"] * 2,
+    ],
+)
+def test_bad_extra_budget_overrides_fail_before_writes(source_run, tmp_path, overrides):
+    options = [value for item in overrides for value in ("--extra-epochs-for", item)]
+    with pytest.raises(ValueError):
+        runner.build_plan(_args(source_run, tmp_path, *options))
+    assert not (tmp_path / "transition").exists()
+
+
+def test_plan_only_is_json_and_does_not_create_files_or_probe(
+    source_run, tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        runner, "execute", lambda *_args, **_kwargs: pytest.fail("plan launched execution")
+    )
+    assert (
+        runner.main(
+            [
+                "--source-manifest",
+                str(source_run[0]),
+                "--output-dir",
+                str(tmp_path / "transition"),
+                "--plan-only",
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["read_only"] is True and result["gpu_work_launched"] is False
+    assert len(result["jobs"]) == 8
+    assert not (tmp_path / "transition").exists()
+
+
+def test_rich_source_resolves_only_conductance_child(source_run, tmp_path):
+    rich = tmp_path / "rich.json"
+    rich.write_text(
+        json.dumps(
+            {
+                "suite": "rich_scaling",
+                "run_id": "rich",
+                "jobs": [
+                    {"track": "cycle", "output_dir": "do-not-open"},
+                    {"track": "conductance", "output_dir": str(source_run[0].parent)},
+                    {"track": "tree", "output_dir": "do-not-open-either"},
+                ],
+            }
+        )
+    )
+    args = _args(source_run, tmp_path)
+    args.source_manifest = rich
+    plan = runner.build_plan(args)
+    assert plan["source_manifest"] == str(source_run[0])
+    assert all(job["job_id"].startswith("v5/") for job in plan["jobs"])
+
+
+def test_corrupt_source_checkpoint_aborts_whole_plan(source_run, tmp_path, monkeypatch):
+    def broken(_path):
+        raise ValueError("corrupt source checkpoint")
+
+    monkeypatch.setattr(runner, "_inspect_checkpoint", broken)
+    with pytest.raises(ValueError, match="corrupt source"):
+        runner.build_plan(_args(source_run, tmp_path))
+    assert not (tmp_path / "transition").exists()
+
+
+def test_source_mutation_and_new_pending_checkpoint_are_detected(source_run, tmp_path):
+    plan = runner.build_plan(_args(source_run, tmp_path))
+    pending = next(job for job in plan["jobs"] if job["action"] == "fresh_dynamic")
+    new_checkpoint = Path(pending["source_output_dir"]) / "last.pt"
+    new_checkpoint.write_bytes(b"source-still-running-debug")
+    with pytest.raises(ValueError, match="source artifact changed"):
+        runner._verify_sources(plan)
+
+
+@pytest.mark.parametrize("where", ["source", "inside", "ancestor", "data"])
+def test_source_and_data_overlap_are_rejected(source_run, tmp_path, where):
+    args = _args(source_run, tmp_path)
+    args.output_dir = {
+        "source": source_run[0].parent,
+        "inside": source_run[0].parent / "new",
+        "ancestor": tmp_path,
+        "data": tmp_path / "data" / "new",
+    }[where]
+    with pytest.raises(ValueError, match="distinct|overlap"):
+        runner.build_plan(args)
+
+
+def test_execution_requires_confirmation_and_refuses_active_original(
+    source_run, tmp_path, monkeypatch
+):
+    plan = runner.build_plan(_args(source_run, tmp_path))
+    with pytest.raises(ValueError, match="confirm-source-stopped"):
+        runner.execute(plan, confirm_source_stopped=False)
+    monkeypatch.setattr(
+        runner, "_active_source_processes", lambda _plan: [{"pid": 123, "command": ["debug"]}]
+    )
+    with pytest.raises(ValueError, match="still active"):
+        runner.execute(plan, confirm_source_stopped=True)
+    assert not (tmp_path / "transition").exists()
+
+
+def _fake_execution(monkeypatch, *, fail_once=False):
+    calls = []
+    failed = False
+    monkeypatch.setattr(runner, "_active_source_processes", lambda _plan: [])
+    monkeypatch.setattr(
+        runner,
+        "_validate_certificate",
+        lambda job, _path: {"selected_execution": dict(job["baseline_execution"])},
+    )
+    monkeypatch.setattr(runner, "_write_report", lambda _manifest, _output: None)
+    monkeypatch.setattr(
+        runner,
+        "_completed",
+        lambda job: {"debug_checkpoint_sha256": runner._sha(Path(job["output_dir"]) / "last.pt")},
+    )
+
+    def dispatch(command, _log):
+        nonlocal failed
+        calls.append(command)
+        if "--probe-job" in command:
+            path = Path(_value(command, "--probe-job"))
+            (path.parent / "resource-certificate.json").write_text('{"debug_only":true}')
+            return 0
+        output = Path(_value(command, "--output-dir"))
+        output.mkdir(parents=True, exist_ok=True)
+        if fail_once and not failed:
+            failed = True
+            (output / "last.pt").write_bytes(b"debug-interrupted-new-checkpoint")
+            return 7
+        (output / "last.pt").write_bytes(b"debug-completed-new-checkpoint")
+        return 0
+
+    monkeypatch.setattr(runner, "_run_logged", dispatch)
+    return calls
+
+
+def test_incomplete_transition_resumes_and_keeps_finished_controls_and_budget_pending(
+    source_run, tmp_path, monkeypatch
+):
+    plan = runner.build_plan(_args(source_run, tmp_path))
+    originals = {
+        path: Path(path).read_bytes()
+        for path, value in plan["source_artifact_sha256"].items()
+        if value
+    }
+    calls = _fake_execution(monkeypatch, fail_once=True)
+    with pytest.raises(RuntimeError, match="code 7"):
+        runner.execute(plan, confirm_source_stopped=True)
+    assert runner.execute(plan, confirm_source_stopped=True) == 3
+    training = [command for command in calls if "-m" in command]
+    assert len(training) == 6  # One interrupted attempt, five eligible final children.
+    assert all("--resume" in command for command in training)
+    assert all(
+        _value(command, "--output-dir").startswith(str(tmp_path / "transition"))
+        for command in training
+    )
+    assert not any(
+        "reference/model-seed-0/ogbn-arxiv" in _value(command, "--output-dir").replace("\\", "/")
+        for command in training
+    )
+    before = len(calls)
+    assert runner.execute(plan, confirm_source_stopped=True) == 3
+    assert len(calls) == before
+    for path, contents in originals.items():
+        assert Path(path).read_bytes() == contents
+    manifest = runner._read(Path(plan["output_dir"]) / "manifest.json")
+    assert manifest["status"] == "pending_extra_budget"
+    assert sum(job["status"] == "historical_reference" for job in manifest["jobs"]) == 2
+    assert sum(job["status"] == "passed" for job in manifest["jobs"]) == 5
+
+
+def test_changed_completed_target_is_rejected_without_retraining(source_run, tmp_path, monkeypatch):
+    plan = runner.build_plan(_args(source_run, tmp_path))
+    calls = _fake_execution(monkeypatch)
+    assert runner.execute(plan, confirm_source_stopped=True) == 3
+    completed = next(job for job in plan["jobs"] if job["action"] == "transition_dynamic")
+    (Path(completed["output_dir"]) / "last.pt").write_bytes(b"tampered-debug-target")
+    before = len(calls)
+    with pytest.raises(ValueError, match="completed transition child changed"):
+        runner.execute(plan, confirm_source_stopped=True)
+    assert len(calls) == before
+
+
+def test_incomplete_fixed_keeps_legacy_schedule_and_exact_execution(source_run, tmp_path):
+    path, source, infos = source_run
+    job = next(
+        job
+        for job in source["jobs"]
+        if job["dataset"] == "ogbn-arxiv" and job["condition"] == "fixed_c"
+    )
+    job["status"] = "failed"
+    info = infos[str(Path(job["output_dir"]) / "last.pt")]
+    info["source_epoch"], info["source_complete"] = 80, False
+    path.write_text(json.dumps(source), encoding="utf-8")
+    plan = runner.build_plan(_args(source_run, tmp_path))
+    continuation = next(item for item in plan["jobs"] if item["job_id"] == job["job_id"])
+    assert continuation["action"] == "resume_incomplete_fixed"
+    assert continuation["source_epoch"] == 80 and continuation["remaining_epochs"] == 120
+    assert _value(continuation["command"], "--training-schedule") == "staged"
+    assert _value(continuation["command"], "--conductance-backend") == "mlp"
+    assert _value(continuation["command"], "--transition-mode") == "continue_fixed"
+
+
+def test_explicit_pending_budget_revision_keeps_all_completed_children_untouched(
+    source_run, tmp_path, monkeypatch
+):
+    original_plan = runner.build_plan(_args(source_run, tmp_path))
+    calls = _fake_execution(monkeypatch)
+    assert runner.execute(original_plan, confirm_source_stopped=True) == 3
+    manifest_path = Path(original_plan["output_dir"]) / "manifest.json"
+    old_manifest = runner._read(manifest_path)
+    completed_bytes = {
+        job["output_dir"]: (Path(job["output_dir"]) / "last.pt").read_bytes()
+        for job in old_manifest["jobs"]
+        if job["status"] == "passed"
+    }
+    job_id = next(
+        job["job_id"] for job in original_plan["jobs"] if job["requires_extra_epoch_budget"]
+    )
+    revised_plan = runner.build_plan(
+        _args(source_run, tmp_path, "--extra-epochs-for", f"{job_id}=30")
+    )
+    before = len(calls)
+    assert runner.execute(revised_plan, confirm_source_stopped=True) == 0
+    additional_training = [command for command in calls[before:] if "-m" in command]
+    assert len(additional_training) == 1
+    assert _value(additional_training[0], "--epochs") == "230"
+    assert _value(additional_training[0], "--transition-extra-epochs") == "30"
+    for output, expected in completed_bytes.items():
+        assert (Path(output) / "last.pt").read_bytes() == expected
+    revised_manifest = runner._read(manifest_path)
+    revision = revised_manifest["plan_revisions"][0]
+    assert revision["previous_plan"] == original_plan
+    assert revision["old_plan_sha256"] == runner.digest(original_plan)
+    assert revision["new_plan_sha256"] == runner.digest(revised_plan)
+    assert revision["changed_job_ids"] == [job_id]
+    assert revised_manifest["status"] == "passed"
+    before = len(calls)
+    assert runner.execute(revised_plan, confirm_source_stopped=True) == 0
+    assert len(calls) == before
+    # Removing an activated budget is not a resume; refuse without writes/dispatch.
+    manifest_bytes = manifest_path.read_bytes()
+    with pytest.raises(ValueError, match="cannot change or remove prior explicit budgets"):
+        runner.execute(original_plan, confirm_source_stopped=True)
+    assert len(calls) == before and manifest_path.read_bytes() == manifest_bytes
+
+
+@pytest.mark.parametrize("drift", ["checkpoint", "code", "trained_budget"])
+def test_pending_budget_revision_refuses_existing_target_or_unrelated_drift(
+    source_run, tmp_path, monkeypatch, drift
+):
+    original = runner.build_plan(_args(source_run, tmp_path))
+    calls = _fake_execution(monkeypatch)
+    assert runner.execute(original, confirm_source_stopped=True) == 3
+    pending = next(job for job in original["jobs"] if job["requires_extra_epoch_budget"])
+    options = ["--extra-epochs-for", f"{pending['job_id']}=30"]
+    if drift == "trained_budget":
+        trained = next(job for job in original["jobs"] if job["action"] == "transition_dynamic")
+        options += ["--extra-epochs-for", f"{trained['job_id']}=10"]
+    revised = runner.build_plan(_args(source_run, tmp_path, *options))
+    if drift == "checkpoint":
+        target = Path(pending["output_dir"])
+        target.mkdir(parents=True)
+        (target / "last.pt").write_bytes(b"debug-unexpected-state")
+    elif drift == "code":
+        revised["source_sha256"] = {"debug": "different-implementation"}
+    manifest_path = Path(original["output_dir"]) / "manifest.json"
+    before, contents = len(calls), manifest_path.read_bytes()
+    with pytest.raises(ValueError):
+        runner.execute(revised, confirm_source_stopped=True)
+    assert len(calls) == before and manifest_path.read_bytes() == contents
+
+
+def _measurement(job, size, workers):
+    gib = 1024**3
+    return {
+        "status": "passed",
+        "condition": job["condition"],
+        "model_seed": job["model_seed"],
+        "batch_size": size,
+        "workers": workers,
+        "samples_per_second": float(size),
+        "elapsed_seconds": 5.0,
+        "processed_units": size * 5,
+        "optimizer_steps": 5,
+        "measurement_steps_requested": 5,
+        "warmup_steps_requested": 2,
+        "minimum_measure_seconds_requested": 3.0,
+        "optimizer_state_bytes": gib,
+        "peak_reserved_bytes": 8 * gib,
+        "total_memory_bytes": 48 * gib,
+        "free_bytes_before": 45 * gib,
+        "peak_allocated_bytes": 7 * gib,
+        "unit": "seed_nodes",
+    }
+
+
+@pytest.mark.parametrize("scenario", ["sampled", "sampled_oom", "full_graph", "fixed_full_graph"])
+def test_real_probe_path_sweeps_new_solver_batches_and_certificate_binds_recipe(
+    source_run, tmp_path, monkeypatch, scenario
+):
+    import torch
+
+    from research.conductance_gat.v5 import batch_calibration, train, transition_training
+    from scripts import calibrate_training_resources as calibration
+    from scripts import training_resource_plan
+
+    plan = runner.build_plan(_args(source_run, tmp_path))
+    job = next(job for job in plan["jobs"] if job["action"] == "transition_dynamic")
+    full_graph = "full_graph" in scenario
+    fixed = scenario == "fixed_full_graph"
+    if full_graph:
+        job["command"] = runner._set_option(job["command"], "--sampling", "full")
+    if fixed:
+        job["action"], job["condition"] = "resume_incomplete_fixed", "fixed_c"
+        for option, value in (
+            ("--condition", "fixed_c"),
+            ("--transition-mode", "continue_fixed"),
+            ("--conductance-backend", "mlp"),
+            ("--training-schedule", "staged"),
+        ):
+            job["command"] = runner._set_option(job["command"], option, value)
+    job["source_dataset_protocol"]["split_counts"] = {"train": 8192}
+    directory = Path(job["resource_directory"])
+    directory.mkdir(parents=True)
+    path = directory / "job.json"
+    path.write_text(json.dumps(job))
+    args, _ = runner._training_arguments(job["command"])
+    runtime, hardware = {"unit": "runtime"}, {"total_memory_bytes": 48 * 1024**3}
+    monkeypatch.setattr(
+        runner, "_probe_runtime", lambda _job: (copy.deepcopy(args), runtime, hardware)
+    )
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *_args: (45 * 1024**3, 48 * 1024**3))
+    monkeypatch.setattr(
+        batch_calibration,
+        "load_calibration_payload",
+        lambda _args: (
+            {"splits": {"train": torch.ones(8192, dtype=torch.bool)}},
+            job["source_dataset_protocol"],
+        ),
+    )
+    observed = []
+
+    def measure(probe_job, _payload, candidate_args, *, batch_size, workers):
+        assert candidate_args.conductance_backend == ("mlp" if fixed else "optimization")
+        # Existing production candidate builder must retain the unused PPI setting.
+        checked = batch_calibration._candidate_args(candidate_args, batch_size, workers)
+        if full_graph:
+            assert batch_size == 1 and checked.batch_size == job["baseline_execution"]["batch_size"]
+        observed.append((batch_size, workers))
+        if scenario == "sampled_oom" and batch_size == 8192:
+            return {
+                "status": "oom",
+                "error": "debug-only simulated candidate OOM",
+                "condition": job["condition"],
+                "model_seed": job["model_seed"],
+            }
+        return _measurement(probe_job, batch_size, workers)
+
+    monkeypatch.setattr(calibration, "_measure", measure)
+    assert runner._probe(path) == 0
+    assert observed == ([(1, 0)] if full_graph else [(2048, 0), (4096, 0), (8192, 0)])
+    certificate_path = directory / "resource-certificate.json"
+    certificate = runner._validate_certificate(job, certificate_path)
+    assert certificate["selected_execution"]["sample_seed_batch_size"] == (
+        2048 if full_graph else 4096 if scenario == "sampled_oom" else 8192
+    )
+    assert certificate["natural_training_split_size"] == (1 if full_graph else 8192)
+    if full_graph:
+        assert certificate["selected_execution"] == job["baseline_execution"]
+        assert certificate["selected_candidate"] == {"batch_size": 1, "workers": 0}
+    assert certificate["selected_configuration"]["solver_steps"] == 8
+    assert certificate["source_resource_plan_is_new_model_measurement"] is False
+    # Cross-module contract test: consume this producer's evidence in the REAL trainer validator.
+    monkeypatch.setattr(train, "_versions", lambda: runtime)
+    monkeypatch.setattr(calibration, "_hardware", lambda _device: hardware)
+    monkeypatch.setattr(training_resource_plan, "source_snapshot", runner.source_snapshot)
+    resolved = list(job["command"])
+    for field, value in certificate["selected_execution"].items():
+        resolved = runner._set_option(resolved, "--" + field.replace("_", "-"), value)
+    resolved += [
+        "--transition-resource-certificate",
+        str(certificate_path),
+        "--transition-resource-sha256",
+        runner._sha(certificate_path),
+    ]
+    selected_args = train.build_parser().parse_args(resolved[resolved.index("-m") + 2 :])
+    train.validate_args(selected_args)
+    inspected = {
+        "sha256": job["source_checkpoint_sha256"],
+        "source_epoch": job["source_epoch"],
+        "identity": {"configuration": job["source_configuration"]},
+    }
+    verified, changes = transition_training._read_certificate(
+        selected_args, inspected, job["source_dataset_protocol"], train.configuration(selected_args)
+    )
+    assert verified == certificate
+    assert ("sample_seed_batch_size" in changes) == (not full_graph)
+    # Completed disposable measurements are reused, never repeated on probe resume.
+    observed.clear()
+    assert runner._probe(path) == 0
+    assert observed == []
+    certificate["selected_configuration"]["solver_steps"] = 9
+    certificate_path.write_text(json.dumps(certificate))
+    with pytest.raises(ValueError, match="different V5 model"):
+        runner._validate_certificate(job, certificate_path)
+````
+
+# tests/test_v5_transition_state.py
+
+````python
+"""CPU-only debug checkpoints for explicit, non-destructive V5 C replacement."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import math
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.v5.model import GraphConditionedConductanceNodeClassifier
+from research.conductance_gat.v5.train import make_optimizer
+from research.conductance_gat.v5.transition import (
+    C_NAMESPACE,
+    canonical_sha256,
+    inspect_transition_source,
+    prepare_transition_state,
+)
+
+# Reviewed 76e514a Linux/LF source hashes, not test aliases accepted in production.
+LEGACY_SOURCE = dict(
+    zip(
+        [
+            "research/conductance_gat/ablation/train.py",
+            "research/conductance_gat/benchmark.py",
+            "research/conductance_gat/benchmark_data.py",
+            "research/conductance_gat/v5/__init__.py",
+            "research/conductance_gat/v5/batch_calibration.py",
+            "research/conductance_gat/v5/diagnostics.py",
+            "research/conductance_gat/v5/model.py",
+            "research/conductance_gat/v5/operator.py",
+            "research/conductance_gat/v5/protocol.py",
+            "research/conductance_gat/v5/report.py",
+            "research/conductance_gat/v5/sampling.py",
+            "research/conductance_gat/v5/train.py",
+            "src/chartgat/cache.py",
+            "src/chartgat/observability.py",
+        ],
+        [
+            "522df8ee0c7d40acb2db6814bcf6065648f8674fb3669d299ffb9872c66dbff5",
+            "c441a65e22f0431e0c362d4eeadb3036aaceabb5b89863bd8709e6b7680b5d13",
+            "082e4a1a94bb7beffddfa2d5f59a922c806f15093d5ffc97fb3240b0bb844dc7",
+            "8b313a477bbd51eedc0861fad06cffdf7f7a0aed5d9fcddc55fa89c333a3bd46",
+            "46cb2d2632c1283089f3684e32bcc22d97d6e5b81809646ffe21a5eb2ab7148f",
+            "cd7b7bb6f72bae2d8282a8cb33e48a0f0a25872b2c0ffd27008528e029fe9182",
+            "fd2256d0815c2eed40a3a5cefaca3a1b786049a7fa799e8cf63b12ac4419b57f",
+            "28e252ac76116217beaf801ccbb6308c37c85cef7334125322043e326cbfe0b3",
+            "77bd54d053172a82bcd0b07f22d70eda8f9a5c0c9204f50291b4ea2f0ffd81e3",
+            "ad8964970d3372cc631c49f412057941a067c65c0b09d160139780350629c0f7",
+            "0f4d5226cd91202fdcca1e269c03de36aee56f1ed95992b9da14046ed108a7dd",
+            "e0f68e4ecb73e93018af1a12d63d36050228eef58661234c687b98fa846db6ad",
+            "b9feeef3c3e033a064677a612790b036d78d09eecddce773a44273e007cd7cab",
+            "53b1b037f84371ad51abb9524c808b5d72cf27f3c66eca8fcc97a825e81755b1",
+        ],
+        strict=True,
+    )
+)
+
+
+def _model(*, backend="mlp", fixed=False):
+    return GraphConditionedConductanceNodeClassifier(
+        5,
+        3,
+        hidden_channels=8,
+        layers=2,
+        heads=2,
+        ffn_multiplier=2,
+        dropout=0,
+        conductance_mode="fixed_one" if fixed else "dynamic",
+        conductance_backend=backend,
+        activation_checkpoint=False,
+        edge_chunk_size=3,
+    )
+
+
+def _graph():
+    return SimpleNamespace(
+        x=torch.randn(7, 5),
+        incidence_edge_index=torch.tensor([[0, 0, 1, 2, 2, 3, 4, 5], [1, 6, 2, 3, 5, 4, 5, 6]]),
+    )
+
+
+def _save(tmp_path, *, fixed=False, epoch=2, complete=False):
+    torch.manual_seed(56)
+    model = _model(fixed=fixed)
+    optimizer = make_optimizer(model)
+    graph = _graph()
+    for _ in range(epoch):
+        optimizer.zero_grad(set_to_none=True)
+        model(graph).square().mean().backward()
+        optimizer.step()
+    configuration = {
+        "optimizer": "AdamW",
+        "model_seed": 0,
+        "epochs": 10,
+        "hidden_channels": 8,
+        "layers": 2,
+        "heads": 2,
+        "ffn_multiplier": 2,
+        "dropout": 0,
+        "activation_checkpoint": False,
+        "precision": "fp32",
+        "amp": False,
+        "sampling": "cluster",
+        "sample_seed_batch_size": 8,
+        "num_neighbors": [15, 10],
+        "batch_size": 1,
+        "workers": 0,
+        "loader_workers": 0,
+        "persistent_workers": False,
+        "prefetch_factor": None,
+        "worker_configuration_source": "debug_fixture",
+        "lr": 0.0005,
+        "beta_initial": 0.1,
+        "beta_parameterization": "sigmoid",
+        "patience": 5,
+    }
+    protocol = {"data_sha256": "a" * 64, "dataset": "cora", "debug_fixture": True}
+    identity = {
+        "schema_version": 1,
+        "research_suite": "conductance_graph_conditioned_v5",
+        "dataset": "cora",
+        "condition": "fixed_c" if fixed else "shared_dynamic_c",
+        "configuration": configuration,
+        "schedule": [
+            {"name": "spatial_warmup", "start_epoch": 1, "end_epoch": 1, "length": 1},
+            {"name": "conductance_calibration", "start_epoch": 2, "end_epoch": 2, "length": 1},
+            {"name": "alternating", "start_epoch": 3, "end_epoch": 4, "length": 2},
+            {"name": "joint", "start_epoch": 5, "end_epoch": 10, "length": 6},
+        ],
+        "dataset_protocol": protocol,
+        "dataset_protocol_sha256": canonical_sha256(protocol),
+        "cache_sha256": protocol["data_sha256"],
+        "initial_state_sha256": "b" * 64,
+        "source_sha256": copy.deepcopy(LEGACY_SOURCE),
+        "runtime_versions": {"torch": str(torch.__version__), "test_scope": "CPU debug fixture"},
+        "resume_semantics": "epoch-boundary deterministic resume",
+    }
+    saved = {
+        "schema_version": 3,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "resume_identity": identity,
+        "resume_identity_sha256": canonical_sha256(identity),
+        "epoch": epoch,
+        "complete": complete,
+        "history": [{"epoch": i, "validation": 0.4} for i in range(1, epoch + 1)],
+        "best_epoch": 1,
+        "best_metric": 0.4,
+        "best_checkpoint_sha256": "c" * 64,
+        "global_best_epoch": 1,
+        "global_best_metric": 0.4,
+        "joint_best_epoch": 0,
+        "joint_best_metric": -math.inf,
+        "optimizer_steps": epoch,
+        "effective_optimizer_steps_by_group": {
+            "backbone": epoch,
+            "spatial_w": epoch,
+            "beta": epoch,
+            "conductance": 0 if fixed else epoch,
+        },
+        "first_c_gradient": None if fixed else 0.01,
+        "cpu_rng_state": torch.get_rng_state(),
+        # This is a typed debug placeholder for format tests, not a CUDA claim.
+        "cuda_rng_state": torch.get_rng_state(),
+        "elapsed_seconds": 12.5,
+        "peak_cuda_allocated_bytes": 0,
+        "peak_cuda_reserved_bytes": 0,
+        "resume_source_compatibility": [],
+    }
+    path = tmp_path / "legacy-last.pt"
+    torch.save(saved, path)
+    return path, saved
+
+
+def _target(saved, *, fixed=False, extra=0):
+    model = _model(backend="mlp" if fixed else "optimization", fixed=fixed)
+    optimizer = make_optimizer(model)
+    identity = copy.deepcopy(saved["resume_identity"])
+    identity["configuration"].update(
+        conductance_backend="mlp" if fixed else "optimization",
+        training_schedule="staged" if fixed else "joint",
+        solver_steps=8,
+        solver_step_size=0.25,
+        solver_entropy=1.0,
+        solver_degree_barrier=0.1,
+        epochs=identity["configuration"]["epochs"] + extra,
+    )
+    if fixed:
+        identity["schedule"][-1]["end_epoch"] += extra
+        identity["schedule"][-1]["length"] += extra
+    else:
+        identity["schedule"] = [
+            {
+                "name": "joint",
+                "start_epoch": 1,
+                "end_epoch": 10 + extra,
+                "length": 10 + extra,
+            }
+        ]
+    identity["source_sha256"]["research/conductance_gat/v5/model.py"] = "d" * 64
+    identity["source_sha256"]["research/conductance_gat/v5/optimization.py"] = "e" * 64
+    return model, optimizer, identity
+
+
+def _prepare(path, target, **kwargs):
+    model, optimizer, identity = target
+    return prepare_transition_state(
+        path,
+        expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        target_model=model,
+        target_optimizer=optimizer,
+        target_identity=identity,
+        **kwargs,
+    )
+
+
+def _assert_nested_equal(first, second):
+    if isinstance(first, torch.Tensor):
+        assert torch.equal(first, second)
+    elif isinstance(first, dict):
+        assert first.keys() == second.keys()
+        for key in first:
+            _assert_nested_equal(first[key], second[key])
+    elif isinstance(first, (list, tuple)):
+        assert len(first) == len(second)
+        for a, b in zip(first, second, strict=True):
+            _assert_nested_equal(a, b)
+    else:
+        assert first == second
+
+
+def test_c_only_transition_preserves_all_shared_weights_moments_and_progress(tmp_path):
+    path, saved = _save(tmp_path)
+    original_bytes = path.read_bytes()
+    target = _target(saved)
+    model, optimizer, _ = target
+    before = copy.deepcopy(model.state_dict())
+    result = _prepare(path, target)
+    assert path.read_bytes() == original_bytes
+    _assert_nested_equal(model.state_dict(), before)  # Preparation is pure.
+    assert optimizer.state_dict()["state"] == {}
+    for name, value in result["model_state"].items():
+        expected = before[name] if C_NAMESPACE.match(name) else saved["model_state"][name]
+        assert torch.equal(value, expected), name
+    assert result["start_epoch"] == 3 and result["total_epochs"] == 10
+    assert result["epoch_offset"] == 2 and result["history"] == []
+    assert result["source_history"] == saved["history"]
+    assert result["selection_state"]["best_metric"] == -math.inf
+    assert result["selection_state"]["joint_best_epoch"] == 0
+    assert result["counters"]["optimizer_steps"] == 2
+    assert result["counters"]["effective_optimizer_steps_by_group"]["conductance"] == 0
+    for old, new in zip(
+        saved["optimizer_state"]["param_groups"],
+        result["optimizer_state"]["param_groups"],
+        strict=True,
+    ):
+        if old["name"] == "conductance":
+            assert all(index not in result["optimizer_state"]["state"] for index in new["params"])
+            continue
+        assert {k: v for k, v in old.items() if k != "params"} == {
+            k: v for k, v in new.items() if k != "params"
+        }
+        for old_id, new_id in zip(old["params"], new["params"], strict=True):
+            _assert_nested_equal(
+                saved["optimizer_state"]["state"][old_id],
+                result["optimizer_state"]["state"][new_id],
+            )
+    for name in ("cpu_rng_state", "cuda_rng_state"):
+        assert torch.equal(result["rng_state"][name], saved[name])
+    assert result["provenance"]["test_labels_used"] is False
+    json.dumps(result["provenance"], allow_nan=False)
+    assert result["provenance"]["source_selection_state"]["joint_best_metric"] is None
+    assert result["provenance"]["source_selection_applicability"]["joint_best_metric"].startswith(
+        "not_yet"
+    )
+    assert all(C_NAMESPACE.match(name) for name in result["provenance"]["dropped_c_tensor_names"])
+    model.load_state_dict(result["model_state"])
+    optimizer.load_state_dict(result["optimizer_state"])
+    optimizer.zero_grad(set_to_none=True)
+    model(_graph()).square().mean().backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+    optimizer.step()
+    assert all(
+        float(state["step"]) == (1 if C_NAMESPACE.match(name) else 3)
+        for group in optimizer.param_groups
+        for name, parameter in zip(group["parameter_names"], group["params"], strict=True)
+        for state in (optimizer.state[parameter],)
+    )
+
+
+def test_fixed_continuation_preserves_entire_state_history_and_best(tmp_path):
+    path, saved = _save(tmp_path, fixed=True)
+    target = _target(saved, fixed=True)
+    result = _prepare(path, target, mode="continue_fixed")
+    _assert_nested_equal(result["model_state"], saved["model_state"])
+    _assert_nested_equal(result["optimizer_state"], saved["optimizer_state"])
+    assert result["history"] == saved["history"]
+    assert result["epoch_offset"] == 0
+    assert result["selection_state"]["best_metric"] == 0.4
+    assert result["selection_state"]["best_checkpoint_sha256"] == "c" * 64
+    assert result["provenance"]["dropped_c_tensor_names"] == []
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("model_seed", 1),
+        ("hidden_channels", 16),
+        ("layers", 3),
+        ("heads", 4),
+        ("dropout", 0.5),
+        ("precision", "bf16"),
+        ("sampling", "neighbor"),
+        ("sample_seed_batch_size", 4),
+        ("beta_initial", 0.2),
+        ("lr", 0.01),
+    ],
+)
+def test_shared_configuration_drift_fails_without_modifying_source_or_target(
+    tmp_path, field, value
+):
+    path, saved = _save(tmp_path)
+    original = path.read_bytes()
+    target = _target(saved)
+    before = copy.deepcopy(target[0].state_dict())
+    target[2]["configuration"][field] = value
+    with pytest.raises(ValueError, match="shared identity"):
+        _prepare(path, target)
+    assert path.read_bytes() == original
+    _assert_nested_equal(target[0].state_dict(), before)
+    assert target[1].state_dict()["state"] == {}
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "hash",
+        "identity",
+        "source",
+        "data",
+        "schema",
+        "history",
+        "rng",
+        "model_nan",
+        "moment_nan",
+        "moment_shape",
+        "names",
+        "negative_step",
+        "resources",
+        "legacy_c_names",
+    ],
+)
+def test_corrupt_checkpoint_fails_closed(tmp_path, kind):
+    path, saved = _save(tmp_path)
+    old_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    if kind == "hash":
+        with path.open("ab") as stream:
+            stream.write(b"changed")
+        with pytest.raises(ValueError, match="SHA-256"):
+            inspect_transition_source(path, expected_sha256=old_hash)
+        return
+    if kind == "identity":
+        saved["resume_identity"]["configuration"]["model_seed"] = 3
+    elif kind == "source":
+        saved["resume_identity"]["source_sha256"]["research/conductance_gat/v5/model.py"] = "f" * 64
+        saved["resume_identity_sha256"] = canonical_sha256(saved["resume_identity"])
+    elif kind == "data":
+        saved["resume_identity"]["cache_sha256"] = "f" * 64
+        saved["resume_identity_sha256"] = canonical_sha256(saved["resume_identity"])
+    elif kind == "schema":
+        saved["schema_version"] = 2
+    elif kind == "history":
+        saved["history"][1]["epoch"] = 1
+    elif kind == "rng":
+        saved["cpu_rng_state"] = torch.ones(4)
+    elif kind == "model_nan":
+        saved["model_state"]["encoder.weight"][0, 0] = math.nan
+    elif kind == "moment_nan":
+        next(iter(saved["optimizer_state"]["state"].values()))["exp_avg"][0] = math.nan
+    elif kind == "moment_shape":
+        next(iter(saved["optimizer_state"]["state"].values()))["exp_avg"] = torch.zeros(1)
+    elif kind == "names":
+        saved["optimizer_state"]["param_groups"][0]["parameter_names"][0] = "missing.weight"
+    elif kind == "negative_step":
+        next(iter(saved["optimizer_state"]["state"].values()))["step"] = torch.tensor(-1.0)
+    elif kind == "resources":
+        saved["elapsed_seconds"] = math.nan
+    elif kind == "legacy_c_names":
+        saved["model_state"]["blocks.0.operator.estimator.mystery"] = torch.ones(1)
+    torch.save(saved, path)
+    before = path.read_bytes()
+    with pytest.raises(ValueError):
+        inspect_transition_source(path)
+    assert path.read_bytes() == before
+
+
+def test_complete_dynamic_requires_explicit_remaining_budget(tmp_path):
+    path, saved = _save(tmp_path, epoch=10, complete=True)
+    with pytest.raises(ValueError, match="no remaining epochs"):
+        _prepare(path, _target(saved))
+    target = _target(saved, extra=4)
+    with pytest.raises(ValueError, match="epoch budget"):
+        _prepare(path, target)
+    result = _prepare(path, target, additional_epochs=4)
+    assert result["start_epoch"] == 11 and result["total_epochs"] == 14
+    assert result["provenance"]["additional_epochs"] == 4
+
+
+def test_complete_fixed_is_reference_not_retraining_and_fixed_extension_keeps_phases(tmp_path):
+    path, saved = _save(tmp_path, fixed=True, complete=True)
+    with pytest.raises(ValueError, match="historical reference"):
+        _prepare(path, _target(saved, fixed=True), mode="continue_fixed")
+    path, saved = _save(tmp_path, fixed=True)
+    target = _target(saved, fixed=True, extra=5)
+    result = _prepare(path, target, mode="continue_fixed", additional_epochs=5)
+    assert result["total_epochs"] == 15
+    target[2]["schedule"][0]["length"] += 1
+    with pytest.raises(ValueError, match="retain phases"):
+        _prepare(path, target, mode="continue_fixed", additional_epochs=5)
+
+
+def test_explicit_nondecreasing_execution_change_is_audited(tmp_path):
+    path, saved = _save(tmp_path)
+    target = _target(saved)
+    target[2]["configuration"]["sample_seed_batch_size"] = 16
+    declared = {"sample_seed_batch_size": {"before": 8, "after": 16}}
+    result = _prepare(path, target, declared_execution_changes=declared)
+    assert result["provenance"]["declared_execution_changes"] == declared
+    target[2]["configuration"]["sample_seed_batch_size"] = 4
+    with pytest.raises(ValueError, match="reduce physical"):
+        _prepare(
+            path,
+            target,
+            declared_execution_changes={"sample_seed_batch_size": {"before": 8, "after": 4}},
+        )
+
+
+def test_target_request_must_match_verified_action_and_source(tmp_path):
+    path, saved = _save(tmp_path)
+    target = _target(saved)
+    sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    request = {
+        "source_checkpoint_sha256": sha,
+        "mode": "replace_c",
+        "additional_epochs": 0,
+        "declared_execution_changes": {},
+        "source_path": str(path),
+        "resource_certificate_sha256": "d" * 64,
+        "resource_certificate_path": "debug-only.json",
+    }
+    target[2]["transition_request"] = request
+    assert _prepare(path, target)["provenance"]["source_checkpoint_sha256"] == sha
+    request["source_checkpoint_sha256"] = "f" * 64
+    with pytest.raises(ValueError, match="request"):
+        _prepare(path, target)
+
+
+def test_undeclared_shared_operator_and_dataset_runtime_changes_rejected(tmp_path):
+    path, saved = _save(tmp_path)
+    for field in ("dataset", "runtime_versions", "dataset_protocol"):
+        target = _target(saved)
+        target[2][field] = "changed"
+        with pytest.raises(ValueError, match="shared identity"):
+            _prepare(path, target)
+    target = _target(saved)
+    target[2]["source_sha256"]["research/conductance_gat/v5/operator.py"] = "f" * 64
+    with pytest.raises(ValueError, match="shared operator"):
+        _prepare(path, target)
+
+
+def test_shared_tensor_dtype_shape_and_busy_target_optimizer_are_rejected(tmp_path):
+    path, saved = _save(tmp_path)
+    target = _target(saved)
+    target[0].encoder.weight = torch.nn.Parameter(torch.zeros(9, 5))
+    with pytest.raises(ValueError, match="shape/dtype"):
+        _prepare(path, target)
+    target = _target(saved)
+    target[0].double()
+    with pytest.raises(ValueError, match="shape/dtype"):
+        _prepare(path, target)
+    target = _target(saved)
+    target[0](_graph()).square().mean().backward()
+    target[1].step()
+    with pytest.raises(ValueError, match="fresh"):
+        _prepare(path, target)
+
+
+@pytest.mark.parametrize(
+    "kind", ["missing_moments", "zero_step", "step_above_group", "group_counter"]
+)
+def test_missing_reusable_adam_state_cannot_silently_restart_optimizer(tmp_path, kind):
+    path, saved = _save(tmp_path)
+    if kind == "missing_moments":
+        saved["optimizer_state"]["state"].clear()
+    elif kind == "zero_step":
+        next(iter(saved["optimizer_state"]["state"].values()))["step"] = torch.tensor(0.0)
+    elif kind == "step_above_group":
+        saved["effective_optimizer_steps_by_group"]["backbone"] = 1
+    else:
+        saved["effective_optimizer_steps_by_group"]["backbone"] = 0
+    torch.save(saved, path)
+    original = path.read_bytes()
+    with pytest.raises(ValueError, match="moments/steps"):
+        inspect_transition_source(path)
+    assert path.read_bytes() == original
+
+
+def test_later_skipped_gradient_preserves_smaller_actual_adam_step(tmp_path):
+    path, saved = _save(tmp_path)
+    old_model = _model()
+    old_optimizer = make_optimizer(old_model)
+    old_model.load_state_dict(saved["model_state"])
+    old_optimizer.load_state_dict(saved["optimizer_state"])
+    old_optimizer.zero_grad(set_to_none=True)
+    old_model(_graph()).square().mean().backward()
+    skipped_name, skipped_parameter = next(iter(old_model.named_parameters()))
+    # Model-dependent later branches can yield grad=None for an initialized
+    # parameter; AdamW correctly leaves that parameter's step/moments intact.
+    skipped_parameter.grad = None
+    old_optimizer.step()
+    saved["model_state"] = old_model.state_dict()
+    saved["optimizer_state"] = old_optimizer.state_dict()
+    saved["epoch"] = saved["optimizer_steps"] = 3
+    saved["history"].append({"epoch": 3, "validation": 0.4})
+    saved["effective_optimizer_steps_by_group"] = dict.fromkeys(
+        saved["effective_optimizer_steps_by_group"], 3
+    )
+    torch.save(saved, path)
+    result = _prepare(path, _target(saved))
+    for group in result["optimizer_state"]["param_groups"]:
+        for name, identifier in zip(group["parameter_names"], group["params"], strict=True):
+            if name == skipped_name:
+                assert float(result["optimizer_state"]["state"][identifier]["step"]) == 2.0
+                _assert_nested_equal(
+                    result["optimizer_state"]["state"][identifier],
+                    old_optimizer.state[skipped_parameter],
+                )
+                break
+        else:
+            continue
+        break
+    else:
+        pytest.fail("skipped shared parameter was not retained")
+
+
+def test_reviewed_8963821_snapshot_is_accepted_without_source_waiver(tmp_path):
+    path, saved = _save(tmp_path)
+    source = saved["resume_identity"]["source_sha256"]
+    changes = dict(
+        [
+            (
+                "research/conductance_gat/v5/report.py",
+                "5c417d340ff299eb589c2044b975717285e56425441bf401094ff3abdca4e249",
+            ),
+            (
+                "research/conductance_gat/v5/train.py",
+                "5bda72fb2a947f521d57337e2dab3645879b256d8d187171c1031d3396c60705",
+            ),
+            (
+                "scripts/resume_compatibility_v1.json",
+                "4c8695580f8723e6960db591e65f24777a0dddbf7295b01498a62a0548b8a6ec",
+            ),
+            (
+                "src/chartgat/resume_compat.py",
+                "379e4691c24fa888c937a25420c37f8ef9ab542551eae406ed81e608856afa35",
+            ),
+        ]
+    )
+    source.update(changes)
+    saved["resume_identity_sha256"] = canonical_sha256(saved["resume_identity"])
+    torch.save(saved, path)
+    inspected = inspect_transition_source(path)
+    assert inspected["legacy_revision"] == "89638212e2188746905abe92de9d8545dd624915"
+````
+
+# tests/test_v5_transition_training.py
+
+````python
+"""Explicit CPU debug integration of V5 transfer and atomic interruption/resume.
+
+Only CUDA/resource measurements and loading the small synthetic input graph are
+stubbed. Model forward, validation, loss, backward, clipping, AdamW, checkpoint
+publication, migration verification and resume are the real implementations.
+These tests provide no GPU utilization, throughput or final-dataset evidence.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import math
+
+import pytest
+import torch
+from test_v5_transition_state import LEGACY_SOURCE, _assert_nested_equal
+
+from research.conductance_gat.v5 import train, transition_initialization, transition_training
+from research.conductance_gat.v5.model import GraphConditionedConductanceNodeClassifier
+from research.conductance_gat.v5.transition import C_NAMESPACE
+
+
+class DebugCrash(RuntimeError):
+    pass
+
+
+class DebugGraph:
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+    def clone(self):
+        return DebugGraph(
+            **{
+                name: value.clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value)
+                for name, value in vars(self).items()
+            }
+        )
+
+    def to(self, device, **_kwargs):
+        return DebugGraph(
+            **{
+                name: value.to(device) if isinstance(value, torch.Tensor) else value
+                for name, value in vars(self).items()
+            }
+        )
+
+
+class CpuDebugMonitor:
+    def __init__(self, device):
+        assert device.type == "cpu"
+
+    def start(self):
+        return {"classification": "explicit_cpu_debug_hardware_stub"}
+
+    def finish(self, **_kwargs):
+        return {
+            "classification": "explicit_cpu_debug_hardware_stub",
+            "summary": {"classification": "CPU debug; GPU metrics unavailable"},
+            "interval_series": {
+                "gpu_sm_utilization_percent": {
+                    "value": None,
+                    "reason": "CPU debug test has no GPU measurements",
+                }
+            },
+        }
+
+
+@pytest.fixture(autouse=True)
+def preserve_rng():
+    with torch.random.fork_rng(devices=[]):
+        yield
+
+
+def _args(output, *, fixed=False):
+    args = train.build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            "fixed_c" if fixed else "shared_dynamic_c",
+            "--output-dir",
+            str(output),
+            "--device",
+            "cpu",
+            "--hidden-channels",
+            "8",
+            "--layers",
+            "2",
+            "--heads",
+            "2",
+            "--ffn-multiplier",
+            "2",
+            "--epochs",
+            "4",
+            "--patience",
+            "20",
+            "--dropout",
+            "0.2",
+            "--no-activation-checkpoint",
+            "--edge-chunk-size",
+            "3",
+            "--conductance-backend",
+            "mlp" if fixed else "optimization",
+            "--training-schedule",
+            "staged" if fixed else "joint",
+        ]
+    )
+    train.validate_args(args)
+    return args
+
+
+def _model(args):
+    return GraphConditionedConductanceNodeClassifier(
+        5,
+        3,
+        **train.architecture_configuration(args),
+        conductance_mode=train.CONDITIONS[args.condition]["conductance_mode"],
+        max_log_conductance=train.COMMON["max_log_conductance"],
+        edge_chunk_size=args.edge_chunk_size,
+    )
+
+
+def _debug_data():
+    generator = torch.Generator().manual_seed(108)
+    graph = DebugGraph(
+        x=torch.randn(9, 5, generator=generator),
+        y=torch.arange(9) % 3,
+        incidence_edge_index=torch.tensor(
+            [[0, 0, 0, 1, 2, 2, 3, 4, 5, 5, 6, 7], [1, 2, 3, 2, 3, 4, 4, 5, 6, 7, 7, 8]]
+        ),
+    )
+    indices = {"train": torch.arange(6), "validation": torch.arange(6, 9)}
+    payload = {
+        "dataset": "cora",
+        "classes": 3,
+        "graphs": [vars(graph)],
+        "classification": "synthetic_cpu_debug_fixture",
+    }
+    protocol = {
+        "data_sha256": "a" * 64,
+        "dataset": "cora",
+        "classification": "synthetic_cpu_debug_fixture",
+    }
+    return graph, indices, payload, protocol
+
+
+def _install_cpu_debug_environment(monkeypatch, graph, indices):
+    monkeypatch.setattr(train, "_require_cuda", lambda device: None)
+    monkeypatch.setattr(
+        train,
+        "validate_hardware_runtime",
+        lambda args, device: {
+            "classification": "explicit_cpu_debug_hardware_stub",
+            "total_memory_bytes": 1,
+        },
+    )
+    monkeypatch.setattr(train, "RuntimeResourceMonitor", CpuDebugMonitor)
+    monkeypatch.setattr(train, "configure_compute", lambda args: None)
+    monkeypatch.setattr(train, "_prepare_data", lambda *_args: (graph.clone(), indices, None))
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda *_args: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *_args: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda *_args: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *_args: "CPU debug; no CUDA device")
+    monkeypatch.setattr(torch.cuda, "get_rng_state", lambda *_args: torch.get_rng_state())
+    monkeypatch.setattr(torch.cuda, "set_rng_state", lambda *_args: None)
+    # The production certificate validator is tested independently. No GPU
+    # measurement is invented or used as a scientific result in this fixture.
+    monkeypatch.setattr(
+        transition_training,
+        "_read_certificate",
+        lambda *_args: (
+            {"classification": "explicit_cpu_debug_certificate_stub"},
+            {},
+        ),
+    )
+    target_sources = copy.deepcopy(LEGACY_SOURCE)
+    target_sources["research/conductance_gat/v5/model.py"] = "d" * 64
+    target_sources["research/conductance_gat/v5/train.py"] = "e" * 64
+    target_sources["research/conductance_gat/v5/optimization.py"] = "f" * 64
+    monkeypatch.setattr(
+        train, "implementation_source_hashes", lambda: copy.deepcopy(target_sources)
+    )
+
+
+def _source(tmp_path, graph, indices, protocol, *, fixed=False):
+    directory = tmp_path / ("old-fixed" if fixed else "old-dynamic")
+    directory.mkdir()
+    args = _args(directory, fixed=fixed)
+    args.conductance_backend, args.training_schedule = "mlp", "staged"
+    train._seed(args.model_seed)
+    model, optimizer = _model(args), None
+    optimizer = train.make_optimizer(model)
+    schedule = train.phase_schedule(4, list(args.phase_fractions), "staged")
+    initial = train.state_sha256(model)
+    counts = dict.fromkeys(("backbone", "spatial_w", "beta", "conductance"), 0)
+    history = []
+    first_gradient = None
+    for epoch in (1, 2):
+        phase, local = train.phase_at(schedule, epoch)
+        phase_state = train.configure_phase(model, phase, local)
+        optimizer.zero_grad(set_to_none=True)
+        loss, count = train.training_loss(model(graph), graph, indices["train"])
+        loss.backward()
+        train.validate_active_gradient_connectivity(model, phase_state["active_parameter_groups"])
+        if not fixed and epoch == 2:
+            first_gradient = train.require_first_step_conductance_gradient(model)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), train.COMMON["gradient_clip_norm"])
+        optimizer.step()
+        counts = train.count_effective_group_step(
+            counts, optimizer, phase_state["active_parameter_groups"]
+        )
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": float(loss.detach()),
+                "train_label_count": count,
+                "train_batches": 1,
+                "maximum_preclip_gradient_norm": 1.0,
+                "validation": 0.99,
+                "classification": "historical_selection_sentinel_cpu_debug_only",
+            }
+        )
+    identity = train.build_resume_identity(
+        args,
+        protocol,
+        schedule,
+        initial_state_sha256=initial,
+        source_sha256=copy.deepcopy(LEGACY_SOURCE),
+        runtime_versions=train._versions(),
+    )
+    for name in (
+        "conductance_backend",
+        "training_schedule",
+        "solver_steps",
+        "solver_step_size",
+        "solver_entropy",
+        "solver_degree_barrier",
+    ):
+        identity["configuration"].pop(name, None)
+    identity_hash = train._canonical_sha256(identity)
+    selected = {
+        "model_state": copy.deepcopy(model.state_dict()),
+        "resume_identity": identity,
+        "resume_identity_sha256": identity_hash,
+        "epoch": 2,
+        "validation": 0.99,
+        "selection_role": "primary",
+        "phase": "conductance_calibration",
+        "configuration": copy.deepcopy(identity["configuration"]),
+        "schedule": schedule,
+    }
+    source_best = directory / "best.pt"
+    torch.save(selected, source_best)
+    saved = {
+        "schema_version": 3,
+        "complete": False,
+        "epoch": 2,
+        "history": history,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "resume_identity": identity,
+        "resume_identity_sha256": identity_hash,
+        "best_epoch": 2,
+        "best_metric": 0.99,
+        "best_checkpoint_sha256": train.sha256_file(source_best),
+        "global_best_epoch": 2,
+        "global_best_metric": 0.99,
+        "joint_best_epoch": 0,
+        "joint_best_metric": -math.inf,
+        "first_c_gradient": first_gradient,
+        "optimizer_steps": 2,
+        "effective_optimizer_steps_by_group": counts,
+        "cpu_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.get_rng_state(),
+        "elapsed_seconds": 1.0,
+        "peak_cuda_allocated_bytes": 0,
+        "peak_cuda_reserved_bytes": 0,
+        "resume_source_compatibility": [],
+    }
+    source = directory / "last.pt"
+    torch.save(saved, source)
+    return source, saved
+
+
+def _transition_args(source, output, *, fixed=False):
+    args = _args(output, fixed=fixed)
+    args.transition_from_checkpoint = source
+    args.transition_source_sha256 = train.sha256_file(source)
+    args.transition_mode = "continue_fixed" if fixed else "replace_c"
+    args.transition_extra_epochs = 0
+    args.transition_resource_certificate = source.parent / "not-a-real-gpu-certificate.json"
+    args.transition_resource_sha256 = "b" * 64
+    return args
+
+
+def _run(args, payload, protocol):
+    args.output_dir.mkdir(exist_ok=True)
+    return train._train_model_impl(
+        payload, protocol, args, torch.device("cpu"), args.output_dir, resource_state={}
+    )
+
+
+def _crash_after_save(monkeypatch, epoch):
+    real = train._save
+
+    def save_then_crash(path, payload):
+        real(path, payload)
+        if path.name == "last.pt" and payload.get("epoch") == epoch:
+            raise DebugCrash(f"CPU debug interruption after atomic epoch {epoch}")
+
+    monkeypatch.setattr(train, "_save", save_then_crash)
+    return real
+
+
+def test_real_training_reuses_shared_state_and_only_selects_new_c_epochs(tmp_path, monkeypatch):
+    graph, indices, payload, protocol = _debug_data()
+    _install_cpu_debug_environment(monkeypatch, graph, indices)
+    source, saved = _source(tmp_path, graph, indices, protocol)
+    source_bytes = source.read_bytes()
+    args = _transition_args(source, tmp_path / "new-dynamic")
+    result = _run(args, payload, protocol)
+    last = train.load_checkpoint_on_cpu(args.output_dir / "last.pt")
+    assert last["schema_version"] == 4
+    assert last["epoch"] == 4 and last["epoch_offset"] == 2
+    assert [row["epoch"] for row in last["history"]] == [3, 4]
+    assert last["optimizer_steps"] == 4
+    assert last["best_epoch"] in (3, 4) and last["global_best_epoch"] in (3, 4)
+    assert last["joint_best_epoch"] in (3, 4)
+    assert result["transition_provenance"]["source_selection_state"]["best_metric"] == 0.99
+    assert result["post_transition_epochs_completed"] == 2
+    assert result["post_transition_optimizer_steps"] == 2
+    assert result["comparison_design"]["fresh_paired_initialization"] is False
+    old_steps = {
+        name: float(saved["optimizer_state"]["state"][identifier]["step"])
+        for group in saved["optimizer_state"]["param_groups"]
+        for name, identifier in zip(group["parameter_names"], group["params"], strict=True)
+    }
+    for group in last["optimizer_state"]["param_groups"]:
+        for name, identifier in zip(group["parameter_names"], group["params"], strict=True):
+            expected = 2 if C_NAMESPACE.match(name) else old_steps[name] + 2
+            assert float(last["optimizer_state"]["state"][identifier]["step"]) == expected
+    assert source.read_bytes() == source_bytes
+
+
+@pytest.mark.parametrize("crash_epoch", [2, 3])
+def test_boundary_and_epoch3_crash_resume_match_uninterrupted_cpu_exactly(
+    tmp_path,
+    monkeypatch,
+    crash_epoch,
+):
+    graph, indices, payload, protocol = _debug_data()
+    _install_cpu_debug_environment(monkeypatch, graph, indices)
+    source, _ = _source(tmp_path, graph, indices, protocol)
+    control_args = _transition_args(source, tmp_path / "control")
+    _run(control_args, payload, protocol)
+    expected = train.load_checkpoint_on_cpu(control_args.output_dir / "last.pt")
+    resumed_args = _transition_args(source, tmp_path / "interrupted")
+    real_save = _crash_after_save(monkeypatch, crash_epoch)
+    with pytest.raises(DebugCrash, match=f"epoch {crash_epoch}"):
+        _run(resumed_args, payload, protocol)
+    boundary = train.load_checkpoint_on_cpu(resumed_args.output_dir / "last.pt")
+    assert boundary["epoch"] == crash_epoch
+    assert boundary["epoch_offset"] == 2
+    if crash_epoch == 2:
+        assert boundary["history"] == []
+        assert boundary["best_epoch"] == 0
+        assert boundary["optimizer_steps"] == 2
+    else:
+        assert [row["epoch"] for row in boundary["history"]] == [3]
+        assert boundary["best_epoch"] == 3
+    monkeypatch.setattr(train, "_save", real_save)
+    _run(resumed_args, payload, protocol)
+    actual = train.load_checkpoint_on_cpu(resumed_args.output_dir / "last.pt")
+    for field in ("model_state", "optimizer_state", "cpu_rng_state", "cuda_rng_state"):
+        _assert_nested_equal(actual[field], expected[field])
+    assert [row["epoch"] for row in actual["history"]] == [3, 4]
+    assert actual["optimizer_steps"] == expected["optimizer_steps"] == 4
+
+
+def test_fixed_boundary_copies_best_with_new_identity_without_changing_source(
+    tmp_path,
+    monkeypatch,
+):
+    graph, indices, payload, protocol = _debug_data()
+    _install_cpu_debug_environment(monkeypatch, graph, indices)
+    source, saved = _source(tmp_path, graph, indices, protocol, fixed=True)
+    source_bytes = source.read_bytes()
+    old_best = (source.parent / "best.pt").read_bytes()
+    args = _transition_args(source, tmp_path / "fixed-continuation", fixed=True)
+    _crash_after_save(monkeypatch, 2)
+    with pytest.raises(DebugCrash):
+        _run(args, payload, protocol)
+    boundary = train.load_checkpoint_on_cpu(args.output_dir / "last.pt")
+    selected = train.load_checkpoint_on_cpu(args.output_dir / "best.pt")
+    _assert_nested_equal(boundary["model_state"], saved["model_state"])
+    _assert_nested_equal(boundary["optimizer_state"], saved["optimizer_state"])
+    assert boundary["history"] == saved["history"]
+    assert boundary["epoch_offset"] == 0 and boundary["best_metric"] == 0.99
+    assert selected["resume_identity"] == boundary["resume_identity"]
+    assert selected["resume_identity"] != saved["resume_identity"]
+    assert selected["source_selected_checkpoint_sha256"] == saved["best_checkpoint_sha256"]
+    assert train.sha256_file(args.output_dir / "best.pt") == boundary["best_checkpoint_sha256"]
+    assert source.read_bytes() == source_bytes
+    assert (source.parent / "best.pt").read_bytes() == old_best
+
+
+def test_completed_fixed_c_is_rejected_by_training_transition(tmp_path, monkeypatch):
+    graph, indices, payload, protocol = _debug_data()
+    _install_cpu_debug_environment(monkeypatch, graph, indices)
+    source, saved = _source(tmp_path, graph, indices, protocol, fixed=True)
+    saved["complete"] = True
+    torch.save(saved, source)
+    args = _transition_args(source, tmp_path / "must-not-retrain", fixed=True)
+    with pytest.raises(ValueError, match="historical reference"):
+        _run(args, payload, protocol)
+    assert not (args.output_dir / "last.pt").exists()
+
+
+def test_transition_request_rejects_no_resume(tmp_path):
+    source = tmp_path / "source-last.pt"
+    source.write_bytes(b"explicit CPU debug placeholder; validation does not load this file")
+    args = _transition_args(source, tmp_path / "new-output")
+    args.resume = False
+    with pytest.raises(ValueError, match="resume"):
+        transition_training.validate_arguments(args)
+
+
+def _main_argv(args):
+    """Serialize the explicit CPU debug profile; production defaults are untouched."""
+    fields = (
+        "dataset",
+        "condition",
+        "output_dir",
+        "device",
+        "hidden_channels",
+        "layers",
+        "heads",
+        "ffn_multiplier",
+        "epochs",
+        "patience",
+        "dropout",
+        "edge_chunk_size",
+        "conductance_backend",
+        "training_schedule",
+        "transition_from_checkpoint",
+        "transition_source_sha256",
+        "transition_mode",
+        "transition_extra_epochs",
+        "transition_resource_certificate",
+        "transition_resource_sha256",
+    )
+    argv = [
+        part for key in fields for part in ("--" + key.replace("_", "-"), str(getattr(args, key)))
+    ]
+    return argv + ["--no-activation-checkpoint"]
+
+
+def _main_fixture(tmp_path, monkeypatch, *, fixed=False):
+    graph, indices, payload, protocol = _debug_data()
+    _install_cpu_debug_environment(monkeypatch, graph, indices)
+    monkeypatch.setattr(train, "load_dataset", lambda *_args, **_kwargs: (payload, protocol))
+    source, saved = _source(tmp_path, graph, indices, protocol, fixed=fixed)
+    return source, saved
+
+
+def _inject_initialization_crash(monkeypatch, point):
+    if point in {"marker", "metrics", "source_history"}:
+        owner, filename = {
+            "marker": (transition_initialization, transition_initialization.MARKER_FILENAME),
+            "metrics": (train, "metrics.json"),
+            "source_history": (transition_training, "source-history.json"),
+        }[point]
+        real = owner.atomic_write_json
+
+        def write_then_crash(path, payload):
+            real(path, payload)
+            if path.name == filename:
+                raise DebugCrash(f"explicit CPU debug crash after {point}")
+
+        monkeypatch.setattr(owner, "atomic_write_json", write_then_crash)
+    else:
+        real = train._save
+
+        def checkpoint_crash(path, payload):
+            if point == "before_last" and path.name == "last.pt":
+                raise DebugCrash("explicit CPU debug crash before_last")
+            real(path, payload)
+            if point == "fixed_best" and path.name == "best.pt":
+                raise DebugCrash("explicit CPU debug crash after fixed_best")
+
+        monkeypatch.setattr(train, "_save", checkpoint_crash)
+
+
+@pytest.mark.parametrize(
+    ("point", "fixed"),
+    [
+        ("marker", False),
+        ("metrics", False),
+        ("source_history", False),
+        ("fixed_best", True),
+        ("before_last", True),
+    ],
+)
+def test_main_retries_each_owned_initialization_publication_exactly(
+    tmp_path,
+    monkeypatch,
+    point,
+    fixed,
+):
+    source, _ = _main_fixture(tmp_path, monkeypatch, fixed=fixed)
+    source_bytes = source.read_bytes()
+    source_best_bytes = (source.parent / "best.pt").read_bytes()
+    control = _transition_args(source, tmp_path / "control-main", fixed=fixed)
+    assert train.main(_main_argv(control)) == 0
+    expected = train.load_checkpoint_on_cpu(control.output_dir / "last.pt")
+    args = _transition_args(source, tmp_path / "retry-main", fixed=fixed)
+    with monkeypatch.context() as interruption:
+        _inject_initialization_crash(interruption, point)
+        with pytest.raises(DebugCrash, match=point):
+            train.main(_main_argv(args))
+    assert not (args.output_dir / "last.pt").exists()
+    marker = args.output_dir / transition_initialization.MARKER_FILENAME
+    marker_bytes = marker.read_bytes()
+    retained = {
+        name: (args.output_dir / name).read_bytes()
+        for name in ("best.pt", "source-history.json")
+        if (args.output_dir / name).exists()
+    }
+    assert train.main(_main_argv(args)) == 0
+    actual = train.load_checkpoint_on_cpu(args.output_dir / "last.pt")
+    for field in ("model_state", "optimizer_state", "cpu_rng_state", "cuda_rng_state"):
+        _assert_nested_equal(actual[field], expected[field])
+    assert actual["complete"] and actual["epoch"] == 4
+    assert actual["epoch_offset"] == (0 if fixed else 2)
+    assert actual["optimizer_steps"] == expected["optimizer_steps"] == 4
+    assert marker.read_bytes() == marker_bytes
+    for name, original in retained.items():
+        assert (args.output_dir / name).read_bytes() == original
+    if fixed:
+        assert not (args.output_dir / "best.previous.pt").exists()
+    assert source.read_bytes() == source_bytes
+    assert (source.parent / "best.pt").read_bytes() == source_best_bytes
+
+
+def _ensure_marker(args):
+    return transition_initialization.ensure_transition_initialization(
+        args,
+        args.output_dir,
+        configuration=train.configuration(args),
+        source_sha256=train.implementation_source_hashes(),
+        runtime_versions=train._versions(),
+    )
+
+
+def test_initialization_never_adopts_unmarked_nonempty_output(tmp_path, monkeypatch):
+    source, _ = _main_fixture(tmp_path, monkeypatch)
+    args = _transition_args(source, tmp_path / "unowned")
+    args.output_dir.mkdir()
+    unrelated = args.output_dir / "user-results.txt"
+    unrelated.write_text("existing results must remain unchanged", encoding="utf-8")
+    before = unrelated.read_bytes()
+    with pytest.raises(FileExistsError, match="no matching initialization marker"):
+        train.main(_main_argv(args))
+    assert unrelated.read_bytes() == before
+    assert list(args.output_dir.iterdir()) == [unrelated]
+
+
+@pytest.mark.parametrize("field", ["dataset", "condition", "epochs", "transition_resource_sha256"])
+def test_marker_only_retry_binds_request_dataset_condition_and_configuration(
+    tmp_path,
+    monkeypatch,
+    field,
+):
+    source, _ = _main_fixture(tmp_path, monkeypatch)
+    args = _transition_args(source, tmp_path / "claimed")
+    assert _ensure_marker(args)
+    marker = args.output_dir / transition_initialization.MARKER_FILENAME
+    original = marker.read_bytes()
+    changed = copy.deepcopy(args)
+    setattr(
+        changed,
+        field,
+        {
+            "dataset": "citeseer",
+            "condition": "fixed_c",
+            "epochs": 5,
+            "transition_resource_sha256": "c" * 64,
+        }[field],
+    )
+    with pytest.raises(ValueError, match="identity mismatch"):
+        _ensure_marker(changed)
+    assert marker.read_bytes() == original
+
+
+@pytest.mark.parametrize("artifact", ["history.json", "best.previous.pt", "unrelated.json"])
+def test_marker_does_not_authorize_trained_or_unrelated_artifacts(
+    tmp_path,
+    monkeypatch,
+    artifact,
+):
+    source, _ = _main_fixture(tmp_path, monkeypatch)
+    args = _transition_args(source, tmp_path / "claimed")
+    assert _ensure_marker(args)
+    other = args.output_dir / artifact
+    other.write_text("unowned debug artifact", encoding="utf-8")
+    before = other.read_bytes()
+    with pytest.raises(FileExistsError, match="unrelated or trained artifact"):
+        _ensure_marker(args)
+    assert other.read_bytes() == before
+
+
+def test_marker_rejects_completed_metrics_without_last_checkpoint(tmp_path, monkeypatch):
+    source, _ = _main_fixture(tmp_path, monkeypatch)
+    args = _transition_args(source, tmp_path / "claimed")
+    assert _ensure_marker(args)
+    metrics = args.output_dir / "metrics.json"
+    train.atomic_write_json(
+        metrics,
+        {
+            "schema_version": 1,
+            "research_suite": train.SUITE,
+            "dataset": args.dataset,
+            "condition": args.condition,
+            "configuration": train.configuration(args),
+            "test_evaluated": False,
+            "status": "passed",
+        },
+    )
+    before = metrics.read_bytes()
+    with pytest.raises(ValueError, match="completed, trained or mismatched"):
+        _ensure_marker(args)
+    assert metrics.read_bytes() == before
+
+
+@pytest.mark.parametrize("artifact", ["source-history.json", "best.pt"])
+def test_main_refuses_tampered_partial_publications_without_overwriting(
+    tmp_path,
+    monkeypatch,
+    artifact,
+):
+    source, _ = _main_fixture(tmp_path, monkeypatch, fixed=True)
+    source_bytes = source.read_bytes()
+    args = _transition_args(source, tmp_path / "partial-tamper", fixed=True)
+    with monkeypatch.context() as interruption:
+        _inject_initialization_crash(interruption, "before_last")
+        with pytest.raises(DebugCrash, match="before_last"):
+            train.main(_main_argv(args))
+    path = args.output_dir / artifact
+    if artifact == "source-history.json":
+        rows = json.loads(path.read_text(encoding="utf-8"))
+        rows[0]["train_loss"] += 1.0
+        train.atomic_write_json(path, rows)
+    else:
+        selected = train.load_checkpoint_on_cpu(path)
+        next(iter(selected["model_state"].values())).add_(1.0)
+        torch.save(selected, path)
+    tampered_bytes = path.read_bytes()
+    with pytest.raises(ValueError, match="source history differs|best checkpoint does not match"):
+        train.main(_main_argv(args))
+    assert path.read_bytes() == tampered_bytes
+    assert source.read_bytes() == source_bytes
+    assert not (args.output_dir / "last.pt").exists()
+    assert not (args.output_dir / "best.previous.pt").exists()
 ````

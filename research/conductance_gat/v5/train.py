@@ -52,6 +52,21 @@ from .protocol import (
     conductance_configuration,
 )
 from .sampling import TransductiveGraphSampler
+from .transition_initialization import ensure_transition_initialization
+from .transition_training import (
+    prepare_training_origin,
+    publish_transition_boundary,
+    validate_transition_resume,
+)
+from .transition_training import (
+    request_from_args as transition_request_from_args,
+)
+from .transition_training import (
+    validate_arguments as validate_transition_arguments,
+)
+from .transition_training import (
+    validate_output_boundary as validate_transition_output,
+)
 
 FAILURE_RESOURCE_FILENAME = "failure-resource-observability.json"
 
@@ -791,12 +806,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--activation-checkpoint", action=argparse.BooleanOptionalAction, default=None
     )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--transition-from-checkpoint", type=Path)
+    parser.add_argument("--transition-source-sha256")
+    parser.add_argument("--transition-mode", choices=("replace_c", "continue_fixed"))
+    parser.add_argument("--transition-extra-epochs", type=int, default=0)
+    parser.add_argument("--transition-resource-certificate", type=Path)
+    parser.add_argument("--transition-resource-sha256")
     return parser
 
 
 def validate_args(args: argparse.Namespace) -> None:
     resolve_hardware_arguments(args)
     conductance_arguments_configuration(args)
+    validate_transition_arguments(args)
     integers = (
         args.epochs,
         args.patience,
@@ -998,7 +1020,7 @@ def build_resume_identity(
         raise ValueError("official dataset protocol has no valid data_sha256")
     if len(initial_state_sha256) != 64:
         raise ValueError("initial model state fingerprint is invalid")
-    return {
+    identity = {
         "schema_version": 1,
         "research_suite": SUITE,
         "dataset": args.dataset,
@@ -1013,6 +1035,10 @@ def build_resume_identity(
         "runtime_versions": runtime_versions or _versions(),
         "resume_semantics": RESUME_SEMANTICS,
     }
+    request = transition_request_from_args(args)
+    if request is not None:
+        identity["transition_request"] = request
+    return identity
 
 
 def validate_resume_identity(actual: Any, expected: dict[str, Any], stored_sha256: Any) -> None:
@@ -1284,6 +1310,12 @@ def _train_model_impl(
     optimizer = make_optimizer(model)
     validate_optimizer_parameter_ownership(model, optimizer)
     schedule = phase_schedule(args.epochs, list(args.phase_fractions), args.training_schedule)
+    origin = None
+    if getattr(args, "transition_from_checkpoint", None) is not None:
+        origin = prepare_training_origin(args, model, optimizer, protocol, output)
+        schedule = origin["schedule"]
+        initial_state_sha256 = origin["initial_state_sha256"]
+        shared_state_sha256 = origin["shared_initial_state_sha256"]
     total_parameters_at_construction = sum(value.numel() for value in model.parameters())
     optimizer_owned_parameters = sum(
         value.numel() for group in optimizer.param_groups for value in group["params"]
@@ -1356,9 +1388,20 @@ def _train_model_impl(
             "test_evaluated": False,
         },
     }
+    if origin is not None:
+        pre_run_observability["transition_provenance"] = origin["provenance"]
+        pre_run_observability["optimization"].update(
+            source_epochs_completed=origin["provenance"]["source_epoch"],
+            post_transition_epoch_budget=args.epochs - origin["provenance"]["source_epoch"],
+            prior_epoch_progress_discarded=False,
+        )
     print(json.dumps(pre_run_observability, sort_keys=True), flush=True)
-    resume_identity = build_resume_identity(
-        args, protocol, schedule, initial_state_sha256=initial_state_sha256
+    resume_identity = (
+        origin["resume_identity"]
+        if origin is not None
+        else build_resume_identity(
+            args, protocol, schedule, initial_state_sha256=initial_state_sha256
+        )
     )
     resume_identity_sha256 = _canonical_sha256(resume_identity)
     checkpoint, previous_checkpoint, last_path, history_path = (
@@ -1379,15 +1422,25 @@ def _train_model_impl(
     effective_group_steps = {name: 0 for name in _PARAMETER_GROUPS}
     gradient_groups_validated_this_invocation: set[str] = set()
     resume_source_compatibility: list[dict[str, Any]] = []
+    epoch_offset = origin["epoch_offset"] if origin is not None else 0
+    optimizer_steps_before_transition = (
+        origin["provenance"]["source_optimizer_steps"]
+        if origin is not None and origin["provenance"]["mode"] == "replace_c"
+        else 0
+    )
+    if origin is not None:
+        publish_transition_boundary(origin, args, output, architecture)
     if args.resume and last_path.exists():
         saved = load_checkpoint_on_cpu(last_path)
-        if saved.get("schema_version") != 3:
+        if saved.get("schema_version") != (4 if origin is not None else 3):
             raise ValueError("last.pt uses an incompatible V5 selection-state schema")
         validate_resume_identity(
             saved.get("resume_identity"),
             resume_identity,
             saved.get("resume_identity_sha256"),
         )
+        if origin is not None:
+            validate_transition_resume(saved, origin, output)
         stored_transitions = saved.get("resume_source_compatibility", [])
         if not isinstance(stored_transitions, list) or any(
             not isinstance(item, dict) for item in stored_transitions
@@ -1407,7 +1460,7 @@ def _train_model_impl(
             not isinstance(saved_history, list)
             or isinstance(saved_epoch, bool)
             or not isinstance(saved_epoch, int)
-            or saved_epoch != len(saved_history)
+            or saved_epoch != epoch_offset + len(saved_history)
             or saved_epoch < 1
         ):
             raise ValueError("last.pt epoch/history state is invalid")
@@ -1439,6 +1492,11 @@ def _train_model_impl(
         )
         restore_checkpoint_rng(saved, device)
         del saved
+    if origin is not None:
+        # Only immutable metadata is needed after loading. Release the staged
+        # CPU model/moments/RNG/history copies before the first GPU update.
+        for key in ("model_state", "optimizer_state", "rng_state", "source_history"):
+            del origin[key]
     validation_indices = indices["validation"] if indices is not None else None
     validation_data = _validation_source(data, sampler)
     torch.cuda.reset_peak_memory_stats(device)
@@ -1522,6 +1580,8 @@ def _train_model_impl(
             "validation": metric,
             "layers": layer_diagnostics(model),
         }
+        if origin is not None:
+            row["transition_stage_epoch"] = epoch - origin["provenance"]["source_epoch"]
         history.append(row)
         eligibility = selection_eligibility(args.condition, phase)
         if metric > global_best_metric:
@@ -1549,6 +1609,11 @@ def _train_model_impl(
                         "all_epochs" if args.condition == "fixed_c" else "c_active_epochs"
                     ),
                     "phase": phase,
+                    **(
+                        {"transition_provenance": origin["provenance"]}
+                        if origin is not None
+                        else {}
+                    ),
                 },
             )
         if eligibility["joint_early_stopping"] and metric > joint_best_metric:
@@ -1585,7 +1650,7 @@ def _train_model_impl(
         _save(
             last_path,
             {
-                "schema_version": 3,
+                "schema_version": 4 if origin is not None else 3,
                 "complete": stop_after_epoch,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
@@ -1607,10 +1672,18 @@ def _train_model_impl(
                 "cpu_rng_state": torch.get_rng_state(),
                 "cuda_rng_state": torch.cuda.get_rng_state(device),
                 "resume_source_compatibility": resume_source_compatibility,
+                **(
+                    {
+                        "epoch_offset": epoch_offset,
+                        "transition_provenance": origin["provenance"],
+                    }
+                    if origin is not None
+                    else {}
+                ),
                 **efficiency,
             },
         )
-        if epoch == 1 or epoch % 10 == 0:
+        if epoch == start_epoch or epoch % 10 == 0:
             primary_best_text = f"{best_metric:.6f}" if math.isfinite(best_metric) else "pending"
             joint_best_text = (
                 "n/a"
@@ -1698,7 +1771,8 @@ def _train_model_impl(
         "early_stopping_patience": args.patience,
         "planned_maximum_optimizer_steps": batch_observability["planned_maximum_training_batches"],
         "actual_training_batches": observed_training_batches,
-        "actual_optimizer_steps": optimizer_steps,
+        "actual_optimizer_steps": optimizer_steps - optimizer_steps_before_transition,
+        "lifetime_optimizer_steps": optimizer_steps,
         "effective_optimizer_steps_by_group": effective_group_steps,
         "gradient_accumulation_steps": 1,
         "step_definition": (
@@ -1706,7 +1780,7 @@ def _train_model_impl(
             "least one active parameter group"
         ),
         "optimizer_step_difference_from_training_batches": (
-            observed_training_batches - optimizer_steps
+            observed_training_batches - (optimizer_steps - optimizer_steps_before_transition)
         ),
     }
     result = {
@@ -1831,6 +1905,26 @@ def _train_model_impl(
         ),
         **efficiency,
     }
+    if origin is not None:
+        result.update(
+            transition_provenance=origin["provenance"],
+            epoch_offset=epoch_offset,
+            lifetime_epochs_completed=epoch_offset + len(history),
+            post_transition_optimizer_steps=optimizer_steps
+            - origin["provenance"]["source_optimizer_steps"],
+            post_transition_epochs_completed=epoch_offset
+            + len(history)
+            - origin["provenance"]["source_epoch"],
+            source_history=str((output / "source-history.json").resolve()),
+            source_history_sha256=sha256_file(output / "source-history.json"),
+            comparison_design={
+                "kind": "explicit_v5_checkpoint_transition",
+                "fresh_paired_initialization": False,
+                "single_factor_causal_effect_of_c": False,
+                "historical_metrics_are_new_c_metrics": False,
+                "source_provenance_sha256": resume_identity["transition_provenance_sha256"],
+            },
+        )
     print(
         json.dumps(
             {
@@ -1857,11 +1951,24 @@ def main(argv: list[str] | None = None) -> int:
         args.output_dir.expanduser().resolve(),
         args.data_root.expanduser().resolve(),
     )
+    validate_transition_output(args, output)
     if output == data_root or output.is_relative_to(data_root) or data_root.is_relative_to(output):
         raise ValueError("V5 output and V1 dataset cache must not overlap")
+    initializing_transition = (
+        ensure_transition_initialization(
+            args,
+            output,
+            configuration=configuration(args),
+            source_sha256=implementation_source_hashes(),
+            runtime_versions=_versions(),
+        )
+        if args.transition_from_checkpoint is not None
+        else False
+    )
     if (
         output.exists()
         and any(output.iterdir())
+        and not initializing_transition
         and not (args.resume and (output / "last.pt").exists())
     ):
         raise FileExistsError("nonempty output has no resumable V5 last.pt")

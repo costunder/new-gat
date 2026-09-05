@@ -33,7 +33,7 @@
 | [CONDUCTANCE_V2.md](../gpt_handoff/CONDUCTANCE_V2.md) | 엣지별 C 직접 학습 |
 | [CONDUCTANCE_V3.md](../gpt_handoff/CONDUCTANCE_V3.md) | 상대 C graph operator 학습 |
 | [CONDUCTANCE_V4.md](../gpt_handoff/CONDUCTANCE_V4.md) | 상대 C graph operator × spatial W 2×2 통합 문서 |
-| [CONDUCTANCE_V5.md](../gpt_handoff/CONDUCTANCE_V5.md) | 입력별 C 최적화 계층·가중 라플라시안·multi-head W의 V5 계약과 MLP 비교 옵션 |
+| [CONDUCTANCE_V5.md](../gpt_handoff/CONDUCTANCE_V5.md) | 입력별 C 최적화·가중 라플라시안·multi-head W와 기존 학습 상태를 보존하는 전환 |
 
 ## Cycle PE와 Tree Augmentation
 

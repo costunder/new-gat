@@ -11,7 +11,7 @@ GPT에는 파일을 따로 고르지 말고 이 폴더의 **10개 파일을 전�
 4. `CONDUCTANCE_V2.md`: 고정 그래프의 엣지별 C 직접 학습 계약
 5. `CONDUCTANCE_V3.md`: 공유 상대 C graph operator 학습 계약
 6. `CONDUCTANCE_V4.md`: C graph operator × spatial W 2×2 실험의 정확한 계약
-7. `CONDUCTANCE_V5.md`: 입력 그래프별 C 최적화 계층·가중 라플라시안 전파와 연구급 규모 계약
+7. `CONDUCTANCE_V5.md`: C 최적화 계층·가중 라플라시안, 기존 가중치/optimizer/진행분 유지 전환 계약
 8. `CYCLE_PE_V2.md`: QR-free DFS 기저의 구조 SE 대 SE+cycle 상대 PE 비교 계약
 9. `RICH_SCALING_EXPERIMENTS.md`: Conductance V1–V5, Cycle PE V1/V2, Tree의
    reference/large 전체 scaling 계약(122 child / 126 model trainings)
@@ -32,7 +32,10 @@ Conductance v2/v3/v4/v5와 Cycle PE v2는 각각의 원문 문서를 직접 제�
 > 심각도순으로 보고해라. 단일 `--device` 순차 실행과 명시적 distinct `--devices` 병렬 실행,
 > same-GPU 동시성 계층, GPU/CPU/RAM 실측 필드와 `null+reason` 처리도 코드와 대조해라. Rich
 > runner가 V5/Cycle V2의 본 학습 전 실제 optimizer-inclusive batch/worker 후보를 측정하고
-> paired arm에 공통 자원 계획을 고정하는지 확인해라. 이전 fixed-real-batch profiler의
+> paired arm에 공통 자원 계획을 고정하는지 확인해라.
+> 별도 V5 전환 실행기는 완료 fixed 결과를 보존하고 공통 가중치·AdamW state·누적 epoch를
+> 유지하며 C만 초기화하는지, 신형 C 실측 인증서와 전환 전후 결과가 정확히 구분되는지도 확인해라.
+> 전환 결과를 같은 초기값의 fresh paired 결과로 취급해서는 안 된다. 이전 profiler의
 > optimizer/전체 epoch 제외 범위를 이 새 측정과 혼동하지 마라. 실제 수령한 GPU 결과와
 > 로컬 CPU fixture, 아직 실행하지 않은 실험을 반드시 구분하고, 현재 근거로 허용되는 주장과
 > 금지해야 할 주장을 나눠라.

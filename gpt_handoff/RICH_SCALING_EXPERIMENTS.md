@@ -5,13 +5,33 @@
 capacity에서 성능을 낼 수 있는지를 본다. 기본 seed는 시간 제약 때문에 0 하나다.
 
 이 문서의 전체 matrix는 실험 계약 설명이며 완료한 V1–V4/Cycle V1/Tree를 다시 돌리라는
-안내가 아니다. 현재 V5는 바로 아래 2026-09-06 구조 변경 절을 우선한다.
+안내가 아니다. 기존 V5 진행분이 있다면 바로 아래 선택적 전환 절을 우선한다.
 구 source/checkpoint의 strict resume 검사는 우회하지 않는다.
 
-## 현재 V5: 2026-09-06 C 최적화 계층 — 새로운 실행 ID, conductance만
+## 현재 진행분을 유지하는 V5 전환
+
+진행 중이거나 완료한 MLP V5가 있다면 20개를 모두 새로 초기화하는 아래 fresh 명령이 아니라
+`scripts/run_v5_transition.py`를 사용한다. `--source-manifest`에 기존 conductance scaling
+또는 rich manifest, `--output-dir`에 원본과 분리된 새 전환 디렉터리를 지정한다.
+`--plan-only`는 읽기 전용으로 각 조건의 유지/전환/새 시작/추가 예산 필요 내역을 출력한다.
+실제 실행은 원본 학습 프로세스가 더 이상 checkpoint를 갱신하지 않는 것을 확인한 뒤
+`--confirm-source-stopped`로 명시한다. 실행기가 서버/셸/다른 프로세스를 종료하지 않는다.
+
+완료 fixed C는 검증 후 재학습 없이 보존한다. Dynamic은 공통 가중치·AdamW 상태·누적 epoch를
+유지하고 C만 교체한다. 실제 last.pt가 160/200이면 161부터 남은 예산을 사용한다.
+완료 dynamic의 예산이 소진됐다면 자동 200 epochs 재시작 대신 `pending_extra_budget`를
+기록한다. 명시적 조건별 `--extra-epochs-for JOB_ID=N`으로 그 조건에만 추가 예산을 줄 수 있다.
+동일 전환 출력에서 예산이 없어 보류된 조건만 나중에 활성화할 수 있다. 이때 실행기는
+변경 전후 계획을 기록하고 이미 완료된 전환 조건은 검증 후 건너뛴다. 다른 설정 변경이나
+이미 학습된 조건의 예산 변경은 이 예외로 허용하지 않는다.
+아직 시작하지 않은 조건만 fresh training이며 Cycle/Tree/V1–V4는 다시 실행하지 않는다.
+전환 결과는 초기값이 같은 fresh 비교와 섞지 않는다. 상세 계약은 CONDUCTANCE_V5.md 첫 절에 있다.
+
+## 새 초기화 실험을 별도로 의도할 때만: C 최적화 V5 fresh 실행
 
 V5 기본값을 `optimization` backend와 `joint` 학습으로 변경했다. 기존 MLP V5와 모델 및
-학습 계약이 다르므로 과거 measured run ID/checkpoint/resource plan을 이어 쓰지 않는다.
+학습 계약이 다르므로 일반 resume로 과거 measured run ID/checkpoint/resource plan을 이어 쓰지 않는다.
+공통 가중치·진행분을 살리는 명시적 전환은 위 절을 사용한다.
 과거 완료한 V5 결과는 삭제하지 않고 MLP 구조의 결과로 보존하며 Cycle/Tree는 다시 실행하지 않는다.
 아래 명령은 **수정한 소스를 서버에 반영한 뒤** 사용하는 예시다. 문서 갱신은 GitHub push나
 원격 학습 실행을 의미하지 않는다. 활성 학습과 같은 checkout의 소스를 도중에 바꾸지 않는다.
