@@ -8,7 +8,31 @@
 
 ## 1. 소스 버전과 측정 범위
 
-### 현재: 실제 학습 자원 calibration 도입, 서버 측정 결과는 아직 없음
+### 현재: measured run 재개 오류 수령과 복구
+
+사용자 첨부 `d735747a-bea6-4e6b-9a8e-c5b2b14b537d/pasted-text.txt`에서
+`measured-v5-cycle-se-pe-a6000-gpu3-seed0-v1`의 다음 상태를 확인했다.
+
+- 첫 3개 V5 조건은 `verified, skipping`으로 기존 완료 결과를 재검증했다.
+- 네 번째 large/ogbn-arxiv/shared_dynamic_c는 `last.pt` RNG 복원 중
+  `TypeError: RNG state must be a torch.ByteTensor`로 학습 재개 전에 실패했다.
+- Cycle은 GPU preflight를 통과했으나 resource plan의 데이터 식별 비교에서 실패했다.
+  코드상 최적 worker 변경을 데이터 변경으로 오인하는 경로를 재현했다. 서버 실측 plan
+  원문은 수령하지 않아 실제로 달라진 worker 값 자체는 아직 확인하지 못했다.
+
+후속 수정은 CPU checkpoint/RNG 복원과 Cycle worker 메타데이터 비교 분리다.
+기존 결과·체크포인트·실측 계획을 재사용하도록 정확한 source hash 쌍만 허용하는
+`v5-rng-cycle-workers-v1` 호환 목록을 추가했다. 데이터·recipe·runtime·artifact 검증과
+실행 중 소스 변경 검출은 유지한다. 이전 best checkpoint 및 old fixed/new dynamic 비교도
+별도로 검사한다. 이는 모델 구조 변경이나 과거 모든 source에 대한 포괄적 호환이 아니다.
+
+최종 전체 로컬 회귀는 **2,148 passed / 103 skipped** (211.73초)다. 앞선 타깃 회귀
+299 passed / 10 skipped, V5 호환 26개 및 scaling 호환 13개 시험도 통과했다.
+CPU 실제 dropout/AdamW 다음 step 일치와 Cycle 실제 loader의 worker 8→2/4/16을 검사했다.
+CUDA와 Windows symlink 미지원 시험은 구분해 생략했고, 수정판 원격 GPU 학습·전체 평가는
+아직 실행하지 않았다. 전체 원본 실험 artifact의 독립 재검증도 미실시다.
+
+### 이전: 실제 학습 자원 calibration 도입
 
 사용자 A6000 GPU 3 화면은 9,311/46,068MiB와 utilization 100%였다. GPU 실행 중이라는
 관측이며 최적 batch·처리량·전체 학습 완료 근거는 아니다. 이전 `a6000-48gb` profile에는

@@ -30,6 +30,11 @@ for directory in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(directory))
 
 from chartgat.cache import atomic_write_json  # noqa: E402
+from chartgat.resume_compat import (  # noqa: E402
+    COMPATIBILITY_SOURCE_FILES,
+    adopt_source_snapshot,
+    snapshots_match,
+)
 from scripts.check_dependencies import (  # noqa: E402
     DependencyCheckError,
     check_dependencies,
@@ -508,7 +513,10 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
 
 
 def _source_snapshot() -> dict[str, str]:
-    return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in SOURCE_FILES}
+    return {
+        name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+        for name in (*SOURCE_FILES, *COMPATIBILITY_SOURCE_FILES)
+    }
 
 
 def _environment() -> dict[str, str]:
@@ -1519,17 +1527,19 @@ def _resume_manifest(
         "output_dir": str(run_dir),
         "run_configuration": _run_configuration(args),
         "dependencies": dependencies,
-        "source_sha256": sources,
     }
     for key, expected in expected_identity.items():
         if manifest.get(key) != expected:
             raise ValueError(f"existing run cannot be resumed: {key} differs")
+    if not snapshots_match(manifest.get("source_sha256"), sources):
+        raise ValueError("existing run cannot be resumed: source_sha256 differs")
     previous_status = manifest.get("status")
     if previous_status not in {"running", "failed", "passed"}:
         raise ValueError("existing run cannot be resumed: status is invalid")
     if manifest.get("source_integrity_valid") is not True:
         raise ValueError("existing run cannot be resumed after a source-integrity failure")
     _restore_job_state(jobs, manifest.get("jobs"), label="candidate")
+    adopt_source_snapshot(manifest, sources)
     manifest["jobs"] = jobs
     manifest["status"] = "running"
     manifest.pop("error", None)

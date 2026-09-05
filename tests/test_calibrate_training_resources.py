@@ -16,8 +16,10 @@ GIB = 1024**3
 
 def debug_report(job, batch_size, workers, *, rate=100.0, unsafe=False, oom=False):
     report = {
-        "condition": job["condition"], "model_seed": job["model_seed"],
-        "batch_size": batch_size, "workers": workers,
+        "condition": job["condition"],
+        "model_seed": job["model_seed"],
+        "batch_size": batch_size,
+        "workers": workers,
     }
     if oom:
         return {**report, "status": "oom", "error": "explicit synthetic CUDA OOM test fixture"}
@@ -25,11 +27,17 @@ def debug_report(job, batch_size, workers, *, rate=100.0, unsafe=False, oom=Fals
     processed = batch_size * 1000
     return {
         **report,
-        "status": "passed", "unit": "debug_fixture_graphs",
-        "processed_units": processed, "elapsed_seconds": processed / rate,
-        "samples_per_second": rate, "optimizer_steps": 1003,
-        "optimizer_state_bytes": 1024, "measurement_steps": 1000, "warmup_steps": 2,
-        "measurement_steps_requested": 5, "warmup_steps_requested": 2,
+        "status": "passed",
+        "unit": "debug_fixture_graphs",
+        "processed_units": processed,
+        "elapsed_seconds": processed / rate,
+        "samples_per_second": rate,
+        "optimizer_steps": 1003,
+        "optimizer_state_bytes": 1024,
+        "measurement_steps": 1000,
+        "warmup_steps": 2,
+        "measurement_steps_requested": 5,
+        "warmup_steps_requested": 2,
         "minimum_measure_seconds_requested": 3.0,
         "peak_allocated_bytes": (44 if unsafe else 3) * GIB,
         "peak_reserved_bytes": (45 if unsafe else 4) * GIB,
@@ -37,32 +45,56 @@ def debug_report(job, batch_size, workers, *, rate=100.0, unsafe=False, oom=Fals
         "free_bytes_before": 47 * GIB,
         "free_bytes_after": (2 if unsafe else 43) * GIB,
         "resource_observability": {"debug_mock_only": True},
-        "calibration_only": True, "final_training_performed": False,
+        "calibration_only": True,
+        "final_training_performed": False,
     }
 
 
 def debug_harness(
-    monkeypatch, *, axis="graphs", baseline=4, maximum=64,
-    workers=(2, 4), seeds=(0,), report_factory=None,
+    monkeypatch,
+    *,
+    axis="graphs",
+    baseline=4,
+    maximum=64,
+    workers=(2, 4),
+    seeds=(0,),
+    report_factory=None,
 ):
     track = "conductance" if axis != "graphs" else "cycle"
     conditions = ("fixed_c", "shared_dynamic_c") if track == "conductance" else ("se", "pe")
     module = (
         "research.conductance_gat.v5.train"
-        if track == "conductance" else "research.cycle_pe.v2.benchmark"
+        if track == "conductance"
+        else "research.cycle_pe.v2.benchmark"
     )
     jobs = [
         {
-            "track": track, "profile": "large", "dataset": "debug_official_fixture",
-            "condition": condition, "model_seed": seed, "device": "cuda:0",
-            "command": ["python", "-B", "-m", module, "--debug-fixture-identity", condition,
-                        "--model-seed", str(seed)],
+            "track": track,
+            "profile": "large",
+            "dataset": "debug_official_fixture",
+            "condition": condition,
+            "model_seed": seed,
+            "device": "cuda:0",
+            "command": [
+                "python",
+                "-B",
+                "-m",
+                module,
+                "--debug-fixture-identity",
+                condition,
+                "--model-seed",
+                str(seed),
+            ],
         }
-        for condition in conditions for seed in seeds
+        for condition in conditions
+        for seed in seeds
     ]
     parsed = SimpleNamespace(
-        batch_size=baseline, sample_seed_batch_size=baseline,
-        workers=4, device="cuda:0", dataset=jobs[0]["dataset"],
+        batch_size=baseline,
+        sample_seed_batch_size=baseline,
+        workers=4,
+        device="cuda:0",
+        dataset=jobs[0]["dataset"],
     )
     loaded = object()
     identity = {"debug_mock_only": True, "full_split_sha256": "a" * 64}
@@ -72,9 +104,7 @@ def debug_harness(
         calibration, "_load_group", lambda _job, _args: (loaded, identity, maximum, axis)
     )
     monkeypatch.setattr(calibration, "allocated_cpu_count", lambda: 8)
-    monkeypatch.setattr(
-        calibration, "worker_candidates", lambda *_args, **_kwargs: list(workers)
-    )
+    monkeypatch.setattr(calibration, "worker_candidates", lambda *_args, **_kwargs: list(workers))
 
     def measure(job, payload, _args, *, batch_size, workers):
         assert payload is loaded
@@ -96,8 +126,8 @@ def debug_harness(
 
 
 @pytest.mark.parametrize(
-    "track,axis", [("cycle", "graphs"), ("conductance", "graphs"),
-                   ("conductance", "sampled_seed_nodes")],
+    "track,axis",
+    [("cycle", "graphs"), ("conductance", "graphs"), ("conductance", "sampled_seed_nodes")],
 )
 def test_explicit_reuse_rejects_a_new_floor_above_the_measured_selection(monkeypatch, track, axis):
     jobs, entry, persist, _, _, _ = debug_harness(monkeypatch, axis=axis, maximum=8)
@@ -162,8 +192,10 @@ def test_real_group_algorithm_selects_one_measured_policy_for_all_paired_arms(mo
         assert {(row["condition"], row["model_seed"]) for row in candidate["measurements"]} == {
             (condition, seed) for condition in ("se", "pe") for seed in (0, 7)
         }
-    assert all(contract["argv_sha256"] == command_identity(job["command"])
-               for contract, job in zip(entry["job_contracts"], jobs, strict=True))
+    assert all(
+        contract["argv_sha256"] == command_identity(job["command"])
+        for contract, job in zip(entry["job_contracts"], jobs, strict=True)
+    )
     assert snapshots[-1]["status"] == "passed"
 
 
@@ -177,7 +209,8 @@ def test_growth_reaches_natural_full_split_without_arbitrary_cap(monkeypatch):
 
 def test_unsafe_reserved_memory_boundary_never_accepted_as_candidate(monkeypatch):
     jobs, entry, persist, calls, _, _ = debug_harness(
-        monkeypatch, maximum=64,
+        monkeypatch,
+        maximum=64,
         report_factory=lambda job, batch, workers: debug_report(
             job, batch, workers, rate=float(batch * workers), unsafe=batch >= 16
         ),
@@ -192,7 +225,10 @@ def test_unsafe_reserved_memory_boundary_never_accepted_as_candidate(monkeypatch
 def test_oom_in_either_paired_arm_rejects_whole_resource_candidate(monkeypatch):
     def report(job, batch, workers):
         return debug_report(
-            job, batch, workers, rate=float(batch * workers),
+            job,
+            batch,
+            workers,
+            rate=float(batch * workers),
             oom=batch >= 8 and job["condition"] == "pe",
         )
 
@@ -283,17 +319,33 @@ def test_training_args_accept_actual_generated_cycle_se_pe_commands(monkeypatch,
     # Parsing only: mocks CUDA availability for existing parser validation,
     # never allocates a CUDA tensor or invokes a model.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    args = run_cycle_scaling.parser().parse_args([
-        "--versions", "v2", "--encodings", "se", "pe",
-        "--profiles", "reference", "large", "--model-seeds", "0",
-        "--hardware-profile", "a6000-48gb", "--min-free-gb", "40",
-        "--device", "cuda:0",
-    ])
+    args = run_cycle_scaling.parser().parse_args(
+        [
+            "--versions",
+            "v2",
+            "--encodings",
+            "se",
+            "pe",
+            "--profiles",
+            "reference",
+            "large",
+            "--model-seeds",
+            "0",
+            "--hardware-profile",
+            "a6000-48gb",
+            "--min-free-gb",
+            "40",
+            "--device",
+            "cuda:0",
+        ]
+    )
     jobs = run_cycle_scaling.make_jobs(args, tmp_path / "debug-command-generation-only")
     assert len(jobs) == 8
     for job in jobs:
         normalized = {
-            **job, "track": "cycle", "dataset": job["datasets"][0],
+            **job,
+            "track": "cycle",
+            "dataset": job["datasets"][0],
             "condition": job["encoding"],
         }
         parsed = calibration._training_args(normalized)
@@ -305,3 +357,182 @@ def test_training_args_accept_actual_generated_cycle_se_pe_commands(monkeypatch,
         assert parsed.pe_dim == job["config"]["pe_dim"]
         assert parsed.batch_size == job["resources"]["batch_size"]
         assert parsed.workers == job["resources"]["workers"]
+
+
+def _debug_real_cycle_loader_plan(monkeypatch, tmp_path, selected_workers):
+    """Real parser, DFS preparation/cache validation and identity; fake timing only."""
+    from research.cycle_pe.v2 import calibration as cycle_calibration
+    from research.cycle_pe.v2 import data
+
+    official = SimpleNamespace(
+        num_nodes=3,
+        x=torch.tensor([[0], [1], [2]]),
+        edge_index=torch.tensor([[0, 1, 1, 2, 0, 2], [1, 0, 2, 1, 2, 0]]),
+        edge_attr=torch.ones(6, 1, dtype=torch.long),
+        y=torch.tensor([0.7]),
+    )
+
+    def debug_official_split(_root, dataset, *, allow_download, splits):
+        assert dataset == "zinc12k" and not allow_download and splits == ("train",)
+        return {"train": [official]}
+
+    # Explicit one-graph CPU fixture. Production sizes and defaults are untouched.
+    monkeypatch.setattr(data, "load_official_splits", debug_official_split)
+    monkeypatch.setitem(cycle_calibration.EXPECTED_SIZES, "zinc12k", (1, 1, 1))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)  # Parser validation only.
+    monkeypatch.setattr(calibration, "allocated_cpu_count", lambda: 16)
+    jobs = [
+        {
+            "track": "cycle",
+            "profile": "reference",
+            "dataset": "zinc12k",
+            "condition": encoding,
+            "model_seed": 0,
+            "device": "cuda:0",
+            "command": [
+                "python",
+                "-B",
+                "-m",
+                "research.cycle_pe.v2.benchmark",
+                "--datasets",
+                "zinc12k",
+                "--encoding",
+                encoding,
+                "--data-root",
+                str(tmp_path / "debug-data"),
+                "--output-dir",
+                str(tmp_path / "debug-not-training"),
+                "--workers",
+                "8",
+                "--batch-size",
+                "2",
+                "--device",
+                "cuda:0",
+            ],
+        }
+        for encoding in ("se", "pe")
+    ]
+
+    def measure(job, loaded, _args, *, batch_size, workers):
+        assert len(loaded) == 1 and loaded[0].cycle_basis.shape == (3, 1)
+        return debug_report(
+            job, batch_size, workers, rate=200.0 if workers == selected_workers else 100.0
+        )
+
+    monkeypatch.setattr(calibration, "_measure", measure)
+    entry = {}
+    calibration._calibrate_group(jobs, entry, lambda: None)
+    assert entry["input_identity"]["preparation_workers"] == 8
+    assert entry["selected"]["workers"] == selected_workers
+    for job in jobs:
+        command = job["command"]
+        command[command.index("--workers") + 1] = str(selected_workers)
+    return jobs, entry, official
+
+
+@pytest.mark.parametrize("selected_workers", [2, 4, 16])
+def test_cycle_real_loader_accepts_measured_workers_without_mutating_legacy_plan(
+    monkeypatch, tmp_path, capsys, selected_workers
+):
+    jobs, entry, _ = _debug_real_cycle_loader_plan(monkeypatch, tmp_path, selected_workers)
+    before = copy.deepcopy(entry)
+    calibration.verify_plan_inputs({"entries": [entry]}, jobs)
+    assert entry == before
+    assert entry["input_identity"]["preparation_workers"] == 8
+    assert f"preparation_workers 8 -> {selected_workers}" in capsys.readouterr().out
+
+
+def test_cycle_real_loader_still_rejects_changed_official_graph_before_plan_reuse(
+    monkeypatch, tmp_path
+):
+    from chartgat.cache import CacheWrongRequestError
+
+    jobs, entry, official = _debug_real_cycle_loader_plan(monkeypatch, tmp_path, 2)
+    before = copy.deepcopy(entry)
+    official.y.add_(1)
+    with pytest.raises(CacheWrongRequestError, match="Mismatched cycle PE v2 cache"):
+        calibration.verify_plan_inputs({"entries": [entry]}, jobs)
+    assert entry == before
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "input_identity.split_content_sha256.train",
+        "input_identity.split_sizes.train",
+        "input_identity.official_splits",
+        "input_identity.preparation.implementation_sha256.v2/basis.py",
+        "input_identity.basis_backend",
+        "input_identity.cache_directory",
+        "natural_training_split_size",
+        "batch_axis",
+    ],
+)
+def test_cycle_worker_exception_keeps_all_scientific_identity_fields_strict(
+    monkeypatch, tmp_path, field
+):
+    jobs, entry, _ = _debug_real_cycle_loader_plan(monkeypatch, tmp_path, 2)
+    if field == "input_identity.preparation.implementation_sha256.v2/basis.py":
+        entry["input_identity"]["preparation"]["implementation_sha256"]["v2/basis.py"] = "changed"
+    else:
+        parts = field.split(".")
+        parent = entry
+        for part in parts[:-1]:
+            parent = parent[part]
+        parent[parts[-1]] = "changed"
+    # batch_axis affects the requested batch lookup but remains a required exact identity.
+    before = copy.deepcopy(entry)
+    with pytest.raises(ValueError, match="changed fields:") as error:
+        calibration.verify_plan_inputs({"entries": [entry]}, jobs)
+    assert field in str(error.value)
+    assert entry == before
+
+
+def test_conductance_does_not_ignore_a_preparation_workers_field(monkeypatch):
+    jobs, entry, persist, _, _, identity = debug_harness(
+        monkeypatch, axis="sampled_seed_nodes", workers=(0,)
+    )
+    identity["preparation_workers"] = 8
+    calibration._calibrate_group(jobs, entry, persist)
+    changed = {**identity, "preparation_workers": 2}
+    monkeypatch.setattr(
+        calibration, "_load_group", lambda *_args: (object(), changed, 64, "sampled_seed_nodes")
+    )
+    before = copy.deepcopy(entry)
+    with pytest.raises(ValueError, match="input_identity.preparation_workers"):
+        calibration.verify_plan_inputs({"entries": [entry]}, jobs)
+    assert entry == before
+
+
+def test_partial_cycle_resume_preserves_original_worker_observation(monkeypatch):
+    jobs, entry, persist, calls, _, identity = debug_harness(monkeypatch, maximum=8)
+    identity["preparation_workers"] = 8
+    calibration._calibrate_group(jobs, entry, persist)
+    before, previous_calls = copy.deepcopy(entry["input_identity"]), len(calls)
+    reread_identity = {**identity, "preparation_workers": 2}
+    monkeypatch.setattr(
+        calibration, "_load_group", lambda *_args: (object(), reread_identity, 8, "graphs")
+    )
+    calibration._calibrate_group(jobs, entry, persist)
+    assert entry["input_identity"] == before
+    assert len(calls) == previous_calls
+
+
+@pytest.mark.parametrize("change", ["data", "count", "axis"])
+def test_partial_cycle_resume_rejects_true_input_changes_before_any_measurement(
+    monkeypatch, change
+):
+    jobs, entry, persist, calls, _, identity = debug_harness(monkeypatch, maximum=8)
+    calibration._calibrate_group(jobs, entry, persist)
+    changed_identity = dict(identity)
+    if change == "data":
+        changed_identity["full_split_sha256"] = "b" * 64
+    maximum = 9 if change == "count" else 8
+    axis = "full_graph" if change == "axis" else "graphs"
+    monkeypatch.setattr(
+        calibration, "_load_group", lambda *_args: (object(), changed_identity, maximum, axis)
+    )
+    before, previous_calls = copy.deepcopy(entry), len(calls)
+    with pytest.raises(ValueError, match="since partial calibration.*changed fields:"):
+        calibration._calibrate_group(jobs, entry, persist)
+    assert entry == before and len(calls) == previous_calls

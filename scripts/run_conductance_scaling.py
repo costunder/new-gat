@@ -24,6 +24,11 @@ for directory in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(directory))
 
 from chartgat.cache import atomic_write_json  # noqa: E402
+from chartgat.resume_compat import (  # noqa: E402
+    COMPATIBILITY_SOURCE_FILES,
+    adopt_source_snapshot,
+    snapshots_match,
+)
 from research.conductance_gat.v2.protocol import (  # noqa: E402
     CONDITIONS as V2_CONDITIONS,
 )
@@ -520,6 +525,7 @@ def _source_snapshot() -> dict[str, str]:
             "sparse.py",
         )
     ]
+    paths += [ROOT / name for name in COMPATIBILITY_SOURCE_FILES]
     paths += list((ROOT / "research/conductance_gat/ablation").glob("*.py"))
     paths += list((ROOT / "research/conductance_gat/v2").glob("*.py"))
     paths += list((ROOT / "research/conductance_gat/v3").glob("*.py"))
@@ -715,12 +721,13 @@ def _load_resume_manifest(
         ("run_id", run_id),
         ("config", config),
         ("exclusions", exclusions),
-        ("source_sha256", source_sha256),
         ("source_integrity_valid", True),
         ("dependencies", dependencies),
     ):
         if manifest.get(key) != expected:
             raise RuntimeError(f"existing manifest {key} does not match this invocation")
+    if not snapshots_match(manifest.get("source_sha256"), source_sha256):
+        raise RuntimeError("existing manifest source_sha256 does not match this invocation")
     existing_jobs = manifest.get("jobs")
     if not isinstance(existing_jobs, list) or not all(
         isinstance(job, dict) for job in existing_jobs
@@ -756,6 +763,7 @@ def _load_resume_manifest(
     if manifest["status"] == "passed" and any(job["status"] != "passed" for job in existing_jobs):
         raise RuntimeError("passed manifest contains a non-passed job")
     _verify_preflight_evidence(manifest, run_dir, str(config["hardware_profile"]))
+    adopt_source_snapshot(manifest, source_sha256)
     return manifest
 
 

@@ -22,9 +22,15 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
 
+from chartgat.resume_compat import (  # noqa: E402
+    COMPATIBILITY_SOURCE_FILES,
+    adopt_source_snapshot,
+    snapshots_match,
+)
 from research.conductance_gat.v5.protocol import (  # noqa: E402
     BETA_PARAMETERIZATIONS,
     DEFAULT_BETA_INITIAL,
@@ -36,9 +42,6 @@ from scripts.process_safety import (  # noqa: E402
     run_failure_reporter,
     terminate_owned_child,
     terminate_owned_child_after_error,
-)
-from scripts.training_resource_plan import (  # noqa: E402
-    digest as resource_digest,
 )
 from scripts.training_resource_plan import (  # noqa: E402
     load_resource_plan,
@@ -551,6 +554,7 @@ def _source_snapshot() -> dict[str, str]:
         ROOT / "scripts/verify_gpu_lock.py",
         ROOT / "research/tree_augmentation/config.yaml",
     ]
+    paths.extend(ROOT / name for name in COMPATIBILITY_SOURCE_FILES)
     paths.extend(ROOT / "scripts" / TRACK_SPECS[track]["script"] for track in TRACKS)
     for source_root in (
         ROOT / "research/conductance_gat",
@@ -1278,7 +1282,7 @@ def _resume_manifest(
         raise ValueError("existing run configuration differs; use its original arguments")
     if payload.get("planned_counts") != expected_totals:
         raise ValueError("existing run count contract differs from the requested plan")
-    if payload.get("source_sha256") != expected_sources:
+    if not snapshots_match(payload.get("source_sha256"), expected_sources):
         raise ValueError("experiment source changed since this run started; use a new run ID")
     if payload.get("source_integrity_valid") is not True:
         raise ValueError("existing run failed source integrity and cannot be resumed")
@@ -1316,6 +1320,7 @@ def _resume_manifest(
             "result",
         ):
             stored.pop(field, None)
+    adopt_source_snapshot(payload, expected_sources)
     payload["status"] = "running"
     payload["source_integrity_valid"] = True
     resume_count = payload.get("resume_count", 0)
@@ -1470,7 +1475,15 @@ def _ensure_measured_plan(args: argparse.Namespace, run_id: str, run_dir: Path) 
     if directory.exists():
         if not request_path.is_file() or request_path.is_symlink():
             raise ValueError("existing calibration directory is not owned by this request")
-        if resource_digest(json.loads(request_path.read_bytes())) != resource_digest(request):
+        stored_request = json.loads(request_path.read_bytes())
+        # Preserve the original request and its digest in the measured certificate.
+        # Only the reviewed recovery patch may differ; the recipe stays exact.
+        same_recipe = isinstance(stored_request, dict) and {
+            key: value for key, value in stored_request.items() if key != "source_sha256"
+        } == {key: value for key, value in request.items() if key != "source_sha256"}
+        if not same_recipe or not snapshots_match(
+            stored_request.get("source_sha256"), request["source_sha256"]
+        ):
             raise ValueError(
                 "calibration source/configuration differs; previous measurements preserved; "
                 "use a new run ID"

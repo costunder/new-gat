@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from chartgat.cache import atomic_write_bytes, atomic_write_json
+from chartgat.resume_compat import snapshots_match
 
 from .protocol import COMPARISON_DESIGN, CONDITIONS, SUITE
 
@@ -336,6 +337,11 @@ def build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             "metric",
         ):
             if fixed[field] != dynamic[field]:
+                if field == "source_sha256" and (
+                    snapshots_match(fixed[field], dynamic[field])
+                    or snapshots_match(dynamic[field], fixed[field])
+                ):
+                    continue
                 raise ComparisonIntegrityError(f"{dataset}: fixed/dynamic {field} mismatch")
         contrasts.append(
             {
@@ -349,19 +355,12 @@ def build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                     dynamic["global_prediction_validation"] - fixed["validation"]
                 ),
                 "dynamic_joint_best": dynamic["joint_best_validation"],
-                "fixed_allocated_parameter_capacity": fixed[
-                    "allocated_parameter_capacity"
-                ],
-                "dynamic_allocated_parameter_capacity": dynamic[
-                    "allocated_parameter_capacity"
-                ],
+                "fixed_allocated_parameter_capacity": fixed["allocated_parameter_capacity"],
+                "dynamic_allocated_parameter_capacity": dynamic["allocated_parameter_capacity"],
                 "dynamic_minus_fixed_parameter_capacity": (
-                    dynamic["allocated_parameter_capacity"]
-                    - fixed["allocated_parameter_capacity"]
+                    dynamic["allocated_parameter_capacity"] - fixed["allocated_parameter_capacity"]
                 ),
-                "shared_initial_state_sha256": fixed[
-                    "shared_initial_state_sha256"
-                ],
+                "shared_initial_state_sha256": fixed["shared_initial_state_sha256"],
                 "comparison_design": COMPARISON_DESIGN,
                 "fixed_effective_optimizer_steps_by_group": fixed[
                     "effective_optimizer_steps_by_group"

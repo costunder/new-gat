@@ -8,6 +8,25 @@ capacity에서 성능을 낼 수 있는지를 본다. 기본 seed는 시간 제�
 안내가 아니다. 현재 V5·Cycle V2의 실행은 바로 아래 실측 calibration 절을 우선한다.
 구 source/checkpoint의 strict resume 검사는 우회하지 않는다.
 
+## 2026-09-05 재개 오류 복구: 기존 measured run ID 유지
+
+`76e514a` 실행의 V5 CPU RNG 복원 오류와 Cycle worker 식별 오탐을 수정했다.
+V5는 last/best checkpoint를 CPU로 읽고 CPU/CUDA RNG의 CPU uint8 상태를 복원한다.
+Cycle은 데이터 식별 비교에서 실행 메타데이터 `preparation_workers`만 제외한다.
+원본 split/hash, DFS preparation signature/backend, 개수와 batch axis는 계속 검증하며,
+`data.py`를 변경하지 않아 기존 DFS 캐시를 다시 만들 필요가 없다.
+
+`scripts/resume_compatibility_v1.json`에 등록한 정확한 이전/이후 소스 해시만 호환된다.
+모델·학습 recipe·실측 batch/worker 선택은 바꾸지 않는다. 기존 request/plan, 완료 child
+artifact와 checkpoint의 해시는 고쳐 쓰지 않고 검증한다. 재개 manifest에는 이전·현재
+소스를 provenance로 남기고, 실행 중 소스 변경 검사는 여전히 strict equality다.
+다른 모델 변경이나 미등록 수정, 데이터/runtime/recipe 변경은 이 예외에 포함되지 않는다.
+
+오류로 종료된 `measured-v5-cycle-se-pe-a6000-gpu3-seed0-v1`은 아래 **같은 run ID와
+같은 명령**으로 이어간다. 완료한 3개 V5 조건은 다시 검증해 건너뛰고, 네 번째는 저장된
+epoch 경계에서 재개한다. 결과 폴더·`last.pt`·실측 plan을 삭제하거나 새 run ID로 바꾸지 않는다.
+원격 A6000에서 수정판을 재실행한 결과는 아직 없으며 로컬 CPU 회귀만으로 성공을 주장하지 않는다.
+
 ## 현재 실행: 실제 학습 batch/worker 측정 후 V5·Cycle V2 시작
 
 `a6000-48gb`라는 이름이나 GPU 사용률 100%만으로 batch가 최적이라고 판단하지 않는다.

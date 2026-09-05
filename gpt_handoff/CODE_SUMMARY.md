@@ -28604,6 +28604,7 @@ from pathlib import Path
 from typing import Any
 
 from chartgat.cache import atomic_write_bytes, atomic_write_json
+from chartgat.resume_compat import snapshots_match
 
 from .protocol import COMPARISON_DESIGN, CONDITIONS, SUITE
 
@@ -28928,6 +28929,11 @@ def build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
             "metric",
         ):
             if fixed[field] != dynamic[field]:
+                if field == "source_sha256" and (
+                    snapshots_match(fixed[field], dynamic[field])
+                    or snapshots_match(dynamic[field], fixed[field])
+                ):
+                    continue
                 raise ComparisonIntegrityError(f"{dataset}: fixed/dynamic {field} mismatch")
         contrasts.append(
             {
@@ -28941,19 +28947,12 @@ def build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                     dynamic["global_prediction_validation"] - fixed["validation"]
                 ),
                 "dynamic_joint_best": dynamic["joint_best_validation"],
-                "fixed_allocated_parameter_capacity": fixed[
-                    "allocated_parameter_capacity"
-                ],
-                "dynamic_allocated_parameter_capacity": dynamic[
-                    "allocated_parameter_capacity"
-                ],
+                "fixed_allocated_parameter_capacity": fixed["allocated_parameter_capacity"],
+                "dynamic_allocated_parameter_capacity": dynamic["allocated_parameter_capacity"],
                 "dynamic_minus_fixed_parameter_capacity": (
-                    dynamic["allocated_parameter_capacity"]
-                    - fixed["allocated_parameter_capacity"]
+                    dynamic["allocated_parameter_capacity"] - fixed["allocated_parameter_capacity"]
                 ),
-                "shared_initial_state_sha256": fixed[
-                    "shared_initial_state_sha256"
-                ],
+                "shared_initial_state_sha256": fixed["shared_initial_state_sha256"],
                 "comparison_design": COMPARISON_DESIGN,
                 "fixed_effective_optimizer_steps_by_group": fixed[
                     "effective_optimizer_steps_by_group"
@@ -29339,6 +29338,11 @@ import torch
 
 from chartgat.cache import atomic_publish, atomic_write_json
 from chartgat.observability import RuntimeResourceMonitor, observed
+from chartgat.resume_compat import (
+    COMPATIBILITY_SOURCE_FILES,
+    require_source_compatibility,
+    snapshots_match,
+)
 
 from ..ablation.model import state_sha256
 from ..ablation.train import _configure_fp32, _make_data, _require_cuda, training_loss
@@ -29382,6 +29386,7 @@ _SHARED_IMPLEMENTATION_SOURCES = (
     "research/conductance_gat/benchmark.py",
     "research/conductance_gat/benchmark_data.py",
     "src/chartgat/cache.py",
+    *COMPATIBILITY_SOURCE_FILES,
 )
 
 
@@ -29429,9 +29434,7 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
         "loader_workers": loader_workers,
         "persistent_workers": loader_workers > 0,
         "prefetch_factor": 2 if loader_workers > 0 else None,
-        "worker_configuration_source": getattr(
-            args, "worker_configuration_source", "explicit_cli"
-        ),
+        "worker_configuration_source": getattr(args, "worker_configuration_source", "explicit_cli"),
         "loader_worker_policy": (
             "PPI uses the configured worker pool with deterministic epoch-seeded shuffling; "
             "transductive full/sampled graphs use no DataLoader workers"
@@ -29696,22 +29699,16 @@ def validate_optimizer_parameter_ownership(
         )
 
 
-def validate_active_gradient_connectivity(
-    model: torch.nn.Module, active_groups: list[str]
-) -> None:
+def validate_active_gradient_connectivity(model: torch.nn.Module, active_groups: list[str]) -> None:
     active = set(active_groups)
     expected = [
         (name, parameter)
         for name, parameter in model.named_parameters()
         if parameter_group(name) in active
     ]
-    requires_mismatch = [
-        name for name, parameter in expected if not parameter.requires_grad
-    ]
+    requires_mismatch = [name for name, parameter in expected if not parameter.requires_grad]
     missing = [
-        name
-        for name, parameter in expected
-        if parameter.requires_grad and parameter.grad is None
+        name for name, parameter in expected if parameter.requires_grad and parameter.grad is None
     ]
     nonfinite = [
         name
@@ -29770,9 +29767,7 @@ def merge_efficiency(
     }
 
 
-def training_throughput(
-    history: list[dict[str, Any]], elapsed_seconds: float
-) -> dict[str, Any]:
+def training_throughput(history: list[dict[str, Any]], elapsed_seconds: float) -> dict[str, Any]:
     """Report retained training work over the existing cumulative wall-time interval.
 
     History and elapsed time both include restored checkpoint state. This is not
@@ -29804,9 +29799,7 @@ def training_throughput(
         return (
             observed(count / elapsed_seconds, unit=unit)
             if elapsed_seconds > 0
-            else observed(
-                None, reason="observed cumulative wall duration was zero", unit=unit
-            )
+            else observed(None, reason="observed cumulative wall duration was zero", unit=unit)
         )
 
     return {
@@ -29913,9 +29906,7 @@ def _v5_data_observability(
         unit = "nodes"
     elif isinstance(data, dict):
         split_counts = {
-            name: len(loader.dataset)
-            for name, loader in data.items()
-            if hasattr(loader, "dataset")
+            name: len(loader.dataset) for name, loader in data.items() if hasattr(loader, "dataset")
         }
         total_units = graph_observation["official_graph_count"]
         unit = "graphs"
@@ -29924,9 +29915,7 @@ def _v5_data_observability(
         total_units = graph_observation["official_graph_count"]
         unit = "graphs"
     training_units = split_counts.get("train", 0)
-    validation_units = sum(
-        split_counts.get(name, 0) for name in ("validation", "valid", "val")
-    )
+    validation_units = sum(split_counts.get(name, 0) for name in ("validation", "valid", "val"))
     actually_used = training_units + validation_units
     if total_units > 0:
         used_fraction = observed(actually_used / total_units, unit="fraction")
@@ -29962,9 +29951,7 @@ def _v5_data_observability(
         "time_window": observed(
             None, reason="not applicable to static graph benchmarks", unit="steps"
         ),
-        "input_resolution": observed(
-            None, reason="not applicable to graph feature tensors"
-        ),
+        "input_resolution": observed(None, reason="not applicable to graph feature tensors"),
     }
 
 
@@ -30347,8 +30334,40 @@ def validate_resume_identity(actual: Any, expected: dict[str, Any], stored_sha25
         keys = sorted(
             key for key in set(actual) | set(expected) if actual.get(key) != expected.get(key)
         )
+        if keys == ["source_sha256"] and snapshots_match(
+            actual["source_sha256"], expected["source_sha256"]
+        ):
+            return
         detail = ", ".join(keys) if keys else "unknown"
         raise ValueError(f"last.pt resume identity mismatch: {detail}")
+
+
+def load_checkpoint_on_cpu(path: Path) -> dict[str, Any]:
+    """Keep RNG bytes and checkpoint staging storage off the training GPU.
+
+    Model loading copies tensors into the existing parameter devices, and the
+    optimizer loader casts its moments to those parameter devices. Mapping the
+    whole payload to CUDA instead also moves the CPU generator's ByteTensor and
+    retains an unnecessary second model allocation during resumed training.
+    """
+
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(saved, dict):
+        raise ValueError(f"{path.name} checkpoint payload is invalid")
+    return saved
+
+
+def restore_checkpoint_rng(saved: dict[str, Any], device: torch.device) -> None:
+    """Restore both generators from CPU byte states, including the CUDA one."""
+
+    states = {}
+    for name in ("cpu_rng_state", "cuda_rng_state"):
+        value = saved.get(name)
+        if not isinstance(value, torch.Tensor) or value.dtype != torch.uint8 or value.ndim != 1:
+            raise ValueError(f"last.pt {name} must be a one-dimensional uint8 tensor")
+        states[name] = value.detach().cpu().contiguous()
+    torch.set_rng_state(states["cpu_rng_state"])
+    torch.cuda.set_rng_state(states["cuda_rng_state"], device)
 
 
 def recover_best_checkpoint(checkpoint: Path, previous: Path, expected_hash: Any) -> str:
@@ -30411,7 +30430,7 @@ def validate_selected_checkpoint(
         expected_identity,
         selected.get("resume_identity_sha256"),
     )
-    if selected.get("resume_identity_sha256") != expected_identity_sha256:
+    if _canonical_sha256(expected_identity) != expected_identity_sha256:
         raise ValueError("best.pt identity is not the selected last.pt identity")
     if selected.get("epoch") != expected_epoch:
         raise ValueError("best.pt epoch does not match last.pt best_epoch")
@@ -30511,8 +30530,7 @@ def _record_failure_resources(
         atomic_write_json(output / FAILURE_RESOURCE_FILENAME, payload)
     except BaseException as exc:  # failure reporting must not mask the scientific failure
         error.add_note(
-            "failure resource telemetry could not be written: "
-            f"{type(exc).__name__}: {exc}"
+            f"failure resource telemetry could not be written: {type(exc).__name__}: {exc}"
         )
     if cleanup_error is not None:
         error.add_note(f"resource monitor cleanup failed: {cleanup_error}")
@@ -30658,8 +30676,9 @@ def _train_model_impl(
     best_recovery_slot = "fresh"
     effective_group_steps = {name: 0 for name in _PARAMETER_GROUPS}
     gradient_groups_validated_this_invocation: set[str] = set()
+    resume_source_compatibility: list[dict[str, Any]] = []
     if args.resume and last_path.exists():
-        saved = torch.load(last_path, map_location=device, weights_only=False)
+        saved = load_checkpoint_on_cpu(last_path)
         if saved.get("schema_version") != 3:
             raise ValueError("last.pt uses an incompatible V5 selection-state schema")
         validate_resume_identity(
@@ -30667,6 +30686,20 @@ def _train_model_impl(
             resume_identity,
             saved.get("resume_identity_sha256"),
         )
+        stored_transitions = saved.get("resume_source_compatibility", [])
+        if not isinstance(stored_transitions, list) or any(
+            not isinstance(item, dict) for item in stored_transitions
+        ):
+            raise ValueError("last.pt source compatibility history is invalid")
+        resume_source_compatibility = list(stored_transitions)
+        transition = require_source_compatibility(
+            saved["resume_identity"]["source_sha256"], resume_identity["source_sha256"]
+        )
+        if transition is not None:
+            resume_source_compatibility.append(transition)
+            print(
+                f"[resume compatibility] {transition['patch_id']}; saved epoch retained", flush=True
+            )
         saved_history, saved_epoch = saved.get("history"), saved.get("epoch")
         if (
             not isinstance(saved_history, list)
@@ -30702,8 +30735,8 @@ def _train_model_impl(
         best_recovery_slot = recover_best_checkpoint(
             checkpoint, previous_checkpoint, best_checkpoint_sha256
         )
-        torch.set_rng_state(saved["cpu_rng_state"])
-        torch.cuda.set_rng_state(saved["cuda_rng_state"], device)
+        restore_checkpoint_rng(saved, device)
+        del saved
     validation_indices = indices["validation"] if indices is not None else None
     validation_data = _validation_source(data, sampler)
     torch.cuda.reset_peak_memory_stats(device)
@@ -30725,16 +30758,15 @@ def _train_model_impl(
                 loss, count = training_loss(logits, graph, train_indices)
             if phase_state["active_parameter_groups"]:
                 loss.backward()
-                groups_requiring_validation = set(
-                    phase_state["active_parameter_groups"]
-                ) - gradient_groups_validated_this_invocation
+                groups_requiring_validation = (
+                    set(phase_state["active_parameter_groups"])
+                    - gradient_groups_validated_this_invocation
+                )
                 if groups_requiring_validation:
                     validate_active_gradient_connectivity(
                         model, sorted(groups_requiring_validation)
                     )
-                    gradient_groups_validated_this_invocation.update(
-                        groups_requiring_validation
-                    )
+                    gradient_groups_validated_this_invocation.update(groups_requiring_validation)
                 if (
                     args.condition == "shared_dynamic_c"
                     and phase_state["coordinate"] in {"conductance", "joint"}
@@ -30872,6 +30904,7 @@ def _train_model_impl(
                 "first_c_gradient": first_c_gradient,
                 "cpu_rng_state": torch.get_rng_state(),
                 "cuda_rng_state": torch.cuda.get_rng_state(device),
+                "resume_source_compatibility": resume_source_compatibility,
                 **efficiency,
             },
         )
@@ -30903,7 +30936,7 @@ def _train_model_impl(
     best_recovery_slot = recover_best_checkpoint(
         checkpoint, previous_checkpoint, best_checkpoint_sha256
     )
-    selected = torch.load(checkpoint, map_location=device, weights_only=False)
+    selected = load_checkpoint_on_cpu(checkpoint)
     validate_selected_checkpoint(
         selected,
         expected_identity=resume_identity,
@@ -30913,6 +30946,7 @@ def _train_model_impl(
         expected_selection_role="primary",
     )
     model.load_state_dict(selected["model_state"])
+    del selected
     for operator in model.operators:
         operator.estimator.override = None
     interventions = selected_checkpoint_interventions(
@@ -30960,9 +30994,7 @@ def _train_model_impl(
         "epochs_requested": args.epochs,
         "epochs_completed": len(history),
         "early_stopping_patience": args.patience,
-        "planned_maximum_optimizer_steps": batch_observability[
-            "planned_maximum_training_batches"
-        ],
+        "planned_maximum_optimizer_steps": batch_observability["planned_maximum_training_batches"],
         "actual_training_batches": observed_training_batches,
         "actual_optimizer_steps": optimizer_steps,
         "effective_optimizer_steps_by_group": effective_group_steps,
@@ -31080,6 +31112,7 @@ def _train_model_impl(
         "protocol": protocol,
         "cache_sha256": protocol["data_sha256"],
         "source_sha256": resume_identity["source_sha256"],
+        "resume_source_compatibility": resume_source_compatibility,
         "initial_state_sha256": initial_state_sha256,
         "shared_initial_state_sha256": shared_state_sha256,
         "history_sha256": sha256_file(history_path),
@@ -54620,6 +54653,7 @@ for directory in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(directory))
 
 from chartgat.cache import atomic_write_json  # noqa: E402
+from chartgat.resume_compat import require_source_compatibility  # noqa: E402
 from scripts.training_resource_plan import (  # noqa: E402
     SCHEMA_VERSION,
     allocated_cpu_count,
@@ -54752,13 +54786,73 @@ def _measure(job, loaded, args, *, batch_size: int, workers: int) -> dict[str, A
     return measured
 
 
+def _scientific_input_identity(identity: dict[str, Any], *, track: str) -> dict[str, Any]:
+    """Exclude only Cycle's loader observation, never mutate persisted evidence.
+
+    Cycle's immutable cache loader records the workers used on this particular
+    read alongside its source/split/preparation identity. Calibration intentionally
+    selects a potentially different worker policy for training. The original
+    observation stays in the plan and protocol; it is not a dataset change.
+    """
+    if track == "cycle":
+        return {key: value for key, value in identity.items() if key != "preparation_workers"}
+    return identity
+
+
+def _changed_identity_fields(previous: Any, current: Any, *, path: str) -> list[str]:
+    """Report precise differing fields while leaving the full evidence untouched."""
+    if isinstance(previous, dict) and isinstance(current, dict):
+        changed = []
+        for key in sorted(previous.keys() | current.keys()):
+            field = f"{path}.{key}"
+            if key not in previous or key not in current:
+                changed.append(field)
+            else:
+                changed.extend(_changed_identity_fields(previous[key], current[key], path=field))
+        return changed
+    return [] if previous == current else [path]
+
+
+def _verify_loaded_input(
+    entry: dict[str, Any], identity: dict[str, Any], maximum: int, axis: str, *, context: str
+) -> None:
+    previous = entry["input_identity"]
+    track = entry["track"]
+    changed = _changed_identity_fields(
+        _scientific_input_identity(previous, track=track),
+        _scientific_input_identity(identity, track=track),
+        path="input_identity",
+    )
+    for key, value in (("natural_training_split_size", maximum), ("batch_axis", axis)):
+        if entry[key] != value:
+            changed.append(key)
+    if changed:
+        raise ValueError(f"{context}; {_group_key(entry)}; changed fields: {', '.join(changed)}")
+    if track == "cycle" and previous.get("preparation_workers") != identity.get(
+        "preparation_workers"
+    ):
+        print(
+            f"[calibration input verified] {_group_key(entry)}: unchanged official data; "
+            f"preparation_workers {previous.get('preparation_workers')} -> "
+            f"{identity.get('preparation_workers')} is execution metadata; "
+            "original plan observation preserved",
+            flush=True,
+        )
+
+
 def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist) -> None:
     primary = jobs[0]
     parsed = [_training_args(job) for job in jobs]
     loaded, identity, maximum, axis = _load_group(primary, parsed[0])
-    if entry.get("input_identity") is not None and entry["input_identity"] != identity:
-        raise ValueError(
-            "verified dataset changed since partial calibration; previous evidence preserved"
+    if entry.get("input_identity") is not None:
+        _verify_loaded_input(
+            entry,
+            identity,
+            maximum,
+            axis,
+            context=(
+                "verified dataset changed since partial calibration; previous evidence preserved"
+            ),
         )
     baseline = (
         parsed[0].sample_seed_batch_size if axis == "sampled_seed_nodes" else parsed[0].batch_size
@@ -54780,7 +54874,9 @@ def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist)
         baseline_physical_batch_size=baseline,
         batch_axis=axis,
         natural_training_split_size=maximum,
-        input_identity=identity,
+        input_identity=(
+            entry["input_identity"] if entry.get("input_identity") is not None else identity
+        ),
         job_contracts=[
             {
                 "condition": job["condition"],
@@ -54927,14 +55023,13 @@ def verify_plan_inputs(
                 )
             parsed.append(args)
         loaded, identity, maximum, axis = _load_group(matching[0], parsed[0])
-        if (
-            entry["input_identity"] != identity
-            or entry["natural_training_split_size"] != maximum
-            or entry["batch_axis"] != axis
-        ):
-            raise ValueError(
-                "resource plan verified dataset identity changed; no stale measurement reuse"
-            )
+        _verify_loaded_input(
+            entry,
+            identity,
+            maximum,
+            axis,
+            context="resource plan verified dataset identity changed; no stale measurement reuse",
+        )
         del loaded
         gc.collect()
 
@@ -54944,8 +55039,15 @@ def _run_locked(request_path: Path, output: Path) -> Path:
 
     request = json.loads(request_path.read_bytes())
     expected_sources = source_snapshot()
-    if request.get("source_sha256") != expected_sources:
-        raise ValueError("calibration request source identity differs")
+    try:
+        transition = require_source_compatibility(request.get("source_sha256"), expected_sources)
+    except ValueError as error:
+        raise ValueError("calibration request source identity differs") from error
+    if transition is not None:
+        print(
+            f"[resume compatibility] {transition['patch_id']}; original request preserved",
+            flush=True,
+        )
     jobs = request.get("jobs", [])
     if not jobs:
         raise ValueError("calibration request contains no supported jobs")
@@ -57972,6 +58074,7 @@ LANGUAGES = {
     ".yml": "yaml",
     ".sh": "bash",
     ".ps1": "powershell",
+    ".json": "json",
     ".txt": "text",
 }
 
@@ -57990,6 +58093,8 @@ def _is_source(path: Path, *, root: Path) -> bool:
     if not path.is_file() or _excluded(path, root=root):
         return False
     if path.name in {".gitignore", ".gitattributes"}:
+        return True
+    if path.relative_to(root).as_posix() == "scripts/resume_compatibility_v1.json":
         return True
     if path.suffix in SOURCE_SUFFIXES:
         return True
@@ -58955,6 +59060,55 @@ fi
 main "$@"
 ````
 
+# scripts/resume_compatibility_v1.json
+
+````json
+{
+  "schema_version": 1,
+  "patch_id": "v5-rng-cycle-workers-v1",
+  "base_commit": "76e514a8bf444ef82a323f18ff31982908cf2d8f",
+  "description": "Reviewed recovery-only transition. CPU RNG/checkpoint staging and Cycle preparation worker identity are repaired; model, official data, optimizer recipe, and measured resource selections stay unchanged. Existing artifacts keep their own hashes.",
+  "changes": {
+    "research/conductance_gat/v5/train.py": {
+      "before": "e0f68e4ecb73e93018af1a12d63d36050228eef58661234c687b98fa846db6ad",
+      "after": "5bda72fb2a947f521d57337e2dab3645879b256d8d187171c1031d3396c60705"
+    },
+    "research/conductance_gat/v5/report.py": {
+      "before": "ad8964970d3372cc631c49f412057941a067c65c0b09d160139780350629c0f7",
+      "after": "5c417d340ff299eb589c2044b975717285e56425441bf401094ff3abdca4e249"
+    },
+    "scripts/calibrate_training_resources.py": {
+      "before": "6f26dc7fd5bc36f618024dfca42166f5eb3a0052d4efdc434393be8445e63953",
+      "after": "ef30d604629451139443088b0bc738613830b2550175c4f80c4de85d25566016"
+    },
+    "scripts/run_conductance_scaling.py": {
+      "before": "3295c0a5b2ca36e5c27764a7fd710d44ebf09bc19d5864544178201486cd4f44",
+      "after": "7dbf3c6f812ab18f5d727f42c52442c212eb85042b900afaefb49d6cf18b9304"
+    },
+    "scripts/run_cycle_scaling.py": {
+      "before": "5b4568eb198035e845101cbf501555bdf6401cd57028e86befcf2473df9e669b",
+      "after": "44b3a59b402e5cd5135a3e1158f21eaf0016e6f8f7609c92d975f80845a94d9a"
+    },
+    "scripts/run_rich_scaling.py": {
+      "before": "b38d28c7e9ed7d104173b5609cd21c3df6c3f02739283a24cfd709ddf23aff4b",
+      "after": "3b696e1a151808fb7d3abf9ffc2eded0b7592ae35561e3d7373307f848aed2ae"
+    },
+    "scripts/training_resource_plan.py": {
+      "before": "14554bcb5519081607995045dbce2d00347c096c77e742a075f5144df8351fb6",
+      "after": "3088b02c1aca4e3a31bc4b4e6cd5fdd4154ee08e01ca6ec125ff7b2f2e4bdf5a"
+    },
+    "src/chartgat/resume_compat.py": {
+      "before": null,
+      "after": "379e4691c24fa888c937a25420c37f8ef9ab542551eae406ed81e608856afa35"
+    },
+    "scripts/generate_code_summary.py": {
+      "before": "9191588194cdcfc09e53404f022ea45a5c1f5a33db513e2b8667349336744e01",
+      "after": "bff0e5a34d9eaba2a5d4c1482feae35288a079cfa29881a3fd9548718fa6ed1a"
+    }
+  }
+}
+````
+
 # scripts/run_conductance_c_learning.py
 
 ````python
@@ -59636,6 +59790,11 @@ for directory in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(directory))
 
 from chartgat.cache import atomic_write_json  # noqa: E402
+from chartgat.resume_compat import (  # noqa: E402
+    COMPATIBILITY_SOURCE_FILES,
+    adopt_source_snapshot,
+    snapshots_match,
+)
 from research.conductance_gat.v2.protocol import (  # noqa: E402
     CONDITIONS as V2_CONDITIONS,
 )
@@ -60132,6 +60291,7 @@ def _source_snapshot() -> dict[str, str]:
             "sparse.py",
         )
     ]
+    paths += [ROOT / name for name in COMPATIBILITY_SOURCE_FILES]
     paths += list((ROOT / "research/conductance_gat/ablation").glob("*.py"))
     paths += list((ROOT / "research/conductance_gat/v2").glob("*.py"))
     paths += list((ROOT / "research/conductance_gat/v3").glob("*.py"))
@@ -60327,12 +60487,13 @@ def _load_resume_manifest(
         ("run_id", run_id),
         ("config", config),
         ("exclusions", exclusions),
-        ("source_sha256", source_sha256),
         ("source_integrity_valid", True),
         ("dependencies", dependencies),
     ):
         if manifest.get(key) != expected:
             raise RuntimeError(f"existing manifest {key} does not match this invocation")
+    if not snapshots_match(manifest.get("source_sha256"), source_sha256):
+        raise RuntimeError("existing manifest source_sha256 does not match this invocation")
     existing_jobs = manifest.get("jobs")
     if not isinstance(existing_jobs, list) or not all(
         isinstance(job, dict) for job in existing_jobs
@@ -60368,6 +60529,7 @@ def _load_resume_manifest(
     if manifest["status"] == "passed" and any(job["status"] != "passed" for job in existing_jobs):
         raise RuntimeError("passed manifest contains a non-passed job")
     _verify_preflight_evidence(manifest, run_dir, str(config["hardware_profile"]))
+    adopt_source_snapshot(manifest, source_sha256)
     return manifest
 
 
@@ -62683,6 +62845,11 @@ for directory in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(directory))
 
 from chartgat.cache import atomic_write_json  # noqa: E402
+from chartgat.resume_compat import (  # noqa: E402
+    COMPATIBILITY_SOURCE_FILES,
+    adopt_source_snapshot,
+    snapshots_match,
+)
 from scripts.check_dependencies import (  # noqa: E402
     DependencyCheckError,
     check_dependencies,
@@ -63161,7 +63328,10 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
 
 
 def _source_snapshot() -> dict[str, str]:
-    return {name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in SOURCE_FILES}
+    return {
+        name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+        for name in (*SOURCE_FILES, *COMPATIBILITY_SOURCE_FILES)
+    }
 
 
 def _environment() -> dict[str, str]:
@@ -64172,17 +64342,19 @@ def _resume_manifest(
         "output_dir": str(run_dir),
         "run_configuration": _run_configuration(args),
         "dependencies": dependencies,
-        "source_sha256": sources,
     }
     for key, expected in expected_identity.items():
         if manifest.get(key) != expected:
             raise ValueError(f"existing run cannot be resumed: {key} differs")
+    if not snapshots_match(manifest.get("source_sha256"), sources):
+        raise ValueError("existing run cannot be resumed: source_sha256 differs")
     previous_status = manifest.get("status")
     if previous_status not in {"running", "failed", "passed"}:
         raise ValueError("existing run cannot be resumed: status is invalid")
     if manifest.get("source_integrity_valid") is not True:
         raise ValueError("existing run cannot be resumed after a source-integrity failure")
     _restore_job_state(jobs, manifest.get("jobs"), label="candidate")
+    adopt_source_snapshot(manifest, sources)
     manifest["jobs"] = jobs
     manifest["status"] = "running"
     manifest.pop("error", None)
@@ -66253,9 +66425,15 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
 
+from chartgat.resume_compat import (  # noqa: E402
+    COMPATIBILITY_SOURCE_FILES,
+    adopt_source_snapshot,
+    snapshots_match,
+)
 from research.conductance_gat.v5.protocol import (  # noqa: E402
     BETA_PARAMETERIZATIONS,
     DEFAULT_BETA_INITIAL,
@@ -66267,9 +66445,6 @@ from scripts.process_safety import (  # noqa: E402
     run_failure_reporter,
     terminate_owned_child,
     terminate_owned_child_after_error,
-)
-from scripts.training_resource_plan import (  # noqa: E402
-    digest as resource_digest,
 )
 from scripts.training_resource_plan import (  # noqa: E402
     load_resource_plan,
@@ -66782,6 +66957,7 @@ def _source_snapshot() -> dict[str, str]:
         ROOT / "scripts/verify_gpu_lock.py",
         ROOT / "research/tree_augmentation/config.yaml",
     ]
+    paths.extend(ROOT / name for name in COMPATIBILITY_SOURCE_FILES)
     paths.extend(ROOT / "scripts" / TRACK_SPECS[track]["script"] for track in TRACKS)
     for source_root in (
         ROOT / "research/conductance_gat",
@@ -67509,7 +67685,7 @@ def _resume_manifest(
         raise ValueError("existing run configuration differs; use its original arguments")
     if payload.get("planned_counts") != expected_totals:
         raise ValueError("existing run count contract differs from the requested plan")
-    if payload.get("source_sha256") != expected_sources:
+    if not snapshots_match(payload.get("source_sha256"), expected_sources):
         raise ValueError("experiment source changed since this run started; use a new run ID")
     if payload.get("source_integrity_valid") is not True:
         raise ValueError("existing run failed source integrity and cannot be resumed")
@@ -67547,6 +67723,7 @@ def _resume_manifest(
             "result",
         ):
             stored.pop(field, None)
+    adopt_source_snapshot(payload, expected_sources)
     payload["status"] = "running"
     payload["source_integrity_valid"] = True
     resume_count = payload.get("resume_count", 0)
@@ -67701,7 +67878,15 @@ def _ensure_measured_plan(args: argparse.Namespace, run_id: str, run_dir: Path) 
     if directory.exists():
         if not request_path.is_file() or request_path.is_symlink():
             raise ValueError("existing calibration directory is not owned by this request")
-        if resource_digest(json.loads(request_path.read_bytes())) != resource_digest(request):
+        stored_request = json.loads(request_path.read_bytes())
+        # Preserve the original request and its digest in the measured certificate.
+        # Only the reviewed recovery patch may differ; the recipe stays exact.
+        same_recipe = isinstance(stored_request, dict) and {
+            key: value for key, value in stored_request.items() if key != "source_sha256"
+        } == {key: value for key, value in request.items() if key != "source_sha256"}
+        if not same_recipe or not snapshots_match(
+            stored_request.get("source_sha256"), request["source_sha256"]
+        ):
             raise ValueError(
                 "calibration source/configuration differs; previous measurements preserved; "
                 "use a new run ID"
@@ -70403,6 +70588,8 @@ import stat
 from pathlib import Path
 from typing import Any
 
+from chartgat.resume_compat import COMPATIBILITY_SOURCE_FILES, require_source_compatibility
+
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 1
 IGNORED_COMMAND_OPTIONS = {
@@ -70420,6 +70607,7 @@ def digest(value: Any) -> str:
 
 def source_snapshot() -> dict[str, str]:
     paths = [ROOT / "AGENTS.md", ROOT / "pyproject.toml"]
+    paths.extend(ROOT / name for name in COMPATIBILITY_SOURCE_FILES)
     for directory in ("research", "src/chartgat", "scripts"):
         paths.extend((ROOT / directory).rglob("*.py"))
     paths.extend((ROOT / "research").rglob("*.yaml"))
@@ -70770,10 +70958,13 @@ def validate_resource_plan(
         or seeds != list(model_seeds)
     ):
         raise ValueError("resource plan profile/seed identity differs")
-    if check_sources and plan.get("source_sha256") != source_snapshot():
-        raise ValueError(
-            "resource plan source identity differs; recalibration requires a separate new run"
-        )
+    if check_sources:
+        try:
+            require_source_compatibility(plan.get("source_sha256"), source_snapshot())
+        except ValueError as error:
+            raise ValueError(
+                "resource plan source identity differs; recalibration requires a separate new run"
+            ) from error
     hardware = plan.get("hardware")
     runtime = plan.get("runtime")
     if (
@@ -72863,6 +73054,164 @@ __all__ = [
     "observed",
     "runtime_resource_snapshot",
 ]
+````
+
+# src/chartgat/resume_compat.py
+
+````python
+"""Read-only, exact-source compatibility for the reviewed RNG/worker repair.
+
+Only recorded old and new file digests may differ. Model, data and recipe
+checks remain mandatory at their callers. Published artifacts are not edited.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import re
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[2]
+HELPER_SOURCE = "src/chartgat/resume_compat.py"
+REGISTRY_SOURCE = "scripts/resume_compatibility_v1.json"
+REGISTRY_PATH = ROOT / REGISTRY_SOURCE
+COMPATIBILITY_SOURCE_FILES = (HELPER_SOURCE, REGISTRY_SOURCE)
+PATCH_ID = "v5-rng-cycle-workers-v1"
+BASE_COMMIT = "76e514a8bf444ef82a323f18ff31982908cf2d8f"
+
+
+def _digest(value: Any) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _source_path(value: Any) -> bool:
+    if not isinstance(value, str) or not value or "\\" in value or ":" in value:
+        return False
+    path = PurePosixPath(value)
+    return not path.is_absolute() and path.as_posix() == value and ".." not in path.parts
+
+
+def _source_map(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and bool(value)
+        and all(_source_path(key) and _digest(digest) for key, digest in value.items())
+    )
+
+
+def _unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("source compatibility registry contains duplicate JSON keys")
+        result[key] = value
+    return result
+
+
+def _registry() -> tuple[dict[str, Any], str]:
+    if REGISTRY_PATH.is_symlink() or not REGISTRY_PATH.is_file():
+        raise ValueError("source compatibility registry must be a regular file")
+    try:
+        raw = REGISTRY_PATH.read_bytes()
+        registry = json.loads(raw, object_pairs_hook=_unique_pairs)
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("source compatibility registry is unreadable") from error
+    if (
+        not isinstance(registry, dict)
+        or type(registry.get("schema_version")) is not int
+        or registry["schema_version"] != 1
+        or registry.get("patch_id") != PATCH_ID
+        or registry.get("base_commit") != BASE_COMMIT
+        or not isinstance(registry.get("changes"), dict)
+        or not registry["changes"]
+    ):
+        raise ValueError("source compatibility registry identity is invalid")
+    for name, change in registry["changes"].items():
+        if (
+            not _source_path(name)
+            or name == REGISTRY_SOURCE
+            or not isinstance(change, dict)
+            or set(change) != {"before", "after"}
+            or (change["before"] is not None and not _digest(change["before"]))
+            or not _digest(change["after"])
+            or change["before"] == change["after"]
+        ):
+            raise ValueError("source compatibility registry change is invalid")
+    return registry, hashlib.sha256(raw).hexdigest()
+
+
+def require_source_compatibility(previous: Any, current: Any) -> dict[str, Any] | None:
+    """Accept equality or the exact reviewed one-way source transition.
+
+    Equality retains existing callers' semantics, including their synthetic
+    test snapshots. A transition requires actual SHA-256 maps and a live,
+    hash-bound registry; unrelated or partially applied changes are rejected.
+    """
+    if previous == current:
+        return None
+    if not _source_map(previous) or not _source_map(current):
+        raise ValueError("source snapshots differ and are not valid SHA-256 maps")
+    registry, registry_sha256 = _registry()
+    if any(name not in current for name in COMPATIBILITY_SOURCE_FILES):
+        raise ValueError("source transition is missing its compatibility implementation")
+    if current[REGISTRY_SOURCE] != registry_sha256:
+        raise ValueError("source compatibility registry changed after the snapshot")
+    helper_sha256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    if current[HELPER_SOURCE] != helper_sha256:
+        raise ValueError("source compatibility helper changed after the snapshot")
+    helper_change = registry["changes"].get(HELPER_SOURCE)
+    if helper_change != {"before": None, "after": helper_sha256}:
+        raise ValueError("source compatibility helper is not pinned by the registry")
+    removed = set(previous) - set(current)
+    if removed:
+        raise ValueError(f"source transition cannot remove files: {sorted(removed)}")
+    for name, change in registry["changes"].items():
+        if name in current and (
+            current[name] != change["after"] or previous.get(name) != change["before"]
+        ):
+            raise ValueError(f"source transition is not the complete reviewed repair: {name}")
+    for name in sorted(set(previous) | set(current)):
+        before, after = previous.get(name), current.get(name)
+        if before == after:
+            continue
+        if name == REGISTRY_SOURCE:
+            if before is not None or after != registry_sha256:
+                raise ValueError("source compatibility registry transition is not an addition")
+            continue
+        if registry["changes"].get(name) != {"before": before, "after": after}:
+            raise ValueError(f"source change is not covered by the reviewed repair: {name}")
+    return {
+        "patch_id": registry["patch_id"],
+        "base_commit": registry["base_commit"],
+        "registry_sha256": registry_sha256,
+        "previous_source_sha256": copy.deepcopy(previous),
+        "current_source_sha256": copy.deepcopy(current),
+    }
+
+
+def adopt_source_snapshot(record: dict[str, Any], current: dict[str, str]) -> dict[str, Any] | None:
+    """Update only a caller-owned in-memory record, retaining exact provenance."""
+    evidence = require_source_compatibility(record.get("source_sha256"), current)
+    if evidence is None:
+        return None
+    history = record.get("source_compatibility", [])
+    if not isinstance(history, list) or any(not isinstance(item, dict) for item in history):
+        raise ValueError("source compatibility provenance must be a list of objects")
+    record["source_compatibility"] = [*history, copy.deepcopy(evidence)]
+    record["source_sha256"] = copy.deepcopy(current)
+    return evidence
+
+
+def snapshots_match(previous: Any, current: Any) -> bool:
+    """Test equality or the same narrow forward transition without mutations."""
+    try:
+        require_source_compatibility(previous, current)
+    except ValueError:
+        return False
+    return True
 ````
 
 # src/chartgat/seeds.py
@@ -75518,8 +75867,10 @@ GIB = 1024**3
 
 def debug_report(job, batch_size, workers, *, rate=100.0, unsafe=False, oom=False):
     report = {
-        "condition": job["condition"], "model_seed": job["model_seed"],
-        "batch_size": batch_size, "workers": workers,
+        "condition": job["condition"],
+        "model_seed": job["model_seed"],
+        "batch_size": batch_size,
+        "workers": workers,
     }
     if oom:
         return {**report, "status": "oom", "error": "explicit synthetic CUDA OOM test fixture"}
@@ -75527,11 +75878,17 @@ def debug_report(job, batch_size, workers, *, rate=100.0, unsafe=False, oom=Fals
     processed = batch_size * 1000
     return {
         **report,
-        "status": "passed", "unit": "debug_fixture_graphs",
-        "processed_units": processed, "elapsed_seconds": processed / rate,
-        "samples_per_second": rate, "optimizer_steps": 1003,
-        "optimizer_state_bytes": 1024, "measurement_steps": 1000, "warmup_steps": 2,
-        "measurement_steps_requested": 5, "warmup_steps_requested": 2,
+        "status": "passed",
+        "unit": "debug_fixture_graphs",
+        "processed_units": processed,
+        "elapsed_seconds": processed / rate,
+        "samples_per_second": rate,
+        "optimizer_steps": 1003,
+        "optimizer_state_bytes": 1024,
+        "measurement_steps": 1000,
+        "warmup_steps": 2,
+        "measurement_steps_requested": 5,
+        "warmup_steps_requested": 2,
         "minimum_measure_seconds_requested": 3.0,
         "peak_allocated_bytes": (44 if unsafe else 3) * GIB,
         "peak_reserved_bytes": (45 if unsafe else 4) * GIB,
@@ -75539,32 +75896,56 @@ def debug_report(job, batch_size, workers, *, rate=100.0, unsafe=False, oom=Fals
         "free_bytes_before": 47 * GIB,
         "free_bytes_after": (2 if unsafe else 43) * GIB,
         "resource_observability": {"debug_mock_only": True},
-        "calibration_only": True, "final_training_performed": False,
+        "calibration_only": True,
+        "final_training_performed": False,
     }
 
 
 def debug_harness(
-    monkeypatch, *, axis="graphs", baseline=4, maximum=64,
-    workers=(2, 4), seeds=(0,), report_factory=None,
+    monkeypatch,
+    *,
+    axis="graphs",
+    baseline=4,
+    maximum=64,
+    workers=(2, 4),
+    seeds=(0,),
+    report_factory=None,
 ):
     track = "conductance" if axis != "graphs" else "cycle"
     conditions = ("fixed_c", "shared_dynamic_c") if track == "conductance" else ("se", "pe")
     module = (
         "research.conductance_gat.v5.train"
-        if track == "conductance" else "research.cycle_pe.v2.benchmark"
+        if track == "conductance"
+        else "research.cycle_pe.v2.benchmark"
     )
     jobs = [
         {
-            "track": track, "profile": "large", "dataset": "debug_official_fixture",
-            "condition": condition, "model_seed": seed, "device": "cuda:0",
-            "command": ["python", "-B", "-m", module, "--debug-fixture-identity", condition,
-                        "--model-seed", str(seed)],
+            "track": track,
+            "profile": "large",
+            "dataset": "debug_official_fixture",
+            "condition": condition,
+            "model_seed": seed,
+            "device": "cuda:0",
+            "command": [
+                "python",
+                "-B",
+                "-m",
+                module,
+                "--debug-fixture-identity",
+                condition,
+                "--model-seed",
+                str(seed),
+            ],
         }
-        for condition in conditions for seed in seeds
+        for condition in conditions
+        for seed in seeds
     ]
     parsed = SimpleNamespace(
-        batch_size=baseline, sample_seed_batch_size=baseline,
-        workers=4, device="cuda:0", dataset=jobs[0]["dataset"],
+        batch_size=baseline,
+        sample_seed_batch_size=baseline,
+        workers=4,
+        device="cuda:0",
+        dataset=jobs[0]["dataset"],
     )
     loaded = object()
     identity = {"debug_mock_only": True, "full_split_sha256": "a" * 64}
@@ -75574,9 +75955,7 @@ def debug_harness(
         calibration, "_load_group", lambda _job, _args: (loaded, identity, maximum, axis)
     )
     monkeypatch.setattr(calibration, "allocated_cpu_count", lambda: 8)
-    monkeypatch.setattr(
-        calibration, "worker_candidates", lambda *_args, **_kwargs: list(workers)
-    )
+    monkeypatch.setattr(calibration, "worker_candidates", lambda *_args, **_kwargs: list(workers))
 
     def measure(job, payload, _args, *, batch_size, workers):
         assert payload is loaded
@@ -75598,8 +75977,8 @@ def debug_harness(
 
 
 @pytest.mark.parametrize(
-    "track,axis", [("cycle", "graphs"), ("conductance", "graphs"),
-                   ("conductance", "sampled_seed_nodes")],
+    "track,axis",
+    [("cycle", "graphs"), ("conductance", "graphs"), ("conductance", "sampled_seed_nodes")],
 )
 def test_explicit_reuse_rejects_a_new_floor_above_the_measured_selection(monkeypatch, track, axis):
     jobs, entry, persist, _, _, _ = debug_harness(monkeypatch, axis=axis, maximum=8)
@@ -75664,8 +76043,10 @@ def test_real_group_algorithm_selects_one_measured_policy_for_all_paired_arms(mo
         assert {(row["condition"], row["model_seed"]) for row in candidate["measurements"]} == {
             (condition, seed) for condition in ("se", "pe") for seed in (0, 7)
         }
-    assert all(contract["argv_sha256"] == command_identity(job["command"])
-               for contract, job in zip(entry["job_contracts"], jobs, strict=True))
+    assert all(
+        contract["argv_sha256"] == command_identity(job["command"])
+        for contract, job in zip(entry["job_contracts"], jobs, strict=True)
+    )
     assert snapshots[-1]["status"] == "passed"
 
 
@@ -75679,7 +76060,8 @@ def test_growth_reaches_natural_full_split_without_arbitrary_cap(monkeypatch):
 
 def test_unsafe_reserved_memory_boundary_never_accepted_as_candidate(monkeypatch):
     jobs, entry, persist, calls, _, _ = debug_harness(
-        monkeypatch, maximum=64,
+        monkeypatch,
+        maximum=64,
         report_factory=lambda job, batch, workers: debug_report(
             job, batch, workers, rate=float(batch * workers), unsafe=batch >= 16
         ),
@@ -75694,7 +76076,10 @@ def test_unsafe_reserved_memory_boundary_never_accepted_as_candidate(monkeypatch
 def test_oom_in_either_paired_arm_rejects_whole_resource_candidate(monkeypatch):
     def report(job, batch, workers):
         return debug_report(
-            job, batch, workers, rate=float(batch * workers),
+            job,
+            batch,
+            workers,
+            rate=float(batch * workers),
             oom=batch >= 8 and job["condition"] == "pe",
         )
 
@@ -75785,17 +76170,33 @@ def test_training_args_accept_actual_generated_cycle_se_pe_commands(monkeypatch,
     # Parsing only: mocks CUDA availability for existing parser validation,
     # never allocates a CUDA tensor or invokes a model.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    args = run_cycle_scaling.parser().parse_args([
-        "--versions", "v2", "--encodings", "se", "pe",
-        "--profiles", "reference", "large", "--model-seeds", "0",
-        "--hardware-profile", "a6000-48gb", "--min-free-gb", "40",
-        "--device", "cuda:0",
-    ])
+    args = run_cycle_scaling.parser().parse_args(
+        [
+            "--versions",
+            "v2",
+            "--encodings",
+            "se",
+            "pe",
+            "--profiles",
+            "reference",
+            "large",
+            "--model-seeds",
+            "0",
+            "--hardware-profile",
+            "a6000-48gb",
+            "--min-free-gb",
+            "40",
+            "--device",
+            "cuda:0",
+        ]
+    )
     jobs = run_cycle_scaling.make_jobs(args, tmp_path / "debug-command-generation-only")
     assert len(jobs) == 8
     for job in jobs:
         normalized = {
-            **job, "track": "cycle", "dataset": job["datasets"][0],
+            **job,
+            "track": "cycle",
+            "dataset": job["datasets"][0],
             "condition": job["encoding"],
         }
         parsed = calibration._training_args(normalized)
@@ -75807,6 +76208,185 @@ def test_training_args_accept_actual_generated_cycle_se_pe_commands(monkeypatch,
         assert parsed.pe_dim == job["config"]["pe_dim"]
         assert parsed.batch_size == job["resources"]["batch_size"]
         assert parsed.workers == job["resources"]["workers"]
+
+
+def _debug_real_cycle_loader_plan(monkeypatch, tmp_path, selected_workers):
+    """Real parser, DFS preparation/cache validation and identity; fake timing only."""
+    from research.cycle_pe.v2 import calibration as cycle_calibration
+    from research.cycle_pe.v2 import data
+
+    official = SimpleNamespace(
+        num_nodes=3,
+        x=torch.tensor([[0], [1], [2]]),
+        edge_index=torch.tensor([[0, 1, 1, 2, 0, 2], [1, 0, 2, 1, 2, 0]]),
+        edge_attr=torch.ones(6, 1, dtype=torch.long),
+        y=torch.tensor([0.7]),
+    )
+
+    def debug_official_split(_root, dataset, *, allow_download, splits):
+        assert dataset == "zinc12k" and not allow_download and splits == ("train",)
+        return {"train": [official]}
+
+    # Explicit one-graph CPU fixture. Production sizes and defaults are untouched.
+    monkeypatch.setattr(data, "load_official_splits", debug_official_split)
+    monkeypatch.setitem(cycle_calibration.EXPECTED_SIZES, "zinc12k", (1, 1, 1))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)  # Parser validation only.
+    monkeypatch.setattr(calibration, "allocated_cpu_count", lambda: 16)
+    jobs = [
+        {
+            "track": "cycle",
+            "profile": "reference",
+            "dataset": "zinc12k",
+            "condition": encoding,
+            "model_seed": 0,
+            "device": "cuda:0",
+            "command": [
+                "python",
+                "-B",
+                "-m",
+                "research.cycle_pe.v2.benchmark",
+                "--datasets",
+                "zinc12k",
+                "--encoding",
+                encoding,
+                "--data-root",
+                str(tmp_path / "debug-data"),
+                "--output-dir",
+                str(tmp_path / "debug-not-training"),
+                "--workers",
+                "8",
+                "--batch-size",
+                "2",
+                "--device",
+                "cuda:0",
+            ],
+        }
+        for encoding in ("se", "pe")
+    ]
+
+    def measure(job, loaded, _args, *, batch_size, workers):
+        assert len(loaded) == 1 and loaded[0].cycle_basis.shape == (3, 1)
+        return debug_report(
+            job, batch_size, workers, rate=200.0 if workers == selected_workers else 100.0
+        )
+
+    monkeypatch.setattr(calibration, "_measure", measure)
+    entry = {}
+    calibration._calibrate_group(jobs, entry, lambda: None)
+    assert entry["input_identity"]["preparation_workers"] == 8
+    assert entry["selected"]["workers"] == selected_workers
+    for job in jobs:
+        command = job["command"]
+        command[command.index("--workers") + 1] = str(selected_workers)
+    return jobs, entry, official
+
+
+@pytest.mark.parametrize("selected_workers", [2, 4, 16])
+def test_cycle_real_loader_accepts_measured_workers_without_mutating_legacy_plan(
+    monkeypatch, tmp_path, capsys, selected_workers
+):
+    jobs, entry, _ = _debug_real_cycle_loader_plan(monkeypatch, tmp_path, selected_workers)
+    before = copy.deepcopy(entry)
+    calibration.verify_plan_inputs({"entries": [entry]}, jobs)
+    assert entry == before
+    assert entry["input_identity"]["preparation_workers"] == 8
+    assert f"preparation_workers 8 -> {selected_workers}" in capsys.readouterr().out
+
+
+def test_cycle_real_loader_still_rejects_changed_official_graph_before_plan_reuse(
+    monkeypatch, tmp_path
+):
+    from chartgat.cache import CacheWrongRequestError
+
+    jobs, entry, official = _debug_real_cycle_loader_plan(monkeypatch, tmp_path, 2)
+    before = copy.deepcopy(entry)
+    official.y.add_(1)
+    with pytest.raises(CacheWrongRequestError, match="Mismatched cycle PE v2 cache"):
+        calibration.verify_plan_inputs({"entries": [entry]}, jobs)
+    assert entry == before
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "input_identity.split_content_sha256.train",
+        "input_identity.split_sizes.train",
+        "input_identity.official_splits",
+        "input_identity.preparation.implementation_sha256.v2/basis.py",
+        "input_identity.basis_backend",
+        "input_identity.cache_directory",
+        "natural_training_split_size",
+        "batch_axis",
+    ],
+)
+def test_cycle_worker_exception_keeps_all_scientific_identity_fields_strict(
+    monkeypatch, tmp_path, field
+):
+    jobs, entry, _ = _debug_real_cycle_loader_plan(monkeypatch, tmp_path, 2)
+    if field == "input_identity.preparation.implementation_sha256.v2/basis.py":
+        entry["input_identity"]["preparation"]["implementation_sha256"]["v2/basis.py"] = "changed"
+    else:
+        parts = field.split(".")
+        parent = entry
+        for part in parts[:-1]:
+            parent = parent[part]
+        parent[parts[-1]] = "changed"
+    # batch_axis affects the requested batch lookup but remains a required exact identity.
+    before = copy.deepcopy(entry)
+    with pytest.raises(ValueError, match="changed fields:") as error:
+        calibration.verify_plan_inputs({"entries": [entry]}, jobs)
+    assert field in str(error.value)
+    assert entry == before
+
+
+def test_conductance_does_not_ignore_a_preparation_workers_field(monkeypatch):
+    jobs, entry, persist, _, _, identity = debug_harness(
+        monkeypatch, axis="sampled_seed_nodes", workers=(0,)
+    )
+    identity["preparation_workers"] = 8
+    calibration._calibrate_group(jobs, entry, persist)
+    changed = {**identity, "preparation_workers": 2}
+    monkeypatch.setattr(
+        calibration, "_load_group", lambda *_args: (object(), changed, 64, "sampled_seed_nodes")
+    )
+    before = copy.deepcopy(entry)
+    with pytest.raises(ValueError, match="input_identity.preparation_workers"):
+        calibration.verify_plan_inputs({"entries": [entry]}, jobs)
+    assert entry == before
+
+
+def test_partial_cycle_resume_preserves_original_worker_observation(monkeypatch):
+    jobs, entry, persist, calls, _, identity = debug_harness(monkeypatch, maximum=8)
+    identity["preparation_workers"] = 8
+    calibration._calibrate_group(jobs, entry, persist)
+    before, previous_calls = copy.deepcopy(entry["input_identity"]), len(calls)
+    reread_identity = {**identity, "preparation_workers": 2}
+    monkeypatch.setattr(
+        calibration, "_load_group", lambda *_args: (object(), reread_identity, 8, "graphs")
+    )
+    calibration._calibrate_group(jobs, entry, persist)
+    assert entry["input_identity"] == before
+    assert len(calls) == previous_calls
+
+
+@pytest.mark.parametrize("change", ["data", "count", "axis"])
+def test_partial_cycle_resume_rejects_true_input_changes_before_any_measurement(
+    monkeypatch, change
+):
+    jobs, entry, persist, calls, _, identity = debug_harness(monkeypatch, maximum=8)
+    calibration._calibrate_group(jobs, entry, persist)
+    changed_identity = dict(identity)
+    if change == "data":
+        changed_identity["full_split_sha256"] = "b" * 64
+    maximum = 9 if change == "count" else 8
+    axis = "full_graph" if change == "axis" else "graphs"
+    monkeypatch.setattr(
+        calibration, "_load_group", lambda *_args: (object(), changed_identity, maximum, axis)
+    )
+    before, previous_calls = copy.deepcopy(entry), len(calls)
+    with pytest.raises(ValueError, match="since partial calibration.*changed fields:"):
+        calibration._calibrate_group(jobs, entry, persist)
+    assert entry == before and len(calls) == previous_calls
 ````
 
 # tests/test_calibration_lock.py
@@ -82756,6 +83336,182 @@ def test_block_checkpoint_is_not_disabled_by_calibration_eval_mode(monkeypatch):
     )
 ````
 
+# tests/test_conductance_v5_rng_resume.py
+
+````python
+"""Checkpoint/RNG unit regressions; these are not production training runs."""
+
+from __future__ import annotations
+
+import inspect
+
+import pytest
+import torch
+
+from research.conductance_gat.v5 import train
+
+
+@pytest.fixture(autouse=True)
+def preserve_cpu_rng():
+    with torch.random.fork_rng(devices=[]):
+        yield
+
+
+def _unit_model(device):
+    return torch.nn.Sequential(
+        torch.nn.Linear(4, 8),
+        torch.nn.GELU(),
+        torch.nn.Dropout(0.3),
+        torch.nn.Linear(8, 2),
+    ).to(device)
+
+
+def _unit_step(model, optimizer, device):
+    optimizer.zero_grad(set_to_none=True)
+    # CPU sampling and model-device dropout exercise both RNG streams on CUDA.
+    inputs = torch.randn(7, 4).to(device)
+    target = torch.randn(7, 2).to(device)
+    loss = torch.nn.functional.mse_loss(model(inputs), target)
+    loss.backward()
+    optimizer.step()
+    return loss.detach().cpu()
+
+
+def _all_tensors(value):
+    if isinstance(value, torch.Tensor):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _all_tensors(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _all_tensors(child)
+
+
+def _assert_resumed_step_matches_uninterrupted(tmp_path, device):
+    torch.manual_seed(71)
+    model = _unit_model(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.005)
+    _unit_step(model, optimizer, device)
+    path = tmp_path / "last.pt"
+    train._save(
+        path,
+        {
+            "schema_version": 3,
+            "epoch": 1,
+            "history": [{"epoch": 1, "scope": "unit_test"}],
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "cpu_rng_state": torch.get_rng_state(),
+            "cuda_rng_state": (
+                torch.cuda.get_rng_state(device) if device.type == "cuda" else torch.get_rng_state()
+            ),
+        },
+    )
+    checkpoint_bytes = path.read_bytes()
+    expected_loss = _unit_step(model, optimizer, device)
+    expected_parameters = {
+        name: value.detach().clone() for name, value in model.state_dict().items()
+    }
+    expected_cpu_draw = torch.rand(11)
+    expected_cuda_draw = torch.rand(11, device=device) if device.type == "cuda" else None
+
+    resumed = _unit_model(device)
+    resumed_optimizer = torch.optim.AdamW(resumed.parameters(), lr=0.005)
+    saved = train.load_checkpoint_on_cpu(path)
+    assert all(value.device.type == "cpu" for value in _all_tensors(saved))
+    assert saved["epoch"] == 1 and saved["history"][0]["epoch"] == 1
+    resumed.load_state_dict(saved["model_state"])
+    resumed_optimizer.load_state_dict(saved["optimizer_state"])
+    for parameter, state in resumed_optimizer.state.items():
+        # The non-capturable Adam step scalar stays on CPU; moments follow params.
+        assert state["exp_avg"].device == parameter.device
+        assert state["exp_avg_sq"].device == parameter.device
+        assert state["step"].device.type == "cpu"
+    train.restore_checkpoint_rng(saved, device)
+    del saved
+    actual_loss = _unit_step(resumed, resumed_optimizer, device)
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=0, atol=0)
+    for name, actual in resumed.state_dict().items():
+        torch.testing.assert_close(actual, expected_parameters[name], rtol=0, atol=0)
+    torch.testing.assert_close(torch.rand(11), expected_cpu_draw, rtol=0, atol=0)
+    if expected_cuda_draw is not None:
+        torch.testing.assert_close(
+            torch.rand(11, device=device), expected_cuda_draw, rtol=0, atol=0
+        )
+    assert path.read_bytes() == checkpoint_bytes
+
+
+def test_cpu_checkpoint_resume_preserves_next_dropout_and_adam_step(tmp_path, monkeypatch):
+    calls = []
+
+    def capture_cuda_state(state, device):
+        assert state.device.type == "cpu" and state.dtype == torch.uint8 and state.ndim == 1
+        calls.append(device)
+
+    monkeypatch.setattr(torch.cuda, "set_rng_state", capture_cuda_state)
+    _assert_resumed_step_matches_uninterrupted(tmp_path, torch.device("cpu"))
+    assert calls == [torch.device("cpu")]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an actual CUDA GPU")
+def test_cuda_checkpoint_resume_stages_on_cpu_and_restores_both_rngs(tmp_path):
+    device = torch.device("cuda", torch.cuda.current_device())
+    with torch.random.fork_rng(devices=[device.index]):
+        _assert_resumed_step_matches_uninterrupted(tmp_path, device)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an actual CUDA GPU")
+def test_rng_restore_normalizes_accidentally_cuda_mapped_byte_states():
+    device = torch.device("cuda", torch.cuda.current_device())
+    with torch.random.fork_rng(devices=[device.index]):
+        states = {
+            "cpu_rng_state": torch.get_rng_state().to(device),
+            "cuda_rng_state": torch.cuda.get_rng_state(device).to(device),
+        }
+        expected_cpu, expected_cuda = torch.rand(9), torch.rand(9, device=device)
+        train.restore_checkpoint_rng(states, device)
+        assert torch.equal(torch.rand(9), expected_cpu)
+        assert torch.equal(torch.rand(9, device=device), expected_cuda)
+
+
+@pytest.mark.parametrize("name", ["cpu_rng_state", "cuda_rng_state"])
+@pytest.mark.parametrize(
+    "invalid", [None, [1, 2], torch.ones(3), torch.zeros((2, 3), dtype=torch.uint8)]
+)
+def test_rng_restore_rejects_invalid_bytes_before_changing_generators(name, invalid, monkeypatch):
+    states = {"cpu_rng_state": torch.get_rng_state(), "cuda_rng_state": torch.get_rng_state()}
+    states[name] = invalid
+    monkeypatch.setattr(torch, "set_rng_state", lambda *_: pytest.fail("must validate first"))
+    monkeypatch.setattr(torch.cuda, "set_rng_state", lambda *_: pytest.fail("must validate first"))
+    with pytest.raises(ValueError, match=name):
+        train.restore_checkpoint_rng(states, torch.device("cuda:0"))
+
+
+def test_checkpoint_loader_explicitly_uses_cpu_and_rejects_nonmapping(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_load(path, *, map_location, weights_only):
+        calls.append((path, map_location, weights_only))
+        return []
+
+    monkeypatch.setattr(torch, "load", fake_load)
+    path = tmp_path / "last.pt"
+    with pytest.raises(ValueError, match="checkpoint payload"):
+        train.load_checkpoint_on_cpu(path)
+    assert calls == [(path, "cpu", False)]
+
+
+def test_training_path_uses_cpu_staging_and_releases_checkpoint_references():
+    source = inspect.getsource(train._train_model_impl)
+    assert "saved = load_checkpoint_on_cpu(last_path)" in source
+    assert "restore_checkpoint_rng(saved, device)" in source
+    assert "del saved" in source
+    assert "selected = load_checkpoint_on_cpu(checkpoint)" in source
+    assert "del selected" in source
+    assert "map_location=device" not in source
+````
+
 # tests/test_conductance_v5_runner.py
 
 ````python
@@ -88339,6 +89095,212 @@ def test_tree_augmentation_depends_on_neither_conductance_nor_combined_track() -
     )
 ````
 
+# tests/test_resume_compat.py
+
+````python
+"""Explicit synthetic source fixtures; no training or artifact migrations."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+
+from chartgat import resume_compat as compat
+
+
+@pytest.fixture
+def transition(tmp_path, monkeypatch):
+    registry_path = tmp_path / "registry.json"
+    monkeypatch.setattr(compat, "REGISTRY_PATH", registry_path)
+    helper_hash = hashlib.sha256(Path(compat.__file__).read_bytes()).hexdigest()
+    registry = {
+        "schema_version": 1,
+        "patch_id": compat.PATCH_ID,
+        "base_commit": compat.BASE_COMMIT,
+        "changes": {
+            "research/example/train.py": {"before": "a" * 64, "after": "b" * 64},
+            compat.HELPER_SOURCE: {"before": None, "after": helper_hash},
+        },
+    }
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    previous = {"research/example/train.py": "a" * 64, "model.py": "c" * 64}
+    current = {
+        "research/example/train.py": "b" * 64,
+        "model.py": "c" * 64,
+        compat.HELPER_SOURCE: helper_hash,
+        compat.REGISTRY_SOURCE: hashlib.sha256(registry_path.read_bytes()).hexdigest(),
+    }
+    return registry_path, registry, previous, current
+
+
+def test_equal_snapshots_require_no_registry(tmp_path, monkeypatch):
+    monkeypatch.setattr(compat, "REGISTRY_PATH", tmp_path / "absent.json")
+    assert compat.require_source_compatibility({"fixture": "stable"}, {"fixture": "stable"}) is None
+
+
+def test_exact_forward_transition_retains_independent_provenance(transition):
+    _, _, previous, current = transition
+    old, new = copy.deepcopy(previous), copy.deepcopy(current)
+    evidence = compat.require_source_compatibility(previous, current)
+    assert evidence == {
+        "patch_id": compat.PATCH_ID,
+        "base_commit": compat.BASE_COMMIT,
+        "registry_sha256": current[compat.REGISTRY_SOURCE],
+        "previous_source_sha256": old,
+        "current_source_sha256": new,
+    }
+    assert previous == old and current == new
+    previous["model.py"] = "d" * 64
+    current["model.py"] = "e" * 64
+    assert evidence["previous_source_sha256"] == old
+    assert evidence["current_source_sha256"] == new
+
+
+@pytest.mark.parametrize("side", ["previous", "current"])
+def test_modified_unchanged_source_is_rejected(transition, side):
+    _, _, previous, current = transition
+    (previous if side == "previous" else current)["model.py"] = "d" * 64
+    with pytest.raises(ValueError, match="not covered"):
+        compat.require_source_compatibility(previous, current)
+
+
+@pytest.mark.parametrize("side", ["previous", "current"])
+def test_inexact_reviewed_digest_is_rejected(transition, side):
+    _, _, previous, current = transition
+    (previous if side == "previous" else current)["research/example/train.py"] = "d" * 64
+    assert not compat.snapshots_match(previous, current)
+
+
+def test_source_deletion_is_rejected(transition):
+    _, _, previous, current = transition
+    current.pop("model.py")
+    with pytest.raises(ValueError, match="cannot remove"):
+        compat.require_source_compatibility(previous, current)
+
+
+def test_unregistered_addition_is_rejected(transition):
+    _, _, previous, current = transition
+    current["extra.py"] = "d" * 64
+    assert not compat.snapshots_match(previous, current)
+
+
+@pytest.mark.parametrize("source", compat.COMPATIBILITY_SOURCE_FILES)
+def test_both_compatibility_files_are_required(transition, source):
+    _, _, previous, current = transition
+    current.pop(source)
+    with pytest.raises(ValueError, match="missing its compatibility"):
+        compat.require_source_compatibility(previous, current)
+
+
+def test_reverse_transition_is_not_implicitly_approved(transition):
+    _, _, previous, current = transition
+    assert compat.snapshots_match(previous, current)
+    assert not compat.snapshots_match(current, previous)
+
+
+def test_registry_changes_are_not_cached(transition):
+    registry_path, registry, previous, current = transition
+    assert compat.snapshots_match(previous, current)
+    registry["description"] = "changed after initial snapshot"
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    with pytest.raises(ValueError, match="registry changed"):
+        compat.require_source_compatibility(previous, current)
+
+
+def test_helper_digest_must_match_live_implementation(transition):
+    _, _, previous, current = transition
+    current[compat.HELPER_SOURCE] = "d" * 64
+    with pytest.raises(ValueError, match="helper changed"):
+        compat.require_source_compatibility(previous, current)
+
+
+def test_helper_digest_must_be_pinned(transition):
+    registry_path, registry, previous, current = transition
+    registry["changes"][compat.HELPER_SOURCE]["after"] = "d" * 64
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    current[compat.REGISTRY_SOURCE] = hashlib.sha256(registry_path.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="not pinned"):
+        compat.require_source_compatibility(previous, current)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("schema_version", True), ("patch_id", "unreviewed"), ("base_commit", "0" * 40)],
+)
+def test_registry_identity_is_pinned(transition, field, value):
+    registry_path, registry, previous, current = transition
+    registry[field] = value
+    registry_path.write_text(json.dumps(registry), encoding="utf-8")
+    current[compat.REGISTRY_SOURCE] = hashlib.sha256(registry_path.read_bytes()).hexdigest()
+    assert not compat.snapshots_match(previous, current)
+
+
+@pytest.mark.parametrize("name", ["/absolute.py", "../escape.py", "a\\b.py", "./a.py"])
+def test_noncanonical_paths_are_rejected(transition, name):
+    _, _, previous, current = transition
+    previous[name] = "d" * 64
+    current[name] = "d" * 64
+    assert not compat.snapshots_match(previous, current)
+
+
+def test_duplicate_registry_keys_are_rejected(transition):
+    registry_path, _, previous, current = transition
+    registry_path.write_text('{"schema_version": 1, "schema_version": 1}', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate"):
+        compat.require_source_compatibility(previous, current)
+
+
+def test_adopt_updates_memory_and_keeps_original_provenance(transition):
+    _, _, previous, current = transition
+    original = copy.deepcopy(previous)
+    record = {"source_sha256": previous, "scientific_recipe": {"epochs": 200}}
+    evidence = compat.adopt_source_snapshot(record, current)
+    assert record["source_sha256"] == current
+    assert record["source_compatibility"] == [evidence]
+    assert record["source_compatibility"][0]["previous_source_sha256"] == original
+    assert record["scientific_recipe"] == {"epochs": 200}
+    assert previous == original
+    assert compat.adopt_source_snapshot(record, current) is None
+    assert len(record["source_compatibility"]) == 1
+
+
+def test_failed_adoption_is_atomic_in_memory(transition):
+    _, _, previous, current = transition
+    record = {"source_sha256": previous, "source_compatibility": "invalid"}
+    original = copy.deepcopy(record)
+    with pytest.raises(ValueError, match="provenance"):
+        compat.adopt_source_snapshot(record, current)
+    assert record == original
+
+
+def test_partial_snapshot_still_requires_compatibility_additions(transition):
+    _, _, previous, current = transition
+    previous.pop("research/example/train.py")
+    current.pop("research/example/train.py")
+    assert compat.snapshots_match(previous, current)
+
+
+def test_existing_registry_is_not_an_approved_addition(transition):
+    _, _, previous, current = transition
+    previous[compat.REGISTRY_SOURCE] = "d" * 64
+    assert not compat.snapshots_match(previous, current)
+
+
+@pytest.mark.parametrize("side", ["old", "new"])
+def test_half_applied_release_is_rejected(transition, side):
+    _, _, previous, current = transition
+    if side == "old":
+        current["research/example/train.py"] = previous["research/example/train.py"]
+    else:
+        previous["research/example/train.py"] = current["research/example/train.py"]
+    with pytest.raises(ValueError, match="complete reviewed"):
+        compat.require_source_compatibility(previous, current)
+````
+
 # tests/test_rich_resource_calibration.py
 
 ````python
@@ -91112,6 +92074,276 @@ def test_conductance_main_tracks_explicit_worker_conflict(
     )
 ````
 
+# tests/test_scaling_recovery_compatibility.py
+
+````python
+"""CPU/file-fixture recovery integration only; never real GPU training or metrics."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import platform
+from pathlib import Path
+
+import pytest
+import torch
+
+from chartgat import resume_compat
+from scripts import calibrate_training_resources as calibration
+from scripts import run_conductance_scaling as conductance
+from scripts import run_cycle_scaling as cycle
+from scripts import run_rich_scaling as rich
+from scripts import training_resource_plan as resources
+
+
+def _legacy_snapshot(current):
+    """Reconstruct the reviewed predecessor from the actual checked-in registry."""
+    registry = json.loads(resume_compat.REGISTRY_PATH.read_bytes())
+    previous = dict(current)
+    for name, change in registry["changes"].items():
+        if name not in previous:
+            continue
+        assert previous[name] == change["after"]
+        if change["before"] is None:
+            previous.pop(name)
+        else:
+            previous[name] = change["before"]
+    previous.pop(resume_compat.REGISTRY_SOURCE)
+    assert previous != current
+    assert resume_compat.require_source_compatibility(previous, current) is not None
+    return previous
+
+
+def _fixture_module(name):
+    """Reuse existing explicit mock-child fixtures without importing their tests."""
+    spec = importlib.util.spec_from_file_location(
+        f"recovery_fixture_{name}", Path(__file__).with_name(f"{name}.py")
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _rich_args(tmp_path):
+    args = rich.parser().parse_args([
+        "--tracks", "conductance", "cycle", "--conductance-versions", "v5",
+        "--cycle-versions", "v2", "--profiles", "reference", "large",
+        "--model-seeds", "0", "--hardware-profile", "a6000-48gb",
+        "--data-root", str(tmp_path / "data"), "--results-root", str(tmp_path / "results"),
+        "--run-id", "debug-reviewed-recovery",
+    ])
+    rich._validate(args)
+    return args
+
+
+@pytest.mark.parametrize("drift", [None, "recipe", "source"])
+def test_existing_measured_plan_keeps_original_request_and_certificate_bytes(
+    tmp_path, monkeypatch, drift
+):
+    args = _rich_args(tmp_path)
+    request = rich._calibration_request(args, args.run_id)
+    request["source_sha256"] = _legacy_snapshot(request["source_sha256"])
+    if drift == "source":
+        request["source_sha256"]["research/cycle_pe/v2/model.py"] = "0" * 64
+    directory = args.results_root / "resource_calibration" / args.run_id
+    directory.mkdir(parents=True)
+    request_path, plan_path = directory / "request.json", directory / "resource-plan.json"
+    request_path.write_text(json.dumps(request, indent=3), encoding="utf-8")
+    plan_path.write_text('{"explicit_cpu_fixture_not_a_real_measurement": true}', encoding="utf-8")
+    request_before, plan_before = request_path.read_bytes(), plan_path.read_bytes()
+    hardware = {"debug_only": True}
+    plan = {
+        "_sha256": hashlib.sha256(plan_before).hexdigest(), "entries": [],
+        "request_sha256": resources.digest(request), "source_sha256": request["source_sha256"],
+        "hardware": {job["device"]: hardware for job in request["jobs"]},
+        "runtime": {
+            "python": platform.python_version(), "torch": torch.__version__,
+            "cuda": torch.version.cuda,
+        },
+    }
+    events = []
+    monkeypatch.setattr(calibration, "_hardware", lambda _name: hardware)
+    monkeypatch.setattr(calibration, "load_resource_plan", lambda *_a, **_kw: plan)
+    monkeypatch.setattr(rich, "load_resource_plan", lambda *_a, **_kw: plan)
+    monkeypatch.setattr(resources, "validate_plan_runtime", lambda _plan: events.append("runtime"))
+
+    def verify_inputs(selected_plan, jobs):
+        assert selected_plan is plan and jobs == request["jobs"]
+        events.append("official_input_validation")
+
+    def verify_existing_plan(command, _log, _environment):
+        assert Path(command[command.index("--request") + 1]) == request_path
+        assert calibration._run_locked(request_path, directory) == plan_path
+        events.append("existing_plan_returned_without_measurement")
+        return 0
+
+    monkeypatch.setattr(calibration, "verify_plan_inputs", verify_inputs)
+    monkeypatch.setattr(rich, "_run_logged", verify_existing_plan)
+    if drift == "recipe":
+        args.model_seeds = [0, 1]
+    run_dir = args.results_root / "rich_scaling" / args.run_id
+    if drift is None:
+        rich._ensure_measured_plan(args, args.run_id, run_dir)
+        assert events == [
+            "official_input_validation", "existing_plan_returned_without_measurement", "runtime"
+        ]
+        assert args.resolved_resource_plan["_sha256"] == hashlib.sha256(plan_before).hexdigest()
+    else:
+        with pytest.raises(ValueError, match="source/configuration differs"):
+            rich._ensure_measured_plan(args, args.run_id, run_dir)
+        assert events == []
+    assert request_path.read_bytes() == request_before
+    assert plan_path.read_bytes() == plan_before
+
+
+@pytest.mark.parametrize("case", ["resume", "completed", "recipe", "artifact", "source"])
+def test_conductance_legacy_manifest_recovery_revalidates_and_skips_completed_children(
+    tmp_path, monkeypatch, case
+):
+    current = conductance._source_snapshot()
+    previous = _legacy_snapshot(current)
+    fixture = _fixture_module("test_conductance_scaling_runner")
+    options, calls = fixture._stub(tmp_path, monkeypatch)
+    options += ["--versions", "v5", "--model-seeds", "0"]
+    monkeypatch.setattr(conductance, "_source_snapshot", lambda: previous)
+    assert conductance.main(options) == 0  # Existing synthetic subprocess fixture only.
+    path = tmp_path / "conductance_gat/scaling/unit-fixture/manifest.json"
+    manifest = json.loads(path.read_bytes())
+    manifest["status"] = "failed"
+    if case == "resume":
+        manifest["jobs"][0]["status"] = "failed"
+    elif case == "recipe":
+        manifest["config"]["epochs"] += 1
+    elif case == "source":
+        manifest["source_sha256"]["research/conductance_gat/v5/model.py"] = "0" * 64
+    elif case == "artifact":
+        metrics_path = Path(manifest["jobs"][0]["metrics_path"])
+        metric = json.loads(metrics_path.read_bytes())
+        metric["validation"] = 0.5
+        metrics_path.write_text(json.dumps(metric), encoding="utf-8")
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    before = path.read_bytes()
+    unchanged_completed = Path(manifest["jobs"][-1]["metrics_path"])
+    completed_before = unchanged_completed.read_bytes()
+    calls.clear()
+    monkeypatch.setattr(conductance, "_source_snapshot", lambda: current)
+    result = conductance.main(options)
+    if case in {"recipe", "artifact", "source"}:
+        assert result == 1 and calls == [] and path.read_bytes() == before
+    else:
+        assert result == 0
+        assert len(calls) == (2 if case == "resume" else 0)
+        recovered = json.loads(path.read_bytes())
+        assert recovered["source_sha256"] == current
+        assert recovered["source_compatibility"][0]["previous_source_sha256"] == previous
+        assert recovered["status"] == "passed"
+    assert unchanged_completed.read_bytes() == completed_before
+
+
+@pytest.mark.parametrize("artifact_changed", [False, True])
+def test_cycle_legacy_failed_manifest_adoption_does_not_trust_passed_candidate_status(
+    tmp_path, monkeypatch, artifact_changed
+):
+    args = cycle.parser().parse_args([
+        "--versions", "v2", "--encodings", "se", "pe", "--profiles", "reference",
+        "--datasets", "zinc12k", "--model-seeds", "0", "--data-root", str(tmp_path / "data"),
+        "--results-root", str(tmp_path), "--run-id", "debug-cycle-recovery",
+    ])
+    cycle._validate(args)
+    run_dir = tmp_path / "cycle_pe/scaling" / args.run_id
+    run_dir.mkdir(parents=True)
+    current = cycle._source_snapshot()
+    previous = _legacy_snapshot(current)
+    jobs = cycle.make_jobs(args, run_dir)
+    manifest = cycle._manifest_base(args, args.run_id, run_dir, jobs, {"debug": True}, previous)
+    accepted = [{"debug_certificate": "unchanged"}]
+    manifest["status"] = "failed"
+    jobs[0].update(status="passed", returncode=0, accepted_rows=accepted)
+    jobs[1].update(status="failed", returncode=1)
+    path = run_dir / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    before = path.read_bytes()
+    recovered, status = cycle._resume_manifest(
+        args, args.run_id, run_dir, cycle.make_jobs(args, run_dir), {"debug": True}, current
+    )
+    assert status == "failed" and recovered["source_sha256"] == current
+    assert recovered["source_compatibility"][0]["previous_source_sha256"] == previous
+    reads = []
+
+    def read_rows(job):
+        reads.append(job["job_id"])
+        return [{"debug_certificate": "changed"}] if artifact_changed else accepted
+
+    monkeypatch.setattr(cycle, "read_job_rows", read_rows)
+    rows = cycle._recover_candidate_rows(recovered["jobs"])
+    assert reads == [jobs[0]["job_id"]]
+    assert rows == ([] if artifact_changed else accepted)
+    assert recovered["jobs"][0]["status"] == ("pending" if artifact_changed else "passed")
+    assert recovered["jobs"][1]["status"] == "pending"
+    assert path.read_bytes() == before  # Adoption changes only the returned in-memory manifest.
+
+
+def test_rich_legacy_failed_manifest_revalidates_completed_track_and_continues_only_failed_work(
+    tmp_path, monkeypatch
+):
+    fixture = _fixture_module("test_rich_scaling_runner")
+    current, calls = rich._source_snapshot(), []
+    previous = _legacy_snapshot(current)
+    monkeypatch.setattr(rich, "_ensure_measured_plan", lambda *_args: None)
+    monkeypatch.setattr(rich, "_source_snapshot", lambda: previous)
+    options = ["--tracks", "conductance", "cycle", *fixture._base_options(tmp_path)]
+
+    def first_run(command, _log, _environment):
+        if Path(command[2]).name == "run_cycle_scaling.py":
+            return 9
+        fixture._write_summary(command)
+        return 0
+
+    monkeypatch.setattr(rich, "_run_logged", first_run)
+    assert rich.main(options) == 1
+    path = tmp_path / "rich_scaling/unit/manifest.json"
+    old = json.loads(path.read_bytes())
+    completed_path = Path(old["jobs"][0]["summary_path"])
+    completed_before = completed_path.read_bytes()
+
+    def continue_run(command, _log, _environment):
+        script = Path(command[2]).name
+        calls.append(script)
+        if script == "run_cycle_scaling.py":
+            fixture._write_summary(command)
+        return 0  # Completed conductance track only re-verifies its unchanged artifacts.
+
+    monkeypatch.setattr(rich, "_run_logged", continue_run)
+    monkeypatch.setattr(rich, "_source_snapshot", lambda: current)
+    assert rich.main(options) == 0
+    recovered = json.loads(path.read_bytes())
+    assert recovered["status"] == "passed" and recovered["resume_count"] == 1
+    assert recovered["source_sha256"] == current
+    assert recovered["source_compatibility"][0]["previous_source_sha256"] == previous
+    assert calls == ["run_conductance_scaling.py", "run_cycle_scaling.py"]
+    assert completed_path.read_bytes() == completed_before
+
+
+@pytest.mark.parametrize("runner,check", [
+    (conductance, "_check_sources"), (rich, "_check_central_sources")
+])
+def test_reviewed_resume_does_not_allow_any_source_change_mid_run(monkeypatch, runner, check):
+    current = runner._source_snapshot()
+    previous = _legacy_snapshot(current)
+    manifest = {"source_sha256": previous, "source_integrity_valid": True}
+    resume_compat.adopt_source_snapshot(manifest, current)
+    monkeypatch.setattr(runner, "_source_snapshot", lambda: current)
+    getattr(runner, check)(manifest)
+    # Even the reviewed transition cannot be applied during an active run.
+    monkeypatch.setattr(runner, "_source_snapshot", lambda: previous)
+    with pytest.raises(RuntimeError, match="source changed"):
+        getattr(runner, check)(manifest)
+    assert manifest["source_integrity_valid"] is False
+````
+
 # tests/test_seed_protocol.py
 
 ````python
@@ -92695,4 +93927,228 @@ def test_source_snapshot_covers_tree_model_runner_and_shared_math() -> None:
         "scripts/telemetry_validation.py",
     ):
         assert name in snapshot and len(snapshot[name]) == 64
+````
+
+# tests/test_v5_recovery_compatibility.py
+
+````python
+"""CPU-only recovery boundaries plus unstubbed, checked-in registry integration."""
+
+from __future__ import annotations
+
+import copy
+import json
+
+import pytest
+
+from chartgat import resume_compat
+from research.conductance_gat.tests.test_v5_contract import (
+    test_report_is_partial_safe_then_requires_complete_pairs as _write_valid_pair,
+)
+from research.conductance_gat.tests.test_v5_p0_integrity import _identity
+from research.conductance_gat.v5 import report, train
+
+
+@pytest.fixture
+def reviewed_sources(monkeypatch):
+    """Boundary-only stub; the real-registry test below does not use this fixture."""
+    before = {"research/conductance_gat/v5/train.py": "a" * 64}
+    after = {"research/conductance_gat/v5/train.py": "b" * 64}
+
+    def one_reviewed_transition(previous, current):
+        return previous == current or (previous == before and current == after)
+
+    monkeypatch.setattr(train, "snapshots_match", one_reviewed_transition)
+    monkeypatch.setattr(report, "snapshots_match", one_reviewed_transition)
+    return before, after
+
+
+def _identities(sources):
+    previous = _identity()
+    previous["source_sha256"] = copy.deepcopy(sources[0])
+    current = copy.deepcopy(previous)
+    current["source_sha256"] = copy.deepcopy(sources[1])
+    return previous, current
+
+
+def _best(identity):
+    return {
+        "resume_identity": copy.deepcopy(identity),
+        "resume_identity_sha256": train._canonical_sha256(identity),
+        "epoch": 4,
+        "validation": 0.75,
+        "selection_role": "primary",
+    }
+
+
+def _validate_best(selected, current, **overrides):
+    options = {
+        "expected_identity": current,
+        "expected_identity_sha256": train._canonical_sha256(current),
+        "expected_epoch": 4,
+        "expected_metric": 0.75,
+    }
+    options.update(overrides)
+    train.validate_selected_checkpoint(selected, **options)
+
+
+def _write_pair(tmp_path, sources):
+    # Reuse the existing artifact fixture, not a fake _validate_child result.
+    _write_valid_pair(tmp_path)
+    jobs = []
+    for condition, source in zip(("fixed_c", "shared_dynamic_c"), sources, strict=True):
+        path = tmp_path / condition / "metrics.json"
+        child = json.loads(path.read_text(encoding="utf-8"))
+        child["source_sha256"] = copy.deepcopy(source)
+        child["resume_identity"]["source_sha256"] = copy.deepcopy(source)
+        child["resume_identity_sha256"] = train._canonical_sha256(child["resume_identity"])
+        path.write_text(json.dumps(child), encoding="utf-8")
+        jobs.append({"dataset": "cora", "condition": condition, "output_dir": str(path.parent)})
+    return {
+        "status": "passed",
+        "config": {"datasets": ["cora"], "model_seed": 0, "batch_size": 1},
+        "jobs": jobs,
+    }
+
+
+def test_old_last_and_best_accept_reviewed_source_change_without_rewriting(reviewed_sources):
+    previous, current = _identities(reviewed_sources)
+    selected = _best(previous)
+    before = copy.deepcopy((previous, current, selected))
+    train.validate_resume_identity(previous, current, train._canonical_sha256(previous))
+    _validate_best(selected, current)
+    assert (previous, current, selected) == before
+    assert selected["resume_identity_sha256"] != train._canonical_sha256(current)
+
+
+@pytest.mark.parametrize(
+    ("field", "subkey", "replacement"),
+    [
+        ("configuration", "hidden_channels", 128),
+        ("configuration", "workers", 4),
+        ("configuration", "batch_size", 8),
+        ("configuration", "model_seed", 1),
+        ("dataset_protocol", "split", "different-split"),
+        ("runtime_versions", "torch", "different-runtime"),
+        ("cache_sha256", None, "e" * 64),
+        ("dataset_protocol_sha256", None, "e" * 64),
+        ("initial_state_sha256", None, "e" * 64),
+        ("condition", None, "fixed_c"),
+        ("schedule", None, []),
+    ],
+)
+def test_reviewed_sources_never_relax_recipe_data_or_runtime_contracts(
+    reviewed_sources, field, subkey, replacement
+):
+    previous, current = _identities(reviewed_sources)
+    if subkey is None:
+        current[field] = replacement
+    else:
+        current[field][subkey] = replacement
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        train.validate_resume_identity(previous, current, train._canonical_sha256(previous))
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        _validate_best(_best(previous), current)
+
+
+def test_last_identity_hash_and_unreviewed_sources_remain_rejected(reviewed_sources):
+    previous, current = _identities(reviewed_sources)
+    with pytest.raises(ValueError, match="identity hash mismatch"):
+        train.validate_resume_identity(previous, current, "0" * 64)
+    current["source_sha256"]["research/conductance_gat/v5/train.py"] = "c" * 64
+    with pytest.raises(ValueError, match="source_sha256"):
+        train.validate_resume_identity(previous, current, train._canonical_sha256(previous))
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "message"),
+    [
+        ("resume_identity_sha256", "0" * 64, "identity hash mismatch"),
+        ("epoch", 3, "epoch"),
+        ("validation", 0.74, "best_metric"),
+        ("selection_role", "global_prediction_auxiliary", "selection role"),
+    ],
+)
+def test_old_best_still_checks_its_own_hash_epoch_metric_and_role(
+    reviewed_sources, field, replacement, message
+):
+    previous, current = _identities(reviewed_sources)
+    selected = _best(previous)
+    selected[field] = replacement
+    with pytest.raises(ValueError, match=message):
+        _validate_best(selected, current)
+
+
+def test_best_requires_current_expected_identity_hash_too(reviewed_sources):
+    previous, current = _identities(reviewed_sources)
+    with pytest.raises(ValueError, match="selected last.pt identity"):
+        _validate_best(
+            _best(previous), current, expected_identity_sha256=train._canonical_sha256(previous)
+        )
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mixed_completed_pair_accepts_both_orderings_without_rewriting_artifacts(
+    tmp_path, reviewed_sources, reverse
+):
+    sources = tuple(reversed(reviewed_sources)) if reverse else reviewed_sources
+    manifest = _write_pair(tmp_path, sources)
+    before = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+    comparison = report.build_comparison(tmp_path, manifest)
+    assert comparison["status"] == "passed"
+    assert comparison["contrasts"][0]["dynamic_minus_fixed"] == 0
+    assert {row["condition"] for row in comparison["rows"]} == {"fixed_c", "shared_dynamic_c"}
+    assert all(path.read_bytes() == contents for path, contents in before.items())
+
+
+@pytest.mark.parametrize(
+    ("field", "subkey", "replacement"),
+    [
+        ("configuration", "dropout", 0.6),
+        ("versions", "torch", "different-runtime"),
+        ("protocol", "split", "different-split"),
+        ("shared_initial_state_sha256", None, "e" * 64),
+        ("source_sha256", "research/conductance_gat/v5/train.py", "c" * 64),
+    ],
+)
+def test_mixed_pair_keeps_non_source_and_unreviewed_source_mismatch_guards(
+    tmp_path, reviewed_sources, field, subkey, replacement
+):
+    manifest = _write_pair(tmp_path, reviewed_sources)
+    path = tmp_path / "shared_dynamic_c" / "metrics.json"
+    child = json.loads(path.read_text(encoding="utf-8"))
+    if subkey is None:
+        child[field] = replacement
+    else:
+        child[field][subkey] = replacement
+    if field == "source_sha256":
+        child["resume_identity"][field] = copy.deepcopy(child[field])
+        child["resume_identity_sha256"] = train._canonical_sha256(child["resume_identity"])
+    path.write_text(json.dumps(child), encoding="utf-8")
+    with pytest.raises(report.ComparisonIntegrityError, match="fixed/dynamic .* mismatch"):
+        report.build_comparison(tmp_path, manifest)
+
+
+def test_real_registry_preserves_old_checkpoint_contracts_and_completed_pair(tmp_path):
+    # No snapshots_match/require_source_compatibility mocks in this test.
+    registry = json.loads(resume_compat.REGISTRY_PATH.read_text(encoding="utf-8"))
+    current_sources = train.implementation_source_hashes()
+    previous_sources = copy.deepcopy(current_sources)
+    previous_sources.pop(resume_compat.REGISTRY_SOURCE)
+    for name, change in registry["changes"].items():
+        if name not in previous_sources:
+            continue
+        if change["before"] is None:
+            previous_sources.pop(name)
+        else:
+            previous_sources[name] = change["before"]
+    evidence = resume_compat.require_source_compatibility(previous_sources, current_sources)
+    assert evidence["patch_id"] == "v5-rng-cycle-workers-v1"
+    assert resume_compat.snapshots_match(previous_sources, current_sources)
+    assert not resume_compat.snapshots_match(current_sources, previous_sources)
+    previous, current = _identities((previous_sources, current_sources))
+    train.validate_resume_identity(previous, current, train._canonical_sha256(previous))
+    _validate_best(_best(previous), current)
+    manifest = _write_pair(tmp_path, (previous_sources, current_sources))
+    assert report.build_comparison(tmp_path, manifest)["status"] == "passed"
 ````

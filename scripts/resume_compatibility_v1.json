@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "patch_id": "v5-rng-cycle-workers-v1",
+  "base_commit": "76e514a8bf444ef82a323f18ff31982908cf2d8f",
+  "description": "Reviewed recovery-only transition. CPU RNG/checkpoint staging and Cycle preparation worker identity are repaired; model, official data, optimizer recipe, and measured resource selections stay unchanged. Existing artifacts keep their own hashes.",
+  "changes": {
+    "research/conductance_gat/v5/train.py": {
+      "before": "e0f68e4ecb73e93018af1a12d63d36050228eef58661234c687b98fa846db6ad",
+      "after": "5bda72fb2a947f521d57337e2dab3645879b256d8d187171c1031d3396c60705"
+    },
+    "research/conductance_gat/v5/report.py": {
+      "before": "ad8964970d3372cc631c49f412057941a067c65c0b09d160139780350629c0f7",
+      "after": "5c417d340ff299eb589c2044b975717285e56425441bf401094ff3abdca4e249"
+    },
+    "scripts/calibrate_training_resources.py": {
+      "before": "6f26dc7fd5bc36f618024dfca42166f5eb3a0052d4efdc434393be8445e63953",
+      "after": "ef30d604629451139443088b0bc738613830b2550175c4f80c4de85d25566016"
+    },
+    "scripts/run_conductance_scaling.py": {
+      "before": "3295c0a5b2ca36e5c27764a7fd710d44ebf09bc19d5864544178201486cd4f44",
+      "after": "7dbf3c6f812ab18f5d727f42c52442c212eb85042b900afaefb49d6cf18b9304"
+    },
+    "scripts/run_cycle_scaling.py": {
+      "before": "5b4568eb198035e845101cbf501555bdf6401cd57028e86befcf2473df9e669b",
+      "after": "44b3a59b402e5cd5135a3e1158f21eaf0016e6f8f7609c92d975f80845a94d9a"
+    },
+    "scripts/run_rich_scaling.py": {
+      "before": "b38d28c7e9ed7d104173b5609cd21c3df6c3f02739283a24cfd709ddf23aff4b",
+      "after": "3b696e1a151808fb7d3abf9ffc2eded0b7592ae35561e3d7373307f848aed2ae"
+    },
+    "scripts/training_resource_plan.py": {
+      "before": "14554bcb5519081607995045dbce2d00347c096c77e742a075f5144df8351fb6",
+      "after": "3088b02c1aca4e3a31bc4b4e6cd5fdd4154ee08e01ca6ec125ff7b2f2e4bdf5a"
+    },
+    "src/chartgat/resume_compat.py": {
+      "before": null,
+      "after": "379e4691c24fa888c937a25420c37f8ef9ab542551eae406ed81e608856afa35"
+    },
+    "scripts/generate_code_summary.py": {
+      "before": "9191588194cdcfc09e53404f022ea45a5c1f5a33db513e2b8667349336744e01",
+      "after": "bff0e5a34d9eaba2a5d4c1482feae35288a079cfa29881a3fd9548718fa6ed1a"
+    }
+  }
+}

@@ -33,6 +33,7 @@ LANGUAGES = {
     ".yml": "yaml",
     ".sh": "bash",
     ".ps1": "powershell",
+    ".json": "json",
     ".txt": "text",
 }
 
@@ -51,6 +52,8 @@ def _is_source(path: Path, *, root: Path) -> bool:
     if not path.is_file() or _excluded(path, root=root):
         return False
     if path.name in {".gitignore", ".gitattributes"}:
+        return True
+    if path.relative_to(root).as_posix() == "scripts/resume_compatibility_v1.json":
         return True
     if path.suffix in SOURCE_SUFFIXES:
         return True

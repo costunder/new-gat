@@ -16,6 +16,11 @@ import torch
 
 from chartgat.cache import atomic_publish, atomic_write_json
 from chartgat.observability import RuntimeResourceMonitor, observed
+from chartgat.resume_compat import (
+    COMPATIBILITY_SOURCE_FILES,
+    require_source_compatibility,
+    snapshots_match,
+)
 
 from ..ablation.model import state_sha256
 from ..ablation.train import _configure_fp32, _make_data, _require_cuda, training_loss
@@ -59,6 +64,7 @@ _SHARED_IMPLEMENTATION_SOURCES = (
     "research/conductance_gat/benchmark.py",
     "research/conductance_gat/benchmark_data.py",
     "src/chartgat/cache.py",
+    *COMPATIBILITY_SOURCE_FILES,
 )
 
 
@@ -106,9 +112,7 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
         "loader_workers": loader_workers,
         "persistent_workers": loader_workers > 0,
         "prefetch_factor": 2 if loader_workers > 0 else None,
-        "worker_configuration_source": getattr(
-            args, "worker_configuration_source", "explicit_cli"
-        ),
+        "worker_configuration_source": getattr(args, "worker_configuration_source", "explicit_cli"),
         "loader_worker_policy": (
             "PPI uses the configured worker pool with deterministic epoch-seeded shuffling; "
             "transductive full/sampled graphs use no DataLoader workers"
@@ -373,22 +377,16 @@ def validate_optimizer_parameter_ownership(
         )
 
 
-def validate_active_gradient_connectivity(
-    model: torch.nn.Module, active_groups: list[str]
-) -> None:
+def validate_active_gradient_connectivity(model: torch.nn.Module, active_groups: list[str]) -> None:
     active = set(active_groups)
     expected = [
         (name, parameter)
         for name, parameter in model.named_parameters()
         if parameter_group(name) in active
     ]
-    requires_mismatch = [
-        name for name, parameter in expected if not parameter.requires_grad
-    ]
+    requires_mismatch = [name for name, parameter in expected if not parameter.requires_grad]
     missing = [
-        name
-        for name, parameter in expected
-        if parameter.requires_grad and parameter.grad is None
+        name for name, parameter in expected if parameter.requires_grad and parameter.grad is None
     ]
     nonfinite = [
         name
@@ -447,9 +445,7 @@ def merge_efficiency(
     }
 
 
-def training_throughput(
-    history: list[dict[str, Any]], elapsed_seconds: float
-) -> dict[str, Any]:
+def training_throughput(history: list[dict[str, Any]], elapsed_seconds: float) -> dict[str, Any]:
     """Report retained training work over the existing cumulative wall-time interval.
 
     History and elapsed time both include restored checkpoint state. This is not
@@ -481,9 +477,7 @@ def training_throughput(
         return (
             observed(count / elapsed_seconds, unit=unit)
             if elapsed_seconds > 0
-            else observed(
-                None, reason="observed cumulative wall duration was zero", unit=unit
-            )
+            else observed(None, reason="observed cumulative wall duration was zero", unit=unit)
         )
 
     return {
@@ -590,9 +584,7 @@ def _v5_data_observability(
         unit = "nodes"
     elif isinstance(data, dict):
         split_counts = {
-            name: len(loader.dataset)
-            for name, loader in data.items()
-            if hasattr(loader, "dataset")
+            name: len(loader.dataset) for name, loader in data.items() if hasattr(loader, "dataset")
         }
         total_units = graph_observation["official_graph_count"]
         unit = "graphs"
@@ -601,9 +593,7 @@ def _v5_data_observability(
         total_units = graph_observation["official_graph_count"]
         unit = "graphs"
     training_units = split_counts.get("train", 0)
-    validation_units = sum(
-        split_counts.get(name, 0) for name in ("validation", "valid", "val")
-    )
+    validation_units = sum(split_counts.get(name, 0) for name in ("validation", "valid", "val"))
     actually_used = training_units + validation_units
     if total_units > 0:
         used_fraction = observed(actually_used / total_units, unit="fraction")
@@ -639,9 +629,7 @@ def _v5_data_observability(
         "time_window": observed(
             None, reason="not applicable to static graph benchmarks", unit="steps"
         ),
-        "input_resolution": observed(
-            None, reason="not applicable to graph feature tensors"
-        ),
+        "input_resolution": observed(None, reason="not applicable to graph feature tensors"),
     }
 
 
@@ -1024,8 +1012,40 @@ def validate_resume_identity(actual: Any, expected: dict[str, Any], stored_sha25
         keys = sorted(
             key for key in set(actual) | set(expected) if actual.get(key) != expected.get(key)
         )
+        if keys == ["source_sha256"] and snapshots_match(
+            actual["source_sha256"], expected["source_sha256"]
+        ):
+            return
         detail = ", ".join(keys) if keys else "unknown"
         raise ValueError(f"last.pt resume identity mismatch: {detail}")
+
+
+def load_checkpoint_on_cpu(path: Path) -> dict[str, Any]:
+    """Keep RNG bytes and checkpoint staging storage off the training GPU.
+
+    Model loading copies tensors into the existing parameter devices, and the
+    optimizer loader casts its moments to those parameter devices. Mapping the
+    whole payload to CUDA instead also moves the CPU generator's ByteTensor and
+    retains an unnecessary second model allocation during resumed training.
+    """
+
+    saved = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(saved, dict):
+        raise ValueError(f"{path.name} checkpoint payload is invalid")
+    return saved
+
+
+def restore_checkpoint_rng(saved: dict[str, Any], device: torch.device) -> None:
+    """Restore both generators from CPU byte states, including the CUDA one."""
+
+    states = {}
+    for name in ("cpu_rng_state", "cuda_rng_state"):
+        value = saved.get(name)
+        if not isinstance(value, torch.Tensor) or value.dtype != torch.uint8 or value.ndim != 1:
+            raise ValueError(f"last.pt {name} must be a one-dimensional uint8 tensor")
+        states[name] = value.detach().cpu().contiguous()
+    torch.set_rng_state(states["cpu_rng_state"])
+    torch.cuda.set_rng_state(states["cuda_rng_state"], device)
 
 
 def recover_best_checkpoint(checkpoint: Path, previous: Path, expected_hash: Any) -> str:
@@ -1088,7 +1108,7 @@ def validate_selected_checkpoint(
         expected_identity,
         selected.get("resume_identity_sha256"),
     )
-    if selected.get("resume_identity_sha256") != expected_identity_sha256:
+    if _canonical_sha256(expected_identity) != expected_identity_sha256:
         raise ValueError("best.pt identity is not the selected last.pt identity")
     if selected.get("epoch") != expected_epoch:
         raise ValueError("best.pt epoch does not match last.pt best_epoch")
@@ -1188,8 +1208,7 @@ def _record_failure_resources(
         atomic_write_json(output / FAILURE_RESOURCE_FILENAME, payload)
     except BaseException as exc:  # failure reporting must not mask the scientific failure
         error.add_note(
-            "failure resource telemetry could not be written: "
-            f"{type(exc).__name__}: {exc}"
+            f"failure resource telemetry could not be written: {type(exc).__name__}: {exc}"
         )
     if cleanup_error is not None:
         error.add_note(f"resource monitor cleanup failed: {cleanup_error}")
@@ -1335,8 +1354,9 @@ def _train_model_impl(
     best_recovery_slot = "fresh"
     effective_group_steps = {name: 0 for name in _PARAMETER_GROUPS}
     gradient_groups_validated_this_invocation: set[str] = set()
+    resume_source_compatibility: list[dict[str, Any]] = []
     if args.resume and last_path.exists():
-        saved = torch.load(last_path, map_location=device, weights_only=False)
+        saved = load_checkpoint_on_cpu(last_path)
         if saved.get("schema_version") != 3:
             raise ValueError("last.pt uses an incompatible V5 selection-state schema")
         validate_resume_identity(
@@ -1344,6 +1364,20 @@ def _train_model_impl(
             resume_identity,
             saved.get("resume_identity_sha256"),
         )
+        stored_transitions = saved.get("resume_source_compatibility", [])
+        if not isinstance(stored_transitions, list) or any(
+            not isinstance(item, dict) for item in stored_transitions
+        ):
+            raise ValueError("last.pt source compatibility history is invalid")
+        resume_source_compatibility = list(stored_transitions)
+        transition = require_source_compatibility(
+            saved["resume_identity"]["source_sha256"], resume_identity["source_sha256"]
+        )
+        if transition is not None:
+            resume_source_compatibility.append(transition)
+            print(
+                f"[resume compatibility] {transition['patch_id']}; saved epoch retained", flush=True
+            )
         saved_history, saved_epoch = saved.get("history"), saved.get("epoch")
         if (
             not isinstance(saved_history, list)
@@ -1379,8 +1413,8 @@ def _train_model_impl(
         best_recovery_slot = recover_best_checkpoint(
             checkpoint, previous_checkpoint, best_checkpoint_sha256
         )
-        torch.set_rng_state(saved["cpu_rng_state"])
-        torch.cuda.set_rng_state(saved["cuda_rng_state"], device)
+        restore_checkpoint_rng(saved, device)
+        del saved
     validation_indices = indices["validation"] if indices is not None else None
     validation_data = _validation_source(data, sampler)
     torch.cuda.reset_peak_memory_stats(device)
@@ -1402,16 +1436,15 @@ def _train_model_impl(
                 loss, count = training_loss(logits, graph, train_indices)
             if phase_state["active_parameter_groups"]:
                 loss.backward()
-                groups_requiring_validation = set(
-                    phase_state["active_parameter_groups"]
-                ) - gradient_groups_validated_this_invocation
+                groups_requiring_validation = (
+                    set(phase_state["active_parameter_groups"])
+                    - gradient_groups_validated_this_invocation
+                )
                 if groups_requiring_validation:
                     validate_active_gradient_connectivity(
                         model, sorted(groups_requiring_validation)
                     )
-                    gradient_groups_validated_this_invocation.update(
-                        groups_requiring_validation
-                    )
+                    gradient_groups_validated_this_invocation.update(groups_requiring_validation)
                 if (
                     args.condition == "shared_dynamic_c"
                     and phase_state["coordinate"] in {"conductance", "joint"}
@@ -1549,6 +1582,7 @@ def _train_model_impl(
                 "first_c_gradient": first_c_gradient,
                 "cpu_rng_state": torch.get_rng_state(),
                 "cuda_rng_state": torch.cuda.get_rng_state(device),
+                "resume_source_compatibility": resume_source_compatibility,
                 **efficiency,
             },
         )
@@ -1580,7 +1614,7 @@ def _train_model_impl(
     best_recovery_slot = recover_best_checkpoint(
         checkpoint, previous_checkpoint, best_checkpoint_sha256
     )
-    selected = torch.load(checkpoint, map_location=device, weights_only=False)
+    selected = load_checkpoint_on_cpu(checkpoint)
     validate_selected_checkpoint(
         selected,
         expected_identity=resume_identity,
@@ -1590,6 +1624,7 @@ def _train_model_impl(
         expected_selection_role="primary",
     )
     model.load_state_dict(selected["model_state"])
+    del selected
     for operator in model.operators:
         operator.estimator.override = None
     interventions = selected_checkpoint_interventions(
@@ -1637,9 +1672,7 @@ def _train_model_impl(
         "epochs_requested": args.epochs,
         "epochs_completed": len(history),
         "early_stopping_patience": args.patience,
-        "planned_maximum_optimizer_steps": batch_observability[
-            "planned_maximum_training_batches"
-        ],
+        "planned_maximum_optimizer_steps": batch_observability["planned_maximum_training_batches"],
         "actual_training_batches": observed_training_batches,
         "actual_optimizer_steps": optimizer_steps,
         "effective_optimizer_steps_by_group": effective_group_steps,
@@ -1757,6 +1790,7 @@ def _train_model_impl(
         "protocol": protocol,
         "cache_sha256": protocol["data_sha256"],
         "source_sha256": resume_identity["source_sha256"],
+        "resume_source_compatibility": resume_source_compatibility,
         "initial_state_sha256": initial_state_sha256,
         "shared_initial_state_sha256": shared_state_sha256,
         "history_sha256": sha256_file(history_path),

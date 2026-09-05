@@ -24,6 +24,7 @@ for directory in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(directory))
 
 from chartgat.cache import atomic_write_json  # noqa: E402
+from chartgat.resume_compat import require_source_compatibility  # noqa: E402
 from scripts.training_resource_plan import (  # noqa: E402
     SCHEMA_VERSION,
     allocated_cpu_count,
@@ -156,13 +157,73 @@ def _measure(job, loaded, args, *, batch_size: int, workers: int) -> dict[str, A
     return measured
 
 
+def _scientific_input_identity(identity: dict[str, Any], *, track: str) -> dict[str, Any]:
+    """Exclude only Cycle's loader observation, never mutate persisted evidence.
+
+    Cycle's immutable cache loader records the workers used on this particular
+    read alongside its source/split/preparation identity. Calibration intentionally
+    selects a potentially different worker policy for training. The original
+    observation stays in the plan and protocol; it is not a dataset change.
+    """
+    if track == "cycle":
+        return {key: value for key, value in identity.items() if key != "preparation_workers"}
+    return identity
+
+
+def _changed_identity_fields(previous: Any, current: Any, *, path: str) -> list[str]:
+    """Report precise differing fields while leaving the full evidence untouched."""
+    if isinstance(previous, dict) and isinstance(current, dict):
+        changed = []
+        for key in sorted(previous.keys() | current.keys()):
+            field = f"{path}.{key}"
+            if key not in previous or key not in current:
+                changed.append(field)
+            else:
+                changed.extend(_changed_identity_fields(previous[key], current[key], path=field))
+        return changed
+    return [] if previous == current else [path]
+
+
+def _verify_loaded_input(
+    entry: dict[str, Any], identity: dict[str, Any], maximum: int, axis: str, *, context: str
+) -> None:
+    previous = entry["input_identity"]
+    track = entry["track"]
+    changed = _changed_identity_fields(
+        _scientific_input_identity(previous, track=track),
+        _scientific_input_identity(identity, track=track),
+        path="input_identity",
+    )
+    for key, value in (("natural_training_split_size", maximum), ("batch_axis", axis)):
+        if entry[key] != value:
+            changed.append(key)
+    if changed:
+        raise ValueError(f"{context}; {_group_key(entry)}; changed fields: {', '.join(changed)}")
+    if track == "cycle" and previous.get("preparation_workers") != identity.get(
+        "preparation_workers"
+    ):
+        print(
+            f"[calibration input verified] {_group_key(entry)}: unchanged official data; "
+            f"preparation_workers {previous.get('preparation_workers')} -> "
+            f"{identity.get('preparation_workers')} is execution metadata; "
+            "original plan observation preserved",
+            flush=True,
+        )
+
+
 def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist) -> None:
     primary = jobs[0]
     parsed = [_training_args(job) for job in jobs]
     loaded, identity, maximum, axis = _load_group(primary, parsed[0])
-    if entry.get("input_identity") is not None and entry["input_identity"] != identity:
-        raise ValueError(
-            "verified dataset changed since partial calibration; previous evidence preserved"
+    if entry.get("input_identity") is not None:
+        _verify_loaded_input(
+            entry,
+            identity,
+            maximum,
+            axis,
+            context=(
+                "verified dataset changed since partial calibration; previous evidence preserved"
+            ),
         )
     baseline = (
         parsed[0].sample_seed_batch_size if axis == "sampled_seed_nodes" else parsed[0].batch_size
@@ -184,7 +245,9 @@ def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist)
         baseline_physical_batch_size=baseline,
         batch_axis=axis,
         natural_training_split_size=maximum,
-        input_identity=identity,
+        input_identity=(
+            entry["input_identity"] if entry.get("input_identity") is not None else identity
+        ),
         job_contracts=[
             {
                 "condition": job["condition"],
@@ -331,14 +394,13 @@ def verify_plan_inputs(
                 )
             parsed.append(args)
         loaded, identity, maximum, axis = _load_group(matching[0], parsed[0])
-        if (
-            entry["input_identity"] != identity
-            or entry["natural_training_split_size"] != maximum
-            or entry["batch_axis"] != axis
-        ):
-            raise ValueError(
-                "resource plan verified dataset identity changed; no stale measurement reuse"
-            )
+        _verify_loaded_input(
+            entry,
+            identity,
+            maximum,
+            axis,
+            context="resource plan verified dataset identity changed; no stale measurement reuse",
+        )
         del loaded
         gc.collect()
 
@@ -348,8 +410,15 @@ def _run_locked(request_path: Path, output: Path) -> Path:
 
     request = json.loads(request_path.read_bytes())
     expected_sources = source_snapshot()
-    if request.get("source_sha256") != expected_sources:
-        raise ValueError("calibration request source identity differs")
+    try:
+        transition = require_source_compatibility(request.get("source_sha256"), expected_sources)
+    except ValueError as error:
+        raise ValueError("calibration request source identity differs") from error
+    if transition is not None:
+        print(
+            f"[resume compatibility] {transition['patch_id']}; original request preserved",
+            flush=True,
+        )
     jobs = request.get("jobs", [])
     if not jobs:
         raise ValueError("calibration request contains no supported jobs")

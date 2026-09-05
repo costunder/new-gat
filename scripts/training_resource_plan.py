@@ -16,6 +16,8 @@ import stat
 from pathlib import Path
 from typing import Any
 
+from chartgat.resume_compat import COMPATIBILITY_SOURCE_FILES, require_source_compatibility
+
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 1
 IGNORED_COMMAND_OPTIONS = {
@@ -33,6 +35,7 @@ def digest(value: Any) -> str:
 
 def source_snapshot() -> dict[str, str]:
     paths = [ROOT / "AGENTS.md", ROOT / "pyproject.toml"]
+    paths.extend(ROOT / name for name in COMPATIBILITY_SOURCE_FILES)
     for directory in ("research", "src/chartgat", "scripts"):
         paths.extend((ROOT / directory).rglob("*.py"))
     paths.extend((ROOT / "research").rglob("*.yaml"))
@@ -383,10 +386,13 @@ def validate_resource_plan(
         or seeds != list(model_seeds)
     ):
         raise ValueError("resource plan profile/seed identity differs")
-    if check_sources and plan.get("source_sha256") != source_snapshot():
-        raise ValueError(
-            "resource plan source identity differs; recalibration requires a separate new run"
-        )
+    if check_sources:
+        try:
+            require_source_compatibility(plan.get("source_sha256"), source_snapshot())
+        except ValueError as error:
+            raise ValueError(
+                "resource plan source identity differs; recalibration requires a separate new run"
+            ) from error
     hardware = plan.get("hardware")
     runtime = plan.get("runtime")
     if (
