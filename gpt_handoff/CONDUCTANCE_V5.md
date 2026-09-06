@@ -1,5 +1,75 @@
 # Conductance GAT V5 — graph-specific C optimization and weighted-Laplacian propagation
 
+## 2026-09-06: 저성능 결과 이후의 명시적 교정 설정
+
+사용자가 올린 20조건 validation 요약은 `historical_reference` 2개,
+`pending_extra_budget` 1개, `passed` 17개다. 세부 수치와 혼합 provenance는
+`EXPERIMENT_STATUS.md`에 기록한다. 원본 서버 metrics/history/checkpoint는 아직 로컬에 없으므로
+학습된 C가 붕괴했다거나 특정 변경으로 성능이 회복됐다고 주장하지 않는다.
+
+확정한 두 단계와 joint 역전파는 유지한다. 모델 폭/깊이/heads/FFN, 전체 공식 데이터,
+seed 0, C 공유 채널, 8-step solver, C 양수/가중 평균 1은 줄이거나 바꾸지 않는다.
+
+- 수치 수정: graph-context의 분산 0에서 sqrt backward가 NaN이 되지 않도록 sqrt 입력을 먼저
+  안전하게 분기한다. forward의 `sqrt(clamp(var,0))` 값은 유지하며 가짜 분산을 더하지 않는다.
+- 명시적 `solver_cost_scaling=width_scaled`: 단위 길이 특징의 quadratic 비용 q에 대해
+  `r_e=sqrt(hidden_channels)*q_e+structure_e`,
+  `delta_e=b*tanh((r_e-weighted_mean_graph(r))/b)`를 사용한다. 전체 그래프별 중심화이며
+  chunk별 중심화가 아니다. 기존 bound b=2와 entropy=1을 유지하고 C 분산 목표를 강요하지 않는다.
+  기본 `legacy_unit`은 과거 비용/gradient를 보존하는 비교 설정이다.
+- 교정 실행 예시는 `beta_initial=0.5`로 자기/이웃 계수를 균형 있게 시작한다. beta는 여전히
+  sigmoid로 학습되며 0.05 같은 강제 하한을 추가하지 않는다. 이는 0.1 초기화와 다른 학습 설정이다.
+- 명시적 `learning_budget_policy=reference_updates`: GPU 실측으로 physical batch가 커져도
+  기준 batch 대비 최대 업데이트 및 patience 예산을 줄이지 않는다. A6000 기준은 기존
+  PPI graph batch 8, sampled seed batch 2048, full graph 1이다. 기준은 별도 CLI로 지정할 수도 있다.
+  요청 E epochs, 기준 R batches/epoch, 실측 A batches/epoch에 대해
+  `planned_epochs=max(E,ceil(E*R/A))`다. patience는 실제 저장된 optimizer-step 차이로 판단한다.
+  PPI 20개/200 epochs에서 batch 8이면 600 updates/200 epochs, batch 20이면
+  같은 600 updates를 계획하므로 최대 600 epochs다. 조기종료는 여전히 가능하며,
+  큰 배치가 동일한 학습 궤적이나 충분한 총 학습량을 보장한다는 주장은 하지 않는다.
+  기존 `epochs` 정책은 자동 연장하지 않는다. 새 정책은 현재 joint fresh 학습 및 그 정확한
+  재개에 연결되며, 구형 MLP 전환의 누적 예산을 임의로 변경하는 데 사용하지 못한다.
+- 매 epoch 마지막 실제 train batch의 C/W/backbone/beta gradient norm을 기록한다.
+  validation C/beta 통계와 train gradient의 관측 시점은 명확히 분리한다.
+
+CPU 초기값 진단(학습/실제 데이터 성능 아님)에서 width 256/384의 비용 SD는 각각
+0.08074/0.06488에서 0.98884/0.97724로 바뀌었다. 이것은 비용의 차원 스케일 교정 증거이며
+정확도 향상 증거가 아니다. 실제 검증에서는 기존 `selected_checkpoint_interventions`의
+learned/C=1/shuffle 성적, layer별 C/beta, train loss와 실제 update 수를 함께 확인한다.
+
+`scripts/analyze_v5_results.py --root <결과폴더 또는 manifest.json>`는 위 진단을 stdout으로
+모아서 읽는다. JSON만 읽고 GPU/torch/checkpoint 로딩·파일 생성·원본 변경을 하지 않는다.
+누락은 unavailable로, 구형 참조·전환·fresh·추가 예산 대기는 각각 분리해서 표시한다.
+
+이 교정 설정을 기존 run ID/source hash에 조용히 덮어씌우지 않는다. 과거 결과와 checkpoint는
+삭제하지 않는다. 구형 MLP 전용 전환 실행기가 이미 optimization으로 학습된 checkpoint를
+이번 교정 설정으로 자동 이식한다고 주장하지 않는다. 새 설정의 정확한 중단/완료 재개는
+검증하되, 과거 모델을 새 설정으로 이어 학습하는 별도 전환은 현재 지원 범위가 아니다.
+실행 예시는 `RICH_SCALING_EXPERIMENTS.md`의 교정 설정 절을 따른다.
+
+## 사용자 확정 기준: 샘플 B의 C 학습과 후속 GNN의 공동 최적화
+
+이 절은 이후 설계·구현 검토에서 유지할 사용자 요구다. 현재 코드의 구현 범위와 혼동하지 않는다.
+
+1. 전체 그래프에서 유효한 노드–엣지 부분 연결구조를 샘플링해 발생행렬 B_s를 구성한다.
+2. 1단계는 B_s와 입력 특징에서 C_theta,s를 학습하고 L_theta,s = B_s^T C_theta,s B_s를 만든다.
+3. 2단계는 그 학습된 가중 라플라시안을 사용하는 메시지 패싱 GNN으로 최종 예측을 만든다.
+4. 2단계의 task loss는 L과 C 계산을 거쳐 1단계의 학습 파라미터 theta까지 역전파되어야 한다.
+   2단계 W와 1단계 theta를 최종 과제에 맞게 함께 조정한다. 1단계의 자체 에너지 감소나
+   정렬만으로 최종 예측에 유용한 라플라시안을 학습했다고 판단하지 않는다.
+
+여기서 두 단계는 기능적 계산 순서다. 1단계를 먼저 완전히 학습한 뒤 영구 고정한다는 뜻도,
+별도의 spatial GNN encoder를 반드시 추가한다는 뜻도 아니다. B 샘플링은 전체 그래프의
+연결구조를 국소적으로 학습하기 위한 수단이다. 현재 고정된 샘플링 규칙 자체를 미분 가능하게
+만들 필요는 없지만, 해당 샘플의 C→라플라시안→예측 경로를 detach해서는 안 된다.
+
+현재 optimization/joint dynamic-C 경로에는 이 task-loss 피드백이 연결되어 있다. 내부 K회
+C 최적화와 외부 task-loss 파라미터 갱신은 구분한다. 매 입력에서 C=1로 반복 계산을 시작해도
+학습된 theta를 초기화하지는 않는다. Fixed-C 대조군은 의도적으로 C를 학습하지 않는다.
+실제 전파는 sampling 보정·degree 정규화를 포함하며 블록마다 C 계산과 전파를 반복한다.
+현재 기본 실행의 B 샘플링은 ogbn-arxiv에만 적용된다. 다른 transductive 데이터셋은 full graph,
+PPI는 원래 그래프들의 미니배치다. 이를 모든 데이터셋의 B 샘플링 구현 완료로 보고하지 않는다.
+
 ## 현재 기본 구조: 2026-09-06 C 최적화 계층
 
 현재 V5의 기본 `conductance_backend`는 `optimization`이다. 이전 endpoint MLP가 C를

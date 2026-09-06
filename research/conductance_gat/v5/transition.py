@@ -37,6 +37,7 @@ _C_CONFIGURATION = {
     "solver_step_size",
     "solver_entropy",
     "solver_degree_barrier",
+    "solver_cost_scaling",
     "training_schedule",
 }
 _UNCHANGED_SOURCES = (

@@ -42,6 +42,11 @@ Conductance v2/v3/v4/v5와 Cycle PE v2는 각각의 원문 문서를 직접 제�
 
 ## 근거 범위
 
+- 최신 20조건 validation 요약과 저성능 교정 설정은 `EXPERIMENT_STATUS.md` 및
+  `CONDUCTANCE_V5.md` 첫 절에 있다. NaN 수정, width-scaled 비용, beta 초기화와 명시적
+  reference-update 예산을 검토한다. 기존 결과 분석 CLI는 읽기 전용이며, 교정된 코드의 CPU
+  테스트를 실제 A6000 성능 회복으로 해석하지 않는다. 원본 결과·checkpoint는 보존한다.
+
 - 2026-09-06 V5 기본은 `optimization`/`joint`다. MLP-C는 명시적 비교 옵션이다.
   새 구조의 C 반복 최적화와 task loss 역전파를 검토하고, 과거 MLP checkpoint의 재개 허용을
   새 구조까지 확대하지 않았는지 확인한다. K회 수행은 수렴 보증이 아니다.

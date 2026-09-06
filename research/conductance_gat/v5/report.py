@@ -14,7 +14,12 @@ from typing import Any
 from chartgat.cache import atomic_write_bytes, atomic_write_json
 from chartgat.resume_compat import snapshots_match
 
-from .protocol import COMPARISON_DESIGN, CONDITIONS, SUITE
+from .learning_budget import (
+    compare_learning_budgets,
+    deterministic_batches_per_epoch,
+    validate_learning_budget,
+)
+from .protocol import COMPARISON_DESIGN, CONDITIONS, HARDWARE_PROFILES, SUITE
 
 
 class ComparisonIntegrityError(ValueError):
@@ -52,6 +57,106 @@ def _job_seed(job: dict[str, Any], manifest: dict[str, Any]) -> int:
     return int(manifest.get("config", {}).get("model_seed", 0))
 
 
+def _validate_learning_budget(child: dict[str, Any]) -> dict[str, Any] | None:
+    """Certify explicit fresh update budgets without changing legacy result contracts."""
+    configuration = child["configuration"]
+    policy = configuration.get("learning_budget_policy", "epochs")
+    if policy == "epochs":
+        return None
+    if policy != "reference_updates":
+        raise ComparisonIntegrityError("unsupported reported learning budget policy")
+    budget = child.get("learning_budget")
+    try:
+        validate_learning_budget(budget)
+    except ValueError as error:
+        raise ComparisonIntegrityError(f"invalid learning budget: {error}") from error
+    if (
+        budget["policy"] != policy
+        or configuration.get("training_schedule") != "joint"
+        or child.get("transition_provenance") is not None
+        or child.get("resume_identity", {}).get("transition_request") is not None
+        or any(
+            type(configuration.get(key)) is not int or configuration[key] != budget[budget_key]
+            for key, budget_key in (
+                ("epochs", "requested_epochs"),
+                ("patience", "requested_patience"),
+            )
+        )
+    ):
+        raise ComparisonIntegrityError(
+            "learning budget differs from the requested fresh joint recipe"
+        )
+    batches = (
+        child.get("batch_observability", {}).get("training_batches_per_epoch", {}).get("value")
+    )
+    if type(batches) is not int or batches != budget["actual_batches_per_epoch"]:
+        raise ComparisonIntegrityError(
+            "learning budget actual batches differ from observed execution"
+        )
+    try:
+        explicit_reference = configuration.get("budget_reference_batch_size")
+        if explicit_reference is not None and (
+            type(explicit_reference) is not int or explicit_reference < 1
+        ):
+            raise ValueError("reference physical batch must be a positive integer")
+        if child["dataset"] != "ppi" and configuration["sampling"] == "full":
+            if explicit_reference not in {None, 1}:
+                raise ValueError("full graph reference physical batch must be 1")
+            reference_batches = 1
+        else:
+            hardware = HARDWARE_PROFILES[configuration["hardware_profile"]]
+            baseline = (
+                explicit_reference
+                or hardware[
+                    "ppi_batch_size" if child["dataset"] == "ppi" else "sample_seed_batch_size"
+                ]
+            )
+            reference_batches = deterministic_batches_per_epoch(
+                child["data_observability"]["optimization_count"], baseline
+            )
+    except (ValueError, KeyError, TypeError) as error:
+        raise ComparisonIntegrityError(
+            "learning budget has no valid reference batch evidence"
+        ) from error
+    if budget["reference_batches_per_epoch"] != reference_batches:
+        raise ComparisonIntegrityError(
+            "learning budget reference updates differ from the dataset/batch recipe"
+        )
+    planned = budget["planned_epochs"]
+    if child.get("schedule") != [
+        {"name": "joint", "start_epoch": 1, "end_epoch": planned, "length": planned}
+    ]:
+        raise ComparisonIntegrityError(
+            "learning budget schedule does not cover its planned joint epochs"
+        )
+    epochs, steps = child.get("epochs_run"), child.get("optimizer_steps")
+    if (
+        type(epochs) is not int
+        or not 1 <= epochs <= planned
+        or type(steps) is not int
+        or not 1 <= steps <= budget["planned_maximum_optimizer_steps"]
+        or steps != epochs * batches
+    ):
+        raise ComparisonIntegrityError(
+            "learning budget completed epochs/updates contradict its capacity"
+        )
+    observation = child.get("optimization_observability")
+    if not isinstance(observation, dict) or any(
+        observation.get(key) != value
+        for key, value in {
+            "learning_budget": budget,
+            "planned_training_epochs": planned,
+            "epochs_requested": budget["requested_epochs"],
+            "epochs_completed": epochs,
+            "actual_optimizer_steps": steps,
+        }.items()
+    ):
+        raise ComparisonIntegrityError(
+            "learning budget optimization observations contradict the result"
+        )
+    return budget
+
+
 def _validate_child(
     child: dict[str, Any], job: dict[str, Any], manifest: dict[str, Any], path: Path
 ) -> dict[str, Any]:
@@ -69,6 +174,7 @@ def _validate_child(
     configuration = child.get("configuration")
     if not isinstance(configuration, dict):
         raise ComparisonIntegrityError(f"missing child configuration: {path}")
+    learning_budget = _validate_learning_budget(child)
     if any(configuration.get(key) != value for key, value in job.get("architecture", {}).items()):
         raise ComparisonIntegrityError(f"job/child architecture mismatch: {path}")
     execution = job.get("execution")
@@ -253,6 +359,15 @@ def _validate_child(
         "joint_best_epoch": child.get("joint_best_epoch"),
         "checkpoint_selection": selection,
         "effective_optimizer_steps_by_group": group_steps,
+        **(
+            {
+                "learning_budget": learning_budget,
+                "optimizer_steps": child["optimizer_steps"],
+                "epochs_run": child["epochs_run"],
+            }
+            if learning_budget is not None
+            else {}
+        ),
         "cache_sha256": child["cache_sha256"],
         "source_sha256": child["source_sha256"],
         "runtime_versions": child["versions"],
@@ -368,6 +483,22 @@ def build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                 "dynamic_effective_optimizer_steps_by_group": dynamic[
                     "effective_optimizer_steps_by_group"
                 ],
+                **(
+                    {
+                        "learning_budget_comparison": {
+                            **compare_learning_budgets(
+                                fixed["learning_budget"], dynamic["learning_budget"]
+                            ),
+                            "fixed_completed_optimizer_steps": fixed["optimizer_steps"],
+                            "dynamic_completed_optimizer_steps": dynamic["optimizer_steps"],
+                            "completed_optimizer_step_difference": dynamic["optimizer_steps"]
+                            - fixed["optimizer_steps"],
+                            "actual_completed_updates_compared": True,
+                        }
+                    }
+                    if "learning_budget" in fixed and "learning_budget" in dynamic
+                    else {}
+                ),
             }
         )
     if complete and len(rows) != len(jobs):

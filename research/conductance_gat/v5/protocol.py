@@ -13,6 +13,8 @@ DEFAULT_SOLVER_STEPS = 8
 DEFAULT_SOLVER_STEP_SIZE = 0.25
 DEFAULT_SOLVER_ENTROPY = 1.0
 DEFAULT_SOLVER_DEGREE_BARRIER = 0.1
+SOLVER_COST_SCALINGS = ("legacy_unit", "width_scaled")
+LEARNING_BUDGET_POLICIES = ("epochs", "reference_updates")
 TRAINING_SCHEDULES = ("joint", "staged")
 DEFAULT_TRAINING_SCHEDULE = "joint"
 BETA_PARAMETERIZATIONS = ("sigmoid", "margin_sigmoid")
@@ -33,11 +35,16 @@ def conductance_configuration(
     solver_step_size: float = DEFAULT_SOLVER_STEP_SIZE,
     solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
     solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
+    solver_cost_scaling: str = "legacy_unit",
 ) -> dict[str, int | float | str]:
     """Canonical architecture identity; solver fields are inactive for the MLP ablation."""
 
     if conductance_backend not in CONDUCTANCE_BACKENDS:
         raise ValueError(f"unsupported conductance backend: {conductance_backend}")
+    if solver_cost_scaling not in SOLVER_COST_SCALINGS:
+        raise ValueError(f"unsupported solver cost scaling: {solver_cost_scaling}")
+    if conductance_backend == "mlp" and solver_cost_scaling != "legacy_unit":
+        raise ValueError("width_scaled costs require the optimization conductance backend")
     if isinstance(solver_steps, bool) or not isinstance(solver_steps, int) or solver_steps < 1:
         raise ValueError("solver_steps must be a positive integer")
     values = {
@@ -60,6 +67,12 @@ def conductance_configuration(
         "conductance_backend": conductance_backend,
         "solver_steps": solver_steps,
         **{name: float(value) for name, value in values.items()},
+        # Omit inactive defaults to preserve historical configuration identities.
+        **(
+            {"solver_cost_scaling": solver_cost_scaling}
+            if solver_cost_scaling != "legacy_unit"
+            else {}
+        ),
     }
 
 
@@ -73,6 +86,29 @@ def add_conductance_arguments(parser, *, prefix: str = "") -> None:
         help="optimization unrolls C updates; mlp explicitly selects the legacy ablation",
     )
     parser.add_argument(f"--{prefix}solver-steps", type=int, default=DEFAULT_SOLVER_STEPS)
+    parser.add_argument(
+        f"--{prefix}solver-cost-scaling",
+        choices=SOLVER_COST_SCALINGS,
+        default="legacy_unit",
+        help=(
+            "width_scaled centers sqrt(width)-scaled quadratic costs before bounding; "
+            "changes the training recipe"
+        ),
+    )
+    parser.add_argument(
+        f"--{prefix}learning-budget-policy",
+        choices=LEARNING_BUDGET_POLICIES,
+        default="epochs",
+        help=(
+            "reference_updates explicitly extends the epoch ceiling/patience "
+            "when a larger batch reduces updates"
+        ),
+    )
+    parser.add_argument(
+        f"--{prefix}budget-reference-batch-size",
+        type=int,
+        help="reference physical batch; otherwise use the original hardware-profile batch",
+    )
     parser.add_argument(f"--{prefix}solver-step-size", type=float, default=DEFAULT_SOLVER_STEP_SIZE)
     parser.add_argument(f"--{prefix}solver-entropy", type=float, default=DEFAULT_SOLVER_ENTROPY)
     parser.add_argument(
@@ -90,12 +126,32 @@ def conductance_arguments_configuration(args, *, prefix: str = "") -> dict[str, 
     """Validate both solver architecture and schedule from a parsed namespace."""
 
     configuration = conductance_configuration(
-        **{name: getattr(args, prefix + name) for name in conductance_configuration()}
+        **{name: getattr(args, prefix + name) for name in conductance_configuration()},
+        solver_cost_scaling=getattr(args, prefix + "solver_cost_scaling", "legacy_unit"),
     )
     schedule = getattr(args, prefix + "training_schedule")
     if schedule not in TRAINING_SCHEDULES:
         raise ValueError(f"unsupported training schedule: {schedule}")
     return {**configuration, "training_schedule": schedule}
+
+
+def learning_budget_arguments_configuration(args, *, prefix: str = "") -> dict[str, Any]:
+    """Keep budget policy separate from model architecture and legacy identities."""
+    policy = getattr(args, prefix + "learning_budget_policy", "epochs")
+    reference = getattr(args, prefix + "budget_reference_batch_size", None)
+    if policy not in LEARNING_BUDGET_POLICIES:
+        raise ValueError(f"unsupported learning budget policy: {policy}")
+    if reference is not None and (
+        isinstance(reference, bool) or not isinstance(reference, int) or reference < 1
+    ):
+        raise ValueError("budget reference batch size must be a positive integer")
+    if policy == "epochs":
+        if reference is not None:
+            raise ValueError("budget reference batch size requires reference_updates")
+        return {}
+    if getattr(args, prefix + "training_schedule", "joint") != "joint":
+        raise ValueError("reference_updates currently requires the explicit joint schedule")
+    return {"learning_budget_policy": policy, "budget_reference_batch_size": reference}
 
 
 def beta_configuration(

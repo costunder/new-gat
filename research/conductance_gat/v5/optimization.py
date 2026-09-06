@@ -79,6 +79,14 @@ class GraphOptimizedConductance(nn.Module):
     metric, and symmetric structural features. There is no edge MLP or
     edge-specific parameter table. C is shared across all feature heads.
 
+    ``legacy_unit`` preserves the original unit-normalized compatibility.
+    ``width_scaled`` compensates the O(channels**-0.5) contrast of isotropic
+    normalized features by scaling the quadratic term by sqrt(channels).
+    Its raw cost is graph-weighted centered before the existing tanh bound,
+    so an unidentifiable graph-wide offset cannot saturate that bound. This
+    changes neither the entropy coefficient nor C's positivity/gauge and
+    imposes no target C variance; learned costs can still be constant.
+
     The configured step size is an upper bound. Each graph gets a
     differentiable relative-curvature/log-displacement-bounded step. This
     preserves K and all edges without host-synchronized line search or
@@ -94,6 +102,7 @@ class GraphOptimizedConductance(nn.Module):
         solver_step_size: float = 0.25,
         solver_entropy: float = 1.0,
         solver_degree_barrier: float = 0.1,
+        solver_cost_scaling: str = "legacy_unit",
         cost_bound: float = 2.0,
         edge_chunk_size: int = 65536,
     ) -> None:
@@ -126,12 +135,16 @@ class GraphOptimizedConductance(nn.Module):
             raise ValueError("solver_degree_barrier must be finite and nonnegative")
         if mode not in {"dynamic", "fixed_one"}:
             raise ValueError(f"unsupported conductance mode: {mode}")
+        if solver_cost_scaling not in ("legacy_unit", "width_scaled"):
+            raise ValueError(f"unsupported solver_cost_scaling: {solver_cost_scaling}")
         self.channels = channels
         self.mode = mode
         self.solver_steps = solver_steps
         self.solver_step_size = float(solver_step_size)
         self.solver_entropy = float(solver_entropy)
         self.solver_degree_barrier = float(solver_degree_barrier)
+        self.solver_cost_scaling = solver_cost_scaling
+        self.quadratic_scale = math.sqrt(channels) if solver_cost_scaling == "width_scaled" else 1.0
         self.cost_bound = float(cost_bound)
         self.edge_chunk_size = edge_chunk_size
         if mode == "dynamic":
@@ -150,7 +163,7 @@ class GraphOptimizedConductance(nn.Module):
         self.last_c: Tensor | None = None
         self.last_solver_diagnostics: dict[str, Tensor | int | float | bool | str] = {}
 
-    def _compatibility_chunk(
+    def _raw_compatibility_chunk(
         self,
         projected: Tensor,
         metric: Tensor,
@@ -202,8 +215,27 @@ class GraphOptimizedConductance(nn.Module):
             dim=1,
         )
         quadratic = ((left - right).square() * metric[edge_graph]).sum(dim=1)
+        if self.solver_cost_scaling == "width_scaled":
+            quadratic = quadratic * self.quadratic_scale
         structural = (local.tanh() * self.structure_metric.to(projected.dtype)).sum(dim=1)
-        return self.cost_bound * torch.tanh((quadratic + structural) / self.cost_bound)
+        return quadratic + structural
+
+    def _compatibility_chunk(
+        self,
+        projected: Tensor,
+        metric: Tensor,
+        tail: Tensor,
+        head: Tensor,
+        sample_degree: Tensor,
+        full_degree: Tensor,
+        edge_graph: Tensor,
+    ) -> Tensor:
+        """Keep the legacy bounded-chunk path numerically unchanged."""
+
+        raw = self._raw_compatibility_chunk(
+            projected, metric, tail, head, sample_degree, full_degree, edge_graph
+        )
+        return self.cost_bound * torch.tanh(raw / self.cost_bound)
 
     def _scaled_gradient(
         self,
@@ -320,6 +352,8 @@ class GraphOptimizedConductance(nn.Module):
                 "executed_steps": 0,
                 "reason": "edgeless_graph" if tail.numel() == 0 else "fixed_one_intervention",
                 "finite_step_approximation": False,
+                "solver_cost_scaling": self.solver_cost_scaling,
+                "quadratic_scale": self.quadratic_scale,
             }
             return c
         if self.node_projection is None or self.context_metric is None:
@@ -330,6 +364,11 @@ class GraphOptimizedConductance(nn.Module):
         sample_degree = sample_degree.to(compute_dtype)
         full_degree = full_degree.to(compute_dtype)
         chunks = []
+        compatibility = (
+            self._raw_compatibility_chunk
+            if self.solver_cost_scaling == "width_scaled"
+            else self._compatibility_chunk
+        )
         for start in range(0, tail.numel(), self.edge_chunk_size):
             stop = start + self.edge_chunk_size
             arguments = (
@@ -345,15 +384,21 @@ class GraphOptimizedConductance(nn.Module):
                 from torch.utils.checkpoint import checkpoint
 
                 delta = checkpoint(
-                    self._compatibility_chunk,
+                    compatibility,
                     *arguments,
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
             else:
-                delta = self._compatibility_chunk(*arguments)
+                delta = compatibility(*arguments)
             chunks.append(delta)
         delta = torch.cat(chunks)
+        if self.solver_cost_scaling == "width_scaled":
+            # Center over complete graphs, never individual memory chunks.
+            # A graph-constant cost has no effect under mean_omega(C)=1;
+            # removing it before tanh avoids spurious width-driven saturation.
+            delta = delta - graph_weighted_mean(delta, edge_graph, num_graphs, omega)[edge_graph]
+            delta = self.cost_bound * torch.tanh(delta / self.cost_bound)
         graph_mass = delta.new_zeros(num_graphs).index_add(0, edge_graph, omega)
         reference_degree = _degree(omega, incidence, state.shape[0])
         active_counts = delta.new_zeros(num_graphs).index_add(
@@ -446,6 +491,8 @@ class GraphOptimizedConductance(nn.Module):
                 "method": "curvature_bounded_kl_proximal",
                 "executed_steps": self.solver_steps,
                 "finite_step_approximation": True,
+                "solver_cost_scaling": self.solver_cost_scaling,
+                "quadratic_scale": self.quadratic_scale,
                 "objective_initial": initial_energy,
                 "objective_final": final_energy,
                 "projected_gradient_rms_initial": initial_residual,

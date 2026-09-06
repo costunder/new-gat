@@ -41,6 +41,19 @@ def _node_degree(state: Tensor, incidence: Tensor) -> Tensor:
     return state.new_zeros(state.shape[0]).index_add(0, tail, ones).index_add(0, head, ones)
 
 
+def _finite_standard_deviation(variance: Tensor) -> Tensor:
+    """Preserve sqrt(clamp(var, 0)) forward with a finite derivative at zero.
+
+    Mask before sqrt, not after: an inactive sqrt(0) backward still evaluates
+    0 * infinity. Constant channels legitimately have zero standard deviation.
+    """
+    nonnegative = variance.clamp_min(0)
+    zero = nonnegative == 0
+    # NaN must remain NaN, not become zero through a failed `variance > 0` test.
+    safe = torch.where(zero, torch.ones_like(nonnegative), nonnegative)
+    return torch.where(zero, torch.zeros_like(nonnegative), safe.sqrt())
+
+
 def graph_context_features(
     state: Tensor,
     incidence: Tensor,
@@ -59,16 +72,12 @@ def graph_context_features(
     full_degree = full_degree.to(state.dtype)
     mean = _graph_node_mean(state, node_graph, num_graphs)
     second = _graph_node_mean(state.square(), node_graph, num_graphs)
-    std = (second - mean.square()).clamp_min(0).sqrt()
+    std = _finite_standard_deviation(second - mean.square())
     coverage = sample_degree / full_degree.clamp_min(1)
     coverage_mean = _graph_node_mean(coverage[:, None], node_graph, num_graphs)
-    coverage_std = (
-        (
-            _graph_node_mean(coverage.square()[:, None], node_graph, num_graphs)
-            - coverage_mean.square()
-        )
-        .clamp_min(0)
-        .sqrt()
+    coverage_std = _finite_standard_deviation(
+        _graph_node_mean(coverage.square()[:, None], node_graph, num_graphs)
+        - coverage_mean.square()
     )
     if graph_structure is None:
         node_count = state.new_zeros(num_graphs).index_add(
@@ -80,10 +89,8 @@ def graph_context_features(
         )
         log_degree = full_degree.log1p()[:, None]
         degree_mean = _graph_node_mean(log_degree, node_graph, num_graphs)
-        degree_std = (
-            (_graph_node_mean(log_degree.square(), node_graph, num_graphs) - degree_mean.square())
-            .clamp_min(0)
-            .sqrt()
+        degree_std = _finite_standard_deviation(
+            _graph_node_mean(log_degree.square(), node_graph, num_graphs) - degree_mean.square()
         )
         density = 2 * edge_count / (node_count * (node_count - 1)).clamp_min(1)
         graph_structure = torch.stack(
@@ -367,6 +374,7 @@ class SharedConductanceMultihead(nn.Module):
         solver_step_size: float = DEFAULT_SOLVER_STEP_SIZE,
         solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
         solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
+        solver_cost_scaling: str = "legacy_unit",
     ) -> None:
         super().__init__()
         if channels % heads:
@@ -385,6 +393,7 @@ class SharedConductanceMultihead(nn.Module):
                     solver_step_size=solver_step_size,
                     solver_entropy=solver_entropy,
                     solver_degree_barrier=solver_degree_barrier,
+                    solver_cost_scaling=solver_cost_scaling,
                     cost_bound=max_log_conductance,
                     edge_chunk_size=edge_chunk_size,
                 )
@@ -523,6 +532,7 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
         solver_step_size: float = DEFAULT_SOLVER_STEP_SIZE,
         solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
         solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
+        solver_cost_scaling: str = "legacy_unit",
     ) -> None:
         super().__init__()
         for name, value in (
@@ -553,6 +563,7 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
             solver_step_size,
             solver_entropy,
             solver_degree_barrier,
+            solver_cost_scaling,
         )
         self.conductance_backend = conductance_backend
         self.activation_checkpoint = bool(activation_checkpoint)

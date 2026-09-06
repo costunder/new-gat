@@ -27653,6 +27653,241 @@ def selected_checkpoint_interventions(
     return result
 ````
 
+# research/conductance_gat/v5/learning_budget.py
+
+````python
+"""Explicit epoch and optimizer-update budgets; no training or resource side effects.
+
+``epochs`` preserves the historical recipe. ``reference_updates`` is an explicit
+new recipe: retain at least the requested epoch/patience horizons and, when a
+larger physical batch decreases updates per epoch, extend those horizons to
+cover the reference update budget. No batch, model, graph or sample is reduced.
+
+Counts mean optimizer updates, assuming one update per physical batch and a
+constant complete-epoch batch count. They are not forward calls, C solver inner
+iterations, or parameter-group updates in a staged schedule. Early stopping can
+finish before the planned full-run capacity; this module does not claim that
+capacity was actually trained or that different batches have equal trajectories.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+LEARNING_BUDGET_POLICIES = ("epochs", "reference_updates")
+DEFAULT_LEARNING_BUDGET_POLICY = "epochs"
+
+
+def _integer(value: Any, name: str, *, zero: bool = False) -> int:
+    if type(value) is not int or value < (0 if zero else 1):
+        qualifier = "nonnegative" if zero else "positive"
+        raise ValueError(f"{name} must be a {qualifier} integer")
+    return value
+
+
+def _optional_batch_count(value: Any, name: str) -> int | None:
+    return None if value is None else _integer(value, name)
+
+
+def _ceil_div(numerator: int, denominator: int) -> int:
+    # Integer arithmetic preserves exact budgets even above float's 2**53 limit.
+    return (numerator + denominator - 1) // denominator
+
+
+def deterministic_batches_per_epoch(training_units: int, physical_batch_size: int) -> int:
+    """Count every unit, including a final partial batch (drop_last=False).
+
+    The caller supplies the verified graph/seed-node count and chosen physical
+    batch. This does not infer a dataset size, replicate a full graph, or support
+    variable topology-dependent batch counts by inventing an average.
+    """
+
+    return _ceil_div(
+        _integer(training_units, "training_units"),
+        _integer(physical_batch_size, "physical_batch_size"),
+    )
+
+
+def plan_learning_budget(
+    requested_epochs: int,
+    requested_patience: int,
+    reference_batches_per_epoch: int | None,
+    actual_batches_per_epoch: int | None,
+    policy: str = DEFAULT_LEARNING_BUDGET_POLICY,
+) -> dict[str, Any]:
+    """Build a JSON-safe immutable recipe description, without changing arguments.
+
+    For known reference R and actual A, the explicit update policy plans
+    E'=max(E, ceil(E*R/A)) and P'=max(P, ceil(P*R/A)). Step-based patience is
+    max(P*R, P*A), evaluated at the caller's real validation boundaries. Rounding
+    to a complete epoch may exceed a target; that excess is reported explicitly.
+
+    Unknown/variable batch counts are accepted only for the legacy epoch policy
+    and stay ``None`` in derived fields. They are never silently replaced by 1.
+    """
+
+    epochs = _integer(requested_epochs, "requested_epochs")
+    patience = _integer(requested_patience, "requested_patience")
+    reference = _optional_batch_count(reference_batches_per_epoch, "reference_batches_per_epoch")
+    actual = _optional_batch_count(actual_batches_per_epoch, "actual_batches_per_epoch")
+    if policy not in LEARNING_BUDGET_POLICIES:
+        raise ValueError(f"unsupported learning budget policy: {policy!r}")
+    if policy == "reference_updates" and (reference is None or actual is None):
+        raise ValueError(
+            "reference_updates requires known constant reference and actual batches per epoch; "
+            "variable samplers need an explicit measured update-budget implementation"
+        )
+
+    reference_steps = None if reference is None else epochs * reference
+    requested_steps = None if actual is None else epochs * actual
+    reference_patience = None if reference is None else patience * reference
+    requested_patience_steps = None if actual is None else patience * actual
+    planned_epochs, planned_patience = epochs, patience
+    target_steps, patience_steps = requested_steps, requested_patience_steps
+    if policy == "reference_updates":
+        target_steps = max(reference_steps, requested_steps)
+        patience_steps = max(reference_patience, requested_patience_steps)
+        planned_epochs = _ceil_div(target_steps, actual)
+        planned_patience = _ceil_div(patience_steps, actual)
+    planned_steps = None if actual is None else planned_epochs * actual
+    planned_patience_steps = None if actual is None else planned_patience * actual
+    return {
+        "schema_version": 1,
+        "policy": policy,
+        "requested_epochs": epochs,
+        "requested_patience": patience,
+        "reference_batches_per_epoch": reference,
+        "actual_batches_per_epoch": actual,
+        "planned_epochs": planned_epochs,
+        "planned_patience": planned_patience,
+        "reference_optimizer_steps": reference_steps,
+        "requested_epoch_optimizer_steps": requested_steps,
+        "target_optimizer_steps": target_steps,
+        "planned_maximum_optimizer_steps": planned_steps,
+        "epoch_rounding_extra_steps": None if actual is None else planned_steps - target_steps,
+        "reference_patience_optimizer_steps": reference_patience,
+        "patience_optimizer_steps": patience_steps,
+        "planned_patience_optimizer_steps": planned_patience_steps,
+        "patience_rounding_extra_steps": (
+            None if actual is None else planned_patience_steps - patience_steps
+        ),
+        "epoch_extension": planned_epochs - epochs,
+        "patience_epoch_extension": planned_patience - patience,
+        "updates_preserved_against_reference": (
+            None
+            if reference_steps is None or planned_steps is None
+            else planned_steps >= reference_steps
+        ),
+        "patience_updates_preserved_against_reference": (
+            None
+            if reference_patience is None or patience_steps is None
+            else patience_steps >= reference_patience
+        ),
+        "early_stopping_unit": "optimizer_steps" if policy == "reference_updates" else "epochs",
+        "early_stopping_can_finish_before_target": True,
+        "batch_count_assumption": (
+            "constant complete-epoch batch count; one optimizer update per physical batch"
+            if actual is not None
+            else "unknown; no optimizer-update count inferred"
+        ),
+        "parameter_group_update_equality_claimed": False,
+        "equal_optimization_trajectory_claimed": False,
+    }
+
+
+def validate_learning_budget(plan: dict[str, Any]) -> None:
+    """Reject changed derived fields or unknown schema instead of relaxing resume."""
+
+    if not isinstance(plan, dict):
+        raise ValueError("learning budget must be a complete plan object")
+    names = (
+        "requested_epochs",
+        "requested_patience",
+        "reference_batches_per_epoch",
+        "actual_batches_per_epoch",
+        "policy",
+    )
+    if any(name not in plan for name in names):
+        raise ValueError("learning budget is missing its requested recipe")
+    expected = plan_learning_budget(**{name: plan[name] for name in names})
+    # Dictionary equality alone treats True==1 and 200.0==200 as equal. Require
+    # canonical value types as well, so resume evidence cannot change schema.
+    if set(plan) != set(expected) or any(
+        type(plan[key]) is not type(value) or plan[key] != value for key, value in expected.items()
+    ):
+        raise ValueError("learning budget does not match its exact derived recipe")
+
+
+def should_stop_learning_budget(
+    plan: dict[str, Any],
+    *,
+    epochs_since_best: int | None = None,
+    optimizer_steps_since_best: int | None = None,
+    eligible: bool = True,
+) -> bool:
+    """Apply patience using actual age of the caller's eligible best checkpoint.
+
+    Both ages absent means no eligible best exists yet. The caller remains
+    responsible for selecting fixed/global vs dynamic/joint best, updating its
+    actual step counter, and persisting that counter for deterministic resume.
+    This helper never substitutes ``epoch * batches`` for actual updates.
+    """
+
+    validate_learning_budget(plan)
+    if type(eligible) is not bool:
+        raise ValueError("early-stopping eligibility must be boolean")
+    if epochs_since_best is not None:
+        _integer(epochs_since_best, "epochs_since_best", zero=True)
+    if optimizer_steps_since_best is not None:
+        _integer(optimizer_steps_since_best, "optimizer_steps_since_best", zero=True)
+    if not eligible or (epochs_since_best is None and optimizer_steps_since_best is None):
+        return False
+    if plan["policy"] == "reference_updates":
+        if optimizer_steps_since_best is None:
+            raise ValueError("reference_updates early stopping requires actual optimizer-step age")
+        return optimizer_steps_since_best >= plan["patience_optimizer_steps"]
+    if epochs_since_best is None:
+        raise ValueError("epochs early stopping requires epoch age")
+    return epochs_since_best >= plan["requested_patience"]
+
+
+def compare_learning_budgets(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+    """Expose per-condition budget differences; never assert causal comparability."""
+
+    validate_learning_budget(first)
+    validate_learning_budget(second)
+    fields = (
+        "policy",
+        "requested_epochs",
+        "requested_patience",
+        "reference_batches_per_epoch",
+        "actual_batches_per_epoch",
+        "planned_epochs",
+        "planned_patience",
+        "target_optimizer_steps",
+        "planned_maximum_optimizer_steps",
+        "patience_optimizer_steps",
+    )
+    differences = {
+        key: {"first": first[key], "second": second[key]}
+        for key in fields
+        if first[key] != second[key]
+    }
+
+    def known_equal(key: str) -> bool | None:
+        return None if first[key] is None or second[key] is None else first[key] == second[key]
+
+    return {
+        "differences": differences,
+        "same_planned_optimizer_steps": known_equal("planned_maximum_optimizer_steps"),
+        "same_patience_optimizer_steps": known_equal("patience_optimizer_steps"),
+        "same_reference_optimizer_steps": known_equal("reference_optimizer_steps"),
+        "actual_completed_updates_compared": False,
+        "equal_optimization_trajectory_claimed": False,
+        "causal_comparability_claimed": False,
+    }
+````
+
 # research/conductance_gat/v5/model.py
 
 ````python
@@ -27699,6 +27934,19 @@ def _node_degree(state: Tensor, incidence: Tensor) -> Tensor:
     return state.new_zeros(state.shape[0]).index_add(0, tail, ones).index_add(0, head, ones)
 
 
+def _finite_standard_deviation(variance: Tensor) -> Tensor:
+    """Preserve sqrt(clamp(var, 0)) forward with a finite derivative at zero.
+
+    Mask before sqrt, not after: an inactive sqrt(0) backward still evaluates
+    0 * infinity. Constant channels legitimately have zero standard deviation.
+    """
+    nonnegative = variance.clamp_min(0)
+    zero = nonnegative == 0
+    # NaN must remain NaN, not become zero through a failed `variance > 0` test.
+    safe = torch.where(zero, torch.ones_like(nonnegative), nonnegative)
+    return torch.where(zero, torch.zeros_like(nonnegative), safe.sqrt())
+
+
 def graph_context_features(
     state: Tensor,
     incidence: Tensor,
@@ -27717,16 +27965,12 @@ def graph_context_features(
     full_degree = full_degree.to(state.dtype)
     mean = _graph_node_mean(state, node_graph, num_graphs)
     second = _graph_node_mean(state.square(), node_graph, num_graphs)
-    std = (second - mean.square()).clamp_min(0).sqrt()
+    std = _finite_standard_deviation(second - mean.square())
     coverage = sample_degree / full_degree.clamp_min(1)
     coverage_mean = _graph_node_mean(coverage[:, None], node_graph, num_graphs)
-    coverage_std = (
-        (
-            _graph_node_mean(coverage.square()[:, None], node_graph, num_graphs)
-            - coverage_mean.square()
-        )
-        .clamp_min(0)
-        .sqrt()
+    coverage_std = _finite_standard_deviation(
+        _graph_node_mean(coverage.square()[:, None], node_graph, num_graphs)
+        - coverage_mean.square()
     )
     if graph_structure is None:
         node_count = state.new_zeros(num_graphs).index_add(
@@ -27738,10 +27982,8 @@ def graph_context_features(
         )
         log_degree = full_degree.log1p()[:, None]
         degree_mean = _graph_node_mean(log_degree, node_graph, num_graphs)
-        degree_std = (
-            (_graph_node_mean(log_degree.square(), node_graph, num_graphs) - degree_mean.square())
-            .clamp_min(0)
-            .sqrt()
+        degree_std = _finite_standard_deviation(
+            _graph_node_mean(log_degree.square(), node_graph, num_graphs) - degree_mean.square()
         )
         density = 2 * edge_count / (node_count * (node_count - 1)).clamp_min(1)
         graph_structure = torch.stack(
@@ -28025,6 +28267,7 @@ class SharedConductanceMultihead(nn.Module):
         solver_step_size: float = DEFAULT_SOLVER_STEP_SIZE,
         solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
         solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
+        solver_cost_scaling: str = "legacy_unit",
     ) -> None:
         super().__init__()
         if channels % heads:
@@ -28043,6 +28286,7 @@ class SharedConductanceMultihead(nn.Module):
                     solver_step_size=solver_step_size,
                     solver_entropy=solver_entropy,
                     solver_degree_barrier=solver_degree_barrier,
+                    solver_cost_scaling=solver_cost_scaling,
                     cost_bound=max_log_conductance,
                     edge_chunk_size=edge_chunk_size,
                 )
@@ -28181,6 +28425,7 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
         solver_step_size: float = DEFAULT_SOLVER_STEP_SIZE,
         solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
         solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
+        solver_cost_scaling: str = "legacy_unit",
     ) -> None:
         super().__init__()
         for name, value in (
@@ -28211,6 +28456,7 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
             solver_step_size,
             solver_entropy,
             solver_degree_barrier,
+            solver_cost_scaling,
         )
         self.conductance_backend = conductance_backend
         self.activation_checkpoint = bool(activation_checkpoint)
@@ -28555,6 +28801,14 @@ class GraphOptimizedConductance(nn.Module):
     metric, and symmetric structural features. There is no edge MLP or
     edge-specific parameter table. C is shared across all feature heads.
 
+    ``legacy_unit`` preserves the original unit-normalized compatibility.
+    ``width_scaled`` compensates the O(channels**-0.5) contrast of isotropic
+    normalized features by scaling the quadratic term by sqrt(channels).
+    Its raw cost is graph-weighted centered before the existing tanh bound,
+    so an unidentifiable graph-wide offset cannot saturate that bound. This
+    changes neither the entropy coefficient nor C's positivity/gauge and
+    imposes no target C variance; learned costs can still be constant.
+
     The configured step size is an upper bound. Each graph gets a
     differentiable relative-curvature/log-displacement-bounded step. This
     preserves K and all edges without host-synchronized line search or
@@ -28570,6 +28824,7 @@ class GraphOptimizedConductance(nn.Module):
         solver_step_size: float = 0.25,
         solver_entropy: float = 1.0,
         solver_degree_barrier: float = 0.1,
+        solver_cost_scaling: str = "legacy_unit",
         cost_bound: float = 2.0,
         edge_chunk_size: int = 65536,
     ) -> None:
@@ -28602,12 +28857,16 @@ class GraphOptimizedConductance(nn.Module):
             raise ValueError("solver_degree_barrier must be finite and nonnegative")
         if mode not in {"dynamic", "fixed_one"}:
             raise ValueError(f"unsupported conductance mode: {mode}")
+        if solver_cost_scaling not in ("legacy_unit", "width_scaled"):
+            raise ValueError(f"unsupported solver_cost_scaling: {solver_cost_scaling}")
         self.channels = channels
         self.mode = mode
         self.solver_steps = solver_steps
         self.solver_step_size = float(solver_step_size)
         self.solver_entropy = float(solver_entropy)
         self.solver_degree_barrier = float(solver_degree_barrier)
+        self.solver_cost_scaling = solver_cost_scaling
+        self.quadratic_scale = math.sqrt(channels) if solver_cost_scaling == "width_scaled" else 1.0
         self.cost_bound = float(cost_bound)
         self.edge_chunk_size = edge_chunk_size
         if mode == "dynamic":
@@ -28626,7 +28885,7 @@ class GraphOptimizedConductance(nn.Module):
         self.last_c: Tensor | None = None
         self.last_solver_diagnostics: dict[str, Tensor | int | float | bool | str] = {}
 
-    def _compatibility_chunk(
+    def _raw_compatibility_chunk(
         self,
         projected: Tensor,
         metric: Tensor,
@@ -28678,8 +28937,27 @@ class GraphOptimizedConductance(nn.Module):
             dim=1,
         )
         quadratic = ((left - right).square() * metric[edge_graph]).sum(dim=1)
+        if self.solver_cost_scaling == "width_scaled":
+            quadratic = quadratic * self.quadratic_scale
         structural = (local.tanh() * self.structure_metric.to(projected.dtype)).sum(dim=1)
-        return self.cost_bound * torch.tanh((quadratic + structural) / self.cost_bound)
+        return quadratic + structural
+
+    def _compatibility_chunk(
+        self,
+        projected: Tensor,
+        metric: Tensor,
+        tail: Tensor,
+        head: Tensor,
+        sample_degree: Tensor,
+        full_degree: Tensor,
+        edge_graph: Tensor,
+    ) -> Tensor:
+        """Keep the legacy bounded-chunk path numerically unchanged."""
+
+        raw = self._raw_compatibility_chunk(
+            projected, metric, tail, head, sample_degree, full_degree, edge_graph
+        )
+        return self.cost_bound * torch.tanh(raw / self.cost_bound)
 
     def _scaled_gradient(
         self,
@@ -28796,6 +29074,8 @@ class GraphOptimizedConductance(nn.Module):
                 "executed_steps": 0,
                 "reason": "edgeless_graph" if tail.numel() == 0 else "fixed_one_intervention",
                 "finite_step_approximation": False,
+                "solver_cost_scaling": self.solver_cost_scaling,
+                "quadratic_scale": self.quadratic_scale,
             }
             return c
         if self.node_projection is None or self.context_metric is None:
@@ -28806,6 +29086,11 @@ class GraphOptimizedConductance(nn.Module):
         sample_degree = sample_degree.to(compute_dtype)
         full_degree = full_degree.to(compute_dtype)
         chunks = []
+        compatibility = (
+            self._raw_compatibility_chunk
+            if self.solver_cost_scaling == "width_scaled"
+            else self._compatibility_chunk
+        )
         for start in range(0, tail.numel(), self.edge_chunk_size):
             stop = start + self.edge_chunk_size
             arguments = (
@@ -28821,15 +29106,21 @@ class GraphOptimizedConductance(nn.Module):
                 from torch.utils.checkpoint import checkpoint
 
                 delta = checkpoint(
-                    self._compatibility_chunk,
+                    compatibility,
                     *arguments,
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
             else:
-                delta = self._compatibility_chunk(*arguments)
+                delta = compatibility(*arguments)
             chunks.append(delta)
         delta = torch.cat(chunks)
+        if self.solver_cost_scaling == "width_scaled":
+            # Center over complete graphs, never individual memory chunks.
+            # A graph-constant cost has no effect under mean_omega(C)=1;
+            # removing it before tanh avoids spurious width-driven saturation.
+            delta = delta - graph_weighted_mean(delta, edge_graph, num_graphs, omega)[edge_graph]
+            delta = self.cost_bound * torch.tanh(delta / self.cost_bound)
         graph_mass = delta.new_zeros(num_graphs).index_add(0, edge_graph, omega)
         reference_degree = _degree(omega, incidence, state.shape[0])
         active_counts = delta.new_zeros(num_graphs).index_add(
@@ -28922,6 +29213,8 @@ class GraphOptimizedConductance(nn.Module):
                 "method": "curvature_bounded_kl_proximal",
                 "executed_steps": self.solver_steps,
                 "finite_step_approximation": True,
+                "solver_cost_scaling": self.solver_cost_scaling,
+                "quadratic_scale": self.quadratic_scale,
                 "objective_initial": initial_energy,
                 "objective_final": final_energy,
                 "projected_gradient_rms_initial": initial_residual,
@@ -28967,6 +29260,8 @@ DEFAULT_SOLVER_STEPS = 8
 DEFAULT_SOLVER_STEP_SIZE = 0.25
 DEFAULT_SOLVER_ENTROPY = 1.0
 DEFAULT_SOLVER_DEGREE_BARRIER = 0.1
+SOLVER_COST_SCALINGS = ("legacy_unit", "width_scaled")
+LEARNING_BUDGET_POLICIES = ("epochs", "reference_updates")
 TRAINING_SCHEDULES = ("joint", "staged")
 DEFAULT_TRAINING_SCHEDULE = "joint"
 BETA_PARAMETERIZATIONS = ("sigmoid", "margin_sigmoid")
@@ -28987,11 +29282,16 @@ def conductance_configuration(
     solver_step_size: float = DEFAULT_SOLVER_STEP_SIZE,
     solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
     solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
+    solver_cost_scaling: str = "legacy_unit",
 ) -> dict[str, int | float | str]:
     """Canonical architecture identity; solver fields are inactive for the MLP ablation."""
 
     if conductance_backend not in CONDUCTANCE_BACKENDS:
         raise ValueError(f"unsupported conductance backend: {conductance_backend}")
+    if solver_cost_scaling not in SOLVER_COST_SCALINGS:
+        raise ValueError(f"unsupported solver cost scaling: {solver_cost_scaling}")
+    if conductance_backend == "mlp" and solver_cost_scaling != "legacy_unit":
+        raise ValueError("width_scaled costs require the optimization conductance backend")
     if isinstance(solver_steps, bool) or not isinstance(solver_steps, int) or solver_steps < 1:
         raise ValueError("solver_steps must be a positive integer")
     values = {
@@ -29014,6 +29314,12 @@ def conductance_configuration(
         "conductance_backend": conductance_backend,
         "solver_steps": solver_steps,
         **{name: float(value) for name, value in values.items()},
+        # Omit inactive defaults to preserve historical configuration identities.
+        **(
+            {"solver_cost_scaling": solver_cost_scaling}
+            if solver_cost_scaling != "legacy_unit"
+            else {}
+        ),
     }
 
 
@@ -29027,6 +29333,29 @@ def add_conductance_arguments(parser, *, prefix: str = "") -> None:
         help="optimization unrolls C updates; mlp explicitly selects the legacy ablation",
     )
     parser.add_argument(f"--{prefix}solver-steps", type=int, default=DEFAULT_SOLVER_STEPS)
+    parser.add_argument(
+        f"--{prefix}solver-cost-scaling",
+        choices=SOLVER_COST_SCALINGS,
+        default="legacy_unit",
+        help=(
+            "width_scaled centers sqrt(width)-scaled quadratic costs before bounding; "
+            "changes the training recipe"
+        ),
+    )
+    parser.add_argument(
+        f"--{prefix}learning-budget-policy",
+        choices=LEARNING_BUDGET_POLICIES,
+        default="epochs",
+        help=(
+            "reference_updates explicitly extends the epoch ceiling/patience "
+            "when a larger batch reduces updates"
+        ),
+    )
+    parser.add_argument(
+        f"--{prefix}budget-reference-batch-size",
+        type=int,
+        help="reference physical batch; otherwise use the original hardware-profile batch",
+    )
     parser.add_argument(f"--{prefix}solver-step-size", type=float, default=DEFAULT_SOLVER_STEP_SIZE)
     parser.add_argument(f"--{prefix}solver-entropy", type=float, default=DEFAULT_SOLVER_ENTROPY)
     parser.add_argument(
@@ -29044,12 +29373,32 @@ def conductance_arguments_configuration(args, *, prefix: str = "") -> dict[str, 
     """Validate both solver architecture and schedule from a parsed namespace."""
 
     configuration = conductance_configuration(
-        **{name: getattr(args, prefix + name) for name in conductance_configuration()}
+        **{name: getattr(args, prefix + name) for name in conductance_configuration()},
+        solver_cost_scaling=getattr(args, prefix + "solver_cost_scaling", "legacy_unit"),
     )
     schedule = getattr(args, prefix + "training_schedule")
     if schedule not in TRAINING_SCHEDULES:
         raise ValueError(f"unsupported training schedule: {schedule}")
     return {**configuration, "training_schedule": schedule}
+
+
+def learning_budget_arguments_configuration(args, *, prefix: str = "") -> dict[str, Any]:
+    """Keep budget policy separate from model architecture and legacy identities."""
+    policy = getattr(args, prefix + "learning_budget_policy", "epochs")
+    reference = getattr(args, prefix + "budget_reference_batch_size", None)
+    if policy not in LEARNING_BUDGET_POLICIES:
+        raise ValueError(f"unsupported learning budget policy: {policy}")
+    if reference is not None and (
+        isinstance(reference, bool) or not isinstance(reference, int) or reference < 1
+    ):
+        raise ValueError("budget reference batch size must be a positive integer")
+    if policy == "epochs":
+        if reference is not None:
+            raise ValueError("budget reference batch size requires reference_updates")
+        return {}
+    if getattr(args, prefix + "training_schedule", "joint") != "joint":
+        raise ValueError("reference_updates currently requires the explicit joint schedule")
+    return {"learning_budget_policy": policy, "budget_reference_batch_size": reference}
 
 
 def beta_configuration(
@@ -29250,7 +29599,12 @@ from typing import Any
 from chartgat.cache import atomic_write_bytes, atomic_write_json
 from chartgat.resume_compat import snapshots_match
 
-from .protocol import COMPARISON_DESIGN, CONDITIONS, SUITE
+from .learning_budget import (
+    compare_learning_budgets,
+    deterministic_batches_per_epoch,
+    validate_learning_budget,
+)
+from .protocol import COMPARISON_DESIGN, CONDITIONS, HARDWARE_PROFILES, SUITE
 
 
 class ComparisonIntegrityError(ValueError):
@@ -29288,6 +29642,106 @@ def _job_seed(job: dict[str, Any], manifest: dict[str, Any]) -> int:
     return int(manifest.get("config", {}).get("model_seed", 0))
 
 
+def _validate_learning_budget(child: dict[str, Any]) -> dict[str, Any] | None:
+    """Certify explicit fresh update budgets without changing legacy result contracts."""
+    configuration = child["configuration"]
+    policy = configuration.get("learning_budget_policy", "epochs")
+    if policy == "epochs":
+        return None
+    if policy != "reference_updates":
+        raise ComparisonIntegrityError("unsupported reported learning budget policy")
+    budget = child.get("learning_budget")
+    try:
+        validate_learning_budget(budget)
+    except ValueError as error:
+        raise ComparisonIntegrityError(f"invalid learning budget: {error}") from error
+    if (
+        budget["policy"] != policy
+        or configuration.get("training_schedule") != "joint"
+        or child.get("transition_provenance") is not None
+        or child.get("resume_identity", {}).get("transition_request") is not None
+        or any(
+            type(configuration.get(key)) is not int or configuration[key] != budget[budget_key]
+            for key, budget_key in (
+                ("epochs", "requested_epochs"),
+                ("patience", "requested_patience"),
+            )
+        )
+    ):
+        raise ComparisonIntegrityError(
+            "learning budget differs from the requested fresh joint recipe"
+        )
+    batches = (
+        child.get("batch_observability", {}).get("training_batches_per_epoch", {}).get("value")
+    )
+    if type(batches) is not int or batches != budget["actual_batches_per_epoch"]:
+        raise ComparisonIntegrityError(
+            "learning budget actual batches differ from observed execution"
+        )
+    try:
+        explicit_reference = configuration.get("budget_reference_batch_size")
+        if explicit_reference is not None and (
+            type(explicit_reference) is not int or explicit_reference < 1
+        ):
+            raise ValueError("reference physical batch must be a positive integer")
+        if child["dataset"] != "ppi" and configuration["sampling"] == "full":
+            if explicit_reference not in {None, 1}:
+                raise ValueError("full graph reference physical batch must be 1")
+            reference_batches = 1
+        else:
+            hardware = HARDWARE_PROFILES[configuration["hardware_profile"]]
+            baseline = (
+                explicit_reference
+                or hardware[
+                    "ppi_batch_size" if child["dataset"] == "ppi" else "sample_seed_batch_size"
+                ]
+            )
+            reference_batches = deterministic_batches_per_epoch(
+                child["data_observability"]["optimization_count"], baseline
+            )
+    except (ValueError, KeyError, TypeError) as error:
+        raise ComparisonIntegrityError(
+            "learning budget has no valid reference batch evidence"
+        ) from error
+    if budget["reference_batches_per_epoch"] != reference_batches:
+        raise ComparisonIntegrityError(
+            "learning budget reference updates differ from the dataset/batch recipe"
+        )
+    planned = budget["planned_epochs"]
+    if child.get("schedule") != [
+        {"name": "joint", "start_epoch": 1, "end_epoch": planned, "length": planned}
+    ]:
+        raise ComparisonIntegrityError(
+            "learning budget schedule does not cover its planned joint epochs"
+        )
+    epochs, steps = child.get("epochs_run"), child.get("optimizer_steps")
+    if (
+        type(epochs) is not int
+        or not 1 <= epochs <= planned
+        or type(steps) is not int
+        or not 1 <= steps <= budget["planned_maximum_optimizer_steps"]
+        or steps != epochs * batches
+    ):
+        raise ComparisonIntegrityError(
+            "learning budget completed epochs/updates contradict its capacity"
+        )
+    observation = child.get("optimization_observability")
+    if not isinstance(observation, dict) or any(
+        observation.get(key) != value
+        for key, value in {
+            "learning_budget": budget,
+            "planned_training_epochs": planned,
+            "epochs_requested": budget["requested_epochs"],
+            "epochs_completed": epochs,
+            "actual_optimizer_steps": steps,
+        }.items()
+    ):
+        raise ComparisonIntegrityError(
+            "learning budget optimization observations contradict the result"
+        )
+    return budget
+
+
 def _validate_child(
     child: dict[str, Any], job: dict[str, Any], manifest: dict[str, Any], path: Path
 ) -> dict[str, Any]:
@@ -29305,6 +29759,7 @@ def _validate_child(
     configuration = child.get("configuration")
     if not isinstance(configuration, dict):
         raise ComparisonIntegrityError(f"missing child configuration: {path}")
+    learning_budget = _validate_learning_budget(child)
     if any(configuration.get(key) != value for key, value in job.get("architecture", {}).items()):
         raise ComparisonIntegrityError(f"job/child architecture mismatch: {path}")
     execution = job.get("execution")
@@ -29489,6 +29944,15 @@ def _validate_child(
         "joint_best_epoch": child.get("joint_best_epoch"),
         "checkpoint_selection": selection,
         "effective_optimizer_steps_by_group": group_steps,
+        **(
+            {
+                "learning_budget": learning_budget,
+                "optimizer_steps": child["optimizer_steps"],
+                "epochs_run": child["epochs_run"],
+            }
+            if learning_budget is not None
+            else {}
+        ),
         "cache_sha256": child["cache_sha256"],
         "source_sha256": child["source_sha256"],
         "runtime_versions": child["versions"],
@@ -29604,6 +30068,22 @@ def build_comparison(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
                 "dynamic_effective_optimizer_steps_by_group": dynamic[
                     "effective_optimizer_steps_by_group"
                 ],
+                **(
+                    {
+                        "learning_budget_comparison": {
+                            **compare_learning_budgets(
+                                fixed["learning_budget"], dynamic["learning_budget"]
+                            ),
+                            "fixed_completed_optimizer_steps": fixed["optimizer_steps"],
+                            "dynamic_completed_optimizer_steps": dynamic["optimizer_steps"],
+                            "completed_optimizer_step_difference": dynamic["optimizer_steps"]
+                            - fixed["optimizer_steps"],
+                            "actual_completed_updates_compared": True,
+                        }
+                    }
+                    if "learning_budget" in fixed and "learning_budget" in dynamic
+                    else {}
+                ),
             }
         )
     if complete and len(rows) != len(jobs):
@@ -29995,9 +30475,16 @@ from ..benchmark_data import load_dataset, sha256_file, tensor_hash
 from .diagnostics import (
     evaluate,
     layer_diagnostics,
+    parameter_norm,
     require_finite_tensor,
     require_first_step_conductance_gradient,
     selected_checkpoint_interventions,
+)
+from .learning_budget import (
+    deterministic_batches_per_epoch,
+    plan_learning_budget,
+    should_stop_learning_budget,
+    validate_learning_budget,
 )
 from .model import GraphConditionedConductanceNodeClassifier
 from .protocol import (
@@ -30016,6 +30503,7 @@ from .protocol import (
     beta_configuration,
     conductance_arguments_configuration,
     conductance_configuration,
+    learning_budget_arguments_configuration,
 )
 from .sampling import TransductiveGraphSampler
 from .transition_initialization import ensure_transition_initialization
@@ -30080,6 +30568,7 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
     return {
         **COMMON,
         **architecture_configuration(args),
+        **learning_budget_arguments_configuration(args),
         "model_seed": args.model_seed,
         "epochs": args.epochs,
         "patience": args.patience,
@@ -30632,6 +31121,8 @@ def _v5_batch_observability(
     indices: dict[str, torch.Tensor] | None,
     sampler: TransductiveGraphSampler | None,
     args: argparse.Namespace,
+    *,
+    planned_epochs: int | None = None,
 ) -> dict[str, Any]:
     if indices is not None and sampler is None:
         physical_batch_size, batch_unit, batches_per_epoch = 1, "full_graph", 1
@@ -30657,7 +31148,10 @@ def _v5_batch_observability(
         )
     )
     planned_batches = (
-        observed(args.epochs * batches_per_epoch, unit="batches")
+        observed(
+            (args.epochs if planned_epochs is None else planned_epochs) * batches_per_epoch,
+            unit="batches",
+        )
         if batches_per_epoch is not None
         else observed(
             None,
@@ -30683,6 +31177,73 @@ def _v5_batch_observability(
         "sample_prefetch": args.sample_prefetch,
         "cache": "verified immutable official graph cache; static topology reused",
         "sampler": sampler.metadata() if sampler is not None else {"mode": "full"},
+    }
+
+
+def resolve_learning_budget(data, indices, sampler, args) -> dict[str, Any]:
+    """Resolve a declared update budget from full training counts, never a subset."""
+    selected = learning_budget_arguments_configuration(args)
+    reference_batch = selected.get("budget_reference_batch_size")
+    hardware = HARDWARE_PROFILES[args.hardware_profile]
+    if indices is not None and sampler is None:
+        if reference_batch not in {None, 1}:
+            raise ValueError("a full graph has one physical batch; reference batch must be 1")
+        actual, reference = 1, 1
+    elif indices is not None:
+        actual = len(sampler)
+        reference = deterministic_batches_per_epoch(
+            int(indices["train"].numel()),
+            reference_batch or hardware["sample_seed_batch_size"],
+        )
+    else:
+        actual = len(data["train"])
+        reference = deterministic_batches_per_epoch(
+            len(data["train"].dataset), reference_batch or hardware["ppi_batch_size"]
+        )
+    return plan_learning_budget(
+        args.epochs,
+        args.patience,
+        reference,
+        actual,
+        policy=selected.get("learning_budget_policy", "epochs"),
+    )
+
+
+def budget_should_stop(args, budget, history, *, primary_best_epoch, joint_best_epoch) -> bool:
+    """Use persisted actual updates, including after an epoch-boundary resume."""
+    last = history[-1]
+    phase = last["phase"]["phase"]
+    if budget["policy"] == "epochs":
+        return should_stop_early(
+            args.condition,
+            phase,
+            last["epoch"],
+            primary_best_epoch=primary_best_epoch,
+            joint_best_epoch=joint_best_epoch,
+            patience=args.patience,
+        )
+    best = primary_best_epoch if args.condition == "fixed_c" else joint_best_epoch
+    if best < 1:
+        return False
+    selected = next((row for row in history if row["epoch"] == best), None)
+    if selected is None:
+        raise ValueError("update-budget best epoch has no retained optimizer-step evidence")
+    return should_stop_learning_budget(
+        budget,
+        epochs_since_best=last["epoch"] - best,
+        optimizer_steps_since_best=last["optimizer_steps"] - selected["optimizer_steps"],
+        eligible=args.condition == "fixed_c" or phase == "joint",
+    )
+
+
+def _group_gradient_diagnostics(model) -> dict[str, Any]:
+    groups = {name: [] for name in _PARAMETER_GROUPS}
+    for name, value in model.named_parameters():
+        if value.requires_grad:
+            groups[parameter_group(name)].append(value)
+    return {
+        "scope": "last training batch, after global clipping; not an epoch average",
+        "norms": {name: parameter_norm(values, gradient=True) for name, values in groups.items()},
     }
 
 
@@ -30784,6 +31345,12 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_args(args: argparse.Namespace) -> None:
     resolve_hardware_arguments(args)
     conductance_arguments_configuration(args)
+    budget_configuration = learning_budget_arguments_configuration(args)
+    if budget_configuration and getattr(args, "transition_from_checkpoint", None) is not None:
+        raise ValueError(
+            "reference_updates is a changed learning recipe, not an exact legacy transition; "
+            "preserve the source run and use a separate explicitly configured run"
+        )
     validate_transition_arguments(args)
     integers = (
         args.epochs,
@@ -31262,6 +31829,8 @@ def _train_model_impl(
     configure_compute(args)
     _seed(args.model_seed)
     data, indices, sampler = _prepare_data(payload, args, device)
+    learning_budget = resolve_learning_budget(data, indices, sampler, args)
+    planned_epochs = learning_budget["planned_epochs"]
     architecture = architecture_configuration(args)
     model = GraphConditionedConductanceNodeClassifier(
         payload["graphs"][0]["x"].shape[1],
@@ -31275,7 +31844,7 @@ def _train_model_impl(
     shared_state_sha256 = shared_initial_state_sha256(model)
     optimizer = make_optimizer(model)
     validate_optimizer_parameter_ownership(model, optimizer)
-    schedule = phase_schedule(args.epochs, list(args.phase_fractions), args.training_schedule)
+    schedule = phase_schedule(planned_epochs, list(args.phase_fractions), args.training_schedule)
     origin = None
     if getattr(args, "transition_from_checkpoint", None) is not None:
         origin = prepare_training_origin(args, model, optimizer, protocol, output)
@@ -31298,7 +31867,9 @@ def _train_model_impl(
         "optimizer_groups": optimizer_metadata(optimizer),
     }
     data_observability = _v5_data_observability(payload, data, indices, args)
-    batch_observability = _v5_batch_observability(data, indices, sampler, args)
+    batch_observability = _v5_batch_observability(
+        data, indices, sampler, args, planned_epochs=planned_epochs
+    )
     pre_run_observability = {
         "status": "pre_run_configuration",
         "model": {
@@ -31315,6 +31886,7 @@ def _train_model_impl(
                 args.solver_step_size,
                 args.solver_entropy,
                 args.solver_degree_barrier,
+                getattr(args, "solver_cost_scaling", "legacy_unit"),
             ),
             **parameter_observability,
         },
@@ -31324,6 +31896,8 @@ def _train_model_impl(
             "training_schedule": args.training_schedule,
             "phase_schedule": schedule,
             "epochs_requested": args.epochs,
+            "planned_training_epochs": planned_epochs,
+            "learning_budget": learning_budget,
             "early_stopping_patience": args.patience,
             "planned_maximum_optimizer_steps": batch_observability[
                 "planned_maximum_training_batches"
@@ -31421,6 +31995,10 @@ def _train_model_impl(
             print(
                 f"[resume compatibility] {transition['patch_id']}; saved epoch retained", flush=True
             )
+        if learning_budget["policy"] != "epochs":
+            validate_learning_budget(saved.get("learning_budget"))
+            if saved["learning_budget"] != learning_budget:
+                raise ValueError("last.pt learning budget differs from the requested recipe")
         saved_history, saved_epoch = saved.get("history"), saved.get("epoch")
         if (
             not isinstance(saved_history, list)
@@ -31433,7 +32011,7 @@ def _train_model_impl(
         model.load_state_dict(saved["model_state"])
         optimizer.load_state_dict(saved["optimizer_state"])
         history = saved_history
-        start_epoch = args.epochs + 1 if saved.get("complete") is True else saved_epoch + 1
+        start_epoch = planned_epochs + 1 if saved.get("complete") is True else saved_epoch + 1
         best_metric, best_epoch = float(saved["best_metric"]), int(saved["best_epoch"])
         global_best_metric = float(saved.get("global_best_metric", best_metric))
         global_best_epoch = int(saved.get("global_best_epoch", best_epoch))
@@ -31468,7 +32046,7 @@ def _train_model_impl(
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
     started = time.perf_counter()
-    for epoch in range(start_epoch, args.epochs + 1):
+    for epoch in range(start_epoch, planned_epochs + 1):
         epoch_started = time.perf_counter()
         phase, local_epoch = phase_at(schedule, epoch)
         phase_state = configure_phase(model, phase, local_epoch)
@@ -31519,6 +32097,13 @@ def _train_model_impl(
             batch_count += 1
         if not label_count:
             raise RuntimeError("training phase produced no supervised labels")
+        if (
+            learning_budget["policy"] == "reference_updates"
+            and batch_count != learning_budget["actual_batches_per_epoch"]
+        ):
+            raise RuntimeError(
+                "actual training batches changed; refusing an inaccurate update budget"
+            )
         observation = evaluate(
             model,
             validation_data if indices is not None else data["validation"],
@@ -31544,7 +32129,12 @@ def _train_model_impl(
             "maximum_preclip_gradient_norm": maximum_preclip_gradient_norm_value,
             "elapsed_wall_seconds": time.perf_counter() - epoch_started,
             "validation": metric,
-            "layers": layer_diagnostics(model),
+            "layers": layer_diagnostics(model, gradients=True),
+            "layer_observation_scope": {
+                "conductance_and_beta": "last validation forward, not an all-graph distribution",
+                "gradients": "last training batch after global clipping, not validation gradients",
+            },
+            "parameter_group_gradients": _group_gradient_diagnostics(model),
         }
         if origin is not None:
             row["transition_stage_epoch"] = epoch - origin["provenance"]["source_epoch"]
@@ -31605,19 +32195,19 @@ def _train_model_impl(
             torch.cuda.max_memory_allocated(device),
             torch.cuda.max_memory_reserved(device),
         )
-        stop_after_epoch = epoch == args.epochs or should_stop_early(
-            args.condition,
-            phase,
-            epoch,
+        stop_after_epoch = epoch == planned_epochs or budget_should_stop(
+            args,
+            learning_budget,
+            history,
             primary_best_epoch=best_epoch,
             joint_best_epoch=joint_best_epoch,
-            patience=args.patience,
         )
         _save(
             last_path,
             {
                 "schema_version": 4 if origin is not None else 3,
                 "complete": stop_after_epoch,
+                "learning_budget": learning_budget,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "resume_identity": resume_identity,
@@ -31733,6 +32323,8 @@ def _train_model_impl(
     observed_training_batches = sum(int(row["train_batches"]) for row in history)
     optimization_observability = {
         "epochs_requested": args.epochs,
+        "planned_training_epochs": planned_epochs,
+        "learning_budget": learning_budget,
         "epochs_completed": len(history),
         "early_stopping_patience": args.patience,
         "planned_maximum_optimizer_steps": batch_observability["planned_maximum_training_batches"],
@@ -31761,6 +32353,7 @@ def _train_model_impl(
         "schedule": schedule,
         "best_epoch": best_epoch,
         "epochs_run": len(history),
+        "learning_budget": learning_budget,
         "optimizer_steps": optimizer_steps,
         "effective_optimizer_steps_by_group": effective_group_steps,
         "optimization_observability": optimization_observability,
@@ -32019,6 +32612,7 @@ _C_CONFIGURATION = {
     "solver_step_size",
     "solver_entropy",
     "solver_degree_barrier",
+    "solver_cost_scaling",
     "training_schedule",
 }
 _UNCHANGED_SOURCES = (
@@ -54964,6 +55558,523 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ````
 
+# scripts/analyze_v5_results.py
+
+````python
+"""Read-only analysis of recorded V5 JSON evidence; never load a checkpoint.
+
+This command does not train/evaluate a model, certify a run, or infer SOTA from
+stored scores. Missing diagnostics stay unavailable. Output goes to stdout only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+SUITE = "conductance_graph_conditioned_v5"
+CONDITIONS = {"fixed_c", "shared_dynamic_c"}
+UNAVAILABLE = "unavailable"
+
+
+class AnalysisError(ValueError):
+    """An input is corrupt or contradicts its recorded JSON evidence."""
+
+
+def _nonfinite(value: str) -> None:
+    raise ValueError(f"non-finite JSON number {value}")
+
+
+def _float(value: str) -> float:
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"non-finite JSON number {value}")
+    return result
+
+
+def _read(path: Path, expected_sha256: str | None = None) -> Any:
+    if path.suffix.lower() != ".json":
+        raise AnalysisError(f"Only JSON artifacts can be read, never checkpoints: {path}")
+    if path.is_symlink():
+        raise AnalysisError(f"Refusing a symlink input: {path}")
+    try:
+        raw = path.read_bytes()
+        if expected_sha256 and hashlib.sha256(raw).hexdigest() != expected_sha256:
+            raise AnalysisError(f"Recorded SHA256 mismatch: {path}")
+        return json.loads(raw.decode("utf-8-sig"), parse_constant=_nonfinite, parse_float=_float)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise AnalysisError(f"Cannot analyze JSON {path}: {exc}") from exc
+
+
+def _get(value: Any, *keys: str) -> Any:
+    for key in keys:
+        if not isinstance(value, dict) or key not in value:
+            return UNAVAILABLE
+        value = value[key]
+    return UNAVAILABLE if value is None else value
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _delta(after: Any, before: Any) -> Any:
+    return after - before if _number(after) and _number(before) else UNAVAILABLE
+
+
+def _is_metrics(value: Any) -> bool:
+    return (
+        isinstance(value, dict)
+        and value.get("research_suite") == SUITE
+        and value.get("schema_version") == 1
+        and value.get("condition") in CONDITIONS
+    )
+
+
+def _path(value: Any, parent: Path) -> Path | None:
+    if not isinstance(value, str) or not value:
+        return None
+    path = Path(value)
+    return path if path.is_absolute() else parent / path
+
+
+def _history(metrics: dict, metrics_path: Path) -> tuple[list[dict] | None, Any]:
+    path = _path(metrics.get("history"), metrics_path.parent)
+    if path is None or not path.is_file():
+        sibling = metrics_path.parent / "history.json"
+        path = sibling if sibling.is_file() else None
+    if path is None:
+        return None, UNAVAILABLE
+    rows = _read(path, metrics.get("history_sha256"))
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise AnalysisError(f"History must be a JSON array of epoch objects: {path}")
+    epochs = [row.get("epoch") for row in rows]
+    if any(not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 1 for epoch in epochs):
+        raise AnalysisError(f"History contains an invalid cumulative epoch: {path}")
+    if any(a >= b for a, b in zip(epochs, epochs[1:], strict=False)):
+        raise AnalysisError(f"History cumulative epochs are not strictly increasing: {path}")
+    return rows, str(path.resolve())
+
+
+def _history_summary(rows: list[dict] | None) -> dict:
+    fields = (
+        "recorded_epochs",
+        "first_epoch",
+        "last_epoch",
+        "first_train_loss",
+        "last_train_loss",
+        "train_loss_delta",
+        "first_validation",
+        "last_validation",
+        "observed_best_validation",
+        "observed_best_epoch",
+        "observed_best_phase",
+        "epochs_after_best",
+        "best_to_final_drop",
+        "observed_peak_fraction",
+        "actual_train_batches_in_recorded_history",
+    )
+    result = dict.fromkeys(fields, UNAVAILABLE)
+    if rows is None:
+        return result
+    result["recorded_epochs"] = len(rows)
+    if not rows:
+        return result
+    first, last = rows[0], rows[-1]
+    result.update(
+        first_epoch=first["epoch"],
+        last_epoch=last["epoch"],
+        first_train_loss=_get(first, "train_loss"),
+        last_train_loss=_get(last, "train_loss"),
+        first_validation=_get(first, "validation"),
+        last_validation=_get(last, "validation"),
+    )
+    result["train_loss_delta"] = _delta(result["last_train_loss"], result["first_train_loss"])
+    observed = [(i, row) for i, row in enumerate(rows) if _number(row.get("validation"))]
+    if observed:
+        index, best = max(observed, key=lambda item: item[1]["validation"])
+        result.update(
+            observed_best_validation=best["validation"],
+            observed_best_epoch=best["epoch"],
+            observed_best_phase=_get(best, "phase"),
+            epochs_after_best=last["epoch"] - best["epoch"],
+            best_to_final_drop=_delta(best["validation"], result["last_validation"]),
+            observed_peak_fraction=(index + 1) / len(rows),
+        )
+    batches = [row.get("train_batches") for row in rows]
+    if all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in batches
+    ):
+        result["actual_train_batches_in_recorded_history"] = sum(batches)
+    return result
+
+
+def _diagnostics(metrics: dict, rows: list[dict] | None) -> dict:
+    interventions = metrics.get("selected_checkpoint_interventions", {})
+    if not isinstance(interventions, dict):
+        raise AnalysisError("selected_checkpoint_interventions must be a JSON object")
+    learned = _get(interventions, "learned", "metric")
+    comparisons = {}
+    for name in ("learned", "c_one", "mean_c", "shuffled_c"):
+        value = _get(interventions, name, "metric")
+        comparisons[name] = {
+            "metric": value,
+            "delta_from_learned": _delta(value, learned),
+            "recorded_delta_from_learned": _get(interventions, name, "delta_from_learned"),
+        }
+    layers = _get(interventions, "learned", "layers")
+    layer_source = "selected checkpoint learned intervention"
+    if not isinstance(layers, list):
+        layers = _get(rows[-1], "layers") if rows else UNAVAILABLE
+        layer_source = "last recorded training history epoch"
+    summaries = UNAVAILABLE
+    if isinstance(layers, list):
+        summaries = [
+            {
+                "layer": _get(layer, "layer"),
+                "conductance_backend": _get(layer, "conductance_backend"),
+                "c_mean": _get(layer, "conductance", "mean"),
+                "c_cv": _get(layer, "conductance", "cv"),
+                "beta_mean": _get(layer, "beta", "mean"),
+                "beta_min": _get(layer, "beta", "min"),
+                "beta_max": _get(layer, "beta", "max"),
+                "score_std": _get(layer, "score", "std"),
+                "c_optimization": _get(layer, "c_optimization"),
+            }
+            for layer in layers
+        ]
+    return {
+        "interventions": comparisons,
+        "delta_definition": "intervention metric minus learned metric; raw metric units",
+        "layers": summaries,
+        "layer_source": layer_source if isinstance(layers, list) else UNAVAILABLE,
+        "layer_scope": (
+            "recorded last forward graph/batch only, not a dataset-wide pooled statistic"
+        ),
+        "first_active_conductance_gradient": _get(metrics, "first_active_conductance_gradient"),
+    }
+
+
+def _analyze_metrics(path: Path, metrics: dict, contexts: list[dict]) -> dict:
+    configuration = metrics.get("configuration", {})
+    if not isinstance(configuration, dict):
+        raise AnalysisError(f"configuration must be a JSON object: {path}")
+    rows, history_path = _history(metrics, path)
+    history = _history_summary(rows)
+    backend = configuration.get("conductance_backend") or "unspecified_legacy"
+    roles = sorted({context["role"] for context in contexts})
+    if not roles:
+        roles = [
+            "transitioned_training" if metrics.get("transition_provenance") else "fresh_training"
+        ]
+    notes = []
+    if backend == "unspecified_legacy":
+        notes.append(
+            "Backend was not recorded; these scores must not be assigned "
+            "to the current default backend."
+        )
+    if not contexts and not metrics.get("transition_provenance"):
+        notes.append(
+            "Fresh classification means no transition lineage was recorded; "
+            "it does not verify initialization."
+        )
+    if rows is None:
+        notes.append(
+            "History unavailable: learning curves and actual epoch-level updates "
+            "cannot be inspected."
+        )
+    if (
+        _number(history["train_loss_delta"])
+        and history["train_loss_delta"] < 0
+        and _number(history["best_to_final_drop"])
+        and history["best_to_final_drop"] > 0
+    ):
+        notes.append(
+            "Observed: train loss decreased but final validation is below its peak. "
+            "Generalization/selection is a hypothesis, not a proven cause."
+        )
+    if _number(history["observed_peak_fraction"]) and history["observed_peak_fraction"] <= 0.25:
+        notes.append(
+            "Observed validation peak occurred in the first quarter of the recorded "
+            "history (not necessarily the lifetime run)."
+        )
+    if (
+        metrics.get("best_epoch") is not None
+        and _number(history["observed_best_epoch"])
+        and metrics["best_epoch"] != history["observed_best_epoch"]
+    ):
+        notes.append(
+            "Selected and observed-best epochs differ; inspect checkpoint selection "
+            "and phase policy before comparing scores."
+        )
+    execution = metrics.get("hardware_execution", {})
+    batch = _get(metrics, "batch_observability")
+    if not isinstance(batch, dict):
+        batch = _get(execution, "batching")
+    if not isinstance(batch, dict):
+        batch = _get(metrics, "pre_run_observability", "batching")
+    optimizer_steps = _get(metrics, "optimizer_steps")
+    groups = _get(metrics, "effective_optimizer_steps_by_group")
+    if rows:
+        if optimizer_steps == UNAVAILABLE:
+            optimizer_steps = _get(rows[-1], "optimizer_steps")
+        if groups == UNAVAILABLE:
+            groups = _get(rows[-1], "effective_optimizer_steps_by_group")
+    return {
+        "metrics_path": str(path.resolve()),
+        "roles": roles,
+        "contexts": contexts,
+        "status": _get(metrics, "status"),
+        "dataset": _get(metrics, "dataset"),
+        "condition": _get(metrics, "condition"),
+        "model_seed": metrics.get("model_seed", _get(configuration, "model_seed")),
+        "conductance_backend": backend,
+        "configuration": configuration,
+        "recorded_batching": batch,
+        "configured_graph_batch_size": _get(configuration, "batch_size"),
+        "configured_sample_seed_batch_size": _get(configuration, "sample_seed_batch_size"),
+        "sampling": _get(configuration, "sampling"),
+        "actual_optimizer_steps": optimizer_steps,
+        "actual_optimizer_steps_by_group": groups,
+        "post_transition_optimizer_steps": _get(metrics, "post_transition_optimizer_steps"),
+        "learning_budget": _get(metrics, "learning_budget"),
+        "optimization_observability": _get(metrics, "optimization_observability"),
+        "metric_name": _get(metrics, "metric_name"),
+        "validation": _get(metrics, "validation"),
+        "selected_epoch": _get(metrics, "best_epoch"),
+        "checkpoint_selection": _get(metrics, "checkpoint_selection"),
+        "history_path": history_path,
+        "history": history,
+        "diagnostics": _diagnostics(metrics, rows),
+        "transition_provenance": _get(metrics, "transition_provenance"),
+        "source_sha256": _get(metrics, "source_sha256"),
+        "resource_observability": _get(metrics, "resource_observability", "summary"),
+        "throughput": _get(metrics, "throughput"),
+        "error": _get(metrics, "error"),
+        "notes": notes,
+    }
+
+
+def analyze(root: Path) -> dict:
+    """Inspect JSON files only; do not create, modify, or load any checkpoint."""
+    root = Path(root)
+    if not root.exists() or root.is_symlink():
+        raise AnalysisError(
+            f"Input must be an existing non-symlink result directory or JSON file: {root}"
+        )
+    root = root.resolve()
+    if root.is_file():
+        if root.suffix.lower() != ".json":
+            raise AnalysisError(f"Only JSON files are supported, never checkpoints: {root}")
+        paths = [root]
+    else:
+        paths = []
+        for directory, subdirs, files in os.walk(root, followlinks=False):
+            subdirs[:] = sorted(
+                name for name in subdirs if not (Path(directory) / name).is_symlink()
+            )
+            paths.extend(
+                Path(directory) / name
+                for name in sorted(files)
+                if name in {"metrics.json", "manifest.json"}
+                and not (Path(directory) / name).is_symlink()
+            )
+    metrics_by_path: dict[Path, dict] = {}
+    contexts: dict[Path, list[dict]] = {}
+    unavailable_jobs = []
+    manifests = []
+    ignored = []
+    for path in sorted(paths):
+        value = _read(path)
+        if _is_metrics(value):
+            metrics_by_path[path.resolve()] = value
+        elif isinstance(value, dict) and isinstance(value.get("jobs"), list):
+            manifests.append((path, value))
+        else:
+            ignored.append(str(path))
+
+    def reference(value: Any, parent: Path, context: dict, expected: Any = None) -> bool:
+        path = _path(value, parent)
+        if path is None or not path.is_file():
+            return False
+        metrics = _read(path, expected)
+        if not _is_metrics(metrics):
+            raise AnalysisError(f"Referenced job is not a supported V5 metrics object: {path}")
+        for key in ("dataset", "condition"):
+            if context.get(key) not in (None, UNAVAILABLE, metrics.get(key)):
+                raise AnalysisError(f"Manifest/metrics {key} mismatch: {path}")
+        seed = metrics.get("model_seed", _get(metrics, "configuration", "model_seed"))
+        if seed != UNAVAILABLE and context.get("model_seed") not in (None, UNAVAILABLE, seed):
+            raise AnalysisError(f"Manifest/metrics model_seed mismatch: {path}")
+        resolved = path.resolve()
+        metrics_by_path[resolved] = metrics
+        contexts.setdefault(resolved, []).append(context)
+        return True
+
+    for manifest_path, manifest in manifests:
+        for job in manifest["jobs"]:
+            if not isinstance(job, dict):
+                raise AnalysisError(f"Manifest jobs must be objects: {manifest_path}")
+            if job.get("condition") not in CONDITIONS or job.get("version", "v5") != "v5":
+                continue
+            action = job.get("action")
+            context = {
+                key: _get(job, key)
+                for key in (
+                    "job_id",
+                    "dataset",
+                    "condition",
+                    "profile",
+                    "model_seed",
+                    "action",
+                    "status",
+                )
+            }
+            context["manifest_path"] = str(manifest_path)
+            historical = job.get("historical_reference")
+            historical_found = False
+            if isinstance(historical, dict):
+                historical_context = {**context, "role": "historical_reference"}
+                historical_found = reference(
+                    historical.get("metrics_path"),
+                    manifest_path.parent,
+                    historical_context,
+                    historical.get("metrics_sha256"),
+                )
+            if action in {"reuse_completed_fixed", "preserve_legacy_dynamic"}:
+                role = "historical_reference"
+                found = historical_found
+            else:
+                role = (
+                    "transitioned_training"
+                    if action in {"transition_dynamic", "resume_incomplete_fixed"}
+                    else "fresh_training"
+                )
+                output = _path(job.get("output_dir"), manifest_path.parent)
+                metrics_path = job.get("metrics_path") or (
+                    str(output / "metrics.json") if output else None
+                )
+                expected = job.get("metrics_sha256") or _get(job, "result", "metrics_sha256")
+                found = reference(
+                    metrics_path,
+                    manifest_path.parent,
+                    {**context, "role": role},
+                    None if expected == UNAVAILABLE else expected,
+                )
+            if not found:
+                unavailable_jobs.append(
+                    {
+                        **context,
+                        "role": role,
+                        "evidence": UNAVAILABLE,
+                        "planned_configuration": job.get(
+                            "configuration", job.get("architecture", UNAVAILABLE)
+                        ),
+                        "reason": (
+                            "No readable V5 metrics at the recorded path; "
+                            "status is not evidence of new training completion."
+                        ),
+                    }
+                )
+    records = [
+        _analyze_metrics(path, value, contexts.get(path, []))
+        for path, value in sorted(metrics_by_path.items())
+    ]
+    if not records and not unavailable_jobs:
+        raise AnalysisError(f"No supported V5 metrics or V5 manifest jobs found under {root}")
+    return {
+        "schema_version": 1,
+        "root": str(root),
+        "scope": (
+            "Read-only recorded JSON diagnostics; no checkpoint/GPU execution, "
+            "causal comparison, or SOTA claim."
+        ),
+        "records": records,
+        "unavailable_jobs": unavailable_jobs,
+        "ignored_json": ignored,
+    }
+
+
+def render_text(report: dict) -> str:
+    lines = [report["scope"]]
+    for record in report["records"]:
+        lines.extend(
+            (
+                "",
+                f"{record['dataset']}/{record['condition']} seed={record['model_seed']} | "
+                f"{','.join(record['roles'])} | status={record['status']} | "
+                f"backend={record['conductance_backend']}",
+                f"  metrics: {record['metrics_path']}",
+            )
+        )
+        for key in (
+            "configuration",
+            "recorded_batching",
+            "actual_optimizer_steps",
+            "actual_optimizer_steps_by_group",
+            "post_transition_optimizer_steps",
+            "learning_budget",
+            "optimization_observability",
+            "validation",
+            "selected_epoch",
+            "checkpoint_selection",
+            "history",
+            "diagnostics",
+            "transition_provenance",
+            "resource_observability",
+            "throughput",
+        ):
+            lines.append(f"  {key}: {json.dumps(record[key], ensure_ascii=False, allow_nan=False)}")
+        lines.extend(f"  note: {note}" for note in record["notes"])
+    for job in report["unavailable_jobs"]:
+        lines.extend(
+            (
+                "",
+                f"{job['dataset']}/{job['condition']} | {job['role']} | "
+                f"status={job['status']} | evidence=unavailable",
+                f"  {job['reason']}",
+            )
+        )
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--root",
+        type=Path,
+        required=True,
+        help="Result directory, manifest.json, or V5 metrics.json",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print JSON to stdout instead of text; never write a file",
+    )
+    args = parser.parse_args(argv)
+    try:
+        report = analyze(args.root)
+    except AnalysisError as exc:
+        print(f"V5 analysis failed: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False)
+        if args.json
+        else render_text(report)
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # scripts/archive_failed_rich_run.py
 
 ````python
@@ -62709,6 +63820,7 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     add_conductance_arguments,
     beta_configuration,
     conductance_arguments_configuration,
+    learning_budget_arguments_configuration,
 )
 from research.conductance_gat.v5.protocol import (  # noqa: E402
     CONDITIONS as V5_CONDITIONS,
@@ -62878,6 +63990,8 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("portable V5 PPI requires graph batch-size at least 2")
     _v5_beta_configuration(args)
     _v5_conductance_configuration(args)
+    if "v5" in args.versions:
+        _v5_learning_budget_configuration(args)
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
         raise ValueError("CUDA is required; CPU training/fallback is not supported")
     if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
@@ -62972,6 +64086,10 @@ def _effective_min_free_gb(args: argparse.Namespace) -> float:
 
 def _v5_conductance_configuration(args: argparse.Namespace) -> dict[str, Any]:
     return conductance_arguments_configuration(args, prefix="v5_")
+
+
+def _v5_learning_budget_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return learning_budget_arguments_configuration(args, prefix="v5_")
 
 
 def _exclusions(args: argparse.Namespace) -> list[dict[str, str]]:
@@ -63109,6 +64227,9 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                                 command += ["--" + name.replace("_", "-"), str(value)]
                             for name, value in _v5_conductance_configuration(args).items():
                                 command += ["--" + name.replace("_", "-"), str(value)]
+                            for name, value in _v5_learning_budget_configuration(args).items():
+                                if value is not None:
+                                    command += ["--" + name.replace("_", "-"), str(value)]
                             validate_job_plan(
                                 getattr(args, "resolved_resource_plan", None),
                                 track="conductance",
@@ -63125,6 +64246,11 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                                 "version": version,
                                 "profile": profile_name,
                                 "architecture": dict(profile),
+                                **(
+                                    {"learning_budget": _v5_learning_budget_configuration(args)}
+                                    if version == "v5" and _v5_learning_budget_configuration(args)
+                                    else {}
+                                ),
                                 "sampling": sampling,
                                 "execution": execution,
                                 "occupancy_expectation": (
@@ -63546,6 +64672,13 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("child physical batch size does not match the execution plan")
     if job["version"] == "v5":
         execution = job["execution"]
+        budget = job.get("learning_budget", {})
+        if configuration.get("learning_budget_policy", "epochs") != budget.get(
+            "learning_budget_policy", "epochs"
+        ) or configuration.get("budget_reference_batch_size") != budget.get(
+            "budget_reference_batch_size"
+        ):
+            raise RuntimeError("V5 child learning budget does not match its requested recipe")
         expected_configuration = {
             "hardware_profile": execution["hardware_profile"],
             "precision": execution["precision"],
@@ -63811,6 +64944,11 @@ def main(argv: list[str] | None = None) -> int:
         "v5_ppi_batch_size": args.v5_ppi_batch_size,
         "v5_beta": _v5_beta_configuration(args),
         "v5_conductance": (_v5_conductance_configuration(args) if "v5" in args.versions else None),
+        **(
+            {"v5_learning_budget": _v5_learning_budget_configuration(args)}
+            if "v5" in args.versions and _v5_learning_budget_configuration(args)
+            else {}
+        ),
         "hardware_profile": args.hardware_profile,
         "resource_plan": (
             resource_plan_identity(args.resolved_resource_plan)
@@ -65087,6 +66225,7 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     add_conductance_arguments,
     beta_configuration,
     conductance_arguments_configuration,
+    learning_budget_arguments_configuration,
 )
 from scripts import run_conductance_factorial as shared  # noqa: E402
 from scripts.check_dependencies import (  # noqa: E402
@@ -65220,6 +66359,7 @@ def _effective_min_free_gb(args: argparse.Namespace) -> float:
 
 
 def _validate(args: argparse.Namespace) -> None:
+    learning_budget_arguments_configuration(args)
     if not args.datasets or len(set(args.datasets)) != len(args.datasets):
         raise ValueError("datasets must be nonempty and contain no duplicates")
     if args.model_seed < 0:
@@ -65272,6 +66412,7 @@ def make_jobs(
 ) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     data_root = args.data_root.expanduser().resolve()
+    learning_budget = learning_budget_arguments_configuration(args)
     for dataset in args.datasets:
         sampling = _sampling(dataset, args.sampling)
         execution = _resolved_execution(args, dataset)
@@ -65322,12 +66463,16 @@ def make_jobs(
             ]
             for name, value in architecture.items():
                 command.extend(("--" + name.replace("_", "-"), str(value)))
+            for name, value in learning_budget.items():
+                if value is not None:
+                    command.extend(("--" + name.replace("_", "-"), str(value)))
             jobs.append(
                 {
                     "job_id": f"{dataset}/{condition}",
                     "dataset": dataset,
                     "condition": condition,
                     "architecture": dict(architecture),
+                    **({"learning_budget": dict(learning_budget)} if learning_budget else {}),
                     "sampling": sampling,
                     "batch_size": child_batch_size,
                     "workers": execution["dataloader_workers"],
@@ -65406,6 +66551,13 @@ def _load_metrics(job: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("child graph batch size does not match the V5 dataset contract")
     if configuration.get("workers") != job["workers"]:
         raise RuntimeError("child DataLoader workers do not match the V5 dataset contract")
+    budget = job.get("learning_budget", {})
+    if configuration.get("learning_budget_policy", "epochs") != budget.get(
+        "learning_budget_policy", "epochs"
+    ) or configuration.get("budget_reference_batch_size") != budget.get(
+        "budget_reference_batch_size"
+    ):
+        raise RuntimeError("child learning budget does not match the requested V5 recipe")
     execution = job["execution"]
     for key in ("hardware_profile", "precision", "tf32", "edge_chunk_size"):
         if configuration.get(key) != execution[key]:
@@ -65520,6 +66672,11 @@ def main(argv: list[str] | None = None) -> int:
         "datasets": list(args.datasets),
         "profile": args.profile,
         "architecture": architecture,
+        **(
+            {"learning_budget": learning_budget_arguments_configuration(args)}
+            if learning_budget_arguments_configuration(args)
+            else {}
+        ),
         "model_seed": args.model_seed,
         "epochs": args.epochs,
         "patience": args.patience,
@@ -69349,6 +70506,7 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     add_conductance_arguments,
     beta_configuration,
     conductance_arguments_configuration,
+    learning_budget_arguments_configuration,
 )
 from scripts.process_safety import (  # noqa: E402
     close_owned_child_stdout,
@@ -69617,6 +70775,8 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("nondefault Cycle basis backend requires v2 in --cycle-versions")
     _v5_beta_configuration(args)
     _v5_conductance_configuration(args)
+    if "conductance" in args.tracks and "v5" in args.conductance_versions:
+        _v5_learning_budget_configuration(args)
 
 
 def _execution_devices(args: argparse.Namespace) -> list[str]:
@@ -69726,6 +70886,10 @@ def _v5_conductance_configuration(args: argparse.Namespace) -> dict[str, Any]:
     return conductance_arguments_configuration(args, prefix="v5_")
 
 
+def _v5_learning_budget_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return learning_budget_arguments_configuration(args, prefix="v5_")
+
+
 def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
     """Build one child job per track; execution waves bind at most one track per GPU."""
     results_root = args.results_root.expanduser().resolve()
@@ -69785,6 +70949,9 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             if "v5" in args.conductance_versions:
                 for name, value in _v5_conductance_configuration(args).items():
                     command += ["--v5-" + name.replace("_", "-"), str(value)]
+                for name, value in _v5_learning_budget_configuration(args).items():
+                    if value is not None:
+                        command += ["--v5-" + name.replace("_", "-"), str(value)]
             if args.conductance_legacy_ppi_batch_size is not None:
                 command += [
                     "--legacy-ppi-batch-size",
@@ -70575,6 +71742,13 @@ def _config_payload(
             else None
         ),
         "v5_activation_checkpoint": args.v5_activation_checkpoint,
+        **(
+            {"v5_learning_budget": _v5_learning_budget_configuration(args)}
+            if "conductance" in args.tracks
+            and "v5" in args.conductance_versions
+            and _v5_learning_budget_configuration(args)
+            else {}
+        ),
         "cycle_v2_basis_backend": args.cycle_v2_basis_backend,
         "allow_download": args.allow_download,
         "data_root": str(data_root),
@@ -70731,6 +71905,9 @@ def _calibration_request(args: argparse.Namespace, run_id: str) -> dict[str, Any
     baseline.resource_plan = None
     baseline.resolved_resource_plan = None
     baseline.dry_run = False
+    # Budget policy remains in the exact argv identity. Disposable resource probes
+    # still measure the same fixed optimizer-step workload; they do not train the
+    # requested full learning budget or change the caller's epoch ceiling.
     # Both mechanisms must fit the same selected resources, even for a one-arm final selection.
     baseline.cycle_v2_encodings = ["se", "pe"]
     paired_jobs = []
@@ -73056,6 +74233,7 @@ from chartgat.cache import atomic_write_json  # noqa: E402
 from research.conductance_gat.v5.protocol import (  # noqa: E402
     add_conductance_arguments,
     conductance_arguments_configuration,
+    learning_budget_arguments_configuration,
 )
 from scripts.training_resource_plan import (  # noqa: E402
     allocated_cpu_count,
@@ -73227,6 +74405,11 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     if args.output_dir is None or args.extra_epochs < 0:
         raise ValueError("a distinct --output-dir and nonnegative --extra-epochs are required")
     requested = conductance_arguments_configuration(args)
+    if learning_budget_arguments_configuration(args):
+        raise ValueError(
+            "reference_updates is not a legacy transition policy; preserve the source "
+            "budget or configure a separate new run instead of silently changing it"
+        )
     if (
         requested["conductance_backend"] != "optimization"
         or requested["training_schedule"] != "joint"
@@ -78011,6 +79194,360 @@ def test_orientation_flips_preserve_physical_relations(B):
     np.testing.assert_allclose(B_flipped.T @ F_flipped, 0.0, atol=1e-12)
     np.testing.assert_allclose(B_flipped @ p, flip_edge_quantity(B @ p, signs))
     np.testing.assert_allclose(F_flipped @ a, flip_edge_quantity(F @ a, signs))
+````
+
+# tests/test_analyze_v5_results.py
+
+````python
+"""Synthetic JSON unit fixtures only: not real experiments or GPU measurements."""
+
+import hashlib
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from scripts import analyze_v5_results as analyzer
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, allow_nan=False), encoding="utf-8")
+    return path
+
+
+def metrics(**changes):
+    return {
+        "schema_version": 1,
+        "research_suite": analyzer.SUITE,
+        "status": "passed",
+        "dataset": "ppi",
+        "condition": "shared_dynamic_c",
+        "model_seed": 0,
+        "configuration": {
+            "conductance_backend": "optimization",
+            "training_schedule": "joint",
+            "batch_size": 8,
+            "sample_seed_batch_size": 1024,
+            "sampling": "full",
+            "epochs": 200,
+        },
+        "validation": 0.8,
+        "best_epoch": 41,
+        "metric_name": "micro_f1",
+        **changes,
+    }
+
+
+def history():
+    return [
+        {
+            "epoch": epoch,
+            "train_loss": loss,
+            "validation": validation,
+            "phase": {"phase": "joint"},
+            "train_batches": 3,
+            "optimizer_steps": epoch * 3,
+            "effective_optimizer_steps_by_group": {"conductance": epoch * 3},
+        }
+        for epoch, loss, validation in [
+            (41, 0.5, 0.8),
+            (42, 0.4, 0.7),
+            (43, 0.3, 0.6),
+            (44, 0.2, 0.5),
+        ]
+    ]
+
+
+def test_recorded_curves_keep_cumulative_epochs_updates_and_actual_batch(tmp_path):
+    write_json(tmp_path / "history.json", history())
+    write_json(
+        tmp_path / "metrics.json",
+        metrics(
+            batch_observability={"configured_physical_batch_size": 8, "batch_unit": "graphs"},
+            learning_budget={"policy": "reference_updates", "target_optimizer_steps": 600},
+        ),
+    )
+    record = analyzer.analyze(tmp_path)["records"][0]
+    assert record["history"]["first_epoch"] == 41
+    assert record["history"]["observed_best_epoch"] == 41
+    assert record["history"]["epochs_after_best"] == 3
+    assert record["history"]["best_to_final_drop"] == pytest.approx(0.3)
+    assert record["history"]["train_loss_delta"] == pytest.approx(-0.3)
+    assert record["history"]["actual_train_batches_in_recorded_history"] == 12
+    assert record["actual_optimizer_steps"] == 132
+    assert record["actual_optimizer_steps_by_group"] == {"conductance": 132}
+    assert record["recorded_batching"]["configured_physical_batch_size"] == 8
+    assert record["learning_budget"]["target_optimizer_steps"] == 600
+    assert any("first quarter" in note for note in record["notes"])
+    assert any("hypothesis" in note for note in record["notes"])
+
+
+def test_interventions_delta_sign_layers_and_first_gradient(tmp_path):
+    layer = {
+        "layer": 0,
+        "conductance": {"mean": 1, "cv": 0.25},
+        "score": {"std": 0.1},
+        "beta": {"mean": 0.7, "min": 0.6, "max": 0.8},
+        "conductance_backend": "mlp",
+    }
+    first_gradient = {"applicable": True, "passed": True, "layers": [{"total_gradient_norm": 0.01}]}
+    write_json(
+        tmp_path / "metrics.json",
+        metrics(
+            configuration={"conductance_backend": "mlp"},
+            selected_checkpoint_interventions={
+                "learned": {"metric": 0.8, "layers": [layer]},
+                "c_one": {"metric": 0.7},
+                "shuffled_c": {"metric": 0.6},
+            },
+            first_active_conductance_gradient=first_gradient,
+        ),
+    )
+    record = analyzer.analyze(tmp_path)["records"][0]
+    diagnostics = record["diagnostics"]
+    assert record["conductance_backend"] == "mlp"
+    assert diagnostics["interventions"]["c_one"]["delta_from_learned"] == pytest.approx(-0.1)
+    assert diagnostics["interventions"]["shuffled_c"]["delta_from_learned"] == pytest.approx(-0.2)
+    assert diagnostics["interventions"]["mean_c"]["metric"] == "unavailable"
+    assert diagnostics["layers"][0]["c_cv"] == 0.25
+    assert diagnostics["layers"][0]["score_std"] == 0.1
+    assert diagnostics["layers"][0]["beta_mean"] == 0.7
+    assert diagnostics["first_active_conductance_gradient"] == first_gradient
+    assert "not a dataset-wide" in diagnostics["layer_scope"]
+
+
+def test_missing_values_are_unavailable_and_legacy_not_current_backend(tmp_path):
+    write_json(
+        tmp_path / "metrics.json", metrics(configuration={}, validation=0.0, optimizer_steps=0)
+    )
+    record = analyzer.analyze(tmp_path)["records"][0]
+    assert record["conductance_backend"] == "unspecified_legacy"
+    assert record["history"]["recorded_epochs"] == "unavailable"
+    assert record["actual_optimizer_steps"] == 0
+    assert record["validation"] == 0.0
+    assert record["diagnostics"]["first_active_conductance_gradient"] == "unavailable"
+    assert any("must not be assigned" in note for note in record["notes"])
+
+
+def test_history_checkpoint_selection_and_layer_fallback(tmp_path):
+    rows = history()
+    rows[-1]["layers"] = [{"layer": 2, "conductance": {"cv": 0}}]
+    write_json(tmp_path / "history.json", rows)
+    write_json(tmp_path / "metrics.json", metrics(best_epoch=43))
+    record = analyzer.analyze(tmp_path)["records"][0]
+    assert record["selected_epoch"] == 43
+    assert record["history"]["observed_best_epoch"] == 41
+    assert record["diagnostics"]["layers"][0]["c_cv"] == 0
+    assert record["diagnostics"]["layer_source"] == "last recorded training history epoch"
+    assert any("phase policy" in note for note in record["notes"])
+
+
+def test_manifest_historical_pending_and_transition_are_separate(tmp_path):
+    old = write_json(
+        tmp_path / "old" / "metrics.json",
+        metrics(condition="fixed_c", configuration={"conductance_backend": "mlp"}),
+    )
+    new = write_json(
+        tmp_path / "new" / "metrics.json",
+        metrics(
+            transition_provenance={"mode": "replace_c", "source_epoch": 40},
+            post_transition_optimizer_steps=12,
+        ),
+    )
+    manifest = write_json(
+        tmp_path / "manifest.json",
+        {
+            "jobs": [
+                {
+                    "dataset": "ppi",
+                    "condition": "fixed_c",
+                    "action": "reuse_completed_fixed",
+                    "status": "historical_reference",
+                    "historical_reference": {"metrics_path": str(old)},
+                },
+                {
+                    "dataset": "ppi",
+                    "condition": "shared_dynamic_c",
+                    "action": "transition_dynamic",
+                    "status": "passed",
+                    "output_dir": str(new.parent),
+                },
+                {
+                    "dataset": "cora",
+                    "condition": "shared_dynamic_c",
+                    "action": "fresh_dynamic",
+                    "status": "pending",
+                    "output_dir": str(tmp_path / "missing"),
+                },
+            ]
+        },
+    )
+    report = analyzer.analyze(manifest)
+    assert len(report["records"]) == 2
+    roles = {record["condition"]: record["roles"] for record in report["records"]}
+    assert roles["fixed_c"] == ["historical_reference"]
+    assert roles["shared_dynamic_c"] == ["transitioned_training"]
+    assert report["unavailable_jobs"][0]["status"] == "pending"
+    assert report["unavailable_jobs"][0]["evidence"] == "unavailable"
+    assert "new training completion" in report["unavailable_jobs"][0]["reason"]
+
+
+def test_completed_old_dynamic_is_historical_not_new_solver_completion(tmp_path):
+    old = write_json(
+        tmp_path / "old" / "metrics.json", metrics(configuration={"conductance_backend": "mlp"})
+    )
+    write_json(
+        tmp_path / "manifest.json",
+        {
+            "jobs": [
+                {
+                    "condition": "shared_dynamic_c",
+                    "dataset": "ppi",
+                    "action": "preserve_legacy_dynamic",
+                    "status": "pending_extra_budget",
+                    "historical_reference": {"metrics_path": str(old)},
+                }
+            ]
+        },
+    )
+    report = analyzer.analyze(tmp_path)
+    assert len(report["records"]) == 1
+    assert report["records"][0]["roles"] == ["historical_reference"]
+    assert report["records"][0]["conductance_backend"] == "mlp"
+
+
+def test_unknown_suite_and_version_are_not_v5_results(tmp_path):
+    write_json(tmp_path / "v2" / "metrics.json", metrics(research_suite="conductance_direct_v2"))
+    write_json(tmp_path / "future" / "metrics.json", metrics(schema_version=999))
+    actual = write_json(tmp_path / "v5" / "metrics.json", metrics())
+    report = analyzer.analyze(tmp_path)
+    assert [record["metrics_path"] for record in report["records"]] == [str(actual.resolve())]
+    assert len(report["ignored_json"]) == 2
+
+
+@pytest.mark.parametrize("raw", ["{broken", '{"x": NaN}', '{"x": Infinity}', '{"x": 1e999}'])
+def test_corrupt_or_nonfinite_json_is_an_explicit_path_error(tmp_path, raw, capsys):
+    path = tmp_path / "metrics.json"
+    path.write_text(raw, encoding="utf-8")
+    assert analyzer.main(["--root", str(tmp_path), "--json"]) == 1
+    captured = capsys.readouterr()
+    assert str(path) in captured.err
+    assert "failed" in captured.err
+    assert captured.out == ""
+
+
+def test_history_sha256_is_checked_and_stale_server_path_uses_local_sibling(tmp_path):
+    local = write_json(tmp_path / "history.json", history())
+    digest = hashlib.sha256(local.read_bytes()).hexdigest()
+    target = tmp_path / "metrics.json"
+    write_json(
+        target, metrics(history="/not-present-server-run/history.json", history_sha256=digest)
+    )
+    assert analyzer.analyze(target)["records"][0]["history_path"] == str(local.resolve())
+    write_json(target, metrics(history_sha256="0" * 64))
+    with pytest.raises(analyzer.AnalysisError, match="SHA256 mismatch"):
+        analyzer.analyze(target)
+
+
+@pytest.mark.parametrize("rows", [{"epoch": 1}, [{"epoch": 2}, {"epoch": 1}], [{"epoch": True}]])
+def test_invalid_history_contract_is_not_silently_replaced(tmp_path, rows):
+    write_json(tmp_path / "history.json", rows)
+    write_json(tmp_path / "metrics.json", metrics())
+    with pytest.raises(analyzer.AnalysisError, match="History"):
+        analyzer.analyze(tmp_path)
+
+
+def test_manifest_identity_and_recorded_metric_hash_must_match(tmp_path):
+    target = write_json(tmp_path / "child" / "metrics.json", metrics())
+    manifest = tmp_path / "manifest.json"
+    job = {
+        "dataset": "ppi",
+        "condition": "shared_dynamic_c",
+        "output_dir": str(target.parent),
+        "metrics_sha256": "0" * 64,
+    }
+    write_json(manifest, {"jobs": [job]})
+    with pytest.raises(analyzer.AnalysisError, match="SHA256 mismatch"):
+        analyzer.analyze(manifest)
+    job.pop("metrics_sha256")
+    job["dataset"] = "cora"
+    write_json(manifest, {"jobs": [job]})
+    with pytest.raises(analyzer.AnalysisError, match="dataset mismatch"):
+        analyzer.analyze(manifest)
+
+
+def test_stdout_only_without_torch_site_packages_or_checkpoint_access(tmp_path):
+    write_json(tmp_path / "metrics.json", metrics())
+    checkpoint = tmp_path / "last.pt"
+    checkpoint.write_bytes(b"not a checkpoint; must never be opened")
+    before = {
+        path.relative_to(tmp_path): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    script = Path(analyzer.__file__).resolve()
+    completed = subprocess.run(
+        [sys.executable, "-B", "-S", str(script), "--root", str(tmp_path), "--json"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["records"][0]["dataset"] == "ppi"
+    assert completed.stderr == ""
+    after = {
+        path.relative_to(tmp_path): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+
+
+def test_explicit_checkpoint_and_empty_root_are_rejected(tmp_path):
+    checkpoint = tmp_path / "last.pt"
+    checkpoint.write_bytes(b"unit-only")
+    with pytest.raises(analyzer.AnalysisError, match="never checkpoints"):
+        analyzer.analyze(checkpoint)
+    with pytest.raises(analyzer.AnalysisError, match="No supported V5"):
+        analyzer.analyze(tmp_path)
+
+
+def test_manifest_cannot_make_analyzer_read_checkpoint(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "last.pt"
+    checkpoint.write_bytes(b"unit-only")
+    manifest = write_json(
+        tmp_path / "manifest.json",
+        {
+            "jobs": [
+                {
+                    "condition": "shared_dynamic_c",
+                    "metrics_path": str(checkpoint),
+                }
+            ]
+        },
+    )
+    original = Path.read_bytes
+
+    def guarded_read(path):
+        assert path != checkpoint, "analyzer must not even read checkpoint bytes"
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read)
+    with pytest.raises(analyzer.AnalysisError, match="never checkpoints"):
+        analyzer.analyze(manifest)
+
+
+def test_default_text_names_diagnostics_and_missing_data(tmp_path, capsys):
+    write_json(tmp_path / "metrics.json", metrics())
+    assert analyzer.main(["--root", str(tmp_path)]) == 0
+    text = capsys.readouterr().out
+    assert "Read-only" in text and "no checkpoint/GPU" in text
+    assert "first_active_conductance_gradient" in text
+    assert "unavailable" in text
+    assert "shuffled_c" in text and "c_one" in text
 ````
 
 # tests/test_archive_failed_rich_run.py
@@ -87069,6 +88606,292 @@ def test_calibration_group_uses_verified_payload_splits_not_guessed_graph_fields
     assert actual_axis == axis
     assert identity["data_sha256"] == protocol["data_sha256"]
     assert identity["split_sha256"] == protocol["split_sha256"]
+````
+
+# tests/test_conductance_v5_cost_scaling.py
+
+````python
+"""Synthetic CPU debug tests; not real-data training or performance evidence."""
+
+from __future__ import annotations
+
+import copy
+import math
+
+import pytest
+import torch
+from torch.nn import functional as F
+
+from research.conductance_gat.v5.operator import graph_weighted_mean, shared_head_diffusion
+from research.conductance_gat.v5.optimization import GraphOptimizedConductance
+
+
+def _inputs(channels=5):
+    generator = torch.Generator().manual_seed(731)
+    x = torch.randn(9, channels, generator=generator, dtype=torch.float64)
+    incidence = torch.tensor([[0, 0, 0, 1, 2, 4, 5, 5], [1, 2, 3, 2, 3, 5, 6, 7]])
+    batch = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1, 2])
+    degree = torch.bincount(incidence.flatten(), minlength=9).double()
+    full_degree = degree + torch.arange(9).double() % 3
+    context = torch.randn(3, 2 * channels + 8, generator=generator, dtype=torch.float64)
+    omega = torch.tensor([1.0, 2.5, 0.7, 1.3, 3.0, 1.2, 0.8, 2.1], dtype=torch.float64)
+    return x, incidence, batch, degree, full_degree, context, omega
+
+
+def _run(model, inputs, *, x=None, context=None):
+    state, incidence, batch, degree, full_degree, z, omega = inputs
+    return model(
+        state if x is None else x,
+        incidence,
+        batch,
+        z.shape[0],
+        graph_context=z if context is None else context,
+        sample_degree=degree,
+        full_degree=full_degree,
+        edge_normalization_weight=omega,
+    )
+
+
+def _model(channels=5, **kwargs):
+    return GraphOptimizedConductance(
+        channels, solver_cost_scaling="width_scaled", **kwargs
+    ).double()
+
+
+@pytest.mark.parametrize("invalid", [None, True, "auto", "standardized", 2, [], {}])
+def test_cost_scaling_requires_an_explicit_known_recipe(invalid):
+    with pytest.raises(ValueError, match="solver_cost_scaling"):
+        GraphOptimizedConductance(5, solver_cost_scaling=invalid)
+
+
+def test_legacy_default_is_bitwise_identical_and_adds_no_parameters():
+    torch.manual_seed(19)
+    inputs = _inputs()
+    default = GraphOptimizedConductance(5).double()
+    explicit = GraphOptimizedConductance(5, solver_cost_scaling="legacy_unit").double()
+    explicit.load_state_dict(default.state_dict())
+    expected = _run(default, inputs)
+    actual = _run(explicit, inputs)
+    assert torch.equal(expected, actual)
+    assert torch.equal(default.last_scores, explicit.last_scores)
+    weights = torch.arange(expected.numel(), dtype=expected.dtype)
+    (expected * weights).sum().backward()
+    (actual * weights).sum().backward()
+    assert all(
+        torch.equal(left.grad, right.grad)
+        for left, right in zip(default.parameters(), explicit.parameters(), strict=True)
+    )
+    scaled = _model()
+    assert scaled.state_dict().keys() == default.state_dict().keys()
+    assert sum(p.numel() for p in scaled.parameters()) == sum(
+        p.numel() for p in default.parameters()
+    )
+    assert default.quadratic_scale == 1.0
+    assert scaled.quadratic_scale == math.sqrt(5)
+
+
+def test_quadratic_only_is_width_scaled_then_complete_graph_centered_before_bound():
+    torch.manual_seed(23)
+    inputs = _inputs()
+    model = _model(edge_chunk_size=2)
+    state, incidence, batch, degree, full_degree, context, omega = inputs
+    projected = F.normalize(model.node_projection(state), dim=1, eps=1e-6)
+    metric = model.context_metric(F.layer_norm(context, (context.shape[1],))).tanh()
+    edge_graph = batch[incidence[0]]
+    arguments = (projected, metric, *incidence, degree, full_degree, edge_graph)
+    raw_scaled = model._raw_compatibility_chunk(*arguments)
+    legacy = GraphOptimizedConductance(5).double()
+    legacy.load_state_dict(model.state_dict())
+    raw_legacy = legacy._raw_compatibility_chunk(*arguments)
+    quadratic = (
+        (projected[incidence[0]] - projected[incidence[1]]).square() * metric[edge_graph]
+    ).sum(1)
+    torch.testing.assert_close(raw_scaled - raw_legacy, (math.sqrt(5) - 1) * quadratic)
+    centered = raw_scaled - graph_weighted_mean(raw_scaled, edge_graph, 3, omega)[edge_graph]
+    expected = model.cost_bound * torch.tanh(centered / model.cost_bound)
+    _run(model, inputs)
+    torch.testing.assert_close(model.last_scores, expected)
+    assert model.last_solver_diagnostics["solver_cost_scaling"] == "width_scaled"
+    assert model.last_solver_diagnostics["quadratic_scale"] == math.sqrt(5)
+    assert model.last_solver_diagnostics["executed_steps"] == 8
+
+
+def test_graph_constant_raw_cost_offsets_do_not_cause_saturation(monkeypatch):
+    torch.manual_seed(27)
+    inputs = _inputs()
+    model = _model(edge_chunk_size=2)
+    expected = _run(model, inputs)
+    expected_scores = model.last_scores.clone()
+    raw = model._raw_compatibility_chunk
+
+    def shifted(*args):
+        offsets = args[0].new_tensor([700.0, -900.0, 50.0])
+        return raw(*args) + offsets[args[-1]]
+
+    monkeypatch.setattr(model, "_raw_compatibility_chunk", shifted)
+    actual = _run(model, inputs)
+    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-11)
+    torch.testing.assert_close(model.last_scores, expected_scores, rtol=1e-10, atol=1e-11)
+
+
+def test_orientation_node_edge_permutation_and_disjoint_graph_independence():
+    torch.manual_seed(41)
+    inputs = _inputs()
+    model = _model()
+    expected = _run(model, inputs)
+    reversed_inputs = list(inputs)
+    reversed_inputs[1] = inputs[1].flip(0)
+    torch.testing.assert_close(_run(model, reversed_inputs), expected, rtol=1e-11, atol=1e-12)
+    permutation = torch.tensor([8, 4, 1, 6, 0, 3, 7, 2, 5])
+    edge_permutation = torch.tensor([7, 3, 0, 5, 1, 6, 4, 2])
+    changed = list(inputs)
+    changed[0] = inputs[0][permutation]
+    changed[1] = permutation.argsort()[inputs[1][:, edge_permutation]]
+    for index in (2, 3, 4):
+        changed[index] = inputs[index][permutation]
+    changed[6] = inputs[6][edge_permutation]
+    torch.testing.assert_close(
+        _run(model, changed), expected[edge_permutation], rtol=1e-10, atol=1e-11
+    )
+    single = [
+        inputs[0][:4],
+        inputs[1][:, :5],
+        torch.zeros(4, dtype=torch.long),
+        inputs[3][:4],
+        inputs[4][:4],
+        inputs[5][:1],
+        inputs[6][:5],
+    ]
+    torch.testing.assert_close(_run(model, single), expected[:5], rtol=1e-10, atol=1e-11)
+    changed = list(inputs)
+    changed[-1] = inputs[-1] * torch.tensor([1000.0] * 5 + [0.03] * 3, dtype=torch.float64)
+    torch.testing.assert_close(_run(model, changed), expected, rtol=1e-10, atol=1e-11)
+    mean = graph_weighted_mean(expected, inputs[2][inputs[1][0]], 3, inputs[-1])
+    torch.testing.assert_close(mean, torch.tensor([1.0, 1.0, 0.0], dtype=expected.dtype))
+
+
+def test_chunking_preserves_values_and_parameter_gradients():
+    torch.manual_seed(17)
+    inputs = _inputs()
+    chunked = _model(edge_chunk_size=2)
+    whole = copy.deepcopy(chunked)
+    whole.edge_chunk_size = 65536
+    actual, expected = _run(chunked, inputs), _run(whole, inputs)
+    torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-11)
+    weights = torch.arange(actual.numel(), dtype=actual.dtype)
+    (actual * weights).sum().backward()
+    (expected * weights).sum().backward()
+    for left, right in zip(chunked.parameters(), whole.parameters(), strict=True):
+        torch.testing.assert_close(left.grad, right.grad, rtol=1e-9, atol=1e-11)
+
+
+def test_task_gradient_reaches_scaled_cost_through_c_and_normalized_diffusion():
+    torch.manual_seed(14)
+    inputs = _inputs()
+    x = inputs[0].clone().requires_grad_(True)
+    context = inputs[5].clone().requires_grad_(True)
+    model = _model(edge_chunk_size=2)
+    c = _run(model, inputs, x=x, context=context)
+    message = torch.randn(9, 2, 4, dtype=torch.float64, requires_grad=True)
+    propagated = shared_head_diffusion(
+        message,
+        c,
+        inputs[1],
+        inputs[2],
+        torch.full((3, 2), 0.5, dtype=torch.float64),
+        sampling_correction=inputs[-1],
+        edge_chunk_size=2,
+    )
+    (propagated - torch.randn_like(propagated)).square().mean().backward()
+    for name, parameter in model.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        assert parameter.grad.abs().sum() > 0, name
+    for value in (x, context, message):
+        assert value.grad is not None and torch.isfinite(value.grad).all()
+
+
+def test_double_gradcheck_through_scaled_cost_and_unrolled_solver():
+    torch.manual_seed(13)
+    inputs = _inputs(channels=3)
+    model = _model(channels=3, solver_steps=3)
+    assert torch.autograd.gradcheck(
+        lambda x, context: _run(model, inputs, x=x, context=context),
+        (inputs[0].requires_grad_(True), inputs[5].requires_grad_(True)),
+        eps=1e-6,
+        atol=1e-5,
+        rtol=2e-4,
+        fast_mode=True,
+    )
+
+
+def test_same_entropy_objective_converges_to_analytic_solution_without_barrier():
+    torch.manual_seed(15)
+    inputs = _inputs()
+    model = _model(solver_degree_barrier=0, solver_steps=128)
+    with torch.no_grad():
+        actual = _run(model, inputs)
+    raw = (-model.last_scores / model.solver_entropy).exp()
+    edge_graph = inputs[2][inputs[1][0]]
+    expected = raw / graph_weighted_mean(raw, edge_graph, 3, inputs[-1])[edge_graph]
+    torch.testing.assert_close(actual, expected, rtol=1e-9, atol=1e-11)
+    diagnostics = model.last_solver_diagnostics
+    assert diagnostics["objective_final"].le(diagnostics["objective_initial"] + 1e-12).all()
+    assert diagnostics["projected_gradient_rms_final"].max() < 1e-9
+    assert model.solver_entropy == 1.0 and model.cost_bound == 2.0
+
+
+def test_constant_cost_does_not_force_nonuniform_c_and_fixed_arm_stays_parameter_free():
+    nodes = torch.arange(8)
+    incidence = torch.stack((nodes, (nodes + 1) % 8))
+    state = torch.ones(8, 5, dtype=torch.float64)
+    inputs = (
+        state,
+        incidence,
+        torch.zeros(8, dtype=torch.long),
+        torch.full((8,), 2.0).double(),
+        torch.full((8,), 2.0).double(),
+        torch.ones(1, 18, dtype=torch.float64),
+        torch.ones(8, dtype=torch.float64),
+    )
+    model = _model()
+    torch.testing.assert_close(_run(model, inputs), inputs[-1])
+    control = _model(mode="fixed_one")
+    assert list(control.parameters()) == []
+    torch.testing.assert_close(_run(control, inputs), inputs[-1])
+
+
+@pytest.mark.parametrize("channels", [256, 384])
+def test_synthetic_initialization_cost_contrast_is_not_lost_at_real_profile_width(channels):
+    # Explicit initialization-scale regression, not a trained accuracy assertion.
+    torch.manual_seed(0)
+    count = 256
+    state = torch.randn(count, channels)
+    nodes = torch.arange(count)
+    incidence = torch.stack(
+        (nodes.repeat(4), torch.cat([(nodes + s) % count for s in (1, 3, 9, 27)]))
+    )
+    context = torch.randn(1, 2 * channels + 8)
+    inputs = (
+        state,
+        incidence,
+        torch.zeros(count, dtype=torch.long),
+        torch.full((count,), 8.0),
+        torch.full((count,), 8.0),
+        context,
+        torch.ones(incidence.shape[1]),
+    )
+    legacy = GraphOptimizedConductance(channels)
+    scaled = GraphOptimizedConductance(channels, solver_cost_scaling="width_scaled")
+    scaled.load_state_dict(legacy.state_dict())
+    with torch.no_grad():
+        old_c, new_c = _run(legacy, inputs), _run(scaled, inputs)
+    assert scaled.last_scores.std(correction=0) > 3 * legacy.last_scores.std(correction=0)
+    assert new_c.std(correction=0) > 3 * old_c.std(correction=0)
+    assert torch.isfinite(new_c).all() and (new_c > 0).all()
+    assert scaled.solver_steps == legacy.solver_steps == 8
+    assert scaled.solver_entropy == legacy.solver_entropy == 1.0
+    assert scaled.cost_bound == legacy.cost_bound == 2.0
 ````
 
 # tests/test_conductance_v5_diffusion_memory.py
@@ -98949,6 +100772,613 @@ def test_source_snapshot_covers_tree_model_runner_and_shared_math() -> None:
         assert name in snapshot and len(snapshot[name]) == 64
 ````
 
+# tests/test_v5_learning_budget.py
+
+````python
+"""CPU-only arithmetic/contract tests; never substitute for GPU training."""
+
+from __future__ import annotations
+
+import copy
+import json
+
+import pytest
+
+from research.conductance_gat.v5.learning_budget import (
+    compare_learning_budgets,
+    deterministic_batches_per_epoch,
+    plan_learning_budget,
+    should_stop_learning_budget,
+    validate_learning_budget,
+)
+
+
+@pytest.mark.parametrize("batch,batches", [(8, 3), (16, 2), (20, 1), (24, 1)])
+def test_complete_ppi_split_is_counted_without_drop_or_batch_reduction(batch, batches):
+    assert deterministic_batches_per_epoch(20, batch) == batches
+
+
+@pytest.mark.parametrize(
+    "actual_batch,epochs,patience,updates",
+    [(8, 200, 50, 600), (16, 300, 75, 600), (20, 600, 150, 600)],
+)
+def test_ppi_reference_updates_preserve_baseline8_without_shrinking_physical_batch(
+    actual_batch, epochs, patience, updates
+):
+    reference = deterministic_batches_per_epoch(20, 8)
+    actual = deterministic_batches_per_epoch(20, actual_batch)
+    plan = plan_learning_budget(200, 50, reference, actual, policy="reference_updates")
+    assert plan["requested_epochs"] == 200 and plan["requested_patience"] == 50
+    assert plan["planned_epochs"] == epochs and plan["planned_patience"] == patience
+    assert plan["planned_maximum_optimizer_steps"] == updates
+    assert plan["patience_optimizer_steps"] == 150
+    assert plan["updates_preserved_against_reference"] is True
+    assert plan["patience_updates_preserved_against_reference"] is True
+    assert plan["early_stopping_can_finish_before_target"] is True
+    validate_learning_budget(json.loads(json.dumps(plan)))
+
+
+def test_default_epoch_policy_preserves_existing_recipe_and_reports_step_reduction():
+    plan = plan_learning_budget(200, 50, 3, 1)
+    assert plan["policy"] == "epochs"
+    assert plan["planned_epochs"] == 200 and plan["planned_patience"] == 50
+    assert plan["reference_optimizer_steps"] == 600
+    assert plan["target_optimizer_steps"] == plan["planned_maximum_optimizer_steps"] == 200
+    assert plan["reference_patience_optimizer_steps"] == 150
+    assert plan["patience_optimizer_steps"] == 50
+    assert plan["updates_preserved_against_reference"] is False
+    assert plan["patience_updates_preserved_against_reference"] is False
+
+
+def test_epochs_and_patience_are_never_reduced_when_actual_batch_count_increases():
+    plan = plan_learning_budget(200, 50, 3, 5, policy="reference_updates")
+    assert plan["planned_epochs"] == 200 and plan["planned_patience"] == 50
+    assert plan["reference_optimizer_steps"] == 600
+    assert plan["target_optimizer_steps"] == 1000
+    assert plan["patience_optimizer_steps"] == 250
+
+
+def test_epoch_boundary_rounding_is_explicit_not_a_fake_exact_update_budget():
+    plan = plan_learning_budget(3, 1, 3, 2, policy="reference_updates")
+    assert plan["planned_epochs"] == 5 and plan["planned_patience"] == 2
+    assert plan["target_optimizer_steps"] == 9
+    assert plan["planned_maximum_optimizer_steps"] == 10
+    assert plan["epoch_rounding_extra_steps"] == 1
+    assert plan["patience_optimizer_steps"] == 3
+    assert plan["planned_patience_optimizer_steps"] == 4
+    assert plan["patience_rounding_extra_steps"] == 1
+
+
+def test_large_integer_budgets_do_not_lose_precision_to_float_ceil():
+    epochs = 2**60 + 1
+    plan = plan_learning_budget(epochs, 7, 3, 2, policy="reference_updates")
+    assert plan["planned_epochs"] == (epochs * 3 + 1) // 2
+    assert plan["target_optimizer_steps"] == epochs * 3
+    assert plan["epoch_rounding_extra_steps"] == 1
+
+
+@pytest.mark.parametrize("reference,actual", [(None, None), (3, None), (None, 1)])
+def test_unknown_variable_batch_counts_stay_unknown_only_for_epoch_policy(reference, actual):
+    plan = plan_learning_budget(200, 50, reference, actual)
+    assert plan["planned_epochs"] == 200
+    assert plan["updates_preserved_against_reference"] is None
+    if actual is None:
+        assert plan["target_optimizer_steps"] is None
+        assert plan["planned_maximum_optimizer_steps"] is None
+        assert plan["patience_optimizer_steps"] is None
+    validate_learning_budget(plan)
+    with pytest.raises(ValueError, match="known constant"):
+        plan_learning_budget(200, 50, reference, actual, policy="reference_updates")
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "requested_epochs",
+        "requested_patience",
+        "reference_batches_per_epoch",
+        "actual_batches_per_epoch",
+    ],
+)
+@pytest.mark.parametrize("value", [True, False, 0, -1, 2.0, float("nan"), float("inf"), "3"])
+def test_malformed_integer_budgets_fail_explicitly(field, value):
+    arguments = dict(
+        requested_epochs=200,
+        requested_patience=50,
+        reference_batches_per_epoch=3,
+        actual_batches_per_epoch=1,
+    )
+    arguments[field] = value
+    with pytest.raises(ValueError, match="positive integer"):
+        plan_learning_budget(**arguments)
+
+
+@pytest.mark.parametrize("policy", [None, "", "auto", "steps", True, 1])
+def test_unknown_policies_do_not_silently_use_epoch_fallback(policy):
+    with pytest.raises(ValueError, match="unsupported"):
+        plan_learning_budget(200, 50, 3, 1, policy=policy)
+
+
+@pytest.mark.parametrize("arguments", [(0, 8), (20, 0), (True, 8), (20, 8.0), (-1, 8)])
+def test_batch_count_helper_rejects_empty_or_invalid_scope(arguments):
+    with pytest.raises(ValueError, match="positive integer"):
+        deterministic_batches_per_epoch(*arguments)
+
+
+def test_all_reference_update_plans_meet_floor_without_excessive_integer_rounding():
+    for epochs in (1, 7, 200):
+        for reference in range(1, 12):
+            for actual in range(1, 12):
+                plan = plan_learning_budget(epochs, 5, reference, actual, "reference_updates")
+                assert plan["planned_epochs"] >= epochs
+                assert plan["planned_patience"] >= 5
+                assert plan["planned_maximum_optimizer_steps"] >= epochs * reference
+                assert plan["patience_optimizer_steps"] >= 5 * reference
+                assert 0 <= plan["epoch_rounding_extra_steps"] < actual
+                assert 0 <= plan["patience_rounding_extra_steps"] < actual
+
+
+def test_reference_update_early_stopping_uses_real_steps_not_nominal_epochs():
+    plan = plan_learning_budget(200, 50, 3, 1, "reference_updates")
+    assert not should_stop_learning_budget(plan)
+    assert not should_stop_learning_budget(
+        plan, epochs_since_best=200, optimizer_steps_since_best=149
+    )
+    assert should_stop_learning_budget(plan, epochs_since_best=150, optimizer_steps_since_best=150)
+    assert not should_stop_learning_budget(
+        plan, epochs_since_best=200, optimizer_steps_since_best=200, eligible=False
+    )
+    with pytest.raises(ValueError, match="actual optimizer-step age"):
+        should_stop_learning_budget(plan, epochs_since_best=200)
+
+
+def test_epoch_policy_early_stopping_is_backward_compatible():
+    plan = plan_learning_budget(200, 50, 3, 1)
+    assert not should_stop_learning_budget(
+        plan, epochs_since_best=49, optimizer_steps_since_best=5000
+    )
+    assert should_stop_learning_budget(plan, epochs_since_best=50, optimizer_steps_since_best=1)
+    with pytest.raises(ValueError, match="epoch age"):
+        should_stop_learning_budget(plan, optimizer_steps_since_best=50)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("epochs_since_best", -1),
+        ("optimizer_steps_since_best", -1),
+        ("optimizer_steps_since_best", True),
+        ("eligible", 1),
+    ],
+)
+def test_early_stop_does_not_hide_invalid_or_rollback_counters(field, value):
+    with pytest.raises(ValueError):
+        should_stop_learning_budget(plan_learning_budget(200, 50, 3, 1), **{field: value})
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("planned_epochs", 1),
+        ("requested_epochs", 201),
+        ("schema_version", True),
+        ("planned_maximum_optimizer_steps", 200.0),
+        ("policy", "auto"),
+        ("new_field", 5),
+    ],
+)
+def test_saved_plan_tampering_is_rejected_including_bool_int_type_aliases(field, value):
+    plan = plan_learning_budget(200, 50, 3, 1)
+    plan[field] = value
+    with pytest.raises(ValueError):
+        validate_learning_budget(plan)
+
+
+def test_validation_and_comparison_do_not_mutate_inputs_or_claim_equal_completed_training():
+    first = plan_learning_budget(200, 50, 3, 1, "reference_updates")
+    second = plan_learning_budget(200, 50, 3, 2, "reference_updates")
+    snapshots = copy.deepcopy((first, second))
+    report = compare_learning_budgets(first, second)
+    assert (first, second) == snapshots
+    assert report["same_reference_optimizer_steps"] is True
+    assert report["same_planned_optimizer_steps"] is True
+    assert report["same_patience_optimizer_steps"] is True
+    assert report["differences"]["planned_epochs"] == {"first": 600, "second": 300}
+    assert report["differences"]["actual_batches_per_epoch"] == {"first": 1, "second": 2}
+    assert report["actual_completed_updates_compared"] is False
+    assert report["causal_comparability_claimed"] is False
+
+
+def test_unknown_counts_are_not_reported_as_equal_update_budgets():
+    plan = plan_learning_budget(200, 50, None, None)
+    report = compare_learning_budgets(plan, plan)
+    assert report["same_reference_optimizer_steps"] is None
+    assert report["same_planned_optimizer_steps"] is None
+    assert report["same_patience_optimizer_steps"] is None
+````
+
+# tests/test_v5_learning_budget_report.py
+
+````python
+"""CPU-only report integrity fixtures; these are not trained model results."""
+
+from __future__ import annotations
+
+import copy
+import json
+
+import pytest
+
+from research.conductance_gat.v5 import report
+from research.conductance_gat.v5.learning_budget import plan_learning_budget
+
+
+def _child():
+    plan = plan_learning_budget(200, 50, 3, 1, "reference_updates")
+    return {
+        "dataset": "ppi",
+        "data_observability": {"optimization_count": 20},
+        "configuration": {
+            "epochs": 200,
+            "patience": 50,
+            "training_schedule": "joint",
+            "learning_budget_policy": "reference_updates",
+            "hardware_profile": "a6000-48gb",
+            "sampling": "full",
+        },
+        "learning_budget": plan,
+        "batch_observability": {"training_batches_per_epoch": {"value": 1}},
+        "schedule": [{"name": "joint", "start_epoch": 1, "end_epoch": 600, "length": 600}],
+        "epochs_run": 400,
+        "optimizer_steps": 400,
+        "optimization_observability": {
+            "learning_budget": copy.deepcopy(plan),
+            "planned_training_epochs": 600,
+            "epochs_requested": 200,
+            "epochs_completed": 400,
+            "actual_optimizer_steps": 400,
+        },
+    }
+
+
+def test_valid_extended_budget_and_early_stopping_are_not_mistaken_for_200epoch_overrun():
+    child = _child()
+    assert report._validate_learning_budget(child) == child["learning_budget"]
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        (("learning_budget", "planned_epochs"), 1),
+        (("learning_budget", "planned_maximum_optimizer_steps"), 999999),
+        (("learning_budget", "patience_optimizer_steps"), 1),
+        (("configuration", "epochs"), 201),
+        (("configuration", "epochs"), 200.0),
+        (("configuration", "patience"), 49),
+        (("configuration", "training_schedule"), "staged"),
+        (("batch_observability", "training_batches_per_epoch", "value"), 2),
+        (("batch_observability", "training_batches_per_epoch", "value"), True),
+        (("schedule",), [{"name": "joint", "start_epoch": 1, "end_epoch": 200, "length": 200}]),
+        (("epochs_run",), 601),
+        (("epochs_run",), True),
+        (("optimizer_steps",), 601),
+        (("optimizer_steps",), 399),
+        (("optimization_observability", "epochs_completed"), 10),
+        (("optimization_observability", "planned_training_epochs"), 200),
+        (("optimization_observability", "actual_optimizer_steps"), 10),
+        (("transition_provenance",), {"mode": "replace_c"}),
+        (("resume_identity",), {"transition_request": {"mode": "replace_c"}}),
+    ],
+)
+def test_arithmetic_or_execution_tampering_is_never_released_as_passed(path, value):
+    child = _child()
+    target = child
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(report.ComparisonIntegrityError, match="learning budget"):
+        report._validate_learning_budget(child)
+
+
+def test_epoch_legacy_artifacts_without_new_budget_fields_remain_accepted():
+    assert report._validate_learning_budget({"configuration": {"epochs": 200}}) is None
+
+
+def test_recomputed_forged_reference_count_still_fails_dataset_binding():
+    child = _child()
+    forged = plan_learning_budget(200, 50, 1, 1, "reference_updates")
+    child.update(
+        learning_budget=forged,
+        epochs_run=200,
+        optimizer_steps=200,
+        schedule=[{"name": "joint", "start_epoch": 1, "end_epoch": 200, "length": 200}],
+    )
+    child["optimization_observability"].update(
+        learning_budget=forged,
+        epochs_completed=200,
+        planned_training_epochs=200,
+        actual_optimizer_steps=200,
+    )
+    with pytest.raises(report.ComparisonIntegrityError, match="reference updates differ"):
+        report._validate_learning_budget(child)
+
+
+def test_full_report_checks_budget_and_compares_actual_steps_without_causal_claims(tmp_path):
+    # Reuse the existing explicitly synthetic artifact fixture, including its
+    # unchanged hash checks; do not bypass the real report's artifact validator.
+    from research.conductance_gat.tests.test_v5_contract import (
+        test_report_is_partial_safe_then_requires_complete_pairs,
+    )
+
+    test_report_is_partial_safe_then_requires_complete_pairs(tmp_path)
+    jobs = []
+    for condition, completed in (("fixed_c", 180), ("shared_dynamic_c", 200)):
+        output = tmp_path / condition
+        path = output / "metrics.json"
+        child = json.loads(path.read_text(encoding="utf-8"))
+        architecture = dict(child["configuration"])
+        child["configuration"].update(
+            epochs=200,
+            patience=50,
+            training_schedule="joint",
+            learning_budget_policy="reference_updates",
+        )
+        plan = plan_learning_budget(200, 50, 1, 1, "reference_updates")
+        child.update(
+            learning_budget=plan,
+            epochs_run=completed,
+            optimizer_steps=completed,
+            batch_observability={"training_batches_per_epoch": {"value": 1}},
+            schedule=[{"name": "joint", "start_epoch": 1, "end_epoch": 200, "length": 200}],
+            optimization_observability={
+                "learning_budget": plan,
+                "planned_training_epochs": 200,
+                "epochs_requested": 200,
+                "epochs_completed": completed,
+                "actual_optimizer_steps": completed,
+            },
+        )
+        path.write_text(json.dumps(child), encoding="utf-8")
+        jobs.append(
+            {
+                "dataset": "cora",
+                "condition": condition,
+                "status": "passed",
+                "output_dir": str(output),
+                "architecture": architecture,
+                "sampling": "full",
+            }
+        )
+    manifest = {"status": "passed", "config": {"datasets": ["cora"]}, "jobs": jobs}
+    result = report.build_comparison(tmp_path, manifest)
+    assert result["status"] == "passed"
+    assert all(row["learning_budget"]["policy"] == "reference_updates" for row in result["rows"])
+    contrast = result["contrasts"][0]["learning_budget_comparison"]
+    assert contrast["same_planned_optimizer_steps"] is True
+    assert contrast["completed_optimizer_step_difference"] == 20
+    assert contrast["actual_completed_updates_compared"] is True
+    assert contrast["causal_comparability_claimed"] is False
+    path = tmp_path / "fixed_c" / "metrics.json"
+    child = json.loads(path.read_text(encoding="utf-8"))
+    child["learning_budget"]["planned_epochs"] = 201
+    path.write_text(json.dumps(child), encoding="utf-8")
+    with pytest.raises(report.ComparisonIntegrityError, match="learning budget"):
+        report.build_comparison(tmp_path, manifest)
+````
+
+# tests/test_v5_learning_budget_runners.py
+
+````python
+"""CPU-only V5 learning-budget forwarding; no hardware probes or training."""
+
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+
+import pytest
+
+from research.conductance_gat.v5 import train
+from scripts import run_conductance_scaling as scaling
+from scripts import run_conductance_v5 as standalone
+from scripts import run_rich_scaling as rich
+
+
+def _value(command, flag):
+    return command[command.index(flag) + 1]
+
+
+def _jobs(module, args, output):
+    module._validate(args)
+    return (
+        standalone.make_jobs(args, output, standalone._architecture(args))
+        if module is standalone
+        else scaling.make_jobs(args, output)
+    )
+
+
+@pytest.mark.parametrize(
+    "module,prefix,scope",
+    [
+        (standalone, "", ["--datasets", "ppi"]),
+        (scaling, "v5-", ["--versions", "v5", "--datasets", "ppi", "--profiles", "reference"]),
+    ],
+)
+@pytest.mark.parametrize("reference", [None, 8])
+def test_budget_reaches_every_real_child_without_entering_model_architecture(
+    tmp_path, module, prefix, scope, reference
+):
+    flags = [*scope, f"--{prefix}learning-budget-policy", "reference_updates"]
+    if reference is not None:
+        flags += [f"--{prefix}budget-reference-batch-size", str(reference)]
+    args = module.parser().parse_args(flags)
+    base = module.parser().parse_args(scope)
+    jobs, original = _jobs(module, args, tmp_path), _jobs(module, base, tmp_path)
+    assert len(jobs) == len(original) == 2
+    for job, previous in zip(jobs, original, strict=True):
+        assert job["architecture"] == previous["architecture"]
+        assert job["learning_budget"] == {
+            "learning_budget_policy": "reference_updates",
+            "budget_reference_batch_size": reference,
+        }
+        assert "learning_budget_policy" not in job["architecture"]
+        assert "budget_reference_batch_size" not in job["architecture"]
+        assert _value(job["command"], "--learning-budget-policy") == "reference_updates"
+        assert ("--budget-reference-batch-size" in job["command"]) is (reference is not None)
+        child = train.build_parser().parse_args(job["command"][5:])
+        train.validate_args(child)
+        assert child.learning_budget_policy == "reference_updates"
+        assert child.budget_reference_batch_size == reference
+        assert child.epochs == args.epochs and child.patience == args.patience
+        assert train.configuration(child)["learning_budget_policy"] == "reference_updates"
+
+
+@pytest.mark.parametrize(
+    "module,prefix,scope",
+    [
+        (standalone, "", ["--datasets", "ppi"]),
+        (scaling, "v5-", ["--versions", "v5", "--datasets", "ppi"]),
+    ],
+)
+def test_default_epoch_budget_does_not_change_legacy_job_identity(tmp_path, module, prefix, scope):
+    implicit = module.parser().parse_args(scope)
+    explicit = module.parser().parse_args([*scope, f"--{prefix}learning-budget-policy", "epochs"])
+    assert _jobs(module, implicit, tmp_path) == _jobs(module, explicit, tmp_path)
+    for job in _jobs(module, implicit, tmp_path):
+        assert "learning_budget" not in job
+        assert "--learning-budget-policy" not in job["command"]
+        assert "--budget-reference-batch-size" not in job["command"]
+        assert "--solver-cost-scaling" not in job["command"]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--learning-budget-policy", "reference_updates", "--training-schedule", "staged"],
+        ["--budget-reference-batch-size", "8"],
+        ["--learning-budget-policy", "reference_updates", "--budget-reference-batch-size", "0"],
+    ],
+)
+def test_standalone_budget_errors_are_rejected_before_child_launch(options):
+    args = standalone.parser().parse_args(["--datasets", "ppi", *options])
+    with pytest.raises(ValueError):
+        standalone._validate(args)
+
+
+@pytest.mark.parametrize("module", [standalone, scaling])
+def test_child_cannot_report_epoch_recipe_for_a_requested_update_budget(tmp_path, module):
+    prefix = "" if module is standalone else "v5-"
+    scope = ["--datasets", "ppi"]
+    if module is scaling:
+        scope += ["--versions", "v5", "--profiles", "reference"]
+    args = module.parser().parse_args(
+        [*scope, f"--{prefix}learning-budget-policy", "reference_updates"]
+    )
+    job = _jobs(module, args, tmp_path)[0]
+    payload = {
+        "status": "passed",
+        "dataset": job["dataset"],
+        "condition": job["condition"],
+        "model_seed": 0,
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+        "configuration": {
+            **job["architecture"],
+            "sampling": job["sampling"],
+            "workers": job["workers"],
+            "batch_size": job["batch_size"],
+        },
+    }
+    path = Path(job["metrics_path"])
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(payload))
+    with pytest.raises(RuntimeError, match="learning budget"):
+        (standalone._load_metrics if module is standalone else scaling._load_child)(job)
+
+
+def test_rich_budget_is_immutable_config_but_does_not_affect_other_tracks(tmp_path):
+    flags = ["--tracks", "conductance", "--conductance-versions", "v5"]
+    original = rich.parser().parse_args(flags)
+    updated = rich.parser().parse_args([*flags, "--v5-learning-budget-policy", "reference_updates"])
+    before = rich._config_payload(original, data_root=tmp_path, results_root=tmp_path)
+    after = rich._config_payload(updated, data_root=tmp_path, results_root=tmp_path)
+    assert "v5_learning_budget" not in before
+    assert after.pop("v5_learning_budget") == {
+        "learning_budget_policy": "reference_updates",
+        "budget_reference_batch_size": None,
+    }
+    assert before == after
+    other = rich.parser().parse_args(["--tracks", "cycle", "tree"])
+    changed = copy.deepcopy(other)
+    changed.v5_learning_budget_policy = "reference_updates"
+    changed.v5_budget_reference_batch_size = 8
+    assert rich.make_jobs(other, "unchanged") == rich.make_jobs(changed, "unchanged")
+    assert rich._config_payload(
+        other, data_root=tmp_path, results_root=tmp_path
+    ) == rich._config_payload(changed, data_root=tmp_path, results_root=tmp_path)
+
+
+def test_explicit_corrected_recipe_preserves_full_v5_matrix_and_probe_argv_contract(tmp_path):
+    flags = [
+        "--tracks",
+        "conductance",
+        "--conductance-versions",
+        "v5",
+        "--profiles",
+        "reference",
+        "large",
+        "--model-seeds",
+        "0",
+        "--device",
+        "cuda:0",
+        "--hardware-profile",
+        "a6000-48gb",
+        "--min-free-gb",
+        "40",
+        "--v5-solver-cost-scaling",
+        "width_scaled",
+        "--v5-beta-initial",
+        "0.5",
+        "--v5-learning-budget-policy",
+        "reference_updates",
+        "--results-root",
+        str(tmp_path),
+    ]
+    args = rich.parser().parse_args(flags)
+    rich._validate(args)
+    parents = rich.make_jobs(args, "corrected-v5-contract")
+    assert len(parents) == 1 and parents[0]["track"] == "conductance"
+    child_args = scaling.parser().parse_args(parents[0]["command"][3:])
+    jobs = _jobs(scaling, child_args, Path(parents[0]["output_dir"]))
+    assert len(jobs) == 20
+    assert {job["dataset"] for job in jobs} == {"cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"}
+    assert {job["profile"] for job in jobs} == {"reference", "large"}
+    assert {job["model_seed"] for job in jobs} == {0}
+    for job in jobs:
+        child = train.build_parser().parse_args(job["command"][5:])
+        train.validate_args(child)
+        assert child.epochs == 200 and child.patience == 50
+        assert child.solver_cost_scaling == "width_scaled" and child.beta_initial == 0.5
+        assert child.learning_budget_policy == "reference_updates"
+        assert child.budget_reference_batch_size is None
+        assert child.hardware_profile == "a6000-48gb" and child.device == "cuda:0"
+        assert "learning_budget_policy" not in job["architecture"]
+        assert job["architecture"]["solver_cost_scaling"] == "width_scaled"
+    request = rich._calibration_request(args, "corrected-v5-contract")
+    assert len(request["jobs"]) == 20 and rich._needs_resource_calibration(args)
+
+    def key(job):
+        return job["profile"], job["dataset"], job["condition"], job["model_seed"]
+
+    final_commands = {key(job): job["command"] for job in jobs}
+    assert all(probe["command"] == final_commands[key(probe)] for probe in request["jobs"])
+    assert all(
+        _value(probe["command"], "--learning-budget-policy") == "reference_updates"
+        for probe in request["jobs"]
+    )
+````
+
 # tests/test_v5_optimizer_runner_contract.py
 
 ````python
@@ -99360,6 +101790,232 @@ def test_actual_optimization_sources_reject_archived_checkpoint_and_pair_without
     ):
         report.build_comparison(tmp_path, manifest)
     assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == before
+````
+
+# tests/test_v5_training_repair.py
+
+````python
+"""Explicit CPU/synthetic debug checks; not official-data or GPU performance evidence."""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from test_v5_transition_state import _assert_nested_equal
+from test_v5_transition_training import (
+    DebugCrash,
+    DebugGraph,
+    _args,
+    _debug_data,
+    _install_cpu_debug_environment,
+    _run,
+)
+
+from research.conductance_gat.v5 import train
+from research.conductance_gat.v5.learning_budget import plan_learning_budget
+from research.conductance_gat.v5.model import (
+    _finite_standard_deviation,
+    graph_context_features,
+)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_zero_variance_forward_preserved_and_gradient_finite(dtype):
+    variance = torch.tensor([-1.0, 0.0, 1.0, 4.0], dtype=dtype, requires_grad=True)
+    output = _finite_standard_deviation(variance)
+    assert torch.equal(output, variance.clamp_min(0).sqrt())
+    output.sum().backward()
+    torch.testing.assert_close(variance.grad, torch.tensor([0.0, 0.0, 0.5, 0.25], dtype=dtype))
+
+
+def test_safe_std_does_not_hide_nonfinite_input():
+    value = _finite_standard_deviation(torch.tensor([float("nan"), float("inf")]))
+    assert torch.isnan(value[0]) and torch.isposinf(value[1])
+
+
+def test_constant_channel_graph_context_has_finite_task_gradient():
+    state = torch.tensor([[1.0, 2.0, 3.0], [1.0, 4.0, 5.0], [1.0, 6.0, 7.0]], requires_grad=True)
+    edges = torch.tensor([[0, 1], [1, 2]])
+    context, _, _ = graph_context_features(state, edges, torch.zeros(3, dtype=torch.long), 1)
+    context.sum().backward()
+    assert torch.isfinite(state.grad).all()
+    assert context[0, 3] == 0
+
+
+@pytest.mark.parametrize("batch,planned", [(8, 200), (16, 300), (20, 600)])
+def test_actual_ppi_counts_resolve_explicit_update_budget(batch, planned):
+    args = SimpleNamespace(
+        learning_budget_policy="reference_updates",
+        budget_reference_batch_size=None,
+        training_schedule="joint",
+        hardware_profile="a6000-48gb",
+        epochs=200,
+        patience=50,
+    )
+    loader = DebugLoader([None] * 20, batch)
+    budget = train.resolve_learning_budget({"train": loader}, None, None, args)
+    assert budget["planned_epochs"] == planned
+    assert budget["planned_maximum_optimizer_steps"] == 600
+    assert budget["patience_optimizer_steps"] == 150
+    assert args.epochs == 200 and args.patience == 50
+
+
+def test_update_patience_uses_restored_actual_steps_not_epoch_age():
+    budget = plan_learning_budget(200, 2, 3, 1, "reference_updates")
+    args = SimpleNamespace(condition="shared_dynamic_c")
+    history = [
+        {"epoch": 1, "optimizer_steps": 4, "phase": {"phase": "joint"}},
+        {"epoch": 5, "optimizer_steps": 9, "phase": {"phase": "joint"}},
+    ]
+    assert not train.budget_should_stop(
+        args, budget, history, primary_best_epoch=1, joint_best_epoch=1
+    )
+    history.append({"epoch": 6, "optimizer_steps": 10, "phase": {"phase": "joint"}})
+    assert train.budget_should_stop(args, budget, history, primary_best_epoch=1, joint_best_epoch=1)
+
+
+class DebugLoader:
+    """Small disjoint-union CPU fixture, not a replacement production DataLoader."""
+
+    def __init__(self, graphs, batch_size):
+        self.dataset, self.batch_size = graphs, batch_size
+        self.generator = torch.Generator().manual_seed(21)
+
+    def __len__(self):
+        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+    def __iter__(self):
+        order = torch.randperm(len(self.dataset), generator=self.generator).tolist()
+        for start in range(0, len(order), self.batch_size):
+            graphs = [self.dataset[index] for index in order[start : start + self.batch_size]]
+            offsets, offset = [], 0
+            for graph in graphs:
+                offsets.append(offset)
+                offset += graph.x.shape[0]
+            yield DebugGraph(
+                x=torch.cat([graph.x for graph in graphs]),
+                y=torch.cat([graph.y for graph in graphs]),
+                incidence_edge_index=torch.cat(
+                    [
+                        graph.incidence_edge_index + shift
+                        for graph, shift in zip(graphs, offsets, strict=True)
+                    ],
+                    dim=1,
+                ),
+                batch=torch.cat(
+                    [
+                        torch.full((graph.x.shape[0],), index, dtype=torch.long)
+                        for index, graph in enumerate(graphs)
+                    ]
+                ),
+                num_graphs=len(graphs),
+            )
+
+
+def _repair_fixture(tmp_path, monkeypatch):
+    graph, indices, _, protocol = _debug_data()
+    _install_cpu_debug_environment(monkeypatch, graph, indices)
+    generator = torch.Generator().manual_seed(312)
+    graphs = []
+    for _index in range(8):
+        item = graph.clone()
+        item.x = torch.randn(item.x.shape, generator=generator)
+        item.y = torch.randint(2, (item.x.shape[0], 3), generator=generator).float()
+        graphs.append(item)
+    data = {"train": DebugLoader(graphs[:6], 3), "validation": DebugLoader(graphs[6:], 2)}
+    monkeypatch.setattr(train, "_prepare_data", lambda *_args: (data, None, None))
+    # Fixed validation order: the production loader also does not shuffle validation.
+    data["validation"].generator = torch.Generator().manual_seed(0)
+    payload = {
+        "dataset": "ppi",
+        "classes": 3,
+        "graphs": [vars(item) for item in graphs],
+        "classification": "synthetic_cpu_debug_fixture_not_official_ppi",
+    }
+    protocol = {**protocol, "dataset": "ppi"}
+    args = _args(tmp_path)
+    args.dataset, args.batch_size, args.workers = "ppi", 3, 0
+    args.solver_cost_scaling, args.beta_initial = "width_scaled", 0.5
+    args.learning_budget_policy, args.budget_reference_batch_size = "reference_updates", 2
+    train.validate_args(args)
+    return args, payload, protocol
+
+
+def test_real_cpu_training_extended_budget_and_completed_resume_do_not_retrain(
+    tmp_path, monkeypatch
+):
+    args, payload, protocol = _repair_fixture(tmp_path / "continuous", monkeypatch)
+    result = _run(args, payload, protocol)
+    assert result["epochs_run"] == 6 and result["optimizer_steps"] == 12
+    assert result["configuration"]["epochs"] == 4
+    assert result["learning_budget"]["planned_epochs"] == 6
+    assert result["first_active_conductance_gradient"]["passed"]
+    saved = train.load_checkpoint_on_cpu(args.output_dir / "last.pt")
+    for name in ("conductance", "spatial_w", "beta", "backbone"):
+        assert result["effective_optimizer_steps_by_group"][name] == 12
+
+    def forbidden_update(*_args, **_kwargs):
+        raise AssertionError("completed repaired run must not train again")
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", forbidden_update)
+    resumed = _run(args, payload, protocol)
+    assert resumed["optimizer_steps"] == 12
+    final = train.load_checkpoint_on_cpu(args.output_dir / "last.pt")
+    _assert_nested_equal(final["model_state"], saved["model_state"])
+
+
+def test_repaired_cpu_training_interruption_preserves_model_and_optimizer(tmp_path, monkeypatch):
+    args, payload, protocol = _repair_fixture(tmp_path / "expected", monkeypatch)
+    _run(args, payload, protocol)
+    expected = train.load_checkpoint_on_cpu(args.output_dir / "last.pt")
+    args, payload, protocol = _repair_fixture(tmp_path / "resumed", monkeypatch)
+    save = train._save
+
+    def crash_after_epoch(path, value):
+        save(path, value)
+        if path.name == "last.pt" and value["epoch"] == 3:
+            raise DebugCrash("CPU debug interruption at completed epoch boundary")
+
+    monkeypatch.setattr(train, "_save", crash_after_epoch)
+    with pytest.raises(DebugCrash):
+        _run(args, payload, protocol)
+    monkeypatch.setattr(train, "_save", save)
+    _run(args, payload, protocol)
+    actual = train.load_checkpoint_on_cpu(args.output_dir / "last.pt")
+    for field in ("model_state", "optimizer_state", "learning_budget", "optimizer_steps"):
+        _assert_nested_equal(actual[field], expected[field])
+
+
+def test_recipe_change_is_not_silently_treated_as_same_checkpoint(tmp_path):
+    args = _args(tmp_path)
+    before = train.configuration(args)
+    args.solver_cost_scaling, args.beta_initial = "width_scaled", 0.5
+    args.learning_budget_policy = "reference_updates"
+    after = train.configuration(args)
+    assert before != after
+    assert "solver_cost_scaling" not in before
+    assert after["solver_cost_scaling"] == "width_scaled"
+    assert "learning_budget_policy" not in train.architecture_configuration(args)
+
+
+def test_legacy_transition_does_not_silently_ignore_new_budget(tmp_path):
+    from scripts import run_v5_transition
+
+    args = run_v5_transition.parser().parse_args(
+        [
+            "--source-manifest",
+            str(tmp_path / "unread-source.json"),
+            "--output-dir",
+            str(tmp_path / "untouched-output"),
+            "--learning-budget-policy",
+            "reference_updates",
+        ]
+    )
+    with pytest.raises(ValueError, match="not a legacy transition policy"):
+        run_v5_transition.build_plan(args)
+    assert not (tmp_path / "untouched-output").exists()
 ````
 
 # tests/test_v5_transition_report.py

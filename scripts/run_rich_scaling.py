@@ -38,6 +38,7 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     add_conductance_arguments,
     beta_configuration,
     conductance_arguments_configuration,
+    learning_budget_arguments_configuration,
 )
 from scripts.process_safety import (  # noqa: E402
     close_owned_child_stdout,
@@ -306,6 +307,8 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("nondefault Cycle basis backend requires v2 in --cycle-versions")
     _v5_beta_configuration(args)
     _v5_conductance_configuration(args)
+    if "conductance" in args.tracks and "v5" in args.conductance_versions:
+        _v5_learning_budget_configuration(args)
 
 
 def _execution_devices(args: argparse.Namespace) -> list[str]:
@@ -415,6 +418,10 @@ def _v5_conductance_configuration(args: argparse.Namespace) -> dict[str, Any]:
     return conductance_arguments_configuration(args, prefix="v5_")
 
 
+def _v5_learning_budget_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return learning_budget_arguments_configuration(args, prefix="v5_")
+
+
 def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
     """Build one child job per track; execution waves bind at most one track per GPU."""
     results_root = args.results_root.expanduser().resolve()
@@ -474,6 +481,9 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             if "v5" in args.conductance_versions:
                 for name, value in _v5_conductance_configuration(args).items():
                     command += ["--v5-" + name.replace("_", "-"), str(value)]
+                for name, value in _v5_learning_budget_configuration(args).items():
+                    if value is not None:
+                        command += ["--v5-" + name.replace("_", "-"), str(value)]
             if args.conductance_legacy_ppi_batch_size is not None:
                 command += [
                     "--legacy-ppi-batch-size",
@@ -1264,6 +1274,13 @@ def _config_payload(
             else None
         ),
         "v5_activation_checkpoint": args.v5_activation_checkpoint,
+        **(
+            {"v5_learning_budget": _v5_learning_budget_configuration(args)}
+            if "conductance" in args.tracks
+            and "v5" in args.conductance_versions
+            and _v5_learning_budget_configuration(args)
+            else {}
+        ),
         "cycle_v2_basis_backend": args.cycle_v2_basis_backend,
         "allow_download": args.allow_download,
         "data_root": str(data_root),
@@ -1420,6 +1437,9 @@ def _calibration_request(args: argparse.Namespace, run_id: str) -> dict[str, Any
     baseline.resource_plan = None
     baseline.resolved_resource_plan = None
     baseline.dry_run = False
+    # Budget policy remains in the exact argv identity. Disposable resource probes
+    # still measure the same fixed optimizer-step workload; they do not train the
+    # requested full learning budget or change the caller's epoch ceiling.
     # Both mechanisms must fit the same selected resources, even for a one-arm final selection.
     baseline.cycle_v2_encodings = ["se", "pe"]
     paired_jobs = []

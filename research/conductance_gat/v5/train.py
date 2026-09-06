@@ -29,9 +29,16 @@ from ..benchmark_data import load_dataset, sha256_file, tensor_hash
 from .diagnostics import (
     evaluate,
     layer_diagnostics,
+    parameter_norm,
     require_finite_tensor,
     require_first_step_conductance_gradient,
     selected_checkpoint_interventions,
+)
+from .learning_budget import (
+    deterministic_batches_per_epoch,
+    plan_learning_budget,
+    should_stop_learning_budget,
+    validate_learning_budget,
 )
 from .model import GraphConditionedConductanceNodeClassifier
 from .protocol import (
@@ -50,6 +57,7 @@ from .protocol import (
     beta_configuration,
     conductance_arguments_configuration,
     conductance_configuration,
+    learning_budget_arguments_configuration,
 )
 from .sampling import TransductiveGraphSampler
 from .transition_initialization import ensure_transition_initialization
@@ -114,6 +122,7 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
     return {
         **COMMON,
         **architecture_configuration(args),
+        **learning_budget_arguments_configuration(args),
         "model_seed": args.model_seed,
         "epochs": args.epochs,
         "patience": args.patience,
@@ -666,6 +675,8 @@ def _v5_batch_observability(
     indices: dict[str, torch.Tensor] | None,
     sampler: TransductiveGraphSampler | None,
     args: argparse.Namespace,
+    *,
+    planned_epochs: int | None = None,
 ) -> dict[str, Any]:
     if indices is not None and sampler is None:
         physical_batch_size, batch_unit, batches_per_epoch = 1, "full_graph", 1
@@ -691,7 +702,10 @@ def _v5_batch_observability(
         )
     )
     planned_batches = (
-        observed(args.epochs * batches_per_epoch, unit="batches")
+        observed(
+            (args.epochs if planned_epochs is None else planned_epochs) * batches_per_epoch,
+            unit="batches",
+        )
         if batches_per_epoch is not None
         else observed(
             None,
@@ -717,6 +731,73 @@ def _v5_batch_observability(
         "sample_prefetch": args.sample_prefetch,
         "cache": "verified immutable official graph cache; static topology reused",
         "sampler": sampler.metadata() if sampler is not None else {"mode": "full"},
+    }
+
+
+def resolve_learning_budget(data, indices, sampler, args) -> dict[str, Any]:
+    """Resolve a declared update budget from full training counts, never a subset."""
+    selected = learning_budget_arguments_configuration(args)
+    reference_batch = selected.get("budget_reference_batch_size")
+    hardware = HARDWARE_PROFILES[args.hardware_profile]
+    if indices is not None and sampler is None:
+        if reference_batch not in {None, 1}:
+            raise ValueError("a full graph has one physical batch; reference batch must be 1")
+        actual, reference = 1, 1
+    elif indices is not None:
+        actual = len(sampler)
+        reference = deterministic_batches_per_epoch(
+            int(indices["train"].numel()),
+            reference_batch or hardware["sample_seed_batch_size"],
+        )
+    else:
+        actual = len(data["train"])
+        reference = deterministic_batches_per_epoch(
+            len(data["train"].dataset), reference_batch or hardware["ppi_batch_size"]
+        )
+    return plan_learning_budget(
+        args.epochs,
+        args.patience,
+        reference,
+        actual,
+        policy=selected.get("learning_budget_policy", "epochs"),
+    )
+
+
+def budget_should_stop(args, budget, history, *, primary_best_epoch, joint_best_epoch) -> bool:
+    """Use persisted actual updates, including after an epoch-boundary resume."""
+    last = history[-1]
+    phase = last["phase"]["phase"]
+    if budget["policy"] == "epochs":
+        return should_stop_early(
+            args.condition,
+            phase,
+            last["epoch"],
+            primary_best_epoch=primary_best_epoch,
+            joint_best_epoch=joint_best_epoch,
+            patience=args.patience,
+        )
+    best = primary_best_epoch if args.condition == "fixed_c" else joint_best_epoch
+    if best < 1:
+        return False
+    selected = next((row for row in history if row["epoch"] == best), None)
+    if selected is None:
+        raise ValueError("update-budget best epoch has no retained optimizer-step evidence")
+    return should_stop_learning_budget(
+        budget,
+        epochs_since_best=last["epoch"] - best,
+        optimizer_steps_since_best=last["optimizer_steps"] - selected["optimizer_steps"],
+        eligible=args.condition == "fixed_c" or phase == "joint",
+    )
+
+
+def _group_gradient_diagnostics(model) -> dict[str, Any]:
+    groups = {name: [] for name in _PARAMETER_GROUPS}
+    for name, value in model.named_parameters():
+        if value.requires_grad:
+            groups[parameter_group(name)].append(value)
+    return {
+        "scope": "last training batch, after global clipping; not an epoch average",
+        "norms": {name: parameter_norm(values, gradient=True) for name, values in groups.items()},
     }
 
 
@@ -818,6 +899,12 @@ def build_parser() -> argparse.ArgumentParser:
 def validate_args(args: argparse.Namespace) -> None:
     resolve_hardware_arguments(args)
     conductance_arguments_configuration(args)
+    budget_configuration = learning_budget_arguments_configuration(args)
+    if budget_configuration and getattr(args, "transition_from_checkpoint", None) is not None:
+        raise ValueError(
+            "reference_updates is a changed learning recipe, not an exact legacy transition; "
+            "preserve the source run and use a separate explicitly configured run"
+        )
     validate_transition_arguments(args)
     integers = (
         args.epochs,
@@ -1296,6 +1383,8 @@ def _train_model_impl(
     configure_compute(args)
     _seed(args.model_seed)
     data, indices, sampler = _prepare_data(payload, args, device)
+    learning_budget = resolve_learning_budget(data, indices, sampler, args)
+    planned_epochs = learning_budget["planned_epochs"]
     architecture = architecture_configuration(args)
     model = GraphConditionedConductanceNodeClassifier(
         payload["graphs"][0]["x"].shape[1],
@@ -1309,7 +1398,7 @@ def _train_model_impl(
     shared_state_sha256 = shared_initial_state_sha256(model)
     optimizer = make_optimizer(model)
     validate_optimizer_parameter_ownership(model, optimizer)
-    schedule = phase_schedule(args.epochs, list(args.phase_fractions), args.training_schedule)
+    schedule = phase_schedule(planned_epochs, list(args.phase_fractions), args.training_schedule)
     origin = None
     if getattr(args, "transition_from_checkpoint", None) is not None:
         origin = prepare_training_origin(args, model, optimizer, protocol, output)
@@ -1332,7 +1421,9 @@ def _train_model_impl(
         "optimizer_groups": optimizer_metadata(optimizer),
     }
     data_observability = _v5_data_observability(payload, data, indices, args)
-    batch_observability = _v5_batch_observability(data, indices, sampler, args)
+    batch_observability = _v5_batch_observability(
+        data, indices, sampler, args, planned_epochs=planned_epochs
+    )
     pre_run_observability = {
         "status": "pre_run_configuration",
         "model": {
@@ -1349,6 +1440,7 @@ def _train_model_impl(
                 args.solver_step_size,
                 args.solver_entropy,
                 args.solver_degree_barrier,
+                getattr(args, "solver_cost_scaling", "legacy_unit"),
             ),
             **parameter_observability,
         },
@@ -1358,6 +1450,8 @@ def _train_model_impl(
             "training_schedule": args.training_schedule,
             "phase_schedule": schedule,
             "epochs_requested": args.epochs,
+            "planned_training_epochs": planned_epochs,
+            "learning_budget": learning_budget,
             "early_stopping_patience": args.patience,
             "planned_maximum_optimizer_steps": batch_observability[
                 "planned_maximum_training_batches"
@@ -1455,6 +1549,10 @@ def _train_model_impl(
             print(
                 f"[resume compatibility] {transition['patch_id']}; saved epoch retained", flush=True
             )
+        if learning_budget["policy"] != "epochs":
+            validate_learning_budget(saved.get("learning_budget"))
+            if saved["learning_budget"] != learning_budget:
+                raise ValueError("last.pt learning budget differs from the requested recipe")
         saved_history, saved_epoch = saved.get("history"), saved.get("epoch")
         if (
             not isinstance(saved_history, list)
@@ -1467,7 +1565,7 @@ def _train_model_impl(
         model.load_state_dict(saved["model_state"])
         optimizer.load_state_dict(saved["optimizer_state"])
         history = saved_history
-        start_epoch = args.epochs + 1 if saved.get("complete") is True else saved_epoch + 1
+        start_epoch = planned_epochs + 1 if saved.get("complete") is True else saved_epoch + 1
         best_metric, best_epoch = float(saved["best_metric"]), int(saved["best_epoch"])
         global_best_metric = float(saved.get("global_best_metric", best_metric))
         global_best_epoch = int(saved.get("global_best_epoch", best_epoch))
@@ -1502,7 +1600,7 @@ def _train_model_impl(
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
     started = time.perf_counter()
-    for epoch in range(start_epoch, args.epochs + 1):
+    for epoch in range(start_epoch, planned_epochs + 1):
         epoch_started = time.perf_counter()
         phase, local_epoch = phase_at(schedule, epoch)
         phase_state = configure_phase(model, phase, local_epoch)
@@ -1553,6 +1651,13 @@ def _train_model_impl(
             batch_count += 1
         if not label_count:
             raise RuntimeError("training phase produced no supervised labels")
+        if (
+            learning_budget["policy"] == "reference_updates"
+            and batch_count != learning_budget["actual_batches_per_epoch"]
+        ):
+            raise RuntimeError(
+                "actual training batches changed; refusing an inaccurate update budget"
+            )
         observation = evaluate(
             model,
             validation_data if indices is not None else data["validation"],
@@ -1578,7 +1683,12 @@ def _train_model_impl(
             "maximum_preclip_gradient_norm": maximum_preclip_gradient_norm_value,
             "elapsed_wall_seconds": time.perf_counter() - epoch_started,
             "validation": metric,
-            "layers": layer_diagnostics(model),
+            "layers": layer_diagnostics(model, gradients=True),
+            "layer_observation_scope": {
+                "conductance_and_beta": "last validation forward, not an all-graph distribution",
+                "gradients": "last training batch after global clipping, not validation gradients",
+            },
+            "parameter_group_gradients": _group_gradient_diagnostics(model),
         }
         if origin is not None:
             row["transition_stage_epoch"] = epoch - origin["provenance"]["source_epoch"]
@@ -1639,19 +1749,19 @@ def _train_model_impl(
             torch.cuda.max_memory_allocated(device),
             torch.cuda.max_memory_reserved(device),
         )
-        stop_after_epoch = epoch == args.epochs or should_stop_early(
-            args.condition,
-            phase,
-            epoch,
+        stop_after_epoch = epoch == planned_epochs or budget_should_stop(
+            args,
+            learning_budget,
+            history,
             primary_best_epoch=best_epoch,
             joint_best_epoch=joint_best_epoch,
-            patience=args.patience,
         )
         _save(
             last_path,
             {
                 "schema_version": 4 if origin is not None else 3,
                 "complete": stop_after_epoch,
+                "learning_budget": learning_budget,
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "resume_identity": resume_identity,
@@ -1767,6 +1877,8 @@ def _train_model_impl(
     observed_training_batches = sum(int(row["train_batches"]) for row in history)
     optimization_observability = {
         "epochs_requested": args.epochs,
+        "planned_training_epochs": planned_epochs,
+        "learning_budget": learning_budget,
         "epochs_completed": len(history),
         "early_stopping_patience": args.patience,
         "planned_maximum_optimizer_steps": batch_observability["planned_maximum_training_batches"],
@@ -1795,6 +1907,7 @@ def _train_model_impl(
         "schedule": schedule,
         "best_epoch": best_epoch,
         "epochs_run": len(history),
+        "learning_budget": learning_budget,
         "optimizer_steps": optimizer_steps,
         "effective_optimizer_steps_by_group": effective_group_steps,
         "optimization_observability": optimization_observability,

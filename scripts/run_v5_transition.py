@@ -29,6 +29,7 @@ from chartgat.cache import atomic_write_json  # noqa: E402
 from research.conductance_gat.v5.protocol import (  # noqa: E402
     add_conductance_arguments,
     conductance_arguments_configuration,
+    learning_budget_arguments_configuration,
 )
 from scripts.training_resource_plan import (  # noqa: E402
     allocated_cpu_count,
@@ -200,6 +201,11 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     if args.output_dir is None or args.extra_epochs < 0:
         raise ValueError("a distinct --output-dir and nonnegative --extra-epochs are required")
     requested = conductance_arguments_configuration(args)
+    if learning_budget_arguments_configuration(args):
+        raise ValueError(
+            "reference_updates is not a legacy transition policy; preserve the source "
+            "budget or configure a separate new run instead of silently changing it"
+        )
     if (
         requested["conductance_backend"] != "optimization"
         or requested["training_schedule"] != "joint"

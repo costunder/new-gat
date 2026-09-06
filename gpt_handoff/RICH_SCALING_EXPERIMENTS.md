@@ -5,8 +5,49 @@
 capacity에서 성능을 낼 수 있는지를 본다. 기본 seed는 시간 제약 때문에 0 하나다.
 
 이 문서의 전체 matrix는 실험 계약 설명이며 완료한 V1–V4/Cycle V1/Tree를 다시 돌리라는
-안내가 아니다. 기존 V5 진행분이 있다면 바로 아래 선택적 전환 절을 우선한다.
+안내가 아니다. 구형 MLP V5 진행분은 아래 선택적 전환 절을 참조한다.
 구 source/checkpoint의 strict resume 검사는 우회하지 않는다.
+
+## 최신: 저성능 교정 설정과 기존 결과 분석
+
+기존 결과는 먼저 재학습 없이 읽을 수 있다. 아래는 stdout 출력만 하며 새 파일이나 GPU 작업을
+만들지 않는다. 이 경로는 사용자가 진행한 전환 run이며 다른 run이면 --root만 그 경로로 바꾼다.
+
+```bash
+python -B scripts/analyze_v5_results.py \
+  --root results/conductance_gat/transitions/preserved-copt-gpu3-seed0-v1
+```
+
+다음은 교정 소스를 서버에 반영한 뒤 **별도 새 초기화 비교를 의도할 때만** 쓰는 설정이다.
+기존 결과를 덮어쓰거나 자동 재실행하지 않는다. V5의 reference/large, 기존 5개 데이터셋,
+seed 0, fixed/dynamic 20조건이며 V1–V4/Cycle/Tree를 다시 실행하지 않는다.
+
+```bash
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+python -B scripts/run_rich_scaling.py \
+  --run-id corrected-c-v5-a6000-gpu3-seed0-v1 \
+  --tracks conductance \
+  --conductance-versions v5 \
+  --profiles reference large \
+  --model-seeds 0 \
+  --device cuda:0 \
+  --hardware-profile a6000-48gb \
+  --min-free-gb 40 \
+  --v5-solver-cost-scaling width_scaled \
+  --v5-beta-initial 0.5 \
+  --v5-learning-budget-policy reference_updates
+```
+
+실제 학습 전에 동일 C/beta 설정의 batch/worker 후보를 GPU에서 실측한다. 전체 matrix에서는
+reference batch를 하나로 지정하지 않는다: 원래 hardware profile의 PPI 8/seed 2048/full 1을
+각각 사용한다. `reference_updates`는 요청 200 epochs를 기준으로 업데이트를 보존하므로
+선택 batch에 따라 최대 epochs와 patience가 늘어날 수 있으며 pre-run/metrics에 모두 기록한다.
+예를 들어 PPI batch 20이면 최대 600 epochs/600 updates다. 같은 설정·source·run ID 재개는
+완료 조건을 재실행하지 않고 미완료 epoch 이후부터 이어 간다.
+
+이전 optimization checkpoint를 위 변경 설정으로 자동 이식하는 기능은 이번 범위에 없다.
+기존 MLP 전용 transition 명령으로 그것이 된다고 해석하지 않는다. 새 설정의 fresh 결과와
+과거/전환 결과는 분리한다. 문서의 명령은 push 완료나 GPU 학습 완료를 뜻하지 않는다.
 
 ## 현재 진행분을 유지하는 V5 전환
 

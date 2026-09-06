@@ -56,6 +56,7 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     add_conductance_arguments,
     beta_configuration,
     conductance_arguments_configuration,
+    learning_budget_arguments_configuration,
 )
 from research.conductance_gat.v5.protocol import (  # noqa: E402
     CONDITIONS as V5_CONDITIONS,
@@ -225,6 +226,8 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("portable V5 PPI requires graph batch-size at least 2")
     _v5_beta_configuration(args)
     _v5_conductance_configuration(args)
+    if "v5" in args.versions:
+        _v5_learning_budget_configuration(args)
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
         raise ValueError("CUDA is required; CPU training/fallback is not supported")
     if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
@@ -319,6 +322,10 @@ def _effective_min_free_gb(args: argparse.Namespace) -> float:
 
 def _v5_conductance_configuration(args: argparse.Namespace) -> dict[str, Any]:
     return conductance_arguments_configuration(args, prefix="v5_")
+
+
+def _v5_learning_budget_configuration(args: argparse.Namespace) -> dict[str, Any]:
+    return learning_budget_arguments_configuration(args, prefix="v5_")
 
 
 def _exclusions(args: argparse.Namespace) -> list[dict[str, str]]:
@@ -456,6 +463,9 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                                 command += ["--" + name.replace("_", "-"), str(value)]
                             for name, value in _v5_conductance_configuration(args).items():
                                 command += ["--" + name.replace("_", "-"), str(value)]
+                            for name, value in _v5_learning_budget_configuration(args).items():
+                                if value is not None:
+                                    command += ["--" + name.replace("_", "-"), str(value)]
                             validate_job_plan(
                                 getattr(args, "resolved_resource_plan", None),
                                 track="conductance",
@@ -472,6 +482,11 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                                 "version": version,
                                 "profile": profile_name,
                                 "architecture": dict(profile),
+                                **(
+                                    {"learning_budget": _v5_learning_budget_configuration(args)}
+                                    if version == "v5" and _v5_learning_budget_configuration(args)
+                                    else {}
+                                ),
                                 "sampling": sampling,
                                 "execution": execution,
                                 "occupancy_expectation": (
@@ -893,6 +908,13 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("child physical batch size does not match the execution plan")
     if job["version"] == "v5":
         execution = job["execution"]
+        budget = job.get("learning_budget", {})
+        if configuration.get("learning_budget_policy", "epochs") != budget.get(
+            "learning_budget_policy", "epochs"
+        ) or configuration.get("budget_reference_batch_size") != budget.get(
+            "budget_reference_batch_size"
+        ):
+            raise RuntimeError("V5 child learning budget does not match its requested recipe")
         expected_configuration = {
             "hardware_profile": execution["hardware_profile"],
             "precision": execution["precision"],
@@ -1158,6 +1180,11 @@ def main(argv: list[str] | None = None) -> int:
         "v5_ppi_batch_size": args.v5_ppi_batch_size,
         "v5_beta": _v5_beta_configuration(args),
         "v5_conductance": (_v5_conductance_configuration(args) if "v5" in args.versions else None),
+        **(
+            {"v5_learning_budget": _v5_learning_budget_configuration(args)}
+            if "v5" in args.versions and _v5_learning_budget_configuration(args)
+            else {}
+        ),
         "hardware_profile": args.hardware_profile,
         "resource_plan": (
             resource_plan_identity(args.resolved_resource_plan)

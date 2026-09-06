@@ -8,7 +8,51 @@
 
 ## 1. 소스 버전과 측정 범위
 
-### 현재: V5 기존 학습 상태를 유지하는 선택적 전환 구현
+### 최신 수령: 선택적 전환 후 20조건 validation 결과와 교정 구현
+
+사용자 제공 요약: 전체 `pending_extra_budget`, historical_reference 2 / pending_extra_budget 1 /
+passed 17. 이는 20개의 신형 모델 학습 완료나 test 평가 완료라는 뜻이 아니다.
+ogbn-arxiv reference fixed 0.725427 및 large fixed 0.710997은 역사적 참조다.
+reference dynamic 0.727944는 구형 C의 완료 결과로 새 학습 예산이 없어 보류돼 있다.
+large dynamic 0.675895는 원본 epoch 186에서 새 C로 200까지 14 epochs 전환한 결과다.
+
+나머지 16개는 source epoch 0에서 시작한 결과이며 아래 값은 모두 validation이다.
+PPI는 micro-F1, 다른 데이터셋은 accuracy다. 차이는 기술적 비교이며 동일 학습 궤적이나
+C의 단일 요인 인과효과를 증명하지 않는다.
+
+| Dataset | Profile | Fixed C | Dynamic C | Dynamic−fixed (percentage points) |
+|---|---|---:|---:|---:|
+| PPI | reference | 0.710244 | 0.707290 | -0.2954 |
+| PPI | large | 0.566501 | 0.634512 | +6.8011 |
+| PubMed | reference | 0.712000 | 0.712000 | 0.0 |
+| PubMed | large | 0.700000 | 0.698000 | -0.2 |
+| CiteSeer | reference | 0.610000 | 0.616000 | +0.6 |
+| CiteSeer | large | 0.602000 | 0.602000 | 0.0 |
+| Cora | reference | 0.688000 | 0.694000 | +0.6 |
+| Cora | large | 0.638000 | 0.648000 | +1.0 |
+
+확인 가능한 해석: 큰 모델의 fixed도 악화되어 C만의 문제라고 할 수 없다. 같은 accuracy도
+C가 동일하거나 gradient가 끊겼음을 뜻하지 않는다. arxiv의 14-epoch 전환으로 나머지
+fresh 조건의 부진을 설명해서는 안 된다. 실제 학습 C/beta·train loss·선택 batch·update 수는
+요약표에 없으므로 서버 원본 진단 JSON 없이는 원인을 확정하지 않는다.
+
+코드 교정은 CONDUCTANCE_V5.md 첫 절에 정의한다. 분산 0의 NaN을 고치고 명시적인
+width-scaled 비용·beta 0.5 초기화·reference-update 예산을 제공한다. CPU 수치/실제
+forward-loss-backward-AdamW 및 중단/완료 재개 테스트와 실제 A6000 전체 학습을 구분한다.
+이번 교정 설정의 실제 데이터 학습·GPU 처리량·성능 회복은 아직 검증하지 않았다.
+원본 결과를 읽는 stdout 분석 CLI도 추가했다. 과거 검증 기록은 아래에 보존한다.
+
+교정 후 전체 로컬 회귀: **2,560 passed / 103 skipped**, 183.31초. 변경한 Python 18개
+파일의 Ruff check/format 검사 및 CODE_SUMMARY 284개 source 일치 검사도 통과했다.
+이 검증에는 실제 CPU forward/loss/backward/AdamW, 0분산 NaN 회귀, width-scaled C의
+수치 미분·대칭·chunk/batch 불변성, 업데이트 예산의 실제 trainer 적용, 중간 checkpoint 재개
+동일성, 완료 checkpoint의 재학습 금지, 결과 예산 변조 거부와 읽기 전용 분석을 포함한다.
+로컬 환경은 torch 2.13.0+cpu, CUDA 없음, 논리 CPU 16개다. 생략 103개는 CUDA/BF16,
+미설치 PyG, Linux/Bash/native Linux, Windows symlink 권한 및 opt-in IPC stress 제약이다.
+디버그 합성 입력을 실제 데이터나 성능 결과로 제출하지 않는다. GitHub push와 서버 실행은
+이번 코드 수정 작업에서 수행하지 않았다.
+
+### 이전: V5 기존 학습 상태를 유지하는 선택적 전환 구현
 
 추가 사용자 로그 `204d5998-9283-424e-a79b-c7b8f94aaf0f/pasted-text.txt`에는 reference/arxiv의
 fixed·dynamic과 large/arxiv fixed, 총 3개 완료 조건을 검증 후 건너뛴 기록이 있다.

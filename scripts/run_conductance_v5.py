@@ -41,6 +41,7 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     add_conductance_arguments,
     beta_configuration,
     conductance_arguments_configuration,
+    learning_budget_arguments_configuration,
 )
 from scripts import run_conductance_factorial as shared  # noqa: E402
 from scripts.check_dependencies import (  # noqa: E402
@@ -174,6 +175,7 @@ def _effective_min_free_gb(args: argparse.Namespace) -> float:
 
 
 def _validate(args: argparse.Namespace) -> None:
+    learning_budget_arguments_configuration(args)
     if not args.datasets or len(set(args.datasets)) != len(args.datasets):
         raise ValueError("datasets must be nonempty and contain no duplicates")
     if args.model_seed < 0:
@@ -226,6 +228,7 @@ def make_jobs(
 ) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     data_root = args.data_root.expanduser().resolve()
+    learning_budget = learning_budget_arguments_configuration(args)
     for dataset in args.datasets:
         sampling = _sampling(dataset, args.sampling)
         execution = _resolved_execution(args, dataset)
@@ -276,12 +279,16 @@ def make_jobs(
             ]
             for name, value in architecture.items():
                 command.extend(("--" + name.replace("_", "-"), str(value)))
+            for name, value in learning_budget.items():
+                if value is not None:
+                    command.extend(("--" + name.replace("_", "-"), str(value)))
             jobs.append(
                 {
                     "job_id": f"{dataset}/{condition}",
                     "dataset": dataset,
                     "condition": condition,
                     "architecture": dict(architecture),
+                    **({"learning_budget": dict(learning_budget)} if learning_budget else {}),
                     "sampling": sampling,
                     "batch_size": child_batch_size,
                     "workers": execution["dataloader_workers"],
@@ -360,6 +367,13 @@ def _load_metrics(job: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("child graph batch size does not match the V5 dataset contract")
     if configuration.get("workers") != job["workers"]:
         raise RuntimeError("child DataLoader workers do not match the V5 dataset contract")
+    budget = job.get("learning_budget", {})
+    if configuration.get("learning_budget_policy", "epochs") != budget.get(
+        "learning_budget_policy", "epochs"
+    ) or configuration.get("budget_reference_batch_size") != budget.get(
+        "budget_reference_batch_size"
+    ):
+        raise RuntimeError("child learning budget does not match the requested V5 recipe")
     execution = job["execution"]
     for key in ("hardware_profile", "precision", "tf32", "edge_chunk_size"):
         if configuration.get(key) != execution[key]:
@@ -474,6 +488,11 @@ def main(argv: list[str] | None = None) -> int:
         "datasets": list(args.datasets),
         "profile": args.profile,
         "architecture": architecture,
+        **(
+            {"learning_budget": learning_budget_arguments_configuration(args)}
+            if learning_budget_arguments_configuration(args)
+            else {}
+        ),
         "model_seed": args.model_seed,
         "epochs": args.epochs,
         "patience": args.patience,
