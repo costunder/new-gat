@@ -27,6 +27,7 @@ from ..ablation.train import _configure_fp32, _make_data, _require_cuda, trainin
 from ..benchmark import _seed, _versions
 from ..benchmark_data import load_dataset, sha256_file, tensor_hash
 from .diagnostics import (
+    PreparedValidationGraph,
     evaluate,
     layer_diagnostics,
     parameter_norm,
@@ -60,6 +61,7 @@ from .protocol import (
     learning_budget_arguments_configuration,
 )
 from .sampling import TransductiveGraphSampler
+from .timing import StageTimer
 from .transition_initialization import ensure_transition_initialization
 from .transition_training import (
     prepare_training_origin,
@@ -1027,9 +1029,12 @@ def _training_batches(data, indices, sampler, epoch, device, model_seed, args, *
                     graph = next(samples)
                 except StopIteration:
                     return
+                # The mask is still on CPU. Avoid CUDA nonzero's dynamic-shape
+                # synchronization on every sampled training batch.
+                train_indices = graph.train_mask.nonzero(as_tuple=False).flatten()
             with stage("host_to_device"):
                 graph = graph.to(device, non_blocking=args.pin_memory)
-                train_indices = graph.train_mask.nonzero(as_tuple=False).flatten()
+                train_indices = train_indices.to(device, non_blocking=args.pin_memory)
             yield graph, train_indices
     elif indices is not None:
         yield data, indices["train"]
@@ -1597,25 +1602,50 @@ def _train_model_impl(
             del origin[key]
     validation_indices = indices["validation"] if indices is not None else None
     validation_data = _validation_source(data, sampler)
+    if indices is not None:
+        # Own one immutable validation input; never move the sampler's CPU
+        # canonical graph or retain any model activation between epochs.
+        validation_data = PreparedValidationGraph(validation_data, device)
+    validation_cache_metadata = (
+        validation_data.metadata if isinstance(validation_data, PreparedValidationGraph) else None
+    )
+    print(json.dumps({"validation_input_cache": validation_cache_metadata}), flush=True)
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
     started = time.perf_counter()
     for epoch in range(start_epoch, planned_epochs + 1):
         epoch_started = time.perf_counter()
+        timing = StageTimer(device)
+        batch_observations = []
         phase, local_epoch = phase_at(schedule, epoch)
         phase_state = configure_phase(model, phase, local_epoch)
         loss_sum = torch.zeros((), dtype=torch.float32, device=device)
         label_count, batch_count = 0, 0
         maximum_preclip_gradient_norm = torch.zeros((), dtype=torch.float32, device=device)
         for graph, train_indices in _training_batches(
-            data, indices, sampler, epoch, device, args.model_seed, args
+            data, indices, sampler, epoch, device, args.model_seed, args, timing=timing
         ):
-            optimizer.zero_grad(set_to_none=True)
-            with autocast_context(args):
-                logits = model(graph)
-                loss, count = training_loss(logits, graph, train_indices)
+            batch_observations.append(
+                {
+                    "nodes": int(graph.x.shape[0]),
+                    "physical_edges": int(graph.incidence_edge_index.shape[1]),
+                    "supervised_seed_nodes": (
+                        int(train_indices.numel()) if train_indices is not None else None
+                    ),
+                    "original_graph_nodes": (
+                        int(sampler.graph.x.shape[0]) if sampler is not None else None
+                    ),
+                }
+            )
+            with timing.stage("zero_grad"):
+                optimizer.zero_grad(set_to_none=True)
+            with timing.stage("forward_and_loss"):
+                with autocast_context(args):
+                    logits = model(graph)
+                    loss, count = training_loss(logits, graph, train_indices)
             if phase_state["active_parameter_groups"]:
-                loss.backward()
+                with timing.stage("backward"):
+                    loss.backward()
                 groups_requiring_validation = (
                     set(phase_state["active_parameter_groups"])
                     - gradient_groups_validated_this_invocation
@@ -1631,17 +1661,19 @@ def _train_model_impl(
                     and first_c_gradient is None
                 ):
                     first_c_gradient = require_first_step_conductance_gradient(model)
-                gradient_norm = torch.nn.utils.clip_grad_norm_(
-                    (value for value in model.parameters() if value.requires_grad),
-                    COMMON["gradient_clip_norm"],
-                    error_if_nonfinite=False,
-                    foreach=True,
-                )
-                require_finite_gradient_norm_async(gradient_norm)
+                with timing.stage("gradient_clipping"):
+                    gradient_norm = torch.nn.utils.clip_grad_norm_(
+                        (value for value in model.parameters() if value.requires_grad),
+                        COMMON["gradient_clip_norm"],
+                        error_if_nonfinite=False,
+                        foreach=True,
+                    )
+                    require_finite_gradient_norm_async(gradient_norm)
                 maximum_preclip_gradient_norm = torch.maximum(
                     maximum_preclip_gradient_norm, gradient_norm.float()
                 )
-                optimizer.step()
+                with timing.stage("optimizer"):
+                    optimizer.step()
                 optimizer_steps += 1
                 effective_group_steps = count_effective_group_step(
                     effective_group_steps, optimizer, phase_state["active_parameter_groups"]
@@ -1658,13 +1690,15 @@ def _train_model_impl(
             raise RuntimeError(
                 "actual training batches changed; refusing an inaccurate update budget"
             )
-        observation = evaluate(
-            model,
-            validation_data if indices is not None else data["validation"],
-            validation_indices,
-            device=device,
-            precision=args.precision,
-        )
+        with timing.stage("validation"):
+            observation = evaluate(
+                model,
+                validation_data if indices is not None else data["validation"],
+                validation_indices,
+                device=device,
+                precision=args.precision,
+                collect_diagnostics=False,
+            )
         metric = float(observation["metric"])
         train_loss_tensor = loss_sum / label_count
         require_finite_tensor(train_loss_tensor, "epoch training loss")
@@ -1672,6 +1706,10 @@ def _train_model_impl(
         maximum_preclip_gradient_norm_value = float(maximum_preclip_gradient_norm)
         if not math.isfinite(train_loss) or not math.isfinite(metric):
             raise FloatingPointError("nonfinite epoch loss or validation metric")
+        with timing.stage("diagnostics"):
+            epoch_layer_diagnostics = layer_diagnostics(model, gradients=True)
+            epoch_group_gradients = _group_gradient_diagnostics(model)
+        stage_report = timing.report(synchronize=True)
         row = {
             "epoch": epoch,
             "phase": phase_state,
@@ -1682,17 +1720,21 @@ def _train_model_impl(
             "train_batches": batch_count,
             "maximum_preclip_gradient_norm": maximum_preclip_gradient_norm_value,
             "elapsed_wall_seconds": time.perf_counter() - epoch_started,
+            "elapsed_wall_scope": "training, validation and diagnostics; before checkpoint commit",
+            "stage_seconds": stage_report,
+            "batch_observations": batch_observations,
             "validation": metric,
-            "layers": layer_diagnostics(model, gradients=True),
+            "layers": epoch_layer_diagnostics,
             "layer_observation_scope": {
                 "conductance_and_beta": "last validation forward, not an all-graph distribution",
                 "gradients": "last training batch after global clipping, not validation gradients",
             },
-            "parameter_group_gradients": _group_gradient_diagnostics(model),
+            "parameter_group_gradients": epoch_group_gradients,
         }
         if origin is not None:
             row["transition_stage_epoch"] = epoch - origin["provenance"]["source_epoch"]
         history.append(row)
+        post_compute_started = time.perf_counter()
         eligibility = selection_eligibility(args.condition, phase)
         if metric > global_best_metric:
             global_best_metric, global_best_epoch = metric, epoch
@@ -1793,6 +1835,29 @@ def _train_model_impl(
                 **efficiency,
             },
         )
+        checkpoint_commit_seconds = time.perf_counter() - post_compute_started
+        # This sidecar is execution telemetry, not an authoritative checkpoint.
+        # Publish only after last.pt commits; a crash cannot advance training
+        # state through this file. Its own write is outside the reported time.
+        atomic_write_json(
+            output / "performance.json",
+            {
+                "schema_version": 1,
+                "dataset": args.dataset,
+                "condition": args.condition,
+                "epoch": epoch,
+                "optimizer_steps": optimizer_steps,
+                "planned_epochs": planned_epochs,
+                "train_batches": batch_count,
+                "stage_seconds": stage_report,
+                "batch_observations": batch_observations,
+                "validation_input_cache": validation_cache_metadata,
+                "checkpoint_commit_cpu_wall_seconds": checkpoint_commit_seconds,
+                "epoch_wall_seconds_before_timing_publish": time.perf_counter() - epoch_started,
+                "checkpoint_scope": "best/history/last commit and post-compute bookkeeping",
+                "not_a_resume_checkpoint": True,
+            },
+        )
         if epoch == start_epoch or epoch % 10 == 0:
             primary_best_text = f"{best_metric:.6f}" if math.isfinite(best_metric) else "pending"
             joint_best_text = (
@@ -1807,7 +1872,10 @@ def _train_model_impl(
                 f"loss={row['train_loss']:.6f} val={metric:.6f} "
                 f"primary_best={primary_best_text} "
                 f"global_best={global_best_metric:.6f} "
-                f"joint_best={joint_best_text}",
+                f"joint_best={joint_best_text} "
+                f"seconds={row['elapsed_wall_seconds']:.2f} "
+                f"validation_gpu_seconds={stage_report['cuda_event_seconds'].get('validation')} "
+                f"checkpoint_seconds={checkpoint_commit_seconds:.2f}",
                 flush=True,
             )
         if stop_after_epoch:

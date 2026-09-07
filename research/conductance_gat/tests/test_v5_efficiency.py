@@ -1,3 +1,4 @@
+import ast
 import inspect
 import json
 from types import SimpleNamespace
@@ -101,10 +102,46 @@ def test_gradient_finite_assert_uses_async_primitive(monkeypatch):
     assert len(observed) == 1 and bool(observed[0][0])
 
 
-def test_model_and_operator_hot_paths_have_no_cuda_scalar_reduction_reads():
-    source = inspect.getsource(v5_model) + inspect.getsource(v5_operator)
-    for forbidden in (".item()", ".any()", ".all()", "torch.equal(", "int(batch.max"):
+def _require_no_host_scalar_reductions(source):
+    for forbidden in (".item()", "torch.equal(", "int(batch.max"):
         assert forbidden not in source
+    tree = ast.parse(source)
+    # Tensor reductions are safe when consumed entirely by a device-side
+    # assertion. A Python condition/bool/item read still synchronizes CUDA.
+    async_reductions = {
+        id(descendant)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "torch"
+        and node.func.attr == "_assert_async"
+        for argument in node.args[:1]
+        for descendant in ast.walk(argument)
+    }
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"all", "any"}
+        ):
+            assert id(node) in async_reductions, ast.unparse(node)
+
+
+def test_model_and_operator_hot_paths_have_no_cuda_scalar_reduction_reads():
+    _require_no_host_scalar_reductions(inspect.getsource(v5_model) + inspect.getsource(v5_operator))
+
+
+@pytest.mark.parametrize(
+    "source", ["if mask.all():\n    work()", "bool(mask.any())", "mask.all().item()"]
+)
+def test_hot_path_guard_rejects_host_scalar_reductions(source):
+    with pytest.raises(AssertionError):
+        _require_no_host_scalar_reductions(source)
+
+
+def test_hot_path_guard_accepts_device_side_validation():
+    _require_no_host_scalar_reductions('torch._assert_async(mask.all(), "bad ID")')
 
 
 @pytest.mark.parametrize(
@@ -138,9 +175,7 @@ def test_training_failure_finishes_monitor_once_and_preserves_original_error(
         v5_train.train_model({}, {}, args, torch.device("cpu"), output)
     assert caught.value is original
     assert monitor.calls == 1
-    failure = json.loads(
-        (output / v5_train.FAILURE_RESOURCE_FILENAME).read_text(encoding="utf-8")
-    )
+    failure = json.loads((output / v5_train.FAILURE_RESOURCE_FILENAME).read_text(encoding="utf-8"))
     assert failure["status"] == "failed"
     assert failure["error"] == "FloatingPointError: nonfinite training loss"
     if finish_failure is not None:

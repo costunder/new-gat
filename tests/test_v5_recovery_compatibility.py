@@ -30,9 +30,10 @@ def _archived_source_pair():
         after[name] = change["after"]
         if change["before"] is not None:
             before[name] = change["before"]
-    after[resume_compat.REGISTRY_SOURCE] = hashlib.sha256(
-        resume_compat.REGISTRY_PATH.read_bytes()
-    ).hexdigest()
+    after[resume_compat.REGISTRY_SOURCE] = registry.get("performance_repair", {}).get(
+        "registry_before_sha256",
+        hashlib.sha256(resume_compat.REGISTRY_PATH.read_bytes()).hexdigest(),
+    )
     return before, after
 
 

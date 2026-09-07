@@ -29,6 +29,10 @@ class DebugGraph:
     def __init__(self, **values):
         self.__dict__.update(values)
 
+    def items(self):
+        """Expose PyG's tensor-container API; keep the real validation cache active."""
+        return vars(self).items()
+
     def clone(self):
         return DebugGraph(
             **{

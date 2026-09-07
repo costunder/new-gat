@@ -6,6 +6,55 @@ import torch
 from torch import Tensor
 
 
+def _validate_graph_index(graph_index: Tensor, num_graphs: int) -> None:
+    """Keep invalid graph IDs an error without synchronizing CUDA to the host."""
+
+    if graph_index.ndim != 1 or graph_index.dtype != torch.long:
+        raise ValueError("graph_index must be a one-dimensional int64 tensor")
+    if isinstance(num_graphs, bool) or not isinstance(num_graphs, int) or num_graphs < 0:
+        raise ValueError("num_graphs must be a nonnegative integer")
+    torch._assert_async(
+        ((graph_index >= 0) & (graph_index < num_graphs)).all(),
+        "graph_index must be in [0, num_graphs)",
+    )
+
+
+def graph_sum(
+    values: Tensor, graph_index: Tensor, num_graphs: int, *, validate_index: bool = True
+) -> Tensor:
+    """Sum rows by graph; one graph uses a reduction, not contended scatter.
+
+    Internal callers may skip the index check only after validating the same
+    graph structure once. Empty inputs retain a differentiable zero result.
+    """
+
+    if validate_index:
+        if values.ndim < 1 or graph_index.shape != (values.shape[0],):
+            raise ValueError("values and graph_index must have aligned rows")
+        if values.device != graph_index.device:
+            raise ValueError("values and graph_index must share a device")
+        _validate_graph_index(graph_index, num_graphs)
+    if num_graphs == 1:
+        return values.sum(dim=0, keepdim=True, dtype=values.dtype)
+    return values.new_zeros((num_graphs, *values.shape[1:])).index_add(0, graph_index, values)
+
+
+def graph_broadcast(
+    values: Tensor, graph_index: Tensor, num_graphs: int, *, validate_index: bool = True
+) -> Tensor:
+    """Expand graph rows without indexed accumulation in single-graph backward."""
+
+    if validate_index:
+        if values.ndim < 1 or values.shape[0] != num_graphs:
+            raise ValueError("values must have one row per graph")
+        if values.device != graph_index.device:
+            raise ValueError("values and graph_index must share a device")
+        _validate_graph_index(graph_index, num_graphs)
+    if num_graphs == 1:
+        return values.expand((graph_index.numel(), *values.shape[1:]))
+    return values[graph_index]
+
+
 def graph_weighted_mean(
     values: Tensor,
     graph_index: Tensor,
@@ -28,8 +77,9 @@ def graph_weighted_mean(
         or weights.device != values.device
     ):
         raise ValueError("weights must match values")
-    numerator = values.new_zeros(num_graphs).index_add(0, graph_index, values * weights)
-    denominator = values.new_zeros(num_graphs).index_add(0, graph_index, weights)
+    _validate_graph_index(graph_index, num_graphs)
+    numerator = graph_sum(values * weights, graph_index, num_graphs, validate_index=False)
+    denominator = graph_sum(weights, graph_index, num_graphs, validate_index=False)
     return numerator / denominator.clamp_min(torch.finfo(values.dtype).tiny)
 
 
@@ -174,6 +224,6 @@ def shared_head_diffusion(
     propagated = _ChunkedUndirectedPropagation.apply(
         message_compute, weight, incidence, edge_chunk_size
     )
-    node_beta = beta.to(compute_dtype)[node_graph].unsqueeze(-1)
+    node_beta = graph_broadcast(beta.to(compute_dtype), node_graph, beta.shape[0]).unsqueeze(-1)
     output = message_compute + node_beta * (propagated - active[:, None, None] * message_compute)
     return output.to(message.dtype)

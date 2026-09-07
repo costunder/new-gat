@@ -1,5 +1,47 @@
 # Conductance GAT V5 — graph-specific C optimization and weighted-Laplacian propagation
 
+## 2026-09-07: 모델·샘플링 계약을 보존한 실행 병목 수정
+
+사용자 서버 로그의 reference/arxiv dynamic-C는 epoch 62–66에 12 train batches,
+epoch당 평균 667.36초였다. 이 시간은 train forward/backward만이 아니라 validation 등을
+포함한다. GPU 100%/27,143 MiB/112.77 W 한 번의 관측만으로 계산 효율을 판정하지 않는다.
+
+- 단일 그래프 C solver의 graph-ID scatter를 sum/amax/expand로 바꾼다. K=8 forward에서
+  graph 목적지 index_add 54회와 scatter_reduce 24회를 없애고, 같은 degree 계산을
+  14회에서 9회로 재사용한다. 메시지 패싱의 실제 node/edge reduction은 생략하지 않는다.
+  다중 그래프의 분리 집계, max 동률 gradient, 양수 C·가중 평균 1과 task-loss 역전파를 유지한다.
+- topology-only degree/coverage/구조 context는 forward당 한 번 계산한다.
+  layer별 hidden-dependent context는 매번 계산하고 AMP 아래 geometry는 FP32를 유지한다.
+- 현재 arxiv auto sampler는 neighbor가 아니라 cluster다. seed 수×26의 기존 확장 예산이
+  전체 노드 수 이상이면 seed가 속한 연결 성분 전체까지 탐색하는 동일한 규칙을 유지하되,
+  무방향 그래프의 connected components를 한 번 cache하여 Python BFS 반복을 제거한다.
+  방향성이 비대칭이거나 SciPy가 없으면 이유를 명시하고 원래 탐색을 사용한다.
+  포화 경고와 실제 nodes/edges/seed 수를 기록한다. 새로운 샘플링 법칙이나 cap은 추가하지 않는다.
+  따라서 기존 실행의 큰 배치에서 B_s가 반복적으로 거의 전체 그래프가 되는 문제 자체가
+  새로 다양한 국소 샘플로 바뀌었다고 주장하지 않는다.
+- 고정 validation 입력은 학습 invocation당 한 번 clone/device transfer한다.
+  모델 출력·activation은 cache하지 않고 입력 변조를 검출한다. 이 상주 메모리는
+  새 physical-batch 후보 실측에도 포함하며, validation 자체의 forward 시간은 별도 계측한다.
+- epoch마다 중복하던 layer diagnostics를 한 번으로 통합하고 sampled train mask의 nonzero는
+  GPU 전송 전에 수행한다. training/validation/diagnostics의 CUDA event와 CPU wall time,
+  checkpoint commit 시간 및 actual batch shapes를 history.json과 performance.json에 기록한다.
+  CPU/GPU 시간은 overlap 가능하므로 더해서 전체 시간으로 해석하지 않는다.
+- 새 calibration은 reference_updates 예산에서 samples/sec만 최대화하지 않고 같은 실제
+  update 예산을 완료하는 예상 training 시간을 비교한다. full measurement epoch 수와
+  마지막 불완전 batch까지 반영한다. validation/checkpoint 비용은 선택 목적함수에서 제외되며
+  따라서 end-to-end 최적 배치라고 주장하지 않는다. 이미 완료된 자원 계획은 재선택하지 않는다.
+
+폭·깊이·heads·K=8·데이터·샘플링 범위·physical batch·optimization 예산은 임의 축소하지 않았다.
+기존 corrected run의 12 batches/epoch와 reference_updates를 그대로 유지하면 코드상
+기준 45 batches/epoch × 200 epochs = 9,000 updates, 최대 750 epochs다
+(실제 저장된 자원/예산 계획이 우선). 이번 수정이 이를 200 epochs로 줄이지 않는다.
+
+정확한 51da819 소스에서 이번 성능 수정으로만 한 방향 재개를 허용한다.
+기존 모델/AdamW/RNG/epoch/recipe 검사는 그대로이며 기존 결과를 삭제하지 않는다.
+reduction 순서가 바뀌므로 이후 부동소수점 궤적의 bitwise 동일성은 주장하지 않는다.
+기존 자원 계획은 과거 실측임을 유지하며 새 코드의 처리량 인증으로 재해석하지 않는다.
+로컬 CPU 수식·gradient·sampler·재개 검증과 실제 A6000 전체 학습/성능 검증은 구분한다.
+
 ## 2026-09-06: 저성능 결과 이후의 명시적 교정 설정
 
 사용자가 올린 20조건 validation 요약은 `historical_reference` 2개,

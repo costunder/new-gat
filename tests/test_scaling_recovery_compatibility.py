@@ -34,9 +34,10 @@ def _archived_reviewed_snapshots(source_paths):
         repaired[name] = change["after"]
         if change["before"] is not None:
             previous[name] = change["before"]
-    repaired[resume_compat.REGISTRY_SOURCE] = hashlib.sha256(
-        resume_compat.REGISTRY_PATH.read_bytes()
-    ).hexdigest()
+    repaired[resume_compat.REGISTRY_SOURCE] = registry.get("performance_repair", {}).get(
+        "registry_before_sha256",
+        hashlib.sha256(resume_compat.REGISTRY_PATH.read_bytes()).hexdigest(),
+    )
     assert resume_compat.require_source_compatibility(previous, repaired) is not None
     return previous, repaired
 

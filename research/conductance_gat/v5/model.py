@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from torch import Tensor, nn
@@ -30,6 +30,8 @@ def _positive_int(name: str, value: int) -> None:
 
 
 def _graph_node_mean(values: Tensor, node_graph: Tensor, num_graphs: int) -> Tensor:
+    if num_graphs == 1:
+        return values.sum(dim=0, keepdim=True) / max(values.shape[0], 1)
     sums = values.new_zeros((num_graphs, values.shape[1])).index_add(0, node_graph, values)
     counts = values.new_zeros(num_graphs).index_add(0, node_graph, values.new_ones(values.shape[0]))
     return sums / counts.clamp_min(1)[:, None]
@@ -54,15 +56,34 @@ def _finite_standard_deviation(variance: Tensor) -> Tensor:
     return torch.where(zero, torch.zeros_like(nonnegative), safe.sqrt())
 
 
-def graph_context_features(
+class _StaticGraphContext(NamedTuple):
+    incidence: Tensor
+    node_graph: Tensor
+    sample_degree: Tensor
+    full_degree: Tensor
+    features: Tensor
+
+
+def _static_graph_context(
     state: Tensor,
     incidence: Tensor,
     node_graph: Tensor,
     num_graphs: int,
     full_degree: Tensor | None = None,
     graph_structure: Tensor | None = None,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Pool clean hidden state and local/original structural statistics."""
+) -> _StaticGraphContext:
+    """Topology-only statistics for one forward, never reused across graphs."""
+    _positive_int("num_graphs", num_graphs)
+    if (
+        node_graph.dtype != torch.long
+        or node_graph.shape != (state.shape[0],)
+        or node_graph.device != state.device
+    ):
+        raise ValueError("node_graph must contain one same-device int64 graph index per node")
+    torch._assert_async(
+        ((node_graph >= 0) & (node_graph < num_graphs)).all(),
+        "node graph index lies outside the declared graph count",
+    )
 
     sample_degree = _node_degree(state, incidence)
     if full_degree is None:
@@ -70,9 +91,6 @@ def graph_context_features(
     if full_degree.shape != sample_degree.shape or full_degree.device != state.device:
         raise ValueError("full_degree must contain one same-device value per node")
     full_degree = full_degree.to(state.dtype)
-    mean = _graph_node_mean(state, node_graph, num_graphs)
-    second = _graph_node_mean(state.square(), node_graph, num_graphs)
-    std = _finite_standard_deviation(second - mean.square())
     coverage = sample_degree / full_degree.clamp_min(1)
     coverage_mean = _graph_node_mean(coverage[:, None], node_graph, num_graphs)
     coverage_std = _finite_standard_deviation(
@@ -80,13 +98,17 @@ def graph_context_features(
         - coverage_mean.square()
     )
     if graph_structure is None:
-        node_count = state.new_zeros(num_graphs).index_add(
-            0, node_graph, state.new_ones(state.shape[0])
-        )
-        edge_graph = node_graph[incidence[0]]
-        edge_count = state.new_zeros(num_graphs).index_add(
-            0, edge_graph, state.new_ones(edge_graph.numel())
-        )
+        if num_graphs == 1:
+            node_count = state.new_full((1,), state.shape[0])
+            edge_count = state.new_full((1,), incidence.shape[1])
+        else:
+            node_count = state.new_zeros(num_graphs).index_add(
+                0, node_graph, state.new_ones(state.shape[0])
+            )
+            edge_graph = node_graph[incidence[0]]
+            edge_count = state.new_zeros(num_graphs).index_add(
+                0, edge_graph, state.new_ones(edge_graph.numel())
+            )
         log_degree = full_degree.log1p()[:, None]
         degree_mean = _graph_node_mean(log_degree, node_graph, num_graphs)
         degree_std = _finite_standard_deviation(
@@ -106,10 +128,46 @@ def graph_context_features(
         )
     if graph_structure.shape != (num_graphs, 6) or graph_structure.device != state.device:
         raise ValueError("graph_structure must be a same-device num_graphs x 6 tensor")
-    return (
-        torch.cat((mean, std, graph_structure.to(state.dtype), coverage_mean, coverage_std), dim=1),
+    return _StaticGraphContext(
+        incidence,
+        node_graph,
         sample_degree,
         full_degree,
+        torch.cat((graph_structure.to(state.dtype), coverage_mean, coverage_std), dim=1),
+    )
+
+
+def graph_context_features(
+    state: Tensor,
+    incidence: Tensor,
+    node_graph: Tensor,
+    num_graphs: int,
+    full_degree: Tensor | None = None,
+    graph_structure: Tensor | None = None,
+    *,
+    static_context: _StaticGraphContext | None = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Pool current hidden state while reusing this forward's static topology."""
+    if static_context is None:
+        static_context = _static_graph_context(
+            state, incidence, node_graph, num_graphs, full_degree, graph_structure
+        )
+    if (
+        static_context.incidence is not incidence
+        or static_context.node_graph is not node_graph
+        or static_context.sample_degree.shape != (state.shape[0],)
+        or static_context.features.shape != (num_graphs, 8)
+        or static_context.features.device != state.device
+        or static_context.features.dtype != state.dtype
+    ):
+        raise ValueError("static graph context must belong to this same-device forward graph")
+    mean = _graph_node_mean(state, node_graph, num_graphs)
+    second = _graph_node_mean(state.square(), node_graph, num_graphs)
+    std = _finite_standard_deviation(second - mean.square())
+    return (
+        torch.cat((mean, std, static_context.features), dim=1),
+        static_context.sample_degree,
+        static_context.full_degree,
     )
 
 
@@ -432,13 +490,20 @@ class SharedConductanceMultihead(nn.Module):
         graph_structure: Tensor | None,
         edge_normalization_weight: Tensor | None,
         sampling_correction: Tensor | None,
+        static_context: _StaticGraphContext | None = None,
     ) -> Tensor:
         # Dynamic-C geometry stays FP32 under an outer BF16 autocast region.
         # This includes its score network, centering/exp gauge and beta sigmoid.
         with torch.autocast(device_type=state.device.type, enabled=False):
             fp32_state = state.float()
             context, sample_degree, full_degree = graph_context_features(
-                fp32_state, incidence, node_graph, num_graphs, full_degree, graph_structure
+                fp32_state,
+                incidence,
+                node_graph,
+                num_graphs,
+                full_degree,
+                graph_structure,
+                static_context=static_context,
             )
             c = self.estimator(
                 fp32_state,
@@ -621,6 +686,15 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
             "edge_normalization_weight": getattr(graph, "edge_normalization_weight", None),
             "sampling_correction": getattr(graph, "sampling_correction", None),
         }
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            kwargs["static_context"] = _static_graph_context(
+                x.float(),
+                incidence,
+                batch,
+                num_graphs,
+                kwargs["full_degree"],
+                kwargs["graph_structure"],
+            )
         for block in self.blocks:
             if self.activation_checkpoint and torch.is_grad_enabled():
                 from torch.utils.checkpoint import checkpoint

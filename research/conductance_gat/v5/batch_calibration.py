@@ -22,48 +22,7 @@ import torch
 from chartgat.observability import RuntimeResourceMonitor
 
 from . import train
-
-
-class _StageTimer:
-    """CPU wall time plus asynchronous CUDA events; no per-stage synchronization."""
-
-    def __init__(self, device: torch.device) -> None:
-        self.device = device
-        self.cpu_seconds: dict[str, float] = {}
-        self.events: list[tuple[str, Any, Any]] = []
-
-    @contextmanager
-    def stage(self, name: str):
-        cuda = self.device.type == "cuda" and name != "sampling_and_loader_wait"
-        start_event = end_event = None
-        if cuda:
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record(torch.cuda.current_stream(self.device))
-        started = time.perf_counter()
-        try:
-            yield
-        finally:
-            self.cpu_seconds[name] = self.cpu_seconds.get(name, 0.0) + (
-                time.perf_counter() - started
-            )
-            if cuda:
-                end_event.record(torch.cuda.current_stream(self.device))
-                self.events.append((name, start_event, end_event))
-
-    def report(self) -> dict[str, Any]:
-        # Caller synchronizes once at the complete-epoch measurement boundary.
-        gpu_seconds: dict[str, float] = {}
-        for name, started, ended in self.events:
-            gpu_seconds[name] = gpu_seconds.get(name, 0.0) + started.elapsed_time(ended) / 1000
-        return {
-            "cpu_wall_seconds": dict(self.cpu_seconds),
-            "cuda_event_seconds": gpu_seconds,
-            "interpretation": (
-                "CUDA event durations and CPU submission/wait durations overlap; do not add "
-                "them as an end-to-end step time. Sampling includes exposed prefetch wait."
-            ),
-        }
+from .timing import StageTimer as _StageTimer
 
 
 @contextmanager
@@ -164,7 +123,13 @@ def _run_epoch(model, optimizer, data, indices, sampler, args, device, epoch, ti
         data, indices, sampler, epoch, device, args.model_seed, args, timing=timing
     ):
         label_count = _update(
-            model, optimizer, graph, selected, args, phase, timing,
+            model,
+            optimizer,
+            graph,
+            selected,
+            args,
+            phase,
+            timing,
             validate=not optimizer.state,
         )
         supervised_labels += label_count
@@ -199,7 +164,7 @@ def _ppi_stress_update(payload, args, device, model, optimizer):
         ),
         reverse=True,
     )
-    selected = order[:args.batch_size]
+    selected = order[: args.batch_size]
     graph = Batch.from_data_list([Data(**payload["graphs"][index]) for index in selected])
     graph._v5_num_graphs = int(graph.num_graphs)
     if args.pin_memory:
@@ -218,8 +183,14 @@ def _ppi_stress_update(payload, args, device, model, optimizer):
 
 
 def run_training_candidate(
-    payload, args, device: torch.device, *, physical_batch_size: int, workers: int,
-    warmup_steps: int = 2, measurement_steps: int = 5,
+    payload,
+    args,
+    device: torch.device,
+    *,
+    physical_batch_size: int,
+    workers: int,
+    warmup_steps: int = 2,
+    measurement_steps: int = 5,
     minimum_measure_seconds: float = 3.0,
 ) -> dict[str, Any]:
     """Measure a disposable joint-phase model, including real AdamW state and IO.
@@ -230,8 +201,10 @@ def run_training_candidate(
     """
     train._require_cuda(device)
     if (
-        any(isinstance(value, bool) or not isinstance(value, int) or value < 1
-            for value in (warmup_steps, measurement_steps))
+        any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in (warmup_steps, measurement_steps)
+        )
         or isinstance(minimum_measure_seconds, bool)
         or not isinstance(minimum_measure_seconds, (int, float))
         or not math.isfinite(minimum_measure_seconds)
@@ -241,7 +214,7 @@ def run_training_candidate(
     candidate = _candidate_args(args, physical_batch_size, workers)
     if payload.get("dataset") != candidate.dataset:
         raise ValueError("calibration dataset does not match the verified cache payload")
-    model = optimizer = data = indices = sampler = None
+    model = optimizer = data = indices = sampler = validation_cache = None
     monitor = None
     report = None
     with _isolated_execution_state(device):
@@ -257,8 +230,17 @@ def run_training_candidate(
             train._seed(candidate.model_seed)
             setup_started = time.perf_counter()
             data, indices, sampler = train._prepare_data(payload, candidate, device)
+            if indices is not None:
+                # Final training retains this input cache while updating the
+                # model. Include the same resident storage in candidate peaks,
+                # without evaluating validation labels or changing its score.
+                validation_cache = train.PreparedValidationGraph(
+                    train._validation_source(data, sampler), device
+                )
+                validation_cache.prepare(indices["validation"], device)
             model = train.GraphConditionedConductanceNodeClassifier(
-                payload["graphs"][0]["x"].shape[1], payload["classes"],
+                payload["graphs"][0]["x"].shape[1],
+                payload["classes"],
                 **train.architecture_configuration(candidate),
                 conductance_mode=train.CONDITIONS[candidate.condition]["conductance_mode"],
                 max_log_conductance=train.COMMON["max_log_conductance"],
@@ -271,7 +253,8 @@ def run_training_candidate(
             setup_seconds = time.perf_counter() - setup_started
             stress = (
                 _ppi_stress_update(payload, candidate, device, model, optimizer)
-                if candidate.dataset == "ppi" else {
+                if candidate.dataset == "ppi"
+                else {
                     "scope": "every training seed covered by full warmup and measurement epochs",
                     "sampling": candidate.sampling,
                     "fanouts": list(candidate.num_neighbors),
@@ -285,8 +268,15 @@ def run_training_candidate(
             while warmup_updates < warmup_steps:
                 warmup_epoch += 1
                 warmup = _run_epoch(
-                    model, optimizer, data, indices, sampler, candidate, device,
-                    warmup_epoch, _StageTimer(device),
+                    model,
+                    optimizer,
+                    data,
+                    indices,
+                    sampler,
+                    candidate,
+                    device,
+                    warmup_epoch,
+                    _StageTimer(device),
                 )
                 warmup_updates += warmup["optimizer_steps"]
             if not optimizer.state or _optimizer_state_bytes(optimizer) <= 0:
@@ -300,8 +290,15 @@ def run_training_candidate(
             while measured_steps < measurement_steps or elapsed < minimum_measure_seconds:
                 measured_epochs += 1
                 values = _run_epoch(
-                    model, optimizer, data, indices, sampler, candidate, device,
-                    warmup_epoch + measured_epochs, timing,
+                    model,
+                    optimizer,
+                    data,
+                    indices,
+                    sampler,
+                    candidate,
+                    device,
+                    warmup_epoch + measured_epochs,
+                    timing,
                 )
                 measured_steps += values["optimizer_steps"]
                 units += values["processed_units"]
@@ -317,18 +314,26 @@ def run_training_candidate(
             peak_reserved = int(torch.cuda.max_memory_reserved(device))
             free_after, _ = torch.cuda.mem_get_info(device)
             report = {
-                "status": "passed", "calibration_not_final": True,
-                "elapsed_seconds": elapsed, "processed_units": units,
+                "status": "passed",
+                "calibration_not_final": True,
+                "elapsed_seconds": elapsed,
+                "processed_units": units,
                 "unit": "graphs" if indices is None else "supervised_seed_nodes",
-                "optimizer_steps": measured_steps, "samples_per_second": units / elapsed,
+                "optimizer_steps": measured_steps,
+                "samples_per_second": units / elapsed,
                 "measurement_steps_requested": measurement_steps,
                 "minimum_measure_seconds_requested": minimum_measure_seconds,
                 "warmup_steps_requested": warmup_steps,
-                "stage_seconds": timing.report(), "setup_seconds": setup_seconds,
-                "peak_allocated_bytes": peak_allocated, "peak_reserved_bytes": peak_reserved,
-                "free_bytes_before": int(free_before), "free_bytes_after": int(free_after),
-                "total_memory_bytes": int(total), "batch_size": physical_batch_size,
-                "workers": workers, "optimizer_state_bytes": _optimizer_state_bytes(optimizer),
+                "stage_seconds": timing.report(),
+                "setup_seconds": setup_seconds,
+                "peak_allocated_bytes": peak_allocated,
+                "peak_reserved_bytes": peak_reserved,
+                "free_bytes_before": int(free_before),
+                "free_bytes_after": int(free_after),
+                "total_memory_bytes": int(total),
+                "batch_size": physical_batch_size,
+                "workers": workers,
+                "optimizer_state_bytes": _optimizer_state_bytes(optimizer),
                 "model_parameter_count": sum(value.numel() for value in model.parameters()),
                 "initial_model_sha256": initial_hash,
                 "parameter_update_verified": initial_hash != train.state_sha256(model),
@@ -342,12 +347,17 @@ def run_training_candidate(
                 "stress_observation": stress,
                 "model_phase": "joint_all_condition_parameter_groups_active",
                 "sampling": sampler.metadata() if sampler is not None else {"mode": "full"},
-                "configuration": train.configuration(candidate), "hardware": hardware,
+                "configuration": train.configuration(candidate),
+                "hardware": hardware,
+                "validation_input_cache": (
+                    validation_cache.metadata if validation_cache is not None else None
+                ),
                 "scope": (
                     "fresh real training batches, full training epochs; "
                     "no validation/test/checkpoints"
                 ),
-                "gradient_accumulation_steps": 1, "data_parallel_workers": 1,
+                "gradient_accumulation_steps": 1,
+                "data_parallel_workers": 1,
                 "effective_batch_size": physical_batch_size,
             }
             if not report["parameter_update_verified"]:
@@ -375,7 +385,7 @@ def run_training_candidate(
                     if report is not None:
                         report["resource_observability"] = resources
             finally:
-                model = optimizer = data = indices = sampler = None
+                model = optimizer = data = indices = sampler = validation_cache = None
                 gc.collect()
                 torch.cuda.empty_cache()
     return report

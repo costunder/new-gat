@@ -40,5 +40,60 @@
       "before": "9191588194cdcfc09e53404f022ea45a5c1f5a33db513e2b8667349336744e01",
       "after": "bff0e5a34d9eaba2a5d4c1482feae35288a079cfa29881a3fd9548718fa6ed1a"
     }
+  },
+  "performance_repair": {
+    "patch_id": "v5-single-graph-performance-v1",
+    "base_commit": "51da8191274e8e8ff89b6878964a6e5af091c696",
+    "registry_before_sha256": "4c8695580f8723e6960db591e65f24777a0dddbf7295b01498a62a0548b8a6ec",
+    "changes": {
+      "research/conductance_gat/v5/batch_calibration.py": {
+        "before": "46cb2d2632c1283089f3684e32bcc22d97d6e5b81809646ffe21a5eb2ab7148f",
+        "after": "265ebacb059289f1b7445cf0db1fc9f8c2359de52fd2c83cf455f2ebfa264ddc"
+      },
+      "research/conductance_gat/v5/diagnostics.py": {
+        "before": "2983e8d504c52ffd9315208106a91243a90a8b49f929a27be72973726d5936e1",
+        "after": "b1d629f638319c95a19997b0525a31f1d7aa44dcfe0451a7e20d979f11845a68"
+      },
+      "research/conductance_gat/v5/model.py": {
+        "before": "c73d8d8944ba4a0182852174f4dee49f6af159ec23037ae27210021dde6b27b6",
+        "after": "963881743c2c7113df5cecaf05d91670b190d9fb7a3ca3a3f976d363d6925282"
+      },
+      "research/conductance_gat/v5/operator.py": {
+        "before": "28e252ac76116217beaf801ccbb6308c37c85cef7334125322043e326cbfe0b3",
+        "after": "f79b59708b5787ff79ffc3c0a8976432bccaa8f4cb6f6edbf172d3f037bd03d3"
+      },
+      "research/conductance_gat/v5/optimization.py": {
+        "before": "4526232838b9394747ba35576c1f96346c3aef08871bd5f79f20e9d257b5bcad",
+        "after": "34fc5475cd95966d63f14b720d82c73062bf3586236ec8671258a1f3e5d4c49b"
+      },
+      "research/conductance_gat/v5/sampling.py": {
+        "before": "0f4d5226cd91202fdcca1e269c03de36aee56f1ed95992b9da14046ed108a7dd",
+        "after": "98333613164281dbb599189fb91703d6b231413ffbbe6b0dafde5fa93d28a6a2"
+      },
+      "research/conductance_gat/v5/timing.py": {
+        "before": null,
+        "after": "c4767edd02f5b7a6c0c857cc7f17b2f22c36b1404576481c60d66d967a76d033"
+      },
+      "research/conductance_gat/v5/train.py": {
+        "before": "608517e0022389c2dc89f99080deef3223c2ec5df1dcc2334589e3ba29f58eb4",
+        "after": "b3f4bf7503651c75cd3f3f1b030bff26f243a45eda5f0d645e9a842664b3faec"
+      },
+      "scripts/calibrate_training_resources.py": {
+        "before": "ef30d604629451139443088b0bc738613830b2550175c4f80c4de85d25566016",
+        "after": "4f02c9ff5ab1ac938fd38673c40f8afbd5ecdf219d7591634820217ad72d8a08"
+      },
+      "scripts/training_resource_plan.py": {
+        "before": "3088b02c1aca4e3a31bc4b4e6cd5fdd4154ee08e01ca6ec125ff7b2f2e4bdf5a",
+        "after": "a1003f2b9643364d23b2351a8cf36d281c0ee1953c1144e7e60989e27b56de94"
+      },
+      "src/chartgat/resume_compat.py": {
+        "before": "379e4691c24fa888c937a25420c37f8ef9ab542551eae406ed81e608856afa35",
+        "after": "c503e207ff10db490b2624473ae330c2cee7873bf3ebdd930ce1d9cc682076bd"
+      },
+      "research/conductance_gat/tests/test_v5_efficiency.py": {
+        "before": "97e2d8091678cd232fc85c1e9d54918d0d3948a4f0697bdc214972a7da891f22",
+        "after": "d4d455fb91d97eba3917f479221fb5fd992648ce257c9fe12bec07618f48cbca"
+      }
+    }
   }
 }

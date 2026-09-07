@@ -33,7 +33,9 @@ from scripts.training_resource_plan import (  # noqa: E402
     command_identity,
     completed_candidate_status,
     digest,
+    learning_budget_selection_policy,
     load_resource_plan,
+    projected_training_budget_cost,
     source_snapshot,
     validate_resource_plan,
     worker_candidates,
@@ -225,6 +227,40 @@ def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist)
                 "verified dataset changed since partial calibration; previous evidence preserved"
             ),
         )
+    policies = [
+        learning_budget_selection_policy(vars(args), training_split_size=maximum, batch_axis=axis)
+        if primary["track"] == "conductance"
+        else None
+        for args in parsed
+    ]
+    if any(policy != policies[0] for policy in policies):
+        raise ValueError("paired calibration conditions must use the same learning budget")
+    selection_policy = policies[0]
+    if entry.get("status") == "passed":
+        # Completed legacy evidence is never reselected under the newer objective.
+        if (
+            entry.get("selection_policy") is not None
+            and entry["selection_policy"] != selection_policy
+        ):
+            raise ValueError(
+                "completed resource selection policy differs; previous evidence preserved"
+            )
+        return
+    if (entry.get("candidates") or "selection_policy" in entry) and entry.get(
+        "selection_policy"
+    ) != selection_policy:
+        raise ValueError(
+            "partial calibration selection policy differs; previous candidates preserved; "
+            "use a new calibration run ID instead of silently reselecting legacy measurements"
+        )
+    if selection_policy is not None:
+        entry["selection_policy"] = selection_policy
+        print(
+            f"[calibration objective] {_group_key(primary)}: minimize worst paired full "
+            "update-budget training time; validation/checkpoint/final evaluation unmeasured "
+            "and excluded; original epoch/update targets and physical batch floor retained",
+            flush=True,
+        )
     baseline = (
         parsed[0].sample_seed_batch_size if axis == "sampled_seed_nodes" else parsed[0].batch_size
     )
@@ -306,7 +342,7 @@ def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist)
                         persist()
                 candidate["status"] = completed_candidate_status(candidate["measurements"])
                 persist()
-            score = candidate_score(candidate)
+            score = candidate_score(candidate, selection_policy=selection_policy)
             if score is not None:
                 size_has_safe_candidate = True
                 size_best = score if size_best is None else max(size_best, score)
@@ -326,10 +362,14 @@ def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist)
             plateau = 0
         best_score = size_best if best_score is None else max(best_score, size_best)
         if plateau >= 2:
-            entry["stop_reason"] = "measured_throughput_plateau"
+            entry["stop_reason"] = (
+                "measured_budget_cost_plateau"
+                if selection_policy is not None
+                else "measured_throughput_plateau"
+            )
             break
         current = min(current * 2, natural_maximum)
-    chosen = choose_candidate(entry["candidates"], baseline)
+    chosen = choose_candidate(entry["candidates"], baseline, selection_policy=selection_policy)
     selected = {"batch_size": parsed[0].batch_size, "workers": chosen["workers"]}
     if primary["track"] == "conductance":
         selected["sample_seed_batch_size"] = parsed[0].sample_seed_batch_size
@@ -340,7 +380,11 @@ def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist)
         status="passed",
         selected=selected,
         selection={
-            "algorithm": "highest minimum paired throughput among safe measured candidates",
+            "algorithm": (
+                "lowest worst paired projected update-budget training seconds among safe candidates"
+                if selection_policy is not None
+                else "highest minimum paired throughput among safe measured candidates"
+            ),
             "memory_margin": "max(2 GiB, 10% visible capacity), including optimizer peak reserve",
             "minimum_requested_batch_preserved": True,
             "global_optimum_claimed": False,
@@ -351,6 +395,15 @@ def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist)
             ),
         },
     )
+    if selection_policy is not None:
+        entry["selection"]["projected_budget_costs"] = [
+            {
+                "condition": report["condition"],
+                "model_seed": report["model_seed"],
+                **projected_training_budget_cost(report, selection_policy),
+            }
+            for report in chosen["measurements"]
+        ]
     persist()
     print(
         f"[calibration selected] {_group_key(primary)} {selected}; boundary={entry['stop_reason']}",
@@ -393,6 +446,27 @@ def verify_plan_inputs(
                     "previous measurements preserved"
                 )
             parsed.append(args)
+        expected_policies = [
+            learning_budget_selection_policy(
+                vars(args),
+                training_split_size=entry["natural_training_split_size"],
+                batch_axis=entry["batch_axis"],
+            )
+            if entry["track"] == "conductance"
+            else None
+            for args in parsed
+        ]
+        if entry.get("selection_policy") is not None:
+            if any(policy != entry["selection_policy"] for policy in expected_policies):
+                raise ValueError(
+                    "resource selection policy differs from the requested training budget"
+                )
+        elif any(policy is not None for policy in expected_policies):
+            print(
+                f"[resource plan preserved] {_group_key(entry)}: legacy samples/second "
+                "selection remains immutable; update-budget reselection requires a new run ID",
+                flush=True,
+            )
         loaded, identity, maximum, axis = _load_group(matching[0], parsed[0])
         _verify_loaded_input(
             entry,

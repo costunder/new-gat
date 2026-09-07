@@ -14,19 +14,54 @@ from research.conductance_gat.v5 import train
 
 
 def _args(dataset="ogbn-arxiv", sampling="neighbor"):
-    result = train.build_parser().parse_args([
-        "--dataset", dataset, "--condition", "shared_dynamic_c", "--output-dir", "unused",
-        "--sampling", sampling, "--sample-seed-batch-size", "32", "--hidden-channels", "32",
-        "--layers", "2", "--heads", "4", "--ffn-multiplier", "2", "--epochs", "4",
-        "--no-activation-checkpoint",
-    ])
+    result = train.build_parser().parse_args(
+        [
+            "--dataset",
+            dataset,
+            "--condition",
+            "shared_dynamic_c",
+            "--output-dir",
+            "unused",
+            "--sampling",
+            sampling,
+            "--sample-seed-batch-size",
+            "32",
+            "--hidden-channels",
+            "32",
+            "--layers",
+            "2",
+            "--heads",
+            "4",
+            "--ffn-multiplier",
+            "2",
+            "--epochs",
+            "4",
+            "--no-activation-checkpoint",
+        ]
+    )
     train.validate_args(result)
     return result
 
 
+class DebugGraph(SimpleNamespace):
+    """CPU tensor container that includes the production clone/transfer contract."""
+
+    def items(self):
+        return vars(self).items()
+
+    def clone(self):
+        return DebugGraph(**{name: value.clone() for name, value in self.items()})
+
+    def to(self, device):
+        for name, value in list(self.items()):
+            setattr(self, name, value.to(device))
+        return self
+
+
 def _graph():
-    return SimpleNamespace(
-        x=torch.randn(9, 6), y=torch.arange(9) % 3,
+    return DebugGraph(
+        x=torch.randn(9, 6),
+        y=torch.arange(9) % 3,
         incidence_edge_index=torch.tensor(
             [[0, 0, 1, 2, 2, 3, 4, 5, 6, 7], [1, 2, 2, 3, 4, 4, 5, 6, 7, 8]]
         ),
@@ -35,9 +70,9 @@ def _graph():
 
 def test_sampled_physical_batch_report_is_supervised_seeds_not_one_graph():
     args = _args()
-    sampler_type = type("Sampler", (), {
-        "__len__": lambda self: 7, "metadata": lambda self: {"mode": "neighbor"}
-    })
+    sampler_type = type(
+        "Sampler", (), {"__len__": lambda self: 7, "metadata": lambda self: {"mode": "neighbor"}}
+    )
     report = train._v5_batch_observability(
         _graph(), {"train": torch.arange(9)}, sampler_type(), args
     )
@@ -89,7 +124,9 @@ def test_isolation_restores_python_numpy_torch_rng_and_precision_after_error():
     np.random.seed(11)
     torch.manual_seed(12)
     python_state, numpy_state, torch_state = (
-        random.getstate(), np.random.get_state(), torch.get_rng_state().clone()
+        random.getstate(),
+        np.random.get_state(),
+        torch.get_rng_state().clone(),
     )
     precision = torch.get_float32_matmul_precision()
     tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -115,7 +152,10 @@ def _cpu_fixture(monkeypatch):
     graph = _graph()
     indices = {"train": torch.arange(6), "validation": torch.arange(6, 9)}
     payload = {"dataset": args.dataset, "graphs": [vars(graph)], "classes": 3}
-    sampler = SimpleNamespace(metadata=lambda: {"mode": "neighbor", "seed_batch_size": 64})
+    sampler = SimpleNamespace(
+        graph=graph,
+        metadata=lambda: {"mode": "neighbor", "seed_batch_size": 64},
+    )
     calls = []
 
     def batches(data, split, actual_sampler, epoch, device, model_seed, actual_args, *, timing):
@@ -159,11 +199,18 @@ def test_debug_cpu_smoke_runs_production_joint_model_loss_backward_optimizer_and
     args, payload, calls = _cpu_fixture(monkeypatch)
     before = torch.get_rng_state().clone()
     report = calibration.run_training_candidate(
-        payload, args, torch.device("cpu"), physical_batch_size=64, workers=0,
-        warmup_steps=2, measurement_steps=3, minimum_measure_seconds=0.000001,
+        payload,
+        args,
+        torch.device("cpu"),
+        physical_batch_size=64,
+        workers=0,
+        warmup_steps=2,
+        measurement_steps=3,
+        minimum_measure_seconds=0.000001,
     )
     assert report["status"] == "passed"
     assert report["calibration_not_final"] is True
+    assert report["validation_input_cache"]["cached_graph_tensor_storage_bytes"] > 0
     assert report["complete_warmup_epochs"] == 1
     assert report["complete_measurement_epochs"] == 2
     assert report["optimizer_steps"] == 4
@@ -176,8 +223,12 @@ def test_debug_cpu_smoke_runs_production_joint_model_loss_backward_optimizer_and
     assert report["configuration"]["num_neighbors"] == args.num_neighbors
     assert report["samples_per_second"] > 0
     assert set(report["stage_seconds"]["cpu_wall_seconds"]) >= {
-        "sampling_and_loader_wait", "host_to_device", "forward_and_loss", "backward",
-        "gradient_clipping", "optimizer",
+        "sampling_and_loader_wait",
+        "host_to_device",
+        "forward_and_loss",
+        "backward",
+        "gradient_clipping",
+        "optimizer",
     }
     assert report["stage_seconds"]["cuda_event_seconds"] == {}
     assert torch.equal(torch.get_rng_state(), before)
@@ -194,7 +245,11 @@ def test_candidate_failure_is_reraised_with_observation_not_small_model_fallback
     monkeypatch.setattr(calibration, "_run_epoch", fail)
     with pytest.raises(torch.OutOfMemoryError) as failure:
         calibration.run_training_candidate(
-            payload, args, torch.device("cpu"), physical_batch_size=64, workers=0,
+            payload,
+            args,
+            torch.device("cpu"),
+            physical_batch_size=64,
+            workers=0,
         )
     assert failure.value is original_error
     assert failure.value.calibration_resource_observability["debug_fixture"] is True
@@ -204,7 +259,11 @@ def test_candidate_failure_is_reraised_with_observation_not_small_model_fallback
 def test_production_candidate_refuses_cpu_even_when_payload_would_be_available():
     with pytest.raises(RuntimeError, match="CUDA"):
         calibration.run_training_candidate(
-            {}, _args(), torch.device("cpu"), physical_batch_size=64, workers=0,
+            {},
+            _args(),
+            torch.device("cpu"),
+            physical_batch_size=64,
+            workers=0,
         )
 
 
@@ -253,30 +312,45 @@ def test_monitor_cleanup_error_does_not_replace_primary_candidate_failure(monkey
     monkeypatch.setattr(calibration.RuntimeResourceMonitor, "finish", fail_finish)
     with pytest.raises(RuntimeError, match="primary model failure") as failure:
         calibration.run_training_candidate(
-            payload, args, torch.device("cpu"), physical_batch_size=64, workers=0,
+            payload,
+            args,
+            torch.device("cpu"),
+            physical_batch_size=64,
+            workers=0,
         )
     assert failure.value is original_error
     assert len(finish_calls) == 1
     assert "secondary monitor failure" in " ".join(failure.value.__notes__)
 
 
-@pytest.mark.parametrize("dataset,sampling,split,expected,axis", [
-    ("ppi", "full", [0, 2, 3], 3, "graphs"),
-    ("ogbn-arxiv", "neighbor", torch.tensor([True, False, True, True]),
-     3, "sampled_seed_nodes"),
-    ("cora", "full", torch.tensor([True, False, True]), 1, "full_graph"),
-])
+@pytest.mark.parametrize(
+    "dataset,sampling,split,expected,axis",
+    [
+        ("ppi", "full", [0, 2, 3], 3, "graphs"),
+        (
+            "ogbn-arxiv",
+            "neighbor",
+            torch.tensor([True, False, True, True]),
+            3,
+            "sampled_seed_nodes",
+        ),
+        ("cora", "full", torch.tensor([True, False, True]), 1, "full_graph"),
+    ],
+)
 def test_calibration_group_uses_verified_payload_splits_not_guessed_graph_fields(
-    monkeypatch, dataset, sampling, split, expected, axis,
+    monkeypatch,
+    dataset,
+    sampling,
+    split,
+    expected,
+    axis,
 ):
     from scripts.calibrate_training_resources import _load_group
 
     args = _args(dataset, sampling)
     payload = {"splits": {"train": split}, "graphs": [{}]}
     protocol = {"data_sha256": "a" * 64, "split_sha256": {"train": "b" * 64}}
-    monkeypatch.setattr(
-        calibration, "load_calibration_payload", lambda actual: (payload, protocol)
-    )
+    monkeypatch.setattr(calibration, "load_calibration_payload", lambda actual: (payload, protocol))
     actual_payload, identity, maximum, actual_axis = _load_group({"track": "conductance"}, args)
     assert actual_payload is payload
     assert maximum == expected

@@ -504,7 +504,9 @@ def _reviewed_legacy_sources():
         for name, value in before.items()
     }
     after[resume_compat.HELPER_SOURCE] = registry["changes"][resume_compat.HELPER_SOURCE]["after"]
-    after[resume_compat.REGISTRY_SOURCE] = _sha(resume_compat.REGISTRY_PATH)
+    after[resume_compat.REGISTRY_SOURCE] = registry.get("performance_repair", {}).get(
+        "registry_before_sha256", _sha(resume_compat.REGISTRY_PATH)
+    )
     assert LEGACY_SOURCE_SNAPSHOTS[report._canonical(before)].startswith("76e514a")
     assert LEGACY_SOURCE_SNAPSHOTS[report._canonical(after)].startswith("8963821")
     evidence = resume_compat.require_source_compatibility(before, after)

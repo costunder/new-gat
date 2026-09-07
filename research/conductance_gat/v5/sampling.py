@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Iterator, Sequence
 
 import torch
@@ -155,6 +156,22 @@ class TransductiveGraphSampler:
             ],
             dtype=torch.float32,
         )
+        self._component_labels = None
+        self._component_nodes = None
+        self._component_rowptr = None
+        self._component_cache_status = "not_built"
+        self.last_sample_observation = None
+        if (
+            self.mode == "cluster"
+            and self.seed_batch_size * (1 + sum(self.fanouts)) >= self.num_nodes
+        ):
+            warnings.warn(
+                "V5 cluster node budget reaches the full graph: saturated seed batches "
+                "select complete reachable components, not small local subgraphs. "
+                "Sampling law, graph size and physical seed batch are unchanged.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         if not self.train_indices.numel():
             raise ValueError("sampler requires nonempty train indices")
         if int(self.train_indices.min()) < 0 or int(self.train_indices.max()) >= self.num_nodes:
@@ -189,6 +206,10 @@ class TransductiveGraphSampler:
 
     def _cluster_nodes(self, seeds: Tensor, generator: torch.Generator) -> Tensor:
         budget = max(seeds.numel(), seeds.numel() * (1 + sum(self.fanouts)))
+        if budget >= self.num_nodes:
+            selected = self._complete_seed_components(seeds)
+            if selected is not None:
+                return selected
         selected, frontier = seeds.unique(), seeds.unique()
         while selected.numel() < budget and frontier.numel():
             candidates = self._neighbors(frontier)
@@ -199,6 +220,47 @@ class TransductiveGraphSampler:
             selected = torch.cat((selected, unseen)).unique()
             frontier = unseen
         return selected
+
+    def _complete_seed_components(self, seeds: Tensor) -> Tensor | None:
+        """Exactly replace saturated BFS, which makes no random draws.
+
+        SciPy belongs to the existing paper dependencies. Base-only installs
+        and directed inputs retain the original BFS with an observable reason.
+        """
+        if seeds.dtype != torch.long or seeds.ndim != 1 or seeds.device.type != "cpu":
+            raise ValueError("component seeds must be a one-dimensional CPU int64 tensor")
+        if seeds.numel() and (int(seeds.min()) < 0 or int(seeds.max()) >= self.num_nodes):
+            raise ValueError("component seed lies outside the graph")
+        if self._component_cache_status == "not_built":
+            try:
+                import numpy as np
+                from scipy.sparse import csr_matrix
+                from scipy.sparse.csgraph import connected_components
+            except ImportError:
+                self._component_cache_status = "original_bfs_scipy_unavailable"
+                return None
+            adjacency = csr_matrix(
+                (
+                    np.ones(self.arcs.shape[1], dtype=np.int8),
+                    self.arcs[1].numpy(),
+                    self.rowptr.numpy(),
+                ),
+                shape=(self.num_nodes, self.num_nodes),
+            )
+            if (adjacency != adjacency.transpose()).nnz:
+                self._component_cache_status = "original_bfs_asymmetric_adjacency"
+                return None
+            count, labels = connected_components(adjacency, directed=False)
+            self._component_labels = torch.from_numpy(labels.astype(np.int64, copy=False))
+            self._component_nodes = torch.argsort(self._component_labels, stable=True)
+            sizes = torch.bincount(self._component_labels, minlength=count)
+            self._component_rowptr = torch.cat((torch.zeros(1, dtype=torch.long), sizes.cumsum(0)))
+            self._component_cache_status = "immutable_undirected_component_csr"
+        if self._component_labels is None:
+            return None
+        components = self._component_labels[seeds].unique(sorted=True)
+        # Preserve exactly the old torch.unique BFS ordering, without RNG use.
+        return csr_values(self._component_nodes, self._component_rowptr, components).sort().values
 
     def _induced(self, nodes: Tensor, seeds: Tensor):
         from torch_geometric.data import Data
@@ -224,6 +286,20 @@ class TransductiveGraphSampler:
         else:
             correction = torch.empty(0, dtype=torch.float32)
         train_mask = torch.isin(nodes, seeds)
+        self.last_sample_observation = {
+            "supervised_seed_nodes": int(seeds.numel()),
+            "sampled_nodes": int(nodes.numel()),
+            "sampled_physical_edges": int(incidence.shape[1]),
+            "original_nodes": self.num_nodes,
+            "original_physical_edges": int(self.incidence.shape[1]),
+            "configured_cluster_node_budget": (
+                int(seeds.numel()) * (1 + sum(self.fanouts)) if self.mode == "cluster" else None
+            ),
+            "cluster_budget_saturated": (
+                self.mode == "cluster" and seeds.numel() * (1 + sum(self.fanouts)) >= self.num_nodes
+            ),
+            "component_cache": self._component_cache_status,
+        }
         return Data(
             x=self.graph.x[nodes],
             y=self.graph.y[nodes],
@@ -268,4 +344,13 @@ class TransductiveGraphSampler:
             "normalization_importance_weight": "same boundary correction",
             "original_graph_context_carried": True,
             "validation_graph": "complete_official_graph",
+            "cluster_saturation": {
+                "configured_node_budget": self.seed_batch_size * (1 + sum(self.fanouts)),
+                "full_seed_batch_reaches_graph_size": (
+                    self.mode == "cluster"
+                    and self.seed_batch_size * (1 + sum(self.fanouts)) >= self.num_nodes
+                ),
+                "policy": "complete reachable seed components; original law unchanged",
+                "component_cache": self._component_cache_status,
+            },
         }

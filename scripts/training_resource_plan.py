@@ -20,6 +20,7 @@ from chartgat.resume_compat import COMPATIBILITY_SOURCE_FILES, require_source_co
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_VERSION = 1
+UPDATE_BUDGET_SELECTION = "reference_updates_training_budget_v1"
 IGNORED_COMMAND_OPTIONS = {
     "--output-dir",
     "--batch-size",
@@ -167,7 +168,128 @@ def completed_candidate_status(reports: list[dict[str, Any]]) -> str:
     return "oom" if "oom" in statuses else "passed"
 
 
-def candidate_score(candidate: dict[str, Any]) -> float | None:
+def learning_budget_selection_policy(
+    configuration: dict[str, Any], *, training_split_size: int, batch_axis: str
+) -> dict[str, Any] | None:
+    """Declare a cost objective without changing the scientific training budget."""
+    policy = configuration.get("learning_budget_policy", "epochs")
+    if policy == "epochs":
+        return None
+    if policy != "reference_updates":
+        raise ValueError("unknown resource selection learning budget policy")
+    from research.conductance_gat.v5.learning_budget import deterministic_batches_per_epoch
+    from research.conductance_gat.v5.protocol import HARDWARE_PROFILES
+
+    split_size = _positive(training_split_size, "full training split size")
+    hardware = configuration.get("hardware_profile")
+    if hardware not in HARDWARE_PROFILES:
+        raise ValueError("update-budget selection requires a known hardware profile")
+    reference = configuration.get("budget_reference_batch_size")
+    if reference is not None:
+        _positive(reference, "budget reference batch")
+    if batch_axis == "full_graph":
+        if split_size != 1 or reference not in {None, 1}:
+            raise ValueError("full graph resource budget requires one physical batch")
+        reference_batch = 1
+    elif batch_axis in {"graphs", "sampled_seed_nodes"}:
+        field = "ppi_batch_size" if batch_axis == "graphs" else "sample_seed_batch_size"
+        reference_batch = reference or HARDWARE_PROFILES[hardware][field]
+    else:
+        raise ValueError("invalid update-budget physical batch axis")
+    return {
+        "name": UPDATE_BUDGET_SELECTION,
+        "learning_budget_policy": policy,
+        "hardware_profile": hardware,
+        "budget_reference_batch_size": reference,
+        "requested_epochs": _positive(configuration.get("epochs"), "requested epochs"),
+        "requested_patience": _positive(configuration.get("patience"), "requested patience"),
+        "training_split_size": split_size,
+        "batch_axis": batch_axis,
+        "reference_physical_batch_size": reference_batch,
+        "reference_batches_per_epoch": deterministic_batches_per_epoch(split_size, reference_batch),
+        "cost_scope": (
+            "optimizer-inclusive training; validation/checkpoint/final evaluation excluded"
+        ),
+        "validation_cost_included": False,
+        "checkpoint_cost_included": False,
+        "early_stopping_assumed": False,
+    }
+
+
+def _validate_selection_policy(policy: dict[str, Any]) -> None:
+    if not isinstance(policy, dict):
+        raise ValueError("resource selection policy must be an object")
+    configuration = {
+        **policy,
+        "epochs": policy.get("requested_epochs"),
+        "patience": policy.get("requested_patience"),
+    }
+    expected = learning_budget_selection_policy(
+        configuration,
+        training_split_size=policy.get("training_split_size"),
+        batch_axis=policy.get("batch_axis"),
+    )
+    if expected is None or digest(policy) != digest(expected):
+        raise ValueError("resource selection policy is not its canonical declared budget")
+
+
+def projected_training_budget_cost(
+    report: dict[str, Any], selection_policy: dict[str, Any]
+) -> dict[str, Any]:
+    """Extrapolate full requested update work, never pretend excluded costs were measured."""
+    from research.conductance_gat.v5.learning_budget import (
+        deterministic_batches_per_epoch,
+        plan_learning_budget,
+    )
+
+    _validate_selection_policy(selection_policy)
+    configuration = report.get("configuration")
+    if (
+        not isinstance(configuration, dict)
+        or learning_budget_selection_policy(
+            configuration,
+            training_split_size=selection_policy["training_split_size"],
+            batch_axis=selection_policy["batch_axis"],
+        )
+        != selection_policy
+    ):
+        raise ValueError("measured training configuration differs from selection budget")
+    epochs = _positive(report.get("complete_measurement_epochs"), "complete measurement epochs")
+    steps = _positive(report.get("optimizer_steps"), "measured optimizer steps")
+    units = _positive(report.get("processed_units"), "real processed units")
+    elapsed = _number(report.get("elapsed_seconds"), "measured elapsed seconds")
+    batch = _positive(report.get("batch_size"), "measured physical batch")
+    axis = selection_policy["batch_axis"]
+    actual = (
+        1
+        if axis == "full_graph"
+        else deterministic_batches_per_epoch(selection_policy["training_split_size"], batch)
+    )
+    if steps != epochs * actual:
+        raise ValueError("measured optimizer steps do not cover complete budget epochs")
+    if axis != "full_graph" and units != epochs * selection_policy["training_split_size"]:
+        raise ValueError("measured units do not cover the complete official training split")
+    plan = plan_learning_budget(
+        selection_policy["requested_epochs"],
+        selection_policy["requested_patience"],
+        selection_policy["reference_batches_per_epoch"],
+        actual,
+        "reference_updates",
+    )
+    return {
+        "learning_budget": plan,
+        "optimizer_steps_per_second": steps / elapsed,
+        "projected_training_seconds": plan["planned_maximum_optimizer_steps"] * elapsed / steps,
+        "cost_scope": selection_policy["cost_scope"],
+        "early_stopping_assumed": False,
+    }
+
+
+def candidate_score(
+    candidate: dict[str, Any], *, selection_policy: dict[str, Any] | None = None
+) -> float | None:
+    if selection_policy is not None:
+        _validate_selection_policy(selection_policy)
     if not isinstance(candidate, dict):
         raise ValueError("candidate must be an object")
     _positive(candidate.get("batch_size"), "candidate batch")
@@ -184,10 +306,25 @@ def candidate_score(candidate: dict[str, Any]) -> float | None:
     units = {item["unit"] for item in reports}
     if len(units) != 1:
         raise ValueError("paired calibration reports use different throughput units")
+    if selection_policy is not None:
+        # A larger batch can improve samples/s but worsen time to the fixed update budget.
+        if any(
+            item.get("batch_size") != candidate["batch_size"]
+            or item.get("workers") != candidate["workers"]
+            for item in reports
+        ):
+            raise ValueError("budget measurement physical resources differ from their candidate")
+        costs = [projected_training_budget_cost(item, selection_policy) for item in reports]
+        return 1.0 / max(item["projected_training_seconds"] for item in costs)
     return min(float(item["samples_per_second"]) for item in reports)
 
 
-def choose_candidate(candidates: list[dict[str, Any]], baseline: int) -> dict[str, Any]:
+def choose_candidate(
+    candidates: list[dict[str, Any]],
+    baseline: int,
+    *,
+    selection_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     _positive(baseline, "baseline batch")
     if not isinstance(candidates, list) or not candidates:
         raise ValueError("candidate selection requires actual measurements")
@@ -195,7 +332,7 @@ def choose_candidate(candidates: list[dict[str, Any]], baseline: int) -> dict[st
     for candidate in candidates:
         if _positive(candidate.get("batch_size"), "candidate batch") < baseline:
             raise ValueError("calibration cannot shrink the requested batch")
-        score = candidate_score(candidate)
+        score = candidate_score(candidate, selection_policy=selection_policy)
         if score is not None:
             eligible.append((score, candidate))
     if not eligible:
@@ -240,6 +377,15 @@ def _validate_entry(
     if entry["track"] == "conductance" and (entry.get("dataset") == "ppi") != (axis == "graphs"):
         raise ValueError("only inductive PPI has a Conductance graph-batch axis")
     split_size = _positive(entry.get("natural_training_split_size"), "full training split size")
+    selection_policy = entry.get("selection_policy")
+    if selection_policy is not None:
+        _validate_selection_policy(selection_policy)
+        if (
+            entry["track"] != "conductance"
+            or selection_policy["training_split_size"] != split_size
+            or selection_policy["batch_axis"] != axis
+        ):
+            raise ValueError("selection budget differs from the certified dataset/physical axis")
     worker_options = entry.get("worker_candidates")
     if not isinstance(worker_options, list) or not worker_options:
         raise ValueError("resource plan has no measured worker candidates")
@@ -262,7 +408,7 @@ def _validate_entry(
     seen: set[tuple[int, int]] = set()
     scores_by_batch: dict[int, list[float | None]] = {}
     for candidate in candidates:
-        score = candidate_score(candidate)
+        score = candidate_score(candidate, selection_policy=selection_policy)
         key = candidate["batch_size"], candidate["workers"]
         if key in seen or key[1] not in worker_options:
             raise ValueError("duplicate candidate or unrequested worker setting")
@@ -290,7 +436,20 @@ def _validate_entry(
         raise ValueError("a measured batch is missing a worker candidate")
     if axis != "full_graph" and baseline < split_size and len(batches) < 2:
         raise ValueError("batch selection requires at least two distinct measured physical batches")
-    best = choose_candidate(candidates, baseline)
+    best = choose_candidate(candidates, baseline, selection_policy=selection_policy)
+    if selection_policy is not None:
+        expected_costs = [
+            {
+                "condition": report["condition"],
+                "model_seed": report["model_seed"],
+                **projected_training_budget_cost(report, selection_policy),
+            }
+            for report in best["measurements"]
+        ]
+        if digest(entry.get("selection", {}).get("projected_budget_costs")) != digest(
+            expected_costs
+        ):
+            raise ValueError("selected projected budget costs differ from their measured evidence")
     selected = entry.get("selected", {})
     if not isinstance(selected, dict):
         raise ValueError("selected resources must be an object")
@@ -329,7 +488,9 @@ def _validate_entry(
     elif reason == "complete_training_split_boundary":
         if batches[-1] != max(split_size, baseline) or not last_safe:
             raise ValueError("claimed natural boundary did not measure the full training split")
-    elif reason == "measured_throughput_plateau":
+    elif reason in {"measured_throughput_plateau", "measured_budget_cost_plateau"}:
+        if (reason == "measured_budget_cost_plateau") != (selection_policy is not None):
+            raise ValueError("plateau boundary does not match the declared selection objective")
         plateau, maximum = 0, None
         for batch in batches:
             safe = [score for score in scores_by_batch[batch] if score is not None]
@@ -560,7 +721,14 @@ def resource_plan_identity(plan: dict[str, Any] | None) -> dict[str, Any] | None
     return {
         "sha256": plan["_sha256"],
         "selections": [
-            {key: entry[key] for key in ("track", "profile", "dataset", "selected")}
+            {
+                **{key: entry[key] for key in ("track", "profile", "dataset", "selected")},
+                **(
+                    {"selection_policy": entry["selection_policy"]}
+                    if "selection_policy" in entry
+                    else {}
+                ),
+            }
             for entry in plan["entries"]
         ],
     }

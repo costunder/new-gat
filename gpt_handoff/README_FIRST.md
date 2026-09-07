@@ -1,5 +1,11 @@
 # GPT 전달용 전체 프로젝트 묶음
 
+최신 갱신(2026-09-07): corrected V5의 667초/epoch 로그를 근거로 실행 병목을 수정했다.
+모델/샘플링/예산을 보존한 단일 graph solver 집계·정적 구조/검증 입력 cache,
+예산 기반 새 batch 실측 선택, 기존 진행분 재개와 구간별 성능 계측이 포함된다.
+실제 A6000 수정 후 속도·성적은 아직 측정하지 않았다. 상세는 CONDUCTANCE_V5.md,
+RICH_SCALING_EXPERIMENTS.md, EXPERIMENT_STATUS.md를 함께 읽는다.
+
 이 폴더는 **V5만이 아니라 NEW GAT 전체 프로젝트를 외부 GPT에게 검토시키기 위한 전달 묶음**이다.
 GPT에는 파일을 따로 고르지 말고 이 폴더의 **10개 파일을 전부** 전달한다.
 

@@ -1,6 +1,39 @@
 # 실험 결과와 구현 상태
 
-기준일: 2026-09-06 (Asia/Seoul).
+기준일: 2026-09-07 (Asia/Seoul).
+
+## 2026-09-07 최신: corrected V5 실행 시간과 병목 수정
+
+수령 경로: corrected-c-v5-a6000-gpu3-seed0-v1-conductance /
+v5/reference/model-seed-0/ogbn-arxiv/shared_dynamic_c/history.json.
+epoch 62–66은 각각 12 train batches, 666.9104/667.7595/666.9653/667.9185/667.2440초,
+optimizer_steps 744/756/768/780/792다. 평균은 667.3595초/epoch다.
+해당 필드는 train+validation을 포함하므로 순수 batch time이나 GPU kernel time이 아니다.
+같은 시점 제공된 RTX A6000 관측은 GPU 100%, 27,143/46,068 MiB, 112.77 W다.
+validation은 0.685828/0.687305/0.681566/0.683278/0.679251이고 이전 best는 0.717004다.
+새 test 성적이나 수렴 완료 결과는 아니다.
+
+코드에서는 단일 graph 집계 병목, 정적 구조 재계산, 포화 cluster BFS 반복,
+validation 입력 재복제/재전송, 중복 diagnostics를 수정했다.
+batch 선택에는 reference_updates 예산을 반영하고 이미 저장된 자원 계획은 보존한다.
+실제 C solver 수식/모든 gradient 비교와 CPU profiler에서 graph 목적지
+index_add 54회 및 scatter_reduce 24회가 sum/amax로 대체됨을 확인했다.
+이 연산 횟수는 CPU ATen 관측이며 A6000 가속 배수나 667초 중 기여 시간은 아니다.
+
+수정 후 phase별 CPU/CUDA 시간과 checkpoint 시간, 실제 Bs 크기를 수집한다.
+모델 크기·K=8·샘플링 법칙·기존 배치·epoch/update 예산을 축소하지 않았다.
+검증 범위: 로컬 정적 검사, 단위/회귀 검사, synthetic CPU 학습·재개 검사.
+현재 로컬 torch는 CPU-only여서 수정 후 실제 데이터 A6000 학습·VRAM·처리량·정확도는
+미검증이다. 서버의 기존 프로세스/결과는 변경하지 않았다.
+상세 구현과 재개 계약은 CONDUCTANCE_V5.md 및 RICH_SCALING_EXPERIMENTS.md에 있다.
+
+최종 로컬 회귀: 2,704 passed / 103 skipped / 10 warnings (217.21초).
+생략 사유는 실제 CUDA·PyG 부재, Linux 전용 셸/파일시스템 검사, Windows symlink 권한,
+별도 opt-in 대형 IPC stress다. 10 warnings는 의도적으로 드러낸 cluster 포화 경고다.
+Ruff 정적·format 검사와 git diff --check 통과, CODE_SUMMARY.md 291개 소스 일치 확인.
+실제 51da819 Git 소스→현행의 rich/conductance/resource 세 검사 및 synthetic CPU의
+fixed/dynamic checkpoint 모델·AdamW·RNG·epoch 보존 후 업데이트를 검증했다.
+이 검사는 과거 GPU 커널의 재실행이나 서버 원본 checkpoint의 독립 검증을 뜻하지 않는다.
 
 이 문서는 사용자가 제공한 **서버 결과 출력**과 **현재 소스 버전의 구현**을 구분한 기록이다.
 문서 작성 자체가 새 학습을 실행했다는 뜻은 아니다. 수치는 사용자 로그에서 확인했으며,

@@ -10,6 +10,57 @@ import torch
 from torch import Tensor, nn
 
 
+class PreparedValidationGraph:
+    """One invocation's owned, immutable full-graph device snapshot.
+
+    The CPU sampler graph is never moved or mutated. Construction is explicit
+    so the trainer/calibration can account for this resident memory allocation.
+    No hidden global cache and no cache for PPI's varying graph batches.
+    """
+
+    def __init__(self, source, device: torch.device):
+        self.graph = source.clone().to(device)
+        self.device = self.graph.x.device
+        self._tensors = {
+            key: (value, value._version)
+            for key, value in self.graph.items()
+            if isinstance(value, Tensor)
+        }
+        storages = {
+            (value.device, value.untyped_storage().data_ptr()): value.untyped_storage().nbytes()
+            for value, _ in self._tensors.values()
+        }
+        self._selected_source = None
+        self._selected_version = None
+        self._selected = None
+        self._selected_cache_version = None
+        self.metadata = {
+            "policy": "one owned immutable graph clone/device transfer per training invocation",
+            "source_mutated": False,
+            "device": str(self.device),
+            "cached_graph_tensor_storage_bytes": sum(storages.values()),
+            "indices_policy": "one device clone per source tensor identity/version",
+            "scope": "full validation graph only; no model activations or predictions cached",
+        }
+
+    def prepare(self, indices: Tensor, device: torch.device):
+        requested = torch.device(device)
+        if requested.type != self.device.type or (
+            requested.index is not None and requested.index != self.device.index
+        ):
+            raise ValueError("validation graph cache belongs to another device")
+        for key, (value, version) in self._tensors.items():
+            if getattr(self.graph, key) is not value or value._version != version:
+                raise RuntimeError("owned validation graph cache was mutated")
+        if self._selected is not None and self._selected._version != self._selected_cache_version:
+            raise RuntimeError("owned validation index cache was mutated")
+        if indices is not self._selected_source or indices._version != self._selected_version:
+            self._selected = indices.detach().clone().to(self.device)
+            self._selected_source, self._selected_version = indices, indices._version
+            self._selected_cache_version = self._selected._version
+        return self.graph, self._selected
+
+
 def require_finite_tensor(value: Tensor, label: str) -> None:
     """Reject non-finite model outputs before they can contaminate metrics/state."""
 
@@ -147,12 +198,17 @@ def evaluate(
     *,
     device: torch.device,
     precision: str = "fp32",
+    collect_diagnostics: bool = True,
 ) -> dict[str, Any]:
     model.eval()
     if indices is not None:
         # PyG Data.to mutates storage. Clone so sampled training keeps its
         # canonical full graph on CPU after full-graph validation.
-        graph = source.clone().to(device)
+        if isinstance(source, PreparedValidationGraph):
+            graph, selected_indices = source.prepare(indices, device)
+        else:
+            graph = source.clone().to(device)
+            selected_indices = indices.to(device)
         with torch.autocast(
             device_type=device.type,
             dtype=torch.bfloat16,
@@ -160,8 +216,8 @@ def evaluate(
         ):
             logits = model(graph)
         require_finite_tensor(logits, "validation logits")
-        selected = logits.index_select(0, indices.to(device))
-        target = graph.y.index_select(0, indices.to(device))
+        selected = logits.index_select(0, selected_indices)
+        target = graph.y.index_select(0, selected_indices)
         metric = float((selected.argmax(dim=-1) == target).float().mean())
         count = int(target.numel())
     else:
@@ -193,7 +249,10 @@ def evaluate(
         metric = 2 * tp / denominator if denominator else 0.0
     if not math.isfinite(metric):
         raise FloatingPointError("nonfinite validation metric")
-    return {"metric": metric, "label_count": count, "layers": layer_diagnostics(model)}
+    result = {"metric": metric, "label_count": count}
+    if collect_diagnostics:
+        result["layers"] = layer_diagnostics(model)
+    return result
 
 
 def selected_checkpoint_interventions(

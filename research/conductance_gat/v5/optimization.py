@@ -15,27 +15,75 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from .operator import graph_weighted_mean
+from .operator import _validate_graph_index, graph_broadcast, graph_sum
 
 
 def _degree(c: Tensor, incidence: Tensor, num_nodes: int) -> Tensor:
     return c.new_zeros(num_nodes).index_add(0, incidence[0], c).index_add(0, incidence[1], c)
 
 
-def _graph_max(values: Tensor, edge_graph: Tensor, num_graphs: int) -> Tensor:
-    return values.new_zeros(num_graphs).scatter_reduce(
+def _graph_max(
+    values: Tensor, edge_graph: Tensor, num_graphs: int, *, initial: float = 0.0
+) -> Tensor:
+    if num_graphs == 1:
+        # Include the original self value, also in the gradient's tie count.
+        # clamp_min/maximum after amax would give different zero-tie gradients.
+        return torch.cat((values.new_full((1,), initial), values)).amax(dim=0, keepdim=True)
+    return values.new_full((num_graphs,), initial).scatter_reduce(
         0, edge_graph, values, reduce="amax", include_self=True
     )
 
 
-def _normalize_log_c(log_c: Tensor, edge_graph: Tensor, num_graphs: int, omega: Tensor) -> Tensor:
+def _weighted_mean(
+    values: Tensor, edge_graph: Tensor, num_graphs: int, omega: Tensor, graph_mass: Tensor
+) -> Tensor:
+    # Graph IDs are validated at the solver boundary. Reuse the live mass:
+    # detaching it would change derivatives when sampling weights need grad.
+    numerator = graph_sum(values * omega, edge_graph, num_graphs, validate_index=False)
+    return numerator / graph_mass.clamp_min(torch.finfo(values.dtype).tiny)
+
+
+def _normalize_log_c(
+    log_c: Tensor,
+    edge_graph: Tensor,
+    num_graphs: int,
+    omega: Tensor,
+    graph_mass: Tensor | None = None,
+) -> Tensor:
     # Numerical shift only: no edge or C value is truncated.
-    maxima = log_c.new_full((num_graphs,), -torch.inf).scatter_reduce(
-        0, edge_graph, log_c, reduce="amax", include_self=True
+    if graph_mass is None:
+        _validate_graph_index(edge_graph, num_graphs)
+        graph_mass = graph_sum(omega, edge_graph, num_graphs, validate_index=False)
+    maxima = _graph_max(log_c, edge_graph, num_graphs, initial=-torch.inf)
+    shifted = log_c - graph_broadcast(maxima, edge_graph, num_graphs, validate_index=False)
+    mean = _weighted_mean(shifted.exp(), edge_graph, num_graphs, omega, graph_mass)
+    return shifted - graph_broadcast(mean, edge_graph, num_graphs, validate_index=False).log()
+
+
+def _energy_from_degrees(
+    c: Tensor,
+    delta: Tensor,
+    node_graph: Tensor,
+    edge_graph: Tensor,
+    num_graphs: int,
+    omega: Tensor,
+    graph_mass: Tensor,
+    degree: Tensor,
+    reference: Tensor,
+    counts: Tensor,
+    *,
+    entropy: float,
+    degree_barrier: float,
+) -> Tensor:
+    active = reference > 0
+    safe_degree = torch.where(active, degree, torch.ones_like(degree))
+    safe_reference = torch.where(active, reference, torch.ones_like(reference))
+    log_ratio_sum = graph_sum(
+        (safe_degree / safe_reference).log(), node_graph, num_graphs, validate_index=False
     )
-    shifted = log_c - maxima[edge_graph]
-    mean = graph_weighted_mean(shifted.exp(), edge_graph, num_graphs, omega)
-    return shifted - mean[edge_graph].log()
+    return _weighted_mean(
+        c * delta + entropy * (c * c.log() - c + 1), edge_graph, num_graphs, omega, graph_mass
+    ) - degree_barrier * log_ratio_sum / counts.clamp_min(1)
 
 
 def conductance_energy(
@@ -57,19 +105,26 @@ def conductance_energy(
     The caller maintains mean_omega(c)=1. Scaling all omega in one graph
     by a positive constant leaves both the objective and constraint unchanged.
     """
+    _validate_graph_index(node_graph, num_graphs)
     edge_graph = node_graph[incidence[0]]
     degree = _degree(omega * c, incidence, node_graph.numel())
     reference = _degree(omega, incidence, node_graph.numel())
-    active = reference > 0
-    safe_degree = torch.where(active, degree, torch.ones_like(degree))
-    safe_reference = torch.where(active, reference, torch.ones_like(reference))
-    counts = c.new_zeros(num_graphs).index_add(0, node_graph, active.to(c.dtype))
-    log_ratio_sum = c.new_zeros(num_graphs).index_add(
-        0, node_graph, (safe_degree / safe_reference).log()
+    counts = graph_sum((reference > 0).to(c.dtype), node_graph, num_graphs, validate_index=False)
+    graph_mass = graph_sum(omega, edge_graph, num_graphs, validate_index=False)
+    return _energy_from_degrees(
+        c,
+        delta,
+        node_graph,
+        edge_graph,
+        num_graphs,
+        omega,
+        graph_mass,
+        degree,
+        reference,
+        counts,
+        entropy=entropy,
+        degree_barrier=degree_barrier,
     )
-    return graph_weighted_mean(
-        c * delta + entropy * (c * c.log() - c + 1), edge_graph, num_graphs, omega
-    ) - degree_barrier * log_ratio_sum / counts.clamp_min(1)
 
 
 class GraphOptimizedConductance(nn.Module):
@@ -214,7 +269,8 @@ class GraphOptimizedConductance(nn.Module):
             ),
             dim=1,
         )
-        quadratic = ((left - right).square() * metric[edge_graph]).sum(dim=1)
+        edge_metric = graph_broadcast(metric, edge_graph, metric.shape[0], validate_index=False)
+        quadratic = ((left - right).square() * edge_metric).sum(dim=1)
         if self.solver_cost_scaling == "width_scaled":
             quadratic = quadratic * self.quadratic_scale
         structural = (local.tanh() * self.structure_metric.to(projected.dtype)).sum(dim=1)
@@ -247,12 +303,21 @@ class GraphOptimizedConductance(nn.Module):
         graph_mass: Tensor,
         active_counts: Tensor,
         num_nodes: int,
+        *,
+        barrier_coefficient: Tensor | None = None,
+        degree: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        degree = _degree(omega * log_c.exp(), incidence, num_nodes)
+        if degree is None:
+            degree = _degree(omega * log_c.exp(), incidence, num_nodes)
         inverse_sum = degree[incidence[0]].reciprocal() + degree[incidence[1]].reciprocal()
+        if barrier_coefficient is None:
+            barrier_coefficient = self.solver_degree_barrier * (
+                graph_mass / active_counts.clamp_min(1)
+            )
         barrier = (
-            self.solver_degree_barrier
-            * (graph_mass / active_counts.clamp_min(1))[edge_graph]
+            graph_broadcast(
+                barrier_coefficient, edge_graph, graph_mass.numel(), validate_index=False
+            )
             * inverse_sum
         )
         return delta + self.solver_entropy * log_c - barrier, barrier
@@ -268,12 +333,26 @@ class GraphOptimizedConductance(nn.Module):
         graph_mass: Tensor,
         active_counts: Tensor,
         num_nodes: int,
+        barrier_coefficient: Tensor | None = None,
+        degree: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         gradient, barrier = self._scaled_gradient(
-            log_c, delta, incidence, edge_graph, omega, graph_mass, active_counts, num_nodes
+            log_c,
+            delta,
+            incidence,
+            edge_graph,
+            omega,
+            graph_mass,
+            active_counts,
+            num_nodes,
+            barrier_coefficient=barrier_coefficient,
+            degree=degree,
         )
-        centered = (
-            gradient - graph_weighted_mean(gradient, edge_graph, num_graphs, omega)[edge_graph]
+        centered = gradient - graph_broadcast(
+            _weighted_mean(gradient, edge_graph, num_graphs, omega, graph_mass),
+            edge_graph,
+            num_graphs,
+            validate_index=False,
         )
         curvature = _graph_max(barrier, edge_graph, num_graphs)
         magnitude = _graph_max(centered.abs(), edge_graph, num_graphs)
@@ -290,10 +369,9 @@ class GraphOptimizedConductance(nn.Module):
         curvature_step = math.exp(-1) / curvature.clamp_min(math.exp(-1) / self.solver_step_size)
         displacement_step = 0.5 / magnitude.clamp_min(0.5 / self.solver_step_size)
         step = torch.minimum(curvature_step, displacement_step)
-        proposal = log_c - step[edge_graph] * centered / (
-            1 + step[edge_graph] * self.solver_entropy
-        )
-        updated = _normalize_log_c(proposal, edge_graph, num_graphs, omega)
+        edge_step = graph_broadcast(step, edge_graph, num_graphs, validate_index=False)
+        proposal = log_c - edge_step * centered / (1 + edge_step * self.solver_entropy)
+        updated = _normalize_log_c(proposal, edge_graph, num_graphs, omega, graph_mass)
         return updated, step, centered
 
     def forward(
@@ -328,6 +406,7 @@ class GraphOptimizedConductance(nn.Module):
         compute_dtype = (
             torch.float32 if state.dtype in {torch.float16, torch.bfloat16} else state.dtype
         )
+        _validate_graph_index(node_graph, num_graphs)
         tail, head = incidence
         edge_graph = node_graph[tail]
         omega = torch.ones(tail.numel(), device=state.device, dtype=compute_dtype)
@@ -393,22 +472,28 @@ class GraphOptimizedConductance(nn.Module):
                 delta = compatibility(*arguments)
             chunks.append(delta)
         delta = torch.cat(chunks)
+        graph_mass = graph_sum(omega, edge_graph, num_graphs, validate_index=False)
         if self.solver_cost_scaling == "width_scaled":
             # Center over complete graphs, never individual memory chunks.
             # A graph-constant cost has no effect under mean_omega(C)=1;
             # removing it before tanh avoids spurious width-driven saturation.
-            delta = delta - graph_weighted_mean(delta, edge_graph, num_graphs, omega)[edge_graph]
+            delta = delta - graph_broadcast(
+                _weighted_mean(delta, edge_graph, num_graphs, omega, graph_mass),
+                edge_graph,
+                num_graphs,
+                validate_index=False,
+            )
             delta = self.cost_bound * torch.tanh(delta / self.cost_bound)
-        graph_mass = delta.new_zeros(num_graphs).index_add(0, edge_graph, omega)
         reference_degree = _degree(omega, incidence, state.shape[0])
-        active_counts = delta.new_zeros(num_graphs).index_add(
-            0, node_graph, (reference_degree > 0).to(compute_dtype)
+        active_counts = graph_sum(
+            (reference_degree > 0).to(compute_dtype), node_graph, num_graphs, validate_index=False
         )
+        barrier_coefficient = self.solver_degree_barrier * (graph_mass / active_counts.clamp_min(1))
         log_c = torch.zeros_like(delta)
         steps = []
         initial_residual = None
         previous_log_c = log_c
-        for _ in range(self.solver_steps):
+        for iteration in range(self.solver_steps):
             previous_log_c = log_c
             arguments = (
                 log_c,
@@ -420,6 +505,10 @@ class GraphOptimizedConductance(nn.Module):
                 graph_mass,
                 active_counts,
                 state.shape[0],
+                barrier_coefficient,
+                # C starts as the constant one vector, so this degree is
+                # exactly the live reference degree, including omega's grad.
+                reference_degree if iteration == 0 else None,
             )
             if torch.is_grad_enabled():
                 from torch.utils.checkpoint import checkpoint
@@ -434,23 +523,28 @@ class GraphOptimizedConductance(nn.Module):
                 log_c, step, centered = self._step(*arguments)
             steps.append(step.detach())
             if initial_residual is None:
-                initial_residual = graph_weighted_mean(
-                    centered.detach().square(), edge_graph, num_graphs, omega
-                ).sqrt()
+                with torch.no_grad():
+                    initial_residual = _weighted_mean(
+                        centered.detach().square(), edge_graph, num_graphs, omega, graph_mass
+                    ).sqrt()
         c = log_c.exp()
         with torch.no_grad():
-            energy_arguments = (incidence, node_graph, num_graphs, omega)
-            initial_energy = conductance_energy(
-                torch.ones_like(c),
-                delta.detach(),
-                *energy_arguments,
-                entropy=self.solver_entropy,
-                degree_barrier=self.solver_degree_barrier,
+            # At C=1, entropy and log(d_c/d_reference) are exactly zero.
+            initial_energy = _weighted_mean(
+                delta.detach(), edge_graph, num_graphs, omega, graph_mass
             )
-            final_energy = conductance_energy(
+            final_degree = _degree(omega * c.detach(), incidence, state.shape[0])
+            final_energy = _energy_from_degrees(
                 c.detach(),
                 delta.detach(),
-                *energy_arguments,
+                node_graph,
+                edge_graph,
+                num_graphs,
+                omega,
+                graph_mass,
+                final_degree,
+                reference_degree,
+                active_counts,
                 entropy=self.solver_entropy,
                 degree_barrier=self.solver_degree_barrier,
             )
@@ -463,16 +557,24 @@ class GraphOptimizedConductance(nn.Module):
                 graph_mass,
                 active_counts,
                 state.shape[0],
+                barrier_coefficient=barrier_coefficient,
+                degree=final_degree,
             )
-            centered = (
-                gradient - graph_weighted_mean(gradient, edge_graph, num_graphs, omega)[edge_graph]
+            centered = gradient - graph_broadcast(
+                _weighted_mean(gradient, edge_graph, num_graphs, omega, graph_mass),
+                edge_graph,
+                num_graphs,
+                validate_index=False,
             )
-            residual = graph_weighted_mean(centered.square(), edge_graph, num_graphs, omega).sqrt()
-            update = graph_weighted_mean(
+            residual = _weighted_mean(
+                centered.square(), edge_graph, num_graphs, omega, graph_mass
+            ).sqrt()
+            update = _weighted_mean(
                 (log_c.detach() - previous_log_c.detach()).square(),
                 edge_graph,
                 num_graphs,
                 omega,
+                graph_mass,
             ).sqrt()
             tolerance = 128 * torch.finfo(compute_dtype).eps * (1 + initial_energy.abs())
             valid = (
@@ -501,11 +603,16 @@ class GraphOptimizedConductance(nn.Module):
                 "step_size_requested": self.solver_step_size,
                 "step_size_min": step_history.amin(dim=0),
                 "step_size_max": step_history.amax(dim=0),
-                "mean_c": graph_weighted_mean(c.detach(), edge_graph, num_graphs, omega),
+                "mean_c": _weighted_mean(c.detach(), edge_graph, num_graphs, omega, graph_mass),
                 "active_nodes": active_counts.detach(),
             }
         if self.override == "mean":
-            c = graph_weighted_mean(c, edge_graph, num_graphs, omega)[edge_graph]
+            c = graph_broadcast(
+                _weighted_mean(c, edge_graph, num_graphs, omega, graph_mass),
+                edge_graph,
+                num_graphs,
+                validate_index=False,
+            )
         elif self.override == "shuffle" and c.numel() > 1:
             # Reverse within each graph with no Python graph loop.
             order = torch.argsort(edge_graph, stable=True)

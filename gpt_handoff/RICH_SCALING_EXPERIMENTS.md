@@ -1,5 +1,30 @@
 # Conductance V1–V5·Cycle PE V1/V2·Tree reference/large 전체 scaling
 
+## 2026-09-07: 진행 중 corrected V5의 성능 수정·재개
+
+이번 수정은 새 모델/새 run을 만드는 변경이 아니다. 서버에 이 소스가 반영된 뒤에는
+기존 corrected-c-v5-a6000-gpu3-seed0-v1의 동일 명령·동일 run ID를 사용한다.
+완료 조건은 검증 후 건너뛰고 미완료 조건은 last.pt의 마지막 commit된 epoch 이후부터
+이어간다. 실행 중인 Python에 로컬 수정이 자동 반영되지는 않으며 서버 작업을 여기서
+종료하거나 저장 결과를 지우지 않았다. 이번 문서는 git push 완료를 의미하지 않는다.
+
+정확한 소스 전환 허용 범위는 scripts/resume_compatibility_v1.json의 performance_repair다.
+시작 소스는 51da819, 구조·학습 설정·데이터·optimizer/RNG 검사는 유지한다.
+과거 76→896 소스 쌍의 읽기 전용 검증을 현행 코드로의 연쇄 재개 권한으로 쓰지 않는다.
+
+새 실측에서 reference_updates 정책은 같은 update 예산의 예상 training 시간으로
+후보를 선택한다. 기존 완료된 자원 계획/physical batch/학습 예산은 변경하지 않는다.
+예상 비용은 optimizer-inclusive training이며 validation/checkpoint까지 포함한 최소 시간은
+아니다. 고정 validation 입력 cache의 상주 VRAM은 새 실측 후보에서도 포함한다.
+
+각 조건 결과 폴더의 performance.json은 마지막으로 commit된 epoch의
+stage_seconds(cpu_wall_seconds/cuda_event_seconds), batch_observations,
+validation_input_cache, checkpoint_commit_cpu_wall_seconds,
+epoch_wall_seconds_before_timing_publish, planned_epochs를 담는다.
+이는 관측용 파일이며 재개 기준은 last.pt다. history.json에도 epoch별 단계 시간과
+실제 sampled nodes/physical edges/supervised seed 수가 남는다.
+한 epoch의 667초를 12로 나눈 값을 순수 training batch 시간으로 해석하면 안 된다.
+
 과거 `64/128 × 2/4층` grid는 mechanism probe로만 남기고 현재 scaling 기본 계획에서는
 폐기한다. 새 계획은 파라미터를 버전 사이에 강제로 일치시키지 않으며, 각 구조가 실제 연구급
 capacity에서 성능을 낼 수 있는지를 본다. 기본 seed는 시간 제약 때문에 0 하나다.

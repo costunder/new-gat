@@ -49,6 +49,19 @@ def _args(*extra):
     return args
 
 
+class DebugGraph(SimpleNamespace):
+    def items(self):
+        return vars(self).items()
+
+    def clone(self):
+        return type(self)(**{key: value.clone() for key, value in self.items()})
+
+    def to(self, device):
+        for key, value in list(self.items()):
+            setattr(self, key, value.to(device))
+        return self
+
+
 def _debug_graph(*, labels=True):
     generator = torch.Generator().manual_seed(109)
     values = {
@@ -60,7 +73,7 @@ def _debug_graph(*, labels=True):
     }
     if labels:
         values["y"] = torch.arange(9) % 3
-    return SimpleNamespace(**values)
+    return DebugGraph(**values)
 
 
 def _model(args):
@@ -339,7 +352,7 @@ def test_debug_calibration_forwards_solver_arguments_and_runs_real_joint_updates
     graph = _debug_graph()
     indices = {"train": torch.arange(6), "validation": torch.arange(6, 9)}
     payload = {"dataset": args.dataset, "graphs": [vars(graph)], "classes": 3}
-    sampler = SimpleNamespace(metadata=lambda: {"mode": "neighbor", "scope": "debug"})
+    sampler = SimpleNamespace(graph=graph, metadata=lambda: {"mode": "neighbor", "scope": "debug"})
     created_models, epochs = [], []
     constructor = train.GraphConditionedConductanceNodeClassifier
 
