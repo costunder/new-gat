@@ -69,7 +69,11 @@ def _candidate_args(args, physical_batch_size: int, workers: int):
     elif candidate.sampling != "full":
         minimum = candidate.sample_seed_batch_size
         candidate.sample_seed_batch_size = physical_batch_size
-        if workers != 0:
+        if candidate.sampling == "cluster_disjoint":
+            if workers < 1:
+                raise ValueError("disjoint context construction requires positive worker count")
+            candidate.sample_context_workers = workers
+        elif workers != 0:
             raise ValueError("transductive sampling uses CPU CSR/prefetch, not DataLoader workers")
     else:
         minimum = 1
@@ -137,9 +141,7 @@ def _run_epoch(model, optimizer, data, indices, sampler, args, device, epoch, ti
         optimizer_steps += 1
         largest_nodes = max(largest_nodes, int(graph.x.shape[0]))
         largest_edges = max(largest_edges, int(graph.incidence_edge_index.shape[1]))
-        largest_graph_batch = max(
-            largest_graph_batch, int(graph.num_graphs) if indices is None else 1
-        )
+        largest_graph_batch = max(largest_graph_batch, int(getattr(graph, "_v5_num_graphs", 1)))
     if not optimizer_steps or not processed_units:
         raise RuntimeError("calibration full training epoch produced no supervised updates")
     return {
@@ -333,6 +335,13 @@ def run_training_candidate(
                 "total_memory_bytes": int(total),
                 "batch_size": physical_batch_size,
                 "workers": workers,
+                "worker_axis": (
+                    "sample_context_workers"
+                    if candidate.sampling == "cluster_disjoint"
+                    else "loader_workers"
+                ),
+                "loader_workers": candidate.workers,
+                "sample_context_workers": getattr(candidate, "sample_context_workers", None),
                 "optimizer_state_bytes": _optimizer_state_bytes(optimizer),
                 "model_parameter_count": sum(value.numel() for value in model.parameters()),
                 "initial_model_sha256": initial_hash,

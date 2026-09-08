@@ -1,6 +1,18 @@
 # NEW GAT 연구 프로젝트 Hand-off
 
-작성 기준일: 2026-09-05 (Asia/Seoul)
+작성 기준일: 2026-09-08 (Asia/Seoul)
+
+최신 결과·검토(2026-09-08): corrected V5 20조건 학습은 수령 출력상 모두 passed다.
+Dynamic-C 10조건 test와 전체 3,832개 에포크 기록, fixed/dynamic validation 비교 및
+문제 목록은 [EXPERIMENT_STATUS.md](EXPERIMENT_STATUS.md#v5-audit-20260908)에 있다.
+수학적 C→가중 라플라시안→message passing/gradient 연결은 검증됐지만, 실제 C의 유용성,
+production K8의 충분성, 다양한 sampled B의 학습·full-graph 근사 품질은 미검증이다.
+정확한 목적함수·spectral 해석·기존 테스트와 CPU 수치 점검의 경계는
+[CONDUCTANCE_V5.md](CONDUCTANCE_V5.md#c-learning-audit-20260908)를 우선한다.
+PPI 일반화 개선과 arxiv 약 667→29초/epoch 관측은 있으나, C의 추가 validation 이득은
+작거나 음수이며 fixed-C test는 아직 수령하지 않았다. 단일 seed 결과를 SOTA나 가설 입증으로
+표현하지 않는다. 아래 과거 전환 결과/미실행 판정은 당시 기록이며 최신 corrected run과 별개다.
+이번 갱신은 기존 10개 파일 묶음 안의 문서만 수정하고 모델/결과/checkpoint는 보존했다.
 
 이 문서는 `gpt_handoff/`의 열 파일 중 전체 프로젝트 인수인계를 담당한다. 외부 ChatGPT 또는
 연구 리뷰어가 저장소를 처음 받아도 수학적 가설, 구현 경계,

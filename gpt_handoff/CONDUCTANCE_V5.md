@@ -1,5 +1,375 @@
 # Conductance GAT V5 — graph-specific C optimization and weighted-Laplacian propagation
 
+<a id="feedback-implementation-20260908"></a>
+
+## 2026-09-08: 피드백 반영 구현 — 독립 부분 그래프 배치와 C 역할 검사
+
+아래 기존 결과 감사 이후의 **코드 변경**이다. 기존 20조건 결과와 checkpoint는 보존했다.
+이를 새 실험 결과로 재해석하거나 성능이 개선됐다고 보고하지 않는다.
+
+### 변경한 학습 경로
+
+`cluster_disjoint`는 physical seed batch와 개별 부분 그래프의 seed context를 분리한다.
+한 physical batch 안의 context마다 독립적으로 기존 cluster BFS 규칙을 적용해 B_s를
+만든 뒤, 노드·엣지의 독립 복사본들을 PyG disjoint-union batch로 합친다.
+각 context의 C·degree·graph 통계·beta는 분리되고, C→가중 라플라시안→메시지 패싱을
+한 batched forward/backward로 처리한다. 겹치는 원본 노드라도 context 간 메시지는 섞이지 않는다.
+감독 seed는 epoch당 정확히 한 번 사용하며 physical batch당 optimizer update는 한 번이다.
+context RNG는 seed/epoch/context 순번에 고정되어 CPU thread 순서에 영향받지 않는다.
+
+- `--v5-sampling auto_disjoint`: arxiv만 새 방식, Cora/CiteSeer/PubMed full graph,
+  PPI 원래 그래프 batch를 유지한다. **모든 데이터셋의 부분 B 샘플링 구현으로 주장하지 않는다.**
+- `--v5-sampling cluster_disjoint`: 명시한 transductive 데이터에 적용한다. PPI에는 허용하지 않는다.
+- `--v5-sample-context-seed-batch-size`는 새 방식에서 필수다. 2,048은 기존 A6000
+  기준 seed context를 보존하는 제안값이다. physical 8,192라면 독립 context 4개로 합친다.
+  기존 8,192개 seed를 하나의 큰 B로 확장한 계산과는 **다른 샘플링 실험**이다.
+- physical batch는 context 크기의 정수배여야 한다. 마지막 epoch 꼬리와 train split 전체를
+  담는 자연 경계만 예외다. 샘플 수·fanout·학습 예산을 줄이는 자동 fallback은 없다.
+- context 자체가 그래프 크기까지 포화될 수는 있다. 새 모드라는 이유만으로 다양성을
+  보장하지 않으며, 실제 context 노드/엣지 수·비율·hash·Jaccard overlap으로 판정한다.
+
+`history.json`과 `performance.json`의 `batch_observations`에 disjoint graph 수와
+`sampling_observation`을 함께 기록한다. context별 크기, context 쌍 및 직전 physical batch와의
+노드/엣지 overlap을 구분한다. 예전 기록에 overlap이 없으면 unavailable로 표시한다.
+
+Rich 실행기의 optimizer-inclusive GPU 실측에도 새 방식을 연결했다. physical seed batch
+후보와 **CPU sampling context worker** 후보를 별도로 측정하며, loader workers=0과 혼동하지
+않는다. 선택한 context worker는 자원 계획에 고정하고 양팔에 공통 적용한다.
+같은 context/fanout으로 physical batch를 묶는 정도만 탐색한다. 기존 규모보다 작은 physical
+batch로 자동 전환하지 않으며, 안전한 후보가 없으면 실패 원인과 측정을 남긴다.
+
+### 재학습 없는 기존 checkpoint 검사
+
+`scripts/audit_v5_stages.py`는 corrected `optimization/joint/width_scaled/beta_initial=0.5`
+checkpoint의 **전체 official validation**을 검사한다. 파일을 쓰거나 optimizer를 호출하지 않는다.
+
+1. learned C / C=1 / mean C / shuffle C의 validation·logit·예측 변화를 비교한다.
+   개입한 C로 실제 degree를 다시 계산한다. fresh fixed-C 학습과는 다른 실험이다.
+2. 각 층 baseline H/B/ω/W/β를 고정한 채 학습 K와 더 큰 K의 C 및 operator 오차를 비교한다.
+   별도로 전체 모델의 K를 늘린 validation도 출력하되, 그때 downstream H는 바뀐다고 명시한다.
+3. 참조 계산의 projected-gradient residual·energy·사용자 지정 tolerance 도달 여부,
+   기존 history의 C/β/gradient와 sampling 관측을 출력한다.
+
+더 큰 K도 정확해/충분한 수렴으로 가정하지 않는다. execution=passed는 검사 실행 성공이며,
+contribution=observed는 C 개입에 출력이 민감하다는 뜻일 뿐 이득·일반화 증명이 아니다.
+β=0처럼 C가 달라도 출력이 같으면 inconclusive로 표시한다. β/residual/FFN을 강제 변경하거나
+C 분산만 커지도록 loss를 추가하지 않았다. 모델 규모·학습 K=8·τ·ρ·joint gradient 경로는 유지했다.
+
+아래는 기존 서버 결과를 읽는 명령이다. 64회는 **진단용 비교 예산**이며 수렴 보장이나 학습 K 변경이 아니다.
+
+```bash
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+python -B scripts/audit_v5_stages.py \
+  --root results/conductance_gat/scaling/corrected-c-v5-a6000-gpu3-seed0-v1-conductance \
+  --device cuda:0 \
+  --reference-steps 64 \
+  --reference-tolerance 0.0001
+```
+
+기본은 조건·층별 사람이 읽는 stdout이고 `--json`은 전체 수치를 출력한다. 특정 조건만
+검사하려면 `--root`를 그 조건 디렉터리로 지정한다. checksum/selected epoch/데이터 split과
+정확한 소스 allowlist를 검증한다. 이 읽기 전용 허용은 training resume 권한이 아니다.
+test 예측/선택은 하지 않으며 데이터 cache 무결성 확인은 전체 split 메타데이터를 검사한다.
+진단 forward 전체를 기존 자원 관측 모듈로 감싸 CPU·RAM·UUID 확인 GPU utilization을
+주기적으로 기록한다. GPU utilization은 장치 전체 값이지 이 프로세스만의 값이 아니며,
+미확인 값은 원인과 함께 null로 남긴다. 조건별 CUDA peak를 분리하고 실패 시에도
+관측 thread를 정리한다. 이 기능을 구현한 것과 실제 서버 값을 수령한 것은 구분한다.
+
+### 기존 실험과 새 설정의 경계
+
+기존 `auto` 기본값은 바꾸지 않았다. 새 B 샘플링을 기존 run-id/checkpoint에 조용히
+이어 붙이지 않는다. 동일한 새 설정으로 시작한 run은 기존 epoch checkpoint 규칙으로
+재개할 수 있지만 구형 sampling run과의 동등성은 주장하지 않는다.
+구형 결과는 위 읽기 전용 검사에 재사용한다. 변경 전 미완료 학습은 원래 소스의 재개 계약을
+따르며, 이번 변경을 포괄적인 구소스 training resume 허용으로 등록하지 않았다.
+
+신규 설정의 **무실행 계획 확인** 예시다. 현재 Rich의 V5 전체 grid인 20조건을 출력한다.
+완료 조건의 재학습 지시가 아니며, V1–V4/Cycle/Tree는 이 계획에 포함하지 않는다.
+
+```bash
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+python -B scripts/run_rich_scaling.py \
+  --run-id disjoint-c-v5-a6000-gpu3-seed0-v1 \
+  --tracks conductance --conductance-versions v5 \
+  --profiles reference large --model-seeds 0 \
+  --device cuda:0 --hardware-profile a6000-48gb --min-free-gb 40 \
+  --v5-solver-cost-scaling width_scaled --v5-beta-initial 0.5 \
+  --v5-learning-budget-policy reference_updates \
+  --v5-sampling auto_disjoint --v5-sample-context-seed-batch-size 2048 \
+  --dry-run
+```
+
+이 예시에서 dry-run을 제거하면 V5 20조건의 새 학습이 시작되므로, 기존 checkpoint
+감사와 새 실험 범위 결정 전에 제거해 실행하지 않는다. 실제 실행 경로에는 먼저 GPU
+자원 후보를 실측하는 단계가 연결되어 있다.
+검증 범위: 로컬 CPU 수치·회귀·파서 검사를 수행했다. 로컬 CUDA와 PyG가 없어 실제 PyG
+integration 일부는 skip이고 A6000 처리량·VRAM, 실제 checkpoint 감사 및 새 전체 학습은
+미실행이다. 이 제약을 GPU 검증 완료나 모델 성능 개선으로 바꿔 보고하지 않는다.
+
+최종 로컬 검증(2026-09-08): 전체 pytest **2,836 passed / 106 skipped / 10 warnings**,
+215.71초. skip은 CUDA/PyG 미설치, Linux/Bash·symlink 권한 등 해당 환경에서 실행할 수 없는
+검사와 기존 opt-in stress 검사다. 경고 10개는 기존 cluster 포화 경고의 회귀 검사다.
+변경 Python의 Ruff와 `git diff --check`가 통과했고, `CODE_SUMMARY.md`는 298개 소스와
+일치하도록 재생성·확인했다. 기존 재개 registry는 넓히지 않았다. 역사 51da→8da source-map
+계약 검사와 실제 현행 소스 거부·checkpoint 바이트 보존 검사를 분리했다.
+
+<a id="c-learning-audit-20260908"></a>
+
+## 2026-09-08: C 학습 구조·spectral 해석·실제 검증 범위
+
+이 절은 소스 `8da06ca`와 corrected V5 수령 결과를 검토한 최신 판정이다.
+[전체 결과·문제 목록](EXPERIMENT_STATUS.md#v5-audit-20260908)에 20조건 학습,
+3,832개 에포크 원문, dynamic 10조건 test, 비용·일반화 문제와 증거 출처를 모았다.
+아래 날짜별 교정·구형 MLP 기록은 유지하지만 현재 결과와 혼합하지 않는다.
+**배선/수치 검증은 존재한다. 그러나 실제 데이터에서 C의 유용성·K8 최적화 충분성·
+샘플링 확장의 타당성까지 검증 완료라고 말한 것은 과장이었다.**
+
+### 1. 사용자 요구와 실제 두 단계
+
+B는 edge×node의 signed incidence다. 무방향 physical edge마다 방향은 임의로 한 번만 잡는다.
+레이어 ℓ의 현재 hidden state를 H라고 쓰면,
+
+\[
+B_s=\operatorname{Sample}(B),\qquad
+c_{\theta,s}=\operatorname{Solve}_{K=8}(B_s,H_s;\theta),\qquad
+C_{\theta,s}=\operatorname{diag}(c_{\theta,s}),
+\]
+\[
+L_{\theta,s}
+=B_s^\top\operatorname{diag}(\omega_s\odot c_{\theta,s})B_s,\quad
+\mathcal L_{\theta,s}=D_{\theta,s}^{-1/2}L_{\theta,s}D_{\theta,s}^{-1/2},
+\]
+\[
+M_h=(I-\beta_{g,h}\mathcal L_{\theta,s})H_sW_h,\qquad
+\widehat Y_s=\operatorname{GNN}_{W}(H_s,\mathcal L_{\theta,s}).
+\]
+
+D는 실제 유효 가중치 ωc의 degree다. ω는 sampling 보정이고 full graph에서는 1이다.
+고립 노드의 D^{-1/2}는 0, 정규화 L의 해당 행/열은 0이며 메시지의 identity 항은 유지한다.
+복수 그래프 batch에서는 graph별 beta와 block-diagonal operator로 해석한다.
+각 residual/FFN block이 C 계산→전파를 반복하고, C는 모든 feature head가 공유한다.
+
+\[
+\min_{\theta,W,\psi}\;
+\mathbb E_s\left[
+\mathcal L_{\rm task}\bigl(\widehat Y_s,y_s\bigr)
+\right],
+\quad
+\mathcal L_{\rm task}\to M\to\mathcal L\to L\to c\to\theta.
+\]
+
+ψ는 beta/backbone 등 나머지 학습 파라미터를 뜻한다.
+두 단계는 계산 역할의 구분이다. 1단계를 완전히 학습한 뒤 고정하는 방식이나
+별도 spatial encoder를 새로 추가하라는 요구가 아니다. 샘플러 자체는 고정 규칙이고,
+샘플에서 계산되는 C와 degree를 통한 task gradient는 끊지 않는다.
+
+구현 근거(행 번호는 8da06ca 기준):
+
+- `model.py:508–527`: 같은 incidence와 샘플 metadata로 C를 계산하고 실제 diffusion에 전달.
+- `operator.py:213–228`: ωc, 그 가중치의 live degree, 양방향 sparse 전파와 beta 혼합.
+- `model.py:566–571`: residual/FFN을 포함한 전체 block.
+- `train.py:356–384, 825–827, 1644–1676`: C/W/backbone/beta optimizer 그룹,
+  joint 활성화 및 task-loss backward/optimizer update.
+- `optimization.py:624–627`: 진단 복사본만 detach하고 forward에는 live C 반환.
+- 코드 파일들은 `research/conductance_gat/v5/` 아래이며, 원문 스냅샷은
+  `gpt_handoff/CODE_SUMMARY.md`에서 확인할 수 있다.
+
+현재 corrected run은 **optimization / joint / width_scaled / beta_initial=0.5**다.
+아래 역사적 staged warmup/MLP 또는 beta 0.1 설명을 이 run에 적용하지 않는다.
+Fixed-C는 의도적으로 C=1이며 잔여 V5 구조는 유지한다. 따라서 vanilla GCN과 동일하지 않다.
+
+### 2. C는 무엇을 학습하며 왜 입력마다 다시 계산하는가
+
+학습되는 공유 θ는 node projection, graph-context metric, structure metric이다.
+기존 edge ID마다 영구 파라미터 하나를 저장하는 형태는 아니다.
+매 forward에서 c=1로 내부 반복을 시작하지만 학습된 θ까지 초기화하지 않는다.
+현재 입력·연결구조에 맞는 c를 산출하도록 **내부 최적화 과정을 통해 θ를 학습**한다.
+이는 endpoint MLP가 C를 한 번 바로 출력하던 구형 backend와 다르다.
+다만 현행에도 비용을 만드는 학습 가능한 선형 projection/metric은 존재한다.
+
+그래프 하나에 대해 S=Σ_e ω_e, n₊는 degree 양수 노드 수,
+d_i(c)=Σ_{e∋i}ω_ec_e, d_i(ref)=Σ_{e∋i}ω_e로 놓으면,
+
+\[
+E_g(c;\delta_\theta)=
+\frac1S\sum_e\omega_e
+\left[c_e\delta_{\theta,e}
++\tau(c_e\log c_e-c_e+1)\right]
+-\frac{\rho}{n_+}\sum_{i:d_i(ref)>0}
+\log\frac{d_i(c)}{d_i(ref)},
+\]
+\[
+c_e>0,\qquad \frac1S\sum_e\omega_ec_e=1.
+\]
+
+실제 cost는 projection p_i=L2Normalize(AθH_i), signed graph metric
+m_g=tanh(Mθ LayerNorm(z_g)), 8차원 edge structure s_e를 사용한다.
+s_e는 sample/full degree의 log1p 합·절대차 4개, 끝점별 sample/full coverage 2개,
+full degree 역수 2개를 모아 tanh한 벡터다. 끝점 쌍의 coverage/역수는 정렬해 방향에
+의존하지 않도록 한다. 아래 aθᵀs_e는 이 tanh 이후의 구조 특징에 대한 선형 비용이다.
+
+\[
+r_e=\sqrt{d}\sum_k m_{g,k}(p_{u,k}-p_{v,k})^2+a_\theta^\top s_e,
+\qquad
+\delta_{\theta,e}=2\tanh\left(\frac{r_e-\overline r_g^{\,\omega}}2\right).
+\]
+
+이는 positive-distance smoothness만 강제하는 cost가 아니다. Signed metric은
+feature 관계에 따라 연결을 선호/억제할 수 있다. Graph 전체의 weighted mean으로
+중심화하며 memory chunk별로 서로 다른 중심을 쓰지 않는다.
+
+현재 τ=1, ρ=0.1, cost bound=2, K=8이다.
+KL-prox 반복의 step upper bound는 0.25이고 curvature/displacement에 따라 줄어든다.
+내부 에너지는 C 문제의 목적함수이며, 외부 θ/W는 **최종 task loss**로 갱신된다.
+K-step unroll의 gradient이지 완전히 수렴한 argmin의 implicit gradient라고 주장하지 않는다.
+
+평균 C=1은 공통 배율의 gauge를 고정한다. 정규화 전파에서 C 전체를 같은 양수로
+배율 변경하면 degree 정규화가 상쇄하므로, 이 gauge 자체를 C 학습을 막는 버그라고 할 수 없다.
+반면 entropy τ=1과 bounded cost/metric, finite K는 상대 C 대비와 표현력에 영향을 주는
+실제 설계 제약이다. 이것들이 **실제 성능 부진의 원인인지는 아직 확인되지 않았다.**
+
+코드는 C 양수/유한, energy/residual 유한 및 final energy가 initial energy보다
+허용 오차 밖으로 증가하지 않는지 검사한다. **실제 K8 residual이 task에 충분히 작은지**,
+C 개입 효과가 충분한지에 대한 통과 기준은 없다.
+고정 δ, τ>0의 내부 문제는 convex 구조지만 K=8 실행만으로 정확 최적해를 보장하지 않는다.
+
+### 3. Spectral과 spatial의 관계: 현재 무엇이 같은가
+
+한 forward의 C를 고정해 해석하면 정규화 L은
+\(\mathcal L_C=U\Lambda U^\top\)이고 각 head 전파는
+
+\[
+(I-\beta_h\mathcal L_C)V_h
+=U(I-\beta_h\Lambda)U^\top V_h,\qquad V_h=HW_h.
+\]
+
+따라서 현재의 **선형 전파 부분**은 1차 spectral polynomial filter를 sparse message passing으로
+계산한 것과 같다. 전체 모델은 C가 H에 의존하고 beta·비선형·residual/FFN을 포함하므로
+하나의 고정 spectral filter라고 부르면 부정확하다.
+C 학습은 L의 edge weight와 그에 따른 spectrum/eigenbasis를 바꾸는 것이며,
+고정 L에서 필터 계수만 학습하는 방식과도 구별한다.
+
+고유값분해를 매번 실행해야만 spectral 필터인 것은 아니다.
+다항식 기반 localized spectral filtering의 근거는
+[Defferrard et al., 2016](https://arxiv.org/abs/1606.09375)을 참고한다.
+그래프 edge weight 자체를 신호로 학습하는 선행 예는
+[Kalofolias, 2016](https://proceedings.mlr.press/v51/kalofolias16.html)이다.
+현행의 signed learned cost/entropy/task unroll이 해당 논문의 정확한 재구현이라는 뜻은 아니다.
+논문 존재가 현재 C의 학습 효과나 설계의 신규성을 입증하지도 않는다.
+이 문서화에서 production에 dense eigendecomposition/QR/SVD를 추가하지 않았다.
+
+### 4. 이미 존재하는 검증과 실제 범위
+
+아래는 테스트 본문 확인이다. 이번 문서 작업에서 전체 suite를 새로 실행한 것은 아니다.
+8da06ca의 기존 로컬 기록은 2704 passed / 103 skipped / 10 warnings다.
+CPU synthetic/수치/재개 검증을 실제 데이터 A6000 학습 성공으로 보고하지 않는다.
+
+| 검증 | 코드 근거 | 확인하는 것 / 한계 |
+|---|---|---|
+| 독립 dense adjacency와 sparse 전파 | tests/test_conductance_v5_diffusion_memory.py:25,72 | 출력 및 message/C/beta/correction gradient; disjoint graph·isolate·chunk 포함 |
+| 1·2차 수치 미분 및 AMP geometry | 같은 파일 :100,132 | gradcheck/gradgradcheck, BF16 아래 FP32 geometry; 실제 학습 성적 검증 아님 |
+| 내부 E와 analytic C gradient | tests/test_conductance_v5_optimization.py:167 | dense unsigned-incidence/autograd 기준식과 일치 |
+| Task loss→C 파라미터→update | optimization.py 테스트 :204; optimization_integration.py 테스트 :170 | 실제 optimizer 경로; 해당 기본 integration fixture는 legacy_unit |
+| 현재 width_scaled/K8 task gradient | tests/test_conductance_v5_cost_scaling.py:176 | 모든 C 파라미터의 finite nonzero task gradient |
+| 방향·순열·graph 독립·ω 공통 배율 | 같은 파일 :125 | 현재 width_scaled의 equivariance/invariance; unseen-topology 학습 효과는 아님 |
+| 비용 스케일의 수치 미분 | 같은 파일 :201 | K3 gradcheck, K8 실제 데이터 수렴 검사가 아님 |
+| Iteration 증가 시 E 감소 | tests/test_conductance_v5_optimization.py:268 | synthetic legacy_unit, K1/2/4/8/16/32, 마지막 residual 감소; production K8 충분성 아님 |
+| Analytic entropy 최적해 | optimization.py 테스트 :402; cost_scaling.py 테스트 :214 | ρ=0/K128에서 closed-form과 일치; 현재 ρ=.1/K8의 보증 아님 |
+| Width 256/384 초기 cost 대비 | tests/test_conductance_v5_cost_scaling.py:250 | 초기 synthetic 대비 교정; 학습 완료 C의 대비/정확도 검증 아님 |
+| 성능 패치 전후 수식·gradient | tests/test_conductance_v5_single_graph_reductions.py:180 | 두 cost mode/K8/여러 barrier·dtype의 C 및 모든 활성 gradient 동등성 |
+| 샘플 구조·seed/RNG 보존 | tests/test_v5_sampling_performance.py:45; tests/test_v5_static_graph_runtime.py:140 | 유효 induced physical edges 및 성능 수정 전후 샘플 보존; full-graph 근사 보증 아님 |
+
+경로가 축약된 optimization/integration/cost_scaling 테스트는 모두
+`tests/test_conductance_v5_*.py`를 뜻한다.
+기존 수렴 테스트가 있으므로 '수렴 검증을 전혀 안 했다'는 설명도 잘못이다.
+정확한 한계는 **현재 설정·실제 그래프에서 유용성까지 입증한 검증이 부족하다**는 것이다.
+
+### 5. 추가로 실행한 읽기 전용 CPU 수치 점검
+
+앞선 감사에서 synthetic CPU float64로 한 번 실행했다. 신규 학습/실제 데이터 실험이나
+지속적인 regression test 추가는 아니다. Random seed 741, CPU threads 2,
+8 nodes(삼각형·경로·분리 edge·isolate), 6 edges,
+width=256, optimization/width_scaled/K8/τ1/ρ.1,
+비균일 ω=[1,1.4,.8,1.2,1,1.7], beta=[.3,.7] 조건이다.
+
+Signed B를 직접 만들고 \(B^\top\operatorname{diag}(\omega c)B\),
+정규화 dense 연산, 실제 sparse 전파, eigendecomposition 기준 전파를 비교했다.
+C를 생성하는 파라미터까지 포함한 gradient 비교는 **dense BᵀCB 경로 대 실제 sparse 경로**다.
+Eigendecomposition은 detach한 forward 기준이므로 EVD 자체의 gradient를 검사한 것이 아니다.
+
+| 관측 | 값 |
+|---|---:|
+| Sparse 대 dense BᵀCB 전파 최대 절대 오차 | 3.3306690738754696e-16 |
+| Sparse 대 eigen-filter forward 최대 절대 오차 | 1.3322676295501878e-15 |
+| Dense/sparse 모든 활성 gradient 최대 절대 오차 | 4.718447854656915e-16 |
+| L 대칭 오차 / L·1 오차 | 0 / 0 |
+| 정규화 L 최소 / 최대 고유값 | −4.163336342344337e-17 / 2 |
+| C 파라미터의 task gradient | 모두 finite·nonzero |
+| Projected residual 초기 → K8 후 | 0.5954043678306257 → 0.07066408603804239 |
+
+최소 고유값의 미소 음수는 float64 반올림 수준이다.
+이 결과는 해당 입력의 수학 연결과 역전파를 뒷받침한다.
+**실제 데이터의 K8 수렴 완료, C의 성능 이득, sample/full 일치, A6000 성능 측정은 아니다.**
+이번 문서에만 기존 점검 결과를 보존하며 원본 checkpoint나 학습 코드를 바꾸지 않았다.
+
+### 6. Spatial 샘플링 확장의 구현 범위와 검증 공백
+
+실제 sampler는 원래 physical edge 중 양 끝 노드가 샘플에 들어온 induced edge만 선택한다.
+동일한 B_s가 C solver와 전파를 함께 구동한다. 없는 연결을 임의로 만드는 방식은 아니다.
+
+\[
+\omega_{uv}=
+\operatorname{clip}_{[1,64]}
+\sqrt{\frac{d_u^{full}}{\max(d_u^s,1)}
+      \frac{d_v^{full}}{\max(d_v^s,1)}}.
+\]
+
+`sampling.py:283–311`의 같은 ω가 C 목적함수/gauge와 실제 연산자에 쓰인다.
+앞의 사용은 **최적화 문제를 정의**하고 뒤의 사용은 **전파 가중치를 정의**하므로
+우연히 ω²을 메시지에 곱하는 코드라는 뜻은 아니다.
+하지만 edge inclusion probability의 역수가 아니며 `sampling.py:341`도 근사라고 명시한다.
+정규화 및 context-dependent C가 비선형이므로 raw edge sum에 관한 가정만으로
+normalized operator나 task gradient의 unbiasedness가 따라오지 않는다.
+
+현재 `auto`는 arxiv만 cluster다. Citation은 full graph이고 PPI는 원래 그래프 batch다.
+전체 train seeds는 epoch마다 사용되지만 **여러 종류의 부분 연결구조를 모든 데이터셋에서
+학습했다는 요구 충족으로 확대할 수 없다.**
+
+특히 arxiv reference의 저장 seed batch는 8192, fanouts=[15,10]이고 cluster budget은
+8192×(1+15+10)=212992 > 원래 169343 nodes다.
+`sampling.py:207–211`의 포화 경로에서는 supervised seeds가 속한 연결 성분 전체를 선택한다.
+따라서 대부분 full batch가 거대한 성분을 반복 사용하며 seed mask만 달라질 수 있다.
+구조 다양성 부족의 우려는 있지만, 실제 Bs 크기·overlap를 읽지 않고 모든 batch가
+완전히 동일하다고 단정하지 않는다. 완전 성분을 쓰는 경우 경계 근사 오차는 오히려 없어지므로
+'포화 때문에 반드시 sample/full mismatch가 커진다'는 설명도 잘못이다.
+
+아직 확인하지 않은 항목:
+
+- 실제 학습된 C의 구조별 분포 및 새 연결구조에서의 task 일반화.
+- Sampling 평균의 full-graph operator/gradient/주파수 응답 근사 품질.
+- Sample 크기·coverage·overlap 변화에 대한 C와 prediction의 안정성.
+- 현재 K8/.1의 residual 충분성과 수렴 참조 대비 task 수준 차이.
+- 학습 후 C=1/mean/shuffle validation 개입, beta 및 장기 gradient의 실제 수치.
+
+샘플 기반 학습이 biased라는 이유만으로 무효인 것은 아니다.
+C가 Bs와 hidden context에 의존하므로 C_s가 full C의 제한과 항상 같아야 하는 것도 아니다.
+검증 목표는 사용자가 의도한 연결구조 학습과 downstream task에 이 근사가 적합한지 확인하는 것이다.
+
+### 7. C가 학습됐다는 판정 기준을 구분한다
+
+- **현재 입증된 것:** C 계산/정규화/전파/optimizer 경로 연결, 독립 수식과 gradient의
+  synthetic 일치, 실제 run의 loss 감소·PPI 일반화 개선, 일부 synthetic solver 수렴 특성.
+- **실제 run에서 아직 수치가 없는 것:** 장기 C/β 변화, task gradient 균형,
+  K8 잔차 품질, learned 대 ones/shuffle validation 차이.
+  기록 코드가 있다는 사실을 그 값을 읽어 효과를 검증한 것처럼 표현하지 않는다.
+- **결과에서 관측한 것:** fixed 대비 C의 추가 validation 이득은 작거나 음수이고
+  계산 비용은 증가한다. 이것만으로 C gradient가 끊겼다고 역추론하지 않는다.
+- **다음 진단:** 기존 metrics/history를 먼저 읽고 원인을 분리한다.
+  동일 LR 자체를 버그로 단정하지 않으며, entropy/K/폭/깊이/배치/샘플링 범위를
+  승인 없이 바꾸거나 C variance를 강제로 키워 검증을 대체하지 않는다.
+- **보존:** 완료된 fixed/dynamic checkpoint와 전체 history를 유지한다.
+  이번 문서화가 기존 결과 폐기·재시작·새 C 구조 도입 또는 Git push를 뜻하지 않는다.
+
 ## 2026-09-07: 모델·샘플링 계약을 보존한 실행 병목 수정
 
 사용자 서버 로그의 reference/arxiv dynamic-C는 epoch 62–66에 12 train batches,

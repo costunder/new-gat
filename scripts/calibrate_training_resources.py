@@ -269,11 +269,27 @@ def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist)
         raise ValueError("the official training split is empty")
     # A configured batch larger than the complete split is never silently reduced.
     natural_maximum = max(maximum, baseline)
+    context_workers = (
+        primary["track"] == "conductance"
+        and getattr(parsed[0], "sampling", None) == "cluster_disjoint"
+    )
+    requested_workers = parsed[0].sample_context_workers if context_workers else parsed[0].workers
+    if context_workers:
+        context_size = parsed[0].sample_context_seed_batch_size
+        if baseline < maximum and baseline % context_size:
+            raise ValueError("physical calibration floor must group whole sampling contexts")
+        if any(
+            item.sampling != "cluster_disjoint"
+            or item.sample_context_seed_batch_size != context_size
+            for item in parsed
+        ):
+            raise ValueError("paired calibration must use identical disjoint context rules")
+        entry["worker_axis"] = "sample_context_workers"
     workers = worker_candidates(
-        parsed[0].workers, allocated_cpu_count(), applicable=axis == "graphs"
+        requested_workers, allocated_cpu_count(), applicable=axis == "graphs" or context_workers
     )
     # Explore neighbouring loader policies, rather than launching hundreds of workers at once.
-    workers = [value for value in workers if value <= max(2, parsed[0].workers * 2)]
+    workers = [value for value in workers if value <= max(2, requested_workers * 2)]
     entry.update(
         track=primary["track"],
         profile=primary["profile"],
@@ -371,6 +387,9 @@ def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist)
         current = min(current * 2, natural_maximum)
     chosen = choose_candidate(entry["candidates"], baseline, selection_policy=selection_policy)
     selected = {"batch_size": parsed[0].batch_size, "workers": chosen["workers"]}
+    if context_workers:
+        selected["workers"] = 0
+        selected["sample_context_workers"] = chosen["workers"]
     if primary["track"] == "conductance":
         selected["sample_seed_batch_size"] = parsed[0].sample_seed_batch_size
     selected["sample_seed_batch_size" if axis == "sampled_seed_nodes" else "batch_size"] = chosen[
@@ -433,6 +452,14 @@ def verify_plan_inputs(
             if contract not in entry["job_contracts"]:
                 raise ValueError("resource plan training recipe or measured device differs")
             args = _training_args(job)
+            expected_worker_axis = (
+                "sample_context_workers"
+                if entry["track"] == "conductance"
+                and getattr(args, "sampling", None) == "cluster_disjoint"
+                else None
+            )
+            if entry.get("worker_axis") != expected_worker_axis:
+                raise ValueError("resource plan worker axis differs from the sampling recipe")
             key = (
                 "sample_seed_batch_size"
                 if entry["batch_axis"] == "sampled_seed_nodes"

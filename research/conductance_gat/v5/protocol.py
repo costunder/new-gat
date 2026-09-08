@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 SUITE = "conductance_graph_conditioned_v5"
@@ -273,7 +274,62 @@ CONDITIONS = {
     "fixed_c": {"conductance_mode": "fixed_one"},
     "shared_dynamic_c": {"conductance_mode": "dynamic"},
 }
-SAMPLING_MODES = ("full", "neighbor", "cluster")
+SAMPLING_MODES = ("full", "neighbor", "cluster", "cluster_disjoint")
+SAMPLING_CHOICES = ("auto", "auto_disjoint", *SAMPLING_MODES)
+
+
+def resolve_sampling(dataset: str, requested: str) -> str:
+    """Keep legacy auto stable; the new structural sampling recipe is explicit."""
+    if requested not in SAMPLING_CHOICES:
+        raise ValueError(f"unsupported sampling mode: {requested}")
+    if requested in {"auto", "auto_disjoint"}:
+        if dataset != "ogbn-arxiv":
+            return "full"
+        return "cluster_disjoint" if requested == "auto_disjoint" else "cluster"
+    return requested
+
+
+def add_sampling_context_arguments(parser, *, prefix: str = "") -> None:
+    parser.add_argument(
+        f"--{prefix}sample-context-seed-batch-size",
+        type=int,
+        help=(
+            "required for cluster_disjoint/auto_disjoint: supervised seeds per independent "
+            "B context, separate from the total physical seed batch; changes sampling recipe"
+        ),
+    )
+    parser.add_argument(
+        f"--{prefix}sample-context-workers",
+        type=int,
+        help=(
+            "CPU context-construction threads, separate from DataLoader workers; omission "
+            "starts from up to four allocated CPUs and rich calibration measures alternatives"
+        ),
+    )
+
+
+def sampling_context_configuration(args, *, prefix: str = "", sampling=None) -> dict[str, int]:
+    requested = getattr(args, prefix + "sampling", "full")
+    mode = requested if sampling is None else sampling
+    size = getattr(args, prefix + "sample_context_seed_batch_size", None)
+    workers = getattr(args, prefix + "sample_context_workers", None)
+    if mode not in {"auto_disjoint", "cluster_disjoint"}:
+        if requested not in {"auto_disjoint", "cluster_disjoint"} and (
+            size is not None or workers is not None
+        ):
+            raise ValueError("context options require explicit cluster_disjoint/auto_disjoint")
+        return {}
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise ValueError("disjoint sampling requires a positive explicit context seed batch size")
+    if workers is None:
+        affinity = getattr(os, "sched_getaffinity", None)
+        cpus = len(affinity(0)) if affinity is not None else (os.cpu_count() or 1)
+        workers = min(4, cpus)
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ValueError("sample context workers must be a positive integer")
+    return {"sample_context_seed_batch_size": size, "sample_context_workers": workers}
+
+
 TRAINING_PHASES = ("spatial_warmup", "conductance_calibration", "alternating", "joint")
 
 # The default joint schedule updates every active group from epoch one. The

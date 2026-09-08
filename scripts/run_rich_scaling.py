@@ -35,10 +35,13 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     BETA_PARAMETERIZATIONS,
     DEFAULT_BETA_INITIAL,
     DEFAULT_BETA_PARAMETERIZATION,
+    SAMPLING_CHOICES,
     add_conductance_arguments,
+    add_sampling_context_arguments,
     beta_configuration,
     conductance_arguments_configuration,
     learning_budget_arguments_configuration,
+    sampling_context_configuration,
 )
 from scripts.process_safety import (  # noqa: E402
     close_owned_child_stdout,
@@ -220,6 +223,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--v5-beta-min", type=float)
     result.add_argument("--v5-beta-max", type=float)
     add_conductance_arguments(result, prefix="v5-")
+    result.add_argument("--v5-sampling", choices=SAMPLING_CHOICES, default="auto")
+    result.add_argument("--v5-num-neighbors", type=int, nargs="+", default=[15, 10])
+    add_sampling_context_arguments(result, prefix="v5-")
     result.add_argument(
         "--v5-activation-checkpoint",
         action=argparse.BooleanOptionalAction,
@@ -246,6 +252,13 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _validate(args: argparse.Namespace) -> None:
+    sampling_context_configuration(args, prefix="v5_")
+    if not args.v5_num_neighbors or any(value < 1 for value in args.v5_num_neighbors):
+        raise ValueError("V5 sampling fanouts must be positive")
+    if (args.v5_sampling != "auto" or args.v5_num_neighbors != [15, 10]) and (
+        "conductance" not in args.tracks or "v5" not in args.conductance_versions
+    ):
+        raise ValueError("V5 sampling options require the Conductance V5 track")
     for label, values in (
         ("tracks", args.tracks),
         ("conductance versions", args.conductance_versions),
@@ -479,6 +492,20 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             for name, value in _v5_beta_configuration(args).items():
                 command += ["--v5-" + name.replace("_", "-"), str(value)]
             if "v5" in args.conductance_versions:
+                if args.v5_sampling != "auto" or args.v5_num_neighbors != [15, 10]:
+                    command += [
+                        "--v5-sampling",
+                        args.v5_sampling,
+                        "--v5-num-neighbors",
+                        *(str(v) for v in args.v5_num_neighbors),
+                    ]
+                for name, value in sampling_context_configuration(args, prefix="v5_").items():
+                    # A measured plan owns context workers; retain the requested seed context.
+                    if name == "sample_context_workers" and getattr(
+                        args, "resolved_resource_plan", None
+                    ):
+                        continue
+                    command += ["--v5-" + name.replace("_", "-"), str(value)]
                 for name, value in _v5_conductance_configuration(args).items():
                     command += ["--v5-" + name.replace("_", "-"), str(value)]
                 for name, value in _v5_learning_budget_configuration(args).items():
@@ -1268,6 +1295,19 @@ def _config_payload(
         },
         "min_free_gb": args.min_free_gb,
         "v5_beta": _v5_beta_configuration(args),
+        **(
+            {
+                "v5_sampling_recipe": {
+                    "sampling": args.v5_sampling,
+                    "num_neighbors": list(args.v5_num_neighbors),
+                    **sampling_context_configuration(args, prefix="v5_"),
+                }
+            }
+            if "conductance" in args.tracks
+            and "v5" in args.conductance_versions
+            and (args.v5_sampling != "auto" or args.v5_num_neighbors != [15, 10])
+            else {}
+        ),
         "v5_conductance": (
             _v5_conductance_configuration(args)
             if "conductance" in args.tracks and "v5" in args.conductance_versions

@@ -1,5 +1,34 @@
 # Conductance V1–V5·Cycle PE V1/V2·Tree reference/large 전체 scaling
 
+## 2026-09-08: 피드백 반영 후의 실행 구분
+
+아래 날짜별 실행·재개 설명은 각 당시 소스 기준이다. 최신 추가 구현과 정확한 명령은
+[V5 피드백 반영 절](CONDUCTANCE_V5.md#feedback-implementation-20260908)에 모았다.
+기존 corrected checkpoint는 `audit_v5_stages.py`로 재학습 없이 검사할 수 있다.
+새 `auto_disjoint`/`cluster_disjoint` 설정은 별도 run-id를 쓰는 변경된 sampling 실험이다.
+기존 run의 설정이나 training source 검사를 우회해 적용하지 않는다. 새 실험은 GPU에서
+physical seed batch와 sampling context worker 후보를 실측한 뒤 실행하도록 연결했다.
+완료한 V1–V4/Cycle/Tree 재실행이나 기존 결과 삭제는 이번 작업에 포함하지 않는다.
+
+## 2026-09-08: corrected V5 결과 수령 — 아래 실행 예시는 재학습 지시가 아님
+
+`corrected-c-v5-a6000-gpu3-seed0-v1-conductance`의 20조건 학습 출력은 모두 passed다.
+Dynamic-C 10조건 test, fixed/dynamic validation 비교와 3,832개 에포크 원문은
+[EXPERIMENT_STATUS.md](EXPERIMENT_STATUS.md#v5-audit-20260908)에 보존했다.
+기존 선택적 전환 run의 pending_extra_budget과 혼동하지 않는다. V1–V4/Cycle/Tree를
+이번에 다시 실행하거나 그 트랙의 새 결과를 수령한 것은 아니다.
+
+PPI는 train graph batch 20으로 1 update/epoch, reference_updates 기준 600 epochs다.
+arxiv reference는 seed batch 8192/12 batches, large는 2048/45 batches다.
+따라서 모델 크기만의 실험이라고 하거나 epoch 수만으로 수렴 속도를 비교하지 않는다.
+reference/arxiv dynamic 기록은 epoch 77의 667.54초에서 79의 29.13초로 바뀌었고
+누적 updates는 연속이다. 이는 실측 로그의 시간 개선이지 정확도 개선이나 모든 자원 후보의
+최적성 인증은 아니다. 실제 C 기여와 샘플링 타당성의 미검증 항목은 V5 최신 감사에 있다.
+
+이번 작업은 문서화만 수행했다. 아래 날짜별 재개/실행 예시는 과거 계약 설명으로 보존하며
+완료된 조건을 새 run으로 다시 시작하라는 뜻이 아니다. 원본 checkpoint와 결과를 지우거나
+학습 예산·physical batch·K·모델 규모를 변경하지 않았다.
+
 ## 2026-09-07: 진행 중 corrected V5의 성능 수정·재개
 
 이번 수정은 새 모델/새 run을 만드는 변경이 아니다. 서버에 이 소스가 반영된 뒤에는

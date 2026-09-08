@@ -52,11 +52,15 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     DEFAULT_BETA_INITIAL,
     DEFAULT_BETA_PARAMETERIZATION,
     HARDWARE_PROFILES,
+    SAMPLING_CHOICES,
     SCALE_PROFILES,
     add_conductance_arguments,
+    add_sampling_context_arguments,
     beta_configuration,
     conductance_arguments_configuration,
     learning_budget_arguments_configuration,
+    resolve_sampling,
+    sampling_context_configuration,
 )
 from research.conductance_gat.v5.protocol import (  # noqa: E402
     CONDITIONS as V5_CONDITIONS,
@@ -166,13 +170,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--v5-beta-min", type=float)
     result.add_argument("--v5-beta-max", type=float)
     add_conductance_arguments(result, prefix="v5-")
+    add_sampling_context_arguments(result, prefix="v5-")
     result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
     result.add_argument(
         "--resource-plan", type=Path, help="Immutable measured V5 batch/worker plan"
     )
     result.add_argument(
         "--v5-sampling",
-        choices=("auto", "full", "neighbor", "cluster"),
+        choices=SAMPLING_CHOICES,
         default="auto",
         help="V5 only: auto uses cluster sampling for ogbn-arxiv and full otherwise",
     )
@@ -226,6 +231,7 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("portable V5 PPI requires graph batch-size at least 2")
     _v5_beta_configuration(args)
     _v5_conductance_configuration(args)
+    sampling_context_configuration(args, prefix="v5_")
     if "v5" in args.versions:
         _v5_learning_budget_configuration(args)
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
@@ -253,6 +259,9 @@ def _v5_execution(
         batch_size = args.v5_ppi_batch_size or profile["ppi_batch_size"]
     loader_workers = shared.workers_for_dataset(dataset, args.workers)
     sample_seed_batch_size = args.v5_sample_seed_batch_size or profile["sample_seed_batch_size"]
+    context = sampling_context_configuration(
+        args, prefix="v5_", sampling=resolve_sampling(dataset, args.v5_sampling)
+    )
     plan = getattr(args, "resolved_resource_plan", None)
     if plan is not None:
         if profile_name is None:
@@ -284,8 +293,22 @@ def _v5_execution(
         batch_size = measured["batch_size"]
         sample_seed_batch_size = measured["sample_seed_batch_size"]
         loader_workers = measured["workers"]
+        if context:
+            if "sample_context_workers" not in measured:
+                raise ValueError("disjoint sampling needs its own measured context worker plan")
+            explicit_workers = getattr(args, "v5_sample_context_workers", None)
+            if (
+                explicit_workers is not None
+                and explicit_workers != measured["sample_context_workers"]
+            ):
+                raise ValueError(
+                    "--v5-sample-context-workers conflicts with "
+                    "the immutable measured resource plan"
+                )
+            context["sample_context_workers"] = measured["sample_context_workers"]
     return {
         "hardware_profile": args.hardware_profile,
+        **context,
         "precision": profile["precision"],
         "tf32": profile["tf32"],
         "batch_size": batch_size,
@@ -429,13 +452,7 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             command[command.index("--workers") + 1] = str(child_workers)
                             batch_position = command.index("--batch-size") + 1
                             command[batch_position] = str(execution["batch_size"])
-                            sampling = (
-                                "cluster"
-                                if args.v5_sampling == "auto" and dataset == "ogbn-arxiv"
-                                else "full"
-                                if args.v5_sampling == "auto"
-                                else args.v5_sampling
-                            )
+                            sampling = resolve_sampling(dataset, args.v5_sampling)
                             if dataset == "ppi" and sampling != "full":
                                 raise ValueError("V5 PPI is inductive and requires full sampling")
                             command += [
@@ -461,6 +478,12 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             ]
                             for name, value in _v5_beta_configuration(args).items():
                                 command += ["--" + name.replace("_", "-"), str(value)]
+                            for name in (
+                                "sample_context_seed_batch_size",
+                                "sample_context_workers",
+                            ):
+                                if name in execution:
+                                    command += ["--" + name.replace("_", "-"), str(execution[name])]
                             for name, value in _v5_conductance_configuration(args).items():
                                 command += ["--" + name.replace("_", "-"), str(value)]
                             for name, value in _v5_learning_budget_configuration(args).items():
@@ -917,6 +940,11 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("V5 child learning budget does not match its requested recipe")
         expected_configuration = {
             "hardware_profile": execution["hardware_profile"],
+            **{
+                name: execution[name]
+                for name in ("sample_context_seed_batch_size", "sample_context_workers")
+                if name in execution
+            },
             "precision": execution["precision"],
             "tf32": execution["tf32"],
             "batch_size": execution["batch_size"],
@@ -1193,6 +1221,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
         "effective_min_free_gb": _effective_min_free_gb(args),
         "v5_sampling": args.v5_sampling,
+        **(
+            {"v5_sampling_context": sampling_context_configuration(args, prefix="v5_")}
+            if sampling_context_configuration(args, prefix="v5_")
+            else {}
+        ),
         "v5_num_neighbors": list(args.v5_num_neighbors),
         "v5_sample_seed_batch_size": args.v5_sample_seed_batch_size,
         "v5_activation_checkpoint": args.v5_activation_checkpoint,

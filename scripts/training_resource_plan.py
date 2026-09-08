@@ -26,6 +26,7 @@ IGNORED_COMMAND_OPTIONS = {
     "--batch-size",
     "--workers",
     "--sample-seed-batch-size",
+    "--sample-context-workers",
     "--resource-plan",
 }
 
@@ -387,6 +388,13 @@ def _validate_entry(
         ):
             raise ValueError("selection budget differs from the certified dataset/physical axis")
     worker_options = entry.get("worker_candidates")
+    context_worker_axis = entry.get("worker_axis") == "sample_context_workers"
+    if entry.get("worker_axis") not in {None, "sample_context_workers"}:
+        raise ValueError("unknown measured worker axis")
+    if context_worker_axis and not (
+        entry["track"] == "conductance" and axis == "sampled_seed_nodes"
+    ):
+        raise ValueError("context workers require a sampled Conductance seed batch")
     if not isinstance(worker_options, list) or not worker_options:
         raise ValueError("resource plan has no measured worker candidates")
     for count in worker_options:
@@ -394,14 +402,16 @@ def _validate_entry(
     if len(set(worker_options)) != len(worker_options):
         raise ValueError("worker candidates must be unique")
     if (
-        axis == "graphs"
+        (axis == "graphs" or context_worker_axis)
         and allocated_cpus is not None
         and allocated_cpus > 1
         and len(worker_options) < 2
     ):
         raise ValueError("graph loading needs multiple measured worker candidates")
-    if axis != "graphs" and worker_options != [0]:
+    if axis != "graphs" and not context_worker_axis and worker_options != [0]:
         raise ValueError("GPU-resident/full graph execution has no DataLoader worker axis")
+    if context_worker_axis and any(value < 1 for value in worker_options):
+        raise ValueError("disjoint context workers must be positive")
     candidates = entry.get("candidates")
     if not isinstance(candidates, list) or not candidates:
         raise ValueError("resource plan has no measured candidates")
@@ -422,6 +432,12 @@ def _validate_entry(
                 raise ValueError("measurement condition is missing")
             measured.add((condition, seed))
             if item["status"] == "passed":
+                if context_worker_axis and (
+                    item.get("worker_axis") != "sample_context_workers"
+                    or item.get("loader_workers") != 0
+                    or item.get("sample_context_workers") != key[1]
+                ):
+                    raise ValueError("measurement context worker axis differs from its candidate")
                 if (
                     _positive(item.get("batch_size"), "measured batch") != key[0]
                     or _positive(item.get("workers"), "measured workers", zero=True) != key[1]
@@ -456,12 +472,16 @@ def _validate_entry(
     expected_fields = {"batch_size", "workers"}
     if entry["track"] == "conductance":
         expected_fields.add("sample_seed_batch_size")
+    if context_worker_axis:
+        expected_fields.add("sample_context_workers")
     if set(selected) != expected_fields:
         raise ValueError("selected resource fields are incomplete or unknown")
     for field, value in selected.items():
         _positive(value, f"selected {field}", zero=field == "workers")
     if axis in {"sampled_seed_nodes", "full_graph"} and selected["batch_size"] != 1:
         raise ValueError("a transductive graph cannot be duplicated to fill a graph batch")
+    if context_worker_axis and selected["workers"] != 0:
+        raise ValueError("disjoint contexts are CPU sampling threads, not DataLoader workers")
     physical_key = (
         "sample_seed_batch_size"
         if entry.get("batch_axis") == "sampled_seed_nodes"
@@ -469,7 +489,8 @@ def _validate_entry(
     )
     if (
         selected.get(physical_key) != best["batch_size"]
-        or selected.get("workers") != best["workers"]
+        or selected.get("sample_context_workers" if context_worker_axis else "workers")
+        != best["workers"]
     ):
         raise ValueError("selected resources do not match the best safe measured candidate")
     reason = entry.get("stop_reason")
@@ -795,6 +816,17 @@ def validate_job_plan(
         if (entry["track"], entry["profile"], entry["dataset"]) == (track, profile, dataset):
             if expected not in entry["job_contracts"]:
                 raise ValueError("training command differs from the measured scientific recipe")
+            disjoint = any(
+                token == "--sampling=cluster_disjoint"
+                or (
+                    token == "--sampling"
+                    and index + 1 < len(command)
+                    and command[index + 1] == "cluster_disjoint"
+                )
+                for index, token in enumerate(command)
+            )
+            if disjoint != (entry.get("worker_axis") == "sample_context_workers"):
+                raise ValueError("training sampling recipe differs from the measured worker axis")
             for key, value in entry["selected"].items():
                 option = "--" + key.replace("_", "-")
                 if command.count(option) != 1:

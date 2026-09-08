@@ -269,9 +269,31 @@ def test_historical_attestation_does_not_treat_an_existing_helper_as_an_addition
     assert not compat.snapshots_match(before, after)
 
 
+def _git_source_map(prefix, root, revision, names):
+    blobs = subprocess.run(
+        [*prefix, "cat-file", "--batch"],
+        cwd=root,
+        input="".join(f"{revision}:{name}\n" for name in names).encode(),
+        capture_output=True,
+        check=True,
+    ).stdout
+    position, result = 0, {}
+    for name in names:
+        boundary = blobs.index(b"\n", position)
+        header = blobs[position:boundary].split()
+        assert header[1] == b"blob"
+        size = int(header[2])
+        start = boundary + 1
+        result[name] = hashlib.sha256(blobs[start : start + size]).hexdigest()
+        position = start + size + 1
+    return result
+
+
 @pytest.mark.parametrize("inventory", ["rich", "conductance", "resource"])
-def test_registered_performance_repair_covers_real_server_source_inventory(inventory):
-    """Read actual base Git blobs; normalize only the explicit server-LF test view."""
+def test_registered_historical_performance_inventory_does_not_authorize_current_sources(
+    inventory, tmp_path
+):
+    """Exact 51da -> 8da blobs are historical; today's full inventory must fail."""
     from scripts import run_conductance_scaling, run_rich_scaling, training_resource_plan
 
     git = shutil.which("git")
@@ -280,6 +302,7 @@ def test_registered_performance_repair_covers_real_server_source_inventory(inven
     root = compat.ROOT
     prefix = [git, "-c", f"safe.directory={root.as_posix()}"]
     base = compat.PERFORMANCE_BASE_COMMIT
+    target = "8da06cacec59515d84c08d892315e4c8ecfd5b5b"
     listing = subprocess.run(
         [*prefix, "ls-tree", "-r", "--name-only", base],
         cwd=root,
@@ -288,6 +311,12 @@ def test_registered_performance_repair_covers_real_server_source_inventory(inven
     )
     if listing.returncode:
         pytest.skip("read-only real-source regression requires the recorded base commit")
+    target_listing = subprocess.run(
+        [*prefix, "ls-tree", "-r", "--name-only", target],
+        cwd=root,
+        capture_output=True,
+        check=True,
+    )
     providers = {
         "rich": run_rich_scaling._source_snapshot,
         "conductance": run_conductance_scaling._source_snapshot,
@@ -302,30 +331,37 @@ def test_registered_performance_repair_covers_real_server_source_inventory(inven
     }
     if any(current[name] != linux_current[name] for name in compat.COMPATIBILITY_SOURCE_FILES):
         pytest.skip("server-LF compatibility fixture requires LF helper and registry files")
-    known = set(listing.stdout.decode().splitlines())
-    names = sorted(name for name in current if name in known)
-    blobs = subprocess.run(
-        [*prefix, "cat-file", "--batch"],
-        cwd=root,
-        input="".join(f"{base}:{name}\n" for name in names).encode(),
-        capture_output=True,
-        check=True,
-    ).stdout
-    position, previous = 0, {}
-    for name in names:
-        boundary = blobs.index(b"\n", position)
-        header = blobs[position:boundary].split()
-        assert header[1] == b"blob"
-        size = int(header[2])
-        start = boundary + 1
-        previous[name] = hashlib.sha256(blobs[start : start + size]).hexdigest()
-        position = start + size + 1
+    known_before = set(listing.stdout.decode().splitlines())
+    known_target = set(target_listing.stdout.decode().splitlines())
+    # Use the inventory's path scope but fetch historical content only. Current
+    # additions stay out of this historical pair, and are included UNFILTERED
+    # in the mandatory live-upgrade rejection below.
+    target_names = sorted(set(current) & known_target)
+    previous_names = sorted(set(target_names) & known_before)
+    previous = _git_source_map(prefix, root, base, previous_names)
+    historical_target = _git_source_map(prefix, root, target, target_names)
     registered = set(recorded["performance_repair"]["changes"]) | {compat.REGISTRY_SOURCE}
     assert {
-        name for name in linux_current if previous.get(name) != linux_current[name]
+        name for name in historical_target if previous.get(name) != historical_target[name]
     } <= registered
-    evidence = compat.require_source_compatibility(previous, linux_current)
+    evidence = compat.require_source_compatibility(previous, historical_target)
     assert evidence["patch_id"] == compat.PERFORMANCE_PATCH_ID
     assert evidence["resource_plan_semantics"] == (
         "historical measured selection retained; no new measurement claimed"
     )
+
+    assert linux_current != historical_target
+    for source in (previous, historical_target):
+        assert not compat.snapshots_match(source, linux_current)
+        with pytest.raises(ValueError):
+            compat.require_source_compatibility(source, linux_current)
+
+    artifact = tmp_path / "debug-preserved-source-manifest.json"
+    record = {"source_sha256": copy.deepcopy(historical_target), "epoch": 66}
+    artifact.write_text(json.dumps(record), encoding="utf-8")
+    original_bytes = artifact.read_bytes()
+    original_record = copy.deepcopy(record)
+    with pytest.raises(ValueError):
+        compat.adopt_source_snapshot(record, linux_current)
+    assert record == original_record
+    assert artifact.read_bytes() == original_bytes

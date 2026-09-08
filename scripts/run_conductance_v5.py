@@ -36,12 +36,16 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     DEFAULT_BETA_PARAMETERIZATION,
     DEFAULT_DATASETS,
     HARDWARE_PROFILES,
+    SAMPLING_CHOICES,
     SCALE_PROFILES,
     SUITE,
     add_conductance_arguments,
+    add_sampling_context_arguments,
     beta_configuration,
     conductance_arguments_configuration,
     learning_budget_arguments_configuration,
+    resolve_sampling,
+    sampling_context_configuration,
 )
 from scripts import run_conductance_factorial as shared  # noqa: E402
 from scripts.check_dependencies import (  # noqa: E402
@@ -51,7 +55,6 @@ from scripts.check_dependencies import (  # noqa: E402
 )
 
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
-SAMPLING_CHOICES = ("auto", "full", "neighbor", "cluster")
 TRANSDUCTIVE_DATASETS = frozenset({"cora", "citeseer", "pubmed", "ogbn-arxiv"})
 
 
@@ -73,6 +76,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--beta-min", type=float)
     result.add_argument("--beta-max", type=float)
     add_conductance_arguments(result)
+    add_sampling_context_arguments(result)
     result.add_argument("--model-seed", type=int, default=0)
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
@@ -134,9 +138,7 @@ def _architecture(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _sampling(dataset: str, requested: str) -> str:
-    if requested != "auto":
-        return requested
-    return "cluster" if dataset == "ogbn-arxiv" else "full"
+    return resolve_sampling(dataset, requested)
 
 
 def _resolved_execution(args: argparse.Namespace, dataset: str) -> dict[str, Any]:
@@ -147,6 +149,7 @@ def _resolved_execution(args: argparse.Namespace, dataset: str) -> dict[str, Any
     loader_workers = shared.workers_for_dataset(dataset, args.workers)
     return {
         "hardware_profile": args.hardware_profile,
+        **sampling_context_configuration(args, sampling=_sampling(dataset, args.sampling)),
         "precision": profile["precision"],
         "tf32": profile["tf32"],
         "batch_size": batch_size,
@@ -176,6 +179,7 @@ def _effective_min_free_gb(args: argparse.Namespace) -> float:
 
 def _validate(args: argparse.Namespace) -> None:
     learning_budget_arguments_configuration(args)
+    sampling_context_configuration(args)
     if not args.datasets or len(set(args.datasets)) != len(args.datasets):
         raise ValueError("datasets must be nonempty and contain no duplicates")
     if args.model_seed < 0:
@@ -217,7 +221,7 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("minimum free GPU memory must be finite and nonnegative")
     if args.run_id is not None and RUN_ID_PATTERN.fullmatch(args.run_id) is None:
         raise ValueError("run ID must be 1-120 letters, digits, underscores, or hyphens")
-    if args.sampling in {"neighbor", "cluster"} and any(
+    if args.sampling in {"neighbor", "cluster", "cluster_disjoint"} and any(
         dataset not in TRANSDUCTIVE_DATASETS for dataset in args.datasets
     ):
         raise ValueError("neighbor/cluster sampling is transductive-only; PPI requires full")
@@ -279,6 +283,9 @@ def make_jobs(
             ]
             for name, value in architecture.items():
                 command.extend(("--" + name.replace("_", "-"), str(value)))
+            for name in ("sample_context_seed_batch_size", "sample_context_workers"):
+                if name in execution:
+                    command.extend(("--" + name.replace("_", "-"), str(execution[name])))
             for name, value in learning_budget.items():
                 if value is not None:
                     command.extend(("--" + name.replace("_", "-"), str(value)))
@@ -375,6 +382,9 @@ def _load_metrics(job: dict[str, Any]) -> dict[str, Any]:
     ):
         raise RuntimeError("child learning budget does not match the requested V5 recipe")
     execution = job["execution"]
+    for key in ("sample_context_seed_batch_size", "sample_context_workers"):
+        if key in execution and configuration.get(key) != execution[key]:
+            raise RuntimeError(f"child sampling context mismatch for {key}")
     for key in ("hardware_profile", "precision", "tf32", "edge_chunk_size"):
         if configuration.get(key) != execution[key]:
             raise RuntimeError(f"child hardware execution mismatch for {key}")
@@ -510,6 +520,7 @@ def main(argv: list[str] | None = None) -> int:
             dataset: shared.workers_for_dataset(dataset, args.workers) for dataset in args.datasets
         },
         "sampling": args.sampling,
+        **sampling_context_configuration(args),
         "num_neighbors": list(args.num_neighbors),
         "device": args.device,
         "min_free_gb": args.min_free_gb,

@@ -1,10 +1,15 @@
 # GPT 전달용 전체 프로젝트 묶음
 
-최신 갱신(2026-09-07): corrected V5의 667초/epoch 로그를 근거로 실행 병목을 수정했다.
-모델/샘플링/예산을 보존한 단일 graph solver 집계·정적 구조/검증 입력 cache,
-예산 기반 새 batch 실측 선택, 기존 진행분 재개와 구간별 성능 계측이 포함된다.
-실제 A6000 수정 후 속도·성적은 아직 측정하지 않았다. 상세는 CONDUCTANCE_V5.md,
-RICH_SCALING_EXPERIMENTS.md, EXPERIMENT_STATUS.md를 함께 읽는다.
+최신 갱신(2026-09-08): corrected V5의 20조건 학습 결과, 3,832개 에포크 원문과
+dynamic-C 10조건 test 결과를 `EXPERIMENT_STATUS.md` 첫 절 및 부록에 기록했다.
+reference/arxiv dynamic은 기록상 약 667초에서 29초/epoch로 바뀌었지만, C의 추가 성능
+이득은 작거나 음수이고 샘플링 확장의 유효성은 아직 검증되지 않았다. `CONDUCTANCE_V5.md`
+첫 절은 C→가중 라플라시안→메시지 패싱의 수학·gradient 검증과 실제 학습 효과의 미검증을
+구분한다. 아래 과거 기록의 ‘GPU 결과 미수령’은 해당 날짜의 상태이지 최신 판정이 아니다.
+이후 피드백 반영 코드 변경은 `CONDUCTANCE_V5.md` 맨 위 절에 있다. 독립 부분 그래프
+배치(`cluster_disjoint`)와 기존 checkpoint의 C 기여·K 참조 검사를 추가했다. 기존 결과와
+checkpoint는 보존하고 소스 스냅샷은 갱신했다. GPU 실측·실제 checkpoint 감사·새 학습은
+아직 하지 않았다. 이전 절의 결과와 새 sampling 실험을 섞지 않는다.
 
 이 폴더는 **V5만이 아니라 NEW GAT 전체 프로젝트를 외부 GPT에게 검토시키기 위한 전달 묶음**이다.
 GPT에는 파일을 따로 고르지 말고 이 폴더의 **10개 파일을 전부** 전달한다.
@@ -48,10 +53,13 @@ Conductance v2/v3/v4/v5와 Cycle PE v2는 각각의 원문 문서를 직접 제�
 
 ## 근거 범위
 
-- 최신 20조건 validation 요약과 저성능 교정 설정은 `EXPERIMENT_STATUS.md` 및
-  `CONDUCTANCE_V5.md` 첫 절에 있다. NaN 수정, width-scaled 비용, beta 초기화와 명시적
-  reference-update 예산을 검토한다. 기존 결과 분석 CLI는 읽기 전용이며, 교정된 코드의 CPU
-  테스트를 실제 A6000 성능 회복으로 해석하지 않는다. 원본 결과·checkpoint는 보존한다.
+- 최신 corrected run의 20조건은 모두 passed이고, 과거 선택적 전환 run의
+  historical_reference 2 / pending_extra_budget 1 / passed 17과 별개다.
+  `EXPERIMENT_STATUS.md`에 validation/test 구분, fixed/dynamic 비교, 전체 에포크 원문,
+  test 원시 점수·checkpoint SHA, 비용·일반화 문제와 미검증 목록이 있다.
+  `CONDUCTANCE_V5.md`에는 현재 width_scaled/K=8 C 목적함수와 검증 범위가 있다.
+  핵심 배선·수치 검증 통과를 C의 학습 효과·K=8 수렴·sampling/full-graph 일치 증명으로
+  확대하지 않는다. 원본 결과·checkpoint는 보존한다.
 
 - 2026-09-06 V5 기본은 `optimization`/`joint`다. MLP-C는 명시적 비교 옵션이다.
   새 구조의 C 반복 최적화와 task loss 역전파를 검토하고, 과거 MLP checkpoint의 재개 허용을

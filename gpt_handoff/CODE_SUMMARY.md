@@ -27152,7 +27152,11 @@ def _candidate_args(args, physical_batch_size: int, workers: int):
     elif candidate.sampling != "full":
         minimum = candidate.sample_seed_batch_size
         candidate.sample_seed_batch_size = physical_batch_size
-        if workers != 0:
+        if candidate.sampling == "cluster_disjoint":
+            if workers < 1:
+                raise ValueError("disjoint context construction requires positive worker count")
+            candidate.sample_context_workers = workers
+        elif workers != 0:
             raise ValueError("transductive sampling uses CPU CSR/prefetch, not DataLoader workers")
     else:
         minimum = 1
@@ -27220,9 +27224,7 @@ def _run_epoch(model, optimizer, data, indices, sampler, args, device, epoch, ti
         optimizer_steps += 1
         largest_nodes = max(largest_nodes, int(graph.x.shape[0]))
         largest_edges = max(largest_edges, int(graph.incidence_edge_index.shape[1]))
-        largest_graph_batch = max(
-            largest_graph_batch, int(graph.num_graphs) if indices is None else 1
-        )
+        largest_graph_batch = max(largest_graph_batch, int(getattr(graph, "_v5_num_graphs", 1)))
     if not optimizer_steps or not processed_units:
         raise RuntimeError("calibration full training epoch produced no supervised updates")
     return {
@@ -27416,6 +27418,13 @@ def run_training_candidate(
                 "total_memory_bytes": int(total),
                 "batch_size": physical_batch_size,
                 "workers": workers,
+                "worker_axis": (
+                    "sample_context_workers"
+                    if candidate.sampling == "cluster_disjoint"
+                    else "loader_workers"
+                ),
+                "loader_workers": candidate.workers,
+                "sample_context_workers": getattr(candidate, "sample_context_workers", None),
                 "optimizer_state_bytes": _optimizer_state_bytes(optimizer),
                 "model_parameter_count": sum(value.numel() for value in model.parameters()),
                 "initial_model_sha256": initial_hash,
@@ -29585,6 +29594,7 @@ class GraphOptimizedConductance(nn.Module):
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 SUITE = "conductance_graph_conditioned_v5"
@@ -29855,7 +29865,62 @@ CONDITIONS = {
     "fixed_c": {"conductance_mode": "fixed_one"},
     "shared_dynamic_c": {"conductance_mode": "dynamic"},
 }
-SAMPLING_MODES = ("full", "neighbor", "cluster")
+SAMPLING_MODES = ("full", "neighbor", "cluster", "cluster_disjoint")
+SAMPLING_CHOICES = ("auto", "auto_disjoint", *SAMPLING_MODES)
+
+
+def resolve_sampling(dataset: str, requested: str) -> str:
+    """Keep legacy auto stable; the new structural sampling recipe is explicit."""
+    if requested not in SAMPLING_CHOICES:
+        raise ValueError(f"unsupported sampling mode: {requested}")
+    if requested in {"auto", "auto_disjoint"}:
+        if dataset != "ogbn-arxiv":
+            return "full"
+        return "cluster_disjoint" if requested == "auto_disjoint" else "cluster"
+    return requested
+
+
+def add_sampling_context_arguments(parser, *, prefix: str = "") -> None:
+    parser.add_argument(
+        f"--{prefix}sample-context-seed-batch-size",
+        type=int,
+        help=(
+            "required for cluster_disjoint/auto_disjoint: supervised seeds per independent "
+            "B context, separate from the total physical seed batch; changes sampling recipe"
+        ),
+    )
+    parser.add_argument(
+        f"--{prefix}sample-context-workers",
+        type=int,
+        help=(
+            "CPU context-construction threads, separate from DataLoader workers; omission "
+            "starts from up to four allocated CPUs and rich calibration measures alternatives"
+        ),
+    )
+
+
+def sampling_context_configuration(args, *, prefix: str = "", sampling=None) -> dict[str, int]:
+    requested = getattr(args, prefix + "sampling", "full")
+    mode = requested if sampling is None else sampling
+    size = getattr(args, prefix + "sample_context_seed_batch_size", None)
+    workers = getattr(args, prefix + "sample_context_workers", None)
+    if mode not in {"auto_disjoint", "cluster_disjoint"}:
+        if requested not in {"auto_disjoint", "cluster_disjoint"} and (
+            size is not None or workers is not None
+        ):
+            raise ValueError("context options require explicit cluster_disjoint/auto_disjoint")
+        return {}
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise ValueError("disjoint sampling requires a positive explicit context seed batch size")
+    if workers is None:
+        affinity = getattr(os, "sched_getaffinity", None)
+        cpus = len(affinity(0)) if affinity is not None else (os.cpu_count() or 1)
+        workers = min(4, cpus)
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ValueError("sample context workers must be a positive integer")
+    return {"sample_context_seed_batch_size": size, "sample_context_workers": workers}
+
+
 TRAINING_PHASES = ("spatial_warmup", "conductance_calibration", "alternating", "joint")
 
 # The default joint schedule updates every active group from epoch one. The
@@ -30507,9 +30572,13 @@ if __name__ == "__main__":
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import math
+import time
 import warnings
 from collections.abc import Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 from torch import Tensor
@@ -30612,6 +30681,8 @@ class TransductiveGraphSampler:
     exponential sample. Cluster sampling performs one randomized breadth-first
     expansion to a node budget. Both carry original-graph degree and a bounded
     degree-ratio boundary correction. The correction is metadata, never learned C.
+    ``cluster_disjoint`` applies that same cluster rule independently to explicitly
+    sized seed contexts and joins their independent copies into one physical batch.
     """
 
     def __init__(
@@ -30623,17 +30694,47 @@ class TransductiveGraphSampler:
         seed_batch_size: int,
         fanouts: Sequence[int],
         model_seed: int,
+        context_seed_batch_size: int | None = None,
+        context_workers: int = 1,
     ) -> None:
-        if mode not in {"neighbor", "cluster"}:
-            raise ValueError("sample mode must be neighbor or cluster")
-        if seed_batch_size < 1 or not fanouts or any(value < 1 for value in fanouts):
-            raise ValueError("seed batch size and every fanout must be positive")
+        if mode not in {"neighbor", "cluster", "cluster_disjoint"}:
+            raise ValueError("sample mode must be neighbor, cluster or cluster_disjoint")
+        if (
+            isinstance(seed_batch_size, bool)
+            or not isinstance(seed_batch_size, int)
+            or seed_batch_size < 1
+            or not fanouts
+            or any(
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+                for value in fanouts
+            )
+        ):
+            raise ValueError("seed batch size and every fanout must be positive integers")
+        if (
+            isinstance(context_workers, bool)
+            or not isinstance(context_workers, int)
+            or context_workers < 1
+        ):
+            raise ValueError("context_workers must be a positive integer")
+        if mode == "cluster_disjoint":
+            if (
+                isinstance(context_seed_batch_size, bool)
+                or not isinstance(context_seed_batch_size, int)
+                or context_seed_batch_size < 1
+            ):
+                raise ValueError("cluster_disjoint requires positive context_seed_batch_size")
+        elif context_seed_batch_size is not None or context_workers != 1:
+            raise ValueError("context options apply only to cluster_disjoint")
         self.graph = graph.cpu()
         self.train_indices = train_indices.detach().cpu().long()
         self.mode = mode
         self.seed_batch_size = int(seed_batch_size)
         self.fanouts = tuple(int(value) for value in fanouts)
         self.model_seed = int(model_seed)
+        self.context_seed_batch_size = (
+            int(context_seed_batch_size) if context_seed_batch_size is not None else None
+        )
+        self.context_workers = int(context_workers)
         self.num_nodes = int(graph.x.shape[0])
         self.incidence = graph.incidence_edge_index.detach().cpu().long()
         self.incident_edge_ids, self.incident_rowptr = physical_edge_id_csr(
@@ -30681,6 +30782,28 @@ class TransductiveGraphSampler:
             raise ValueError("sampler requires nonempty train indices")
         if int(self.train_indices.min()) < 0 or int(self.train_indices.max()) >= self.num_nodes:
             raise ValueError("train index lies outside graph")
+        if self.mode == "cluster_disjoint":
+            if self.train_indices.ndim != 1:
+                raise ValueError("cluster_disjoint train indices must be one-dimensional")
+            if self.train_indices.unique().numel() != self.train_indices.numel():
+                raise ValueError("cluster_disjoint requires unique supervised train indices")
+            if (
+                self.seed_batch_size < self.train_indices.numel()
+                and self.seed_batch_size % self.context_seed_batch_size
+            ):
+                raise ValueError(
+                    "physical seed batch must group whole sampling contexts "
+                    "(integer multiple of context_seed_batch_size), except a batch "
+                    "containing the complete train split"
+                )
+            if self.context_seed_batch_size * (1 + sum(self.fanouts)) >= self.num_nodes:
+                warnings.warn(
+                    "V5 cluster_disjoint context budget reaches the full graph: "
+                    "separating physical batching does not prevent saturated contexts. "
+                    "The explicit context recipe is retained and saturation is recorded.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
     def __len__(self) -> int:
         return math.ceil(self.train_indices.numel() / self.seed_batch_size)
@@ -30767,11 +30890,12 @@ class TransductiveGraphSampler:
         # Preserve exactly the old torch.unique BFS ordering, without RNG use.
         return csr_values(self._component_nodes, self._component_rowptr, components).sort().values
 
-    def _induced(self, nodes: Tensor, seeds: Tensor):
+    def _induced_result(self, nodes: Tensor, seeds: Tensor):
+        """Construct one context without mutating shared sampler observations."""
         from torch_geometric.data import Data
 
         nodes = nodes.unique(sorted=True)
-        edge_ids, self.last_induced_candidate_arc_count = induced_physical_edge_ids(
+        edge_ids, candidate_count = induced_physical_edge_ids(
             self.incidence,
             self.incident_edge_ids,
             self.incident_rowptr,
@@ -30791,21 +30915,24 @@ class TransductiveGraphSampler:
         else:
             correction = torch.empty(0, dtype=torch.float32)
         train_mask = torch.isin(nodes, seeds)
-        self.last_sample_observation = {
+        observation = {
             "supervised_seed_nodes": int(seeds.numel()),
             "sampled_nodes": int(nodes.numel()),
             "sampled_physical_edges": int(incidence.shape[1]),
             "original_nodes": self.num_nodes,
             "original_physical_edges": int(self.incidence.shape[1]),
             "configured_cluster_node_budget": (
-                int(seeds.numel()) * (1 + sum(self.fanouts)) if self.mode == "cluster" else None
+                int(seeds.numel()) * (1 + sum(self.fanouts))
+                if self.mode in {"cluster", "cluster_disjoint"}
+                else None
             ),
             "cluster_budget_saturated": (
-                self.mode == "cluster" and seeds.numel() * (1 + sum(self.fanouts)) >= self.num_nodes
+                self.mode in {"cluster", "cluster_disjoint"}
+                and seeds.numel() * (1 + sum(self.fanouts)) >= self.num_nodes
             ),
             "component_cache": self._component_cache_status,
         }
-        return Data(
+        sampled = Data(
             x=self.graph.x[nodes],
             y=self.graph.y[nodes],
             edge_index=arcs,
@@ -30818,10 +30945,188 @@ class TransductiveGraphSampler:
             global_node_id=nodes,
             sample_seed_count=torch.tensor([int(seeds.numel())]),
         )
+        return sampled, edge_ids, observation, candidate_count
+
+    def _induced(self, nodes: Tensor, seeds: Tensor):
+        sampled, _, observation, candidate_count = self._induced_result(nodes, seeds)
+        self.last_induced_candidate_arc_count = candidate_count
+        self.last_sample_observation = copy.deepcopy(observation)
+        sampled.sampling_observation = copy.deepcopy(observation)
+        return sampled
+
+    @staticmethod
+    def _id_hash(ids: Tensor) -> str:
+        # CPU sampling metadata only; IDs never enter the history JSON itself.
+        return hashlib.sha256(ids.contiguous().numpy().tobytes()).hexdigest()
+
+    @staticmethod
+    def _overlap(left: Tensor, right: Tensor) -> dict[str, object]:
+        # Every caller supplies sorted unique original IDs. Reuse this ordering
+        # instead of sorting the same context repeatedly inside torch.isin for
+        # every pair. Search the shorter vector; retain ALL context comparisons.
+        if left.numel() > right.numel():
+            left, right = right, left
+        if left.numel():
+            positions = torch.searchsorted(right, left)
+            inside = positions < right.numel()
+            intersection = int((right[positions[inside]] == left[inside]).sum())
+        else:
+            intersection = 0
+        union = int(left.numel() + right.numel()) - intersection
+        return {
+            "intersection": intersection,
+            "union": union,
+            "jaccard": intersection / union if union else 1.0,
+            "both_empty": union == 0,
+        }
+
+    def _disjoint_context(self, specification):
+        seeds, rng_seed = specification
+        generator = torch.Generator().manual_seed(rng_seed)
+        nodes = self._cluster_nodes(seeds, generator)
+        return self._induced_result(nodes, seeds)
+
+    def _iter_disjoint(self, order: Tensor, epoch: int) -> Iterator:
+        from torch_geometric.data import Batch
+
+        context_size = self.context_seed_batch_size
+        # Initialize the optional immutable component cache BEFORE worker threads.
+        # This is only the existing saturation shortcut, not another sampling law.
+        if min(context_size, self.seed_batch_size) * (1 + sum(self.fanouts)) >= self.num_nodes:
+            self._complete_seed_components(order[:1])
+        previous_nodes = previous_edges = None
+        seen_seeds = torch.zeros(self.num_nodes, dtype=torch.bool)
+        context_ordinal = 0
+        executor = (
+            ThreadPoolExecutor(max_workers=self.context_workers)
+            if self.context_workers > 1
+            else None
+        )
+        try:
+            for batch_index, start in enumerate(range(0, order.numel(), self.seed_batch_size)):
+                seeds = order[start : start + self.seed_batch_size]
+                specifications = []
+                for context_start in range(0, seeds.numel(), context_size):
+                    context_seeds = seeds[context_start : context_start + context_size]
+                    # A private generator per context makes worker scheduling irrelevant
+                    # and never touches the process-global torch RNG.
+                    rng_seed = (
+                        self.model_seed + 1_000_003 * epoch + 97_409 * (context_ordinal + 1)
+                    ) % (2**63 - 1)
+                    specifications.append((context_seeds, rng_seed))
+                    context_ordinal += 1
+                results = list(
+                    executor.map(self._disjoint_context, specifications)
+                    if executor is not None
+                    else map(self._disjoint_context, specifications)
+                )
+                contexts = [item[0] for item in results]
+                node_sets = [graph.global_node_id for graph in contexts]
+                edge_sets = [item[1] for item in results]
+                batch = Batch.from_data_list(contexts)
+                batch._v5_num_graphs = len(contexts)
+                # No offset: these identify original physical edges, unlike local
+                # incidence_edge_index, which PyG offsets into the disjoint union.
+                batch.global_physical_edge_id = torch.cat(edge_sets)
+                supervised = batch.global_node_id[batch.train_mask]
+                if (
+                    supervised.numel() != seeds.numel()
+                    or supervised.unique().numel() != seeds.numel()
+                    or not torch.equal(supervised.sort().values, seeds.sort().values)
+                    or bool(seen_seeds[supervised].any())
+                ):
+                    raise RuntimeError("disjoint sampling duplicated or lost supervised seeds")
+                seen_seeds[supervised] = True
+                observation_started = time.perf_counter()
+                unique_nodes = torch.cat(node_sets).unique(sorted=True)
+                unique_edges = torch.cat(edge_sets).unique(sorted=True)
+                pairwise = []
+                for i in range(len(contexts)):
+                    for j in range(i + 1, len(contexts)):
+                        pairwise.append(
+                            {
+                                "contexts": [i, j],
+                                "nodes": self._overlap(node_sets[i], node_sets[j]),
+                                "physical_edges": self._overlap(edge_sets[i], edge_sets[j]),
+                            }
+                        )
+                context_observations = []
+                for index, (_, edges, observation, candidate_count) in enumerate(results):
+                    context_observations.append(
+                        {
+                            **observation,
+                            "context_index": index,
+                            "node_ids_sha256": self._id_hash(node_sets[index]),
+                            "physical_edge_ids_sha256": self._id_hash(edges),
+                            "induced_candidate_arcs": candidate_count,
+                            "node_coverage_fraction": node_sets[index].numel() / self.num_nodes,
+                            "selects_all_original_nodes": node_sets[index].numel()
+                            == self.num_nodes,
+                        }
+                    )
+                observation = {
+                    "mode": self.mode,
+                    "epoch": epoch,
+                    "batch_index": batch_index,
+                    "physical_seed_batch_size": self.seed_batch_size,
+                    "context_seed_batch_size": context_size,
+                    "context_count": len(contexts),
+                    "supervised_seed_nodes": int(seeds.numel()),
+                    "unique_supervised_seed_nodes": int(supervised.unique().numel()),
+                    "epoch_supervised_seeds_so_far": int(seen_seeds.sum()),
+                    "epoch_total_supervised_seeds": int(self.train_indices.numel()),
+                    "epoch_seed_coverage_fraction": float(seen_seeds.sum())
+                    / self.train_indices.numel(),
+                    "sampled_nodes": int(batch.x.shape[0]),
+                    "sampled_physical_edges": int(batch.incidence_edge_index.shape[1]),
+                    "unique_original_nodes": int(unique_nodes.numel()),
+                    "unique_original_physical_edges": int(unique_edges.numel()),
+                    "duplicated_context_node_copies": int(batch.x.shape[0] - unique_nodes.numel()),
+                    "original_nodes": self.num_nodes,
+                    "original_physical_edges": int(self.incidence.shape[1]),
+                    "node_ids_sha256": self._id_hash(unique_nodes),
+                    "physical_edge_ids_sha256": self._id_hash(unique_edges),
+                    "cluster_budget_saturated": any(
+                        item["cluster_budget_saturated"] for item in context_observations
+                    ),
+                    "saturated_context_count": sum(
+                        item["cluster_budget_saturated"] for item in context_observations
+                    ),
+                    "contexts": context_observations,
+                    "within_batch_context_overlap": pairwise,
+                    "previous_physical_batch_overlap": None
+                    if previous_nodes is None
+                    else {
+                        "nodes": self._overlap(previous_nodes, unique_nodes),
+                        "physical_edges": self._overlap(previous_edges, unique_edges),
+                    },
+                }
+                observation["observation_cpu_wall_seconds"] = (
+                    time.perf_counter() - observation_started
+                )
+                observation["observation_timing_scope"] = (
+                    "unique ID unions, all-pair overlap, hashes and observation assembly; "
+                    "excludes context sampling, batch collation and snapshot copies"
+                )
+                previous_nodes, previous_edges = unique_nodes, unique_edges
+                self.last_induced_candidate_arc_count = sum(item[3] for item in results)
+                self.last_sample_observation = copy.deepcopy(observation)
+                # Immutable-by-convention snapshot travels with the batch even if
+                # prefetch advances the sampler before this batch is consumed.
+                batch.sampling_observation = copy.deepcopy(observation)
+                yield batch
+            if not bool(seen_seeds[self.train_indices].all()):
+                raise RuntimeError("disjoint sampling did not supervise every training seed")
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
 
     def iter_epoch(self, epoch: int) -> Iterator:
         generator = torch.Generator().manual_seed(self.model_seed + 1_000_003 * int(epoch))
         order = self.train_indices[torch.randperm(self.train_indices.numel(), generator=generator)]
+        if self.mode == "cluster_disjoint":
+            yield from self._iter_disjoint(order, int(epoch))
+            return
         for start in range(0, order.numel(), self.seed_batch_size):
             seeds = order[start : start + self.seed_batch_size]
             nodes = (
@@ -30832,7 +31137,7 @@ class TransductiveGraphSampler:
             yield self._induced(nodes, seeds)
 
     def metadata(self) -> dict[str, object]:
-        return {
+        metadata = {
             "mode": self.mode,
             "implementation": "dependency_free_induced_subgraph",
             "induced_edge_enumeration": (
@@ -30859,6 +31164,490 @@ class TransductiveGraphSampler:
                 "component_cache": self._component_cache_status,
             },
         }
+        if self.mode == "cluster_disjoint":
+            context_budget = self.context_seed_batch_size * (1 + sum(self.fanouts))
+            metadata.update(
+                {
+                    "implementation": "dependency_free_cluster_contexts_pyg_disjoint_union",
+                    "context_seed_batch_size": self.context_seed_batch_size,
+                    "context_workers": self.context_workers,
+                    "contexts_per_full_physical_batch": math.ceil(
+                        self.seed_batch_size / self.context_seed_batch_size
+                    ),
+                    "context_sampling": (
+                        "independent randomized cluster BFS using unchanged fanouts per context"
+                    ),
+                    "context_rng": (
+                        "private generator keyed by model_seed, epoch and context ordinal"
+                    ),
+                    "optimization": (
+                        "one loss/backward/optimizer step per physical seed batch; "
+                        "every training seed once per epoch"
+                    ),
+                    "context_node_copies": (
+                        "independent disjoint copies; "
+                        "no cross-context message passing or graph statistics"
+                    ),
+                    "cluster_saturation": {
+                        "configured_node_budget": context_budget,
+                        "full_seed_batch_reaches_graph_size": context_budget >= self.num_nodes,
+                        "policy": (
+                            "per-context reachable components; "
+                            "explicit context recipe never auto-shrunk"
+                        ),
+                        "component_cache": self._component_cache_status,
+                    },
+                }
+            )
+        return metadata
+````
+
+# research/conductance_gat/v5/stage_audit.py
+
+````python
+"""Read-only, validation-only audits of the two V5 learning roles.
+
+This measures a saved model, not a new training recipe. A finite-step reference
+is never called an exact optimizer, and an executed audit is not a claim that C
+improves generalization. Local comparisons freeze the baseline layer input;
+whole-model higher-K evaluation deliberately has a separate interpretation.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import time
+from contextlib import contextmanager
+from typing import Any
+
+import numpy as np
+import torch
+from torch import Tensor, nn
+
+from .diagnostics import PreparedValidationGraph, require_finite_tensor
+
+
+def _diagnostic_state(module: nn.Module) -> dict[str, Any]:
+    return {key: value for key, value in vars(module).items() if key.startswith("last_")}
+
+
+def _restore_diagnostics(module: nn.Module, previous: dict[str, Any]) -> None:
+    for key in list(vars(module)):
+        if key.startswith("last_") and key not in previous:
+            delattr(module, key)
+    for key, value in previous.items():
+        setattr(module, key, value)
+
+
+@contextmanager
+def _preserve_state(model: nn.Module, device: torch.device, source):
+    modules = list(model.modules())
+    training = [module.training for module in modules]
+    diagnostics = [_diagnostic_state(module) for module in modules]
+    estimators = [operator.estimator for operator in model.operators]
+    settings = [(estimator.override, estimator.solver_steps) for estimator in estimators]
+    python_rng, numpy_rng, cpu_rng = random.getstate(), np.random.get_state(), torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
+    # DataLoader generators are not necessarily the global torch generator.
+    owners = [source, getattr(source, "sampler", None), getattr(source, "batch_sampler", None)]
+    owners += [getattr(owner, "sampler", None) for owner in list(owners)]
+    generators = {
+        id(generator): (generator, generator.get_state())
+        for owner in owners
+        if isinstance((generator := getattr(owner, "generator", None)), torch.Generator)
+    }
+    try:
+        model.eval()
+        yield
+    finally:
+        for estimator, (override, steps) in zip(estimators, settings, strict=True):
+            estimator.override, estimator.solver_steps = override, steps
+        for module, mode, previous in zip(modules, training, diagnostics, strict=True):
+            module.training = mode  # Preserve heterogeneous flags, not just the root flag.
+            _restore_diagnostics(module, previous)
+        random.setstate(python_rng)
+        np.random.set_state(numpy_rng)
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng is not None:
+            torch.cuda.set_rng_state(cuda_rng, device)
+        for generator, state in generators.values():
+            generator.set_state(state)
+
+
+def _json(value):
+    if isinstance(value, Tensor):
+        require_finite_tensor(value, "stage audit statistic")
+        return value.detach().cpu().tolist()
+    if isinstance(value, dict):
+        return {key: _json(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        raise FloatingPointError("nonfinite stage audit statistic")
+    return value
+
+
+def _difference(left: Tensor, reference: Tensor) -> dict[str, Any]:
+    require_finite_tensor(left, "stage audit compared output")
+    require_finite_tensor(reference, "stage audit reference output")
+    delta = left.float() - reference.float()
+    return {
+        "squared_difference": delta.square().sum(dtype=torch.float64),
+        "squared_reference": reference.float().square().sum(dtype=torch.float64),
+        "max_abs": delta.abs().amax() if delta.numel() else delta.new_zeros(()),
+        "elements": delta.numel(),
+    }
+
+
+def _finish_difference(value: dict[str, Any]) -> dict[str, Any]:
+    value = _json(value)
+    numerator = math.sqrt(value["squared_difference"])
+    denominator = math.sqrt(value["squared_reference"])
+    return {
+        "relative_l2": numerator / denominator if denominator else (0.0 if not numerator else None),
+        "reference_l2": denominator,
+        "difference_l2": numerator,
+        "rms_difference": numerator / math.sqrt(value["elements"]) if value["elements"] else None,
+        "max_abs": value["max_abs"],
+        "elements": value["elements"],
+        "zero_reference_norm": denominator == 0,
+    }
+
+
+def _moments(value: Tensor) -> dict[str, Any]:
+    flat = value.detach().float().flatten()
+    if not flat.numel():
+        return {"count": 0, "mean": None, "std": None, "min": None, "max": None}
+    return {
+        "count": flat.numel(),
+        "mean": flat.mean(),
+        "std": flat.std(correction=0),
+        "min": flat.amin(),
+        "max": flat.amax(),
+    }
+
+
+def _local_hook(layer: int, batch_number: int, rows: list, reference_steps: int):
+    def hook(operator, args, kwargs, baseline_output):
+        # Only this layer's O(E) conductances and O(ND) output are live during
+        # recomputation. No all-layer feature/edge activation cache is retained.
+        estimator = operator.estimator
+        modules = list(operator.modules())
+        previous_diagnostics = [_diagnostic_state(module) for module in modules]
+        previous_override, previous_steps = estimator.override, estimator.solver_steps
+        baseline_c = estimator.last_c
+        baseline_solver = estimator.last_solver_diagnostics
+        baseline_beta = operator.last_beta
+        try:
+            estimator.override = "ones"
+            # Calling forward directly avoids recursion into this audit hook.
+            ones_output = operator.forward(*args, **kwargs)
+            ones_comparison = _difference(ones_output, baseline_output)
+            del ones_output
+            estimator.override, estimator.solver_steps = None, reference_steps
+            reference_output = operator.forward(*args, **kwargs)
+            reference_c = estimator.last_c
+            reference_solver = estimator.last_solver_diagnostics
+            rows.append(
+                {
+                    "layer": layer,
+                    "batch": batch_number,
+                    "scope": "same baseline H, B, omega, W and beta; before residual/FFN",
+                    "nodes": args[0].shape[0],
+                    "edges": args[1].shape[1],
+                    "graphs": args[3],
+                    "deployed_steps": previous_steps,
+                    "reference_steps": reference_steps,
+                    "baseline_c": _moments(baseline_c),
+                    "baseline_beta": _moments(baseline_beta),
+                    "c_deployed_vs_reference": _difference(baseline_c, reference_c),
+                    "operator_deployed_vs_reference": _difference(
+                        baseline_output, reference_output
+                    ),
+                    "operator_c_one_vs_deployed": ones_comparison,
+                    "baseline_solver": baseline_solver,
+                    "reference_solver": reference_solver,
+                }
+            )
+        finally:
+            estimator.override, estimator.solver_steps = previous_override, previous_steps
+            for module, previous in zip(modules, previous_diagnostics, strict=True):
+                _restore_diagnostics(module, previous)
+
+    return hook
+
+
+def _batches(source, indices: Tensor | None, device: torch.device):
+    if indices is not None:
+        if isinstance(source, PreparedValidationGraph):
+            graph, selected = source.prepare(indices, device)
+        else:
+            graph, selected = source.clone().to(device), indices.to(device)
+        yield graph, selected
+    else:
+        # The caller supplies measured disjoint-union graph batches. Never split
+        # a physical batch into per-graph GPU forwards or truncate the iterable.
+        for original in source:
+            graph = original.clone().to(device, non_blocking=True)
+            graph._v5_num_graphs = int(original.num_graphs)
+            yield graph, None
+
+
+def _memory(device: torch.device) -> dict[str, Any]:
+    if device.type != "cuda":
+        return {
+            "cuda_available_for_this_audit": False,
+            "allocated_bytes": None,
+            "reserved_bytes": None,
+        }
+    return {
+        "cuda_available_for_this_audit": True,
+        "allocated_bytes": torch.cuda.memory_allocated(device),
+        "reserved_bytes": torch.cuda.memory_reserved(device),
+        "process_peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+        "peak_scope": "process cumulative peak; audit does not reset the caller's counters",
+    }
+
+
+@torch.no_grad()
+def audit_stage_roles(
+    model: nn.Module,
+    source,
+    indices: Tensor | None,
+    *,
+    device: torch.device,
+    precision: str = "fp32",
+    reference_steps: int,
+    reference_tolerance: float,
+) -> dict[str, Any]:
+    """Inspect all supplied validation labels without fitting any parameter.
+
+    ``indices`` selects the complete official validation split on a full graph.
+    ``None`` denotes a single-pass iterable of already-batched PPI validation
+    graphs. The caller must supply validation data, never test data or a subset;
+    this API cannot infer the provenance of an arbitrary tensor of indices.
+    """
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    if precision not in {"fp32", "bf16"}:
+        raise ValueError("precision must preserve the saved fp32 or bf16 recipe")
+    if (
+        isinstance(reference_steps, bool)
+        or not isinstance(reference_steps, int)
+        or reference_steps < 1
+    ):
+        raise ValueError("reference_steps must be a positive integer")
+    if (
+        isinstance(reference_tolerance, bool)
+        or not isinstance(reference_tolerance, (int, float))
+        or not math.isfinite(reference_tolerance)
+        or reference_tolerance <= 0
+    ):
+        raise ValueError("reference_tolerance must be finite and positive")
+    operators = list(model.operators)
+    if not operators or any(
+        operator.conductance_backend != "optimization" for operator in operators
+    ):
+        raise ValueError("stage audit requires V5 optimization-backend operators")
+    deployed_steps = [operator.estimator.solver_steps for operator in operators]
+    if any(reference_steps < steps for steps in deployed_steps):
+        raise ValueError("reference_steps cannot reduce any deployed solver budget")
+    if indices is not None and (
+        indices.dtype != torch.long or indices.ndim != 1 or not indices.numel()
+    ):
+        raise ValueError("validation indices must be a nonempty one-dimensional int64 tensor")
+    if any(
+        parameter.device.type != device.type
+        or (device.index is not None and parameter.device.index != device.index)
+        for parameter in model.parameters()
+    ):
+        raise ValueError("model must already reside on the requested device")
+    variants = (
+        ("learned", None),
+        ("c_one", "ones"),
+        ("mean_c", "mean"),
+        ("shuffled_c", "shuffle"),
+        ("higher_k_full_model", None),
+    )
+    totals = {name: torch.zeros(7, dtype=torch.float64, device=device) for name, _ in variants}
+    differences = {name: None for name, _ in variants}
+    local_rows, input_rows = [], []
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    memory_before, start = _memory(device), time.perf_counter()
+    with _preserve_state(model, device, source):
+        for batch_number, (graph, selected) in enumerate(_batches(source, indices, device)):
+            target = graph.y if selected is None else graph.y.index_select(0, selected)
+            if (
+                (selected is None and target.ndim != 2)
+                or (selected is not None and target.ndim != 1)
+                or not target.numel()
+            ):
+                raise ValueError("validation target shape does not match classification task")
+            require_finite_tensor(target, "validation targets")
+            input_rows.append(
+                {
+                    "batch": batch_number,
+                    "nodes": graph.x.shape[0],
+                    "edges": graph.incidence_edge_index.shape[1],
+                    "input_shape": list(graph.x.shape),
+                    "graphs": int(getattr(graph, "_v5_num_graphs", 1)),
+                    "label_count": target.numel(),
+                }
+            )
+            baseline = baseline_prediction = None
+            for name, override in variants:
+                for operator, steps in zip(operators, deployed_steps, strict=True):
+                    operator.estimator.override = override
+                    operator.estimator.solver_steps = (
+                        reference_steps if name == "higher_k_full_model" else steps
+                    )
+                handles = []
+                try:
+                    if name == "learned":
+                        handles = [
+                            operator.register_forward_hook(
+                                _local_hook(layer, batch_number, local_rows, reference_steps),
+                                with_kwargs=True,
+                            )
+                            for layer, operator in enumerate(operators)
+                        ]
+                    with torch.autocast(
+                        device_type=device.type, dtype=torch.bfloat16, enabled=precision == "bf16"
+                    ):
+                        logits = model(graph)
+                    require_finite_tensor(logits, "stage audit validation logits")
+                finally:
+                    for handle in handles:
+                        handle.remove()
+                logits = logits if selected is None else logits.index_select(0, selected)
+                prediction = logits > 0 if selected is None else logits.argmax(dim=-1)
+                if name == "learned":
+                    baseline, baseline_prediction = logits, prediction
+                difference = _difference(logits, baseline)
+                previous = differences[name]
+                if previous is None:
+                    differences[name] = difference
+                else:
+                    previous["squared_difference"] += difference["squared_difference"]
+                    previous["squared_reference"] += difference["squared_reference"]
+                    previous["max_abs"] = torch.maximum(previous["max_abs"], difference["max_abs"])
+                    previous["elements"] += difference["elements"]
+                totals[name][4] += target.numel()
+                totals[name][5] += (prediction != baseline_prediction).sum()
+                totals[name][6] += prediction.numel()
+                if selected is None:
+                    positive = target.bool()
+                    totals[name][:3] += torch.stack(
+                        (
+                            (prediction & positive).sum(),
+                            (prediction & ~positive).sum(),
+                            (~prediction & positive).sum(),
+                        )
+                    )
+                else:
+                    totals[name][3] += (prediction == target).sum()
+        if not input_rows:
+            raise ValueError("validation source produced no batches")
+        if len(local_rows) != len(input_rows) * len(operators):
+            raise RuntimeError("not every V5 operator participated exactly once per baseline batch")
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elapsed, memory_after = time.perf_counter() - start, _memory(device)
+    interventions = {}
+    for name, _ in variants:
+        tp, fp, fn, correct, count, changed, prediction_count = totals[name].cpu().tolist()
+        denominator = 2 * tp + fp + fn
+        metric = (
+            correct / count
+            if indices is not None
+            else (2 * tp / denominator if denominator else 0.0)
+        )
+        diff = _finish_difference(differences[name])
+        interventions[name] = {
+            "metric": metric,
+            "label_count": int(count),
+            "logit_relative_l2": diff["relative_l2"],
+            "logit_max_abs": diff["max_abs"],
+            "logit_difference": diff,
+            "prediction_changed_count": int(changed),
+            "prediction_changed_fraction": changed / prediction_count,
+        }
+    for value in interventions.values():
+        value["delta_from_learned"] = value["metric"] - interventions["learned"]["metric"]
+    for row in local_rows:
+        for key in (
+            "c_deployed_vs_reference",
+            "operator_deployed_vs_reference",
+            "operator_c_one_vs_deployed",
+        ):
+            row[key] = _finish_difference(row[key])
+        residual = row["reference_solver"].get("projected_gradient_rms_final")
+        active = row["reference_solver"].get("active_nodes")
+        row["reference_residual_tolerance"] = reference_tolerance
+        row["reference_tolerance_reached_by_graph"] = (
+            None if residual is None else ((residual <= reference_tolerance) | (active == 0))
+        )
+        row["reference_is_exact_optimum"] = False
+    return _json(
+        {
+            "execution_status": "passed",
+            "contribution_status": "observed"
+            if interventions["c_one"]["logit_max_abs"] > 0
+            else "inconclusive",
+            "contribution_interpretation": (
+                "observed means sensitivity to C=1, not beneficial C learning, convergence, "
+                "statistical significance or generalization proof"
+            ),
+            "scope": {
+                "split": "validation_only",
+                "test_used": False,
+                "split_provenance": "caller must verify complete official validation data",
+                "optimizer_used": False,
+                "backward_used": False,
+                "parameters_updated": False,
+                "training_recipe_changed": False,
+                "model_state_restored": True,
+                "full_validation_passes": len(variants),
+                "metric": "accuracy" if indices is not None else "micro_f1",
+            },
+            "reference_contract": {
+                "deployed_steps_by_layer": deployed_steps,
+                "reference_steps": reference_steps,
+                "projected_gradient_rms_tolerance": reference_tolerance,
+                "exact_optimum_claimed": False,
+                "local_scope": "baseline H/B/omega/W/beta frozen; only C solver K differs",
+                "full_model_scope": (
+                    "all layers use higher K; upstream C changes downstream H; "
+                    "not a frozen-input solver comparison"
+                ),
+                "sampling_fidelity_or_unbiasedness_verified": False,
+            },
+            "interventions": interventions,
+            "local_layer_comparisons": local_rows,
+            "inputs": input_rows,
+            "resources": {
+                "device": str(device),
+                "precision": precision,
+                "geometry_precision": "fp32",
+                "elapsed_wall_seconds": elapsed,
+                "memory_before": memory_before,
+                "memory_after": memory_after,
+                "memory_policy": (
+                    "single input batch and local layer recomputations; "
+                    "no all-layer activation cache"
+                ),
+                "gpu_utilization": None,
+                "gpu_utilization_reason": "not measured by this read-only numerical audit",
+                "parameter_count": sum(p.numel() for p in model.parameters()),
+                "trainable_parameter_count": sum(
+                    p.numel() for p in model.parameters() if p.requires_grad
+                ),
+            },
+        }
+    )
 ````
 
 # research/conductance_gat/v5/timing.py
@@ -30983,10 +31772,12 @@ from .protocol import (
     SUITE,
     TRAINING_PHASES,
     add_conductance_arguments,
+    add_sampling_context_arguments,
     beta_configuration,
     conductance_arguments_configuration,
     conductance_configuration,
     learning_budget_arguments_configuration,
+    sampling_context_configuration,
 )
 from .sampling import TransductiveGraphSampler
 from .timing import StageTimer
@@ -31053,6 +31844,7 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
         **COMMON,
         **architecture_configuration(args),
         **learning_budget_arguments_configuration(args),
+        **sampling_context_configuration(args),
         "model_seed": args.model_seed,
         "epochs": args.epochs,
         "patience": args.patience,
@@ -31805,6 +32597,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sampling", choices=SAMPLING_MODES, default="full")
     parser.add_argument("--num-neighbors", type=int, nargs="+", default=[15, 10])
     parser.add_argument("--sample-seed-batch-size", type=int)
+    add_sampling_context_arguments(parser)
     parser.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
     parser.add_argument(
         "--phase-fractions",
@@ -31828,6 +32621,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_args(args: argparse.Namespace) -> None:
     resolve_hardware_arguments(args)
+    context = sampling_context_configuration(args)
+    for name, value in context.items():
+        setattr(args, name, value)
     conductance_arguments_configuration(args)
     budget_configuration = learning_budget_arguments_configuration(args)
     if budget_configuration and getattr(args, "transition_from_checkpoint", None) is not None:
@@ -31909,6 +32705,16 @@ def _prepare_data(payload, args, device):
         key: payload["splits"][key].nonzero(as_tuple=False).flatten().long()
         for key in ("train", "validation")
     }
+    # Reject invalid grouping before constructing the full-graph sampler/CSR cache.
+    if (
+        args.sampling == "cluster_disjoint"
+        and args.sample_seed_batch_size < indices["train"].numel()
+        and args.sample_seed_batch_size % args.sample_context_seed_batch_size
+    ):
+        raise ValueError(
+            "physical seed batch must group whole sampling contexts (integer multiple of "
+            "sample-context-seed-batch-size), except a batch containing the complete train split"
+        )
     sampler = TransductiveGraphSampler(
         graph,
         indices["train"],
@@ -31916,6 +32722,14 @@ def _prepare_data(payload, args, device):
         seed_batch_size=args.sample_seed_batch_size,
         fanouts=args.num_neighbors,
         model_seed=args.model_seed,
+        **(
+            {
+                "context_seed_batch_size": args.sample_context_seed_batch_size,
+                "context_workers": args.sample_context_workers,
+            }
+            if args.sampling == "cluster_disjoint"
+            else {}
+        ),
     )
     return graph, indices, sampler
 
@@ -32557,6 +33371,8 @@ def _train_model_impl(
                 {
                     "nodes": int(graph.x.shape[0]),
                     "physical_edges": int(graph.incidence_edge_index.shape[1]),
+                    "disjoint_graphs": int(getattr(graph, "_v5_num_graphs", 1)),
+                    "sampling_observation": getattr(graph, "sampling_observation", None),
                     "supervised_seed_nodes": (
                         int(train_indices.numel()) if train_indices is not None else None
                     ),
@@ -57109,6 +57925,918 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ````
 
+# scripts/audit_v5_stages.py
+
+````python
+"""Read-only validation audit of completed corrected V5 checkpoints.
+
+No training, optimizer, checkpoint recovery/publication, dataset download, or
+test evaluation. All reports go to stdout. Source compatibility here authorizes
+only this diagnostic, never a training resume or a changed model recipe.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.dont_write_bytecode = True
+for _entry in (ROOT, ROOT / "src"):
+    if str(_entry) not in sys.path:
+        sys.path.insert(0, str(_entry))
+
+SUITE = "conductance_graph_conditioned_v5"
+BASE_COMMIT = "8da06cacec59515d84c08d892315e4c8ecfd5b5b"
+BASELINE_SOURCES = {
+    "research/conductance_gat/ablation/train.py": (
+        "522df8ee0c7d40acb2db6814bcf6065648f8674fb3669d299ffb9872c66dbff5"
+    ),
+    "research/conductance_gat/benchmark.py": (
+        "c441a65e22f0431e0c362d4eeadb3036aaceabb5b89863bd8709e6b7680b5d13"
+    ),
+    "research/conductance_gat/benchmark_data.py": (
+        "082e4a1a94bb7beffddfa2d5f59a922c806f15093d5ffc97fb3240b0bb844dc7"
+    ),
+    "research/conductance_gat/v5/__init__.py": (
+        "8b313a477bbd51eedc0861fad06cffdf7f7a0aed5d9fcddc55fa89c333a3bd46"
+    ),
+    "research/conductance_gat/v5/batch_calibration.py": (
+        "265ebacb059289f1b7445cf0db1fc9f8c2359de52fd2c83cf455f2ebfa264ddc"
+    ),
+    "research/conductance_gat/v5/diagnostics.py": (
+        "b1d629f638319c95a19997b0525a31f1d7aa44dcfe0451a7e20d979f11845a68"
+    ),
+    "research/conductance_gat/v5/learning_budget.py": (
+        "e0ae75c0ca5bd2423ea7903ec920c871acb528e05ca07c326672153951eca7a1"
+    ),
+    "research/conductance_gat/v5/model.py": (
+        "963881743c2c7113df5cecaf05d91670b190d9fb7a3ca3a3f976d363d6925282"
+    ),
+    "research/conductance_gat/v5/operator.py": (
+        "f79b59708b5787ff79ffc3c0a8976432bccaa8f4cb6f6edbf172d3f037bd03d3"
+    ),
+    "research/conductance_gat/v5/optimization.py": (
+        "34fc5475cd95966d63f14b720d82c73062bf3586236ec8671258a1f3e5d4c49b"
+    ),
+    "research/conductance_gat/v5/protocol.py": (
+        "3018d646b044ef8b2d1eba786d7ce97bba70149dbd9692f15da4ca1925e4991a"
+    ),
+    "research/conductance_gat/v5/report.py": (
+        "8fdcbcf02a1658873d6c6102beb904a2ffb2f711e5a484dbda674d0ab1f79f1d"
+    ),
+    "research/conductance_gat/v5/sampling.py": (
+        "98333613164281dbb599189fb91703d6b231413ffbbe6b0dafde5fa93d28a6a2"
+    ),
+    "research/conductance_gat/v5/timing.py": (
+        "c4767edd02f5b7a6c0c857cc7f17b2f22c36b1404576481c60d66d967a76d033"
+    ),
+    "research/conductance_gat/v5/train.py": (
+        "b3f4bf7503651c75cd3f3f1b030bff26f243a45eda5f0d645e9a842664b3faec"
+    ),
+    "research/conductance_gat/v5/transition.py": (
+        "fccfe27baec519231ba1405c56f17375a460adba663b6ad3b98176b295f51700"
+    ),
+    "research/conductance_gat/v5/transition_initialization.py": (
+        "574c9ce4f61aa7f64a071bdbb00bea95f3f229612647f3d5699961ef43004611"
+    ),
+    "research/conductance_gat/v5/transition_report.py": (
+        "872528bf12290db06c28374f0a6160dbe808d0709e3a76ebb3a4df83ec63d51c"
+    ),
+    "research/conductance_gat/v5/transition_training.py": (
+        "9a57550941505654eafeeeb90cd509e0e7e22eed0d2f07a8a4148f81264de4c3"
+    ),
+    "scripts/resume_compatibility_v1.json": (
+        "aa496773d18f9ae7eee9fff83f45a88f8e6c4ffc773852a6ea2a2028f25605e9"
+    ),
+    "src/chartgat/cache.py": ("b9feeef3c3e033a064677a612790b036d78d09eecddce773a44273e007cd7cab"),
+    "src/chartgat/observability.py": (
+        "53b1b037f84371ad51abb9524c808b5d72cf27f3c66eca8fcc97a825e81755b1"
+    ),
+    "src/chartgat/resume_compat.py": (
+        "c503e207ff10db490b2624473ae330c2cee7873bf3ebdd930ce1d9cc682076bd"
+    ),
+}
+# Exact reviewed diagnostic/observability additions. No wildcard source bypass.
+AUDIT_SOURCE_OVERRIDES: dict[str, str] = {
+    "research/conductance_gat/v5/batch_calibration.py": (
+        "df8e6a975e9a25cc2672ea64636afef43607a7da764ad73d44c5bdd75612d966"
+    ),
+    "research/conductance_gat/v5/protocol.py": (
+        "c476c1c4e362968396031aa3fb03bb8c4807c6542741f17c46851695ebae473e"
+    ),
+    "research/conductance_gat/v5/sampling.py": (
+        "05c24c85765bdc0b0c1bc9a58261f849fc4af8eb11fec9e4b101a2dcff8f3803"
+    ),
+    "research/conductance_gat/v5/stage_audit.py": (
+        "44e99513aa00f080945a25ae802b991854128e36bf3752740b1f30f0e77191e4"
+    ),
+    "research/conductance_gat/v5/train.py": (
+        "a64e46d0c340a5f65920a0de4ca2cb8707bd3900410753e15da78e543f2e04a3"
+    ),
+}
+
+
+class AuditError(ValueError):
+    """Evidence is incomplete, corrupt, or outside the reviewed audit contract."""
+
+
+def _finite_positive(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
+    return value
+
+
+def _positive_integer(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--root", type=Path, required=True, help="Existing run or condition directory"
+    )
+    parser.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--reference-steps",
+        type=_positive_integer,
+        required=True,
+        help="Explicit diagnostic reference K; never changes training K",
+    )
+    parser.add_argument(
+        "--reference-tolerance",
+        type=_finite_positive,
+        required=True,
+        help="Explicit convergence residual tolerance for the reference",
+    )
+    parser.add_argument("--json", action="store_true", help="One full JSON report to stdout")
+    return parser
+
+
+def _sha(path: Path) -> str:
+    if path.is_symlink() or not path.is_file():
+        raise AuditError(f"Required regular file is missing or is a symlink: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _pairs(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise AuditError(f"Duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def _constant(value):
+    raise AuditError(f"Nonfinite JSON value: {value}")
+
+
+def _read(path: Path) -> Any:
+    _sha(path)
+    return json.loads(
+        path.read_text(encoding="utf-8-sig"), object_pairs_hook=_pairs, parse_constant=_constant
+    )
+
+
+def _canonical(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def discover_conditions(root: Path) -> list[Path]:
+    root = root.expanduser()
+    if root.is_symlink() or not root.is_dir():
+        raise AuditError(f"--root must be an existing regular directory: {root}")
+    found = []
+    for folder, directories, files in os.walk(root, followlinks=False):
+        directories[:] = sorted(
+            name for name in directories if not (Path(folder) / name).is_symlink()
+        )
+        if "metrics.json" not in files:
+            continue
+        path = Path(folder) / "metrics.json"
+        metrics = _read(path)
+        if isinstance(metrics, dict) and metrics.get("research_suite") == SUITE:
+            found.append(path.resolve())
+    if not found:
+        raise AuditError(f"No V5 metrics.json found under {root}")
+    return sorted(found)
+
+
+def verify_sources(previous: Any, current: dict[str, str]) -> dict[str, Any]:
+    from chartgat.resume_compat import require_source_compatibility
+
+    target = {**BASELINE_SOURCES, **AUDIT_SOURCE_OVERRIDES}
+    if current != target:
+        changed = sorted(
+            key for key in set(current) | set(target) if current.get(key) != target.get(key)
+        )
+        raise AuditError(f"Live audit sources are not the exact reviewed release: {changed}")
+    if previous == target:
+        transition = None
+    else:
+        transition = require_source_compatibility(previous, BASELINE_SOURCES)
+    return {
+        "base_commit": BASE_COMMIT,
+        "training_resume_authorized": False,
+        "scope": "read-only validation diagnostic only",
+        "historical_repair": transition,
+        "checkpoint_sources": previous,
+        "audit_sources": current,
+    }
+
+
+def inspect_evidence(path: Path) -> dict[str, Any]:
+    metrics = _read(path)
+    if not isinstance(metrics, dict) or metrics.get("research_suite") != SUITE:
+        raise AuditError(f"Not a V5 metrics artifact: {path}")
+    if metrics.get("status") != "passed":
+        raise AuditError(f"Only completed passed checkpoints can be audited: {path}")
+    if metrics.get("condition") not in {"fixed_c", "shared_dynamic_c"}:
+        raise AuditError("Unsupported V5 condition")
+    identity = metrics.get("resume_identity")
+    if not isinstance(identity, dict) or _canonical(identity) != metrics.get(
+        "resume_identity_sha256"
+    ):
+        raise AuditError("metrics resume identity SHA256 mismatch")
+    for key in ("research_suite", "dataset", "condition", "configuration"):
+        if identity.get(key) != metrics.get(key):
+            raise AuditError(f"metrics and resume identity disagree on {key}")
+    protocol = metrics.get("protocol")
+    if not isinstance(protocol, dict) or protocol != identity.get("dataset_protocol"):
+        raise AuditError("metrics and identity dataset protocol mismatch")
+    if _canonical(protocol) != identity.get("dataset_protocol_sha256"):
+        raise AuditError("dataset protocol SHA256 mismatch")
+    if protocol.get("data_sha256") != metrics.get("cache_sha256") or metrics.get(
+        "cache_sha256"
+    ) != identity.get("cache_sha256"):
+        raise AuditError("dataset cache SHA256 mismatch")
+    if metrics.get("source_sha256") != identity.get("source_sha256"):
+        raise AuditError("metrics and identity source fingerprints disagree")
+    config = metrics.get("configuration")
+    required = {
+        "conductance_backend": "optimization",
+        "training_schedule": "joint",
+        "solver_cost_scaling": "width_scaled",
+        "beta_parameterization": "sigmoid",
+        "beta_initial": 0.5,
+    }
+    if not isinstance(config, dict) or any(config.get(k) != v for k, v in required.items()):
+        raise AuditError(
+            "This audit requires the explicitly corrected optimization/joint/width_scaled V5 recipe"
+        )
+    for name in (
+        "hidden_channels",
+        "layers",
+        "heads",
+        "ffn_multiplier",
+        "solver_steps",
+        "batch_size",
+    ):
+        if type(config.get(name)) is not int or config[name] < 1:
+            raise AuditError(f"Missing/invalid saved configuration: {name}")
+    if (
+        type(metrics.get("best_epoch")) is not int
+        or metrics["best_epoch"] < 1
+        or not _number(metrics.get("validation"))
+    ):
+        raise AuditError("Selected checkpoint epoch or validation score is invalid")
+    selection = metrics.get("checkpoint_selection")
+    if (
+        not isinstance(selection, dict)
+        or selection.get("primary_epoch") != metrics["best_epoch"]
+        or selection.get("primary_validation") != metrics["validation"]
+    ):
+        raise AuditError("Selected checkpoint role disagrees with metrics")
+    if (
+        metrics.get("evaluation_split") != "validation"
+        or metrics.get("test_evaluated") is not False
+        or selection.get("test_used") is not False
+    ):
+        raise AuditError("Training checkpoint selection must be validation-only")
+    checkpoint, history_path = path.parent / "best.pt", path.parent / "history.json"
+    for artifact, expected in (
+        (checkpoint, metrics.get("checkpoint_sha256")),
+        (history_path, metrics.get("history_sha256")),
+    ):
+        if _sha(artifact) != expected:
+            raise AuditError(f"Artifact SHA256 does not match metrics: {artifact}")
+    rows = _read(history_path)
+    if not isinstance(rows, list) or not rows or any(not isinstance(row, dict) for row in rows):
+        raise AuditError("History must be a nonempty list of epoch records")
+    epochs = [row.get("epoch") for row in rows]
+    if any(type(epoch) is not int or epoch < 1 for epoch in epochs) or any(
+        a >= b for a, b in zip(epochs, epochs[1:], strict=False)
+    ):
+        raise AuditError("History epochs are invalid or not strictly increasing")
+    selected = [row for row in rows if row["epoch"] == metrics["best_epoch"]]
+    if len(selected) != 1 or selected[0].get("validation") != metrics["validation"]:
+        raise AuditError("Selected epoch validation is absent or inconsistent in history")
+    artifacts = {str(item): _sha(item) for item in (path, checkpoint, history_path)}
+    return {
+        "metrics": metrics,
+        "history": rows,
+        "checkpoint": checkpoint,
+        "artifacts": artifacts,
+        "metrics_path": path,
+    }
+
+
+def _unavailable(reason: str) -> dict[str, Any]:
+    return {"value": None, "reason": reason}
+
+
+def historical_diagnostics(metrics: dict, rows: list[dict]) -> dict:
+    from scripts.analyze_v5_results import _diagnostics
+
+    diagnostics = _diagnostics(metrics, rows)
+    diagnostics["epoch_layers"] = [
+        {"epoch": row["epoch"], "layers": row["layers"]}
+        for row in rows
+        if isinstance(row.get("layers"), list)
+    ]
+    diagnostics["sampling_metadata"] = metrics.get("sampling", _unavailable("not recorded"))
+    observations = [
+        {"epoch": row["epoch"], "sampling_observation": row["sampling_observation"]}
+        for row in rows
+        if "sampling_observation" in row
+    ]
+    batch_observations = [
+        {"epoch": row["epoch"], "batches": row["batch_observations"]}
+        for row in rows
+        if isinstance(row.get("batch_observations"), list)
+    ]
+    diagnostics["batch_observations"] = batch_observations or _unavailable(
+        "Per-batch node/edge/seed counts were not recorded in this historical history"
+    )
+    diagnostics["sampling_observations"] = (
+        observations
+        or batch_observations
+        or _unavailable(
+            "Historical batches/overlap were not recorded; no retrospective batch diversity claim"
+        )
+    )
+    return diagnostics
+
+
+def validation_source(payload: dict, config: dict):
+    """Construct only the official validation source; never select test indices."""
+    from torch_geometric.data import Data
+    from torch_geometric.loader import DataLoader
+
+    if payload["dataset"] != "ppi":
+        indices = payload["splits"]["validation"].nonzero(as_tuple=False).flatten().long()
+        graph = Data(**payload["graphs"][0])
+        if not indices.numel():
+            raise AuditError("Official validation mask is empty")
+        return (
+            graph,
+            indices,
+            {
+                "validation_nodes": indices.numel(),
+                "graph_nodes": graph.x.shape[0],
+                "graph_edges": graph.incidence_edge_index.shape[1],
+                "used_fraction": 1.0,
+            },
+        )
+    selected = payload["splits"]["validation"]
+    graphs = [Data(**payload["graphs"][int(index)]) for index in selected]
+    if not graphs:
+        raise AuditError("Official PPI validation graph split is empty")
+    workers = config.get("workers")
+    if type(workers) is not int or workers < 0 or type(config.get("pin_memory")) is not bool:
+        raise AuditError("Missing saved PPI worker/pin-memory settings")
+    loader = DataLoader(
+        graphs,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=workers,
+        pin_memory=config["pin_memory"],
+        persistent_workers=workers > 0,
+        prefetch_factor=2 if workers > 0 else None,
+    )
+    return (
+        loader,
+        None,
+        {
+            "validation_graphs": len(graphs),
+            "validation_nodes": sum(g.x.shape[0] for g in graphs),
+            "graph_nodes": [g.x.shape[0] for g in graphs],
+            "graph_edges": [g.incidence_edge_index.shape[1] for g in graphs],
+            "saved_graph_batch_size": config["batch_size"],
+            "actual_physical_batch_size": min(config["batch_size"], len(graphs)),
+            "used_fraction": 1.0,
+            "workers": workers,
+        },
+    )
+
+
+def verify_unchanged(artifacts: dict[str, str]) -> None:
+    for name, expected in artifacts.items():
+        if _sha(Path(name)) != expected:
+            raise AuditError(f"Read-only audit input changed during execution: {name}")
+
+
+def _monitored_stage_audit(model, source, indices, *, device, **kwargs) -> tuple[dict, dict]:
+    """Sample the actual audit interval and always finish a started monitor.
+
+    CUDA peaks were reset by the caller before model allocation. This wrapper
+    never resets them and makes no numeric-ordinal NVML mapping of its own.
+    """
+    import torch
+
+    from chartgat.observability import RuntimeResourceMonitor
+    from research.conductance_gat.v5.stage_audit import audit_stage_roles
+
+    monitor = RuntimeResourceMonitor(device)
+    started = False
+    primary_error = None
+    cleanup_errors = []
+    telemetry = None
+    peaks = {"peak_allocated_bytes": None, "peak_reserved_bytes": None}
+    clock_started = time.perf_counter()
+    try:
+        monitor.start()
+        started = True
+        result = audit_stage_roles(model, source, indices, device=device, **kwargs)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        if started:
+            if device.type == "cuda":
+                for key, counter in (
+                    ("peak_allocated_bytes", torch.cuda.max_memory_allocated),
+                    ("peak_reserved_bytes", torch.cuda.max_memory_reserved),
+                ):
+                    try:
+                        peaks[key] = int(counter(device))
+                    except BaseException as error:
+                        cleanup_errors.append((key, error))
+            # A failed counter read must not bypass stopping/joining the sampler.
+            try:
+                telemetry = monitor.finish(**peaks)
+            except BaseException as error:
+                cleanup_errors.append(("runtime_resource_monitor_finish", error))
+        resources = {
+            "scope": "this condition only; CUDA allocator peaks reset before model allocation",
+            "telemetry_scope": (
+                "validation audit interval including local recomputations and all interventions; "
+                "GPU utilization is device-wide, not attributed solely to this process"
+            ),
+            "elapsed_seconds": time.perf_counter() - clock_started,
+            **peaks,
+            "runtime_observability": telemetry,
+            "resource_monitor": {
+                "started": started,
+                "finish_attempted": started,
+                "finished": telemetry is not None,
+                "cleanup_errors": [
+                    {"stage": stage, "error": f"{type(error).__name__}: {error}"}
+                    for stage, error in cleanup_errors
+                ],
+            },
+            "gpu_utilization": (
+                telemetry["summary"]["run_average_gpu_sm_utilization_percent"]
+                if telemetry is not None
+                else _unavailable(
+                    "runtime resource monitor did not produce a completed report; "
+                    "see primary error and resource_monitor cleanup errors"
+                )
+            ),
+        }
+        if primary_error is not None:
+            primary_error.audit_resources = resources
+            for stage, error in cleanup_errors:
+                primary_error.add_note(
+                    f"Audit resource cleanup also failed at {stage}: "
+                    f"{type(error).__name__}: {error}"
+                )
+        elif cleanup_errors:
+            stage, error = cleanup_errors[0]
+            error.audit_resources = resources
+            error.add_note(
+                f"Audit numerical forwards completed; resource cleanup failed at {stage}"
+            )
+            for additional_stage, additional in cleanup_errors[1:]:
+                error.add_note(
+                    f"Additional cleanup failure at {additional_stage}: "
+                    f"{type(additional).__name__}: {additional}"
+                )
+            raise error
+    return result, resources
+
+
+def audit_condition(evidence: dict, args, device) -> dict:
+    import torch
+
+    from research.conductance_gat.v5 import train
+
+    metrics, config = evidence["metrics"], evidence["metrics"]["configuration"]
+    verification = evidence.setdefault(
+        "audit_verification",
+        {"source_verified": False, "cache_split_hashes_verified": None},
+    )
+    provenance = verify_sources(metrics["source_sha256"], train.implementation_source_hashes())
+    verification["source_verified"] = True
+    if args.reference_steps <= config["solver_steps"]:
+        raise AuditError("--reference-steps must exceed the saved training solver_steps")
+    runtime = SimpleNamespace(
+        **{
+            **config,
+            "dataset": metrics["dataset"],
+            "condition": metrics["condition"],
+            "device": str(device),
+            "beta_min": config.get("beta_min"),
+            "beta_max": config.get("beta_max"),
+        }
+    )
+    train._require_cuda(device)
+    hardware = train.validate_hardware_runtime(runtime, device)
+    train.configure_compute(runtime)
+    selected = train.load_checkpoint_on_cpu(evidence["checkpoint"])
+    train.validate_selected_checkpoint(
+        selected,
+        expected_identity=metrics["resume_identity"],
+        expected_identity_sha256=metrics["resume_identity_sha256"],
+        expected_epoch=metrics["best_epoch"],
+        expected_metric=metrics["validation"],
+        expected_selection_role="primary",
+    )
+    architecture = train.architecture_configuration(runtime)
+    if (
+        selected.get("architecture") != architecture
+        or selected.get("configuration") != config
+        or selected.get("condition") != metrics["condition"]
+    ):
+        raise AuditError(
+            "Selected checkpoint architecture/recipe/condition disagrees with immutable metrics"
+        )
+    cache_folder = (
+        args.data_root.expanduser().resolve()
+        / "conductance_gat/matched_benchmark_v1"
+        / metrics["dataset"]
+    )
+    cache_artifacts = {
+        str(path): _sha(path) for path in (cache_folder / "data.pt", cache_folder / "manifest.json")
+    }
+    artifacts = {**evidence["artifacts"], **cache_artifacts}
+    try:
+        payload, protocol = train.load_dataset(
+            metrics["dataset"], args.data_root, allow_download=False
+        )
+        for name in ("data_sha256", "split_sha256"):
+            if protocol.get(name) != metrics["protocol"].get(name):
+                raise AuditError(f"Official data fingerprint mismatch: {name}")
+        verification["cache_split_hashes_verified"] = True
+        source, indices, source_metadata = validation_source(payload, config)
+        torch.cuda.reset_peak_memory_stats(device)
+        model = train.GraphConditionedConductanceNodeClassifier(
+            payload["graphs"][0]["x"].shape[1],
+            payload["classes"],
+            **architecture,
+            conductance_mode=train.CONDITIONS[metrics["condition"]]["conductance_mode"],
+            max_log_conductance=config["max_log_conductance"],
+            edge_chunk_size=config["edge_chunk_size"],
+        ).to(device)
+        model.load_state_dict(selected["model_state"], strict=True)
+        parameter_count = sum(p.numel() for p in model.parameters())
+        if parameter_count != metrics.get("total_parameters"):
+            raise AuditError("Restored model parameter count differs from recorded metrics")
+        model.eval()
+        result, resources = _monitored_stage_audit(
+            model,
+            source,
+            indices,
+            device=device,
+            precision=config["precision"],
+            reference_steps=args.reference_steps,
+            reference_tolerance=args.reference_tolerance,
+        )
+        return {
+            "dataset": metrics["dataset"],
+            "condition": metrics["condition"],
+            "metrics_path": str(evidence["metrics_path"]),
+            "configuration": config,
+            "selected_epoch": metrics["best_epoch"],
+            "selected_validation": metrics["validation"],
+            "checkpoint_sha256": metrics["checkpoint_sha256"],
+            "source_provenance": provenance,
+            "verification": dict(verification),
+            "validation_source": source_metadata,
+            "hardware": hardware,
+            "total_parameters": parameter_count,
+            "historical_diagnostics": historical_diagnostics(metrics, evidence["history"]),
+            "audit": result,
+            "resources": resources,
+            "files_written": False,
+            "test_evaluated": False,
+            "optimizer_created": False,
+        }
+    finally:
+        primary_error = sys.exception()
+        try:
+            verify_unchanged(artifacts)
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            primary_error.add_note(
+                "Immutable input verification also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+
+
+def _score(value) -> str:
+    return f"{100 * value:.4f}%" if _number(value) else "unavailable"
+
+
+def _resource_value(observation, *, divisor: float = 1.0, suffix: str = "") -> str:
+    if not isinstance(observation, dict):
+        return "unavailable (not recorded)"
+    value = observation.get("value")
+    if not _number(value):
+        return f"unavailable ({observation.get('reason') or 'no finite observation'})"
+    return f"{value / divisor:.3f}{suffix}"
+
+
+def human_resources(resource: dict) -> list[str]:
+    telemetry = resource.get("runtime_observability") or {}
+    summary = telemetry.get("summary", {})
+    series = telemetry.get("interval_series", {})
+    return [
+        "  measured GPU SM mean="
+        + _resource_value(resource.get("gpu_utilization"), suffix="%")
+        + " (device-wide); CPU process="
+        + _resource_value(summary.get("average_cpu_percent_of_one_core"), suffix="% of one core"),
+        "  sampled RSS max="
+        + _resource_value(
+            series.get("process_resident_bytes", {}).get("maximum"),
+            divisor=2**30,
+            suffix=" GiB",
+        )
+        + "; host RAM min available="
+        + _resource_value(
+            series.get("system_available_bytes", {}).get("minimum"),
+            divisor=2**30,
+            suffix=" GiB",
+        )
+        + f"; interval samples={telemetry.get('background_sample_count', 'unavailable')}",
+        *(
+            ["  resource sampler errors: " + "; ".join(telemetry["sampler_errors"])]
+            if telemetry.get("sampler_errors")
+            else []
+        ),
+    ]
+
+
+def sampling_summary(historical: dict) -> dict:
+    rows = historical.get("batch_observations")
+    if not isinstance(rows, list) or not rows:
+        return {"available": False, "reason": "Historical per-batch sizes/overlap not recorded"}
+    latest = rows[-1]
+    batches = latest["batches"]
+    observations = [
+        batch["sampling_observation"]
+        for batch in batches
+        if isinstance(batch.get("sampling_observation"), dict)
+    ]
+    pairs = [
+        observation["previous_physical_batch_overlap"]
+        for observation in observations
+        if isinstance(observation.get("previous_physical_batch_overlap"), dict)
+    ]
+    context_pairs = [
+        pair
+        for observation in observations
+        for pair in observation.get("within_batch_context_overlap", [])
+    ]
+
+    def span(values):
+        finite = [value for value in values if _number(value)]
+        return {"min": min(finite), "max": max(finite)} if finite else None
+
+    return {
+        "available": True,
+        "scope": "last recorded epoch only",
+        "epoch": latest["epoch"],
+        "batches": len(batches),
+        "nodes": span(batch.get("nodes") for batch in batches),
+        "physical_edges": span(batch.get("physical_edges") for batch in batches),
+        "previous_batch_node_jaccard": span(pair.get("nodes", {}).get("jaccard") for pair in pairs),
+        "previous_batch_edge_jaccard": span(
+            pair.get("physical_edges", {}).get("jaccard") for pair in pairs
+        ),
+        "within_batch_node_jaccard": span(
+            pair.get("nodes", {}).get("jaccard") for pair in context_pairs
+        ),
+        "overlap_available": bool(pairs or context_pairs),
+        "saturated_batch_count": sum(
+            observation.get("cluster_budget_saturated") is True for observation in observations
+        )
+        if observations
+        else None,
+    }
+
+
+def human_condition(row: dict) -> str:
+    title = (
+        f"[{row.get('dataset', '?')} | {row.get('condition', '?')}] {row.get('metrics_path', '')}"
+    )
+    if row.get("execution_status") == "failed":
+        lines = [title, "  FAILED: " + row["error"]]
+        lines.extend("  " + note for note in row.get("error_notes", []))
+        if "resources" in row:
+            lines.extend(human_resources(row["resources"]))
+        return "\n".join(lines)
+    audit = row["audit"]
+    lines = [
+        title,
+        f"  selected epoch={row['selected_epoch']}; "
+        f"saved validation={_score(row['selected_validation'])}",
+        f"  execution={audit['execution_status']}; contribution={audit['contribution_status']} "
+        "(not a usefulness certificate)",
+    ]
+    for name, observation in audit["interventions"].items():
+        delta = observation.get("delta_from_learned")
+        lines.append(
+            f"  {name}: validation={_score(observation.get('metric'))}; delta={100 * delta:+.4f} pp"
+            if _number(delta)
+            else f"  {name}: validation={_score(observation.get('metric'))}"
+        )
+        lines.append(
+            f"    logit relative-L2={observation.get('logit_relative_l2')}; "
+            f"max-abs={observation.get('logit_max_abs')}; "
+            f"prediction changed={_score(observation.get('prediction_changed_fraction'))}"
+        )
+    lines.append(
+        "  reference contract: " + json.dumps(audit.get("reference_contract"), ensure_ascii=False)
+    )
+    historical = row["historical_diagnostics"]
+    if isinstance(historical.get("layers"), list):
+        for layer in historical["layers"]:
+            lines.append(
+                f"  recorded layer={layer['layer']}: C CV={layer['c_cv']}; beta mean/min/max="
+                f"{layer['beta_mean']}/{layer['beta_min']}/{layer['beta_max']}"
+            )
+    for local in audit.get("local_layer_comparisons", []):
+        reference = local["operator_deployed_vs_reference"]
+        one = local.get("operator_c_one_vs_deployed")
+        one_difference = one.get("relative_l2") if isinstance(one, dict) else None
+        lines.append(
+            f"  local batch/layer={local['batch']}/{local['layer']}: "
+            f"C=1 operator relative-L2={one_difference}; "
+            f"K-reference relative-L2={reference.get('relative_l2')}; "
+            f"residual tolerance reached={local.get('reference_tolerance_reached_by_graph')}"
+        )
+        baseline_residual = local.get("baseline_solver", {}).get("projected_gradient_rms_final")
+        reference_residual = local.get("reference_solver", {}).get("projected_gradient_rms_final")
+        lines.append(
+            f"    frozen H/B/W/beta: C relative-L2="
+            f"{local.get('c_deployed_vs_reference', {}).get('relative_l2')}; "
+            f"residual deployed/reference={baseline_residual}/{reference_residual}; "
+            f"tolerance={local.get('reference_residual_tolerance')}; exact optimum=False"
+        )
+    samples = sampling_summary(historical)
+    lines.append("  historical sampling: " + json.dumps(samples, ensure_ascii=False))
+    resource = row["resources"]
+    lines.append(
+        f"  condition peak allocated={resource['peak_allocated_bytes'] / 2**30:.3f} GiB; "
+        f"elapsed={resource['elapsed_seconds']:.2f}s"
+    )
+    lines.extend(human_resources(resource))
+    return "\n".join(lines)
+
+
+def aggregate_verification(rows: list[dict]) -> dict:
+    keys = ("source_verified", "cache_split_hashes_verified")
+    result = {}
+    for key in keys:
+        values = [row.get("verification", {}).get(key) for row in rows]
+        result[key] = all(values) if values and all(isinstance(v, bool) for v in values) else None
+    result["scope"] = (
+        "all requested conditions; null means at least one condition failed before verification"
+    )
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    rows: list[dict] = []
+    try:
+        if not (args.device == "cuda" or args.device.startswith("cuda:")):
+            raise AuditError("CUDA is required; CPU fallback is forbidden")
+        paths = discover_conditions(args.root)
+        evidences = [inspect_evidence(path) for path in paths]
+        import torch
+
+        from research.conductance_gat.v5 import train
+
+        device = torch.device(args.device)
+        train._require_cuda(device)
+        for index, evidence in enumerate(evidences, start=1):
+            if not args.json:
+                print(
+                    f"[{index}/{len(evidences)}] validation-only audit: "
+                    f"{evidence['metrics_path'].parent}",
+                    flush=True,
+                )
+            try:
+                row = audit_condition(evidence, args, device)
+            except (AuditError, RuntimeError, ValueError, OSError, KeyError, TypeError) as exc:
+                row = {
+                    "execution_status": "failed",
+                    "dataset": evidence["metrics"]["dataset"],
+                    "condition": evidence["metrics"]["condition"],
+                    "metrics_path": str(evidence["metrics_path"]),
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "error_notes": list(getattr(exc, "__notes__", [])),
+                    "verification": dict(evidence.get("audit_verification", {})),
+                    "files_written": False,
+                    "test_evaluated": False,
+                }
+                if hasattr(exc, "audit_resources"):
+                    row["resources"] = exc.audit_resources
+            rows.append(row)
+            if not args.json:
+                print(human_condition(row), flush=True)
+        failures = sum(row.get("execution_status") == "failed" for row in rows)
+        peaks = [
+            row["resources"]["peak_allocated_bytes"]
+            for row in rows
+            if _number(row.get("resources", {}).get("peak_allocated_bytes"))
+        ]
+        report = {
+            "execution_status": "failed" if failures else "passed",
+            "conditions": rows,
+            "failed_conditions": failures,
+            "files_written": False,
+            "test_evaluated": False,
+            "verification": aggregate_verification(rows),
+            "scope": (
+                "full official validation only; cache integrity checks split metadata, "
+                "never test predictions"
+            ),
+            "aggregate_resources": {
+                "max_condition_peak_allocated_bytes": max(peaks) if peaks else None,
+                "scope": (
+                    "maximum of individually reset condition peaks; not the last condition peak"
+                ),
+                "missing_conditions": failures,
+            },
+        }
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, allow_nan=False))
+        else:
+            print(
+                f"Audit: {report['execution_status']}; {len(rows)} conditions; {failures} failed. "
+                "No files written, no training, no test evaluation."
+            )
+        return 1 if failures else 0
+    except (AuditError, RuntimeError, ValueError, OSError, KeyError, TypeError, ImportError) as exc:
+        error = {
+            "execution_status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "files_written": False,
+            "test_evaluated": False,
+            "conditions": rows,
+        }
+        print(
+            json.dumps(error, ensure_ascii=False)
+            if args.json
+            else f"Audit failed: {error['error']}"
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # scripts/benchmark_speed.py
 
 ````python
@@ -59446,11 +61174,27 @@ def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist)
         raise ValueError("the official training split is empty")
     # A configured batch larger than the complete split is never silently reduced.
     natural_maximum = max(maximum, baseline)
+    context_workers = (
+        primary["track"] == "conductance"
+        and getattr(parsed[0], "sampling", None) == "cluster_disjoint"
+    )
+    requested_workers = parsed[0].sample_context_workers if context_workers else parsed[0].workers
+    if context_workers:
+        context_size = parsed[0].sample_context_seed_batch_size
+        if baseline < maximum and baseline % context_size:
+            raise ValueError("physical calibration floor must group whole sampling contexts")
+        if any(
+            item.sampling != "cluster_disjoint"
+            or item.sample_context_seed_batch_size != context_size
+            for item in parsed
+        ):
+            raise ValueError("paired calibration must use identical disjoint context rules")
+        entry["worker_axis"] = "sample_context_workers"
     workers = worker_candidates(
-        parsed[0].workers, allocated_cpu_count(), applicable=axis == "graphs"
+        requested_workers, allocated_cpu_count(), applicable=axis == "graphs" or context_workers
     )
     # Explore neighbouring loader policies, rather than launching hundreds of workers at once.
-    workers = [value for value in workers if value <= max(2, parsed[0].workers * 2)]
+    workers = [value for value in workers if value <= max(2, requested_workers * 2)]
     entry.update(
         track=primary["track"],
         profile=primary["profile"],
@@ -59548,6 +61292,9 @@ def _calibrate_group(jobs: list[dict[str, Any]], entry: dict[str, Any], persist)
         current = min(current * 2, natural_maximum)
     chosen = choose_candidate(entry["candidates"], baseline, selection_policy=selection_policy)
     selected = {"batch_size": parsed[0].batch_size, "workers": chosen["workers"]}
+    if context_workers:
+        selected["workers"] = 0
+        selected["sample_context_workers"] = chosen["workers"]
     if primary["track"] == "conductance":
         selected["sample_seed_batch_size"] = parsed[0].sample_seed_batch_size
     selected["sample_seed_batch_size" if axis == "sampled_seed_nodes" else "batch_size"] = chosen[
@@ -59610,6 +61357,14 @@ def verify_plan_inputs(
             if contract not in entry["job_contracts"]:
                 raise ValueError("resource plan training recipe or measured device differs")
             args = _training_args(job)
+            expected_worker_axis = (
+                "sample_context_workers"
+                if entry["track"] == "conductance"
+                and getattr(args, "sampling", None) == "cluster_disjoint"
+                else None
+            )
+            if entry.get("worker_axis") != expected_worker_axis:
+                raise ValueError("resource plan worker axis differs from the sampling recipe")
             key = (
                 "sample_seed_batch_size"
                 if entry["batch_axis"] == "sampled_seed_nodes"
@@ -64495,11 +66250,15 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     DEFAULT_BETA_INITIAL,
     DEFAULT_BETA_PARAMETERIZATION,
     HARDWARE_PROFILES,
+    SAMPLING_CHOICES,
     SCALE_PROFILES,
     add_conductance_arguments,
+    add_sampling_context_arguments,
     beta_configuration,
     conductance_arguments_configuration,
     learning_budget_arguments_configuration,
+    resolve_sampling,
+    sampling_context_configuration,
 )
 from research.conductance_gat.v5.protocol import (  # noqa: E402
     CONDITIONS as V5_CONDITIONS,
@@ -64609,13 +66368,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--v5-beta-min", type=float)
     result.add_argument("--v5-beta-max", type=float)
     add_conductance_arguments(result, prefix="v5-")
+    add_sampling_context_arguments(result, prefix="v5-")
     result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
     result.add_argument(
         "--resource-plan", type=Path, help="Immutable measured V5 batch/worker plan"
     )
     result.add_argument(
         "--v5-sampling",
-        choices=("auto", "full", "neighbor", "cluster"),
+        choices=SAMPLING_CHOICES,
         default="auto",
         help="V5 only: auto uses cluster sampling for ogbn-arxiv and full otherwise",
     )
@@ -64669,6 +66429,7 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("portable V5 PPI requires graph batch-size at least 2")
     _v5_beta_configuration(args)
     _v5_conductance_configuration(args)
+    sampling_context_configuration(args, prefix="v5_")
     if "v5" in args.versions:
         _v5_learning_budget_configuration(args)
     if not re.fullmatch(r"cuda(?::[0-9]+)?", args.device):
@@ -64696,6 +66457,9 @@ def _v5_execution(
         batch_size = args.v5_ppi_batch_size or profile["ppi_batch_size"]
     loader_workers = shared.workers_for_dataset(dataset, args.workers)
     sample_seed_batch_size = args.v5_sample_seed_batch_size or profile["sample_seed_batch_size"]
+    context = sampling_context_configuration(
+        args, prefix="v5_", sampling=resolve_sampling(dataset, args.v5_sampling)
+    )
     plan = getattr(args, "resolved_resource_plan", None)
     if plan is not None:
         if profile_name is None:
@@ -64727,8 +66491,22 @@ def _v5_execution(
         batch_size = measured["batch_size"]
         sample_seed_batch_size = measured["sample_seed_batch_size"]
         loader_workers = measured["workers"]
+        if context:
+            if "sample_context_workers" not in measured:
+                raise ValueError("disjoint sampling needs its own measured context worker plan")
+            explicit_workers = getattr(args, "v5_sample_context_workers", None)
+            if (
+                explicit_workers is not None
+                and explicit_workers != measured["sample_context_workers"]
+            ):
+                raise ValueError(
+                    "--v5-sample-context-workers conflicts with "
+                    "the immutable measured resource plan"
+                )
+            context["sample_context_workers"] = measured["sample_context_workers"]
     return {
         "hardware_profile": args.hardware_profile,
+        **context,
         "precision": profile["precision"],
         "tf32": profile["tf32"],
         "batch_size": batch_size,
@@ -64872,13 +66650,7 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             command[command.index("--workers") + 1] = str(child_workers)
                             batch_position = command.index("--batch-size") + 1
                             command[batch_position] = str(execution["batch_size"])
-                            sampling = (
-                                "cluster"
-                                if args.v5_sampling == "auto" and dataset == "ogbn-arxiv"
-                                else "full"
-                                if args.v5_sampling == "auto"
-                                else args.v5_sampling
-                            )
+                            sampling = resolve_sampling(dataset, args.v5_sampling)
                             if dataset == "ppi" and sampling != "full":
                                 raise ValueError("V5 PPI is inductive and requires full sampling")
                             command += [
@@ -64904,6 +66676,12 @@ def make_jobs(args: argparse.Namespace, run_dir: Path) -> list[dict[str, Any]]:
                             ]
                             for name, value in _v5_beta_configuration(args).items():
                                 command += ["--" + name.replace("_", "-"), str(value)]
+                            for name in (
+                                "sample_context_seed_batch_size",
+                                "sample_context_workers",
+                            ):
+                                if name in execution:
+                                    command += ["--" + name.replace("_", "-"), str(execution[name])]
                             for name, value in _v5_conductance_configuration(args).items():
                                 command += ["--" + name.replace("_", "-"), str(value)]
                             for name, value in _v5_learning_budget_configuration(args).items():
@@ -65360,6 +67138,11 @@ def _load_child(job: dict[str, Any]) -> dict[str, Any]:
             raise RuntimeError("V5 child learning budget does not match its requested recipe")
         expected_configuration = {
             "hardware_profile": execution["hardware_profile"],
+            **{
+                name: execution[name]
+                for name in ("sample_context_seed_batch_size", "sample_context_workers")
+                if name in execution
+            },
             "precision": execution["precision"],
             "tf32": execution["tf32"],
             "batch_size": execution["batch_size"],
@@ -65636,6 +67419,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
         "effective_min_free_gb": _effective_min_free_gb(args),
         "v5_sampling": args.v5_sampling,
+        **(
+            {"v5_sampling_context": sampling_context_configuration(args, prefix="v5_")}
+            if sampling_context_configuration(args, prefix="v5_")
+            else {}
+        ),
         "v5_num_neighbors": list(args.v5_num_neighbors),
         "v5_sample_seed_batch_size": args.v5_sample_seed_batch_size,
         "v5_activation_checkpoint": args.v5_activation_checkpoint,
@@ -66899,12 +68687,16 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     DEFAULT_BETA_PARAMETERIZATION,
     DEFAULT_DATASETS,
     HARDWARE_PROFILES,
+    SAMPLING_CHOICES,
     SCALE_PROFILES,
     SUITE,
     add_conductance_arguments,
+    add_sampling_context_arguments,
     beta_configuration,
     conductance_arguments_configuration,
     learning_budget_arguments_configuration,
+    resolve_sampling,
+    sampling_context_configuration,
 )
 from scripts import run_conductance_factorial as shared  # noqa: E402
 from scripts.check_dependencies import (  # noqa: E402
@@ -66914,7 +68706,6 @@ from scripts.check_dependencies import (  # noqa: E402
 )
 
 RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,119}")
-SAMPLING_CHOICES = ("auto", "full", "neighbor", "cluster")
 TRANSDUCTIVE_DATASETS = frozenset({"cora", "citeseer", "pubmed", "ogbn-arxiv"})
 
 
@@ -66936,6 +68727,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--beta-min", type=float)
     result.add_argument("--beta-max", type=float)
     add_conductance_arguments(result)
+    add_sampling_context_arguments(result)
     result.add_argument("--model-seed", type=int, default=0)
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
@@ -66997,9 +68789,7 @@ def _architecture(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _sampling(dataset: str, requested: str) -> str:
-    if requested != "auto":
-        return requested
-    return "cluster" if dataset == "ogbn-arxiv" else "full"
+    return resolve_sampling(dataset, requested)
 
 
 def _resolved_execution(args: argparse.Namespace, dataset: str) -> dict[str, Any]:
@@ -67010,6 +68800,7 @@ def _resolved_execution(args: argparse.Namespace, dataset: str) -> dict[str, Any
     loader_workers = shared.workers_for_dataset(dataset, args.workers)
     return {
         "hardware_profile": args.hardware_profile,
+        **sampling_context_configuration(args, sampling=_sampling(dataset, args.sampling)),
         "precision": profile["precision"],
         "tf32": profile["tf32"],
         "batch_size": batch_size,
@@ -67039,6 +68830,7 @@ def _effective_min_free_gb(args: argparse.Namespace) -> float:
 
 def _validate(args: argparse.Namespace) -> None:
     learning_budget_arguments_configuration(args)
+    sampling_context_configuration(args)
     if not args.datasets or len(set(args.datasets)) != len(args.datasets):
         raise ValueError("datasets must be nonempty and contain no duplicates")
     if args.model_seed < 0:
@@ -67080,7 +68872,7 @@ def _validate(args: argparse.Namespace) -> None:
         raise ValueError("minimum free GPU memory must be finite and nonnegative")
     if args.run_id is not None and RUN_ID_PATTERN.fullmatch(args.run_id) is None:
         raise ValueError("run ID must be 1-120 letters, digits, underscores, or hyphens")
-    if args.sampling in {"neighbor", "cluster"} and any(
+    if args.sampling in {"neighbor", "cluster", "cluster_disjoint"} and any(
         dataset not in TRANSDUCTIVE_DATASETS for dataset in args.datasets
     ):
         raise ValueError("neighbor/cluster sampling is transductive-only; PPI requires full")
@@ -67142,6 +68934,9 @@ def make_jobs(
             ]
             for name, value in architecture.items():
                 command.extend(("--" + name.replace("_", "-"), str(value)))
+            for name in ("sample_context_seed_batch_size", "sample_context_workers"):
+                if name in execution:
+                    command.extend(("--" + name.replace("_", "-"), str(execution[name])))
             for name, value in learning_budget.items():
                 if value is not None:
                     command.extend(("--" + name.replace("_", "-"), str(value)))
@@ -67238,6 +69033,9 @@ def _load_metrics(job: dict[str, Any]) -> dict[str, Any]:
     ):
         raise RuntimeError("child learning budget does not match the requested V5 recipe")
     execution = job["execution"]
+    for key in ("sample_context_seed_batch_size", "sample_context_workers"):
+        if key in execution and configuration.get(key) != execution[key]:
+            raise RuntimeError(f"child sampling context mismatch for {key}")
     for key in ("hardware_profile", "precision", "tf32", "edge_chunk_size"):
         if configuration.get(key) != execution[key]:
             raise RuntimeError(f"child hardware execution mismatch for {key}")
@@ -67373,6 +69171,7 @@ def main(argv: list[str] | None = None) -> int:
             dataset: shared.workers_for_dataset(dataset, args.workers) for dataset in args.datasets
         },
         "sampling": args.sampling,
+        **sampling_context_configuration(args),
         "num_neighbors": list(args.num_neighbors),
         "device": args.device,
         "min_free_gb": args.min_free_gb,
@@ -71182,10 +72981,13 @@ from research.conductance_gat.v5.protocol import (  # noqa: E402
     BETA_PARAMETERIZATIONS,
     DEFAULT_BETA_INITIAL,
     DEFAULT_BETA_PARAMETERIZATION,
+    SAMPLING_CHOICES,
     add_conductance_arguments,
+    add_sampling_context_arguments,
     beta_configuration,
     conductance_arguments_configuration,
     learning_budget_arguments_configuration,
+    sampling_context_configuration,
 )
 from scripts.process_safety import (  # noqa: E402
     close_owned_child_stdout,
@@ -71367,6 +73169,9 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--v5-beta-min", type=float)
     result.add_argument("--v5-beta-max", type=float)
     add_conductance_arguments(result, prefix="v5-")
+    result.add_argument("--v5-sampling", choices=SAMPLING_CHOICES, default="auto")
+    result.add_argument("--v5-num-neighbors", type=int, nargs="+", default=[15, 10])
+    add_sampling_context_arguments(result, prefix="v5-")
     result.add_argument(
         "--v5-activation-checkpoint",
         action=argparse.BooleanOptionalAction,
@@ -71393,6 +73198,13 @@ def parser() -> argparse.ArgumentParser:
 
 
 def _validate(args: argparse.Namespace) -> None:
+    sampling_context_configuration(args, prefix="v5_")
+    if not args.v5_num_neighbors or any(value < 1 for value in args.v5_num_neighbors):
+        raise ValueError("V5 sampling fanouts must be positive")
+    if (args.v5_sampling != "auto" or args.v5_num_neighbors != [15, 10]) and (
+        "conductance" not in args.tracks or "v5" not in args.conductance_versions
+    ):
+        raise ValueError("V5 sampling options require the Conductance V5 track")
     for label, values in (
         ("tracks", args.tracks),
         ("conductance versions", args.conductance_versions),
@@ -71626,6 +73438,20 @@ def make_jobs(args: argparse.Namespace, run_id: str) -> list[dict[str, Any]]:
             for name, value in _v5_beta_configuration(args).items():
                 command += ["--v5-" + name.replace("_", "-"), str(value)]
             if "v5" in args.conductance_versions:
+                if args.v5_sampling != "auto" or args.v5_num_neighbors != [15, 10]:
+                    command += [
+                        "--v5-sampling",
+                        args.v5_sampling,
+                        "--v5-num-neighbors",
+                        *(str(v) for v in args.v5_num_neighbors),
+                    ]
+                for name, value in sampling_context_configuration(args, prefix="v5_").items():
+                    # A measured plan owns context workers; retain the requested seed context.
+                    if name == "sample_context_workers" and getattr(
+                        args, "resolved_resource_plan", None
+                    ):
+                        continue
+                    command += ["--v5-" + name.replace("_", "-"), str(value)]
                 for name, value in _v5_conductance_configuration(args).items():
                     command += ["--v5-" + name.replace("_", "-"), str(value)]
                 for name, value in _v5_learning_budget_configuration(args).items():
@@ -72415,6 +74241,19 @@ def _config_payload(
         },
         "min_free_gb": args.min_free_gb,
         "v5_beta": _v5_beta_configuration(args),
+        **(
+            {
+                "v5_sampling_recipe": {
+                    "sampling": args.v5_sampling,
+                    "num_neighbors": list(args.v5_num_neighbors),
+                    **sampling_context_configuration(args, prefix="v5_"),
+                }
+            }
+            if "conductance" in args.tracks
+            and "v5" in args.conductance_versions
+            and (args.v5_sampling != "auto" or args.v5_num_neighbors != [15, 10])
+            else {}
+        ),
         "v5_conductance": (
             _v5_conductance_configuration(args)
             if "conductance" in args.tracks and "v5" in args.conductance_versions
@@ -76519,6 +78358,7 @@ IGNORED_COMMAND_OPTIONS = {
     "--batch-size",
     "--workers",
     "--sample-seed-batch-size",
+    "--sample-context-workers",
     "--resource-plan",
 }
 
@@ -76880,6 +78720,13 @@ def _validate_entry(
         ):
             raise ValueError("selection budget differs from the certified dataset/physical axis")
     worker_options = entry.get("worker_candidates")
+    context_worker_axis = entry.get("worker_axis") == "sample_context_workers"
+    if entry.get("worker_axis") not in {None, "sample_context_workers"}:
+        raise ValueError("unknown measured worker axis")
+    if context_worker_axis and not (
+        entry["track"] == "conductance" and axis == "sampled_seed_nodes"
+    ):
+        raise ValueError("context workers require a sampled Conductance seed batch")
     if not isinstance(worker_options, list) or not worker_options:
         raise ValueError("resource plan has no measured worker candidates")
     for count in worker_options:
@@ -76887,14 +78734,16 @@ def _validate_entry(
     if len(set(worker_options)) != len(worker_options):
         raise ValueError("worker candidates must be unique")
     if (
-        axis == "graphs"
+        (axis == "graphs" or context_worker_axis)
         and allocated_cpus is not None
         and allocated_cpus > 1
         and len(worker_options) < 2
     ):
         raise ValueError("graph loading needs multiple measured worker candidates")
-    if axis != "graphs" and worker_options != [0]:
+    if axis != "graphs" and not context_worker_axis and worker_options != [0]:
         raise ValueError("GPU-resident/full graph execution has no DataLoader worker axis")
+    if context_worker_axis and any(value < 1 for value in worker_options):
+        raise ValueError("disjoint context workers must be positive")
     candidates = entry.get("candidates")
     if not isinstance(candidates, list) or not candidates:
         raise ValueError("resource plan has no measured candidates")
@@ -76915,6 +78764,12 @@ def _validate_entry(
                 raise ValueError("measurement condition is missing")
             measured.add((condition, seed))
             if item["status"] == "passed":
+                if context_worker_axis and (
+                    item.get("worker_axis") != "sample_context_workers"
+                    or item.get("loader_workers") != 0
+                    or item.get("sample_context_workers") != key[1]
+                ):
+                    raise ValueError("measurement context worker axis differs from its candidate")
                 if (
                     _positive(item.get("batch_size"), "measured batch") != key[0]
                     or _positive(item.get("workers"), "measured workers", zero=True) != key[1]
@@ -76949,12 +78804,16 @@ def _validate_entry(
     expected_fields = {"batch_size", "workers"}
     if entry["track"] == "conductance":
         expected_fields.add("sample_seed_batch_size")
+    if context_worker_axis:
+        expected_fields.add("sample_context_workers")
     if set(selected) != expected_fields:
         raise ValueError("selected resource fields are incomplete or unknown")
     for field, value in selected.items():
         _positive(value, f"selected {field}", zero=field == "workers")
     if axis in {"sampled_seed_nodes", "full_graph"} and selected["batch_size"] != 1:
         raise ValueError("a transductive graph cannot be duplicated to fill a graph batch")
+    if context_worker_axis and selected["workers"] != 0:
+        raise ValueError("disjoint contexts are CPU sampling threads, not DataLoader workers")
     physical_key = (
         "sample_seed_batch_size"
         if entry.get("batch_axis") == "sampled_seed_nodes"
@@ -76962,7 +78821,8 @@ def _validate_entry(
     )
     if (
         selected.get(physical_key) != best["batch_size"]
-        or selected.get("workers") != best["workers"]
+        or selected.get("sample_context_workers" if context_worker_axis else "workers")
+        != best["workers"]
     ):
         raise ValueError("selected resources do not match the best safe measured candidate")
     reason = entry.get("stop_reason")
@@ -77288,6 +79148,17 @@ def validate_job_plan(
         if (entry["track"], entry["profile"], entry["dataset"]) == (track, profile, dataset):
             if expected not in entry["job_contracts"]:
                 raise ValueError("training command differs from the measured scientific recipe")
+            disjoint = any(
+                token == "--sampling=cluster_disjoint"
+                or (
+                    token == "--sampling"
+                    and index + 1 < len(command)
+                    and command[index + 1] == "cluster_disjoint"
+                )
+                for index, token in enumerate(command)
+            )
+            if disjoint != (entry.get("worker_axis") == "sample_context_workers"):
+                raise ValueError("training sampling recipe differs from the measured worker axis")
             for key, value in entry["selected"].items():
                 option = "--" + key.replace("_", "-")
                 if command.count(option) != 1:
@@ -80987,6 +82858,558 @@ def test_native_linux_rename_success_and_no_replace(tmp_path):
         archive._rename_no_replace(source, empty_destination)
     assert (source / "another.pt").is_file()
     assert empty_destination.is_dir() and not list(empty_destination.iterdir())
+````
+
+# tests/test_audit_v5_stages.py
+
+````python
+"""CPU-only unit tests of audit provenance/CLI contracts, not a GPU experiment."""
+
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+
+import pytest
+
+from scripts import audit_v5_stages as audit
+
+
+def _write_json(path: Path, value) -> str:
+    path.write_text(json.dumps(value), encoding="utf-8")
+    return audit._sha(path)
+
+
+@pytest.fixture
+def evidence(tmp_path):
+    folder = tmp_path / "v5/reference/model-seed-0/cora/shared_dynamic_c"
+    folder.mkdir(parents=True)
+    checkpoint = folder / "best.pt"
+    checkpoint.write_bytes(b"explicit unit fixture; not a training checkpoint")
+    config = {
+        "conductance_backend": "optimization",
+        "training_schedule": "joint",
+        "solver_cost_scaling": "width_scaled",
+        "beta_parameterization": "sigmoid",
+        "beta_initial": 0.5,
+        "hidden_channels": 256,
+        "layers": 8,
+        "heads": 8,
+        "ffn_multiplier": 4,
+        "solver_steps": 8,
+        "batch_size": 1,
+    }
+    protocol = {
+        "data_sha256": "a" * 64,
+        "split_sha256": {"train": "b" * 64, "validation": "c" * 64, "test": "d" * 64},
+    }
+    identity = {
+        "research_suite": audit.SUITE,
+        "dataset": "cora",
+        "condition": "shared_dynamic_c",
+        "configuration": config,
+        "dataset_protocol": protocol,
+        "dataset_protocol_sha256": audit._canonical(protocol),
+        "cache_sha256": protocol["data_sha256"],
+        "source_sha256": audit.BASELINE_SOURCES,
+    }
+    rows = [{"epoch": 1, "validation": 0.6}, {"epoch": 2, "validation": 0.7}]
+    history_sha = _write_json(folder / "history.json", rows)
+    metrics = {
+        "schema_version": 1,
+        "research_suite": audit.SUITE,
+        "status": "passed",
+        "dataset": "cora",
+        "condition": "shared_dynamic_c",
+        "configuration": config,
+        "protocol": protocol,
+        "resume_identity": identity,
+        "resume_identity_sha256": audit._canonical(identity),
+        "cache_sha256": protocol["data_sha256"],
+        "source_sha256": audit.BASELINE_SOURCES,
+        "best_epoch": 2,
+        "validation": 0.7,
+        "checkpoint_sha256": audit._sha(checkpoint),
+        "history_sha256": history_sha,
+        "checkpoint_selection": {"primary_epoch": 2, "primary_validation": 0.7, "test_used": False},
+        "evaluation_split": "validation",
+        "test_evaluated": False,
+    }
+    path = folder / "metrics.json"
+    _write_json(path, metrics)
+    return path, metrics
+
+
+def _args(root: Path):
+    return ["--root", str(root), "--reference-steps", "64", "--reference-tolerance", "0.001"]
+
+
+def test_reference_budget_and_tolerance_are_explicit(tmp_path):
+    parser = audit.build_parser()
+    for missing in (
+        ["--root", str(tmp_path)],
+        ["--root", str(tmp_path), "--reference-steps", "64"],
+    ):
+        with pytest.raises(SystemExit):
+            parser.parse_args(missing)
+    args = parser.parse_args(_args(tmp_path))
+    assert args.device == "cuda:0"
+    assert args.reference_steps == 64
+    assert args.reference_tolerance == 0.001
+    assert args.json is False
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("--reference-steps", "0"),
+        ("--reference-steps", "-1"),
+        ("--reference-tolerance", "0"),
+        ("--reference-tolerance", "nan"),
+        ("--reference-tolerance", "inf"),
+    ],
+)
+def test_invalid_reference_arguments(tmp_path, option, value):
+    args = _args(tmp_path)
+    args[args.index(option) + 1] = value
+    with pytest.raises(SystemExit):
+        audit.build_parser().parse_args(args)
+
+
+def test_discovery_and_inspection_are_read_only(evidence, tmp_path):
+    path, metrics = evidence
+    before = {p: audit._sha(p) for p in path.parent.iterdir()}
+    assert audit.discover_conditions(tmp_path) == [path.resolve()]
+    inspected = audit.inspect_evidence(path)
+    assert inspected["metrics"] == metrics
+    assert inspected["history"][-1]["epoch"] == 2
+    audit.verify_unchanged(inspected["artifacts"])
+    assert {p: audit._sha(p) for p in path.parent.iterdir()} == before
+
+
+def test_missing_root_and_missing_results(tmp_path):
+    with pytest.raises(audit.AuditError, match="existing"):
+        audit.discover_conditions(tmp_path / "missing")
+    with pytest.raises(audit.AuditError, match="No V5"):
+        audit.discover_conditions(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["checkpoint", "history", "identity", "selection", "test", "config", "protocol", "source"],
+)
+def test_rejects_inconsistent_or_mutated_evidence(evidence, change):
+    path, metrics = evidence
+    if change == "checkpoint":
+        (path.parent / "best.pt").write_bytes(b"changed")
+    elif change == "history":
+        _write_json(path.parent / "history.json", [{"epoch": 2, "validation": 0.1}])
+    elif change == "identity":
+        metrics["resume_identity_sha256"] = "f" * 64
+    elif change == "selection":
+        metrics["checkpoint_selection"]["primary_epoch"] = 1
+    elif change == "test":
+        metrics["test_evaluated"] = True
+    elif change == "config":
+        metrics["configuration"] = {**metrics["configuration"], "layers": 1}
+    elif change == "protocol":
+        metrics["protocol"] = {**metrics["protocol"], "data_sha256": "f" * 64}
+    elif change == "source":
+        metrics["source_sha256"] = {"bad": "f" * 64}
+    _write_json(path, metrics)
+    with pytest.raises(audit.AuditError):
+        audit.inspect_evidence(path)
+
+
+def test_rejects_uncorrected_recipe_even_with_valid_identity(evidence):
+    path, metrics = evidence
+    metrics["configuration"]["solver_cost_scaling"] = "legacy_unit"
+    metrics["resume_identity_sha256"] = audit._canonical(metrics["resume_identity"])
+    _write_json(path, metrics)
+    with pytest.raises(audit.AuditError, match="explicitly corrected"):
+        audit.inspect_evidence(path)
+
+
+def test_rejects_history_selection_mismatch_even_with_valid_history_hash(evidence):
+    path, metrics = evidence
+    metrics["history_sha256"] = _write_json(
+        path.parent / "history.json", [{"epoch": 2, "validation": 0.5}]
+    )
+    _write_json(path, metrics)
+    with pytest.raises(audit.AuditError, match="Selected epoch"):
+        audit.inspect_evidence(path)
+
+
+def test_recorded_diagnostics_do_not_invent_missing_overlap_or_gradient(evidence):
+    path, _ = evidence
+    inspected = audit.inspect_evidence(path)
+    result = audit.historical_diagnostics(inspected["metrics"], inspected["history"])
+    assert result["sampling_observations"]["value"] is None
+    assert "not recorded" in result["sampling_observations"]["reason"]
+    assert result["first_active_conductance_gradient"] == "unavailable"
+
+
+def test_recorded_layer_solver_and_sampling_observations_retained():
+    layers = [
+        {
+            "layer": 0,
+            "conductance": {"mean": 1.0, "cv": 0.2},
+            "beta": {"mean": 0.4, "min": 0.3, "max": 0.5},
+            "conductance_gradient_norm": 0.001,
+            "c_optimization": {"projected_gradient_rms_final": [0.06]},
+        }
+    ]
+    rows = [{"epoch": 1, "layers": layers, "sampling_observation": {"nodes": 11, "overlap": 0.5}}]
+    result = audit.historical_diagnostics({}, rows)
+    assert result["layers"][0]["c_cv"] == 0.2
+    assert result["epoch_layers"][0]["layers"][0]["conductance_gradient_norm"] == 0.001
+    assert result["sampling_observations"][0]["sampling_observation"]["overlap"] == 0.5
+
+
+def test_source_compatibility_is_exact_and_readonly(monkeypatch):
+    baseline = audit.BASELINE_SOURCES
+    monkeypatch.setattr(audit, "AUDIT_SOURCE_OVERRIDES", {})
+    result = audit.verify_sources(copy.deepcopy(baseline), copy.deepcopy(baseline))
+    assert result["training_resume_authorized"] is False
+    assert result["historical_repair"] is None
+    modified = {**baseline, "research/conductance_gat/v5/model.py": "1" * 64}
+    with pytest.raises(audit.AuditError, match="exact reviewed"):
+        audit.verify_sources(baseline, modified)
+    with pytest.raises(ValueError):
+        audit.verify_sources(modified, baseline)
+
+
+def test_packaged_audit_source_pins_match_live_implementation():
+    pytest.importorskip("torch")
+    from research.conductance_gat.v5.train import implementation_source_hashes
+
+    current = implementation_source_hashes()
+    verified = audit.verify_sources(audit.BASELINE_SOURCES, current)
+    assert verified["training_resume_authorized"] is False
+    assert verified["audit_sources"] == current
+
+
+def test_reviewed_added_source_requires_exact_digest(monkeypatch):
+    added = {"research/conductance_gat/v5/stage_audit.py": "2" * 64}
+    monkeypatch.setattr(audit, "AUDIT_SOURCE_OVERRIDES", added)
+    current = {**audit.BASELINE_SOURCES, **added}
+    assert (
+        audit.verify_sources(audit.BASELINE_SOURCES, current)["training_resume_authorized"] is False
+    )
+    with pytest.raises(audit.AuditError):
+        audit.verify_sources(audit.BASELINE_SOURCES, audit.BASELINE_SOURCES)
+
+
+def test_immutable_guard_detects_mutation(evidence):
+    path, _ = evidence
+    original = audit.inspect_evidence(path)["artifacts"]
+    (path.parent / "best.pt").write_bytes(b"mutation")
+    with pytest.raises(audit.AuditError, match="changed during"):
+        audit.verify_unchanged(original)
+
+
+def test_cpu_device_rejected_without_running_a_model(tmp_path, capsys):
+    result = audit.main([*_args(tmp_path), "--device", "cpu", "--json"])
+    report = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert report["files_written"] is False
+    assert report["test_evaluated"] is False
+    assert "CPU fallback" in report["error"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_validation_source_never_selects_test_split():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch_geometric")
+
+    class ValidationOnly(dict):
+        def __getitem__(self, key):
+            assert key == "validation", "audit attempted to select a non-validation split"
+            return super().__getitem__(key)
+
+    payload = {
+        "dataset": "cora",
+        "graphs": [
+            {
+                "x": torch.ones(4, 2),
+                "y": torch.zeros(4, dtype=torch.long),
+                "incidence_edge_index": torch.tensor([[0, 1], [1, 2]]),
+            }
+        ],
+        "splits": ValidationOnly(validation=torch.tensor([False, True, False, True])),
+    }
+    source, indices, metadata = audit.validation_source(payload, {})
+    assert indices.tolist() == [1, 3]
+    assert source.x.shape == (4, 2)
+    assert metadata["used_fraction"] == 1.0
+
+
+def test_pii_validation_preserves_disjoint_batch_and_all_graphs():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torch_geometric")
+    graph = {
+        "x": torch.ones(3, 2),
+        "y": torch.zeros(3, 2),
+        "incidence_edge_index": torch.tensor([[0, 1], [1, 2]]),
+    }
+    payload = {"dataset": "ppi", "graphs": [graph, graph], "splits": {"validation": [0, 1]}}
+    source, indices, metadata = audit.validation_source(
+        payload, {"workers": 0, "pin_memory": False, "batch_size": 20}
+    )
+    batches = list(source)
+    assert indices is None and len(batches) == 1
+    assert batches[0].num_graphs == 2
+    assert batches[0].incidence_edge_index.max().item() == 5
+    assert metadata["saved_graph_batch_size"] == 20
+    assert metadata["actual_physical_batch_size"] == 2
+
+
+def test_json_duplicate_and_nonfinite_rejected(tmp_path):
+    path = tmp_path / "invalid.json"
+    for data in ('{"x": 1, "x": 2}', '{"x": NaN}'):
+        path.write_text(data, encoding="utf-8")
+        with pytest.raises(audit.AuditError):
+            audit._read(path)
+
+
+def test_aggregate_verification_does_not_certify_unexecuted_conditions():
+    complete = {"verification": {"source_verified": True, "cache_split_hashes_verified": True}}
+    assert audit.aggregate_verification([complete])["cache_split_hashes_verified"] is True
+    missing = {"execution_status": "failed", "verification": {"source_verified": False}}
+    report = audit.aggregate_verification([complete, missing])
+    assert report["cache_split_hashes_verified"] is None
+    assert report["source_verified"] is False
+    assert audit.aggregate_verification([])["cache_split_hashes_verified"] is None
+
+
+def test_sampling_summary_retains_latest_batch_sizes_without_invented_overlap():
+    result = audit.sampling_summary(
+        {
+            "batch_observations": [
+                {"epoch": 3, "batches": [{"nodes": 10, "physical_edges": 20}]},
+                {
+                    "epoch": 4,
+                    "batches": [
+                        {"nodes": 13, "physical_edges": 21, "sampling_observation": None},
+                        {"nodes": 11, "physical_edges": 19, "sampling_observation": None},
+                    ],
+                },
+            ],
+        }
+    )
+    assert result["epoch"] == 4
+    assert result["nodes"] == {"min": 11, "max": 13}
+    assert result["physical_edges"] == {"min": 19, "max": 21}
+    assert result["previous_batch_node_jaccard"] is None
+    assert result["overlap_available"] is False
+    assert result["saturated_batch_count"] is None
+
+
+def test_sampling_summary_reads_actual_overlap():
+    result = audit.sampling_summary(
+        {
+            "batch_observations": [
+                {
+                    "epoch": 2,
+                    "batches": [
+                        {
+                            "nodes": 14,
+                            "physical_edges": 20,
+                            "sampling_observation": {
+                                "cluster_budget_saturated": True,
+                                "previous_physical_batch_overlap": {
+                                    "nodes": {"jaccard": 0.7},
+                                    "physical_edges": {"jaccard": 0.6},
+                                },
+                                "within_batch_context_overlap": [{"nodes": {"jaccard": 0.3}}],
+                            },
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    assert result["previous_batch_node_jaccard"] == {"min": 0.7, "max": 0.7}
+    assert result["previous_batch_edge_jaccard"] == {"min": 0.6, "max": 0.6}
+    assert result["within_batch_node_jaccard"] == {"min": 0.3, "max": 0.3}
+    assert result["saturated_batch_count"] == 1
+
+
+def test_human_report_contains_c_intervention_and_frozen_input_reference_details():
+    row = {
+        "dataset": "cora",
+        "condition": "shared_dynamic_c",
+        "metrics_path": "/unit/metrics.json",
+        "selected_epoch": 2,
+        "selected_validation": 0.7,
+        "historical_diagnostics": {"layers": "unavailable", "batch_observations": "unavailable"},
+        "resources": {"peak_allocated_bytes": 100, "elapsed_seconds": 3.0},
+        "audit": {
+            "execution_status": "passed",
+            "contribution_status": "observed",
+            "interventions": {
+                "c_one": {
+                    "metric": 0.68,
+                    "delta_from_learned": -0.02,
+                    "logit_relative_l2": 0.12,
+                    "logit_max_abs": 0.8,
+                    "prediction_changed_fraction": 0.06,
+                }
+            },
+            "reference_contract": {"reference_steps": 64, "exact_optimum_claimed": False},
+            "local_layer_comparisons": [
+                {
+                    "batch": 0,
+                    "layer": 1,
+                    "operator_deployed_vs_reference": {"relative_l2": 0.03},
+                    "operator_c_one_vs_deployed": {"relative_l2": 0.04},
+                    "c_deployed_vs_reference": {"relative_l2": 0.05},
+                    "baseline_solver": {"projected_gradient_rms_final": [0.07]},
+                    "reference_solver": {"projected_gradient_rms_final": [0.002]},
+                    "reference_residual_tolerance": 0.001,
+                    "reference_tolerance_reached_by_graph": [False],
+                }
+            ],
+        },
+    }
+    output = audit.human_condition(row)
+    for expected in (
+        "68.0000%",
+        "-2.0000 pp",
+        "logit relative-L2=0.12",
+        "prediction changed=6.0000%",
+        "frozen H/B/W/beta",
+        "C relative-L2=0.05",
+        "residual deployed/reference=[0.07]/[0.002]",
+        "tolerance=0.001",
+        "exact optimum=False",
+        "not recorded",
+    ):
+        assert expected in output
+    assert "not a usefulness certificate" in output
+
+
+def _mock_monitor(monkeypatch, *, forward_error=None, finish_error=None):
+    torch = pytest.importorskip("torch")
+    from chartgat import observability
+    from research.conductance_gat.v5 import stage_audit
+
+    events = []
+    missing_gpu = {"value": None, "reason": "synthetic CPU test has no GPU measurement"}
+    report = {
+        "summary": {
+            "run_average_gpu_sm_utilization_percent": missing_gpu,
+            "average_cpu_percent_of_one_core": {"value": 125.0, "reason": None},
+        },
+        "interval_series": {
+            "process_resident_bytes": {"maximum": {"value": 2**30, "reason": None}},
+            "system_available_bytes": {"minimum": {"value": 4 * 2**30, "reason": None}},
+        },
+        "background_sample_count": 2,
+        "sampler_errors": [],
+    }
+
+    class Monitor:
+        active = False
+
+        def __init__(self, device):
+            assert device.type == "cpu"
+
+        def start(self):
+            events.append("start")
+            self.active = True
+
+        def finish(self, **peaks):
+            events.append("finish")
+            assert peaks == {"peak_allocated_bytes": None, "peak_reserved_bytes": None}
+            self.active = False
+            if finish_error is not None:
+                raise finish_error
+            return report
+
+    monitor = Monitor(torch.device("cpu"))
+    monkeypatch.setattr(observability, "RuntimeResourceMonitor", lambda device: monitor)
+
+    def forward(*args, **kwargs):
+        events.append("forward")
+        assert monitor.active
+        assert kwargs["reference_steps"] == 64
+        if forward_error is not None:
+            raise forward_error
+        return {"execution_status": "passed", "scope": "synthetic mocked CPU forward"}
+
+    monkeypatch.setattr(stage_audit, "audit_stage_roles", forward)
+    return monitor, events, report
+
+
+def _run_mocked_monitor():
+    import torch
+
+    return audit._monitored_stage_audit(
+        object(),
+        object(),
+        None,
+        device=torch.device("cpu"),
+        precision="fp32",
+        reference_steps=64,
+        reference_tolerance=0.001,
+    )
+
+
+def test_interval_monitor_actually_wraps_forward_and_preserves_full_report(monkeypatch):
+    monitor, events, expected = _mock_monitor(monkeypatch)
+    result, resources = _run_mocked_monitor()
+    assert events == ["start", "forward", "finish"]
+    assert not monitor.active
+    assert result["execution_status"] == "passed"
+    assert resources["runtime_observability"] is expected
+    assert resources["gpu_utilization"]["value"] is None
+    assert resources["peak_allocated_bytes"] is None
+    json.dumps(resources, allow_nan=False)
+    text = "\n".join(audit.human_resources(resources))
+    assert "synthetic CPU test has no GPU measurement" in text
+    assert "CPU process=125.000% of one core" in text
+    assert "RSS max=1.000 GiB" in text
+    assert "host RAM min available=4.000 GiB" in text
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_forward_failure_still_finishes_monitor_and_keeps_primary_error(monkeypatch, error_type):
+    primary = error_type("synthetic forward failure")
+    monitor, events, expected = _mock_monitor(monkeypatch, forward_error=primary)
+    with pytest.raises(error_type) as caught:
+        _run_mocked_monitor()
+    assert caught.value is primary
+    assert events == ["start", "forward", "finish"]
+    assert not monitor.active
+    assert primary.audit_resources["runtime_observability"] is expected
+
+
+def test_monitor_cleanup_failure_is_visible_without_masking_forward_failure(monkeypatch):
+    primary = RuntimeError("synthetic primary")
+    cleanup = ValueError("synthetic finish failure")
+    monitor, events, _ = _mock_monitor(monkeypatch, forward_error=primary, finish_error=cleanup)
+    with pytest.raises(RuntimeError) as caught:
+        _run_mocked_monitor()
+    assert caught.value is primary
+    assert events == ["start", "forward", "finish"] and not monitor.active
+    assert any("synthetic finish failure" in note for note in primary.__notes__)
+    resources = primary.audit_resources
+    assert resources["runtime_observability"] is None
+    assert resources["resource_monitor"]["cleanup_errors"][0]["stage"] == (
+        "runtime_resource_monitor_finish"
+    )
+
+
+def test_monitor_failure_after_successful_forward_is_not_hidden(monkeypatch):
+    cleanup = RuntimeError("synthetic finish failure")
+    monitor, events, _ = _mock_monitor(monkeypatch, finish_error=cleanup)
+    with pytest.raises(RuntimeError) as caught:
+        _run_mocked_monitor()
+    assert caught.value is cleanup
+    assert events == ["start", "forward", "finish"] and not monitor.active
+    assert any("numerical forwards completed" in note for note in cleanup.__notes__)
 ````
 
 # tests/test_benchmark_speed.py
@@ -97184,9 +99607,31 @@ def test_historical_attestation_does_not_treat_an_existing_helper_as_an_addition
     assert not compat.snapshots_match(before, after)
 
 
+def _git_source_map(prefix, root, revision, names):
+    blobs = subprocess.run(
+        [*prefix, "cat-file", "--batch"],
+        cwd=root,
+        input="".join(f"{revision}:{name}\n" for name in names).encode(),
+        capture_output=True,
+        check=True,
+    ).stdout
+    position, result = 0, {}
+    for name in names:
+        boundary = blobs.index(b"\n", position)
+        header = blobs[position:boundary].split()
+        assert header[1] == b"blob"
+        size = int(header[2])
+        start = boundary + 1
+        result[name] = hashlib.sha256(blobs[start : start + size]).hexdigest()
+        position = start + size + 1
+    return result
+
+
 @pytest.mark.parametrize("inventory", ["rich", "conductance", "resource"])
-def test_registered_performance_repair_covers_real_server_source_inventory(inventory):
-    """Read actual base Git blobs; normalize only the explicit server-LF test view."""
+def test_registered_historical_performance_inventory_does_not_authorize_current_sources(
+    inventory, tmp_path
+):
+    """Exact 51da -> 8da blobs are historical; today's full inventory must fail."""
     from scripts import run_conductance_scaling, run_rich_scaling, training_resource_plan
 
     git = shutil.which("git")
@@ -97195,6 +99640,7 @@ def test_registered_performance_repair_covers_real_server_source_inventory(inven
     root = compat.ROOT
     prefix = [git, "-c", f"safe.directory={root.as_posix()}"]
     base = compat.PERFORMANCE_BASE_COMMIT
+    target = "8da06cacec59515d84c08d892315e4c8ecfd5b5b"
     listing = subprocess.run(
         [*prefix, "ls-tree", "-r", "--name-only", base],
         cwd=root,
@@ -97203,6 +99649,12 @@ def test_registered_performance_repair_covers_real_server_source_inventory(inven
     )
     if listing.returncode:
         pytest.skip("read-only real-source regression requires the recorded base commit")
+    target_listing = subprocess.run(
+        [*prefix, "ls-tree", "-r", "--name-only", target],
+        cwd=root,
+        capture_output=True,
+        check=True,
+    )
     providers = {
         "rich": run_rich_scaling._source_snapshot,
         "conductance": run_conductance_scaling._source_snapshot,
@@ -97217,33 +99669,40 @@ def test_registered_performance_repair_covers_real_server_source_inventory(inven
     }
     if any(current[name] != linux_current[name] for name in compat.COMPATIBILITY_SOURCE_FILES):
         pytest.skip("server-LF compatibility fixture requires LF helper and registry files")
-    known = set(listing.stdout.decode().splitlines())
-    names = sorted(name for name in current if name in known)
-    blobs = subprocess.run(
-        [*prefix, "cat-file", "--batch"],
-        cwd=root,
-        input="".join(f"{base}:{name}\n" for name in names).encode(),
-        capture_output=True,
-        check=True,
-    ).stdout
-    position, previous = 0, {}
-    for name in names:
-        boundary = blobs.index(b"\n", position)
-        header = blobs[position:boundary].split()
-        assert header[1] == b"blob"
-        size = int(header[2])
-        start = boundary + 1
-        previous[name] = hashlib.sha256(blobs[start : start + size]).hexdigest()
-        position = start + size + 1
+    known_before = set(listing.stdout.decode().splitlines())
+    known_target = set(target_listing.stdout.decode().splitlines())
+    # Use the inventory's path scope but fetch historical content only. Current
+    # additions stay out of this historical pair, and are included UNFILTERED
+    # in the mandatory live-upgrade rejection below.
+    target_names = sorted(set(current) & known_target)
+    previous_names = sorted(set(target_names) & known_before)
+    previous = _git_source_map(prefix, root, base, previous_names)
+    historical_target = _git_source_map(prefix, root, target, target_names)
     registered = set(recorded["performance_repair"]["changes"]) | {compat.REGISTRY_SOURCE}
     assert {
-        name for name in linux_current if previous.get(name) != linux_current[name]
+        name for name in historical_target if previous.get(name) != historical_target[name]
     } <= registered
-    evidence = compat.require_source_compatibility(previous, linux_current)
+    evidence = compat.require_source_compatibility(previous, historical_target)
     assert evidence["patch_id"] == compat.PERFORMANCE_PATCH_ID
     assert evidence["resource_plan_semantics"] == (
         "historical measured selection retained; no new measurement claimed"
     )
+
+    assert linux_current != historical_target
+    for source in (previous, historical_target):
+        assert not compat.snapshots_match(source, linux_current)
+        with pytest.raises(ValueError):
+            compat.require_source_compatibility(source, linux_current)
+
+    artifact = tmp_path / "debug-preserved-source-manifest.json"
+    record = {"source_sha256": copy.deepcopy(historical_target), "epoch": 66}
+    artifact.write_text(json.dumps(record), encoding="utf-8")
+    original_bytes = artifact.read_bytes()
+    original_record = copy.deepcopy(record)
+    with pytest.raises(ValueError):
+        compat.adopt_source_snapshot(record, linux_current)
+    assert record == original_record
+    assert artifact.read_bytes() == original_bytes
 ````
 
 # tests/test_process_safety.py
@@ -102764,6 +105223,1126 @@ def test_source_snapshot_covers_tree_model_runner_and_shared_math() -> None:
         assert name in snapshot and len(snapshot[name]) == 64
 ````
 
+# tests/test_v5_disjoint_resource_plan.py
+
+````python
+"""Synthetic CPU calibration/certificate tests; no actual GPU measurement."""
+
+from __future__ import annotations
+
+import copy
+
+import pytest
+
+from research.conductance_gat.v5 import batch_calibration as probe
+from scripts import calibrate_training_resources as calibration
+from scripts import training_resource_plan as plans
+
+
+def command(condition="fixed_c", mode="cluster_disjoint", *, physical=64, context=32):
+    result = [
+        "python",
+        "-B",
+        "-m",
+        "research.conductance_gat.v5.train",
+        "--dataset",
+        "ogbn-arxiv",
+        "--condition",
+        condition,
+        "--output-dir",
+        "debug-contract-not-created",
+        "--device",
+        "cuda:0",
+        "--hardware-profile",
+        "a6000-48gb",
+        "--sampling",
+        mode,
+        "--batch-size",
+        "1",
+        "--workers",
+        "0",
+        "--sample-seed-batch-size",
+        str(physical),
+        "--model-seed",
+        "0",
+    ]
+    if mode == "cluster_disjoint":
+        result += [
+            "--sample-context-seed-batch-size",
+            str(context),
+            "--sample-context-workers",
+            "2",
+        ]
+    return result
+
+
+def jobs(mode="cluster_disjoint", **kwargs):
+    return [
+        {
+            "track": "conductance",
+            "profile": "reference",
+            "dataset": "ogbn-arxiv",
+            "condition": condition,
+            "model_seed": 0,
+            "device": "cuda:0",
+            "command": command(condition, mode, **kwargs),
+        }
+        for condition in ("fixed_c", "shared_dynamic_c")
+    ]
+
+
+def debug_report(job, size, workers, mode):
+    rate = size * max(workers, 1) * 10
+    report = {
+        "status": "passed",
+        "condition": job["condition"],
+        "model_seed": 0,
+        "batch_size": size,
+        "workers": workers,
+        "unit": "explicit_synthetic_seed_nodes",
+        "elapsed_seconds": 3.0,
+        "processed_units": rate * 3,
+        "samples_per_second": rate,
+        "optimizer_steps": 5,
+        "optimizer_state_bytes": 1024,
+        "measurement_steps_requested": 5,
+        "warmup_steps_requested": 2,
+        "minimum_measure_seconds_requested": 3.0,
+        "peak_allocated_bytes": 8 * 1024**3,
+        "peak_reserved_bytes": 10 * 1024**3,
+        "total_memory_bytes": 48 * 1024**3,
+        "free_bytes_before": 46 * 1024**3,
+        "calibration_only": True,
+        "final_training_performed": False,
+        "resource_observability": {"synthetic_fixture_not_gpu_evidence": True},
+    }
+    if mode == "cluster_disjoint":
+        report.update(
+            worker_axis="sample_context_workers", loader_workers=0, sample_context_workers=workers
+        )
+    return report
+
+
+def debug_calibration(
+    monkeypatch, mode="cluster_disjoint", *, physical=64, context=32, maximum=256
+):
+    group = jobs(mode, physical=physical, context=context)
+    payload = {"synthetic_fixture_only": True}
+    calls, snapshots, entry = [], [], {}
+    monkeypatch.setattr(calibration, "allocated_cpu_count", lambda: 8)
+    monkeypatch.setattr(
+        calibration,
+        "_load_group",
+        lambda *_: (
+            payload,
+            {"data_sha256": "a" * 64, "split_sha256": "b" * 64},
+            maximum,
+            "sampled_seed_nodes",
+        ),
+    )
+
+    def measure(job, loaded, args, *, batch_size, workers):
+        assert loaded is payload
+        # This remains the DataLoader axis, even while the context pool is searched.
+        assert args.workers == 0
+        calls.append((batch_size, workers, job["condition"]))
+        return debug_report(job, batch_size, workers, mode)
+
+    monkeypatch.setattr(calibration, "_measure", measure)
+    calibration._calibrate_group(group, entry, lambda: snapshots.append(copy.deepcopy(entry)))
+    return group, entry, calls, snapshots
+
+
+def test_disjoint_calibration_searches_context_threads_and_multiple_physical_batches(monkeypatch):
+    _, entry, calls, snapshots = debug_calibration(monkeypatch)
+    assert entry["worker_axis"] == "sample_context_workers"
+    assert entry["worker_candidates"] == [2, 4]
+    assert {size for size, _, _ in calls} == {64, 128, 256}
+    assert len(calls) == 3 * 2 * 2
+    assert entry["selected"] == {
+        "batch_size": 1,
+        "sample_seed_batch_size": 256,
+        "workers": 0,
+        "sample_context_workers": 4,
+    }
+    assert entry["stop_reason"] == "complete_training_split_boundary"
+    assert entry["selection"]["paired_resources_identical"]
+    assert snapshots and snapshots[-1] == entry
+    plans._validate_entry(entry, [0], allocated_cpus=8)
+    selected = plans.selected_resources(
+        {"entries": [entry]}, track="conductance", profile="reference", dataset="ogbn-arxiv"
+    )
+    assert selected == entry["selected"] and selected is not entry["selected"]
+
+
+def test_legacy_sampler_still_has_only_worker_zero_and_no_context_selection(monkeypatch):
+    _, entry, calls, _ = debug_calibration(monkeypatch, mode="cluster")
+    assert entry["worker_candidates"] == [0]
+    assert all(workers == 0 for _, workers, _ in calls)
+    assert "worker_axis" not in entry
+    assert "sample_context_workers" not in entry["selected"]
+    assert entry["selected"]["workers"] == 0
+    plans._validate_entry(entry, [0], allocated_cpus=8)
+
+
+def test_actual_probe_candidate_changes_context_pool_not_loader_or_model_dimensions():
+    original = calibration._training_args(jobs()[0])
+    candidate = probe._candidate_args(original, 128, 4)
+    assert original.sample_seed_batch_size == 64 and original.sample_context_workers == 2
+    assert candidate.sample_seed_batch_size == 128 and candidate.sample_context_workers == 4
+    assert candidate.workers == original.workers == 0
+    for key in (
+        "hidden_channels",
+        "layers",
+        "heads",
+        "ffn_multiplier",
+        "num_neighbors",
+        "sample_context_seed_batch_size",
+        "solver_steps",
+        "epochs",
+        "patience",
+    ):
+        assert getattr(candidate, key) == getattr(original, key)
+    with pytest.raises(ValueError, match="positive worker"):
+        probe._candidate_args(original, 128, 0)
+    with pytest.raises(ValueError, match="cannot reduce"):
+        probe._candidate_args(original, 32, 4)
+    legacy = calibration._training_args(jobs("cluster")[0])
+    assert probe._candidate_args(legacy, 128, 0).workers == 0
+    with pytest.raises(ValueError, match="not DataLoader workers"):
+        probe._candidate_args(legacy, 128, 4)
+
+
+def test_invalid_physical_floor_rejected_before_any_probe(monkeypatch):
+    calls = []
+    monkeypatch.setattr(calibration, "_load_group", lambda *_: ({}, {}, 256, "sampled_seed_nodes"))
+    monkeypatch.setattr(calibration, "_measure", lambda *a, **kw: calls.append((a, kw)))
+    with pytest.raises(ValueError, match="whole sampling contexts"):
+        calibration._calibrate_group(jobs(physical=96, context=64), {}, lambda: None)
+    assert not calls
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_pair",
+        "missing_worker_probe",
+        "one_physical_batch",
+        "partial_measurement_window",
+    ],
+)
+def test_incomplete_disjoint_measurements_are_not_certified(monkeypatch, mutation):
+    _, entry, _, _ = debug_calibration(monkeypatch)
+    if mutation == "missing_pair":
+        entry["candidates"][0]["measurements"].pop()
+    elif mutation == "missing_worker_probe":
+        entry["candidates"].pop(0)
+    elif mutation == "one_physical_batch":
+        entry["candidates"] = [item for item in entry["candidates"] if item["batch_size"] == 64]
+    else:
+        entry["candidates"][0]["measurements"][0]["measurement_steps_requested"] = 6
+    with pytest.raises(ValueError):
+        plans._validate_entry(entry, [0], allocated_cpus=8)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_axis",
+        "unknown_axis",
+        "loader_selected",
+        "missing_selected_context_worker",
+        "selected_unmeasured_worker",
+        "report_loader_axis",
+        "report_loader_workers",
+        "report_wrong_context_workers",
+        "report_missing_context_workers",
+    ],
+)
+def test_disjoint_certificate_enforces_separate_measured_worker_axis(monkeypatch, mutation):
+    _, entry, _, _ = debug_calibration(monkeypatch)
+    report = entry["candidates"][0]["measurements"][0]
+    if mutation == "missing_axis":
+        entry.pop("worker_axis")
+    elif mutation == "unknown_axis":
+        entry["worker_axis"] = "invented_workers"
+    elif mutation == "loader_selected":
+        entry["selected"]["workers"] = 4
+    elif mutation == "missing_selected_context_worker":
+        entry["selected"].pop("sample_context_workers")
+    elif mutation == "selected_unmeasured_worker":
+        entry["selected"]["sample_context_workers"] = 8
+    elif mutation == "report_loader_axis":
+        report["worker_axis"] = "loader_workers"
+    elif mutation == "report_loader_workers":
+        report["loader_workers"] = 2
+    elif mutation == "report_wrong_context_workers":
+        report["sample_context_workers"] = 4
+    else:
+        report.pop("sample_context_workers")
+    with pytest.raises(ValueError):
+        plans._validate_entry(entry, [0], allocated_cpus=8)
+
+
+def selected_command(entry, condition="fixed_c"):
+    result = command(condition)
+    for field, value in entry["selected"].items():
+        option = "--" + field.replace("_", "-")
+        result[result.index(option) + 1] = str(value)
+    return result
+
+
+def validate_job(entry, argv):
+    plans.validate_job_plan(
+        {"entries": [entry]},
+        track="conductance",
+        profile="reference",
+        dataset="ogbn-arxiv",
+        condition="fixed_c",
+        model_seed=0,
+        command=argv,
+    )
+
+
+def test_command_binds_context_recipe_but_selected_workers_are_verified_separately(monkeypatch):
+    _, entry, _, _ = debug_calibration(monkeypatch)
+    actual = selected_command(entry)
+    validate_job(entry, actual)
+    wrong_workers = actual.copy()
+    wrong_workers[wrong_workers.index("--sample-context-workers") + 1] = "2"
+    assert plans.command_identity(wrong_workers) == plans.command_identity(actual)
+    with pytest.raises(ValueError, match="measured selection"):
+        validate_job(entry, wrong_workers)
+    wrong_context = actual.copy()
+    wrong_context[wrong_context.index("--sample-context-seed-batch-size") + 1] = "3"
+    assert plans.command_identity(wrong_context) != plans.command_identity(actual)
+    with pytest.raises(ValueError, match="scientific recipe"):
+        validate_job(entry, wrong_context)
+
+
+def test_context_command_cannot_use_legacy_worker_axis_even_with_matching_digest(monkeypatch):
+    _, entry, _, _ = debug_calibration(monkeypatch, mode="cluster")
+    argv = command()
+    argv[argv.index("--sample-seed-batch-size") + 1] = str(
+        entry["selected"]["sample_seed_batch_size"]
+    )
+    entry["job_contracts"][0]["argv_sha256"] = plans.command_identity(argv)
+    with pytest.raises(ValueError, match="context|axis|disjoint"):
+        validate_job(entry, argv)
+
+
+def test_legacy_command_cannot_claim_context_worker_measurement(monkeypatch):
+    _, entry, _, _ = debug_calibration(monkeypatch)
+    argv = selected_command(entry)
+    argv[argv.index("--sampling") + 1] = "cluster"
+    entry["job_contracts"][0]["argv_sha256"] = plans.command_identity(argv)
+    with pytest.raises(ValueError, match="context|axis|disjoint"):
+        validate_job(entry, argv)
+````
+
+# tests/test_v5_disjoint_runner_contract.py
+
+````python
+"""CPU-only orchestration/configuration tests; no training or result writes."""
+
+from __future__ import annotations
+
+import json
+import sys
+from types import ModuleType, SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.v5 import protocol, train
+from scripts import run_conductance_scaling as scaling
+from scripts import run_conductance_v5 as standalone
+from scripts import run_rich_scaling as rich
+
+CONTEXT_KEYS = {"sample_context_seed_batch_size", "sample_context_workers"}
+
+
+def context_options(prefix=""):
+    return [
+        f"--{prefix}sampling",
+        "auto_disjoint",
+        f"--{prefix}sample-context-seed-batch-size",
+        "2048",
+        f"--{prefix}sample-context-workers",
+        "2",
+    ]
+
+
+@pytest.mark.parametrize("dataset", ["ogbn-arxiv", "ppi", "cora", "citeseer", "pubmed"])
+def test_legacy_auto_stable_and_new_recipe_explicit(dataset):
+    assert protocol.resolve_sampling(dataset, "auto") == (
+        "cluster" if dataset == "ogbn-arxiv" else "full"
+    )
+    assert protocol.resolve_sampling(dataset, "auto_disjoint") == (
+        "cluster_disjoint" if dataset == "ogbn-arxiv" else "full"
+    )
+    assert protocol.resolve_sampling(dataset, "neighbor") == "neighbor"
+
+
+@pytest.mark.parametrize("size", [None, 0, -1, True, 2.5])
+def test_context_recipe_requires_explicit_valid_size(size):
+    args = SimpleNamespace(
+        sampling="auto_disjoint", sample_context_seed_batch_size=size, sample_context_workers=2
+    )
+    with pytest.raises(ValueError, match="positive explicit context"):
+        protocol.sampling_context_configuration(args)
+
+
+def test_context_options_do_not_leak_into_full_dataset_execution():
+    args = SimpleNamespace(
+        sampling="auto_disjoint", sample_context_seed_batch_size=2048, sample_context_workers=2
+    )
+    assert protocol.sampling_context_configuration(args, sampling="full") == {}
+    assert protocol.sampling_context_configuration(args, sampling="cluster_disjoint") == {
+        "sample_context_seed_batch_size": 2048,
+        "sample_context_workers": 2,
+    }
+    args.sampling = "auto"
+    with pytest.raises(ValueError, match="explicit cluster_disjoint/auto_disjoint"):
+        protocol.sampling_context_configuration(args)
+
+
+@pytest.mark.parametrize("workers", [0, -1, True, 1.5])
+def test_invalid_context_workers_are_not_silently_coerced(workers):
+    args = SimpleNamespace(
+        sampling="cluster_disjoint",
+        sample_context_seed_batch_size=2048,
+        sample_context_workers=workers,
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        protocol.sampling_context_configuration(args)
+
+
+def test_standalone_execution_and_real_child_configuration_match_without_writes(tmp_path):
+    args = standalone.parser().parse_args(
+        [
+            "--datasets",
+            "ogbn-arxiv",
+            "ppi",
+            "cora",
+            "--hardware-profile",
+            "a6000-48gb",
+            "--sample-seed-batch-size",
+            "8192",
+            *context_options(),
+        ]
+    )
+    standalone._validate(args)
+    jobs = standalone.make_jobs(args, tmp_path / "not_created", standalone._architecture(args))
+    assert len(jobs) == 6
+    for job in jobs:
+        child = train.build_parser().parse_args(job["command"][5:])
+        train.validate_args(child)
+        configuration = train.configuration(child)
+        if job["dataset"] == "ogbn-arxiv":
+            assert child.sampling == "cluster_disjoint"
+            assert child.sample_seed_batch_size == 8192
+            assert child.sample_context_seed_batch_size == 2048
+            assert child.sample_context_workers == 2
+            for key in CONTEXT_KEYS:
+                assert configuration[key] == job["execution"][key]
+        else:
+            assert child.sampling == "full"
+            assert not CONTEXT_KEYS.intersection(configuration)
+            assert not CONTEXT_KEYS.intersection(job["execution"])
+            assert "--sample-context-seed-batch-size" not in job["command"]
+            assert "--sample-context-workers" not in job["command"]
+        assert child.hidden_channels == 256 and child.layers == 8 and child.heads == 8
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_nested_rich_scaling_forwards_sampling_and_context_to_real_train_parser(tmp_path):
+    options = [
+        "--tracks",
+        "conductance",
+        "--conductance-versions",
+        "v5",
+        "--profiles",
+        "reference",
+        "--model-seeds",
+        "0",
+        "--hardware-profile",
+        "a6000-48gb",
+        "--conductance-v5-sample-seed-batch-size",
+        "8192",
+        "--v5-num-neighbors",
+        "15",
+        "10",
+        *context_options("v5-"),
+    ]
+    args = rich.parser().parse_args(options)
+    rich._validate(args)
+    jobs = rich.make_jobs(args, "disjoint-plan")
+    assert len(jobs) == 1
+    scale_args = scaling.parser().parse_args(jobs[0]["command"][3:])
+    scaling._validate(scale_args)
+    assert scale_args.v5_sampling == "auto_disjoint"
+    assert scale_args.v5_num_neighbors == [15, 10]
+    child_jobs = scaling.make_jobs(scale_args, tmp_path / "not_created")
+    assert len(child_jobs) == 10
+    for job in child_jobs:
+        child = train.build_parser().parse_args(job["command"][5:])
+        train.validate_args(child)
+        if child.dataset == "ogbn-arxiv":
+            assert child.sampling == "cluster_disjoint"
+            assert child.sample_context_seed_batch_size == 2048
+            assert child.sample_context_workers == 2
+            assert child.sample_seed_batch_size == 8192
+        else:
+            assert child.sampling == "full"
+            assert child.sample_context_seed_batch_size is None
+            assert child.sample_context_workers is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_dry_run_emits_new_context_contract_without_processes_or_result_directories(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(rich, "_run_logged", lambda *_: pytest.fail("dry run launched a child"))
+    code = rich.main(
+        [
+            "--tracks",
+            "conductance",
+            "--conductance-versions",
+            "v5",
+            "--profiles",
+            "reference",
+            "--model-seeds",
+            "0",
+            "--hardware-profile",
+            "a6000-48gb",
+            "--results-root",
+            str(tmp_path),
+            "--run-id",
+            "disjoint-plan",
+            "--dry-run",
+            *context_options("v5-"),
+        ]
+    )
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "--v5-sampling auto_disjoint" in output
+    assert "--v5-sample-context-seed-batch-size 2048" in output
+    assert "--v5-sample-context-workers 2" in output
+    assert "execution_classification=plan_only" in output
+    assert "no files or directories were written" in output
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_legacy_configs_are_not_polluted_and_new_sampling_has_distinct_job_identity(tmp_path):
+    old_args = standalone.parser().parse_args(["--datasets", "ogbn-arxiv"])
+    old_job = standalone.make_jobs(old_args, tmp_path, standalone._architecture(old_args))[0]
+    old_child = train.build_parser().parse_args(old_job["command"][5:])
+    train.validate_args(old_child)
+    assert not CONTEXT_KEYS.intersection(train.configuration(old_child))
+    assert not CONTEXT_KEYS.intersection(old_job["execution"])
+    old_rich = rich.parser().parse_args(["--tracks", "conductance", "--conductance-versions", "v5"])
+    assert "v5_sampling_recipe" not in rich._config_payload(
+        old_rich, data_root=tmp_path, results_root=tmp_path
+    )
+    base = ["--versions", "v5", "--datasets", "ogbn-arxiv", "--profiles", "reference"]
+    old = scaling.make_jobs(scaling.parser().parse_args(base), tmp_path)
+    new = scaling.make_jobs(scaling.parser().parse_args([*base, *context_options("v5-")]), tmp_path)
+    assert scaling._job_identity(old[0]) != scaling._job_identity(new[0])
+    assert old[0]["architecture"] == new[0]["architecture"]
+
+
+def test_new_sampling_cannot_silently_resume_legacy_run(tmp_path):
+    base = ["--tracks", "conductance", "--conductance-versions", "v5"]
+    legacy = rich._config_payload(
+        rich.parser().parse_args(base), data_root=tmp_path, results_root=tmp_path
+    )
+    corrected = rich._config_payload(
+        rich.parser().parse_args([*base, *context_options("v5-")]),
+        data_root=tmp_path,
+        results_root=tmp_path,
+    )
+    serialized = json.dumps(
+        {
+            "schema_version": 1,
+            "suite": "rich_scaling",
+            "run_id": "existing",
+            "config": legacy,
+        }
+    )
+    # A read-only manifest test double; no historical file is created or modified.
+    manifest = SimpleNamespace(read_text=lambda **_: serialized)
+    with pytest.raises(ValueError, match="new run ID"):
+        rich._resume_manifest(
+            manifest,
+            run_id="existing",
+            expected_config=corrected,
+            expected_jobs=[],
+            expected_totals={},
+            expected_sources={},
+        )
+    assert manifest.read_text() == serialized
+
+
+def test_unused_v5_context_options_leave_cycle_tree_job_and_config_identity_unchanged(tmp_path):
+    base = rich.parser().parse_args(["--tracks", "cycle", "tree"])
+    new = rich.parser().parse_args(["--tracks", "cycle", "tree", *context_options("v5-")])
+    assert rich.make_jobs(base, "untouched") == rich.make_jobs(new, "untouched")
+    assert rich._config_payload(
+        base, data_root=tmp_path, results_root=tmp_path
+    ) == rich._config_payload(
+        new,
+        data_root=tmp_path,
+        results_root=tmp_path,
+    )
+
+
+@pytest.fixture
+def prepare_inputs(monkeypatch):
+    module = ModuleType("torch_geometric.data")
+    module.Data = lambda **kwargs: SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, "torch_geometric.data", module)
+    n = 40
+    train_mask = torch.arange(n) < 20
+    payload = {
+        "graphs": [
+            {
+                "x": torch.ones(n, 3),
+                "y": torch.arange(n) % 2,
+                "incidence_edge_index": torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+            }
+        ],
+        "splits": {"train": train_mask, "validation": ~train_mask},
+    }
+    calls = []
+
+    def captured_sampler(graph, indices, **kwargs):
+        calls.append((graph, indices, kwargs))
+        return "synthetic_sampler_constructor_capture"
+
+    monkeypatch.setattr(train, "TransductiveGraphSampler", captured_sampler)
+    return payload, calls
+
+
+def prepare_args(physical):
+    return SimpleNamespace(
+        dataset="ogbn-arxiv",
+        sampling="cluster_disjoint",
+        model_seed=0,
+        sample_seed_batch_size=physical,
+        num_neighbors=[15, 10],
+        sample_context_seed_batch_size=4,
+        sample_context_workers=2,
+    )
+
+
+def test_prepare_data_connects_explicit_context_without_altering_seed_batch(prepare_inputs):
+    payload, calls = prepare_inputs
+    graph, indices, sampler = train._prepare_data(payload, prepare_args(8), torch.device("cpu"))
+    assert sampler == "synthetic_sampler_constructor_capture"
+    assert torch.equal(indices["train"], torch.arange(20))
+    assert calls[0][2] == {
+        "mode": "cluster_disjoint",
+        "seed_batch_size": 8,
+        "fanouts": [15, 10],
+        "model_seed": 0,
+        "context_seed_batch_size": 4,
+        "context_workers": 2,
+    }
+
+
+@pytest.mark.parametrize("physical", [2, 6])
+def test_prepare_data_rejects_physical_candidates_that_change_context_partition(
+    prepare_inputs, physical
+):
+    payload, calls = prepare_inputs
+    with pytest.raises(ValueError, match="context"):
+        train._prepare_data(payload, prepare_args(physical), torch.device("cpu"))
+    assert not calls
+
+
+def test_single_complete_seed_epoch_allows_final_partial_context(prepare_inputs):
+    payload, calls = prepare_inputs
+    train._prepare_data(payload, prepare_args(21), torch.device("cpu"))
+    assert calls[0][2]["seed_batch_size"] == 21
+
+
+def test_measured_context_workers_do_not_silently_override_explicit_request(monkeypatch):
+    args = scaling.parser().parse_args(
+        [
+            "--versions",
+            "v5",
+            "--hardware-profile",
+            "a6000-48gb",
+            *context_options("v5-"),
+        ]
+    )
+    args.resolved_resource_plan = {"synthetic_selection_contract": True}
+    monkeypatch.setattr(
+        scaling,
+        "selected_resources",
+        lambda *_args, **_kwargs: {
+            "batch_size": 1,
+            "sample_seed_batch_size": 8192,
+            "workers": 0,
+            "sample_context_workers": 4,
+        },
+    )
+    with pytest.raises(ValueError, match="context.*conflicts|context.*plan"):
+        scaling._v5_execution(args, "ogbn-arxiv", "reference")
+
+
+def test_measured_context_workers_replace_only_unmeasured_initial_candidate(monkeypatch):
+    args = scaling.parser().parse_args(
+        [
+            "--versions",
+            "v5",
+            "--hardware-profile",
+            "a6000-48gb",
+            "--v5-sampling",
+            "auto_disjoint",
+            "--v5-sample-context-seed-batch-size",
+            "2048",
+        ]
+    )
+    args.resolved_resource_plan = {"synthetic_selection_contract": True}
+    monkeypatch.setattr(
+        scaling,
+        "selected_resources",
+        lambda *_args, **_kwargs: {
+            "batch_size": 1,
+            "sample_seed_batch_size": 8192,
+            "workers": 0,
+            "sample_context_workers": 8,
+        },
+    )
+    actual = scaling._v5_execution(args, "ogbn-arxiv", "reference")
+    assert actual["sample_context_workers"] == 8
+    assert actual["sample_context_seed_batch_size"] == 2048
+    assert actual["sample_seed_batch_size"] == 8192
+    assert actual["dataloader_workers"] == 0
+
+
+def test_old_loader_worker_measurement_is_not_claimed_as_disjoint_context_measurement(monkeypatch):
+    args = scaling.parser().parse_args(["--versions", "v5", *context_options("v5-")])
+    args.resolved_resource_plan = {"synthetic_legacy_selection": True}
+    monkeypatch.setattr(
+        scaling,
+        "selected_resources",
+        lambda *_args, **_kwargs: {
+            "batch_size": 1,
+            "sample_seed_batch_size": 8192,
+            "workers": 0,
+        },
+    )
+    with pytest.raises(ValueError, match="own measured context worker"):
+        scaling._v5_execution(args, "ogbn-arxiv", "reference")
+````
+
+# tests/test_v5_disjoint_sampling.py
+
+````python
+"""Synthetic CPU sampler/gradient regressions, not real-data or GPU evidence.
+
+The explicit container fixture exercises sampler math without optional PyG.
+The separate integration test only passes when actual PyG is installed.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import sys
+from types import ModuleType, SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.v5.model import GraphConditionedConductanceNodeClassifier
+from research.conductance_gat.v5.sampling import TransductiveGraphSampler, physical_degree
+
+
+class DebugData(SimpleNamespace):
+    def cpu(self):
+        return self
+
+    @property
+    def num_nodes(self):
+        return self.x.shape[0]
+
+
+class DebugBatch(DebugData):
+    """Explicit test double of the used PyG concatenation/offset contract."""
+
+    @classmethod
+    def from_data_list(cls, graphs):
+        ptr = torch.tensor([0] + [graph.num_nodes for graph in graphs]).cumsum(0)
+        fields = {}
+        for key in vars(graphs[0]):
+            values = [getattr(graph, key) for graph in graphs]
+            if key in {"edge_index", "incidence_edge_index"}:
+                fields[key] = torch.cat([value + ptr[i] for i, value in enumerate(values)], 1)
+            else:
+                fields[key] = torch.cat(values, 0)
+        return cls(
+            **fields,
+            ptr=ptr,
+            batch=torch.repeat_interleave(torch.arange(len(graphs)), ptr.diff()),
+            num_graphs=len(graphs),
+            debug_contexts=graphs,
+        )
+
+
+@pytest.fixture
+def debug_container(monkeypatch):
+    package = ModuleType("torch_geometric")
+    data = ModuleType("torch_geometric.data")
+    data.Data, data.Batch = DebugData, DebugBatch
+    package.data = data
+    monkeypatch.setitem(sys.modules, "torch_geometric", package)
+    monkeypatch.setitem(sys.modules, "torch_geometric.data", data)
+
+
+def source_graph(n=71, cls=DebugData):
+    # Ring plus chords: enough frontier choices to test stochastic contexts.
+    nodes = torch.arange(n)
+    incidence = torch.cat(
+        (torch.stack((nodes, (nodes + 1) % n)), torch.stack((nodes, (nodes + 5) % n))), 1
+    )
+    return cls(
+        x=torch.arange(n * 5, dtype=torch.float32).reshape(n, 5).sin(),
+        y=nodes % 3,
+        incidence_edge_index=incidence,
+        edge_index=torch.cat((incidence, incidence.flip(0)), 1),
+    )
+
+
+def make_sampler(
+    *, physical=6, context=2, workers=1, train=None, graph=None, mode="cluster_disjoint"
+):
+    return TransductiveGraphSampler(
+        source_graph() if graph is None else graph,
+        torch.arange(17) if train is None else train,
+        mode=mode,
+        seed_batch_size=physical,
+        fanouts=(2, 1),
+        model_seed=13,
+        context_seed_batch_size=context,
+        context_workers=workers,
+    )
+
+
+@pytest.mark.parametrize("context", [None, 0, -1, 2.5, 2.0, True, False])
+def test_disjoint_requires_explicit_positive_integer_context(context):
+    with pytest.raises(ValueError, match="positive context_seed_batch_size"):
+        make_sampler(context=context)
+
+
+def test_context_options_cannot_silently_modify_legacy_sampler():
+    with pytest.raises(ValueError, match="only to cluster_disjoint"):
+        make_sampler(mode="cluster")
+    with pytest.raises(ValueError, match="positive integer"):
+        make_sampler(workers=0)
+    with pytest.raises(ValueError, match="unique supervised"):
+        make_sampler(train=torch.tensor([0, 1, 1]))
+
+
+@pytest.mark.parametrize("count", [True, False, 1.0, 2.5])
+def test_counts_cannot_be_booleans_or_silently_truncated(count):
+    with pytest.raises(ValueError, match="positive integer"):
+        make_sampler(workers=count)
+    with pytest.raises(ValueError, match="positive integers"):
+        make_sampler(physical=count)
+    with pytest.raises(ValueError, match="positive integers"):
+        TransductiveGraphSampler(
+            source_graph(),
+            torch.arange(17),
+            mode="cluster",
+            seed_batch_size=6,
+            fanouts=(count, 1),
+            model_seed=13,
+        )
+
+
+@pytest.mark.parametrize("physical,context", [(5, 2), (2, 3), (7, 4)])
+def test_sampler_itself_rejects_regrouping_that_changes_context_seed_boundaries(physical, context):
+    with pytest.raises(ValueError, match="whole sampling contexts"):
+        make_sampler(physical=physical, context=context)
+
+
+def test_single_full_train_batch_may_have_a_partial_final_context(debug_container):
+    sampler = make_sampler(physical=17, context=3)
+    batches = list(sampler.iter_epoch(2))
+    assert len(batches) == 1
+    assert [int(graph.train_mask.sum()) for graph in batches[0].debug_contexts] == [
+        3,
+        3,
+        3,
+        3,
+        3,
+        2,
+    ]
+    regrouped = make_sampler(physical=6, context=3)
+    left = [graph for batch in batches for graph in batch.debug_contexts]
+    right = [graph for batch in regrouped.iter_epoch(2) for graph in batch.debug_contexts]
+    assert len(left) == len(right)
+    for a, b in zip(left, right, strict=True):
+        assert torch.equal(a.global_node_id, b.global_node_id)
+        assert torch.equal(a.train_mask, b.train_mask)
+        assert torch.equal(a.incidence_edge_index, b.incidence_edge_index)
+
+
+def test_disjoint_supervision_and_original_ids_cover_every_seed_once(debug_container):
+    sampler = make_sampler()
+    batches = list(sampler.iter_epoch(3))
+    assert len(batches) == len(sampler) == 3
+    assert [int(batch.train_mask.sum()) for batch in batches] == [6, 6, 5]
+    supervised = torch.cat([batch.global_node_id[batch.train_mask] for batch in batches])
+    assert torch.equal(supervised.sort().values, sampler.train_indices.sort().values)
+    for batch in batches:
+        assert batch._v5_num_graphs == batch.num_graphs == 3
+        assert batch.graph_structure.shape == (3, 6)
+        assert torch.equal(batch.x, sampler.graph.x[batch.global_node_id])
+        assert torch.equal(batch.y, sampler.graph.y[batch.global_node_id])
+        tail, head = batch.incidence_edge_index
+        assert torch.equal(batch.batch[tail], batch.batch[head])
+        assert torch.equal(
+            batch.global_node_id[batch.incidence_edge_index],
+            sampler.incidence[:, batch.global_physical_edge_id],
+        )
+        assert torch.equal(batch.full_degree, sampler.full_degree[batch.global_node_id])
+        degree = physical_degree(batch.incidence_edge_index, batch.num_nodes)
+        ratio = batch.full_degree / degree.clamp_min(1)
+        expected = (ratio[tail] * ratio[head]).sqrt().clamp(1, 64)
+        torch.testing.assert_close(batch.edge_normalization_weight, expected)
+        assert torch.equal(batch.sampling_correction, expected)
+        assert int(batch.sample_seed_count.sum()) == int(batch.train_mask.sum())
+    assert batches[-1].sampling_observation["epoch_seed_coverage_fraction"] == 1
+
+
+def test_physical_batch_does_not_inflate_individual_context_budget(debug_container):
+    small = make_sampler(physical=2)
+    large = make_sampler(physical=6)
+    left = [graph for batch in small.iter_epoch(5) for graph in batch.debug_contexts]
+    right = [graph for batch in large.iter_epoch(5) for graph in batch.debug_contexts]
+    assert len(left) == len(right)
+    for a, b in zip(left, right, strict=True):
+        assert torch.equal(a.global_node_id, b.global_node_id)
+        assert torch.equal(a.train_mask, b.train_mask)
+        assert torch.equal(a.incidence_edge_index, b.incidence_edge_index)
+        assert a.num_nodes <= 2 * (1 + sum(small.fanouts))
+    metadata = large.metadata()
+    assert metadata["seed_batch_size"] == 6
+    assert metadata["context_seed_batch_size"] == 2
+    assert metadata["contexts_per_full_physical_batch"] == 3
+    assert metadata["cluster_saturation"]["configured_node_budget"] == 8
+    assert not metadata["cluster_saturation"]["full_seed_batch_reaches_graph_size"]
+
+
+def test_context_workers_reproduce_exact_samples_without_global_rng_changes(debug_container):
+    one = make_sampler(workers=1)
+    many = make_sampler(workers=3)
+    state = torch.random.get_rng_state().clone()
+    a, b = list(one.iter_epoch(4)), list(many.iter_epoch(4))
+    assert torch.equal(state, torch.random.get_rng_state())
+    for left, right in zip(a, b, strict=True):
+        for field in (
+            "global_node_id",
+            "global_physical_edge_id",
+            "incidence_edge_index",
+            "train_mask",
+            "full_degree",
+            "sampling_correction",
+        ):
+            assert torch.equal(getattr(left, field), getattr(right, field))
+        left_observation = dict(left.sampling_observation)
+        right_observation = dict(right.sampling_observation)
+        assert left_observation.pop("observation_cpu_wall_seconds") >= 0
+        assert right_observation.pop("observation_cpu_wall_seconds") >= 0
+        assert left_observation == right_observation
+    assert a[0].sampling_observation != list(one.iter_epoch(5))[0].sampling_observation
+
+
+def test_observation_snapshots_are_prefetch_safe_and_report_exact_overlap(debug_container):
+    sampler = make_sampler(physical=10, context=2)
+    stream = sampler.iter_epoch(1)
+    first = next(stream)
+    saved = copy.deepcopy(first.sampling_observation)
+    second = next(stream)
+    assert first.sampling_observation == saved
+    assert first.sampling_observation is not sampler.last_sample_observation
+    json.dumps(saved, allow_nan=False)
+    assert saved["observation_cpu_wall_seconds"] >= 0
+    assert "all-pair overlap" in saved["observation_timing_scope"]
+    nodes = first.global_node_id.unique(sorted=True)
+    edges = first.global_physical_edge_id.unique(sorted=True)
+    assert saved["node_ids_sha256"] == hashlib.sha256(nodes.numpy().tobytes()).hexdigest()
+    assert saved["physical_edge_ids_sha256"] == hashlib.sha256(edges.numpy().tobytes()).hexdigest()
+    assert saved["duplicated_context_node_copies"] == first.num_nodes - nodes.numel()
+    assert saved["duplicated_context_node_copies"] > 0
+    expected = set(nodes.tolist()) & set(second.global_node_id.tolist())
+    union = set(nodes.tolist()) | set(second.global_node_id.tolist())
+    actual = second.sampling_observation["previous_physical_batch_overlap"]["nodes"]
+    assert actual["intersection"] == len(expected)
+    assert actual["jaccard"] == len(expected) / len(union)
+    for pair in saved["within_batch_context_overlap"]:
+        i, j = pair["contexts"]
+        a = set(first.debug_contexts[i].global_node_id.tolist())
+        b = set(first.debug_contexts[j].global_node_id.tolist())
+        assert pair["nodes"]["intersection"] == len(a & b)
+        assert pair["nodes"]["jaccard"] == len(a & b) / len(a | b)
+        edge_graph = first.batch[first.incidence_edge_index[0]]
+        a_edges = set(first.global_physical_edge_id[edge_graph == i].tolist())
+        b_edges = set(first.global_physical_edge_id[edge_graph == j].tolist())
+        assert pair["physical_edges"]["intersection"] == len(a_edges & b_edges)
+        assert pair["physical_edges"]["union"] == len(a_edges | b_edges)
+    stream.close()
+
+
+@pytest.mark.parametrize(
+    "left,right",
+    [
+        ([], []),
+        ([], [1]),
+        ([1], []),
+        ([1], [2]),
+        ([1, 5], [1, 3, 5, 7]),
+        ([1, 3, 5, 7], [1, 5]),
+        ([1, 2, 9], [1, 2, 9]),
+    ],
+)
+def test_sorted_overlap_preserves_exact_intersections_empty_cases_and_symmetry(left, right):
+    a, b = torch.tensor(left, dtype=torch.long), torch.tensor(right, dtype=torch.long)
+    actual = TransductiveGraphSampler._overlap(a, b)
+    intersection, union = len(set(left) & set(right)), len(set(left) | set(right))
+    assert actual == {
+        "intersection": intersection,
+        "union": union,
+        "jaccard": intersection / union if union else 1.0,
+        "both_empty": union == 0,
+    }
+    assert actual == TransductiveGraphSampler._overlap(b, a)
+
+
+def test_sorted_overlap_matches_isin_for_all_random_context_pairs():
+    generator = torch.Generator().manual_seed(554)
+    contexts = [
+        torch.randint(200, (75,), generator=generator).unique(sorted=True) for _ in range(12)
+    ]
+    for i, left in enumerate(contexts):
+        for right in contexts[i + 1 :]:
+            actual = TransductiveGraphSampler._overlap(left, right)
+            assert actual["intersection"] == int(torch.isin(left, right).sum())
+
+
+def test_disjoint_model_forward_and_task_gradients_equal_independent_contexts(debug_container):
+    torch.manual_seed(61)
+    sampler = make_sampler(physical=6, train=torch.arange(6))
+    batch = next(sampler.iter_epoch(1))
+    network = GraphConditionedConductanceNodeClassifier(
+        5,
+        3,
+        hidden_channels=8,
+        layers=2,
+        heads=2,
+        ffn_multiplier=2,
+        dropout=0,
+        conductance_mode="dynamic",
+        conductance_backend="optimization",
+        solver_steps=8,
+        solver_cost_scaling="width_scaled",
+        activation_checkpoint=False,
+    )
+    separate = copy.deepcopy(network)
+    actual = network(batch)
+    expected = torch.cat([separate(graph) for graph in batch.debug_contexts])
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=3e-6)
+    torch.nn.functional.cross_entropy(
+        actual[batch.train_mask], batch.y[batch.train_mask]
+    ).backward()
+    torch.nn.functional.cross_entropy(
+        expected[batch.train_mask], batch.y[batch.train_mask]
+    ).backward()
+    nonzero_c = 0
+    for (name, a), (_, b) in zip(
+        network.named_parameters(), separate.named_parameters(), strict=True
+    ):
+        assert a.grad is not None and b.grad is not None, name
+        torch.testing.assert_close(a.grad, b.grad, rtol=5e-4, atol=2e-6)
+        if ".estimator." in name:
+            assert bool(torch.isfinite(a.grad).all())
+            nonzero_c += int(bool(a.grad.abs().sum() > 0))
+    assert nonzero_c > 0
+
+
+def test_saturated_contexts_are_explicit_not_silently_capped(debug_container):
+    graph = source_graph(7)
+    with pytest.warns(RuntimeWarning, match="context budget reaches"):
+        sampler = make_sampler(physical=6, context=2, graph=graph, train=torch.arange(6), workers=3)
+    batch = next(sampler.iter_epoch(1))
+    assert batch.num_nodes == 3 * 7
+    assert batch.sampling_observation["saturated_context_count"] == 3
+    assert all(
+        item["selects_all_original_nodes"] for item in batch.sampling_observation["contexts"]
+    )
+
+
+def test_isolated_contexts_preserve_supervision_and_mark_empty_edge_overlap(debug_container):
+    source = DebugData(
+        x=torch.ones(20, 5),
+        y=torch.arange(20) % 3,
+        edge_index=torch.empty((2, 0), dtype=torch.long),
+        incidence_edge_index=torch.empty((2, 0), dtype=torch.long),
+    )
+    sampler = make_sampler(graph=source, train=torch.arange(7), physical=6, workers=2)
+    batches = list(sampler.iter_epoch(1))
+    assert [int(batch.train_mask.sum()) for batch in batches] == [6, 1]
+    assert all(batch.incidence_edge_index.shape == (2, 0) for batch in batches)
+    for pair in batches[0].sampling_observation["within_batch_context_overlap"]:
+        assert pair["nodes"]["jaccard"] == 0
+        assert pair["physical_edges"] == {
+            "intersection": 0,
+            "union": 0,
+            "jaccard": 1.0,
+            "both_empty": True,
+        }
+    assert batches[-1].sampling_observation["epoch_seed_coverage_fraction"] == 1
+
+
+def test_real_pyg_disjoint_container_offsets_and_cpu_model_smoke():
+    pytest.importorskip("torch_geometric")
+    from torch_geometric.data import Batch, Data
+
+    graph = source_graph(cls=Data)
+    sampler = make_sampler(graph=graph)
+    batch = next(sampler.iter_epoch(1))
+    assert isinstance(batch, Batch)
+    assert batch._v5_num_graphs == 3
+    assert torch.equal(
+        batch.global_node_id[batch.incidence_edge_index],
+        sampler.incidence[:, batch.global_physical_edge_id],
+    )
+    assert torch.equal(
+        batch.batch[batch.incidence_edge_index[0]], batch.batch[batch.incidence_edge_index[1]]
+    )
+    network = GraphConditionedConductanceNodeClassifier(
+        5,
+        3,
+        hidden_channels=8,
+        layers=2,
+        heads=2,
+        ffn_multiplier=2,
+        dropout=0,
+        activation_checkpoint=False,
+    )
+    logits = network(batch)
+    torch.nn.functional.cross_entropy(
+        logits[batch.train_mask], batch.y[batch.train_mask]
+    ).backward()
+    assert all(parameter.grad is not None for parameter in network.parameters())
+````
+
 # tests/test_v5_learning_budget.py
 
 ````python
@@ -103530,14 +107109,15 @@ def test_old_rich_config_cannot_resume_as_new_optimizer_and_file_is_preserved(tm
 # tests/test_v5_performance_training_resume.py
 
 ````python
-"""Real archived-source pins with synthetic CPU state-handoff integration.
+"""Archived-source contracts with synthetic CPU state-handoff integration.
 
-The old identities use actual 51da819 Git blobs, not invented SHA fixtures.
-Current source inputs are the canonical LF/server representation of real local
-files; this matters on a CRLF Windows checkout. The live registry/helper checks
-are never mocked. Small checkpoint tensors are generated with current CPU
-kernels: these tests verify state handoff, NOT execution of past GPU kernels,
-past experiment results, bitwise old/new numerical equivalence, or performance.
+Both source identities use actual 51da819 -> 8da06ca Git blobs. Current CPU
+training control flow is exercised with explicitly injected historical source
+maps; it is NOT identified as archived code, an authorized live-source resume,
+or reproduction of past GPU kernels/results. Small tensors exercise state
+handoff only. The unchanged production registry/helper are never mocked.
+Separate tests require the actual current source inventory to be rejected
+without changing checkpoint/history files or making an optimizer update.
 """
 
 from __future__ import annotations
@@ -103584,12 +107164,12 @@ def _git(*arguments, input_bytes=None):
     return result.stdout
 
 
-@pytest.fixture(scope="module")
-def source_maps():
-    old_train = _git("show", f"{REVISION}:research/conductance_gat/v5/train.py")
+def _revision_sources(revision):
+    """Read a revision's own V5 source inventory and exact Git-blob digests."""
+    archived_train = _git("show", f"{revision}:research/conductance_gat/v5/train.py")
     assignment = next(
         item
-        for item in ast.parse(old_train).body
+        for item in ast.parse(archived_train).body
         if isinstance(item, ast.Assign)
         and any(
             isinstance(target, ast.Name) and target.id == "_SHARED_IMPLEMENTATION_SOURCES"
@@ -103606,39 +107186,49 @@ def source_maps():
                 isinstance(item.value, ast.Name) and item.value.id == "COMPATIBILITY_SOURCE_FILES"
             )
             shared.extend(compat.COMPATIBILITY_SOURCE_FILES)
-    old_files = _git("ls-tree", "-r", "--name-only", REVISION).decode("utf-8").splitlines()
+    archived_files = _git("ls-tree", "-r", "--name-only", revision).decode("utf-8").splitlines()
     paths = sorted(
         set(shared)
         | {
             name
-            for name in old_files
+            for name in archived_files
             if name.startswith("research/conductance_gat/v5/")
             and name.count("/") == 3
             and name.endswith(".py")
         }
     )
-    request = "".join(f"{REVISION}:{name}\n" for name in paths).encode()
+    request = "".join(f"{revision}:{name}\n" for name in paths).encode()
     blobs = io.BytesIO(_git("cat-file", "--batch", input_bytes=request))
-    previous = {}
+    result = {}
     for name in paths:
         header = blobs.readline().decode().strip().split()
         assert len(header) == 3 and header[1] == "blob"
         raw = blobs.read(int(header[2]))
         assert blobs.read(1) == b"\n"
-        previous[name] = hashlib.sha256(raw).hexdigest()
-    current = {
+        result[name] = hashlib.sha256(raw).hexdigest()
+    return result
+
+
+def _server_live_sources():
+    return {
         name: hashlib.sha256((ROOT / name).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
         for name in LIVE_SOURCE_FUNCTION()
     }
-    # Current helper and registry really have the bytes checked by the live
-    # production loader; do not normalize away a stale registry/helper pin.
+
+
+@pytest.fixture(scope="module")
+def source_maps():
+    previous = _revision_sources(REVISION)
+    historical_target = _revision_sources("8da06cacec59515d84c08d892315e4c8ecfd5b5b")
+    # The real production helper/registry must still match the registered
+    # historical target. Their authorization is not extended to today's code.
     for name in compat.COMPATIBILITY_SOURCE_FILES:
-        assert current[name] == hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
-    evidence = compat.require_source_compatibility(previous, current)
+        assert historical_target[name] == hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+    evidence = compat.require_source_compatibility(previous, historical_target)
     assert evidence["base_commit"] == REVISION
     assert evidence["patch_id"] == compat.PERFORMANCE_PATCH_ID
     assert evidence["bitwise_numerical_identity"] is False
-    return previous, current
+    return previous, historical_target
 
 
 def _fixture(directory, monkeypatch, sources, *, fixed=False):
@@ -103766,6 +107356,35 @@ def test_real_registry_never_waives_recipe_changes_or_overwrites_checkpoint(
 
     def forbidden_update(*_args, **_kwargs):
         raise AssertionError("a rejected recipe must not perform an optimizer update")
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", forbidden_update)
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        _run(args, payload, protocol)
+    after = {path.name: path.read_bytes() for path in args.output_dir.iterdir() if path.is_file()}
+    assert after == original
+
+
+@pytest.mark.parametrize("origin", ["before_performance_repair", "historical_target"])
+def test_actual_current_sources_cannot_inherit_historical_resume_authority(
+    tmp_path, monkeypatch, source_maps, origin
+):
+    previous, historical_target = source_maps
+    source = previous if origin == "before_performance_repair" else historical_target
+    args, payload, protocol, _ = _boundary(
+        tmp_path / "preserved-live-rejection", monkeypatch, source
+    )
+    original = {
+        path.name: path.read_bytes() for path in args.output_dir.iterdir() if path.is_file()
+    }
+    live = _server_live_sources()
+    assert live != historical_target
+    assert not compat.snapshots_match(source, live)
+    with pytest.raises(ValueError):
+        compat.require_source_compatibility(source, live)
+    monkeypatch.setattr(train, "implementation_source_hashes", lambda: dict(live))
+
+    def forbidden_update(*_args, **_kwargs):
+        raise AssertionError("unregistered live sources must not perform an optimizer update")
 
     monkeypatch.setattr(torch.optim.AdamW, "step", forbidden_update)
     with pytest.raises(ValueError, match="resume identity mismatch"):
@@ -104158,6 +107777,334 @@ def test_training_records_stage_times_and_does_not_duplicate_validation_diagnost
     for row in saved["history"]:
         assert row["stage_seconds"]["stage_calls"]["diagnostics"] == 1
         assert len(row["batch_observations"]) == row["train_batches"]
+````
+
+# tests/test_v5_stage_audit.py
+
+````python
+"""Synthetic CPU debug tests, not real-data accuracy or GPU performance tests."""
+
+from __future__ import annotations
+
+import copy
+import json
+import random
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from research.conductance_gat.v5.diagnostics import PreparedValidationGraph
+from research.conductance_gat.v5.model import GraphConditionedConductanceNodeClassifier
+from research.conductance_gat.v5.stage_audit import audit_stage_roles
+
+
+class DebugGraph(SimpleNamespace):
+    def clone(self):
+        return copy.deepcopy(self)
+
+    def to(self, device, **kwargs):
+        for key, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                setattr(self, key, value.to(device))
+        return self
+
+    def items(self):
+        return vars(self).items()
+
+
+def _fixture(mode="dynamic", batched=False):
+    torch.manual_seed(421)
+    model = GraphConditionedConductanceNodeClassifier(
+        5,
+        3,
+        hidden_channels=16,
+        layers=2,
+        heads=4,
+        ffn_multiplier=2,
+        dropout=0.25,
+        conductance_mode=mode,
+        conductance_backend="optimization",
+        solver_steps=8,
+        solver_cost_scaling="width_scaled",
+        beta_initial=0.5,
+        activation_checkpoint=False,
+    )
+    edges = torch.tensor([[0, 0, 1, 1, 2, 4, 4, 5], [1, 2, 2, 3, 3, 5, 6, 6]])
+    graph = DebugGraph(
+        x=torch.randn(8, 5), incidence_edge_index=edges, y=torch.tensor([0, 1, 2, 1, 0, 2, 1, 0])
+    )
+    if batched:
+        graph.batch = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1])
+        graph.num_graphs = graph._v5_num_graphs = 2
+        graph.y = torch.tensor(
+            [
+                [0, 1, 0],
+                [1, 1, 0],
+                [0, 0, 1],
+                [1, 0, 1],
+                [0, 1, 1],
+                [1, 0, 0],
+                [1, 1, 1],
+                [0, 0, 0],
+            ],
+            dtype=torch.float,
+        )
+    else:
+        graph.edge_normalization_weight = torch.tensor([1.0, 2.0, 1.0, 1.5, 1.2, 1.0, 2.0, 1.0])
+        graph.sampling_correction = graph.edge_normalization_weight
+    return model, graph
+
+
+def _audit(model, source, indices=None, **kwargs):
+    return audit_stage_roles(
+        model,
+        source,
+        indices,
+        device=torch.device("cpu"),
+        reference_steps=kwargs.pop("reference_steps", 32),
+        reference_tolerance=kwargs.pop("reference_tolerance", 1e-4),
+        **kwargs,
+    )
+
+
+def _state(model):
+    return {
+        "weights": {key: value.clone() for key, value in model.state_dict().items()},
+        "gradients": [
+            None if value.grad is None else value.grad.clone() for value in model.parameters()
+        ],
+        "training": [module.training for module in model.modules()],
+        "diagnostics": [
+            (module, {key: value for key, value in vars(module).items() if key.startswith("last_")})
+            for module in model.modules()
+        ],
+        "settings": [
+            (operator.estimator.override, operator.estimator.solver_steps)
+            for operator in model.operators
+        ],
+        "torch_rng": torch.get_rng_state().clone(),
+        "python_rng": random.getstate(),
+        "numpy_rng": np.random.get_state(),
+    }
+
+
+def _assert_restored(model, state):
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, state["weights"][key])
+    for parameter, grad in zip(model.parameters(), state["gradients"], strict=True):
+        assert parameter.grad is None if grad is None else torch.equal(parameter.grad, grad)
+    assert [module.training for module in model.modules()] == state["training"]
+    assert [
+        (operator.estimator.override, operator.estimator.solver_steps)
+        for operator in model.operators
+    ] == state["settings"]
+    for module, previous in state["diagnostics"]:
+        current = {key: value for key, value in vars(module).items() if key.startswith("last_")}
+        assert current.keys() == previous.keys()
+        assert all(current[key] is value for key, value in previous.items())
+    assert torch.equal(torch.get_rng_state(), state["torch_rng"])
+    assert random.getstate() == state["python_rng"]
+    left, right = np.random.get_state(), state["numpy_rng"]
+    assert left[0] == right[0] and np.array_equal(left[1], right[1]) and left[2:] == right[2:]
+    assert not any(module._forward_hooks for module in model.operators)
+
+
+def test_validation_interventions_and_local_reference_are_read_only_and_json_serializable():
+    model, graph = _fixture()
+    model(graph).square().mean().backward()
+    model.blocks[0].eval()  # Preserve mixed flags rather than flattening them.
+    model.operators[1].estimator.override = "mean"
+    state, x = _state(model), graph.x.clone()
+    result = _audit(model, graph, torch.tensor([1, 3, 5, 7]))
+    _assert_restored(model, state)
+    assert torch.equal(graph.x, x)
+    json.dumps(result, allow_nan=False)
+    assert result["execution_status"] == "passed"
+    assert result["contribution_status"] == "observed"
+    assert result["scope"]["test_used"] is False
+    assert result["scope"]["parameters_updated"] is False
+    assert result["interventions"]["learned"]["label_count"] == 4
+    assert result["interventions"]["learned"]["logit_max_abs"] == 0
+    assert result["interventions"]["c_one"]["logit_max_abs"] > 0
+    assert len(result["local_layer_comparisons"]) == 2
+    for row in result["local_layer_comparisons"]:
+        assert row["deployed_steps"] == 8 and row["reference_steps"] == 32
+        assert row["reference_is_exact_optimum"] is False
+        assert row["baseline_solver"]["executed_steps"] == 8
+        assert row["reference_solver"]["executed_steps"] == 32
+        assert row["c_deployed_vs_reference"]["relative_l2"] > 0
+        assert len(row["reference_tolerance_reached_by_graph"]) == 1
+
+
+def test_equal_k_has_zero_local_and_whole_model_error_and_never_asserts_convergence():
+    model, graph = _fixture()
+    result = _audit(model, graph, torch.arange(8), reference_steps=8, reference_tolerance=1e-30)
+    assert result["interventions"]["higher_k_full_model"]["logit_max_abs"] == 0
+    for row in result["local_layer_comparisons"]:
+        assert row["c_deployed_vs_reference"]["relative_l2"] == 0
+        assert row["operator_deployed_vs_reference"]["max_abs"] == 0
+        assert row["reference_tolerance_reached_by_graph"] == [False]
+
+
+def test_ppi_disjoint_batches_are_not_split_and_generator_is_consumed_once():
+    model, graph = _fixture(batched=True)
+    seen = []
+
+    def source():
+        for number in range(2):
+            seen.append(number)
+            random.random()
+            np.random.rand()
+            torch.rand(1)
+            yield graph
+
+    state = _state(model)
+    result = _audit(model, source())
+    _assert_restored(model, state)
+    assert seen == [0, 1]
+    assert result["scope"]["metric"] == "micro_f1"
+    assert [row["graphs"] for row in result["inputs"]] == [2, 2]
+    assert [row["nodes"] for row in result["inputs"]] == [8, 8]
+    assert len(result["local_layer_comparisons"]) == 4
+    assert all(value["label_count"] == 48 for value in result["interventions"].values())
+    assert graph.x.device.type == "cpu"
+
+
+def test_fixed_c_reports_no_inner_optimization_or_contribution_evidence():
+    model, graph = _fixture(mode="fixed_one")
+    result = _audit(model, graph, torch.arange(8))
+    assert result["contribution_status"] == "inconclusive"
+    assert all(value["logit_max_abs"] == 0 for value in result["interventions"].values())
+    for row in result["local_layer_comparisons"]:
+        assert row["reference_tolerance_reached_by_graph"] is None
+        assert row["baseline_solver"]["enabled"] is False
+
+
+def test_prepared_full_graph_is_supported_without_changing_source_tensors():
+    model, graph = _fixture()
+    source = PreparedValidationGraph(graph, torch.device("cpu"))
+    before = source.graph.x.clone()
+    result = _audit(model, source, torch.arange(8))
+    assert torch.equal(source.graph.x, before)
+    assert result["interventions"]["learned"]["label_count"] == 8
+
+
+def test_nonfinite_failure_restores_parameters_flags_settings_diagnostics_and_rng():
+    model, graph = _fixture()
+    model(graph)
+    state = _state(model)
+    handle = model.decoder.register_forward_hook(lambda module, args, output: output * float("nan"))
+    try:
+        with pytest.raises(FloatingPointError, match="nonfinite"):
+            _audit(model, graph, torch.arange(8))
+    finally:
+        handle.remove()
+    _assert_restored(model, state)
+
+
+def test_failure_inside_reference_hook_restores_all_temporary_state(monkeypatch):
+    model, graph = _fixture()
+    estimator = model.operators[0].estimator
+    original = estimator.forward
+
+    def fail_reference(*args, **kwargs):
+        if estimator.solver_steps == 32:
+            raise RuntimeError("synthetic reference failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(estimator, "forward", fail_reference)
+    state = _state(model)
+    with pytest.raises(RuntimeError, match="synthetic reference failure"):
+        _audit(model, graph, torch.arange(8))
+    _assert_restored(model, state)
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"reference_steps": 4}, "cannot reduce"),
+        ({"reference_steps": True}, "positive integer"),
+        ({"reference_tolerance": 0}, "finite and positive"),
+        ({"reference_tolerance": float("nan")}, "finite and positive"),
+        ({"precision": "fp16"}, "precision"),
+    ],
+)
+def test_invalid_contracts_fail_without_changing_model(kwargs, match):
+    model, graph = _fixture()
+    state = _state(model)
+    with pytest.raises(ValueError, match=match):
+        _audit(model, graph, torch.arange(8), **kwargs)
+    _assert_restored(model, state)
+
+
+def test_empty_or_invalid_validation_data_is_not_silently_reported_as_success():
+    model, graph = _fixture()
+    with pytest.raises(ValueError, match="nonempty"):
+        _audit(model, graph, torch.tensor([], dtype=torch.long))
+    with pytest.raises(ValueError, match="no batches"):
+        _audit(model, iter(()))
+
+
+def test_bf16_keeps_geometry_fp32_and_restores_flags():
+    model, graph = _fixture()
+    state = _state(model)
+    result = _audit(model, graph, torch.arange(8), precision="bf16")
+    _assert_restored(model, state)
+    assert result["resources"]["precision"] == "bf16"
+    assert result["resources"]["geometry_precision"] == "fp32"
+    json.dumps(result, allow_nan=False)
+
+
+def test_second_layer_local_reference_matches_independent_frozen_input_calculation():
+    model, graph = _fixture()
+    model.eval()
+    captured = []
+    operator = model.operators[1]
+    handle = operator.register_forward_hook(
+        lambda module, args, kwargs, output: captured.append(
+            (args, kwargs, output.detach().clone(), module.estimator.last_c.clone())
+        ),
+        with_kwargs=True,
+    )
+    with torch.no_grad():
+        model(graph)
+    handle.remove()
+    args, kwargs, deployed_output, deployed_c = captured[0]
+    operator.estimator.solver_steps = 32
+    with torch.no_grad():
+        reference_output = operator(*args, **kwargs)
+        reference_c = operator.estimator.last_c.clone()
+    operator.estimator.solver_steps = 8
+    c_relative = float(torch.linalg.vector_norm(deployed_c - reference_c)) / float(
+        torch.linalg.vector_norm(reference_c)
+    )
+    operator_relative = float(torch.linalg.vector_norm(deployed_output - reference_output)) / float(
+        torch.linalg.vector_norm(reference_output)
+    )
+    result = _audit(model, graph, torch.arange(8))
+    row = result["local_layer_comparisons"][1]
+    assert row["c_deployed_vs_reference"]["relative_l2"] == pytest.approx(c_relative, rel=1e-6)
+    assert row["operator_deployed_vs_reference"]["relative_l2"] == pytest.approx(
+        operator_relative, rel=1e-6
+    )
+
+
+def test_zero_beta_bypass_is_inconclusive_even_when_solver_c_varies():
+    model, graph = _fixture()
+    with torch.no_grad():
+        for operator in model.operators:
+            operator.beta_estimator.network[-1].weight.zero_()
+            operator.beta_estimator.network[-1].bias.fill_(-1000)
+    result = _audit(model, graph, torch.arange(8))
+    assert result["execution_status"] == "passed"
+    assert result["contribution_status"] == "inconclusive"
+    assert all(value["logit_max_abs"] == 0 for value in result["interventions"].values())
+    for row in result["local_layer_comparisons"]:
+        assert row["baseline_c"]["std"] > 0
+        assert row["baseline_beta"]["max"] == 0
+        assert row["operator_c_one_vs_deployed"]["max_abs"] == 0
 ````
 
 # tests/test_v5_static_graph_runtime.py

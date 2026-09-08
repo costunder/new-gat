@@ -55,10 +55,12 @@ from .protocol import (
     SUITE,
     TRAINING_PHASES,
     add_conductance_arguments,
+    add_sampling_context_arguments,
     beta_configuration,
     conductance_arguments_configuration,
     conductance_configuration,
     learning_budget_arguments_configuration,
+    sampling_context_configuration,
 )
 from .sampling import TransductiveGraphSampler
 from .timing import StageTimer
@@ -125,6 +127,7 @@ def configuration(args: argparse.Namespace) -> dict[str, Any]:
         **COMMON,
         **architecture_configuration(args),
         **learning_budget_arguments_configuration(args),
+        **sampling_context_configuration(args),
         "model_seed": args.model_seed,
         "epochs": args.epochs,
         "patience": args.patience,
@@ -877,6 +880,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sampling", choices=SAMPLING_MODES, default="full")
     parser.add_argument("--num-neighbors", type=int, nargs="+", default=[15, 10])
     parser.add_argument("--sample-seed-batch-size", type=int)
+    add_sampling_context_arguments(parser)
     parser.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
     parser.add_argument(
         "--phase-fractions",
@@ -900,6 +904,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_args(args: argparse.Namespace) -> None:
     resolve_hardware_arguments(args)
+    context = sampling_context_configuration(args)
+    for name, value in context.items():
+        setattr(args, name, value)
     conductance_arguments_configuration(args)
     budget_configuration = learning_budget_arguments_configuration(args)
     if budget_configuration and getattr(args, "transition_from_checkpoint", None) is not None:
@@ -981,6 +988,16 @@ def _prepare_data(payload, args, device):
         key: payload["splits"][key].nonzero(as_tuple=False).flatten().long()
         for key in ("train", "validation")
     }
+    # Reject invalid grouping before constructing the full-graph sampler/CSR cache.
+    if (
+        args.sampling == "cluster_disjoint"
+        and args.sample_seed_batch_size < indices["train"].numel()
+        and args.sample_seed_batch_size % args.sample_context_seed_batch_size
+    ):
+        raise ValueError(
+            "physical seed batch must group whole sampling contexts (integer multiple of "
+            "sample-context-seed-batch-size), except a batch containing the complete train split"
+        )
     sampler = TransductiveGraphSampler(
         graph,
         indices["train"],
@@ -988,6 +1005,14 @@ def _prepare_data(payload, args, device):
         seed_batch_size=args.sample_seed_batch_size,
         fanouts=args.num_neighbors,
         model_seed=args.model_seed,
+        **(
+            {
+                "context_seed_batch_size": args.sample_context_seed_batch_size,
+                "context_workers": args.sample_context_workers,
+            }
+            if args.sampling == "cluster_disjoint"
+            else {}
+        ),
     )
     return graph, indices, sampler
 
@@ -1629,6 +1654,8 @@ def _train_model_impl(
                 {
                     "nodes": int(graph.x.shape[0]),
                     "physical_edges": int(graph.incidence_edge_index.shape[1]),
+                    "disjoint_graphs": int(getattr(graph, "_v5_num_graphs", 1)),
+                    "sampling_observation": getattr(graph, "sampling_observation", None),
                     "supervised_seed_nodes": (
                         int(train_indices.numel()) if train_indices is not None else None
                     ),

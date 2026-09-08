@@ -1,11 +1,12 @@
-"""Real archived-source pins with synthetic CPU state-handoff integration.
+"""Archived-source contracts with synthetic CPU state-handoff integration.
 
-The old identities use actual 51da819 Git blobs, not invented SHA fixtures.
-Current source inputs are the canonical LF/server representation of real local
-files; this matters on a CRLF Windows checkout. The live registry/helper checks
-are never mocked. Small checkpoint tensors are generated with current CPU
-kernels: these tests verify state handoff, NOT execution of past GPU kernels,
-past experiment results, bitwise old/new numerical equivalence, or performance.
+Both source identities use actual 51da819 -> 8da06ca Git blobs. Current CPU
+training control flow is exercised with explicitly injected historical source
+maps; it is NOT identified as archived code, an authorized live-source resume,
+or reproduction of past GPU kernels/results. Small tensors exercise state
+handoff only. The unchanged production registry/helper are never mocked.
+Separate tests require the actual current source inventory to be rejected
+without changing checkpoint/history files or making an optimizer update.
 """
 
 from __future__ import annotations
@@ -52,12 +53,12 @@ def _git(*arguments, input_bytes=None):
     return result.stdout
 
 
-@pytest.fixture(scope="module")
-def source_maps():
-    old_train = _git("show", f"{REVISION}:research/conductance_gat/v5/train.py")
+def _revision_sources(revision):
+    """Read a revision's own V5 source inventory and exact Git-blob digests."""
+    archived_train = _git("show", f"{revision}:research/conductance_gat/v5/train.py")
     assignment = next(
         item
-        for item in ast.parse(old_train).body
+        for item in ast.parse(archived_train).body
         if isinstance(item, ast.Assign)
         and any(
             isinstance(target, ast.Name) and target.id == "_SHARED_IMPLEMENTATION_SOURCES"
@@ -74,39 +75,49 @@ def source_maps():
                 isinstance(item.value, ast.Name) and item.value.id == "COMPATIBILITY_SOURCE_FILES"
             )
             shared.extend(compat.COMPATIBILITY_SOURCE_FILES)
-    old_files = _git("ls-tree", "-r", "--name-only", REVISION).decode("utf-8").splitlines()
+    archived_files = _git("ls-tree", "-r", "--name-only", revision).decode("utf-8").splitlines()
     paths = sorted(
         set(shared)
         | {
             name
-            for name in old_files
+            for name in archived_files
             if name.startswith("research/conductance_gat/v5/")
             and name.count("/") == 3
             and name.endswith(".py")
         }
     )
-    request = "".join(f"{REVISION}:{name}\n" for name in paths).encode()
+    request = "".join(f"{revision}:{name}\n" for name in paths).encode()
     blobs = io.BytesIO(_git("cat-file", "--batch", input_bytes=request))
-    previous = {}
+    result = {}
     for name in paths:
         header = blobs.readline().decode().strip().split()
         assert len(header) == 3 and header[1] == "blob"
         raw = blobs.read(int(header[2]))
         assert blobs.read(1) == b"\n"
-        previous[name] = hashlib.sha256(raw).hexdigest()
-    current = {
+        result[name] = hashlib.sha256(raw).hexdigest()
+    return result
+
+
+def _server_live_sources():
+    return {
         name: hashlib.sha256((ROOT / name).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
         for name in LIVE_SOURCE_FUNCTION()
     }
-    # Current helper and registry really have the bytes checked by the live
-    # production loader; do not normalize away a stale registry/helper pin.
+
+
+@pytest.fixture(scope="module")
+def source_maps():
+    previous = _revision_sources(REVISION)
+    historical_target = _revision_sources("8da06cacec59515d84c08d892315e4c8ecfd5b5b")
+    # The real production helper/registry must still match the registered
+    # historical target. Their authorization is not extended to today's code.
     for name in compat.COMPATIBILITY_SOURCE_FILES:
-        assert current[name] == hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
-    evidence = compat.require_source_compatibility(previous, current)
+        assert historical_target[name] == hashlib.sha256((ROOT / name).read_bytes()).hexdigest()
+    evidence = compat.require_source_compatibility(previous, historical_target)
     assert evidence["base_commit"] == REVISION
     assert evidence["patch_id"] == compat.PERFORMANCE_PATCH_ID
     assert evidence["bitwise_numerical_identity"] is False
-    return previous, current
+    return previous, historical_target
 
 
 def _fixture(directory, monkeypatch, sources, *, fixed=False):
@@ -234,6 +245,35 @@ def test_real_registry_never_waives_recipe_changes_or_overwrites_checkpoint(
 
     def forbidden_update(*_args, **_kwargs):
         raise AssertionError("a rejected recipe must not perform an optimizer update")
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", forbidden_update)
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        _run(args, payload, protocol)
+    after = {path.name: path.read_bytes() for path in args.output_dir.iterdir() if path.is_file()}
+    assert after == original
+
+
+@pytest.mark.parametrize("origin", ["before_performance_repair", "historical_target"])
+def test_actual_current_sources_cannot_inherit_historical_resume_authority(
+    tmp_path, monkeypatch, source_maps, origin
+):
+    previous, historical_target = source_maps
+    source = previous if origin == "before_performance_repair" else historical_target
+    args, payload, protocol, _ = _boundary(
+        tmp_path / "preserved-live-rejection", monkeypatch, source
+    )
+    original = {
+        path.name: path.read_bytes() for path in args.output_dir.iterdir() if path.is_file()
+    }
+    live = _server_live_sources()
+    assert live != historical_target
+    assert not compat.snapshots_match(source, live)
+    with pytest.raises(ValueError):
+        compat.require_source_compatibility(source, live)
+    monkeypatch.setattr(train, "implementation_source_hashes", lambda: dict(live))
+
+    def forbidden_update(*_args, **_kwargs):
+        raise AssertionError("unregistered live sources must not perform an optimizer update")
 
     monkeypatch.setattr(torch.optim.AdamW, "step", forbidden_update)
     with pytest.raises(ValueError, match="resume identity mismatch"):
