@@ -2,6 +2,29 @@
 
 기준일: 2026-09-08 (Asia/Seoul).
 
+### 최신 추가 구현: zero gate와 forest/chord 선택
+
+신규 `edge_selection` 실험군은 기존 V5 결과를 수정하지 않는 별도 실행이다.
+구조 11조건과 corruption 2조건, 5데이터셋×reference/large×seed0로 총 130회 계획이다.
+구체적 수학, 예산, 보조 loss와 검증 범위는 `CONDUCTANCE_V5.md` 맨 위 절에 있다.
+기존 멀티-C 120회 계획이나 아래 수령된 과거 점수를 신규 학습 결과로 바꾸지 않는다.
+
+현재 상태: 구현·정적 검사·CPU 단위 및 합성 smoke 검증 완료. 최종 신규 검사 197개와
+기존 문서 위치 검사 1개를 함께 실행해 **198 passed / 5 skipped**를 확인했다.
+skip은 실제 PyG 통합 3개 및 실제 CUDA/pinning 2개다. 파라미터·gradient·optimizer,
+exact budget, cycle adjoint, 출처 분리, read-only 개입, 중단 재개와 완료 checkpoint의
+내부 일치 검사를 포함한다. 별도 실제 CLI dry-run으로 기본 130개 조건을 확인했다.
+
+기존 전체 회귀 실행은 3,127 passed / 112 skipped / 1 failed였다. 실패는 테스트 임시
+산출물의 Markdown을 프로젝트 문서로 인식한 위치 검사 1개였다. 직접 생성한 임시 폴더를
+저장소가 이미 정한 `.pytest-tmp-*` 위치로 옮긴 뒤 위 198개 재검사에 포함해 통과했다.
+기존 문서 검사 규칙을 완화하거나 기존 모델 코드를 바꾸지 않았다. 전체 묶음을 두 번
+모두 실행했다고 주장하지 않는다. Ruff 전체 신규 파일 검사와 diff 공백 검사도 통과했다.
+
+**신규 GPU 배치 실측·실제 데이터 전체 학습·전체 validation/test는 미실행**이다.
+로컬은 CPU PyTorch이며 A6000이 없고 PyG도 설치되어 있지 않다. 실행기가 GPU 자원
+교정을 수행하도록 구현한 사실과 실제로 A6000에서 최적 배치를 측정했다는 주장을 구분한다.
+
 ### 최신 수령: 기존 corrected checkpoint의 20조건 validation 감사
 
 사용자가 전달한 전체 감사 출력은 실행 20/20 성공이며 새 학습/test가 아니다.

@@ -1,5 +1,89 @@
 # Conductance GAT V5 — graph-specific C optimization and weighted-Laplacian propagation
 
+## 2026-09-08 추가: 실제 zero gate / forest–chord 선택 실험
+
+사용자의 추가 제안을 `research/conductance_gat/edge_selection/` 및
+`scripts/run_v5_edge_selection.py`에 **별도 실험군으로 구현**했다. 기존 V5/Cycle 소스와
+체크포인트를 대체하지 않는다. 아래 멀티-C 120회 계획과 이 130회 계획은 서로 다른 실행기다.
+
+각 층에서 기존 양의 C 최적화 출력은 amplitude `r[e,h]>0`로 유지한다.
+새 변수 `z[e]`는 feature head들이 공유하는 물리 엣지 선택이고,
+`c_eff[e,h]=z[e]*r[e,h]`, `L_h=B_s^T diag(omega*z*r_h) B_s`로 실제 전파된다.
+`r`의 보정 가중평균 1은 유지하지만 **z 또는 z*r를 평균 1로 재정규화하지 않는다.**
+행 정규화 attention 계수는 활성 이웃에서 합이 1이고 고립 노드의 이웃 질량은 0이다.
+최종 task loss가 z 생성기, 양의 r 최적화 파라미터, W, beta까지 함께 업데이트한다.
+단, r의 내부 solver는 후보 연결 전체의 기존 양의 목적함수다. z가 포함된 새 내부 최적화
+문제를 풀었다고 주장하지 않는다. z는 외부 task/보조 loss로 학습한다.
+
+### 서로 혼동하지 않는 두 비교
+
+| 실험군 | 조건 | 정확한 의미 |
+| --- | --- | --- |
+| 구조 11조건 | full, forest-only, random/learned/cycle 각각 chord 25/50/75% | 원본 그래프에서 label-free 고정 DFS forest를 보호하며, 각 disjoint graph의 나머지 chord 중 정확히 floor(q*chords)개 선택 |
+| corruption 2조건 | task+L0, task+L0+negative auxiliary | 원본 성분 안에 원본 엣지 수의 10%인 nonedge를 추가하고 hard-concrete로 선택; forest 보호나 exact-k 제약은 없음 |
+
+구조 비교의 train/eval forward는 동일한 정확한 k의 binary mask다. 역전파에는
+합 제약 logistic relaxation의 **편향된 straight-through gradient**를 사용한다.
+hard-concrete를 사용하면서 train에서 정확한 k를 보장한다고 설명하지 않는다.
+corruption은 hard-concrete의 reparameterized stochastic gate와 expected L0를 사용한다.
+기본 온도 2/3, stretch [-0.1,1.1], L0 계수 1e-4, negative 계수 0 대 1이다.
+L0는 그래프별 활성확률 합 → 그래프 평균 → 층 평균이고, negative loss는 그래프별
+원본/추가 클래스 균형 BCE다. BCE의 logit은 raw gate log-alpha가 아니라 Pr(z>0)에 대응한다.
+이 계수들은 명시적인 시작 실험 설정이지 최적 성능을 확인한 값이 아니다.
+
+추가 엣지는 실제 signed negative conductance가 아니다. 원본=1/추가=0의 정답은
+모델 입력에서 분리해 학습 보조 loss와 사후 진단에만 전달한다. train/eval의 추가 엣지는
+서로 겹치지 않으며, 원래 다른 연결 성분이나 PPI의 다른 그래프를 연결하지 않는다.
+정확한 수를 만들 수 없으면 축소·중복·거짓 샘플로 대체하지 않고 명시적으로 실패한다.
+원본·후보·추가 엣지와 출처는 immutable metadata/SHA로 검증한다.
+
+cycle 조건은 DFS fundamental-cycle의 **unsigned edge→cycle→edge scalar context**를
+gate score에 연결한다. QR/SVD/고유값 분해, 명시적인 전체 cycle 경로 행렬 없이
+tree prefix/subtree 누적으로 처리한다. signed implicit basis는 B^T Z=0 및 adjoint
+테스트로 별도 검증한다. 이것은 cycle 선택 문맥이지 새로운 positional encoding이라고
+주장하지 않으며 DFS 기저 선택에 의존한다. 효과 없는 B^T Za 출력으로 연결하지 않는다.
+DFS와 암시적 cycle 연산은 O(N+E)지만 후보 canonical 정렬과 exact top-k 정렬은
+별도 비용이다. 전체 파이프라인을 선형 시간이라고 주장하지 않는다. 긴 경로의 누적 오차를
+막기 위해 cycle prefix/subtree는 FP64로 누적한 뒤 입력 dtype으로 복귀한다.
+
+### 규모·실측·재개 및 결과 판정
+
+- 5개 official V1 데이터셋(Cora/CiteSeer/PubMed/PPI/ogbn-arxiv), seed 0 한 개,
+  reference(256 hidden/8 layers/8 heads), large(384/12/8)를 그대로 사용한다.
+  13조건×5데이터셋×2규모=130회이며 학습 epoch/patience 기준 200/50과
+  `reference_updates` 계약을 유지한다. 물리 배치가 달라지면 필요한 전체 epoch 수가
+  업데이트 예산에 맞춰 늘 수 있다. 샘플링 법칙·fanout·기존 solver K를 축소하지 않았다.
+- 모든 조건은 per-head r, row 정규화, optimized solver, width-scaled 비용,
+  joint 학습, beta 초기값 0.5로 맞춘다. random/learned 선택을 서로 다른 backbone
+  초기값으로 비교하지 않도록 공통 파라미터 초기 SHA를 확인한다.
+- 기본 auto sampling은 arxiv만 기존 cluster 방식이며, citation은 full graph,
+  PPI는 cached topology를 결합하는 disjoint graph minibatch다. forest의 보장은 실제
+  공급된 B_s 안의 연결성이지 샘플링으로 빠진 전체 그래프 경로의 복구가 아니다.
+- 새 실행기는 실제 할당 GPU에서 여러 physical batch/worker 후보의 전체 epoch
+  forward/backward/optimizer, 전체 validation, graph/cycle 준비와 자원을 측정한다.
+  PPI는 큰 그래프들의 동시 배치도 추가 stress 측정한다. 모든 조건에 안전한 공통값을
+  전체 학습 예산의 예상 시간 기준으로 고른다. 교정 모델은 폐기하고 본 학습은 원래 seed로
+  새로 시작한다. 로컬 CPU 테스트를 A6000 배치 최적화 실측으로 표시하지 않는다.
+- 새 run의 재호출은 검증된 완료 학습을 skip하고, 미완료 last.pt에서 model/optimizer/
+  Python·NumPy·CPU·CUDA RNG를 epoch 경계로 복원한다. 소스/설정/데이터/학습 예산
+  차이는 거부한다. 기존 run을 이 새 실험으로 resume하거나 기존 점수를 재명명하지 않는다.
+  신규 파일도 기존 mechanism 실행기의 전체 소스 스냅샷에 잡히므로 구 실행기의 strict
+  resume는 소스 변경으로 거부될 수 있다. 기존 결과 보존과 구 실행기의 resume 허용은 다르다.
+- 각 완료 checkpoint에서 전체 validation을 최소 5회 반복해 수치 변동을 기록한다.
+  z/r/z*r/alpha/beta 분포, 정확한 0 비율, 원본/추가 선택률, 활성 연결 성분·고립 노드·
+  cycle rank, degree별 entropy/effective neighbor/max-alpha를 기록한다. 경로 길이는
+  명시적인 seed 고정 32개 landmark→전체 노드 진단이며 all-pairs라고 주장하지 않는다.
+- 같은 checkpoint에서 all-gates-open, baseline gate를 고정한 amplitude r=1,
+  구조군의 random same-k 개입을 전체 validation labels로 비교한다. corruption 모델은
+  추가 엣지 없는 clean validation도 평가한다. 감사는 optimizer나 checkpoint를 수정하지
+  않으며 실패해도 완료 학습은 보존한다. test set은 이 실행기에서 평가하지 않는다.
+- 정확한 zero mask가 있어도 학습 gradient 경로를 위해 후보 엣지는 계속 계산한다.
+  실제 sparse kernel의 엣지 제거/속도 향상을 구현·측정했다고 주장하지 않는다.
+  effective-resistance sparsifier는 향후 비교 대상이며 이 실행에 포함하지 않았다.
+
+구현·CPU 검증과 실제 데이터에서의 성능 향상은 별개다. 신규 GPU 교정·전체 학습·전체
+평가 결과는 아직 없으며, 최종 로컬 회귀검사 수는 `EXPERIMENT_STATUS.md`에 기록한다.
+
 <a id="multi-c-mechanisms-20260908"></a>
 
 ## 2026-09-08: 멀티 C / attention 정규화 / 원인 분리 실험

@@ -1,5 +1,12 @@
 # GPT 전달용 전체 프로젝트 묶음
 
+최신 추가 구현(2026-09-08): `CONDUCTANCE_V5.md` 맨 위에 zero gate×양의 amplitude,
+보호 forest와 exact chord budget, 별도 corruption/hard-concrete/negative loss 실험을
+추가했다. 새 실행기는 `scripts/run_v5_edge_selection.py`, 실제 구현은
+`research/conductance_gat/edge_selection/`이다. 기본 130회 계획이며 기존 V5/Cycle
+결과는 보존한다. 신규 GPU 학습 결과가 나온 것은 아니다. 아래 멀티-C 실행기 120회와
+혼동하지 않는다. 이 전달 폴더에 새 문서를 늘리지 않고 기존 문서를 업데이트했다.
+
 최신 구현 추가(2026-09-08): `CONDUCTANCE_V5.md` 첫 절에 head별/실제 관계별 C,
 행합 1 attention 전파, C 생성기·solver·다항 필터 대조군, 실제 C/alpha/beta 분포
 진단과 공통 GPU 배치 실측 실행기를 기록했다. 전체 확장 선택은 12조건×5데이터셋×
