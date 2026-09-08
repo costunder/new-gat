@@ -93,6 +93,12 @@ def test_reference_budget_and_tolerance_are_explicit(tmp_path):
     assert args.reference_steps == 64
     assert args.reference_tolerance == 0.001
     assert args.json is False
+    assert args.repeat_evaluations == 5
+    assert args.head_gradient_conflict is False
+    explicit = parser.parse_args(
+        [*_args(tmp_path), "--repeat-evaluations", "6", "--head-gradient-conflict"]
+    )
+    assert explicit.repeat_evaluations == 6 and explicit.head_gradient_conflict is True
 
 
 @pytest.mark.parametrize(
@@ -103,11 +109,15 @@ def test_reference_budget_and_tolerance_are_explicit(tmp_path):
         ("--reference-tolerance", "0"),
         ("--reference-tolerance", "nan"),
         ("--reference-tolerance", "inf"),
+        ("--repeat-evaluations", "4"),
     ],
 )
 def test_invalid_reference_arguments(tmp_path, option, value):
     args = _args(tmp_path)
-    args[args.index(option) + 1] = value
+    if option in args:
+        args[args.index(option) + 1] = value
+    else:
+        args.extend([option, value])
     with pytest.raises(SystemExit):
         audit.build_parser().parse_args(args)
 
@@ -185,6 +195,69 @@ def test_recorded_diagnostics_do_not_invent_missing_overlap_or_gradient(evidence
     assert result["first_active_conductance_gradient"] == "unavailable"
 
 
+def test_explicit_mlp_control_is_auditable_but_not_mislabeled_optimized(evidence):
+    path, metrics = evidence
+    metrics["configuration"]["conductance_backend"] = "mlp"
+    metrics["configuration"]["solver_cost_scaling"] = "legacy_unit"
+    metrics["resume_identity_sha256"] = audit._canonical(metrics["resume_identity"])
+    _write_json(path, metrics)
+    assert audit.inspect_evidence(path)["metrics"]["configuration"]["conductance_backend"] == "mlp"
+    metrics["configuration"]["conductance_heads"] = "per_head"
+    metrics["resume_identity_sha256"] = audit._canonical(metrics["resume_identity"])
+    _write_json(path, metrics)
+    with pytest.raises(audit.AuditError, match="shared untyped MLP"):
+        audit.inspect_evidence(path)
+
+
+def test_beta_override_requires_exact_current_release_not_historical_relaxation(evidence):
+    path, metrics = evidence
+    metrics["configuration"]["beta_initial"] = 0.3
+    metrics["resume_identity_sha256"] = audit._canonical(metrics["resume_identity"])
+    _write_json(path, metrics)
+    with pytest.raises(audit.AuditError, match="explicitly corrected"):
+        audit.inspect_evidence(path)
+    metrics["source_sha256"] = {**audit.BASELINE_SOURCES, **audit.AUDIT_SOURCE_OVERRIDES}
+    metrics["resume_identity"]["source_sha256"] = metrics["source_sha256"]
+    metrics["resume_identity_sha256"] = audit._canonical(metrics["resume_identity"])
+    _write_json(path, metrics)
+    assert audit.inspect_evidence(path)["metrics"]["configuration"]["beta_initial"] == 0.3
+
+
+def test_human_distribution_distinguishes_raw_c_beta_and_row_relative_coefficients():
+    torch = pytest.importorskip("torch")
+    from research.conductance_gat.v5.distribution_audit import audit_conductance_distribution
+    from research.conductance_gat.v5.stage_audit import _json
+
+    distribution = _json(
+        audit_conductance_distribution(
+            torch.tensor([0.2, 0.8, 2.0]),
+            torch.tensor([[0, 0, 0], [1, 2, 3]]),
+            torch.zeros(5, dtype=torch.long),
+            1,
+            heads=2,
+            beta=torch.tensor([[0.3, 0.7]]),
+        )
+    )
+    output = "\n".join(audit.human_distribution(distribution))
+    for text in (
+        "raw C is not probability",
+        "CV=std/mean",
+        "beta=[",
+        "raw C quantiles=",
+        "c_ge_0_7",
+        "histogram=",
+        "degree1=3",
+        "isolates=1",
+        "diagnostic only",
+        "effective neighbors=",
+        "normalized entropy=",
+        "normalized head TV means=",
+        "JS means=",
+        "C=1 same-correction",
+    ):
+        assert text in output
+
+
 def test_recorded_layer_solver_and_sampling_observations_retained():
     layers = [
         {
@@ -223,6 +296,18 @@ def test_packaged_audit_source_pins_match_live_implementation():
     verified = audit.verify_sources(audit.BASELINE_SOURCES, current)
     assert verified["training_resume_authorized"] is False
     assert verified["audit_sources"] == current
+
+
+def test_historical_audit_release_is_readonly_and_exact():
+    current = {**audit.BASELINE_SOURCES, **audit.AUDIT_SOURCE_OVERRIDES}
+    historical = {**audit.BASELINE_SOURCES, **audit.HISTORICAL_AUDIT_SOURCE_OVERRIDES}
+    verified = audit.verify_sources(historical, current)
+    assert verified["training_resume_authorized"] is False
+    assert verified["checkpoint_sources"] == historical
+    assert verified["historical_repair"] is None
+    tampered = {**historical, "research/conductance_gat/v5/model.py": "f" * 64}
+    with pytest.raises(ValueError):
+        audit.verify_sources(tampered, current)
 
 
 def test_reviewed_added_source_requires_exact_digest(monkeypatch):

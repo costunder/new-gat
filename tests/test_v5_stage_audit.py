@@ -13,7 +13,7 @@ import torch
 
 from research.conductance_gat.v5.diagnostics import PreparedValidationGraph
 from research.conductance_gat.v5.model import GraphConditionedConductanceNodeClassifier
-from research.conductance_gat.v5.stage_audit import audit_stage_roles
+from research.conductance_gat.v5.stage_audit import _json, audit_stage_roles
 
 
 class DebugGraph(SimpleNamespace):
@@ -30,11 +30,9 @@ class DebugGraph(SimpleNamespace):
         return vars(self).items()
 
 
-def _fixture(mode="dynamic", batched=False):
+def _fixture(mode="dynamic", batched=False, **overrides):
     torch.manual_seed(421)
-    model = GraphConditionedConductanceNodeClassifier(
-        5,
-        3,
+    configuration = dict(
         hidden_channels=16,
         layers=2,
         heads=4,
@@ -47,6 +45,7 @@ def _fixture(mode="dynamic", batched=False):
         beta_initial=0.5,
         activation_checkpoint=False,
     )
+    model = GraphConditionedConductanceNodeClassifier(5, 3, **{**configuration, **overrides})
     edges = torch.tensor([[0, 0, 1, 1, 2, 4, 4, 5], [1, 2, 2, 3, 3, 5, 6, 6]])
     graph = DebugGraph(
         x=torch.randn(8, 5), incidence_edge_index=edges, y=torch.tensor([0, 1, 2, 1, 0, 2, 1, 0])
@@ -138,7 +137,7 @@ def test_validation_interventions_and_local_reference_are_read_only_and_json_ser
     assert torch.equal(graph.x, x)
     json.dumps(result, allow_nan=False)
     assert result["execution_status"] == "passed"
-    assert result["contribution_status"] == "observed"
+    assert result["contribution_status"] == "observed_above_repeat_noise"
     assert result["scope"]["test_used"] is False
     assert result["scope"]["parameters_updated"] is False
     assert result["interventions"]["learned"]["label_count"] == 4
@@ -191,8 +190,11 @@ def test_ppi_disjoint_batches_are_not_split_and_generator_is_consumed_once():
 def test_fixed_c_reports_no_inner_optimization_or_contribution_evidence():
     model, graph = _fixture(mode="fixed_one")
     result = _audit(model, graph, torch.arange(8))
-    assert result["contribution_status"] == "inconclusive"
-    assert all(value["logit_max_abs"] == 0 for value in result["interventions"].values())
+    assert result["contribution_status"] == "not_applicable"
+    assert all(
+        result["interventions"][name]["logit_max_abs"] == 0
+        for name in ("learned", "c_one", "mean_c", "shuffled_c")
+    )
     for row in result["local_layer_comparisons"]:
         assert row["reference_tolerance_reached_by_graph"] is None
         assert row["baseline_solver"]["enabled"] is False
@@ -321,3 +323,153 @@ def test_zero_beta_bypass_is_inconclusive_even_when_solver_c_varies():
         assert row["baseline_c"]["std"] > 0
         assert row["baseline_beta"]["max"] == 0
         assert row["operator_c_one_vs_deployed"]["max_abs"] == 0
+
+
+def test_same_checkpoint_eval_repeats_do_not_become_training_seeds():
+    model, graph = _fixture()
+    result = _audit(model, graph, torch.arange(8), repeat_evaluations=6)
+    noise = result["repeat_noise_control"]
+    assert noise["evaluation_count"] == len(noise["repeats"]) == 6
+    assert noise["different_training_seeds"] is False
+    assert noise["max_logit_difference_l2"] == 0
+    assert "mean_head_beta" in result["interventions"]
+    assert result["scope"]["full_validation_passes"] == 11
+
+
+def test_fixed_c_numerical_jitter_is_never_a_contribution_certificate():
+    model, graph = _fixture(mode="fixed_one")
+    call = []
+
+    def simulated_numerical_jitter(module, args, output):
+        call.append(1)
+        return output + 0.0001 * len(call)
+
+    handle = model.decoder.register_forward_hook(simulated_numerical_jitter)
+    try:
+        result = _audit(model, graph, torch.arange(8))
+    finally:
+        handle.remove()
+    assert result["repeat_noise_control"]["max_logit_difference_l2"] > 0
+    assert result["interventions"]["c_one"]["logit_max_abs"] > 0
+    assert result["contribution_status"] == "not_applicable"
+
+
+@pytest.mark.parametrize("normalization", ["row", "symmetric"])
+def test_per_head_real_audit_has_scoped_distribution_and_headwise_residual(normalization):
+    model, graph = _fixture(
+        batched=True, conductance_heads="per_head", propagation_normalization=normalization
+    )
+    result = _audit(model, [graph])
+    json.dumps(result, allow_nan=False)
+    for local in result["local_layer_comparisons"]:
+        distribution = local["distribution"]
+        assert distribution["conductance_layout"] == "per_head_E_H"
+        assert distribution["propagation_normalization"] == normalization
+        assert len(distribution["graphs"]) == 2
+        assert len(local["reference_tolerance_reached_by_graph"]) == 2
+        for graph_row in distribution["graphs"]:
+            assert len(graph_row["raw_c"]["quantiles"]["0.5"]) == 4
+            assert graph_row["heads"] == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"conductance_backend": "mlp", "solver_cost_scaling": "legacy_unit"},
+        {"conductance_generator": "entropy_exact", "solver_degree_barrier": 0.0},
+        {"conductance_generator": "degree_only"},
+    ],
+)
+def test_noniterative_controls_have_no_fake_higher_k_measurement(options):
+    model, graph = _fixture(**options)
+    result = _audit(model, graph, torch.arange(8))
+    assert result["reference_contract"]["applicable"] is False
+    assert "higher_k_full_model" not in result["interventions"]
+    for local in result["local_layer_comparisons"]:
+        assert local["c_deployed_vs_reference"] is None
+        assert local["reference_tolerance_reached_by_graph"] is None
+        assert local["distribution"]["graphs"]
+
+
+def test_optional_actual_task_head_c_gradients_preserve_grads_weights_rng_and_hooks():
+    model, graph = _fixture(conductance_heads="per_head", propagation_normalization="row")
+    model(graph).square().mean().backward()
+    state = _state(model)
+    result = _audit(model, graph, torch.arange(8), head_gradient_conflict=True)
+    _assert_restored(model, state)
+    audit = result["head_gradient_conflict"]
+    assert audit["measured"] is True
+    assert "not theta-space" in audit["scope"]
+    assert len(audit["layers"]) == 2
+    assert all(row["measured"] for row in audit["layers"])
+    assert all(len(row["graphs"][0]["head_pair_dot_matrix"]) == 4 for row in audit["layers"])
+    assert result["scope"]["autograd_vjp_used"] is True
+    assert all(not op.estimator._forward_hooks for op in model.operators)
+
+
+def test_optional_shared_c_head_expansion_keeps_forward_and_parameters_unchanged():
+    model, graph = _fixture()
+    state = _state(model)
+    result = _audit(model, graph, torch.arange(8), head_gradient_conflict=True)
+    _assert_restored(model, state)
+    for row in result["head_gradient_conflict"]["layers"]:
+        assert row["equal_c_forward_difference"]["relative_l2"] < 1e-5
+        assert row["graphs"][0]["shared_c_sum_gradient_norm"] > 0
+
+
+def test_too_few_same_checkpoint_repeats_are_rejected():
+    model, graph = _fixture()
+    with pytest.raises(ValueError, match="at least 5"):
+        _audit(model, graph, torch.arange(8), repeat_evaluations=4)
+
+
+def test_optional_vjp_failure_removes_hooks_and_restores_model(monkeypatch):
+    model, graph = _fixture()
+    state = _state(model)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("synthetic requested VJP failure")
+
+    monkeypatch.setattr(torch.autograd, "grad", fail)
+    with pytest.raises(RuntimeError, match="requested VJP"):
+        _audit(model, graph, torch.arange(8), head_gradient_conflict=True)
+    _assert_restored(model, state)
+    assert all(not op.estimator._forward_hooks for op in model.operators)
+
+
+def test_summary_json_packs_once_per_dtype_without_losing_nested_shapes_or_int64(monkeypatch):
+    calls = []
+    original = torch.Tensor.cpu
+
+    def count_cpu(tensor, *args, **kwargs):
+        calls.append((tensor.dtype, tensor.numel()))
+        return original(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", count_cpu)
+    floating = torch.tensor([[0.5, 1.5], [2.5, 3.5]]).T
+    data = {
+        "nested": (floating, {"same_tensor": floating, "empty": torch.empty(2, 0)}),
+        "scalar": torch.tensor(0.25),
+        "integer": torch.tensor(2**62 + 1),
+        "boolean": torch.tensor([True, False]),
+        "none": None,
+    }
+    result = _json(data)
+    assert len(calls) == 3
+    assert sum(count for dtype, count in calls if dtype == torch.float32) == 5
+    assert result["nested"] == [
+        [[0.5, 2.5], [1.5, 3.5]],
+        {"same_tensor": [[0.5, 2.5], [1.5, 3.5]], "empty": [[], []]},
+    ]
+    assert result["integer"] == 2**62 + 1 and type(result["integer"]) is int
+    assert result["boolean"] == [True, False] and type(result["boolean"][0]) is bool
+    assert result["scalar"] == 0.25 and result["none"] is None
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "bad", [torch.tensor(float("nan")), torch.tensor(float("inf")), float("nan")]
+)
+def test_packed_summary_json_rejects_nonfinite_values(bad):
+    with pytest.raises(FloatingPointError, match="nonfinite stage audit statistic"):
+        _json({"nested": [torch.ones(2), {"bad": bad}]})

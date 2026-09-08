@@ -19,7 +19,15 @@ from .operator import _validate_graph_index, graph_broadcast, graph_sum
 
 
 def _degree(c: Tensor, incidence: Tensor, num_nodes: int) -> Tensor:
-    return c.new_zeros(num_nodes).index_add(0, incidence[0], c).index_add(0, incidence[1], c)
+    return (
+        c.new_zeros((num_nodes, *c.shape[1:]))
+        .index_add(0, incidence[0], c)
+        .index_add(0, incidence[1], c)
+    )
+
+
+def _edge_weighted(values: Tensor, omega: Tensor) -> Tensor:
+    return values * (omega[:, None] if values.ndim == 2 else omega)
 
 
 def _graph_max(
@@ -28,9 +36,12 @@ def _graph_max(
     if num_graphs == 1:
         # Include the original self value, also in the gradient's tie count.
         # clamp_min/maximum after amax would give different zero-tie gradients.
-        return torch.cat((values.new_full((1,), initial), values)).amax(dim=0, keepdim=True)
-    return values.new_full((num_graphs,), initial).scatter_reduce(
-        0, edge_graph, values, reduce="amax", include_self=True
+        return torch.cat((values.new_full((1, *values.shape[1:]), initial), values)).amax(
+            dim=0, keepdim=True
+        )
+    index = edge_graph[:, None].expand_as(values) if values.ndim == 2 else edge_graph
+    return values.new_full((num_graphs, *values.shape[1:]), initial).scatter_reduce(
+        0, index, values, reduce="amax", include_self=True
     )
 
 
@@ -39,8 +50,11 @@ def _weighted_mean(
 ) -> Tensor:
     # Graph IDs are validated at the solver boundary. Reuse the live mass:
     # detaching it would change derivatives when sampling weights need grad.
-    numerator = graph_sum(values * omega, edge_graph, num_graphs, validate_index=False)
-    return numerator / graph_mass.clamp_min(torch.finfo(values.dtype).tiny)
+    numerator = graph_sum(
+        _edge_weighted(values, omega), edge_graph, num_graphs, validate_index=False
+    )
+    mass = graph_mass[:, None] if values.ndim == 2 else graph_mass
+    return numerator / mass.clamp_min(torch.finfo(values.dtype).tiny)
 
 
 def _normalize_log_c(
@@ -75,6 +89,9 @@ def _energy_from_degrees(
     entropy: float,
     degree_barrier: float,
 ) -> Tensor:
+    if degree.ndim == 2 and reference.ndim == 1:
+        reference = reference[:, None]
+        counts = counts[:, None]
     active = reference > 0
     safe_degree = torch.where(active, degree, torch.ones_like(degree))
     safe_reference = torch.where(active, reference, torch.ones_like(reference))
@@ -107,7 +124,7 @@ def conductance_energy(
     """
     _validate_graph_index(node_graph, num_graphs)
     edge_graph = node_graph[incidence[0]]
-    degree = _degree(omega * c, incidence, node_graph.numel())
+    degree = _degree(_edge_weighted(c, omega), incidence, node_graph.numel())
     reference = _degree(omega, incidence, node_graph.numel())
     counts = graph_sum((reference > 0).to(c.dtype), node_graph, num_graphs, validate_index=False)
     graph_mass = graph_sum(omega, edge_graph, num_graphs, validate_index=False)
@@ -128,11 +145,17 @@ def conductance_energy(
 
 
 class GraphOptimizedConductance(nn.Module):
-    """Shared signed compatibility, followed by K differentiable C updates.
+    """Signed compatibility followed by independently normalized C optimization.
 
     Uses every feature channel, a graph-conditioned signed diagonal quadratic
     metric, and symmetric structural features. There is no edge MLP or
-    edge-specific parameter table. C is shared across all feature heads.
+    edge-specific parameter table. The legacy default shares C; multiple C
+    heads have separate context/structure metrics, energies, degrees, steps
+    and gauges, vectorized along an explicit head dimension. A common node
+    projection does not average the independently learned head metrics.
+    Explicit relation IDs optionally select additional quadratic metrics.
+    ``degree_only`` removes task-learned costs; ``entropy_exact`` solves the
+    entropy/linear-cost objective analytically and requires degree barrier 0.
 
     ``legacy_unit`` preserves the original unit-normalized compatibility.
     ``width_scaled`` compensates the O(channels**-0.5) contrast of isotropic
@@ -160,12 +183,16 @@ class GraphOptimizedConductance(nn.Module):
         solver_cost_scaling: str = "legacy_unit",
         cost_bound: float = 2.0,
         edge_chunk_size: int = 65536,
+        conductance_heads: int = 1,
+        generator: str = "optimized",
+        num_relations: int = 0,
     ) -> None:
         super().__init__()
         for name, value in (
             ("channels", channels),
             ("solver_steps", solver_steps),
             ("edge_chunk_size", edge_chunk_size),
+            ("conductance_heads", conductance_heads),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -192,7 +219,22 @@ class GraphOptimizedConductance(nn.Module):
             raise ValueError(f"unsupported conductance mode: {mode}")
         if solver_cost_scaling not in ("legacy_unit", "width_scaled"):
             raise ValueError(f"unsupported solver_cost_scaling: {solver_cost_scaling}")
+        if generator not in {"optimized", "degree_only", "entropy_exact"}:
+            raise ValueError(f"unsupported conductance generator: {generator}")
+        if generator == "entropy_exact" and solver_degree_barrier != 0:
+            raise ValueError("entropy_exact requires solver_degree_barrier=0")
+        if (
+            isinstance(num_relations, bool)
+            or not isinstance(num_relations, int)
+            or num_relations < 0
+        ):
+            raise ValueError("num_relations must be a nonnegative integer")
+        if generator == "degree_only" and num_relations:
+            raise ValueError("degree_only has no learned relation costs; num_relations must be 0")
         self.channels = channels
+        self.conductance_heads = conductance_heads
+        self.generator = generator
+        self.num_relations = num_relations
         self.mode = mode
         self.solver_steps = solver_steps
         self.solver_step_size = float(solver_step_size)
@@ -202,16 +244,29 @@ class GraphOptimizedConductance(nn.Module):
         self.quadratic_scale = math.sqrt(channels) if solver_cost_scaling == "width_scaled" else 1.0
         self.cost_bound = float(cost_bound)
         self.edge_chunk_size = edge_chunk_size
-        if mode == "dynamic":
+        if mode == "dynamic" and generator != "degree_only":
             self.node_projection: nn.Linear | None = nn.Linear(channels, channels, bias=False)
-            self.context_metric: nn.Linear | None = nn.Linear(2 * channels + 8, channels)
-            self.structure_metric: nn.Parameter | None = nn.Parameter(torch.empty(8))
+            self.context_metric: nn.Linear | None = nn.Linear(
+                2 * channels + 8, channels * conductance_heads
+            )
+            self.structure_metric: nn.Parameter | None = nn.Parameter(
+                torch.empty(8) if conductance_heads == 1 else torch.empty(conductance_heads, 8)
+            )
             nn.init.normal_(self.structure_metric, std=0.01)
         else:
             # A true parameter-free C=1 control, not frozen unused modules.
             self.node_projection = None
             self.context_metric = None
             self.register_parameter("structure_metric", None)
+        if num_relations and mode == "dynamic":
+            # A genuine relation-conditioned diagonal quadratic metric,
+            # not a constant graph offset and not fabricated relation labels.
+            self.relation_metric = nn.Parameter(
+                torch.empty(num_relations, conductance_heads, channels)
+            )
+            nn.init.normal_(self.relation_metric, std=0.01)
+        else:
+            self.register_parameter("relation_metric", None)
         self.override: str | None = None
         self.last_scores: Tensor | None = None
         self.last_log_c: Tensor | None = None
@@ -227,6 +282,7 @@ class GraphOptimizedConductance(nn.Module):
         sample_degree: Tensor,
         full_degree: Tensor,
         edge_graph: Tensor,
+        edge_relation_id: Tensor | None = None,
     ) -> Tensor:
         if self.structure_metric is None:
             raise RuntimeError("fixed C has no compatibility parameters")
@@ -270,10 +326,23 @@ class GraphOptimizedConductance(nn.Module):
             dim=1,
         )
         edge_metric = graph_broadcast(metric, edge_graph, metric.shape[0], validate_index=False)
-        quadratic = ((left - right).square() * edge_metric).sum(dim=1)
+        if self.conductance_heads == 1:
+            if edge_relation_id is not None and self.relation_metric is not None:
+                edge_metric = (
+                    edge_metric
+                    + self.relation_metric[edge_relation_id, 0].to(projected.dtype).tanh()
+                )
+            quadratic = ((left - right).square() * edge_metric).sum(dim=1)
+            structural = (local.tanh() * self.structure_metric.to(projected.dtype)).sum(dim=1)
+        else:
+            if edge_relation_id is not None and self.relation_metric is not None:
+                edge_metric = (
+                    edge_metric + self.relation_metric[edge_relation_id].to(projected.dtype).tanh()
+                )
+            quadratic = torch.einsum("ed,ehd->eh", (left - right).square(), edge_metric)
+            structural = local.tanh() @ self.structure_metric.to(projected.dtype).T
         if self.solver_cost_scaling == "width_scaled":
             quadratic = quadratic * self.quadratic_scale
-        structural = (local.tanh() * self.structure_metric.to(projected.dtype)).sum(dim=1)
         return quadratic + structural
 
     def _compatibility_chunk(
@@ -285,11 +354,12 @@ class GraphOptimizedConductance(nn.Module):
         sample_degree: Tensor,
         full_degree: Tensor,
         edge_graph: Tensor,
+        edge_relation_id: Tensor | None = None,
     ) -> Tensor:
         """Keep the legacy bounded-chunk path numerically unchanged."""
 
         raw = self._raw_compatibility_chunk(
-            projected, metric, tail, head, sample_degree, full_degree, edge_graph
+            projected, metric, tail, head, sample_degree, full_degree, edge_graph, edge_relation_id
         )
         return self.cost_bound * torch.tanh(raw / self.cost_bound)
 
@@ -308,18 +378,18 @@ class GraphOptimizedConductance(nn.Module):
         degree: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         if degree is None:
-            degree = _degree(omega * log_c.exp(), incidence, num_nodes)
+            degree = _degree(_edge_weighted(log_c.exp(), omega), incidence, num_nodes)
         inverse_sum = degree[incidence[0]].reciprocal() + degree[incidence[1]].reciprocal()
         if barrier_coefficient is None:
             barrier_coefficient = self.solver_degree_barrier * (
                 graph_mass / active_counts.clamp_min(1)
             )
-        barrier = (
-            graph_broadcast(
-                barrier_coefficient, edge_graph, graph_mass.numel(), validate_index=False
-            )
-            * inverse_sum
+        coefficient = graph_broadcast(
+            barrier_coefficient, edge_graph, graph_mass.numel(), validate_index=False
         )
+        if log_c.ndim == 2:
+            coefficient = coefficient[:, None]
+        barrier = coefficient * inverse_sum
         return delta + self.solver_entropy * log_c - barrier, barrier
 
     def _step(
@@ -385,6 +455,7 @@ class GraphOptimizedConductance(nn.Module):
         sample_degree: Tensor,
         full_degree: Tensor,
         edge_normalization_weight: Tensor | None = None,
+        edge_relation_id: Tensor | None = None,
     ) -> Tensor:
         if state.ndim != 2 or state.shape[1] != self.channels or not state.is_floating_point():
             raise ValueError("state must be an N x channels floating tensor")
@@ -408,6 +479,23 @@ class GraphOptimizedConductance(nn.Module):
         )
         _validate_graph_index(node_graph, num_graphs)
         tail, head = incidence
+        if self.num_relations:
+            if (
+                edge_relation_id is None
+                or edge_relation_id.shape != tail.shape
+                or edge_relation_id.dtype != torch.long
+                or edge_relation_id.device != state.device
+            ):
+                raise ValueError(
+                    "explicit edge_relation_id must be same-device int64 "
+                    "with one ID per physical edge"
+                )
+            torch._assert_async(
+                ((edge_relation_id >= 0) & (edge_relation_id < self.num_relations)).all(),
+                "edge_relation_id is outside configured num_relations",
+            )
+        elif edge_relation_id is not None:
+            raise ValueError("edge_relation_id supplied without explicit num_relations")
         edge_graph = node_graph[tail]
         omega = torch.ones(tail.numel(), device=state.device, dtype=compute_dtype)
         if edge_normalization_weight is not None:
@@ -422,7 +510,11 @@ class GraphOptimizedConductance(nn.Module):
             "C solver needs finite positive sampling weights",
         )
         if self.mode == "fixed_one" or self.override == "ones" or tail.numel() == 0:
-            c = torch.ones_like(omega)
+            c = (
+                torch.ones_like(omega)
+                if self.conductance_heads == 1
+                else omega.new_ones((omega.shape[0], self.conductance_heads))
+            )
             self.last_scores = torch.zeros_like(c)
             self.last_log_c = torch.zeros_like(c)
             self.last_c = c.detach()
@@ -435,43 +527,53 @@ class GraphOptimizedConductance(nn.Module):
                 "quadratic_scale": self.quadratic_scale,
             }
             return c
-        if self.node_projection is None or self.context_metric is None:
-            raise RuntimeError("dynamic compatibility parameters are unavailable")
-        projected = F.normalize(self.node_projection(state).to(compute_dtype), dim=1, eps=1e-6)
-        normalized_context = F.layer_norm(graph_context, (graph_context.shape[1],))
-        metric = self.context_metric(normalized_context).to(compute_dtype).tanh()
-        sample_degree = sample_degree.to(compute_dtype)
-        full_degree = full_degree.to(compute_dtype)
-        chunks = []
-        compatibility = (
-            self._raw_compatibility_chunk
-            if self.solver_cost_scaling == "width_scaled"
-            else self._compatibility_chunk
-        )
-        for start in range(0, tail.numel(), self.edge_chunk_size):
-            stop = start + self.edge_chunk_size
-            arguments = (
-                projected,
-                metric,
-                tail[start:stop],
-                head[start:stop],
-                sample_degree,
-                full_degree,
-                edge_graph[start:stop],
+        if self.generator == "degree_only":
+            # This ablation deliberately has no task-learned cost parameters.
+            shape = (
+                (tail.numel(),)
+                if self.conductance_heads == 1
+                else (tail.numel(), self.conductance_heads)
             )
-            if torch.is_grad_enabled():
-                from torch.utils.checkpoint import checkpoint
-
-                delta = checkpoint(
-                    compatibility,
-                    *arguments,
-                    use_reentrant=False,
-                    preserve_rng_state=False,
+            delta = state.new_zeros(shape, dtype=compute_dtype)
+        else:
+            if self.node_projection is None or self.context_metric is None:
+                raise RuntimeError("dynamic compatibility parameters are unavailable")
+            projected = F.normalize(self.node_projection(state).to(compute_dtype), dim=1, eps=1e-6)
+            normalized_context = F.layer_norm(graph_context, (graph_context.shape[1],))
+            metric = self.context_metric(normalized_context).to(compute_dtype).tanh()
+            if self.conductance_heads > 1:
+                metric = metric.reshape(num_graphs, self.conductance_heads, self.channels)
+            sample_degree = sample_degree.to(compute_dtype)
+            full_degree = full_degree.to(compute_dtype)
+            chunks = []
+            compatibility = (
+                self._raw_compatibility_chunk
+                if self.solver_cost_scaling == "width_scaled"
+                else self._compatibility_chunk
+            )
+            for start in range(0, tail.numel(), self.edge_chunk_size):
+                stop = start + self.edge_chunk_size
+                arguments = (
+                    projected,
+                    metric,
+                    tail[start:stop],
+                    head[start:stop],
+                    sample_degree,
+                    full_degree,
+                    edge_graph[start:stop],
                 )
-            else:
-                delta = compatibility(*arguments)
-            chunks.append(delta)
-        delta = torch.cat(chunks)
+                if edge_relation_id is not None:
+                    arguments = (*arguments, edge_relation_id[start:stop])
+                if torch.is_grad_enabled():
+                    from torch.utils.checkpoint import checkpoint
+
+                    chunk = checkpoint(
+                        compatibility, *arguments, use_reentrant=False, preserve_rng_state=False
+                    )
+                else:
+                    chunk = compatibility(*arguments)
+                chunks.append(chunk)
+            delta = torch.cat(chunks)
         graph_mass = graph_sum(omega, edge_graph, num_graphs, validate_index=False)
         if self.solver_cost_scaling == "width_scaled":
             # Center over complete graphs, never individual memory chunks.
@@ -493,7 +595,28 @@ class GraphOptimizedConductance(nn.Module):
         steps = []
         initial_residual = None
         previous_log_c = log_c
-        for iteration in range(self.solver_steps):
+        initial_degree = (
+            reference_degree
+            if delta.ndim == 1
+            else reference_degree[:, None].expand(-1, self.conductance_heads)
+        )
+        if self.generator == "entropy_exact":
+            # Exact minimizer of the entropy + learned linear cost energy
+            # under the same omega-weighted mean-one constraint (rho=0).
+            initial_centered = delta - graph_broadcast(
+                _weighted_mean(delta, edge_graph, num_graphs, omega, graph_mass),
+                edge_graph,
+                num_graphs,
+                validate_index=False,
+            )
+            initial_residual = _weighted_mean(
+                initial_centered.detach().square(), edge_graph, num_graphs, omega, graph_mass
+            ).sqrt()
+            log_c = _normalize_log_c(
+                -delta / self.solver_entropy, edge_graph, num_graphs, omega, graph_mass
+            )
+        executed_steps = 0 if self.generator == "entropy_exact" else self.solver_steps
+        for iteration in range(executed_steps):
             previous_log_c = log_c
             arguments = (
                 log_c,
@@ -508,7 +631,7 @@ class GraphOptimizedConductance(nn.Module):
                 barrier_coefficient,
                 # C starts as the constant one vector, so this degree is
                 # exactly the live reference degree, including omega's grad.
-                reference_degree if iteration == 0 else None,
+                initial_degree if iteration == 0 else None,
             )
             if torch.is_grad_enabled():
                 from torch.utils.checkpoint import checkpoint
@@ -533,7 +656,7 @@ class GraphOptimizedConductance(nn.Module):
             initial_energy = _weighted_mean(
                 delta.detach(), edge_graph, num_graphs, omega, graph_mass
             )
-            final_degree = _degree(omega * c.detach(), incidence, state.shape[0])
+            final_degree = _degree(_edge_weighted(c.detach(), omega), incidence, state.shape[0])
             final_energy = _energy_from_degrees(
                 c.detach(),
                 delta.detach(),
@@ -587,12 +710,18 @@ class GraphOptimizedConductance(nn.Module):
             torch._assert_async(
                 valid, "C optimization produced nonfinite values or increased its objective"
             )
-            step_history = torch.stack(steps)
+            step_history = (
+                torch.stack(steps) if steps else torch.zeros_like(initial_energy).unsqueeze(0)
+            )
             self.last_solver_diagnostics = {
                 "enabled": True,
-                "method": "curvature_bounded_kl_proximal",
-                "executed_steps": self.solver_steps,
-                "finite_step_approximation": True,
+                "method": "analytic_entropy"
+                if self.generator == "entropy_exact"
+                else "curvature_bounded_kl_proximal",
+                "executed_steps": executed_steps,
+                "finite_step_approximation": self.generator != "entropy_exact",
+                "conductance_generator": self.generator,
+                "conductance_heads": self.conductance_heads,
                 "solver_cost_scaling": self.solver_cost_scaling,
                 "quadratic_scale": self.quadratic_scale,
                 "objective_initial": initial_energy,
@@ -618,9 +747,13 @@ class GraphOptimizedConductance(nn.Module):
             order = torch.argsort(edge_graph, stable=True)
             counts = torch.bincount(edge_graph, minlength=num_graphs)
             starts = counts.cumsum(0) - counts
-            position = torch.arange(c.numel(), device=c.device)
+            position = torch.arange(c.shape[0], device=c.device)
             reverse = 2 * starts[edge_graph[order]] + counts[edge_graph[order]] - 1 - position
-            c = torch.empty_like(c).scatter(0, order, c[order[reverse]])
+            c = (
+                torch.empty_like(c).scatter(0, order, c[order[reverse]])
+                if c.ndim == 1
+                else torch.empty_like(c).index_copy(0, order, c[order[reverse]])
+            )
         self.last_scores = delta.detach()
         self.last_log_c = log_c.detach()
         self.last_c = c.detach()

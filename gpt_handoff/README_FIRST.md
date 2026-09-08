@@ -1,5 +1,16 @@
 # GPT 전달용 전체 프로젝트 묶음
 
+최신 구현 추가(2026-09-08): `CONDUCTANCE_V5.md` 첫 절에 head별/실제 관계별 C,
+행합 1 attention 전파, C 생성기·solver·다항 필터 대조군, 실제 C/alpha/beta 분포
+진단과 공통 GPU 배치 실측 실행기를 기록했다. 전체 확장 선택은 12조건×5데이터셋×
+2규모×seed0=120회다. 구형 결과는 보존하며, 새로운 구조의 GPU 학습 결과가 나온 것은 아니다.
+아래 이전 날짜별 결과와 새 실험 계획을 구분한다.
+
+스냅샷 상태: `CODE_SUMMARY.md`는 이번 멀티 C 구현 전의 스냅샷이다. 기존 자동 생성
+파일 재생성이 별도 덮어쓰기 승인 요구로 차단되어 갱신하지 않았다. 현재 구현 검토에는
+저장소의 `research/conductance_gat/v5/`와 `scripts/run_v5_mechanism_experiments.py`,
+해당 tests의 실제 소스를 사용해야 한다. 아래 과거의 스냅샷 갱신 기록과 구분한다.
+
 최신 갱신(2026-09-08): corrected V5의 20조건 학습 결과, 3,832개 에포크 원문과
 dynamic-C 10조건 test 결과를 `EXPERIMENT_STATUS.md` 첫 절 및 부록에 기록했다.
 reference/arxiv dynamic은 기록상 약 667초에서 29초/epoch로 바뀌었지만, C의 추가 성능
@@ -26,7 +37,7 @@ GPT에는 파일을 따로 고르지 말고 이 폴더의 **10개 파일을 전�
 8. `CYCLE_PE_V2.md`: QR-free DFS 기저의 구조 SE 대 SE+cycle 상대 PE 비교 계약
 9. `RICH_SCALING_EXPERIMENTS.md`: Conductance V1–V5, Cycle PE V1/V2, Tree의
    reference/large 전체 scaling 계약(122 child / 126 model trainings)
-10. `CODE_SUMMARY.md`: 현재 Python·test·config·script 전체의 원문 스냅샷
+10. `CODE_SUMMARY.md`: 멀티 C 확장 이전 Python·test·config·script 원문 스냅샷(위 주의 참고)
 
 Conductance v2/v3/v4/v5와 Cycle PE v2는 각각의 원문 문서를 직접 제공한다. 이 문서만 보는
 것도 아니며 Conductance v1, Cycle PE v1, Tree Augmentation, 전체 scaling 실험, 데이터·평가

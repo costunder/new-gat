@@ -413,7 +413,7 @@ class GraphConditionedBeta(nn.Module):
 
 
 class SharedConductanceMultihead(nn.Module):
-    """One shared C with head-specific spatial W and graph-conditioned beta."""
+    """Shared or per-head C with independent W and graph-conditioned beta."""
 
     def __init__(
         self,
@@ -433,6 +433,12 @@ class SharedConductanceMultihead(nn.Module):
         solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
         solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
         solver_cost_scaling: str = "legacy_unit",
+        conductance_heads: str = "shared",
+        propagation_normalization: str = "symmetric",
+        conductance_generator: str = "optimized",
+        num_relations: int = 0,
+        edge_direction: str = "undirected",
+        propagation_filter: str = "linear",
     ) -> None:
         super().__init__()
         if channels % heads:
@@ -440,6 +446,26 @@ class SharedConductanceMultihead(nn.Module):
         self.channels, self.heads, self.head_width = channels, heads, channels // heads
         self.conductance_mode = conductance_mode
         self.conductance_backend = conductance_backend
+        conductance_configuration(
+            conductance_backend,
+            solver_steps,
+            solver_step_size,
+            solver_entropy,
+            solver_degree_barrier,
+            solver_cost_scaling,
+            conductance_heads=conductance_heads,
+            propagation_normalization=propagation_normalization,
+            conductance_generator=conductance_generator,
+            num_relations=num_relations,
+            edge_direction=edge_direction,
+            propagation_filter=propagation_filter,
+        )
+        self.conductance_heads = conductance_heads
+        self.propagation_normalization = propagation_normalization
+        self.conductance_generator = conductance_generator
+        self.num_relations = num_relations
+        self.edge_direction = edge_direction
+        self.propagation_filter = propagation_filter
         # Dynamic-only initialization must not shift the RNG stream used by W, beta,
         # FFNs or later blocks; those shared parameters remain exactly paired by seed.
         with torch.random.fork_rng(devices=[]):
@@ -454,6 +480,9 @@ class SharedConductanceMultihead(nn.Module):
                     solver_cost_scaling=solver_cost_scaling,
                     cost_bound=max_log_conductance,
                     edge_chunk_size=edge_chunk_size,
+                    conductance_heads=heads if conductance_heads == "per_head" else 1,
+                    generator=conductance_generator,
+                    num_relations=num_relations,
                 )
             elif conductance_backend == "mlp":
                 self.estimator = GraphConditionedConductance(
@@ -476,6 +505,10 @@ class SharedConductanceMultihead(nn.Module):
             beta_max=beta_max,
         )
         self.edge_chunk_size = edge_chunk_size
+        if propagation_filter == "polynomial3":
+            self.polynomial_delta = nn.Parameter(torch.zeros(heads, 2))
+        else:
+            self.register_parameter("polynomial_delta", None)
         self.last_beta: Tensor | None = None
         self.last_sampling_correction: Tensor | None = None
 
@@ -491,6 +524,7 @@ class SharedConductanceMultihead(nn.Module):
         edge_normalization_weight: Tensor | None,
         sampling_correction: Tensor | None,
         static_context: _StaticGraphContext | None = None,
+        edge_relation_id: Tensor | None = None,
     ) -> Tensor:
         # Dynamic-C geometry stays FP32 under an outer BF16 autocast region.
         # This includes its score network, centering/exp gauge and beta sigmoid.
@@ -505,6 +539,11 @@ class SharedConductanceMultihead(nn.Module):
                 graph_structure,
                 static_context=static_context,
             )
+            relation_kwargs = (
+                {"edge_relation_id": edge_relation_id}
+                if edge_relation_id is not None or self.num_relations
+                else {}
+            )
             c = self.estimator(
                 fp32_state,
                 incidence,
@@ -514,6 +553,7 @@ class SharedConductanceMultihead(nn.Module):
                 sample_degree=sample_degree,
                 full_degree=full_degree,
                 edge_normalization_weight=edge_normalization_weight,
+                **relation_kwargs,
             )
             beta = self.beta_estimator(context)
         value = torch.einsum("nd,hdk->nhk", state, self.value_weight)
@@ -525,6 +565,8 @@ class SharedConductanceMultihead(nn.Module):
             beta,
             sampling_correction=sampling_correction,
             edge_chunk_size=self.edge_chunk_size,
+            propagation_normalization=self.propagation_normalization,
+            polynomial_coefficients=self.polynomial_delta,
         )
         self.last_beta = beta.detach()
         self.last_sampling_correction = (
@@ -598,6 +640,12 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
         solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
         solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
         solver_cost_scaling: str = "legacy_unit",
+        conductance_heads: str = "shared",
+        propagation_normalization: str = "symmetric",
+        conductance_generator: str = "optimized",
+        num_relations: int = 0,
+        edge_direction: str = "undirected",
+        propagation_filter: str = "linear",
     ) -> None:
         super().__init__()
         for name, value in (
@@ -629,8 +677,20 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
             solver_entropy,
             solver_degree_barrier,
             solver_cost_scaling,
+            conductance_heads=conductance_heads,
+            propagation_normalization=propagation_normalization,
+            conductance_generator=conductance_generator,
+            num_relations=num_relations,
+            edge_direction=edge_direction,
+            propagation_filter=propagation_filter,
         )
         self.conductance_backend = conductance_backend
+        self.conductance_heads = conductance_heads
+        self.propagation_normalization = propagation_normalization
+        self.conductance_generator = conductance_generator
+        self.num_relations = num_relations
+        self.edge_direction = edge_direction
+        self.propagation_filter = propagation_filter
         self.activation_checkpoint = bool(activation_checkpoint)
         self.input_norm = nn.LayerNorm(in_channels)
         self.encoder = nn.Linear(in_channels, hidden_channels)
@@ -685,6 +745,7 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
             "graph_structure": getattr(graph, "graph_structure", None),
             "edge_normalization_weight": getattr(graph, "edge_normalization_weight", None),
             "sampling_correction": getattr(graph, "sampling_correction", None),
+            "edge_relation_id": getattr(graph, "edge_relation_id", None),
         }
         with torch.autocast(device_type=x.device.type, enabled=False):
             kwargs["static_context"] = _static_graph_context(

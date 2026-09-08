@@ -92,6 +92,31 @@ def parameter_norm(parameters, *, gradient: bool = False) -> float | None:
     return float(torch.stack(values).sum().sqrt()) if values else None
 
 
+def head_moments(value: Tensor | None) -> dict[str, Any]:
+    """Small vectorized log-boundary summaries; exact distributions live in audit only."""
+    if value is None or not value.numel():
+        return {"available": False, "reason": "no observations in the last forward"}
+    columns = value.detach().float()
+    columns = columns[:, None] if columns.ndim == 1 else columns
+    mean, std = columns.mean(0), columns.std(0, correction=0)
+    packed = torch.stack(
+        (
+            mean,
+            std,
+            columns.amin(0),
+            columns.amax(0),
+            std / mean.abs().clamp_min(torch.finfo(columns.dtype).tiny),
+        )
+    )
+    return {
+        "available": True,
+        "scope": "last forward; rows pooled, heads kept separate",
+        "layout": "shared" if value.ndim == 1 else "per_head",
+        "count_per_head": columns.shape[0],
+        **dict(zip(("mean", "std", "min", "max", "cv"), packed.cpu().tolist(), strict=True)),
+    }
+
+
 def solver_diagnostics(estimator: nn.Module) -> dict[str, Any]:
     """Serialize the last forward's solver audit only at an existing log boundary."""
 
@@ -121,11 +146,21 @@ def layer_diagnostics(model: nn.Module, *, gradients: bool = False) -> list[dict
             {
                 "layer": layer,
                 "conductance": tensor_moments(operator.estimator.last_c),
+                "conductance_by_head": head_moments(operator.estimator.last_c),
+                "conductance_heads": getattr(operator, "conductance_heads", "shared"),
+                "propagation_normalization": getattr(
+                    operator, "propagation_normalization", "symmetric"
+                ),
+                "conductance_generator": getattr(operator, "conductance_generator", "optimized"),
+                "distribution_scope": (
+                    "last forward only; pooled conductance CV is not raw-C quantiles"
+                ),
                 "log_conductance": tensor_moments(operator.estimator.last_log_c),
                 "score": tensor_moments(operator.estimator.last_scores),
                 "conductance_backend": operator.conductance_backend,
                 "c_optimization": solver_diagnostics(operator.estimator),
                 "beta": tensor_moments(operator.last_beta),
+                "beta_by_head": head_moments(operator.last_beta),
                 "sampling_correction": tensor_moments(operator.last_sampling_correction),
                 "conductance_parameter_norm": parameter_norm(estimator_parameters),
                 "conductance_gradient_norm": (
@@ -145,6 +180,16 @@ def require_first_step_conductance_gradient(model: nn.Module) -> dict[str, Any]:
 
     if model.conductance_mode != "dynamic":
         return {"applicable": False, "passed": True, "layers": []}
+    if all(
+        not any(parameter.requires_grad for parameter in operator.estimator.parameters())
+        for operator in model.operators
+    ):
+        return {
+            "applicable": False,
+            "passed": True,
+            "layers": [],
+            "reason": "parameter-free C generator; no trainable conductance gradient expected",
+        }
     rows = []
     for layer, operator in enumerate(model.operators):
         named = list(operator.estimator.named_parameters())

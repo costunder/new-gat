@@ -1,4 +1,4 @@
-"""Sparse shared-conductance, multi-head diffusion for V5."""
+"""Sparse shared/per-head conductance diffusion and polynomial filtering for V5."""
 
 from __future__ import annotations
 
@@ -92,8 +92,8 @@ def weighted_degree(
 ) -> Tensor:
     """Weighted undirected node degree without constructing an adjacency."""
 
-    degree = edge_weight.new_zeros(num_nodes)
-    for start in range(0, edge_weight.numel(), edge_chunk_size):
+    degree = edge_weight.new_zeros((num_nodes, *edge_weight.shape[1:]))
+    for start in range(0, edge_weight.shape[0], edge_chunk_size):
         stop = start + edge_chunk_size
         tail, head = incidence[:, start:stop]
         values = edge_weight[start:stop]
@@ -156,6 +156,85 @@ class _ChunkedUndirectedPropagation(torch.autograd.Function):
         return grad_message, grad_weight, None, None
 
 
+class _ChunkedHeadPropagation(torch.autograd.Function):
+    """Two receiver-specific arc weights; save O(NHD + EH), not O(EHD)."""
+
+    @staticmethod
+    def forward(ctx, message, to_tail, to_head, incidence, edge_chunk_size):
+        ctx.save_for_backward(message, to_tail, to_head, incidence)
+        ctx.edge_chunk_size = edge_chunk_size
+        ctx.set_materialize_grads(False)
+        result = torch.zeros_like(message)
+        for start in range(0, incidence.shape[1], edge_chunk_size):
+            stop = start + edge_chunk_size
+            tail, head = incidence[:, start:stop]
+            result.index_add_(0, tail, to_tail[start:stop, :, None] * message[head])
+            result.index_add_(0, head, to_head[start:stop, :, None] * message[tail])
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is None:
+            return None, None, None, None, None
+        message, to_tail, to_head, incidence = ctx.saved_tensors
+        need_message, need_tail, need_head = ctx.needs_input_grad[:3]
+        grad_message = torch.zeros_like(message) if need_message else None
+        tail_gradients, head_gradients = [], []
+        for start in range(0, incidence.shape[1], ctx.edge_chunk_size):
+            stop = start + ctx.edge_chunk_size
+            tail, head = incidence[:, start:stop]
+            if need_message:
+                grad_message.index_add_(0, head, to_tail[start:stop, :, None] * grad_output[tail])
+                grad_message.index_add_(0, tail, to_head[start:stop, :, None] * grad_output[head])
+            if need_tail:
+                tail_gradients.append((grad_output[tail] * message[head]).sum(dim=-1))
+            if need_head:
+                head_gradients.append((grad_output[head] * message[tail]).sum(dim=-1))
+        grad_tail = (
+            (torch.cat(tail_gradients) if tail_gradients else torch.zeros_like(to_tail))
+            if need_tail
+            else None
+        )
+        grad_head = (
+            (torch.cat(head_gradients) if head_gradients else torch.zeros_like(to_head))
+            if need_head
+            else None
+        )
+        return grad_message, grad_tail, grad_head, None, None
+
+
+def conductance_propagation_coefficients(
+    relative_c: Tensor,
+    incidence: Tensor,
+    num_nodes: int,
+    *,
+    sampling_correction: Tensor | None = None,
+    normalization: str = "symmetric",
+    edge_chunk_size: int = 65536,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Return (tail-receives, head-receives, degree), independently per C head.
+
+    Raw mean-one C is positive and need not be <=1. Only row-normalized
+    receiver coefficients are probabilities; symmetric coefficients are not
+    a row-stochastic attention matrix. No C heads are averaged here.
+    """
+    if normalization not in {"symmetric", "row"}:
+        raise ValueError("normalization must be symmetric or row")
+    correction = torch.ones_like(relative_c) if sampling_correction is None else sampling_correction
+    if relative_c.ndim == 2 and correction.ndim == 1:
+        correction = correction[:, None]
+    effective = relative_c * correction
+    degree = weighted_degree(effective, incidence, num_nodes, edge_chunk_size=edge_chunk_size)
+    active = degree > 0
+    safe = torch.where(active, degree, torch.ones_like(degree))
+    tail, head = incidence
+    if normalization == "row":
+        return effective / safe[tail], effective / safe[head], degree
+    inverse = safe.rsqrt() * active.to(degree.dtype)
+    weight = effective * inverse[tail] * inverse[head]
+    return weight, weight, degree
+
+
 def shared_head_diffusion(
     message: Tensor,
     relative_c: Tensor,
@@ -165,20 +244,33 @@ def shared_head_diffusion(
     *,
     sampling_correction: Tensor | None = None,
     edge_chunk_size: int = 65536,
+    propagation_normalization: str = "symmetric",
+    polynomial_coefficients: Tensor | None = None,
 ) -> Tensor:
-    """Diffuse ``N x heads x width`` messages with one C shared by all heads.
+    """Diffuse ``N x heads x width`` messages using shared or per-head C.
 
     For head h this is ``V_h + beta_h(G) * (P_C V_h - V_h)`` on
     nonisolated nodes. Isolates retain V exactly. ``sampling_correction`` is a
     known importance weight, not part of learned C.
+    ``row`` uses receiver degree, ``symmetric`` uses both endpoint degrees.
+    Optional polynomial coefficients add a2*(P²-I)+a3*(P³-I), initially zero.
     """
 
     if message.ndim != 3 or not message.is_floating_point():
         raise ValueError("message must be an N x heads x width floating tensor")
     if incidence.dtype != torch.long or incidence.ndim != 2 or incidence.shape[0] != 2:
         raise ValueError("incidence must be a 2 x E int64 tensor")
-    if relative_c.ndim != 1 or relative_c.shape[0] != incidence.shape[1]:
-        raise ValueError("relative_c must contain one value per physical edge")
+    if relative_c.ndim not in {1, 2} or relative_c.shape[0] != incidence.shape[1]:
+        raise ValueError("relative_c must have shape E or E x heads")
+    if relative_c.ndim == 2 and relative_c.shape[1] != message.shape[1]:
+        raise ValueError("per-head C must have one column per message head")
+    if propagation_normalization not in {"symmetric", "row"}:
+        raise ValueError("propagation_normalization must be symmetric or row")
+    if polynomial_coefficients is not None and polynomial_coefficients.shape != (
+        message.shape[1],
+        2,
+    ):
+        raise ValueError("polynomial_coefficients must have shape heads x 2")
     if not relative_c.is_floating_point():
         raise ValueError("relative_c must be floating point")
     if node_graph.dtype != torch.long or node_graph.shape != (message.shape[0],):
@@ -190,7 +282,7 @@ def shared_head_diffusion(
     if sampling_correction is None:
         sampling_correction = torch.ones_like(relative_c)
     if (
-        sampling_correction.shape != relative_c.shape
+        sampling_correction.shape not in {relative_c.shape, (relative_c.shape[0],)}
         or sampling_correction.dtype != relative_c.dtype
         or sampling_correction.device != message.device
     ):
@@ -210,6 +302,45 @@ def shared_head_diffusion(
         torch.float32 if message.dtype in {torch.float16, torch.bfloat16} else message.dtype
     )
     message_compute = message.to(compute_dtype)
+    if (
+        relative_c.ndim == 2
+        or propagation_normalization != "symmetric"
+        or polynomial_coefficients is not None
+    ):
+        to_tail, to_head, degree = conductance_propagation_coefficients(
+            relative_c.to(compute_dtype),
+            incidence,
+            message.shape[0],
+            sampling_correction=sampling_correction.to(compute_dtype),
+            normalization=propagation_normalization,
+            edge_chunk_size=edge_chunk_size,
+        )
+        if to_tail.ndim == 1:
+            to_tail = to_tail[:, None].expand(-1, message.shape[1])
+            to_head = to_head[:, None].expand(-1, message.shape[1])
+            degree = degree[:, None].expand(-1, message.shape[1])
+        active = (degree > 0).unsqueeze(-1)
+        propagated = _ChunkedHeadPropagation.apply(
+            message_compute, to_tail, to_head, incidence, edge_chunk_size
+        )
+        node_beta = graph_broadcast(beta.to(compute_dtype), node_graph, beta.shape[0]).unsqueeze(-1)
+        output = message_compute + node_beta * (propagated - active * message_compute)
+        if polynomial_coefficients is not None:
+            # P acts as identity on isolates. Coefficients represent
+            # (1-beta-a2-a3)I + beta P + a2 P² + a3 P³.
+            p1 = propagated + (~active) * message_compute
+            p2 = (
+                _ChunkedHeadPropagation.apply(p1, to_tail, to_head, incidence, edge_chunk_size)
+                + (~active) * p1
+            )
+            p3 = (
+                _ChunkedHeadPropagation.apply(p2, to_tail, to_head, incidence, edge_chunk_size)
+                + (~active) * p2
+            )
+            coefficients = polynomial_coefficients.to(compute_dtype)
+            output = output + coefficients[None, :, 0, None] * (p2 - message_compute)
+            output = output + coefficients[None, :, 1, None] * (p3 - message_compute)
+        return output.to(message.dtype)
     effective = relative_c.to(compute_dtype) * sampling_correction.to(compute_dtype)
     degree = weighted_degree(
         effective, incidence, message.shape[0], edge_chunk_size=edge_chunk_size

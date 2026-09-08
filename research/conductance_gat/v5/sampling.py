@@ -375,6 +375,16 @@ class TransductiveGraphSampler:
             global_node_id=nodes,
             sample_seed_count=torch.tensor([int(seeds.numel())]),
         )
+        relation = getattr(self.graph, "edge_relation_id", None)
+        if relation is not None:
+            if relation.dtype != torch.long or relation.shape != (self.incidence.shape[1],):
+                raise ValueError("edge_relation_id must align with physical incidence columns")
+            sampled.edge_relation_id = relation[edge_ids]
+        node_type = getattr(self.graph, "node_type", None)
+        if node_type is not None:
+            if node_type.dtype != torch.long or node_type.shape != (self.num_nodes,):
+                raise ValueError("node_type must align with original nodes")
+            sampled.node_type = node_type[nodes]
         return sampled, edge_ids, observation, candidate_count
 
     def _induced(self, nodes: Tensor, seeds: Tensor):

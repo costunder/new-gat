@@ -96,7 +96,7 @@ BASELINE_SOURCES = {
     ),
 }
 # Exact reviewed diagnostic/observability additions. No wildcard source bypass.
-AUDIT_SOURCE_OVERRIDES: dict[str, str] = {
+HISTORICAL_AUDIT_SOURCE_OVERRIDES: dict[str, str] = {
     "research/conductance_gat/v5/batch_calibration.py": (
         "df8e6a975e9a25cc2672ea64636afef43607a7da764ad73d44c5bdd75612d966"
     ),
@@ -111,6 +111,39 @@ AUDIT_SOURCE_OVERRIDES: dict[str, str] = {
     ),
     "research/conductance_gat/v5/train.py": (
         "a64e46d0c340a5f65920a0de4ca2cb8707bd3900410753e15da78e543f2e04a3"
+    ),
+}
+
+AUDIT_SOURCE_OVERRIDES: dict[str, str] = {
+    "research/conductance_gat/v5/batch_calibration.py": (
+        "df8e6a975e9a25cc2672ea64636afef43607a7da764ad73d44c5bdd75612d966"
+    ),
+    "research/conductance_gat/v5/diagnostics.py": (
+        "244e055adebbd275a91a851637256ae5c914d16c7c8416039e93d3dbe16a3717"
+    ),
+    "research/conductance_gat/v5/distribution_audit.py": (
+        "fca7154257ec9b6f3d280133f1088c643f5c5f17e086f04add5047bef936bfb6"
+    ),
+    "research/conductance_gat/v5/model.py": (
+        "3b71244fe72deee3051ea401e5ff72ef2d64720969d2fee8a7d4922d07441d91"
+    ),
+    "research/conductance_gat/v5/operator.py": (
+        "c9525a674d32466b4d1df9b4a985f17931b360d3d481b1fc652b7e7a3bc93905"
+    ),
+    "research/conductance_gat/v5/optimization.py": (
+        "4e7d8f49a3429993516925d8d896be48cce17372ecdfbd0914137004fe799b20"
+    ),
+    "research/conductance_gat/v5/protocol.py": (
+        "43688aa46fb1863209761ad8b7505ad028bf3f83df0ac2f60fa48ad950351b69"
+    ),
+    "research/conductance_gat/v5/sampling.py": (
+        "eea9d3a1be9507e0992971539cf266eec1762d96c02e179ae397a137633b5cc5"
+    ),
+    "research/conductance_gat/v5/stage_audit.py": (
+        "9d01e0cff43edee06a9884f50981cb1a2b10dd896406b10ab841d7fa1943507e"
+    ),
+    "research/conductance_gat/v5/train.py": (
+        "53818533dc551f118e65bcca28fb3a25856fc55b23167a66f38303423e8f4905"
     ),
 }
 
@@ -130,6 +163,13 @@ def _positive_integer(text: str) -> int:
     value = int(text)
     if value < 1:
         raise argparse.ArgumentTypeError("must be positive")
+    return value
+
+
+def _repeat_integer(text: str) -> int:
+    value = _positive_integer(text)
+    if value < 5:
+        raise argparse.ArgumentTypeError("at least 5 same-checkpoint evaluations are required")
     return value
 
 
@@ -153,6 +193,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit convergence residual tolerance for the reference",
     )
     parser.add_argument("--json", action="store_true", help="One full JSON report to stdout")
+    parser.add_argument(
+        "--head-gradient-conflict",
+        action="store_true",
+        help="Extra validation task-loss VJP per layer; C-space, not theta-gradient conflict",
+    )
+    parser.add_argument(
+        "--repeat-evaluations",
+        type=_repeat_integer,
+        default=5,
+        help="Same-checkpoint eval noise control (minimum 5); NOT training seeds",
+    )
     return parser
 
 
@@ -225,7 +276,8 @@ def verify_sources(previous: Any, current: dict[str, str]) -> dict[str, Any]:
             key for key in set(current) | set(target) if current.get(key) != target.get(key)
         )
         raise AuditError(f"Live audit sources are not the exact reviewed release: {changed}")
-    if previous == target:
+    historical_audit = {**BASELINE_SOURCES, **HISTORICAL_AUDIT_SOURCE_OVERRIDES}
+    if previous == target or previous == historical_audit:
         transition = None
     else:
         transition = require_source_compatibility(previous, BASELINE_SOURCES)
@@ -267,16 +319,38 @@ def inspect_evidence(path: Path) -> dict[str, Any]:
     if metrics.get("source_sha256") != identity.get("source_sha256"):
         raise AuditError("metrics and identity source fingerprints disagree")
     config = metrics.get("configuration")
+    backend = config.get("conductance_backend") if isinstance(config, dict) else None
     required = {
-        "conductance_backend": "optimization",
         "training_schedule": "joint",
-        "solver_cost_scaling": "width_scaled",
         "beta_parameterization": "sigmoid",
-        "beta_initial": 0.5,
     }
-    if not isinstance(config, dict) or any(config.get(k) != v for k, v in required.items()):
+    current_release = metrics.get("source_sha256") == {**BASELINE_SOURCES, **AUDIT_SOURCE_OVERRIDES}
+    beta_initial = config.get("beta_initial") if isinstance(config, dict) else None
+    beta_valid = (
+        _number(beta_initial) and 0 < beta_initial < 1 if current_release else beta_initial == 0.5
+    )
+    cost_scaling = (
+        config.get("solver_cost_scaling", "legacy_unit") if isinstance(config, dict) else None
+    )
+    if (
+        not isinstance(config, dict)
+        or any(config.get(k) != v for k, v in required.items())
+        or not beta_valid
+        or backend not in {"optimization", "mlp"}
+        or cost_scaling != ("width_scaled" if backend == "optimization" else "legacy_unit")
+        or (
+            backend == "mlp"
+            and (
+                config.get("conductance_heads", "shared") != "shared"
+                or config.get("conductance_generator", "optimized") != "optimized"
+                or config.get("num_relations", 0) != 0
+            )
+        )
+    ):
         raise AuditError(
-            "This audit requires the explicitly corrected optimization/joint/width_scaled V5 recipe"
+            "This audit requires the explicitly corrected "
+            "optimization/joint/width_scaled V5 recipe "
+            "or the explicit shared untyped MLP/joint/legacy_unit control"
         )
     for name in (
         "hidden_channels",
@@ -607,6 +681,8 @@ def audit_condition(evidence: dict, args, device) -> dict:
             precision=config["precision"],
             reference_steps=args.reference_steps,
             reference_tolerance=args.reference_tolerance,
+            head_gradient_conflict=args.head_gradient_conflict,
+            repeat_evaluations=args.repeat_evaluations,
         )
         return {
             "dataset": metrics["dataset"],
@@ -751,6 +827,15 @@ def human_condition(row: dict) -> str:
         f"  execution={audit['execution_status']}; contribution={audit['contribution_status']} "
         "(not a usefulness certificate)",
     ]
+    noise = audit.get("repeat_noise_control", {})
+    if noise:
+        lines.append(
+            f"  same-checkpoint eval repeats={noise.get('evaluation_count')} (NOT training seeds); "
+            f"validation range={_score(noise.get('validation_min'))}.."
+            f"{_score(noise.get('validation_max'))}; "
+            f"noise max L2={noise.get('max_logit_difference_l2')}; "
+            f"max prediction change={_score(noise.get('max_prediction_changed_fraction'))}"
+        )
     for name, observation in audit["interventions"].items():
         delta = observation.get("delta_from_learned")
         lines.append(
@@ -762,6 +847,8 @@ def human_condition(row: dict) -> str:
             f"    logit relative-L2={observation.get('logit_relative_l2')}; "
             f"max-abs={observation.get('logit_max_abs')}; "
             f"prediction changed={_score(observation.get('prediction_changed_fraction'))}"
+            "; above observed repeat noise="
+            f"{observation.get('above_observed_repeat_noise', 'unavailable')}"
         )
     lines.append(
         "  reference contract: " + json.dumps(audit.get("reference_contract"), ensure_ascii=False)
@@ -774,7 +861,7 @@ def human_condition(row: dict) -> str:
                 f"{layer['beta_mean']}/{layer['beta_min']}/{layer['beta_max']}"
             )
     for local in audit.get("local_layer_comparisons", []):
-        reference = local["operator_deployed_vs_reference"]
+        reference = local["operator_deployed_vs_reference"] or {}
         one = local.get("operator_c_one_vs_deployed")
         one_difference = one.get("relative_l2") if isinstance(one, dict) else None
         lines.append(
@@ -787,10 +874,17 @@ def human_condition(row: dict) -> str:
         reference_residual = local.get("reference_solver", {}).get("projected_gradient_rms_final")
         lines.append(
             f"    frozen H/B/W/beta: C relative-L2="
-            f"{local.get('c_deployed_vs_reference', {}).get('relative_l2')}; "
+            f"{(local.get('c_deployed_vs_reference') or {}).get('relative_l2')}; "
             f"residual deployed/reference={baseline_residual}/{reference_residual}; "
             f"tolerance={local.get('reference_residual_tolerance')}; exact optimum=False"
         )
+        distribution = local.get("distribution")
+        if distribution:
+            lines.extend(human_distribution(distribution))
+    gradient = audit.get("head_gradient_conflict", {})
+    lines.append(
+        "  head C-space task-gradient diagnostic: " + json.dumps(gradient, ensure_ascii=False)
+    )
     samples = sampling_summary(historical)
     lines.append("  historical sampling: " + json.dumps(samples, ensure_ascii=False))
     resource = row["resources"]
@@ -800,6 +894,56 @@ def human_condition(row: dict) -> str:
     )
     lines.extend(human_resources(resource))
     return "\n".join(lines)
+
+
+def human_distribution(distribution: dict) -> list[str]:
+    lines = [
+        f"    actual normalization={distribution['propagation_normalization']}; "
+        f"C layout={distribution['conductance_layout']}; {distribution['coefficient_scope']}",
+        "    raw C is not probability; CV=std/mean; beta is separate graph/head mixing.",
+        "    weighted-C alpha=a/d; kernel-row-relative=P/row_sum(P) is diagnostic only.",
+    ]
+    for graph in distribution["graphs"]:
+        raw = graph["raw_c"]
+        lines.append(
+            f"    graph={graph['graph_in_batch']}; nodes/physical_edges="
+            f"{graph['nodes']}/{graph['physical_edges']}; isolates={graph['isolates']}; "
+            f"degree1={graph['degree_one_nodes']}; heads={graph['heads']}"
+        )
+        lines.append(
+            f"      raw C mean={raw.get('mean')}; CV={raw.get('cv')}; "
+            f"beta={graph['beta_by_head']}; raw C quantiles={raw.get('quantiles')}"
+        )
+        lines.append(
+            f"      raw C fractions={raw.get('fractions')}; histogram={raw.get('histogram')}"
+        )
+        lines.append(
+            f"      actual one-hop P mean={graph['actual_one_hop_coefficient'].get('mean')}; "
+            f"P row-sum mean={graph['actual_one_hop_row_sum'].get('mean')}; "
+            f"C=1 same-correction row-sum={graph['c_one_same_correction_row_sum'].get('mean')}"
+        )
+        for name, family in graph["probabilities"].items():
+            for label, scope in family["node_scopes"].items():
+                if not scope["nodes"]:
+                    continue
+                reference = scope["c_one_same_correction"]
+                lines.append(
+                    f"      {name}/{label}: n={scope['nodes']}; "
+                    f"top1={scope['top1'].get('mean')}; "
+                    f"normalized entropy={scope['normalized_entropy'].get('mean')}; "
+                    f"effective neighbors={scope['effective_neighbors'].get('mean')}; "
+                    f"C=1 top1/entropy/effective={reference['top1'].get('mean')}/"
+                    f"{reference['normalized_entropy'].get('mean')}/"
+                    f"{reference['effective_neighbors'].get('mean')}; "
+                    f"C=1 TV={scope['c_one_total_variation'].get('mean')}"
+                )
+            diversity = family["head_diversity_nonisolates"]
+            lines.append(
+                f"      {name} head pairs={family['head_pairs']}; "
+                f"normalized head TV means={diversity.get('total_variation', {}).get('mean')}; "
+                f"JS means={diversity.get('jensen_shannon_nats', {}).get('mean')}"
+            )
+    return lines
 
 
 def aggregate_verification(rows: list[dict]) -> dict:

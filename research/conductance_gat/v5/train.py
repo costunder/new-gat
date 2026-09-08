@@ -58,7 +58,6 @@ from .protocol import (
     add_sampling_context_arguments,
     beta_configuration,
     conductance_arguments_configuration,
-    conductance_configuration,
     learning_budget_arguments_configuration,
     sampling_context_configuration,
 )
@@ -350,6 +349,8 @@ def parameter_group(name: str) -> str:
     if ".operator.estimator." in name:
         return "conductance"
     if ".operator.beta_estimator." in name:
+        return "beta"
+    if ".operator.polynomial_delta" in name:
         return "beta"
     if ".operator.value_weight" in name or ".operator.output_projection." in name:
         return "spatial_w"
@@ -807,7 +808,10 @@ def _group_gradient_diagnostics(model) -> dict[str, Any]:
 
 
 def configure_phase(model, phase: str, phase_epoch: int) -> dict[str, Any]:
-    dynamic = model.conductance_mode == "dynamic"
+    dynamic = (
+        model.conductance_mode == "dynamic"
+        and getattr(model, "conductance_generator", "optimized") != "degree_only"
+    )
     if phase == "spatial_warmup":
         active, override, training_mode = {"backbone", "spatial_w", "beta"}, "ones", True
         coordinate = "spatial"
@@ -915,6 +919,11 @@ def validate_args(args: argparse.Namespace) -> None:
             "preserve the source run and use a separate explicitly configured run"
         )
     validate_transition_arguments(args)
+    if (
+        getattr(args, "conductance_generator", "optimized") != "optimized"
+        and args.training_schedule != "joint"
+    ):
+        raise ValueError("mechanism generator comparisons require joint training from epoch one")
     integers = (
         args.epochs,
         args.patience,
@@ -978,6 +987,7 @@ def validate_cached_graphs_once(payload: dict[str, Any]) -> None:
 
 def _prepare_data(payload, args, device):
     validate_cached_graphs_once(payload)
+    validate_relation_metadata(payload, getattr(args, "num_relations", 0))
     if args.sampling == "full" or args.dataset == "ppi":
         data, indices = _make_data(payload, args, device)
         return data, indices, None
@@ -1015,6 +1025,33 @@ def _prepare_data(payload, args, device):
         ),
     )
     return graph, indices, sampler
+
+
+def validate_relation_metadata(payload: dict[str, Any], num_relations: int) -> None:
+    """Validate real relation annotations without deriving types from labels/features."""
+    for graph in payload["graphs"]:
+        relation = graph.get("edge_relation_id")
+        if num_relations == 0:
+            if relation is not None:
+                raise ValueError(
+                    "typed graph requires explicit num_relations; "
+                    "relation metadata cannot be ignored"
+                )
+            continue
+        incidence = graph["incidence_edge_index"]
+        if (
+            not isinstance(relation, torch.Tensor)
+            or relation.dtype != torch.long
+            or relation.device.type != "cpu"
+            or relation.shape != (incidence.shape[1],)
+        ):
+            raise ValueError(
+                "num_relations requires one CPU int64 edge_relation_id per physical edge"
+            )
+        if relation.numel() and (int(relation.min()) < 0 or int(relation.max()) >= num_relations):
+            raise ValueError(
+                "physical-edge relation ID is outside the declared relation vocabulary"
+            )
 
 
 def _prefetched_samples(iterator, *, pin_memory: bool):
@@ -1107,6 +1144,22 @@ def shared_initial_state_sha256(model: torch.nn.Module) -> str:
         included += 1
     if included == 0:
         raise RuntimeError("V5 model has no shared state to fingerprint")
+    return digest.hexdigest()
+
+
+def common_backbone_initial_state_sha256(model: torch.nn.Module) -> str:
+    """Common C-independent state, excluding the explicit polynomial filter extension."""
+    digest = hashlib.sha256()
+    included = 0
+    for name, tensor in model.state_dict().items():
+        if ".operator.estimator." in name or ".operator.polynomial_delta" in name:
+            continue
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(tensor_hash(tensor).encode("ascii"))
+        included += 1
+    if included == 0:
+        raise RuntimeError("V5 model has no common backbone state to fingerprint")
     return digest.hexdigest()
 
 
@@ -1426,6 +1479,7 @@ def _train_model_impl(
     ).to(device)
     initial_state_sha256 = state_sha256(model)
     shared_state_sha256 = shared_initial_state_sha256(model)
+    common_backbone_state_sha256 = common_backbone_initial_state_sha256(model)
     optimizer = make_optimizer(model)
     validate_optimizer_parameter_ownership(model, optimizer)
     schedule = phase_schedule(planned_epochs, list(args.phase_fractions), args.training_schedule)
@@ -1464,14 +1518,7 @@ def _train_model_impl(
             "channels": args.hidden_channels,
             "attention_heads": args.heads,
             "ffn_multiplier": args.ffn_multiplier,
-            **conductance_configuration(
-                args.conductance_backend,
-                args.solver_steps,
-                args.solver_step_size,
-                args.solver_entropy,
-                args.solver_degree_barrier,
-                getattr(args, "solver_cost_scaling", "legacy_unit"),
-            ),
+            **conductance_arguments_configuration(args),
             **parameter_observability,
         },
         "data": data_observability,
@@ -2099,6 +2146,14 @@ def _train_model_impl(
         "resume_source_compatibility": resume_source_compatibility,
         "initial_state_sha256": initial_state_sha256,
         "shared_initial_state_sha256": shared_state_sha256,
+        "common_backbone_initial_state_sha256": (
+            common_backbone_state_sha256 if origin is None else None
+        ),
+        "common_backbone_initial_state_scope": (
+            "fresh paired initialization; excludes C estimator and polynomial extension"
+            if origin is None
+            else "not applicable to legacy checkpoint transition"
+        ),
         "history_sha256": sha256_file(history_path),
         "evaluation_split": "validation",
         "test_evaluated": False,

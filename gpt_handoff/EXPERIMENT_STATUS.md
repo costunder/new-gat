@@ -2,6 +2,48 @@
 
 기준일: 2026-09-08 (Asia/Seoul).
 
+### 최신 수령: 기존 corrected checkpoint의 20조건 validation 감사
+
+사용자가 전달한 전체 감사 출력은 실행 20/20 성공이며 새 학습/test가 아니다.
+아래는 해당 감사에서 다시 평가한 validation %, PPI는 micro-F1이고 나머지는 accuracy다.
+과거 저장된 best 점수와 재평가값의 작은 수치 변동을 섞지 않는다.
+
+| Dataset | Profile | Learned C | 같은 checkpoint C=1 | 별도 학습 fixed-C |
+| --- | --- | ---: | ---: | ---: |
+| Cora | reference | 75.6000 | 74.6000 | 75.2000 |
+| Cora | large | 76.0000 | 75.6000 | 75.2000 |
+| CiteSeer | reference | 65.4000 | 65.8000 | 65.8000 |
+| CiteSeer | large | 66.0000 | 66.0000 | 68.0000 |
+| PubMed | reference | 74.2000 | 74.0000 | 75.6000 |
+| PubMed | large | 74.0000 | 73.6000 | 73.6000 |
+| ogbn-arxiv | reference | 71.7071 | 71.0829 | 71.5427 |
+| ogbn-arxiv | large | 71.9017 | 70.9957 | 71.8279 |
+| PPI | reference | 98.5311 | 76.0396 | 98.4048 |
+| PPI | large | 98.6500 | 72.2789 | 98.6123 |
+
+PPI C 제거 개입의 약 22.49/26.37%p 하락은 checkpoint의 C 의존성이지, 독립 fixed-C보다
+그만큼 개선됐다는 뜻이 아니다. 독립 fixed 대비 차이는 약 +0.1263/+0.0377%p다.
+arxiv도 C는 사용하지만 별도 fixed 대비 작은 차이이고 citation 결과는 혼재한다.
+
+K8의 층×그래프 잔차 120개는 모두 1e-4 미달이다. K64에서는 citation/arxiv 80개 충족,
+PPI 40개 미달(약 0.000347~0.001974)이다. 평가 K만 늘린 10조건 점수는 모두 소폭
+하락했지만 K64로 공동 학습한 대조군이 아니므로 solver 정확도가 불필요하다는 증명이 아니다.
+
+구형 감사에는 **max-abs>0만으로 contribution=observed를 표시하는 판정 오류**가 있다.
+fixed-C 10조건도 모두 observed였고, 동일 C 개입에서 PubMed large는 0.2%p 변동했다.
+새 감사는 같은 checkpoint의 무개입 반복 변동과 fixed not-applicable을 명시한다.
+raw C 분위수/구간 비율을 당시 출력하지 않았으므로 CV/베타만으로 C>=0.7 비율을
+추론하지 않는다. graph 평균 C=1은 제약이지 개별 엣지가 전부 1이라는 증거가 아니다.
+
+arxiv reference의 기록에는 최대 169,343 노드로 전체 그래프까지 포화된 배치가 있다.
+모든 조건의 overlap은 미기록이므로 새 disjoint 학습의 다양성 검증으로 취급하지 않는다.
+GPU SM utilization은 pynvml/안전한 장치 매핑 부재로 unavailable였다. CUDA 사용 자체는
+allocator 측정으로 확인되지만 해당 출력으로 GPU 사용률을 확정하지 않는다.
+
+이후 승인된 구현: [멀티 C·정규화·분포·실행 계약](CONDUCTANCE_V5.md#multi-c-mechanisms-20260908).
+기존 결과를 보존하고 별도 mechanism namespace로 12조건 비교를 구성했다. 새 구조의
+실제 GPU 실측·전체 학습·test 결과는 아직 없다. 아래 이전 상태 문구는 당시 시점의 기록이다.
+
 ### 후속 코드 수정 상태
 
 아래 결과 문서화 이후 피드백을 반영해 독립 부분 그래프 배치, sampling overlap 기록,

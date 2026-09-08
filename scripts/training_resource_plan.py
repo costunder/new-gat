@@ -346,7 +346,8 @@ def choose_candidate(
 
 
 def _validate_entry(
-    entry: dict[str, Any], seeds: list[int], *, allocated_cpus: int | None = None
+    entry: dict[str, Any], seeds: list[int], *, allocated_cpus: int | None = None,
+    expected_conditions: set[str] | None = None,
 ) -> None:
     if not isinstance(entry, dict) or entry.get("status") != "passed":
         raise ValueError("resource plan entry is not complete")
@@ -355,9 +356,14 @@ def _validate_entry(
     contracts = entry.get("job_contracts")
     if not isinstance(contracts, list) or not contracts:
         raise ValueError("resource plan is missing exact job contracts")
-    expected_conditions = (
-        {"fixed_c", "shared_dynamic_c"} if entry["track"] == "conductance" else {"se", "pe"}
-    )
+    if expected_conditions is None:
+        expected_conditions = (
+            {"fixed_c", "shared_dynamic_c"} if entry["track"] == "conductance" else {"se", "pe"}
+        )
+    elif not expected_conditions or any(
+        not isinstance(value, str) or not value for value in expected_conditions
+    ):
+        raise ValueError("explicit comparison conditions must be nonempty identifiers")
     for item in contracts:
         if not isinstance(item, dict):
             raise ValueError("job contract must be an object")

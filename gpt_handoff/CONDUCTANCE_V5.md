@@ -1,5 +1,140 @@
 # Conductance GAT V5 — graph-specific C optimization and weighted-Laplacian propagation
 
+<a id="multi-c-mechanisms-20260908"></a>
+
+## 2026-09-08: 멀티 C / attention 정규화 / 원인 분리 실험
+
+이 절은 아래 단일 shared-C 설계의 **명시적 확장**이다. 구형 checkpoint와 결과는
+삭제하거나 신형 구조로 재명명하지 않는다. 기존 shared/symmetric/linear 기본 경로는
+보존했으며, 새 구조는 새 run에서 학습한다. 이 절의 구현은 성능 향상 실험 결과가 아니다.
+
+### 수학과 실제 연결
+
+`--conductance-heads per_head`는 한 층의 각 feature head에 독립적인 비용 metric과
+C 최적화 변수를 둔다. C는 `E × heads`, degree는 `N × heads`로 처리한다. 독립 head의
+C나 degree를 평균 내지 않으며, GPU에서 Python head 루프 없이 일괄 계산한다.
+메시지 함수는 edge-feature 중간곱을 backward에서 재계산하는 sparse/chunked 경로다.
+모델 너비·깊이·head 수·학습 K·fanout·전체 데이터를 줄이지 않았다.
+
+각 head의 유효 conductance는 `a_e^h = omega_e c_e^h`이며
+`L_h = B^T diag(a^h) B = D_h - A_h`다.
+
+- `symmetric`: 기존 `P_h = D_h^(-1/2) A_h D_h^(-1/2)`.
+- `row`: `P_h = D_h^(-1) A_h`, 즉 `alpha_ij^h = a_ij^h / d_i^h`.
+  비고립 노드의 이웃 합은 1이며, 각 head가 자기 weighted degree를 쓴다.
+- 기본 전파는 `(1-beta_h) H W_h + beta_h P_h H W_h`.
+  고립 노드는 자기 메시지를 그대로 유지한다. C와 degree에서 gradient를 끊지 않는다.
+- `polynomial3`: 기존 전파에 `a2_h(P_h^2-I) + a3_h(P_h^3-I)`를 더한다.
+  `a2=a3=0`으로 시작해 기존 전파와 같고, 두 계수는 실제 optimizer로 학습한다.
+  계수 합 1인 3차 필터이며 임의의 모든 다항식 계수를 독립 학습한다고 주장하지 않는다.
+
+최적화 C 원값은 양수이고 1보다 클 수 있다. 그래프·C head별 보정 가중평균을 1로
+맞추는 조건은 유지한다. **C를 [0,1]로 자르지 않는다.** 평균 1 제약과 [0,1] 제한을
+동시에 두면 모든 C=1만 가능하기 때문이다. 사용자가 확인할 [0,1] 이웃 비중은 row
+전파의 alpha이며, raw C·C CV·beta와 별도로 기록한다. 다양성을 강제로 만들도록 loss를
+추가하지 않았다. 균일성/집중도는 실제 분포와 task 효과로 판정한다.
+
+`num_relations > 0`인 모델 API는 **실제** `edge_relation_id`(물리 엣지 순서에 대응하는
+int64 E개)를 요구하고 관계·head별 quadratic metric을 비용에 연결한다. 샘플링에서도
+원본 물리 엣지 ID로 관계를 보존한다. 관계 ID를 라벨/특징으로 임의 생성하지 않는다.
+현재 5개 official 데이터셋은 untyped graph이므로 head별 C 비교만 실행한다.
+이는 공통 feature 공간을 가진 **무방향 관계 타입 그래프** 지원이지 HGT 전체 구현이나
+실제 heterogeneous benchmark 완료가 아니다. 방향성을 요구하는 관계는 명시적으로 거부한다.
+
+### 원인 분리 실험 행렬
+
+새 실행기 `scripts/run_v5_mechanism_experiments.py`의 suite는 다음과 같다.
+
+| Suite | 비교 | 다른 suite와 중복 대조군 처리 |
+| --- | --- | --- |
+| core | fixed / shared optimized / per-head optimized × symmetric / row | 6조건 |
+| generators | fixed / degree-only / shared MLP / shared optimized, symmetric | 추가 2조건 |
+| solvers | 기존 K8 / barrier=0 K8 / barrier=0 entropy 정확해 | 추가 2조건 |
+| filters | fixed / shared optimized × linear / polynomial3, symmetric | 추가 2조건 |
+
+전체 합집합은 12조건이다. 동일 조건을 suite마다 재학습하지 않는다. reference(256폭,
+8층, 8heads)와 large(384폭, 12층, 8heads), Cora/CiteSeer/PubMed/PPI/ogbn-arxiv,
+seed 0을 모두 선택하면 **120회 학습**이다. core+generators 기본은 80회다.
+3~5개 학습 seed를 자동 추가하지 않는다. 5회 반복은 선택 checkpoint의 **평가 변동 측정**이다.
+
+degree-only는 delta=0으로 현재 entropy·degree barrier·K를 유지하며 C 비용 파라미터를
+두지 않는다. W·beta·backbone은 정상 학습한다. entropy-exact는 rho=0에서
+`c*=exp(-delta/tau)/mean_omega(exp(-delta/tau))`를 학습과 평가 모두에 사용한다.
+MLP는 현재 명시적 shared/untyped 대조군이며 optimization-C를 MLP로 몰래 대체하지 않는다.
+
+모든 비교는 joint, beta 초기값 0.5, 기존 corrected optimizer/dropout과 같은 sampler를
+사용한다. 학습 예산은 기본 200 epochs/patience 50의 reference-updates 계약이다.
+실측에서 physical batch가 증가하면 기존 update 예산을 보존하도록 epoch 상한과 patience가
+명시적으로 증가할 수 있다. 선택 epoch/실제 update 수는 별도로 보고한다.
+기본 sampler auto는 arxiv의 기존 cluster, 나머지 full/원래 PPI graph batch다.
+새 disjoint sampler는 명시 선택해야 하며 C 비교 중 일부 조건만 sampler를 바꾸지 않는다.
+
+### 공통 GPU 실측과 재개
+
+profile×dataset마다 **요청한 모든 variant**를 같은 physical batch/worker 후보에서 측정한다.
+optimizer update·validation을 포함한 측정에서 안전한 공통 후보를 고른 뒤 모든 팔에 적용한다.
+모델별로 다른 배치를 골라 비교를 오염시키지 않는다. 초기값은 C 생성기를 제외한 shared
+해시와 polynomial 확장까지 제외한 common-backbone 해시로 검증한다. 숫자상 VRAM 점유율을
+목표로 삼지 않으며 측정되지 않은 GPU utilization은 원인과 함께 미확인으로 남긴다.
+
+새 결과 경로는 `results/conductance_gat/mechanisms/<run-id>`다. 실행 명령을 그대로
+재실행하면 정확히 같은 설정·소스·자원 계획을 검증하고 완료 학습을 건너뛴다.
+미완료 학습은 해당 새 run의 last.pt에서 epoch 경계로 재개한다. **구형 shared-C의
+optimizer를 신형 per-head 모델에 끼워 넣지 않는다.** 과거 fixed/shared 결과는 참고로
+보존하며, 공통 실측/예산/초기화 이력이 다른 결과를 새 paired 대조군으로 자동 재사용하지 않는다.
+
+학습 완료와 감사 완료 상태는 별도다. 감사 실패로 완료 학습을 다시 돌리지 않는다.
+재개 시 누락/실패한 감사만 다시 수행한다. 학습 로그·감사 로그·history.json·checkpoint를
+각 condition 폴더/manifest에서 추적하며 원본 로그를 덮어쓰지 않는다.
+
+### 분포와 학습 역할 검사
+
+각 선택 checkpoint에 전체 official validation 감사를 실행한다.
+
+- raw C: 정확한 분위수·히스토그램·C>=0.7·abs(C-1)<=0.1·C>1 비율.
+- 노드별: alpha 최대 비중·정규화 entropy·유효 이웃 수 `1/sum(alpha^2)`.
+  고립 노드와 degree 1을 분리하고 degree 구간별·graph/layer/head별 관측 범위를 표시한다.
+- 동일 sampling correction의 C=1 대조, head 간 상대 비중 TV/JS 차이.
+  대칭 전파의 실제 kernel 계수와 진단용 행 정규화 비중을 구분한다.
+- 같은 checkpoint 무개입 5회로 수치 변동을 측정한다. fixed-C는 학습 C 기여 판정의
+  대상이 아니며 단순 max-abs>0으로 `observed`를 표시하지 않는다.
+- beta를 head 평균으로 바꾼 평가와 K64 참조 검사를 분리한다. MLP의 solver 비교는
+  not-applicable이며, 정확해와 유한 반복을 혼동하지 않는다. K64도 수렴을 보장하지 않는다.
+- 선택적 `--head-gradient-conflict`: 실제 validation task loss의 C-space head별
+  민감도(VJP)를 측정한다. optimizer를 갱신하지 않으며 theta gradient 충돌과 동일하다고
+  주장하지 않는다. 계산 비용 때문에 명시 선택 옵션이다.
+
+새 학습 실행 예시(기존 결과와 다른 run, GPU 3만 노출):
+
+```bash
+cd /home/aicompetition07/new-gat &&
+git pull --ff-only &&
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=3 \
+/home/aicompetition07/.conda/envs/new-gat/bin/python -B scripts/run_v5_mechanism_experiments.py \
+  --run-id multic-v5-a6000-gpu3-seed0-v1 \
+  --suites core generators solvers filters \
+  --profiles reference large --model-seeds 0 \
+  --datasets cora citeseer pubmed ppi ogbn-arxiv \
+  --device cuda:0 --hardware-profile a6000-48gb \
+  --activation-checkpoint
+```
+
+activation checkpointing은 전체 비교에 공통 적용하는 메모리 전략이며 모델/데이터 축소가
+아니다. `--dry-run` 추가 시 파일/프로세스/GPU 측정 없이 계획만 출력한다.
+이 명령은 구형 학습 재개가 아니라 **승인된 새 구조의 비교 학습**이며, 같은 새 명령의
+재실행만 신규 run 재개다. 기존 V1–V4/Cycle/Tree는 수정하거나 재실행하지 않는다.
+
+검증 구분: 최종 전체 pytest **2,953 passed / 107 skipped / 0 failed**(470.06초),
+수정 Python 파일 Ruff 통과, Git staged 원문의 학습 소스 25개 지문과 감사 계약 일치,
+위 실행 옵션의 dry-run 120개 계획 검증을 완료했다. 로컬 CPU 수치·gradient·optimizer
+update·재개·실행 계약 검증이며 작은 합성 입력은 명시적 debug 테스트에만 사용했다.
+로컬 PyTorch는 CPU 전용이고 PyG가 없어 실제 PyG 통합 일부는 skip이다. CUDA·Linux 전용
+검사도 skip이다. 원격 A6000 실측·실제 데이터의 새 전체 학습·새 test 평가는 미실행이다.
+서버 실행기가 수행할 실측을 이미 측정한 것으로 보고하지 않는다. 자동 생성 CODE_SUMMARY.md는
+별도 덮어쓰기 승인 요구로 미갱신이며, README_FIRST.md에 해당 스냅샷의 범위를 명시했다.
+
+아래 절들은 변경 전 shared-C 실험과 그 당시 검사 기록이다.
+
 <a id="feedback-implementation-20260908"></a>
 
 ## 2026-09-08: 피드백 반영 구현 — 독립 부분 그래프 배치와 C 역할 검사

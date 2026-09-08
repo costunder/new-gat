@@ -15,6 +15,10 @@ DEFAULT_SOLVER_STEP_SIZE = 0.25
 DEFAULT_SOLVER_ENTROPY = 1.0
 DEFAULT_SOLVER_DEGREE_BARRIER = 0.1
 SOLVER_COST_SCALINGS = ("legacy_unit", "width_scaled")
+CONDUCTANCE_HEAD_MODES = ("shared", "per_head")
+PROPAGATION_NORMALIZATIONS = ("symmetric", "row")
+CONDUCTANCE_GENERATORS = ("optimized", "degree_only", "entropy_exact")
+PROPAGATION_FILTERS = ("linear", "polynomial3")
 LEARNING_BUDGET_POLICIES = ("epochs", "reference_updates")
 TRAINING_SCHEDULES = ("joint", "staged")
 DEFAULT_TRAINING_SCHEDULE = "joint"
@@ -37,6 +41,13 @@ def conductance_configuration(
     solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
     solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
     solver_cost_scaling: str = "legacy_unit",
+    *,
+    conductance_heads: str = "shared",
+    propagation_normalization: str = "symmetric",
+    conductance_generator: str = "optimized",
+    num_relations: int = 0,
+    edge_direction: str = "undirected",
+    propagation_filter: str = "linear",
 ) -> dict[str, int | float | str]:
     """Canonical architecture identity; solver fields are inactive for the MLP ablation."""
 
@@ -46,6 +57,28 @@ def conductance_configuration(
         raise ValueError(f"unsupported solver cost scaling: {solver_cost_scaling}")
     if conductance_backend == "mlp" and solver_cost_scaling != "legacy_unit":
         raise ValueError("width_scaled costs require the optimization conductance backend")
+    for name, value, choices in (
+        ("conductance_heads", conductance_heads, CONDUCTANCE_HEAD_MODES),
+        ("propagation_normalization", propagation_normalization, PROPAGATION_NORMALIZATIONS),
+        ("conductance_generator", conductance_generator, CONDUCTANCE_GENERATORS),
+        ("propagation_filter", propagation_filter, PROPAGATION_FILTERS),
+    ):
+        if value not in choices:
+            raise ValueError(f"unsupported {name}: {value}")
+    if isinstance(num_relations, bool) or not isinstance(num_relations, int) or num_relations < 0:
+        raise ValueError("num_relations must be a nonnegative integer")
+    if edge_direction != "undirected":
+        raise ValueError(
+            "B^T C B requires undirected physical relations; directed edges need a separate model"
+        )
+    if conductance_backend == "mlp" and (
+        conductance_generator != "optimized" or conductance_heads != "shared" or num_relations
+    ):
+        raise ValueError("the explicit MLP control supports shared untyped C only")
+    if conductance_generator == "entropy_exact" and solver_degree_barrier != 0:
+        raise ValueError("entropy_exact requires solver_degree_barrier=0")
+    if conductance_generator == "degree_only" and num_relations:
+        raise ValueError("degree_only has no learned relation metric; use untyped topology control")
     if isinstance(solver_steps, bool) or not isinstance(solver_steps, int) or solver_steps < 1:
         raise ValueError("solver_steps must be a positive integer")
     values = {
@@ -74,12 +107,58 @@ def conductance_configuration(
             if solver_cost_scaling != "legacy_unit"
             else {}
         ),
+        **{
+            name: value
+            for name, value, default in (
+                ("conductance_heads", conductance_heads, "shared"),
+                ("propagation_normalization", propagation_normalization, "symmetric"),
+                ("conductance_generator", conductance_generator, "optimized"),
+                ("num_relations", num_relations, 0),
+                ("edge_direction", edge_direction, "undirected"),
+                ("propagation_filter", propagation_filter, "linear"),
+            )
+            if value != default
+        },
     }
 
 
 def add_conductance_arguments(parser, *, prefix: str = "") -> None:
     """Share explicit architecture CLI options across standalone and nested runners."""
 
+    for name, choices, default, help_text in (
+        (
+            "conductance-heads",
+            CONDUCTANCE_HEAD_MODES,
+            "shared",
+            "per_head learns independent C and degrees for every feature head",
+        ),
+        (
+            "propagation-normalization",
+            PROPAGATION_NORMALIZATIONS,
+            "symmetric",
+            "row uses receiver-normalized neighbor attention with row sum one",
+        ),
+        (
+            "conductance-generator",
+            CONDUCTANCE_GENERATORS,
+            "optimized",
+            "degree_only has no learned edge cost; entropy_exact requires zero degree barrier",
+        ),
+        (
+            "propagation-filter",
+            PROPAGATION_FILTERS,
+            "linear",
+            "polynomial3 adds learned degree-three propagation without shrinking the backbone",
+        ),
+    ):
+        parser.add_argument(f"--{prefix}{name}", choices=choices, default=default, help=help_text)
+    parser.add_argument(
+        f"--{prefix}num-relations",
+        type=int,
+        default=0,
+        help="actual physical-edge relation types; requires explicit edge_relation_id metadata",
+    )
+    parser.add_argument(f"--{prefix}edge-direction", choices=("undirected",), default="undirected")
     parser.add_argument(
         f"--{prefix}conductance-backend",
         choices=CONDUCTANCE_BACKENDS,
@@ -129,6 +208,17 @@ def conductance_arguments_configuration(args, *, prefix: str = "") -> dict[str, 
     configuration = conductance_configuration(
         **{name: getattr(args, prefix + name) for name in conductance_configuration()},
         solver_cost_scaling=getattr(args, prefix + "solver_cost_scaling", "legacy_unit"),
+        **{
+            name: getattr(args, prefix + name, default)
+            for name, default in (
+                ("conductance_heads", "shared"),
+                ("propagation_normalization", "symmetric"),
+                ("conductance_generator", "optimized"),
+                ("num_relations", 0),
+                ("edge_direction", "undirected"),
+                ("propagation_filter", "linear"),
+            )
+        },
     )
     schedule = getattr(args, prefix + "training_schedule")
     if schedule not in TRAINING_SCHEDULES:
