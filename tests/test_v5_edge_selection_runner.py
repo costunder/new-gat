@@ -390,6 +390,17 @@ def test_common_calibration_includes_validation_cost(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_completed_calibration_is_verified_without_new_measurement(tmp_path, monkeypatch):
+    jobs, calls = calibration_fixture(monkeypatch, tmp_path)
+    entry = {}
+    calibration.calibrate_group(jobs, entry, lambda: None)
+    prior, measured = copy.deepcopy(entry), list(calls)
+    calibration.calibrate_group(
+        jobs, entry, lambda: pytest.fail("completed measurement unexpectedly changed")
+    )
+    assert entry == prior and calls == measured
+
+
 @pytest.mark.parametrize(
     "damage",
     ["missing_arm", "validation", "auxiliary", "config", "selected", "boundary", "workers"],

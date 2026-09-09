@@ -24,6 +24,43 @@ def test_zero_safe_distribution_including_empty_values():
         diag.distribution([float("nan")])
 
 
+def test_quantile_above_torch_limit_uses_all_values_without_mutation():
+    # Full-size synthetic diagnostic regression, not a reduced training profile.
+    size = (1 << 24) + 1
+    values = torch.arange(size, dtype=torch.float32)
+    values = values.flip(0)
+    before = values.clone()
+    report = diag.distribution(values)
+    expected = np.asarray(report["quantile_probabilities"]) * (size - 1)
+    np.testing.assert_allclose(report["quantiles"], expected, rtol=0, atol=1e-8)
+    assert report["count"] == report["quantile_observation_count"] == size
+    assert report["above_one_count"] == size - 2
+    assert sum(report["unit_interval_histogram_counts"]) == 2
+    assert report["mean"] == (size - 1) / 2
+    assert report["zero_fraction"] == 1 / size
+    assert torch.equal(values, before)
+    json.dumps(report, allow_nan=False)
+
+
+def test_histogram_counts_above_float32_exact_integer_range_are_not_rounded():
+    size = (1 << 24) + 3
+    report = diag.distribution(torch.zeros(size))
+    assert report["unit_interval_histogram_counts"][0] == size
+    assert sum(report["unit_interval_histogram_counts"]) == size
+    assert report["quantiles"] == [0.0] * 9
+    assert report["zero_fraction"] == 1.0
+
+
+@pytest.mark.parametrize("values", [[3.0, 1.0, 2.0, 5.0, -1.0], [1.0], [0.0, 0.0, 1.0, 1.0]])
+def test_quantile_matches_small_float64_linear_oracle(values):
+    report = diag.distribution(values)
+    oracle = torch.quantile(
+        torch.tensor(values, dtype=torch.float64),
+        torch.tensor(report["quantile_probabilities"], dtype=torch.float64),
+    )
+    np.testing.assert_allclose(report["quantiles"], oracle.numpy(), rtol=0, atol=1e-14)
+
+
 def test_active_components_isolates_cycle_rank_and_path_change():
     edges = np.array([[0, 0, 1], [1, 2, 2]])
     before = diag.adjacency(4, edges)

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "patch_id": "edge-selection-exact-large-audit-v1",
+  "base_commit": "03ec0f644da2636f92d022a8efb3533a0dcf614a",
+  "base_source_digests": {
+    "manifest": "435b208635e2941b8b4e5e3d1446448e00d8a9826741a5900e0da015fe58aeeb",
+    "training": "390c5092c07c01636b7b81350ee9377b9dbdf1f73f479f58c760e17d60d46b33"
+  },
+  "changes": {
+    "research/conductance_gat/edge_selection/audit.py": {
+      "before": "acd02bac788a6d33146046d22eb2cae14f4085e5df050cf9f92fe6ff3adb331f",
+      "after": "212137b2a6cc453b496e39b94d555a28e9efcae1d77d7762c3121f933b7d334a"
+    },
+    "research/conductance_gat/edge_selection/audit_compat.py": {
+      "before": null,
+      "after": "b59781e321bea67ed18e8e7c1d720368e18459b12128b0eb2d23928192e033a1"
+    },
+    "research/conductance_gat/edge_selection/diagnostics.py": {
+      "before": "992256684544a036e3cdd057ba7efb08616a294d6d09ced2b4fedf320b795048",
+      "after": "5d5a07a00784273f583ef94162f019f5aee9cbd10a8885096faa03fc57c9b032"
+    },
+    "scripts/run_v5_edge_selection.py": {
+      "before": "0a9180274444bbe4b3058f417f1eb67b47b59373fb64ab3d66890cbb184b5ad1",
+      "after": "3eb669d4be7f5f3bb6be0a44c40152f80c38485b2898b4f4a3833a070ec9085c"
+    }
+  }
+}

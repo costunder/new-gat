@@ -1,5 +1,14 @@
 # Conductance GAT V5 — graph-specific C optimization and weighted-Laplacian propagation
 
+### 2026-09-09 감사 수리
+
+arxiv full/reference의 학습 완료 후 전체 방향별 엣지×head 분포에서
+`torch.quantile()` 크기 제한이 발생했다. `edge_selection/diagnostics.py`를 전체 관측값의
+정확한 linear quantile 및 정수 histogram으로 수정했다. 분위수용 데이터 sampling이나
+모델/그래프 축소는 없다. 기존 학습 체크포인트를 유지하는 감사 전용 소스 호환은
+등록된 변경 전후의 정확한 SHA에만 적용하며, 모델·학습 레시피 변경은 허용하지 않는다.
+실제 수령 결과와 CPU 검증/서버 미검증 범위는 `EXPERIMENT_STATUS.md` 맨 위에 기록한다.
+
 ## 2026-09-08 추가: 실제 zero gate / forest–chord 선택 실험
 
 사용자의 추가 제안을 `research/conductance_gat/edge_selection/` 및

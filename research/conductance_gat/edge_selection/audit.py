@@ -16,6 +16,7 @@ from ..v5.batch_calibration import _isolated_execution_state
 from ..v5.operator import conductance_propagation_coefficients
 from . import diagnostics as diag
 from . import train
+from .audit_compat import require_source_compatibility
 
 
 def _synchronize(device):
@@ -199,10 +200,10 @@ def audit(root, data_root, device, repeats, path_sources):
         )
     metrics = train.inspect_completed(root)
     identity = metrics["resume_identity"]
-    if identity["source_sha256"] != train.implementation_source_hashes():
-        raise ValueError(
-            "audit source differs from the trained implementation; evidence not relabeled"
-        )
+    evaluator_sources = train.implementation_source_hashes()
+    transition = require_source_compatibility(
+        identity["source_sha256"], evaluator_sources, scope="training"
+    )
     args = train.restore_arguments(metrics, root, data_root, device)
     train.base._require_cuda(device)
     train.base.configure_compute(args)
@@ -246,11 +247,20 @@ def audit(root, data_root, device, repeats, path_sources):
                 raise ValueError("read-only audit unexpectedly changed model state")
             if train.inspect_completed(root) != metrics:
                 raise ValueError("training evidence changed while auditing")
+            if evaluator_sources != train.implementation_source_hashes() or transition != (
+                require_source_compatibility(
+                    identity["source_sha256"], evaluator_sources, scope="training"
+                )
+            ):
+                raise ValueError("evaluator source or compatibility proof changed during audit")
             return {
                 "status": "passed",
                 "research_suite": train.SUITE,
                 "checkpoint_sha256": metrics["checkpoint_sha256"],
                 "source_sha256": identity["source_sha256"],
+                "training_source_sha256": identity["source_sha256"],
+                "evaluator_source_sha256": evaluator_sources,
+                "source_compatibility": transition,
                 "dataset": args.dataset,
                 "condition": args.selection_mode,
                 "test_evaluated": False,

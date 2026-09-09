@@ -14,23 +14,29 @@ def distribution(values):
         raise ValueError("nonfinite values in edge-selection audit")
     if values.numel() == 0:
         return {"count": 0, "mean": None, "quantiles": None, "zero_fraction": None}
-    quantiles = torch.quantile(
-        values, torch.tensor([0.0, 0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0])
-    )
-    boundaries = torch.linspace(0, 1, 11)
+    probabilities = [0.0, 0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0]
+    array = values.numpy()
+    # torch.quantile rejects flattened inputs above 2**24 elements (including
+    # arxiv's directed-edge x head coefficients). Use every CPU observation:
+    # NumPy partitions a copy and interpolates q*(n-1), without sampling/caps.
+    # Never overwrite array: it can alias the caller's tensor or diagnostic cache.
+    quantiles = np.quantile(array, probabilities, method="linear", overwrite_input=False)
+    boundaries = torch.linspace(0, 1, 11).numpy()
+    histogram, _ = np.histogram(array, bins=boundaries)
     return {
         "count": values.numel(),
-        "mean": float(values.mean()),
-        "std_population": float(values.std(unbiased=False)),
-        "quantile_probabilities": [0.0, 0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0],
+        "mean": float(array.mean(dtype=np.float64)),
+        "std_population": float(array.std(dtype=np.float64)),
+        "quantile_probabilities": probabilities,
         "quantiles": quantiles.tolist(),
-        "zero_fraction": float((values == 0).float().mean()),
-        "below_zero_count": int((values < 0).sum()),
-        "above_one_count": int((values > 1).sum()),
+        "quantile_method": "all_observations_linear_q_times_n_minus_1",
+        "quantile_observation_count": array.size,
+        "zero_fraction": np.count_nonzero(array == 0) / array.size,
+        "below_zero_count": int(np.count_nonzero(array < 0)),
+        "above_one_count": int(np.count_nonzero(array > 1)),
         "unit_interval_histogram_boundaries": boundaries.tolist(),
-        "unit_interval_histogram_counts": torch.histogram(values, bins=boundaries)
-        .hist.long()
-        .tolist(),
+        # Integer counts remain exact above 2**24 too; float32 histogram bins do not.
+        "unit_interval_histogram_counts": histogram.tolist(),
     }
 
 

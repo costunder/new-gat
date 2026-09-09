@@ -25,6 +25,9 @@ for directory in (ROOT, ROOT / "src"):
 
 from chartgat.cache import atomic_write_bytes, atomic_write_json  # noqa: E402
 from research.conductance_gat.edge_selection import calibration  # noqa: E402
+from research.conductance_gat.edge_selection.audit_compat import (  # noqa: E402
+    require_source_compatibility,
+)
 from research.conductance_gat.v5.protocol import (  # noqa: E402
     DATASETS,
     HARDWARE_PROFILES,
@@ -261,7 +264,6 @@ def _resume(path, args, planned, sources, dependencies):
         "suite": SUITE,
         "run_id": args.run_id,
         "config": _config(args),
-        "source_sha256": sources,
         "dependencies": dependencies,
     }
     if any(manifest.get(key) != value for key, value in required.items()):
@@ -272,6 +274,13 @@ def _resume(path, args, planned, sources, dependencies):
         common._job_identity(job) for job in planned
     ]:
         raise ValueError("edge-selection arm matrix differs; no silent resume")
+    transition = require_source_compatibility(
+        manifest.get("source_sha256"), sources, scope="manifest"
+    )
+    if transition is not None:
+        transitions = manifest.setdefault("source_transitions", [])
+        if transition not in transitions:
+            transitions.append(transition)
     return manifest
 
 
@@ -343,8 +352,9 @@ def _read_result(job):
             raise ValueError(f"edge-selection result and identity disagree on {key}")
     if payload.get("research_suite") != train.SUITE or payload.get("dataset") != job["dataset"]:
         raise ValueError("foreign experiment result cannot be imported")
-    if payload.get("source_sha256") != train.implementation_source_hashes():
-        raise ValueError("edge-selection training source differs from pinned implementation")
+    require_source_compatibility(
+        payload.get("source_sha256"), train.implementation_source_hashes(), scope="training"
+    )
     protocol = payload.get("protocol")
     if (
         not isinstance(protocol, dict)
@@ -426,6 +436,8 @@ def _compare(jobs):
 
 
 def _audit(args, job, environment, persist):
+    from research.conductance_gat.edge_selection import train
+
     command = [
         sys.executable,
         "-B",
@@ -456,6 +468,7 @@ def _audit(args, job, environment, persist):
         "command": command,
         "log_path": str(log),
         "checkpoint_sha256": checkpoint,
+        "evaluator_source_sha256": train.implementation_source_hashes(),
     }
     job["audit"] = state
     persist()
@@ -466,6 +479,8 @@ def _audit(args, job, environment, persist):
             raise RuntimeError(
                 f"edge-selection audit failed ({status}); completed training retained"
             )
+        if state["evaluator_source_sha256"] != train.implementation_source_hashes():
+            raise ValueError("edge-selection evaluator source changed during audit")
         state.update(status="passed", log_sha256=common._file_sha(log))
         persist()
     except (Exception, KeyboardInterrupt) as error:

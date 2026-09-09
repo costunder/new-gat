@@ -1,5 +1,10 @@
 # GPT 전달용 전체 프로젝트 묶음
 
+최신 수령·수리(2026-09-09): arxiv full/reference는 학습 후 best validation 0.721098을
+저장했으나 전체 분포의 `torch.quantile()` 크기 제한으로 감사가 실패했다. 모델 재학습이
+아닌 전체값 분위수 계산과 정확한 소스 해시 기반 감사 재개 수리이며, 원본 학습 결과는
+보존한다. 구체적 실패 로그 해석과 검증 범위는 `EXPERIMENT_STATUS.md` 맨 위에 있다.
+
 최신 추가 구현(2026-09-08): `CONDUCTANCE_V5.md` 맨 위에 zero gate×양의 amplitude,
 보호 forest와 exact chord budget, 별도 corruption/hard-concrete/negative loss 실험을
 추가했다. 새 실행기는 `scripts/run_v5_edge_selection.py`, 실제 구현은

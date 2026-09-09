@@ -1,6 +1,44 @@
 # 실험 결과와 구현 상태
 
-기준일: 2026-09-08 (Asia/Seoul).
+기준일: 2026-09-09 (Asia/Seoul).
+
+### 2026-09-09 수령: arxiv full/reference 학습 완료 후 분위수 감사 실패
+
+`edge-selection-v5-gpu1-seed0-v1`의 `structure-full/reference/ogbn-arxiv` 로그에서
+56 epoch 학습 종료와 `passed` 저장을 확인했다. 기록된 best validation은 **0.721098**,
+마지막 validation은 0.680929이고, 50~56 epoch는 약 141~147초/epoch였다.
+제공된 구간만으로 best epoch 번호나 전체 130조건의 완료 여부를 확정하지 않는다.
+
+실패는 학습·OOM이 아니라 이후 `audit.py → coefficient_statistics → distribution`의
+`torch.quantile()`이었다. 실제 `2**24+1=16,777,217`개 CPU 합성 입력에서도 동일한
+`quantile() input tensor is too large` 오류를 재현했다. 방향별 엣지×head 값을 합친
+전체 분포가 이 API의 크기 제한을 넘을 수 있는데 소규모 검사만으로 이 문제를 놓쳤다.
+수정은 전체 관측값을 사용하는 NumPy linear quantile이다. 입력 추출·sampling·cap을
+추가하지 않고 `q*(n-1)` 보간으로 계산하며 원본 tensor를 덮지 않는다. Histogram도
+큰 개수가 float32에서 반올림되지 않도록 정수 counts로 계산한다.
+
+완료 학습 결과·history·best/last 체크포인트는 보존 대상이다. 이 수리는 모델, C solver,
+샘플러, optimizer, 학습 예산 또는 physical batch를 바꾸지 않는다. 같은 run-id의
+완료 학습을 재학습하지 않고 실패한 감사부터 이어가도록 좁은 소스 수리 호환을 적용한다.
+실행기·평가기의 이번 변경 전후 SHA만 등록하고 다른 코드/설정/데이터 변화는 거부한다.
+원본 학습 source identity를 새 코드로 덮어쓰지 않고 실제 평가 source를 별도로 남긴다.
+이 호환은 완료 학습의 감사 재개용이다. 구형 미완료 `last.pt`의 학습 identity 검사는
+완화하지 않으므로 이를 일반적인 미완료 학습 checkpoint 이식으로 해석하지 않는다.
+
+수정 후 관련 통합 회귀 검사는 **218 passed / 5 skipped**였다. 실제 크기 제한을 넘는
+16,777,217개 합성 입력의 정확한 분위수, 16,777,219개 정수 histogram count,
+원본 입력 불변성, 완료 학습/배치 교정 보존, 실패 감사만 재시도하는 실행 흐름과
+등록되지 않은 소스 변화 거부를 포함한다. skip은 PyG 통합 3개와 CUDA/pinning 2개다.
+로컬 CPU 검증이며 실제 서버의 수정 후 GPU 감사나 전체 학습 완료를 뜻하지 않는다.
+
+로그의 약 3.28 GiB allocator peak와 약 43.64초는 **실패한 감사 단계**의 값이다.
+학습 peak VRAM이나 학습 GPU 활용률로 해석하지 않는다. GPU utilization의 null은
+pynvml 부재 및 숫자 GPU ID를 안전하게 매핑할 수 없어서 측정이 불가능했다는 표시다.
+이는 이번 quantile 실패와 별개이며 GPU 사용률 0%라는 뜻이 아니다. 시스템 CUDA,
+드라이버, Python 환경을 바꿔 해결했다고 주장하지 않는다.
+
+이 수령 로그는 실제 서버의 1개 조건에 대한 증거이며, 아래 2026-09-08의 신규 GPU
+결과 미수령 기록과 구분한다. 수정 후 서버 감사/나머지 학습 결과는 아직 수령하지 않았다.
 
 ### 최신 추가 구현: zero gate와 forest/chord 선택
 
