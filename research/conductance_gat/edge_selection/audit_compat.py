@@ -1,4 +1,4 @@
-"""One-way, exact-source permission for the 03ec0f6 audit-only repair.
+"""Exact released-source permission for audit repair and allocation resume.
 
 This never rewrites a training identity or permits changed model/data/optimizer
 code. The registry pins both source scopes and every reviewed file byte change.
@@ -15,14 +15,17 @@ from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parents[3]
 HELPER_SOURCE = "research/conductance_gat/edge_selection/audit_compat.py"
-REGISTRY_PATH = Path(__file__).with_name("audit_compatibility_v1.json")
-PATCH_ID = "edge-selection-exact-large-audit-v1"
+REGISTRY_PATH = Path(__file__).with_name("reallocation_compatibility_v1.json")
+PATCH_ID = "edge-selection-allocation-resume-v1"
 BASE_COMMIT = "03ec0f644da2636f92d022a8efb3533a0dcf614a"
+BASE_COMMITS = (BASE_COMMIT, "f7bf065037db4ceefa4aed9ff41aab164ce4b005")
 CHANGED_SOURCES = frozenset(
     {
         "research/conductance_gat/edge_selection/diagnostics.py",
         "research/conductance_gat/edge_selection/audit.py",
         "scripts/run_v5_edge_selection.py",
+        "research/conductance_gat/edge_selection/train.py",
+        "research/conductance_gat/edge_selection/reallocation.py",
         HELPER_SOURCE,
     }
 )
@@ -62,11 +65,31 @@ def _unique_pairs(pairs):
     return result
 
 
-def _registry():
+def _registry(base_commit=BASE_COMMIT):
     if REGISTRY_PATH.is_symlink() or not REGISTRY_PATH.is_file():
         raise ValueError("audit repair registry must be a regular file")
     raw = REGISTRY_PATH.read_bytes()
-    registry = json.loads(raw, object_pairs_hook=_unique_pairs)
+    document = json.loads(raw, object_pairs_hook=_unique_pairs)
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"schema_version", "patch_id", "releases"}
+        or type(document["schema_version"]) is not int
+        or document["schema_version"] != 1
+        or document["patch_id"] != PATCH_ID
+        or not isinstance(document["releases"], list)
+        or len(document["releases"]) != len(BASE_COMMITS)
+        or any(not isinstance(item, dict) for item in document["releases"])
+        or [item.get("base_commit") for item in document["releases"]] != list(BASE_COMMITS)
+        or base_commit not in BASE_COMMITS
+    ):
+        raise ValueError("allocation repair registry identity or exact change set is invalid")
+    for item in document["releases"]:
+        _validate_registry(item)
+    registry = next(item for item in document["releases"] if item["base_commit"] == base_commit)
+    return registry, hashlib.sha256(raw).hexdigest()
+
+
+def _validate_registry(registry):
     if (
         not isinstance(registry, dict)
         or set(registry)
@@ -74,7 +97,7 @@ def _registry():
         or type(registry["schema_version"]) is not int
         or registry["schema_version"] != 1
         or registry["patch_id"] != PATCH_ID
-        or registry["base_commit"] != BASE_COMMIT
+        or registry["base_commit"] not in BASE_COMMITS
         or not isinstance(registry["base_source_digests"], dict)
         or set(registry["base_source_digests"]) != {"manifest", "training"}
         or not all(_digest(value) for value in registry["base_source_digests"].values())
@@ -87,23 +110,17 @@ def _registry():
             not isinstance(change, dict)
             or set(change) != {"before", "after"}
             or not _digest(change["after"])
-            or (
-                change["before"] is not None
-                if name == HELPER_SOURCE
-                else not _digest(change["before"])
-            )
-            or change["before"] == change["after"]
+            or (change["before"] is not None and not _digest(change["before"]))
         ):
             raise ValueError(f"audit repair source pin is invalid: {name}")
-    return registry, hashlib.sha256(raw).hexdigest()
 
 
 def require_source_compatibility(previous, current, *, scope):
-    """Allow identical sources or this one reviewed complete old-to-live pair.
+    """Allow identical sources or a reviewed complete released-to-live pair.
 
     All callers still validate configuration, data, runtime, budget, artifacts,
-    and states independently. An old incomplete training checkpoint is not
-    authorized here: the core trainer's strict identity check stays unchanged.
+    and states independently. The trainer additionally requires every non-source
+    identity field to match before restoring a partial checkpoint.
     """
     if scope not in {"manifest", "training"}:
         raise ValueError("unknown audit repair source scope")
@@ -111,9 +128,15 @@ def require_source_compatibility(previous, current, *, scope):
         return None
     if not _source_map(previous) or not _source_map(current):
         raise ValueError("audit repair requires complete SHA256 source maps")
-    registry, registry_sha = _registry()
-    if source_map_digest(previous) != registry["base_source_digests"][scope]:
-        raise ValueError("audit repair source is not the pinned 03ec0f6 release")
+    candidates = [_registry(commit) for commit in BASE_COMMITS]
+    matched = [
+        pair
+        for pair in candidates
+        if source_map_digest(previous) == pair[0]["base_source_digests"][scope]
+    ]
+    if len(matched) != 1:
+        raise ValueError("allocation repair source is not an exact pinned release")
+    registry, registry_sha = matched[0]
     if set(previous) - set(current):
         raise ValueError("audit repair cannot remove source files")
     for name, change in registry["changes"].items():
@@ -132,15 +155,15 @@ def require_source_compatibility(previous, current, *, scope):
             raise ValueError(f"unreviewed source change cannot reuse prior evidence: {name}")
     return {
         "patch_id": PATCH_ID,
-        "base_commit": BASE_COMMIT,
+        "base_commit": registry["base_commit"],
         "scope": scope,
         "registry_sha256": registry_sha,
         "previous_source_map_sha256": source_map_digest(previous),
         "current_source_map_sha256": source_map_digest(current),
         "changed_sources": copy.deepcopy(registry["changes"]),
-        "source_semantics": "audit_only_exact_large_distribution_repair",
+        "source_semantics": "exact_audit_and_allocation_resume_repair_no_learning_recipe_change",
         "training_artifacts_rewritten": False,
         "calibration_semantics": (
-            "original completed measurement retained; no new measurement claimed"
+            "original completed measurement retained; allocation probes recorded separately"
         ),
     }

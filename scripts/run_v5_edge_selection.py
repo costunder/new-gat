@@ -24,7 +24,7 @@ for directory in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(directory))
 
 from chartgat.cache import atomic_write_bytes, atomic_write_json  # noqa: E402
-from research.conductance_gat.edge_selection import calibration  # noqa: E402
+from research.conductance_gat.edge_selection import calibration, reallocation  # noqa: E402
 from research.conductance_gat.edge_selection.audit_compat import (  # noqa: E402
     require_source_compatibility,
 )
@@ -293,10 +293,16 @@ def _ensure_calibration(args, manifest, persist):
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
     }
-    if "hardware" in manifest and (
-        manifest["hardware"] != hardware or manifest["runtime"] != runtime
-    ):
-        raise ValueError("edge-selection resource hardware/runtime changed")
+    pending_groups = {
+        (job["profile"], job["dataset"])
+        for job in manifest["jobs"]
+        if job.get("status") != "passed"
+        or job.get("audit", {}).get("status") != "passed"
+        or job.get("audit", {}).get("command") != _audit_command(args, job)
+    }
+    revalidate = "hardware" in manifest and reallocation.needs_revalidation(
+        manifest, hardware, runtime, pending_groups
+    )
     if args.hardware_profile == "a6000-48gb" and (
         hardware["total_memory_bytes"] < 40 * 1024**3 or hardware["compute_capability"][0] < 8
     ):
@@ -307,7 +313,8 @@ def _ensure_calibration(args, manifest, persist):
     )
     if free < required * 1024**3:
         raise RuntimeError(f"calibration requires {required:g} GiB free; no processes were changed")
-    manifest.update(hardware=hardware, runtime=runtime)
+    if "hardware" not in manifest:
+        manifest.update(hardware=hardware, runtime=runtime)
     entries = manifest["calibration_entries"]
     for (profile, dataset), jobs in common._grouped(manifest["planned_jobs"]).items():
         entry = next(
@@ -317,7 +324,10 @@ def _ensure_calibration(args, manifest, persist):
         if entry is None:
             entry = {"profile": profile, "dataset": dataset}
             entries.append(entry)
-        calibration.calibrate_group(jobs, entry, persist)
+        if revalidate:
+            calibration.validate_entry(entry, jobs)
+        else:
+            calibration.calibrate_group(jobs, entry, persist)
     resolved = common._apply_common_resources(manifest["planned_jobs"], entries)
     if manifest.get("resources_applied"):
         if [common._job_identity(job) for job in manifest["jobs"]] != [
@@ -326,6 +336,18 @@ def _ensure_calibration(args, manifest, persist):
             raise ValueError("saved child resources differ from the immutable common measurement")
     else:
         manifest.update(jobs=resolved, resources_applied=True)
+    if revalidate:
+        reallocation.revalidate_allocation(
+            manifest,
+            hardware,
+            runtime,
+            {
+                key: jobs
+                for key, jobs in common._grouped(manifest["planned_jobs"]).items()
+                if key in pending_groups
+            },
+            persist,
+        )
     manifest["calibration_status"] = "passed"
     persist()
 
@@ -435,10 +457,8 @@ def _compare(jobs):
                     raise ValueError(f"edge-selection arms do not share verified {key}")
 
 
-def _audit(args, job, environment, persist):
-    from research.conductance_gat.edge_selection import train
-
-    command = [
+def _audit_command(args, job):
+    return [
         sys.executable,
         "-B",
         "-m",
@@ -452,6 +472,12 @@ def _audit(args, job, environment, persist):
         "--repeat-evaluations",
         str(args.repeat_evaluations),
     ]
+
+
+def _audit(args, job, environment, persist):
+    from research.conductance_gat.edge_selection import train
+
+    command = _audit_command(args, job)
     prior = job.get("audit", {})
     checkpoint = job["result"]["checkpoint_sha256"]
     if prior.get("status") == "passed" and prior.get("command") == command:

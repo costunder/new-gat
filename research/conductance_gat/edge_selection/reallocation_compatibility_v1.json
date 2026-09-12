@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "patch_id": "edge-selection-allocation-resume-v1",
+  "releases": [
+    {
+      "schema_version": 1,
+      "patch_id": "edge-selection-allocation-resume-v1",
+      "base_commit": "03ec0f644da2636f92d022a8efb3533a0dcf614a",
+      "base_source_digests": {
+        "manifest": "435b208635e2941b8b4e5e3d1446448e00d8a9826741a5900e0da015fe58aeeb",
+        "training": "390c5092c07c01636b7b81350ee9377b9dbdf1f73f479f58c760e17d60d46b33"
+      },
+      "changes": {
+        "research/conductance_gat/edge_selection/audit.py": {
+          "before": "acd02bac788a6d33146046d22eb2cae14f4085e5df050cf9f92fe6ff3adb331f",
+          "after": "212137b2a6cc453b496e39b94d555a28e9efcae1d77d7762c3121f933b7d334a"
+        },
+        "research/conductance_gat/edge_selection/audit_compat.py": {
+          "before": null,
+          "after": "9b697849737e1b7744a20f87d480d0ef4e795bde601bb8b808bced943df4ffdd"
+        },
+        "research/conductance_gat/edge_selection/diagnostics.py": {
+          "before": "992256684544a036e3cdd057ba7efb08616a294d6d09ced2b4fedf320b795048",
+          "after": "5d5a07a00784273f583ef94162f019f5aee9cbd10a8885096faa03fc57c9b032"
+        },
+        "research/conductance_gat/edge_selection/reallocation.py": {
+          "before": null,
+          "after": "37f904280ea2547d285b9e8973a0165db99ff5effe9d7119462864131cbb6b82"
+        },
+        "research/conductance_gat/edge_selection/train.py": {
+          "before": "f318d3953f4ad8c279e28c30a261cf485463d36d41365f2bce1bd96e5192ddc6",
+          "after": "9cb2519d4b96e0907c13bc24ee236f28f0458a2f2f3ac7d31cc6a52d876ebd1f"
+        },
+        "scripts/run_v5_edge_selection.py": {
+          "before": "0a9180274444bbe4b3058f417f1eb67b47b59373fb64ab3d66890cbb184b5ad1",
+          "after": "2ed8aad32b95a9e95eb9066a70938100d16921e38345e27ff73fb5c5ba72b806"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "patch_id": "edge-selection-allocation-resume-v1",
+      "base_commit": "f7bf065037db4ceefa4aed9ff41aab164ce4b005",
+      "base_source_digests": {
+        "manifest": "06ed3f321588d3369b7e18679be1196449996a81b64219c7755c15630afaaf95",
+        "training": "6d4d709b6adaa7ccf3811174d9fb23ffd9ff1dda103998a9f496513b28fbe8e3"
+      },
+      "changes": {
+        "research/conductance_gat/edge_selection/audit.py": {
+          "before": "212137b2a6cc453b496e39b94d555a28e9efcae1d77d7762c3121f933b7d334a",
+          "after": "212137b2a6cc453b496e39b94d555a28e9efcae1d77d7762c3121f933b7d334a"
+        },
+        "research/conductance_gat/edge_selection/audit_compat.py": {
+          "before": "b59781e321bea67ed18e8e7c1d720368e18459b12128b0eb2d23928192e033a1",
+          "after": "9b697849737e1b7744a20f87d480d0ef4e795bde601bb8b808bced943df4ffdd"
+        },
+        "research/conductance_gat/edge_selection/diagnostics.py": {
+          "before": "5d5a07a00784273f583ef94162f019f5aee9cbd10a8885096faa03fc57c9b032",
+          "after": "5d5a07a00784273f583ef94162f019f5aee9cbd10a8885096faa03fc57c9b032"
+        },
+        "research/conductance_gat/edge_selection/reallocation.py": {
+          "before": null,
+          "after": "37f904280ea2547d285b9e8973a0165db99ff5effe9d7119462864131cbb6b82"
+        },
+        "research/conductance_gat/edge_selection/train.py": {
+          "before": "f318d3953f4ad8c279e28c30a261cf485463d36d41365f2bce1bd96e5192ddc6",
+          "after": "9cb2519d4b96e0907c13bc24ee236f28f0458a2f2f3ac7d31cc6a52d876ebd1f"
+        },
+        "scripts/run_v5_edge_selection.py": {
+          "before": "3eb669d4be7f5f3bb6be0a44c40152f80c38485b2898b4f4a3833a070ec9085c",
+          "after": "2ed8aad32b95a9e95eb9066a70938100d16921e38345e27ff73fb5c5ba72b806"
+        }
+      }
+    }
+  ]
+}

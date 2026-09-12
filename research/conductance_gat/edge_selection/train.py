@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import hashlib
 import json
@@ -26,6 +27,7 @@ from ..v5.batch_calibration import (
 from ..v5.learning_budget import should_stop_learning_budget
 from ..v5.timing import StageTimer
 from . import protocol as selection_protocol
+from .audit_compat import require_source_compatibility
 from .data import PreparedInputs
 from .model import EdgeSelectionClassifier
 
@@ -200,6 +202,29 @@ def validate_identity(saved, expected):
         raise ValueError(
             f"edge-selection resume identity mismatch: {changed}; old evidence preserved"
         )
+
+
+def resolve_training_resume(saved, expected):
+    """Preserve the original identity; admit only a pinned infrastructure repair.
+
+    Model, optimizer, data, sampling, arguments, budget and runtime must still
+    agree exactly. Actual resumed execution sources are recorded separately.
+    """
+    identity = saved.get("resume_identity")
+    validate_identity(saved, identity)
+    changed = sorted(
+        key
+        for key in set(identity) | set(expected)
+        if key != "source_sha256" and identity.get(key) != expected.get(key)
+    )
+    if changed:
+        raise ValueError(
+            f"edge-selection resume identity mismatch: {changed}; old evidence preserved"
+        )
+    proof = require_source_compatibility(
+        identity.get("source_sha256"), expected.get("source_sha256"), scope="training"
+    )
+    return copy.deepcopy(identity), proof
 
 
 def autocast(args, device):
@@ -409,6 +434,8 @@ def train_model(payload, protocol, args, device, output):
         optimizer = make_optimizer(model)
         identity = build_identity(args, protocol, budget, initial_hash, inputs)
         identity_hash = base._canonical_sha256(identity)
+        execution_sources = copy.deepcopy(identity["source_sha256"])
+        source_transitions = []
         last_path, best_path, previous_path = (
             output / "last.pt",
             output / "best.pt",
@@ -420,7 +447,22 @@ def train_model(payload, protocol, args, device, output):
             if not args.resume or last_path.is_symlink():
                 raise ValueError("existing checkpoint cannot be replaced without a valid resume")
             saved = base.load_checkpoint_on_cpu(last_path)
-            validate_identity(saved, identity)
+            identity, source_proof = resolve_training_resume(saved, identity)
+            identity_hash = base._canonical_sha256(identity)
+            source_transitions = copy.deepcopy(saved.get("source_transitions", []))
+            if not isinstance(source_transitions, list):
+                raise ValueError("checkpoint source transition evidence must be a list")
+            source_transitions.append(
+                {
+                    "after_epoch": saved["epoch"],
+                    "optimizer_steps": saved["optimizer_steps"],
+                    "source_sha256": execution_sources,
+                    "source_compatibility": source_proof,
+                    "restored_checkpoint_sha256": base.sha256_file(last_path),
+                    "hardware": hardware,
+                    "scope": "epoch-boundary continuation; original training identity retained",
+                }
+            )
             history = saved["history"]
             if [row.get("epoch") for row in history] != list(range(1, saved["epoch"] + 1)):
                 raise ValueError("resume history has missing or repeated epochs")
@@ -467,7 +509,8 @@ def train_model(payload, protocol, args, device, output):
                 else None,
             },
         }
-        atomic_write_json(output / "configuration.json", pre_run)
+        if not (output / "configuration.json").exists():
+            atomic_write_json(output / "configuration.json", pre_run)
         print(json.dumps(pre_run, sort_keys=True), flush=True)
         torch.cuda.reset_peak_memory_stats(device)
         for epoch in range(len(history) + 1, budget["planned_epochs"] + 1):
@@ -514,6 +557,8 @@ def train_model(payload, protocol, args, device, output):
                         "selection_role": "primary",
                         "resume_identity": identity,
                         "resume_identity_sha256": identity_hash,
+                        "execution_source_sha256": execution_sources,
+                        "source_transitions": source_transitions,
                     },
                 )
             base._save(
@@ -529,6 +574,8 @@ def train_model(payload, protocol, args, device, output):
                     "best_checkpoint_sha256": best_hash,
                     "resume_identity": identity,
                     "resume_identity_sha256": identity_hash,
+                    "execution_source_sha256": execution_sources,
+                    "source_transitions": source_transitions,
                     "shared_initial_state_sha256": shared_hash,
                     **_checkpoint_rng(device),
                 },
@@ -565,6 +612,8 @@ def train_model(payload, protocol, args, device, output):
             "configuration": configuration(args),
             "protocol": protocol,
             "source_sha256": identity["source_sha256"],
+            "execution_source_sha256": execution_sources,
+            "source_transitions": source_transitions,
             "resume_identity": identity,
             "resume_identity_sha256": identity_hash,
             "learning_budget": budget,

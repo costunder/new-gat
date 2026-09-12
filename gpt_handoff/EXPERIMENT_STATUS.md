@@ -1,6 +1,44 @@
 # 실험 결과와 구현 상태
 
-기준일: 2026-09-09 (Asia/Seoul).
+기준일: 2026-09-12 (Asia/Seoul).
+
+### 2026-09-12: GPU 재할당 후 같은 edge-selection run 재개
+
+사용자는 할당 만료 뒤 같은 서버에서 물리 GPU 1 대신 4를 배정받았다. 실행기의
+`hardware` 사전 전체 비교가 `cuda_visible_devices`/UUID 변경까지 거부했다.
+같이 출력된 `env: ‘ ’: No such file or directory`는 별개의 셸 줄 연결 오류이므로
+그 실패 실행에서 실제 GPU 4가 노출됐다고 단정하지 않는다.
+
+같은 GPU 모델·VRAM·compute capability·할당 CPU 수·Python/Torch/CUDA에서 GPU 번호와
+UUID 등 할당 식별자만 달라진 경우를 지원한다. 원본 `hardware`, `runtime`, 전체
+`calibration_entries`, 완료 학습/감사 및 best/last checkpoint를 새 측정으로 덮지 않는다.
+새 할당은 `allocation_history`에 별도 기록한다. 기존 선택 batch/worker 후보에서
+peak reserved VRAM, peak allocated VRAM, 예상 전체 학습 시간이 각각 가장 컸던 조건의
+합집합을 profile/dataset별로 골라 실제 full-epoch forward/backward/optimizer 및
+전체 validation을 재측정한다. 중복 대표는 한 번만 측정하고 학습과 감사가 모두 완료된
+그룹은 재검증 대상에서 제외한다. 이는 같은 사양 GPU에 대한 기존 계획의 스트레스
+재검증이지 전체 후보 탐색 재실행이나 새 최적 batch를 찾았다는 주장이 아니다.
+
+재검증에 실패하면 기존 배치·worker·모델·샘플링·예산을 줄이지 않고 원인을 보존하며
+학습 진입을 막는다. 전체 필요 그룹이 통과해야 `current_allocation`을 갱신한다.
+실제 GPU 사양/CPU 수/라이브러리 버전이 달라진 경우와 원본 배치 교정이 미완료인
+상태에서 할당이 바뀐 경우는 이번 동일 사양 재개 범위 밖이며 차이 필드를 명시한다.
+
+`03ec0f6`와 `f7bf065`에서 저장한 완료/미완료 학습을 정확한 소스 해시로 검증한다.
+미완료 조건은 다음 epoch부터 model/optimizer/Python·NumPy·CPU·CUDA RNG를 복원한다.
+원본 학습 identity와 기존 best checkpoint는 유지하고, 실제 재개 실행 코드와
+시작 epoch/step/원본 checkpoint SHA/자원은 `source_transitions` 및
+`execution_source_sha256`로 분리한다. 모델·데이터·레시피 변경을 일반적으로 허용하는
+마이그레이션은 아니다. `run-id`의 gpu1은 실험 이름이며 새 GPU 번호에 맞춰 바꾸지 않는다.
+
+서버의 새 GPU에서 실제 재검증/재개 학습은 아직 수행하지 않았다. 로컬은
+PyTorch 2.13.0+cpu, CUDA 없음, 논리 CPU 16개이고 최종 GPU 검증을 대체하지 않는다.
+최종 관련 통합 회귀는 **260 passed / 5 skipped (74.36초)**였다. skip은 PyG 통합
+3개와 실제 CUDA/pinning 2개다. 실제 CPU 모델·AdamW의 epoch 2 중단→3 재개,
+난수/optimizer/모델 복원과 연속 실행 일치, 구형 best checkpoint·설정 파일 바이트 보존,
+두 배포 버전의 정확한 소스 수리, 미등록 변경 거부, 재할당 실패/커밋 원자성 및
+기존 감사·구조·무결성 회귀를 포함한다. GPU 측정 부분은 명시적 CPU 테스트 fixture이며
+실제 A6000 재측정 결과가 아니다. 변경 Python 7개 Ruff 및 서식 검사, diff 공백 검사도 통과했다.
 
 ### 2026-09-09 수령: arxiv full/reference 학습 완료 후 분위수 감사 실패
 

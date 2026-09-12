@@ -1,5 +1,14 @@
 # Conductance GAT V5 — graph-specific C optimization and weighted-Laplacian propagation
 
+### 2026-09-12 동일 사양 GPU 재할당 재개
+
+edge-selection 실행기는 GPU 번호/UUID 변경을 학습 레시피 변경과 분리한다.
+원본 배치 교정과 완료 결과는 보존하고, 같은 GPU 사양/CPU 수/런타임의 새 할당에서
+기존 선택 자원의 측정상 최악 조건을 실제 disposable probe로 재검증한 뒤 이어간다.
+배치·모델·데이터·예산을 자동 축소하지 않는다. 미완료 checkpoint는 원본 identity와
+optimizer/RNG를 유지해 다음 epoch에서 재개하고 새 실행 소스와 할당 증거를 따로 기록한다.
+정확한 지원 범위·실제 검증 범위는 `EXPERIMENT_STATUS.md`의 2026-09-12 절에 있다.
+
 ### 2026-09-09 감사 수리
 
 arxiv full/reference의 학습 완료 후 전체 방향별 엣지×head 분포에서

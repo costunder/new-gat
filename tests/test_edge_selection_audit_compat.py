@@ -16,13 +16,13 @@ from research.conductance_gat.edge_selection import audit, audit_compat, train
 from scripts import run_v5_edge_selection as driver
 
 
-def sources(scope):
+def sources(scope, base_commit=audit_compat.BASE_COMMIT):
     current = (
         driver.resources.source_snapshot()
         if scope == "manifest"
         else train.implementation_source_hashes()
     )
-    registry, _ = audit_compat._registry()
+    registry, _ = audit_compat._registry(base_commit)
     previous = copy.deepcopy(current)
     for name, change in registry["changes"].items():
         if change["before"] is None:
@@ -33,11 +33,13 @@ def sources(scope):
 
 
 @pytest.mark.parametrize("scope", ["manifest", "training"])
-def test_exact_pinned_release_passes_without_relabeling(scope):
-    previous, current = sources(scope)
+@pytest.mark.parametrize("base_commit", audit_compat.BASE_COMMITS)
+def test_exact_pinned_release_passes_without_relabeling(scope, base_commit):
+    previous, current = sources(scope, base_commit)
     before = copy.deepcopy(previous)
     proof = audit_compat.require_source_compatibility(previous, current, scope=scope)
     assert proof["patch_id"] == audit_compat.PATCH_ID
+    assert proof["base_commit"] == base_commit
     assert proof["training_artifacts_rewritten"] is False
     assert proof["previous_source_map_sha256"] != proof["current_source_map_sha256"]
     assert previous == before
@@ -82,7 +84,7 @@ def test_live_pins_are_linux_lf_bytes_not_windows_normalized_claims():
 
 
 def test_registry_is_exact_and_rejects_duplicate_keys(tmp_path, monkeypatch):
-    registry, _ = audit_compat._registry()
+    registry = json.loads(audit_compat.REGISTRY_PATH.read_text())
     target = tmp_path / "debug-registry.json"
     target.write_text(
         json.dumps(registry).replace(
@@ -92,13 +94,42 @@ def test_registry_is_exact_and_rejects_duplicate_keys(tmp_path, monkeypatch):
     monkeypatch.setattr(audit_compat, "REGISTRY_PATH", target)
     with pytest.raises(ValueError, match="duplicate"):
         audit_compat._registry()
-    registry["changes"]["research/conductance_gat/edge_selection/model.py"] = {
+    registry["releases"][0]["changes"]["research/conductance_gat/edge_selection/model.py"] = {
         "before": "0" * 64,
         "after": "1" * 64,
     }
     target.write_text(json.dumps(registry))
     with pytest.raises(ValueError, match="exact change set"):
         audit_compat._registry()
+
+
+@pytest.mark.parametrize("base_commit", audit_compat.BASE_COMMITS)
+def test_partial_checkpoint_accepts_only_exact_source_repair(base_commit):
+    previous, current = sources("training", base_commit)
+    identity = {
+        "research_suite": train.SUITE,
+        "configuration": {"synthetic": "debug-identity-only"},
+        "source_sha256": previous,
+        "training_arguments": {"device": "cuda:0", "seed": 0},
+        "learning_budget": {"epochs": 200},
+    }
+    saved = {
+        "resume_identity": identity,
+        "resume_identity_sha256": train.base._canonical_sha256(identity),
+    }
+    snapshot = copy.deepcopy(saved)
+    expected = {**identity, "source_sha256": current}
+    original, proof = train.resolve_training_resume(saved, expected)
+    assert original == identity and original is not identity
+    assert proof["base_commit"] == base_commit
+    assert saved == snapshot
+    for key in ("research_suite", "configuration", "training_arguments", "learning_budget"):
+        damaged = {**expected, key: "changed"}
+        with pytest.raises(ValueError, match="identity mismatch"):
+            train.resolve_training_resume(saved, damaged)
+    damaged_sources = {**current, "unexpected.py": "a" * 64}
+    with pytest.raises(ValueError, match="unreviewed"):
+        train.resolve_training_resume(saved, {**expected, "source_sha256": damaged_sources})
 
 
 def fake_result():
