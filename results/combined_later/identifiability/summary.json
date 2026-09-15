@@ -1,0 +1,16 @@
+{
+  "experiment": "E1_nullspace_identifiability",
+  "nodes": 16,
+  "edges": 25,
+  "cycle_rank": 10,
+  "pair_divergence_error": 3.774758283725532e-15,
+  "first_full_rank_observation_count": {
+    "chord_first": 10,
+    "random": 11,
+    "rank_greedy": 10,
+    "tree_first": 15
+  },
+  "max_full_rank_noiseless_relative_error": 1.5168161783830456e-14,
+  "noise_std": 0.02,
+  "ridge": 0.01
+}

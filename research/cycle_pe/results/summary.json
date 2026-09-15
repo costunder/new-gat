@@ -1,0 +1,99 @@
+{
+  "notes": {
+    "cycle_set": "invariant only to sign/permutation of a fixed cycle set",
+    "projector_leverage": "basis-invariant prior-style baseline, not novelty",
+    "raw": "diagnostic; column order/sign and spanning-tree dependent"
+  },
+  "scope": "static_graph_cycle_pe_only",
+  "split": {
+    "test_families": [
+      "cactus_cycle_chain",
+      "double_cycle_bridge"
+    ],
+    "test_graphs": 16,
+    "train_families": [
+      "cycle_tail",
+      "random_tree_plus_chords"
+    ],
+    "train_graphs": 16
+  },
+  "task": "edge_is_in_any_cycle",
+  "variants": {
+    "degree_only": {
+      "feature_dim": 4,
+      "test": {
+        "accuracy": 0.2607003891050584,
+        "auroc": 0.3883091787439613,
+        "balanced_accuracy": 0.3666183574879227,
+        "f1": 0.2962962962962963,
+        "macro_graph_accuracy": 0.29518344196653024
+      },
+      "test_edges": 257,
+      "train": {
+        "accuracy": 0.6965174129353234,
+        "auroc": 0.7692079207920792,
+        "balanced_accuracy": 0.6968316831683168,
+        "f1": 0.7136150234741785,
+        "macro_graph_accuracy": 0.6902924332611833
+      },
+      "train_edges": 201
+    },
+    "degree_plus_cycle_set": {
+      "feature_dim": 10,
+      "test": {
+        "accuracy": 1.0,
+        "auroc": 1.0,
+        "balanced_accuracy": 1.0,
+        "f1": 1.0,
+        "macro_graph_accuracy": 1.0
+      },
+      "test_edges": 257,
+      "train": {
+        "accuracy": 1.0,
+        "auroc": 1.0,
+        "balanced_accuracy": 1.0,
+        "f1": 1.0,
+        "macro_graph_accuracy": 1.0
+      },
+      "train_edges": 201
+    },
+    "degree_plus_projector_leverage": {
+      "feature_dim": 5,
+      "test": {
+        "accuracy": 1.0,
+        "auroc": 1.0,
+        "balanced_accuracy": 1.0,
+        "f1": 1.0,
+        "macro_graph_accuracy": 1.0
+      },
+      "test_edges": 257,
+      "train": {
+        "accuracy": 1.0,
+        "auroc": 1.0,
+        "balanced_accuracy": 1.0,
+        "f1": 1.0,
+        "macro_graph_accuracy": 1.0
+      },
+      "train_edges": 201
+    },
+    "degree_plus_raw": {
+      "feature_dim": 16,
+      "test": {
+        "accuracy": 0.377431906614786,
+        "auroc": 0.5599033816425121,
+        "balanced_accuracy": 0.4921739130434783,
+        "f1": 0.4405594405594406,
+        "macro_graph_accuracy": 0.407924638732011
+      },
+      "test_edges": 257,
+      "train": {
+        "accuracy": 0.7860696517412935,
+        "auroc": 0.8637623762376238,
+        "balanced_accuracy": 0.7860891089108911,
+        "f1": 0.7860696517412936,
+        "macro_graph_accuracy": 0.771544687950938
+      },
+      "train_edges": 201
+    }
+  }
+}

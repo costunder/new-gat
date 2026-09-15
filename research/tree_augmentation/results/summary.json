@@ -1,0 +1,25 @@
+{
+  "track": "static_cycle_pe_tree_augmentation",
+  "certification": {
+    "num_nodes": 12,
+    "num_edges": 18,
+    "cycle_rank_beta": 7,
+    "full_beta_enabled": true,
+    "lossy_k_lt_beta_enabled": false,
+    "unique_training_trees": 16,
+    "lossless_transition_error": 9.930136612989092e-16,
+    "transition_cocycle_error": 0.0
+  },
+  "probe": {
+    "cycle_rank_beta": 7,
+    "num_training_charts": 16,
+    "fixed_chart": "bfs:0",
+    "unseen_chart": "unseen-random:10001",
+    "fixed_train_mse": 7.507434934451588e-08,
+    "multi_train_mse": 2.3044736480918255e-05,
+    "fixed_unseen_mse": 0.028995566385470184,
+    "multi_unseen_mse": 0.028363837664405207,
+    "unseen_mse_ratio_multi_over_fixed": 0.9782129201179688,
+    "projector_oracle_unseen_mse": 9.073269960224312e-33
+  }
+}

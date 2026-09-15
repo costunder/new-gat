@@ -1,5 +1,10 @@
 # GPT 전달용 전체 프로젝트 묶음
 
+최신 보존(2026-09-16): 작은 기존 연구 산출물 13개(338.6 KiB)를 Git에 포함했다.
+초기 합성 conductance/cycle/tree 검증과 보류된 combined prototype의 기록이며,
+최근 서버 GPU 결과가 아니다. 원본 파일을 바꾸지 않고 byte-preserving 속성으로 보존한다.
+목록·출처·제외 범위는 `EXPERIMENT_STATUS.md` 맨 위에 있다. 임시/smoke/cache는 계속 제외한다.
+
 최신 수정(2026-09-12): 동일 사양 GPU를 재할당받아 물리 번호가 1→4로 바뀐 경우
 같은 edge-selection run의 기존 학습/교정 기록을 보존하고 새 할당을 별도로 재검증한다.
 미완료 학습은 다음 epoch와 optimizer/RNG부터 복원한다. 실제 다른 GPU 사양이나

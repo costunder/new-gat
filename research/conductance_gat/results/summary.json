@@ -1,0 +1,35 @@
+{
+  "scope": "incidence_conductance_attention_only",
+  "seed": 17,
+  "device": "cpu",
+  "runtime": {
+    "python": "3.12.13",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "torch": "2.13.0+cpu",
+    "cuda_available": false,
+    "torch_cuda_runtime": null,
+    "device": "cpu",
+    "device_name": "cpu"
+  },
+  "num_nodes": 28,
+  "num_edges": 49,
+  "train_excitations": 144,
+  "test_excitations": 48,
+  "step_size": 0.03,
+  "learned": {
+    "node_update_rmse": 0.0010448936372995377,
+    "flux_rmse": 0.018003426492214203,
+    "conductance_rmse": 0.006426416337490082,
+    "conductance_correlation_excited": 0.9999471306800842,
+    "excited_edge_fraction": 1.0,
+    "mean_effective_step": 0.029999995604157448
+  },
+  "isotropic": {
+    "node_update_rmse": 0.046455640345811844,
+    "flux_rmse": 0.8760960102081299,
+    "conductance_rmse": 0.623935878276825,
+    "conductance_correlation_excited": 0.0,
+    "excited_edge_fraction": 1.0,
+    "mean_effective_step": 0.029999995604157448
+  }
+}

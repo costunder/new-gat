@@ -1,1 +1,16 @@
 *.sh text eol=lf
+
+# Preserve the recorded bytes (including CSV line endings) of curated evidence.
+research/conductance_gat/results/summary.json -text
+research/conductance_gat/results/isotropic_history.csv -text
+research/conductance_gat/results/learned_history.csv -text
+research/conductance_gat/results/learned_model.pt -text
+research/cycle_pe/results/summary.json -text
+research/tree_augmentation/results/summary.json -text
+results/combined_later/certification.json -text
+results/combined_later/fixed_c/summary.json -text
+results/combined_later/fixed_c/training.csv -text
+results/combined_later/fixed_c/training.png -text
+results/combined_later/identifiability/summary.json -text
+results/combined_later/identifiability/sweep.csv -text
+results/combined_later/identifiability/identifiability.png -text

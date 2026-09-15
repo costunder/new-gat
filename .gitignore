@@ -22,3 +22,24 @@ results/*
 !results/.gitkeep
 data/*
 !data/.gitkeep
+
+# Curated historical research evidence; generated caches and repeated smoke runs stay ignored.
+!research/conductance_gat/results/summary.json
+!research/conductance_gat/results/isotropic_history.csv
+!research/conductance_gat/results/learned_history.csv
+!research/conductance_gat/results/learned_model.pt
+!research/cycle_pe/results/summary.json
+!research/tree_augmentation/results/summary.json
+!results/combined_later/
+results/combined_later/*
+!results/combined_later/certification.json
+!results/combined_later/fixed_c/
+results/combined_later/fixed_c/*
+!results/combined_later/fixed_c/summary.json
+!results/combined_later/fixed_c/training.csv
+!results/combined_later/fixed_c/training.png
+!results/combined_later/identifiability/
+results/combined_later/identifiability/*
+!results/combined_later/identifiability/summary.json
+!results/combined_later/identifiability/sweep.csv
+!results/combined_later/identifiability/identifiability.png

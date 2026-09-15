@@ -1,0 +1,82 @@
+{
+  "experiment": "E0_algebraic_symmetry_certification",
+  "passed": true,
+  "tolerance": 1e-09,
+  "configuration": {
+    "output": "C:\\Users\\lock1\\Desktop\\\ud504\ub85c\uc81d\ud2b8\\NEW GAT\\results\\certification.json",
+    "seed": 2026,
+    "graphs": 5,
+    "nodes": 9,
+    "extra_edges": 7,
+    "depth": 4,
+    "tolerance": 1e-09
+  },
+  "max_errors": {
+    "cycle_null_error": 0.0,
+    "chord_identity_error": 0.0,
+    "transition_error": 0.0,
+    "cocycle_error": 0.0,
+    "reconstruction_error": 9.992007221626409e-15,
+    "orientation_null_error": 0.0,
+    "multilayer_p_error": 1.1102230246251565e-16,
+    "multilayer_cycle_error": 8.881784197001252e-16,
+    "orientation_layer_error": 0.0
+  },
+  "per_graph": [
+    {
+      "cycle_null_error": 0.0,
+      "chord_identity_error": 0.0,
+      "transition_error": 0.0,
+      "cocycle_error": 0.0,
+      "reconstruction_error": 9.992007221626409e-15,
+      "orientation_null_error": 0.0,
+      "multilayer_p_error": 1.1102230246251565e-16,
+      "multilayer_cycle_error": 8.881784197001252e-16,
+      "orientation_layer_error": 0.0
+    },
+    {
+      "cycle_null_error": 0.0,
+      "chord_identity_error": 0.0,
+      "transition_error": 0.0,
+      "cocycle_error": 0.0,
+      "reconstruction_error": 7.771561172376096e-15,
+      "orientation_null_error": 0.0,
+      "multilayer_p_error": 2.7755575615628914e-17,
+      "multilayer_cycle_error": 4.440892098500626e-16,
+      "orientation_layer_error": 0.0
+    },
+    {
+      "cycle_null_error": 0.0,
+      "chord_identity_error": 0.0,
+      "transition_error": 0.0,
+      "cocycle_error": 0.0,
+      "reconstruction_error": 2.886579864025407e-15,
+      "orientation_null_error": 0.0,
+      "multilayer_p_error": 0.0,
+      "multilayer_cycle_error": 0.0,
+      "orientation_layer_error": 0.0
+    },
+    {
+      "cycle_null_error": 0.0,
+      "chord_identity_error": 0.0,
+      "transition_error": 0.0,
+      "cocycle_error": 0.0,
+      "reconstruction_error": 4.496403249731884e-15,
+      "orientation_null_error": 0.0,
+      "multilayer_p_error": 0.0,
+      "multilayer_cycle_error": 0.0,
+      "orientation_layer_error": 0.0
+    },
+    {
+      "cycle_null_error": 0.0,
+      "chord_identity_error": 0.0,
+      "transition_error": 0.0,
+      "cocycle_error": 0.0,
+      "reconstruction_error": 1.6653345369377348e-15,
+      "orientation_null_error": 0.0,
+      "multilayer_p_error": 0.0,
+      "multilayer_cycle_error": 0.0,
+      "orientation_layer_error": 0.0
+    }
+  ]
+}

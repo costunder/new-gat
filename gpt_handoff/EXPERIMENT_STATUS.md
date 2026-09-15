@@ -1,6 +1,40 @@
 # 실험 결과와 구현 상태
 
-기준일: 2026-09-12 (Asia/Seoul).
+기준일: 2026-09-16 (Asia/Seoul).
+
+### 2026-09-16: 작은 기존 연구 산출물의 Git 보존
+
+작은 연구 결과를 보존하라는 요청에 따라 기존 파일 **13개, 346,743 bytes (338.6 KiB)**를
+선별해 Git 추적 대상으로 추가했다. 원본 숫자·checkpoint·그래프 파일은 수정하거나
+재생성하지 않았고, 해당 파일의 `-text` 속성으로 Git 줄바꿈 변환도 막는다.
+
+- `research/conductance_gat/results/`: 초기 합성 conductance 검증의 `summary.json`,
+  `isotropic_history.csv`, `learned_history.csv`, 작은 `learned_model.pt` (4개).
+- `research/cycle_pe/results/summary.json`: 합성 cycle-membership 분류 비교 (1개).
+  Cycle feature/projector가 목표인 cycle 소속 여부를 직접 드러내는 구형 진단이다.
+  기록된 100%를 PE 일반화 성능이나 신규성 근거로 사용하지 않는다.
+- `research/tree_augmentation/results/summary.json`: 합성 tree-chart 수치 검증 (1개).
+- `results/combined_later/`: `certification.json`, `fixed_c/`의 summary·training CSV·PNG,
+  `identifiability/`의 summary·sweep CSV·PNG (7개). 이 결합 prototype은 보류된 과거 연구다.
+
+모두 **과거의 작은 합성/수치 실험 산출물**이며 현재 V1~V5 공식 데이터셋 benchmark나
+신규 edge-selection GPU 실험 결과로 해석하면 안 된다. 원본에 없는 실행 commit이나
+추가 재현 성공을 추정해 붙이지 않는다. 일부 원본 metadata에는 당시 로컬 출력 경로가
+남아 있고 이는 현재 checkout의 실행 경로나 새 실행 증거가 아니다.
+
+`fixed_c_smoke`, 반복 `readme-e2e`/`reaudit`/`p0-core-tiny` 결과·실행 로그, `data/`의
+tiny 개발용 생성 cache, 가상환경·캐시·pytest 임시파일은 계속 제외한다. 원본 공개
+benchmark cache 및 최근 서버 `results/conductance_gat/edge_selection`/`scaling` 결과는
+현재 로컬에 없어 이번 추가 대상이 아니다. 서버의 원본 결과를 받아야 별도 보존할 수 있다.
+`.gitignore`는 위 파일만 명시적으로 허용하며 새 대용량 결과를 자동 포함하지 않는다.
+
+이번 작업은 기존 산출물 보존이며 모델·데이터 계약·학습 코드·예산을 변경하지 않는다.
+게시 전 JSON 6개 파싱, PNG 2개 형식/metadata, checkpoint의 `weights_only=True` 로드를
+검사했다. checkpoint에는 유한한 float32 가중치 tensor 6개만 있고 외부 원시 데이터나
+optimizer는 없다. CSV 4개의 원본 기록도 보존한다. 이는 자료 검증이며 과거 실험의
+재실행이나 최신 GPU 모델의 전체 평가를 수행했다는 뜻이 아니다.
+원본과 staged Git blob 13개의 바이트 일치 및 임시/smoke/cache 제외를 확인했다.
+기존 edge-selection 소스 호환·문서 위치 검사도 **19 passed**로 통과했다.
 
 ### 2026-09-12: GPU 재할당 후 같은 edge-selection run 재개
 

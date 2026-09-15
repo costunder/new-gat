@@ -1,0 +1,52 @@
+{
+  "experiment": "fixed_C_hard_observation_completion",
+  "device": "cpu",
+  "nodes": 14,
+  "edges": 22,
+  "cycle_rank": 9,
+  "samples": 192,
+  "observed_edges": [
+    0,
+    4,
+    9,
+    11,
+    15,
+    21
+  ],
+  "observation_rank": 6,
+  "epochs": 40,
+  "metrics": {
+    "physical": {
+      "full_rmse": 0.06533093175984979,
+      "missing_rmse": 0.07660730798258712,
+      "observed_max_abs_error": 1.3322676295501878e-15,
+      "unseen_chart_missing_rmse": 0.07660730798258711,
+      "chart_variation_max_abs": 1.7763568394002505e-15,
+      "unseen_observed_max_abs_error": 8.881784197001252e-16,
+      "conservation_max_abs_error": 1.7763568394002505e-15
+    },
+    "raw_coordinate": {
+      "full_rmse": 0.11522179471366521,
+      "missing_rmse": 0.1351095304500288,
+      "observed_max_abs_error": 7.771561172376096e-16,
+      "unseen_chart_missing_rmse": 0.1792002234573148,
+      "chart_variation_max_abs": 0.45292596340891933,
+      "unseen_observed_max_abs_error": 1.3322676295501878e-15
+    },
+    "particular_only": {
+      "full_rmse": 0.21320071635561044,
+      "missing_rmse": 0.20473180549792774,
+      "observed_max_abs_error": 0.6292263262670112
+    },
+    "analytic_anchor": {
+      "full_rmse": 0.11261111777478279,
+      "missing_rmse": 0.13204824038554336,
+      "observed_max_abs_error": 4.440892098500626e-16
+    },
+    "analytic_ridge": {
+      "full_rmse": 0.11301250435579162,
+      "missing_rmse": 0.13245473423240997,
+      "observed_max_abs_error": 0.018914682636697933
+    }
+  }
+}

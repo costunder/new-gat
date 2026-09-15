@@ -13,6 +13,13 @@ Cycle PE tracks have each been evaluated on their own.
 
 Historical outputs were moved to `results/combined_later/`.
 
+The small historical `certification.json`, `fixed_c/` (summary, CSV, PNG), and
+`identifiability/` (summary, CSV, PNG) outputs are now tracked byte-for-byte.
+The duplicate `fixed_c_smoke/` output remains ignored. These are archived
+synthetic/prototype observations, not fresh benchmark results or evidence for
+the current V5/edge-selection implementation. Original local output-path
+metadata is retained; no missing run commit or new reproduction is inferred.
+
 Optional historical checks can be run explicitly:
 
 ```powershell
