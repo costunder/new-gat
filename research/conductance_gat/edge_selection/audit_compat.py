@@ -18,7 +18,11 @@ HELPER_SOURCE = "research/conductance_gat/edge_selection/audit_compat.py"
 REGISTRY_PATH = Path(__file__).with_name("reallocation_compatibility_v1.json")
 PATCH_ID = "edge-selection-allocation-resume-v1"
 BASE_COMMIT = "03ec0f644da2636f92d022a8efb3533a0dcf614a"
-BASE_COMMITS = (BASE_COMMIT, "f7bf065037db4ceefa4aed9ff41aab164ce4b005")
+BASE_COMMITS = (
+    BASE_COMMIT,
+    "f7bf065037db4ceefa4aed9ff41aab164ce4b005",
+    "abe374691f05c2de8a8b17fd69d70c90b364036b",
+)
 CHANGED_SOURCES = frozenset(
     {
         "research/conductance_gat/edge_selection/diagnostics.py",

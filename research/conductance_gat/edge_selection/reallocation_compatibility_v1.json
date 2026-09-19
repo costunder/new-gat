@@ -17,7 +17,7 @@
         },
         "research/conductance_gat/edge_selection/audit_compat.py": {
           "before": null,
-          "after": "9b697849737e1b7744a20f87d480d0ef4e795bde601bb8b808bced943df4ffdd"
+          "after": "85d53130a25f20c23b2329cd57d709d9fc56b0e4c6f2761977c103ed8f293fb1"
         },
         "research/conductance_gat/edge_selection/diagnostics.py": {
           "before": "992256684544a036e3cdd057ba7efb08616a294d6d09ced2b4fedf320b795048",
@@ -25,7 +25,7 @@
         },
         "research/conductance_gat/edge_selection/reallocation.py": {
           "before": null,
-          "after": "37f904280ea2547d285b9e8973a0165db99ff5effe9d7119462864131cbb6b82"
+          "after": "6edbaaa6e0e86838993b794b0332492723771f97f080e484367a28c168416a1a"
         },
         "research/conductance_gat/edge_selection/train.py": {
           "before": "f318d3953f4ad8c279e28c30a261cf485463d36d41365f2bce1bd96e5192ddc6",
@@ -52,7 +52,7 @@
         },
         "research/conductance_gat/edge_selection/audit_compat.py": {
           "before": "b59781e321bea67ed18e8e7c1d720368e18459b12128b0eb2d23928192e033a1",
-          "after": "9b697849737e1b7744a20f87d480d0ef4e795bde601bb8b808bced943df4ffdd"
+          "after": "85d53130a25f20c23b2329cd57d709d9fc56b0e4c6f2761977c103ed8f293fb1"
         },
         "research/conductance_gat/edge_selection/diagnostics.py": {
           "before": "5d5a07a00784273f583ef94162f019f5aee9cbd10a8885096faa03fc57c9b032",
@@ -60,7 +60,7 @@
         },
         "research/conductance_gat/edge_selection/reallocation.py": {
           "before": null,
-          "after": "37f904280ea2547d285b9e8973a0165db99ff5effe9d7119462864131cbb6b82"
+          "after": "6edbaaa6e0e86838993b794b0332492723771f97f080e484367a28c168416a1a"
         },
         "research/conductance_gat/edge_selection/train.py": {
           "before": "f318d3953f4ad8c279e28c30a261cf485463d36d41365f2bce1bd96e5192ddc6",
@@ -68,6 +68,41 @@
         },
         "scripts/run_v5_edge_selection.py": {
           "before": "3eb669d4be7f5f3bb6be0a44c40152f80c38485b2898b4f4a3833a070ec9085c",
+          "after": "2ed8aad32b95a9e95eb9066a70938100d16921e38345e27ff73fb5c5ba72b806"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "patch_id": "edge-selection-allocation-resume-v1",
+      "base_commit": "abe374691f05c2de8a8b17fd69d70c90b364036b",
+      "base_source_digests": {
+        "manifest": "7bcc62507f5884d1cc8791fe8aaee70b36579795e4575d072bc9245081914e6d",
+        "training": "603a5257febc97ad00f7834c4c1c8ee25da8b6382c49e43477090654c3955674"
+      },
+      "changes": {
+        "research/conductance_gat/edge_selection/audit.py": {
+          "before": "212137b2a6cc453b496e39b94d555a28e9efcae1d77d7762c3121f933b7d334a",
+          "after": "212137b2a6cc453b496e39b94d555a28e9efcae1d77d7762c3121f933b7d334a"
+        },
+        "research/conductance_gat/edge_selection/audit_compat.py": {
+          "before": "9b697849737e1b7744a20f87d480d0ef4e795bde601bb8b808bced943df4ffdd",
+          "after": "85d53130a25f20c23b2329cd57d709d9fc56b0e4c6f2761977c103ed8f293fb1"
+        },
+        "research/conductance_gat/edge_selection/diagnostics.py": {
+          "before": "5d5a07a00784273f583ef94162f019f5aee9cbd10a8885096faa03fc57c9b032",
+          "after": "5d5a07a00784273f583ef94162f019f5aee9cbd10a8885096faa03fc57c9b032"
+        },
+        "research/conductance_gat/edge_selection/reallocation.py": {
+          "before": "37f904280ea2547d285b9e8973a0165db99ff5effe9d7119462864131cbb6b82",
+          "after": "6edbaaa6e0e86838993b794b0332492723771f97f080e484367a28c168416a1a"
+        },
+        "research/conductance_gat/edge_selection/train.py": {
+          "before": "9cb2519d4b96e0907c13bc24ee236f28f0458a2f2f3ac7d31cc6a52d876ebd1f",
+          "after": "9cb2519d4b96e0907c13bc24ee236f28f0458a2f2f3ac7d31cc6a52d876ebd1f"
+        },
+        "scripts/run_v5_edge_selection.py": {
+          "before": "2ed8aad32b95a9e95eb9066a70938100d16921e38345e27ff73fb5c5ba72b806",
           "after": "2ed8aad32b95a9e95eb9066a70938100d16921e38345e27ff73fb5c5ba72b806"
         }
       }

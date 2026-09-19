@@ -1,6 +1,30 @@
 # 실험 결과와 구현 상태
 
-기준일: 2026-09-16 (Asia/Seoul).
+기준일: 2026-09-19 (Asia/Seoul).
+
+### 2026-09-19: 동일 GPU 모델의 노출 VRAM 변경 후 재개 수정
+
+사용자가 GPU 6에서 기존 `edge-selection-v5-gpu1-seed0-v1`을 재개했으나
+`hardware.total_memory_bytes: 51041271808 -> 47839313920` 비교에서 거부됐다.
+오류에 보고된 차이는 VRAM 총량이며 원격 재개 학습이 성공한 것은 아니다.
+
+같은 모델명·compute capability·할당 CPU 수·runtime을 요구하되, 유효한 VRAM 총량
+변경은 새 할당 재검증 대상으로 처리한다. 용량이 바뀌면 기존 최대 메모리/시간 대표만
+측정하지 않고 남은 학습/감사가 있는 profile/dataset의 모든 조건·seed를 기존 선택
+batch/worker에서 다시 측정한다. 전체 epoch optimizer/validation과 기존 메모리 여유
+기준을 통과해야 할당을 승인한다. batch·모델·데이터·학습 예산은 변경하지 않는다.
+동일 용량 할당의 기존 대표 조건 검사 및 과거 통과 증거는 그대로 지원한다.
+
+원본 calibration, 완료 결과, checkpoint identity는 유지하고 새 용량·scope·실측은
+allocation_history에 별도로 기록한다. `03ec0f6`, `f7bf065`, `abe3746`의 정확한
+소스에서만 수정판 호환을 허용하며 미등록 모델·데이터·recipe 변경은 거부한다.
+서버에서 이 수정판을 `git pull --ff-only`로 받은 뒤 기존 명령과 run ID로 재개한다.
+manifest나 checkpoint의 하드웨어·소스 해시를 수동으로 편집하지 않는다.
+
+격리 LF 복사본의 관련 CPU 통합 회귀 **170 passed**. 실제 모델/optimizer/RNG 재개,
+완료 결과 보존, 용량 변경의 전체 조건 선택, OOM/미등록 변경 거부를 포함한다.
+자원 probe는 명시적인 CPU fixture이며 실제 GPU 실측·전체 학습/평가는 미실행이다.
+서버에 수정판 반영 후 같은 run ID로 실행해야 실제 적합성과 재개를 확인할 수 있다.
 
 ### 2026-09-16: 작은 기존 연구 산출물의 Git 보존
 

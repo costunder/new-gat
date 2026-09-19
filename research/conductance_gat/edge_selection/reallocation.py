@@ -15,10 +15,17 @@ from scripts import training_resource_plan as resources
 
 ALLOCATION_FIELDS = frozenset({"device", "uuid", "uuid_unavailable_reason", "cuda_visible_devices"})
 SCOPE = "same-class allocation stress revalidation, not new optimum/all-arm fresh measurement"
+CAPACITY_SCOPE = "same-class changed-capacity all-arm revalidation at unchanged resources"
+
+
+def _scope(original, actual):
+    return (
+        CAPACITY_SCOPE if original["total_memory_bytes"] != actual["total_memory_bytes"] else SCOPE
+    )
 
 
 def require_equivalent_allocation(original, runtime, actual, actual_runtime):
-    """Only allocation identifiers may change; unknown hardware fields fail closed."""
+    """Same model/runtime; changed capacity requires fresh all-arm fit evidence."""
     required = {"name", "total_memory_bytes", "compute_capability", "allocated_cpu_count"}
     if not isinstance(original, dict) or not required <= original.keys():
         raise ValueError("original resource hardware fingerprint is incomplete; preserved")
@@ -28,9 +35,13 @@ def require_equivalent_allocation(original, runtime, actual, actual_runtime):
         raise ValueError("original resource runtime fingerprint is incomplete; preserved")
     if not isinstance(actual_runtime, dict):
         raise ValueError("current resource runtime fingerprint is incomplete")
+    for hardware in (original, actual):
+        capacity = hardware["total_memory_bytes"]
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("hardware.total_memory_bytes must be a positive integer")
     differences = []
     for prefix, before, after, ignored in (
-        ("hardware", original, actual, ALLOCATION_FIELDS),
+        ("hardware", original, actual, ALLOCATION_FIELDS | {"total_memory_bytes"}),
         ("runtime", runtime, actual_runtime, frozenset()),
     ):
         for field in sorted((before.keys() | after.keys()) - ignored):
@@ -42,7 +53,8 @@ def require_equivalent_allocation(original, runtime, actual, actual_runtime):
         raise ValueError(
             "edge-selection allocation is not equivalent: "
             + "; ".join(differences)
-            + ". Only GPU allocation identifiers may change. Restore the original GPU class, "
+            + ". Only GPU allocation identifiers and revalidated capacity may change. "
+            "Restore the original GPU class, "
             "runtime and allocated CPU count, or use a separate explicitly calibrated run; "
             "the existing recipe/results remain preserved."
         )
@@ -78,7 +90,7 @@ def needs_revalidation(manifest, hardware, runtime, required_groups):
         if (
             not passed
             or index != passed[-1]
-            or accepted.get("scope") != SCOPE
+            or accepted.get("scope") != _scope(manifest["hardware"], accepted["hardware"])
             or accepted.get("evidence_sha256") != _attempt_digest(accepted)
             or current.get("evidence_sha256") != accepted["evidence_sha256"]
             or accepted.get("original_calibration_sha256") != _original_digest(manifest)
@@ -109,7 +121,7 @@ def needs_revalidation(manifest, hardware, runtime, required_groups):
     return False
 
 
-def _representatives(entry, jobs):
+def _representatives(entry, jobs, *, all_arms=False):
     """Stable union of peak-reserve, peak-allocation and total-budget-cost maxima."""
     selected = entry["selected_candidate"]
     candidate_index = next(
@@ -136,6 +148,11 @@ def _representatives(entry, jobs):
     ):
         index = max(ordered, key=lambda value: score(reports[value]))
         criteria.setdefault(index, []).append(name)
+    if all_arms:
+        if {(report["condition"], report["model_seed"]) for report in reports} != set(lookup):
+            raise ValueError("changed-capacity revalidation requires every arm and seed")
+        for index in ordered:
+            criteria.setdefault(index, []).append("changed_capacity_all_arms")
     return [
         {
             "job_id": lookup[(reports[index]["condition"], reports[index]["model_seed"])]["job_id"],
@@ -223,6 +240,7 @@ def revalidate_allocation(manifest, hardware, runtime, grouped_jobs, persist):
             "allocation revalidation requires pending groups with real workload probes"
         )
     require_equivalent_allocation(manifest["hardware"], manifest["runtime"], hardware, runtime)
+    scope = _scope(manifest["hardware"], hardware)
     entries = {
         (entry["profile"], entry["dataset"]): entry for entry in manifest["calibration_entries"]
     }
@@ -236,14 +254,14 @@ def revalidate_allocation(manifest, hardware, runtime, grouped_jobs, persist):
                 "dataset": key[1],
                 "selected_candidate": copy.deepcopy(entry["selected_candidate"]),
                 "selected": copy.deepcopy(entry["selected"]),
-                "representatives": _representatives(entry, jobs),
+                "representatives": _representatives(entry, jobs, all_arms=scope == CAPACITY_SCOPE),
                 "measurements": [],
             }
         )
     attempt = {
         "schema_version": 1,
         "status": "running",
-        "scope": SCOPE,
+        "scope": scope,
         "hardware": copy.deepcopy(hardware),
         "runtime": copy.deepcopy(runtime),
         "original_calibration_sha256": _original_digest(manifest),
@@ -276,7 +294,7 @@ def revalidate_allocation(manifest, hardware, runtime, grouped_jobs, persist):
                 print(
                     f"[edge allocation revalidation] {job['job_id']} "
                     f"physical={selected['batch_size']} workers={selected['workers']}; "
-                    "disposable same-class stress probe, unchanged recipe",
+                    f"disposable probe, unchanged recipe; {scope}",
                     flush=True,
                 )
                 report = calibration._measure(

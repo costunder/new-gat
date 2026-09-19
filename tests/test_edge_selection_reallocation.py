@@ -179,7 +179,6 @@ def test_reallocation_preserves_original_recipe_and_reuses_passed_evidence(alloc
     "field,new",
     [
         ("name", "different GPU"),
-        ("total_memory_bytes", 24 * 1024**3),
         ("compute_capability", [9, 0]),
         ("allocated_cpu_count", 4),
     ],
@@ -199,6 +198,85 @@ def test_runtime_change_reports_exact_field(allocation_fixture):
     value = allocation_fixture
     value.manifest["runtime"]["torch"] = "different-version"
     with pytest.raises(ValueError, match=r"runtime\.torch"):
+        driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert not value.calls
+
+
+@pytest.mark.parametrize("capacity", [47839313920, 52 * 1024**3])
+def test_changed_capacity_remeasures_all_arms_without_changing_recipe(
+    allocation_fixture, monkeypatch, capacity
+):
+    value = allocation_fixture
+    value.manifest["hardware"]["total_memory_bytes"] = 51041271808
+    value.current["total_memory_bytes"] = capacity
+    original = copy.deepcopy(value.manifest)
+
+    def measure(*args):
+        report = value.measure(*args)
+        report["total_memory_bytes"] = capacity
+        report["hardware"]["total_memory_bytes"] = capacity
+        report["free_bytes_before"] = capacity - 1024**3
+        return report
+
+    monkeypatch.setattr(calibration, "_measure", measure)
+    driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    for key, content in original.items():
+        assert value.manifest[key] == content
+    attempt = value.manifest["allocation_history"][0]
+    assert attempt["scope"] == reallocation.CAPACITY_SCOPE
+    assert {job_id for job_id, _, _ in value.calls} == {job["job_id"] for job in value.jobs}
+    assert all(
+        "changed_capacity_all_arms" in item["selection_criteria"]
+        for item in attempt["groups"][0]["representatives"]
+    )
+    calls = list(value.calls)
+    driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert value.calls == calls
+
+
+def test_changed_capacity_selects_non_maximal_arm_too(allocation_fixture):
+    value = allocation_fixture
+    entry = copy.deepcopy(value.manifest["calibration_entries"][0])
+    selected = entry["selected_candidate"]
+    candidate = next(
+        item for item in entry["candidates"] if {key: item[key] for key in selected} == selected
+    )
+    first, second = candidate["measurements"]
+    for key in list(first):
+        if key not in {"condition", "model_seed"}:
+            second[key] = copy.deepcopy(first[key])
+    assert len(reallocation._representatives(entry, value.jobs)) == 1
+    assert len(reallocation._representatives(entry, value.jobs, all_arms=True)) == 2
+
+
+def test_changed_capacity_oom_preserves_original_and_cannot_commit(allocation_fixture, monkeypatch):
+    value = allocation_fixture
+    value.current["total_memory_bytes"] = 47839313920
+    original = copy.deepcopy(value.manifest)
+    monkeypatch.setattr(
+        calibration, "_measure", lambda *_: {"status": "oom", "error": "synthetic CPU fixture OOM"}
+    )
+    with pytest.raises(RuntimeError, match="no batch, worker, model or data downscale"):
+        driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    for key, content in original.items():
+        assert value.manifest[key] == content
+    assert "current_allocation" not in value.manifest
+    assert value.manifest["allocation_history"][0]["status"] == "failed"
+
+
+def test_changed_capacity_below_hardware_profile_rejected(allocation_fixture):
+    value = allocation_fixture
+    value.current["total_memory_bytes"] = 24 * 1024**3
+    with pytest.raises(ValueError, match=">=40 GiB"):
+        driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert not value.calls
+
+
+@pytest.mark.parametrize("capacity", [0, -1, None, True, float("nan")])
+def test_invalid_capacity_rejected(allocation_fixture, capacity):
+    value = allocation_fixture
+    value.current["total_memory_bytes"] = capacity
+    with pytest.raises(ValueError, match="total_memory_bytes"):
         driver._ensure_calibration(value.args, value.manifest, lambda: None)
     assert not value.calls
 
