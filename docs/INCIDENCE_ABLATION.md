@@ -122,6 +122,35 @@ accuracy evidence. Scientific training settings and source hashes remain strict.
 
 ### A100 MIG 10GB
 
+**Physical-GPU launcher (recommended when device enumeration fails):**
+`experiments.launch_incidence_mig` imports no PyTorch. It reads the chosen physical
+GPU through NVML, resolves the MIG UUID, then starts a fresh Python process with
+that UUID as its only `CUDA_VISIBLE_DEVICES`. It changes no driver settings or
+running processes. Physical GPU selection alone is supported: it chooses the
+10GB instance with the most free memory on that parent (at least 8 GiB).
+When GI/CI are known, it selects that exact instance and never switches to a
+different one just because it has more memory. The launcher's location is outside
+the immutable training source snapshot, so it also works with the existing run
+that failed before calibration, without editing its manifest.
+
+For the reported process-table location **GPU 4 / GI 7 / CI 0**:
+
+```bash
+cd /home/aicompetition07/new-gat &&
+git pull --ff-only &&
+/home/aicompetition07/.conda/envs/new-gat/bin/python -B -m experiments.launch_incidence_mig \
+  --physical-gpu 4 --gpu-instance 7 --compute-instance 0 -- \
+  --run-id incidence-ppi-reference-mig10gb-seed0-v1 \
+  --datasets ppi --profiles reference --model-seeds 0 \
+  --device cuda:0 --hardware-profile portable \
+  --edge-chunk-size 4096 --activation-checkpoint --min-free-gb 8
+```
+
+With only a physical GPU number, omit `--gpu-instance 7 --compute-instance 0`.
+All candidate observations and the selected UUID/GI/CI are read-only; the chosen
+UUID and visible capacity are then recorded by the existing calibration code.
+No real MIG hardware is available in the local CPU test environment.
+
 Use the existing `portable` hardware recipe for the new independent run:
 FP32, TF32 disabled, checkpointing enabled, PPI physical batch candidates starting
 at the established portable batch of 2 and increasing through measured calibration.
