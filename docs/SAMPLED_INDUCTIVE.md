@@ -1,7 +1,24 @@
 # Shared C learning, sampled training, and unseen graphs
 
+## Scope correction after user review (2026-09-27)
+
+The PPI-only implementation below was an agent-selected detour, not the user's
+requested primary experiment. The approved primary comparison uses ogbn-arxiv,
+as already stated in AGGREGATION_COMPARISON.md. Do not use the PPI commands below
+as the next main experiment or present this package as completion of that request.
+They remain a record of the implemented PPI-specific path.
+
+The main sampling comparison must keep the current backbone and ogbn-arxiv
+protocol, and cross fixed/learned C with full/sampled training. Incidence-only
+sampling is now permitted by the aggregation runner. A unified, verified
+four-cell ogbn-arxiv comparison/report has not been delivered by this package.
+Official ogbn-arxiv node splits do not establish unseen-independent-graph
+generalization. That claim requires a separately specified graph-held-out
+protocol; it must not be silently substituted with PPI.
+
 This independent `sampled_inductive_v1` study implements the original research
-question on the current residual-free incidence backbone. The existing 19-arm
+question only on PPI, with the scope limitation above, on the current
+residual-free incidence backbone. The existing 19-arm
 aggregation experiment remains a separate representation/energy/lift study.
 Neither a spectral interpretation nor successful unit tests establish a speedup.
 

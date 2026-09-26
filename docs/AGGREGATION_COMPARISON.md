@@ -4,8 +4,10 @@
 
 V4 preserves the 19-arm design and replaces Gram backward with a single-buffer
 analytic accumulation. Incidence-only transductive runs now allow sampling;
-external comparators retain full context. The original sampled/unseen-graph
-hypothesis has a separate four-cell PPI runner, described in
+external comparators retain full context. **The primary benchmark remains
+ogbn-arxiv.** The separate four-cell PPI runner was an agent-selected scope
+error; it does not fulfill the requested primary sampling comparison. Its
+implementation and correction are recorded in
 [SAMPLED_INDUCTIVE.md](SAMPLED_INDUCTIVE.md). Use fresh run IDs after the v4
 source change; v3 checkpoints/results remain historical evidence.
 

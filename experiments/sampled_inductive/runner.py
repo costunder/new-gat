@@ -253,8 +253,15 @@ def measurement_digest(report):
 
 def evaluate_test(options, payload, protocol, manifest, folder, device, save):
     # Freeze the entire completed matrix before touching test labels.
-    if len(manifest["results"]) != len(cells(options)):
+    expected_keys = {f"seed-{s}/{m}/{a}" for s, m, a in cells(options)}
+    if set(manifest["results"]) != expected_keys:
         raise ValueError("test evaluation requires every validation-selected cell")
+    validated = {}
+    for key in sorted(expected_keys):
+        result = train.completed(folder / key)
+        if result != manifest["results"][key]:
+            raise ValueError("test matrix differs from validated on-disk training evidence")
+        validated[key] = result
     lock = {key: result["last_sha256"] for key, result in manifest["results"].items()}
     if manifest.get("test_checkpoint_lock") not in (None, lock):
         raise ValueError("test-selected checkpoint matrix changed")
@@ -262,7 +269,7 @@ def evaluate_test(options, payload, protocol, manifest, folder, device, save):
     save()
     for seed, mode, arm in cells(options):
         key = f"seed-{seed}/{mode}/{arm}"
-        result = train.completed(folder / key)
+        result = validated[key]
         if result["last_sha256"] != lock[key]:
             raise ValueError("test-selected checkpoint changed")
         if key in manifest.setdefault("test", {}):
