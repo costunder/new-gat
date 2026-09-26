@@ -32,12 +32,12 @@ from research.conductance_gat.v5.batch_calibration import (
 from research.conductance_gat.v5.learning_budget import should_stop_learning_budget
 from research.conductance_gat.v5.timing import StageTimer
 
-from .model import ARMS, AggregationClassifier
+from .model import ARMS, AggregationClassifier, conductance_contract
 from .provenance import require_source_compatibility
 from .validation import POLICY, require_reproduction, require_score
 
 ROOT = Path(__file__).resolve().parents[2]
-SUITE = "aggregation_comparison_v2"
+SUITE = "aggregation_comparison_v3"
 
 
 def build_parser():
@@ -82,9 +82,16 @@ def configuration(args):
     inherited = base.configuration(args)
     inherited.pop("ffn_multiplier")  # The comparison contains no external FFN.
     inherited["lr"] = args.learning_rate
+    c_config = conductance_contract(args.ablation_arm)
+    if c_config is not None:
+        inherited.update({key: value for key, value in c_config.items() if key != "regime"})
+    topology = selection_protocol.configuration(args)
+    topology["gate_axis"] = (
+        "full physical support shared across heads; amplitude regime specified by arm"
+    )
     return {
         **inherited,
-        "edge_selection": selection_protocol.configuration(args),
+        "edge_selection": topology,
         "ablation_arm": args.ablation_arm,
         "validation_reproduction_policy": dict(POLICY),
         "comparison_contract": {
@@ -97,6 +104,11 @@ def configuration(args):
             "parameter_matched": False,
             "optimizer": "uniform AdamW",
             "learning_rate": args.learning_rate,
+            "conductance": c_config,
+            "c_control_lift": "none" if c_config and c_config["regime"] != "per_head" else None,
+            "mechanism_audit": (
+                "full-validation layer/head statistics and inference interventions v1"
+            ),
         },
     }
 
@@ -108,12 +120,15 @@ def implementation_source_hashes():
 
 
 def make_model(payload, args, device):
+    architecture = base.architecture_configuration(args)
+    c_config = conductance_contract(args.ablation_arm)
+    if c_config is not None:
+        architecture.update({key: value for key, value in c_config.items() if key != "regime"})
     return AggregationClassifier(
         payload["graphs"][0]["x"].shape[1],
         payload["classes"],
         arm=args.ablation_arm,
-        **base.architecture_configuration(args),
-        conductance_mode="dynamic",
+        **architecture,
         max_log_conductance=base.COMMON["max_log_conductance"],
         edge_chunk_size=args.edge_chunk_size,
         selection_config=selection_protocol.model_configuration(args),
@@ -121,7 +136,21 @@ def make_model(payload, args, device):
 
 
 def parameter_group(name):
-    return "backbone"
+    parts = name.split(".")
+    if parts[0] == "energy_readouts":
+        return f"layer_{parts[1]}.energy_readout"
+    if parts[0] in {"encoder", "decoder", "norms"}:
+        return parts[0]
+    if parts[0] == "layers" and len(parts) > 2:
+        component = {
+            "estimator": "conductance",
+            "beta_estimator": "beta",
+            "value_weight": "value_projection",
+            "output_projection": "output_projection",
+            "lift_projection": "lift_projection",
+        }.get(parts[2], "attention")
+        return f"layer_{parts[1]}.{component}"
+    raise ValueError(f"unclassified trainable parameter {name}")
 
 
 def make_optimizer(model, learning_rate=None):
@@ -821,9 +850,18 @@ def run_calibration_candidate(
                 torch.cuda.synchronize(device)
                 elapsed = time.perf_counter() - started
             started = time.perf_counter()
-            evaluate(model, inputs, candidate, device)
+            measured_validation = evaluate(model, inputs, candidate, device)
             torch.cuda.synchronize(device)
             validation_seconds = time.perf_counter() - started
+            # Include the complete diagnostic/intervention path in the memory
+            # probe: even a no-energy control collects full Gram statistics.
+            from .mechanisms import mechanism_audit
+
+            with torch.no_grad():
+                mechanism_report = mechanism_audit(
+                    model, inputs, candidate, device, measured_validation, evaluate
+                )
+            torch.cuda.synchronize(device)
             free_after, _ = torch.cuda.mem_get_info(device)
             report = {
                 "status": "passed",
@@ -845,6 +883,8 @@ def run_calibration_candidate(
                 "topology_preparation_seconds": inputs.plan_preparation_seconds,
                 "validation_seconds": validation_seconds,
                 "validation_completed": True,
+                "mechanism_audit_completed": True,
+                "mechanism_audit_seconds": mechanism_report.get("seconds", 0.0),
                 "auxiliary_path_measured": True,
                 "cycle_preparation_measured": candidate.selection_mode == "forest_cycle",
                 "batch_size": physical_batch_size,
@@ -868,8 +908,8 @@ def run_calibration_candidate(
                 "data_parallel_workers": 1,
                 "effective_batch_size": physical_batch_size,
                 "scope": (
-                    "disposable complete official training epochs + full validation + "
-                    "topology preparation; no test or checkpoints"
+                    "disposable complete official training epochs + full validation and "
+                    "mechanism audit + topology preparation; no test or checkpoints"
                 ),
             }
             if not report["parameter_update_verified"] or report["optimizer_state_bytes"] <= 0:

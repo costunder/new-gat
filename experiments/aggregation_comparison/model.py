@@ -8,14 +8,19 @@ Its optional no-skip control is explicitly named, never called a reproduction.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
-from experiments.incidence_ablation.model import IncidenceClassifier
-from research.conductance_gat.v5.model import _static_graph_context
+from experiments.incidence_ablation.model import IncidenceOperator
+from research.conductance_gat.edge_selection.selection import selection_configuration
+from research.conductance_gat.v5.model import (
+    GraphConditionedConductanceNodeClassifier,
+    _static_graph_context,
+)
 
 ARMS = {
     "incidence": ("baseline", False),
@@ -34,6 +39,24 @@ for _energy_suffix, _energy in (("", False), ("_diagonal", "diagonal"), ("_energ
         ("_post_lift", "post_lift"),
     ):
         ARMS.setdefault("incidence" + _energy_suffix + _lift_suffix, (_lift, _energy))
+for _regime in ("fixed", "shared"):
+    ARMS[f"incidence_{_regime}"] = ("baseline", False)
+    ARMS[f"incidence_{_regime}_energy"] = ("baseline", True)
+
+
+def conductance_contract(arm):
+    if not arm.startswith("incidence"):
+        return None
+    regime = (
+        "fixed"
+        if arm.startswith("incidence_fixed")
+        else ("shared" if arm.startswith("incidence_shared") else "per_head")
+    )
+    return {
+        "regime": regime,
+        "conductance_mode": "fixed_one" if regime == "fixed" else "dynamic",
+        "conductance_heads": "shared" if regime in {"fixed", "shared"} else "per_head",
+    }
 
 
 def local_gram(history, edges, conductance, edge_chunk_size, *, diagonal_only=False):
@@ -44,6 +67,8 @@ def local_gram(history, edges, conductance, edge_chunk_size, *, diagonal_only=Fa
     The identity assumes a common, frozen conductance and feature coordinates.
     """
     depth, nodes, heads, _ = history.shape
+    if conductance.ndim == 1:
+        conductance = conductance[:, None]
     pairs = (
         torch.arange(depth, device=history.device).expand(2, -1)
         if diagonal_only
@@ -205,6 +230,8 @@ class AggregationClassifier(nn.Module):
         self.layers = nn.ModuleList()
         self.energy_readouts = nn.ParameterList()
         self.diagonal_only = arm.startswith("incidence_diagonal")
+        self.energy_intervention = None
+        self.diagnostic_collector = None
         self.dual_alpha = dual_alpha
         if arm == "gatv2":
             from torch_geometric.nn import GATv2Conv
@@ -234,11 +261,23 @@ class AggregationClassifier(nn.Module):
             )
         else:
             old_arm, energy = ARMS[arm]
-            original = IncidenceClassifier(
+            # Build the original V5 initialization, then retain only its operators.
+            # Do not use the historical edge-selection classifier: its fixed
+            # per-head/dynamic contract intentionally excludes these new controls.
+            selected = selection_configuration(selection_config)
+            c_config = conductance_contract(arm)
+            architecture.update(
+                conductance_mode=c_config["conductance_mode"],
+                conductance_heads=c_config["conductance_heads"],
+                conductance_backend="optimization",
+                conductance_generator="optimized",
+                propagation_normalization="row",
+                propagation_filter="linear",
+            )
+            architecture.setdefault("solver_cost_scaling", "width_scaled")
+            original = GraphConditionedConductanceNodeClassifier(
                 in_channels,
                 classes,
-                arm=old_arm,
-                selection_config=selection_config,
                 hidden_channels=hidden_channels,
                 layers=layers,
                 heads=heads,
@@ -249,7 +288,16 @@ class AggregationClassifier(nn.Module):
             )
             # Only retain the actual operator modules. The old encoder, norms,
             # SwiGLU FFNs and both external residual paths are absent.
-            self.layers.extend(original.operators)
+            lift = {
+                "baseline": "none",
+                "linear_lift": "linear",
+                "pre_lift": "pre",
+                "post_lift": "post",
+            }[old_arm]
+            self.layers.extend(
+                IncidenceOperator(operator, selected, layer=index, lift=lift, bilinear=False)
+                for index, operator in enumerate(original.operators)
+            )
             if energy:
                 for operator in self.layers:
                     # Full-support selector is identically one, hence r is C.
@@ -275,6 +323,7 @@ class AggregationClassifier(nn.Module):
         dual = self.arm.startswith("dualformer")
         return {
             "model": self.arm,
+            "conductance": conductance_contract(self.arm),
             "external_residual": False,
             "external_ffn": False,
             "common_encoder": "linear",
@@ -329,7 +378,46 @@ class AggregationClassifier(nn.Module):
         zero = self.decoder.weight.new_zeros(())
         return {"l0": zero, "negative": zero}
 
+    @contextmanager
+    def intervention(self, name):
+        """Read-only, whole-network evaluation intervention; restore even on error."""
+        if self.training or torch.is_grad_enabled() or not self.arm.startswith("incidence"):
+            raise RuntimeError("incidence interventions require eval and no_grad")
+        allowed = {
+            "energy_off",
+            "cross_off",
+            "diagonal_off",
+            "c_ones",
+            "c_mean",
+            "c_shuffle",
+            "lift_second_off",
+        }
+        if name not in allowed:
+            raise ValueError(f"unknown intervention {name}")
+        prior = (
+            self.energy_intervention,
+            [(op.estimator.override, op.disable_lift_channel) for op in self.layers],
+        )
+        try:
+            if name in {"energy_off", "cross_off", "diagonal_off"}:
+                self.energy_intervention = name
+            for op in self.layers:
+                if name.startswith("c_"):
+                    op.estimator.override = name[2:]
+                elif name == "lift_second_off":
+                    op.disable_lift_channel = True
+            yield
+        finally:
+            self.energy_intervention = prior[0]
+            for op, (override, lift_disabled) in zip(self.layers, prior[1], strict=True):
+                op.estimator.override, op.disable_lift_channel = override, lift_disabled
+            self.clear_auxiliary_cache()
+
     def forward(self, graph):
+        if self.diagnostic_collector is not None and (self.training or torch.is_grad_enabled()):
+            raise RuntimeError(
+                "mechanism capture requires eval/no_grad; never retain training graphs"
+            )
         x, edges = graph.x, graph.incidence_edge_index
         batch = getattr(graph, "batch", None)
         if batch is None:
@@ -409,16 +497,20 @@ class AggregationClassifier(nn.Module):
             def step(*past, operator=operator, index=index):
                 current = past[-1]
                 value = operator(current, edges, batch, graphs, **kwargs)
-                if len(self.energy_readouts):
+                if len(self.energy_readouts) or self.diagnostic_collector is not None:
                     projected = torch.einsum(
                         "knd,hdw->knhw", torch.stack(past), operator.value_weight
                     )
                     # Reuse the live metric so gradients reach conductance;
                     # last_effective_c is deliberately detached in the legacy op.
-                    metric = operator.live_comparison_c
+                    metric = (
+                        operator.live_comparison_c
+                        if len(self.energy_readouts)
+                        else operator.last_effective_c
+                    )
                     correction = kwargs["sampling_correction"]
                     if correction is not None:
-                        metric = metric * correction.reshape(-1, 1)
+                        metric = metric * (correction if metric.ndim == 1 else correction[:, None])
                     statistics = local_gram(
                         projected.float(),
                         edges,
@@ -426,12 +518,38 @@ class AggregationClassifier(nn.Module):
                         self.edge_chunk_size,
                         diagonal_only=self.diagonal_only,
                     )
-                    extra = torch.einsum(
-                        "nhp,hpd->nhd", statistics, self.energy_readouts[index].float()
+                    pairs = (
+                        torch.arange(len(past), device=value.device).expand(2, -1)
+                        if self.diagonal_only
+                        else torch.triu_indices(len(past), len(past), device=value.device)
                     )
-                    value = value + F.linear(
-                        extra.to(value.dtype).flatten(1), operator.output_projection.weight
-                    )
+                    diagonal = pairs[0] == pairs[1]
+                    if len(self.energy_readouts):
+                        used = statistics
+                        if self.energy_intervention is not None:
+                            if self.training or torch.is_grad_enabled():
+                                raise RuntimeError("energy interventions are evaluation-only")
+                            mask = (
+                                diagonal
+                                if self.energy_intervention == "cross_off"
+                                else ~diagonal
+                                if self.energy_intervention == "diagonal_off"
+                                else torch.zeros_like(diagonal)
+                            )
+                            used = used * mask
+                        extra = torch.einsum(
+                            "nhp,hpd->nhd", used, self.energy_readouts[index].float()
+                        )
+                        branch = F.linear(
+                            extra.to(value.dtype).flatten(1), operator.output_projection.weight
+                        )
+                    else:
+                        branch = torch.zeros_like(value)
+                    if self.diagnostic_collector is not None:
+                        self.diagnostic_collector.record(
+                            index, metric, statistics, diagonal, value, branch
+                        )
+                    value = value + branch
                 return F.dropout(F.relu(value), self.dropout, self.training)
 
             h = (

@@ -41,7 +41,7 @@ from scripts import run_v5_mechanism_experiments as common  # noqa: E402
 from scripts import training_resource_plan as resources  # noqa: E402
 from scripts.calibration_lock import calibration_lock  # noqa: E402
 
-SUITE = "aggregation_comparison_controller_v2"
+SUITE = "aggregation_comparison_controller_v3"
 TRAIN_MODULE = "experiments.aggregation_comparison.engine"
 
 
@@ -385,6 +385,8 @@ def _read_result(job):
         "validation_evidence": payload["validation_evidence"],
         "model_contract": payload["model_contract"],
         "total_parameters": payload["model_contract"]["total_parameters"],
+        "comparison_configuration": payload["configuration"],
+        "source_sha256": payload["source_sha256"],
         "best_epoch": best,
         "epochs_run": len(history),
         "shared_initial_state_sha256": initial,
@@ -479,6 +481,8 @@ def _audit(args, job, environment, persist):
 
 
 def _summary(run_dir, manifest):
+    from .effects import contrast_report, markdown
+
     lines = [
         "# Aggregation-comparison experiment progress",
         "",
@@ -501,6 +505,9 @@ def _summary(run_dir, manifest):
             f"{job['variant_id']} | {job['status']} | {label} | {score} | "
             f"{result.get('best_epoch', '')} | {result.get('total_parameters', '')} |"
         )
+    effects = contrast_report(manifest["jobs"])
+    atomic_write_json(run_dir / "effects.json", effects)
+    lines.extend(markdown(effects))
     atomic_write_bytes(run_dir / "comparison.md", ("\n".join(lines) + "\n").encode())
 
 

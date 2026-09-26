@@ -1,6 +1,9 @@
 # Aggregation comparison: review corrections (2026-09-26)
 
-This record concerns `experiments/aggregation_comparison`, now suite v2.
+This historical correction record describes suite v2 at commit `8f4602d`.
+The current suite is v3; its additional C controls and mechanism diagnostics are
+documented in [AGGREGATION_MECHANISMS.md](AGGREGATION_MECHANISMS.md). The v2 test
+counts below apply to that earlier revision, not automatically to v3.
 It does not reinterpret the completed historical PPI eight-condition experiment.
 Existing historical source files, checkpoints, results and allocation contracts
 are preserved. Use a new comparison run ID; source/contract checks deliberately

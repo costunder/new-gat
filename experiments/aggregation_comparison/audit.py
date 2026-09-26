@@ -16,6 +16,7 @@ from research.conductance_gat.edge_selection.audit import (
 from research.conductance_gat.v5.batch_calibration import _isolated_execution_state
 
 from . import engine as train
+from .mechanisms import mechanism_audit
 from .provenance import require_source_compatibility
 from .validation import POLICY, require_reproduction
 
@@ -67,6 +68,9 @@ def audit(root, data_root, device, repeats):
                 model.clear_auxiliary_cache()
                 _synchronize(device)
                 timings.append(time.perf_counter() - started)
+            mechanisms = mechanism_audit(
+                model, inputs, args, device, metrics["selected_validation_evidence"], train.evaluate
+            )
             if before != train.base.state_sha256(model) or train.inspect_completed(root) != metrics:
                 raise ValueError("read-only audit unexpectedly changed training evidence")
             require_source_compatibility(
@@ -91,6 +95,7 @@ def audit(root, data_root, device, repeats):
                     "evaluation_seconds": timings,
                 },
                 "model_contract": model.contract(),
+                "mechanisms": mechanisms,
                 "published_score_reproduction_claim": False,
             }
     finally:

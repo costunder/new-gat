@@ -52,7 +52,14 @@ def _full_budget_seconds(report, policy):
         return None
     if report.get("validation_completed") is not True:
         raise ValueError("calibration did not measure complete validation")
-    for name in ("validation_seconds", "topology_preparation_seconds", "setup_seconds"):
+    if report.get("mechanism_audit_completed") is not True:
+        raise ValueError("calibration did not measure the mechanism audit")
+    for name in (
+        "validation_seconds",
+        "topology_preparation_seconds",
+        "setup_seconds",
+        "mechanism_audit_seconds",
+    ):
         value = report.get(name)
         if (
             isinstance(value, bool)
@@ -78,6 +85,7 @@ def _full_budget_seconds(report, policy):
         cost["projected_training_seconds"]
         + cost["learning_budget"]["planned_epochs"] * report["validation_seconds"]
         + report["setup_seconds"]
+        + report["mechanism_audit_seconds"]
     )
 
 

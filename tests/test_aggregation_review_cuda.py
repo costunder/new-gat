@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 from experiments.aggregation_comparison.model import (
     ARMS,
     AggregationClassifier,
+    conductance_contract,
     local_gram,
     normalized_graph_step,
 )
@@ -91,7 +92,7 @@ def test_all_twelve_incidence_controls_have_paired_initial_function():
     _, graph, _ = synthetic_disjoint_batch("cuda")
     outputs = []
     for arm in ARMS:
-        if not arm.startswith("incidence"):
+        if not arm.startswith("incidence") or conductance_contract(arm)["regime"] != "per_head":
             continue
         torch.manual_seed(62)
         net = (
@@ -270,14 +271,16 @@ def test_gatv2_cached_support_matches_native_pyg_and_reuses_edges():
     assert graph._comparison_gatv2_edges is not cached
 
 
-@pytest.mark.parametrize("corrupt", [False, True])
-def test_training_completion_and_corrupt_reload(monkeypatch, tmp_path, corrupt):
+@pytest.mark.parametrize(
+    "arm,corrupt", [("gatv2", False), ("gatv2", True), ("incidence_energy", False)]
+)
+def test_training_completion_and_corrupt_reload(monkeypatch, tmp_path, arm, corrupt):
     """Actual CUDA training with an explicitly injected final-evaluation fault."""
     from experiments.aggregation_comparison import engine
     from tests.test_aggregation_comparison_cuda import reference_arguments
 
     inputs, graph, payload = synthetic_disjoint_batch("cuda")
-    args = reference_arguments("gatv2", "fp32")
+    args = reference_arguments(arm, "fp32")
     args.epochs, args.patience = 4, 4  # Dedicated synthetic test budget only.
     payload["dataset"] = args.dataset
     # Mirror the real CPU dataset cache; PreparedInputs below supplies CUDA batches.
@@ -329,5 +332,13 @@ def test_training_completion_and_corrupt_reload(monkeypatch, tmp_path, corrupt):
         report = audit.audit(output, args.data_root, torch.device("cuda:0"), 5)
         assert report["status"] == "passed"
         assert len(report["repeated_validation"]["evaluations"]) == 5
-    assert len(evaluations) == (5 if corrupt else 10)
+        if arm == "incidence_energy":
+            mechanism = report["mechanisms"]
+            assert len(mechanism["diagnostics"]["rows"]) == 8
+            assert len(mechanism["interventions"]) == 6
+            require_reproduction(
+                result["validation_evidence"], mechanism["restored_validation"], label="restored"
+            )
+            assert mechanism["diagnostics"]["rows"][-1]["energy_output_l2"] > 0
+    assert len(evaluations) == (5 if corrupt else 18 if arm == "incidence_energy" else 10)
     assert (output / "best.pt").is_file() and (output / "last.pt").is_file()

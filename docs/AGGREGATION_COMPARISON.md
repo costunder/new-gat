@@ -1,10 +1,11 @@
 # Independent aggregation comparison
 
-## Review correction, 2026-09-26 (v2)
+## Review correction, 2026-09-26 (v3)
 
-The v2 runner now defaults to **15 conditions**: 12 incidence controls, GATv2,
-DUALFormer and its separately labelled no-skip control. Original six-condition
-v1 evidence must not be resumed or pooled with v2; use a fresh run ID. Historical
+The v3 runner defaults to **19 conditions**: 12 per-head incidence controls,
+four additional fixed/shared-C controls, GATv2, DUALFormer and its separately
+labelled no-skip control. Earlier v1/v2 evidence must not be resumed or pooled
+with v3; use a fresh run ID. Historical
 incidence-ablation code and results are untouched.
 
 The incidence controls form a complete 3 x 4 design on the same backbone:
@@ -20,6 +21,20 @@ separate nonlinear placement from a linear channel-expansion control. Energy
 always uses the pre-lift projected value coordinates. Readouts start at zero;
 the energy branch's additional gradient to C starts only after readouts learn.
 All preceding depths and all original edges remain included.
+
+The six no-lift C controls are `incidence_fixed`, `incidence_fixed_energy`,
+`incidence_shared`, `incidence_shared_energy`, `incidence`, and `incidence_energy`.
+The last two already belong to the 12-cell matrix. Fixed C is exactly one with
+no trainable C estimator; shared dynamic C is one learned scalar per edge;
+per-head dynamic C is one learned scalar per edge/head. The control isolates
+conductance expressivity at a fixed lift; it is not a full 3 x 3 x 4 factorial.
+
+Every incidence audit now records full-validation layer/head C histograms and
+moments, diagonal/cross Gram magnitudes, branch/message norms, and inference
+interventions. Training history records per-layer/component gradient norms.
+`effects.json` and `comparison.md` provide matched conditional differences and
+2 x 2 interactions after all contributing cells pass training and audit. See
+[the v3 mechanism contract](AGGREGATION_MECHANISMS.md) for definitions and limits.
 
 `gatv2` uses PyG's actual `GATv2Conv` in the same linear encoder/decoder wrapper,
 8 layers / 256 total channels / 8 heads (32 channels per head) for reference,
@@ -69,7 +84,7 @@ M3Dphormer (NeurIPS 2025) was inspected as another candidate but is **not implem
 in this suite**. Its cluster/global token construction and additional global-node
 supervision must be reproduced and accounted for before a valid comparison.
 
-## Original six conditions (retained within the v2 matrix above)
+## Original six conditions (retained within the v3 matrix above)
 
 | CLI arm | Actual computation |
 | --- | --- |
@@ -140,24 +155,24 @@ Dry-run the comparison on **ogbn-arxiv**, not PPI as the primary benchmark:
 ```bash
 cd /home/aicompetition07/new-gat &&
 /home/aicompetition07/.conda/envs/new-gat/bin/python -B -m experiments.aggregation_comparison \
-  --run-id aggregation-arxiv-reference-gpu4-seed0-v1 \
+  --run-id aggregation-arxiv-reference-gpu4-seed0-v3 \
   --datasets ogbn-arxiv --profiles reference --model-seeds 0 \
   --hardware-profile portable --sampling full --edge-chunk-size 4096 --dry-run
 ```
 
-Train only after this code is available on that server (fresh v2 run ID):
+Train only after this code is available on that server (fresh v3 run ID):
 
 ```bash
 cd /home/aicompetition07/new-gat &&
 env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=4 \
 /home/aicompetition07/.conda/envs/new-gat/bin/python -B -m experiments.aggregation_comparison \
-  --run-id aggregation-arxiv-reference-gpu4-seed0-v2 \
+  --run-id aggregation-arxiv-reference-gpu4-seed0-v3 \
   --datasets ogbn-arxiv --profiles reference --model-seeds 0 \
   --device cuda:0 --hardware-profile portable --sampling full \
   --edge-chunk-size 4096 --activation-checkpoint --min-free-gb 8
 ```
 
-This performs 15 fresh trainings, not the old eight-arm run. It uses no existing
+This performs 19 fresh trainings, not the old eight-arm run. It uses no existing
 training evidence. GPU 4 means the user's allocated physical GPU, mapped to
 visible cuda:0 as in the successful earlier initialization.
 
@@ -178,17 +193,17 @@ The local machine has an RTX 5070 Ti with 16 GB VRAM. The default `.venv` was
 incorrectly installed with CPU-only PyTorch. It has been repaired from
 2.14.0+cpu to 2.14.0+cu130, preserving its existing PyTorch release. Use this
 default CUDA environment for local model execution when all dependencies are
-installed. The v2 GATv2 arm also requires PyG; the complete separate `.venv-gpu`
+installed. The GATv2 arm also requires PyG; the complete separate `.venv-gpu`
 also remains available with Python 3.13.2, torch 2.13.0+cu130 and the remaining
 packages pinned in `requirements-lock.txt`. Neither environment changes the
 Linux production installation profile or GPU driver.
 
 ```powershell
 .venv-gpu/Scripts/python.exe -c "import torch, torch_geometric; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
-.venv-gpu/Scripts/python.exe -m pytest tests/test_aggregation_comparison_cuda.py tests/test_aggregation_review_cuda.py -v
+.venv-gpu/Scripts/python.exe -m pytest tests/test_aggregation_comparison_cuda.py tests/test_aggregation_review_cuda.py tests/test_aggregation_mechanisms_cuda.py -v
 ```
 
-The CUDA suite covers all 15 reference-size models (8 graph layers, width 256,
+The CUDA suite covers all 19 reference-size models (8 graph layers, width 256,
 8 heads) in FP32 and BF16. Four synthetic graphs are processed together, with
 256 total nodes and 512 undirected edges. The tests execute the actual training
 loop, backward, optimizer update, validation, checkpoint/optimizer restoration,
