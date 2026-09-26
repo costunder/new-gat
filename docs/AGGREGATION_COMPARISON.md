@@ -108,7 +108,7 @@ visible cuda:0 as in the successful earlier initialization.
 
 A real A100 MIG 10GB fit has **not** been measured locally. Calibration may
 reject the full graph recipe; it never reduces graph size, model size, physical
-batch or training budget to manufacture a successful run. CPU tests are
+batch or training budget to manufacture a successful run. CPU and CUDA tests are
 synthetic verification only, not full training or evaluation. The output is
 validation-only; test performance and multi-seed conclusions remain unmeasured.
 

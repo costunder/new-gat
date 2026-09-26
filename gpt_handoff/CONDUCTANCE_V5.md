@@ -1,5 +1,84 @@
 # Conductance GAT V5 — graph-specific C optimization and weighted-Laplacian propagation
 
+## 2026-09-26: 독립 aggregation comparison의 수학·구현 경계
+
+최신 구현은 `experiments/aggregation_comparison/`이며 기존 V5와 8조건 incidence ablation을
+수정하거나 그 checkpoint를 승계하지 않는다. 코드 원문은 `CODE_SUMMARY.md`,
+검수 우선순위는 [HANDOFF.md](HANDOFF.md), 실제 검증은
+[EXPERIMENT_STATUS.md](EXPERIMENT_STATUS.md)의 최신 절을 따른다.
+
+### 국소 자기 에너지와 교차항
+
+물리 무방향 edge 하나당 B의 행 하나를 두고 `L = B^T C B`로 쓴다.
+현재 layer ℓ의 head projection을 모든 이전 depth state에 공통 적용해
+`v^(k) = H^(k) W_ℓ,h`를 만든다. `local_gram`은 각 k≤m에 대해
+
+`Gamma_i^(k,m) = (1/2) Σ_(j~i) c_ij,h <v_i^(k)-v_j^(k), v_i^(m)-v_j^(m)>`
+
+를 별도 node/head/pair 채널로 계산한다. 같은 물리 edge가 양 endpoint에 1/2씩
+들어가므로 node 합은 해당 head의 `tr(V_k^T L_h V_m)`이다. degree normalization은
+이 Gamma 정의에 넣지 않는다. 이는 뒤의 row-normalized diffusion과 동일한 행렬이라는
+뜻이 아니다. fixed C에서 diagonal은 이차형식, off-diagonal은 쌍선형형식이다.
+학습에서는 C(H)가 입력에 의존하므로 전체 함수가 고정 쌍선형 함수인 것은 아니다.
+
+현재 코드의 흐름은 linear encoder → incidence diffusion → 선택적 Gamma readout 가산
+→ ReLU/dropout을 profile 깊이만큼 반복 → linear decoder이다.
+Gamma의 learned readout은 0으로 초기화한다. 초기 출력은 대응하는 no-energy 모델과
+일치하도록 설계됐고, 첫 step에는 readout 자체가 gradient를 받으며 그 이후 C/feature에
+대한 추가 energy gradient가 생긴다. readout이 0인데도 첫 step부터 그 경로로 C gradient가
+증가한다고 주장하면 안 된다. 기본 diffusion 경로의 C gradient는 별도로 존재한다.
+
+현재 Gamma에 쓰는 v는 현재 operator의 **1차 value projection**이며, pre-lift 조건의
+diffusion에 전달하는 `[v,v²]`와 좌표 차원이 다르다. 조합 조건은 두 기능을 함께 넣은
+것이지 'lift된 공간의 모든 Gamma'를 구현한 것은 아니다. 이 선택의 타당성도 검수 대상이다.
+
+기존 내부 ablation은 diagonal 없는 cross-depth 값을 degree-normalized scalar gate로
+사용했지만, 새 구현은 diagonal도 포함하는 raw Gram 채널을 별도 readout으로 사용한다.
+이 차이를 같은 실험의 단순 재개 또는 이미 입증된 성능 개선으로 표현하지 않는다.
+
+### residual, 비선형성, rank 주장
+
+우리 모델의 외부 residual/FFN/LayerNorm은 제거했다. diffusion 정의 자체의
+`I - beta D^-1 L`에 포함된 identity 항은 남는다. operator의 내부 identity와 wrapper
+residual을 구분해야 한다. pre-lift는 `[v,v²]`를 전파 전에 만들고 learned projection으로
+원래 width로 되돌린다. 전체 feature dimension 확대·축소와 task gradient 연결이 존재한다.
+이 사실이 Laplacian nullspace 제거나 전체 네트워크의 역변환 가능성을 증명하지 않는다.
+
+depth state는 exact-distance hop/shell이 아니다. 현재 fixed-C 수식 해석을 input-dependent
+C의 전체 Jacobian으로 바꾸려면 dC/dH 항까지 다뤄야 한다. 이번 새 suite에는 전체 network
+Jacobian, distance별 B_r, 이분 graph boundary solver, inverse recovery 실험이 없다.
+옛 reconstruction probe의 결과도 full network invertibility 증거로 사용하지 않는다.
+
+### 외부 comparator: DUALFormer
+
+공식 commit `68fbdaf007af2f7d409cd435c4c48dd0e3155510`의 feature-space SA를 따른다.
+head마다 Q/K/V 차원은 전체 hidden width이며,
+`A = softmax_(feature input axis)(K^T V / sqrt(N))`, `SA = mean_heads(Q A)`다.
+여러 독립 graph의 통계는 각각 계산한다. exact two-pass node streaming은 모든 node를
+방문하며 node sampling으로 global context를 바꾸지 않는다.
+
+새 공통 레시피는 SA 1층 뒤 SGC 8(reference)/12(large)단계, 공통 AdamW와 dropout이다.
+공식 기본 SGC 2단계·논문별 튜닝된 recipe/score의 완전 재현이 아니다.
+원형 comparator에는 intrinsic alpha residual 및 LayerNorm이 남고, 별도
+`dualformer_no_skip_control`만 skip을 제거한다. 원형과 변형을 같은 모델로 집계하지 않는다.
+같은 width/head를 맞췄어도 trainable parameter 수와 computational depth가 같지 않다.
+공식 논문: [ICLR 2025](https://proceedings.iclr.cc/paper_files/paper/2025/hash/128911cc894d57bcae78074a9551c132-Abstract-Conference.html),
+구현: [DUALFormer](https://github.com/JiamingZhuo/DUALFormer/tree/68fbdaf007af2f7d409cd435c4c48dd0e3155510).
+
+### 실행·결과의 구분
+
+`python -m experiments.aggregation_comparison --help`로 현재 인자를 확인한다.
+6개 조건×선택한 dataset/profile/seed가 별도 학습된다. CLI는 full graph를 요구하며,
+calibration은 전체 validation과 optimizer state를 포함한다. 학습 예산은 기존
+reference-update/early-stop 계약을 공유한다. 완료 결과의 source·data·split·history·
+best/last checkpoint가 검증되고 감사는 validation만 반복한다.
+CPU 수식/무결성 검사와 CUDA synthetic 검증은 통과했지만 공식 데이터셋 새 비교 결과는 없다.
+기존 8조건 PPI validation이나 역사적 V5 test 수치를 새 6조건의 결과로 표기하지 않는다.
+
+---
+
+## 아래는 이전 V5·edge-selection의 날짜별 기록
+
 ### 2026-09-12 동일 사양 GPU 재할당 재개
 
 edge-selection 실행기는 GPU 번호/UUID 변경을 학습 레시피 변경과 분리한다.

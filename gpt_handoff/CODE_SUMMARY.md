@@ -2,6 +2,21 @@
 
 ````text
 *.sh text eol=lf
+
+# Preserve the recorded bytes (including CSV line endings) of curated evidence.
+research/conductance_gat/results/summary.json -text
+research/conductance_gat/results/isotropic_history.csv -text
+research/conductance_gat/results/learned_history.csv -text
+research/conductance_gat/results/learned_model.pt -text
+research/cycle_pe/results/summary.json -text
+research/tree_augmentation/results/summary.json -text
+results/combined_later/certification.json -text
+results/combined_later/fixed_c/summary.json -text
+results/combined_later/fixed_c/training.csv -text
+results/combined_later/fixed_c/training.png -text
+results/combined_later/identifiability/summary.json -text
+results/combined_later/identifiability/sweep.csv -text
+results/combined_later/identifiability/identifiability.png -text
 ````
 
 # .gitignore
@@ -31,6 +46,27 @@ results/*
 !results/.gitkeep
 data/*
 !data/.gitkeep
+
+# Curated historical research evidence; generated caches and repeated smoke runs stay ignored.
+!research/conductance_gat/results/summary.json
+!research/conductance_gat/results/isotropic_history.csv
+!research/conductance_gat/results/learned_history.csv
+!research/conductance_gat/results/learned_model.pt
+!research/cycle_pe/results/summary.json
+!research/tree_augmentation/results/summary.json
+!results/combined_later/
+results/combined_later/*
+!results/combined_later/certification.json
+!results/combined_later/fixed_c/
+results/combined_later/fixed_c/*
+!results/combined_later/fixed_c/summary.json
+!results/combined_later/fixed_c/training.csv
+!results/combined_later/fixed_c/training.png
+!results/combined_later/identifiability/
+results/combined_later/identifiability/*
+!results/combined_later/identifiability/summary.json
+!results/combined_later/identifiability/sweep.csv
+!results/combined_later/identifiability/identifiability.png
 ````
 
 # constraints-cu118.txt
@@ -158,6 +194,6672 @@ dependencies:
 # prepare_data.sh also runs that installer if the active environment is incomplete.
 # CUDA packages are kept out of the bootstrap environment so the official
 # PyTorch wheel index and constraints file are always applied together.
+````
+
+# experiments/aggregation_comparison/__init__.py
+
+````python
+"""Independent fresh-training incidence and recent-architecture comparison."""
+
+import sys
+from pathlib import Path
+
+_src = str(Path(__file__).resolve().parents[2] / "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
+````
+
+# experiments/aggregation_comparison/__main__.py
+
+````python
+from .runner import main
+
+raise SystemExit(main())
+````
+
+# experiments/aggregation_comparison/audit.py
+
+````python
+"""Read-only full-validation audit of fresh aggregation comparison checkpoints."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import torch
+
+from chartgat.observability import RuntimeResourceMonitor
+from research.conductance_gat.edge_selection.audit import (
+    _synchronize,
+)
+from research.conductance_gat.v5.batch_calibration import _isolated_execution_state
+
+from . import engine as train
+from .provenance import require_source_compatibility
+
+
+def audit(root, data_root, device, repeats):
+    if repeats < 5:
+        raise ValueError("at least five repeated full validations are required")
+    metrics = train.inspect_completed(root)
+    identity = metrics["resume_identity"]
+    sources = train.implementation_source_hashes()
+    require_source_compatibility(identity["source_sha256"], sources, scope="training")
+    args = train.restore_arguments(metrics, root, data_root, device)
+    train.base._require_cuda(device)
+    train.base.configure_compute(args)
+    payload, protocol = train.base.load_dataset(args.dataset, args.data_root, allow_download=False)
+    if protocol != identity["dataset_protocol"]:
+        raise ValueError("audit cache/split provenance differs from training")
+    monitor = RuntimeResourceMonitor(device)
+    monitor.start()
+    try:
+        with _isolated_execution_state(device), torch.no_grad():
+            train.base._seed(args.model_seed)
+            inputs = train.PreparedInputs(payload, args)
+            if inputs.provenance != identity["input_provenance"]:
+                raise ValueError("audit topology provenance differs from training")
+            model = train.make_model(payload, args, device)
+            selected = train.base.load_checkpoint_on_cpu(Path(root) / "best.pt")
+            train.validate_identity(selected, identity)
+            model.load_state_dict(selected["model_state"], strict=True)
+            del selected
+            before = train.base.state_sha256(model)
+            torch.cuda.reset_peak_memory_stats(device)
+            evaluations, timings = [], []
+            for _ in range(repeats):
+                _synchronize(device)
+                started = time.perf_counter()
+                evaluations.append(train.evaluate(model, inputs, args, device))
+                model.clear_auxiliary_cache()
+                _synchronize(device)
+                timings.append(time.perf_counter() - started)
+            if before != train.base.state_sha256(model) or train.inspect_completed(root) != metrics:
+                raise ValueError("read-only audit unexpectedly changed training evidence")
+            require_source_compatibility(
+                sources, train.implementation_source_hashes(), scope="audit"
+            )
+            scores = [row["metric"] for row in evaluations]
+            return {
+                "status": "passed",
+                "research_suite": train.SUITE,
+                "ablation_arm": args.ablation_arm,
+                "dataset": args.dataset,
+                "checkpoint_sha256": metrics["checkpoint_sha256"],
+                "source_sha256": sources,
+                "test_evaluated": False,
+                "validation": evaluations[0],
+                "repeated_validation": {
+                    "count": repeats,
+                    "scores": scores,
+                    "range_pp": 100 * (max(scores) - min(scores)),
+                    "evaluation_seconds": timings,
+                },
+                "model_contract": model.contract(),
+                "published_score_reproduction_claim": False,
+            }
+    finally:
+        resources = monitor.finish(
+            peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+            peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+        )
+        print(json.dumps({"audit_resources": resources}, sort_keys=True), flush=True)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--data-root", type=Path, default=Path("data/paper"))
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--repeat-evaluations", type=int, default=5)
+    args = parser.parse_args(argv)
+    result = audit(
+        args.root,
+        args.data_root,
+        torch.device(args.device),
+        args.repeat_evaluations,
+    )
+    print(json.dumps(result, sort_keys=True, allow_nan=False), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# experiments/aggregation_comparison/calibration.py
+
+````python
+"""Measured common resources for the independent aggregation-comparison experiment suite.
+
+Only disposable calibration probes run here. No final-training model/data/budget
+is reduced, and no older V5 calibration implementation is changed.
+"""
+
+from __future__ import annotations
+
+import copy
+import gc
+import math
+import traceback
+
+from scripts import training_resource_plan as resources
+
+
+def parse_job(job):
+    from experiments.aggregation_comparison import engine as train
+
+    args = train.build_parser().parse_args(job["command"][job["command"].index("-m") + 2 :])
+    train.validate_args(args)
+    return args
+
+
+def _contracts(jobs):
+    return [
+        {
+            "condition": job["variant_id"],
+            "model_seed": job["model_seed"],
+            "argv_sha256": resources.command_identity(job["command"]),
+        }
+        for job in jobs
+    ]
+
+
+def _probe_args(args, axis, batch, workers):
+    from research.conductance_gat.v5.batch_calibration import _candidate_args
+
+    expected_axis = (
+        "graphs"
+        if args.dataset == "ppi"
+        else ("full_graph" if args.sampling == "full" else "sampled_seed_nodes")
+    )
+    if axis != expected_axis:
+        raise ValueError("calibration batch axis differs from the actual dataset/sampler")
+    return _candidate_args(args, batch, workers)
+
+
+def _full_budget_seconds(report, policy):
+    safe = resources.measurement_is_safe(report)
+    if report["status"] == "oom":
+        return None
+    if report.get("validation_completed") is not True:
+        raise ValueError("calibration did not measure complete validation")
+    for name in ("validation_seconds", "topology_preparation_seconds", "setup_seconds"):
+        value = report.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"calibration lacks a valid measured {name}")
+    if (
+        report.get("required_auxiliary_path") is True
+        and report.get("auxiliary_path_measured") is not True
+    ):
+        raise ValueError("negative auxiliary loss was not measured in calibration")
+    if (
+        report.get("required_cycle_preparation") is True
+        and report.get("cycle_preparation_measured") is not True
+    ):
+        raise ValueError("cycle preparation was not measured in calibration")
+    if not safe:
+        return None
+    cost = resources.projected_training_budget_cost(report, policy)
+    return (
+        cost["projected_training_seconds"]
+        + cost["learning_budget"]["planned_epochs"] * report["validation_seconds"]
+        + report["setup_seconds"]
+    )
+
+
+def _score(candidate, policy):
+    costs = [_full_budget_seconds(report, policy) for report in candidate["measurements"]]
+    if not costs or any(value is None for value in costs):
+        return None
+    return max(costs)
+
+
+def _choose(candidates, policy):
+    eligible = [(value, _score(value, policy)) for value in candidates]
+    eligible = [(candidate, score) for candidate, score in eligible if score is not None]
+    if not eligible:
+        raise RuntimeError("no common safe physical batch fits all arms; no model/data downscale")
+    return min(eligible, key=lambda item: (item[1], -item[0]["batch_size"], item[0]["workers"]))[0]
+
+
+def _measure(job, loaded, args, batch, workers):
+    import torch
+
+    from experiments.aggregation_comparison import engine as train
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    try:
+        report = train.run_calibration_candidate(
+            loaded,
+            copy.deepcopy(args),
+            torch.device(args.device),
+            physical_batch_size=batch,
+            workers=workers,
+            warmup_steps=2,
+            measurement_steps=5,
+            minimum_measure_seconds=3.0,
+        )
+    except torch.OutOfMemoryError as error:
+        report = {"status": "oom", "error": f"{type(error).__name__}: {error}"}
+        traceback.clear_frames(error.__traceback__)
+    report.update(
+        condition=job["variant_id"],
+        model_seed=job["model_seed"],
+        required_auxiliary_path=args.negative_loss_weight > 0,
+        required_cycle_preparation=args.selection_mode == "forest_cycle",
+    )
+    gc.collect()
+    torch.cuda.empty_cache()
+    return report
+
+
+def validate_entry(entry, jobs):
+    from experiments.aggregation_comparison import engine as train
+
+    if entry.get("status") != "passed" or entry.get("job_contracts") != _contracts(jobs):
+        raise ValueError(
+            "aggregation-comparison common resource entry or exact arm matrix is incomplete"
+        )
+    parsed = [parse_job(job) for job in jobs]
+    identities = {
+        (job["variant_id"], job["model_seed"]): args for job, args in zip(jobs, parsed, strict=True)
+    }
+    baseline, axis = entry["baseline_physical_batch_size"], entry["batch_axis"]
+    expected_floor = (
+        parsed[0].sample_seed_batch_size if axis == "sampled_seed_nodes" else parsed[0].batch_size
+    )
+    context = parsed[0].sampling == "cluster_disjoint"
+    requested_workers = parsed[0].sample_context_workers if context else parsed[0].workers
+    expected_workers = resources.worker_candidates(
+        requested_workers, resources.allocated_cpu_count(), applicable=axis == "graphs" or context
+    )
+    expected_workers = [
+        value for value in expected_workers if value <= max(2, 2 * requested_workers)
+    ]
+    if baseline != expected_floor or entry.get("worker_candidates") != expected_workers:
+        raise ValueError(
+            "calibration physical floor or worker search differs from the declared recipe"
+        )
+    if context != (entry.get("worker_axis") == "sample_context_workers"):
+        raise ValueError("calibration worker axis differs from the declared sampler")
+    policy = resources.learning_budget_selection_policy(
+        vars(parsed[0]),
+        training_split_size=entry["natural_training_split_size"],
+        batch_axis=axis,
+    )
+    if policy != entry.get("selection_policy"):
+        raise ValueError("calibration learning-budget selection recipe changed")
+    seen = set()
+    for candidate in entry["candidates"]:
+        pair = candidate["batch_size"], candidate["workers"]
+        if pair in seen or pair[0] < baseline or pair[1] not in entry["worker_candidates"]:
+            raise ValueError("duplicate or unrequested physical calibration candidate")
+        seen.add(pair)
+        reports = candidate["measurements"]
+        if {(item["condition"], item["model_seed"]) for item in reports} != set(identities) or len(
+            reports
+        ) != len(identities):
+            raise ValueError("common calibration candidate is missing a requested arm/seed")
+        if candidate["status"] != resources.completed_candidate_status(reports):
+            raise ValueError("calibration status differs from actual measured evidence")
+        for report in reports:
+            if report["status"] == "passed":
+                expected = _probe_args(
+                    identities[(report["condition"], report["model_seed"])], axis, *pair
+                )
+                if report.get("configuration") != train.configuration(expected):
+                    raise ValueError(
+                        "measurement configuration differs from the exact child candidate"
+                    )
+                if report.get("required_auxiliary_path") != (
+                    expected.negative_loss_weight > 0
+                ) or report.get("required_cycle_preparation") != (
+                    expected.selection_mode == "forest_cycle"
+                ):
+                    raise ValueError("measurement auxiliary/cycle scope differs from its exact arm")
+                if (report.get("batch_size"), report.get("workers")) != pair:
+                    raise ValueError("measurement physical batch/worker differs from its candidate")
+                _full_budget_seconds(report, policy)
+    sizes = sorted({batch for batch, _ in seen})
+    if (
+        not sizes
+        or sizes[0] != baseline
+        or seen != {(size, count) for size in sizes for count in entry["worker_candidates"]}
+    ):
+        raise ValueError("common candidate grid is incomplete")
+    if axis != "full_graph" and baseline < entry["natural_training_split_size"] and len(sizes) < 2:
+        raise ValueError("at least two physical batch candidates must be measured")
+    ceiling = max(baseline, entry["natural_training_split_size"])
+    if any(
+        next_size != min(size * 2, ceiling)
+        for size, next_size in zip(sizes, sizes[1:], strict=False)
+    ):
+        raise ValueError("physical candidate grid skipped an unmeasured expansion")
+    costs_by_size = {
+        size: [
+            score
+            for candidate in entry["candidates"]
+            if candidate["batch_size"] == size and (score := _score(candidate, policy)) is not None
+        ]
+        for size in sizes
+    }
+    reason = entry.get("stop_reason")
+    if axis == "full_graph":
+        if baseline != 1 or sizes != [1] or ceiling != 1 or reason != "full_graph_no_batch_axis":
+            raise ValueError("full graph cannot claim a replicated physical-batch search")
+    elif reason == "memory_headroom_boundary":
+        if costs_by_size[sizes[-1]]:
+            raise ValueError("reported memory boundary still has a common safe candidate")
+    elif reason == "complete_training_split_boundary":
+        if sizes[-1] != ceiling or not costs_by_size[sizes[-1]]:
+            raise ValueError("reported full-split boundary was not measured")
+    elif reason == "measured_full_budget_cost_plateau":
+        previous, plateau = None, 0
+        for costs in costs_by_size.values():
+            if not costs:
+                raise ValueError("cost plateau cannot hide an unsafe memory boundary")
+            best = min(costs)
+            plateau = plateau + 1 if previous is not None and best >= previous / 1.05 else 0
+            previous = best if previous is None else min(previous, best)
+        if plateau < 2:
+            raise ValueError("cost plateau lacks two measured physical expansions")
+    else:
+        raise ValueError("common calibration has an unknown or unmeasured stopping boundary")
+    chosen = _choose(entry["candidates"], policy)
+    if entry.get("selected_candidate") != {
+        "batch_size": chosen["batch_size"],
+        "workers": chosen["workers"],
+    }:
+        raise ValueError(
+            "selected resources differ from the measured worst-arm full-budget minimum"
+        )
+    expected_selected = _selected(parsed[0], axis, chosen)
+    if entry.get("selected") != expected_selected:
+        raise ValueError("stored selected resources differ from the measured configuration")
+
+
+def _selected(args, axis, chosen):
+    result = {
+        "batch_size": args.batch_size,
+        "workers": chosen["workers"],
+        "sample_seed_batch_size": args.sample_seed_batch_size,
+    }
+    result["sample_seed_batch_size" if axis == "sampled_seed_nodes" else "batch_size"] = chosen[
+        "batch_size"
+    ]
+    if args.sampling == "cluster_disjoint":
+        result.update(workers=0, sample_context_workers=chosen["workers"])
+    return result
+
+
+def calibrate_group(jobs, entry, persist):
+    from experiments.aggregation_comparison import engine as train
+
+    parsed = [parse_job(job) for job in jobs]
+    loaded, identity, maximum, axis = train.load_calibration_payload(parsed[0])
+    if entry.get("input_identity") is not None and (
+        entry["input_identity"] != identity
+        or entry["natural_training_split_size"] != maximum
+        or entry["batch_axis"] != axis
+    ):
+        raise ValueError(
+            "official data/topology calibration identity changed; previous evidence retained"
+        )
+    if entry.get("status") == "passed":
+        validate_entry(entry, jobs)
+        return
+    policy = resources.learning_budget_selection_policy(
+        vars(parsed[0]), training_split_size=maximum, batch_axis=axis
+    )
+    if policy is None:
+        raise ValueError(
+            "aggregation-comparison calibration requires explicit reference_updates budget"
+        )
+    if entry.get("selection_policy") not in (None, policy):
+        raise ValueError("partial common calibration budget changed")
+    baseline = (
+        parsed[0].sample_seed_batch_size if axis == "sampled_seed_nodes" else parsed[0].batch_size
+    )
+    context = parsed[0].sampling == "cluster_disjoint"
+    requested_workers = parsed[0].sample_context_workers if context else parsed[0].workers
+    workers = resources.worker_candidates(
+        requested_workers, resources.allocated_cpu_count(), applicable=axis == "graphs" or context
+    )
+    workers = [count for count in workers if count <= max(2, 2 * requested_workers)]
+    entry.update(
+        track="conductance",
+        profile=jobs[0]["profile"],
+        dataset=jobs[0]["dataset"],
+        input_identity=identity,
+        natural_training_split_size=maximum,
+        batch_axis=axis,
+        baseline_physical_batch_size=baseline,
+        worker_candidates=workers,
+        selection_policy=policy,
+        job_contracts=_contracts(jobs),
+    )
+    if context:
+        entry["worker_axis"] = "sample_context_workers"
+    entry.setdefault("candidates", [])
+    current, plateau, previous_best = baseline, 0, None
+    while True:
+        costs = []
+        for count in workers:
+            candidate = next(
+                (
+                    item
+                    for item in entry["candidates"]
+                    if (item["batch_size"], item["workers"]) == (current, count)
+                ),
+                None,
+            )
+            if candidate is None:
+                candidate = {
+                    "batch_size": current,
+                    "workers": count,
+                    "status": "running",
+                    "measurements": [],
+                }
+                entry["candidates"].append(candidate)
+            if candidate["status"] == "running":
+                for job, args in zip(jobs, parsed, strict=True):
+                    if not any(
+                        (item["condition"], item["model_seed"])
+                        == (job["variant_id"], job["model_seed"])
+                        for item in candidate["measurements"]
+                    ):
+                        print(
+                            f"[comparison calibration] {job['job_id']} "
+                            f"physical={current} workers={count}",
+                            flush=True,
+                        )
+                        candidate["measurements"].append(
+                            _measure(job, loaded, args, current, count)
+                        )
+                        persist()
+                candidate["status"] = resources.completed_candidate_status(
+                    candidate["measurements"]
+                )
+                persist()
+            score = _score(candidate, policy)
+            if score is not None:
+                costs.append(score)
+        if not costs:
+            entry["stop_reason"] = "memory_headroom_boundary"
+            break
+        if axis == "full_graph" or current >= max(maximum, baseline):
+            entry["stop_reason"] = (
+                "full_graph_no_batch_axis"
+                if axis == "full_graph"
+                else "complete_training_split_boundary"
+            )
+            break
+        best = min(costs)
+        plateau = plateau + 1 if previous_best is not None and best >= previous_best / 1.05 else 0
+        previous_best = best if previous_best is None else min(best, previous_best)
+        if plateau >= 2:
+            entry["stop_reason"] = "measured_full_budget_cost_plateau"
+            break
+        current = min(current * 2, max(maximum, baseline))
+    chosen = _choose(entry["candidates"], policy)
+    entry.update(
+        status="passed",
+        selected=_selected(parsed[0], axis, chosen),
+        selected_candidate={"batch_size": chosen["batch_size"], "workers": chosen["workers"]},
+        selection={
+            "objective": "minimum worst-arm projected train + full validation + one-time setup",
+            "preparation_accounting": (
+                "per-epoch topology work is already in measured train/validation"
+            ),
+            "all_arms_share_resources": True,
+            "global_optimum_claimed": False,
+        },
+    )
+    validate_entry(entry, jobs)
+    persist()
+````
+
+# experiments/aggregation_comparison/engine.py
+
+````python
+"""Independent fresh comparison trainer, adapted from the incidence-ablation trainer.
+
+Same full-data, optimizer-inclusive calibration and epoch/RNG commit contracts.
+No import or mutation of legacy checkpoints is permitted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import gc
+import hashlib
+import json
+import math
+import random
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from chartgat.cache import atomic_write_json
+from chartgat.observability import RuntimeResourceMonitor
+from research.conductance_gat.edge_selection import protocol as selection_protocol
+from research.conductance_gat.edge_selection.data import PreparedInputs
+from research.conductance_gat.v5 import train as base
+from research.conductance_gat.v5.batch_calibration import (
+    _candidate_args,
+    _isolated_execution_state,
+    _optimizer_state_bytes,
+)
+from research.conductance_gat.v5.learning_budget import should_stop_learning_budget
+from research.conductance_gat.v5.timing import StageTimer
+
+from .model import ARMS, AggregationClassifier
+from .provenance import require_source_compatibility
+
+ROOT = Path(__file__).resolve().parents[2]
+SUITE = "aggregation_comparison_v1"
+
+
+def build_parser():
+    parser = base.build_parser()
+    parser.description = __doc__
+    parser.set_defaults(
+        conductance_heads="per_head",
+        propagation_normalization="row",
+        solver_cost_scaling="width_scaled",
+        beta_initial=0.5,
+        training_schedule="joint",
+    )
+    selection_protocol.add_arguments(parser)
+    parser.add_argument("--learning-rate", type=float, default=base.COMMON["lr"])
+    parser.add_argument("--ablation-arm", choices=tuple(ARMS), required=True)
+    return parser
+
+
+def validate_args(args):
+    base.validate_args(args)
+    if args.sampling != "full":
+        raise ValueError(
+            "global-attention comparison requires full graph support; no sampled fallback"
+        )
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        raise ValueError("learning rate must be finite and positive")
+    selection_protocol.validate(args)
+    if (
+        args.selection_mode != "full"
+        or args.corruption_ratio
+        or args.l0_weight
+        or args.negative_loss_weight
+    ):
+        raise ValueError(
+            "comparison requires unchanged full candidate support, no corruption/gate loss"
+        )
+    if args.propagation_filter != "linear" or args.propagation_normalization != "row":
+        raise ValueError("comparison requires linear row diffusion for incidence operators")
+
+
+def configuration(args):
+    inherited = base.configuration(args)
+    inherited.pop("ffn_multiplier")  # The comparison contains no external FFN.
+    inherited["lr"] = args.learning_rate
+    return {
+        **inherited,
+        "edge_selection": selection_protocol.configuration(args),
+        "ablation_arm": args.ablation_arm,
+        "comparison_contract": {
+            "external_residual": False,
+            "external_ffn": False,
+            "normalization": "intrinsic DUALFormer LayerNorm only",
+            "activation": "ReLU",
+            "encoder": "linear",
+            "decoder": "linear",
+            "parameter_matched": False,
+            "optimizer": "uniform AdamW",
+            "learning_rate": args.learning_rate,
+        },
+    }
+
+
+def implementation_source_hashes():
+    from .provenance import source_snapshot
+
+    return source_snapshot()
+
+
+def make_model(payload, args, device):
+    return AggregationClassifier(
+        payload["graphs"][0]["x"].shape[1],
+        payload["classes"],
+        arm=args.ablation_arm,
+        **base.architecture_configuration(args),
+        conductance_mode="dynamic",
+        max_log_conductance=base.COMMON["max_log_conductance"],
+        edge_chunk_size=args.edge_chunk_size,
+        selection_config=selection_protocol.model_configuration(args),
+    ).to(device)
+
+
+def parameter_group(name):
+    return "backbone"
+
+
+def make_optimizer(model, learning_rate=None):
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=base.COMMON["lr"] if learning_rate is None else learning_rate,
+        weight_decay=base.COMMON["weight_decay"],
+    )
+
+
+def shared_initial_state_sha256(model):
+    """Only common encoder/decoder are paired across different operators."""
+    digest = hashlib.sha256()
+    for name, value in model.state_dict().items():
+        if name.startswith(("encoder.", "decoder.")):
+            digest.update(name.encode())
+            digest.update(base.tensor_hash(value).encode())
+    return digest.hexdigest()
+
+
+def resolve_budget(inputs, args):
+    if inputs.indices is not None:
+        return base.resolve_learning_budget(inputs.data, inputs.indices, inputs.sampler, args)
+    return base.resolve_learning_budget(inputs.data, None, None, args)
+
+
+def build_identity(args, protocol, budget, initial_hash, inputs):
+    return {
+        "schema_version": 1,
+        "research_suite": SUITE,
+        "dataset": args.dataset,
+        "condition": args.selection_mode,
+        "configuration": configuration(args),
+        "training_arguments": serializable_arguments(args),
+        "dataset_protocol": protocol,
+        "dataset_protocol_sha256": base._canonical_sha256(protocol),
+        "source_sha256": implementation_source_hashes(),
+        "runtime_versions": base._versions(),
+        "initial_state_sha256": initial_hash,
+        "learning_budget": budget,
+        "input_provenance": inputs.provenance,
+        "resume_semantics": (
+            "epoch-boundary model/optimizer/Python/NumPy/CPU/CUDA RNG restore; "
+            "no bitwise CUDA claim"
+        ),
+    }
+
+
+def serializable_arguments(args):
+    return {
+        key: False if key == "resume" else str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+
+
+def restore_arguments(metrics, output, data_root, device):
+    identity = metrics["resume_identity"]
+    saved = identity.get("training_arguments")
+    if not isinstance(saved, dict):
+        raise ValueError("audit requires immutable training arguments")
+    args = argparse.Namespace(**saved)
+    for name in ("output_dir", "data_root"):
+        setattr(args, name, Path(getattr(args, name)))
+    validate_args(args)
+    if configuration(args) != identity["configuration"]:
+        raise ValueError("restored CLI arguments do not reproduce the trained configuration")
+    args.output_dir, args.data_root, args.device = Path(output), Path(data_root), str(device)
+    return args
+
+
+def validate_identity(saved, expected):
+    identity = saved.get("resume_identity")
+    if not isinstance(identity, dict) or base._canonical_sha256(identity) != saved.get(
+        "resume_identity_sha256"
+    ):
+        raise ValueError("aggregation-comparison checkpoint identity is absent or corrupt")
+    if identity != expected:
+        changed = sorted(
+            key for key in set(identity) | set(expected) if identity.get(key) != expected.get(key)
+        )
+        raise ValueError(
+            f"aggregation-comparison resume identity mismatch: {changed}; old evidence preserved"
+        )
+
+
+def resolve_training_resume(saved, expected):
+    """Preserve the original identity; require exactly matching suite sources.
+
+    Model, optimizer, data, sampling, arguments, budget and runtime must still
+    agree exactly. Actual resumed execution sources are recorded separately.
+    """
+    identity = saved.get("resume_identity")
+    validate_identity(saved, identity)
+    changed = sorted(
+        key
+        for key in set(identity) | set(expected)
+        if key != "source_sha256" and identity.get(key) != expected.get(key)
+    )
+    if changed:
+        raise ValueError(
+            f"aggregation-comparison resume identity mismatch: {changed}; old evidence preserved"
+        )
+    proof = require_source_compatibility(
+        identity.get("source_sha256"), expected.get("source_sha256"), scope="training"
+    )
+    return copy.deepcopy(identity), proof
+
+
+def autocast(args, device):
+    return torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=args.precision == "bf16"
+    )
+
+
+def loss_components(model, batch, logits, args):
+    task, count = base.training_loss(logits, batch.graph, batch.selected_indices)
+    targets = batch.origin_targets if args.negative_loss_weight else None
+    auxiliary = model.auxiliary_loss(targets)
+    loss = (
+        task + args.l0_weight * auxiliary["l0"] + args.negative_loss_weight * auxiliary["negative"]
+    )
+    return loss, task, auxiliary, int(count)
+
+
+def validate_gradients(model):
+    missing = [
+        name
+        for name, value in model.named_parameters()
+        if value.requires_grad and value.grad is None
+    ]
+    if missing:
+        raise RuntimeError(f"trainable parameters disconnected from task/auxiliary loss: {missing}")
+    by_group = {}
+    for name, value in model.named_parameters():
+        if value.grad is not None:
+            by_group.setdefault(parameter_group(name), []).append(
+                value.grad.detach().float().square().sum()
+            )
+    result = {name: torch.stack(values).sum().sqrt() for name, values in by_group.items()}
+    for name, norm in result.items():
+        torch._assert_async(torch.isfinite(norm), f"nonfinite {name} gradient")
+    return result
+
+
+def run_training_epoch(
+    model, optimizer, inputs, args, device, epoch, *, timing=None, validate=False
+):
+    model.train()
+    timing = timing or StageTimer(device)
+    sums = torch.zeros(4, device=device, dtype=torch.float64)
+    labels = steps = units = 0
+    largest_nodes = largest_edges = largest_graphs = 0
+    observations = []
+    gradient_rows = {}
+    iterator = iter(inputs.training_batches(epoch, device))
+    while True:
+        with timing.stage("sampling_forest_loader_transfer"):
+            batch = next(iterator, None)
+        if batch is None:
+            break
+        with timing.stage("zero_grad"):
+            optimizer.zero_grad(set_to_none=True)
+        with timing.stage("forward_and_loss"):
+            with autocast(args, device):
+                logits = model(batch.graph)
+                loss, task, auxiliary, count = loss_components(model, batch, logits, args)
+        with timing.stage("backward"):
+            loss.backward()
+        if validate and steps == 0:
+            gradient_rows = validate_gradients(model)
+        with timing.stage("gradient_clipping"):
+            norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                base.COMMON["gradient_clip_norm"],
+                error_if_nonfinite=False,
+                foreach=True,
+            )
+            base.require_finite_gradient_norm_async(norm)
+        with timing.stage("optimizer"):
+            optimizer.step()
+        sums += (
+            torch.stack(
+                (
+                    loss.detach(),
+                    task.detach(),
+                    auxiliary["l0"].detach(),
+                    auxiliary["negative"].detach(),
+                )
+            ).double()
+            * count
+        )
+        labels += count
+        steps += 1
+        graph_count = int(batch.graph._v5_num_graphs)
+        units += graph_count if inputs.indices is None else count
+        largest_nodes = max(largest_nodes, batch.graph.x.shape[0])
+        largest_edges = max(largest_edges, batch.graph.incidence_edge_index.shape[1])
+        largest_graphs = max(largest_graphs, graph_count)
+        observations.append(
+            {
+                "nodes": batch.graph.x.shape[0],
+                "candidate_edges": batch.graph.incidence_edge_index.shape[1],
+                "disjoint_graphs": graph_count,
+                "supervised_labels": count,
+                "sampling": getattr(batch.graph, "sampling_observation", None),
+            }
+        )
+        model.clear_auxiliary_cache()
+        del loss, task, auxiliary, logits, batch
+    if labels < 1 or steps < 1:
+        raise RuntimeError("official training split produced no supervised updates")
+    values = (sums / labels).cpu().tolist()
+    if not all(math.isfinite(value) for value in values):
+        raise FloatingPointError("nonfinite training/auxiliary epoch loss")
+    return {
+        "train_loss": values[0],
+        "train_task_loss": values[1],
+        "train_l0": values[2],
+        "train_negative_loss": values[3],
+        "train_labels": labels,
+        "train_batches": steps,
+        "optimizer_steps": steps,
+        "processed_units": units,
+        "largest_measured_nodes": largest_nodes,
+        "largest_measured_physical_edges": largest_edges,
+        "largest_measured_graph_batch": largest_graphs,
+        "batch_observations": observations,
+        "first_step_gradient_norms": {
+            name: float(value.cpu()) for name, value in gradient_rows.items()
+        },
+    }
+
+
+@torch.no_grad()
+def evaluate(model, inputs, args, device, *, observer=None):
+    model.eval()
+    totals = torch.zeros(6, dtype=torch.float64, device=device)
+    batches = 0
+    for batch in inputs.validation_batches(device):
+        with autocast(args, device):
+            logits = model(batch.graph)
+            task, count = base.training_loss(logits, batch.graph, batch.selected_indices)
+        base.require_finite_tensor(logits, "aggregation-comparison validation logits")
+        if batch.selected_indices is None:
+            pred, target = logits > 0, batch.graph.y.bool()
+            numbers = ((pred & target).sum(), (pred & ~target).sum(), (~pred & target).sum())
+        else:
+            chosen = logits[batch.selected_indices]
+            target = batch.graph.y[batch.selected_indices]
+            numbers = (
+                (chosen.argmax(-1) == target).sum(),
+                target.new_zeros(()),
+                target.new_zeros(()),
+            )
+        totals[:3] += torch.stack(numbers)
+        totals[3] += count
+        totals[4] += task.double() * count
+        totals[5] += torch.isfinite(task).double()
+        if observer is not None:
+            observer(model, batch, logits, batches)
+        model.clear_auxiliary_cache()
+        batches += 1
+    first, fp, fn, count, loss, finite = totals.cpu().tolist()
+    if count <= 0 or finite != batches:
+        raise ValueError("validation is empty or contains a nonfinite loss")
+    metric = (
+        (2 * first / (2 * first + fp + fn) if 2 * first + fp + fn else 0.0)
+        if inputs.indices is None
+        else first / count
+    )
+    return {"metric": metric, "loss": loss / count, "label_count": int(count), "batches": batches}
+
+
+def _checkpoint_rng(device):
+    return {
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": np.random.get_state(),
+        "cpu_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state(device),
+    }
+
+
+def _restore_rng(saved, device):
+    random.setstate(saved["python_rng_state"])
+    np.random.set_state(saved["numpy_rng_state"])
+    base.restore_checkpoint_rng(saved, device)
+
+
+def inspect_completed(output):
+    from .integrity import inspect_completed as inspect_evidence
+
+    return inspect_evidence(output)
+
+
+def train_model(payload, protocol, args, device, output):
+    base._require_cuda(device)
+    validate_args(args)
+    base.validate_cached_graphs_once(payload)
+    if payload["dataset"] != args.dataset:
+        raise ValueError("dataset request and verified cache disagree")
+    hardware = base.validate_hardware_runtime(args, device)
+    base.configure_compute(args)
+    base._seed(args.model_seed)
+    monitor = RuntimeResourceMonitor(device)
+    monitor.start()
+    finished = False
+    try:
+        inputs = PreparedInputs(payload, args)
+        budget = resolve_budget(inputs, args)
+        model = make_model(payload, args, device)
+        initial_hash = base.state_sha256(model)
+        shared_hash = shared_initial_state_sha256(model)
+        optimizer = make_optimizer(model, args.learning_rate)
+        identity = build_identity(args, protocol, budget, initial_hash, inputs)
+        identity_hash = base._canonical_sha256(identity)
+        execution_sources = copy.deepcopy(identity["source_sha256"])
+        source_transitions = []
+        last_path, best_path, previous_path = (
+            output / "last.pt",
+            output / "best.pt",
+            output / "best.previous.pt",
+        )
+        history = []
+        best_metric, best_epoch, best_hash, steps = -math.inf, 0, None, 0
+        if last_path.exists():
+            if not args.resume or last_path.is_symlink():
+                raise ValueError("existing checkpoint cannot be replaced without a valid resume")
+            saved = base.load_checkpoint_on_cpu(last_path)
+            identity, source_proof = resolve_training_resume(saved, identity)
+            identity_hash = base._canonical_sha256(identity)
+            source_transitions = copy.deepcopy(saved.get("source_transitions", []))
+            if not isinstance(source_transitions, list):
+                raise ValueError("checkpoint source transition evidence must be a list")
+            source_transitions.append(
+                {
+                    "after_epoch": saved["epoch"],
+                    "optimizer_steps": saved["optimizer_steps"],
+                    "source_sha256": execution_sources,
+                    "source_compatibility": source_proof,
+                    "restored_checkpoint_sha256": base.sha256_file(last_path),
+                    "hardware": hardware,
+                    "scope": "epoch-boundary continuation; original training identity retained",
+                }
+            )
+            history = saved["history"]
+            if [row.get("epoch") for row in history] != list(range(1, saved["epoch"] + 1)):
+                raise ValueError("resume history has missing or repeated epochs")
+            model.load_state_dict(saved["model_state"], strict=True)
+            optimizer.load_state_dict(saved["optimizer_state"])
+            best_metric, best_epoch = saved["best_validation"], saved["best_epoch"]
+            best_hash, steps = saved["best_checkpoint_sha256"], saved["optimizer_steps"]
+            base.recover_best_checkpoint(best_path, previous_path, best_hash)
+            _restore_rng(saved, device)
+            del saved
+        elif output.exists() and any(output.iterdir()):
+            raise FileExistsError(
+                "nonempty selection output has no valid last.pt; no files overwritten"
+            )
+        output.mkdir(parents=True, exist_ok=True)
+        pre_run = {
+            "research_suite": SUITE,
+            "configuration": configuration(args),
+            "hardware": hardware,
+            "parameters": {
+                "total": sum(p.numel() for p in model.parameters()),
+                "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            },
+            "optimizer_groups": base.optimizer_metadata(optimizer),
+            "learning_budget": budget,
+            "data": base._v5_data_observability(payload, inputs.data, inputs.indices, args),
+            "topology": inputs.metadata(),
+            "model_contract": model.contract(),
+            "debug": False,
+            "subset": False,
+            "test_evaluated": False,
+            "batching": {
+                "physical_batch_size": args.batch_size
+                if inputs.indices is None
+                else (args.sample_seed_batch_size if inputs.sampler is not None else 1),
+                "batch_axis": "graphs"
+                if inputs.indices is None
+                else ("supervised_seed_nodes" if inputs.sampler is not None else "complete_graph"),
+                "gradient_accumulation_steps": 1,
+                "data_parallel_workers": 1,
+                "full_graph_exception": (
+                    "one complete transductive graph, not serial independent samples"
+                )
+                if inputs.indices is not None and inputs.sampler is None
+                else None,
+            },
+        }
+        if not (output / "configuration.json").exists():
+            atomic_write_json(output / "configuration.json", pre_run)
+        print(json.dumps(pre_run, sort_keys=True), flush=True)
+        torch.cuda.reset_peak_memory_stats(device)
+        for epoch in range(len(history) + 1, budget["planned_epochs"] + 1):
+            if history and should_stop_learning_budget(
+                budget,
+                epochs_since_best=history[-1]["epoch"] - best_epoch,
+                optimizer_steps_since_best=steps - history[best_epoch - 1]["optimizer_steps"],
+                eligible=True,
+            ):
+                break
+            started = time.perf_counter()
+            timing = StageTimer(device)
+            values = run_training_epoch(
+                model, optimizer, inputs, args, device, epoch, timing=timing, validate=True
+            )
+            if values["train_batches"] != budget["actual_batches_per_epoch"]:
+                raise RuntimeError(
+                    "measured supervised batches differ from the immutable update budget"
+                )
+            steps += values.pop("optimizer_steps")
+            with timing.stage("validation"):
+                validation = evaluate(model, inputs, args, device)
+            row = {
+                **values,
+                "epoch": epoch,
+                "phase": {"phase": "joint"},
+                "optimizer_steps": steps,
+                "validation": validation["metric"],
+                "validation_loss": validation["loss"],
+                "stage_seconds": timing.report(synchronize=True),
+                "elapsed_wall_seconds": time.perf_counter() - started,
+                "topology_preparation_seconds_cumulative": inputs.plan_preparation_seconds,
+            }
+            history.append(row)
+            if validation["metric"] > best_metric:
+                best_metric, best_epoch = validation["metric"], epoch
+                best_hash = base.publish_best_checkpoint(
+                    best_path,
+                    previous_path,
+                    {
+                        "model_state": model.state_dict(),
+                        "epoch": epoch,
+                        "validation": best_metric,
+                        "selection_role": "primary",
+                        "resume_identity": identity,
+                        "resume_identity_sha256": identity_hash,
+                        "execution_source_sha256": execution_sources,
+                        "source_transitions": source_transitions,
+                    },
+                )
+            base._save(
+                last_path,
+                {
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "history": history,
+                    "optimizer_steps": steps,
+                    "best_validation": best_metric,
+                    "best_epoch": best_epoch,
+                    "best_checkpoint_sha256": best_hash,
+                    "resume_identity": identity,
+                    "resume_identity_sha256": identity_hash,
+                    "execution_source_sha256": execution_sources,
+                    "source_transitions": source_transitions,
+                    "shared_initial_state_sha256": shared_hash,
+                    **_checkpoint_rng(device),
+                },
+            )
+            atomic_write_json(output / "history.json", history)
+            print(
+                f"{args.dataset}/{args.selection_mode} epoch={epoch} "
+                f"loss={row['train_loss']:.6f} task={row['train_task_loss']:.6f} "
+                f"val={row['validation']:.6f} best={best_metric:.6f} "
+                f"seconds={row['elapsed_wall_seconds']:.2f}",
+                flush=True,
+            )
+        if not history or best_epoch < 1:
+            raise RuntimeError("training completed without valid epoch/selection evidence")
+        atomic_write_json(output / "history.json", history)
+        selected = base.load_checkpoint_on_cpu(best_path)
+        validate_identity(selected, identity)
+        if selected["epoch"] != best_epoch or selected["validation"] != best_metric:
+            raise ValueError("best checkpoint selection disagrees with last.pt")
+        model.load_state_dict(selected["model_state"], strict=True)
+        del selected
+        final_validation = evaluate(model, inputs, args, device)
+        resources = monitor.finish(
+            peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+            peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+        )
+        finished = True
+        result = {
+            "schema_version": 1,
+            "status": "passed",
+            "research_suite": SUITE,
+            "dataset": args.dataset,
+            "condition": args.selection_mode,
+            "configuration": configuration(args),
+            "protocol": protocol,
+            "source_sha256": identity["source_sha256"],
+            "execution_source_sha256": execution_sources,
+            "source_transitions": source_transitions,
+            "resume_identity": identity,
+            "resume_identity_sha256": identity_hash,
+            "learning_budget": budget,
+            "initial_state_sha256": initial_hash,
+            "shared_initial_state_sha256": shared_hash,
+            "common_encoder_decoder_initial_state_sha256": shared_hash,
+            "epochs_run": len(history),
+            "optimizer_steps": steps,
+            "best_epoch": best_epoch,
+            "best_validation": best_metric,
+            "validation": final_validation["metric"],
+            "validation_loss": final_validation["loss"],
+            "checkpoint_sha256": base.sha256_file(best_path),
+            "last_checkpoint_sha256": base.sha256_file(last_path),
+            "history_sha256": base.sha256_file(output / "history.json"),
+            "resource_observability": resources,
+            "model_contract": model.contract(),
+            "topology": inputs.metadata(),
+            "test_evaluated": False,
+            "debug": False,
+            "subset": False,
+        }
+        atomic_write_json(output / "metrics.json", result)
+        return result
+    except BaseException as error:
+        if not finished:
+            try:
+                resources = monitor.finish(
+                    peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+                    peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+                )
+                finished = True
+                if output.is_dir():
+                    atomic_write_json(
+                        output / "failure-resources.json",
+                        {"error": f"{type(error).__name__}: {error}", "resources": resources},
+                    )
+            except BaseException as reporting_error:
+                error.add_note(f"failure telemetry also failed: {reporting_error}")
+        raise
+
+
+def load_calibration_payload(args):
+    payload, protocol = base.load_dataset(args.dataset, args.data_root, allow_download=False)
+    maximum = (
+        len(payload["splits"]["train"])
+        if args.dataset == "ppi"
+        else (int(payload["splits"]["train"].count_nonzero()) if args.sampling != "full" else 1)
+    )
+    axis = (
+        "graphs"
+        if args.dataset == "ppi"
+        else ("sampled_seed_nodes" if args.sampling != "full" else "full_graph")
+    )
+    identity = {
+        "dataset": args.dataset,
+        "data_sha256": protocol["data_sha256"],
+        "split_sha256": protocol["split_sha256"],
+        "protocol": protocol,
+        "corruption_ratio": args.corruption_ratio,
+        "corruption_seed": args.corruption_seed,
+    }
+    return {"payload": payload, "protocol": protocol}, identity, maximum, axis
+
+
+def run_calibration_candidate(
+    loaded,
+    args,
+    device,
+    *,
+    physical_batch_size,
+    workers,
+    warmup_steps=2,
+    measurement_steps=5,
+    minimum_measure_seconds=3.0,
+):
+    base._require_cuda(device)
+    if warmup_steps < 2 or measurement_steps < 5 or minimum_measure_seconds < 3:
+        raise ValueError(
+            "resource probes require complete-epoch windows meeting the calibration minima"
+        )
+    candidate = _candidate_args(args, physical_batch_size, workers)
+    validate_args(candidate)
+    model = optimizer = inputs = None
+    monitor = None
+    report = None
+    with _isolated_execution_state(device):
+        try:
+            gc.collect()
+            torch.cuda.empty_cache()
+            hardware = base.validate_hardware_runtime(candidate, device)
+            free_before, total = torch.cuda.mem_get_info(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            monitor = RuntimeResourceMonitor(device)
+            monitor.start()
+            base.configure_compute(candidate)
+            base._seed(candidate.model_seed)
+            started = time.perf_counter()
+            inputs = PreparedInputs(loaded["payload"], candidate)
+            model = make_model(loaded["payload"], candidate, device)
+            optimizer = make_optimizer(model, args.learning_rate)
+            initial_hash = base.state_sha256(model)
+            # Match the persistent full-validation cache used during production training.
+            if inputs.indices is not None:
+                next(inputs.validation_batches(device))
+            torch.cuda.synchronize(device)
+            setup_seconds = time.perf_counter() - started
+            stress = None
+            if inputs.indices is None:
+                stress_started = time.perf_counter()
+                stress_batch = inputs.stress_batch(device)
+                optimizer.zero_grad(set_to_none=True)
+                with autocast(candidate, device):
+                    stress_logits = model(stress_batch.graph)
+                    stress_loss, stress_task, _auxiliary, _count = loss_components(
+                        model, stress_batch, stress_logits, candidate
+                    )
+                stress_loss.backward()
+                validate_gradients(model)
+                norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), base.COMMON["gradient_clip_norm"], foreach=True
+                )
+                base.require_finite_gradient_norm_async(norm)
+                optimizer.step()
+                torch.cuda.synchronize(device)
+                stress = {
+                    "graphs": int(stress_batch.graph._v5_num_graphs),
+                    "nodes": stress_batch.graph.x.shape[0],
+                    "physical_edges": stress_batch.graph.incidence_edge_index.shape[1],
+                    "seconds": time.perf_counter() - stress_started,
+                    "optimizer_steps": 1,
+                    "scope": (
+                        "additional largest-graph joint-batch stress; outside throughput window"
+                    ),
+                }
+                model.clear_auxiliary_cache()
+                del stress_batch, stress_logits, stress_loss, stress_task, _auxiliary
+            warmup_epochs = warmup_updates = 0
+            while warmup_updates < warmup_steps:
+                warmup_epochs += 1
+                values = run_training_epoch(
+                    model, optimizer, inputs, candidate, device, warmup_epochs, validate=True
+                )
+                warmup_updates += values["optimizer_steps"]
+            timing = StageTimer(device)
+            torch.cuda.synchronize(device)
+            started = time.perf_counter()
+            measured_epochs = measured_steps = units = labels = 0
+            largest_nodes = largest_edges = largest_graphs = 0
+            elapsed = 0.0
+            while measured_steps < measurement_steps or elapsed < minimum_measure_seconds:
+                measured_epochs += 1
+                values = run_training_epoch(
+                    model,
+                    optimizer,
+                    inputs,
+                    candidate,
+                    device,
+                    warmup_epochs + measured_epochs,
+                    timing=timing,
+                )
+                measured_steps += values["optimizer_steps"]
+                units += values["processed_units"]
+                labels += values["train_labels"]
+                largest_nodes = max(largest_nodes, values["largest_measured_nodes"])
+                largest_edges = max(largest_edges, values["largest_measured_physical_edges"])
+                largest_graphs = max(largest_graphs, values["largest_measured_graph_batch"])
+                torch.cuda.synchronize(device)
+                elapsed = time.perf_counter() - started
+            started = time.perf_counter()
+            evaluate(model, inputs, candidate, device)
+            torch.cuda.synchronize(device)
+            validation_seconds = time.perf_counter() - started
+            free_after, _ = torch.cuda.mem_get_info(device)
+            report = {
+                "status": "passed",
+                "calibration_not_final": True,
+                "elapsed_seconds": elapsed,
+                "processed_units": units,
+                "samples_per_second": units / elapsed,
+                "unit": "graphs" if inputs.indices is None else "supervised_seed_nodes",
+                "optimizer_steps": measured_steps,
+                "complete_measurement_epochs": measured_epochs,
+                "complete_warmup_epochs": warmup_epochs,
+                "warmup_optimizer_steps": warmup_updates,
+                "warmup_steps_requested": warmup_steps,
+                "measurement_steps_requested": measurement_steps,
+                "minimum_measure_seconds_requested": minimum_measure_seconds,
+                "stage_seconds": timing.report(),
+                "large_graph_batch_stress": stress,
+                "setup_seconds": setup_seconds,
+                "topology_preparation_seconds": inputs.plan_preparation_seconds,
+                "validation_seconds": validation_seconds,
+                "validation_completed": True,
+                "auxiliary_path_measured": True,
+                "cycle_preparation_measured": candidate.selection_mode == "forest_cycle",
+                "batch_size": physical_batch_size,
+                "workers": workers,
+                "configuration": configuration(candidate),
+                "hardware": hardware,
+                "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+                "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+                "free_bytes_before": int(free_before),
+                "free_bytes_after": int(free_after),
+                "total_memory_bytes": int(total),
+                "optimizer_state_bytes": _optimizer_state_bytes(optimizer),
+                "model_parameter_count": sum(p.numel() for p in model.parameters()),
+                "initial_model_sha256": initial_hash,
+                "parameter_update_verified": initial_hash != base.state_sha256(model),
+                "supervised_labels": labels,
+                "largest_measured_nodes": largest_nodes,
+                "largest_measured_physical_edges": largest_edges,
+                "largest_measured_graph_batch": largest_graphs,
+                "gradient_accumulation_steps": 1,
+                "data_parallel_workers": 1,
+                "effective_batch_size": physical_batch_size,
+                "scope": (
+                    "disposable complete official training epochs + full validation + "
+                    "topology preparation; no test or checkpoints"
+                ),
+            }
+            if not report["parameter_update_verified"] or report["optimizer_state_bytes"] <= 0:
+                raise RuntimeError(
+                    "calibration failed to verify actual optimizer state and parameter update"
+                )
+        except BaseException as error:
+            if monitor is not None:
+                failed_monitor, monitor = monitor, None
+                try:
+                    error.calibration_resource_observability = failed_monitor.finish(
+                        peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+                        peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+                    )
+                except BaseException as report_error:
+                    error.add_note(f"probe telemetry failed: {report_error}")
+            raise
+        finally:
+            try:
+                if monitor is not None:
+                    resources = monitor.finish(
+                        peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+                        peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+                    )
+                    if report is not None:
+                        report["resource_observability"] = resources
+            finally:
+                model = optimizer = inputs = None
+                gc.collect()
+                torch.cuda.empty_cache()
+    return report
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    validate_args(args)
+    output, data_root = (
+        args.output_dir.expanduser().resolve(),
+        args.data_root.expanduser().resolve(),
+    )
+    if output.is_relative_to(data_root) or data_root.is_relative_to(output):
+        raise ValueError("selection output must not overlap the immutable official data cache")
+    if args.output_dir.is_symlink() or any(path.is_symlink() for path in args.output_dir.parents):
+        raise ValueError("selection output must not be indirect")
+    payload, protocol = base.load_dataset(args.dataset, data_root, allow_download=False)
+    train_model(payload, protocol, args, torch.device(args.device), output)
+    print(f"passed: {output}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# experiments/aggregation_comparison/integrity.py
+
+````python
+"""Read-only semantic validation of completed aggregation-comparison training evidence."""
+
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+
+
+def _positive_integer(value, label):
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _score(value, label):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= value <= 1
+    ):
+        raise ValueError(f"{label} must be a finite validation score in [0, 1]")
+    return value
+
+
+def _fingerprint(value, label):
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a SHA256 fingerprint")
+    return value
+
+
+def _budget(args, metrics):
+    from research.conductance_gat.v5.learning_budget import (
+        deterministic_batches_per_epoch,
+        plan_learning_budget,
+    )
+    from research.conductance_gat.v5.protocol import (
+        HARDWARE_PROFILES,
+        learning_budget_arguments_configuration,
+    )
+
+    topology = metrics.get("topology")
+    if not isinstance(topology, dict):
+        raise ValueError("completed evidence has no full-training topology/count metadata")
+    count = _positive_integer(topology.get("train_count"), "official training unit count")
+    selected = learning_budget_arguments_configuration(args)
+    reference = selected.get("budget_reference_batch_size")
+    if args.dataset != "ppi" and args.sampling == "full":
+        if reference not in {None, 1}:
+            raise ValueError("full-graph training cannot declare a replicated reference batch")
+        actual_batches = reference_batches = 1
+    else:
+        physical = args.batch_size if args.dataset == "ppi" else args.sample_seed_batch_size
+        field = "ppi_batch_size" if args.dataset == "ppi" else "sample_seed_batch_size"
+        reference = reference or HARDWARE_PROFILES[args.hardware_profile][field]
+        actual_batches = deterministic_batches_per_epoch(count, physical)
+        reference_batches = deterministic_batches_per_epoch(count, reference)
+    return plan_learning_budget(
+        args.epochs,
+        args.patience,
+        reference_batches,
+        actual_batches,
+        policy=selected.get("learning_budget_policy", "epochs"),
+    ), count
+
+
+def _history(metrics, identity, rows, args):
+    from research.conductance_gat.v5.learning_budget import should_stop_learning_budget
+
+    epochs = _positive_integer(metrics.get("epochs_run"), "completed epoch count")
+    if (
+        not isinstance(rows, list)
+        or len(rows) != epochs
+        or any(not isinstance(row, dict) for row in rows)
+    ):
+        raise ValueError("completed history must contain one record per completed epoch")
+    if [row.get("epoch") for row in rows] != list(range(1, epochs + 1)):
+        raise ValueError("completed history does not contain contiguous full epochs")
+    budget, count = _budget(args, metrics)
+    if metrics.get("learning_budget") != budget or identity.get("learning_budget") != budget:
+        raise ValueError(
+            "completed learning budget differs from the actual CLI and full-training count"
+        )
+    if epochs > budget["planned_epochs"]:
+        raise ValueError("completed epochs exceed the declared full learning budget")
+    for row in rows:
+        _positive_integer(row.get("epoch"), "history epoch")
+        _score(row.get("validation"), "history validation")
+        if (
+            row.get("train_batches") != budget["actual_batches_per_epoch"]
+            or row.get("optimizer_steps") != row["epoch"] * budget["actual_batches_per_epoch"]
+            or row.get("processed_units") != count
+        ):
+            raise ValueError("history does not prove complete supervised epoch/update coverage")
+        for key in ("train_batches", "optimizer_steps", "processed_units"):
+            _positive_integer(row[key], key)
+        if row.get("phase", {}).get("phase") != "joint":
+            raise ValueError("aggregation-comparison history contains a foreign training phase")
+    steps = _positive_integer(metrics.get("optimizer_steps"), "completed optimizer update count")
+    if steps != rows[-1]["optimizer_steps"]:
+        raise ValueError("completed optimizer update count disagrees with history")
+    best = _positive_integer(metrics.get("best_epoch"), "selected epoch")
+    score = _score(metrics.get("best_validation"), "selected validation score")
+    first_maximum = max(range(epochs), key=lambda index: rows[index]["validation"])
+    if best != first_maximum + 1 or score != rows[first_maximum]["validation"]:
+        raise ValueError("selected checkpoint is not the first strict maximum validation epoch")
+    _score(metrics.get("validation"), "selected-checkpoint validation recheck")
+    if epochs < budget["planned_epochs"] and not should_stop_learning_budget(
+        budget,
+        epochs_since_best=epochs - best,
+        optimizer_steps_since_best=steps - rows[best - 1]["optimizer_steps"],
+        eligible=True,
+    ):
+        raise ValueError("completed training stopped before its declared budget and patience")
+
+
+def _checkpoint(checkpoint, identity, *, role):
+    from . import engine as train
+
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"{role} checkpoint must be an object")
+    train.validate_identity(checkpoint, identity)
+    if not isinstance(checkpoint.get("model_state"), dict) or not checkpoint["model_state"]:
+        raise ValueError(f"{role} checkpoint has no model state")
+
+
+def inspect_completed(output):
+    """Validate metadata, budget, full epochs, and both CPU checkpoint interiors.
+
+    The larger last checkpoint is released before loading best.pt. No model is
+    instantiated, CUDA tensor allocated, dataset fetched, or artifact written.
+    """
+    from . import engine as train
+
+    output = Path(output)
+    paths = {name: output / name for name in ("metrics.json", "history.json", "last.pt", "best.pt")}
+    for path in paths.values():
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(
+                f"completed aggregation-comparison artifact is missing or indirect: {path}"
+            )
+    fingerprints = {name: train.base.sha256_file(path) for name, path in paths.items()}
+    metrics = json.loads(paths["metrics.json"].read_text(encoding="utf-8"))
+    if (
+        not isinstance(metrics, dict)
+        or metrics.get("status") != "passed"
+        or metrics.get("research_suite") != train.SUITE
+    ):
+        raise ValueError("not completed aggregation-comparison evidence")
+    identity = metrics.get("resume_identity")
+    if not isinstance(identity, dict) or metrics.get(
+        "resume_identity_sha256"
+    ) != train.base._canonical_sha256(identity):
+        raise ValueError("completed aggregation-comparison identity is corrupt")
+    for name, field in (
+        ("best.pt", "checkpoint_sha256"),
+        ("last.pt", "last_checkpoint_sha256"),
+        ("history.json", "history_sha256"),
+    ):
+        if fingerprints[name] != metrics.get(field):
+            raise ValueError(f"completed aggregation-comparison artifact mismatch: {name}")
+    for key in (
+        "research_suite",
+        "dataset",
+        "condition",
+        "configuration",
+        "source_sha256",
+        "initial_state_sha256",
+        "learning_budget",
+    ):
+        if metrics.get(key) != identity.get(key):
+            raise ValueError(f"completed metrics and immutable identity disagree on {key}")
+    if (
+        metrics.get("test_evaluated") is not False
+        or metrics.get("debug") is not False
+        or metrics.get("subset") is not False
+    ):
+        raise ValueError(
+            "completed comparison evidence is not full validation-only research training"
+        )
+    sources = identity.get("source_sha256")
+    if not isinstance(sources, dict) or not sources:
+        raise ValueError("completed identity has no source provenance")
+    for name, value in sources.items():
+        _fingerprint(value, f"source {name}")
+    protocol = metrics.get("protocol")
+    if (
+        not isinstance(protocol, dict)
+        or protocol != identity.get("dataset_protocol")
+        or train.base._canonical_sha256(protocol) != identity.get("dataset_protocol_sha256")
+    ):
+        raise ValueError("completed data/split protocol identity mismatch")
+    _fingerprint(protocol.get("data_sha256"), "official data cache")
+    if not isinstance(identity.get("input_provenance"), list) or not identity["input_provenance"]:
+        raise ValueError("completed identity has no topology/corruption provenance")
+    if metrics.get("topology", {}).get("provenance") != identity["input_provenance"]:
+        raise ValueError("completed topology/corruption provenance differs from training")
+    saved_args = identity.get("training_arguments")
+    if (
+        not isinstance(saved_args, dict)
+        or "data_root" not in saved_args
+        or "device" not in saved_args
+    ):
+        raise ValueError("completed identity has no restorable training arguments")
+    if "training_arguments" in metrics and metrics["training_arguments"] != saved_args:
+        raise ValueError("completed training arguments disagree with the immutable identity")
+    args = train.restore_arguments(metrics, output, saved_args["data_root"], saved_args["device"])
+    if args.dataset != metrics["dataset"] or args.selection_mode != metrics["condition"]:
+        raise ValueError("saved dataset/selection mode disagrees with the actual trained arguments")
+    initial = _fingerprint(metrics.get("initial_state_sha256"), "initial model")
+    if initial != identity.get("initial_state_sha256"):
+        raise ValueError("initial state differs from the immutable identity")
+    shared = _fingerprint(metrics.get("shared_initial_state_sha256"), "shared initial model")
+    if metrics.get("common_encoder_decoder_initial_state_sha256") != shared:
+        raise ValueError("common encoder/decoder initialization differs from shared initialization")
+    rows = json.loads(paths["history.json"].read_text(encoding="utf-8"))
+    _history(metrics, identity, rows, args)
+    last = train.base.load_checkpoint_on_cpu(paths["last.pt"])
+    _checkpoint(last, identity, role="last")
+    expected = {
+        "epoch": metrics["epochs_run"],
+        "optimizer_steps": metrics["optimizer_steps"],
+        "best_epoch": metrics["best_epoch"],
+        "best_validation": metrics["best_validation"],
+        "best_checkpoint_sha256": metrics["checkpoint_sha256"],
+        "shared_initial_state_sha256": shared,
+        "history": rows,
+    }
+    if any(last.get(key) != value for key, value in expected.items()):
+        raise ValueError(
+            "last checkpoint history/best/update metadata disagrees with completed metrics"
+        )
+    optimizer = last.get("optimizer_state")
+    if (
+        not isinstance(optimizer, dict)
+        or not isinstance(optimizer.get("state"), dict)
+        or not optimizer["state"]
+        or not isinstance(optimizer.get("param_groups"), list)
+        or not optimizer["param_groups"]
+    ):
+        raise ValueError("last checkpoint lacks actual optimizer state")
+    del optimizer, last
+    best = train.base.load_checkpoint_on_cpu(paths["best.pt"])
+    _checkpoint(best, identity, role="best")
+    if (
+        best.get("selection_role") != "primary"
+        or best.get("epoch") != metrics["best_epoch"]
+        or best.get("validation") != metrics["best_validation"]
+    ):
+        raise ValueError("best checkpoint selection metadata disagrees with completed metrics")
+    del best
+    if fingerprints != {name: train.base.sha256_file(path) for name, path in paths.items()}:
+        raise ValueError("completed evidence changed while being inspected")
+    return metrics
+````
+
+# experiments/aggregation_comparison/model.py
+
+````python
+"""Residual-free incidence models and a DUALFormer (ICLR 2025) comparator.
+
+DUALFormer preserves its published SA-residual/normalization mechanism. Those
+are intrinsic to that comparator; no extra wrapper residual or FFN is added.
+Its optional no-skip control is explicitly named, never called a reproduction.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
+
+from experiments.incidence_ablation.model import IncidenceClassifier
+from research.conductance_gat.v5.model import _static_graph_context
+
+ARMS = {
+    "incidence": ("baseline", False),
+    "incidence_pre_lift": ("pre_lift", False),
+    "incidence_energy": ("baseline", True),
+    "incidence_energy_pre_lift": ("pre_lift", True),
+    "dualformer": None,
+    "dualformer_no_skip_control": None,
+}
+
+
+def local_gram(history, edges, conductance, edge_chunk_size):
+    """N x heads x pairs, including diagonal local energies and cross terms.
+
+    Each undirected edge contributes half its weighted inner product to each
+    endpoint, so summing nodes gives tr(H_k.T L H_l), without degree scaling.
+    The identity assumes a common, frozen conductance and feature coordinates.
+    """
+    depth, nodes, heads, _ = history.shape
+    pairs = torch.triu_indices(depth, depth, device=history.device)
+    result = history.new_zeros(nodes, heads, pairs.shape[1])
+    chunk = max(1, (edge_chunk_size or max(edges.shape[1], 1)) // depth)
+
+    def compute(past, ends, weight):
+        delta = past[:, ends[1]] - past[:, ends[0]]
+        values = (delta[pairs[0]] * delta[pairs[1]]).sum(-1)
+        return values.permute(1, 2, 0) * weight[..., None] / 2
+
+    for start in range(0, edges.shape[1], chunk):
+        ends = edges[:, start : start + chunk]
+        weight = conductance[start : start + chunk]
+        values = (
+            checkpoint(compute, history, ends, weight, use_reentrant=False)
+            if torch.is_grad_enabled()
+            else compute(history, ends, weight)
+        )
+        result = result.index_add(0, ends[0], values).index_add(0, ends[1], values)
+    return result
+
+
+class DualAttention(nn.Module):
+    """Official feature-space SA: Q softmax(K.T V / sqrt(N)), mean heads.
+
+    Reference: JiamingZhuo/DUALFormer, commit 68fbdaf, model/sa.py.
+    Heads each have hidden_channels features, as in the original code.
+    """
+
+    def __init__(self, width, heads, chunk_size=None):
+        super().__init__()
+        self.width, self.heads = width, heads
+        self.chunk_size = chunk_size
+        self.query = nn.Linear(width, width * heads)
+        self.key = nn.Linear(width, width * heads)
+        self.value = nn.Linear(width, width * heads)
+
+    def forward(self, x, batch, graphs):
+        if self.chunk_size is not None:
+            return self.streamed(x, batch, graphs)
+        q = self.query(x).reshape(-1, self.width, self.heads)
+        k = self.key(x).reshape_as(q)
+        v = self.value(x).reshape_as(q)
+        # Each graph is independent. Vectorized disjoint batching, no mixing
+        # across the PPI tissues in a physical minibatch.
+        counts = torch.bincount(batch, minlength=graphs)
+        if graphs == 1:
+            attention = torch.einsum("nmh,ndh->mdh", k / math.sqrt(x.shape[0]), v)
+            return torch.einsum("nmh,mdh->ndh", q, attention.softmax(0)).mean(-1)
+        membership = F.one_hot(batch, graphs).to(k.dtype)
+        attention = torch.einsum("ng,nmh,ndh->gmdh", membership, k, v)
+        attention = attention / counts.to(k.dtype).sqrt()[:, None, None, None]
+        queries = torch.einsum("ng,nmh->gnmh", membership, q)
+        return torch.einsum("gnmh,gmdh->ndh", queries, attention.softmax(1)).mean(-1)
+
+    def streamed(self, x, batch, graphs):
+        """Exact two-pass global attention; chunking does not sample nodes."""
+        counts = torch.bincount(batch, minlength=graphs).to(x.dtype)
+        metric = x.new_zeros(graphs, self.width, self.width, self.heads)
+
+        def accumulate(features, groups):
+            k = self.key(features).reshape(-1, self.width, self.heads)
+            v = self.value(features).reshape_as(k)
+            membership = F.one_hot(groups, graphs).to(k.dtype)
+            return torch.einsum("gnmh,ndh->gmdh", membership.T[..., None, None] * k[None], v)
+
+        def apply(features, groups, attention):
+            q = self.query(features).reshape(-1, self.width, self.heads)
+            membership = F.one_hot(groups, graphs).to(q.dtype)
+            queries = torch.einsum("ng,nmh->gnmh", membership, q)
+            return torch.einsum("gnmh,gmdh->ndh", queries, attention).mean(-1)
+
+        for start in range(0, x.shape[0], self.chunk_size):
+            features, groups = (
+                x[start : start + self.chunk_size],
+                batch[start : start + self.chunk_size],
+            )
+            term = (
+                checkpoint(accumulate, features, groups, use_reentrant=False)
+                if torch.is_grad_enabled()
+                else accumulate(features, groups)
+            )
+            metric = metric + term
+        attention = (metric / counts.sqrt()[:, None, None, None]).softmax(1)
+        outputs = []
+        for start in range(0, x.shape[0], self.chunk_size):
+            features, groups = (
+                x[start : start + self.chunk_size],
+                batch[start : start + self.chunk_size],
+            )
+            outputs.append(
+                checkpoint(apply, features, groups, attention, use_reentrant=False)
+                if torch.is_grad_enabled()
+                else apply(features, groups, attention)
+            )
+        return torch.cat(outputs)
+
+
+def graph_normalization(x, edges):
+    """Static symmetric normalization, shared by every propagation layer."""
+    degree = torch.ones(x.shape[0], device=x.device, dtype=torch.float32)
+    ones = degree.new_ones(edges.shape[1])
+    degree.index_add_(0, edges[0], ones)
+    degree.index_add_(0, edges[1], ones)
+    inverse = degree.rsqrt()
+    return degree, inverse[edges[0]] * inverse[edges[1]]
+
+
+def normalized_graph_step(x, edges, chunk, normalization=None):
+    """Symmetric GCN normalization with unit self loops, all physical edges."""
+    degree, weights = graph_normalization(x, edges) if normalization is None else normalization
+    out = x / degree[:, None]
+    for start in range(0, edges.shape[1], chunk or max(edges.shape[1], 1)):
+        ends = edges[:, start : start + (chunk or edges.shape[1])]
+        weight = weights[start : start + ends.shape[1]]
+        out = out.index_add(0, ends[0], x[ends[1]] * weight[:, None])
+        out = out.index_add(0, ends[1], x[ends[0]] * weight[:, None])
+    return out
+
+
+class AggregationClassifier(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        classes,
+        *,
+        arm,
+        selection_config,
+        hidden_channels,
+        layers,
+        heads,
+        dropout=0.2,
+        activation_checkpoint=True,
+        edge_chunk_size=None,
+        dual_sa_layers=1,
+        dual_alpha=0.1,
+        **architecture,
+    ):
+        super().__init__()
+        if arm not in ARMS:
+            raise ValueError(f"unknown comparison model: {arm}")
+        if selection_config.get("condition") != "full":
+            raise ValueError("comparison requires full original edge support")
+        if layers < 1 or dual_sa_layers < 1 or not 0 <= dual_alpha <= 1:
+            raise ValueError("invalid depth or DUALFormer residual coefficient")
+        self.arm, self.width, self.heads = arm, hidden_channels, heads
+        self.depth, self.dropout = layers, dropout
+        self.activation_checkpoint = activation_checkpoint
+        self.edge_chunk_size = edge_chunk_size
+        # Instantiate the common endpoints before any family-specific RNG use.
+        self.encoder = nn.Linear(in_channels, hidden_channels)
+        self.decoder = nn.Linear(hidden_channels, classes)
+        self.layers = nn.ModuleList()
+        self.energy_readouts = nn.ParameterList()
+        self.dual_alpha = dual_alpha
+        if arm.startswith("dualformer"):
+            self.layers.extend(
+                DualAttention(hidden_channels, heads, edge_chunk_size)
+                for _ in range(dual_sa_layers)
+            )
+            self.norms = nn.ModuleList(
+                nn.LayerNorm(hidden_channels) for _ in range(dual_sa_layers + 1)
+            )
+        else:
+            old_arm, energy = ARMS[arm]
+            original = IncidenceClassifier(
+                in_channels,
+                classes,
+                arm=old_arm,
+                selection_config=selection_config,
+                hidden_channels=hidden_channels,
+                layers=layers,
+                heads=heads,
+                dropout=dropout,
+                activation_checkpoint=activation_checkpoint,
+                edge_chunk_size=edge_chunk_size,
+                **architecture,
+            )
+            # Only retain the actual operator modules. The old encoder, norms,
+            # SwiGLU FFNs and both external residual paths are absent.
+            self.layers.extend(original.operators)
+            if energy:
+                for operator in self.layers:
+                    # Full-support selector is identically one, hence r is C.
+                    # Keep its live tensor for the energy path, not the detached
+                    # diagnostics copy. Return None to preserve estimator output.
+                    operator.estimator.register_forward_hook(
+                        lambda module, inputs, output, op=operator: setattr(
+                            op, "live_comparison_c", output
+                        )
+                    )
+                for depth in range(1, layers + 1):
+                    self.energy_readouts.append(
+                        nn.Parameter(
+                            torch.zeros(heads, depth * (depth + 1) // 2, hidden_channels // heads)
+                        )
+                    )
+
+    def contract(self):
+        dual = self.arm.startswith("dualformer")
+        return {
+            "model": self.arm,
+            "external_residual": False,
+            "external_ffn": False,
+            "common_encoder": "linear",
+            "common_decoder": "linear",
+            "hidden_channels": self.width,
+            "heads": self.heads,
+            "graph_propagation_layers": self.depth,
+            "dual_sa_layers": len(self.layers) if dual else 0,
+            "intrinsic_dual_residual": self.arm == "dualformer",
+            "intrinsic_dual_layernorm": dual,
+            "dual_alpha": self.dual_alpha if dual else None,
+            "activation": "ReLU",
+            "dropout": self.dropout,
+            "parameter_matched": False,
+            "total_parameters": sum(p.numel() for p in self.parameters()),
+            "energy": "diagonal and cross-depth local Gram channels"
+            if len(self.energy_readouts)
+            else None,
+            "depth_states_are_distance_shells": False,
+            "dual_upstream_commit": "68fbdaf007af2f7d409cd435c4c48dd0e3155510" if dual else None,
+            "comparison_scope": "common training protocol, not published tuned score reproduction",
+        }
+
+    def clear_auxiliary_cache(self):
+        # Shared trainer interface; this suite has no auxiliary objectives.
+        for layer in self.layers:
+            if hasattr(layer, "live_comparison_c"):
+                layer.live_comparison_c = None
+
+    def auxiliary_loss(self, targets=None):
+        if targets is not None:
+            raise ValueError("comparison has no corruption objective")
+        zero = self.decoder.weight.new_zeros(())
+        return {"l0": zero, "negative": zero}
+
+    def forward(self, graph):
+        x, edges = graph.x, graph.incidence_edge_index
+        batch = getattr(graph, "batch", None)
+        if batch is None:
+            batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            graphs = 1
+        else:
+            graphs = graph._v5_num_graphs
+        h = self.encoder(x)
+        if self.arm.startswith("dualformer"):
+            h = F.dropout(F.relu(self.norms[0](h)), self.dropout, self.training)
+            for index, layer in enumerate(self.layers):
+
+                def step(value, layer=layer, norm=self.norms[index + 1]):
+                    result = layer(value, batch, graphs)
+                    if self.arm == "dualformer":
+                        result = self.dual_alpha * result + (1 - self.dual_alpha) * value
+                    return F.dropout(F.relu(norm(result)), self.dropout, self.training)
+
+                h = (
+                    checkpoint(step, h, use_reentrant=False)
+                    if self.activation_checkpoint and torch.is_grad_enabled()
+                    else step(h)
+                )
+            cached = getattr(graph, "_comparison_sgc_normalization", None)
+            signature = (edges._version, h.shape[0], h.device)
+            if cached is None or cached[0] is not edges or cached[1] != signature:
+                cached = (edges, signature, graph_normalization(h, edges))
+                graph._comparison_sgc_normalization = cached
+            normalization = cached[2]
+            for _ in range(self.depth):
+                h = normalized_graph_step(h, edges, self.edge_chunk_size, normalization)
+            return self.decoder(F.dropout(h, self.dropout, self.training))
+        kwargs = {
+            name: getattr(graph, name, None)
+            for name in (
+                "full_degree",
+                "graph_structure",
+                "edge_normalization_weight",
+                "sampling_correction",
+                "edge_relation_id",
+            )
+        }
+        kwargs["edge_selection_topology"] = graph.edge_selection_topology
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            kwargs["static_context"] = _static_graph_context(
+                x.float(), edges, batch, graphs, kwargs["full_degree"], kwargs["graph_structure"]
+            )
+        history = [h]
+        for index, operator in enumerate(self.layers):
+
+            def step(*past, operator=operator, index=index):
+                current = past[-1]
+                value = operator(current, edges, batch, graphs, **kwargs)
+                if len(self.energy_readouts):
+                    projected = torch.einsum(
+                        "knd,hdw->knhw", torch.stack(past), operator.value_weight
+                    )
+                    # Reuse the live metric so gradients reach conductance;
+                    # last_effective_c is deliberately detached in the legacy op.
+                    metric = operator.live_comparison_c
+                    correction = kwargs["sampling_correction"]
+                    if correction is not None:
+                        metric = metric * correction.reshape(-1, 1)
+                    statistics = local_gram(
+                        projected.float(), edges, metric.float(), self.edge_chunk_size
+                    )
+                    extra = torch.einsum(
+                        "nhp,hpd->nhd", statistics, self.energy_readouts[index].float()
+                    )
+                    value = value + F.linear(
+                        extra.to(value.dtype).flatten(1), operator.output_projection.weight
+                    )
+                return F.dropout(F.relu(value), self.dropout, self.training)
+
+            h = (
+                checkpoint(step, *history, use_reentrant=False)
+                if self.activation_checkpoint and torch.is_grad_enabled()
+                else step(*history)
+            )
+            history.append(h)
+        return self.decoder(h)
+````
+
+# experiments/aggregation_comparison/provenance.py
+
+````python
+"""Independent immutable sources; historical manifests never include this package."""
+
+import hashlib
+from pathlib import Path
+
+from scripts.training_resource_plan import source_snapshot as core_snapshot
+
+
+def source_snapshot():
+    root = Path(__file__).resolve().parents[2]
+    sources = core_snapshot()
+    for path in sorted(Path(__file__).parent.glob("*.py")):
+        sources[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in sorted((root / "experiments" / "incidence_ablation").glob("*.py")):
+        sources[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return sources
+
+
+def require_source_compatibility(saved, current, *, scope):
+    if not isinstance(saved, dict) or not saved or saved != current:
+        raise ValueError(
+            f"independent comparison {scope} source mismatch; retain results and use a new run ID"
+        )
+    return None
+````
+
+# experiments/aggregation_comparison/reallocation.py
+
+````python
+"""Preserve resource selection while stress-checking an equivalent GPU allocation.
+
+Fresh disposable probes cover the original selected candidate's measured worst
+cases. They do not select a new optimum or change the final training recipe.
+"""
+
+from __future__ import annotations
+
+import copy
+import datetime as dt
+import math
+
+from experiments.aggregation_comparison import calibration
+from scripts import training_resource_plan as resources
+
+ALLOCATION_FIELDS = frozenset({"device", "uuid", "uuid_unavailable_reason", "cuda_visible_devices"})
+SCOPE = "same-class allocation stress revalidation, not new optimum/all-arm fresh measurement"
+CAPACITY_SCOPE = "same-class changed-capacity all-arm revalidation at unchanged resources"
+
+
+def _scope(original, actual):
+    return (
+        CAPACITY_SCOPE if original["total_memory_bytes"] != actual["total_memory_bytes"] else SCOPE
+    )
+
+
+def require_equivalent_allocation(original, runtime, actual, actual_runtime):
+    """Same model/runtime; changed capacity requires fresh all-arm fit evidence."""
+    required = {"name", "total_memory_bytes", "compute_capability", "allocated_cpu_count"}
+    if not isinstance(original, dict) or not required <= original.keys():
+        raise ValueError("original resource hardware fingerprint is incomplete; preserved")
+    if not isinstance(actual, dict) or not required <= actual.keys():
+        raise ValueError("current resource hardware fingerprint is incomplete")
+    if not isinstance(runtime, dict) or not {"python", "torch", "cuda"} <= runtime.keys():
+        raise ValueError("original resource runtime fingerprint is incomplete; preserved")
+    if not isinstance(actual_runtime, dict):
+        raise ValueError("current resource runtime fingerprint is incomplete")
+    for hardware in (original, actual):
+        capacity = hardware["total_memory_bytes"]
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("hardware.total_memory_bytes must be a positive integer")
+    differences = []
+    for prefix, before, after, ignored in (
+        ("hardware", original, actual, ALLOCATION_FIELDS | {"total_memory_bytes"}),
+        ("runtime", runtime, actual_runtime, frozenset()),
+    ):
+        for field in sorted((before.keys() | after.keys()) - ignored):
+            if field not in before or field not in after or before[field] != after[field]:
+                differences.append(
+                    f"{prefix}.{field}: {before.get(field)!r} -> {after.get(field)!r}"
+                )
+    if differences:
+        raise ValueError(
+            "aggregation-comparison allocation is not equivalent: "
+            + "; ".join(differences)
+            + ". Only GPU allocation identifiers and revalidated capacity may change. "
+            "Restore the original GPU class, "
+            "runtime and allocated CPU count, or use a separate explicitly calibrated run; "
+            "the existing recipe/results remain preserved."
+        )
+
+
+def _original_digest(manifest):
+    return resources.digest(
+        {key: manifest[key] for key in ("hardware", "runtime", "calibration_entries")}
+    )
+
+
+def _attempt_digest(attempt):
+    return resources.digest(
+        {key: value for key, value in attempt.items() if key != "evidence_sha256"}
+    )
+
+
+def needs_revalidation(manifest, hardware, runtime, required_groups):
+    """Validate the accepted evidence and decide whether pending work is covered."""
+    require_equivalent_allocation(manifest["hardware"], manifest.get("runtime"), hardware, runtime)
+    current = manifest.get("current_allocation")
+    if current is None:
+        if any(item.get("status") == "passed" for item in manifest.get("allocation_history", [])):
+            raise ValueError("passed allocation history has no committed current allocation")
+        changed = hardware != manifest["hardware"] or runtime != manifest["runtime"]
+    else:
+        history = manifest.get("allocation_history", [])
+        index = current.get("history_index")
+        if type(index) is not int or not 0 <= index < len(history):
+            raise ValueError("current allocation has no retained revalidation evidence")
+        accepted = history[index]
+        passed = [i for i, item in enumerate(history) if item.get("status") == "passed"]
+        if (
+            not passed
+            or index != passed[-1]
+            or accepted.get("scope") != _scope(manifest["hardware"], accepted["hardware"])
+            or accepted.get("evidence_sha256") != _attempt_digest(accepted)
+            or current.get("evidence_sha256") != accepted["evidence_sha256"]
+            or accepted.get("original_calibration_sha256") != _original_digest(manifest)
+        ):
+            raise ValueError("accepted allocation evidence or original calibration changed")
+        require_equivalent_allocation(
+            manifest["hardware"], manifest["runtime"], accepted["hardware"], accepted["runtime"]
+        )
+        covered = {(group["profile"], group["dataset"]) for group in accepted["groups"]}
+        changed = (
+            hardware != accepted["hardware"]
+            or runtime != accepted["runtime"]
+            or not set(required_groups) <= covered
+        )
+    if changed and required_groups:
+        if (
+            manifest.get("calibration_status") != "passed"
+            or manifest.get("resources_applied") is not True
+            or not manifest.get("calibration_entries")
+            or any(entry.get("status") != "passed" for entry in manifest["calibration_entries"])
+        ):
+            raise ValueError(
+                "GPU allocation changed before the original common calibration completed; "
+                "partial measurements cannot be mixed across allocations. Restore the original "
+                "allocation or use a separate run; original evidence is preserved."
+            )
+        return True
+    return False
+
+
+def _representatives(entry, jobs, *, all_arms=False):
+    """Stable union of peak-reserve, peak-allocation and total-budget-cost maxima."""
+    selected = entry["selected_candidate"]
+    candidate_index = next(
+        index
+        for index, candidate in enumerate(entry["candidates"])
+        if {key: candidate[key] for key in selected} == selected
+    )
+    reports = entry["candidates"][candidate_index]["measurements"]
+    lookup = {(job["variant_id"], job["model_seed"]): job for job in jobs}
+    ordered = sorted(
+        range(len(reports)),
+        key=lambda index: lookup[(reports[index]["condition"], reports[index]["model_seed"])][
+            "job_id"
+        ],
+    )
+    criteria = {}
+    for name, score in (
+        ("maximum_peak_reserved_bytes", lambda report: report["peak_reserved_bytes"]),
+        ("maximum_peak_allocated_bytes", lambda report: report["peak_allocated_bytes"]),
+        (
+            "maximum_projected_full_budget_seconds",
+            lambda report: calibration._full_budget_seconds(report, entry["selection_policy"]),
+        ),
+    ):
+        index = max(ordered, key=lambda value: score(reports[value]))
+        criteria.setdefault(index, []).append(name)
+    if all_arms:
+        if {(report["condition"], report["model_seed"]) for report in reports} != set(lookup):
+            raise ValueError("changed-capacity revalidation requires every arm and seed")
+        for index in ordered:
+            criteria.setdefault(index, []).append("changed_capacity_all_arms")
+    return [
+        {
+            "job_id": lookup[(reports[index]["condition"], reports[index]["model_seed"])]["job_id"],
+            "condition": reports[index]["condition"],
+            "model_seed": reports[index]["model_seed"],
+            "original_candidate_index": candidate_index,
+            "original_measurement_index": index,
+            "original_measurement_sha256": resources.digest(reports[index]),
+            "selection_criteria": criteria[index],
+        }
+        for index in ordered
+        if index in criteria
+    ]
+
+
+def _validate_measurement(report, job, child, entry, original, hardware):
+    from experiments.aggregation_comparison import engine as train
+
+    if calibration._full_budget_seconds(report, entry["selection_policy"]) is None:
+        raise RuntimeError(
+            f"reallocated GPU cannot safely execute unchanged resources for {job['job_id']}; "
+            "no batch, worker, model or data downscale was applied"
+        )
+    selected = entry["selected_candidate"]
+    expected = calibration._probe_args(
+        child, entry["batch_axis"], selected["batch_size"], selected["workers"]
+    )
+    required = {
+        "condition": job["variant_id"],
+        "model_seed": job["model_seed"],
+        "configuration": train.configuration(expected),
+        "batch_size": selected["batch_size"],
+        "workers": selected["workers"],
+        "total_memory_bytes": hardware["total_memory_bytes"],
+        "parameter_update_verified": True,
+        "calibration_not_final": True,
+        "gradient_accumulation_steps": 1,
+        "data_parallel_workers": 1,
+        "effective_batch_size": selected["batch_size"],
+        "validation_completed": True,
+        "required_auxiliary_path": child.negative_loss_weight > 0,
+        "required_cycle_preparation": child.selection_mode == "forest_cycle",
+        "auxiliary_path_measured": True,
+        "cycle_preparation_measured": child.selection_mode == "forest_cycle",
+        "model_parameter_count": original["model_parameter_count"],
+        "initial_model_sha256": original["initial_model_sha256"],
+    }
+    for key, value in required.items():
+        actual = report.get(key)
+        if actual != value or (isinstance(value, bool) and actual is not value):
+            raise ValueError(f"allocation measurement differs from unchanged recipe: {key}")
+    for key, minimum in (
+        ("complete_measurement_epochs", 1),
+        ("complete_warmup_epochs", 1),
+        ("warmup_optimizer_steps", 2),
+        ("measurement_steps_requested", 5),
+        ("warmup_steps_requested", 2),
+        ("minimum_measure_seconds_requested", 3.0),
+    ):
+        value = report.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < minimum
+            or (key != "minimum_measure_seconds_requested" and type(value) is not int)
+        ):
+            raise ValueError(f"allocation measurement lacks complete full-sized probe scope: {key}")
+    measured_hardware = report.get("hardware", {})
+    for report_key, actual_key in (
+        ("device_name", "name"),
+        ("total_memory_bytes", "total_memory_bytes"),
+        ("compute_capability", "compute_capability"),
+    ):
+        if measured_hardware.get(report_key) != hardware[actual_key]:
+            raise ValueError(f"allocation measurement hardware mismatch: {report_key}")
+
+
+def revalidate_allocation(manifest, hardware, runtime, grouped_jobs, persist):
+    """Append an attempt and atomically accept it only after all probes pass."""
+    from experiments.aggregation_comparison import engine as train
+
+    if not grouped_jobs:
+        raise ValueError(
+            "allocation revalidation requires pending groups with real workload probes"
+        )
+    require_equivalent_allocation(manifest["hardware"], manifest["runtime"], hardware, runtime)
+    scope = _scope(manifest["hardware"], hardware)
+    entries = {
+        (entry["profile"], entry["dataset"]): entry for entry in manifest["calibration_entries"]
+    }
+    groups = []
+    for key, jobs in grouped_jobs.items():
+        entry = entries[key]
+        calibration.validate_entry(entry, jobs)
+        groups.append(
+            {
+                "profile": key[0],
+                "dataset": key[1],
+                "selected_candidate": copy.deepcopy(entry["selected_candidate"]),
+                "selected": copy.deepcopy(entry["selected"]),
+                "representatives": _representatives(entry, jobs, all_arms=scope == CAPACITY_SCOPE),
+                "measurements": [],
+            }
+        )
+    attempt = {
+        "schema_version": 1,
+        "status": "running",
+        "scope": scope,
+        "hardware": copy.deepcopy(hardware),
+        "runtime": copy.deepcopy(runtime),
+        "original_calibration_sha256": _original_digest(manifest),
+        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "representative_tie_break": "lexicographically first job_id",
+        "inherited_evidence": "original complete all-arm calibration at unchanged resources",
+        "groups": groups,
+    }
+    history = manifest.setdefault("allocation_history", [])
+    history.append(attempt)
+    persist()
+    try:
+        for group in groups:
+            key = group["profile"], group["dataset"]
+            entry, jobs = entries[key], grouped_jobs[key]
+            lookup = {job["job_id"]: job for job in jobs}
+            loaded, identity, maximum, axis = train.load_calibration_payload(
+                calibration.parse_job(jobs[0])
+            )
+            if (identity, maximum, axis) != (
+                entry["input_identity"],
+                entry["natural_training_split_size"],
+                entry["batch_axis"],
+            ):
+                raise ValueError("allocation revalidation data/split/topology identity changed")
+            for reference in group["representatives"]:
+                job = lookup[reference["job_id"]]
+                child = calibration.parse_job(job)
+                selected = entry["selected_candidate"]
+                print(
+                    f"[edge allocation revalidation] {job['job_id']} "
+                    f"physical={selected['batch_size']} workers={selected['workers']}; "
+                    f"disposable probe, unchanged recipe; {scope}",
+                    flush=True,
+                )
+                report = calibration._measure(
+                    job, loaded, child, selected["batch_size"], selected["workers"]
+                )
+                group["measurements"].append({"job_id": job["job_id"], "report": report})
+                persist()
+                original = entry["candidates"][reference["original_candidate_index"]][
+                    "measurements"
+                ][reference["original_measurement_index"]]
+                _validate_measurement(report, job, child, entry, original, hardware)
+            del loaded
+        attempt.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+        attempt["evidence_sha256"] = _attempt_digest(attempt)
+        manifest["current_allocation"] = {
+            "history_index": len(history) - 1,
+            "evidence_sha256": attempt["evidence_sha256"],
+        }
+        persist()
+    except (Exception, KeyboardInterrupt) as error:
+        attempt.update(
+            status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+            error=f"{type(error).__name__}: {error}",
+            finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+        )
+        # Publication failure must not leave an in-memory accepted failed attempt.
+        if manifest.get("current_allocation", {}).get("history_index") == len(history) - 1:
+            previous = [
+                index for index, item in enumerate(history[:-1]) if item.get("status") == "passed"
+            ]
+            if previous:
+                manifest["current_allocation"] = {
+                    "history_index": previous[-1],
+                    "evidence_sha256": history[previous[-1]]["evidence_sha256"],
+                }
+            else:
+                manifest.pop("current_allocation", None)
+        try:
+            persist()
+        except (Exception, KeyboardInterrupt) as reporting_error:
+            error.add_note(f"allocation failure evidence could not be persisted: {reporting_error}")
+        raise
+````
+
+# experiments/aggregation_comparison/runner.py
+
+````python
+#!/usr/bin/env python3
+"""Independent full-size comparison of incidence operators and DUALFormer.
+
+All arms share a measured physical batch/worker plan; previous V5 runs are untouched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import json
+import math
+import platform
+import shlex
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_bytes, atomic_write_json  # noqa: E402
+from experiments.aggregation_comparison import calibration, provenance, reallocation  # noqa: E402
+from experiments.aggregation_comparison.model import ARMS  # noqa: E402
+from experiments.aggregation_comparison.provenance import (  # noqa: E402
+    require_source_compatibility,
+)
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    DATASETS,
+    HARDWARE_PROFILES,
+    SAMPLING_CHOICES,
+    add_sampling_context_arguments,
+    sampling_context_configuration,
+)
+from scripts import calibrate_training_resources as hardware_tools  # noqa: E402
+from scripts import run_conductance_v5 as standalone  # noqa: E402
+from scripts import run_v5_mechanism_experiments as common  # noqa: E402
+from scripts import training_resource_plan as resources  # noqa: E402
+from scripts.calibration_lock import calibration_lock  # noqa: E402
+
+SUITE = "aggregation_comparison_controller_v1"
+TRAIN_MODULE = "experiments.aggregation_comparison.engine"
+
+
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--run-id", required=True)
+    result.add_argument("--learning-rate", type=float, default=0.0005)
+    result.add_argument("--arms", nargs="+", choices=tuple(ARMS), default=list(ARMS))
+    result.add_argument("--datasets", nargs="+", choices=DATASETS, required=True)
+    result.add_argument("--profiles", nargs="+", choices=("reference", "large"), required=True)
+    result.add_argument("--model-seeds", nargs="+", type=int, default=[0])
+    result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    result.add_argument("--results-root", type=Path, default=ROOT / "results")
+    result.add_argument("--device", default="cuda:0")
+    result.add_argument(
+        "--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="a6000-48gb"
+    )
+    result.add_argument("--epochs", type=int, default=200)
+    result.add_argument("--patience", type=int, default=50)
+    result.add_argument("--workers", type=int, default=4)
+    result.add_argument("--ppi-batch-size", type=int)
+    result.add_argument("--sample-seed-batch-size", type=int)
+    result.add_argument("--edge-chunk-size", type=int)
+    result.add_argument(
+        "--activation-checkpoint", action=argparse.BooleanOptionalAction, default=True
+    )
+    result.add_argument("--sampling", choices=SAMPLING_CHOICES, default="full")
+    result.add_argument("--num-neighbors", nargs="+", type=int, default=[15, 10])
+    add_sampling_context_arguments(result)
+    result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument("--repeat-evaluations", type=int, default=5)
+    result.add_argument("--dry-run", action="store_true")
+    result.add_argument("--calibration-only", action="store_true")
+    return result
+
+
+def validate_args(args):
+    if not standalone.RUN_ID_PATTERN.fullmatch(args.run_id):
+        raise ValueError("run-id must be a safe 1-120 character identifier")
+    for name in ("arms", "datasets", "profiles", "model_seeds"):
+        values = getattr(args, name)
+        if not values or len(set(values)) != len(values):
+            raise ValueError(f"{name} must be nonempty and unique")
+    if args.epochs < 4 or args.patience < 1 or args.workers < 0 or args.repeat_evaluations < 5:
+        raise ValueError("invalid full training/worker/audit budget")
+    if any(seed < 0 for seed in args.model_seeds):
+        raise ValueError("model seeds must be nonnegative")
+    if args.sampling != "full":
+        raise ValueError("comparison requires full graph support for global attention")
+    if not str(args.device).startswith("cuda"):
+        raise ValueError("production training requires CUDA; no CPU fallback")
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        raise ValueError("learning-rate must be finite and positive")
+    sampling_context_configuration(args)
+
+
+def variants(args):
+    return [
+        {
+            "variant_id": arm,
+            "suite": "aggregation_comparison",
+            "configuration": {
+                "ablation_arm": arm,
+                "learning_rate": args.learning_rate,
+                "selection_mode": "full",
+                "l0_weight": 0.0,
+                "negative_loss_weight": 0.0,
+                "corruption_ratio": 0.0,
+            },
+        }
+        for arm in args.arms
+    ]
+
+
+def make_jobs(args, run_dir):
+    result = []
+    for profile in args.profiles:
+        for seed in args.model_seeds:
+            for variant in variants(args):
+                options = [
+                    "--profile",
+                    profile,
+                    "--datasets",
+                    *args.datasets,
+                    "--model-seed",
+                    str(seed),
+                    "--conductance-heads",
+                    "per_head",
+                    "--propagation-normalization",
+                    "row",
+                    "--conductance-backend",
+                    "optimization",
+                    "--solver-cost-scaling",
+                    "width_scaled",
+                    "--training-schedule",
+                    "joint",
+                    "--beta-initial",
+                    "0.5",
+                    "--learning-budget-policy",
+                    "reference_updates",
+                ]
+                for name in (
+                    "data_root",
+                    "results_root",
+                    "device",
+                    "hardware_profile",
+                    "epochs",
+                    "patience",
+                    "workers",
+                    "ppi_batch_size",
+                    "sample_seed_batch_size",
+                    "edge_chunk_size",
+                    "sampling",
+                    "sample_context_seed_batch_size",
+                    "sample_context_workers",
+                    "min_free_gb",
+                ):
+                    value = getattr(args, name)
+                    if value is not None:
+                        options += ["--" + name.replace("_", "-"), str(value)]
+                options += ["--num-neighbors", *(str(value) for value in args.num_neighbors)]
+                options.append(
+                    "--activation-checkpoint"
+                    if args.activation_checkpoint
+                    else "--no-activation-checkpoint"
+                )
+                baseline = standalone.parser().parse_args(options)
+                standalone._validate(baseline)
+                namespace = (
+                    run_dir / "variants" / variant["variant_id"] / profile / f"model-seed-{seed}"
+                )
+                for job in standalone.make_jobs(
+                    baseline, namespace, standalone._architecture(baseline)
+                ):
+                    if job["condition"] != "shared_dynamic_c":
+                        continue
+                    command = job["command"]
+                    command[command.index("-m") + 1] = TRAIN_MODULE
+                    for name, value in variant["configuration"].items():
+                        if value is not None:
+                            command += ["--" + name.replace("_", "-"), str(value)]
+                    job.update(
+                        variant=copy.deepcopy(variant),
+                        variant_id=variant["variant_id"],
+                        track="conductance",
+                        profile=profile,
+                        model_seed=seed,
+                        job_id=f"{profile}/{job['dataset']}/model-seed-{seed}/{variant['variant_id']}",
+                    )
+                    result.append(job)
+    return result
+
+
+def _config(args):
+    return {
+        name: str(value.expanduser().resolve()) if isinstance(value, Path) else value
+        for name, value in vars(args).items()
+        if name
+        not in {
+            "dry_run",
+            "calibration_only",
+            "run_id",
+            "repeat_evaluations",
+        }
+    }
+
+
+def _resume(path, args, planned, sources, dependencies):
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    required = {
+        "schema_version": 1,
+        "suite": SUITE,
+        "run_id": args.run_id,
+        "config": _config(args),
+        "dependencies": dependencies,
+    }
+    if any(manifest.get(key) != value for key, value in required.items()):
+        raise ValueError(
+            "comparison run identity changed; use a new run ID; no old results overwritten"
+        )
+    if [common._job_identity(job) for job in manifest.get("planned_jobs", [])] != [
+        common._job_identity(job) for job in planned
+    ]:
+        raise ValueError("aggregation-comparison arm matrix differs; no silent resume")
+    transition = require_source_compatibility(
+        manifest.get("source_sha256"), sources, scope="manifest"
+    )
+    if transition is not None:
+        transitions = manifest.setdefault("source_transitions", [])
+        if transition not in transitions:
+            transitions.append(transition)
+    return manifest
+
+
+def _ensure_calibration(args, manifest, persist):
+    import torch
+
+    hardware = hardware_tools._hardware(args.device)
+    runtime = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+    }
+    pending_groups = {
+        (job["profile"], job["dataset"])
+        for job in manifest["jobs"]
+        if job.get("status") != "passed"
+        or job.get("audit", {}).get("status") != "passed"
+        or job.get("audit", {}).get("command") != _audit_command(args, job)
+    }
+    revalidate = "hardware" in manifest and reallocation.needs_revalidation(
+        manifest, hardware, runtime, pending_groups
+    )
+    if args.hardware_profile == "a6000-48gb" and (
+        hardware["total_memory_bytes"] < 40 * 1024**3 or hardware["compute_capability"][0] < 8
+    ):
+        raise ValueError("A6000 profile requires >=40 GiB visible VRAM and capability >=8")
+    free, _ = torch.cuda.mem_get_info(torch.device(args.device))
+    required = max(
+        args.min_free_gb, 32.0 if args.hardware_profile == "a6000-48gb" else args.min_free_gb
+    )
+    if free < required * 1024**3:
+        raise RuntimeError(f"calibration requires {required:g} GiB free; no processes were changed")
+    if "hardware" not in manifest:
+        manifest.update(hardware=hardware, runtime=runtime)
+    entries = manifest["calibration_entries"]
+    for (profile, dataset), jobs in common._grouped(manifest["planned_jobs"]).items():
+        entry = next(
+            (item for item in entries if (item["profile"], item["dataset"]) == (profile, dataset)),
+            None,
+        )
+        if entry is None:
+            entry = {"profile": profile, "dataset": dataset}
+            entries.append(entry)
+        if revalidate:
+            calibration.validate_entry(entry, jobs)
+        else:
+            calibration.calibrate_group(jobs, entry, persist)
+    resolved = common._apply_common_resources(manifest["planned_jobs"], entries)
+    if manifest.get("resources_applied"):
+        if [common._job_identity(job) for job in manifest["jobs"]] != [
+            common._job_identity(job) for job in resolved
+        ]:
+            raise ValueError("saved child resources differ from the immutable common measurement")
+    else:
+        manifest.update(jobs=resolved, resources_applied=True)
+    if revalidate:
+        reallocation.revalidate_allocation(
+            manifest,
+            hardware,
+            runtime,
+            {
+                key: jobs
+                for key, jobs in common._grouped(manifest["planned_jobs"]).items()
+                if key in pending_groups
+            },
+            persist,
+        )
+    manifest["calibration_status"] = "passed"
+    persist()
+
+
+def _read_result(job):
+    from experiments.aggregation_comparison import engine as train
+    from research.conductance_gat.v5.train import _canonical_sha256
+
+    path = Path(job["metrics_path"])
+    if path.is_symlink():
+        raise ValueError("aggregation-comparison metrics cannot be an indirect path")
+    payload = train.inspect_completed(Path(job["output_dir"]))
+    child = calibration.parse_job(job)
+    config = train.configuration(child)
+    if payload.get("status") != "passed" or payload.get("configuration") != config:
+        raise ValueError(
+            "completed aggregation-comparison result differs from the exact measured recipe"
+        )
+    identity = payload.get("resume_identity")
+    if not isinstance(identity, dict) or _canonical_sha256(identity) != payload.get(
+        "resume_identity_sha256"
+    ):
+        raise ValueError("completed aggregation-comparison resume identity hash mismatch")
+    for key in ("research_suite", "dataset", "condition", "configuration", "source_sha256"):
+        if payload.get(key) != identity.get(key):
+            raise ValueError(f"aggregation-comparison result and identity disagree on {key}")
+    if payload.get("research_suite") != train.SUITE or payload.get("dataset") != job["dataset"]:
+        raise ValueError("foreign experiment result cannot be imported")
+    require_source_compatibility(
+        payload.get("source_sha256"), train.implementation_source_hashes(), scope="training"
+    )
+    protocol = payload.get("protocol")
+    if (
+        not isinstance(protocol, dict)
+        or identity.get("dataset_protocol") != protocol
+        or identity.get("dataset_protocol_sha256") != _canonical_sha256(protocol)
+    ):
+        raise ValueError("aggregation-comparison data/split protocol identity mismatch")
+    if payload.get("test_evaluated") is not False:
+        raise ValueError("training comparisons must be validation-only")
+    output = Path(job["output_dir"])
+    hashes = {}
+    for filename, key in (
+        ("best.pt", "checkpoint_sha256"),
+        ("last.pt", "last_checkpoint_sha256"),
+        ("history.json", "history_sha256"),
+    ):
+        actual = common._file_sha(output / filename)
+        if actual != payload.get(key):
+            raise ValueError(f"aggregation-comparison artifact changed: {filename}")
+        hashes[key] = actual
+    history = json.loads((output / "history.json").read_text(encoding="utf-8"))
+    if (
+        not isinstance(history, list)
+        or not history
+        or payload.get("epochs_run") != len(history)
+        or [row.get("epoch") for row in history] != list(range(1, len(history) + 1))
+    ):
+        raise ValueError("aggregation-comparison completed epoch history is incomplete")
+    best, value = (
+        payload.get("best_epoch"),
+        payload.get("best_validation", payload.get("validation")),
+    )
+    if (
+        type(best) is not int
+        or not 1 <= best <= len(history)
+        or isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise ValueError("aggregation-comparison selected validation checkpoint is invalid")
+    if history[best - 1].get("validation") != value:
+        raise ValueError(
+            "aggregation-comparison selected score differs from retained epoch history"
+        )
+    initial = payload.get("shared_initial_state_sha256")
+    if not resources._is_sha256(initial):
+        raise ValueError("aggregation-comparison lacks shared initialization provenance")
+    if payload.get("optimizer_steps") != history[-1].get("optimizer_steps"):
+        raise ValueError("aggregation-comparison final optimizer-step evidence is inconsistent")
+    return {
+        "validation": value,
+        "best_epoch": best,
+        "epochs_run": len(history),
+        "shared_initial_state_sha256": initial,
+        "data_sha256": protocol.get("data_sha256"),
+        "split_sha256": protocol.get("split_sha256"),
+        "learning_budget": payload.get("learning_budget"),
+        **hashes,
+    }
+
+
+def _compare(jobs):
+    for group in common._grouped(jobs).values():
+        for seed in {job["model_seed"] for job in group}:
+            completed = [
+                job["result"]
+                for job in group
+                if job["model_seed"] == seed and job["status"] == "passed"
+            ]
+            for key in (
+                "shared_initial_state_sha256",
+                "data_sha256",
+                "split_sha256",
+                "learning_budget",
+            ):
+                values = [result.get(key) for result in completed]
+                if any(value is None for value in values) or any(
+                    value != values[0] for value in values
+                ):
+                    raise ValueError(f"aggregation-comparison arms do not share verified {key}")
+
+
+def _audit_command(args, job):
+    return [
+        sys.executable,
+        "-B",
+        "-m",
+        "experiments.aggregation_comparison.audit",
+        "--root",
+        job["output_dir"],
+        "--data-root",
+        str(args.data_root.expanduser().resolve()),
+        "--device",
+        args.device,
+        "--repeat-evaluations",
+        str(args.repeat_evaluations),
+    ]
+
+
+def _audit(args, job, environment, persist):
+    from experiments.aggregation_comparison import engine as train
+
+    command = _audit_command(args, job)
+    prior = job.get("audit", {})
+    checkpoint = job["result"]["checkpoint_sha256"]
+    if prior.get("status") == "passed" and prior.get("command") == command:
+        if prior.get("checkpoint_sha256") != checkpoint or common._file_sha(
+            Path(prior["log_path"])
+        ) != prior.get("log_sha256"):
+            raise ValueError("completed aggregation-comparison audit evidence changed")
+        return
+    if prior:
+        job.setdefault("audit_attempts", []).append(copy.deepcopy(prior))
+    log = standalone._next_log(Path(job["log_path"]).with_suffix(".audit.log"))
+    state = {
+        "status": "running",
+        "command": command,
+        "log_path": str(log),
+        "checkpoint_sha256": checkpoint,
+        "evaluator_source_sha256": train.implementation_source_hashes(),
+    }
+    job["audit"] = state
+    persist()
+    try:
+        status = standalone.shared.run_logged(command, log, environment)
+        state["exit_code"] = status
+        if status:
+            raise RuntimeError(
+                f"aggregation-comparison audit failed ({status}); completed training retained"
+            )
+        if state["evaluator_source_sha256"] != train.implementation_source_hashes():
+            raise ValueError("aggregation-comparison evaluator source changed during audit")
+        state.update(status="passed", log_sha256=common._file_sha(log))
+        persist()
+    except (Exception, KeyboardInterrupt) as error:
+        state.update(status="failed", error=f"{type(error).__name__}: {error}")
+        if log.is_file() and not log.is_symlink():
+            state["log_sha256"] = common._file_sha(log)
+        standalone.shared.run_failure_reporter(
+            persist, original_error=error, action="independent edge audit"
+        )
+        raise
+
+
+def _summary(run_dir, manifest):
+    lines = [
+        "# Aggregation-comparison experiment progress",
+        "",
+        "Validation only; no SOTA or multi-seed claim.",
+        "",
+        "Fresh models; paired encoder/decoder initialization, full splits and measured resources.",
+        "",
+        "| Profile | Dataset | Seed | Arm | Training | Audit | Validation | Epoch |",
+        "| --- | --- | ---: | --- | --- | --- | ---: | ---: |",
+    ]
+    for job in manifest["jobs"]:
+        result, audit = job.get("result", {}), job.get("audit", {})
+        label = audit.get("status", "pending")
+        if audit.get("log_path"):
+            label = f"[{label}](<{Path(audit['log_path']).relative_to(run_dir).as_posix()}>)"
+        score = f"{result['validation']:.6f}" if "validation" in result else "pending"
+        lines.append(
+            f"| {job['profile']} | {job['dataset']} | {job['model_seed']} | "
+            f"{job['variant_id']} | {job['status']} | {label} | {score} | "
+            f"{result.get('best_epoch', '')} |"
+        )
+    atomic_write_bytes(run_dir / "comparison.md", ("\n".join(lines) + "\n").encode())
+
+
+def _run(args, run_dir, planned, sources, dependencies):
+    path = run_dir / "manifest.json"
+    if path.exists():
+        manifest = _resume(path, args, planned, sources, dependencies)
+    else:
+        if any(item.name != ".calibration.lock" for item in run_dir.iterdir()):
+            raise ValueError(
+                "new aggregation-comparison directory has untracked contents; preserved"
+            )
+        manifest = {
+            "schema_version": 1,
+            "suite": SUITE,
+            "run_id": args.run_id,
+            "status": "calibrating",
+            "config": _config(args),
+            "source_sha256": sources,
+            "dependencies": dependencies,
+            "planned_jobs": planned,
+            "jobs": copy.deepcopy(planned),
+            "calibration_entries": [],
+            "test_evaluated": False,
+            "legacy_results_imported": False,
+            "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        }
+
+    def persist():
+        atomic_write_json(path, manifest)
+
+    current = None
+    try:
+        _ensure_calibration(args, manifest, persist)
+        if provenance.source_snapshot() != sources:
+            raise ValueError("aggregation-comparison implementation changed during calibration")
+        if args.calibration_only:
+            manifest["status"] = "calibrated"
+            persist()
+            _summary(run_dir, manifest)
+            return 0
+        environment = standalone.shared._environment()
+        environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+        manifest["status"] = "running"
+        for index, job in enumerate(manifest["jobs"], 1):
+            if provenance.source_snapshot() != sources:
+                raise ValueError("aggregation-comparison implementation changed during the run")
+            if job["status"] == "passed":
+                if _read_result(job) != job.get("result"):
+                    raise ValueError("completed aggregation-comparison result changed")
+                print(f"[{index}/{len(planned)}] verified, skipping {job['job_id']}", flush=True)
+                _audit(args, job, environment, persist)
+                continue
+            current = job
+            command = list(job["command"])
+            checkpoint = Path(job["output_dir"]) / "last.pt"
+            if checkpoint.is_file() and not checkpoint.is_symlink():
+                command.append("--resume")
+            else:
+                standalone._preserve_incomplete_child(job, run_dir)
+            job.update(status="running", attempt_command=command)
+            persist()
+            print(f"[{index}/{len(planned)}] {job['job_id']}", flush=True)
+            started = time.monotonic()
+            status = standalone.shared.run_logged(
+                command, standalone._next_log(Path(job["log_path"])), environment
+            )
+            job.update(exit_code=status, elapsed_seconds=time.monotonic() - started)
+            if status:
+                raise RuntimeError(f"{job['job_id']} failed with child status {status}")
+            job.update(result=_read_result(job), status="passed")
+            _compare(manifest["jobs"])
+            current = None
+            persist()
+            _audit(args, job, environment, persist)
+            _summary(run_dir, manifest)
+        _compare(manifest["jobs"])
+        if provenance.source_snapshot() != sources:
+            raise ValueError("aggregation-comparison implementation changed during the final audit")
+        manifest.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+        manifest.pop("error", None)
+        persist()
+        _summary(run_dir, manifest)
+        print(f"Aggregation-comparison comparisons passed: {run_dir / 'comparison.md'}", flush=True)
+        return 0
+    except (Exception, KeyboardInterrupt) as error:
+        manifest.update(
+            status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+            error=f"{type(error).__name__}: {error}",
+        )
+        if current is not None:
+            current.update(status="failed", error=manifest["error"])
+        standalone.shared.run_failure_reporter(
+            persist, original_error=error, action="edge manifest"
+        )
+        standalone.shared.run_failure_reporter(
+            lambda: _summary(run_dir, manifest), original_error=error, action="edge summary"
+        )
+        print(
+            f"Aggregation-comparison stopped safely: {manifest['error']}\nPreserved: {run_dir}",
+            file=sys.stderr,
+        )
+        return 130 if isinstance(error, KeyboardInterrupt) else 1
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    try:
+        validate_args(args)
+        data = args.data_root.expanduser().resolve()
+        run_dir = args.results_root.expanduser().resolve() / "aggregation_comparison" / args.run_id
+        if (
+            run_dir.resolve() != run_dir
+            or run_dir.is_relative_to(data)
+            or data.is_relative_to(run_dir)
+        ):
+            raise ValueError(
+                "aggregation-comparison outputs must be direct paths outside the dataset cache"
+            )
+        planned = make_jobs(args, run_dir)
+        if args.dry_run:
+            print(
+                f"{len(variants(args))} independent arms; {len(planned)} full-size trainings; "
+                f"profiles={args.profiles}; datasets={args.datasets}; seeds={args.model_seeds}"
+            )
+            print("Fresh models; per-head C + row diffusion; old experiments are untouched.")
+            print(
+                "Common measured train+optimizer+validation+preparation calibration "
+                "precedes training; old V5 runs are untouched."
+            )
+            for job in planned:
+                print(f"{job['job_id']}: {shlex.join(job['command'])}")
+            print("Dry run only: no files, GPU probes, child processes or final training created.")
+            return 0
+        dependencies, sources = standalone.check_dependencies(), provenance.source_snapshot()
+        path = run_dir / "manifest.json"
+        if path.exists():
+            if path.is_symlink():
+                raise ValueError("aggregation-comparison manifest must not be indirect")
+            _resume(path, args, planned, sources, dependencies)
+        with calibration_lock(run_dir):
+            return _run(args, run_dir, planned, sources, dependencies)
+    except (ValueError, RuntimeError, OSError, standalone.DependencyCheckError) as error:
+        print(f"Aggregation-comparison refused: {type(error).__name__}: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# experiments/incidence_ablation/__init__.py
+
+````python
+"""Independent fresh-training incidence/bilinear/lifting ablation suite."""
+
+import sys
+from pathlib import Path
+
+_src = str(Path(__file__).resolve().parents[2] / "src")
+if _src not in sys.path:
+    sys.path.insert(0, _src)
+````
+
+# experiments/incidence_ablation/__main__.py
+
+````python
+from .runner import main
+
+raise SystemExit(main())
+````
+
+# experiments/incidence_ablation/audit.py
+
+````python
+"""Read-only full-validation audit of fresh incidence ablation checkpoints."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import torch
+
+from chartgat.observability import RuntimeResourceMonitor
+from research.conductance_gat.edge_selection.audit import (
+    PredictionSummary,
+    _synchronize,
+    release_amplitude_diagnostics,
+)
+from research.conductance_gat.v5.batch_calibration import _isolated_execution_state
+
+from . import engine as train
+from .diagnostics import components, cross_hop_gram, reconstruction_probe
+from .provenance import require_source_compatibility
+
+
+class Observer:
+    def __init__(self, args, *, tolerance=1e-7, iterations=2000):
+        self.args = args
+        self.tolerance, self.iterations = tolerance, iterations
+        self.records = []
+        self.predictions = {}
+
+    @torch.no_grad()
+    def __call__(self, model, batch, logits, batch_index):
+        incidence = batch.graph.incidence_edge_index
+        topology = components(incidence, batch.graph.x.shape[0])
+        records = []
+        for layer, operator in enumerate(model.operators):
+            weight = operator.last_effective_c.mean(dim=-1)
+            if operator.last_sampling_correction is not None:
+                weight = weight * operator.last_sampling_correction
+            probe = operator.last_probe.flatten(1)
+            records.append(
+                {
+                    "layer": layer,
+                    "reconstruction": [
+                        reconstruction_probe(
+                            probe,
+                            incidence,
+                            weight,
+                            noise_relative=noise,
+                            seed=self.args.model_seed + layer,
+                            topology=topology,
+                            edge_chunk_size=self.args.edge_chunk_size,
+                            tolerance=self.tolerance,
+                            iterations=self.iterations,
+                        )
+                        for noise in (0.0, 1e-3)
+                    ],
+                }
+            )
+        self.records.append(
+            {
+                "batch": batch_index,
+                "layers": records,
+                "all_hop_cross_energy": cross_hop_gram(
+                    model.last_history,
+                    incidence,
+                    weight,
+                    self.args.edge_chunk_size,
+                ),
+            }
+        )
+        active = []
+        if any(op.hop_coefficients is not None for op in model.operators):
+            active.append(("disable_bilinear", "disable_bilinear"))
+        if any(op.lift_projection is not None for op in model.operators):
+            active.append(("remove_second_lift_channel", "disable_lift_channel"))
+        model.capture = False
+        try:
+            for name, flag in active:
+                try:
+                    for op in model.operators:
+                        setattr(op, flag, True)
+                    with train.autocast(self.args, logits.device):
+                        changed = model(batch.graph)
+                    train.base.require_finite_tensor(changed, f"incidence intervention {name}")
+                    self.predictions.setdefault(
+                        name, PredictionSummary(self.args.dataset == "ppi")
+                    ).add(changed, logits, batch)
+                finally:
+                    for op in model.operators:
+                        setattr(op, flag, False)
+        finally:
+            model.capture = True
+            model.last_history = None
+            for op in model.operators:
+                op.last_probe = None
+            release_amplitude_diagnostics(model)
+
+    def report(self, baseline):
+        interventions = {name: value.report() for name, value in self.predictions.items()}
+        for value in interventions.values():
+            value["delta_validation_pp"] = 100 * (value["validation"] - baseline)
+        return {
+            "layers_and_batches": self.records,
+            "interventions": interventions,
+            "metric_scope": (
+                "frozen arithmetic mean of effective head conductances, "
+                "including sampling correction"
+            ),
+            "reconstruction_scope": (
+                "all layer projected input features and full validation graph support; "
+                "B[x,x²] constrained inverse, not inversion of P, the encoder or complete network"
+            ),
+            "cross_hop_scope": (
+                "all encoder/block states under the final layer frozen mean-head metric; "
+                "depth states are not exact-distance shells"
+            ),
+            "post_lift_scope": (
+                "phi(Bx) cannot identify component means; the actual trained post arm is phi(Px), "
+                "a different operator retaining constants"
+            ),
+            "intervention_scope": (
+                "same fresh selected checkpoint; full validation; no retraining; "
+                "primary causal comparison is the independent retrained eight-arm matrix"
+            ),
+        }
+
+
+def audit(root, data_root, device, repeats, *, tolerance=1e-7, iterations=2000):
+    if repeats < 5:
+        raise ValueError("at least five repeated full validations are required")
+    metrics = train.inspect_completed(root)
+    identity = metrics["resume_identity"]
+    sources = train.implementation_source_hashes()
+    require_source_compatibility(identity["source_sha256"], sources, scope="training")
+    args = train.restore_arguments(metrics, root, data_root, device)
+    train.base._require_cuda(device)
+    train.base.configure_compute(args)
+    payload, protocol = train.base.load_dataset(args.dataset, args.data_root, allow_download=False)
+    if protocol != identity["dataset_protocol"]:
+        raise ValueError("audit cache/split provenance differs from training")
+    monitor = RuntimeResourceMonitor(device)
+    monitor.start()
+    try:
+        with _isolated_execution_state(device), torch.no_grad():
+            train.base._seed(args.model_seed)
+            inputs = train.PreparedInputs(payload, args)
+            if inputs.provenance != identity["input_provenance"]:
+                raise ValueError("audit topology provenance differs from training")
+            model = train.make_model(payload, args, device)
+            selected = train.base.load_checkpoint_on_cpu(Path(root) / "best.pt")
+            train.validate_identity(selected, identity)
+            model.load_state_dict(selected["model_state"], strict=True)
+            del selected
+            before = train.base.state_sha256(model)
+            torch.cuda.reset_peak_memory_stats(device)
+            evaluations, timings = [], []
+            for _ in range(repeats):
+                _synchronize(device)
+                started = time.perf_counter()
+                evaluations.append(train.evaluate(model, inputs, args, device))
+                release_amplitude_diagnostics(model)
+                _synchronize(device)
+                timings.append(time.perf_counter() - started)
+            model.capture = True
+            observer = Observer(args, tolerance=tolerance, iterations=iterations)
+            detailed = train.evaluate(model, inputs, args, device, observer=observer)
+            if before != train.base.state_sha256(model) or train.inspect_completed(root) != metrics:
+                raise ValueError("read-only audit unexpectedly changed training evidence")
+            require_source_compatibility(
+                sources, train.implementation_source_hashes(), scope="audit"
+            )
+            scores = [row["metric"] for row in evaluations]
+            return {
+                "status": "passed",
+                "research_suite": train.SUITE,
+                "ablation_arm": args.ablation_arm,
+                "dataset": args.dataset,
+                "checkpoint_sha256": metrics["checkpoint_sha256"],
+                "source_sha256": sources,
+                "test_evaluated": False,
+                "validation": detailed,
+                "repeated_validation": {
+                    "count": repeats,
+                    "scores": scores,
+                    "range_pp": 100 * (max(scores) - min(scores)),
+                    "evaluation_seconds": timings,
+                },
+                "diagnostics": observer.report(detailed["metric"]),
+            }
+    finally:
+        resources = monitor.finish(
+            peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+            peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+        )
+        print(json.dumps({"audit_resources": resources}, sort_keys=True), flush=True)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--data-root", type=Path, default=Path("data/paper"))
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--repeat-evaluations", type=int, default=5)
+    parser.add_argument("--cg-tolerance", type=float, default=1e-7)
+    parser.add_argument("--cg-iterations", type=int, default=2000)
+    args = parser.parse_args(argv)
+    if not 0 < args.cg_tolerance < 1 or args.cg_iterations < 1:
+        raise ValueError("CG tolerance must be in (0,1) and iterations positive")
+    result = audit(
+        args.root,
+        args.data_root,
+        torch.device(args.device),
+        args.repeat_evaluations,
+        tolerance=args.cg_tolerance,
+        iterations=args.cg_iterations,
+    )
+    print(json.dumps(result, sort_keys=True, allow_nan=False), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# experiments/incidence_ablation/calibration.py
+
+````python
+"""Measured common resources for the independent incidence-ablation experiment suite.
+
+Only disposable calibration probes run here. No final-training model/data/budget
+is reduced, and no older V5 calibration implementation is changed.
+"""
+
+from __future__ import annotations
+
+import copy
+import gc
+import math
+import traceback
+
+from scripts import training_resource_plan as resources
+
+
+def parse_job(job):
+    from experiments.incidence_ablation import engine as train
+
+    args = train.build_parser().parse_args(job["command"][job["command"].index("-m") + 2 :])
+    train.validate_args(args)
+    return args
+
+
+def _contracts(jobs):
+    return [
+        {
+            "condition": job["variant_id"],
+            "model_seed": job["model_seed"],
+            "argv_sha256": resources.command_identity(job["command"]),
+        }
+        for job in jobs
+    ]
+
+
+def _probe_args(args, axis, batch, workers):
+    from research.conductance_gat.v5.batch_calibration import _candidate_args
+
+    expected_axis = (
+        "graphs"
+        if args.dataset == "ppi"
+        else ("full_graph" if args.sampling == "full" else "sampled_seed_nodes")
+    )
+    if axis != expected_axis:
+        raise ValueError("calibration batch axis differs from the actual dataset/sampler")
+    return _candidate_args(args, batch, workers)
+
+
+def _full_budget_seconds(report, policy):
+    safe = resources.measurement_is_safe(report)
+    if report["status"] == "oom":
+        return None
+    if report.get("validation_completed") is not True:
+        raise ValueError("calibration did not measure complete validation")
+    for name in ("validation_seconds", "topology_preparation_seconds", "setup_seconds"):
+        value = report.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"calibration lacks a valid measured {name}")
+    if (
+        report.get("required_auxiliary_path") is True
+        and report.get("auxiliary_path_measured") is not True
+    ):
+        raise ValueError("negative auxiliary loss was not measured in calibration")
+    if (
+        report.get("required_cycle_preparation") is True
+        and report.get("cycle_preparation_measured") is not True
+    ):
+        raise ValueError("cycle preparation was not measured in calibration")
+    if not safe:
+        return None
+    cost = resources.projected_training_budget_cost(report, policy)
+    return (
+        cost["projected_training_seconds"]
+        + cost["learning_budget"]["planned_epochs"] * report["validation_seconds"]
+        + report["setup_seconds"]
+    )
+
+
+def _score(candidate, policy):
+    costs = [_full_budget_seconds(report, policy) for report in candidate["measurements"]]
+    if not costs or any(value is None for value in costs):
+        return None
+    return max(costs)
+
+
+def _choose(candidates, policy):
+    eligible = [(value, _score(value, policy)) for value in candidates]
+    eligible = [(candidate, score) for candidate, score in eligible if score is not None]
+    if not eligible:
+        raise RuntimeError("no common safe physical batch fits all arms; no model/data downscale")
+    return min(eligible, key=lambda item: (item[1], -item[0]["batch_size"], item[0]["workers"]))[0]
+
+
+def _measure(job, loaded, args, batch, workers):
+    import torch
+
+    from experiments.incidence_ablation import engine as train
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    try:
+        report = train.run_calibration_candidate(
+            loaded,
+            copy.deepcopy(args),
+            torch.device(args.device),
+            physical_batch_size=batch,
+            workers=workers,
+            warmup_steps=2,
+            measurement_steps=5,
+            minimum_measure_seconds=3.0,
+        )
+    except torch.OutOfMemoryError as error:
+        report = {"status": "oom", "error": f"{type(error).__name__}: {error}"}
+        traceback.clear_frames(error.__traceback__)
+    report.update(
+        condition=job["variant_id"],
+        model_seed=job["model_seed"],
+        required_auxiliary_path=args.negative_loss_weight > 0,
+        required_cycle_preparation=args.selection_mode == "forest_cycle",
+    )
+    gc.collect()
+    torch.cuda.empty_cache()
+    return report
+
+
+def validate_entry(entry, jobs):
+    from experiments.incidence_ablation import engine as train
+
+    if entry.get("status") != "passed" or entry.get("job_contracts") != _contracts(jobs):
+        raise ValueError(
+            "incidence-ablation common resource entry or exact arm matrix is incomplete"
+        )
+    parsed = [parse_job(job) for job in jobs]
+    identities = {
+        (job["variant_id"], job["model_seed"]): args for job, args in zip(jobs, parsed, strict=True)
+    }
+    baseline, axis = entry["baseline_physical_batch_size"], entry["batch_axis"]
+    expected_floor = (
+        parsed[0].sample_seed_batch_size if axis == "sampled_seed_nodes" else parsed[0].batch_size
+    )
+    context = parsed[0].sampling == "cluster_disjoint"
+    requested_workers = parsed[0].sample_context_workers if context else parsed[0].workers
+    expected_workers = resources.worker_candidates(
+        requested_workers, resources.allocated_cpu_count(), applicable=axis == "graphs" or context
+    )
+    expected_workers = [
+        value for value in expected_workers if value <= max(2, 2 * requested_workers)
+    ]
+    if baseline != expected_floor or entry.get("worker_candidates") != expected_workers:
+        raise ValueError(
+            "calibration physical floor or worker search differs from the declared recipe"
+        )
+    if context != (entry.get("worker_axis") == "sample_context_workers"):
+        raise ValueError("calibration worker axis differs from the declared sampler")
+    policy = resources.learning_budget_selection_policy(
+        vars(parsed[0]),
+        training_split_size=entry["natural_training_split_size"],
+        batch_axis=axis,
+    )
+    if policy != entry.get("selection_policy"):
+        raise ValueError("calibration learning-budget selection recipe changed")
+    seen = set()
+    for candidate in entry["candidates"]:
+        pair = candidate["batch_size"], candidate["workers"]
+        if pair in seen or pair[0] < baseline or pair[1] not in entry["worker_candidates"]:
+            raise ValueError("duplicate or unrequested physical calibration candidate")
+        seen.add(pair)
+        reports = candidate["measurements"]
+        if {(item["condition"], item["model_seed"]) for item in reports} != set(identities) or len(
+            reports
+        ) != len(identities):
+            raise ValueError("common calibration candidate is missing a requested arm/seed")
+        if candidate["status"] != resources.completed_candidate_status(reports):
+            raise ValueError("calibration status differs from actual measured evidence")
+        for report in reports:
+            if report["status"] == "passed":
+                expected = _probe_args(
+                    identities[(report["condition"], report["model_seed"])], axis, *pair
+                )
+                if report.get("configuration") != train.configuration(expected):
+                    raise ValueError(
+                        "measurement configuration differs from the exact child candidate"
+                    )
+                if report.get("required_auxiliary_path") != (
+                    expected.negative_loss_weight > 0
+                ) or report.get("required_cycle_preparation") != (
+                    expected.selection_mode == "forest_cycle"
+                ):
+                    raise ValueError("measurement auxiliary/cycle scope differs from its exact arm")
+                if (report.get("batch_size"), report.get("workers")) != pair:
+                    raise ValueError("measurement physical batch/worker differs from its candidate")
+                _full_budget_seconds(report, policy)
+    sizes = sorted({batch for batch, _ in seen})
+    if (
+        not sizes
+        or sizes[0] != baseline
+        or seen != {(size, count) for size in sizes for count in entry["worker_candidates"]}
+    ):
+        raise ValueError("common candidate grid is incomplete")
+    if axis != "full_graph" and baseline < entry["natural_training_split_size"] and len(sizes) < 2:
+        raise ValueError("at least two physical batch candidates must be measured")
+    ceiling = max(baseline, entry["natural_training_split_size"])
+    if any(
+        next_size != min(size * 2, ceiling)
+        for size, next_size in zip(sizes, sizes[1:], strict=False)
+    ):
+        raise ValueError("physical candidate grid skipped an unmeasured expansion")
+    costs_by_size = {
+        size: [
+            score
+            for candidate in entry["candidates"]
+            if candidate["batch_size"] == size and (score := _score(candidate, policy)) is not None
+        ]
+        for size in sizes
+    }
+    reason = entry.get("stop_reason")
+    if axis == "full_graph":
+        if baseline != 1 or sizes != [1] or ceiling != 1 or reason != "full_graph_no_batch_axis":
+            raise ValueError("full graph cannot claim a replicated physical-batch search")
+    elif reason == "memory_headroom_boundary":
+        if costs_by_size[sizes[-1]]:
+            raise ValueError("reported memory boundary still has a common safe candidate")
+    elif reason == "complete_training_split_boundary":
+        if sizes[-1] != ceiling or not costs_by_size[sizes[-1]]:
+            raise ValueError("reported full-split boundary was not measured")
+    elif reason == "measured_full_budget_cost_plateau":
+        previous, plateau = None, 0
+        for costs in costs_by_size.values():
+            if not costs:
+                raise ValueError("cost plateau cannot hide an unsafe memory boundary")
+            best = min(costs)
+            plateau = plateau + 1 if previous is not None and best >= previous / 1.05 else 0
+            previous = best if previous is None else min(previous, best)
+        if plateau < 2:
+            raise ValueError("cost plateau lacks two measured physical expansions")
+    else:
+        raise ValueError("common calibration has an unknown or unmeasured stopping boundary")
+    chosen = _choose(entry["candidates"], policy)
+    if entry.get("selected_candidate") != {
+        "batch_size": chosen["batch_size"],
+        "workers": chosen["workers"],
+    }:
+        raise ValueError(
+            "selected resources differ from the measured worst-arm full-budget minimum"
+        )
+    expected_selected = _selected(parsed[0], axis, chosen)
+    if entry.get("selected") != expected_selected:
+        raise ValueError("stored selected resources differ from the measured configuration")
+
+
+def _selected(args, axis, chosen):
+    result = {
+        "batch_size": args.batch_size,
+        "workers": chosen["workers"],
+        "sample_seed_batch_size": args.sample_seed_batch_size,
+    }
+    result["sample_seed_batch_size" if axis == "sampled_seed_nodes" else "batch_size"] = chosen[
+        "batch_size"
+    ]
+    if args.sampling == "cluster_disjoint":
+        result.update(workers=0, sample_context_workers=chosen["workers"])
+    return result
+
+
+def calibrate_group(jobs, entry, persist):
+    from experiments.incidence_ablation import engine as train
+
+    parsed = [parse_job(job) for job in jobs]
+    loaded, identity, maximum, axis = train.load_calibration_payload(parsed[0])
+    if entry.get("input_identity") is not None and (
+        entry["input_identity"] != identity
+        or entry["natural_training_split_size"] != maximum
+        or entry["batch_axis"] != axis
+    ):
+        raise ValueError(
+            "official data/topology calibration identity changed; previous evidence retained"
+        )
+    if entry.get("status") == "passed":
+        validate_entry(entry, jobs)
+        return
+    policy = resources.learning_budget_selection_policy(
+        vars(parsed[0]), training_split_size=maximum, batch_axis=axis
+    )
+    if policy is None:
+        raise ValueError(
+            "incidence-ablation calibration requires explicit reference_updates budget"
+        )
+    if entry.get("selection_policy") not in (None, policy):
+        raise ValueError("partial common calibration budget changed")
+    baseline = (
+        parsed[0].sample_seed_batch_size if axis == "sampled_seed_nodes" else parsed[0].batch_size
+    )
+    context = parsed[0].sampling == "cluster_disjoint"
+    requested_workers = parsed[0].sample_context_workers if context else parsed[0].workers
+    workers = resources.worker_candidates(
+        requested_workers, resources.allocated_cpu_count(), applicable=axis == "graphs" or context
+    )
+    workers = [count for count in workers if count <= max(2, 2 * requested_workers)]
+    entry.update(
+        track="conductance",
+        profile=jobs[0]["profile"],
+        dataset=jobs[0]["dataset"],
+        input_identity=identity,
+        natural_training_split_size=maximum,
+        batch_axis=axis,
+        baseline_physical_batch_size=baseline,
+        worker_candidates=workers,
+        selection_policy=policy,
+        job_contracts=_contracts(jobs),
+    )
+    if context:
+        entry["worker_axis"] = "sample_context_workers"
+    entry.setdefault("candidates", [])
+    current, plateau, previous_best = baseline, 0, None
+    while True:
+        costs = []
+        for count in workers:
+            candidate = next(
+                (
+                    item
+                    for item in entry["candidates"]
+                    if (item["batch_size"], item["workers"]) == (current, count)
+                ),
+                None,
+            )
+            if candidate is None:
+                candidate = {
+                    "batch_size": current,
+                    "workers": count,
+                    "status": "running",
+                    "measurements": [],
+                }
+                entry["candidates"].append(candidate)
+            if candidate["status"] == "running":
+                for job, args in zip(jobs, parsed, strict=True):
+                    if not any(
+                        (item["condition"], item["model_seed"])
+                        == (job["variant_id"], job["model_seed"])
+                        for item in candidate["measurements"]
+                    ):
+                        print(
+                            f"[incidence calibration] {job['job_id']} "
+                            f"physical={current} workers={count}",
+                            flush=True,
+                        )
+                        candidate["measurements"].append(
+                            _measure(job, loaded, args, current, count)
+                        )
+                        persist()
+                candidate["status"] = resources.completed_candidate_status(
+                    candidate["measurements"]
+                )
+                persist()
+            score = _score(candidate, policy)
+            if score is not None:
+                costs.append(score)
+        if not costs:
+            entry["stop_reason"] = "memory_headroom_boundary"
+            break
+        if axis == "full_graph" or current >= max(maximum, baseline):
+            entry["stop_reason"] = (
+                "full_graph_no_batch_axis"
+                if axis == "full_graph"
+                else "complete_training_split_boundary"
+            )
+            break
+        best = min(costs)
+        plateau = plateau + 1 if previous_best is not None and best >= previous_best / 1.05 else 0
+        previous_best = best if previous_best is None else min(best, previous_best)
+        if plateau >= 2:
+            entry["stop_reason"] = "measured_full_budget_cost_plateau"
+            break
+        current = min(current * 2, max(maximum, baseline))
+    chosen = _choose(entry["candidates"], policy)
+    entry.update(
+        status="passed",
+        selected=_selected(parsed[0], axis, chosen),
+        selected_candidate={"batch_size": chosen["batch_size"], "workers": chosen["workers"]},
+        selection={
+            "objective": "minimum worst-arm projected train + full validation + one-time setup",
+            "preparation_accounting": (
+                "per-epoch topology work is already in measured train/validation"
+            ),
+            "all_arms_share_resources": True,
+            "global_optimum_claimed": False,
+        },
+    )
+    validate_entry(entry, jobs)
+    persist()
+````
+
+# experiments/incidence_ablation/diagnostics.py
+
+````python
+"""Frozen-metric incidence probes, not claims of a neural-network inverse."""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+
+
+def components(incidence, nodes):
+    ends = incidence.detach().cpu().numpy()
+    adjacency = coo_matrix((np.ones(ends.shape[1]), ends), shape=(nodes, nodes))
+    count, labels = connected_components(adjacency, directed=False)
+    return count, torch.as_tensor(labels, device=incidence.device, dtype=torch.long)
+
+
+def component_mean(x, labels, count):
+    sizes = torch.bincount(labels, minlength=count).to(x.dtype)
+    sums = x.new_zeros((count, x.shape[1])).index_add_(0, labels, x)
+    return sums / sizes[:, None]
+
+
+def laplacian(incidence, weight, nodes):
+    tail, head = incidence
+    index = torch.stack((torch.cat((tail, head, tail, head)), torch.cat((tail, head, head, tail))))
+    return torch.sparse_coo_tensor(
+        index, torch.cat((weight, weight, -weight, -weight)), (nodes, nodes), check_invariants=True
+    ).coalesce()
+
+
+def solve_centered(
+    incidence, weight, differences, labels, count, *, tolerance=1e-7, iterations=2000
+):
+    """Batched Jacobi-PCG on the component-centered subspace, every RHS.
+
+    The solve consumes Bx, never x or its means. Nonconvergence is a reported
+    audit error, not silently returned as a successful reconstruction.
+    """
+    nodes = labels.numel()
+    tail, head = incidence
+    rhs = differences.new_zeros((nodes, differences.shape[1]))
+    rhs.index_add_(0, head, weight[:, None] * differences)
+    rhs.index_add_(0, tail, -weight[:, None] * differences)
+    return solve_rhs(
+        incidence, weight, rhs, labels, count, tolerance=tolerance, iterations=iterations
+    )
+
+
+def solve_rhs(incidence, weight, rhs, labels, count, *, tolerance=1e-7, iterations=2000):
+    nodes = labels.numel()
+    tail, head = incidence
+    matrix = laplacian(incidence, weight, nodes)
+    rhs -= component_mean(rhs, labels, count)[labels]
+    degree = weight.new_zeros(nodes).index_add_(0, tail, weight).index_add_(0, head, weight)
+    degree = degree.clamp_min(torch.finfo(weight.dtype).tiny)
+    result, residual = torch.zeros_like(rhs), rhs.clone()
+    norm = rhs.norm(dim=0)
+    target = tolerance * norm
+    active = norm > 0
+    z = residual / degree[:, None]
+    z -= component_mean(z, labels, count)[labels]
+    direction = z.clone()
+    rz = (residual * z).sum(0)
+    used = 0
+    for iteration in range(iterations):
+        if not bool(active.any()):
+            break
+        used = iteration + 1
+        product = torch.sparse.mm(matrix, direction)
+        denom = (direction * product).sum(0)
+        if bool(((denom <= 0) & active).any()):
+            raise RuntimeError("incidence PCG lost positive definiteness on an active RHS")
+        alpha = torch.where(active, rz / denom.clamp_min(torch.finfo(weight.dtype).tiny), 0)
+        result += direction * alpha
+        residual -= product * alpha
+        active = residual.norm(dim=0) > target
+        z = residual / degree[:, None]
+        z -= component_mean(z, labels, count)[labels]
+        new_rz = (residual * z).sum(0)
+        beta = torch.where(active, new_rz / rz.clamp_min(torch.finfo(weight.dtype).tiny), 0)
+        direction = z + direction * beta
+        direction[:, ~active] = 0
+        rz = new_rz
+    result -= component_mean(result, labels, count)[labels]
+    actual = (torch.sparse.mm(matrix, result) - rhs).norm(dim=0)
+    relative = torch.where(norm > 0, actual / norm.clamp_min(torch.finfo(norm.dtype).tiny), actual)
+    if bool((relative > tolerance * 10).any()):
+        raise RuntimeError(
+            f"incidence reconstruction did not converge after {used} iterations; "
+            f"max relative residual={relative.max().item():.3g}"
+        )
+    return result, {
+        "iterations": used,
+        "max_relative_residual": relative.max().item(),
+        "tolerance": tolerance,
+    }
+
+
+def rank_summary(x):
+    """All rows/features, Gram eigenspectrum; tolerance is explicitly reported."""
+    return rank_from_gram(x.T @ x, x.shape)
+
+
+def rank_from_gram(gram, shape):
+    eigen = torch.linalg.eigvalsh(gram).clamp_min(0)
+    cutoff = eigen.max() * max(shape) * torch.finfo(gram.dtype).eps
+    positive = eigen > cutoff
+    probability = eigen / eigen.sum().clamp_min(torch.finfo(gram.dtype).tiny)
+    entropy = -(probability * probability.clamp_min(torch.finfo(gram.dtype).tiny).log()).sum()
+    return {
+        "shape": list(shape),
+        "gram_numerical_rank": int(positive.sum()),
+        "gram_eigenvalue_cutoff": cutoff.item(),
+        "spectral_entropy_rank": entropy.exp().item() if bool(eigen.sum() > 0) else 0.0,
+    }
+
+
+@torch.no_grad()
+def reconstruction_probe(
+    x,
+    incidence,
+    weight,
+    *,
+    noise_relative=0.0,
+    seed=0,
+    topology=None,
+    edge_chunk_size=None,
+    tolerance=1e-7,
+    iterations=2000,
+):
+    """Recover component means from B[x,x²] using its lifted-manifold constraint.
+
+    Bx and phi(Bx) share an unobservable component mean. The quadratic pre-lift
+    identifies that mean only in component/features having nonzero variation.
+    Oracle means are used solely in the separately labelled oracle control.
+    """
+    x, weight = x.double(), weight.double()
+    if (
+        weight.shape != (incidence.shape[1],)
+        or not bool((weight > 0).all())
+        or not bool(torch.isfinite(x).all())
+        or not bool(torch.isfinite(weight).all())
+    ):
+        raise ValueError("probe needs strictly positive scalar edge weights")
+    count, labels = components(incidence, x.shape[0]) if topology is None else topology
+    if noise_relative < 0:
+        raise ValueError("noise magnitude must be nonnegative")
+    chunk = edge_chunk_size or max(incidence.shape[1], 1)
+    if chunk <= 0:
+        raise ValueError("diagnostic edge chunks must be positive")
+    squares = x.new_zeros(2)
+    width = x.shape[1]
+    grams = [
+        x.new_zeros(width, width),
+        x.new_zeros(2 * width, 2 * width),
+        x.new_zeros(2 * width, 2 * width),
+    ]
+    for start in range(0, incidence.shape[1], chunk):
+        tail, head = incidence[:, start : start + chunk]
+        dx, q = x[head] - x[tail], x[head].square() - x[tail].square()
+        squares += torch.stack((dx.square().sum(), q.square().sum()))
+        for gram, values in zip(
+            grams, (dx, torch.cat((dx, q), -1), torch.cat((dx, dx.square()), -1)), strict=True
+        ):
+            gram += values.T @ values
+    scales = (squares / max(incidence.shape[1] * x.shape[1], 1)).sqrt() * noise_relative
+
+    def observations(power, channel):
+        generator = torch.Generator(device=x.device).manual_seed(seed + channel)
+        for start in range(0, incidence.shape[1], chunk):
+            tail, head = incidence[:, start : start + chunk]
+            value = x[head].pow(power) - x[tail].pow(power)
+            if noise_relative:
+                value += (
+                    torch.randn(value.shape, device=x.device, dtype=x.dtype, generator=generator)
+                    * scales[channel]
+                )
+            yield start, tail, head, value
+
+    rhs = torch.zeros_like(x)
+    for start, tail, head, dx in observations(1, 0):
+        weighted = weight[start : start + chunk, None] * dx
+        rhs.index_add_(0, head, weighted).index_add_(0, tail, -weighted)
+    centered, solver = solve_rhs(
+        incidence, weight, rhs, labels, count, tolerance=tolerance, iterations=iterations
+    )
+    denominator = x.new_zeros((count, x.shape[1]))
+    numerator = torch.zeros_like(denominator)
+    for start, tail, head, q in observations(2, 1):
+        dy = centered[head] - centered[tail]
+        weighted = weight[start : start + chunk, None]
+        edge_labels = labels[tail]
+        denominator.index_add_(0, edge_labels, weighted * dy.square())
+        numerator.index_add_(
+            0,
+            edge_labels,
+            weighted * dy * (q - (centered[head].square() - centered[tail].square())),
+        )
+    threshold = denominator.max(dim=0).values * 1e-12
+    identifiable = denominator > threshold
+    inferred_mean = numerator / (2 * denominator).clamp_min(torch.finfo(x.dtype).tiny)
+    reconstructed = centered + inferred_mean[labels]
+    mask = identifiable[labels]
+    true_mean = component_mean(x, labels, count)
+    scale = x.square().sum()
+
+    def relative(error, target):
+        size = target.square().sum()
+        return (error.square().sum() / size).sqrt().item() if bool(size > 0) else None
+
+    return {
+        "nodes": x.shape[0],
+        "edges": incidence.shape[1],
+        "features": x.shape[1],
+        "components": count,
+        "incidence_rank": x.shape[0] - count,
+        "laplacian_nullity": count,
+        "noise_relative": noise_relative,
+        "linear_minimum_norm_relative_l2": relative(centered - x, x),
+        "linear_with_oracle_means_relative_l2": relative(centered + true_mean[labels] - x, x),
+        "pre_quadratic_identifiable_relative_l2": relative((reconstructed - x)[mask], x[mask])
+        if bool(mask.any())
+        else None,
+        "identifiable_component_features": int(identifiable.sum()),
+        "total_component_features": identifiable.numel(),
+        "identifiability_relative_energy_threshold": 1e-12,
+        "mean_component_energy_fraction": (
+            (true_mean[labels].square().sum() / scale).item() if bool(scale > 0) else None
+        ),
+        "minimum_identifiable_edge_energy": denominator[identifiable].min().item()
+        if bool(identifiable.any())
+        else None,
+        "post_incidence_lift_mean_recoverable": False,
+        "solver": solver,
+        "original_feature_rank": rank_summary(x),
+        "quadratic_lift_feature_rank": rank_summary(torch.cat((x, x.square()), -1)),
+        "noiseless_edge_feature_ranks": {
+            name: rank_from_gram(gram, (incidence.shape[1], gram.shape[0]))
+            for name, gram in zip(("Bx", "B_phi_x", "phi_Bx"), grams, strict=True)
+        },
+    }
+
+
+@torch.no_grad()
+def cross_hop_gram(history, incidence, weight, edge_chunk_size):
+    history = history.double()
+    gram = history.new_zeros((len(history), len(history)))
+    chunk = max(1, (edge_chunk_size or max(incidence.shape[1], 1)) // len(history))
+    for start in range(0, incidence.shape[1], chunk):
+        tail, head = incidence[:, start : start + chunk]
+        delta = history[:, head] - history[:, tail]
+        gram += torch.einsum("kef,e,lef->kl", delta, weight[start : start + chunk].double(), delta)
+    denominator = (gram.diag()[:, None] * gram.diag()[None]).clamp_min(0).sqrt()
+    cosine = torch.where(
+        denominator > 0, gram / denominator.clamp_min(torch.finfo(gram.dtype).tiny), 0
+    )
+    return {
+        "energy_gram": gram.cpu().tolist(),
+        "normalized_cross_energy": cosine.cpu().tolist(),
+        "nonzero_energy_hops": (gram.diag() > 0).cpu().tolist(),
+    }
+````
+
+# experiments/incidence_ablation/engine.py
+
+````python
+"""Independent fresh ablation trainer, adapted from the verified incidence-ablation trainer.
+
+Same full-data, optimizer-inclusive calibration and epoch/RNG commit contracts.
+No import or mutation of legacy checkpoints is permitted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import gc
+import hashlib
+import json
+import math
+import random
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from chartgat.cache import atomic_write_json
+from chartgat.observability import RuntimeResourceMonitor
+from research.conductance_gat.edge_selection import protocol as selection_protocol
+from research.conductance_gat.edge_selection.data import PreparedInputs
+from research.conductance_gat.v5 import train as base
+from research.conductance_gat.v5.batch_calibration import (
+    _candidate_args,
+    _isolated_execution_state,
+    _optimizer_state_bytes,
+)
+from research.conductance_gat.v5.learning_budget import should_stop_learning_budget
+from research.conductance_gat.v5.timing import StageTimer
+
+from .model import ARMS, IncidenceClassifier
+from .provenance import require_source_compatibility
+
+ROOT = Path(__file__).resolve().parents[2]
+SUITE = "incidence_hop_lifting_ablation_v1"
+
+
+def build_parser():
+    parser = base.build_parser()
+    parser.description = __doc__
+    parser.set_defaults(
+        conductance_heads="per_head",
+        propagation_normalization="row",
+        solver_cost_scaling="width_scaled",
+        beta_initial=0.5,
+        training_schedule="joint",
+    )
+    selection_protocol.add_arguments(parser)
+    parser.add_argument("--ablation-arm", choices=tuple(ARMS), required=True)
+    return parser
+
+
+def validate_args(args):
+    base.validate_args(args)
+    selection_protocol.validate(args)
+    if (
+        args.selection_mode != "full"
+        or args.corruption_ratio
+        or args.l0_weight
+        or args.negative_loss_weight
+    ):
+        raise ValueError(
+            "incidence ablation requires unchanged full candidate support, no corruption/gate loss"
+        )
+    if args.propagation_filter != "linear" or args.propagation_normalization != "row":
+        raise ValueError("incidence ablation requires linear row diffusion")
+
+
+def configuration(args):
+    return {
+        **base.configuration(args),
+        "edge_selection": selection_protocol.configuration(args),
+        "ablation_arm": args.ablation_arm,
+    }
+
+
+def implementation_source_hashes():
+    from .provenance import source_snapshot
+
+    return source_snapshot()
+
+
+def make_model(payload, args, device):
+    return IncidenceClassifier(
+        payload["graphs"][0]["x"].shape[1],
+        payload["classes"],
+        arm=args.ablation_arm,
+        **base.architecture_configuration(args),
+        conductance_mode="dynamic",
+        max_log_conductance=base.COMMON["max_log_conductance"],
+        edge_chunk_size=args.edge_chunk_size,
+        selection_config=selection_protocol.model_configuration(args),
+    ).to(device)
+
+
+def parameter_group(name):
+    if "lift_projection" in name or "hop_coefficients" in name:
+        return "backbone"
+    if ".selector." in name:
+        return "gate"
+    return base.parameter_group(name)
+
+
+def make_optimizer(model):
+    options = {
+        "backbone": (base.COMMON["lr"], base.COMMON["weight_decay"]),
+        "spatial_w": (base.COMMON["lr"], base.COMMON["weight_decay"]),
+        "beta": (
+            base.COMMON["lr"] * base.COMMON["beta_lr_multiplier"],
+            base.COMMON["scalar_weight_decay"],
+        ),
+        "conductance": (
+            base.COMMON["lr"] * base.COMMON["conductance_lr_multiplier"],
+            base.COMMON["conductance_weight_decay"],
+        ),
+        "gate": (
+            base.COMMON["lr"] * base.COMMON["conductance_lr_multiplier"],
+            base.COMMON["conductance_weight_decay"],
+        ),
+    }
+    grouped = {name: [] for name in options}
+    names = {name: [] for name in options}
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            group = parameter_group(name)
+            grouped[group].append(parameter)
+            names[group].append(name)
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "name": name,
+                "params": values,
+                "parameter_names": names[name],
+                "lr": options[name][0],
+                "weight_decay": options[name][1],
+            }
+            for name, values in grouped.items()
+            if values
+        ],
+        lr=base.COMMON["lr"],
+    )
+    expected = {id(value) for value in model.parameters() if value.requires_grad}
+    actual = [id(value) for group in optimizer.param_groups for value in group["params"]]
+    if set(actual) != expected or len(actual) != len(expected):
+        raise RuntimeError(
+            "incidence-ablation optimizer ownership is not exactly once per parameter"
+        )
+    return optimizer
+
+
+def shared_initial_state_sha256(model):
+    digest = hashlib.sha256()
+    for name, value in model.state_dict().items():
+        if (
+            ".selector." not in name
+            and "lift_projection" not in name
+            and "hop_coefficients" not in name
+        ):
+            digest.update(name.encode())
+            digest.update(base.tensor_hash(value).encode())
+    return digest.hexdigest()
+
+
+def resolve_budget(inputs, args):
+    if inputs.indices is not None:
+        return base.resolve_learning_budget(inputs.data, inputs.indices, inputs.sampler, args)
+    return base.resolve_learning_budget(inputs.data, None, None, args)
+
+
+def build_identity(args, protocol, budget, initial_hash, inputs):
+    return {
+        "schema_version": 1,
+        "research_suite": SUITE,
+        "dataset": args.dataset,
+        "condition": args.selection_mode,
+        "configuration": configuration(args),
+        "training_arguments": serializable_arguments(args),
+        "dataset_protocol": protocol,
+        "dataset_protocol_sha256": base._canonical_sha256(protocol),
+        "source_sha256": implementation_source_hashes(),
+        "runtime_versions": base._versions(),
+        "initial_state_sha256": initial_hash,
+        "learning_budget": budget,
+        "input_provenance": inputs.provenance,
+        "resume_semantics": (
+            "epoch-boundary model/optimizer/Python/NumPy/CPU/CUDA RNG restore; "
+            "no bitwise CUDA claim"
+        ),
+    }
+
+
+def serializable_arguments(args):
+    return {
+        key: False if key == "resume" else str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+
+
+def restore_arguments(metrics, output, data_root, device):
+    identity = metrics["resume_identity"]
+    saved = identity.get("training_arguments")
+    if not isinstance(saved, dict):
+        raise ValueError("audit requires immutable training arguments")
+    args = argparse.Namespace(**saved)
+    for name in ("output_dir", "data_root"):
+        setattr(args, name, Path(getattr(args, name)))
+    validate_args(args)
+    if configuration(args) != identity["configuration"]:
+        raise ValueError("restored CLI arguments do not reproduce the trained configuration")
+    args.output_dir, args.data_root, args.device = Path(output), Path(data_root), str(device)
+    return args
+
+
+def validate_identity(saved, expected):
+    identity = saved.get("resume_identity")
+    if not isinstance(identity, dict) or base._canonical_sha256(identity) != saved.get(
+        "resume_identity_sha256"
+    ):
+        raise ValueError("incidence-ablation checkpoint identity is absent or corrupt")
+    if identity != expected:
+        changed = sorted(
+            key for key in set(identity) | set(expected) if identity.get(key) != expected.get(key)
+        )
+        raise ValueError(
+            f"incidence-ablation resume identity mismatch: {changed}; old evidence preserved"
+        )
+
+
+def resolve_training_resume(saved, expected):
+    """Preserve the original identity; require exactly matching suite sources.
+
+    Model, optimizer, data, sampling, arguments, budget and runtime must still
+    agree exactly. Actual resumed execution sources are recorded separately.
+    """
+    identity = saved.get("resume_identity")
+    validate_identity(saved, identity)
+    changed = sorted(
+        key
+        for key in set(identity) | set(expected)
+        if key != "source_sha256" and identity.get(key) != expected.get(key)
+    )
+    if changed:
+        raise ValueError(
+            f"incidence-ablation resume identity mismatch: {changed}; old evidence preserved"
+        )
+    proof = require_source_compatibility(
+        identity.get("source_sha256"), expected.get("source_sha256"), scope="training"
+    )
+    return copy.deepcopy(identity), proof
+
+
+def autocast(args, device):
+    return torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=args.precision == "bf16"
+    )
+
+
+def loss_components(model, batch, logits, args):
+    task, count = base.training_loss(logits, batch.graph, batch.selected_indices)
+    targets = batch.origin_targets if args.negative_loss_weight else None
+    auxiliary = model.auxiliary_loss(targets)
+    loss = (
+        task + args.l0_weight * auxiliary["l0"] + args.negative_loss_weight * auxiliary["negative"]
+    )
+    return loss, task, auxiliary, int(count)
+
+
+def validate_gradients(model):
+    missing = [
+        name
+        for name, value in model.named_parameters()
+        if value.requires_grad and value.grad is None
+    ]
+    if missing:
+        raise RuntimeError(f"trainable parameters disconnected from task/auxiliary loss: {missing}")
+    by_group = {}
+    for name, value in model.named_parameters():
+        if value.grad is not None:
+            by_group.setdefault(parameter_group(name), []).append(
+                value.grad.detach().float().square().sum()
+            )
+    result = {name: torch.stack(values).sum().sqrt() for name, values in by_group.items()}
+    for name, norm in result.items():
+        torch._assert_async(torch.isfinite(norm), f"nonfinite {name} gradient")
+    return result
+
+
+def run_training_epoch(
+    model, optimizer, inputs, args, device, epoch, *, timing=None, validate=False
+):
+    model.train()
+    timing = timing or StageTimer(device)
+    sums = torch.zeros(4, device=device, dtype=torch.float64)
+    labels = steps = units = 0
+    largest_nodes = largest_edges = largest_graphs = 0
+    observations = []
+    gradient_rows = {}
+    iterator = iter(inputs.training_batches(epoch, device))
+    while True:
+        with timing.stage("sampling_forest_loader_transfer"):
+            batch = next(iterator, None)
+        if batch is None:
+            break
+        with timing.stage("zero_grad"):
+            optimizer.zero_grad(set_to_none=True)
+        with timing.stage("forward_and_loss"):
+            with autocast(args, device):
+                logits = model(batch.graph)
+                loss, task, auxiliary, count = loss_components(model, batch, logits, args)
+        with timing.stage("backward"):
+            loss.backward()
+        if validate and steps == 0:
+            gradient_rows = validate_gradients(model)
+        with timing.stage("gradient_clipping"):
+            norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                base.COMMON["gradient_clip_norm"],
+                error_if_nonfinite=False,
+                foreach=True,
+            )
+            base.require_finite_gradient_norm_async(norm)
+        with timing.stage("optimizer"):
+            optimizer.step()
+        sums += (
+            torch.stack(
+                (
+                    loss.detach(),
+                    task.detach(),
+                    auxiliary["l0"].detach(),
+                    auxiliary["negative"].detach(),
+                )
+            ).double()
+            * count
+        )
+        labels += count
+        steps += 1
+        graph_count = int(batch.graph._v5_num_graphs)
+        units += graph_count if inputs.indices is None else count
+        largest_nodes = max(largest_nodes, batch.graph.x.shape[0])
+        largest_edges = max(largest_edges, batch.graph.incidence_edge_index.shape[1])
+        largest_graphs = max(largest_graphs, graph_count)
+        observations.append(
+            {
+                "nodes": batch.graph.x.shape[0],
+                "candidate_edges": batch.graph.incidence_edge_index.shape[1],
+                "disjoint_graphs": graph_count,
+                "supervised_labels": count,
+                "sampling": getattr(batch.graph, "sampling_observation", None),
+            }
+        )
+        model.clear_auxiliary_cache()
+        del loss, task, auxiliary, logits, batch
+    if labels < 1 or steps < 1:
+        raise RuntimeError("official training split produced no supervised updates")
+    values = (sums / labels).cpu().tolist()
+    if not all(math.isfinite(value) for value in values):
+        raise FloatingPointError("nonfinite training/auxiliary epoch loss")
+    return {
+        "train_loss": values[0],
+        "train_task_loss": values[1],
+        "train_l0": values[2],
+        "train_negative_loss": values[3],
+        "train_labels": labels,
+        "train_batches": steps,
+        "optimizer_steps": steps,
+        "processed_units": units,
+        "largest_measured_nodes": largest_nodes,
+        "largest_measured_physical_edges": largest_edges,
+        "largest_measured_graph_batch": largest_graphs,
+        "batch_observations": observations,
+        "first_step_gradient_norms": {
+            name: float(value.cpu()) for name, value in gradient_rows.items()
+        },
+    }
+
+
+@torch.no_grad()
+def evaluate(model, inputs, args, device, *, observer=None):
+    model.eval()
+    totals = torch.zeros(6, dtype=torch.float64, device=device)
+    batches = 0
+    for batch in inputs.validation_batches(device):
+        with autocast(args, device):
+            logits = model(batch.graph)
+            task, count = base.training_loss(logits, batch.graph, batch.selected_indices)
+        base.require_finite_tensor(logits, "incidence-ablation validation logits")
+        if batch.selected_indices is None:
+            pred, target = logits > 0, batch.graph.y.bool()
+            numbers = ((pred & target).sum(), (pred & ~target).sum(), (~pred & target).sum())
+        else:
+            chosen = logits[batch.selected_indices]
+            target = batch.graph.y[batch.selected_indices]
+            numbers = (
+                (chosen.argmax(-1) == target).sum(),
+                target.new_zeros(()),
+                target.new_zeros(()),
+            )
+        totals[:3] += torch.stack(numbers)
+        totals[3] += count
+        totals[4] += task.double() * count
+        totals[5] += torch.isfinite(task).double()
+        if observer is not None:
+            observer(model, batch, logits, batches)
+        model.clear_auxiliary_cache()
+        batches += 1
+    first, fp, fn, count, loss, finite = totals.cpu().tolist()
+    if count <= 0 or finite != batches:
+        raise ValueError("validation is empty or contains a nonfinite loss")
+    metric = (
+        (2 * first / (2 * first + fp + fn) if 2 * first + fp + fn else 0.0)
+        if inputs.indices is None
+        else first / count
+    )
+    return {"metric": metric, "loss": loss / count, "label_count": int(count), "batches": batches}
+
+
+def _checkpoint_rng(device):
+    return {
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": np.random.get_state(),
+        "cpu_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state(device),
+    }
+
+
+def _restore_rng(saved, device):
+    random.setstate(saved["python_rng_state"])
+    np.random.set_state(saved["numpy_rng_state"])
+    base.restore_checkpoint_rng(saved, device)
+
+
+def inspect_completed(output):
+    from .integrity import inspect_completed as inspect_evidence
+
+    return inspect_evidence(output)
+
+
+def train_model(payload, protocol, args, device, output):
+    base._require_cuda(device)
+    validate_args(args)
+    base.validate_cached_graphs_once(payload)
+    if payload["dataset"] != args.dataset:
+        raise ValueError("dataset request and verified cache disagree")
+    hardware = base.validate_hardware_runtime(args, device)
+    base.configure_compute(args)
+    base._seed(args.model_seed)
+    monitor = RuntimeResourceMonitor(device)
+    monitor.start()
+    finished = False
+    try:
+        inputs = PreparedInputs(payload, args)
+        budget = resolve_budget(inputs, args)
+        model = make_model(payload, args, device)
+        initial_hash = base.state_sha256(model)
+        shared_hash = shared_initial_state_sha256(model)
+        optimizer = make_optimizer(model)
+        identity = build_identity(args, protocol, budget, initial_hash, inputs)
+        identity_hash = base._canonical_sha256(identity)
+        execution_sources = copy.deepcopy(identity["source_sha256"])
+        source_transitions = []
+        last_path, best_path, previous_path = (
+            output / "last.pt",
+            output / "best.pt",
+            output / "best.previous.pt",
+        )
+        history = []
+        best_metric, best_epoch, best_hash, steps = -math.inf, 0, None, 0
+        if last_path.exists():
+            if not args.resume or last_path.is_symlink():
+                raise ValueError("existing checkpoint cannot be replaced without a valid resume")
+            saved = base.load_checkpoint_on_cpu(last_path)
+            identity, source_proof = resolve_training_resume(saved, identity)
+            identity_hash = base._canonical_sha256(identity)
+            source_transitions = copy.deepcopy(saved.get("source_transitions", []))
+            if not isinstance(source_transitions, list):
+                raise ValueError("checkpoint source transition evidence must be a list")
+            source_transitions.append(
+                {
+                    "after_epoch": saved["epoch"],
+                    "optimizer_steps": saved["optimizer_steps"],
+                    "source_sha256": execution_sources,
+                    "source_compatibility": source_proof,
+                    "restored_checkpoint_sha256": base.sha256_file(last_path),
+                    "hardware": hardware,
+                    "scope": "epoch-boundary continuation; original training identity retained",
+                }
+            )
+            history = saved["history"]
+            if [row.get("epoch") for row in history] != list(range(1, saved["epoch"] + 1)):
+                raise ValueError("resume history has missing or repeated epochs")
+            model.load_state_dict(saved["model_state"], strict=True)
+            optimizer.load_state_dict(saved["optimizer_state"])
+            best_metric, best_epoch = saved["best_validation"], saved["best_epoch"]
+            best_hash, steps = saved["best_checkpoint_sha256"], saved["optimizer_steps"]
+            base.recover_best_checkpoint(best_path, previous_path, best_hash)
+            _restore_rng(saved, device)
+            del saved
+        elif output.exists() and any(output.iterdir()):
+            raise FileExistsError(
+                "nonempty selection output has no valid last.pt; no files overwritten"
+            )
+        output.mkdir(parents=True, exist_ok=True)
+        pre_run = {
+            "research_suite": SUITE,
+            "configuration": configuration(args),
+            "hardware": hardware,
+            "parameters": {
+                "total": sum(p.numel() for p in model.parameters()),
+                "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            },
+            "optimizer_groups": base.optimizer_metadata(optimizer),
+            "learning_budget": budget,
+            "data": base._v5_data_observability(payload, inputs.data, inputs.indices, args),
+            "topology": inputs.metadata(),
+            "debug": False,
+            "subset": False,
+            "test_evaluated": False,
+            "batching": {
+                "physical_batch_size": args.batch_size
+                if inputs.indices is None
+                else (args.sample_seed_batch_size if inputs.sampler is not None else 1),
+                "batch_axis": "graphs"
+                if inputs.indices is None
+                else ("supervised_seed_nodes" if inputs.sampler is not None else "complete_graph"),
+                "gradient_accumulation_steps": 1,
+                "data_parallel_workers": 1,
+                "full_graph_exception": (
+                    "one complete transductive graph, not serial independent samples"
+                )
+                if inputs.indices is not None and inputs.sampler is None
+                else None,
+            },
+        }
+        if not (output / "configuration.json").exists():
+            atomic_write_json(output / "configuration.json", pre_run)
+        print(json.dumps(pre_run, sort_keys=True), flush=True)
+        torch.cuda.reset_peak_memory_stats(device)
+        for epoch in range(len(history) + 1, budget["planned_epochs"] + 1):
+            if history and should_stop_learning_budget(
+                budget,
+                epochs_since_best=history[-1]["epoch"] - best_epoch,
+                optimizer_steps_since_best=steps - history[best_epoch - 1]["optimizer_steps"],
+                eligible=True,
+            ):
+                break
+            started = time.perf_counter()
+            timing = StageTimer(device)
+            values = run_training_epoch(
+                model, optimizer, inputs, args, device, epoch, timing=timing, validate=True
+            )
+            if values["train_batches"] != budget["actual_batches_per_epoch"]:
+                raise RuntimeError(
+                    "measured supervised batches differ from the immutable update budget"
+                )
+            steps += values.pop("optimizer_steps")
+            with timing.stage("validation"):
+                validation = evaluate(model, inputs, args, device)
+            row = {
+                **values,
+                "epoch": epoch,
+                "phase": {"phase": "joint"},
+                "optimizer_steps": steps,
+                "validation": validation["metric"],
+                "validation_loss": validation["loss"],
+                "stage_seconds": timing.report(synchronize=True),
+                "elapsed_wall_seconds": time.perf_counter() - started,
+                "topology_preparation_seconds_cumulative": inputs.plan_preparation_seconds,
+            }
+            history.append(row)
+            if validation["metric"] > best_metric:
+                best_metric, best_epoch = validation["metric"], epoch
+                best_hash = base.publish_best_checkpoint(
+                    best_path,
+                    previous_path,
+                    {
+                        "model_state": model.state_dict(),
+                        "epoch": epoch,
+                        "validation": best_metric,
+                        "selection_role": "primary",
+                        "resume_identity": identity,
+                        "resume_identity_sha256": identity_hash,
+                        "execution_source_sha256": execution_sources,
+                        "source_transitions": source_transitions,
+                    },
+                )
+            base._save(
+                last_path,
+                {
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "history": history,
+                    "optimizer_steps": steps,
+                    "best_validation": best_metric,
+                    "best_epoch": best_epoch,
+                    "best_checkpoint_sha256": best_hash,
+                    "resume_identity": identity,
+                    "resume_identity_sha256": identity_hash,
+                    "execution_source_sha256": execution_sources,
+                    "source_transitions": source_transitions,
+                    "shared_initial_state_sha256": shared_hash,
+                    **_checkpoint_rng(device),
+                },
+            )
+            atomic_write_json(output / "history.json", history)
+            print(
+                f"{args.dataset}/{args.selection_mode} epoch={epoch} "
+                f"loss={row['train_loss']:.6f} task={row['train_task_loss']:.6f} "
+                f"val={row['validation']:.6f} best={best_metric:.6f} "
+                f"seconds={row['elapsed_wall_seconds']:.2f}",
+                flush=True,
+            )
+        if not history or best_epoch < 1:
+            raise RuntimeError("training completed without valid epoch/selection evidence")
+        atomic_write_json(output / "history.json", history)
+        selected = base.load_checkpoint_on_cpu(best_path)
+        validate_identity(selected, identity)
+        if selected["epoch"] != best_epoch or selected["validation"] != best_metric:
+            raise ValueError("best checkpoint selection disagrees with last.pt")
+        model.load_state_dict(selected["model_state"], strict=True)
+        del selected
+        final_validation = evaluate(model, inputs, args, device)
+        resources = monitor.finish(
+            peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+            peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+        )
+        finished = True
+        result = {
+            "schema_version": 1,
+            "status": "passed",
+            "research_suite": SUITE,
+            "dataset": args.dataset,
+            "condition": args.selection_mode,
+            "configuration": configuration(args),
+            "protocol": protocol,
+            "source_sha256": identity["source_sha256"],
+            "execution_source_sha256": execution_sources,
+            "source_transitions": source_transitions,
+            "resume_identity": identity,
+            "resume_identity_sha256": identity_hash,
+            "learning_budget": budget,
+            "initial_state_sha256": initial_hash,
+            "shared_initial_state_sha256": shared_hash,
+            "common_backbone_initial_state_sha256": shared_hash,
+            "epochs_run": len(history),
+            "optimizer_steps": steps,
+            "best_epoch": best_epoch,
+            "best_validation": best_metric,
+            "validation": final_validation["metric"],
+            "validation_loss": final_validation["loss"],
+            "checkpoint_sha256": base.sha256_file(best_path),
+            "last_checkpoint_sha256": base.sha256_file(last_path),
+            "history_sha256": base.sha256_file(output / "history.json"),
+            "resource_observability": resources,
+            "topology": inputs.metadata(),
+            "test_evaluated": False,
+            "debug": False,
+            "subset": False,
+        }
+        atomic_write_json(output / "metrics.json", result)
+        return result
+    except BaseException as error:
+        if not finished:
+            try:
+                resources = monitor.finish(
+                    peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+                    peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+                )
+                finished = True
+                if output.is_dir():
+                    atomic_write_json(
+                        output / "failure-resources.json",
+                        {"error": f"{type(error).__name__}: {error}", "resources": resources},
+                    )
+            except BaseException as reporting_error:
+                error.add_note(f"failure telemetry also failed: {reporting_error}")
+        raise
+
+
+def load_calibration_payload(args):
+    payload, protocol = base.load_dataset(args.dataset, args.data_root, allow_download=False)
+    maximum = (
+        len(payload["splits"]["train"])
+        if args.dataset == "ppi"
+        else (int(payload["splits"]["train"].count_nonzero()) if args.sampling != "full" else 1)
+    )
+    axis = (
+        "graphs"
+        if args.dataset == "ppi"
+        else ("sampled_seed_nodes" if args.sampling != "full" else "full_graph")
+    )
+    identity = {
+        "dataset": args.dataset,
+        "data_sha256": protocol["data_sha256"],
+        "split_sha256": protocol["split_sha256"],
+        "protocol": protocol,
+        "corruption_ratio": args.corruption_ratio,
+        "corruption_seed": args.corruption_seed,
+    }
+    return {"payload": payload, "protocol": protocol}, identity, maximum, axis
+
+
+def run_calibration_candidate(
+    loaded,
+    args,
+    device,
+    *,
+    physical_batch_size,
+    workers,
+    warmup_steps=2,
+    measurement_steps=5,
+    minimum_measure_seconds=3.0,
+):
+    base._require_cuda(device)
+    if warmup_steps < 2 or measurement_steps < 5 or minimum_measure_seconds < 3:
+        raise ValueError(
+            "resource probes require complete-epoch windows meeting the calibration minima"
+        )
+    candidate = _candidate_args(args, physical_batch_size, workers)
+    validate_args(candidate)
+    model = optimizer = inputs = None
+    monitor = None
+    report = None
+    with _isolated_execution_state(device):
+        try:
+            gc.collect()
+            torch.cuda.empty_cache()
+            hardware = base.validate_hardware_runtime(candidate, device)
+            free_before, total = torch.cuda.mem_get_info(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            monitor = RuntimeResourceMonitor(device)
+            monitor.start()
+            base.configure_compute(candidate)
+            base._seed(candidate.model_seed)
+            started = time.perf_counter()
+            inputs = PreparedInputs(loaded["payload"], candidate)
+            model = make_model(loaded["payload"], candidate, device)
+            optimizer = make_optimizer(model)
+            initial_hash = base.state_sha256(model)
+            # Match the persistent full-validation cache used during production training.
+            if inputs.indices is not None:
+                next(inputs.validation_batches(device))
+            torch.cuda.synchronize(device)
+            setup_seconds = time.perf_counter() - started
+            stress = None
+            if inputs.indices is None:
+                stress_started = time.perf_counter()
+                stress_batch = inputs.stress_batch(device)
+                optimizer.zero_grad(set_to_none=True)
+                with autocast(candidate, device):
+                    stress_logits = model(stress_batch.graph)
+                    stress_loss, stress_task, _auxiliary, _count = loss_components(
+                        model, stress_batch, stress_logits, candidate
+                    )
+                stress_loss.backward()
+                validate_gradients(model)
+                norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), base.COMMON["gradient_clip_norm"], foreach=True
+                )
+                base.require_finite_gradient_norm_async(norm)
+                optimizer.step()
+                torch.cuda.synchronize(device)
+                stress = {
+                    "graphs": int(stress_batch.graph._v5_num_graphs),
+                    "nodes": stress_batch.graph.x.shape[0],
+                    "physical_edges": stress_batch.graph.incidence_edge_index.shape[1],
+                    "seconds": time.perf_counter() - stress_started,
+                    "optimizer_steps": 1,
+                    "scope": (
+                        "additional largest-graph joint-batch stress; outside throughput window"
+                    ),
+                }
+                model.clear_auxiliary_cache()
+                del stress_batch, stress_logits, stress_loss, stress_task, _auxiliary
+            warmup_epochs = warmup_updates = 0
+            while warmup_updates < warmup_steps:
+                warmup_epochs += 1
+                values = run_training_epoch(
+                    model, optimizer, inputs, candidate, device, warmup_epochs, validate=True
+                )
+                warmup_updates += values["optimizer_steps"]
+            timing = StageTimer(device)
+            torch.cuda.synchronize(device)
+            started = time.perf_counter()
+            measured_epochs = measured_steps = units = labels = 0
+            largest_nodes = largest_edges = largest_graphs = 0
+            elapsed = 0.0
+            while measured_steps < measurement_steps or elapsed < minimum_measure_seconds:
+                measured_epochs += 1
+                values = run_training_epoch(
+                    model,
+                    optimizer,
+                    inputs,
+                    candidate,
+                    device,
+                    warmup_epochs + measured_epochs,
+                    timing=timing,
+                )
+                measured_steps += values["optimizer_steps"]
+                units += values["processed_units"]
+                labels += values["train_labels"]
+                largest_nodes = max(largest_nodes, values["largest_measured_nodes"])
+                largest_edges = max(largest_edges, values["largest_measured_physical_edges"])
+                largest_graphs = max(largest_graphs, values["largest_measured_graph_batch"])
+                torch.cuda.synchronize(device)
+                elapsed = time.perf_counter() - started
+            started = time.perf_counter()
+            evaluate(model, inputs, candidate, device)
+            torch.cuda.synchronize(device)
+            validation_seconds = time.perf_counter() - started
+            free_after, _ = torch.cuda.mem_get_info(device)
+            report = {
+                "status": "passed",
+                "calibration_not_final": True,
+                "elapsed_seconds": elapsed,
+                "processed_units": units,
+                "samples_per_second": units / elapsed,
+                "unit": "graphs" if inputs.indices is None else "supervised_seed_nodes",
+                "optimizer_steps": measured_steps,
+                "complete_measurement_epochs": measured_epochs,
+                "complete_warmup_epochs": warmup_epochs,
+                "warmup_optimizer_steps": warmup_updates,
+                "warmup_steps_requested": warmup_steps,
+                "measurement_steps_requested": measurement_steps,
+                "minimum_measure_seconds_requested": minimum_measure_seconds,
+                "stage_seconds": timing.report(),
+                "large_graph_batch_stress": stress,
+                "setup_seconds": setup_seconds,
+                "topology_preparation_seconds": inputs.plan_preparation_seconds,
+                "validation_seconds": validation_seconds,
+                "validation_completed": True,
+                "auxiliary_path_measured": True,
+                "cycle_preparation_measured": candidate.selection_mode == "forest_cycle",
+                "batch_size": physical_batch_size,
+                "workers": workers,
+                "configuration": configuration(candidate),
+                "hardware": hardware,
+                "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+                "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+                "free_bytes_before": int(free_before),
+                "free_bytes_after": int(free_after),
+                "total_memory_bytes": int(total),
+                "optimizer_state_bytes": _optimizer_state_bytes(optimizer),
+                "model_parameter_count": sum(p.numel() for p in model.parameters()),
+                "initial_model_sha256": initial_hash,
+                "parameter_update_verified": initial_hash != base.state_sha256(model),
+                "supervised_labels": labels,
+                "largest_measured_nodes": largest_nodes,
+                "largest_measured_physical_edges": largest_edges,
+                "largest_measured_graph_batch": largest_graphs,
+                "gradient_accumulation_steps": 1,
+                "data_parallel_workers": 1,
+                "effective_batch_size": physical_batch_size,
+                "scope": (
+                    "disposable complete official training epochs + full validation + "
+                    "topology preparation; no test or checkpoints"
+                ),
+            }
+            if not report["parameter_update_verified"] or report["optimizer_state_bytes"] <= 0:
+                raise RuntimeError(
+                    "calibration failed to verify actual optimizer state and parameter update"
+                )
+        except BaseException as error:
+            if monitor is not None:
+                failed_monitor, monitor = monitor, None
+                try:
+                    error.calibration_resource_observability = failed_monitor.finish(
+                        peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+                        peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+                    )
+                except BaseException as report_error:
+                    error.add_note(f"probe telemetry failed: {report_error}")
+            raise
+        finally:
+            try:
+                if monitor is not None:
+                    resources = monitor.finish(
+                        peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+                        peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+                    )
+                    if report is not None:
+                        report["resource_observability"] = resources
+            finally:
+                model = optimizer = inputs = None
+                gc.collect()
+                torch.cuda.empty_cache()
+    return report
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    validate_args(args)
+    output, data_root = (
+        args.output_dir.expanduser().resolve(),
+        args.data_root.expanduser().resolve(),
+    )
+    if output.is_relative_to(data_root) or data_root.is_relative_to(output):
+        raise ValueError("selection output must not overlap the immutable official data cache")
+    if args.output_dir.is_symlink() or any(path.is_symlink() for path in args.output_dir.parents):
+        raise ValueError("selection output must not be indirect")
+    payload, protocol = base.load_dataset(args.dataset, data_root, allow_download=False)
+    train_model(payload, protocol, args, torch.device(args.device), output)
+    print(f"passed: {output}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# experiments/incidence_ablation/integrity.py
+
+````python
+"""Read-only semantic validation of completed incidence-ablation training evidence."""
+
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+
+
+def _positive_integer(value, label):
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _score(value, label):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= value <= 1
+    ):
+        raise ValueError(f"{label} must be a finite validation score in [0, 1]")
+    return value
+
+
+def _fingerprint(value, label):
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a SHA256 fingerprint")
+    return value
+
+
+def _budget(args, metrics):
+    from research.conductance_gat.v5.learning_budget import (
+        deterministic_batches_per_epoch,
+        plan_learning_budget,
+    )
+    from research.conductance_gat.v5.protocol import (
+        HARDWARE_PROFILES,
+        learning_budget_arguments_configuration,
+    )
+
+    topology = metrics.get("topology")
+    if not isinstance(topology, dict):
+        raise ValueError("completed evidence has no full-training topology/count metadata")
+    count = _positive_integer(topology.get("train_count"), "official training unit count")
+    selected = learning_budget_arguments_configuration(args)
+    reference = selected.get("budget_reference_batch_size")
+    if args.dataset != "ppi" and args.sampling == "full":
+        if reference not in {None, 1}:
+            raise ValueError("full-graph training cannot declare a replicated reference batch")
+        actual_batches = reference_batches = 1
+    else:
+        physical = args.batch_size if args.dataset == "ppi" else args.sample_seed_batch_size
+        field = "ppi_batch_size" if args.dataset == "ppi" else "sample_seed_batch_size"
+        reference = reference or HARDWARE_PROFILES[args.hardware_profile][field]
+        actual_batches = deterministic_batches_per_epoch(count, physical)
+        reference_batches = deterministic_batches_per_epoch(count, reference)
+    return plan_learning_budget(
+        args.epochs,
+        args.patience,
+        reference_batches,
+        actual_batches,
+        policy=selected.get("learning_budget_policy", "epochs"),
+    ), count
+
+
+def _history(metrics, identity, rows, args):
+    from research.conductance_gat.v5.learning_budget import should_stop_learning_budget
+
+    epochs = _positive_integer(metrics.get("epochs_run"), "completed epoch count")
+    if (
+        not isinstance(rows, list)
+        or len(rows) != epochs
+        or any(not isinstance(row, dict) for row in rows)
+    ):
+        raise ValueError("completed history must contain one record per completed epoch")
+    if [row.get("epoch") for row in rows] != list(range(1, epochs + 1)):
+        raise ValueError("completed history does not contain contiguous full epochs")
+    budget, count = _budget(args, metrics)
+    if metrics.get("learning_budget") != budget or identity.get("learning_budget") != budget:
+        raise ValueError(
+            "completed learning budget differs from the actual CLI and full-training count"
+        )
+    if epochs > budget["planned_epochs"]:
+        raise ValueError("completed epochs exceed the declared full learning budget")
+    for row in rows:
+        _positive_integer(row.get("epoch"), "history epoch")
+        _score(row.get("validation"), "history validation")
+        if (
+            row.get("train_batches") != budget["actual_batches_per_epoch"]
+            or row.get("optimizer_steps") != row["epoch"] * budget["actual_batches_per_epoch"]
+            or row.get("processed_units") != count
+        ):
+            raise ValueError("history does not prove complete supervised epoch/update coverage")
+        for key in ("train_batches", "optimizer_steps", "processed_units"):
+            _positive_integer(row[key], key)
+        if row.get("phase", {}).get("phase") != "joint":
+            raise ValueError("incidence-ablation history contains a foreign training phase")
+    steps = _positive_integer(metrics.get("optimizer_steps"), "completed optimizer update count")
+    if steps != rows[-1]["optimizer_steps"]:
+        raise ValueError("completed optimizer update count disagrees with history")
+    best = _positive_integer(metrics.get("best_epoch"), "selected epoch")
+    score = _score(metrics.get("best_validation"), "selected validation score")
+    first_maximum = max(range(epochs), key=lambda index: rows[index]["validation"])
+    if best != first_maximum + 1 or score != rows[first_maximum]["validation"]:
+        raise ValueError("selected checkpoint is not the first strict maximum validation epoch")
+    _score(metrics.get("validation"), "selected-checkpoint validation recheck")
+    if epochs < budget["planned_epochs"] and not should_stop_learning_budget(
+        budget,
+        epochs_since_best=epochs - best,
+        optimizer_steps_since_best=steps - rows[best - 1]["optimizer_steps"],
+        eligible=True,
+    ):
+        raise ValueError("completed training stopped before its declared budget and patience")
+
+
+def _checkpoint(checkpoint, identity, *, role):
+    from . import engine as train
+
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"{role} checkpoint must be an object")
+    train.validate_identity(checkpoint, identity)
+    if not isinstance(checkpoint.get("model_state"), dict) or not checkpoint["model_state"]:
+        raise ValueError(f"{role} checkpoint has no model state")
+
+
+def inspect_completed(output):
+    """Validate metadata, budget, full epochs, and both CPU checkpoint interiors.
+
+    The larger last checkpoint is released before loading best.pt. No model is
+    instantiated, CUDA tensor allocated, dataset fetched, or artifact written.
+    """
+    from . import engine as train
+
+    output = Path(output)
+    paths = {name: output / name for name in ("metrics.json", "history.json", "last.pt", "best.pt")}
+    for path in paths.values():
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(
+                f"completed incidence-ablation artifact is missing or indirect: {path}"
+            )
+    fingerprints = {name: train.base.sha256_file(path) for name, path in paths.items()}
+    metrics = json.loads(paths["metrics.json"].read_text(encoding="utf-8"))
+    if (
+        not isinstance(metrics, dict)
+        or metrics.get("status") != "passed"
+        or metrics.get("research_suite") != train.SUITE
+    ):
+        raise ValueError("not completed incidence-ablation evidence")
+    identity = metrics.get("resume_identity")
+    if not isinstance(identity, dict) or metrics.get(
+        "resume_identity_sha256"
+    ) != train.base._canonical_sha256(identity):
+        raise ValueError("completed incidence-ablation identity is corrupt")
+    for name, field in (
+        ("best.pt", "checkpoint_sha256"),
+        ("last.pt", "last_checkpoint_sha256"),
+        ("history.json", "history_sha256"),
+    ):
+        if fingerprints[name] != metrics.get(field):
+            raise ValueError(f"completed incidence-ablation artifact mismatch: {name}")
+    for key in (
+        "research_suite",
+        "dataset",
+        "condition",
+        "configuration",
+        "source_sha256",
+        "initial_state_sha256",
+        "learning_budget",
+    ):
+        if metrics.get(key) != identity.get(key):
+            raise ValueError(f"completed metrics and immutable identity disagree on {key}")
+    if (
+        metrics.get("test_evaluated") is not False
+        or metrics.get("debug") is not False
+        or metrics.get("subset") is not False
+    ):
+        raise ValueError(
+            "completed incidence-ablation evidence is not full validation-only research training"
+        )
+    sources = identity.get("source_sha256")
+    if not isinstance(sources, dict) or not sources:
+        raise ValueError("completed identity has no source provenance")
+    for name, value in sources.items():
+        _fingerprint(value, f"source {name}")
+    protocol = metrics.get("protocol")
+    if (
+        not isinstance(protocol, dict)
+        or protocol != identity.get("dataset_protocol")
+        or train.base._canonical_sha256(protocol) != identity.get("dataset_protocol_sha256")
+    ):
+        raise ValueError("completed data/split protocol identity mismatch")
+    _fingerprint(protocol.get("data_sha256"), "official data cache")
+    if not isinstance(identity.get("input_provenance"), list) or not identity["input_provenance"]:
+        raise ValueError("completed identity has no topology/corruption provenance")
+    if metrics.get("topology", {}).get("provenance") != identity["input_provenance"]:
+        raise ValueError("completed topology/corruption provenance differs from training")
+    saved_args = identity.get("training_arguments")
+    if (
+        not isinstance(saved_args, dict)
+        or "data_root" not in saved_args
+        or "device" not in saved_args
+    ):
+        raise ValueError("completed identity has no restorable training arguments")
+    if "training_arguments" in metrics and metrics["training_arguments"] != saved_args:
+        raise ValueError("completed training arguments disagree with the immutable identity")
+    args = train.restore_arguments(metrics, output, saved_args["data_root"], saved_args["device"])
+    if args.dataset != metrics["dataset"] or args.selection_mode != metrics["condition"]:
+        raise ValueError("saved dataset/selection mode disagrees with the actual trained arguments")
+    initial = _fingerprint(metrics.get("initial_state_sha256"), "initial model")
+    if initial != identity.get("initial_state_sha256"):
+        raise ValueError("initial state differs from the immutable identity")
+    shared = _fingerprint(metrics.get("shared_initial_state_sha256"), "shared initial model")
+    if metrics.get("common_backbone_initial_state_sha256", shared) != shared:
+        raise ValueError("common backbone initialization differs from shared initialization")
+    rows = json.loads(paths["history.json"].read_text(encoding="utf-8"))
+    _history(metrics, identity, rows, args)
+    last = train.base.load_checkpoint_on_cpu(paths["last.pt"])
+    _checkpoint(last, identity, role="last")
+    expected = {
+        "epoch": metrics["epochs_run"],
+        "optimizer_steps": metrics["optimizer_steps"],
+        "best_epoch": metrics["best_epoch"],
+        "best_validation": metrics["best_validation"],
+        "best_checkpoint_sha256": metrics["checkpoint_sha256"],
+        "shared_initial_state_sha256": shared,
+        "history": rows,
+    }
+    if any(last.get(key) != value for key, value in expected.items()):
+        raise ValueError(
+            "last checkpoint history/best/update metadata disagrees with completed metrics"
+        )
+    optimizer = last.get("optimizer_state")
+    if (
+        not isinstance(optimizer, dict)
+        or not isinstance(optimizer.get("state"), dict)
+        or not optimizer["state"]
+        or not isinstance(optimizer.get("param_groups"), list)
+        or not optimizer["param_groups"]
+    ):
+        raise ValueError("last checkpoint lacks actual optimizer state")
+    del optimizer, last
+    best = train.base.load_checkpoint_on_cpu(paths["best.pt"])
+    _checkpoint(best, identity, role="best")
+    if (
+        best.get("selection_role") != "primary"
+        or best.get("epoch") != metrics["best_epoch"]
+        or best.get("validation") != metrics["best_validation"]
+    ):
+        raise ValueError("best checkpoint selection metadata disagrees with completed metrics")
+    del best
+    if fingerprints != {name: train.base.sha256_file(path) for name, path in paths.items()}:
+        raise ValueError("completed evidence changed while being inspected")
+    return metrics
+````
+
+# experiments/incidence_ablation/model.py
+
+````python
+"""Full V5 backbone with paired lift placement and cross-hop energy terms."""
+
+from __future__ import annotations
+
+import math
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
+
+from research.conductance_gat.edge_selection.model import (
+    EdgeSelectionClassifier,
+    EdgeSelectionOperator,
+)
+from research.conductance_gat.v5.model import _static_graph_context, graph_context_features
+from research.conductance_gat.v5.operator import shared_head_diffusion
+
+ARMS = {
+    "baseline": ("none", False),
+    "linear_lift": ("linear", False),
+    "pre_lift": ("pre", False),
+    "post_lift": ("post", False),
+    "bilinear": ("none", True),
+    "bilinear_linear_lift": ("linear", True),
+    "bilinear_pre_lift": ("pre", True),
+    "bilinear_post_lift": ("post", True),
+}
+
+
+def cross_hop_score(values, incidence, weight, coefficients, edge_chunk_size):
+    """All unordered hop pairs, all physical edges, all heads, no diagonal terms.
+
+    values: K x N x H x d; weight: E x H. The returned N x H score is
+    the weighted local cross-energy divided by weighted node degree.
+    Chunking changes only working memory. Checkpointing avoids retaining
+    E x K x H x d intermediates during training.
+    """
+    hops, nodes, heads, width = values.shape
+    pairs = torch.triu_indices(hops, hops, offset=1, device=values.device)
+    if coefficients.shape != (heads, pairs.shape[1]):
+        raise ValueError("cross-hop coefficients must cover every unordered pair")
+    matrix = values.new_zeros((heads, hops, hops))
+    matrix[:, pairs[0], pairs[1]] = coefficients.to(values.dtype) / 2
+    matrix = matrix + matrix.transpose(-1, -2)
+    score, degree = weight.new_zeros((nodes, heads)), weight.new_zeros((nodes, heads))
+    edges = incidence.shape[1]
+    chunk = max(edges, 1) if edge_chunk_size is None else edge_chunk_size
+    if chunk <= 0:
+        raise ValueError("edge chunk size must be positive")
+    # Keep the live edge-feature working set comparable to one-hop diffusion.
+    # Every edge is still visited; this never changes the graph or receptive field.
+    chunk = max(1, chunk // hops)
+
+    def energy(hidden, metric, endpoints):
+        delta = hidden[:, endpoints[1]] - hidden[:, endpoints[0]]
+        return torch.einsum("kehd,hkl,lehd->eh", delta, metric, delta) / math.sqrt(width)
+
+    for start in range(0, edges, max(chunk or 1, 1)):
+        ends = incidence[:, start : start + chunk]
+        w = weight[start : start + chunk]
+        local = (
+            checkpoint(energy, values, matrix, ends, use_reentrant=False)
+            if torch.is_grad_enabled()
+            else energy(values, matrix, ends)
+        )
+        weighted = local.float() * w
+        score = score.index_add(0, ends[0], weighted).index_add(0, ends[1], weighted)
+        degree.index_add_(0, ends[0], w)
+        degree.index_add_(0, ends[1], w)
+    return score / degree.clamp_min(torch.finfo(degree.dtype).tiny)
+
+
+class IncidenceOperator(EdgeSelectionOperator):
+    def __init__(self, original, selection_config, *, layer, lift, bilinear):
+        super().__init__(original, selection_config, layer=layer)
+        self.lift, self.hops = lift, layer + 1
+        self.capture = False
+        self.last_probe = None
+        self.disable_bilinear = False
+        self.disable_lift_channel = False
+        if lift != "none":
+            projection = self.value_weight.new_zeros(
+                self.heads, 2 * self.head_width, self.head_width
+            )
+            projection[:, : self.head_width] = torch.eye(self.head_width)
+            self.lift_projection = nn.Parameter(projection)
+        else:
+            self.register_parameter("lift_projection", None)
+        if bilinear and layer:
+            self.hop_coefficients = nn.Parameter(
+                self.value_weight.new_zeros(self.heads, self.hops * (self.hops - 1) // 2)
+            )
+        else:
+            self.register_parameter("hop_coefficients", None)
+
+    def forward(
+        self,
+        state,
+        incidence,
+        node_graph,
+        num_graphs,
+        *,
+        full_degree,
+        graph_structure,
+        edge_normalization_weight,
+        sampling_correction,
+        edge_selection_topology,
+        static_context=None,
+        edge_relation_id=None,
+        history=None,
+    ):
+        with torch.autocast(device_type=state.device.type, enabled=False):
+            geometry = state.float()
+            context, sample_degree, full_degree = graph_context_features(
+                geometry,
+                incidence,
+                node_graph,
+                num_graphs,
+                full_degree,
+                graph_structure,
+                static_context=static_context,
+            )
+            relation = (
+                {"edge_relation_id": edge_relation_id}
+                if edge_relation_id is not None or self.num_relations
+                else {}
+            )
+            r = self.estimator(
+                geometry,
+                incidence,
+                node_graph,
+                num_graphs,
+                graph_context=context,
+                sample_degree=sample_degree,
+                full_degree=full_degree,
+                edge_normalization_weight=edge_normalization_weight,
+                **relation,
+            )
+            gate = self.selector(
+                geometry,
+                incidence,
+                node_graph,
+                num_graphs,
+                topology=edge_selection_topology,
+                sample_degree=sample_degree,
+                full_degree=full_degree,
+            )
+            effective = r * (gate[:, None] if r.ndim == 2 else gate)
+            beta = self.beta_estimator(context)
+        value = torch.einsum("nd,hdk->nhk", state, self.value_weight)
+
+        def lift(v):
+            second = v if self.lift == "linear" else v.square()
+            if self.disable_lift_channel:
+                second = torch.zeros_like(second)
+            return torch.cat((v, second), dim=-1)
+
+        lifted = lift(value) if self.lift in {"linear", "pre"} else value
+        propagated = shared_head_diffusion(
+            lifted,
+            effective,
+            incidence,
+            node_graph,
+            beta,
+            sampling_correction=sampling_correction,
+            edge_chunk_size=self.edge_chunk_size,
+            propagation_normalization=self.propagation_normalization,
+            polynomial_coefficients=self.polynomial_delta,
+        )
+        if self.lift == "post":
+            propagated = lift(propagated)
+        if self.lift_projection is not None:
+            propagated = torch.einsum("nhd,hdk->nhk", propagated, self.lift_projection)
+        if self.hop_coefficients is not None:
+            if history is None or len(history) != self.hops:
+                raise ValueError("bilinear branch requires every preceding layer state")
+            history_values = torch.einsum("knd,hdw->knhw", history, self.value_weight)
+            with torch.autocast(device_type=state.device.type, enabled=False):
+                weight = effective.float()
+                if sampling_correction is not None:
+                    weight = weight * sampling_correction.reshape(-1, 1)
+                cross = cross_hop_score(
+                    history_values.float(),
+                    incidence,
+                    weight,
+                    self.hop_coefficients,
+                    self.edge_chunk_size,
+                )
+            if not self.disable_bilinear:
+                propagated = propagated + torch.tanh(cross).unsqueeze(-1) * value
+        self.last_gate, self.last_r, self.last_effective_c = (
+            gate.detach(),
+            r.detach(),
+            effective.detach(),
+        )
+        self.last_beta = beta.detach()
+        self.last_sampling_correction = (
+            None if sampling_correction is None else sampling_correction.detach()
+        )
+        self.live_edge_graph, self.live_num_graphs = edge_selection_topology.edge_graph, num_graphs
+        if self.capture:
+            self.last_probe = value.detach()
+        return self.output_projection(propagated.reshape(state.shape[0], self.channels))
+
+
+class IncidenceClassifier(EdgeSelectionClassifier):
+    def __init__(self, in_channels, classes, *, arm, selection_config, **architecture):
+        if arm not in ARMS:
+            raise ValueError(f"unknown ablation arm: {arm}")
+        super().__init__(in_channels, classes, selection_config=selection_config, **architecture)
+        if self.selection_config["condition"] != "full":
+            raise ValueError("incidence ablations use all original physical edges")
+        self.arm = arm
+        lift, bilinear = ARMS[arm]
+        self.capture = False
+        self.last_history = None
+        for layer, block in enumerate(self.blocks):
+            block.operator = IncidenceOperator(
+                block.operator,
+                self.selection_config,
+                layer=layer,
+                lift=lift,
+                bilinear=bilinear,
+            )
+
+    def forward(self, graph):
+        self.clear_auxiliary_cache()
+        x, incidence = graph.x, graph.incidence_edge_index
+        if x.ndim != 2 or x.shape[1] != self.in_channels or not x.is_floating_point():
+            raise ValueError("graph.x must match the configured input width")
+        if (
+            incidence.dtype != torch.long
+            or incidence.ndim != 2
+            or incidence.shape[0] != 2
+            or incidence.device != x.device
+        ):
+            raise ValueError("physical incidence must be same-device 2 x E int64")
+        topology = getattr(graph, "edge_selection_topology", None)
+        if topology is None:
+            raise ValueError("prepare graph.edge_selection_topology before forward")
+        batch = getattr(graph, "batch", None)
+        if batch is None:
+            batch, graphs = torch.zeros(x.shape[0], dtype=torch.long, device=x.device), 1
+        else:
+            graphs = getattr(graph, "_v5_num_graphs", None)
+            if (
+                type(graphs) is not int
+                or graphs < 1
+                or batch.shape != (x.shape[0],)
+                or batch.dtype != torch.long
+            ):
+                raise ValueError("batched graphs need explicit positive _v5_num_graphs")
+        kwargs = {
+            name: getattr(graph, name, None)
+            for name in (
+                "full_degree",
+                "graph_structure",
+                "edge_normalization_weight",
+                "sampling_correction",
+                "edge_relation_id",
+            )
+        }
+        kwargs["edge_selection_topology"] = topology
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            kwargs["static_context"] = _static_graph_context(
+                x.float(),
+                incidence,
+                batch,
+                graphs,
+                kwargs["full_degree"],
+                kwargs["graph_structure"],
+            )
+        hidden = self.encoder(self.input_norm(x))
+        history = [hidden]
+        for block in self.blocks:
+            block.operator.capture = self.capture
+
+            def step(*past, layer=block):
+                current = past[-1]
+                clean = layer.operator_norm(current)
+                previous = (
+                    layer.operator_norm(torch.stack(past))
+                    if layer.operator.hop_coefficients is not None
+                    else None
+                )
+                current = current + F.dropout(
+                    layer.operator(
+                        clean,
+                        incidence,
+                        batch,
+                        graphs,
+                        history=previous,
+                        **kwargs,
+                    ),
+                    layer.dropout,
+                    layer.training,
+                )
+                return current + F.dropout(
+                    layer.ffn(layer.ffn_norm(current)), layer.dropout, layer.training
+                )
+
+            if self.activation_checkpoint and torch.is_grad_enabled():
+                hidden = checkpoint(step, *history, use_reentrant=False, preserve_rng_state=True)
+            else:
+                hidden = step(*history)
+            history.append(hidden)
+        if self.capture:
+            self.last_history = torch.stack([value.detach() for value in history])
+        return self.decoder(self.final_norm(hidden))
+````
+
+# experiments/incidence_ablation/provenance.py
+
+````python
+"""Independent immutable sources; historical manifests never include this package."""
+
+import hashlib
+from pathlib import Path
+
+from scripts.training_resource_plan import source_snapshot as core_snapshot
+
+
+def source_snapshot():
+    root = Path(__file__).resolve().parents[2]
+    sources = core_snapshot()
+    for path in sorted(Path(__file__).parent.glob("*.py")):
+        sources[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return sources
+
+
+def require_source_compatibility(saved, current, *, scope):
+    if not isinstance(saved, dict) or not saved or saved != current:
+        raise ValueError(
+            f"independent incidence {scope} source mismatch; retain results and use a new run ID"
+        )
+    return None
+````
+
+# experiments/incidence_ablation/reallocation.py
+
+````python
+"""Preserve resource selection while stress-checking an equivalent GPU allocation.
+
+Fresh disposable probes cover the original selected candidate's measured worst
+cases. They do not select a new optimum or change the final training recipe.
+"""
+
+from __future__ import annotations
+
+import copy
+import datetime as dt
+import math
+
+from experiments.incidence_ablation import calibration
+from scripts import training_resource_plan as resources
+
+ALLOCATION_FIELDS = frozenset({"device", "uuid", "uuid_unavailable_reason", "cuda_visible_devices"})
+SCOPE = "same-class allocation stress revalidation, not new optimum/all-arm fresh measurement"
+CAPACITY_SCOPE = "same-class changed-capacity all-arm revalidation at unchanged resources"
+
+
+def _scope(original, actual):
+    return (
+        CAPACITY_SCOPE if original["total_memory_bytes"] != actual["total_memory_bytes"] else SCOPE
+    )
+
+
+def require_equivalent_allocation(original, runtime, actual, actual_runtime):
+    """Same model/runtime; changed capacity requires fresh all-arm fit evidence."""
+    required = {"name", "total_memory_bytes", "compute_capability", "allocated_cpu_count"}
+    if not isinstance(original, dict) or not required <= original.keys():
+        raise ValueError("original resource hardware fingerprint is incomplete; preserved")
+    if not isinstance(actual, dict) or not required <= actual.keys():
+        raise ValueError("current resource hardware fingerprint is incomplete")
+    if not isinstance(runtime, dict) or not {"python", "torch", "cuda"} <= runtime.keys():
+        raise ValueError("original resource runtime fingerprint is incomplete; preserved")
+    if not isinstance(actual_runtime, dict):
+        raise ValueError("current resource runtime fingerprint is incomplete")
+    for hardware in (original, actual):
+        capacity = hardware["total_memory_bytes"]
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("hardware.total_memory_bytes must be a positive integer")
+    differences = []
+    for prefix, before, after, ignored in (
+        ("hardware", original, actual, ALLOCATION_FIELDS | {"total_memory_bytes"}),
+        ("runtime", runtime, actual_runtime, frozenset()),
+    ):
+        for field in sorted((before.keys() | after.keys()) - ignored):
+            if field not in before or field not in after or before[field] != after[field]:
+                differences.append(
+                    f"{prefix}.{field}: {before.get(field)!r} -> {after.get(field)!r}"
+                )
+    if differences:
+        raise ValueError(
+            "incidence-ablation allocation is not equivalent: "
+            + "; ".join(differences)
+            + ". Only GPU allocation identifiers and revalidated capacity may change. "
+            "Restore the original GPU class, "
+            "runtime and allocated CPU count, or use a separate explicitly calibrated run; "
+            "the existing recipe/results remain preserved."
+        )
+
+
+def _original_digest(manifest):
+    return resources.digest(
+        {key: manifest[key] for key in ("hardware", "runtime", "calibration_entries")}
+    )
+
+
+def _attempt_digest(attempt):
+    return resources.digest(
+        {key: value for key, value in attempt.items() if key != "evidence_sha256"}
+    )
+
+
+def needs_revalidation(manifest, hardware, runtime, required_groups):
+    """Validate the accepted evidence and decide whether pending work is covered."""
+    require_equivalent_allocation(manifest["hardware"], manifest.get("runtime"), hardware, runtime)
+    current = manifest.get("current_allocation")
+    if current is None:
+        if any(item.get("status") == "passed" for item in manifest.get("allocation_history", [])):
+            raise ValueError("passed allocation history has no committed current allocation")
+        changed = hardware != manifest["hardware"] or runtime != manifest["runtime"]
+    else:
+        history = manifest.get("allocation_history", [])
+        index = current.get("history_index")
+        if type(index) is not int or not 0 <= index < len(history):
+            raise ValueError("current allocation has no retained revalidation evidence")
+        accepted = history[index]
+        passed = [i for i, item in enumerate(history) if item.get("status") == "passed"]
+        if (
+            not passed
+            or index != passed[-1]
+            or accepted.get("scope") != _scope(manifest["hardware"], accepted["hardware"])
+            or accepted.get("evidence_sha256") != _attempt_digest(accepted)
+            or current.get("evidence_sha256") != accepted["evidence_sha256"]
+            or accepted.get("original_calibration_sha256") != _original_digest(manifest)
+        ):
+            raise ValueError("accepted allocation evidence or original calibration changed")
+        require_equivalent_allocation(
+            manifest["hardware"], manifest["runtime"], accepted["hardware"], accepted["runtime"]
+        )
+        covered = {(group["profile"], group["dataset"]) for group in accepted["groups"]}
+        changed = (
+            hardware != accepted["hardware"]
+            or runtime != accepted["runtime"]
+            or not set(required_groups) <= covered
+        )
+    if changed and required_groups:
+        if (
+            manifest.get("calibration_status") != "passed"
+            or manifest.get("resources_applied") is not True
+            or not manifest.get("calibration_entries")
+            or any(entry.get("status") != "passed" for entry in manifest["calibration_entries"])
+        ):
+            raise ValueError(
+                "GPU allocation changed before the original common calibration completed; "
+                "partial measurements cannot be mixed across allocations. Restore the original "
+                "allocation or use a separate run; original evidence is preserved."
+            )
+        return True
+    return False
+
+
+def _representatives(entry, jobs, *, all_arms=False):
+    """Stable union of peak-reserve, peak-allocation and total-budget-cost maxima."""
+    selected = entry["selected_candidate"]
+    candidate_index = next(
+        index
+        for index, candidate in enumerate(entry["candidates"])
+        if {key: candidate[key] for key in selected} == selected
+    )
+    reports = entry["candidates"][candidate_index]["measurements"]
+    lookup = {(job["variant_id"], job["model_seed"]): job for job in jobs}
+    ordered = sorted(
+        range(len(reports)),
+        key=lambda index: lookup[(reports[index]["condition"], reports[index]["model_seed"])][
+            "job_id"
+        ],
+    )
+    criteria = {}
+    for name, score in (
+        ("maximum_peak_reserved_bytes", lambda report: report["peak_reserved_bytes"]),
+        ("maximum_peak_allocated_bytes", lambda report: report["peak_allocated_bytes"]),
+        (
+            "maximum_projected_full_budget_seconds",
+            lambda report: calibration._full_budget_seconds(report, entry["selection_policy"]),
+        ),
+    ):
+        index = max(ordered, key=lambda value: score(reports[value]))
+        criteria.setdefault(index, []).append(name)
+    if all_arms:
+        if {(report["condition"], report["model_seed"]) for report in reports} != set(lookup):
+            raise ValueError("changed-capacity revalidation requires every arm and seed")
+        for index in ordered:
+            criteria.setdefault(index, []).append("changed_capacity_all_arms")
+    return [
+        {
+            "job_id": lookup[(reports[index]["condition"], reports[index]["model_seed"])]["job_id"],
+            "condition": reports[index]["condition"],
+            "model_seed": reports[index]["model_seed"],
+            "original_candidate_index": candidate_index,
+            "original_measurement_index": index,
+            "original_measurement_sha256": resources.digest(reports[index]),
+            "selection_criteria": criteria[index],
+        }
+        for index in ordered
+        if index in criteria
+    ]
+
+
+def _validate_measurement(report, job, child, entry, original, hardware):
+    from experiments.incidence_ablation import engine as train
+
+    if calibration._full_budget_seconds(report, entry["selection_policy"]) is None:
+        raise RuntimeError(
+            f"reallocated GPU cannot safely execute unchanged resources for {job['job_id']}; "
+            "no batch, worker, model or data downscale was applied"
+        )
+    selected = entry["selected_candidate"]
+    expected = calibration._probe_args(
+        child, entry["batch_axis"], selected["batch_size"], selected["workers"]
+    )
+    required = {
+        "condition": job["variant_id"],
+        "model_seed": job["model_seed"],
+        "configuration": train.configuration(expected),
+        "batch_size": selected["batch_size"],
+        "workers": selected["workers"],
+        "total_memory_bytes": hardware["total_memory_bytes"],
+        "parameter_update_verified": True,
+        "calibration_not_final": True,
+        "gradient_accumulation_steps": 1,
+        "data_parallel_workers": 1,
+        "effective_batch_size": selected["batch_size"],
+        "validation_completed": True,
+        "required_auxiliary_path": child.negative_loss_weight > 0,
+        "required_cycle_preparation": child.selection_mode == "forest_cycle",
+        "auxiliary_path_measured": True,
+        "cycle_preparation_measured": child.selection_mode == "forest_cycle",
+        "model_parameter_count": original["model_parameter_count"],
+        "initial_model_sha256": original["initial_model_sha256"],
+    }
+    for key, value in required.items():
+        actual = report.get(key)
+        if actual != value or (isinstance(value, bool) and actual is not value):
+            raise ValueError(f"allocation measurement differs from unchanged recipe: {key}")
+    for key, minimum in (
+        ("complete_measurement_epochs", 1),
+        ("complete_warmup_epochs", 1),
+        ("warmup_optimizer_steps", 2),
+        ("measurement_steps_requested", 5),
+        ("warmup_steps_requested", 2),
+        ("minimum_measure_seconds_requested", 3.0),
+    ):
+        value = report.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < minimum
+            or (key != "minimum_measure_seconds_requested" and type(value) is not int)
+        ):
+            raise ValueError(f"allocation measurement lacks complete full-sized probe scope: {key}")
+    measured_hardware = report.get("hardware", {})
+    for report_key, actual_key in (
+        ("device_name", "name"),
+        ("total_memory_bytes", "total_memory_bytes"),
+        ("compute_capability", "compute_capability"),
+    ):
+        if measured_hardware.get(report_key) != hardware[actual_key]:
+            raise ValueError(f"allocation measurement hardware mismatch: {report_key}")
+
+
+def revalidate_allocation(manifest, hardware, runtime, grouped_jobs, persist):
+    """Append an attempt and atomically accept it only after all probes pass."""
+    from experiments.incidence_ablation import engine as train
+
+    if not grouped_jobs:
+        raise ValueError(
+            "allocation revalidation requires pending groups with real workload probes"
+        )
+    require_equivalent_allocation(manifest["hardware"], manifest["runtime"], hardware, runtime)
+    scope = _scope(manifest["hardware"], hardware)
+    entries = {
+        (entry["profile"], entry["dataset"]): entry for entry in manifest["calibration_entries"]
+    }
+    groups = []
+    for key, jobs in grouped_jobs.items():
+        entry = entries[key]
+        calibration.validate_entry(entry, jobs)
+        groups.append(
+            {
+                "profile": key[0],
+                "dataset": key[1],
+                "selected_candidate": copy.deepcopy(entry["selected_candidate"]),
+                "selected": copy.deepcopy(entry["selected"]),
+                "representatives": _representatives(entry, jobs, all_arms=scope == CAPACITY_SCOPE),
+                "measurements": [],
+            }
+        )
+    attempt = {
+        "schema_version": 1,
+        "status": "running",
+        "scope": scope,
+        "hardware": copy.deepcopy(hardware),
+        "runtime": copy.deepcopy(runtime),
+        "original_calibration_sha256": _original_digest(manifest),
+        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "representative_tie_break": "lexicographically first job_id",
+        "inherited_evidence": "original complete all-arm calibration at unchanged resources",
+        "groups": groups,
+    }
+    history = manifest.setdefault("allocation_history", [])
+    history.append(attempt)
+    persist()
+    try:
+        for group in groups:
+            key = group["profile"], group["dataset"]
+            entry, jobs = entries[key], grouped_jobs[key]
+            lookup = {job["job_id"]: job for job in jobs}
+            loaded, identity, maximum, axis = train.load_calibration_payload(
+                calibration.parse_job(jobs[0])
+            )
+            if (identity, maximum, axis) != (
+                entry["input_identity"],
+                entry["natural_training_split_size"],
+                entry["batch_axis"],
+            ):
+                raise ValueError("allocation revalidation data/split/topology identity changed")
+            for reference in group["representatives"]:
+                job = lookup[reference["job_id"]]
+                child = calibration.parse_job(job)
+                selected = entry["selected_candidate"]
+                print(
+                    f"[edge allocation revalidation] {job['job_id']} "
+                    f"physical={selected['batch_size']} workers={selected['workers']}; "
+                    f"disposable probe, unchanged recipe; {scope}",
+                    flush=True,
+                )
+                report = calibration._measure(
+                    job, loaded, child, selected["batch_size"], selected["workers"]
+                )
+                group["measurements"].append({"job_id": job["job_id"], "report": report})
+                persist()
+                original = entry["candidates"][reference["original_candidate_index"]][
+                    "measurements"
+                ][reference["original_measurement_index"]]
+                _validate_measurement(report, job, child, entry, original, hardware)
+            del loaded
+        attempt.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+        attempt["evidence_sha256"] = _attempt_digest(attempt)
+        manifest["current_allocation"] = {
+            "history_index": len(history) - 1,
+            "evidence_sha256": attempt["evidence_sha256"],
+        }
+        persist()
+    except (Exception, KeyboardInterrupt) as error:
+        attempt.update(
+            status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+            error=f"{type(error).__name__}: {error}",
+            finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+        )
+        # Publication failure must not leave an in-memory accepted failed attempt.
+        if manifest.get("current_allocation", {}).get("history_index") == len(history) - 1:
+            previous = [
+                index for index, item in enumerate(history[:-1]) if item.get("status") == "passed"
+            ]
+            if previous:
+                manifest["current_allocation"] = {
+                    "history_index": previous[-1],
+                    "evidence_sha256": history[previous[-1]]["evidence_sha256"],
+                }
+            else:
+                manifest.pop("current_allocation", None)
+        try:
+            persist()
+        except (Exception, KeyboardInterrupt) as reporting_error:
+            error.add_note(f"allocation failure evidence could not be persisted: {reporting_error}")
+        raise
+````
+
+# experiments/incidence_ablation/runner.py
+
+````python
+#!/usr/bin/env python3
+"""Independent fresh full-size cross-hop and nonlinear-lifting experiments.
+
+All arms share a measured physical batch/worker plan; previous V5 runs are untouched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import json
+import math
+import platform
+import shlex
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_bytes, atomic_write_json  # noqa: E402
+from experiments.incidence_ablation import calibration, provenance, reallocation  # noqa: E402
+from experiments.incidence_ablation.model import ARMS  # noqa: E402
+from experiments.incidence_ablation.provenance import (  # noqa: E402
+    require_source_compatibility,
+)
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    DATASETS,
+    HARDWARE_PROFILES,
+    SAMPLING_CHOICES,
+    add_sampling_context_arguments,
+    sampling_context_configuration,
+)
+from scripts import calibrate_training_resources as hardware_tools  # noqa: E402
+from scripts import run_conductance_v5 as standalone  # noqa: E402
+from scripts import run_v5_mechanism_experiments as common  # noqa: E402
+from scripts import training_resource_plan as resources  # noqa: E402
+from scripts.calibration_lock import calibration_lock  # noqa: E402
+
+SUITE = "incidence_hop_lifting_ablation_controller_v1"
+TRAIN_MODULE = "experiments.incidence_ablation.engine"
+
+
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--run-id", required=True)
+    result.add_argument("--arms", nargs="+", choices=tuple(ARMS), default=list(ARMS))
+    result.add_argument("--datasets", nargs="+", choices=DATASETS, required=True)
+    result.add_argument("--profiles", nargs="+", choices=("reference", "large"), required=True)
+    result.add_argument("--model-seeds", nargs="+", type=int, default=[0])
+    result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    result.add_argument("--results-root", type=Path, default=ROOT / "results")
+    result.add_argument("--device", default="cuda:0")
+    result.add_argument(
+        "--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="a6000-48gb"
+    )
+    result.add_argument("--epochs", type=int, default=200)
+    result.add_argument("--patience", type=int, default=50)
+    result.add_argument("--workers", type=int, default=4)
+    result.add_argument("--ppi-batch-size", type=int)
+    result.add_argument("--sample-seed-batch-size", type=int)
+    result.add_argument("--edge-chunk-size", type=int)
+    result.add_argument(
+        "--activation-checkpoint", action=argparse.BooleanOptionalAction, default=True
+    )
+    result.add_argument("--sampling", choices=SAMPLING_CHOICES, default="auto")
+    result.add_argument("--num-neighbors", nargs="+", type=int, default=[15, 10])
+    add_sampling_context_arguments(result)
+    result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument("--repeat-evaluations", type=int, default=5)
+    result.add_argument("--cg-tolerance", type=float, default=1e-7)
+    result.add_argument("--cg-iterations", type=int, default=2000)
+    result.add_argument("--dry-run", action="store_true")
+    result.add_argument("--calibration-only", action="store_true")
+    return result
+
+
+def validate_args(args):
+    if not standalone.RUN_ID_PATTERN.fullmatch(args.run_id):
+        raise ValueError("run-id must be a safe 1-120 character identifier")
+    for name in ("arms", "datasets", "profiles", "model_seeds"):
+        values = getattr(args, name)
+        if not values or len(set(values)) != len(values):
+            raise ValueError(f"{name} must be nonempty and unique")
+    if args.epochs < 4 or args.patience < 1 or args.workers < 0 or args.repeat_evaluations < 5:
+        raise ValueError("invalid full training/worker/audit budget")
+    if any(seed < 0 for seed in args.model_seeds):
+        raise ValueError("model seeds must be nonnegative")
+    if not 0 < args.cg_tolerance < 1 or args.cg_iterations < 1:
+        raise ValueError("CG tolerance must be in (0,1) and iterations positive")
+    if not str(args.device).startswith("cuda"):
+        raise ValueError("production training requires CUDA; no CPU fallback")
+    sampling_context_configuration(args)
+
+
+def variants(args):
+    return [
+        {
+            "variant_id": arm,
+            "suite": "incidence_ablation",
+            "configuration": {
+                "ablation_arm": arm,
+                "selection_mode": "full",
+                "l0_weight": 0.0,
+                "negative_loss_weight": 0.0,
+                "corruption_ratio": 0.0,
+            },
+        }
+        for arm in args.arms
+    ]
+
+
+def make_jobs(args, run_dir):
+    result = []
+    for profile in args.profiles:
+        for seed in args.model_seeds:
+            for variant in variants(args):
+                options = [
+                    "--profile",
+                    profile,
+                    "--datasets",
+                    *args.datasets,
+                    "--model-seed",
+                    str(seed),
+                    "--conductance-heads",
+                    "per_head",
+                    "--propagation-normalization",
+                    "row",
+                    "--conductance-backend",
+                    "optimization",
+                    "--solver-cost-scaling",
+                    "width_scaled",
+                    "--training-schedule",
+                    "joint",
+                    "--beta-initial",
+                    "0.5",
+                    "--learning-budget-policy",
+                    "reference_updates",
+                ]
+                for name in (
+                    "data_root",
+                    "results_root",
+                    "device",
+                    "hardware_profile",
+                    "epochs",
+                    "patience",
+                    "workers",
+                    "ppi_batch_size",
+                    "sample_seed_batch_size",
+                    "edge_chunk_size",
+                    "sampling",
+                    "sample_context_seed_batch_size",
+                    "sample_context_workers",
+                    "min_free_gb",
+                ):
+                    value = getattr(args, name)
+                    if value is not None:
+                        options += ["--" + name.replace("_", "-"), str(value)]
+                options += ["--num-neighbors", *(str(value) for value in args.num_neighbors)]
+                options.append(
+                    "--activation-checkpoint"
+                    if args.activation_checkpoint
+                    else "--no-activation-checkpoint"
+                )
+                baseline = standalone.parser().parse_args(options)
+                standalone._validate(baseline)
+                namespace = (
+                    run_dir / "variants" / variant["variant_id"] / profile / f"model-seed-{seed}"
+                )
+                for job in standalone.make_jobs(
+                    baseline, namespace, standalone._architecture(baseline)
+                ):
+                    if job["condition"] != "shared_dynamic_c":
+                        continue
+                    command = job["command"]
+                    command[command.index("-m") + 1] = TRAIN_MODULE
+                    for name, value in variant["configuration"].items():
+                        if value is not None:
+                            command += ["--" + name.replace("_", "-"), str(value)]
+                    job.update(
+                        variant=copy.deepcopy(variant),
+                        variant_id=variant["variant_id"],
+                        track="conductance",
+                        profile=profile,
+                        model_seed=seed,
+                        job_id=f"{profile}/{job['dataset']}/model-seed-{seed}/{variant['variant_id']}",
+                    )
+                    result.append(job)
+    return result
+
+
+def _config(args):
+    return {
+        name: str(value.expanduser().resolve()) if isinstance(value, Path) else value
+        for name, value in vars(args).items()
+        if name
+        not in {
+            "dry_run",
+            "calibration_only",
+            "run_id",
+            "repeat_evaluations",
+            "cg_tolerance",
+            "cg_iterations",
+        }
+    }
+
+
+def _resume(path, args, planned, sources, dependencies):
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    required = {
+        "schema_version": 1,
+        "suite": SUITE,
+        "run_id": args.run_id,
+        "config": _config(args),
+        "dependencies": dependencies,
+    }
+    if any(manifest.get(key) != value for key, value in required.items()):
+        raise ValueError(
+            "incidence-ablation run identity changed; use a new run ID; no old results overwritten"
+        )
+    if [common._job_identity(job) for job in manifest.get("planned_jobs", [])] != [
+        common._job_identity(job) for job in planned
+    ]:
+        raise ValueError("incidence-ablation arm matrix differs; no silent resume")
+    transition = require_source_compatibility(
+        manifest.get("source_sha256"), sources, scope="manifest"
+    )
+    if transition is not None:
+        transitions = manifest.setdefault("source_transitions", [])
+        if transition not in transitions:
+            transitions.append(transition)
+    return manifest
+
+
+def _ensure_calibration(args, manifest, persist):
+    import torch
+
+    hardware = hardware_tools._hardware(args.device)
+    runtime = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+    }
+    pending_groups = {
+        (job["profile"], job["dataset"])
+        for job in manifest["jobs"]
+        if job.get("status") != "passed"
+        or job.get("audit", {}).get("status") != "passed"
+        or job.get("audit", {}).get("command") != _audit_command(args, job)
+    }
+    revalidate = "hardware" in manifest and reallocation.needs_revalidation(
+        manifest, hardware, runtime, pending_groups
+    )
+    if args.hardware_profile == "a6000-48gb" and (
+        hardware["total_memory_bytes"] < 40 * 1024**3 or hardware["compute_capability"][0] < 8
+    ):
+        raise ValueError("A6000 profile requires >=40 GiB visible VRAM and capability >=8")
+    free, _ = torch.cuda.mem_get_info(torch.device(args.device))
+    required = max(
+        args.min_free_gb, 32.0 if args.hardware_profile == "a6000-48gb" else args.min_free_gb
+    )
+    if free < required * 1024**3:
+        raise RuntimeError(f"calibration requires {required:g} GiB free; no processes were changed")
+    if "hardware" not in manifest:
+        manifest.update(hardware=hardware, runtime=runtime)
+    entries = manifest["calibration_entries"]
+    for (profile, dataset), jobs in common._grouped(manifest["planned_jobs"]).items():
+        entry = next(
+            (item for item in entries if (item["profile"], item["dataset"]) == (profile, dataset)),
+            None,
+        )
+        if entry is None:
+            entry = {"profile": profile, "dataset": dataset}
+            entries.append(entry)
+        if revalidate:
+            calibration.validate_entry(entry, jobs)
+        else:
+            calibration.calibrate_group(jobs, entry, persist)
+    resolved = common._apply_common_resources(manifest["planned_jobs"], entries)
+    if manifest.get("resources_applied"):
+        if [common._job_identity(job) for job in manifest["jobs"]] != [
+            common._job_identity(job) for job in resolved
+        ]:
+            raise ValueError("saved child resources differ from the immutable common measurement")
+    else:
+        manifest.update(jobs=resolved, resources_applied=True)
+    if revalidate:
+        reallocation.revalidate_allocation(
+            manifest,
+            hardware,
+            runtime,
+            {
+                key: jobs
+                for key, jobs in common._grouped(manifest["planned_jobs"]).items()
+                if key in pending_groups
+            },
+            persist,
+        )
+    manifest["calibration_status"] = "passed"
+    persist()
+
+
+def _read_result(job):
+    from experiments.incidence_ablation import engine as train
+    from research.conductance_gat.v5.train import _canonical_sha256
+
+    path = Path(job["metrics_path"])
+    if path.is_symlink():
+        raise ValueError("incidence-ablation metrics cannot be an indirect path")
+    payload = train.inspect_completed(Path(job["output_dir"]))
+    child = calibration.parse_job(job)
+    config = train.configuration(child)
+    if payload.get("status") != "passed" or payload.get("configuration") != config:
+        raise ValueError(
+            "completed incidence-ablation result differs from the exact measured recipe"
+        )
+    identity = payload.get("resume_identity")
+    if not isinstance(identity, dict) or _canonical_sha256(identity) != payload.get(
+        "resume_identity_sha256"
+    ):
+        raise ValueError("completed incidence-ablation resume identity hash mismatch")
+    for key in ("research_suite", "dataset", "condition", "configuration", "source_sha256"):
+        if payload.get(key) != identity.get(key):
+            raise ValueError(f"incidence-ablation result and identity disagree on {key}")
+    if payload.get("research_suite") != train.SUITE or payload.get("dataset") != job["dataset"]:
+        raise ValueError("foreign experiment result cannot be imported")
+    require_source_compatibility(
+        payload.get("source_sha256"), train.implementation_source_hashes(), scope="training"
+    )
+    protocol = payload.get("protocol")
+    if (
+        not isinstance(protocol, dict)
+        or identity.get("dataset_protocol") != protocol
+        or identity.get("dataset_protocol_sha256") != _canonical_sha256(protocol)
+    ):
+        raise ValueError("incidence-ablation data/split protocol identity mismatch")
+    if payload.get("test_evaluated") is not False:
+        raise ValueError("training comparisons must be validation-only")
+    output = Path(job["output_dir"])
+    hashes = {}
+    for filename, key in (
+        ("best.pt", "checkpoint_sha256"),
+        ("last.pt", "last_checkpoint_sha256"),
+        ("history.json", "history_sha256"),
+    ):
+        actual = common._file_sha(output / filename)
+        if actual != payload.get(key):
+            raise ValueError(f"incidence-ablation artifact changed: {filename}")
+        hashes[key] = actual
+    history = json.loads((output / "history.json").read_text(encoding="utf-8"))
+    if (
+        not isinstance(history, list)
+        or not history
+        or payload.get("epochs_run") != len(history)
+        or [row.get("epoch") for row in history] != list(range(1, len(history) + 1))
+    ):
+        raise ValueError("incidence-ablation completed epoch history is incomplete")
+    best, value = (
+        payload.get("best_epoch"),
+        payload.get("best_validation", payload.get("validation")),
+    )
+    if (
+        type(best) is not int
+        or not 1 <= best <= len(history)
+        or isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise ValueError("incidence-ablation selected validation checkpoint is invalid")
+    if history[best - 1].get("validation") != value:
+        raise ValueError("incidence-ablation selected score differs from retained epoch history")
+    initial = payload.get("shared_initial_state_sha256")
+    if not resources._is_sha256(initial):
+        raise ValueError("incidence-ablation lacks shared initialization provenance")
+    if payload.get("optimizer_steps") != history[-1].get("optimizer_steps"):
+        raise ValueError("incidence-ablation final optimizer-step evidence is inconsistent")
+    return {
+        "validation": value,
+        "best_epoch": best,
+        "epochs_run": len(history),
+        "shared_initial_state_sha256": initial,
+        "data_sha256": protocol.get("data_sha256"),
+        "split_sha256": protocol.get("split_sha256"),
+        "learning_budget": payload.get("learning_budget"),
+        **hashes,
+    }
+
+
+def _compare(jobs):
+    for group in common._grouped(jobs).values():
+        for seed in {job["model_seed"] for job in group}:
+            completed = [
+                job["result"]
+                for job in group
+                if job["model_seed"] == seed and job["status"] == "passed"
+            ]
+            for key in (
+                "shared_initial_state_sha256",
+                "data_sha256",
+                "split_sha256",
+                "learning_budget",
+            ):
+                values = [result.get(key) for result in completed]
+                if any(value is None for value in values) or any(
+                    value != values[0] for value in values
+                ):
+                    raise ValueError(f"incidence-ablation arms do not share verified {key}")
+
+
+def _audit_command(args, job):
+    return [
+        sys.executable,
+        "-B",
+        "-m",
+        "experiments.incidence_ablation.audit",
+        "--root",
+        job["output_dir"],
+        "--data-root",
+        str(args.data_root.expanduser().resolve()),
+        "--device",
+        args.device,
+        "--repeat-evaluations",
+        str(args.repeat_evaluations),
+        "--cg-tolerance",
+        str(args.cg_tolerance),
+        "--cg-iterations",
+        str(args.cg_iterations),
+    ]
+
+
+def _audit(args, job, environment, persist):
+    from experiments.incidence_ablation import engine as train
+
+    command = _audit_command(args, job)
+    prior = job.get("audit", {})
+    checkpoint = job["result"]["checkpoint_sha256"]
+    if prior.get("status") == "passed" and prior.get("command") == command:
+        if prior.get("checkpoint_sha256") != checkpoint or common._file_sha(
+            Path(prior["log_path"])
+        ) != prior.get("log_sha256"):
+            raise ValueError("completed incidence-ablation audit evidence changed")
+        return
+    if prior:
+        job.setdefault("audit_attempts", []).append(copy.deepcopy(prior))
+    log = standalone._next_log(Path(job["log_path"]).with_suffix(".audit.log"))
+    state = {
+        "status": "running",
+        "command": command,
+        "log_path": str(log),
+        "checkpoint_sha256": checkpoint,
+        "evaluator_source_sha256": train.implementation_source_hashes(),
+    }
+    job["audit"] = state
+    persist()
+    try:
+        status = standalone.shared.run_logged(command, log, environment)
+        state["exit_code"] = status
+        if status:
+            raise RuntimeError(
+                f"incidence-ablation audit failed ({status}); completed training retained"
+            )
+        if state["evaluator_source_sha256"] != train.implementation_source_hashes():
+            raise ValueError("incidence-ablation evaluator source changed during audit")
+        state.update(status="passed", log_sha256=common._file_sha(log))
+        persist()
+    except (Exception, KeyboardInterrupt) as error:
+        state.update(status="failed", error=f"{type(error).__name__}: {error}")
+        if log.is_file() and not log.is_symlink():
+            state["log_sha256"] = common._file_sha(log)
+        standalone.shared.run_failure_reporter(
+            persist, original_error=error, action="independent edge audit"
+        )
+        raise
+
+
+def _summary(run_dir, manifest):
+    lines = [
+        "# Incidence-ablation experiment progress",
+        "",
+        "Validation only; no SOTA or multi-seed claim.",
+        "",
+        "Fresh ablations; same backbone initialization, full splits and measured resources.",
+        "",
+        "| Profile | Dataset | Seed | Arm | Training | Audit | Validation | Epoch |",
+        "| --- | --- | ---: | --- | --- | --- | ---: | ---: |",
+    ]
+    for job in manifest["jobs"]:
+        result, audit = job.get("result", {}), job.get("audit", {})
+        label = audit.get("status", "pending")
+        if audit.get("log_path"):
+            label = f"[{label}](<{Path(audit['log_path']).relative_to(run_dir).as_posix()}>)"
+        score = f"{result['validation']:.6f}" if "validation" in result else "pending"
+        lines.append(
+            f"| {job['profile']} | {job['dataset']} | {job['model_seed']} | "
+            f"{job['variant_id']} | {job['status']} | {label} | {score} | "
+            f"{result.get('best_epoch', '')} |"
+        )
+    atomic_write_bytes(run_dir / "comparison.md", ("\n".join(lines) + "\n").encode())
+
+
+def _run(args, run_dir, planned, sources, dependencies):
+    path = run_dir / "manifest.json"
+    if path.exists():
+        manifest = _resume(path, args, planned, sources, dependencies)
+    else:
+        if any(item.name != ".calibration.lock" for item in run_dir.iterdir()):
+            raise ValueError("new incidence-ablation directory has untracked contents; preserved")
+        manifest = {
+            "schema_version": 1,
+            "suite": SUITE,
+            "run_id": args.run_id,
+            "status": "calibrating",
+            "config": _config(args),
+            "source_sha256": sources,
+            "dependencies": dependencies,
+            "planned_jobs": planned,
+            "jobs": copy.deepcopy(planned),
+            "calibration_entries": [],
+            "test_evaluated": False,
+            "legacy_results_imported": False,
+            "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        }
+
+    def persist():
+        atomic_write_json(path, manifest)
+
+    current = None
+    try:
+        _ensure_calibration(args, manifest, persist)
+        if provenance.source_snapshot() != sources:
+            raise ValueError("incidence-ablation implementation changed during calibration")
+        if args.calibration_only:
+            manifest["status"] = "calibrated"
+            persist()
+            _summary(run_dir, manifest)
+            return 0
+        environment = standalone.shared._environment()
+        environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+        manifest["status"] = "running"
+        for index, job in enumerate(manifest["jobs"], 1):
+            if provenance.source_snapshot() != sources:
+                raise ValueError("incidence-ablation implementation changed during the run")
+            if job["status"] == "passed":
+                if _read_result(job) != job.get("result"):
+                    raise ValueError("completed incidence-ablation result changed")
+                print(f"[{index}/{len(planned)}] verified, skipping {job['job_id']}", flush=True)
+                _audit(args, job, environment, persist)
+                continue
+            current = job
+            command = list(job["command"])
+            checkpoint = Path(job["output_dir"]) / "last.pt"
+            if checkpoint.is_file() and not checkpoint.is_symlink():
+                command.append("--resume")
+            else:
+                standalone._preserve_incomplete_child(job, run_dir)
+            job.update(status="running", attempt_command=command)
+            persist()
+            print(f"[{index}/{len(planned)}] {job['job_id']}", flush=True)
+            started = time.monotonic()
+            status = standalone.shared.run_logged(
+                command, standalone._next_log(Path(job["log_path"])), environment
+            )
+            job.update(exit_code=status, elapsed_seconds=time.monotonic() - started)
+            if status:
+                raise RuntimeError(f"{job['job_id']} failed with child status {status}")
+            job.update(result=_read_result(job), status="passed")
+            _compare(manifest["jobs"])
+            current = None
+            persist()
+            _audit(args, job, environment, persist)
+            _summary(run_dir, manifest)
+        _compare(manifest["jobs"])
+        if provenance.source_snapshot() != sources:
+            raise ValueError("incidence-ablation implementation changed during the final audit")
+        manifest.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+        manifest.pop("error", None)
+        persist()
+        _summary(run_dir, manifest)
+        print(f"Incidence-ablation comparisons passed: {run_dir / 'comparison.md'}", flush=True)
+        return 0
+    except (Exception, KeyboardInterrupt) as error:
+        manifest.update(
+            status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+            error=f"{type(error).__name__}: {error}",
+        )
+        if current is not None:
+            current.update(status="failed", error=manifest["error"])
+        standalone.shared.run_failure_reporter(
+            persist, original_error=error, action="edge manifest"
+        )
+        standalone.shared.run_failure_reporter(
+            lambda: _summary(run_dir, manifest), original_error=error, action="edge summary"
+        )
+        print(
+            f"Incidence-ablation stopped safely: {manifest['error']}\nPreserved: {run_dir}",
+            file=sys.stderr,
+        )
+        return 130 if isinstance(error, KeyboardInterrupt) else 1
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    try:
+        validate_args(args)
+        data = args.data_root.expanduser().resolve()
+        run_dir = args.results_root.expanduser().resolve() / "incidence_ablation" / args.run_id
+        if (
+            run_dir.resolve() != run_dir
+            or run_dir.is_relative_to(data)
+            or data.is_relative_to(run_dir)
+        ):
+            raise ValueError(
+                "incidence-ablation outputs must be direct paths outside the dataset cache"
+            )
+        planned = make_jobs(args, run_dir)
+        if args.dry_run:
+            print(
+                f"{len(variants(args))} independent arms; {len(planned)} full-size trainings; "
+                f"profiles={args.profiles}; datasets={args.datasets}; seeds={args.model_seeds}"
+            )
+            print("Fresh models; per-head C + row diffusion; old experiments are untouched.")
+            print(
+                "Common measured train+optimizer+validation+preparation calibration "
+                "precedes training; old V5 runs are untouched."
+            )
+            for job in planned:
+                print(f"{job['job_id']}: {shlex.join(job['command'])}")
+            print("Dry run only: no files, GPU probes, child processes or final training created.")
+            return 0
+        dependencies, sources = standalone.check_dependencies(), provenance.source_snapshot()
+        path = run_dir / "manifest.json"
+        if path.exists():
+            if path.is_symlink():
+                raise ValueError("incidence-ablation manifest must not be indirect")
+            _resume(path, args, planned, sources, dependencies)
+        with calibration_lock(run_dir):
+            return _run(args, run_dir, planned, sources, dependencies)
+    except (ValueError, RuntimeError, OSError, standalone.DependencyCheckError) as error:
+        print(f"Incidence-ablation refused: {type(error).__name__}: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# experiments/launch_incidence_mig.py
+
+````python
+"""Select a MIG on an explicitly requested physical GPU before importing torch.
+
+Read-only NVML APIs: https://docs.nvidia.com/deploy/nvml-api/api/group__nvmlMultiInstanceGPU.html
+This environment-only launcher is outside the immutable training source scope.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ctypes as ct
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+
+
+class Memory(ct.Structure):
+    _fields_ = [(name, ct.c_ulonglong) for name in ("total", "free", "used")]
+
+
+def nvml_devices(physical_gpu):
+    library = ct.CDLL("libnvidia-ml.so.1")
+    signatures = {
+        "nvmlInit_v2": [],
+        "nvmlShutdown": [],
+        "nvmlDeviceGetHandleByIndex_v2": [ct.c_uint, ct.POINTER(ct.c_void_p)],
+        "nvmlDeviceGetMaxMigDeviceCount": [ct.c_void_p, ct.POINTER(ct.c_uint)],
+        "nvmlDeviceGetMigDeviceHandleByIndex": [ct.c_void_p, ct.c_uint, ct.POINTER(ct.c_void_p)],
+        "nvmlDeviceGetGpuInstanceId": [ct.c_void_p, ct.POINTER(ct.c_uint)],
+        "nvmlDeviceGetComputeInstanceId": [ct.c_void_p, ct.POINTER(ct.c_uint)],
+        "nvmlDeviceGetUUID": [ct.c_void_p, ct.POINTER(ct.c_char), ct.c_uint],
+        "nvmlDeviceGetMemoryInfo": [ct.c_void_p, ct.POINTER(Memory)],
+    }
+    for name, signature in signatures.items():
+        function = getattr(library, name)
+        function.argtypes, function.restype = signature, ct.c_int
+
+    def call(name, *args):
+        code = getattr(library, name)(*args)
+        if code:
+            raise RuntimeError(f"{name} failed with NVML status {code}")
+
+    call("nvmlInit_v2")
+    try:
+        parent, count = ct.c_void_p(), ct.c_uint()
+        call("nvmlDeviceGetHandleByIndex_v2", physical_gpu, ct.byref(parent))
+        call("nvmlDeviceGetMaxMigDeviceCount", parent, ct.byref(count))
+        records = []
+        for index in range(count.value):
+            handle = ct.c_void_p()
+            code = library.nvmlDeviceGetMigDeviceHandleByIndex(parent, index, ct.byref(handle))
+            if code == 6:  # NVML_ERROR_NOT_FOUND: an unpopulated MIG slot.
+                continue
+            if code:
+                raise RuntimeError(f"MIG slot {index}: NVML status {code}")
+            gi, ci, memory = ct.c_uint(), ct.c_uint(), Memory()
+            uuid = ct.create_string_buffer(128)
+            call("nvmlDeviceGetGpuInstanceId", handle, ct.byref(gi))
+            call("nvmlDeviceGetComputeInstanceId", handle, ct.byref(ci))
+            call("nvmlDeviceGetUUID", handle, uuid, len(uuid))
+            call("nvmlDeviceGetMemoryInfo", handle, ct.byref(memory))
+            records.append(
+                {
+                    "physical_gpu": physical_gpu,
+                    "mig_index": index,
+                    "gpu_instance": gi.value,
+                    "compute_instance": ci.value,
+                    "uuid": uuid.value.decode("ascii"),
+                    "total_bytes": memory.total,
+                    "free_bytes": memory.free,
+                }
+            )
+        return records
+    finally:
+        call("nvmlShutdown")  # Release this process's NVML library handle only.
+
+
+def select_device(records, *, physical_gpu, gpu_instance, compute_instance, min_free_gb):
+    matching = [
+        row
+        for row in records
+        if row["physical_gpu"] == physical_gpu
+        and (gpu_instance is None or row["gpu_instance"] == gpu_instance)
+        and (compute_instance is None or row["compute_instance"] == compute_instance)
+        and 8 * 2**30 <= row["total_bytes"] <= 11 * 2**30
+        and row["free_bytes"] >= min_free_gb * 2**30
+    ]
+    if not matching:
+        raise RuntimeError(
+            "No requested 10GB MIG has the required free memory; "
+            f"observed={json.dumps(records, sort_keys=True)}"
+        )
+    chosen = max(matching, key=lambda row: (row["free_bytes"], -row["mig_index"]))
+    if not re.fullmatch(r"MIG-[A-Za-z0-9/-]+", chosen["uuid"]):
+        raise ValueError("NVML returned an invalid MIG UUID")
+    return chosen
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--physical-gpu", type=int, required=True)
+    parser.add_argument("--gpu-instance", type=int)
+    parser.add_argument("--compute-instance", type=int)
+    parser.add_argument("--min-free-gb", type=float, default=8)
+    parser.add_argument("training_args", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    command = args.training_args
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        parser.error("provide the unchanged training arguments after --")
+    if (
+        any(
+            value is not None and value < 0
+            for value in (args.physical_gpu, args.gpu_instance, args.compute_instance)
+        )
+        or not math.isfinite(args.min_free_gb)
+        or args.min_free_gb < 0
+    ):
+        parser.error("device identifiers and minimum free memory must be nonnegative")
+    if args.compute_instance is not None and args.gpu_instance is None:
+        parser.error("compute-instance requires gpu-instance")
+    try:
+        chosen = select_device(
+            nvml_devices(args.physical_gpu),
+            physical_gpu=args.physical_gpu,
+            gpu_instance=args.gpu_instance,
+            compute_instance=args.compute_instance,
+            min_free_gb=args.min_free_gb,
+        )
+        environment = dict(os.environ)
+        environment["CUDA_VISIBLE_DEVICES"] = chosen["uuid"]
+        environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+        print(json.dumps({"selected_mig": chosen, "logical_device": "cuda:0"}), flush=True)
+        return subprocess.run(
+            [sys.executable, "-B", "-m", "experiments.incidence_ablation", *command],
+            env=environment,
+            check=False,
+        ).returncode
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"MIG selection stopped safely: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ````
 
 # pyproject.toml
@@ -7937,6 +14639,4538 @@ datasets:
     claim: Negative-control boundary for strictly positive diffusion.
     adapter: planned sparse node-classification adapter
     leakage_guard: Treat a failure as a model limitation, not a dataset to tune away.
+````
+
+# research/conductance_gat/edge_selection/__init__.py
+
+````python
+"""Explicit edge-selection experiments; historical V5 implementations remain unchanged."""
+````
+
+# research/conductance_gat/edge_selection/audit.py
+
+````python
+"""Read-only full-validation gate, amplitude, topology and intervention audit."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from chartgat.observability import RuntimeResourceMonitor
+
+from ..v5.batch_calibration import _isolated_execution_state
+from ..v5.operator import conductance_propagation_coefficients
+from . import diagnostics as diag
+from . import train
+from .audit_compat import require_source_compatibility
+
+
+def _synchronize(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def release_amplitude_diagnostics(model):
+    """Post-audit-only cache release; gates and learned state remain unchanged."""
+    if model.training or torch.is_grad_enabled():
+        raise RuntimeError("diagnostic cache release is eval/no-grad only")
+    model.clear_auxiliary_cache()
+    for operator in model.operators:
+        operator.last_r = operator.last_effective_c = None
+        operator.estimator.last_c = operator.estimator.last_log_c = None
+        operator.estimator.last_scores = None
+        operator.estimator.last_solver_diagnostics = {}
+
+
+class PredictionSummary:
+    def __init__(self, multilabel):
+        self.multilabel = multilabel
+        self.rows = []
+
+    def add(self, logits, baseline, batch):
+        selected = batch.selected_indices
+        target = batch.graph.y if selected is None else batch.graph.y[selected]
+        current = logits if selected is None else logits[selected]
+        original = baseline if selected is None else baseline[selected]
+        if self.multilabel:
+            predicted, truth = current > 0, target.bool()
+            counts = (
+                (predicted & truth).sum(),
+                (predicted & ~truth).sum(),
+                (~predicted & truth).sum(),
+            )
+            flips = ((current > 0) != (original > 0)).sum()
+            decisions = current.numel()
+        else:
+            counts = (
+                (current.argmax(-1) == target).sum(),
+                target.new_zeros(()),
+                target.new_zeros(()),
+            )
+            flips = (current.argmax(-1) != original.argmax(-1)).sum()
+            decisions = target.numel()
+        values = (
+            *counts,
+            flips,
+            torch.tensor(decisions, device=current.device, dtype=torch.float64),
+            (current.float() - original.float()).square().sum(),
+            original.float().square().sum(),
+        )
+        self.rows.append(torch.stack([value.detach().double() for value in values]))
+
+    def report(self):
+        a, fp, fn, flips, decisions, difference, baseline = (
+            torch.stack(self.rows).sum(0).cpu().tolist()
+        )
+        denominator = 2 * a + fp + fn
+        metric = (2 * a / denominator if denominator else 0.0) if self.multilabel else a / decisions
+        return {
+            "validation": metric,
+            "prediction_flip_fraction": flips / decisions,
+            "logit_relative_l2": (difference / baseline) ** 0.5 if baseline > 0 else None,
+        }
+
+
+class Observer:
+    def __init__(self, args, path_sources):
+        self.args, self.path_sources = args, path_sources
+        self.records = []
+        names = ["all_gates_open", "frozen_gates_amplitude_one"]
+        if args.selection_mode in train.selection_protocol.BUDGET_MODES:
+            names.append("random_same_chord_budget")
+        self.predictions = {name: PredictionSummary(args.dataset == "ppi") for name in names}
+        self.intervention_seconds = {name: 0.0 for name in names}
+
+    @torch.no_grad()
+    def __call__(self, model, batch, logits, batch_index):
+        plan = batch.topology
+        incidence = batch.graph.incidence_edge_index
+        edges = incidence.cpu().numpy()
+        graph_nodes = plan.node_graph.cpu().numpy()
+        graph_edges = plan.edge_graph.cpu().numpy()
+        origin = batch.origin_targets.cpu()
+        references = {}
+        for group in range(plan.num_graphs):
+            nodes = np.flatnonzero(graph_nodes == group)
+            chosen = np.flatnonzero(graph_edges == group)
+            local = np.searchsorted(nodes, edges[:, chosen])
+            matrix = diag.adjacency(nodes.size, local)
+            references[group] = (
+                nodes,
+                chosen,
+                local,
+                diag.topology_statistics(matrix),
+                diag.path_reference(matrix, sources=self.path_sources, seed=self.args.forest_seed),
+            )
+        frozen = [operator.last_gate.detach().clone() for operator in model.operators]
+        for layer, operator in enumerate(model.operators):
+            gate = operator.last_gate.cpu()
+            amplitude, effective = operator.last_r, operator.last_effective_c
+            tail_alpha, head_alpha, _ = conductance_propagation_coefficients(
+                effective,
+                incidence,
+                batch.graph.x.shape[0],
+                sampling_correction=operator.last_sampling_correction,
+                normalization="row",
+                edge_chunk_size=self.args.edge_chunk_size,
+            )
+            row = {
+                "batch": batch_index,
+                "layer": layer,
+                "gate": diag.distribution(gate),
+                "positive_amplitude_r": diag.distribution(amplitude),
+                "effective_c_zr": diag.distribution(effective),
+                "alpha": diag.coefficient_statistics(
+                    tail_alpha, head_alpha, *incidence, batch.graph.x.shape[0]
+                ),
+                "beta": diag.distribution(operator.last_beta),
+                "graphs": [],
+            }
+            for group, (nodes, chosen, local, before, reference) in references.items():
+                active = diag.adjacency(nodes.size, local, gate[chosen].numpy() > 0)
+                row["graphs"].append(
+                    {
+                        "graph_in_batch": group,
+                        "before": before,
+                        "after": diag.topology_statistics(active),
+                        "origins": diag.gate_origins(gate[chosen], origin[chosen]),
+                        "path_change": diag.path_change(active, reference),
+                    }
+                )
+            self.records.append(row)
+            del tail_alpha, head_alpha, amplitude, effective
+        release_amplitude_diagnostics(model)
+        variants = {"all_gates_open": ("all", False), "frozen_gates_amplitude_one": (frozen, True)}
+        if "random_same_chord_budget" in self.predictions:
+            variants["random_same_chord_budget"] = ("random_budget", False)
+        for name, (mode, ones) in variants.items():
+            _synchronize(logits.device)
+            started = time.perf_counter()
+            with (
+                model.gate_intervention(mode, amplitude_ones=ones),
+                train.autocast(self.args, logits.device),
+            ):
+                changed = model(batch.graph)
+            train.base.require_finite_tensor(changed, f"audit intervention {name}")
+            _synchronize(logits.device)
+            self.intervention_seconds[name] += time.perf_counter() - started
+            self.predictions[name].add(changed, logits, batch)
+
+    def report(self, baseline):
+        interventions = {}
+        for name, values in self.predictions.items():
+            result = values.report()
+            interventions[name] = {
+                **result,
+                "delta_validation_pp": 100 * (result["validation"] - baseline),
+                "model_forward_seconds": self.intervention_seconds[name],
+            }
+        return {
+            "layers_and_graphs": self.records,
+            "interventions": interventions,
+            "intervention_scope": (
+                "same selected checkpoint and complete validation labels; "
+                "no retraining; r=1 keeps every baseline gate fixed"
+            ),
+            "amplitude_scope": (
+                "r is positive candidate-support solver output; z learns via "
+                "task/auxiliary loss, not an inner gated-solver objective"
+            ),
+        }
+
+
+def audit(root, data_root, device, repeats, path_sources):
+    if repeats < 5:
+        raise ValueError(
+            "at least five repeated full validations are required for numerical-noise measurement"
+        )
+    metrics = train.inspect_completed(root)
+    identity = metrics["resume_identity"]
+    evaluator_sources = train.implementation_source_hashes()
+    transition = require_source_compatibility(
+        identity["source_sha256"], evaluator_sources, scope="training"
+    )
+    args = train.restore_arguments(metrics, root, data_root, device)
+    train.base._require_cuda(device)
+    train.base.configure_compute(args)
+    payload, protocol = train.base.load_dataset(args.dataset, args.data_root, allow_download=False)
+    if protocol != identity["dataset_protocol"]:
+        raise ValueError("audit cache/split provenance differs from training")
+    monitor = RuntimeResourceMonitor(device)
+    monitor.start()
+    try:
+        with _isolated_execution_state(device), torch.no_grad():
+            train.base._seed(args.model_seed)
+            inputs = train.PreparedInputs(payload, args)
+            if inputs.provenance != identity["input_provenance"]:
+                raise ValueError(
+                    "audit edge corruption or topology provenance differs from training"
+                )
+            model = train.make_model(payload, args, device)
+            selected = train.base.load_checkpoint_on_cpu(Path(root) / "best.pt")
+            train.validate_identity(selected, identity)
+            model.load_state_dict(selected["model_state"], strict=True)
+            del selected
+            before = train.base.state_sha256(model)
+            torch.cuda.reset_peak_memory_stats(device)
+            evaluations, timings = [], []
+            for _ in range(repeats):
+                _synchronize(device)
+                started = time.perf_counter()
+                evaluations.append(train.evaluate(model, inputs, args, device))
+                release_amplitude_diagnostics(model)
+                _synchronize(device)
+                timings.append(time.perf_counter() - started)
+            scores = [row["metric"] for row in evaluations]
+            observer = Observer(args, path_sources)
+            detailed = train.evaluate(model, inputs, args, device, observer=observer)
+            clean = (
+                train.evaluate(model, inputs.clean_validation(payload), args, device)
+                if args.corruption_ratio
+                else detailed
+            )
+            if before != train.base.state_sha256(model):
+                raise ValueError("read-only audit unexpectedly changed model state")
+            if train.inspect_completed(root) != metrics:
+                raise ValueError("training evidence changed while auditing")
+            if evaluator_sources != train.implementation_source_hashes() or transition != (
+                require_source_compatibility(
+                    identity["source_sha256"], evaluator_sources, scope="training"
+                )
+            ):
+                raise ValueError("evaluator source or compatibility proof changed during audit")
+            return {
+                "status": "passed",
+                "research_suite": train.SUITE,
+                "checkpoint_sha256": metrics["checkpoint_sha256"],
+                "source_sha256": identity["source_sha256"],
+                "training_source_sha256": identity["source_sha256"],
+                "evaluator_source_sha256": evaluator_sources,
+                "source_compatibility": transition,
+                "dataset": args.dataset,
+                "condition": args.selection_mode,
+                "test_evaluated": False,
+                "validation": detailed,
+                "clean_validation": clean,
+                "repeated_validation": {
+                    "count": repeats,
+                    "scores": scores,
+                    "min": min(scores),
+                    "max": max(scores),
+                    "range_pp": 100 * (max(scores) - min(scores)),
+                    "evaluation_seconds": timings,
+                },
+                "selection_semantics": model.selection_metadata(),
+                "diagnostics": observer.report(detailed["metric"]),
+                "automatic_sparse_speedup_claimed": False,
+                "physical_compute_scope": (
+                    "candidate edges remain materialized so zero gates retain "
+                    "gradient paths; exact zeros do not imply sparse-kernel speedup"
+                ),
+            }
+    finally:
+        resources = monitor.finish(
+            peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+            peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+        )
+        print(json.dumps({"audit_resources": resources}, sort_keys=True), flush=True)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--data-root", type=Path, default=Path("data/paper"))
+    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--repeat-evaluations", type=int, default=5)
+    parser.add_argument(
+        "--path-probe-sources",
+        type=int,
+        default=32,
+        help="diagnostic landmarks only; evaluation still uses all validation labels",
+    )
+    args = parser.parse_args(argv)
+    result = audit(
+        args.root,
+        args.data_root,
+        torch.device(args.device),
+        args.repeat_evaluations,
+        args.path_probe_sources,
+    )
+    print(json.dumps(result, sort_keys=True, allow_nan=False), flush=True)
+    print(
+        f"Validation={result['validation']['metric']:.6f}; "
+        f"clean={result['clean_validation']['metric']:.6f}; no test evaluated",
+        flush=True,
+    )
+    for name, row in result["diagnostics"]["interventions"].items():
+        print(
+            f"{name}: validation={row['validation']:.6f}, "
+            f"delta={row['delta_validation_pp']:+.4f} pp",
+            flush=True,
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# research/conductance_gat/edge_selection/audit_compat.py
+
+````python
+"""Exact released-source permission for audit repair and allocation resume.
+
+This never rewrites a training identity or permits changed model/data/optimizer
+code. The registry pins both source scopes and every reviewed file byte change.
+It is deliberately not a general source-ignore or checkpoint migration API.
+"""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import re
+from pathlib import Path, PurePosixPath
+
+ROOT = Path(__file__).resolve().parents[3]
+HELPER_SOURCE = "research/conductance_gat/edge_selection/audit_compat.py"
+REGISTRY_PATH = Path(__file__).with_name("reallocation_compatibility_v1.json")
+PATCH_ID = "edge-selection-allocation-resume-v1"
+BASE_COMMIT = "03ec0f644da2636f92d022a8efb3533a0dcf614a"
+BASE_COMMITS = (
+    BASE_COMMIT,
+    "f7bf065037db4ceefa4aed9ff41aab164ce4b005",
+    "abe374691f05c2de8a8b17fd69d70c90b364036b",
+)
+CHANGED_SOURCES = frozenset(
+    {
+        "research/conductance_gat/edge_selection/diagnostics.py",
+        "research/conductance_gat/edge_selection/audit.py",
+        "scripts/run_v5_edge_selection.py",
+        "research/conductance_gat/edge_selection/train.py",
+        "research/conductance_gat/edge_selection/reallocation.py",
+        HELPER_SOURCE,
+    }
+)
+
+
+def _digest(value):
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _source_map(value):
+    if not isinstance(value, dict) or not value:
+        return False
+    for name, digest in value.items():
+        if not isinstance(name, str) or not name or "\\" in name or ":" in name:
+            return False
+        path = PurePosixPath(name)
+        if (
+            path.is_absolute()
+            or path.as_posix() != name
+            or ".." in path.parts
+            or not _digest(digest)
+        ):
+            return False
+    return True
+
+
+def source_map_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+def _unique_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("audit repair registry contains duplicate JSON keys")
+        result[key] = value
+    return result
+
+
+def _registry(base_commit=BASE_COMMIT):
+    if REGISTRY_PATH.is_symlink() or not REGISTRY_PATH.is_file():
+        raise ValueError("audit repair registry must be a regular file")
+    raw = REGISTRY_PATH.read_bytes()
+    document = json.loads(raw, object_pairs_hook=_unique_pairs)
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"schema_version", "patch_id", "releases"}
+        or type(document["schema_version"]) is not int
+        or document["schema_version"] != 1
+        or document["patch_id"] != PATCH_ID
+        or not isinstance(document["releases"], list)
+        or len(document["releases"]) != len(BASE_COMMITS)
+        or any(not isinstance(item, dict) for item in document["releases"])
+        or [item.get("base_commit") for item in document["releases"]] != list(BASE_COMMITS)
+        or base_commit not in BASE_COMMITS
+    ):
+        raise ValueError("allocation repair registry identity or exact change set is invalid")
+    for item in document["releases"]:
+        _validate_registry(item)
+    registry = next(item for item in document["releases"] if item["base_commit"] == base_commit)
+    return registry, hashlib.sha256(raw).hexdigest()
+
+
+def _validate_registry(registry):
+    if (
+        not isinstance(registry, dict)
+        or set(registry)
+        != {"schema_version", "patch_id", "base_commit", "base_source_digests", "changes"}
+        or type(registry["schema_version"]) is not int
+        or registry["schema_version"] != 1
+        or registry["patch_id"] != PATCH_ID
+        or registry["base_commit"] not in BASE_COMMITS
+        or not isinstance(registry["base_source_digests"], dict)
+        or set(registry["base_source_digests"]) != {"manifest", "training"}
+        or not all(_digest(value) for value in registry["base_source_digests"].values())
+        or not isinstance(registry["changes"], dict)
+        or set(registry["changes"]) != CHANGED_SOURCES
+    ):
+        raise ValueError("audit repair registry identity or exact change set is invalid")
+    for name, change in registry["changes"].items():
+        if (
+            not isinstance(change, dict)
+            or set(change) != {"before", "after"}
+            or not _digest(change["after"])
+            or (change["before"] is not None and not _digest(change["before"]))
+        ):
+            raise ValueError(f"audit repair source pin is invalid: {name}")
+
+
+def require_source_compatibility(previous, current, *, scope):
+    """Allow identical sources or a reviewed complete released-to-live pair.
+
+    All callers still validate configuration, data, runtime, budget, artifacts,
+    and states independently. The trainer additionally requires every non-source
+    identity field to match before restoring a partial checkpoint.
+    """
+    if scope not in {"manifest", "training"}:
+        raise ValueError("unknown audit repair source scope")
+    if previous == current:
+        return None
+    if not _source_map(previous) or not _source_map(current):
+        raise ValueError("audit repair requires complete SHA256 source maps")
+    candidates = [_registry(commit) for commit in BASE_COMMITS]
+    matched = [
+        pair
+        for pair in candidates
+        if source_map_digest(previous) == pair[0]["base_source_digests"][scope]
+    ]
+    if len(matched) != 1:
+        raise ValueError("allocation repair source is not an exact pinned release")
+    registry, registry_sha = matched[0]
+    if set(previous) - set(current):
+        raise ValueError("audit repair cannot remove source files")
+    for name, change in registry["changes"].items():
+        path = ROOT / name
+        if (
+            current.get(name) != change["after"]
+            or previous.get(name) != change["before"]
+            or path.is_symlink()
+            or not path.is_file()
+            or hashlib.sha256(path.read_bytes()).hexdigest() != change["after"]
+        ):
+            raise ValueError(f"audit repair is not the complete pinned live implementation: {name}")
+    for name in set(previous) | set(current):
+        before, after = previous.get(name), current.get(name)
+        if before != after and registry["changes"].get(name) != {"before": before, "after": after}:
+            raise ValueError(f"unreviewed source change cannot reuse prior evidence: {name}")
+    return {
+        "patch_id": PATCH_ID,
+        "base_commit": registry["base_commit"],
+        "scope": scope,
+        "registry_sha256": registry_sha,
+        "previous_source_map_sha256": source_map_digest(previous),
+        "current_source_map_sha256": source_map_digest(current),
+        "changed_sources": copy.deepcopy(registry["changes"]),
+        "source_semantics": "exact_audit_and_allocation_resume_repair_no_learning_recipe_change",
+        "training_artifacts_rewritten": False,
+        "calibration_semantics": (
+            "original completed measurement retained; allocation probes recorded separately"
+        ),
+    }
+````
+
+# research/conductance_gat/edge_selection/calibration.py
+
+````python
+"""Measured common resources for the independent edge-selection experiment suite.
+
+Only disposable calibration probes run here. No final-training model/data/budget
+is reduced, and no older V5 calibration implementation is changed.
+"""
+
+from __future__ import annotations
+
+import copy
+import gc
+import math
+import traceback
+
+from scripts import training_resource_plan as resources
+
+
+def parse_job(job):
+    from research.conductance_gat.edge_selection import train
+
+    args = train.build_parser().parse_args(job["command"][job["command"].index("-m") + 2 :])
+    train.validate_args(args)
+    return args
+
+
+def _contracts(jobs):
+    return [
+        {
+            "condition": job["variant_id"],
+            "model_seed": job["model_seed"],
+            "argv_sha256": resources.command_identity(job["command"]),
+        }
+        for job in jobs
+    ]
+
+
+def _probe_args(args, axis, batch, workers):
+    from research.conductance_gat.v5.batch_calibration import _candidate_args
+
+    expected_axis = (
+        "graphs"
+        if args.dataset == "ppi"
+        else ("full_graph" if args.sampling == "full" else "sampled_seed_nodes")
+    )
+    if axis != expected_axis:
+        raise ValueError("calibration batch axis differs from the actual dataset/sampler")
+    return _candidate_args(args, batch, workers)
+
+
+def _full_budget_seconds(report, policy):
+    safe = resources.measurement_is_safe(report)
+    if report["status"] == "oom":
+        return None
+    if report.get("validation_completed") is not True:
+        raise ValueError("calibration did not measure complete validation")
+    for name in ("validation_seconds", "topology_preparation_seconds", "setup_seconds"):
+        value = report.get(name)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"calibration lacks a valid measured {name}")
+    if (
+        report.get("required_auxiliary_path") is True
+        and report.get("auxiliary_path_measured") is not True
+    ):
+        raise ValueError("negative auxiliary loss was not measured in calibration")
+    if (
+        report.get("required_cycle_preparation") is True
+        and report.get("cycle_preparation_measured") is not True
+    ):
+        raise ValueError("cycle preparation was not measured in calibration")
+    if not safe:
+        return None
+    cost = resources.projected_training_budget_cost(report, policy)
+    return (
+        cost["projected_training_seconds"]
+        + cost["learning_budget"]["planned_epochs"] * report["validation_seconds"]
+        + report["setup_seconds"]
+    )
+
+
+def _score(candidate, policy):
+    costs = [_full_budget_seconds(report, policy) for report in candidate["measurements"]]
+    if not costs or any(value is None for value in costs):
+        return None
+    return max(costs)
+
+
+def _choose(candidates, policy):
+    eligible = [(value, _score(value, policy)) for value in candidates]
+    eligible = [(candidate, score) for candidate, score in eligible if score is not None]
+    if not eligible:
+        raise RuntimeError("no common safe physical batch fits all arms; no model/data downscale")
+    return min(eligible, key=lambda item: (item[1], -item[0]["batch_size"], item[0]["workers"]))[0]
+
+
+def _measure(job, loaded, args, batch, workers):
+    import torch
+
+    from research.conductance_gat.edge_selection import train
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    try:
+        report = train.run_calibration_candidate(
+            loaded,
+            copy.deepcopy(args),
+            torch.device(args.device),
+            physical_batch_size=batch,
+            workers=workers,
+            warmup_steps=2,
+            measurement_steps=5,
+            minimum_measure_seconds=3.0,
+        )
+    except torch.OutOfMemoryError as error:
+        report = {"status": "oom", "error": f"{type(error).__name__}: {error}"}
+        traceback.clear_frames(error.__traceback__)
+    report.update(
+        condition=job["variant_id"],
+        model_seed=job["model_seed"],
+        required_auxiliary_path=args.negative_loss_weight > 0,
+        required_cycle_preparation=args.selection_mode == "forest_cycle",
+    )
+    gc.collect()
+    torch.cuda.empty_cache()
+    return report
+
+
+def validate_entry(entry, jobs):
+    from research.conductance_gat.edge_selection import train
+
+    if entry.get("status") != "passed" or entry.get("job_contracts") != _contracts(jobs):
+        raise ValueError("edge-selection common resource entry or exact arm matrix is incomplete")
+    parsed = [parse_job(job) for job in jobs]
+    identities = {
+        (job["variant_id"], job["model_seed"]): args for job, args in zip(jobs, parsed, strict=True)
+    }
+    baseline, axis = entry["baseline_physical_batch_size"], entry["batch_axis"]
+    expected_floor = (
+        parsed[0].sample_seed_batch_size if axis == "sampled_seed_nodes" else parsed[0].batch_size
+    )
+    context = parsed[0].sampling == "cluster_disjoint"
+    requested_workers = parsed[0].sample_context_workers if context else parsed[0].workers
+    expected_workers = resources.worker_candidates(
+        requested_workers, resources.allocated_cpu_count(), applicable=axis == "graphs" or context
+    )
+    expected_workers = [
+        value for value in expected_workers if value <= max(2, 2 * requested_workers)
+    ]
+    if baseline != expected_floor or entry.get("worker_candidates") != expected_workers:
+        raise ValueError(
+            "calibration physical floor or worker search differs from the declared recipe"
+        )
+    if context != (entry.get("worker_axis") == "sample_context_workers"):
+        raise ValueError("calibration worker axis differs from the declared sampler")
+    policy = resources.learning_budget_selection_policy(
+        vars(parsed[0]),
+        training_split_size=entry["natural_training_split_size"],
+        batch_axis=axis,
+    )
+    if policy != entry.get("selection_policy"):
+        raise ValueError("calibration learning-budget selection recipe changed")
+    seen = set()
+    for candidate in entry["candidates"]:
+        pair = candidate["batch_size"], candidate["workers"]
+        if pair in seen or pair[0] < baseline or pair[1] not in entry["worker_candidates"]:
+            raise ValueError("duplicate or unrequested physical calibration candidate")
+        seen.add(pair)
+        reports = candidate["measurements"]
+        if {(item["condition"], item["model_seed"]) for item in reports} != set(identities) or len(
+            reports
+        ) != len(identities):
+            raise ValueError("common calibration candidate is missing a requested arm/seed")
+        if candidate["status"] != resources.completed_candidate_status(reports):
+            raise ValueError("calibration status differs from actual measured evidence")
+        for report in reports:
+            if report["status"] == "passed":
+                expected = _probe_args(
+                    identities[(report["condition"], report["model_seed"])], axis, *pair
+                )
+                if report.get("configuration") != train.configuration(expected):
+                    raise ValueError(
+                        "measurement configuration differs from the exact child candidate"
+                    )
+                if report.get("required_auxiliary_path") != (
+                    expected.negative_loss_weight > 0
+                ) or report.get("required_cycle_preparation") != (
+                    expected.selection_mode == "forest_cycle"
+                ):
+                    raise ValueError("measurement auxiliary/cycle scope differs from its exact arm")
+                if (report.get("batch_size"), report.get("workers")) != pair:
+                    raise ValueError("measurement physical batch/worker differs from its candidate")
+                _full_budget_seconds(report, policy)
+    sizes = sorted({batch for batch, _ in seen})
+    if (
+        not sizes
+        or sizes[0] != baseline
+        or seen != {(size, count) for size in sizes for count in entry["worker_candidates"]}
+    ):
+        raise ValueError("common candidate grid is incomplete")
+    if axis != "full_graph" and baseline < entry["natural_training_split_size"] and len(sizes) < 2:
+        raise ValueError("at least two physical batch candidates must be measured")
+    ceiling = max(baseline, entry["natural_training_split_size"])
+    if any(
+        next_size != min(size * 2, ceiling)
+        for size, next_size in zip(sizes, sizes[1:], strict=False)
+    ):
+        raise ValueError("physical candidate grid skipped an unmeasured expansion")
+    costs_by_size = {
+        size: [
+            score
+            for candidate in entry["candidates"]
+            if candidate["batch_size"] == size and (score := _score(candidate, policy)) is not None
+        ]
+        for size in sizes
+    }
+    reason = entry.get("stop_reason")
+    if axis == "full_graph":
+        if baseline != 1 or sizes != [1] or ceiling != 1 or reason != "full_graph_no_batch_axis":
+            raise ValueError("full graph cannot claim a replicated physical-batch search")
+    elif reason == "memory_headroom_boundary":
+        if costs_by_size[sizes[-1]]:
+            raise ValueError("reported memory boundary still has a common safe candidate")
+    elif reason == "complete_training_split_boundary":
+        if sizes[-1] != ceiling or not costs_by_size[sizes[-1]]:
+            raise ValueError("reported full-split boundary was not measured")
+    elif reason == "measured_full_budget_cost_plateau":
+        previous, plateau = None, 0
+        for costs in costs_by_size.values():
+            if not costs:
+                raise ValueError("cost plateau cannot hide an unsafe memory boundary")
+            best = min(costs)
+            plateau = plateau + 1 if previous is not None and best >= previous / 1.05 else 0
+            previous = best if previous is None else min(previous, best)
+        if plateau < 2:
+            raise ValueError("cost plateau lacks two measured physical expansions")
+    else:
+        raise ValueError("common calibration has an unknown or unmeasured stopping boundary")
+    chosen = _choose(entry["candidates"], policy)
+    if entry.get("selected_candidate") != {
+        "batch_size": chosen["batch_size"],
+        "workers": chosen["workers"],
+    }:
+        raise ValueError(
+            "selected resources differ from the measured worst-arm full-budget minimum"
+        )
+    expected_selected = _selected(parsed[0], axis, chosen)
+    if entry.get("selected") != expected_selected:
+        raise ValueError("stored selected resources differ from the measured configuration")
+
+
+def _selected(args, axis, chosen):
+    result = {
+        "batch_size": args.batch_size,
+        "workers": chosen["workers"],
+        "sample_seed_batch_size": args.sample_seed_batch_size,
+    }
+    result["sample_seed_batch_size" if axis == "sampled_seed_nodes" else "batch_size"] = chosen[
+        "batch_size"
+    ]
+    if args.sampling == "cluster_disjoint":
+        result.update(workers=0, sample_context_workers=chosen["workers"])
+    return result
+
+
+def calibrate_group(jobs, entry, persist):
+    from research.conductance_gat.edge_selection import train
+
+    parsed = [parse_job(job) for job in jobs]
+    loaded, identity, maximum, axis = train.load_calibration_payload(parsed[0])
+    if entry.get("input_identity") is not None and (
+        entry["input_identity"] != identity
+        or entry["natural_training_split_size"] != maximum
+        or entry["batch_axis"] != axis
+    ):
+        raise ValueError(
+            "official data/topology calibration identity changed; previous evidence retained"
+        )
+    if entry.get("status") == "passed":
+        validate_entry(entry, jobs)
+        return
+    policy = resources.learning_budget_selection_policy(
+        vars(parsed[0]), training_split_size=maximum, batch_axis=axis
+    )
+    if policy is None:
+        raise ValueError("edge-selection calibration requires explicit reference_updates budget")
+    if entry.get("selection_policy") not in (None, policy):
+        raise ValueError("partial common calibration budget changed")
+    baseline = (
+        parsed[0].sample_seed_batch_size if axis == "sampled_seed_nodes" else parsed[0].batch_size
+    )
+    context = parsed[0].sampling == "cluster_disjoint"
+    requested_workers = parsed[0].sample_context_workers if context else parsed[0].workers
+    workers = resources.worker_candidates(
+        requested_workers, resources.allocated_cpu_count(), applicable=axis == "graphs" or context
+    )
+    workers = [count for count in workers if count <= max(2, 2 * requested_workers)]
+    entry.update(
+        track="conductance",
+        profile=jobs[0]["profile"],
+        dataset=jobs[0]["dataset"],
+        input_identity=identity,
+        natural_training_split_size=maximum,
+        batch_axis=axis,
+        baseline_physical_batch_size=baseline,
+        worker_candidates=workers,
+        selection_policy=policy,
+        job_contracts=_contracts(jobs),
+    )
+    if context:
+        entry["worker_axis"] = "sample_context_workers"
+    entry.setdefault("candidates", [])
+    current, plateau, previous_best = baseline, 0, None
+    while True:
+        costs = []
+        for count in workers:
+            candidate = next(
+                (
+                    item
+                    for item in entry["candidates"]
+                    if (item["batch_size"], item["workers"]) == (current, count)
+                ),
+                None,
+            )
+            if candidate is None:
+                candidate = {
+                    "batch_size": current,
+                    "workers": count,
+                    "status": "running",
+                    "measurements": [],
+                }
+                entry["candidates"].append(candidate)
+            if candidate["status"] == "running":
+                for job, args in zip(jobs, parsed, strict=True):
+                    if not any(
+                        (item["condition"], item["model_seed"])
+                        == (job["variant_id"], job["model_seed"])
+                        for item in candidate["measurements"]
+                    ):
+                        print(
+                            f"[edge calibration] {job['job_id']} "
+                            f"physical={current} workers={count}",
+                            flush=True,
+                        )
+                        candidate["measurements"].append(
+                            _measure(job, loaded, args, current, count)
+                        )
+                        persist()
+                candidate["status"] = resources.completed_candidate_status(
+                    candidate["measurements"]
+                )
+                persist()
+            score = _score(candidate, policy)
+            if score is not None:
+                costs.append(score)
+        if not costs:
+            entry["stop_reason"] = "memory_headroom_boundary"
+            break
+        if axis == "full_graph" or current >= max(maximum, baseline):
+            entry["stop_reason"] = (
+                "full_graph_no_batch_axis"
+                if axis == "full_graph"
+                else "complete_training_split_boundary"
+            )
+            break
+        best = min(costs)
+        plateau = plateau + 1 if previous_best is not None and best >= previous_best / 1.05 else 0
+        previous_best = best if previous_best is None else min(best, previous_best)
+        if plateau >= 2:
+            entry["stop_reason"] = "measured_full_budget_cost_plateau"
+            break
+        current = min(current * 2, max(maximum, baseline))
+    chosen = _choose(entry["candidates"], policy)
+    entry.update(
+        status="passed",
+        selected=_selected(parsed[0], axis, chosen),
+        selected_candidate={"batch_size": chosen["batch_size"], "workers": chosen["workers"]},
+        selection={
+            "objective": "minimum worst-arm projected train + full validation + one-time setup",
+            "preparation_accounting": (
+                "per-epoch topology work is already in measured train/validation"
+            ),
+            "all_arms_share_resources": True,
+            "global_optimum_claimed": False,
+        },
+    )
+    validate_entry(entry, jobs)
+    persist()
+````
+
+# research/conductance_gat/edge_selection/corruption.py
+
+````python
+"""Exact controlled non-edge corruption with trainer-only immutable provenance.
+
+Uniform sampling uses compressed complement ranks, not rejection loops or a
+dense N x N complement. Memory is O(N+E+excluded+requested). Candidate edges are
+canonically sorted so append position never reveals which edges were inserted.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import random
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+from torch import Tensor
+
+from .topology import TopologyPlan, build_topology, topology_fingerprint, validate_cpu_topology
+
+
+def _tensor_sha(value: Tensor) -> str:
+    digest = hashlib.sha256(str((tuple(value.shape), str(value.dtype))).encode("ascii"))
+    digest.update(value.contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def canonical_incidence(incidence: Tensor) -> tuple[Tensor, Tensor]:
+    """Canonical undirected endpoint order and lexicographic column permutation."""
+    if (
+        not isinstance(incidence, Tensor)
+        or incidence.ndim != 2
+        or incidence.device.type != "cpu"
+        or incidence.dtype != torch.long
+        or incidence.shape[0] != 2
+    ):
+        raise ValueError("canonical incidence requires CPU int64 2 x E")
+    values = incidence.numpy()
+    left, right = np.minimum(values[0], values[1]), np.maximum(values[0], values[1])
+    order = np.lexsort((right, left))
+    return torch.from_numpy(np.stack((left[order], right[order]))), torch.from_numpy(order.copy())
+
+
+def _complement_space(num_nodes, incidence, node_graph, exclude, original_plan):
+    edge, graph = validate_cpu_topology(num_nodes, incidence, node_graph)
+    node_graph = torch.from_numpy(graph.copy())
+    if original_plan is None:
+        original_plan = build_topology(num_nodes, incidence, node_graph)
+    if (
+        original_plan.incidence_edge_index.device.type != "cpu"
+        or original_plan.metadata["topology_sha256"]
+        != topology_fingerprint(num_nodes, incidence, node_graph)
+        or not torch.equal(original_plan.incidence_edge_index, incidence)
+        or not torch.equal(original_plan.node_graph, node_graph)
+    ):
+        raise ValueError("cached original topology does not match the supplied graph")
+    excluded = torch.empty((2, 0), dtype=torch.long) if exclude is None else exclude
+    excluded_edge, _ = validate_cpu_topology(num_nodes, excluded, node_graph)
+    # Canonical component order by smallest original node, independent of DFS
+    # forest seed. Never expose these original-component labels as model features.
+    groups = {}
+    for node, component in enumerate(original_plan.components.tolist()):
+        groups.setdefault(component, []).append(node)
+    sizes = np.array([len(nodes) for nodes in groups.values()], dtype=np.int64)
+    component_of = np.empty(num_nodes, dtype=np.int64)
+    local_position = np.empty(num_nodes, dtype=np.int64)
+    members = []
+    for component, nodes in enumerate(groups.values()):
+        component_of[nodes] = component
+        local_position[nodes] = np.arange(len(nodes))
+        members.extend(nodes)
+    members = np.asarray(members, dtype=np.int64)
+    if excluded_edge.size and np.any(
+        component_of[excluded_edge[0]] != component_of[excluded_edge[1]]
+    ):
+        raise ValueError("excluded negatives cross original connected components")
+    possibilities = [int(size) * (int(size) - 1) // 2 for size in sizes]
+    if sum(possibilities) > np.iinfo(np.int64).max:
+        raise ValueError("component pair space exceeds supported exact int64 rank indexing")
+    offsets = np.concatenate(([0], np.cumsum(possibilities, dtype=np.int64)))
+    node_offsets = np.concatenate(([0], np.cumsum(sizes, dtype=np.int64)))
+
+    def ranks(edges):
+        component = component_of[edges[0]]
+        first = np.minimum(local_position[edges[0]], local_position[edges[1]])
+        second = np.maximum(local_position[edges[0]], local_position[edges[1]])
+        return (
+            offsets[component]
+            + first * (2 * sizes[component] - first - 1) // 2
+            + second
+            - first
+            - 1
+        )
+
+    original_ranks, excluded_ranks = ranks(edge), ranks(excluded_edge)
+    if np.intersect1d(original_ranks, excluded_ranks).size:
+        raise ValueError("excluded negatives contain an original edge")
+    forbidden = np.sort(np.concatenate((original_ranks, excluded_ranks)))
+    return sizes, offsets, node_offsets, members, forbidden
+
+
+def sample_nonedges(
+    num_nodes: int,
+    original_incidence_edge_index: Tensor,
+    *,
+    count: int,
+    seed: int,
+    node_graph: Tensor | None = None,
+    exclude: Tensor | None = None,
+    original_plan: TopologyPlan | None = None,
+) -> Tensor:
+    """Sample exactly count distinct original-component nonedges, excluding train negatives.
+
+    Count is global over the union of eligible within-component pairs. Sampling
+    is uniform without replacement over that union; no per-component quota or
+    independence claim is silently introduced. Impossible requests fail.
+    """
+    if type(count) is not int or count < 0 or type(seed) is not int or seed < 0:
+        raise ValueError("count and seed must be nonnegative integers")
+    if count == 0 and (
+        exclude is None
+        or (isinstance(exclude, Tensor) and exclude.ndim == 2 and exclude.shape == (2, 0))
+    ):
+        _, graph = validate_cpu_topology(num_nodes, original_incidence_edge_index, node_graph)
+        if exclude is not None:
+            validate_cpu_topology(num_nodes, exclude, node_graph)
+        if original_plan is not None and (
+            original_plan.metadata["topology_sha256"]
+            != topology_fingerprint(
+                num_nodes, original_incidence_edge_index, torch.from_numpy(graph)
+            )
+        ):
+            raise ValueError("cached original topology does not match the supplied graph")
+        # Exactly the caller's explicit zero request, not an error/OOM fallback.
+        return torch.empty((2, 0), dtype=torch.long)
+    sizes, offsets, node_offsets, members, forbidden = _complement_space(
+        num_nodes, original_incidence_edge_index, node_graph, exclude, original_plan
+    )
+    available = int(offsets[-1]) - len(forbidden)
+    if count > available:
+        raise ValueError(f"requested {count} nonedges but only {available} eligible pairs remain")
+    # random.sample(range(...)) does not enumerate a large dense pair space.
+    compressed = np.asarray(random.Random(seed).sample(range(available), count), dtype=np.int64)
+    adjusted_forbidden = forbidden - np.arange(len(forbidden), dtype=np.int64)
+    rank = compressed + np.searchsorted(adjusted_forbidden, compressed, side="right")
+    component = np.searchsorted(offsets[1:], rank, side="right")
+    local_rank = rank - offsets[component]
+    size = sizes[component]
+    # Integer binary search avoids floating inverse-triangular rounding errors.
+    lower, upper = np.zeros(count, dtype=np.int64), size - 1
+    while np.any(lower + 1 < upper):
+        middle = (lower + upper) // 2
+        prefix = middle * (2 * size - middle - 1) // 2
+        left = prefix <= local_rank
+        lower = np.where(left, middle, lower)
+        upper = np.where(left, upper, middle)
+    first = lower
+    second = first + 1 + local_rank - first * (2 * size - first - 1) // 2
+    pairs = torch.from_numpy(
+        np.stack(
+            (members[node_offsets[component] + first], members[node_offsets[component] + second])
+        )
+    )
+    return canonical_incidence(pairs)[0]
+
+
+@dataclass(frozen=True)
+class CorruptionProvenance:
+    split: str
+    seed: int
+    requested_count: int
+    original_edge_count: int
+    inserted_edge_count: int
+    excluded_negative_count: int
+    original_topology_sha256: str
+    candidate_incidence_sha256: str
+    negative_incidence_sha256: str
+    excluded_incidence_sha256: str
+    edge_targets_sha256: str
+    sampler: str = "uniform exact compressed complement ranks within original components"
+    model_feature_policy: str = "origin labels, excluded edges and provenance are trainer-only"
+
+
+@dataclass(frozen=True)
+class CorruptionData:
+    candidate_incidence: Tensor
+    negative_incidence: Tensor
+    edge_targets: Tensor
+    provenance: CorruptionProvenance
+
+    def model_input(self) -> dict[str, Tensor]:
+        """Whitelist-only topology copy: never return labels or provenance."""
+        return {"incidence_edge_index": self.candidate_incidence.clone()}
+
+    def verify_unchanged(self) -> None:
+        for tensor, expected in (
+            (self.candidate_incidence, self.provenance.candidate_incidence_sha256),
+            (self.negative_incidence, self.provenance.negative_incidence_sha256),
+            (self.edge_targets, self.provenance.edge_targets_sha256),
+        ):
+            if _tensor_sha(tensor) != expected:
+                raise ValueError("controlled corruption artifact changed after provenance creation")
+
+
+def build_corruption(
+    num_nodes: int,
+    original_incidence_edge_index: Tensor,
+    *,
+    count: int,
+    seed: int,
+    split: str,
+    node_graph: Tensor | None = None,
+    exclude: Tensor | None = None,
+    original_plan: TopologyPlan | None = None,
+) -> CorruptionData:
+    """Create sorted candidates plus separate trainer targets/provenance.
+
+    Validation/test explicitly require the excluded training-negative tensor,
+    including an empty 2x0 tensor when training had no inserted negatives.
+    """
+    if split not in {"train", "validation", "test"}:
+        raise ValueError("split must be train, validation or test")
+    if split != "train" and exclude is None:
+        raise ValueError("evaluation corruption requires explicit excluded training negatives")
+    negative = sample_nonedges(
+        num_nodes,
+        original_incidence_edge_index,
+        count=count,
+        seed=seed,
+        node_graph=node_graph,
+        exclude=exclude,
+        original_plan=original_plan,
+    )
+    candidate, order = canonical_incidence(
+        torch.cat((original_incidence_edge_index, negative), dim=1)
+    )
+    targets = torch.cat((torch.ones(original_incidence_edge_index.shape[1]), torch.zeros(count)))[
+        order
+    ]
+    graph = torch.zeros(num_nodes, dtype=torch.long) if node_graph is None else node_graph
+    excluded = torch.empty((2, 0), dtype=torch.long) if exclude is None else exclude
+    provenance = CorruptionProvenance(
+        split=split,
+        seed=seed,
+        requested_count=count,
+        original_edge_count=original_incidence_edge_index.shape[1],
+        inserted_edge_count=count,
+        excluded_negative_count=excluded.shape[1],
+        original_topology_sha256=topology_fingerprint(
+            num_nodes, original_incidence_edge_index, graph
+        ),
+        candidate_incidence_sha256=_tensor_sha(candidate),
+        negative_incidence_sha256=_tensor_sha(negative),
+        excluded_incidence_sha256=_tensor_sha(excluded),
+        edge_targets_sha256=_tensor_sha(targets),
+    )
+    return CorruptionData(candidate, negative, targets, provenance)
+````
+
+# research/conductance_gat/edge_selection/data.py
+
+````python
+"""Full official data with label-free topology plans and trainer-only corruption targets."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import math
+import multiprocessing
+import time
+from concurrent.futures import ProcessPoolExecutor
+from dataclasses import asdict, dataclass
+
+import torch
+
+from ..v5.sampling import TransductiveGraphSampler
+from .corruption import CorruptionData, build_corruption, canonical_incidence, sample_nonedges
+from .topology import batch_topologies, build_topology, validate_cpu_topology
+
+
+def tensor_digest(value):
+    tensor = value.detach().cpu().contiguous()
+    return hashlib.sha256(tensor.numpy().tobytes()).hexdigest()
+
+
+def prepare_controlled_corruption(specification) -> CorruptionData:
+    """Label/origin-blind geometry preparation, separately testable without PyG."""
+    row, graph_id, split, ratio, corruption_seed, forest_seed = specification
+    typed = [
+        name
+        for name in (
+            "node_type",
+            "node_types",
+            "node_type_id",
+            "edge_relation_id",
+            "edge_type",
+            "edge_types",
+            "edge_relation",
+            "relation_id",
+            "relation_type",
+            "relation_types",
+            "edge_attr",
+        )
+        if row.get(name) is not None
+    ]
+    if typed or row.get("num_relations", 0) not in (None, 0):
+        raise ValueError(f"typed/edge-feature graph rows are unsupported; cannot discard {typed}")
+    if (
+        isinstance(ratio, bool)
+        or not isinstance(ratio, (int, float))
+        or not math.isfinite(ratio)
+        or ratio < 0
+    ):
+        raise ValueError("corruption ratio must be finite and nonnegative")
+    if type(corruption_seed) is not int or corruption_seed < 0:
+        raise ValueError("corruption_seed must be a nonnegative integer")
+    original = row["incidence_edge_index"]
+    nodes = row["x"].shape[0]
+    validate_cpu_topology(nodes, original)
+    original = canonical_incidence(original)[0]
+    count = math.floor(original.shape[1] * ratio)
+    seed = (corruption_seed + 1_000_003 * (graph_id + 1)) % (2**63 - 1)
+    # Reuse original-component preprocessing across train/evaluation negative sets.
+    original_plan = build_topology(nodes, original, forest_seed=forest_seed) if count else None
+    training_negative = (
+        None
+        if split == "train"
+        else sample_nonedges(nodes, original, count=count, seed=seed, original_plan=original_plan)
+    )
+    return build_corruption(
+        nodes,
+        original,
+        count=count,
+        seed=seed if split == "train" else (seed + 97_409) % (2**63 - 1),
+        split=split,
+        exclude=training_negative,
+        original_plan=original_plan,
+    )
+
+
+@dataclass(frozen=True)
+class RecordEvidence:
+    graph_id: int
+    corruption: CorruptionData
+
+    @property
+    def split(self):
+        return self.corruption.provenance.split
+
+    def verify_unchanged(self, graph=None, topology=None, targets=None):
+        self.corruption.verify_unchanged()
+        if graph is not None and not torch.equal(
+            graph.incidence_edge_index, self.corruption.candidate_incidence
+        ):
+            raise ValueError("model candidate topology differs from frozen corruption provenance")
+        if topology is not None and not torch.equal(
+            topology.incidence_edge_index, self.corruption.candidate_incidence
+        ):
+            raise ValueError("forest plan differs from frozen candidate topology")
+        if targets is not None and not torch.equal(targets, self.corruption.edge_targets):
+            raise ValueError("trainer origin targets differ from frozen corruption provenance")
+
+    def json_copy(self):
+        self.verify_unchanged()
+        provenance = self.corruption.provenance
+        return {
+            "graph_id": self.graph_id,
+            "split": provenance.split,
+            "original_edges": provenance.original_edge_count,
+            "candidate_edges": provenance.original_edge_count + provenance.inserted_edge_count,
+            "added_edges": provenance.inserted_edge_count,
+            "origin_not_a_model_input": True,
+            "corruption": asdict(provenance),
+        }
+
+
+def prepare_record(specification):
+    """CPU preprocessing once per official graph/split; no label is inspected."""
+    corruption = prepare_controlled_corruption(specification)
+    from torch_geometric.data import Data
+
+    row, graph_id, _, _, _, forest_seed = specification
+    candidate, target = corruption.candidate_incidence, corruption.edge_targets
+    graph = Data(
+        x=row["x"],
+        y=row["y"],
+        incidence_edge_index=candidate,
+        edge_index=torch.cat((candidate, candidate.flip(0)), dim=1),
+    )
+    plan = build_topology(row["x"].shape[0], candidate, forest_seed=forest_seed)
+    evidence = RecordEvidence(graph_id, corruption)
+    evidence.verify_unchanged(graph, plan, target)
+    return graph, plan, target, evidence
+
+
+@dataclass
+class SelectionBatch:
+    graph: object
+    topology: object
+    origin_targets: torch.Tensor
+    selected_indices: torch.Tensor | None = None
+
+    def to(self, device, *, non_blocking=False):
+        graph = self.graph.clone().to(device, non_blocking=non_blocking)
+        graph.edge_selection_topology = self.topology.to(device, non_blocking=non_blocking)
+        graph._v5_num_graphs = int(getattr(self.topology, "num_graphs", 1))
+        selected = (
+            None
+            if self.selected_indices is None
+            else self.selected_indices.to(device, non_blocking=non_blocking, copy=True)
+        )
+        return SelectionBatch(
+            graph,
+            graph.edge_selection_topology,
+            self.origin_targets.to(device, non_blocking=non_blocking, copy=True),
+            selected,
+        )
+
+    def pin_memory(self):
+        self.graph.pin_memory()
+        self.topology = self.topology.pin_memory()
+        self.origin_targets = self.origin_targets.pin_memory()
+        if self.selected_indices is not None:
+            self.selected_indices = self.selected_indices.pin_memory()
+        return self
+
+
+def collate_records(records):
+    from torch_geometric.data import Batch
+
+    graphs, plans, targets, evidences = zip(*records, strict=True)
+    for graph, plan, target, evidence in zip(graphs, plans, targets, evidences, strict=True):
+        evidence.verify_unchanged(graph, plan, target)
+    graph = Batch.from_data_list(list(graphs))
+    plan = batch_topologies(list(plans))
+    if not torch.equal(graph.incidence_edge_index, plan.incidence_edge_index):
+        raise ValueError("batched physical incidence and forest plan are misaligned")
+    graph._v5_num_graphs = len(graphs)
+    return SelectionBatch(graph, plan, torch.cat(targets))
+
+
+class PreparedInputs:
+    """Static CPU plans are reused; PPI batches merge plans without recomputing DFS."""
+
+    def __init__(self, payload, args):
+        from torch.utils.data import DataLoader
+
+        self.args = args
+        self.sampler = None
+        self.indices = None
+        self._records = ()
+        self.plan_preparation_seconds = 0.0
+        self._device_validation = None
+        self._device_training = None
+        started = time.perf_counter()
+        specifications = []
+        for split in ("train", "validation"):
+            ids = payload["splits"][split] if args.dataset == "ppi" else [0]
+            for graph_id in ids:
+                specifications.append(
+                    (
+                        payload["graphs"][int(graph_id)],
+                        int(graph_id),
+                        split,
+                        args.corruption_ratio,
+                        args.corruption_seed,
+                        args.forest_seed,
+                    )
+                )
+        if args.dataset == "ppi" and args.workers > 0:
+            # Independent graph preparation, on the explicitly configured CPU allocation.
+            with ProcessPoolExecutor(
+                max_workers=args.workers, mp_context=multiprocessing.get_context("spawn")
+            ) as pool:
+                records = list(pool.map(prepare_record, specifications))
+        else:
+            records = [prepare_record(specification) for specification in specifications]
+        self._records = tuple(records)
+        split_records = {"train": [], "validation": []}
+        for record in records:
+            split_records[record[3].split].append(record)
+        if args.dataset == "ppi":
+            self.data = {}
+            for split, items in split_records.items():
+                self.data[split] = DataLoader(
+                    items,
+                    batch_size=args.batch_size,
+                    shuffle=split == "train",
+                    collate_fn=collate_records,
+                    num_workers=args.workers,
+                    generator=torch.Generator().manual_seed(args.model_seed),
+                    pin_memory=args.pin_memory,
+                    persistent_workers=args.workers > 0,
+                    prefetch_factor=2 if args.workers > 0 else None,
+                )
+            self.train_count = len(split_records["train"])
+            self.validation_count = len(split_records["validation"])
+        else:
+            self.indices = {
+                split: payload["splits"][split].nonzero(as_tuple=False).flatten().long()
+                for split in ("train", "validation")
+            }
+            graph, plan, target, _ = split_records["train"][0]
+            self.data = graph
+            self.training_record = SelectionBatch(graph, plan, target, self.indices["train"])
+            val_graph, val_plan, val_target, _ = split_records["validation"][0]
+            self.validation_record = SelectionBatch(
+                val_graph, val_plan, val_target, self.indices["validation"]
+            )
+            if args.sampling != "full":
+                self.sampler = TransductiveGraphSampler(
+                    graph,
+                    self.indices["train"],
+                    mode=args.sampling,
+                    seed_batch_size=args.sample_seed_batch_size,
+                    fanouts=args.num_neighbors,
+                    model_seed=args.model_seed,
+                    **(
+                        {
+                            "context_seed_batch_size": args.sample_context_seed_batch_size,
+                            "context_workers": args.sample_context_workers,
+                        }
+                        if args.sampling == "cluster_disjoint"
+                        else {}
+                    ),
+                )
+            self.train_count = self.indices["train"].numel()
+            self.validation_count = self.indices["validation"].numel()
+        self.plan_preparation_seconds = time.perf_counter() - started
+
+    def verify_provenance(self):
+        for graph, plan, target, evidence in self._records:
+            evidence.verify_unchanged(graph, plan, target)
+
+    @property
+    def provenance(self):
+        self.verify_provenance()
+        return [record[3].json_copy() for record in self._records]
+
+    def metadata(self):
+        return {
+            "provenance": self.provenance,
+            "topology_preparation_seconds": self.plan_preparation_seconds,
+            "preparation_workers": self.args.workers if self.args.dataset == "ppi" else 1,
+            "preparation_scope": (
+                "static CPU DFS per graph; merge cached plans for disjoint batches"
+            ),
+            "train_count": self.train_count,
+            "validation_count": self.validation_count,
+            "sampling": self.sampler.metadata() if self.sampler is not None else {"mode": "full"},
+            "sample_forest_scope": "each realized B_s, not unsampled global connectivity",
+            "no_origin_features": True,
+            "provenance_policy": (
+                "frozen trainer-only CorruptionData; SHA checks at epoch/evaluation "
+                "and collation boundaries"
+            ),
+        }
+
+    def stress_batch(self, device):
+        """Extra calibration-only largest-graph physical batch; training is untouched."""
+        if self.indices is not None:
+            raise ValueError("largest-graph stress batch is defined only for PPI graph batching")
+        self.verify_provenance()
+        records = [record for record in self._records if record[3].split == "train"]
+        size = self.args.batch_size
+        if type(size) is not int or size < 1 or size > len(records):
+            raise ValueError("stress batch_size must fit the actual full PPI training graph count")
+        ranked = sorted(
+            records,
+            key=lambda record: (
+                -(record[0].x.shape[0] + record[0].incidence_edge_index.shape[1]),
+                record[3].graph_id,
+            ),
+        )
+        batch = collate_records(ranked[:size])
+        if self.args.pin_memory:
+            batch.pin_memory()
+        return batch.to(device, non_blocking=self.args.pin_memory)
+
+    def _cpu_training(self, epoch):
+        self.verify_provenance()
+        if self.sampler is not None:
+            source_edges = self.training_record.graph.incidence_edge_index
+            source_nodes = self.training_record.graph.x.shape[0]
+            source_keys = source_edges[0] * source_nodes + source_edges[1]
+            for graph in self.sampler.iter_epoch(epoch):
+                started = time.perf_counter()
+                batch = getattr(graph, "batch", None)
+                plan = build_topology(
+                    graph.x.shape[0],
+                    graph.incidence_edge_index,
+                    node_graph=batch,
+                    forest_seed=self.args.forest_seed,
+                )
+                ids = getattr(graph, "global_physical_edge_id", None)
+                if ids is None:
+                    global_edges = (
+                        graph.global_node_id[graph.incidence_edge_index].sort(dim=0).values
+                    )
+                    ids = torch.searchsorted(
+                        source_keys, global_edges[0] * source_nodes + global_edges[1]
+                    )
+                target = self.training_record.origin_targets[ids]
+                selected = graph.train_mask.nonzero(as_tuple=False).flatten()
+                self.plan_preparation_seconds += time.perf_counter() - started
+                yield SelectionBatch(graph, plan, target, selected)
+        elif self.indices is None:
+            self.data["train"].generator.manual_seed(self.args.model_seed + 1_000_003 * epoch)
+            yield from self.data["train"]
+        else:
+            yield self.training_record
+
+    def training_batches(self, epoch, device):
+        if self.indices is not None and self.sampler is None:
+            self.verify_provenance()
+            if self._device_training is None:
+                self._device_training = self.training_record.to(device)
+            yield self._device_training
+            return
+        iterator = self._cpu_training(epoch)
+        if self.sampler is not None and self.args.sample_prefetch:
+            from ..v5.train import _prefetched_samples
+
+            # One next-batch producer overlaps CPU graph/forest construction with CUDA.
+            iterator = _prefetched_samples(iterator, pin_memory=self.args.pin_memory)
+        for batch in iterator:
+            yield batch.to(device, non_blocking=self.args.pin_memory)
+
+    def validation_batches(self, device):
+        self.verify_provenance()
+        if self.indices is not None:
+            if self._device_validation is None:
+                self._device_validation = self.validation_record.to(device)
+            yield self._device_validation
+        else:
+            for batch in self.data["validation"]:
+                yield batch.to(device, non_blocking=self.args.pin_memory)
+
+    def clean_validation(self, payload):
+        clean_args = copy.deepcopy(self.args)
+        clean_args.corruption_ratio = 0.0
+        return PreparedInputs(payload, clean_args)
+````
+
+# research/conductance_gat/edge_selection/diagnostics.py
+
+````python
+"""Zero-safe graph/weight diagnostics; CPU work belongs to post-training audit only."""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components, shortest_path
+
+
+def distribution(values):
+    values = torch.as_tensor(values).detach().float().cpu().flatten()
+    if not torch.isfinite(values).all():
+        raise ValueError("nonfinite values in edge-selection audit")
+    if values.numel() == 0:
+        return {"count": 0, "mean": None, "quantiles": None, "zero_fraction": None}
+    probabilities = [0.0, 0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0]
+    array = values.numpy()
+    # torch.quantile rejects flattened inputs above 2**24 elements (including
+    # arxiv's directed-edge x head coefficients). Use every CPU observation:
+    # NumPy partitions a copy and interpolates q*(n-1), without sampling/caps.
+    # Never overwrite array: it can alias the caller's tensor or diagnostic cache.
+    quantiles = np.quantile(array, probabilities, method="linear", overwrite_input=False)
+    boundaries = torch.linspace(0, 1, 11).numpy()
+    histogram, _ = np.histogram(array, bins=boundaries)
+    return {
+        "count": values.numel(),
+        "mean": float(array.mean(dtype=np.float64)),
+        "std_population": float(array.std(dtype=np.float64)),
+        "quantile_probabilities": probabilities,
+        "quantiles": quantiles.tolist(),
+        "quantile_method": "all_observations_linear_q_times_n_minus_1",
+        "quantile_observation_count": array.size,
+        "zero_fraction": np.count_nonzero(array == 0) / array.size,
+        "below_zero_count": int(np.count_nonzero(array < 0)),
+        "above_one_count": int(np.count_nonzero(array > 1)),
+        "unit_interval_histogram_boundaries": boundaries.tolist(),
+        # Integer counts remain exact above 2**24 too; float32 histogram bins do not.
+        "unit_interval_histogram_counts": histogram.tolist(),
+    }
+
+
+def adjacency(num_nodes, edges, active=None):
+    edges = np.asarray(edges, dtype=np.int64)
+    if edges.shape[0] != 2:
+        raise ValueError("incidence endpoint array must be 2 x E")
+    if active is not None:
+        edges = edges[:, np.asarray(active, dtype=bool)]
+    source, target = edges
+    return coo_matrix(
+        (np.ones(2 * source.size), (np.r_[source, target], np.r_[target, source])),
+        shape=(num_nodes, num_nodes),
+    ).tocsr()
+
+
+def topology_statistics(matrix):
+    count = matrix.shape[0]
+    components = (
+        int(connected_components(matrix, directed=False, return_labels=False)) if count else 0
+    )
+    edges = matrix.nnz // 2
+    degree = np.diff(matrix.indptr)
+    return {
+        "nodes": count,
+        "edges": edges,
+        "components": components,
+        "isolated_nodes": int((degree == 0).sum()),
+        "cycle_rank": edges - count + components,
+        "degree": distribution(degree),
+    }
+
+
+def path_reference(matrix, *, sources=32, seed=0):
+    if sources < 1:
+        raise ValueError("path diagnostic must request a positive number of landmark sources")
+    count = matrix.shape[0]
+    chosen = np.sort(np.random.default_rng(seed).choice(count, min(sources, count), replace=False))
+    distances = shortest_path(matrix, directed=False, unweighted=True, indices=chosen)
+    return chosen, distances
+
+
+def path_change(matrix, reference):
+    chosen, before = reference
+    after = shortest_path(matrix, directed=False, unweighted=True, indices=chosen)
+    positive = np.isfinite(before) & (before > 0)
+    retained = positive & np.isfinite(after)
+    lost = positive & ~np.isfinite(after)
+    return {
+        "scope": "fixed seeded landmark sources to every node; not all-pairs distances",
+        "source_nodes": chosen.tolist(),
+        "source_count": chosen.size,
+        "source_coverage": chosen.size / matrix.shape[0] if matrix.shape[0] else None,
+        "originally_reachable_ordered_pairs": int(positive.sum()),
+        "lost_reachable_ordered_pairs": int(lost.sum()),
+        "distance_increase_on_retained_pairs": distribution(after[retained] - before[retained]),
+        "stretch_on_retained_pairs": distribution(after[retained] / before[retained]),
+    }
+
+
+def gate_origins(gate, targets):
+    gate, targets = torch.as_tensor(gate), torch.as_tensor(targets)
+    if gate.shape != targets.shape or not ((targets == 0) | (targets == 1)).all():
+        raise ValueError("origin diagnostic target alignment is invalid")
+    result = {}
+    for name, mask in (("original", targets == 1), ("added", targets == 0)):
+        result[name] = {
+            "candidate_count": int(mask.sum()),
+            "active_count": int((gate[mask] > 0).sum()),
+            "active_rate": float((gate[mask] > 0).float().mean()) if mask.any() else None,
+            "gate": distribution(gate[mask]),
+        }
+    return result
+
+
+def coefficient_statistics(tail_coeff, head_coeff, tail, head, num_nodes):
+    # Directed coefficients are normalized across incoming neighbors, not across heads.
+    coefficients = torch.cat((tail_coeff, head_coeff)).detach().float()
+    receivers = torch.cat((tail, head))
+    degree = torch.bincount(receivers[coefficients.max(dim=1).values > 0], minlength=num_nodes)
+    mass = coefficients.new_zeros((num_nodes, coefficients.shape[1])).index_add_(
+        0, receivers, coefficients
+    )
+    entropy = mass.new_zeros(mass.shape).index_add_(
+        0, receivers, -torch.special.xlogy(coefficients, coefficients)
+    )
+    squares = mass.new_zeros(mass.shape).index_add_(0, receivers, coefficients.square())
+    active = squares > 0
+    effective = torch.where(active, squares.reciprocal(), 0.0)
+    maximum = mass.new_zeros(mass.shape).scatter_reduce_(
+        0,
+        receivers[:, None].expand_as(coefficients),
+        coefficients,
+        reduce="amax",
+        include_self=True,
+    )
+    rows = {}
+    for lo, hi in ((0, 1), (1, 2), (2, 5), (5, 11), (11, 33), (33, None)):
+        selected = degree >= lo
+        if hi is not None:
+            selected &= degree < hi
+        rows[f"{lo}:{hi}"] = {
+            "nodes": int(selected.sum()),
+            "mass": distribution(mass[selected]),
+            "entropy": distribution(entropy[selected]),
+            "effective_neighbors": distribution(effective[selected]),
+            "max_alpha": distribution(maximum[selected]),
+        }
+    return {
+        "alpha": distribution(coefficients),
+        "incoming_mass": distribution(mass),
+        "active_degree_bins": rows,
+        "isolates_have_zero_neighbor_mass": True,
+    }
+````
+
+# research/conductance_gat/edge_selection/integrity.py
+
+````python
+"""Read-only semantic validation of completed edge-selection training evidence."""
+
+from __future__ import annotations
+
+import json
+import math
+from pathlib import Path
+
+
+def _positive_integer(value, label):
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _score(value, label):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or not 0 <= value <= 1
+    ):
+        raise ValueError(f"{label} must be a finite validation score in [0, 1]")
+    return value
+
+
+def _fingerprint(value, label):
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a SHA256 fingerprint")
+    return value
+
+
+def _budget(args, metrics):
+    from ..v5.learning_budget import deterministic_batches_per_epoch, plan_learning_budget
+    from ..v5.protocol import HARDWARE_PROFILES, learning_budget_arguments_configuration
+
+    topology = metrics.get("topology")
+    if not isinstance(topology, dict):
+        raise ValueError("completed evidence has no full-training topology/count metadata")
+    count = _positive_integer(topology.get("train_count"), "official training unit count")
+    selected = learning_budget_arguments_configuration(args)
+    reference = selected.get("budget_reference_batch_size")
+    if args.dataset != "ppi" and args.sampling == "full":
+        if reference not in {None, 1}:
+            raise ValueError("full-graph training cannot declare a replicated reference batch")
+        actual_batches = reference_batches = 1
+    else:
+        physical = args.batch_size if args.dataset == "ppi" else args.sample_seed_batch_size
+        field = "ppi_batch_size" if args.dataset == "ppi" else "sample_seed_batch_size"
+        reference = reference or HARDWARE_PROFILES[args.hardware_profile][field]
+        actual_batches = deterministic_batches_per_epoch(count, physical)
+        reference_batches = deterministic_batches_per_epoch(count, reference)
+    return plan_learning_budget(
+        args.epochs,
+        args.patience,
+        reference_batches,
+        actual_batches,
+        policy=selected.get("learning_budget_policy", "epochs"),
+    ), count
+
+
+def _history(metrics, identity, rows, args):
+    from ..v5.learning_budget import should_stop_learning_budget
+
+    epochs = _positive_integer(metrics.get("epochs_run"), "completed epoch count")
+    if (
+        not isinstance(rows, list)
+        or len(rows) != epochs
+        or any(not isinstance(row, dict) for row in rows)
+    ):
+        raise ValueError("completed history must contain one record per completed epoch")
+    if [row.get("epoch") for row in rows] != list(range(1, epochs + 1)):
+        raise ValueError("completed history does not contain contiguous full epochs")
+    budget, count = _budget(args, metrics)
+    if metrics.get("learning_budget") != budget or identity.get("learning_budget") != budget:
+        raise ValueError(
+            "completed learning budget differs from the actual CLI and full-training count"
+        )
+    if epochs > budget["planned_epochs"]:
+        raise ValueError("completed epochs exceed the declared full learning budget")
+    for row in rows:
+        _positive_integer(row.get("epoch"), "history epoch")
+        _score(row.get("validation"), "history validation")
+        if (
+            row.get("train_batches") != budget["actual_batches_per_epoch"]
+            or row.get("optimizer_steps") != row["epoch"] * budget["actual_batches_per_epoch"]
+            or row.get("processed_units") != count
+        ):
+            raise ValueError("history does not prove complete supervised epoch/update coverage")
+        for key in ("train_batches", "optimizer_steps", "processed_units"):
+            _positive_integer(row[key], key)
+        if row.get("phase", {}).get("phase") != "joint":
+            raise ValueError("edge-selection history contains a foreign training phase")
+    steps = _positive_integer(metrics.get("optimizer_steps"), "completed optimizer update count")
+    if steps != rows[-1]["optimizer_steps"]:
+        raise ValueError("completed optimizer update count disagrees with history")
+    best = _positive_integer(metrics.get("best_epoch"), "selected epoch")
+    score = _score(metrics.get("best_validation"), "selected validation score")
+    first_maximum = max(range(epochs), key=lambda index: rows[index]["validation"])
+    if best != first_maximum + 1 or score != rows[first_maximum]["validation"]:
+        raise ValueError("selected checkpoint is not the first strict maximum validation epoch")
+    _score(metrics.get("validation"), "selected-checkpoint validation recheck")
+    if epochs < budget["planned_epochs"] and not should_stop_learning_budget(
+        budget,
+        epochs_since_best=epochs - best,
+        optimizer_steps_since_best=steps - rows[best - 1]["optimizer_steps"],
+        eligible=True,
+    ):
+        raise ValueError("completed training stopped before its declared budget and patience")
+
+
+def _checkpoint(checkpoint, identity, *, role):
+    from . import train
+
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"{role} checkpoint must be an object")
+    train.validate_identity(checkpoint, identity)
+    if not isinstance(checkpoint.get("model_state"), dict) or not checkpoint["model_state"]:
+        raise ValueError(f"{role} checkpoint has no model state")
+
+
+def inspect_completed(output):
+    """Validate metadata, budget, full epochs, and both CPU checkpoint interiors.
+
+    The larger last checkpoint is released before loading best.pt. No model is
+    instantiated, CUDA tensor allocated, dataset fetched, or artifact written.
+    """
+    from . import train
+
+    output = Path(output)
+    paths = {name: output / name for name in ("metrics.json", "history.json", "last.pt", "best.pt")}
+    for path in paths.values():
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"completed edge-selection artifact is missing or indirect: {path}")
+    fingerprints = {name: train.base.sha256_file(path) for name, path in paths.items()}
+    metrics = json.loads(paths["metrics.json"].read_text(encoding="utf-8"))
+    if (
+        not isinstance(metrics, dict)
+        or metrics.get("status") != "passed"
+        or metrics.get("research_suite") != train.SUITE
+    ):
+        raise ValueError("not completed edge-selection evidence")
+    identity = metrics.get("resume_identity")
+    if not isinstance(identity, dict) or metrics.get(
+        "resume_identity_sha256"
+    ) != train.base._canonical_sha256(identity):
+        raise ValueError("completed edge-selection identity is corrupt")
+    for name, field in (
+        ("best.pt", "checkpoint_sha256"),
+        ("last.pt", "last_checkpoint_sha256"),
+        ("history.json", "history_sha256"),
+    ):
+        if fingerprints[name] != metrics.get(field):
+            raise ValueError(f"completed edge-selection artifact mismatch: {name}")
+    for key in (
+        "research_suite",
+        "dataset",
+        "condition",
+        "configuration",
+        "source_sha256",
+        "initial_state_sha256",
+        "learning_budget",
+    ):
+        if metrics.get(key) != identity.get(key):
+            raise ValueError(f"completed metrics and immutable identity disagree on {key}")
+    if (
+        metrics.get("test_evaluated") is not False
+        or metrics.get("debug") is not False
+        or metrics.get("subset") is not False
+    ):
+        raise ValueError(
+            "completed edge-selection evidence is not full validation-only research training"
+        )
+    sources = identity.get("source_sha256")
+    if not isinstance(sources, dict) or not sources:
+        raise ValueError("completed identity has no source provenance")
+    for name, value in sources.items():
+        _fingerprint(value, f"source {name}")
+    protocol = metrics.get("protocol")
+    if (
+        not isinstance(protocol, dict)
+        or protocol != identity.get("dataset_protocol")
+        or train.base._canonical_sha256(protocol) != identity.get("dataset_protocol_sha256")
+    ):
+        raise ValueError("completed data/split protocol identity mismatch")
+    _fingerprint(protocol.get("data_sha256"), "official data cache")
+    if not isinstance(identity.get("input_provenance"), list) or not identity["input_provenance"]:
+        raise ValueError("completed identity has no topology/corruption provenance")
+    if metrics.get("topology", {}).get("provenance") != identity["input_provenance"]:
+        raise ValueError("completed topology/corruption provenance differs from training")
+    saved_args = identity.get("training_arguments")
+    if (
+        not isinstance(saved_args, dict)
+        or "data_root" not in saved_args
+        or "device" not in saved_args
+    ):
+        raise ValueError("completed identity has no restorable training arguments")
+    if "training_arguments" in metrics and metrics["training_arguments"] != saved_args:
+        raise ValueError("completed training arguments disagree with the immutable identity")
+    args = train.restore_arguments(metrics, output, saved_args["data_root"], saved_args["device"])
+    if args.dataset != metrics["dataset"] or args.selection_mode != metrics["condition"]:
+        raise ValueError("saved dataset/selection mode disagrees with the actual trained arguments")
+    initial = _fingerprint(metrics.get("initial_state_sha256"), "initial model")
+    if initial != identity.get("initial_state_sha256"):
+        raise ValueError("initial state differs from the immutable identity")
+    shared = _fingerprint(metrics.get("shared_initial_state_sha256"), "shared initial model")
+    if metrics.get("common_backbone_initial_state_sha256", shared) != shared:
+        raise ValueError("common backbone initialization differs from shared initialization")
+    rows = json.loads(paths["history.json"].read_text(encoding="utf-8"))
+    _history(metrics, identity, rows, args)
+    last = train.base.load_checkpoint_on_cpu(paths["last.pt"])
+    _checkpoint(last, identity, role="last")
+    expected = {
+        "epoch": metrics["epochs_run"],
+        "optimizer_steps": metrics["optimizer_steps"],
+        "best_epoch": metrics["best_epoch"],
+        "best_validation": metrics["best_validation"],
+        "best_checkpoint_sha256": metrics["checkpoint_sha256"],
+        "shared_initial_state_sha256": shared,
+        "history": rows,
+    }
+    if any(last.get(key) != value for key, value in expected.items()):
+        raise ValueError(
+            "last checkpoint history/best/update metadata disagrees with completed metrics"
+        )
+    optimizer = last.get("optimizer_state")
+    if (
+        not isinstance(optimizer, dict)
+        or not isinstance(optimizer.get("state"), dict)
+        or not optimizer["state"]
+        or not isinstance(optimizer.get("param_groups"), list)
+        or not optimizer["param_groups"]
+    ):
+        raise ValueError("last checkpoint lacks actual optimizer state")
+    del optimizer, last
+    best = train.base.load_checkpoint_on_cpu(paths["best.pt"])
+    _checkpoint(best, identity, role="best")
+    if (
+        best.get("selection_role") != "primary"
+        or best.get("epoch") != metrics["best_epoch"]
+        or best.get("validation") != metrics["best_validation"]
+    ):
+        raise ValueError("best checkpoint selection metadata disagrees with completed metrics")
+    del best
+    if fingerprints != {name: train.base.sha256_file(path) for name, path in paths.items()}:
+        raise ValueError("completed evidence changed while being inspected")
+    return metrics
+````
+
+# research/conductance_gat/edge_selection/model.py
+
+````python
+"""New topology-selection experiment; the historical V5 implementation is untouched."""
+
+from __future__ import annotations
+
+import math
+from contextlib import contextmanager
+
+import torch
+from torch import Tensor, nn
+
+from research.conductance_gat.v5.model import (
+    GraphConditionedConductanceNodeClassifier,
+    _static_graph_context,
+    graph_context_features,
+)
+from research.conductance_gat.v5.operator import graph_sum, shared_head_diffusion
+
+from .selection import EdgeSelector, selection_configuration
+
+
+class EdgeSelectionOperator(nn.Module):
+    """Original positive r, new physical gate z, actual diffusion with z*r.
+
+    r is still optimized on the complete candidate B. Its solver energy and
+    convergence diagnostics describe r, NOT a newly solved gated objective.
+    All candidate edges are computed; masking alone is not a speedup claim.
+    """
+
+    def __init__(self, original, selection_config, *, layer):
+        super().__init__()
+        # Reuse already-initialized modules/parameters without a second draw.
+        # Their state_dict keys and exact seed-paired values stay the same.
+        for name, module in original.named_children():
+            self.add_module(name, module)
+        for name, parameter in original._parameters.items():
+            self.register_parameter(name, parameter)
+        for name in (
+            "channels",
+            "heads",
+            "head_width",
+            "conductance_mode",
+            "conductance_backend",
+            "conductance_heads",
+            "propagation_normalization",
+            "conductance_generator",
+            "num_relations",
+            "edge_direction",
+            "propagation_filter",
+            "edge_chunk_size",
+        ):
+            setattr(self, name, getattr(original, name))
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(selection_config["selection_seed"] + layer)
+            self.selector = EdgeSelector(
+                self.channels, selection_config, edge_chunk_size=self.edge_chunk_size
+            )
+        self.last_gate = self.last_r = self.last_effective_c = None
+        self.last_logits = self.last_probability = self.last_beta = None
+        self.last_sampling_correction = None
+        self.live_edge_graph = None
+        self.live_num_graphs = None
+        self.amplitude_override = None
+
+    def forward(
+        self,
+        state,
+        incidence,
+        node_graph,
+        num_graphs,
+        *,
+        full_degree,
+        graph_structure,
+        edge_normalization_weight,
+        sampling_correction,
+        edge_selection_topology,
+        static_context=None,
+        edge_relation_id=None,
+    ):
+        with torch.autocast(device_type=state.device.type, enabled=False):
+            geometry = state.float()
+            context, sample_degree, full_degree = graph_context_features(
+                geometry,
+                incidence,
+                node_graph,
+                num_graphs,
+                full_degree,
+                graph_structure,
+                static_context=static_context,
+            )
+            relation = (
+                {"edge_relation_id": edge_relation_id}
+                if edge_relation_id is not None or self.num_relations
+                else {}
+            )
+            r = self.estimator(
+                geometry,
+                incidence,
+                node_graph,
+                num_graphs,
+                graph_context=context,
+                sample_degree=sample_degree,
+                full_degree=full_degree,
+                edge_normalization_weight=edge_normalization_weight,
+                **relation,
+            )
+            if self.amplitude_override is not None:
+                if self.training or torch.is_grad_enabled():
+                    raise RuntimeError("amplitude interventions are evaluation/no-grad only")
+                if self.amplitude_override != "ones":
+                    raise ValueError("unsupported amplitude intervention")
+                r = torch.ones_like(r)
+            gate = self.selector(
+                geometry,
+                incidence,
+                node_graph,
+                num_graphs,
+                topology=edge_selection_topology,
+                sample_degree=sample_degree,
+                full_degree=full_degree,
+            )
+            effective = r * (gate[:, None] if r.ndim == 2 else gate)
+            beta = self.beta_estimator(context)
+        value = torch.einsum("nd,hdk->nhk", state, self.value_weight)
+        propagated = shared_head_diffusion(
+            value,
+            effective,
+            incidence,
+            node_graph,
+            beta,
+            sampling_correction=sampling_correction,
+            edge_chunk_size=self.edge_chunk_size,
+            propagation_normalization=self.propagation_normalization,
+            polynomial_coefficients=self.polynomial_delta,
+        )
+        self.last_gate, self.last_r, self.last_effective_c = (
+            gate.detach(),
+            r.detach(),
+            effective.detach(),
+        )
+        self.last_logits, self.last_probability = (
+            self.selector.last_logits,
+            self.selector.last_probability,
+        )
+        self.last_beta = beta.detach()
+        self.last_sampling_correction = (
+            None if sampling_correction is None else sampling_correction.detach()
+        )
+        self.live_edge_graph, self.live_num_graphs = edge_selection_topology.edge_graph, num_graphs
+        return self.output_projection(propagated.reshape(state.shape[0], self.channels))
+
+    def clear_auxiliary_cache(self):
+        self.selector.clear_auxiliary_cache()
+        self.live_edge_graph = self.live_num_graphs = None
+
+
+class EdgeSelectionClassifier(GraphConditionedConductanceNodeClassifier):
+    """Seed-paired full V5 backbone with an explicit sibling edge-selection axis."""
+
+    def __init__(self, in_channels, classes, *, selection_config: dict, **architecture):
+        selected = selection_configuration(selection_config)
+        required = {
+            "conductance_backend": "optimization",
+            "conductance_generator": "optimized",
+            "conductance_heads": "per_head",
+            "propagation_normalization": "row",
+            "propagation_filter": "linear",
+            "conductance_mode": "dynamic",
+        }
+        for name, value in required.items():
+            if name in architecture and architecture[name] != value:
+                raise ValueError(f"edge selection holds {name}={value} fixed across conditions")
+            architecture[name] = value
+        architecture.setdefault("solver_cost_scaling", "width_scaled")
+        super().__init__(in_channels, classes, **architecture)
+        self.selection_config = selected
+        for layer, block in enumerate(self.blocks):
+            block.operator = EdgeSelectionOperator(block.operator, selected, layer=layer)
+
+    def forward(self, graph):
+        self.clear_auxiliary_cache()
+        x, incidence = graph.x, graph.incidence_edge_index
+        if x.ndim != 2 or x.shape[1] != self.in_channels or not x.is_floating_point():
+            raise ValueError("graph.x must match the configured input width")
+        if (
+            incidence.dtype != torch.long
+            or incidence.ndim != 2
+            or incidence.shape[0] != 2
+            or incidence.device != x.device
+        ):
+            raise ValueError("physical incidence must be same-device 2 x E int64")
+        topology = getattr(graph, "edge_selection_topology", None)
+        if topology is None:
+            raise ValueError("prepare graph.edge_selection_topology before model forward")
+        batch = getattr(graph, "batch", None)
+        if batch is None:
+            batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            graphs = 1
+        else:
+            graphs = getattr(graph, "_v5_num_graphs", None)
+            if (
+                type(graphs) is not int
+                or graphs < 1
+                or batch.shape != (x.shape[0],)
+                or batch.dtype != torch.long
+            ):
+                raise ValueError(
+                    "batched selection graphs require explicit positive _v5_num_graphs"
+                )
+        kwargs = {
+            "full_degree": getattr(graph, "full_degree", None),
+            "graph_structure": getattr(graph, "graph_structure", None),
+            "edge_normalization_weight": getattr(graph, "edge_normalization_weight", None),
+            "sampling_correction": getattr(graph, "sampling_correction", None),
+            "edge_relation_id": getattr(graph, "edge_relation_id", None),
+            "edge_selection_topology": topology,
+        }
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            kwargs["static_context"] = _static_graph_context(
+                x.float(),
+                incidence,
+                batch,
+                graphs,
+                kwargs["full_degree"],
+                kwargs["graph_structure"],
+            )
+        hidden = self.encoder(self.input_norm(x))
+        for block in self.blocks:
+            if self.activation_checkpoint and torch.is_grad_enabled():
+                from torch.utils.checkpoint import checkpoint
+
+                hidden = checkpoint(
+                    lambda value, layer=block: layer(value, incidence, batch, graphs, **kwargs),
+                    hidden,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+            else:
+                hidden = block(hidden, incidence, batch, graphs, **kwargs)
+        return self.decoder(self.final_norm(hidden))
+
+    def clear_auxiliary_cache(self):
+        for operator in self.operators:
+            operator.clear_auxiliary_cache()
+
+    @contextmanager
+    def gate_intervention(self, mode, *, amplitude_ones=False):
+        """Read-only eval intervention, restoring RNG and diagnostics even on error.
+
+        mode is None, 'all', 'random_budget', or one frozen E tensor per layer.
+        Random budget preserves the declared forest and exact chord k; it is
+        intentionally unavailable for unconstrained hard-concrete. To keep
+        baseline gates fixed while replacing r=1, pass detached baseline gate
+        tensors explicitly: earlier layer changes otherwise change later H/z.
+        This is a full-model intervention, not a fixed-H local comparison.
+        """
+        if any(module.training for module in self.modules()):
+            raise RuntimeError("call eval() before an edge-selection intervention")
+        operators = list(self.operators)
+        if isinstance(mode, (list, tuple)):
+            if len(mode) != len(operators) or any(not isinstance(gate, Tensor) for gate in mode):
+                raise ValueError("frozen intervention requires one E tensor per layer")
+            overrides = [gate.detach() for gate in mode]
+        elif mode is None or isinstance(mode, str) and mode in {"all", "random_budget"}:
+            overrides = [mode] * len(operators)
+        else:
+            raise ValueError("unsupported gate intervention")
+        snapshots = [
+            (
+                module,
+                {
+                    name: value
+                    for name, value in vars(module).items()
+                    if name.startswith(("last_", "live_"))
+                    or name in {"gate_override", "amplitude_override"}
+                },
+            )
+            for module in self.modules()
+        ]
+        devices = sorted(
+            {parameter.device.index for parameter in self.parameters() if parameter.is_cuda}
+        )
+        try:
+            with torch.random.fork_rng(devices=devices), torch.no_grad():
+                for operator, override in zip(operators, overrides, strict=True):
+                    operator.selector.gate_override = override
+                    operator.amplitude_override = "ones" if amplitude_ones else None
+                yield self
+        finally:
+            for module, attributes in snapshots:
+                for name in list(vars(module)):
+                    if (
+                        name.startswith(("last_", "live_"))
+                        or name in {"gate_override", "amplitude_override"}
+                    ) and name not in attributes:
+                        delattr(module, name)
+                for name, value in attributes.items():
+                    setattr(module, name, value)
+
+    def auxiliary_loss(self, negative_targets: Tensor | None = None) -> dict[str, Tensor]:
+        """Unweighted L0 and source-label loss, unavailable to model.forward.
+
+        L0 = mean_layers(mean_graphs(sum_edges Pr(z>0))). The optional negative
+        objective averages positive/negative BCE class means within each graph,
+        then graphs and layers. Targets are 1 for original / 0 for corruption.
+        This is corruption discrimination, not an assertion that all absent
+        edges are harmful. Budgeted structure arms have no L0/negative loss.
+        """
+        zero = self.decoder.weight.new_zeros(())
+        if self.selection_config["condition"] != "hard_concrete":
+            if negative_targets is not None:
+                raise ValueError(
+                    "negative targets belong only to the separate corruption experiment"
+                )
+            return {"l0": zero, "negative": zero}
+        l0, negatives = [], []
+        for operator in self.operators:
+            logits, probability = operator.selector.live_logits, operator.selector.live_probability
+            groups, graphs = operator.live_edge_graph, operator.live_num_graphs
+            if logits is None or probability is None or groups is None:
+                raise RuntimeError(
+                    "auxiliary_loss requires the current forward; cache was empty or cleared"
+                )
+            l0.append(graph_sum(probability, groups, graphs).mean())
+            if negative_targets is not None:
+                if (
+                    negative_targets.shape != logits.shape
+                    or negative_targets.device != logits.device
+                ):
+                    raise ValueError(
+                        "negative targets must align with current same-device physical edges"
+                    )
+                torch._assert_async(
+                    ((negative_targets == 0) | (negative_targets == 1)).all(),
+                    "negative targets must be binary original/corruption labels",
+                )
+                target = negative_targets.to(logits.dtype)
+                positive, negative = target == 1, target == 0
+                config = self.selection_config
+                active_logit = logits - config["hard_concrete_temperature"] * math.log(
+                    -config["hard_concrete_lower"] / config["hard_concrete_upper"]
+                )
+                losses = torch.nn.functional.binary_cross_entropy_with_logits(
+                    active_logit, target, reduction="none"
+                )
+                pos_count = graph_sum(positive.to(logits.dtype), groups, graphs)
+                neg_count = graph_sum(negative.to(logits.dtype), groups, graphs)
+                pos_loss = graph_sum(losses * positive, groups, graphs) / pos_count.clamp_min(1)
+                neg_loss = graph_sum(losses * negative, groups, graphs) / neg_count.clamp_min(1)
+                class_count = (pos_count > 0).to(logits.dtype) + (neg_count > 0).to(logits.dtype)
+                negatives.append(((pos_loss + neg_loss) / class_count.clamp_min(1)).mean())
+        return {
+            "l0": torch.stack(l0).mean(),
+            "negative": torch.stack(negatives).mean() if negatives else zero,
+        }
+
+    def selection_metadata(self) -> dict:
+        return {
+            "configuration": self.selection_config,
+            "gate_layout": "one shared physical-edge E gate; amplitudes E x H",
+            "probability_meaning": (
+                "hard-concrete: Pr(z>0); budgeted learned train: constrained logistic relaxation; "
+                "budgeted eval/control or frozen override: actual gate"
+            ),
+            "amplitude_objective": (
+                "original positive solver on full candidate support; "
+                "gate not in omega or amplitude energy"
+            ),
+            "budget": (
+                "exact floor(chord_fraction*chords) per graph in both train and eval "
+                "for budgeted conditions"
+            ),
+            "gradient": (
+                "budgeted: biased straight-through constrained-logistic gradient; "
+                "hard-concrete: reparameterized stochastic relaxation"
+            ),
+            "cycle_context": (
+                "unsigned fundamental-cycle membership edge-cycle-edge scalar means; "
+                "DFS-basis dependent"
+            ),
+            "l0_aggregation": (
+                "sum physical edges per graph, mean graphs, mean layers; "
+                "unconstrained corruption arm only"
+            ),
+            "negative_aggregation": (
+                "BCE on Pr(z>0), mean per binary class, mean present classes per graph, "
+                "mean graphs, mean layers"
+            ),
+            "negative_targets_visible_to_forward": False,
+            "automatic_speedup_claimed": False,
+        }
+````
+
+# research/conductance_gat/edge_selection/protocol.py
+
+````python
+"""Separate scientific identity for topology selection, not a V5 resume migration."""
+
+from __future__ import annotations
+
+import math
+
+SUITE = "conductance_edge_selection_v1"
+MODES = ("full", "forest_only", "forest_random", "forest_learned", "forest_cycle", "hard_concrete")
+BUDGET_MODES = {"forest_random", "forest_learned", "forest_cycle"}
+
+
+def add_arguments(parser):
+    parser.add_argument("--selection-mode", choices=MODES, required=True)
+    parser.add_argument("--chord-fraction", type=float)
+    parser.add_argument("--forest-seed", type=int, default=0)
+    parser.add_argument("--selection-temperature", type=float, default=1.0)
+    parser.add_argument("--gate-temperature", type=float, default=2 / 3)
+    parser.add_argument("--corruption-ratio", type=float, default=0.0)
+    parser.add_argument("--corruption-seed", type=int, default=0)
+    parser.add_argument("--negative-loss-weight", type=float, default=0.0)
+    parser.add_argument("--l0-weight", type=float, default=0.0)
+
+
+def validate(args):
+    if args.selection_mode not in MODES:
+        raise ValueError("unknown edge selection condition")
+    fraction = args.chord_fraction
+    if args.selection_mode in BUDGET_MODES:
+        if fraction is None or not math.isfinite(fraction) or not 0 < fraction < 1:
+            raise ValueError(
+                "chord comparisons require an explicit fraction strictly between 0 and 1"
+            )
+    elif fraction is not None:
+        raise ValueError("chord-fraction is inactive outside budgeted chord comparisons")
+    for name in ("selection_temperature", "gate_temperature"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    for name in ("corruption_ratio", "negative_loss_weight", "l0_weight"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{name} must be finite and nonnegative")
+    if args.forest_seed < 0 or args.corruption_seed < 0:
+        raise ValueError("forest and corruption seeds must be nonnegative")
+    if (
+        args.selection_mode not in {"forest_learned", "forest_cycle"}
+        and args.selection_temperature != 1.0
+    ):
+        raise ValueError("selection-temperature is inactive outside learned exact-budget gates")
+    if args.selection_mode != "hard_concrete" and args.gate_temperature != 2 / 3:
+        raise ValueError("gate-temperature is inactive outside hard-concrete gates")
+    if args.selection_mode != "hard_concrete" and args.corruption_seed != 0:
+        raise ValueError("corruption-seed is inactive in clean structure comparisons")
+    if args.selection_mode == "hard_concrete":
+        if args.corruption_ratio <= 0:
+            raise ValueError(
+                "the corruption experiment requires a positive explicit corruption ratio"
+            )
+        if args.forest_seed != 0:
+            raise ValueError("hard-concrete corruption does not protect or select a forest")
+    elif args.corruption_ratio or args.negative_loss_weight or args.l0_weight:
+        raise ValueError(
+            "corruption and auxiliary losses belong only to the separate hard-concrete experiment"
+        )
+    if args.conductance_heads != "per_head" or args.propagation_normalization != "row":
+        raise ValueError(
+            "edge-selection comparisons fix all amplitude heads to per_head and propagation to row"
+        )
+    if args.conductance_backend != "optimization" or args.conductance_generator != "optimized":
+        raise ValueError(
+            "edge-selection comparisons retain the optimized positive amplitude generator"
+        )
+    if args.propagation_filter != "linear" or args.num_relations:
+        raise ValueError(
+            "this comparison fixes linear untyped propagation; no silent relation conversion"
+        )
+    if args.condition != "shared_dynamic_c" or args.training_schedule != "joint":
+        raise ValueError(
+            "all edge-selection arms train the positive amplitude and backbone jointly"
+        )
+    if args.transition_from_checkpoint is not None:
+        raise ValueError("edge-selection runs cannot import or relabel historical V5 training")
+
+
+def model_configuration(args):
+    result = {
+        "condition": args.selection_mode,
+        "selection_temperature": args.selection_temperature,
+        "hard_concrete_temperature": args.gate_temperature,
+        "hard_concrete_lower": -0.1,
+        "hard_concrete_upper": 1.1,
+        "selection_seed": args.forest_seed,
+    }
+    if args.selection_mode in BUDGET_MODES:
+        result["chord_fraction"] = args.chord_fraction
+    return result
+
+
+def configuration(args):
+    return {
+        "model": model_configuration(args),
+        "forest_seed": args.forest_seed,
+        "corruption_ratio": args.corruption_ratio,
+        "corruption_seed": args.corruption_seed,
+        "negative_loss_weight": args.negative_loss_weight,
+        "l0_weight": args.l0_weight,
+        "gate_axis": (
+            "one physical topology shared across heads; positive amplitude remains per-head"
+        ),
+        "connectivity_scope": (
+            "each supplied graph or sampled B_s; not unsampled full-graph reachability"
+        ),
+        "negative_provenance_model_input": False,
+        "negative_definition": "synthetically added nonedge, not a negative signed conductance",
+        "budget_rule": "floor(chord_fraction * number_of_candidate_chords) per disjoint graph",
+        "sampling_axis": "same V5 sampling law and seed across topology comparison arms",
+    }
+````
+
+# research/conductance_gat/edge_selection/reallocation.py
+
+````python
+"""Preserve resource selection while stress-checking an equivalent GPU allocation.
+
+Fresh disposable probes cover the original selected candidate's measured worst
+cases. They do not select a new optimum or change the final training recipe.
+"""
+
+from __future__ import annotations
+
+import copy
+import datetime as dt
+import math
+
+from research.conductance_gat.edge_selection import calibration
+from scripts import training_resource_plan as resources
+
+ALLOCATION_FIELDS = frozenset({"device", "uuid", "uuid_unavailable_reason", "cuda_visible_devices"})
+SCOPE = "same-class allocation stress revalidation, not new optimum/all-arm fresh measurement"
+CAPACITY_SCOPE = "same-class changed-capacity all-arm revalidation at unchanged resources"
+
+
+def _scope(original, actual):
+    return (
+        CAPACITY_SCOPE if original["total_memory_bytes"] != actual["total_memory_bytes"] else SCOPE
+    )
+
+
+def require_equivalent_allocation(original, runtime, actual, actual_runtime):
+    """Same model/runtime; changed capacity requires fresh all-arm fit evidence."""
+    required = {"name", "total_memory_bytes", "compute_capability", "allocated_cpu_count"}
+    if not isinstance(original, dict) or not required <= original.keys():
+        raise ValueError("original resource hardware fingerprint is incomplete; preserved")
+    if not isinstance(actual, dict) or not required <= actual.keys():
+        raise ValueError("current resource hardware fingerprint is incomplete")
+    if not isinstance(runtime, dict) or not {"python", "torch", "cuda"} <= runtime.keys():
+        raise ValueError("original resource runtime fingerprint is incomplete; preserved")
+    if not isinstance(actual_runtime, dict):
+        raise ValueError("current resource runtime fingerprint is incomplete")
+    for hardware in (original, actual):
+        capacity = hardware["total_memory_bytes"]
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("hardware.total_memory_bytes must be a positive integer")
+    differences = []
+    for prefix, before, after, ignored in (
+        ("hardware", original, actual, ALLOCATION_FIELDS | {"total_memory_bytes"}),
+        ("runtime", runtime, actual_runtime, frozenset()),
+    ):
+        for field in sorted((before.keys() | after.keys()) - ignored):
+            if field not in before or field not in after or before[field] != after[field]:
+                differences.append(
+                    f"{prefix}.{field}: {before.get(field)!r} -> {after.get(field)!r}"
+                )
+    if differences:
+        raise ValueError(
+            "edge-selection allocation is not equivalent: "
+            + "; ".join(differences)
+            + ". Only GPU allocation identifiers and revalidated capacity may change. "
+            "Restore the original GPU class, "
+            "runtime and allocated CPU count, or use a separate explicitly calibrated run; "
+            "the existing recipe/results remain preserved."
+        )
+
+
+def _original_digest(manifest):
+    return resources.digest(
+        {key: manifest[key] for key in ("hardware", "runtime", "calibration_entries")}
+    )
+
+
+def _attempt_digest(attempt):
+    return resources.digest(
+        {key: value for key, value in attempt.items() if key != "evidence_sha256"}
+    )
+
+
+def needs_revalidation(manifest, hardware, runtime, required_groups):
+    """Validate the accepted evidence and decide whether pending work is covered."""
+    require_equivalent_allocation(manifest["hardware"], manifest.get("runtime"), hardware, runtime)
+    current = manifest.get("current_allocation")
+    if current is None:
+        if any(item.get("status") == "passed" for item in manifest.get("allocation_history", [])):
+            raise ValueError("passed allocation history has no committed current allocation")
+        changed = hardware != manifest["hardware"] or runtime != manifest["runtime"]
+    else:
+        history = manifest.get("allocation_history", [])
+        index = current.get("history_index")
+        if type(index) is not int or not 0 <= index < len(history):
+            raise ValueError("current allocation has no retained revalidation evidence")
+        accepted = history[index]
+        passed = [i for i, item in enumerate(history) if item.get("status") == "passed"]
+        if (
+            not passed
+            or index != passed[-1]
+            or accepted.get("scope") != _scope(manifest["hardware"], accepted["hardware"])
+            or accepted.get("evidence_sha256") != _attempt_digest(accepted)
+            or current.get("evidence_sha256") != accepted["evidence_sha256"]
+            or accepted.get("original_calibration_sha256") != _original_digest(manifest)
+        ):
+            raise ValueError("accepted allocation evidence or original calibration changed")
+        require_equivalent_allocation(
+            manifest["hardware"], manifest["runtime"], accepted["hardware"], accepted["runtime"]
+        )
+        covered = {(group["profile"], group["dataset"]) for group in accepted["groups"]}
+        changed = (
+            hardware != accepted["hardware"]
+            or runtime != accepted["runtime"]
+            or not set(required_groups) <= covered
+        )
+    if changed and required_groups:
+        if (
+            manifest.get("calibration_status") != "passed"
+            or manifest.get("resources_applied") is not True
+            or not manifest.get("calibration_entries")
+            or any(entry.get("status") != "passed" for entry in manifest["calibration_entries"])
+        ):
+            raise ValueError(
+                "GPU allocation changed before the original common calibration completed; "
+                "partial measurements cannot be mixed across allocations. Restore the original "
+                "allocation or use a separate run; original evidence is preserved."
+            )
+        return True
+    return False
+
+
+def _representatives(entry, jobs, *, all_arms=False):
+    """Stable union of peak-reserve, peak-allocation and total-budget-cost maxima."""
+    selected = entry["selected_candidate"]
+    candidate_index = next(
+        index
+        for index, candidate in enumerate(entry["candidates"])
+        if {key: candidate[key] for key in selected} == selected
+    )
+    reports = entry["candidates"][candidate_index]["measurements"]
+    lookup = {(job["variant_id"], job["model_seed"]): job for job in jobs}
+    ordered = sorted(
+        range(len(reports)),
+        key=lambda index: lookup[(reports[index]["condition"], reports[index]["model_seed"])][
+            "job_id"
+        ],
+    )
+    criteria = {}
+    for name, score in (
+        ("maximum_peak_reserved_bytes", lambda report: report["peak_reserved_bytes"]),
+        ("maximum_peak_allocated_bytes", lambda report: report["peak_allocated_bytes"]),
+        (
+            "maximum_projected_full_budget_seconds",
+            lambda report: calibration._full_budget_seconds(report, entry["selection_policy"]),
+        ),
+    ):
+        index = max(ordered, key=lambda value: score(reports[value]))
+        criteria.setdefault(index, []).append(name)
+    if all_arms:
+        if {(report["condition"], report["model_seed"]) for report in reports} != set(lookup):
+            raise ValueError("changed-capacity revalidation requires every arm and seed")
+        for index in ordered:
+            criteria.setdefault(index, []).append("changed_capacity_all_arms")
+    return [
+        {
+            "job_id": lookup[(reports[index]["condition"], reports[index]["model_seed"])]["job_id"],
+            "condition": reports[index]["condition"],
+            "model_seed": reports[index]["model_seed"],
+            "original_candidate_index": candidate_index,
+            "original_measurement_index": index,
+            "original_measurement_sha256": resources.digest(reports[index]),
+            "selection_criteria": criteria[index],
+        }
+        for index in ordered
+        if index in criteria
+    ]
+
+
+def _validate_measurement(report, job, child, entry, original, hardware):
+    from research.conductance_gat.edge_selection import train
+
+    if calibration._full_budget_seconds(report, entry["selection_policy"]) is None:
+        raise RuntimeError(
+            f"reallocated GPU cannot safely execute unchanged resources for {job['job_id']}; "
+            "no batch, worker, model or data downscale was applied"
+        )
+    selected = entry["selected_candidate"]
+    expected = calibration._probe_args(
+        child, entry["batch_axis"], selected["batch_size"], selected["workers"]
+    )
+    required = {
+        "condition": job["variant_id"],
+        "model_seed": job["model_seed"],
+        "configuration": train.configuration(expected),
+        "batch_size": selected["batch_size"],
+        "workers": selected["workers"],
+        "total_memory_bytes": hardware["total_memory_bytes"],
+        "parameter_update_verified": True,
+        "calibration_not_final": True,
+        "gradient_accumulation_steps": 1,
+        "data_parallel_workers": 1,
+        "effective_batch_size": selected["batch_size"],
+        "validation_completed": True,
+        "required_auxiliary_path": child.negative_loss_weight > 0,
+        "required_cycle_preparation": child.selection_mode == "forest_cycle",
+        "auxiliary_path_measured": True,
+        "cycle_preparation_measured": child.selection_mode == "forest_cycle",
+        "model_parameter_count": original["model_parameter_count"],
+        "initial_model_sha256": original["initial_model_sha256"],
+    }
+    for key, value in required.items():
+        actual = report.get(key)
+        if actual != value or (isinstance(value, bool) and actual is not value):
+            raise ValueError(f"allocation measurement differs from unchanged recipe: {key}")
+    for key, minimum in (
+        ("complete_measurement_epochs", 1),
+        ("complete_warmup_epochs", 1),
+        ("warmup_optimizer_steps", 2),
+        ("measurement_steps_requested", 5),
+        ("warmup_steps_requested", 2),
+        ("minimum_measure_seconds_requested", 3.0),
+    ):
+        value = report.get(key)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < minimum
+            or (key != "minimum_measure_seconds_requested" and type(value) is not int)
+        ):
+            raise ValueError(f"allocation measurement lacks complete full-sized probe scope: {key}")
+    measured_hardware = report.get("hardware", {})
+    for report_key, actual_key in (
+        ("device_name", "name"),
+        ("total_memory_bytes", "total_memory_bytes"),
+        ("compute_capability", "compute_capability"),
+    ):
+        if measured_hardware.get(report_key) != hardware[actual_key]:
+            raise ValueError(f"allocation measurement hardware mismatch: {report_key}")
+
+
+def revalidate_allocation(manifest, hardware, runtime, grouped_jobs, persist):
+    """Append an attempt and atomically accept it only after all probes pass."""
+    from research.conductance_gat.edge_selection import train
+
+    if not grouped_jobs:
+        raise ValueError(
+            "allocation revalidation requires pending groups with real workload probes"
+        )
+    require_equivalent_allocation(manifest["hardware"], manifest["runtime"], hardware, runtime)
+    scope = _scope(manifest["hardware"], hardware)
+    entries = {
+        (entry["profile"], entry["dataset"]): entry for entry in manifest["calibration_entries"]
+    }
+    groups = []
+    for key, jobs in grouped_jobs.items():
+        entry = entries[key]
+        calibration.validate_entry(entry, jobs)
+        groups.append(
+            {
+                "profile": key[0],
+                "dataset": key[1],
+                "selected_candidate": copy.deepcopy(entry["selected_candidate"]),
+                "selected": copy.deepcopy(entry["selected"]),
+                "representatives": _representatives(entry, jobs, all_arms=scope == CAPACITY_SCOPE),
+                "measurements": [],
+            }
+        )
+    attempt = {
+        "schema_version": 1,
+        "status": "running",
+        "scope": scope,
+        "hardware": copy.deepcopy(hardware),
+        "runtime": copy.deepcopy(runtime),
+        "original_calibration_sha256": _original_digest(manifest),
+        "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        "representative_tie_break": "lexicographically first job_id",
+        "inherited_evidence": "original complete all-arm calibration at unchanged resources",
+        "groups": groups,
+    }
+    history = manifest.setdefault("allocation_history", [])
+    history.append(attempt)
+    persist()
+    try:
+        for group in groups:
+            key = group["profile"], group["dataset"]
+            entry, jobs = entries[key], grouped_jobs[key]
+            lookup = {job["job_id"]: job for job in jobs}
+            loaded, identity, maximum, axis = train.load_calibration_payload(
+                calibration.parse_job(jobs[0])
+            )
+            if (identity, maximum, axis) != (
+                entry["input_identity"],
+                entry["natural_training_split_size"],
+                entry["batch_axis"],
+            ):
+                raise ValueError("allocation revalidation data/split/topology identity changed")
+            for reference in group["representatives"]:
+                job = lookup[reference["job_id"]]
+                child = calibration.parse_job(job)
+                selected = entry["selected_candidate"]
+                print(
+                    f"[edge allocation revalidation] {job['job_id']} "
+                    f"physical={selected['batch_size']} workers={selected['workers']}; "
+                    f"disposable probe, unchanged recipe; {scope}",
+                    flush=True,
+                )
+                report = calibration._measure(
+                    job, loaded, child, selected["batch_size"], selected["workers"]
+                )
+                group["measurements"].append({"job_id": job["job_id"], "report": report})
+                persist()
+                original = entry["candidates"][reference["original_candidate_index"]][
+                    "measurements"
+                ][reference["original_measurement_index"]]
+                _validate_measurement(report, job, child, entry, original, hardware)
+            del loaded
+        attempt.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+        attempt["evidence_sha256"] = _attempt_digest(attempt)
+        manifest["current_allocation"] = {
+            "history_index": len(history) - 1,
+            "evidence_sha256": attempt["evidence_sha256"],
+        }
+        persist()
+    except (Exception, KeyboardInterrupt) as error:
+        attempt.update(
+            status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+            error=f"{type(error).__name__}: {error}",
+            finished_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+        )
+        # Publication failure must not leave an in-memory accepted failed attempt.
+        if manifest.get("current_allocation", {}).get("history_index") == len(history) - 1:
+            previous = [
+                index for index, item in enumerate(history[:-1]) if item.get("status") == "passed"
+            ]
+            if previous:
+                manifest["current_allocation"] = {
+                    "history_index": previous[-1],
+                    "evidence_sha256": history[previous[-1]]["evidence_sha256"],
+                }
+            else:
+                manifest.pop("current_allocation", None)
+        try:
+            persist()
+        except (Exception, KeyboardInterrupt) as reporting_error:
+            error.add_note(f"allocation failure evidence could not be persisted: {reporting_error}")
+        raise
+````
+
+# research/conductance_gat/edge_selection/selection.py
+
+````python
+"""Physical-edge selection, separate from positive V5 conductance amplitudes.
+
+Budgeted gates use an exact hard top-k forward and a biased straight-through
+gradient of the entropy-constrained relaxation sum(sigmoid((s-lambda)/T))=k.
+The unconstrained corruption arm instead uses Louizos et al. hard-concrete
+(https://arxiv.org/html/1712.01312v2, equations 10-12); it makes no exact-k claim.
+"""
+
+from __future__ import annotations
+
+import math
+from numbers import Real
+
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+from research.conductance_gat.v5.operator import graph_broadcast, graph_sum
+
+CONDITIONS = (
+    "full",
+    "forest_only",
+    "forest_random",
+    "forest_learned",
+    "forest_cycle",
+    "hard_concrete",
+)
+LEARNED = {"forest_learned", "forest_cycle", "hard_concrete"}
+
+
+def selection_configuration(configuration: dict) -> dict:
+    defaults = {
+        "chord_fraction": None,
+        "selection_temperature": 1.0,
+        "hard_concrete_temperature": 2 / 3,
+        "hard_concrete_lower": -0.1,
+        "hard_concrete_upper": 1.1,
+        "selection_seed": 0,
+    }
+    unknown = set(configuration) - {"condition", *defaults}
+    if unknown:
+        raise ValueError(f"unsupported selection configuration: {sorted(unknown)}")
+    result = {**defaults, **configuration}
+    if result.get("condition") not in CONDITIONS:
+        raise ValueError("an explicit supported edge selection condition is required")
+    fraction = result["chord_fraction"]
+    if fraction is not None and (
+        isinstance(fraction, bool)
+        or not isinstance(fraction, Real)
+        or not math.isfinite(fraction)
+        or not 0 <= fraction <= 1
+    ):
+        raise ValueError("chord_fraction must be finite in [0,1]")
+    if (
+        result["condition"] in {"forest_random", "forest_learned", "forest_cycle"}
+        and fraction is None
+    ):
+        raise ValueError("budgeted selection requires explicit chord_fraction")
+    for key in ("selection_temperature", "hard_concrete_temperature"):
+        value = result[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{key} must be finite and positive")
+    lower, upper = result["hard_concrete_lower"], result["hard_concrete_upper"]
+    if (
+        any(
+            isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value)
+            for value in (lower, upper)
+        )
+        or not lower < 0 < 1 < upper
+    ):
+        raise ValueError("hard-concrete stretch must satisfy lower<0<1<upper")
+    if type(result["selection_seed"]) is not int or result["selection_seed"] < 0:
+        raise ValueError("selection_seed must be a nonnegative integer")
+    return result
+
+
+def _group_extreme(values, group, graphs, reduction):
+    if graphs == 1:
+        value = values.amin() if reduction == "amin" else values.amax()
+        return value.reshape(1)
+    initial = torch.inf if reduction == "amin" else -torch.inf
+    result = values.new_full((graphs,), initial).scatter_reduce(0, group, values, reduce=reduction)
+    return torch.where(torch.isfinite(result), result, torch.zeros_like(result))
+
+
+class _ConstrainedLogistic(torch.autograd.Function):
+    """Implicit first derivative of the fixed-cardinality entropy relaxation.
+
+    The scalar threshold is solved per graph, vectorized on the device. Bisection
+    is a numerical scalar root solve, not a reduction of the model's solver K.
+    No per-graph GPU loop or dense graph-by-edge matrix is constructed.
+    """
+
+    @staticmethod
+    def forward(ctx, scores, edge_graph, counts, budget, temperature):
+        graphs = counts.numel()
+        if not scores.numel():
+            probability = scores.clone()
+        else:
+            lower = _group_extreme(scores, edge_graph, graphs, "amin") - 64 * temperature
+            upper = _group_extreme(scores, edge_graph, graphs, "amax") + 64 * temperature
+            for _ in range(64 if scores.dtype == torch.float64 else 32):
+                threshold = (lower + upper) * 0.5
+                probability = (
+                    (scores - graph_broadcast(threshold, edge_graph, graphs, validate_index=False))
+                    / temperature
+                ).sigmoid()
+                mass = graph_sum(probability, edge_graph, graphs, validate_index=False)
+                above = mass > budget
+                lower = torch.where(above, threshold, lower)
+                upper = torch.where(above, upper, threshold)
+            threshold = (lower + upper) * 0.5
+            probability = (
+                (scores - graph_broadcast(threshold, edge_graph, graphs, validate_index=False))
+                / temperature
+            ).sigmoid()
+            probability = torch.where(
+                budget[edge_graph] == 0, torch.zeros_like(probability), probability
+            )
+            probability = torch.where(
+                budget[edge_graph] == counts[edge_graph], torch.ones_like(probability), probability
+            )
+        ctx.save_for_backward(probability, edge_graph)
+        ctx.graphs, ctx.temperature = graphs, temperature
+        return probability
+
+    @staticmethod
+    def backward(ctx, gradient):
+        probability, edge_graph = ctx.saved_tensors
+        slope = probability * (1 - probability)
+        mass = graph_sum(slope, edge_graph, ctx.graphs, validate_index=False)
+        weighted = graph_sum(slope * gradient, edge_graph, ctx.graphs, validate_index=False)
+        offset = weighted / mass.clamp_min(torch.finfo(slope.dtype).tiny)
+        result = (
+            slope
+            * (gradient - graph_broadcast(offset, edge_graph, ctx.graphs, validate_index=False))
+            / ctx.temperature
+        )
+        return result, None, None, None, None
+
+
+def exact_budget_gate(
+    scores: Tensor,
+    eligible: Tensor,
+    edge_graph: Tensor,
+    num_graphs: int,
+    fraction: float,
+    *,
+    temperature: float,
+    straight_through: bool,
+    tie_breaker: Tensor | None = None,
+):
+    """Exactly floor(fraction * eligible edges) per graph in every forward."""
+    if scores.ndim != 1 or eligible.shape != scores.shape or eligible.dtype != torch.bool:
+        raise ValueError("selection scores and eligibility must be aligned E vectors")
+    if edge_graph.shape != scores.shape or edge_graph.dtype != torch.long:
+        raise ValueError("edge_graph must be aligned int64 graph IDs")
+    if tie_breaker is not None and (
+        tie_breaker.shape != scores.shape or tie_breaker.device != scores.device
+    ):
+        raise ValueError("tie_breaker must align with current same-device physical edges")
+    selected = eligible.nonzero(as_tuple=False).flatten()
+    groups, logits = edge_graph[selected], scores[selected]
+    counts = torch.bincount(groups, minlength=num_graphs)
+    budget = (counts.to(torch.float64) * fraction).floor().long()
+    hard = torch.zeros_like(scores)
+    if selected.numel():
+        order = (
+            torch.arange(selected.numel(), device=scores.device)
+            if tie_breaker is None
+            else torch.argsort(tie_breaker[selected], descending=True, stable=True)
+        )
+        order = order[torch.argsort(logits[order], descending=True, stable=True)]
+        order = order[torch.argsort(groups[order], stable=True)]
+        starts = counts.cumsum(0) - counts
+        rank = torch.arange(selected.numel(), device=scores.device) - starts[groups[order]]
+        hard = hard.scatter(0, selected[order], (rank < budget[groups[order]]).to(scores.dtype))
+    soft = torch.zeros_like(scores)
+    if straight_through:
+        probability = _ConstrainedLogistic.apply(logits, groups, counts, budget, temperature)
+        soft = soft.scatter(0, selected, probability)
+        gate = hard + (soft - soft.detach())
+    else:
+        gate, soft = hard, hard
+    return gate, soft, budget
+
+
+def hard_concrete(logits, *, training, temperature=2 / 3, lower=-0.1, upper=1.1):
+    probability = (logits - temperature * math.log(-lower / upper)).sigmoid()
+    if training:
+        eps = torch.finfo(logits.dtype).eps
+        uniform = torch.rand_like(logits).clamp(min=eps, max=1 - eps)
+        relaxed = ((uniform.log() - torch.log1p(-uniform) + logits) / temperature).sigmoid()
+    else:
+        # Paper deterministic evaluation rule, not an exact binary/top-k budget.
+        relaxed = logits.sigmoid()
+    gate = (relaxed * (upper - lower) + lower).clamp(0, 1)
+    return gate, probability
+
+
+class EdgeSelector(nn.Module):
+    """Symmetric endpoint/degree scores, optionally contextualized by cycles."""
+
+    def __init__(self, channels, configuration, *, edge_chunk_size=65536):
+        super().__init__()
+        self.configuration = selection_configuration(configuration)
+        self.condition = self.configuration["condition"]
+        self.edge_chunk_size = edge_chunk_size
+        if self.condition in LEARNED:
+            self.node_projection = nn.Linear(channels, channels, bias=False)
+            self.edge_hidden = nn.Linear(2 * channels + 4, channels)
+            # A graph-wide constant score is unidentifiable under an exact k.
+            self.score = nn.Linear(channels, 1, bias=self.condition == "hard_concrete")
+        else:
+            self.node_projection = self.edge_hidden = self.score = None
+        if self.condition == "forest_cycle":
+            self.cycle_weight = nn.Parameter(torch.zeros(()))
+        else:
+            self.register_parameter("cycle_weight", None)
+        self.last_logits = self.last_gate = self.last_probability = None
+        self.last_budget = None
+        self.live_logits = self.live_probability = None
+        self.gate_override = None
+
+    def _scores_chunk(self, projected, incidence, sample_degree, full_degree):
+        tail, head = incidence
+        left, right = projected[tail], projected[head]
+        structural = torch.stack(
+            (
+                (sample_degree[tail] + sample_degree[head]).log1p(),
+                (sample_degree[tail] - sample_degree[head]).abs().log1p(),
+                (full_degree[tail] + full_degree[head]).log1p(),
+                (full_degree[tail] - full_degree[head]).abs().log1p(),
+            ),
+            dim=1,
+        )
+        features = torch.cat((left + right, (left - right).abs(), structural), dim=1)
+        return self.score(F.silu(self.edge_hidden(features))).squeeze(-1)
+
+    def forward(
+        self, state, incidence, node_graph, num_graphs, *, topology, sample_degree, full_degree
+    ):
+        edges = incidence.shape[1]
+        if (
+            topology.incidence_edge_index.shape != incidence.shape
+            or topology.incidence_edge_index.device != state.device
+        ):
+            raise ValueError("selection topology must match this same-device graph")
+        if topology.forest_mask.shape != (edges,) or topology.edge_graph.shape != (edges,):
+            raise ValueError("selection topology has invalid physical edge metadata")
+        torch._assert_async(
+            (topology.incidence_edge_index == incidence).all(),
+            "selection topology belongs to different physical edges",
+        )
+        torch._assert_async(
+            (topology.node_graph == node_graph).all(),
+            "selection topology belongs to different graph batching",
+        )
+        self.live_logits = self.live_probability = None
+        if self.condition in LEARNED:
+            projected = self.node_projection(state)
+            chunks = []
+            for start in range(0, edges, self.edge_chunk_size):
+                args = (
+                    projected,
+                    incidence[:, start : start + self.edge_chunk_size],
+                    sample_degree,
+                    full_degree,
+                )
+                if torch.is_grad_enabled():
+                    from torch.utils.checkpoint import checkpoint
+
+                    chunks.append(
+                        checkpoint(
+                            self._scores_chunk, *args, use_reentrant=False, preserve_rng_state=False
+                        )
+                    )
+                else:
+                    chunks.append(self._scores_chunk(*args))
+            logits = torch.cat(chunks) if chunks else state.new_empty(0)
+            if self.condition == "forest_cycle":
+                from .topology import cycle_context
+
+                # Scalar edge context keeps exact all-edge cycle aggregation
+                # without retaining an E x hidden-channel feature cache.
+                contextual = cycle_context(
+                    logits[:, None], topology, signed=False, normalize=True
+                ).squeeze(-1)
+                logits = logits + self.cycle_weight * contextual
+        else:
+            logits = state.new_zeros(edges)
+        torch._assert_async(torch.isfinite(logits).all(), "edge-selection logits must be finite")
+        config = self.configuration
+        budget = None
+        if self.condition == "full":
+            gate = probability = torch.ones_like(logits)
+        elif self.condition == "forest_only":
+            gate = probability = topology.forest_mask.to(logits.dtype)
+        elif self.condition == "hard_concrete":
+            gate, probability = hard_concrete(
+                logits,
+                training=self.training,
+                temperature=config["hard_concrete_temperature"],
+                lower=config["hard_concrete_lower"],
+                upper=config["hard_concrete_upper"],
+            )
+        else:
+            ranking = topology.random_priority if self.condition == "forest_random" else logits
+            gate, probability, budget = exact_budget_gate(
+                ranking,
+                ~topology.forest_mask,
+                topology.edge_graph,
+                num_graphs,
+                config["chord_fraction"],
+                temperature=config["selection_temperature"],
+                straight_through=self.training and self.condition in LEARNED,
+                tie_breaker=topology.random_priority,
+            )
+            gate = torch.where(topology.forest_mask, torch.ones_like(gate), gate)
+            probability = torch.where(
+                topology.forest_mask, torch.ones_like(probability), probability
+            )
+            gate, probability = gate.to(logits.dtype), probability.to(logits.dtype)
+        override = self.gate_override
+        if override is not None:
+            if self.training or torch.is_grad_enabled():
+                raise RuntimeError("gate interventions are evaluation/no-grad only")
+            if isinstance(override, Tensor):
+                if override.shape != gate.shape or override.device != gate.device:
+                    raise ValueError(
+                        "frozen gate must align with current same-device physical edges"
+                    )
+                torch._assert_async(
+                    (torch.isfinite(override) & (override >= 0) & (override <= 1)).all(),
+                    "frozen gate must be finite in [0,1]",
+                )
+                gate = override.to(gate.dtype)
+                probability = gate
+            elif override == "all":
+                gate = probability = torch.ones_like(gate)
+            elif override == "random_budget":
+                if self.condition not in {"forest_random", "forest_learned", "forest_cycle"}:
+                    raise ValueError(
+                        "random_budget intervention requires a protected exact-budget arm"
+                    )
+                gate, probability, budget = exact_budget_gate(
+                    topology.random_priority,
+                    ~topology.forest_mask,
+                    topology.edge_graph,
+                    num_graphs,
+                    config["chord_fraction"],
+                    temperature=config["selection_temperature"],
+                    straight_through=False,
+                )
+                gate = torch.where(topology.forest_mask, torch.ones_like(gate), gate).to(
+                    logits.dtype
+                )
+                probability = gate
+            else:
+                raise ValueError("unsupported gate intervention")
+        self.last_logits, self.last_gate, self.last_probability = (
+            logits.detach(),
+            gate.detach(),
+            probability.detach(),
+        )
+        self.last_budget = None if budget is None else budget.detach()
+        if self.condition == "hard_concrete":
+            self.live_logits, self.live_probability = logits, probability
+        return gate
+
+    def clear_auxiliary_cache(self):
+        self.live_logits = self.live_probability = None
+````
+
+# research/conductance_gat/edge_selection/topology.py
+
+````python
+"""Label-free DFS forests and implicit fundamental-cycle operators.
+
+The CPU DFS and adjacency construction take O(N+E) time/space. No cycle paths,
+cycle incidence matrix, dense adjacency, or cycle-count cap is materialized.
+Torch prefix/scatter operators cost O((N+E)*channels) and preserve autograd.
+"""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass, fields
+from typing import Any
+
+import numpy as np
+import torch
+from torch import Tensor
+
+
+@dataclass(frozen=True)
+class TopologyPlan:
+    incidence_edge_index: Tensor
+    forest_mask: Tensor
+    edge_graph: Tensor
+    node_graph: Tensor
+    components: Tensor
+    parent: Tensor
+    parent_edge: Tensor
+    depth: Tensor
+    preorder: Tensor
+    tin: Tensor
+    tout: Tensor
+    tree_nodes: Tensor
+    tree_child: Tensor
+    tree_sign: Tensor
+    chord_indices: Tensor
+    chord_ancestor: Tensor
+    chord_descendant: Tensor
+    chord_sign: Tensor
+    cycle_length: Tensor
+    cycle_count: Tensor
+    random_priority: Tensor
+    metadata: dict[str, Any]
+
+    @property
+    def num_nodes(self) -> int:
+        return self.node_graph.numel()
+
+    @property
+    def num_edges(self) -> int:
+        return self.forest_mask.numel()
+
+    @property
+    def num_graphs(self) -> int:
+        return self.metadata["num_graphs"]
+
+    def to(self, device, *, non_blocking: bool = False) -> TopologyPlan:
+        """Return independent tensor storage; never mutate the cached CPU plan."""
+        return TopologyPlan(
+            **{
+                field.name: (
+                    getattr(self, field.name).to(device, non_blocking=non_blocking, copy=True)
+                    if isinstance(getattr(self, field.name), Tensor)
+                    else dict(getattr(self, field.name))
+                )
+                for field in fields(self)
+            }
+        )
+
+    def pin_memory(self) -> TopologyPlan:
+        """Pin every index/value tensor for a real asynchronous CPU-to-CUDA transfer.
+
+        Unsupported pinning raises the actual runtime error; no fake CUDA or
+        silent unpinned fallback. Cached tensors are never replaced in-place.
+        """
+        if any(
+            getattr(self, field.name).device.type != "cpu"
+            for field in fields(self)
+            if isinstance(getattr(self, field.name), Tensor)
+        ):
+            raise ValueError("only CPU topology plans can be pinned")
+        return TopologyPlan(
+            **{
+                field.name: (
+                    getattr(self, field.name).pin_memory()
+                    if isinstance(getattr(self, field.name), Tensor)
+                    else dict(getattr(self, field.name))
+                )
+                for field in fields(self)
+            }
+        )
+
+
+def validate_cpu_topology(num_nodes: int, incidence: Tensor, node_graph: Tensor | None = None):
+    if type(num_nodes) is not int or num_nodes < 0:
+        raise ValueError("num_nodes must be a nonnegative integer")
+    if (
+        not isinstance(incidence, Tensor)
+        or incidence.device.type != "cpu"
+        or incidence.dtype != torch.long
+        or incidence.ndim != 2
+        or incidence.shape[0] != 2
+    ):
+        raise ValueError("incidence must be a CPU int64 tensor with shape 2 x E")
+    if node_graph is None:
+        node_graph = torch.zeros(num_nodes, dtype=torch.long)
+    if (
+        not isinstance(node_graph, Tensor)
+        or node_graph.device.type != "cpu"
+        or node_graph.dtype != torch.long
+        or node_graph.shape != (num_nodes,)
+    ):
+        raise ValueError("node_graph must contain one CPU int64 graph ID per node")
+    graph = node_graph.numpy()
+    if graph.size and (
+        graph.min() < 0
+        or graph.max() >= num_nodes
+        or np.count_nonzero(np.bincount(graph)) != graph.max() + 1
+    ):
+        raise ValueError("node_graph IDs must be contiguous and start at zero")
+    edge = incidence.numpy()
+    if edge.size:
+        if edge.min() < 0 or edge.max() >= num_nodes:
+            raise ValueError("edge endpoint outside node range")
+        if np.any(edge[0] == edge[1]):
+            raise ValueError("physical incidence must not contain self-loops")
+        if np.any(graph[edge[0]] != graph[edge[1]]):
+            raise ValueError("physical edges may not cross original graph boundaries")
+        unique = set()
+        for left, right in zip(edge[0], edge[1], strict=True):
+            pair = (min(int(left), int(right)), max(int(left), int(right)))
+            if pair in unique:
+                raise ValueError("physical incidence contains duplicate undirected edges")
+            unique.add(pair)
+    return edge, graph
+
+
+def topology_fingerprint(num_nodes: int, incidence: Tensor, node_graph: Tensor) -> str:
+    """Exact aligned-input identity, not a hash of labels or features."""
+    digest = hashlib.sha256(str(num_nodes).encode("ascii"))
+    for tensor in (incidence, node_graph):
+        digest.update(str(tuple(tensor.shape)).encode("ascii"))
+        digest.update(tensor.contiguous().numpy().astype("<i8", copy=False).tobytes())
+    return digest.hexdigest()
+
+
+def _priority(edge: np.ndarray, seed: int) -> np.ndarray:
+    """Endpoint/orientation/order-stable splitmix64 priorities, independent of labels."""
+    low, high = (
+        np.minimum(edge[0], edge[1]).astype(np.uint64),
+        np.maximum(edge[0], edge[1]).astype(np.uint64),
+    )
+    value = low * np.uint64(0x9E3779B97F4A7C15) ^ high * np.uint64(0xD1B54A32D192ED03)
+    value ^= np.uint64(seed & ((1 << 64) - 1))
+    value = (value ^ (value >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    value = (value ^ (value >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    value ^= value >> np.uint64(31)
+    return (value >> np.uint64(11)).astype(np.float64) / (1 << 53)
+
+
+def _ordered_adjacency(num_nodes: int, edge: np.ndarray, root_order: np.ndarray):
+    """Two counting/CSR passes give neighbor-rank order without comparison sorting."""
+    counts = np.bincount(edge.reshape(-1), minlength=num_nodes)
+    offsets = np.concatenate(([0], np.cumsum(counts, dtype=np.int64)))
+    cursor = offsets[:-1].copy()
+    neighbors = np.empty(2 * edge.shape[1], dtype=np.int64)
+    ids = np.empty_like(neighbors)
+    for edge_id, (left, right) in enumerate(zip(edge[0], edge[1], strict=True)):
+        position = cursor[left]
+        neighbors[position], ids[position] = right, edge_id
+        cursor[left] += 1
+        position = cursor[right]
+        neighbors[position], ids[position] = left, edge_id
+        cursor[right] += 1
+    ordered_neighbors, ordered_ids = np.empty_like(neighbors), np.empty_like(ids)
+    cursor = offsets[:-1].copy()
+    for neighbor in root_order:
+        for position in range(offsets[neighbor], offsets[neighbor + 1]):
+            node = neighbors[position]
+            target = cursor[node]
+            ordered_neighbors[target], ordered_ids[target] = neighbor, ids[position]
+            cursor[node] += 1
+    return offsets, ordered_neighbors, ordered_ids
+
+
+def build_topology(
+    num_nodes: int,
+    incidence_edge_index: Tensor,
+    node_graph: Tensor | None = None,
+    forest_seed: int = 0,
+) -> TopologyPlan:
+    """Build once from candidate edges only; edge origins/labels are not accepted."""
+    if type(forest_seed) is not int or forest_seed < 0:
+        raise ValueError("forest_seed must be a nonnegative integer")
+    edge, graph = validate_cpu_topology(num_nodes, incidence_edge_index, node_graph)
+    node_graph = torch.from_numpy(graph.copy())
+    edges = edge.shape[1]
+    root_order = np.random.default_rng(forest_seed).permutation(num_nodes)
+    offsets, neighbors, ids = _ordered_adjacency(num_nodes, edge, root_order)
+    parent = np.full(num_nodes, -2, dtype=np.int64)
+    parent_edge = np.full(num_nodes, -1, dtype=np.int64)
+    depth = np.zeros(num_nodes, dtype=np.int64)
+    components = np.empty(num_nodes, dtype=np.int64)
+    tin, tout = np.empty(num_nodes, dtype=np.int64), np.empty(num_nodes, dtype=np.int64)
+    preorder = np.empty(num_nodes, dtype=np.int64)
+    forest = np.zeros(edges, dtype=np.bool_)
+    tree_child = np.full(edges, -1, dtype=np.int64)
+    tree_sign = np.zeros(num_nodes, dtype=np.int64)
+    clock, component = 0, 0
+    for root in root_order:
+        if parent[root] != -2:
+            continue
+        parent[root], components[root], tin[root] = -1, component, clock
+        preorder[clock] = root
+        clock += 1
+        stack, positions = [int(root)], [int(offsets[root])]
+        while stack:
+            node, position = stack[-1], positions[-1]
+            if position == offsets[node + 1]:
+                tout[node] = clock
+                stack.pop()
+                positions.pop()
+                continue
+            positions[-1] += 1
+            neighbor, edge_id = neighbors[position], ids[position]
+            if parent[neighbor] != -2:
+                continue
+            parent[neighbor], parent_edge[neighbor] = node, edge_id
+            depth[neighbor], components[neighbor], tin[neighbor] = depth[node] + 1, component, clock
+            preorder[clock] = neighbor
+            clock += 1
+            forest[edge_id], tree_child[edge_id] = True, neighbor
+            tree_sign[neighbor] = 1 if edge[0, edge_id] == node else -1
+            stack.append(int(neighbor))
+            positions.append(int(offsets[neighbor]))
+        component += 1
+    chord = np.flatnonzero(~forest)
+    left, right = edge[:, chord]
+    ancestor = np.where(tin[left] < tin[right], left, right)
+    descendant = np.where(tin[left] < tin[right], right, left)
+    if np.any(tin[descendant] >= tout[ancestor]):
+        raise RuntimeError("DFS produced a non-ancestor chord; invalid fundamental cycle plan")
+    chord_sign = np.where(left == ancestor, 1, -1)
+    tree_nodes = np.flatnonzero(parent >= 0)
+    impulses = np.zeros(num_nodes, dtype=np.int64)
+    np.add.at(impulses, descendant, 1)
+    np.add.at(impulses, ancestor, -1)
+    prefix = np.concatenate(([0], np.cumsum(impulses[preorder], dtype=np.int64)))
+    cycle_count = np.zeros(edges, dtype=np.int64)
+    cycle_count[chord] = 1
+    cycle_count[parent_edge[tree_nodes]] = prefix[tout[tree_nodes]] - prefix[tin[tree_nodes]]
+    arrays = {
+        "forest_mask": forest,
+        "edge_graph": graph[edge[0]],
+        "components": components,
+        "parent": parent,
+        "parent_edge": parent_edge,
+        "depth": depth,
+        "preorder": preorder,
+        "tin": tin,
+        "tout": tout,
+        "tree_nodes": tree_nodes,
+        "tree_child": tree_child,
+        "tree_sign": tree_sign,
+        "chord_indices": chord,
+        "chord_ancestor": ancestor,
+        "chord_descendant": descendant,
+        "chord_sign": chord_sign,
+        "cycle_length": depth[descendant] - depth[ancestor] + 1,
+        "cycle_count": cycle_count,
+        "random_priority": _priority(edge, forest_seed),
+    }
+    return TopologyPlan(
+        incidence_edge_index=incidence_edge_index.clone(),
+        node_graph=node_graph,
+        **{name: torch.from_numpy(value.copy()) for name, value in arrays.items()},
+        metadata={
+            "forest_seed": forest_seed,
+            "num_nodes": num_nodes,
+            "num_edges": edges,
+            "num_graphs": int(graph.max() + 1) if graph.size else 0,
+            "num_components": component,
+            "cycle_rank": len(chord),
+            "dfs_complexity": "O(N+E) time and storage; no explicit cycle paths",
+            "basis": "one DFS fundamental cycle per non-tree physical edge",
+            "forest_input": "candidate topology only; label/origin blind",
+            "priority": "endpoint splitmix64, 53-bit float64; seed=forest_seed",
+            "topology_sha256": topology_fingerprint(num_nodes, incidence_edge_index, node_graph),
+        },
+    )
+
+
+def _values(values: Tensor, plan: TopologyPlan, count: int):
+    if values.ndim < 1 or values.shape[0] != count or not values.is_floating_point():
+        raise ValueError(
+            "values must be floating tensors with the exact edge/cycle leading dimension"
+        )
+    if values.device != plan.incidence_edge_index.device:
+        raise ValueError("values and topology plan must be on the same device")
+
+
+def _factor(value: Tensor, target: Tensor) -> Tensor:
+    return value.to(target.dtype).reshape((-1,) + (1,) * (target.ndim - 1))
+
+
+def edge_to_cycle(edge_values: Tensor, plan: TopologyPlan, *, signed: bool = True) -> Tensor:
+    """Z^T x (signed) or |Z|^T x via subtree interval updates and one prefix sum."""
+    _values(edge_values, plan, plan.num_edges)
+    original_dtype = edge_values.dtype
+    edge_values = edge_values.to(torch.float64)
+    nodes = plan.tree_nodes
+    tree_value = edge_values[plan.parent_edge[nodes]]
+    if signed:
+        tree_value = tree_value * _factor(plan.tree_sign[nodes], tree_value)
+    difference = edge_values.new_zeros((plan.num_nodes + 1,) + edge_values.shape[1:])
+    difference = difference.index_add(0, plan.tin[nodes], tree_value)
+    difference = difference.index_add(0, plan.tout[nodes], -tree_value)
+    potential = difference.cumsum(0)
+    path = potential[plan.tin[plan.chord_descendant]] - potential[plan.tin[plan.chord_ancestor]]
+    chord = edge_values[plan.chord_indices]
+    result = chord - _factor(plan.chord_sign, path) * path if signed else chord + path
+    return result.to(original_dtype)
+
+
+def cycle_to_edge(cycle_values: Tensor, plan: TopologyPlan, *, signed: bool = True) -> Tensor:
+    """Z y or |Z| y, exact adjoint to edge_to_cycle without cycle-path expansion."""
+    _values(cycle_values, plan, plan.chord_indices.numel())
+    original_dtype = cycle_values.dtype
+    cycle_values = cycle_values.to(torch.float64)
+    values = -_factor(plan.chord_sign, cycle_values) * cycle_values if signed else cycle_values
+    impulses = cycle_values.new_zeros((plan.num_nodes,) + cycle_values.shape[1:])
+    impulses = impulses.index_add(0, plan.chord_descendant, values)
+    impulses = impulses.index_add(0, plan.chord_ancestor, -values)
+    prefix = torch.cat(
+        (impulses.new_zeros((1,) + impulses.shape[1:]), impulses[plan.preorder].cumsum(0)), dim=0
+    )
+    nodes = plan.tree_nodes
+    tree_value = prefix[plan.tout[nodes]] - prefix[plan.tin[nodes]]
+    if signed:
+        tree_value = tree_value * _factor(plan.tree_sign[nodes], tree_value)
+    result = cycle_values.new_zeros((plan.num_edges,) + cycle_values.shape[1:])
+    result = result.index_add(0, plan.chord_indices, cycle_values)
+    return result.index_add(0, plan.parent_edge[nodes], tree_value).to(original_dtype)
+
+
+def cycle_context(
+    edge_values: Tensor, plan: TopologyPlan, *, signed: bool = False, normalize: bool = True
+) -> Tensor:
+    """Cycle means then per-edge cycle mean; unsigned is orientation invariant.
+
+    Bridges have zero context because they belong to no cycle, not because any
+    cycle was truncated. normalize=False returns the unnormalized Z Z^T action.
+    """
+    original_dtype = edge_values.dtype
+    cycles = edge_to_cycle(edge_values.to(torch.float64), plan, signed=signed)
+    if normalize:
+        cycles = cycles / _factor(plan.cycle_length, cycles)
+    result = cycle_to_edge(cycles, plan, signed=signed)
+    result = result / _factor(plan.cycle_count.clamp_min(1), result) if normalize else result
+    return result.to(original_dtype)
+
+
+def batch_topologies(plans: list[TopologyPlan]) -> TopologyPlan:
+    """Disjoint offset concatenation of cached CPU plans; never rerun DFS."""
+    if not plans:
+        raise ValueError("at least one topology plan is required")
+    if any(plan.incidence_edge_index.device.type != "cpu" for plan in plans):
+        raise ValueError("batch cached CPU plans before moving the disjoint plan to device")
+    collected = {field.name: [] for field in fields(TopologyPlan) if field.name != "metadata"}
+    node_offset = edge_offset = graph_offset = component_offset = 0
+    node_fields = {
+        "incidence_edge_index",
+        "preorder",
+        "tin",
+        "tout",
+        "tree_nodes",
+        "chord_ancestor",
+        "chord_descendant",
+    }
+    for plan in plans:
+        for name in collected:
+            value = getattr(plan, name)
+            if name in node_fields:
+                value = value + node_offset
+            elif name in {"parent", "tree_child"}:
+                value = torch.where(value >= 0, value + node_offset, value)
+            elif name == "parent_edge":
+                value = torch.where(value >= 0, value + edge_offset, value)
+            elif name == "chord_indices":
+                value = value + edge_offset
+            elif name in {"edge_graph", "node_graph"}:
+                value = value + graph_offset
+            elif name == "components":
+                value = value + component_offset
+            collected[name].append(value)
+        node_offset += plan.num_nodes
+        edge_offset += plan.num_edges
+        graph_offset += plan.metadata["num_graphs"]
+        component_offset += plan.metadata["num_components"]
+    tensors = {
+        name: torch.cat(values, dim=1 if name == "incidence_edge_index" else 0)
+        for name, values in collected.items()
+    }
+    return TopologyPlan(
+        **tensors,
+        metadata={
+            "forest_seed": tuple(plan.metadata["forest_seed"] for plan in plans),
+            "num_nodes": node_offset,
+            "num_edges": edge_offset,
+            "num_graphs": graph_offset,
+            "num_components": component_offset,
+            "cycle_rank": tensors["chord_indices"].numel(),
+            "forest_input": "cached candidate topology plans; no rebuild or edge-origin features",
+            "source_topology_sha256": tuple(plan.metadata["topology_sha256"] for plan in plans),
+            "topology_sha256": topology_fingerprint(
+                node_offset, tensors["incidence_edge_index"], tensors["node_graph"]
+            ),
+            "dfs_reexecuted": False,
+        },
+    )
+````
+
+# research/conductance_gat/edge_selection/train.py
+
+````python
+"""Full-size, epoch-resumable edge selection on official V1 caches; no legacy migration."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import gc
+import hashlib
+import json
+import math
+import random
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from chartgat.cache import atomic_write_json
+from chartgat.observability import RuntimeResourceMonitor
+
+from ..v5 import train as base
+from ..v5.batch_calibration import (
+    _candidate_args,
+    _isolated_execution_state,
+    _optimizer_state_bytes,
+)
+from ..v5.learning_budget import should_stop_learning_budget
+from ..v5.timing import StageTimer
+from . import protocol as selection_protocol
+from .audit_compat import require_source_compatibility
+from .data import PreparedInputs
+from .model import EdgeSelectionClassifier
+
+ROOT = Path(__file__).resolve().parents[3]
+SUITE = selection_protocol.SUITE
+
+
+def build_parser():
+    parser = base.build_parser()
+    parser.description = __doc__
+    parser.set_defaults(
+        conductance_heads="per_head",
+        propagation_normalization="row",
+        solver_cost_scaling="width_scaled",
+        beta_initial=0.5,
+        training_schedule="joint",
+    )
+    selection_protocol.add_arguments(parser)
+    return parser
+
+
+def validate_args(args):
+    base.validate_args(args)
+    selection_protocol.validate(args)
+
+
+def configuration(args):
+    return {**base.configuration(args), "edge_selection": selection_protocol.configuration(args)}
+
+
+def implementation_source_hashes():
+    paths = list((ROOT / "research/conductance_gat/edge_selection").glob("*.py"))
+    paths += [ROOT / "scripts/run_v5_edge_selection.py"]
+    return {
+        **base.implementation_source_hashes(),
+        **{path.relative_to(ROOT).as_posix(): base.sha256_file(path) for path in sorted(paths)},
+    }
+
+
+def make_model(payload, args, device):
+    return EdgeSelectionClassifier(
+        payload["graphs"][0]["x"].shape[1],
+        payload["classes"],
+        **base.architecture_configuration(args),
+        conductance_mode="dynamic",
+        max_log_conductance=base.COMMON["max_log_conductance"],
+        edge_chunk_size=args.edge_chunk_size,
+        selection_config=selection_protocol.model_configuration(args),
+    ).to(device)
+
+
+def parameter_group(name):
+    if ".selector." in name:
+        return "gate"
+    return base.parameter_group(name)
+
+
+def make_optimizer(model):
+    options = {
+        "backbone": (base.COMMON["lr"], base.COMMON["weight_decay"]),
+        "spatial_w": (base.COMMON["lr"], base.COMMON["weight_decay"]),
+        "beta": (
+            base.COMMON["lr"] * base.COMMON["beta_lr_multiplier"],
+            base.COMMON["scalar_weight_decay"],
+        ),
+        "conductance": (
+            base.COMMON["lr"] * base.COMMON["conductance_lr_multiplier"],
+            base.COMMON["conductance_weight_decay"],
+        ),
+        "gate": (
+            base.COMMON["lr"] * base.COMMON["conductance_lr_multiplier"],
+            base.COMMON["conductance_weight_decay"],
+        ),
+    }
+    grouped = {name: [] for name in options}
+    names = {name: [] for name in options}
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            group = parameter_group(name)
+            grouped[group].append(parameter)
+            names[group].append(name)
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "name": name,
+                "params": values,
+                "parameter_names": names[name],
+                "lr": options[name][0],
+                "weight_decay": options[name][1],
+            }
+            for name, values in grouped.items()
+            if values
+        ],
+        lr=base.COMMON["lr"],
+    )
+    expected = {id(value) for value in model.parameters() if value.requires_grad}
+    actual = [id(value) for group in optimizer.param_groups for value in group["params"]]
+    if set(actual) != expected or len(actual) != len(expected):
+        raise RuntimeError("edge-selection optimizer ownership is not exactly once per parameter")
+    return optimizer
+
+
+def shared_initial_state_sha256(model):
+    digest = hashlib.sha256()
+    for name, value in model.state_dict().items():
+        if ".selector." not in name:
+            digest.update(name.encode())
+            digest.update(base.tensor_hash(value).encode())
+    return digest.hexdigest()
+
+
+def resolve_budget(inputs, args):
+    if inputs.indices is not None:
+        return base.resolve_learning_budget(inputs.data, inputs.indices, inputs.sampler, args)
+    return base.resolve_learning_budget(inputs.data, None, None, args)
+
+
+def build_identity(args, protocol, budget, initial_hash, inputs):
+    return {
+        "schema_version": 1,
+        "research_suite": SUITE,
+        "dataset": args.dataset,
+        "condition": args.selection_mode,
+        "configuration": configuration(args),
+        "training_arguments": serializable_arguments(args),
+        "dataset_protocol": protocol,
+        "dataset_protocol_sha256": base._canonical_sha256(protocol),
+        "source_sha256": implementation_source_hashes(),
+        "runtime_versions": base._versions(),
+        "initial_state_sha256": initial_hash,
+        "learning_budget": budget,
+        "input_provenance": inputs.provenance,
+        "resume_semantics": (
+            "epoch-boundary model/optimizer/Python/NumPy/CPU/CUDA RNG restore; "
+            "no bitwise CUDA claim"
+        ),
+    }
+
+
+def serializable_arguments(args):
+    return {
+        key: False if key == "resume" else str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+
+
+def restore_arguments(metrics, output, data_root, device):
+    identity = metrics["resume_identity"]
+    saved = identity.get("training_arguments")
+    if not isinstance(saved, dict):
+        raise ValueError("audit requires immutable training arguments")
+    args = argparse.Namespace(**saved)
+    for name in ("output_dir", "data_root"):
+        setattr(args, name, Path(getattr(args, name)))
+    validate_args(args)
+    if configuration(args) != identity["configuration"]:
+        raise ValueError("restored CLI arguments do not reproduce the trained configuration")
+    args.output_dir, args.data_root, args.device = Path(output), Path(data_root), str(device)
+    return args
+
+
+def validate_identity(saved, expected):
+    identity = saved.get("resume_identity")
+    if not isinstance(identity, dict) or base._canonical_sha256(identity) != saved.get(
+        "resume_identity_sha256"
+    ):
+        raise ValueError("edge-selection checkpoint identity is absent or corrupt")
+    if identity != expected:
+        changed = sorted(
+            key for key in set(identity) | set(expected) if identity.get(key) != expected.get(key)
+        )
+        raise ValueError(
+            f"edge-selection resume identity mismatch: {changed}; old evidence preserved"
+        )
+
+
+def resolve_training_resume(saved, expected):
+    """Preserve the original identity; admit only a pinned infrastructure repair.
+
+    Model, optimizer, data, sampling, arguments, budget and runtime must still
+    agree exactly. Actual resumed execution sources are recorded separately.
+    """
+    identity = saved.get("resume_identity")
+    validate_identity(saved, identity)
+    changed = sorted(
+        key
+        for key in set(identity) | set(expected)
+        if key != "source_sha256" and identity.get(key) != expected.get(key)
+    )
+    if changed:
+        raise ValueError(
+            f"edge-selection resume identity mismatch: {changed}; old evidence preserved"
+        )
+    proof = require_source_compatibility(
+        identity.get("source_sha256"), expected.get("source_sha256"), scope="training"
+    )
+    return copy.deepcopy(identity), proof
+
+
+def autocast(args, device):
+    return torch.autocast(
+        device_type=device.type, dtype=torch.bfloat16, enabled=args.precision == "bf16"
+    )
+
+
+def loss_components(model, batch, logits, args):
+    task, count = base.training_loss(logits, batch.graph, batch.selected_indices)
+    targets = batch.origin_targets if args.negative_loss_weight else None
+    auxiliary = model.auxiliary_loss(targets)
+    loss = (
+        task + args.l0_weight * auxiliary["l0"] + args.negative_loss_weight * auxiliary["negative"]
+    )
+    return loss, task, auxiliary, int(count)
+
+
+def validate_gradients(model):
+    missing = [
+        name
+        for name, value in model.named_parameters()
+        if value.requires_grad and value.grad is None
+    ]
+    if missing:
+        raise RuntimeError(f"trainable parameters disconnected from task/auxiliary loss: {missing}")
+    by_group = {}
+    for name, value in model.named_parameters():
+        if value.grad is not None:
+            by_group.setdefault(parameter_group(name), []).append(
+                value.grad.detach().float().square().sum()
+            )
+    result = {name: torch.stack(values).sum().sqrt() for name, values in by_group.items()}
+    for name, norm in result.items():
+        torch._assert_async(torch.isfinite(norm), f"nonfinite {name} gradient")
+    return result
+
+
+def run_training_epoch(
+    model, optimizer, inputs, args, device, epoch, *, timing=None, validate=False
+):
+    model.train()
+    timing = timing or StageTimer(device)
+    sums = torch.zeros(4, device=device, dtype=torch.float64)
+    labels = steps = units = 0
+    largest_nodes = largest_edges = largest_graphs = 0
+    observations = []
+    gradient_rows = {}
+    iterator = iter(inputs.training_batches(epoch, device))
+    while True:
+        with timing.stage("sampling_forest_loader_transfer"):
+            batch = next(iterator, None)
+        if batch is None:
+            break
+        with timing.stage("zero_grad"):
+            optimizer.zero_grad(set_to_none=True)
+        with timing.stage("forward_and_loss"):
+            with autocast(args, device):
+                logits = model(batch.graph)
+                loss, task, auxiliary, count = loss_components(model, batch, logits, args)
+        with timing.stage("backward"):
+            loss.backward()
+        if validate and steps == 0:
+            gradient_rows = validate_gradients(model)
+        with timing.stage("gradient_clipping"):
+            norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                base.COMMON["gradient_clip_norm"],
+                error_if_nonfinite=False,
+                foreach=True,
+            )
+            base.require_finite_gradient_norm_async(norm)
+        with timing.stage("optimizer"):
+            optimizer.step()
+        sums += (
+            torch.stack(
+                (
+                    loss.detach(),
+                    task.detach(),
+                    auxiliary["l0"].detach(),
+                    auxiliary["negative"].detach(),
+                )
+            ).double()
+            * count
+        )
+        labels += count
+        steps += 1
+        graph_count = int(batch.graph._v5_num_graphs)
+        units += graph_count if inputs.indices is None else count
+        largest_nodes = max(largest_nodes, batch.graph.x.shape[0])
+        largest_edges = max(largest_edges, batch.graph.incidence_edge_index.shape[1])
+        largest_graphs = max(largest_graphs, graph_count)
+        observations.append(
+            {
+                "nodes": batch.graph.x.shape[0],
+                "candidate_edges": batch.graph.incidence_edge_index.shape[1],
+                "disjoint_graphs": graph_count,
+                "supervised_labels": count,
+                "sampling": getattr(batch.graph, "sampling_observation", None),
+            }
+        )
+        model.clear_auxiliary_cache()
+        del loss, task, auxiliary, logits, batch
+    if labels < 1 or steps < 1:
+        raise RuntimeError("official training split produced no supervised updates")
+    values = (sums / labels).cpu().tolist()
+    if not all(math.isfinite(value) for value in values):
+        raise FloatingPointError("nonfinite training/auxiliary epoch loss")
+    return {
+        "train_loss": values[0],
+        "train_task_loss": values[1],
+        "train_l0": values[2],
+        "train_negative_loss": values[3],
+        "train_labels": labels,
+        "train_batches": steps,
+        "optimizer_steps": steps,
+        "processed_units": units,
+        "largest_measured_nodes": largest_nodes,
+        "largest_measured_physical_edges": largest_edges,
+        "largest_measured_graph_batch": largest_graphs,
+        "batch_observations": observations,
+        "first_step_gradient_norms": {
+            name: float(value.cpu()) for name, value in gradient_rows.items()
+        },
+    }
+
+
+@torch.no_grad()
+def evaluate(model, inputs, args, device, *, observer=None):
+    model.eval()
+    totals = torch.zeros(6, dtype=torch.float64, device=device)
+    batches = 0
+    for batch in inputs.validation_batches(device):
+        with autocast(args, device):
+            logits = model(batch.graph)
+            task, count = base.training_loss(logits, batch.graph, batch.selected_indices)
+        base.require_finite_tensor(logits, "edge-selection validation logits")
+        if batch.selected_indices is None:
+            pred, target = logits > 0, batch.graph.y.bool()
+            numbers = ((pred & target).sum(), (pred & ~target).sum(), (~pred & target).sum())
+        else:
+            chosen = logits[batch.selected_indices]
+            target = batch.graph.y[batch.selected_indices]
+            numbers = (
+                (chosen.argmax(-1) == target).sum(),
+                target.new_zeros(()),
+                target.new_zeros(()),
+            )
+        totals[:3] += torch.stack(numbers)
+        totals[3] += count
+        totals[4] += task.double() * count
+        totals[5] += torch.isfinite(task).double()
+        if observer is not None:
+            observer(model, batch, logits, batches)
+        model.clear_auxiliary_cache()
+        batches += 1
+    first, fp, fn, count, loss, finite = totals.cpu().tolist()
+    if count <= 0 or finite != batches:
+        raise ValueError("validation is empty or contains a nonfinite loss")
+    metric = (
+        (2 * first / (2 * first + fp + fn) if 2 * first + fp + fn else 0.0)
+        if inputs.indices is None
+        else first / count
+    )
+    return {"metric": metric, "loss": loss / count, "label_count": int(count), "batches": batches}
+
+
+def _checkpoint_rng(device):
+    return {
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": np.random.get_state(),
+        "cpu_rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state(device),
+    }
+
+
+def _restore_rng(saved, device):
+    random.setstate(saved["python_rng_state"])
+    np.random.set_state(saved["numpy_rng_state"])
+    base.restore_checkpoint_rng(saved, device)
+
+
+def inspect_completed(output):
+    from .integrity import inspect_completed as inspect_evidence
+
+    return inspect_evidence(output)
+
+
+def train_model(payload, protocol, args, device, output):
+    base._require_cuda(device)
+    validate_args(args)
+    base.validate_cached_graphs_once(payload)
+    if payload["dataset"] != args.dataset:
+        raise ValueError("dataset request and verified cache disagree")
+    hardware = base.validate_hardware_runtime(args, device)
+    base.configure_compute(args)
+    base._seed(args.model_seed)
+    monitor = RuntimeResourceMonitor(device)
+    monitor.start()
+    finished = False
+    try:
+        inputs = PreparedInputs(payload, args)
+        budget = resolve_budget(inputs, args)
+        model = make_model(payload, args, device)
+        initial_hash = base.state_sha256(model)
+        shared_hash = shared_initial_state_sha256(model)
+        optimizer = make_optimizer(model)
+        identity = build_identity(args, protocol, budget, initial_hash, inputs)
+        identity_hash = base._canonical_sha256(identity)
+        execution_sources = copy.deepcopy(identity["source_sha256"])
+        source_transitions = []
+        last_path, best_path, previous_path = (
+            output / "last.pt",
+            output / "best.pt",
+            output / "best.previous.pt",
+        )
+        history = []
+        best_metric, best_epoch, best_hash, steps = -math.inf, 0, None, 0
+        if last_path.exists():
+            if not args.resume or last_path.is_symlink():
+                raise ValueError("existing checkpoint cannot be replaced without a valid resume")
+            saved = base.load_checkpoint_on_cpu(last_path)
+            identity, source_proof = resolve_training_resume(saved, identity)
+            identity_hash = base._canonical_sha256(identity)
+            source_transitions = copy.deepcopy(saved.get("source_transitions", []))
+            if not isinstance(source_transitions, list):
+                raise ValueError("checkpoint source transition evidence must be a list")
+            source_transitions.append(
+                {
+                    "after_epoch": saved["epoch"],
+                    "optimizer_steps": saved["optimizer_steps"],
+                    "source_sha256": execution_sources,
+                    "source_compatibility": source_proof,
+                    "restored_checkpoint_sha256": base.sha256_file(last_path),
+                    "hardware": hardware,
+                    "scope": "epoch-boundary continuation; original training identity retained",
+                }
+            )
+            history = saved["history"]
+            if [row.get("epoch") for row in history] != list(range(1, saved["epoch"] + 1)):
+                raise ValueError("resume history has missing or repeated epochs")
+            model.load_state_dict(saved["model_state"], strict=True)
+            optimizer.load_state_dict(saved["optimizer_state"])
+            best_metric, best_epoch = saved["best_validation"], saved["best_epoch"]
+            best_hash, steps = saved["best_checkpoint_sha256"], saved["optimizer_steps"]
+            base.recover_best_checkpoint(best_path, previous_path, best_hash)
+            _restore_rng(saved, device)
+            del saved
+        elif output.exists() and any(output.iterdir()):
+            raise FileExistsError(
+                "nonempty selection output has no valid last.pt; no files overwritten"
+            )
+        output.mkdir(parents=True, exist_ok=True)
+        pre_run = {
+            "research_suite": SUITE,
+            "configuration": configuration(args),
+            "hardware": hardware,
+            "parameters": {
+                "total": sum(p.numel() for p in model.parameters()),
+                "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
+            },
+            "optimizer_groups": base.optimizer_metadata(optimizer),
+            "learning_budget": budget,
+            "data": base._v5_data_observability(payload, inputs.data, inputs.indices, args),
+            "topology": inputs.metadata(),
+            "debug": False,
+            "subset": False,
+            "test_evaluated": False,
+            "batching": {
+                "physical_batch_size": args.batch_size
+                if inputs.indices is None
+                else (args.sample_seed_batch_size if inputs.sampler is not None else 1),
+                "batch_axis": "graphs"
+                if inputs.indices is None
+                else ("supervised_seed_nodes" if inputs.sampler is not None else "complete_graph"),
+                "gradient_accumulation_steps": 1,
+                "data_parallel_workers": 1,
+                "full_graph_exception": (
+                    "one complete transductive graph, not serial independent samples"
+                )
+                if inputs.indices is not None and inputs.sampler is None
+                else None,
+            },
+        }
+        if not (output / "configuration.json").exists():
+            atomic_write_json(output / "configuration.json", pre_run)
+        print(json.dumps(pre_run, sort_keys=True), flush=True)
+        torch.cuda.reset_peak_memory_stats(device)
+        for epoch in range(len(history) + 1, budget["planned_epochs"] + 1):
+            if history and should_stop_learning_budget(
+                budget,
+                epochs_since_best=history[-1]["epoch"] - best_epoch,
+                optimizer_steps_since_best=steps - history[best_epoch - 1]["optimizer_steps"],
+                eligible=True,
+            ):
+                break
+            started = time.perf_counter()
+            timing = StageTimer(device)
+            values = run_training_epoch(
+                model, optimizer, inputs, args, device, epoch, timing=timing, validate=True
+            )
+            if values["train_batches"] != budget["actual_batches_per_epoch"]:
+                raise RuntimeError(
+                    "measured supervised batches differ from the immutable update budget"
+                )
+            steps += values.pop("optimizer_steps")
+            with timing.stage("validation"):
+                validation = evaluate(model, inputs, args, device)
+            row = {
+                **values,
+                "epoch": epoch,
+                "phase": {"phase": "joint"},
+                "optimizer_steps": steps,
+                "validation": validation["metric"],
+                "validation_loss": validation["loss"],
+                "stage_seconds": timing.report(synchronize=True),
+                "elapsed_wall_seconds": time.perf_counter() - started,
+                "topology_preparation_seconds_cumulative": inputs.plan_preparation_seconds,
+            }
+            history.append(row)
+            if validation["metric"] > best_metric:
+                best_metric, best_epoch = validation["metric"], epoch
+                best_hash = base.publish_best_checkpoint(
+                    best_path,
+                    previous_path,
+                    {
+                        "model_state": model.state_dict(),
+                        "epoch": epoch,
+                        "validation": best_metric,
+                        "selection_role": "primary",
+                        "resume_identity": identity,
+                        "resume_identity_sha256": identity_hash,
+                        "execution_source_sha256": execution_sources,
+                        "source_transitions": source_transitions,
+                    },
+                )
+            base._save(
+                last_path,
+                {
+                    "model_state": model.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "history": history,
+                    "optimizer_steps": steps,
+                    "best_validation": best_metric,
+                    "best_epoch": best_epoch,
+                    "best_checkpoint_sha256": best_hash,
+                    "resume_identity": identity,
+                    "resume_identity_sha256": identity_hash,
+                    "execution_source_sha256": execution_sources,
+                    "source_transitions": source_transitions,
+                    "shared_initial_state_sha256": shared_hash,
+                    **_checkpoint_rng(device),
+                },
+            )
+            atomic_write_json(output / "history.json", history)
+            print(
+                f"{args.dataset}/{args.selection_mode} epoch={epoch} "
+                f"loss={row['train_loss']:.6f} task={row['train_task_loss']:.6f} "
+                f"val={row['validation']:.6f} best={best_metric:.6f} "
+                f"seconds={row['elapsed_wall_seconds']:.2f}",
+                flush=True,
+            )
+        if not history or best_epoch < 1:
+            raise RuntimeError("training completed without valid epoch/selection evidence")
+        atomic_write_json(output / "history.json", history)
+        selected = base.load_checkpoint_on_cpu(best_path)
+        validate_identity(selected, identity)
+        if selected["epoch"] != best_epoch or selected["validation"] != best_metric:
+            raise ValueError("best checkpoint selection disagrees with last.pt")
+        model.load_state_dict(selected["model_state"], strict=True)
+        del selected
+        final_validation = evaluate(model, inputs, args, device)
+        resources = monitor.finish(
+            peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+            peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+        )
+        finished = True
+        result = {
+            "schema_version": 1,
+            "status": "passed",
+            "research_suite": SUITE,
+            "dataset": args.dataset,
+            "condition": args.selection_mode,
+            "configuration": configuration(args),
+            "protocol": protocol,
+            "source_sha256": identity["source_sha256"],
+            "execution_source_sha256": execution_sources,
+            "source_transitions": source_transitions,
+            "resume_identity": identity,
+            "resume_identity_sha256": identity_hash,
+            "learning_budget": budget,
+            "initial_state_sha256": initial_hash,
+            "shared_initial_state_sha256": shared_hash,
+            "common_backbone_initial_state_sha256": shared_hash,
+            "epochs_run": len(history),
+            "optimizer_steps": steps,
+            "best_epoch": best_epoch,
+            "best_validation": best_metric,
+            "validation": final_validation["metric"],
+            "validation_loss": final_validation["loss"],
+            "checkpoint_sha256": base.sha256_file(best_path),
+            "last_checkpoint_sha256": base.sha256_file(last_path),
+            "history_sha256": base.sha256_file(output / "history.json"),
+            "resource_observability": resources,
+            "topology": inputs.metadata(),
+            "test_evaluated": False,
+            "debug": False,
+            "subset": False,
+        }
+        atomic_write_json(output / "metrics.json", result)
+        return result
+    except BaseException as error:
+        if not finished:
+            try:
+                resources = monitor.finish(
+                    peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+                    peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+                )
+                finished = True
+                if output.is_dir():
+                    atomic_write_json(
+                        output / "failure-resources.json",
+                        {"error": f"{type(error).__name__}: {error}", "resources": resources},
+                    )
+            except BaseException as reporting_error:
+                error.add_note(f"failure telemetry also failed: {reporting_error}")
+        raise
+
+
+def load_calibration_payload(args):
+    payload, protocol = base.load_dataset(args.dataset, args.data_root, allow_download=False)
+    maximum = (
+        len(payload["splits"]["train"])
+        if args.dataset == "ppi"
+        else (int(payload["splits"]["train"].count_nonzero()) if args.sampling != "full" else 1)
+    )
+    axis = (
+        "graphs"
+        if args.dataset == "ppi"
+        else ("sampled_seed_nodes" if args.sampling != "full" else "full_graph")
+    )
+    identity = {
+        "dataset": args.dataset,
+        "data_sha256": protocol["data_sha256"],
+        "split_sha256": protocol["split_sha256"],
+        "protocol": protocol,
+        "corruption_ratio": args.corruption_ratio,
+        "corruption_seed": args.corruption_seed,
+    }
+    return {"payload": payload, "protocol": protocol}, identity, maximum, axis
+
+
+def run_calibration_candidate(
+    loaded,
+    args,
+    device,
+    *,
+    physical_batch_size,
+    workers,
+    warmup_steps=2,
+    measurement_steps=5,
+    minimum_measure_seconds=3.0,
+):
+    base._require_cuda(device)
+    if warmup_steps < 2 or measurement_steps < 5 or minimum_measure_seconds < 3:
+        raise ValueError(
+            "resource probes require complete-epoch windows meeting the calibration minima"
+        )
+    candidate = _candidate_args(args, physical_batch_size, workers)
+    validate_args(candidate)
+    model = optimizer = inputs = None
+    monitor = None
+    report = None
+    with _isolated_execution_state(device):
+        try:
+            gc.collect()
+            torch.cuda.empty_cache()
+            hardware = base.validate_hardware_runtime(candidate, device)
+            free_before, total = torch.cuda.mem_get_info(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            monitor = RuntimeResourceMonitor(device)
+            monitor.start()
+            base.configure_compute(candidate)
+            base._seed(candidate.model_seed)
+            started = time.perf_counter()
+            inputs = PreparedInputs(loaded["payload"], candidate)
+            model = make_model(loaded["payload"], candidate, device)
+            optimizer = make_optimizer(model)
+            initial_hash = base.state_sha256(model)
+            # Match the persistent full-validation cache used during production training.
+            if inputs.indices is not None:
+                next(inputs.validation_batches(device))
+            torch.cuda.synchronize(device)
+            setup_seconds = time.perf_counter() - started
+            stress = None
+            if inputs.indices is None:
+                stress_started = time.perf_counter()
+                stress_batch = inputs.stress_batch(device)
+                optimizer.zero_grad(set_to_none=True)
+                with autocast(candidate, device):
+                    stress_logits = model(stress_batch.graph)
+                    stress_loss, stress_task, _auxiliary, _count = loss_components(
+                        model, stress_batch, stress_logits, candidate
+                    )
+                stress_loss.backward()
+                validate_gradients(model)
+                norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), base.COMMON["gradient_clip_norm"], foreach=True
+                )
+                base.require_finite_gradient_norm_async(norm)
+                optimizer.step()
+                torch.cuda.synchronize(device)
+                stress = {
+                    "graphs": int(stress_batch.graph._v5_num_graphs),
+                    "nodes": stress_batch.graph.x.shape[0],
+                    "physical_edges": stress_batch.graph.incidence_edge_index.shape[1],
+                    "seconds": time.perf_counter() - stress_started,
+                    "optimizer_steps": 1,
+                    "scope": (
+                        "additional largest-graph joint-batch stress; outside throughput window"
+                    ),
+                }
+                model.clear_auxiliary_cache()
+                del stress_batch, stress_logits, stress_loss, stress_task, _auxiliary
+            warmup_epochs = warmup_updates = 0
+            while warmup_updates < warmup_steps:
+                warmup_epochs += 1
+                values = run_training_epoch(
+                    model, optimizer, inputs, candidate, device, warmup_epochs, validate=True
+                )
+                warmup_updates += values["optimizer_steps"]
+            timing = StageTimer(device)
+            torch.cuda.synchronize(device)
+            started = time.perf_counter()
+            measured_epochs = measured_steps = units = labels = 0
+            largest_nodes = largest_edges = largest_graphs = 0
+            elapsed = 0.0
+            while measured_steps < measurement_steps or elapsed < minimum_measure_seconds:
+                measured_epochs += 1
+                values = run_training_epoch(
+                    model,
+                    optimizer,
+                    inputs,
+                    candidate,
+                    device,
+                    warmup_epochs + measured_epochs,
+                    timing=timing,
+                )
+                measured_steps += values["optimizer_steps"]
+                units += values["processed_units"]
+                labels += values["train_labels"]
+                largest_nodes = max(largest_nodes, values["largest_measured_nodes"])
+                largest_edges = max(largest_edges, values["largest_measured_physical_edges"])
+                largest_graphs = max(largest_graphs, values["largest_measured_graph_batch"])
+                torch.cuda.synchronize(device)
+                elapsed = time.perf_counter() - started
+            started = time.perf_counter()
+            evaluate(model, inputs, candidate, device)
+            torch.cuda.synchronize(device)
+            validation_seconds = time.perf_counter() - started
+            free_after, _ = torch.cuda.mem_get_info(device)
+            report = {
+                "status": "passed",
+                "calibration_not_final": True,
+                "elapsed_seconds": elapsed,
+                "processed_units": units,
+                "samples_per_second": units / elapsed,
+                "unit": "graphs" if inputs.indices is None else "supervised_seed_nodes",
+                "optimizer_steps": measured_steps,
+                "complete_measurement_epochs": measured_epochs,
+                "complete_warmup_epochs": warmup_epochs,
+                "warmup_optimizer_steps": warmup_updates,
+                "warmup_steps_requested": warmup_steps,
+                "measurement_steps_requested": measurement_steps,
+                "minimum_measure_seconds_requested": minimum_measure_seconds,
+                "stage_seconds": timing.report(),
+                "large_graph_batch_stress": stress,
+                "setup_seconds": setup_seconds,
+                "topology_preparation_seconds": inputs.plan_preparation_seconds,
+                "validation_seconds": validation_seconds,
+                "validation_completed": True,
+                "auxiliary_path_measured": True,
+                "cycle_preparation_measured": candidate.selection_mode == "forest_cycle",
+                "batch_size": physical_batch_size,
+                "workers": workers,
+                "configuration": configuration(candidate),
+                "hardware": hardware,
+                "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+                "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+                "free_bytes_before": int(free_before),
+                "free_bytes_after": int(free_after),
+                "total_memory_bytes": int(total),
+                "optimizer_state_bytes": _optimizer_state_bytes(optimizer),
+                "model_parameter_count": sum(p.numel() for p in model.parameters()),
+                "initial_model_sha256": initial_hash,
+                "parameter_update_verified": initial_hash != base.state_sha256(model),
+                "supervised_labels": labels,
+                "largest_measured_nodes": largest_nodes,
+                "largest_measured_physical_edges": largest_edges,
+                "largest_measured_graph_batch": largest_graphs,
+                "gradient_accumulation_steps": 1,
+                "data_parallel_workers": 1,
+                "effective_batch_size": physical_batch_size,
+                "scope": (
+                    "disposable complete official training epochs + full validation + "
+                    "topology preparation; no test or checkpoints"
+                ),
+            }
+            if not report["parameter_update_verified"] or report["optimizer_state_bytes"] <= 0:
+                raise RuntimeError(
+                    "calibration failed to verify actual optimizer state and parameter update"
+                )
+        except BaseException as error:
+            if monitor is not None:
+                failed_monitor, monitor = monitor, None
+                try:
+                    error.calibration_resource_observability = failed_monitor.finish(
+                        peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+                        peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+                    )
+                except BaseException as report_error:
+                    error.add_note(f"probe telemetry failed: {report_error}")
+            raise
+        finally:
+            try:
+                if monitor is not None:
+                    resources = monitor.finish(
+                        peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
+                        peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
+                    )
+                    if report is not None:
+                        report["resource_observability"] = resources
+            finally:
+                model = optimizer = inputs = None
+                gc.collect()
+                torch.cuda.empty_cache()
+    return report
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    validate_args(args)
+    output, data_root = (
+        args.output_dir.expanduser().resolve(),
+        args.data_root.expanduser().resolve(),
+    )
+    if output.is_relative_to(data_root) or data_root.is_relative_to(output):
+        raise ValueError("selection output must not overlap the immutable official data cache")
+    if args.output_dir.is_symlink() or any(path.is_symlink() for path in args.output_dir.parents):
+        raise ValueError("selection output must not be indirect")
+    payload, protocol = base.load_dataset(args.dataset, data_root, allow_download=False)
+    train_model(payload, protocol, args, torch.device(args.device), output)
+    print(f"passed: {output}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ````
 
 # research/conductance_gat/model.py
@@ -27580,6 +38814,31 @@ def parameter_norm(parameters, *, gradient: bool = False) -> float | None:
     return float(torch.stack(values).sum().sqrt()) if values else None
 
 
+def head_moments(value: Tensor | None) -> dict[str, Any]:
+    """Small vectorized log-boundary summaries; exact distributions live in audit only."""
+    if value is None or not value.numel():
+        return {"available": False, "reason": "no observations in the last forward"}
+    columns = value.detach().float()
+    columns = columns[:, None] if columns.ndim == 1 else columns
+    mean, std = columns.mean(0), columns.std(0, correction=0)
+    packed = torch.stack(
+        (
+            mean,
+            std,
+            columns.amin(0),
+            columns.amax(0),
+            std / mean.abs().clamp_min(torch.finfo(columns.dtype).tiny),
+        )
+    )
+    return {
+        "available": True,
+        "scope": "last forward; rows pooled, heads kept separate",
+        "layout": "shared" if value.ndim == 1 else "per_head",
+        "count_per_head": columns.shape[0],
+        **dict(zip(("mean", "std", "min", "max", "cv"), packed.cpu().tolist(), strict=True)),
+    }
+
+
 def solver_diagnostics(estimator: nn.Module) -> dict[str, Any]:
     """Serialize the last forward's solver audit only at an existing log boundary."""
 
@@ -27609,11 +38868,21 @@ def layer_diagnostics(model: nn.Module, *, gradients: bool = False) -> list[dict
             {
                 "layer": layer,
                 "conductance": tensor_moments(operator.estimator.last_c),
+                "conductance_by_head": head_moments(operator.estimator.last_c),
+                "conductance_heads": getattr(operator, "conductance_heads", "shared"),
+                "propagation_normalization": getattr(
+                    operator, "propagation_normalization", "symmetric"
+                ),
+                "conductance_generator": getattr(operator, "conductance_generator", "optimized"),
+                "distribution_scope": (
+                    "last forward only; pooled conductance CV is not raw-C quantiles"
+                ),
                 "log_conductance": tensor_moments(operator.estimator.last_log_c),
                 "score": tensor_moments(operator.estimator.last_scores),
                 "conductance_backend": operator.conductance_backend,
                 "c_optimization": solver_diagnostics(operator.estimator),
                 "beta": tensor_moments(operator.last_beta),
+                "beta_by_head": head_moments(operator.last_beta),
                 "sampling_correction": tensor_moments(operator.last_sampling_correction),
                 "conductance_parameter_norm": parameter_norm(estimator_parameters),
                 "conductance_gradient_norm": (
@@ -27633,6 +38902,16 @@ def require_first_step_conductance_gradient(model: nn.Module) -> dict[str, Any]:
 
     if model.conductance_mode != "dynamic":
         return {"applicable": False, "passed": True, "layers": []}
+    if all(
+        not any(parameter.requires_grad for parameter in operator.estimator.parameters())
+        for operator in model.operators
+    ):
+        return {
+            "applicable": False,
+            "passed": True,
+            "layers": [],
+            "reason": "parameter-free C generator; no trainable conductance gradient expected",
+        }
     rows = []
     for layer, operator in enumerate(model.operators):
         named = list(operator.estimator.named_parameters())
@@ -27764,6 +39043,282 @@ def selected_checkpoint_interventions(
     for value in result.values():
         value["delta_from_learned"] = value["metric"] - baseline
     return result
+````
+
+# research/conductance_gat/v5/distribution_audit.py
+
+````python
+"""Exact selected-checkpoint C/propagation distributions; no training hot-path work.
+
+All edges, nodes and heads participate. Graph loops only format disjoint scopes;
+edge/head arithmetic, degree aggregation and pair comparisons stay vectorized.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor
+
+from .operator import conductance_propagation_coefficients
+
+QUANTILES = (0.0, 0.01, 0.1, 0.25, 0.5, 0.75, 0.9, 0.99, 1.0)
+HISTOGRAM_BOUNDARIES = (0.0, 0.3, 0.5, 0.7, 0.9, 1.0, 1.1, 1.5, 2.0)
+
+
+def _summary(values: Tensor) -> dict:
+    """Columns are heads (or head pairs), never pooled together."""
+    count, _ = values.shape
+    if not count:
+        return {
+            "count_per_column": 0,
+            "mean": None,
+            "std": None,
+            "cv": None,
+            "quantiles": None,
+            "reason": "no observations in this scope",
+        }
+    value = values.detach().float()
+    mean, std = value.mean(0), value.std(0, correction=0)
+    # Sorting has no torch.quantile total-element limit and samples no subset.
+    ordered = value.sort(dim=0).values
+    positions = value.new_tensor(QUANTILES) * (count - 1)
+    lower, upper = positions.floor().long(), positions.ceil().long()
+    fraction = (positions - lower).unsqueeze(1)
+    quantiles = ordered[lower] * (1 - fraction) + ordered[upper] * fraction
+    return {
+        "count_per_column": count,
+        "mean": mean,
+        "std": std,
+        "cv": std / mean.abs().clamp_min(torch.finfo(value.dtype).tiny),
+        "cv_undefined_zero_mean": mean == 0,
+        "quantiles": {str(q): quantiles[index] for index, q in enumerate(QUANTILES)},
+    }
+
+
+def _raw_summary(value: Tensor) -> dict:
+    result = _summary(value)
+    if not value.shape[0]:
+        return {**result, "fractions": None, "histogram": None}
+    boundaries = value.new_tensor(HISTOGRAM_BOUNDARIES)
+    bins = torch.bucketize(value.contiguous(), boundaries, right=True)
+    offsets = torch.arange(value.shape[1], device=value.device) * (len(boundaries) + 1)
+    counts = torch.bincount(
+        (bins + offsets).flatten(), minlength=value.shape[1] * (len(boundaries) + 1)
+    )
+    return {
+        **result,
+        "fractions": {
+            "c_ge_0_7": (value >= 0.7).float().mean(0),
+            "abs_c_minus_1_le_0_1": ((value >= 0.9) & (value <= 1.1)).float().mean(0),
+            "c_gt_1": (value > 1).float().mean(0),
+        },
+        "histogram": {
+            "finite_boundaries": list(HISTOGRAM_BOUNDARIES),
+            "interval_rule": "[-inf,b0), [b0,b1), ..., [blast,+inf)",
+            "counts_by_head": counts.reshape(value.shape[1], -1),
+        },
+    }
+
+
+def _sum_nodes(value: Tensor, destination: Tensor, nodes: int) -> Tensor:
+    return value.new_zeros((nodes, value.shape[1])).index_add_(0, destination, value)
+
+
+def _node_statistics(alpha: Tensor, destination: Tensor, nodes: int, degree: Tensor) -> dict:
+    top1 = alpha.new_zeros((nodes, alpha.shape[1]))
+    top1.scatter_reduce_(
+        0, destination[:, None].expand_as(alpha), alpha, reduce="amax", include_self=True
+    )
+    entropy = _sum_nodes(-torch.special.xlogy(alpha, alpha), destination, nodes)
+    squares = _sum_nodes(alpha.square(), destination, nodes)
+    active = degree[:, None] > 0
+    return {
+        "top1": top1,
+        "entropy_nats": entropy,
+        "normalized_entropy": torch.where(
+            degree[:, None] > 1,
+            entropy / degree[:, None].clamp_min(2).float().log(),
+            torch.zeros_like(entropy),
+        ),
+        "effective_neighbors": torch.where(
+            active, squares.clamp_min(1e-30).reciprocal(), torch.zeros_like(squares)
+        ),
+    }
+
+
+def _head_pairs(alpha: Tensor, destination: Tensor, nodes: int) -> tuple[Tensor, dict]:
+    pair = torch.triu_indices(alpha.shape[1], alpha.shape[1], offset=1, device=alpha.device)
+    if not pair.shape[1]:
+        return pair, {}
+    left, right = alpha[:, pair[0]], alpha[:, pair[1]]
+    midpoint = (left + right) * 0.5
+    tv = _sum_nodes((left - right).abs() * 0.5, destination, nodes)
+    # Positive conductances imply positive probabilities on every retained edge.
+    js = _sum_nodes(
+        0.5
+        * (
+            torch.special.xlogy(left, left / midpoint)
+            + torch.special.xlogy(right, right / midpoint)
+        ),
+        destination,
+        nodes,
+    )
+    return pair, {"total_variation": tv, "jensen_shannon_nats": js}
+
+
+@torch.no_grad()
+def audit_conductance_distribution(
+    conductance: Tensor,
+    incidence: Tensor,
+    node_graph: Tensor,
+    num_graphs: int,
+    *,
+    heads: int,
+    beta: Tensor,
+    sampling_correction: Tensor | None = None,
+    normalization: str = "symmetric",
+    propagation_filter: str = "linear",
+) -> dict:
+    """Summarize this exact forward, not historical epochs or a whole dataset.
+
+    ``weighted_c_row_alpha`` is a/d_destination. ``actual_kernel_row_relative``
+    is P/sum(P) and is explicitly only a diagnostic for symmetric propagation.
+    P excludes beta and polynomial higher-order terms, reported separately.
+    """
+    if normalization not in {"symmetric", "row"}:
+        raise ValueError("unknown propagation normalization")
+    nodes, edges = node_graph.numel(), incidence.shape[1]
+    if conductance.shape not in {(edges,), (edges, heads)}:
+        raise ValueError("C must be physical-edge shared E or per-head E x H")
+    c = conductance.detach().float()
+    c = c[:, None].expand(-1, heads) if c.ndim == 1 else c
+    if sampling_correction is None:
+        correction = c.new_ones(edges)
+    else:
+        correction = sampling_correction.detach().float()
+    if correction.shape != (edges,):
+        raise ValueError("sampling correction must be one value per physical edge")
+    if beta.shape != (num_graphs, heads):
+        raise ValueError("beta must be graph x head")
+    if not bool(
+        torch.isfinite(c).all()
+        & (c > 0).all()
+        & torch.isfinite(correction).all()
+        & (correction > 0).all()
+    ):
+        raise ValueError("C and correction must be finite and positive")
+    tail, head = incidence
+    destination = torch.cat((head, tail))
+    degree = torch.bincount(destination, minlength=nodes)
+    edge_graph = node_graph[tail]
+    effective = c * correction[:, None]
+
+    def coefficients(edge_weight):
+        directed = torch.cat((edge_weight, edge_weight), dim=0)
+        weighted_degree = _sum_nodes(directed, destination, nodes)
+        row_alpha = directed / weighted_degree[destination]
+        to_tail, to_head, _ = conductance_propagation_coefficients(
+            edge_weight, incidence, nodes, normalization=normalization
+        )
+        coefficient = torch.cat((to_head, to_tail), dim=0)
+        rowsum = _sum_nodes(coefficient, destination, nodes)
+        relative = coefficient / rowsum[destination].clamp_min(1e-30)
+        return coefficient, row_alpha, relative, rowsum
+
+    coefficient, alpha, relative, rowsum = coefficients(effective)
+    c1_coefficient, c1_alpha, c1_relative, c1_rowsum = coefficients(
+        correction[:, None].expand_as(c)
+    )
+    families = {}
+    for name, probability, reference in (
+        ("weighted_c_row_alpha", alpha, c1_alpha),
+        ("actual_kernel_row_relative", relative, c1_relative),
+    ):
+        pair, diversity = _head_pairs(probability, destination, nodes)
+        families[name] = {
+            "statistics": _node_statistics(probability, destination, nodes, degree),
+            "c_one_statistics": _node_statistics(reference, destination, nodes, degree),
+            "head_pairs": pair.T,
+            "head_diversity": diversity,
+            "c_one_total_variation": _sum_nodes(
+                (probability - reference).abs() * 0.5, destination, nodes
+            ),
+        }
+    graphs = []
+    for graph_id in range(num_graphs):
+        node_mask = node_graph == graph_id
+        edge_mask = edge_graph == graph_id
+        directed_mask = node_graph[destination] == graph_id
+        active = node_mask & (degree > 0)
+        buckets = (
+            ("degree_1", 1, 1),
+            ("degree_2_4", 2, 4),
+            ("degree_5_9", 5, 9),
+            ("degree_10_19", 10, 19),
+            ("degree_ge_20", 20, None),
+        )
+        graph = {
+            "graph_in_batch": graph_id,
+            "heads": list(range(heads)),
+            "nodes": node_mask.sum(),
+            "physical_edges": edge_mask.sum(),
+            "isolates": (node_mask & (degree == 0)).sum(),
+            "degree_one_nodes": (node_mask & (degree == 1)).sum(),
+            "raw_c": _raw_summary(c[edge_mask]),
+            "beta_by_head": beta[graph_id],
+            "actual_one_hop_coefficient": _summary(coefficient[directed_mask]),
+            "actual_one_hop_row_sum": _summary(rowsum[node_mask]),
+            "c_one_same_correction_coefficient": _summary(c1_coefficient[directed_mask]),
+            "c_one_same_correction_row_sum": _summary(c1_rowsum[node_mask]),
+            "probabilities": {},
+        }
+        for name, family in families.items():
+            masks = [("all_nonisolates", active)] + [
+                (
+                    label,
+                    node_mask
+                    & (degree >= lower)
+                    & ((degree <= upper) if upper is not None else True),
+                )
+                for label, lower, upper in buckets
+            ]
+            graph["probabilities"][name] = {
+                "node_scopes": {
+                    label: {
+                        "nodes": mask.sum(),
+                        **{
+                            key: _summary(value[mask])
+                            for key, value in family["statistics"].items()
+                        },
+                        "c_one_same_correction": {
+                            key: _summary(value[mask])
+                            for key, value in family["c_one_statistics"].items()
+                        },
+                        "c_one_total_variation": _summary(family["c_one_total_variation"][mask]),
+                    }
+                    for label, mask in masks
+                },
+                "head_pairs": family["head_pairs"],
+                "head_diversity_nonisolates": {
+                    key: _summary(value[active]) for key, value in family["head_diversity"].items()
+                },
+            }
+        graphs.append(graph)
+    return {
+        "scope": "this layer forward and physical validation batch; graphs kept separate",
+        "raw_c_units": "positive conductance, not an attention probability; may exceed 1",
+        "conductance_layout": "shared_E" if conductance.ndim == 1 else "per_head_E_H",
+        "propagation_normalization": normalization,
+        "propagation_filter": propagation_filter,
+        "coefficient_scope": "one-hop P before beta; excludes polynomial P^2/P^3 terms",
+        "weighted_c_row_alpha_definition": "omega*c / incident sum(omega*c)",
+        "actual_kernel_row_relative_definition": "P / row_sum(P); diagnostic only",
+        "c_one_reference": "same topology, sampling correction, normalization and heads; C=1",
+        "isolates_policy": "counted; excluded from undefined neighbor probabilities",
+        "degree_one_policy": "top1=1, effective_neighbors=1, normalized_entropy=0",
+        "head_diversity_scope": "normalized neighbor distributions; scale-only C differs by 0",
+        "graphs": graphs,
+    }
 ````
 
 # research/conductance_gat/v5/learning_budget.py
@@ -28419,7 +39974,7 @@ class GraphConditionedBeta(nn.Module):
 
 
 class SharedConductanceMultihead(nn.Module):
-    """One shared C with head-specific spatial W and graph-conditioned beta."""
+    """Shared or per-head C with independent W and graph-conditioned beta."""
 
     def __init__(
         self,
@@ -28439,6 +39994,12 @@ class SharedConductanceMultihead(nn.Module):
         solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
         solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
         solver_cost_scaling: str = "legacy_unit",
+        conductance_heads: str = "shared",
+        propagation_normalization: str = "symmetric",
+        conductance_generator: str = "optimized",
+        num_relations: int = 0,
+        edge_direction: str = "undirected",
+        propagation_filter: str = "linear",
     ) -> None:
         super().__init__()
         if channels % heads:
@@ -28446,6 +40007,26 @@ class SharedConductanceMultihead(nn.Module):
         self.channels, self.heads, self.head_width = channels, heads, channels // heads
         self.conductance_mode = conductance_mode
         self.conductance_backend = conductance_backend
+        conductance_configuration(
+            conductance_backend,
+            solver_steps,
+            solver_step_size,
+            solver_entropy,
+            solver_degree_barrier,
+            solver_cost_scaling,
+            conductance_heads=conductance_heads,
+            propagation_normalization=propagation_normalization,
+            conductance_generator=conductance_generator,
+            num_relations=num_relations,
+            edge_direction=edge_direction,
+            propagation_filter=propagation_filter,
+        )
+        self.conductance_heads = conductance_heads
+        self.propagation_normalization = propagation_normalization
+        self.conductance_generator = conductance_generator
+        self.num_relations = num_relations
+        self.edge_direction = edge_direction
+        self.propagation_filter = propagation_filter
         # Dynamic-only initialization must not shift the RNG stream used by W, beta,
         # FFNs or later blocks; those shared parameters remain exactly paired by seed.
         with torch.random.fork_rng(devices=[]):
@@ -28460,6 +40041,9 @@ class SharedConductanceMultihead(nn.Module):
                     solver_cost_scaling=solver_cost_scaling,
                     cost_bound=max_log_conductance,
                     edge_chunk_size=edge_chunk_size,
+                    conductance_heads=heads if conductance_heads == "per_head" else 1,
+                    generator=conductance_generator,
+                    num_relations=num_relations,
                 )
             elif conductance_backend == "mlp":
                 self.estimator = GraphConditionedConductance(
@@ -28482,6 +40066,10 @@ class SharedConductanceMultihead(nn.Module):
             beta_max=beta_max,
         )
         self.edge_chunk_size = edge_chunk_size
+        if propagation_filter == "polynomial3":
+            self.polynomial_delta = nn.Parameter(torch.zeros(heads, 2))
+        else:
+            self.register_parameter("polynomial_delta", None)
         self.last_beta: Tensor | None = None
         self.last_sampling_correction: Tensor | None = None
 
@@ -28497,6 +40085,7 @@ class SharedConductanceMultihead(nn.Module):
         edge_normalization_weight: Tensor | None,
         sampling_correction: Tensor | None,
         static_context: _StaticGraphContext | None = None,
+        edge_relation_id: Tensor | None = None,
     ) -> Tensor:
         # Dynamic-C geometry stays FP32 under an outer BF16 autocast region.
         # This includes its score network, centering/exp gauge and beta sigmoid.
@@ -28511,6 +40100,11 @@ class SharedConductanceMultihead(nn.Module):
                 graph_structure,
                 static_context=static_context,
             )
+            relation_kwargs = (
+                {"edge_relation_id": edge_relation_id}
+                if edge_relation_id is not None or self.num_relations
+                else {}
+            )
             c = self.estimator(
                 fp32_state,
                 incidence,
@@ -28520,6 +40114,7 @@ class SharedConductanceMultihead(nn.Module):
                 sample_degree=sample_degree,
                 full_degree=full_degree,
                 edge_normalization_weight=edge_normalization_weight,
+                **relation_kwargs,
             )
             beta = self.beta_estimator(context)
         value = torch.einsum("nd,hdk->nhk", state, self.value_weight)
@@ -28531,6 +40126,8 @@ class SharedConductanceMultihead(nn.Module):
             beta,
             sampling_correction=sampling_correction,
             edge_chunk_size=self.edge_chunk_size,
+            propagation_normalization=self.propagation_normalization,
+            polynomial_coefficients=self.polynomial_delta,
         )
         self.last_beta = beta.detach()
         self.last_sampling_correction = (
@@ -28604,6 +40201,12 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
         solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
         solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
         solver_cost_scaling: str = "legacy_unit",
+        conductance_heads: str = "shared",
+        propagation_normalization: str = "symmetric",
+        conductance_generator: str = "optimized",
+        num_relations: int = 0,
+        edge_direction: str = "undirected",
+        propagation_filter: str = "linear",
     ) -> None:
         super().__init__()
         for name, value in (
@@ -28635,8 +40238,20 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
             solver_entropy,
             solver_degree_barrier,
             solver_cost_scaling,
+            conductance_heads=conductance_heads,
+            propagation_normalization=propagation_normalization,
+            conductance_generator=conductance_generator,
+            num_relations=num_relations,
+            edge_direction=edge_direction,
+            propagation_filter=propagation_filter,
         )
         self.conductance_backend = conductance_backend
+        self.conductance_heads = conductance_heads
+        self.propagation_normalization = propagation_normalization
+        self.conductance_generator = conductance_generator
+        self.num_relations = num_relations
+        self.edge_direction = edge_direction
+        self.propagation_filter = propagation_filter
         self.activation_checkpoint = bool(activation_checkpoint)
         self.input_norm = nn.LayerNorm(in_channels)
         self.encoder = nn.Linear(in_channels, hidden_channels)
@@ -28691,6 +40306,7 @@ class GraphConditionedConductanceNodeClassifier(nn.Module):
             "graph_structure": getattr(graph, "graph_structure", None),
             "edge_normalization_weight": getattr(graph, "edge_normalization_weight", None),
             "sampling_correction": getattr(graph, "sampling_correction", None),
+            "edge_relation_id": getattr(graph, "edge_relation_id", None),
         }
         with torch.autocast(device_type=x.device.type, enabled=False):
             kwargs["static_context"] = _static_graph_context(
@@ -28723,7 +40339,7 @@ V5NodeClassifier = GraphConditionedConductanceNodeClassifier
 # research/conductance_gat/v5/operator.py
 
 ````python
-"""Sparse shared-conductance, multi-head diffusion for V5."""
+"""Sparse shared/per-head conductance diffusion and polynomial filtering for V5."""
 
 from __future__ import annotations
 
@@ -28817,8 +40433,8 @@ def weighted_degree(
 ) -> Tensor:
     """Weighted undirected node degree without constructing an adjacency."""
 
-    degree = edge_weight.new_zeros(num_nodes)
-    for start in range(0, edge_weight.numel(), edge_chunk_size):
+    degree = edge_weight.new_zeros((num_nodes, *edge_weight.shape[1:]))
+    for start in range(0, edge_weight.shape[0], edge_chunk_size):
         stop = start + edge_chunk_size
         tail, head = incidence[:, start:stop]
         values = edge_weight[start:stop]
@@ -28881,6 +40497,85 @@ class _ChunkedUndirectedPropagation(torch.autograd.Function):
         return grad_message, grad_weight, None, None
 
 
+class _ChunkedHeadPropagation(torch.autograd.Function):
+    """Two receiver-specific arc weights; save O(NHD + EH), not O(EHD)."""
+
+    @staticmethod
+    def forward(ctx, message, to_tail, to_head, incidence, edge_chunk_size):
+        ctx.save_for_backward(message, to_tail, to_head, incidence)
+        ctx.edge_chunk_size = edge_chunk_size
+        ctx.set_materialize_grads(False)
+        result = torch.zeros_like(message)
+        for start in range(0, incidence.shape[1], edge_chunk_size):
+            stop = start + edge_chunk_size
+            tail, head = incidence[:, start:stop]
+            result.index_add_(0, tail, to_tail[start:stop, :, None] * message[head])
+            result.index_add_(0, head, to_head[start:stop, :, None] * message[tail])
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is None:
+            return None, None, None, None, None
+        message, to_tail, to_head, incidence = ctx.saved_tensors
+        need_message, need_tail, need_head = ctx.needs_input_grad[:3]
+        grad_message = torch.zeros_like(message) if need_message else None
+        tail_gradients, head_gradients = [], []
+        for start in range(0, incidence.shape[1], ctx.edge_chunk_size):
+            stop = start + ctx.edge_chunk_size
+            tail, head = incidence[:, start:stop]
+            if need_message:
+                grad_message.index_add_(0, head, to_tail[start:stop, :, None] * grad_output[tail])
+                grad_message.index_add_(0, tail, to_head[start:stop, :, None] * grad_output[head])
+            if need_tail:
+                tail_gradients.append((grad_output[tail] * message[head]).sum(dim=-1))
+            if need_head:
+                head_gradients.append((grad_output[head] * message[tail]).sum(dim=-1))
+        grad_tail = (
+            (torch.cat(tail_gradients) if tail_gradients else torch.zeros_like(to_tail))
+            if need_tail
+            else None
+        )
+        grad_head = (
+            (torch.cat(head_gradients) if head_gradients else torch.zeros_like(to_head))
+            if need_head
+            else None
+        )
+        return grad_message, grad_tail, grad_head, None, None
+
+
+def conductance_propagation_coefficients(
+    relative_c: Tensor,
+    incidence: Tensor,
+    num_nodes: int,
+    *,
+    sampling_correction: Tensor | None = None,
+    normalization: str = "symmetric",
+    edge_chunk_size: int = 65536,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Return (tail-receives, head-receives, degree), independently per C head.
+
+    Raw mean-one C is positive and need not be <=1. Only row-normalized
+    receiver coefficients are probabilities; symmetric coefficients are not
+    a row-stochastic attention matrix. No C heads are averaged here.
+    """
+    if normalization not in {"symmetric", "row"}:
+        raise ValueError("normalization must be symmetric or row")
+    correction = torch.ones_like(relative_c) if sampling_correction is None else sampling_correction
+    if relative_c.ndim == 2 and correction.ndim == 1:
+        correction = correction[:, None]
+    effective = relative_c * correction
+    degree = weighted_degree(effective, incidence, num_nodes, edge_chunk_size=edge_chunk_size)
+    active = degree > 0
+    safe = torch.where(active, degree, torch.ones_like(degree))
+    tail, head = incidence
+    if normalization == "row":
+        return effective / safe[tail], effective / safe[head], degree
+    inverse = safe.rsqrt() * active.to(degree.dtype)
+    weight = effective * inverse[tail] * inverse[head]
+    return weight, weight, degree
+
+
 def shared_head_diffusion(
     message: Tensor,
     relative_c: Tensor,
@@ -28890,20 +40585,33 @@ def shared_head_diffusion(
     *,
     sampling_correction: Tensor | None = None,
     edge_chunk_size: int = 65536,
+    propagation_normalization: str = "symmetric",
+    polynomial_coefficients: Tensor | None = None,
 ) -> Tensor:
-    """Diffuse ``N x heads x width`` messages with one C shared by all heads.
+    """Diffuse ``N x heads x width`` messages using shared or per-head C.
 
     For head h this is ``V_h + beta_h(G) * (P_C V_h - V_h)`` on
     nonisolated nodes. Isolates retain V exactly. ``sampling_correction`` is a
     known importance weight, not part of learned C.
+    ``row`` uses receiver degree, ``symmetric`` uses both endpoint degrees.
+    Optional polynomial coefficients add a2*(P²-I)+a3*(P³-I), initially zero.
     """
 
     if message.ndim != 3 or not message.is_floating_point():
         raise ValueError("message must be an N x heads x width floating tensor")
     if incidence.dtype != torch.long or incidence.ndim != 2 or incidence.shape[0] != 2:
         raise ValueError("incidence must be a 2 x E int64 tensor")
-    if relative_c.ndim != 1 or relative_c.shape[0] != incidence.shape[1]:
-        raise ValueError("relative_c must contain one value per physical edge")
+    if relative_c.ndim not in {1, 2} or relative_c.shape[0] != incidence.shape[1]:
+        raise ValueError("relative_c must have shape E or E x heads")
+    if relative_c.ndim == 2 and relative_c.shape[1] != message.shape[1]:
+        raise ValueError("per-head C must have one column per message head")
+    if propagation_normalization not in {"symmetric", "row"}:
+        raise ValueError("propagation_normalization must be symmetric or row")
+    if polynomial_coefficients is not None and polynomial_coefficients.shape != (
+        message.shape[1],
+        2,
+    ):
+        raise ValueError("polynomial_coefficients must have shape heads x 2")
     if not relative_c.is_floating_point():
         raise ValueError("relative_c must be floating point")
     if node_graph.dtype != torch.long or node_graph.shape != (message.shape[0],):
@@ -28915,7 +40623,7 @@ def shared_head_diffusion(
     if sampling_correction is None:
         sampling_correction = torch.ones_like(relative_c)
     if (
-        sampling_correction.shape != relative_c.shape
+        sampling_correction.shape not in {relative_c.shape, (relative_c.shape[0],)}
         or sampling_correction.dtype != relative_c.dtype
         or sampling_correction.device != message.device
     ):
@@ -28935,6 +40643,45 @@ def shared_head_diffusion(
         torch.float32 if message.dtype in {torch.float16, torch.bfloat16} else message.dtype
     )
     message_compute = message.to(compute_dtype)
+    if (
+        relative_c.ndim == 2
+        or propagation_normalization != "symmetric"
+        or polynomial_coefficients is not None
+    ):
+        to_tail, to_head, degree = conductance_propagation_coefficients(
+            relative_c.to(compute_dtype),
+            incidence,
+            message.shape[0],
+            sampling_correction=sampling_correction.to(compute_dtype),
+            normalization=propagation_normalization,
+            edge_chunk_size=edge_chunk_size,
+        )
+        if to_tail.ndim == 1:
+            to_tail = to_tail[:, None].expand(-1, message.shape[1])
+            to_head = to_head[:, None].expand(-1, message.shape[1])
+            degree = degree[:, None].expand(-1, message.shape[1])
+        active = (degree > 0).unsqueeze(-1)
+        propagated = _ChunkedHeadPropagation.apply(
+            message_compute, to_tail, to_head, incidence, edge_chunk_size
+        )
+        node_beta = graph_broadcast(beta.to(compute_dtype), node_graph, beta.shape[0]).unsqueeze(-1)
+        output = message_compute + node_beta * (propagated - active * message_compute)
+        if polynomial_coefficients is not None:
+            # P acts as identity on isolates. Coefficients represent
+            # (1-beta-a2-a3)I + beta P + a2 P² + a3 P³.
+            p1 = propagated + (~active) * message_compute
+            p2 = (
+                _ChunkedHeadPropagation.apply(p1, to_tail, to_head, incidence, edge_chunk_size)
+                + (~active) * p1
+            )
+            p3 = (
+                _ChunkedHeadPropagation.apply(p2, to_tail, to_head, incidence, edge_chunk_size)
+                + (~active) * p2
+            )
+            coefficients = polynomial_coefficients.to(compute_dtype)
+            output = output + coefficients[None, :, 0, None] * (p2 - message_compute)
+            output = output + coefficients[None, :, 1, None] * (p3 - message_compute)
+        return output.to(message.dtype)
     effective = relative_c.to(compute_dtype) * sampling_correction.to(compute_dtype)
     degree = weighted_degree(
         effective, incidence, message.shape[0], edge_chunk_size=edge_chunk_size
@@ -28978,7 +40725,15 @@ from .operator import _validate_graph_index, graph_broadcast, graph_sum
 
 
 def _degree(c: Tensor, incidence: Tensor, num_nodes: int) -> Tensor:
-    return c.new_zeros(num_nodes).index_add(0, incidence[0], c).index_add(0, incidence[1], c)
+    return (
+        c.new_zeros((num_nodes, *c.shape[1:]))
+        .index_add(0, incidence[0], c)
+        .index_add(0, incidence[1], c)
+    )
+
+
+def _edge_weighted(values: Tensor, omega: Tensor) -> Tensor:
+    return values * (omega[:, None] if values.ndim == 2 else omega)
 
 
 def _graph_max(
@@ -28987,9 +40742,12 @@ def _graph_max(
     if num_graphs == 1:
         # Include the original self value, also in the gradient's tie count.
         # clamp_min/maximum after amax would give different zero-tie gradients.
-        return torch.cat((values.new_full((1,), initial), values)).amax(dim=0, keepdim=True)
-    return values.new_full((num_graphs,), initial).scatter_reduce(
-        0, edge_graph, values, reduce="amax", include_self=True
+        return torch.cat((values.new_full((1, *values.shape[1:]), initial), values)).amax(
+            dim=0, keepdim=True
+        )
+    index = edge_graph[:, None].expand_as(values) if values.ndim == 2 else edge_graph
+    return values.new_full((num_graphs, *values.shape[1:]), initial).scatter_reduce(
+        0, index, values, reduce="amax", include_self=True
     )
 
 
@@ -28998,8 +40756,11 @@ def _weighted_mean(
 ) -> Tensor:
     # Graph IDs are validated at the solver boundary. Reuse the live mass:
     # detaching it would change derivatives when sampling weights need grad.
-    numerator = graph_sum(values * omega, edge_graph, num_graphs, validate_index=False)
-    return numerator / graph_mass.clamp_min(torch.finfo(values.dtype).tiny)
+    numerator = graph_sum(
+        _edge_weighted(values, omega), edge_graph, num_graphs, validate_index=False
+    )
+    mass = graph_mass[:, None] if values.ndim == 2 else graph_mass
+    return numerator / mass.clamp_min(torch.finfo(values.dtype).tiny)
 
 
 def _normalize_log_c(
@@ -29034,6 +40795,9 @@ def _energy_from_degrees(
     entropy: float,
     degree_barrier: float,
 ) -> Tensor:
+    if degree.ndim == 2 and reference.ndim == 1:
+        reference = reference[:, None]
+        counts = counts[:, None]
     active = reference > 0
     safe_degree = torch.where(active, degree, torch.ones_like(degree))
     safe_reference = torch.where(active, reference, torch.ones_like(reference))
@@ -29066,7 +40830,7 @@ def conductance_energy(
     """
     _validate_graph_index(node_graph, num_graphs)
     edge_graph = node_graph[incidence[0]]
-    degree = _degree(omega * c, incidence, node_graph.numel())
+    degree = _degree(_edge_weighted(c, omega), incidence, node_graph.numel())
     reference = _degree(omega, incidence, node_graph.numel())
     counts = graph_sum((reference > 0).to(c.dtype), node_graph, num_graphs, validate_index=False)
     graph_mass = graph_sum(omega, edge_graph, num_graphs, validate_index=False)
@@ -29087,11 +40851,17 @@ def conductance_energy(
 
 
 class GraphOptimizedConductance(nn.Module):
-    """Shared signed compatibility, followed by K differentiable C updates.
+    """Signed compatibility followed by independently normalized C optimization.
 
     Uses every feature channel, a graph-conditioned signed diagonal quadratic
     metric, and symmetric structural features. There is no edge MLP or
-    edge-specific parameter table. C is shared across all feature heads.
+    edge-specific parameter table. The legacy default shares C; multiple C
+    heads have separate context/structure metrics, energies, degrees, steps
+    and gauges, vectorized along an explicit head dimension. A common node
+    projection does not average the independently learned head metrics.
+    Explicit relation IDs optionally select additional quadratic metrics.
+    ``degree_only`` removes task-learned costs; ``entropy_exact`` solves the
+    entropy/linear-cost objective analytically and requires degree barrier 0.
 
     ``legacy_unit`` preserves the original unit-normalized compatibility.
     ``width_scaled`` compensates the O(channels**-0.5) contrast of isotropic
@@ -29119,12 +40889,16 @@ class GraphOptimizedConductance(nn.Module):
         solver_cost_scaling: str = "legacy_unit",
         cost_bound: float = 2.0,
         edge_chunk_size: int = 65536,
+        conductance_heads: int = 1,
+        generator: str = "optimized",
+        num_relations: int = 0,
     ) -> None:
         super().__init__()
         for name, value in (
             ("channels", channels),
             ("solver_steps", solver_steps),
             ("edge_chunk_size", edge_chunk_size),
+            ("conductance_heads", conductance_heads),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -29151,7 +40925,22 @@ class GraphOptimizedConductance(nn.Module):
             raise ValueError(f"unsupported conductance mode: {mode}")
         if solver_cost_scaling not in ("legacy_unit", "width_scaled"):
             raise ValueError(f"unsupported solver_cost_scaling: {solver_cost_scaling}")
+        if generator not in {"optimized", "degree_only", "entropy_exact"}:
+            raise ValueError(f"unsupported conductance generator: {generator}")
+        if generator == "entropy_exact" and solver_degree_barrier != 0:
+            raise ValueError("entropy_exact requires solver_degree_barrier=0")
+        if (
+            isinstance(num_relations, bool)
+            or not isinstance(num_relations, int)
+            or num_relations < 0
+        ):
+            raise ValueError("num_relations must be a nonnegative integer")
+        if generator == "degree_only" and num_relations:
+            raise ValueError("degree_only has no learned relation costs; num_relations must be 0")
         self.channels = channels
+        self.conductance_heads = conductance_heads
+        self.generator = generator
+        self.num_relations = num_relations
         self.mode = mode
         self.solver_steps = solver_steps
         self.solver_step_size = float(solver_step_size)
@@ -29161,16 +40950,29 @@ class GraphOptimizedConductance(nn.Module):
         self.quadratic_scale = math.sqrt(channels) if solver_cost_scaling == "width_scaled" else 1.0
         self.cost_bound = float(cost_bound)
         self.edge_chunk_size = edge_chunk_size
-        if mode == "dynamic":
+        if mode == "dynamic" and generator != "degree_only":
             self.node_projection: nn.Linear | None = nn.Linear(channels, channels, bias=False)
-            self.context_metric: nn.Linear | None = nn.Linear(2 * channels + 8, channels)
-            self.structure_metric: nn.Parameter | None = nn.Parameter(torch.empty(8))
+            self.context_metric: nn.Linear | None = nn.Linear(
+                2 * channels + 8, channels * conductance_heads
+            )
+            self.structure_metric: nn.Parameter | None = nn.Parameter(
+                torch.empty(8) if conductance_heads == 1 else torch.empty(conductance_heads, 8)
+            )
             nn.init.normal_(self.structure_metric, std=0.01)
         else:
             # A true parameter-free C=1 control, not frozen unused modules.
             self.node_projection = None
             self.context_metric = None
             self.register_parameter("structure_metric", None)
+        if num_relations and mode == "dynamic":
+            # A genuine relation-conditioned diagonal quadratic metric,
+            # not a constant graph offset and not fabricated relation labels.
+            self.relation_metric = nn.Parameter(
+                torch.empty(num_relations, conductance_heads, channels)
+            )
+            nn.init.normal_(self.relation_metric, std=0.01)
+        else:
+            self.register_parameter("relation_metric", None)
         self.override: str | None = None
         self.last_scores: Tensor | None = None
         self.last_log_c: Tensor | None = None
@@ -29186,6 +40988,7 @@ class GraphOptimizedConductance(nn.Module):
         sample_degree: Tensor,
         full_degree: Tensor,
         edge_graph: Tensor,
+        edge_relation_id: Tensor | None = None,
     ) -> Tensor:
         if self.structure_metric is None:
             raise RuntimeError("fixed C has no compatibility parameters")
@@ -29229,10 +41032,23 @@ class GraphOptimizedConductance(nn.Module):
             dim=1,
         )
         edge_metric = graph_broadcast(metric, edge_graph, metric.shape[0], validate_index=False)
-        quadratic = ((left - right).square() * edge_metric).sum(dim=1)
+        if self.conductance_heads == 1:
+            if edge_relation_id is not None and self.relation_metric is not None:
+                edge_metric = (
+                    edge_metric
+                    + self.relation_metric[edge_relation_id, 0].to(projected.dtype).tanh()
+                )
+            quadratic = ((left - right).square() * edge_metric).sum(dim=1)
+            structural = (local.tanh() * self.structure_metric.to(projected.dtype)).sum(dim=1)
+        else:
+            if edge_relation_id is not None and self.relation_metric is not None:
+                edge_metric = (
+                    edge_metric + self.relation_metric[edge_relation_id].to(projected.dtype).tanh()
+                )
+            quadratic = torch.einsum("ed,ehd->eh", (left - right).square(), edge_metric)
+            structural = local.tanh() @ self.structure_metric.to(projected.dtype).T
         if self.solver_cost_scaling == "width_scaled":
             quadratic = quadratic * self.quadratic_scale
-        structural = (local.tanh() * self.structure_metric.to(projected.dtype)).sum(dim=1)
         return quadratic + structural
 
     def _compatibility_chunk(
@@ -29244,11 +41060,12 @@ class GraphOptimizedConductance(nn.Module):
         sample_degree: Tensor,
         full_degree: Tensor,
         edge_graph: Tensor,
+        edge_relation_id: Tensor | None = None,
     ) -> Tensor:
         """Keep the legacy bounded-chunk path numerically unchanged."""
 
         raw = self._raw_compatibility_chunk(
-            projected, metric, tail, head, sample_degree, full_degree, edge_graph
+            projected, metric, tail, head, sample_degree, full_degree, edge_graph, edge_relation_id
         )
         return self.cost_bound * torch.tanh(raw / self.cost_bound)
 
@@ -29267,18 +41084,18 @@ class GraphOptimizedConductance(nn.Module):
         degree: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         if degree is None:
-            degree = _degree(omega * log_c.exp(), incidence, num_nodes)
+            degree = _degree(_edge_weighted(log_c.exp(), omega), incidence, num_nodes)
         inverse_sum = degree[incidence[0]].reciprocal() + degree[incidence[1]].reciprocal()
         if barrier_coefficient is None:
             barrier_coefficient = self.solver_degree_barrier * (
                 graph_mass / active_counts.clamp_min(1)
             )
-        barrier = (
-            graph_broadcast(
-                barrier_coefficient, edge_graph, graph_mass.numel(), validate_index=False
-            )
-            * inverse_sum
+        coefficient = graph_broadcast(
+            barrier_coefficient, edge_graph, graph_mass.numel(), validate_index=False
         )
+        if log_c.ndim == 2:
+            coefficient = coefficient[:, None]
+        barrier = coefficient * inverse_sum
         return delta + self.solver_entropy * log_c - barrier, barrier
 
     def _step(
@@ -29344,6 +41161,7 @@ class GraphOptimizedConductance(nn.Module):
         sample_degree: Tensor,
         full_degree: Tensor,
         edge_normalization_weight: Tensor | None = None,
+        edge_relation_id: Tensor | None = None,
     ) -> Tensor:
         if state.ndim != 2 or state.shape[1] != self.channels or not state.is_floating_point():
             raise ValueError("state must be an N x channels floating tensor")
@@ -29367,6 +41185,23 @@ class GraphOptimizedConductance(nn.Module):
         )
         _validate_graph_index(node_graph, num_graphs)
         tail, head = incidence
+        if self.num_relations:
+            if (
+                edge_relation_id is None
+                or edge_relation_id.shape != tail.shape
+                or edge_relation_id.dtype != torch.long
+                or edge_relation_id.device != state.device
+            ):
+                raise ValueError(
+                    "explicit edge_relation_id must be same-device int64 "
+                    "with one ID per physical edge"
+                )
+            torch._assert_async(
+                ((edge_relation_id >= 0) & (edge_relation_id < self.num_relations)).all(),
+                "edge_relation_id is outside configured num_relations",
+            )
+        elif edge_relation_id is not None:
+            raise ValueError("edge_relation_id supplied without explicit num_relations")
         edge_graph = node_graph[tail]
         omega = torch.ones(tail.numel(), device=state.device, dtype=compute_dtype)
         if edge_normalization_weight is not None:
@@ -29381,7 +41216,11 @@ class GraphOptimizedConductance(nn.Module):
             "C solver needs finite positive sampling weights",
         )
         if self.mode == "fixed_one" or self.override == "ones" or tail.numel() == 0:
-            c = torch.ones_like(omega)
+            c = (
+                torch.ones_like(omega)
+                if self.conductance_heads == 1
+                else omega.new_ones((omega.shape[0], self.conductance_heads))
+            )
             self.last_scores = torch.zeros_like(c)
             self.last_log_c = torch.zeros_like(c)
             self.last_c = c.detach()
@@ -29394,43 +41233,53 @@ class GraphOptimizedConductance(nn.Module):
                 "quadratic_scale": self.quadratic_scale,
             }
             return c
-        if self.node_projection is None or self.context_metric is None:
-            raise RuntimeError("dynamic compatibility parameters are unavailable")
-        projected = F.normalize(self.node_projection(state).to(compute_dtype), dim=1, eps=1e-6)
-        normalized_context = F.layer_norm(graph_context, (graph_context.shape[1],))
-        metric = self.context_metric(normalized_context).to(compute_dtype).tanh()
-        sample_degree = sample_degree.to(compute_dtype)
-        full_degree = full_degree.to(compute_dtype)
-        chunks = []
-        compatibility = (
-            self._raw_compatibility_chunk
-            if self.solver_cost_scaling == "width_scaled"
-            else self._compatibility_chunk
-        )
-        for start in range(0, tail.numel(), self.edge_chunk_size):
-            stop = start + self.edge_chunk_size
-            arguments = (
-                projected,
-                metric,
-                tail[start:stop],
-                head[start:stop],
-                sample_degree,
-                full_degree,
-                edge_graph[start:stop],
+        if self.generator == "degree_only":
+            # This ablation deliberately has no task-learned cost parameters.
+            shape = (
+                (tail.numel(),)
+                if self.conductance_heads == 1
+                else (tail.numel(), self.conductance_heads)
             )
-            if torch.is_grad_enabled():
-                from torch.utils.checkpoint import checkpoint
-
-                delta = checkpoint(
-                    compatibility,
-                    *arguments,
-                    use_reentrant=False,
-                    preserve_rng_state=False,
+            delta = state.new_zeros(shape, dtype=compute_dtype)
+        else:
+            if self.node_projection is None or self.context_metric is None:
+                raise RuntimeError("dynamic compatibility parameters are unavailable")
+            projected = F.normalize(self.node_projection(state).to(compute_dtype), dim=1, eps=1e-6)
+            normalized_context = F.layer_norm(graph_context, (graph_context.shape[1],))
+            metric = self.context_metric(normalized_context).to(compute_dtype).tanh()
+            if self.conductance_heads > 1:
+                metric = metric.reshape(num_graphs, self.conductance_heads, self.channels)
+            sample_degree = sample_degree.to(compute_dtype)
+            full_degree = full_degree.to(compute_dtype)
+            chunks = []
+            compatibility = (
+                self._raw_compatibility_chunk
+                if self.solver_cost_scaling == "width_scaled"
+                else self._compatibility_chunk
+            )
+            for start in range(0, tail.numel(), self.edge_chunk_size):
+                stop = start + self.edge_chunk_size
+                arguments = (
+                    projected,
+                    metric,
+                    tail[start:stop],
+                    head[start:stop],
+                    sample_degree,
+                    full_degree,
+                    edge_graph[start:stop],
                 )
-            else:
-                delta = compatibility(*arguments)
-            chunks.append(delta)
-        delta = torch.cat(chunks)
+                if edge_relation_id is not None:
+                    arguments = (*arguments, edge_relation_id[start:stop])
+                if torch.is_grad_enabled():
+                    from torch.utils.checkpoint import checkpoint
+
+                    chunk = checkpoint(
+                        compatibility, *arguments, use_reentrant=False, preserve_rng_state=False
+                    )
+                else:
+                    chunk = compatibility(*arguments)
+                chunks.append(chunk)
+            delta = torch.cat(chunks)
         graph_mass = graph_sum(omega, edge_graph, num_graphs, validate_index=False)
         if self.solver_cost_scaling == "width_scaled":
             # Center over complete graphs, never individual memory chunks.
@@ -29452,7 +41301,28 @@ class GraphOptimizedConductance(nn.Module):
         steps = []
         initial_residual = None
         previous_log_c = log_c
-        for iteration in range(self.solver_steps):
+        initial_degree = (
+            reference_degree
+            if delta.ndim == 1
+            else reference_degree[:, None].expand(-1, self.conductance_heads)
+        )
+        if self.generator == "entropy_exact":
+            # Exact minimizer of the entropy + learned linear cost energy
+            # under the same omega-weighted mean-one constraint (rho=0).
+            initial_centered = delta - graph_broadcast(
+                _weighted_mean(delta, edge_graph, num_graphs, omega, graph_mass),
+                edge_graph,
+                num_graphs,
+                validate_index=False,
+            )
+            initial_residual = _weighted_mean(
+                initial_centered.detach().square(), edge_graph, num_graphs, omega, graph_mass
+            ).sqrt()
+            log_c = _normalize_log_c(
+                -delta / self.solver_entropy, edge_graph, num_graphs, omega, graph_mass
+            )
+        executed_steps = 0 if self.generator == "entropy_exact" else self.solver_steps
+        for iteration in range(executed_steps):
             previous_log_c = log_c
             arguments = (
                 log_c,
@@ -29467,7 +41337,7 @@ class GraphOptimizedConductance(nn.Module):
                 barrier_coefficient,
                 # C starts as the constant one vector, so this degree is
                 # exactly the live reference degree, including omega's grad.
-                reference_degree if iteration == 0 else None,
+                initial_degree if iteration == 0 else None,
             )
             if torch.is_grad_enabled():
                 from torch.utils.checkpoint import checkpoint
@@ -29492,7 +41362,7 @@ class GraphOptimizedConductance(nn.Module):
             initial_energy = _weighted_mean(
                 delta.detach(), edge_graph, num_graphs, omega, graph_mass
             )
-            final_degree = _degree(omega * c.detach(), incidence, state.shape[0])
+            final_degree = _degree(_edge_weighted(c.detach(), omega), incidence, state.shape[0])
             final_energy = _energy_from_degrees(
                 c.detach(),
                 delta.detach(),
@@ -29546,12 +41416,18 @@ class GraphOptimizedConductance(nn.Module):
             torch._assert_async(
                 valid, "C optimization produced nonfinite values or increased its objective"
             )
-            step_history = torch.stack(steps)
+            step_history = (
+                torch.stack(steps) if steps else torch.zeros_like(initial_energy).unsqueeze(0)
+            )
             self.last_solver_diagnostics = {
                 "enabled": True,
-                "method": "curvature_bounded_kl_proximal",
-                "executed_steps": self.solver_steps,
-                "finite_step_approximation": True,
+                "method": "analytic_entropy"
+                if self.generator == "entropy_exact"
+                else "curvature_bounded_kl_proximal",
+                "executed_steps": executed_steps,
+                "finite_step_approximation": self.generator != "entropy_exact",
+                "conductance_generator": self.generator,
+                "conductance_heads": self.conductance_heads,
                 "solver_cost_scaling": self.solver_cost_scaling,
                 "quadratic_scale": self.quadratic_scale,
                 "objective_initial": initial_energy,
@@ -29577,9 +41453,13 @@ class GraphOptimizedConductance(nn.Module):
             order = torch.argsort(edge_graph, stable=True)
             counts = torch.bincount(edge_graph, minlength=num_graphs)
             starts = counts.cumsum(0) - counts
-            position = torch.arange(c.numel(), device=c.device)
+            position = torch.arange(c.shape[0], device=c.device)
             reverse = 2 * starts[edge_graph[order]] + counts[edge_graph[order]] - 1 - position
-            c = torch.empty_like(c).scatter(0, order, c[order[reverse]])
+            c = (
+                torch.empty_like(c).scatter(0, order, c[order[reverse]])
+                if c.ndim == 1
+                else torch.empty_like(c).index_copy(0, order, c[order[reverse]])
+            )
         self.last_scores = delta.detach()
         self.last_log_c = log_c.detach()
         self.last_c = c.detach()
@@ -29606,6 +41486,10 @@ DEFAULT_SOLVER_STEP_SIZE = 0.25
 DEFAULT_SOLVER_ENTROPY = 1.0
 DEFAULT_SOLVER_DEGREE_BARRIER = 0.1
 SOLVER_COST_SCALINGS = ("legacy_unit", "width_scaled")
+CONDUCTANCE_HEAD_MODES = ("shared", "per_head")
+PROPAGATION_NORMALIZATIONS = ("symmetric", "row")
+CONDUCTANCE_GENERATORS = ("optimized", "degree_only", "entropy_exact")
+PROPAGATION_FILTERS = ("linear", "polynomial3")
 LEARNING_BUDGET_POLICIES = ("epochs", "reference_updates")
 TRAINING_SCHEDULES = ("joint", "staged")
 DEFAULT_TRAINING_SCHEDULE = "joint"
@@ -29628,6 +41512,13 @@ def conductance_configuration(
     solver_entropy: float = DEFAULT_SOLVER_ENTROPY,
     solver_degree_barrier: float = DEFAULT_SOLVER_DEGREE_BARRIER,
     solver_cost_scaling: str = "legacy_unit",
+    *,
+    conductance_heads: str = "shared",
+    propagation_normalization: str = "symmetric",
+    conductance_generator: str = "optimized",
+    num_relations: int = 0,
+    edge_direction: str = "undirected",
+    propagation_filter: str = "linear",
 ) -> dict[str, int | float | str]:
     """Canonical architecture identity; solver fields are inactive for the MLP ablation."""
 
@@ -29637,6 +41528,28 @@ def conductance_configuration(
         raise ValueError(f"unsupported solver cost scaling: {solver_cost_scaling}")
     if conductance_backend == "mlp" and solver_cost_scaling != "legacy_unit":
         raise ValueError("width_scaled costs require the optimization conductance backend")
+    for name, value, choices in (
+        ("conductance_heads", conductance_heads, CONDUCTANCE_HEAD_MODES),
+        ("propagation_normalization", propagation_normalization, PROPAGATION_NORMALIZATIONS),
+        ("conductance_generator", conductance_generator, CONDUCTANCE_GENERATORS),
+        ("propagation_filter", propagation_filter, PROPAGATION_FILTERS),
+    ):
+        if value not in choices:
+            raise ValueError(f"unsupported {name}: {value}")
+    if isinstance(num_relations, bool) or not isinstance(num_relations, int) or num_relations < 0:
+        raise ValueError("num_relations must be a nonnegative integer")
+    if edge_direction != "undirected":
+        raise ValueError(
+            "B^T C B requires undirected physical relations; directed edges need a separate model"
+        )
+    if conductance_backend == "mlp" and (
+        conductance_generator != "optimized" or conductance_heads != "shared" or num_relations
+    ):
+        raise ValueError("the explicit MLP control supports shared untyped C only")
+    if conductance_generator == "entropy_exact" and solver_degree_barrier != 0:
+        raise ValueError("entropy_exact requires solver_degree_barrier=0")
+    if conductance_generator == "degree_only" and num_relations:
+        raise ValueError("degree_only has no learned relation metric; use untyped topology control")
     if isinstance(solver_steps, bool) or not isinstance(solver_steps, int) or solver_steps < 1:
         raise ValueError("solver_steps must be a positive integer")
     values = {
@@ -29665,12 +41578,58 @@ def conductance_configuration(
             if solver_cost_scaling != "legacy_unit"
             else {}
         ),
+        **{
+            name: value
+            for name, value, default in (
+                ("conductance_heads", conductance_heads, "shared"),
+                ("propagation_normalization", propagation_normalization, "symmetric"),
+                ("conductance_generator", conductance_generator, "optimized"),
+                ("num_relations", num_relations, 0),
+                ("edge_direction", edge_direction, "undirected"),
+                ("propagation_filter", propagation_filter, "linear"),
+            )
+            if value != default
+        },
     }
 
 
 def add_conductance_arguments(parser, *, prefix: str = "") -> None:
     """Share explicit architecture CLI options across standalone and nested runners."""
 
+    for name, choices, default, help_text in (
+        (
+            "conductance-heads",
+            CONDUCTANCE_HEAD_MODES,
+            "shared",
+            "per_head learns independent C and degrees for every feature head",
+        ),
+        (
+            "propagation-normalization",
+            PROPAGATION_NORMALIZATIONS,
+            "symmetric",
+            "row uses receiver-normalized neighbor attention with row sum one",
+        ),
+        (
+            "conductance-generator",
+            CONDUCTANCE_GENERATORS,
+            "optimized",
+            "degree_only has no learned edge cost; entropy_exact requires zero degree barrier",
+        ),
+        (
+            "propagation-filter",
+            PROPAGATION_FILTERS,
+            "linear",
+            "polynomial3 adds learned degree-three propagation without shrinking the backbone",
+        ),
+    ):
+        parser.add_argument(f"--{prefix}{name}", choices=choices, default=default, help=help_text)
+    parser.add_argument(
+        f"--{prefix}num-relations",
+        type=int,
+        default=0,
+        help="actual physical-edge relation types; requires explicit edge_relation_id metadata",
+    )
+    parser.add_argument(f"--{prefix}edge-direction", choices=("undirected",), default="undirected")
     parser.add_argument(
         f"--{prefix}conductance-backend",
         choices=CONDUCTANCE_BACKENDS,
@@ -29720,6 +41679,17 @@ def conductance_arguments_configuration(args, *, prefix: str = "") -> dict[str, 
     configuration = conductance_configuration(
         **{name: getattr(args, prefix + name) for name in conductance_configuration()},
         solver_cost_scaling=getattr(args, prefix + "solver_cost_scaling", "legacy_unit"),
+        **{
+            name: getattr(args, prefix + name, default)
+            for name, default in (
+                ("conductance_heads", "shared"),
+                ("propagation_normalization", "symmetric"),
+                ("conductance_generator", "optimized"),
+                ("num_relations", 0),
+                ("edge_direction", "undirected"),
+                ("propagation_filter", "linear"),
+            )
+        },
     )
     schedule = getattr(args, prefix + "training_schedule")
     if schedule not in TRAINING_SCHEDULES:
@@ -30945,6 +42915,16 @@ class TransductiveGraphSampler:
             global_node_id=nodes,
             sample_seed_count=torch.tensor([int(seeds.numel())]),
         )
+        relation = getattr(self.graph, "edge_relation_id", None)
+        if relation is not None:
+            if relation.dtype != torch.long or relation.shape != (self.incidence.shape[1],):
+                raise ValueError("edge_relation_id must align with physical incidence columns")
+            sampled.edge_relation_id = relation[edge_ids]
+        node_type = getattr(self.graph, "node_type", None)
+        if node_type is not None:
+            if node_type.dtype != torch.long or node_type.shape != (self.num_nodes,):
+                raise ValueError("node_type must align with original nodes")
+            sampled.node_type = node_type[nodes]
         return sampled, edge_ids, observation, candidate_count
 
     def _induced(self, nodes: Tensor, seeds: Tensor):
@@ -31226,6 +43206,20 @@ import torch
 from torch import Tensor, nn
 
 from .diagnostics import PreparedValidationGraph, require_finite_tensor
+from .distribution_audit import audit_conductance_distribution
+
+
+def _iterative_reference(operator) -> bool:
+    return (
+        operator.conductance_backend == "optimization"
+        and getattr(operator, "conductance_generator", "optimized") == "optimized"
+        and operator.estimator.mode != "fixed_one"
+    )
+
+
+def _set_steps(estimator, steps):
+    if hasattr(estimator, "solver_steps"):
+        estimator.solver_steps = steps
 
 
 def _diagnostic_state(module: nn.Module) -> dict[str, Any]:
@@ -31246,7 +43240,9 @@ def _preserve_state(model: nn.Module, device: torch.device, source):
     training = [module.training for module in modules]
     diagnostics = [_diagnostic_state(module) for module in modules]
     estimators = [operator.estimator for operator in model.operators]
-    settings = [(estimator.override, estimator.solver_steps) for estimator in estimators]
+    settings = [
+        (estimator.override, getattr(estimator, "solver_steps", None)) for estimator in estimators
+    ]
     python_rng, numpy_rng, cpu_rng = random.getstate(), np.random.get_state(), torch.get_rng_state()
     cuda_rng = torch.cuda.get_rng_state(device) if device.type == "cuda" else None
     # DataLoader generators are not necessarily the global torch generator.
@@ -31262,7 +43258,8 @@ def _preserve_state(model: nn.Module, device: torch.device, source):
         yield
     finally:
         for estimator, (override, steps) in zip(estimators, settings, strict=True):
-            estimator.override, estimator.solver_steps = override, steps
+            estimator.override = override
+            _set_steps(estimator, steps)
         for module, mode, previous in zip(modules, training, diagnostics, strict=True):
             module.training = mode  # Preserve heterogeneous flags, not just the root flag.
             _restore_diagnostics(module, previous)
@@ -31276,16 +43273,48 @@ def _preserve_state(model: nn.Module, device: torch.device, source):
 
 
 def _json(value):
-    if isinstance(value, Tensor):
-        require_finite_tensor(value, "stage audit statistic")
-        return value.detach().cpu().tolist()
-    if isinstance(value, dict):
-        return {key: _json(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [_json(item) for item in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        raise FloatingPointError("nonfinite stage audit statistic")
-    return value
+    """Transfer summary leaves once per device/dtype, not once per tiny statistic.
+
+    Keep integer and bool groups separate from floating values, so JSON counts
+    retain exact int64 values. Only summary tensors are packed, never activations.
+    """
+    groups, seen = {}, set()
+
+    def collect(item):
+        if isinstance(item, Tensor):
+            if id(item) not in seen:
+                seen.add(id(item))
+                groups.setdefault((item.device, item.dtype), []).append(item)
+        elif isinstance(item, dict):
+            for child in item.values():
+                collect(child)
+        elif isinstance(item, (tuple, list)):
+            for child in item:
+                collect(child)
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise FloatingPointError("nonfinite stage audit statistic")
+
+    collect(value)
+    converted = {}
+    for leaves in groups.values():
+        packed = torch.cat([leaf.detach().reshape(-1) for leaf in leaves]).cpu()
+        require_finite_tensor(packed, "stage audit statistic")
+        offset = 0
+        for leaf in leaves:
+            count = leaf.numel()
+            converted[id(leaf)] = packed[offset : offset + count].reshape(leaf.shape).tolist()
+            offset += count
+
+    def rebuild(item):
+        if isinstance(item, Tensor):
+            return converted[id(item)]
+        if isinstance(item, dict):
+            return {key: rebuild(child) for key, child in item.items()}
+        if isinstance(item, (tuple, list)):
+            return [rebuild(child) for child in item]
+        return item
+
+    return rebuild(value)
 
 
 def _difference(left: Tensor, reference: Tensor) -> dict[str, Any]:
@@ -31335,20 +43364,44 @@ def _local_hook(layer: int, batch_number: int, rows: list, reference_steps: int)
         estimator = operator.estimator
         modules = list(operator.modules())
         previous_diagnostics = [_diagnostic_state(module) for module in modules]
-        previous_override, previous_steps = estimator.override, estimator.solver_steps
+        previous_override, previous_steps = (
+            estimator.override,
+            getattr(estimator, "solver_steps", None),
+        )
+        iterative = _iterative_reference(operator)
         baseline_c = estimator.last_c
-        baseline_solver = estimator.last_solver_diagnostics
+        baseline_solver = getattr(estimator, "last_solver_diagnostics", {})
         baseline_beta = operator.last_beta
+        distribution = audit_conductance_distribution(
+            baseline_c,
+            args[1],
+            args[2],
+            args[3],
+            heads=baseline_beta.shape[1],
+            beta=baseline_beta,
+            sampling_correction=kwargs.get("sampling_correction"),
+            normalization=getattr(operator, "propagation_normalization", "symmetric"),
+            propagation_filter=getattr(operator, "propagation_filter", "linear"),
+        )
+        polynomial = getattr(operator, "polynomial_delta", None)
+        distribution["polynomial_delta_by_head"] = (
+            None if polynomial is None else polynomial.detach().float()
+        )
         try:
             estimator.override = "ones"
             # Calling forward directly avoids recursion into this audit hook.
             ones_output = operator.forward(*args, **kwargs)
             ones_comparison = _difference(ones_output, baseline_output)
             del ones_output
-            estimator.override, estimator.solver_steps = None, reference_steps
-            reference_output = operator.forward(*args, **kwargs)
-            reference_c = estimator.last_c
-            reference_solver = estimator.last_solver_diagnostics
+            estimator.override = None
+            _set_steps(estimator, reference_steps if iterative else previous_steps)
+            reference_output = operator.forward(*args, **kwargs) if iterative else None
+            reference_c = estimator.last_c if iterative else None
+            reference_solver = (
+                estimator.last_solver_diagnostics
+                if iterative
+                else {"applicable": False, "reason": "no iterative learned C solver"}
+            )
             rows.append(
                 {
                     "layer": layer,
@@ -31358,12 +43411,16 @@ def _local_hook(layer: int, batch_number: int, rows: list, reference_steps: int)
                     "edges": args[1].shape[1],
                     "graphs": args[3],
                     "deployed_steps": previous_steps,
-                    "reference_steps": reference_steps,
+                    "reference_steps": reference_steps if iterative else None,
+                    "iterative_reference_applicable": iterative,
                     "baseline_c": _moments(baseline_c),
                     "baseline_beta": _moments(baseline_beta),
-                    "c_deployed_vs_reference": _difference(baseline_c, reference_c),
-                    "operator_deployed_vs_reference": _difference(
-                        baseline_output, reference_output
+                    "distribution": distribution,
+                    "c_deployed_vs_reference": _difference(baseline_c, reference_c)
+                    if iterative
+                    else None,
+                    "operator_deployed_vs_reference": (
+                        _difference(baseline_output, reference_output) if iterative else None
                     ),
                     "operator_c_one_vs_deployed": ones_comparison,
                     "baseline_solver": baseline_solver,
@@ -31371,7 +43428,8 @@ def _local_hook(layer: int, batch_number: int, rows: list, reference_steps: int)
                 }
             )
         finally:
-            estimator.override, estimator.solver_steps = previous_override, previous_steps
+            estimator.override = previous_override
+            _set_steps(estimator, previous_steps)
             for module, previous in zip(modules, previous_diagnostics, strict=True):
                 _restore_diagnostics(module, previous)
 
@@ -31410,6 +43468,111 @@ def _memory(device: torch.device) -> dict[str, Any]:
     }
 
 
+def _task_head_gradients(model, graph, selected, baseline, *, batch_number, precision):
+    """Actual validation-loss VJP in C space, not a proxy or theta-gradient claim.
+
+    Replace only the inspected layer's C by equal-valued independent head leaves.
+    Other layers remain live, including downstream C dependence on hidden states.
+    autograd.grad never populates or clears parameter.grad and creates no optimizer.
+    """
+    rows = []
+    for layer, operator in enumerate(model.operators):
+        if operator.estimator.mode == "fixed_one":
+            rows.append(
+                {
+                    "layer": layer,
+                    "batch": batch_number,
+                    "measured": False,
+                    "reason": "fixed C has no learned stage-1 conductance",
+                }
+            )
+            continue
+        if not graph.incidence_edge_index.shape[1]:
+            rows.append(
+                {
+                    "layer": layer,
+                    "batch": batch_number,
+                    "measured": False,
+                    "reason": "edgeless graph has no C-space gradient",
+                }
+            )
+            continue
+        leaves = []
+
+        def split_heads(module, args, c, *, heads=operator.value_weight.shape[0], leaves=leaves):
+            leaf = (c[:, None].expand(-1, heads) if c.ndim == 1 else c).detach().clone()
+            leaf.requires_grad_(True)
+            leaves.append(leaf)
+            return leaf
+
+        handle = operator.estimator.register_forward_hook(split_heads)
+        logits = loss = gradient = None
+        try:
+            with (
+                torch.enable_grad(),
+                torch.autocast(
+                    device_type=graph.x.device.type,
+                    dtype=torch.bfloat16,
+                    enabled=precision == "bf16",
+                ),
+            ):
+                logits = model(graph)
+                logits = logits if selected is None else logits.index_select(0, selected)
+                target = graph.y if selected is None else graph.y.index_select(0, selected)
+                if len(leaves) != 1:
+                    raise RuntimeError(
+                        "head gradient audit requires one selected layer call per batch"
+                    )
+                loss = (
+                    torch.nn.functional.binary_cross_entropy_with_logits(logits, target.float())
+                    if selected is None
+                    else torch.nn.functional.cross_entropy(logits, target)
+                )
+                (gradient,) = torch.autograd.grad(loss, leaves[0])
+            require_finite_tensor(gradient, "actual task head-C gradient")
+            equivalence = _difference(logits.detach(), baseline)
+            node_graph = getattr(graph, "batch", None)
+            if node_graph is None:
+                node_graph = torch.zeros(graph.x.shape[0], dtype=torch.long, device=graph.x.device)
+            edge_graph = node_graph[graph.incidence_edge_index[0]]
+            graphs = []
+            for graph_id in range(int(getattr(graph, "_v5_num_graphs", 1))):
+                g = gradient[edge_graph == graph_id].float()
+                dot = g.T @ g
+                norm = dot.diag().clamp_min(0).sqrt()
+                denominator = norm[:, None] * norm[None, :]
+                cosine = dot / denominator.clamp_min(torch.finfo(dot.dtype).tiny)
+                graphs.append(
+                    {
+                        "graph_in_batch": graph_id,
+                        "physical_edges": g.shape[0],
+                        "head_gradient_norms": norm,
+                        "head_pair_dot_matrix": dot,
+                        "head_pair_cosine_matrix": cosine,
+                        "cosine_undefined_zero_norm": denominator == 0,
+                        "negative_dot_matrix": dot < 0,
+                        "shared_c_sum_gradient_norm": g.sum(-1).norm(),
+                    }
+                )
+            rows.append(
+                {
+                    "layer": layer,
+                    "batch": batch_number,
+                    "measured": True,
+                    "task_loss": loss.detach().float(),
+                    "equal_c_forward_difference": equivalence,
+                    "graphs": graphs,
+                }
+            )
+        finally:
+            handle.remove()
+            # autograd.grad targets C, so upstream parameter/feature branches
+            # can still own saved tensors until the scalar/logit graph dies.
+            leaves.clear()
+            logits = loss = gradient = None
+    return rows
+
+
 @torch.no_grad()
 def audit_stage_roles(
     model: nn.Module,
@@ -31420,6 +43583,8 @@ def audit_stage_roles(
     precision: str = "fp32",
     reference_steps: int,
     reference_tolerance: float,
+    head_gradient_conflict: bool = False,
+    repeat_evaluations: int = 5,
 ) -> dict[str, Any]:
     """Inspect all supplied validation labels without fitting any parameter.
 
@@ -31448,11 +43613,14 @@ def audit_stage_roles(
         raise ValueError("reference_tolerance must be finite and positive")
     operators = list(model.operators)
     if not operators or any(
-        operator.conductance_backend != "optimization" for operator in operators
+        operator.conductance_backend not in {"optimization", "mlp"} for operator in operators
     ):
-        raise ValueError("stage audit requires V5 optimization-backend operators")
-    deployed_steps = [operator.estimator.solver_steps for operator in operators]
-    if any(reference_steps < steps for steps in deployed_steps):
+        raise ValueError("stage audit requires reviewed V5 operators")
+    if type(repeat_evaluations) is not int or repeat_evaluations < 5:
+        raise ValueError("repeat_evaluations must be an integer at least 5")
+    deployed_steps = [getattr(operator.estimator, "solver_steps", None) for operator in operators]
+    iterative = any(_iterative_reference(operator) for operator in operators)
+    if any(steps is not None and reference_steps < steps for steps in deployed_steps):
         raise ValueError("reference_steps cannot reduce any deployed solver budget")
     if indices is not None and (
         indices.dtype != torch.long or indices.ndim != 1 or not indices.numel()
@@ -31466,14 +43634,16 @@ def audit_stage_roles(
         raise ValueError("model must already reside on the requested device")
     variants = (
         ("learned", None),
+        *((f"repeat_{number}", None) for number in range(2, repeat_evaluations + 1)),
         ("c_one", "ones"),
         ("mean_c", "mean"),
         ("shuffled_c", "shuffle"),
-        ("higher_k_full_model", None),
+        ("mean_head_beta", None),
+        *((("higher_k_full_model", None),) if iterative else ()),
     )
     totals = {name: torch.zeros(7, dtype=torch.float64, device=device) for name, _ in variants}
     differences = {name: None for name, _ in variants}
-    local_rows, input_rows = [], []
+    local_rows, input_rows, gradient_rows, batch_noise_rows = [], [], [], []
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     memory_before, start = _memory(device), time.perf_counter()
@@ -31498,11 +43668,15 @@ def audit_stage_roles(
                 }
             )
             baseline = baseline_prediction = None
+            batch_repeats = []
             for name, override in variants:
                 for operator, steps in zip(operators, deployed_steps, strict=True):
                     operator.estimator.override = override
-                    operator.estimator.solver_steps = (
-                        reference_steps if name == "higher_k_full_model" else steps
+                    _set_steps(
+                        operator.estimator,
+                        reference_steps
+                        if name == "higher_k_full_model" and _iterative_reference(operator)
+                        else steps,
                     )
                 handles = []
                 try:
@@ -31513,6 +43687,15 @@ def audit_stage_roles(
                                 with_kwargs=True,
                             )
                             for layer, operator in enumerate(operators)
+                        ]
+                    if name == "mean_head_beta":
+                        handles = [
+                            operator.beta_estimator.register_forward_hook(
+                                lambda module, args, beta: beta.mean(-1, keepdim=True).expand_as(
+                                    beta
+                                )
+                            )
+                            for operator in operators
                         ]
                     with torch.autocast(
                         device_type=device.type, dtype=torch.bfloat16, enabled=precision == "bf16"
@@ -31527,6 +43710,13 @@ def audit_stage_roles(
                 if name == "learned":
                     baseline, baseline_prediction = logits, prediction
                 difference = _difference(logits, baseline)
+                if name == "learned" or name.startswith("repeat_"):
+                    batch_repeats.append(
+                        {
+                            key: value.clone() if isinstance(value, Tensor) else value
+                            for key, value in difference.items()
+                        }
+                    )
                 previous = differences[name]
                 if previous is None:
                     differences[name] = difference
@@ -31549,6 +43739,21 @@ def audit_stage_roles(
                     )
                 else:
                     totals[name][3] += (prediction == target).sum()
+            batch_noise_rows.append({"batch": batch_number, "repeats": batch_repeats})
+            if head_gradient_conflict:
+                for operator, steps in zip(operators, deployed_steps, strict=True):
+                    operator.estimator.override = None
+                    _set_steps(operator.estimator, steps)
+                gradient_rows.extend(
+                    _task_head_gradients(
+                        model,
+                        graph,
+                        selected,
+                        baseline,
+                        batch_number=batch_number,
+                        precision=precision,
+                    )
+                )
         if not input_rows:
             raise ValueError("validation source produced no batches")
         if len(local_rows) != len(input_rows) * len(operators):
@@ -31577,15 +43782,58 @@ def audit_stage_roles(
         }
     for value in interventions.values():
         value["delta_from_learned"] = value["metric"] - interventions["learned"]["metric"]
+    repeats = [
+        interventions["learned"],
+        *[interventions.pop(f"repeat_{number}") for number in range(2, repeat_evaluations + 1)],
+    ]
+    noise_l2 = max(row["logit_difference"]["difference_l2"] for row in repeats)
+    noise_max = max(row["logit_max_abs"] for row in repeats)
+    noise_changed = max(row["prediction_changed_fraction"] for row in repeats)
+    roundoff_floor = (
+        32
+        * torch.finfo(torch.float32).eps
+        * interventions["learned"]["logit_difference"]["reference_l2"]
+    )
+    sensitivity_threshold = max(2 * noise_l2, roundoff_floor)
+    for name, value in interventions.items():
+        value["above_observed_repeat_noise"] = (
+            value["logit_difference"]["difference_l2"] > sensitivity_threshold
+            if name != "learned"
+            else False
+        )
+    fixed = all(operator.estimator.mode == "fixed_one" for operator in operators)
+    contribution = (
+        "not_applicable"
+        if fixed
+        else "observed_above_repeat_noise"
+        if interventions["c_one"]["above_observed_repeat_noise"]
+        else "inconclusive"
+    )
+    for row in batch_noise_rows:
+        row["repeats"] = [_finish_difference(value) for value in row["repeats"]]
+        maximum = max(value["difference_l2"] for value in row["repeats"])
+        floor = 32 * torch.finfo(torch.float32).eps * row["repeats"][0]["reference_l2"]
+        row["sensitivity_threshold_l2"] = max(2 * maximum, floor)
+    for row in gradient_rows:
+        if row["measured"]:
+            row["equal_c_forward_difference"] = _finish_difference(
+                row["equal_c_forward_difference"]
+            )
+            row["forward_equivalence_within_repeat_noise"] = (
+                row["equal_c_forward_difference"]["difference_l2"]
+                <= batch_noise_rows[row["batch"]]["sensitivity_threshold_l2"]
+            )
     for row in local_rows:
         for key in (
             "c_deployed_vs_reference",
             "operator_deployed_vs_reference",
             "operator_c_one_vs_deployed",
         ):
-            row[key] = _finish_difference(row[key])
+            row[key] = _finish_difference(row[key]) if row[key] is not None else None
         residual = row["reference_solver"].get("projected_gradient_rms_final")
         active = row["reference_solver"].get("active_nodes")
+        if residual is not None and active is not None:
+            active = active.reshape(*active.shape, *((1,) * (residual.ndim - active.ndim)))
         row["reference_residual_tolerance"] = reference_tolerance
         row["reference_tolerance_reached_by_graph"] = (
             None if residual is None else ((residual <= reference_tolerance) | (active == 0))
@@ -31594,26 +43842,81 @@ def audit_stage_roles(
     return _json(
         {
             "execution_status": "passed",
-            "contribution_status": "observed"
-            if interventions["c_one"]["logit_max_abs"] > 0
-            else "inconclusive",
+            "contribution_status": contribution,
             "contribution_interpretation": (
-                "observed means sensitivity to C=1, not beneficial C learning, convergence, "
-                "statistical significance or generalization proof"
+                "dynamic C sensitivity requires logit L2 above the numerical screen of "
+                "same-checkpoint eval differences; an empirical noise screen, not a "
+                "significance test, usefulness certificate or convergence proof. Fixed C "
+                "contribution is not_applicable even if numerical repeated outputs differ."
             ),
+            "repeat_noise_control": {
+                "evaluation_count": repeat_evaluations,
+                "different_training_seeds": False,
+                "scope": "same checkpoint, eval mode, same full validation inputs; no retraining",
+                "repeats": repeats,
+                "per_physical_validation_batch": batch_noise_rows,
+                "max_logit_difference_l2": noise_l2,
+                "max_logit_max_abs": noise_max,
+                "fp32_roundoff_guard_l2": roundoff_floor,
+                "sensitivity_threshold_l2": sensitivity_threshold,
+                "max_prediction_changed_fraction": noise_changed,
+                "validation_min": min(row["metric"] for row in repeats),
+                "validation_max": max(row["metric"] for row in repeats),
+                "screen": "L2 > max(2 * observed repeat max L2, 32 * fp32 eps * baseline L2); "
+                "conservative empirical guard, not a proven error bound",
+                "confidence_interval": None,
+            },
+            "head_gradient_conflict": {
+                "requested": head_gradient_conflict,
+                "measured": any(row["measured"] for row in gradient_rows),
+                "reason": (
+                    None
+                    if head_gradient_conflict
+                    else "not requested; enable --head-gradient-conflict for extra validation VJPs"
+                ),
+                "scope": "actual validation task-loss partial gradients in C space; "
+                "not theta-space",
+                "method": "one equal-valued independent E x H C leaf at one layer at a time",
+                "forward_equivalence_policy": "interpret only rows within observed repeat noise",
+                "parameter_grads_modified": False,
+                "optimizer_used": False,
+                "layers": gradient_rows,
+            },
             "scope": {
                 "split": "validation_only",
                 "test_used": False,
                 "split_provenance": "caller must verify complete official validation data",
                 "optimizer_used": False,
-                "backward_used": False,
+                "backward_used": any(row["measured"] for row in gradient_rows),
+                "autograd_vjp_used": any(row["measured"] for row in gradient_rows),
+                "parameter_backward_called": False,
                 "parameters_updated": False,
                 "training_recipe_changed": False,
                 "model_state_restored": True,
                 "full_validation_passes": len(variants),
+                "additional_gradient_validation_passes": (
+                    sum(operator.estimator.mode != "fixed_one" for operator in operators)
+                    if head_gradient_conflict
+                    else 0
+                ),
                 "metric": "accuracy" if indices is not None else "micro_f1",
+                "conductance_role": (
+                    "fixed_one_control"
+                    if fixed
+                    else "learned_C"
+                    if any(
+                        p.requires_grad
+                        for operator in operators
+                        for p in operator.estimator.parameters()
+                    )
+                    else "parameter_free_structural_C_control; sensitivity is not learned C benefit"
+                ),
             },
             "reference_contract": {
+                "applicable": iterative,
+                "not_applicable_reason": None
+                if iterative
+                else "fixed, analytic or MLP generator has no iterative C reference",
                 "deployed_steps_by_layer": deployed_steps,
                 "reference_steps": reference_steps,
                 "projected_gradient_rms_tolerance": reference_tolerance,
@@ -31775,7 +44078,6 @@ from .protocol import (
     add_sampling_context_arguments,
     beta_configuration,
     conductance_arguments_configuration,
-    conductance_configuration,
     learning_budget_arguments_configuration,
     sampling_context_configuration,
 )
@@ -32067,6 +44369,8 @@ def parameter_group(name: str) -> str:
     if ".operator.estimator." in name:
         return "conductance"
     if ".operator.beta_estimator." in name:
+        return "beta"
+    if ".operator.polynomial_delta" in name:
         return "beta"
     if ".operator.value_weight" in name or ".operator.output_projection." in name:
         return "spatial_w"
@@ -32524,7 +44828,10 @@ def _group_gradient_diagnostics(model) -> dict[str, Any]:
 
 
 def configure_phase(model, phase: str, phase_epoch: int) -> dict[str, Any]:
-    dynamic = model.conductance_mode == "dynamic"
+    dynamic = (
+        model.conductance_mode == "dynamic"
+        and getattr(model, "conductance_generator", "optimized") != "degree_only"
+    )
     if phase == "spatial_warmup":
         active, override, training_mode = {"backbone", "spatial_w", "beta"}, "ones", True
         coordinate = "spatial"
@@ -32632,6 +44939,11 @@ def validate_args(args: argparse.Namespace) -> None:
             "preserve the source run and use a separate explicitly configured run"
         )
     validate_transition_arguments(args)
+    if (
+        getattr(args, "conductance_generator", "optimized") != "optimized"
+        and args.training_schedule != "joint"
+    ):
+        raise ValueError("mechanism generator comparisons require joint training from epoch one")
     integers = (
         args.epochs,
         args.patience,
@@ -32695,6 +45007,7 @@ def validate_cached_graphs_once(payload: dict[str, Any]) -> None:
 
 def _prepare_data(payload, args, device):
     validate_cached_graphs_once(payload)
+    validate_relation_metadata(payload, getattr(args, "num_relations", 0))
     if args.sampling == "full" or args.dataset == "ppi":
         data, indices = _make_data(payload, args, device)
         return data, indices, None
@@ -32732,6 +45045,33 @@ def _prepare_data(payload, args, device):
         ),
     )
     return graph, indices, sampler
+
+
+def validate_relation_metadata(payload: dict[str, Any], num_relations: int) -> None:
+    """Validate real relation annotations without deriving types from labels/features."""
+    for graph in payload["graphs"]:
+        relation = graph.get("edge_relation_id")
+        if num_relations == 0:
+            if relation is not None:
+                raise ValueError(
+                    "typed graph requires explicit num_relations; "
+                    "relation metadata cannot be ignored"
+                )
+            continue
+        incidence = graph["incidence_edge_index"]
+        if (
+            not isinstance(relation, torch.Tensor)
+            or relation.dtype != torch.long
+            or relation.device.type != "cpu"
+            or relation.shape != (incidence.shape[1],)
+        ):
+            raise ValueError(
+                "num_relations requires one CPU int64 edge_relation_id per physical edge"
+            )
+        if relation.numel() and (int(relation.min()) < 0 or int(relation.max()) >= num_relations):
+            raise ValueError(
+                "physical-edge relation ID is outside the declared relation vocabulary"
+            )
 
 
 def _prefetched_samples(iterator, *, pin_memory: bool):
@@ -32824,6 +45164,22 @@ def shared_initial_state_sha256(model: torch.nn.Module) -> str:
         included += 1
     if included == 0:
         raise RuntimeError("V5 model has no shared state to fingerprint")
+    return digest.hexdigest()
+
+
+def common_backbone_initial_state_sha256(model: torch.nn.Module) -> str:
+    """Common C-independent state, excluding the explicit polynomial filter extension."""
+    digest = hashlib.sha256()
+    included = 0
+    for name, tensor in model.state_dict().items():
+        if ".operator.estimator." in name or ".operator.polynomial_delta" in name:
+            continue
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(tensor_hash(tensor).encode("ascii"))
+        included += 1
+    if included == 0:
+        raise RuntimeError("V5 model has no common backbone state to fingerprint")
     return digest.hexdigest()
 
 
@@ -33143,6 +45499,7 @@ def _train_model_impl(
     ).to(device)
     initial_state_sha256 = state_sha256(model)
     shared_state_sha256 = shared_initial_state_sha256(model)
+    common_backbone_state_sha256 = common_backbone_initial_state_sha256(model)
     optimizer = make_optimizer(model)
     validate_optimizer_parameter_ownership(model, optimizer)
     schedule = phase_schedule(planned_epochs, list(args.phase_fractions), args.training_schedule)
@@ -33181,14 +45538,7 @@ def _train_model_impl(
             "channels": args.hidden_channels,
             "attention_heads": args.heads,
             "ffn_multiplier": args.ffn_multiplier,
-            **conductance_configuration(
-                args.conductance_backend,
-                args.solver_steps,
-                args.solver_step_size,
-                args.solver_entropy,
-                args.solver_degree_barrier,
-                getattr(args, "solver_cost_scaling", "legacy_unit"),
-            ),
+            **conductance_arguments_configuration(args),
             **parameter_observability,
         },
         "data": data_observability,
@@ -33816,6 +46166,14 @@ def _train_model_impl(
         "resume_source_compatibility": resume_source_compatibility,
         "initial_state_sha256": initial_state_sha256,
         "shared_initial_state_sha256": shared_state_sha256,
+        "common_backbone_initial_state_sha256": (
+            common_backbone_state_sha256 if origin is None else None
+        ),
+        "common_backbone_initial_state_scope": (
+            "fresh paired initialization; excludes C estimator and polynomial extension"
+            if origin is None
+            else "not applicable to legacy checkpoint transition"
+        ),
         "history_sha256": sha256_file(history_path),
         "evaluation_split": "validation",
         "test_evaluated": False,
@@ -58026,7 +70384,7 @@ BASELINE_SOURCES = {
     ),
 }
 # Exact reviewed diagnostic/observability additions. No wildcard source bypass.
-AUDIT_SOURCE_OVERRIDES: dict[str, str] = {
+HISTORICAL_AUDIT_SOURCE_OVERRIDES: dict[str, str] = {
     "research/conductance_gat/v5/batch_calibration.py": (
         "df8e6a975e9a25cc2672ea64636afef43607a7da764ad73d44c5bdd75612d966"
     ),
@@ -58041,6 +70399,39 @@ AUDIT_SOURCE_OVERRIDES: dict[str, str] = {
     ),
     "research/conductance_gat/v5/train.py": (
         "a64e46d0c340a5f65920a0de4ca2cb8707bd3900410753e15da78e543f2e04a3"
+    ),
+}
+
+AUDIT_SOURCE_OVERRIDES: dict[str, str] = {
+    "research/conductance_gat/v5/batch_calibration.py": (
+        "df8e6a975e9a25cc2672ea64636afef43607a7da764ad73d44c5bdd75612d966"
+    ),
+    "research/conductance_gat/v5/diagnostics.py": (
+        "244e055adebbd275a91a851637256ae5c914d16c7c8416039e93d3dbe16a3717"
+    ),
+    "research/conductance_gat/v5/distribution_audit.py": (
+        "fca7154257ec9b6f3d280133f1088c643f5c5f17e086f04add5047bef936bfb6"
+    ),
+    "research/conductance_gat/v5/model.py": (
+        "3b71244fe72deee3051ea401e5ff72ef2d64720969d2fee8a7d4922d07441d91"
+    ),
+    "research/conductance_gat/v5/operator.py": (
+        "c9525a674d32466b4d1df9b4a985f17931b360d3d481b1fc652b7e7a3bc93905"
+    ),
+    "research/conductance_gat/v5/optimization.py": (
+        "4e7d8f49a3429993516925d8d896be48cce17372ecdfbd0914137004fe799b20"
+    ),
+    "research/conductance_gat/v5/protocol.py": (
+        "43688aa46fb1863209761ad8b7505ad028bf3f83df0ac2f60fa48ad950351b69"
+    ),
+    "research/conductance_gat/v5/sampling.py": (
+        "eea9d3a1be9507e0992971539cf266eec1762d96c02e179ae397a137633b5cc5"
+    ),
+    "research/conductance_gat/v5/stage_audit.py": (
+        "9d01e0cff43edee06a9884f50981cb1a2b10dd896406b10ab841d7fa1943507e"
+    ),
+    "research/conductance_gat/v5/train.py": (
+        "53818533dc551f118e65bcca28fb3a25856fc55b23167a66f38303423e8f4905"
     ),
 }
 
@@ -58060,6 +70451,13 @@ def _positive_integer(text: str) -> int:
     value = int(text)
     if value < 1:
         raise argparse.ArgumentTypeError("must be positive")
+    return value
+
+
+def _repeat_integer(text: str) -> int:
+    value = _positive_integer(text)
+    if value < 5:
+        raise argparse.ArgumentTypeError("at least 5 same-checkpoint evaluations are required")
     return value
 
 
@@ -58083,6 +70481,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit convergence residual tolerance for the reference",
     )
     parser.add_argument("--json", action="store_true", help="One full JSON report to stdout")
+    parser.add_argument(
+        "--head-gradient-conflict",
+        action="store_true",
+        help="Extra validation task-loss VJP per layer; C-space, not theta-gradient conflict",
+    )
+    parser.add_argument(
+        "--repeat-evaluations",
+        type=_repeat_integer,
+        default=5,
+        help="Same-checkpoint eval noise control (minimum 5); NOT training seeds",
+    )
     return parser
 
 
@@ -58155,7 +70564,8 @@ def verify_sources(previous: Any, current: dict[str, str]) -> dict[str, Any]:
             key for key in set(current) | set(target) if current.get(key) != target.get(key)
         )
         raise AuditError(f"Live audit sources are not the exact reviewed release: {changed}")
-    if previous == target:
+    historical_audit = {**BASELINE_SOURCES, **HISTORICAL_AUDIT_SOURCE_OVERRIDES}
+    if previous == target or previous == historical_audit:
         transition = None
     else:
         transition = require_source_compatibility(previous, BASELINE_SOURCES)
@@ -58197,16 +70607,38 @@ def inspect_evidence(path: Path) -> dict[str, Any]:
     if metrics.get("source_sha256") != identity.get("source_sha256"):
         raise AuditError("metrics and identity source fingerprints disagree")
     config = metrics.get("configuration")
+    backend = config.get("conductance_backend") if isinstance(config, dict) else None
     required = {
-        "conductance_backend": "optimization",
         "training_schedule": "joint",
-        "solver_cost_scaling": "width_scaled",
         "beta_parameterization": "sigmoid",
-        "beta_initial": 0.5,
     }
-    if not isinstance(config, dict) or any(config.get(k) != v for k, v in required.items()):
+    current_release = metrics.get("source_sha256") == {**BASELINE_SOURCES, **AUDIT_SOURCE_OVERRIDES}
+    beta_initial = config.get("beta_initial") if isinstance(config, dict) else None
+    beta_valid = (
+        _number(beta_initial) and 0 < beta_initial < 1 if current_release else beta_initial == 0.5
+    )
+    cost_scaling = (
+        config.get("solver_cost_scaling", "legacy_unit") if isinstance(config, dict) else None
+    )
+    if (
+        not isinstance(config, dict)
+        or any(config.get(k) != v for k, v in required.items())
+        or not beta_valid
+        or backend not in {"optimization", "mlp"}
+        or cost_scaling != ("width_scaled" if backend == "optimization" else "legacy_unit")
+        or (
+            backend == "mlp"
+            and (
+                config.get("conductance_heads", "shared") != "shared"
+                or config.get("conductance_generator", "optimized") != "optimized"
+                or config.get("num_relations", 0) != 0
+            )
+        )
+    ):
         raise AuditError(
-            "This audit requires the explicitly corrected optimization/joint/width_scaled V5 recipe"
+            "This audit requires the explicitly corrected "
+            "optimization/joint/width_scaled V5 recipe "
+            "or the explicit shared untyped MLP/joint/legacy_unit control"
         )
     for name in (
         "hidden_channels",
@@ -58537,6 +70969,8 @@ def audit_condition(evidence: dict, args, device) -> dict:
             precision=config["precision"],
             reference_steps=args.reference_steps,
             reference_tolerance=args.reference_tolerance,
+            head_gradient_conflict=args.head_gradient_conflict,
+            repeat_evaluations=args.repeat_evaluations,
         )
         return {
             "dataset": metrics["dataset"],
@@ -58681,6 +71115,15 @@ def human_condition(row: dict) -> str:
         f"  execution={audit['execution_status']}; contribution={audit['contribution_status']} "
         "(not a usefulness certificate)",
     ]
+    noise = audit.get("repeat_noise_control", {})
+    if noise:
+        lines.append(
+            f"  same-checkpoint eval repeats={noise.get('evaluation_count')} (NOT training seeds); "
+            f"validation range={_score(noise.get('validation_min'))}.."
+            f"{_score(noise.get('validation_max'))}; "
+            f"noise max L2={noise.get('max_logit_difference_l2')}; "
+            f"max prediction change={_score(noise.get('max_prediction_changed_fraction'))}"
+        )
     for name, observation in audit["interventions"].items():
         delta = observation.get("delta_from_learned")
         lines.append(
@@ -58692,6 +71135,8 @@ def human_condition(row: dict) -> str:
             f"    logit relative-L2={observation.get('logit_relative_l2')}; "
             f"max-abs={observation.get('logit_max_abs')}; "
             f"prediction changed={_score(observation.get('prediction_changed_fraction'))}"
+            "; above observed repeat noise="
+            f"{observation.get('above_observed_repeat_noise', 'unavailable')}"
         )
     lines.append(
         "  reference contract: " + json.dumps(audit.get("reference_contract"), ensure_ascii=False)
@@ -58704,7 +71149,7 @@ def human_condition(row: dict) -> str:
                 f"{layer['beta_mean']}/{layer['beta_min']}/{layer['beta_max']}"
             )
     for local in audit.get("local_layer_comparisons", []):
-        reference = local["operator_deployed_vs_reference"]
+        reference = local["operator_deployed_vs_reference"] or {}
         one = local.get("operator_c_one_vs_deployed")
         one_difference = one.get("relative_l2") if isinstance(one, dict) else None
         lines.append(
@@ -58717,10 +71162,17 @@ def human_condition(row: dict) -> str:
         reference_residual = local.get("reference_solver", {}).get("projected_gradient_rms_final")
         lines.append(
             f"    frozen H/B/W/beta: C relative-L2="
-            f"{local.get('c_deployed_vs_reference', {}).get('relative_l2')}; "
+            f"{(local.get('c_deployed_vs_reference') or {}).get('relative_l2')}; "
             f"residual deployed/reference={baseline_residual}/{reference_residual}; "
             f"tolerance={local.get('reference_residual_tolerance')}; exact optimum=False"
         )
+        distribution = local.get("distribution")
+        if distribution:
+            lines.extend(human_distribution(distribution))
+    gradient = audit.get("head_gradient_conflict", {})
+    lines.append(
+        "  head C-space task-gradient diagnostic: " + json.dumps(gradient, ensure_ascii=False)
+    )
     samples = sampling_summary(historical)
     lines.append("  historical sampling: " + json.dumps(samples, ensure_ascii=False))
     resource = row["resources"]
@@ -58730,6 +71182,56 @@ def human_condition(row: dict) -> str:
     )
     lines.extend(human_resources(resource))
     return "\n".join(lines)
+
+
+def human_distribution(distribution: dict) -> list[str]:
+    lines = [
+        f"    actual normalization={distribution['propagation_normalization']}; "
+        f"C layout={distribution['conductance_layout']}; {distribution['coefficient_scope']}",
+        "    raw C is not probability; CV=std/mean; beta is separate graph/head mixing.",
+        "    weighted-C alpha=a/d; kernel-row-relative=P/row_sum(P) is diagnostic only.",
+    ]
+    for graph in distribution["graphs"]:
+        raw = graph["raw_c"]
+        lines.append(
+            f"    graph={graph['graph_in_batch']}; nodes/physical_edges="
+            f"{graph['nodes']}/{graph['physical_edges']}; isolates={graph['isolates']}; "
+            f"degree1={graph['degree_one_nodes']}; heads={graph['heads']}"
+        )
+        lines.append(
+            f"      raw C mean={raw.get('mean')}; CV={raw.get('cv')}; "
+            f"beta={graph['beta_by_head']}; raw C quantiles={raw.get('quantiles')}"
+        )
+        lines.append(
+            f"      raw C fractions={raw.get('fractions')}; histogram={raw.get('histogram')}"
+        )
+        lines.append(
+            f"      actual one-hop P mean={graph['actual_one_hop_coefficient'].get('mean')}; "
+            f"P row-sum mean={graph['actual_one_hop_row_sum'].get('mean')}; "
+            f"C=1 same-correction row-sum={graph['c_one_same_correction_row_sum'].get('mean')}"
+        )
+        for name, family in graph["probabilities"].items():
+            for label, scope in family["node_scopes"].items():
+                if not scope["nodes"]:
+                    continue
+                reference = scope["c_one_same_correction"]
+                lines.append(
+                    f"      {name}/{label}: n={scope['nodes']}; "
+                    f"top1={scope['top1'].get('mean')}; "
+                    f"normalized entropy={scope['normalized_entropy'].get('mean')}; "
+                    f"effective neighbors={scope['effective_neighbors'].get('mean')}; "
+                    f"C=1 top1/entropy/effective={reference['top1'].get('mean')}/"
+                    f"{reference['normalized_entropy'].get('mean')}/"
+                    f"{reference['effective_neighbors'].get('mean')}; "
+                    f"C=1 TV={scope['c_one_total_variation'].get('mean')}"
+                )
+            diversity = family["head_diversity_nonisolates"]
+            lines.append(
+                f"      {name} head pairs={family['head_pairs']}; "
+                f"normalized head TV means={diversity.get('total_variation', {}).get('mean')}; "
+                f"JS means={diversity.get('jensen_shannon_nats', {}).get('mean')}"
+            )
+    return lines
 
 
 def aggregate_verification(rows: list[dict]) -> dict:
@@ -76717,6 +89219,1624 @@ if __name__ == "__main__":
     raise SystemExit(main())
 ````
 
+# scripts/run_v5_edge_selection.py
+
+````python
+#!/usr/bin/env python3
+"""Independent full-size forest/chord and corrupted-edge selection experiments.
+
+Structure budgets are explicit scientific interventions, never an OOM fallback.
+All arms share a measured physical batch/worker plan; previous V5 runs are untouched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import json
+import math
+import platform
+import shlex
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_bytes, atomic_write_json  # noqa: E402
+from research.conductance_gat.edge_selection import calibration, reallocation  # noqa: E402
+from research.conductance_gat.edge_selection.audit_compat import (  # noqa: E402
+    require_source_compatibility,
+)
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    DATASETS,
+    HARDWARE_PROFILES,
+    SAMPLING_CHOICES,
+    add_sampling_context_arguments,
+    sampling_context_configuration,
+)
+from scripts import calibrate_training_resources as hardware_tools  # noqa: E402
+from scripts import run_conductance_v5 as standalone  # noqa: E402
+from scripts import run_v5_mechanism_experiments as common  # noqa: E402
+from scripts import training_resource_plan as resources  # noqa: E402
+from scripts.calibration_lock import calibration_lock  # noqa: E402
+
+SUITE = "conductance_v5_edge_selection_experiments_v1"
+TRAIN_MODULE = "research.conductance_gat.edge_selection.train"
+
+
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--run-id", required=True)
+    result.add_argument(
+        "--suites",
+        nargs="+",
+        choices=("structure", "corruption"),
+        default=["structure", "corruption"],
+    )
+    result.add_argument("--chord-fractions", nargs="+", type=float, default=[0.25, 0.5, 0.75])
+    result.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    result.add_argument(
+        "--profiles", nargs="+", choices=("reference", "large"), default=["reference", "large"]
+    )
+    result.add_argument("--model-seeds", nargs="+", type=int, default=[0])
+    result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    result.add_argument("--results-root", type=Path, default=ROOT / "results")
+    result.add_argument("--device", default="cuda:0")
+    result.add_argument(
+        "--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="a6000-48gb"
+    )
+    result.add_argument("--epochs", type=int, default=200)
+    result.add_argument("--patience", type=int, default=50)
+    result.add_argument("--workers", type=int, default=4)
+    result.add_argument("--ppi-batch-size", type=int)
+    result.add_argument("--sample-seed-batch-size", type=int)
+    result.add_argument("--edge-chunk-size", type=int)
+    result.add_argument(
+        "--activation-checkpoint", action=argparse.BooleanOptionalAction, default=True
+    )
+    result.add_argument("--sampling", choices=SAMPLING_CHOICES, default="auto")
+    result.add_argument("--num-neighbors", nargs="+", type=int, default=[15, 10])
+    add_sampling_context_arguments(result)
+    result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument("--forest-seed", type=int, default=0)
+    result.add_argument("--corruption-ratio", type=float, default=0.1)
+    result.add_argument("--corruption-seed", type=int, default=0)
+    result.add_argument("--negative-loss-weight", type=float, default=1.0)
+    result.add_argument("--l0-weight", type=float, default=1e-4)
+    result.add_argument("--gate-temperature", type=float, default=2 / 3)
+    result.add_argument("--repeat-evaluations", type=int, default=5)
+    result.add_argument("--dry-run", action="store_true")
+    result.add_argument("--calibration-only", action="store_true")
+    return result
+
+
+def validate_args(args):
+    if not standalone.RUN_ID_PATTERN.fullmatch(args.run_id):
+        raise ValueError("run-id must be a safe 1-120 character experiment identifier")
+    for name in ("suites", "datasets", "profiles", "model_seeds", "chord_fractions"):
+        values = getattr(args, name)
+        if not values or len(values) != len(set(values)):
+            raise ValueError(f"{name} must be nonempty and unique")
+    if any(not math.isfinite(value) or not 0 <= value <= 1 for value in args.chord_fractions):
+        raise ValueError("chord fractions are explicit budgets in [0, 1]")
+    if any(value < 0 for value in [*args.model_seeds, args.forest_seed, args.corruption_seed]):
+        raise ValueError("all seeds must be nonnegative")
+    if args.epochs < 4 or args.patience < 1 or args.workers < 0 or args.repeat_evaluations < 5:
+        raise ValueError("invalid full training/worker/audit budget")
+    if not str(args.device).startswith("cuda"):
+        raise ValueError("edge-selection experiments require CUDA; no CPU fallback")
+    if not math.isfinite(args.corruption_ratio) or not 0 < args.corruption_ratio <= 1:
+        raise ValueError("corruption experiment ratio must be explicit in (0, 1]")
+    for name in ("negative_loss_weight", "gate_temperature"):
+        if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
+            raise ValueError(f"{name} must be finite and positive")
+    if not math.isfinite(args.l0_weight) or args.l0_weight < 0:
+        raise ValueError("l0-weight must be finite and nonnegative")
+    sampling_context_configuration(args)
+
+
+def variants(args):
+    selected = []
+
+    def add(identifier, suite, mode, fraction, *, corruption=0.0, negative=0.0, l0=0.0):
+        selected.append(
+            {
+                "variant_id": identifier,
+                "suite": suite,
+                "declared_chord_budget": fraction,
+                "configuration": {
+                    "selection_mode": mode,
+                    "chord_fraction": fraction
+                    if mode in {"forest_random", "forest_learned", "forest_cycle"}
+                    else None,
+                    "forest_seed": 0 if mode == "hard_concrete" else args.forest_seed,
+                    "corruption_ratio": corruption,
+                    "corruption_seed": args.corruption_seed if mode == "hard_concrete" else 0,
+                    "negative_loss_weight": negative,
+                    "l0_weight": l0,
+                    "gate_temperature": args.gate_temperature if mode == "hard_concrete" else 2 / 3,
+                },
+            }
+        )
+
+    for suite in args.suites:
+        if suite == "structure":
+            add("structure-full", suite, "full", 1.0)
+            add("structure-forest-only", suite, "forest_only", 0.0)
+            for fraction in args.chord_fractions:
+                if fraction in {0.0, 1.0}:
+                    continue  # Endpoints are the identical full/forest-only controls above.
+                for mode in ("forest_random", "forest_learned", "forest_cycle"):
+                    add(f"structure-{mode.replace('_', '-')}-q{fraction!s}", suite, mode, fraction)
+        else:
+            add(
+                "corruption-task-only",
+                suite,
+                "hard_concrete",
+                1.0,
+                corruption=args.corruption_ratio,
+                l0=args.l0_weight,
+            )
+            add(
+                "corruption-negative-aux",
+                suite,
+                "hard_concrete",
+                1.0,
+                corruption=args.corruption_ratio,
+                negative=args.negative_loss_weight,
+                l0=args.l0_weight,
+            )
+    return selected
+
+
+def make_jobs(args, run_dir):
+    result = []
+    for profile in args.profiles:
+        for seed in args.model_seeds:
+            for variant in variants(args):
+                options = [
+                    "--profile",
+                    profile,
+                    "--datasets",
+                    *args.datasets,
+                    "--model-seed",
+                    str(seed),
+                    "--conductance-heads",
+                    "per_head",
+                    "--propagation-normalization",
+                    "row",
+                    "--conductance-backend",
+                    "optimization",
+                    "--solver-cost-scaling",
+                    "width_scaled",
+                    "--training-schedule",
+                    "joint",
+                    "--beta-initial",
+                    "0.5",
+                    "--learning-budget-policy",
+                    "reference_updates",
+                ]
+                for name in (
+                    "data_root",
+                    "results_root",
+                    "device",
+                    "hardware_profile",
+                    "epochs",
+                    "patience",
+                    "workers",
+                    "ppi_batch_size",
+                    "sample_seed_batch_size",
+                    "edge_chunk_size",
+                    "sampling",
+                    "sample_context_seed_batch_size",
+                    "sample_context_workers",
+                    "min_free_gb",
+                ):
+                    value = getattr(args, name)
+                    if value is not None:
+                        options += ["--" + name.replace("_", "-"), str(value)]
+                options += ["--num-neighbors", *(str(value) for value in args.num_neighbors)]
+                options.append(
+                    "--activation-checkpoint"
+                    if args.activation_checkpoint
+                    else "--no-activation-checkpoint"
+                )
+                baseline = standalone.parser().parse_args(options)
+                standalone._validate(baseline)
+                namespace = (
+                    run_dir / "variants" / variant["variant_id"] / profile / f"model-seed-{seed}"
+                )
+                for job in standalone.make_jobs(
+                    baseline, namespace, standalone._architecture(baseline)
+                ):
+                    if job["condition"] != "shared_dynamic_c":
+                        continue
+                    command = job["command"]
+                    command[command.index("-m") + 1] = TRAIN_MODULE
+                    for name, value in variant["configuration"].items():
+                        if value is not None:
+                            command += ["--" + name.replace("_", "-"), str(value)]
+                    job.update(
+                        variant=copy.deepcopy(variant),
+                        variant_id=variant["variant_id"],
+                        track="conductance",
+                        profile=profile,
+                        model_seed=seed,
+                        job_id=f"{profile}/{job['dataset']}/model-seed-{seed}/{variant['variant_id']}",
+                    )
+                    result.append(job)
+    return result
+
+
+def _config(args):
+    return {
+        name: str(value.expanduser().resolve()) if isinstance(value, Path) else value
+        for name, value in vars(args).items()
+        if name not in {"dry_run", "calibration_only", "run_id", "repeat_evaluations"}
+    }
+
+
+def _resume(path, args, planned, sources, dependencies):
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    required = {
+        "schema_version": 1,
+        "suite": SUITE,
+        "run_id": args.run_id,
+        "config": _config(args),
+        "dependencies": dependencies,
+    }
+    if any(manifest.get(key) != value for key, value in required.items()):
+        raise ValueError(
+            "edge-selection run identity changed; use a new run ID; no old results overwritten"
+        )
+    if [common._job_identity(job) for job in manifest.get("planned_jobs", [])] != [
+        common._job_identity(job) for job in planned
+    ]:
+        raise ValueError("edge-selection arm matrix differs; no silent resume")
+    transition = require_source_compatibility(
+        manifest.get("source_sha256"), sources, scope="manifest"
+    )
+    if transition is not None:
+        transitions = manifest.setdefault("source_transitions", [])
+        if transition not in transitions:
+            transitions.append(transition)
+    return manifest
+
+
+def _ensure_calibration(args, manifest, persist):
+    import torch
+
+    hardware = hardware_tools._hardware(args.device)
+    runtime = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+    }
+    pending_groups = {
+        (job["profile"], job["dataset"])
+        for job in manifest["jobs"]
+        if job.get("status") != "passed"
+        or job.get("audit", {}).get("status") != "passed"
+        or job.get("audit", {}).get("command") != _audit_command(args, job)
+    }
+    revalidate = "hardware" in manifest and reallocation.needs_revalidation(
+        manifest, hardware, runtime, pending_groups
+    )
+    if args.hardware_profile == "a6000-48gb" and (
+        hardware["total_memory_bytes"] < 40 * 1024**3 or hardware["compute_capability"][0] < 8
+    ):
+        raise ValueError("A6000 profile requires >=40 GiB visible VRAM and capability >=8")
+    free, _ = torch.cuda.mem_get_info(torch.device(args.device))
+    required = max(
+        args.min_free_gb, 32.0 if args.hardware_profile == "a6000-48gb" else args.min_free_gb
+    )
+    if free < required * 1024**3:
+        raise RuntimeError(f"calibration requires {required:g} GiB free; no processes were changed")
+    if "hardware" not in manifest:
+        manifest.update(hardware=hardware, runtime=runtime)
+    entries = manifest["calibration_entries"]
+    for (profile, dataset), jobs in common._grouped(manifest["planned_jobs"]).items():
+        entry = next(
+            (item for item in entries if (item["profile"], item["dataset"]) == (profile, dataset)),
+            None,
+        )
+        if entry is None:
+            entry = {"profile": profile, "dataset": dataset}
+            entries.append(entry)
+        if revalidate:
+            calibration.validate_entry(entry, jobs)
+        else:
+            calibration.calibrate_group(jobs, entry, persist)
+    resolved = common._apply_common_resources(manifest["planned_jobs"], entries)
+    if manifest.get("resources_applied"):
+        if [common._job_identity(job) for job in manifest["jobs"]] != [
+            common._job_identity(job) for job in resolved
+        ]:
+            raise ValueError("saved child resources differ from the immutable common measurement")
+    else:
+        manifest.update(jobs=resolved, resources_applied=True)
+    if revalidate:
+        reallocation.revalidate_allocation(
+            manifest,
+            hardware,
+            runtime,
+            {
+                key: jobs
+                for key, jobs in common._grouped(manifest["planned_jobs"]).items()
+                if key in pending_groups
+            },
+            persist,
+        )
+    manifest["calibration_status"] = "passed"
+    persist()
+
+
+def _read_result(job):
+    from research.conductance_gat.edge_selection import train
+    from research.conductance_gat.v5.train import _canonical_sha256
+
+    path = Path(job["metrics_path"])
+    if path.is_symlink():
+        raise ValueError("edge-selection metrics cannot be an indirect path")
+    payload = train.inspect_completed(Path(job["output_dir"]))
+    child = calibration.parse_job(job)
+    config = train.configuration(child)
+    if payload.get("status") != "passed" or payload.get("configuration") != config:
+        raise ValueError("completed edge-selection result differs from the exact measured recipe")
+    identity = payload.get("resume_identity")
+    if not isinstance(identity, dict) or _canonical_sha256(identity) != payload.get(
+        "resume_identity_sha256"
+    ):
+        raise ValueError("completed edge-selection resume identity hash mismatch")
+    for key in ("research_suite", "dataset", "condition", "configuration", "source_sha256"):
+        if payload.get(key) != identity.get(key):
+            raise ValueError(f"edge-selection result and identity disagree on {key}")
+    if payload.get("research_suite") != train.SUITE or payload.get("dataset") != job["dataset"]:
+        raise ValueError("foreign experiment result cannot be imported")
+    require_source_compatibility(
+        payload.get("source_sha256"), train.implementation_source_hashes(), scope="training"
+    )
+    protocol = payload.get("protocol")
+    if (
+        not isinstance(protocol, dict)
+        or identity.get("dataset_protocol") != protocol
+        or identity.get("dataset_protocol_sha256") != _canonical_sha256(protocol)
+    ):
+        raise ValueError("edge-selection data/split protocol identity mismatch")
+    if payload.get("test_evaluated") is not False:
+        raise ValueError("training comparisons must be validation-only")
+    output = Path(job["output_dir"])
+    hashes = {}
+    for filename, key in (
+        ("best.pt", "checkpoint_sha256"),
+        ("last.pt", "last_checkpoint_sha256"),
+        ("history.json", "history_sha256"),
+    ):
+        actual = common._file_sha(output / filename)
+        if actual != payload.get(key):
+            raise ValueError(f"edge-selection artifact changed: {filename}")
+        hashes[key] = actual
+    history = json.loads((output / "history.json").read_text(encoding="utf-8"))
+    if (
+        not isinstance(history, list)
+        or not history
+        or payload.get("epochs_run") != len(history)
+        or [row.get("epoch") for row in history] != list(range(1, len(history) + 1))
+    ):
+        raise ValueError("edge-selection completed epoch history is incomplete")
+    best, value = (
+        payload.get("best_epoch"),
+        payload.get("best_validation", payload.get("validation")),
+    )
+    if (
+        type(best) is not int
+        or not 1 <= best <= len(history)
+        or isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise ValueError("edge-selection selected validation checkpoint is invalid")
+    if history[best - 1].get("validation") != value:
+        raise ValueError("edge-selection selected score differs from retained epoch history")
+    initial = payload.get("shared_initial_state_sha256")
+    if not resources._is_sha256(initial):
+        raise ValueError("edge-selection lacks shared initialization provenance")
+    if payload.get("optimizer_steps") != history[-1].get("optimizer_steps"):
+        raise ValueError("edge-selection final optimizer-step evidence is inconsistent")
+    return {
+        "validation": value,
+        "best_epoch": best,
+        "epochs_run": len(history),
+        "shared_initial_state_sha256": initial,
+        "data_sha256": protocol.get("data_sha256"),
+        "split_sha256": protocol.get("split_sha256"),
+        "learning_budget": payload.get("learning_budget"),
+        **hashes,
+    }
+
+
+def _compare(jobs):
+    for group in common._grouped(jobs).values():
+        for seed in {job["model_seed"] for job in group}:
+            completed = [
+                job["result"]
+                for job in group
+                if job["model_seed"] == seed and job["status"] == "passed"
+            ]
+            for key in (
+                "shared_initial_state_sha256",
+                "data_sha256",
+                "split_sha256",
+                "learning_budget",
+            ):
+                values = [result.get(key) for result in completed]
+                if any(value is None for value in values) or any(
+                    value != values[0] for value in values
+                ):
+                    raise ValueError(f"edge-selection arms do not share verified {key}")
+
+
+def _audit_command(args, job):
+    return [
+        sys.executable,
+        "-B",
+        "-m",
+        "research.conductance_gat.edge_selection.audit",
+        "--root",
+        job["output_dir"],
+        "--data-root",
+        str(args.data_root.expanduser().resolve()),
+        "--device",
+        args.device,
+        "--repeat-evaluations",
+        str(args.repeat_evaluations),
+    ]
+
+
+def _audit(args, job, environment, persist):
+    from research.conductance_gat.edge_selection import train
+
+    command = _audit_command(args, job)
+    prior = job.get("audit", {})
+    checkpoint = job["result"]["checkpoint_sha256"]
+    if prior.get("status") == "passed" and prior.get("command") == command:
+        if prior.get("checkpoint_sha256") != checkpoint or common._file_sha(
+            Path(prior["log_path"])
+        ) != prior.get("log_sha256"):
+            raise ValueError("completed edge-selection audit evidence changed")
+        return
+    if prior:
+        job.setdefault("audit_attempts", []).append(copy.deepcopy(prior))
+    log = standalone._next_log(Path(job["log_path"]).with_suffix(".audit.log"))
+    state = {
+        "status": "running",
+        "command": command,
+        "log_path": str(log),
+        "checkpoint_sha256": checkpoint,
+        "evaluator_source_sha256": train.implementation_source_hashes(),
+    }
+    job["audit"] = state
+    persist()
+    try:
+        status = standalone.shared.run_logged(command, log, environment)
+        state["exit_code"] = status
+        if status:
+            raise RuntimeError(
+                f"edge-selection audit failed ({status}); completed training retained"
+            )
+        if state["evaluator_source_sha256"] != train.implementation_source_hashes():
+            raise ValueError("edge-selection evaluator source changed during audit")
+        state.update(status="passed", log_sha256=common._file_sha(log))
+        persist()
+    except (Exception, KeyboardInterrupt) as error:
+        state.update(status="failed", error=f"{type(error).__name__}: {error}")
+        if log.is_file() and not log.is_symlink():
+            state["log_sha256"] = common._file_sha(log)
+        standalone.shared.run_failure_reporter(
+            persist, original_error=error, action="independent edge audit"
+        )
+        raise
+
+
+def _summary(run_dir, manifest):
+    lines = [
+        "# Edge-selection experiment progress",
+        "",
+        "Validation only; no SOTA or multi-seed claim.",
+        "",
+        "Structure chord budgets and corruption auxiliary controls are separate scientific axes.",
+        "",
+        "| Profile | Dataset | Seed | Arm | Training | Audit | Validation | Epoch |",
+        "| --- | --- | ---: | --- | --- | --- | ---: | ---: |",
+    ]
+    for job in manifest["jobs"]:
+        result, audit = job.get("result", {}), job.get("audit", {})
+        label = audit.get("status", "pending")
+        if audit.get("log_path"):
+            label = f"[{label}](<{Path(audit['log_path']).relative_to(run_dir).as_posix()}>)"
+        score = f"{result['validation']:.6f}" if "validation" in result else "pending"
+        lines.append(
+            f"| {job['profile']} | {job['dataset']} | {job['model_seed']} | "
+            f"{job['variant_id']} | {job['status']} | {label} | {score} | "
+            f"{result.get('best_epoch', '')} |"
+        )
+    atomic_write_bytes(run_dir / "comparison.md", ("\n".join(lines) + "\n").encode())
+
+
+def _run(args, run_dir, planned, sources, dependencies):
+    path = run_dir / "manifest.json"
+    if path.exists():
+        manifest = _resume(path, args, planned, sources, dependencies)
+    else:
+        if any(item.name != ".calibration.lock" for item in run_dir.iterdir()):
+            raise ValueError("new edge-selection directory has untracked contents; preserved")
+        manifest = {
+            "schema_version": 1,
+            "suite": SUITE,
+            "run_id": args.run_id,
+            "status": "calibrating",
+            "config": _config(args),
+            "source_sha256": sources,
+            "dependencies": dependencies,
+            "planned_jobs": planned,
+            "jobs": copy.deepcopy(planned),
+            "calibration_entries": [],
+            "test_evaluated": False,
+            "legacy_results_imported": False,
+            "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+        }
+
+    def persist():
+        atomic_write_json(path, manifest)
+
+    current = None
+    try:
+        _ensure_calibration(args, manifest, persist)
+        if resources.source_snapshot() != sources:
+            raise ValueError("edge-selection implementation changed during calibration")
+        if args.calibration_only:
+            manifest["status"] = "calibrated"
+            persist()
+            _summary(run_dir, manifest)
+            return 0
+        environment = standalone.shared._environment()
+        environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+        manifest["status"] = "running"
+        for index, job in enumerate(manifest["jobs"], 1):
+            if resources.source_snapshot() != sources:
+                raise ValueError("edge-selection implementation changed during the run")
+            if job["status"] == "passed":
+                if _read_result(job) != job.get("result"):
+                    raise ValueError("completed edge-selection result changed")
+                print(f"[{index}/{len(planned)}] verified, skipping {job['job_id']}", flush=True)
+                _audit(args, job, environment, persist)
+                continue
+            current = job
+            command = list(job["command"])
+            checkpoint = Path(job["output_dir"]) / "last.pt"
+            if checkpoint.is_file() and not checkpoint.is_symlink():
+                command.append("--resume")
+            else:
+                standalone._preserve_incomplete_child(job, run_dir)
+            job.update(status="running", attempt_command=command)
+            persist()
+            print(f"[{index}/{len(planned)}] {job['job_id']}", flush=True)
+            started = time.monotonic()
+            status = standalone.shared.run_logged(
+                command, standalone._next_log(Path(job["log_path"])), environment
+            )
+            job.update(exit_code=status, elapsed_seconds=time.monotonic() - started)
+            if status:
+                raise RuntimeError(f"{job['job_id']} failed with child status {status}")
+            job.update(result=_read_result(job), status="passed")
+            _compare(manifest["jobs"])
+            current = None
+            persist()
+            _audit(args, job, environment, persist)
+            _summary(run_dir, manifest)
+        _compare(manifest["jobs"])
+        if resources.source_snapshot() != sources:
+            raise ValueError("edge-selection implementation changed during the final audit")
+        manifest.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+        manifest.pop("error", None)
+        persist()
+        _summary(run_dir, manifest)
+        print(f"Edge-selection comparisons passed: {run_dir / 'comparison.md'}", flush=True)
+        return 0
+    except (Exception, KeyboardInterrupt) as error:
+        manifest.update(
+            status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+            error=f"{type(error).__name__}: {error}",
+        )
+        if current is not None:
+            current.update(status="failed", error=manifest["error"])
+        standalone.shared.run_failure_reporter(
+            persist, original_error=error, action="edge manifest"
+        )
+        standalone.shared.run_failure_reporter(
+            lambda: _summary(run_dir, manifest), original_error=error, action="edge summary"
+        )
+        print(
+            f"Edge-selection stopped safely: {manifest['error']}\nPreserved: {run_dir}",
+            file=sys.stderr,
+        )
+        return 130 if isinstance(error, KeyboardInterrupt) else 1
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    try:
+        validate_args(args)
+        data = args.data_root.expanduser().resolve()
+        run_dir = (
+            args.results_root.expanduser().resolve()
+            / "conductance_gat/edge_selection"
+            / args.run_id
+        )
+        if (
+            run_dir.resolve() != run_dir
+            or run_dir.is_relative_to(data)
+            or data.is_relative_to(run_dir)
+        ):
+            raise ValueError(
+                "edge-selection outputs must be direct paths outside the dataset cache"
+            )
+        planned = make_jobs(args, run_dir)
+        if args.dry_run:
+            print(
+                f"{len(variants(args))} independent arms; {len(planned)} full-size trainings; "
+                f"profiles={args.profiles}; datasets={args.datasets}; seeds={args.model_seeds}"
+            )
+            print(
+                f"Explicit chord fractions={args.chord_fractions}; "
+                f"corruption ratio={args.corruption_ratio}; "
+                "per-head C + row propagation in every arm."
+            )
+            print(
+                "Common measured train+optimizer+validation+preparation calibration "
+                "precedes training; old V5 runs are untouched."
+            )
+            for job in planned:
+                print(f"{job['job_id']}: {shlex.join(job['command'])}")
+            print("Dry run only: no files, GPU probes, child processes or final training created.")
+            return 0
+        dependencies, sources = standalone.check_dependencies(), resources.source_snapshot()
+        path = run_dir / "manifest.json"
+        if path.exists():
+            if path.is_symlink():
+                raise ValueError("edge-selection manifest must not be indirect")
+            _resume(path, args, planned, sources, dependencies)
+        with calibration_lock(run_dir):
+            return _run(args, run_dir, planned, sources, dependencies)
+    except (ValueError, RuntimeError, OSError, standalone.DependencyCheckError) as error:
+        print(f"Edge-selection refused: {type(error).__name__}: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
+# scripts/run_v5_mechanism_experiments.py
+
+````python
+#!/usr/bin/env python3
+"""Staged, research-scale V5 mechanism comparisons with one common measured resource plan.
+
+Calibration probes every selected variant at the SAME physical batch/worker
+candidates before any final training. Existing standalone V5 runs are never
+opened, migrated, deleted or relabelled. Test data is not used for model selection.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import gc
+import hashlib
+import json
+import math
+import platform
+import shlex
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+for directory in (ROOT, ROOT / "src"):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from chartgat.cache import atomic_write_bytes, atomic_write_json  # noqa: E402
+from research.conductance_gat.v5.protocol import (  # noqa: E402
+    DATASETS,
+    HARDWARE_PROFILES,
+    SAMPLING_CHOICES,
+    add_sampling_context_arguments,
+    sampling_context_configuration,
+)
+from scripts import calibrate_training_resources as calibration  # noqa: E402
+from scripts import run_conductance_v5 as standalone  # noqa: E402
+from scripts import training_resource_plan as resources  # noqa: E402
+from scripts.calibration_lock import calibration_lock  # noqa: E402
+
+SUITE = "conductance_v5_mechanism_experiments_v1"
+SUITES = ("core", "generators", "solvers", "filters")
+
+
+def variants(suites: list[str]) -> list[dict[str, Any]]:
+    """Union by scientific condition, so shared controls train once within the run."""
+    result: dict[str, dict[str, Any]] = {}
+
+    def add(
+        identifier,
+        family,
+        *,
+        fixed=False,
+        backend="optimization",
+        generator="optimized",
+        heads="shared",
+        normalization="symmetric",
+        barrier=0.1,
+        propagation_filter="linear",
+    ):
+        configuration = {
+            "conductance_backend": backend,
+            "conductance_generator": generator,
+            "conductance_heads": heads,
+            "propagation_normalization": normalization,
+            "solver_degree_barrier": barrier,
+            "propagation_filter": propagation_filter,
+        }
+        condition = "fixed_c" if fixed else "shared_dynamic_c"
+        if identifier in result:
+            if (
+                result[identifier]["configuration"] != configuration
+                or result[identifier]["condition"] != condition
+            ):
+                raise ValueError("a mechanism variant identifier has conflicting definitions")
+            result[identifier]["suites"].append(family)
+        else:
+            result[identifier] = {
+                "variant_id": identifier,
+                "condition": condition,
+                "configuration": configuration,
+                "suites": [family],
+            }
+
+    for family in suites:
+        if family == "core":
+            for normalization in ("symmetric", "row"):
+                add(f"fixed-{normalization}", family, fixed=True, normalization=normalization)
+                add(f"optimized-shared-{normalization}", family, normalization=normalization)
+                add(
+                    f"optimized-per-head-{normalization}",
+                    family,
+                    heads="per_head",
+                    normalization=normalization,
+                )
+        elif family == "generators":
+            add("fixed-symmetric", family, fixed=True)
+            add("degree-only-symmetric", family, generator="degree_only")
+            add("mlp-shared-symmetric", family, backend="mlp")
+            add("optimized-shared-symmetric", family)
+        elif family == "solvers":
+            add("optimized-shared-symmetric", family)
+            add("optimized-no-barrier-symmetric", family, barrier=0.0)
+            add("entropy-exact-symmetric", family, generator="entropy_exact", barrier=0.0)
+        elif family == "filters":
+            add("fixed-symmetric", family, fixed=True)
+            add("optimized-shared-symmetric", family)
+            add("fixed-polynomial3-symmetric", family, fixed=True, propagation_filter="polynomial3")
+            add("optimized-polynomial3-symmetric", family, propagation_filter="polynomial3")
+        else:
+            raise ValueError(f"unsupported mechanism suite: {family}")
+    return list(result.values())
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--suites", nargs="+", choices=SUITES, default=["core", "generators"])
+    result.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
+    result.add_argument(
+        "--profiles", nargs="+", choices=("reference", "large"), default=["reference", "large"]
+    )
+    result.add_argument("--model-seeds", nargs="+", type=int, default=[0])
+    result.add_argument("--run-id", required=True)
+    result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
+    result.add_argument("--results-root", type=Path, default=ROOT / "results")
+    result.add_argument("--device", default="cuda:0")
+    result.add_argument(
+        "--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="a6000-48gb"
+    )
+    result.add_argument("--epochs", type=int, default=200)
+    result.add_argument("--patience", type=int, default=50)
+    result.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="PPI DataLoader initial candidate; measured before training",
+    )
+    result.add_argument("--ppi-batch-size", type=int)
+    result.add_argument("--sample-seed-batch-size", type=int)
+    result.add_argument("--edge-chunk-size", type=int)
+    result.add_argument(
+        "--activation-checkpoint", action=argparse.BooleanOptionalAction, default=None
+    )
+    result.add_argument(
+        "--sampling",
+        choices=SAMPLING_CHOICES,
+        default="auto",
+        help="common sampler for every variant; auto preserves legacy cluster sampling on arxiv",
+    )
+    result.add_argument("--num-neighbors", nargs="+", type=int, default=[15, 10])
+    add_sampling_context_arguments(result)
+    result.add_argument("--beta-initial", type=float, default=0.5)
+    result.add_argument("--solver-steps", type=int, default=8)
+    result.add_argument("--solver-step-size", type=float, default=0.25)
+    result.add_argument("--solver-entropy", type=float, default=1.0)
+    result.add_argument(
+        "--learning-budget-policy",
+        choices=("epochs", "reference_updates"),
+        default="reference_updates",
+    )
+    result.add_argument("--min-free-gb", type=float, default=8.0)
+    result.add_argument("--audit-reference-steps", type=int, default=64)
+    result.add_argument("--audit-reference-tolerance", type=float, default=1e-4)
+    result.add_argument(
+        "--repeat-evaluations",
+        type=int,
+        default=5,
+        help="read-only repetitions of one checkpoint; not additional training seeds",
+    )
+    result.add_argument(
+        "--head-gradient-conflict",
+        action="store_true",
+        help="opt-in expensive per-head gradient conflict audit; no optimizer update",
+    )
+    result.add_argument("--dry-run", action="store_true")
+    result.add_argument(
+        "--calibration-only",
+        action="store_true",
+        help="measure the entire selected comparison set; do not launch final training",
+    )
+    return result
+
+
+def validate_args(args) -> None:
+    if not standalone.RUN_ID_PATTERN.fullmatch(args.run_id):
+        raise ValueError("run-id must be a safe 1-120 character experiment identifier")
+    for name in ("suites", "datasets", "profiles", "model_seeds"):
+        values = getattr(args, name)
+        if not values or len(values) != len(set(values)):
+            raise ValueError(f"{name} must be nonempty and unique")
+    if any(seed < 0 for seed in args.model_seeds):
+        raise ValueError("model seeds must be nonnegative")
+    if args.epochs < 4 or args.patience < 1 or args.workers < 0:
+        raise ValueError("invalid full research training budget or initial worker configuration")
+    if not str(args.device).startswith("cuda"):
+        raise ValueError("mechanism training requires CUDA; no CPU fallback")
+    if args.audit_reference_steps <= args.solver_steps or args.repeat_evaluations < 5:
+        raise ValueError(
+            "audit reference steps must exceed training K and repeat-evaluations must be at least 5"
+        )
+    if not math.isfinite(args.audit_reference_tolerance) or args.audit_reference_tolerance <= 0:
+        raise ValueError("audit reference tolerance must be finite and positive")
+    sampling_context_configuration(args)
+
+
+def _standalone_args(args, variant, profile, seed):
+    options = ["--profile", profile, "--datasets", *args.datasets, "--model-seed", str(seed)]
+    names = (
+        "data_root",
+        "results_root",
+        "device",
+        "hardware_profile",
+        "epochs",
+        "patience",
+        "workers",
+        "ppi_batch_size",
+        "sample_seed_batch_size",
+        "edge_chunk_size",
+        "sampling",
+        "sample_context_seed_batch_size",
+        "sample_context_workers",
+        "beta_initial",
+        "solver_steps",
+        "solver_step_size",
+        "solver_entropy",
+        "learning_budget_policy",
+        "min_free_gb",
+    )
+    for name in names:
+        value = getattr(args, name)
+        if value is not None:
+            options += ["--" + name.replace("_", "-"), str(value)]
+    options += ["--num-neighbors", *(str(value) for value in args.num_neighbors)]
+    if args.activation_checkpoint is not None:
+        options.append(
+            "--activation-checkpoint"
+            if args.activation_checkpoint
+            else "--no-activation-checkpoint"
+        )
+    options += [
+        "--training-schedule",
+        "joint",
+        "--solver-cost-scaling",
+        "legacy_unit"
+        if variant["configuration"]["conductance_backend"] == "mlp"
+        else "width_scaled",
+    ]
+    for name, value in variant["configuration"].items():
+        options += ["--" + name.replace("_", "-"), str(value)]
+    selected = standalone.parser().parse_args(options)
+    standalone._validate(selected)
+    return selected
+
+
+def make_jobs(args, run_dir: Path) -> list[dict[str, Any]]:
+    planned = []
+    selected_variants = variants(args.suites)
+    for profile in args.profiles:
+        for seed in args.model_seeds:
+            for variant in selected_variants:
+                selected = _standalone_args(args, variant, profile, seed)
+                namespace = (
+                    run_dir / "variants" / variant["variant_id"] / profile / f"model-seed-{seed}"
+                )
+                children = standalone.make_jobs(
+                    selected, namespace, standalone._architecture(selected)
+                )
+                for child in children:
+                    if child["condition"] != variant["condition"]:
+                        continue
+                    child.update(
+                        variant=copy.deepcopy(variant),
+                        variant_id=variant["variant_id"],
+                        track="conductance",
+                        profile=profile,
+                        model_seed=seed,
+                        job_id=f"{profile}/{child['dataset']}/model-seed-{seed}/{variant['variant_id']}",
+                    )
+                    planned.append(child)
+    return planned
+
+
+def _config(args) -> dict[str, Any]:
+    return {
+        key: str(value.expanduser().resolve()) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+        if key
+        not in {
+            "dry_run",
+            "calibration_only",
+            "run_id",
+            "audit_reference_steps",
+            "audit_reference_tolerance",
+            "repeat_evaluations",
+            "head_gradient_conflict",
+        }
+    }
+
+
+def _job_identity(job):
+    return {
+        **standalone._identity(job),
+        "variant": job["variant"],
+        "profile": job["profile"],
+        "model_seed": job["model_seed"],
+    }
+
+
+def _calibration_jobs(jobs):
+    # Actual train --condition remains fixed_c/shared_dynamic_c. Only measurement
+    # identity is promoted to a unique scientific variant for common selection.
+    return [
+        {**job, "training_condition": job["condition"], "condition": job["variant_id"]}
+        for job in jobs
+    ]
+
+
+def _grouped(jobs):
+    grouped = {}
+    for job in jobs:
+        grouped.setdefault((job["profile"], job["dataset"]), []).append(job)
+    return grouped
+
+
+def _validate_common_entry(entry, jobs, allocated_cpus):
+    conditions = {job["variant_id"] for job in jobs}
+    resources._validate_entry(
+        entry,
+        sorted({job["model_seed"] for job in jobs}),
+        allocated_cpus=allocated_cpus,
+        expected_conditions=conditions,
+    )
+    expected = [
+        {
+            "condition": job["variant_id"],
+            "model_seed": job["model_seed"],
+            "argv_sha256": resources.command_identity(job["command"]),
+        }
+        for job in jobs
+    ]
+    if entry["job_contracts"] != expected:
+        raise ValueError(
+            "common calibration did not measure the exact requested variants and seeds"
+        )
+
+
+def _apply_common_resources(jobs, entries):
+    resolved = copy.deepcopy(jobs)
+    lookup = {(entry["profile"], entry["dataset"]): entry for entry in entries}
+    for job in resolved:
+        entry = lookup[(job["profile"], job["dataset"])]
+        selected = entry["selected"]
+        for name, value in selected.items():
+            option = "--" + name.replace("_", "-")
+            if job["command"].count(option) != 1:
+                raise ValueError(f"measured resource option is missing/duplicated: {option}")
+            job["command"][job["command"].index(option) + 1] = str(value)
+        job["batch_size"] = selected["batch_size"]
+        job["workers"] = selected["workers"]
+        job["execution"].update(
+            batch_size=selected["batch_size"],
+            dataloader_workers=selected["workers"],
+            persistent_workers=selected["workers"] > 0,
+            prefetch_factor=2 if selected["workers"] > 0 else None,
+        )
+        for name in ("sample_seed_batch_size", "sample_context_workers"):
+            if name in selected:
+                job["execution"][name] = selected[name]
+        resources.validate_job_plan(
+            {"entries": [entry]},
+            track="conductance",
+            profile=job["profile"],
+            dataset=job["dataset"],
+            condition=job["variant_id"],
+            model_seed=job["model_seed"],
+            command=job["command"],
+        )
+    return resolved
+
+
+def _resume_manifest(path, *, args, planned, sources, dependencies):
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    expected = {
+        "schema_version": 1,
+        "suite": SUITE,
+        "run_id": args.run_id,
+        "config": _config(args),
+        "source_sha256": sources,
+        "dependencies": dependencies,
+    }
+    if any(manifest.get(key) != value for key, value in expected.items()):
+        raise ValueError(
+            "existing mechanism configuration/source differs; use a new run ID; "
+            "old results preserved"
+        )
+    if [_job_identity(job) for job in manifest.get("planned_jobs", [])] != [
+        _job_identity(job) for job in planned
+    ]:
+        raise ValueError("existing mechanism variant matrix differs; no silent reuse or overwrite")
+    return manifest
+
+
+def _read_result(job):
+    from research.conductance_gat.v5 import train
+    from scripts.audit_v5_stages import inspect_evidence
+
+    result = standalone._load_metrics(job)
+    evidence = inspect_evidence(Path(job["metrics_path"]))
+    payload, history = evidence["metrics"], evidence["history"]
+    child = train.build_parser().parse_args(job["command"][job["command"].index("-m") + 2 :])
+    train.validate_args(child)
+    _validate_result_recipe(child, payload, history)
+    output = Path(job["output_dir"])
+    hashes = {}
+    for filename, field in (
+        ("best.pt", "checkpoint_sha256"),
+        ("last.pt", "last_checkpoint_sha256"),
+        ("history.json", "history_sha256"),
+    ):
+        path = output / filename
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"completed mechanism artifact is absent or indirect: {path}")
+        with path.open("rb") as stream:
+            actual = hashlib.file_digest(stream, "sha256").hexdigest()
+        if actual != payload.get(field):
+            raise ValueError(f"completed mechanism artifact hash mismatch: {path}")
+        hashes[field] = actual
+    initial_hashes = {
+        name: payload.get(name)
+        for name in (
+            "shared_initial_state_sha256",
+            "common_backbone_initial_state_sha256",
+        )
+    }
+    if not all(resources._is_sha256(value) for value in initial_hashes.values()):
+        raise ValueError(
+            "completed mechanism lacks verified shared/common backbone initialization provenance"
+        )
+    return {
+        **result,
+        **hashes,
+        **initial_hashes,
+        "learning_budget": payload.get("learning_budget"),
+        "effective_optimizer_steps_by_group": payload.get("effective_optimizer_steps_by_group"),
+        "data_sha256": payload.get("protocol", {}).get("data_sha256"),
+        "split_sha256": payload.get("protocol", {}).get("split_sha256"),
+    }
+
+
+def _validate_result_recipe(child, payload, history):
+    """Bind complete configuration, budget and stopping evidence to the actual command.
+
+    inspect_evidence additionally verifies the immutable identity, official data
+    protocol, artifact hashes and selected validation epoch. This run never imports
+    legacy training, so complete epoch history must start at one without gaps.
+    """
+    from research.conductance_gat.v5 import train
+
+    if payload.get("configuration") != train.configuration(child):
+        raise ValueError(
+            "completed mechanism configuration differs from its exact measured child command"
+        )
+    if payload.get("transition_provenance") is not None or payload.get("epoch_offset", 0) != 0:
+        raise ValueError("mechanism comparisons do not import or relabel legacy training")
+    if payload.get("source_sha256") != train.implementation_source_hashes():
+        raise ValueError(
+            "completed mechanism source differs from the pinned training implementation"
+        )
+    budget = payload.get("learning_budget")
+    if not isinstance(budget, dict) or budget != train.plan_learning_budget(
+        child.epochs,
+        child.patience,
+        budget.get("reference_batches_per_epoch"),
+        budget.get("actual_batches_per_epoch"),
+        policy=child.learning_budget_policy,
+    ):
+        raise ValueError("completed mechanism learning budget does not match the child recipe")
+    epochs = len(history)
+    if (
+        payload.get("epochs_run") != epochs
+        or epochs < 1
+        or epochs > budget["planned_epochs"]
+        or [row.get("epoch") for row in history] != list(range(1, epochs + 1))
+    ):
+        raise ValueError("completed mechanism history does not contain contiguous complete epochs")
+    expected_schedule = train.phase_schedule(
+        budget["planned_epochs"],
+        list(child.phase_fractions),
+        child.training_schedule,
+    )
+    if (
+        payload.get("schedule") != expected_schedule
+        or payload["resume_identity"].get("schedule") != expected_schedule
+    ):
+        raise ValueError("completed mechanism phase schedule differs from its full budget")
+    actual_batches = budget["actual_batches_per_epoch"]
+    for row in history:
+        if (
+            row.get("train_batches") != actual_batches
+            or row.get("optimizer_steps") != row["epoch"] * actual_batches
+            or row.get("phase", {}).get("phase")
+            != train.phase_at(expected_schedule, row["epoch"])[0]
+        ):
+            raise ValueError("completed mechanism has incomplete epoch/update/phase evidence")
+    if payload.get("optimizer_steps") != epochs * actual_batches:
+        raise ValueError("completed mechanism optimizer update total is inconsistent")
+    if epochs < budget["planned_epochs"] and not train.budget_should_stop(
+        child,
+        budget,
+        history,
+        primary_best_epoch=payload["best_epoch"],
+        joint_best_epoch=payload.get("joint_best_epoch", 0),
+    ):
+        raise ValueError("completed mechanism stopped before its declared budget and patience")
+
+
+def _audit_command(args, job):
+    command = [
+        sys.executable,
+        "-B",
+        str(ROOT / "scripts/audit_v5_stages.py"),
+        "--root",
+        job["output_dir"],
+        "--data-root",
+        str(args.data_root.expanduser().resolve()),
+        "--device",
+        args.device,
+        "--reference-steps",
+        str(args.audit_reference_steps),
+        "--reference-tolerance",
+        str(args.audit_reference_tolerance),
+        "--repeat-evaluations",
+        str(args.repeat_evaluations),
+    ]
+    if args.head_gradient_conflict:
+        command.append("--head-gradient-conflict")
+    return command
+
+
+def _file_sha(path):
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"required regular audit log is missing or indirect: {path}")
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _ensure_audit(args, job, environment, persist):
+    command = _audit_command(args, job)
+    prior = job.get("audit", {})
+    checkpoint_hash = job["result"]["checkpoint_sha256"]
+    if prior.get("status") == "passed" and prior.get("command") == command:
+        if prior.get("checkpoint_sha256") != checkpoint_hash or (
+            _file_sha(Path(prior["log_path"])) != prior.get("log_sha256")
+        ):
+            raise ValueError("completed audit evidence/checkpoint changed; no silent audit reuse")
+        return
+    if prior:
+        job.setdefault("audit_attempts", []).append(copy.deepcopy(prior))
+    log = standalone._next_log(Path(job["log_path"]).with_suffix(".audit.log"))
+    audit = {
+        "status": "running",
+        "command": command,
+        "log_path": str(log),
+        "checkpoint_sha256": checkpoint_hash,
+        "test_evaluated": False,
+        "training_seed_repetitions": False,
+    }
+    job["audit"] = audit
+    persist()
+    print(
+        f"[validation audit] {job['job_id']}; repeated evaluations={args.repeat_evaluations}; "
+        f"reference K={args.audit_reference_steps}",
+        flush=True,
+    )
+    started = time.monotonic()
+    try:
+        status = standalone.shared.run_logged(command, log, environment)
+        audit.update(exit_code=status, elapsed_seconds=time.monotonic() - started)
+        if status:
+            raise RuntimeError(
+                f"validation audit failed with child status {status}; "
+                "completed training is retained"
+            )
+        audit.update(status="passed", log_sha256=_file_sha(log))
+        persist()
+    except (Exception, KeyboardInterrupt) as error:
+        audit.update(status="failed", error=f"{type(error).__name__}: {error}")
+        if log.is_file() and not log.is_symlink():
+            audit["log_sha256"] = _file_sha(log)
+        standalone.shared.run_failure_reporter(
+            persist, original_error=error, action="independent audit status"
+        )
+        raise
+
+
+def _check_comparison_contracts(jobs):
+    for grouped in _grouped(jobs).values():
+        by_seed = {}
+        for job in grouped:
+            if job.get("status") != "passed":
+                continue
+            by_seed.setdefault(job["model_seed"], []).append(job)
+        for selected in by_seed.values():
+            for key in ("data_sha256", "split_sha256", "learning_budget"):
+                values = [job["result"].get(key) for job in selected]
+                if any(value is None for value in values) or any(
+                    value != values[0] for value in values
+                ):
+                    raise ValueError(f"mechanism variants do not share verified {key}")
+            by_filter = {}
+            for job in selected:
+                name = job["variant"]["configuration"]["propagation_filter"]
+                by_filter.setdefault(name, set()).add(job["result"]["shared_initial_state_sha256"])
+            if any(len(values) != 1 for values in by_filter.values()):
+                raise ValueError(
+                    "same-filter mechanism variants have different common initialization"
+                )
+            common = [job["result"].get("common_backbone_initial_state_sha256") for job in selected]
+            if not all(resources._is_sha256(value) for value in common) or len(set(common)) != 1:
+                raise ValueError("mechanism variants have different common backbone initialization")
+
+
+def _write_summary(run_dir, manifest):
+    lines = [
+        "# V5 mechanism experiment progress",
+        "",
+        "Validation only; seed-0 screening is not a multi-seed or SOTA claim.",
+        "",
+        "Every selected variant in a profile/dataset uses the same measured "
+        "physical batch and workers.",
+        "",
+        "| Profile | Dataset | Seed | Variant | Training | Audit | Best validation | Best epoch |",
+        "| --- | --- | ---: | --- | --- | --- | ---: | ---: |",
+    ]
+    for job in manifest["jobs"]:
+        result = job.get("result", {})
+        value = result.get("validation")
+        score = (
+            f"{100 * value:.4f}%"
+            if isinstance(value, (int, float)) and math.isfinite(value)
+            else "pending"
+        )
+        audit = job.get("audit", {})
+        audit_label = audit.get("status", "pending")
+        if audit.get("log_path"):
+            relative = Path(audit["log_path"]).relative_to(run_dir).as_posix()
+            audit_label = f"[{audit_label}](<{relative}>)"
+        lines.append(
+            f"| {job['profile']} | {job['dataset']} | {job['model_seed']} | {job['variant_id']} | "
+            f"{job['status']} | {audit_label} | "
+            f"{score} | {result.get('best_epoch', '')} |"
+        )
+    atomic_write_bytes(run_dir / "comparison.md", ("\n".join(lines) + "\n").encode())
+
+
+def _ensure_calibration(args, manifest, persist):
+    import torch
+
+    hardware = calibration._hardware(args.device)
+    runtime = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+    }
+    if "hardware" in manifest and (
+        manifest["hardware"] != hardware or manifest["runtime"] != runtime
+    ):
+        raise ValueError(
+            "mechanism calibration hardware/runtime changed; existing evidence preserved"
+        )
+    manifest.setdefault("hardware", hardware)
+    manifest.setdefault("runtime", runtime)
+    if args.hardware_profile == "a6000-48gb" and (
+        hardware["total_memory_bytes"] < 40 * 1024**3 or hardware["compute_capability"][0] < 8
+    ):
+        raise RuntimeError(
+            "A6000 profile requires >=40 GiB visible VRAM and CUDA capability >=8; no downscale"
+        )
+    minimum = max(
+        args.min_free_gb, 32.0 if args.hardware_profile == "a6000-48gb" else args.min_free_gb
+    )
+    free, _ = torch.cuda.mem_get_info(torch.device(args.device))
+    if free < minimum * 1024**3:
+        raise RuntimeError(
+            f"calibration requires {minimum:.2f} GiB free; no other processes were changed"
+        )
+    entries = manifest["calibration_entries"]
+    for (profile, dataset), jobs in _grouped(manifest["planned_jobs"]).items():
+        aliases = _calibration_jobs(jobs)
+        entry = next(
+            (
+                value
+                for value in entries
+                if (value["profile"], value["dataset"]) == (profile, dataset)
+            ),
+            None,
+        )
+        if entry is None:
+            entry = {"track": "conductance", "profile": profile, "dataset": dataset}
+            entries.append(entry)
+        if entry.get("status") == "passed":
+            _validate_common_entry(entry, jobs, hardware["allocated_cpu_count"])
+            calibration.verify_plan_inputs({"entries": [entry]}, aliases)
+        else:
+            calibration._calibrate_group(aliases, entry, persist)
+            _validate_common_entry(entry, jobs, hardware["allocated_cpu_count"])
+        gc.collect()
+        torch.cuda.empty_cache()
+        persist()
+    manifest["calibration_status"] = "passed"
+    expected_jobs = _apply_common_resources(manifest["planned_jobs"], entries)
+    if manifest.get("resources_applied"):
+        if [_job_identity(job) for job in manifest["jobs"]] != [
+            _job_identity(job) for job in expected_jobs
+        ]:
+            raise ValueError(
+                "stored mechanism jobs differ from immutable common measured resources"
+            )
+    else:
+        manifest["jobs"] = expected_jobs
+        manifest["resources_applied"] = True
+    persist()
+
+
+def _run(args, run_dir, planned, sources, dependencies):
+    manifest_path = run_dir / "manifest.json"
+    if manifest_path.exists():
+        if manifest_path.is_symlink():
+            raise ValueError("mechanism manifest must not be a symlink")
+        manifest = _resume_manifest(
+            manifest_path, args=args, planned=planned, sources=sources, dependencies=dependencies
+        )
+    else:
+        unexpected = [path for path in run_dir.iterdir() if path.name != ".calibration.lock"]
+        if unexpected:
+            raise ValueError("mechanism directory has untracked contents; no results overwritten")
+        manifest = {
+            "schema_version": 1,
+            "suite": SUITE,
+            "run_id": args.run_id,
+            "status": "calibrating",
+            "config": _config(args),
+            "source_sha256": sources,
+            "dependencies": dependencies,
+            "planned_jobs": planned,
+            "jobs": copy.deepcopy(planned),
+            "calibration_entries": [],
+            "classification": "full_research_mechanism_comparisons",
+            "test_evaluated": False,
+            "started_at_utc": dt.datetime.now(dt.UTC).isoformat(),
+            "comparison_contract": {
+                "all_variants_share_measured_resources": True,
+                "maximum_supervised_update_budget_shared": True,
+                "same_sampler_across_variants": True,
+                "sampling_rng_seed_shared": True,
+                "initialization_verified_per_filter": True,
+                "old_experiments_relabelled": False,
+                "test_used_for_selection": False,
+            },
+        }
+
+    def persist():
+        atomic_write_json(manifest_path, manifest)
+
+    current = None
+    try:
+        _ensure_calibration(args, manifest, persist)
+        if resources.source_snapshot() != sources:
+            raise ValueError(
+                "mechanism implementation changed during calibration; measured evidence retained"
+            )
+        if args.calibration_only:
+            manifest["status"] = "calibrated"
+            persist()
+            _write_summary(run_dir, manifest)
+            return 0
+        environment = standalone.shared._environment()
+        environment.pop("PYTORCH_NVML_BASED_CUDA_CHECK", None)
+        manifest["status"] = "running"
+        for index, job in enumerate(manifest["jobs"], start=1):
+            if resources.source_snapshot() != sources:
+                raise ValueError(
+                    "mechanism implementation changed during the run; no stale continuation"
+                )
+            if job.get("status") == "passed":
+                if _read_result(job) != job.get("result"):
+                    raise ValueError(f"completed artifacts changed: {job['job_id']}")
+                print(f"[{index}/{len(planned)}] verified, skipping {job['job_id']}", flush=True)
+                _ensure_audit(args, job, environment, persist)
+                continue
+            current = job
+            command = list(job["command"])
+            checkpoint = Path(job["output_dir"]) / "last.pt"
+            if checkpoint.is_file():
+                command.append("--resume")
+            else:
+                standalone._preserve_incomplete_child(job, run_dir)
+            job.update(status="running", attempt_command=command)
+            job.pop("error", None)
+            persist()
+            print(f"[{index}/{len(planned)}] {job['job_id']}", flush=True)
+            started = time.monotonic()
+            status = standalone.shared.run_logged(
+                command, standalone._next_log(Path(job["log_path"])), environment
+            )
+            job.update(exit_code=status, elapsed_seconds=time.monotonic() - started)
+            if status:
+                raise RuntimeError(f"{job['job_id']} failed with child status {status}")
+            job["result"] = _read_result(job)
+            job["status"] = "passed"
+            _check_comparison_contracts(manifest["jobs"])
+            current = None
+            persist()
+            _ensure_audit(args, job, environment, persist)
+            _write_summary(run_dir, manifest)
+        _check_comparison_contracts(manifest["jobs"])
+        if resources.source_snapshot() != sources:
+            raise ValueError(
+                "mechanism implementation changed during the final audit; evidence retained"
+            )
+        manifest.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
+        manifest.pop("error", None)
+        persist()
+        _write_summary(run_dir, manifest)
+        print(f"Mechanism comparisons passed: {run_dir / 'comparison.md'}", flush=True)
+        return 0
+    except (Exception, KeyboardInterrupt) as error:
+        manifest.update(
+            status="interrupted" if isinstance(error, KeyboardInterrupt) else "failed",
+            error=f"{type(error).__name__}: {error}",
+        )
+        if current is not None:
+            current.update(status="failed", error=manifest["error"])
+        standalone.shared.run_failure_reporter(
+            persist, original_error=error, action="mechanism manifest persistence"
+        )
+        standalone.shared.run_failure_reporter(
+            lambda: _write_summary(run_dir, manifest),
+            original_error=error,
+            action="mechanism progress summary",
+        )
+        print(
+            f"Mechanism run stopped safely: {manifest['error']}\n"
+            f"Preserved partial results: {run_dir}",
+            file=sys.stderr,
+        )
+        return 130 if isinstance(error, KeyboardInterrupt) else 1
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    try:
+        validate_args(args)
+        results_root, data_root = (
+            args.results_root.expanduser().resolve(),
+            args.data_root.expanduser().resolve(),
+        )
+        run_dir = results_root / "conductance_gat" / "mechanisms" / args.run_id
+        if (
+            run_dir.resolve() != run_dir
+            or run_dir.is_relative_to(data_root)
+            or data_root.is_relative_to(run_dir)
+        ):
+            raise ValueError(
+                "mechanism outputs must be direct paths outside the immutable dataset cache"
+            )
+        planned = make_jobs(args, run_dir)
+        if args.dry_run:
+            print(
+                f"{len(variants(args.suites))} unique variants; "
+                f"{len(planned)} full-size validation-only trainings; "
+                f"profiles={args.profiles}; datasets={args.datasets}; "
+                f"model_seeds={args.model_seeds}"
+            )
+            print(
+                "Common measured calibration across ALL selected variants "
+                "per profile/dataset precedes training."
+            )
+            print(
+                f"Each completed checkpoint gets a separate validation-only distribution audit: "
+                f"reference K={args.audit_reference_steps}, "
+                f"repeat-evaluations={args.repeat_evaluations}; "
+                "failed audits never restart passed training."
+            )
+            for job in planned:
+                print(f"{job['job_id']}: {shlex.join(job['command'])}")
+            print(
+                "Plan only: no files, directories, processes, GPU probes "
+                "or final training were created."
+            )
+            return 0
+        dependencies = standalone.check_dependencies()
+        sources = resources.source_snapshot()
+        # Refuse incompatible existing runs before even acquiring/creating their lock.
+        path = run_dir / "manifest.json"
+        if path.exists():
+            _resume_manifest(
+                path, args=args, planned=planned, sources=sources, dependencies=dependencies
+            )
+        with calibration_lock(run_dir):
+            return _run(args, run_dir, planned, sources, dependencies)
+    except (ValueError, RuntimeError, OSError, standalone.DependencyCheckError) as error:
+        print(f"Mechanism run refused: {type(error).__name__}: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+````
+
 # scripts/run_v5_transition.py
 
 ````python
@@ -78678,7 +92798,8 @@ def choose_candidate(
 
 
 def _validate_entry(
-    entry: dict[str, Any], seeds: list[int], *, allocated_cpus: int | None = None
+    entry: dict[str, Any], seeds: list[int], *, allocated_cpus: int | None = None,
+    expected_conditions: set[str] | None = None,
 ) -> None:
     if not isinstance(entry, dict) or entry.get("status") != "passed":
         raise ValueError("resource plan entry is not complete")
@@ -78687,9 +92808,14 @@ def _validate_entry(
     contracts = entry.get("job_contracts")
     if not isinstance(contracts, list) or not contracts:
         raise ValueError("resource plan is missing exact job contracts")
-    expected_conditions = (
-        {"fixed_c", "shared_dynamic_c"} if entry["track"] == "conductance" else {"se", "pe"}
-    )
+    if expected_conditions is None:
+        expected_conditions = (
+            {"fixed_c", "shared_dynamic_c"} if entry["track"] == "conductance" else {"se", "pe"}
+        )
+    elif not expected_conditions or any(
+        not isinstance(value, str) or not value for value in expected_conditions
+    ):
+        raise ValueError("explicit comparison conditions must be nonempty identifiers")
     for item in contracts:
         if not isinstance(item, dict):
             raise ValueError("job contract must be an object")
@@ -81928,6 +96054,696 @@ def test_aggregate_tree_schema_pairs_only_registered_downstream_metrics(
     assert all("batch_size" not in row["metric"] for row in efficiency)
 ````
 
+# tests/test_aggregation_comparison.py
+
+````python
+"""Synthetic CPU tests only; no benchmark score or CUDA-fit claim."""
+
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch.nn import functional as F
+
+from experiments.aggregation_comparison import engine, provenance, runner
+from experiments.aggregation_comparison.model import (
+    ARMS,
+    AggregationClassifier,
+    DualAttention,
+    local_gram,
+    normalized_graph_step,
+)
+from tests.test_incidence_ablation import graph
+
+
+def model(arm, checkpoint=False):
+    return AggregationClassifier(
+        5,
+        3,
+        arm=arm,
+        selection_config={"condition": "full"},
+        hidden_channels=16,
+        layers=3,
+        heads=4,
+        dropout=0,
+        activation_checkpoint=checkpoint,
+        edge_chunk_size=3,
+    )
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_trainable_parameters_reach_loss_and_optimizer(arm):
+    torch.manual_seed(91)
+    net, data = model(arm), graph()
+    optimizer = engine.make_optimizer(net)
+    before = {n: p.detach().clone() for n, p in net.named_parameters()}
+    F.cross_entropy(net(data), data.y).backward()
+    engine.validate_gradients(net)
+    for name, parameter in net.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        if "energy_readouts" in name:
+            assert parameter.grad.norm() > 0, name
+    optimizer.step()
+    for name, parameter in net.named_parameters():
+        if "energy_readouts" in name or "lift_projection" in name:
+            assert not torch.equal(parameter, before[name]), name
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_checkpoint_recomputation_matches_forward_and_gradients(arm):
+    torch.manual_seed(22)
+    a, data = model(arm), graph()
+    with torch.no_grad():
+        for p in a.energy_readouts:
+            p.normal_(std=0.03)
+    b = model(arm, checkpoint=True)
+    b.load_state_dict(a.state_dict())
+    ya, yb = a(data), b(data)
+    torch.testing.assert_close(ya, yb)
+    F.cross_entropy(ya, data.y).backward()
+    F.cross_entropy(yb, data.y).backward()
+    for (name, pa), (_, pb) in zip(a.named_parameters(), b.named_parameters(), strict=True):
+        torch.testing.assert_close(pa.grad, pb.grad, msg=name)
+
+
+def test_no_hidden_residual_or_ffn_in_incidence_pipeline():
+    net, data = model("incidence"), graph()
+    assert not any("ffn" in name or "operator_norm" in name for name, _ in net.named_parameters())
+    for operator in net.layers:
+        with torch.no_grad():
+            operator.output_projection.weight.zero_()
+            if operator.output_projection.bias is not None:
+                operator.output_projection.bias.zero_()
+    # A hidden residual would carry the encoded input to the decoder here.
+    torch.testing.assert_close(net(data), net.decoder.bias.expand(data.x.shape[0], -1))
+
+
+def test_local_gram_detects_cancellation_and_matches_global_bilinear_form():
+    edges = torch.tensor([[0, 0], [1, 2]])
+    h = torch.tensor([0.0, 1.0, -1.0]).reshape(1, 3, 1, 1)
+    weight = torch.ones(2, 1)
+    result = local_gram(h, edges, weight, 1)
+    assert result[0, 0, 0] == 1
+    assert h[0, 1:].sum() == 0
+    torch.testing.assert_close(local_gram(h * 0, edges, weight, 2), result * 0)
+    torch.manual_seed(2)
+    h = torch.randn(3, 3, 2, 4, requires_grad=True)
+    weight = torch.rand(2, 2, requires_grad=True)
+    result = local_gram(h, edges, weight, 1)
+    differences = h[:, edges[1]] - h[:, edges[0]]
+    pairs = torch.triu_indices(3, 3)
+    reference = torch.einsum(
+        "pehd,pehd,eh->hp", differences[pairs[0]], differences[pairs[1]], weight
+    )
+    torch.testing.assert_close(result.sum(0), reference)
+    torch.testing.assert_close(result, local_gram(h, edges.flip(0), weight, 5))
+    result.sum().backward()
+    assert weight.grad.abs().sum() > 0
+
+
+def test_dual_attention_matches_official_formula_and_disjoint_batching():
+    torch.manual_seed(71)
+    layer = DualAttention(4, 2)
+    x = torch.randn(7, 4)
+    q = layer.query(x).reshape(7, 4, 2)
+    k = layer.key(x).reshape(7, 4, 2)
+    v = layer.value(x).reshape(7, 4, 2)
+    metric = torch.einsum("lmh,ldh->mdh", k / 7**0.5, v).softmax(0)
+    expected = torch.einsum("lmh,mdh->ldh", q, metric).mean(-1)
+    torch.testing.assert_close(layer(x, torch.zeros(7, dtype=torch.long), 1), expected)
+    batch = torch.tensor([0, 0, 0, 1, 1, 1, 1])
+    result = layer(x, batch, 2)
+    for index in range(2):
+        subset = x[batch == index]
+        torch.testing.assert_close(
+            result[batch == index], layer(subset, torch.zeros(len(subset), dtype=torch.long), 1)
+        )
+
+
+def test_normalized_graph_propagation_matches_dense_reference():
+    data = graph()
+    edges, x = data.incidence_edge_index, data.x
+    adjacency = torch.eye(x.shape[0])
+    adjacency[edges[0], edges[1]] = 1
+    adjacency[edges[1], edges[0]] = 1
+    inverse = adjacency.sum(1).rsqrt()
+    expected = inverse[:, None] * adjacency * inverse[None, :]
+    torch.testing.assert_close(normalized_graph_step(x, edges, 2), expected @ x)
+
+
+def test_dual_normalization_cache_reuses_static_graph_and_invalidates_edge_changes():
+    net, data = model("dualformer"), graph()
+    net(data)
+    first = data._comparison_sgc_normalization
+    net(data)
+    assert data._comparison_sgc_normalization is first
+    data.incidence_edge_index[1, 0] = 2
+    net(data)
+    assert data._comparison_sgc_normalization is not first
+
+
+@pytest.mark.parametrize("graphs", [1, 2])
+def test_streamed_attention_matches_dense_forward_and_gradients(graphs):
+    torch.manual_seed(14)
+    dense, streamed = DualAttention(4, 2), DualAttention(4, 2, chunk_size=2)
+    streamed.load_state_dict(dense.state_dict())
+    x = torch.randn(7, 4, requires_grad=True)
+    y = x.detach().clone().requires_grad_()
+    batch = torch.arange(7) % graphs
+    a, b = dense(x, batch, graphs), streamed(y, batch, graphs)
+    torch.testing.assert_close(a, b)
+    a.square().sum().backward()
+    b.square().sum().backward()
+    torch.testing.assert_close(x.grad, y.grad)
+    for pa, pb in zip(dense.parameters(), streamed.parameters(), strict=True):
+        torch.testing.assert_close(pa.grad, pb.grad)
+
+
+def test_shared_endpoints_seed_pairing_and_provenance_isolation():
+    hashes = []
+    for arm in ARMS:
+        torch.manual_seed(40)
+        hashes.append(engine.shared_initial_state_sha256(model(arm)))
+    assert len(set(hashes)) == 1
+    from experiments.incidence_ablation.provenance import source_snapshot as old_sources
+
+    assert not any("aggregation_comparison" in p for p in old_sources())
+    assert "experiments/aggregation_comparison/model.py" in provenance.source_snapshot()
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_synthetic_training_epoch_checkpoint_optimizer_continuation(arm, tmp_path):
+    """Real trainer/model/optimizer path on synthetic CPU data, never a GPU run."""
+    torch.manual_seed(83)
+    net, data = model(arm, checkpoint=True), graph()
+    indices = torch.arange(data.x.shape[0])
+    batch = SimpleNamespace(graph=data, selected_indices=indices)
+    inputs = SimpleNamespace(
+        indices=indices,
+        training_batches=lambda epoch, device: iter([batch]),
+        validation_batches=lambda device: iter([batch]),
+    )
+    args = SimpleNamespace(precision="fp32", l0_weight=0.0, negative_loss_weight=0.0)
+    optimizer = engine.make_optimizer(net)
+    device = torch.device("cpu")
+    report = engine.run_training_epoch(net, optimizer, inputs, args, device, 1, validate=True)
+    assert report["processed_units"] == len(indices)
+    assert report["optimizer_steps"] == 1
+    assert engine.evaluate(net, inputs, args, device)["label_count"] == len(indices)
+    path = tmp_path / "synthetic-checkpoint.pt"
+    torch.save({"model": net.state_dict(), "optimizer": optimizer.state_dict()}, path)
+    restored = model(arm, checkpoint=True)
+    saved = torch.load(path, weights_only=True)
+    restored.load_state_dict(saved["model"])
+    restored_optimizer = engine.make_optimizer(restored)
+    restored_optimizer.load_state_dict(saved["optimizer"])
+    engine.run_training_epoch(net, optimizer, inputs, args, device, 2, validate=True)
+    engine.run_training_epoch(restored, restored_optimizer, inputs, args, device, 2, validate=True)
+    for a, b in zip(net.parameters(), restored.parameters(), strict=True):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+def test_real_cli_plans_recent_comparator_and_full_reference_architecture():
+    args = runner.parser().parse_args(
+        [
+            "--run-id",
+            "debug-plan",
+            "--datasets",
+            "ogbn-arxiv",
+            "--profiles",
+            "reference",
+            "--hardware-profile",
+            "portable",
+            "--sampling",
+            "full",
+        ]
+    )
+    jobs = runner.make_jobs(args, Path("results/debug-plan"))
+    assert {j["variant_id"] for j in jobs} == set(ARMS)
+    assert "gat" not in ARMS
+    for job in jobs:
+        child = engine.build_parser().parse_args(job["command"][job["command"].index("-m") + 2 :])
+        engine.validate_args(child)
+        assert (child.layers, child.hidden_channels, child.heads) == (8, 256, 8)
+        assert child.sampling == "full"
+        assert child.epochs == 200
+````
+
+# tests/test_aggregation_comparison_cuda.py
+
+````python
+"""CUDA smoke tests with reference-size models and explicitly synthetic graphs.
+
+These tests are not a benchmark, a full-data fit measurement, or an A100 MIG test.
+Invoke this file explicitly after a CUDA preflight; CPU execution is never used.
+"""
+
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from experiments.aggregation_comparison import engine, runner
+from experiments.aggregation_comparison.model import ARMS, DualAttention, local_gram
+from research.conductance_gat.edge_selection.topology import build_topology
+
+
+@pytest.fixture(scope="module", autouse=True)
+def cuda_required():
+    # Isolate checkpoint restoration from CUDA atomic-reduction ordering.
+    # This applies only to these verification tests, never the training recipe.
+    workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    if not torch.cuda.is_available():
+        pytest.fail("CUDA smoke tests require a CUDA-enabled PyTorch environment; no CPU fallback")
+    previous = torch.backends.cuda.matmul.allow_tf32
+    previous_determinism = torch.are_deterministic_algorithms_enabled()
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.use_deterministic_algorithms(True)
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+        torch.use_deterministic_algorithms(previous_determinism)
+        if workspace is None:
+            os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+        else:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = workspace
+
+
+def synthetic_disjoint_batch(device):
+    # Four independent 64-node graphs, processed together in one CUDA batch.
+    nodes, graphs, features, classes = 64, 4, 50, 7
+    ids = torch.arange(nodes)
+    pairs = torch.stack((ids, (ids + 1) % nodes))
+    pairs = torch.cat((pairs, torch.stack((ids, (ids + 5) % nodes))), dim=1)
+    edges = (pairs[:, None, :] + nodes * torch.arange(graphs)[None, :, None]).flatten(1)
+    batch = torch.arange(graphs).repeat_interleave(nodes)
+    plan = build_topology(nodes * graphs, edges, batch, forest_seed=0)
+    graph = SimpleNamespace(
+        x=torch.randn(nodes * graphs, features, device=device),
+        y=torch.arange(nodes * graphs, device=device) % classes,
+        incidence_edge_index=edges.to(device),
+        batch=batch.to(device),
+        _v5_num_graphs=graphs,
+        edge_selection_topology=plan.to(device),
+    )
+    indices = torch.arange(nodes * graphs, device=device)
+    batch = SimpleNamespace(graph=graph, selected_indices=indices)
+    inputs = SimpleNamespace(
+        indices=indices,
+        training_batches=lambda epoch, device: iter([batch]),
+        validation_batches=lambda device: iter([batch]),
+    )
+    return inputs, graph, {"graphs": [{"x": graph.x}], "classes": classes}
+
+
+def reference_arguments(arm, precision):
+    options = runner.parser().parse_args(
+        [
+            "--run-id",
+            "debug-cuda-smoke",
+            "--datasets",
+            "cora",
+            "--profiles",
+            "reference",
+            "--arms",
+            arm,
+            "--hardware-profile",
+            "portable",
+            "--edge-chunk-size",
+            "128",
+        ]
+    )
+    job = runner.make_jobs(options, Path("results/debug-cuda-smoke"))[0]
+    args = engine.build_parser().parse_args(job["command"][job["command"].index("-m") + 2 :])
+    args.precision = precision
+    engine.validate_args(args)
+    assert (args.layers, args.hidden_channels, args.heads) == (8, 256, 8)
+    return args
+
+
+@pytest.mark.parametrize("arm", ARMS)
+@pytest.mark.parametrize("precision", ["fp32", "bf16"])
+def test_cuda_reference_model_training_and_optimizer_resume(
+    arm, precision, tmp_path, record_property
+):
+    device = torch.device("cuda:0")
+    if precision == "bf16":
+        assert torch.cuda.is_bf16_supported(), "requested BF16 path is unsupported"
+    engine.base._seed(71)
+    inputs, graph, payload = synthetic_disjoint_batch(device)
+    args = reference_arguments(arm, precision)
+    model = engine.make_model(payload, args, device)
+    assert all(p.is_cuda for p in model.parameters()) and graph.x.is_cuda
+    optimizer = engine.make_optimizer(model, args.learning_rate)
+    torch.cuda.reset_peak_memory_stats(device)
+    started, ended = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    started.record()
+    report = engine.run_training_epoch(model, optimizer, inputs, args, device, 1, validate=True)
+    assert all(p.grad is not None and p.grad.is_cuda for p in model.parameters())
+    ended.record()
+    ended.synchronize()
+    assert report["processed_units"] == 256 and report["largest_measured_graph_batch"] == 4
+    assert report["optimizer_steps"] == 1
+    assert engine.evaluate(model, inputs, args, device)["label_count"] == 256
+    peak = torch.cuda.max_memory_allocated(device)
+    record_property("gpu", torch.cuda.get_device_name(device))
+    record_property("precision", precision)
+    record_property("deterministic_algorithms", torch.are_deterministic_algorithms_enabled())
+    record_property("synthetic_batch", "4 graphs / 256 nodes / 512 undirected edges")
+    record_property("parameters", sum(p.numel() for p in model.parameters()))
+    record_property("peak_allocated_bytes", peak)
+    record_property("first_training_step_cuda_ms", started.elapsed_time(ended))
+    path = tmp_path / "synthetic-cuda-checkpoint.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "cpu_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state(),
+        },
+        path,
+    )
+    restored = engine.make_model(payload, args, device)
+    saved = torch.load(path, map_location=device, weights_only=True)
+    restored.load_state_dict(saved["model"])
+    restored_optimizer = engine.make_optimizer(restored, args.learning_rate)
+    restored_optimizer.load_state_dict(saved["optimizer"])
+    for net, opt in ((model, optimizer), (restored, restored_optimizer)):
+        torch.set_rng_state(saved["cpu_rng"].cpu())
+        torch.cuda.set_rng_state(saved["cuda_rng"].cpu())
+        engine.run_training_epoch(net, opt, inputs, args, device, 2, validate=True)
+    # Both tolerances are below one AdamW update; a missing optimizer restore
+    # must not be hidden by the much looser BF16 forward-output tolerance.
+    tolerance = 2e-6 if precision == "fp32" else 2e-5
+    for a, b in zip(model.parameters(), restored.parameters(), strict=True):
+        torch.testing.assert_close(a, b, rtol=tolerance, atol=tolerance)
+    torch.cuda.synchronize(device)
+
+
+@pytest.mark.parametrize("graphs", [1, 4])
+def test_cuda_streamed_attention_matches_dense_gradients(graphs):
+    torch.manual_seed(18)
+    dense, streamed = DualAttention(32, 4).cuda(), DualAttention(32, 4, chunk_size=17).cuda()
+    streamed.load_state_dict(dense.state_dict())
+    x = torch.randn(128, 32, device="cuda", requires_grad=True)
+    y = x.detach().clone().requires_grad_()
+    batch = torch.arange(128, device="cuda") % graphs
+    a, b = dense(x, batch, graphs), streamed(y, batch, graphs)
+    torch.testing.assert_close(a, b, rtol=2e-5, atol=2e-6)
+    a.square().sum().backward()
+    b.square().sum().backward()
+    torch.testing.assert_close(x.grad, y.grad, rtol=2e-4, atol=1e-5)
+    for pa, pb in zip(dense.parameters(), streamed.parameters(), strict=True):
+        torch.testing.assert_close(pa.grad, pb.grad, rtol=2e-4, atol=3e-5)
+
+
+def test_cuda_local_energy_matches_bilinear_form():
+    torch.manual_seed(3)
+    h = torch.randn(3, 64, 4, 8, device="cuda", requires_grad=True)
+    edges = torch.stack((torch.arange(63), torch.arange(1, 64))).cuda()
+    c = torch.rand(63, 4, device="cuda", requires_grad=True)
+    result = local_gram(h, edges, c, 32)
+    delta = h[:, edges[1]] - h[:, edges[0]]
+    pairs = torch.triu_indices(3, 3, device="cuda")
+    reference = torch.einsum("pehd,pehd,eh->hp", delta[pairs[0]], delta[pairs[1]], c)
+    torch.testing.assert_close(result.sum(0), reference)
+    result.square().sum().backward()
+    assert torch.isfinite(h.grad).all() and c.grad.abs().sum() > 0
+````
+
+# tests/test_aggregation_comparison_integrity.py
+
+````python
+"""Synthetic CPU checkpoint metadata tests, never evidence of real model training."""
+
+from __future__ import annotations
+
+import copy
+import json
+import weakref
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from experiments.aggregation_comparison import engine as train
+from experiments.aggregation_comparison import integrity
+from research.conductance_gat.v5.learning_budget import plan_learning_budget
+
+
+def publish(case):
+    identity = case.metrics["resume_identity"]
+    identity_hash = train.base._canonical_sha256(identity)
+    case.metrics["resume_identity_sha256"] = identity_hash
+    case.best.update(resume_identity=identity, resume_identity_sha256=identity_hash)
+    case.last.update(resume_identity=identity, resume_identity_sha256=identity_hash)
+    torch.save(case.best, case.folder / "best.pt")
+    best_hash = train.base.sha256_file(case.folder / "best.pt")
+    case.metrics["checkpoint_sha256"] = best_hash
+    case.last["best_checkpoint_sha256"] = best_hash
+    torch.save(case.last, case.folder / "last.pt")
+    (case.folder / "history.json").write_text(json.dumps(case.rows), encoding="utf-8")
+    case.metrics.update(
+        last_checkpoint_sha256=train.base.sha256_file(case.folder / "last.pt"),
+        history_sha256=train.base.sha256_file(case.folder / "history.json"),
+    )
+    (case.folder / "metrics.json").write_text(json.dumps(case.metrics), encoding="utf-8")
+
+
+@pytest.fixture
+def evidence(tmp_path):
+    arguments = train.build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            "shared_dynamic_c",
+            "--selection-mode",
+            "full",
+            "--ablation-arm",
+            "incidence_energy_pre_lift",
+            "--output-dir",
+            str(tmp_path),
+            "--data-root",
+            str(tmp_path / "debug-data"),
+            "--epochs",
+            "4",
+            "--patience",
+            "1",
+            "--learning-budget-policy",
+            "reference_updates",
+        ]
+    )
+    train.validate_args(arguments)
+    budget = plan_learning_budget(4, 1, 1, 1, "reference_updates")
+    provenance = [{"explicit_synthetic_checkpoint_fixture": True}]
+    protocol = {
+        "data_sha256": "a" * 64,
+        "split_sha256": {"train": "b" * 64, "validation": "c" * 64},
+    }
+    identity = train.build_identity(
+        arguments, protocol, budget, "d" * 64, SimpleNamespace(provenance=provenance)
+    )
+    rows = [
+        {
+            "epoch": epoch,
+            "train_batches": 1,
+            "optimizer_steps": epoch,
+            "processed_units": 3,
+            "phase": {"phase": "joint"},
+            "validation": score,
+        }
+        for epoch, score in enumerate((0.4, 0.5, 0.6, 0.7), 1)
+    ]
+    metrics = {
+        "status": "passed",
+        "research_suite": train.SUITE,
+        "dataset": "cora",
+        "condition": "full",
+        "configuration": train.configuration(arguments),
+        "resume_identity": identity,
+        "source_sha256": identity["source_sha256"],
+        "protocol": protocol,
+        "learning_budget": budget,
+        "initial_state_sha256": "d" * 64,
+        "shared_initial_state_sha256": "e" * 64,
+        "common_encoder_decoder_initial_state_sha256": "e" * 64,
+        "topology": {"train_count": 3, "provenance": provenance},
+        "epochs_run": 4,
+        "optimizer_steps": 4,
+        "best_epoch": 4,
+        "best_validation": 0.7,
+        "validation": 0.7,
+        "test_evaluated": False,
+        "debug": False,
+        "subset": False,
+    }
+    last = {
+        "epoch": 4,
+        "optimizer_steps": 4,
+        "history": rows,
+        "best_epoch": 4,
+        "best_validation": 0.7,
+        "shared_initial_state_sha256": "e" * 64,
+        "model_state": {"debug_weight": torch.tensor([1.0])},
+        "optimizer_state": {
+            "state": {0: {"step": torch.tensor(4.0)}},
+            "param_groups": [{"params": [0]}],
+        },
+    }
+    best = {
+        "epoch": 4,
+        "validation": 0.7,
+        "selection_role": "primary",
+        "model_state": {"debug_weight": torch.tensor([0.5])},
+    }
+    case = SimpleNamespace(
+        folder=tmp_path, args=arguments, metrics=metrics, rows=rows, best=best, last=last
+    )
+    publish(case)
+    return case
+
+
+def test_completed_evidence_is_read_only_and_cpu_only(evidence, monkeypatch):
+    before = {path.name: train.base.sha256_file(path) for path in evidence.folder.iterdir()}
+    load = train.base.load_checkpoint_on_cpu
+    last_tensor = []
+    calls = []
+
+    def cpu_load(path):
+        if path.name == "best.pt":
+            assert (
+                last_tensor[0]() is None
+            )  # No simultaneous last+best checkpoint tensor retention.
+        saved = load(path)
+        assert all(value.device.type == "cpu" for value in saved["model_state"].values())
+        calls.append(path.name)
+        if path.name == "last.pt":
+            last_tensor.append(weakref.ref(saved["model_state"]["debug_weight"]))
+        return saved
+
+    monkeypatch.setattr(train.base, "load_checkpoint_on_cpu", cpu_load)
+    assert integrity.inspect_completed(evidence.folder)["best_epoch"] == 4
+    assert calls == ["last.pt", "best.pt"]
+    assert before == {path.name: train.base.sha256_file(path) for path in evidence.folder.iterdir()}
+
+
+@pytest.mark.parametrize(
+    "damage,match",
+    [
+        ("seed", "configuration"),
+        ("budget", "learning budget"),
+        ("gap", "contiguous"),
+        ("partial", "coverage"),
+        ("updates", "coverage"),
+        ("best", "strict maximum"),
+        ("last_history", "last checkpoint"),
+        ("last_steps", "last checkpoint"),
+        ("last_best", "last checkpoint"),
+        ("best_interior", "best checkpoint"),
+        ("optimizer", "optimizer state"),
+        ("protocol", "protocol"),
+        ("source", "source_sha256"),
+        ("shared", "last checkpoint"),
+        ("not_finite", "finite"),
+        ("empty", "positive integer"),
+    ],
+)
+def test_internally_rehashed_but_inconsistent_evidence_is_rejected(evidence, damage, match):
+    case = evidence
+    if damage == "seed":
+        case.metrics["resume_identity"]["training_arguments"]["model_seed"] = 7
+    elif damage == "budget":
+        case.metrics["learning_budget"]["requested_epochs"] = 5
+    elif damage == "gap":
+        case.rows[1]["epoch"] = 3
+    elif damage == "partial":
+        case.rows[1]["processed_units"] = 2
+    elif damage == "updates":
+        case.rows[1]["optimizer_steps"] = 1
+    elif damage == "best":
+        case.metrics.update(best_epoch=3, best_validation=0.6)
+    elif damage == "last_history":
+        case.last["history"] = copy.deepcopy(case.rows[:-1])
+    elif damage == "last_steps":
+        case.last["optimizer_steps"] = 9
+    elif damage == "last_best":
+        case.last["best_epoch"] = 1
+    elif damage == "best_interior":
+        case.best["epoch"] = 3
+    elif damage == "optimizer":
+        case.last["optimizer_state"]["state"] = {}
+    elif damage == "protocol":
+        case.metrics["protocol"] = {"data_sha256": "f" * 64}
+    elif damage == "source":
+        case.metrics["source_sha256"] = {"debug": "f" * 64}
+    elif damage == "shared":
+        case.last["shared_initial_state_sha256"] = "f" * 64
+    elif damage == "not_finite":
+        case.rows[2]["validation"] = float("nan")
+    else:
+        case.rows.clear()
+        case.metrics["epochs_run"] = 0
+    publish(case)
+    with pytest.raises(ValueError, match=match):
+        integrity.inspect_completed(case.folder)
+
+
+def shorten(case, scores, best_epoch):
+    case.rows[:] = case.rows[: len(scores)]
+    for row, value in zip(case.rows, scores, strict=True):
+        row["validation"] = value
+    count, best_value = len(scores), scores[best_epoch - 1]
+    case.metrics.update(
+        epochs_run=count,
+        optimizer_steps=count,
+        best_epoch=best_epoch,
+        best_validation=best_value,
+        validation=best_value,
+    )
+    case.last.update(
+        epoch=count, optimizer_steps=count, best_epoch=best_epoch, best_validation=best_value
+    )
+    case.best.update(epoch=best_epoch, validation=best_value)
+    publish(case)
+
+
+def test_legitimate_patience_stop_is_accepted(evidence):
+    shorten(evidence, (0.7, 0.6), 1)
+    assert integrity.inspect_completed(evidence.folder)["epochs_run"] == 2
+
+
+def test_unjustified_early_completion_is_rejected(evidence):
+    shorten(evidence, (0.4, 0.5, 0.6), 3)
+    with pytest.raises(ValueError, match="budget and patience"):
+        integrity.inspect_completed(evidence.folder)
+
+
+def test_equal_best_scores_select_first_strict_maximum(evidence):
+    shorten(evidence, (0.7, 0.7), 2)
+    with pytest.raises(ValueError, match="first strict maximum"):
+        integrity.inspect_completed(evidence.folder)
+
+
+def test_identity_hash_tampering_is_rejected(evidence):
+    evidence.metrics["resume_identity_sha256"] = "f" * 64
+    (evidence.folder / "metrics.json").write_text(json.dumps(evidence.metrics), encoding="utf-8")
+    with pytest.raises(ValueError, match="identity is corrupt"):
+        integrity.inspect_completed(evidence.folder)
+
+
+def test_resume_boolean_is_not_a_new_scientific_identity(evidence):
+    before = train.serializable_arguments(evidence.args)
+    evidence.args.resume = True
+    assert train.serializable_arguments(evidence.args) == before
+````
+
 # tests/test_algebra.py
 
 ````python
@@ -82958,6 +97774,12 @@ def test_reference_budget_and_tolerance_are_explicit(tmp_path):
     assert args.reference_steps == 64
     assert args.reference_tolerance == 0.001
     assert args.json is False
+    assert args.repeat_evaluations == 5
+    assert args.head_gradient_conflict is False
+    explicit = parser.parse_args(
+        [*_args(tmp_path), "--repeat-evaluations", "6", "--head-gradient-conflict"]
+    )
+    assert explicit.repeat_evaluations == 6 and explicit.head_gradient_conflict is True
 
 
 @pytest.mark.parametrize(
@@ -82968,11 +97790,15 @@ def test_reference_budget_and_tolerance_are_explicit(tmp_path):
         ("--reference-tolerance", "0"),
         ("--reference-tolerance", "nan"),
         ("--reference-tolerance", "inf"),
+        ("--repeat-evaluations", "4"),
     ],
 )
 def test_invalid_reference_arguments(tmp_path, option, value):
     args = _args(tmp_path)
-    args[args.index(option) + 1] = value
+    if option in args:
+        args[args.index(option) + 1] = value
+    else:
+        args.extend([option, value])
     with pytest.raises(SystemExit):
         audit.build_parser().parse_args(args)
 
@@ -83050,6 +97876,69 @@ def test_recorded_diagnostics_do_not_invent_missing_overlap_or_gradient(evidence
     assert result["first_active_conductance_gradient"] == "unavailable"
 
 
+def test_explicit_mlp_control_is_auditable_but_not_mislabeled_optimized(evidence):
+    path, metrics = evidence
+    metrics["configuration"]["conductance_backend"] = "mlp"
+    metrics["configuration"]["solver_cost_scaling"] = "legacy_unit"
+    metrics["resume_identity_sha256"] = audit._canonical(metrics["resume_identity"])
+    _write_json(path, metrics)
+    assert audit.inspect_evidence(path)["metrics"]["configuration"]["conductance_backend"] == "mlp"
+    metrics["configuration"]["conductance_heads"] = "per_head"
+    metrics["resume_identity_sha256"] = audit._canonical(metrics["resume_identity"])
+    _write_json(path, metrics)
+    with pytest.raises(audit.AuditError, match="shared untyped MLP"):
+        audit.inspect_evidence(path)
+
+
+def test_beta_override_requires_exact_current_release_not_historical_relaxation(evidence):
+    path, metrics = evidence
+    metrics["configuration"]["beta_initial"] = 0.3
+    metrics["resume_identity_sha256"] = audit._canonical(metrics["resume_identity"])
+    _write_json(path, metrics)
+    with pytest.raises(audit.AuditError, match="explicitly corrected"):
+        audit.inspect_evidence(path)
+    metrics["source_sha256"] = {**audit.BASELINE_SOURCES, **audit.AUDIT_SOURCE_OVERRIDES}
+    metrics["resume_identity"]["source_sha256"] = metrics["source_sha256"]
+    metrics["resume_identity_sha256"] = audit._canonical(metrics["resume_identity"])
+    _write_json(path, metrics)
+    assert audit.inspect_evidence(path)["metrics"]["configuration"]["beta_initial"] == 0.3
+
+
+def test_human_distribution_distinguishes_raw_c_beta_and_row_relative_coefficients():
+    torch = pytest.importorskip("torch")
+    from research.conductance_gat.v5.distribution_audit import audit_conductance_distribution
+    from research.conductance_gat.v5.stage_audit import _json
+
+    distribution = _json(
+        audit_conductance_distribution(
+            torch.tensor([0.2, 0.8, 2.0]),
+            torch.tensor([[0, 0, 0], [1, 2, 3]]),
+            torch.zeros(5, dtype=torch.long),
+            1,
+            heads=2,
+            beta=torch.tensor([[0.3, 0.7]]),
+        )
+    )
+    output = "\n".join(audit.human_distribution(distribution))
+    for text in (
+        "raw C is not probability",
+        "CV=std/mean",
+        "beta=[",
+        "raw C quantiles=",
+        "c_ge_0_7",
+        "histogram=",
+        "degree1=3",
+        "isolates=1",
+        "diagnostic only",
+        "effective neighbors=",
+        "normalized entropy=",
+        "normalized head TV means=",
+        "JS means=",
+        "C=1 same-correction",
+    ):
+        assert text in output
+
+
 def test_recorded_layer_solver_and_sampling_observations_retained():
     layers = [
         {
@@ -83088,6 +97977,18 @@ def test_packaged_audit_source_pins_match_live_implementation():
     verified = audit.verify_sources(audit.BASELINE_SOURCES, current)
     assert verified["training_resume_authorized"] is False
     assert verified["audit_sources"] == current
+
+
+def test_historical_audit_release_is_readonly_and_exact():
+    current = {**audit.BASELINE_SOURCES, **audit.AUDIT_SOURCE_OVERRIDES}
+    historical = {**audit.BASELINE_SOURCES, **audit.HISTORICAL_AUDIT_SOURCE_OVERRIDES}
+    verified = audit.verify_sources(historical, current)
+    assert verified["training_resume_authorized"] is False
+    assert verified["checkpoint_sources"] == historical
+    assert verified["historical_repair"] is None
+    tampered = {**historical, "research/conductance_gat/v5/model.py": "f" * 64}
+    with pytest.raises(ValueError):
+        audit.verify_sources(tampered, current)
 
 
 def test_reviewed_added_source_requires_exact_digest(monkeypatch):
@@ -97599,6 +112500,2898 @@ def test_checkpoint_restore_eval_and_offline_cache_are_read_only(
     assert _file_snapshot(tmp_path) == before
 ````
 
+# tests/test_edge_selection_allocation_resume.py
+
+````python
+"""Synthetic CPU resume integration, never GPU or final-training evidence.
+
+The production model, loss, backward, AdamW, RNG, checkpoint publication and
+artifact validation run here. Resource/data plumbing and selection scores use
+isolated debug fixtures. Exact registry pins are covered by separate tests.
+"""
+
+from __future__ import annotations
+
+import copy
+import random
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from research.conductance_gat.edge_selection import train
+from research.conductance_gat.edge_selection.topology import build_topology
+
+
+class DebugCheckpointBoundary(RuntimeError):
+    """Python test exception; never a process signal or remote-session action."""
+
+
+def _equal(actual, expected):
+    if isinstance(expected, torch.Tensor):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    elif isinstance(expected, np.ndarray):
+        np.testing.assert_array_equal(actual, expected)
+    elif isinstance(expected, dict):
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            _equal(actual[key], expected[key])
+    elif isinstance(expected, (list, tuple)):
+        assert type(actual) is type(expected) and len(actual) == len(expected)
+        for first, second in zip(actual, expected, strict=True):
+            _equal(first, second)
+    else:
+        assert actual == expected
+
+
+@pytest.fixture
+def debug_training(monkeypatch):
+    generator = torch.Generator().manual_seed(19)
+    edges = torch.tensor([[0, 0, 0, 1, 1, 2, 4, 4, 5, 5, 6], [1, 2, 3, 2, 3, 3, 5, 7, 6, 7, 7]])
+    graph = SimpleNamespace(
+        x=torch.randn(9, 5, generator=generator),
+        y=torch.arange(9) % 3,
+        incidence_edge_index=edges,
+        batch=torch.zeros(9, dtype=torch.long),
+        _v5_num_graphs=1,
+        edge_selection_topology=build_topology(9, edges, forest_seed=0),
+    )
+    provenance = [{"explicit_synthetic_cpu_resume_fixture": True}]
+
+    class DebugInputs:
+        def __init__(self, _payload, _args):
+            self.data = graph
+            self.indices = {"train": torch.arange(9), "validation": torch.arange(9)}
+            self.sampler = None
+            self.provenance = copy.deepcopy(provenance)
+            self.plan_preparation_seconds = 0.0
+
+        def _batch(self):
+            return SimpleNamespace(
+                graph=graph,
+                selected_indices=self.indices["train"],
+                origin_targets=(torch.arange(edges.shape[1]) % 2).float(),
+            )
+
+        def training_batches(self, epoch, device):
+            assert device == torch.device("cpu")
+            random.random()
+            np.random.random()
+            yield self._batch()
+
+        def validation_batches(self, device):
+            assert device == torch.device("cpu")
+            yield self._batch()
+
+        def metadata(self):
+            return {"train_count": 9, "provenance": copy.deepcopy(provenance)}
+
+    class DebugMonitor:
+        def __init__(self, device):
+            assert device == torch.device("cpu")
+
+        def start(self):
+            return {"explicit_synthetic_cpu_fixture": True}
+
+        def finish(self, **_kwargs):
+            return {"explicit_synthetic_cpu_fixture": True}
+
+    state = SimpleNamespace(epoch=0, cuda_rng=torch.tensor([7, 9], dtype=torch.uint8))
+    production_epoch, production_evaluate = train.run_training_epoch, train.evaluate
+
+    def epoch(*args, **kwargs):
+        state.epoch = args[5]
+        return production_epoch(*args, **kwargs)
+
+    def evaluate(*args, **kwargs):
+        measured = production_evaluate(*args, **kwargs)
+        measured["metric"] = 0.8 if state.epoch == 1 else 0.7
+        return measured
+
+    monkeypatch.setattr(train, "PreparedInputs", DebugInputs)
+    monkeypatch.setattr(train, "RuntimeResourceMonitor", DebugMonitor)
+    monkeypatch.setattr(train, "run_training_epoch", epoch)
+    monkeypatch.setattr(train, "evaluate", evaluate)
+    monkeypatch.setattr(train.base, "_require_cuda", lambda _device: None)
+    monkeypatch.setattr(train.base, "validate_cached_graphs_once", lambda _payload: None)
+    monkeypatch.setattr(train.base, "validate_hardware_runtime", lambda *_: {"debug_cpu": True})
+    monkeypatch.setattr(train.base, "_v5_data_observability", lambda *_: {"debug_cpu": True})
+    monkeypatch.setattr(train.base, "_versions", lambda: {"runtime": "synthetic-cpu-test"})
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda _device: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _device: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda _device: 0)
+    monkeypatch.setattr(torch.cuda, "get_rng_state", lambda _device: state.cuda_rng.clone())
+    monkeypatch.setattr(
+        torch.cuda,
+        "set_rng_state",
+        lambda value, _device: setattr(state, "cuda_rng", value.clone()),
+    )
+    state.payload = {"dataset": "cora", "graphs": [{"x": graph.x}], "classes": 3}
+    state.protocol = {
+        "data_sha256": "a" * 64,
+        "split_sha256": {"train": "b" * 64, "validation": "c" * 64},
+    }
+    with train._isolated_execution_state(torch.device("cpu")):
+        yield state
+
+
+def _arguments(directory):
+    args = train.build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            "shared_dynamic_c",
+            "--selection-mode",
+            "hard_concrete",
+            "--corruption-ratio",
+            "0.2",
+            "--l0-weight",
+            "0.0001",
+            "--negative-loss-weight",
+            "0.1",
+            "--output-dir",
+            str(directory),
+            "--data-root",
+            str(directory.parent / "debug-cache"),
+            "--device",
+            "cpu",
+            "--hidden-channels",
+            "16",
+            "--layers",
+            "2",
+            "--heads",
+            "4",
+            "--edge-chunk-size",
+            "3",
+            "--dropout",
+            "0.2",
+            "--workers",
+            "0",
+            "--epochs",
+            "4",
+            "--patience",
+            "10",
+            "--learning-budget-policy",
+            "reference_updates",
+            "--no-activation-checkpoint",
+        ]
+    )
+    train.validate_args(args)
+    return args
+
+
+def _run(args, debug):
+    return train.train_model(
+        debug.payload, debug.protocol, args, torch.device("cpu"), args.output_dir
+    )
+
+
+def _boundary(args, debug, monkeypatch):
+    save = train.base._save
+
+    def save_then_interrupt(path, payload):
+        save(path, payload)
+        if path.name == "last.pt" and payload["epoch"] == 2:
+            raise DebugCheckpointBoundary("synthetic interruption after committed epoch 2")
+
+    with monkeypatch.context() as boundary:
+        boundary.setattr(train.base, "_save", save_then_interrupt)
+        with pytest.raises(DebugCheckpointBoundary, match="committed epoch 2"):
+            _run(args, debug)
+    saved = train.base.load_checkpoint_on_cpu(args.output_dir / "last.pt")
+    assert saved["epoch"] == saved["optimizer_steps"] == 2
+    return saved
+
+
+@pytest.mark.parametrize("source_repair", [False, True])
+def test_partial_resume_retains_identity_best_and_rng_and_finishes(
+    tmp_path, monkeypatch, debug_training, source_repair
+):
+    debug = debug_training
+    old = {"explicit_debug_source.py": "a" * 64}
+    current = {"explicit_debug_source.py": "b" * 64} if source_repair else old
+    monkeypatch.setattr(train, "implementation_source_hashes", lambda: copy.deepcopy(old))
+    args = _arguments(tmp_path / "debug-interrupted")
+    boundary = _boundary(args, debug, monkeypatch)
+    before_best = (args.output_dir / "best.pt").read_bytes()
+    before_configuration = (args.output_dir / "configuration.json").read_bytes()
+    boundary_hash = train.base.sha256_file(args.output_dir / "last.pt")
+    before_history = copy.deepcopy(boundary["history"])
+    captured, resumed_epochs, proof_calls = {}, [], []
+    make_optimizer, run_epoch = train.make_optimizer, train.run_training_epoch
+
+    def exact_debug_proof(previous, following, *, scope):
+        assert previous == old and following == current and scope == "training"
+        proof_calls.append(True)
+        return {"patch_id": "explicit-debug-source-proof", "scope": scope}
+
+    if source_repair:
+        monkeypatch.setattr(train, "require_source_compatibility", exact_debug_proof)
+    monkeypatch.setattr(train, "implementation_source_hashes", lambda: copy.deepcopy(current))
+
+    def optimizer(model):
+        result = make_optimizer(model)
+        captured.update(model=model, optimizer=result)
+        return result
+
+    def inspect_resume(*values, **kwargs):
+        if not resumed_epochs:
+            assert values[5] == 3
+            _equal(captured["model"].state_dict(), boundary["model_state"])
+            _equal(captured["optimizer"].state_dict(), boundary["optimizer_state"])
+            _equal(
+                train._checkpoint_rng(torch.device("cpu")),
+                {
+                    key: boundary[key]
+                    for key in (
+                        "python_rng_state",
+                        "numpy_rng_state",
+                        "cpu_rng_state",
+                        "cuda_rng_state",
+                    )
+                },
+            )
+        resumed_epochs.append(values[5])
+        return run_epoch(*values, **kwargs)
+
+    with monkeypatch.context() as resumed:
+        resumed.setattr(train, "make_optimizer", optimizer)
+        resumed.setattr(train, "run_training_epoch", inspect_resume)
+        args.resume = True
+        result = _run(args, debug)
+    final = train.base.load_checkpoint_on_cpu(args.output_dir / "last.pt")
+    assert resumed_epochs == [3, 4]
+    assert final["epoch"] == final["optimizer_steps"] == 4
+    assert final["history"][:2] == before_history
+    assert final["resume_identity"] == boundary["resume_identity"]
+    assert final["resume_identity_sha256"] == boundary["resume_identity_sha256"]
+    assert result["resume_identity"] == boundary["resume_identity"]
+    assert (args.output_dir / "best.pt").read_bytes() == before_best
+    assert (args.output_dir / "configuration.json").read_bytes() == before_configuration
+    assert not (args.output_dir / "best.previous.pt").exists()
+    assert train.inspect_completed(args.output_dir)["best_epoch"] == 1
+    if source_repair:
+        assert proof_calls
+        assert final["execution_source_sha256"] == result["execution_source_sha256"] == current
+        assert final["source_transitions"] == result["source_transitions"]
+        assert final["source_transitions"][-1]["after_epoch"] == 2
+        assert final["source_transitions"][-1]["optimizer_steps"] == 2
+        assert final["source_transitions"][-1]["restored_checkpoint_sha256"] == boundary_hash
+        assert final["source_transitions"][-1]["source_sha256"] == current
+        assert final["source_transitions"][-1]["source_compatibility"]["patch_id"] == (
+            "explicit-debug-source-proof"
+        )
+
+    control_args = _arguments(tmp_path / "debug-uninterrupted-control")
+    _run(control_args, debug)
+    control = train.base.load_checkpoint_on_cpu(control_args.output_dir / "last.pt")
+    for key in (
+        "model_state",
+        "optimizer_state",
+        "python_rng_state",
+        "numpy_rng_state",
+        "cpu_rng_state",
+        "cuda_rng_state",
+    ):
+        _equal(final[key], control[key])
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "configuration",
+        "training_arguments",
+        "dataset_protocol",
+        "learning_budget",
+        "runtime_versions",
+        "initial_state_sha256",
+        "input_provenance",
+    ],
+)
+def test_source_repair_never_waives_other_identity_changes(field, monkeypatch):
+    original = {
+        "source_sha256": {"explicit_debug_source.py": "a" * 64},
+        field: {"retained": "debug-contract"},
+    }
+    saved = {
+        "resume_identity": original,
+        "resume_identity_sha256": train.base._canonical_sha256(original),
+    }
+    expected = copy.deepcopy(original)
+    expected["source_sha256"] = {"explicit_debug_source.py": "b" * 64}
+    expected[field] = {"changed": "not-authorized-by-source-repair"}
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("recipe/runtime mismatch must fail before source authorization")
+
+    monkeypatch.setattr(train, "require_source_compatibility", forbidden)
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        train.resolve_training_resume(saved, expected)
+    assert saved["resume_identity"] == original
+
+
+def test_rejected_resume_keeps_checkpoint_history_and_configuration_bytes(
+    tmp_path, monkeypatch, debug_training
+):
+    args = _arguments(tmp_path / "debug-rejected-resume")
+    _boundary(args, debug_training, monkeypatch)
+    protected = {
+        path.name: path.read_bytes()
+        for path in args.output_dir.iterdir()
+        if path.name in {"best.pt", "last.pt", "history.json", "configuration.json"}
+    }
+    args.resume, args.dropout = True, 0.1
+
+    def forbidden_update(*_args, **_kwargs):
+        raise AssertionError("a rejected resume must never update optimizer/model state")
+
+    monkeypatch.setattr(torch.optim.AdamW, "step", forbidden_update)
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        _run(args, debug_training)
+    assert {name: (args.output_dir / name).read_bytes() for name in protected} == protected
+````
+
+# tests/test_edge_selection_audit.py
+
+````python
+"""Synthetic CPU diagnostics only, not official dataset or GPU validation."""
+
+import json
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from research.conductance_gat.edge_selection import diagnostics as diag
+from research.conductance_gat.edge_selection.audit import Observer, PredictionSummary
+from research.conductance_gat.edge_selection.model import EdgeSelectionClassifier
+from research.conductance_gat.edge_selection.topology import build_topology
+
+
+def test_zero_safe_distribution_including_empty_values():
+    assert diag.distribution([])["mean"] is None
+    report = diag.distribution([0.0, 0.0, 0.5, 1.0, 2.0])
+    assert report["zero_fraction"] == pytest.approx(0.4)
+    assert report["above_one_count"] == 1
+    assert sum(report["unit_interval_histogram_counts"]) == 4
+    json.dumps(report, allow_nan=False)
+    with pytest.raises(ValueError, match="nonfinite"):
+        diag.distribution([float("nan")])
+
+
+def test_quantile_above_torch_limit_uses_all_values_without_mutation():
+    # Full-size synthetic diagnostic regression, not a reduced training profile.
+    size = (1 << 24) + 1
+    values = torch.arange(size, dtype=torch.float32)
+    values = values.flip(0)
+    before = values.clone()
+    report = diag.distribution(values)
+    expected = np.asarray(report["quantile_probabilities"]) * (size - 1)
+    np.testing.assert_allclose(report["quantiles"], expected, rtol=0, atol=1e-8)
+    assert report["count"] == report["quantile_observation_count"] == size
+    assert report["above_one_count"] == size - 2
+    assert sum(report["unit_interval_histogram_counts"]) == 2
+    assert report["mean"] == (size - 1) / 2
+    assert report["zero_fraction"] == 1 / size
+    assert torch.equal(values, before)
+    json.dumps(report, allow_nan=False)
+
+
+def test_histogram_counts_above_float32_exact_integer_range_are_not_rounded():
+    size = (1 << 24) + 3
+    report = diag.distribution(torch.zeros(size))
+    assert report["unit_interval_histogram_counts"][0] == size
+    assert sum(report["unit_interval_histogram_counts"]) == size
+    assert report["quantiles"] == [0.0] * 9
+    assert report["zero_fraction"] == 1.0
+
+
+@pytest.mark.parametrize("values", [[3.0, 1.0, 2.0, 5.0, -1.0], [1.0], [0.0, 0.0, 1.0, 1.0]])
+def test_quantile_matches_small_float64_linear_oracle(values):
+    report = diag.distribution(values)
+    oracle = torch.quantile(
+        torch.tensor(values, dtype=torch.float64),
+        torch.tensor(report["quantile_probabilities"], dtype=torch.float64),
+    )
+    np.testing.assert_allclose(report["quantiles"], oracle.numpy(), rtol=0, atol=1e-14)
+
+
+def test_active_components_isolates_cycle_rank_and_path_change():
+    edges = np.array([[0, 0, 1], [1, 2, 2]])
+    before = diag.adjacency(4, edges)
+    reference = diag.path_reference(before, sources=4)
+    assert diag.topology_statistics(before)["cycle_rank"] == 1
+    tree = diag.adjacency(4, edges, [1, 1, 0])
+    topology = diag.topology_statistics(tree)
+    assert topology["components"] == 2 and topology["isolated_nodes"] == 1
+    assert topology["cycle_rank"] == 0
+    change = diag.path_change(tree, reference)
+    assert change["lost_reachable_ordered_pairs"] == 0
+    assert change["distance_increase_on_retained_pairs"]["quantiles"][-1] == 1
+    disconnected = diag.path_change(diag.adjacency(4, edges, [1, 0, 0]), reference)
+    assert disconnected["lost_reachable_ordered_pairs"] == 4
+    empty = diag.path_change(diag.adjacency(4, edges, [0, 0, 0]), reference)
+    assert empty["stretch_on_retained_pairs"]["count"] == 0
+
+
+def test_origins_are_separate_and_empty_added_not_reported_as_perfect():
+    result = diag.gate_origins(torch.tensor([1.0, 0.0, 0.2]), torch.tensor([1.0, 0.0, 0.0]))
+    assert result["original"]["active_rate"] == 1
+    assert result["added"]["active_rate"] == 0.5
+    assert diag.gate_origins(torch.ones(3), torch.ones(3))["added"]["active_rate"] is None
+
+
+def test_zero_neighbor_coefficients_do_not_create_nan_or_fake_neighbor():
+    report = diag.coefficient_statistics(
+        torch.zeros(2, 3), torch.zeros(2, 3), torch.tensor([0, 1]), torch.tensor([1, 2]), 4
+    )
+    assert report["incoming_mass"]["mean"] == 0
+    isolated = report["active_degree_bins"]["0:1"]
+    assert isolated["nodes"] == 4 and isolated["effective_neighbors"]["mean"] == 0
+    json.dumps(report, allow_nan=False)
+
+
+def test_prediction_summary_preserves_integer_counts_under_bf16():
+    count = 29799
+    values = torch.ones(count, 2, dtype=torch.bfloat16)
+    values[:, 1] = 0
+    batch = SimpleNamespace(
+        selected_indices=torch.arange(count),
+        graph=SimpleNamespace(y=torch.zeros(count, dtype=torch.long)),
+    )
+    metric = PredictionSummary(False)
+    metric.add(values, values, batch)
+    assert metric.report()["validation"] == 1.0
+    assert metric.report()["logit_relative_l2"] == 0.0
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["full", "forest_only", "forest_random", "forest_learned", "forest_cycle", "hard_concrete"],
+)
+def test_observer_uses_real_core_and_preserves_parameters_rng_diagnostics(mode):
+    torch.manual_seed(14)
+    edges = torch.tensor([[0, 0, 0, 1, 1, 2, 4], [1, 2, 3, 2, 3, 3, 5]])
+    groups = torch.tensor([0, 0, 0, 0, 1, 1, 2])
+    plan = build_topology(7, edges, groups)
+    graph = SimpleNamespace(
+        x=torch.randn(7, 5),
+        y=torch.arange(7) % 3,
+        incidence_edge_index=edges,
+        batch=groups,
+        _v5_num_graphs=3,
+        edge_selection_topology=plan,
+    )
+    batch = SimpleNamespace(
+        graph=graph, topology=plan, origin_targets=torch.ones(7), selected_indices=torch.arange(7)
+    )
+    model = EdgeSelectionClassifier(
+        5,
+        3,
+        hidden_channels=16,
+        layers=2,
+        heads=4,
+        dropout=0.0,
+        edge_chunk_size=3,
+        conductance_heads="per_head",
+        propagation_normalization="row",
+        selection_config={"condition": mode, "chord_fraction": 0.5},
+    ).eval()
+    args = SimpleNamespace(
+        dataset="cora", forest_seed=0, selection_mode=mode, edge_chunk_size=3, precision="fp32"
+    )
+    with torch.no_grad():
+        logits = model(graph)
+        saved = {name: value.clone() for name, value in model.state_dict().items()}
+        gates = [operator.last_gate.clone() for operator in model.operators]
+        rng = torch.get_rng_state()
+        observer = Observer(args, path_sources=3)
+        observer(model, batch, logits, 0)
+        report = observer.report(float((logits.argmax(-1) == graph.y).float().mean()))
+    assert len(report["layers_and_graphs"]) == 2
+    assert len(report["layers_and_graphs"][0]["graphs"]) == 3
+    assert torch.equal(torch.get_rng_state(), rng)
+    for key, value in model.state_dict().items():
+        torch.testing.assert_close(value, saved[key], rtol=0, atol=0)
+    for operator, gate in zip(model.operators, gates, strict=True):
+        torch.testing.assert_close(operator.last_gate, gate, rtol=0, atol=0)
+    json.dumps(report, allow_nan=False)
+
+
+def test_multilabel_summary_matches_exact_micro_f1():
+    logits = torch.tensor([[1.0, -1.0], [1.0, 1.0]])
+    batch = SimpleNamespace(
+        selected_indices=None, graph=SimpleNamespace(y=torch.tensor([[1, 1], [0, 1]]))
+    )
+    metric = PredictionSummary(True)
+    metric.add(logits, logits, batch)
+    assert metric.report()["validation"] == pytest.approx(4 / 6)
+````
+
+# tests/test_edge_selection_audit_compat.py
+
+````python
+"""CPU-only source/driver controls, not GPU training or measured calibration."""
+
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+from contextlib import nullcontext
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.edge_selection import audit, audit_compat, train
+from scripts import run_v5_edge_selection as driver
+
+
+def sources(scope, base_commit=audit_compat.BASE_COMMIT):
+    current = (
+        driver.resources.source_snapshot()
+        if scope == "manifest"
+        else train.implementation_source_hashes()
+    )
+    registry, _ = audit_compat._registry(base_commit)
+    previous = copy.deepcopy(current)
+    for name, change in registry["changes"].items():
+        if change["before"] is None:
+            previous.pop(name)
+        else:
+            previous[name] = change["before"]
+    return previous, current
+
+
+@pytest.mark.parametrize("scope", ["manifest", "training"])
+@pytest.mark.parametrize("base_commit", audit_compat.BASE_COMMITS)
+def test_exact_pinned_release_passes_without_relabeling(scope, base_commit):
+    previous, current = sources(scope, base_commit)
+    before = copy.deepcopy(previous)
+    proof = audit_compat.require_source_compatibility(previous, current, scope=scope)
+    assert proof["patch_id"] == audit_compat.PATCH_ID
+    assert proof["base_commit"] == base_commit
+    assert proof["training_artifacts_rewritten"] is False
+    assert proof["previous_source_map_sha256"] != proof["current_source_map_sha256"]
+    assert previous == before
+    assert audit_compat.require_source_compatibility(current, current, scope=scope) is None
+
+
+@pytest.mark.parametrize(
+    "damage", ["model", "missing", "added", "partial_patch", "helper", "old_release", "scope"]
+)
+def test_no_unregistered_source_change_is_accepted(damage):
+    previous, current = sources("training")
+    if damage == "model":
+        current["research/conductance_gat/edge_selection/model.py"] = "0" * 64
+    elif damage == "missing":
+        current.pop("research/conductance_gat/edge_selection/model.py")
+    elif damage == "added":
+        current["research/conductance_gat/edge_selection/extra.py"] = "0" * 64
+    elif damage == "partial_patch":
+        name = "research/conductance_gat/edge_selection/diagnostics.py"
+        current[name] = previous[name]
+    elif damage == "helper":
+        current[audit_compat.HELPER_SOURCE] = "0" * 64
+    elif damage == "old_release":
+        previous["research/conductance_gat/edge_selection/model.py"] = "0" * 64
+    with pytest.raises(ValueError):
+        audit_compat.require_source_compatibility(
+            previous, current, scope="manifest" if damage == "scope" else "training"
+        )
+
+
+def test_live_pins_are_linux_lf_bytes_not_windows_normalized_claims():
+    registry, _ = audit_compat._registry()
+    previous, current = sources("training")
+    for name, pins in registry["changes"].items():
+        raw = (audit_compat.ROOT / name).read_bytes()
+        assert b"\r\n" not in raw
+        assert hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest() == pins["after"]
+    raw = (audit_compat.ROOT / audit_compat.HELPER_SOURCE).read_bytes()
+    current[audit_compat.HELPER_SOURCE] = hashlib.sha256(raw.replace(b"\n", b"\r\n")).hexdigest()
+    with pytest.raises(ValueError, match="pinned live"):
+        audit_compat.require_source_compatibility(previous, current, scope="training")
+
+
+def test_registry_is_exact_and_rejects_duplicate_keys(tmp_path, monkeypatch):
+    registry = json.loads(audit_compat.REGISTRY_PATH.read_text())
+    target = tmp_path / "debug-registry.json"
+    target.write_text(
+        json.dumps(registry).replace(
+            '"schema_version": 1', '"schema_version": 1, "schema_version": 1'
+        )
+    )
+    monkeypatch.setattr(audit_compat, "REGISTRY_PATH", target)
+    with pytest.raises(ValueError, match="duplicate"):
+        audit_compat._registry()
+    registry["releases"][0]["changes"]["research/conductance_gat/edge_selection/model.py"] = {
+        "before": "0" * 64,
+        "after": "1" * 64,
+    }
+    target.write_text(json.dumps(registry))
+    with pytest.raises(ValueError, match="exact change set"):
+        audit_compat._registry()
+
+
+@pytest.mark.parametrize("base_commit", audit_compat.BASE_COMMITS)
+def test_partial_checkpoint_accepts_only_exact_source_repair(base_commit):
+    previous, current = sources("training", base_commit)
+    identity = {
+        "research_suite": train.SUITE,
+        "configuration": {"synthetic": "debug-identity-only"},
+        "source_sha256": previous,
+        "training_arguments": {"device": "cuda:0", "seed": 0},
+        "learning_budget": {"epochs": 200},
+    }
+    saved = {
+        "resume_identity": identity,
+        "resume_identity_sha256": train.base._canonical_sha256(identity),
+    }
+    snapshot = copy.deepcopy(saved)
+    expected = {**identity, "source_sha256": current}
+    original, proof = train.resolve_training_resume(saved, expected)
+    assert original == identity and original is not identity
+    assert proof["base_commit"] == base_commit
+    assert saved == snapshot
+    for key in ("research_suite", "configuration", "training_arguments", "learning_budget"):
+        damaged = {**expected, key: "changed"}
+        with pytest.raises(ValueError, match="identity mismatch"):
+            train.resolve_training_resume(saved, damaged)
+    damaged_sources = {**current, "unexpected.py": "a" * 64}
+    with pytest.raises(ValueError, match="unreviewed"):
+        train.resolve_training_resume(saved, {**expected, "source_sha256": damaged_sources})
+
+
+def fake_result():
+    return {
+        "validation": 0.721098,
+        "best_epoch": 6,
+        "epochs_run": 56,
+        "shared_initial_state_sha256": "a" * 64,
+        "data_sha256": "b" * 64,
+        "split_sha256": "c" * 64,
+        "learning_budget": {"explicit_debug_fixture": True},
+        "checkpoint_sha256": "d" * 64,
+    }
+
+
+def test_repaired_resume_skips_training_and_measurement_retries_only_failed_audit(
+    tmp_path, monkeypatch
+):
+    previous, current = sources("manifest")
+    options = driver.parser().parse_args(
+        [
+            "--run-id",
+            "debug-source-repair",
+            "--datasets",
+            "cora",
+            "--profiles",
+            "reference",
+            "--suites",
+            "structure",
+            "--chord-fractions",
+            "0.5",
+        ]
+    )
+    planned = driver.make_jobs(options, tmp_path)
+    jobs = copy.deepcopy(planned)
+    result = fake_result()
+    failed_bytes = b"original explicit synthetic failed audit"
+    old_passed = None
+    for index in (0, 1):
+        jobs[index].update(status="passed", result=copy.deepcopy(result))
+        log = tmp_path / f"old-audit-{index}.log"
+        log.write_bytes(failed_bytes if index else b"old passed audit source retained")
+        # Use the actual command the controller would launch, without executing it.
+        monkeypatch.setattr(driver.standalone.shared, "run_logged", lambda *_: 0)
+        monkeypatch.setattr(driver.standalone, "_next_log", lambda _, target=log: target)
+        driver._audit(options, jobs[index], {}, lambda: None)
+        jobs[index]["audit"].pop("evaluator_source_sha256")
+        if index:
+            jobs[index]["audit"]["status"] = "failed"
+        else:
+            old_passed = copy.deepcopy(jobs[index]["audit"])
+    monkeypatch.undo()
+    entries = [{"status": "passed", "explicit_debug_fixture": "immutable measurement"}]
+    manifest = {
+        "schema_version": 1,
+        "suite": driver.SUITE,
+        "run_id": options.run_id,
+        "status": "failed",
+        "config": driver._config(options),
+        "source_sha256": previous,
+        "dependencies": {},
+        "planned_jobs": planned,
+        "jobs": jobs,
+        "calibration_entries": copy.deepcopy(entries),
+        "resources_applied": True,
+    }
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    checked_calibration, training, audited = [], [], []
+
+    def calibration_check(_args, saved, persist):
+        assert saved["calibration_entries"] == entries
+        checked_calibration.append(True)
+
+    def dispatch(command, log, _environment):
+        if "--root" in command:
+            audited.append(command[command.index("--root") + 1])
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text("new synthetic audit with explicit evaluator provenance")
+        else:
+            training.append(command[command.index("--output-dir") + 1])
+        return 0
+
+    monkeypatch.setattr(driver.resources, "source_snapshot", lambda: current)
+    monkeypatch.setattr(driver, "_ensure_calibration", calibration_check)
+    monkeypatch.setattr(driver, "_read_result", lambda _: copy.deepcopy(result))
+    monkeypatch.setattr(driver.standalone.shared, "run_logged", dispatch)
+    assert driver._run(options, tmp_path, planned, current, {}) == 0
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["source_sha256"] == previous
+    assert len(saved["source_transitions"]) == 1
+    assert saved["calibration_entries"] == entries
+    assert saved["jobs"][0]["audit"] == old_passed
+    assert Path(jobs[1]["audit"]["log_path"]).read_bytes() == failed_bytes
+    assert saved["jobs"][1]["audit_attempts"][0] == jobs[1]["audit"]
+    assert saved["jobs"][1]["result"] == result
+    assert jobs[0]["output_dir"] not in training + audited
+    assert jobs[1]["output_dir"] not in training
+    assert len(training) == len(planned) - 2 and len(audited) == len(planned) - 1
+    assert checked_calibration == [True]
+    assert driver._run(options, tmp_path, planned, current, {}) == 0
+    assert len(training) == len(planned) - 2 and len(audited) == len(planned) - 1
+
+
+def test_audit_reports_actual_evaluator_separately_from_training(tmp_path, monkeypatch):
+    previous, current = sources("training")
+    identity = {"source_sha256": previous, "dataset_protocol": {}, "input_provenance": ["debug"]}
+    metrics = {"resume_identity": identity, "checkpoint_sha256": "a" * 64}
+    model = torch.nn.Linear(2, 2)
+    model.operators = []
+    model.clear_auxiliary_cache = lambda: None
+    args = SimpleNamespace(
+        model_seed=0, dataset="cora", data_root=tmp_path, corruption_ratio=0, selection_mode="full"
+    )
+    checkpoint = {
+        "model_state": copy.deepcopy(model.state_dict()),
+        "resume_identity": identity,
+        "resume_identity_sha256": train.base._canonical_sha256(identity),
+    }
+    monkeypatch.setattr(train, "inspect_completed", lambda _: copy.deepcopy(metrics))
+    monkeypatch.setattr(train, "restore_arguments", lambda *_: args)
+    monkeypatch.setattr(train.base, "_require_cuda", lambda _: None)
+    monkeypatch.setattr(train.base, "configure_compute", lambda _: None)
+    monkeypatch.setattr(train.base, "load_dataset", lambda *_args, **_kwargs: ({}, {}))
+    monkeypatch.setattr(train, "PreparedInputs", lambda *_: SimpleNamespace(provenance=["debug"]))
+    monkeypatch.setattr(train, "make_model", lambda *_: model)
+    monkeypatch.setattr(train.base, "load_checkpoint_on_cpu", lambda _: checkpoint)
+    monkeypatch.setattr(audit, "_isolated_execution_state", lambda _: nullcontext())
+    monkeypatch.setattr(audit, "release_amplitude_diagnostics", lambda _: None)
+    monkeypatch.setattr(train, "evaluate", lambda *_args, **_kwargs: {"metric": 0.5})
+    monkeypatch.setattr(audit, "Observer", lambda *_: SimpleNamespace(report=lambda _: {}))
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda _: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda _: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda _: 0)
+    monkeypatch.setattr(
+        audit,
+        "RuntimeResourceMonitor",
+        lambda _: SimpleNamespace(
+            start=lambda: None, finish=lambda **_: {"explicit_debug_fixture": True}
+        ),
+    )
+    model.selection_metadata = lambda: {}
+    report = audit.audit(tmp_path, tmp_path, torch.device("cpu"), 5, 32)
+    assert report["training_source_sha256"] == previous
+    assert report["source_sha256"] == previous
+    assert report["evaluator_source_sha256"] == current
+    assert report["source_compatibility"]["patch_id"] == audit_compat.PATCH_ID
+    assert report["repeated_validation"]["count"] == 5
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_result_reader_accepts_pinned_old_source_without_changing_result_schema(
+    tmp_path, monkeypatch
+):
+    previous, current = sources("training")
+    options = driver.parser().parse_args(
+        [
+            "--run-id",
+            "debug-read",
+            "--datasets",
+            "cora",
+            "--profiles",
+            "reference",
+            "--suites",
+            "structure",
+            "--chord-fractions",
+            "0.5",
+        ]
+    )
+    job = driver.make_jobs(options, tmp_path)[0]
+    output = Path(job["output_dir"])
+    output.mkdir(parents=True)
+    history = [
+        {"epoch": i, "validation": 0.721098 if i == 6 else 0.7, "optimizer_steps": i}
+        for i in range(1, 57)
+    ]
+    (output / "history.json").write_text(json.dumps(history))
+    (output / "last.pt").write_bytes(
+        b"explicit CPU controller fixture: integrity separately tested"
+    )
+    (output / "best.pt").write_bytes(b"explicit CPU controller selected checkpoint fixture")
+    original = {
+        name: (output / name).read_bytes() for name in ("history.json", "last.pt", "best.pt")
+    }
+    protocol = {"data_sha256": "b" * 64, "split_sha256": "c" * 64}
+    identity = {
+        "research_suite": train.SUITE,
+        "dataset": "cora",
+        "condition": "full",
+        "configuration": train.configuration(driver.calibration.parse_job(job)),
+        "source_sha256": previous,
+        "dataset_protocol": protocol,
+        "dataset_protocol_sha256": train.base._canonical_sha256(protocol),
+    }
+    payload = {
+        **identity,
+        "status": "passed",
+        "resume_identity": identity,
+        "resume_identity_sha256": train.base._canonical_sha256(identity),
+        "protocol": protocol,
+        "test_evaluated": False,
+        "epochs_run": 56,
+        "best_epoch": 6,
+        "best_validation": 0.721098,
+        "optimizer_steps": 56,
+        "shared_initial_state_sha256": "a" * 64,
+        "learning_budget": {"explicit_debug_fixture": True},
+        "checkpoint_sha256": driver.common._file_sha(output / "best.pt"),
+        "last_checkpoint_sha256": driver.common._file_sha(output / "last.pt"),
+        "history_sha256": driver.common._file_sha(output / "history.json"),
+    }
+    monkeypatch.setattr(train, "inspect_completed", lambda _: copy.deepcopy(payload))
+    result = driver._read_result(job)
+    assert result == {
+        "validation": 0.721098,
+        "best_epoch": 6,
+        "epochs_run": 56,
+        "shared_initial_state_sha256": "a" * 64,
+        **protocol,
+        "learning_budget": payload["learning_budget"],
+        **{
+            key: payload[key]
+            for key in ("checkpoint_sha256", "last_checkpoint_sha256", "history_sha256")
+        },
+    }
+    assert {name: (output / name).read_bytes() for name in original} == original
+    current["research/conductance_gat/edge_selection/model.py"] = "0" * 64
+    monkeypatch.setattr(train, "implementation_source_hashes", lambda: current)
+    with pytest.raises(ValueError, match="unreviewed"):
+        driver._read_result(job)
+````
+
+# tests/test_edge_selection_corruption.py
+
+````python
+"""Synthetic CPU controlled-corruption contracts, not a data/accuracy experiment."""
+
+import dataclasses
+
+import pytest
+import torch
+
+from research.conductance_gat.edge_selection.corruption import build_corruption, sample_nonedges
+from research.conductance_gat.edge_selection.topology import build_topology
+
+
+def _pairs(edges):
+    return {tuple(sorted(pair)) for pair in edges.T.tolist()}
+
+
+def _path(nodes):
+    return torch.stack((torch.arange(nodes - 1), torch.arange(1, nodes)))
+
+
+def test_exact_count_original_exclusion_and_deterministic_seed():
+    original = _path(20)
+    result = sample_nonedges(20, original, count=50, seed=123)
+    assert result.shape == (2, 50)
+    assert len(_pairs(result)) == 50
+    assert not (_pairs(result) & _pairs(original))
+    assert torch.equal(result, sample_nonedges(20, original, count=50, seed=123))
+    assert not torch.equal(result, sample_nonedges(20, original, count=50, seed=124))
+
+
+def test_dense_nearly_complete_complement_is_exact_without_rejection_failure():
+    complete = torch.triu_indices(10, 10, 1)
+    missing = torch.tensor([2, 11, 29, 40])
+    keep = torch.ones(complete.shape[1], dtype=torch.bool)
+    keep[missing] = False
+    result = sample_nonedges(10, complete[:, keep], count=4, seed=1)
+    assert _pairs(result) == _pairs(complete[:, missing])
+    with pytest.raises(ValueError, match="only 4 eligible"):
+        sample_nonedges(10, complete[:, keep], count=5, seed=1)
+
+
+def test_no_cross_original_components_or_ppi_graphs_even_with_extra_isolate():
+    original = torch.cat((_path(4), _path(4) + 4), dim=1)
+    graph = torch.tensor([0] * 4 + [1] * 5)
+    result = sample_nonedges(9, original, count=6, seed=1, node_graph=graph)
+    assert result.shape[1] == 6
+    assert not (result == 8).any()
+    assert torch.equal(graph[result[0]], graph[result[1]])
+    assert all((left < 4) == (right < 4) for left, right in result.T.tolist())
+
+
+def test_train_eval_corruption_distinct_sorted_and_provenance_not_a_model_feature():
+    original = _path(12)
+    train = build_corruption(12, original, count=15, seed=42, split="train")
+    validation = build_corruption(
+        12, original, count=15, seed=42, split="validation", exclude=train.negative_incidence
+    )
+    assert not (_pairs(train.negative_incidence) & _pairs(validation.negative_incidence))
+    for data in (train, validation):
+        data.verify_unchanged()
+        assert set(data.model_input()) == {"incidence_edge_index"}
+        columns = [tuple(column) for column in data.candidate_incidence.T.tolist()]
+        assert columns == sorted(columns)
+        assert sum(data.edge_targets.tolist()) == original.shape[1]
+        assert all(
+            bool(target) == (tuple(edge) in _pairs(original))
+            for edge, target in zip(columns, data.edge_targets.tolist(), strict=True)
+        )
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        train.provenance.seed = 99
+    with pytest.raises(ValueError, match="explicit excluded"):
+        build_corruption(12, original, count=15, seed=43, split="validation")
+
+
+def test_provenance_detects_tensor_mutation_but_sanitized_copy_is_independent():
+    data = build_corruption(8, _path(8), count=3, seed=0, split="train")
+    data.model_input()["incidence_edge_index"].zero_()
+    data.verify_unchanged()
+    data.edge_targets[0] = 99
+    with pytest.raises(ValueError, match="changed after provenance"):
+        data.verify_unchanged()
+
+
+def test_excluded_edges_must_be_genuine_same_component_nonedges():
+    original = torch.tensor([[0, 1, 3], [1, 2, 4]])
+    with pytest.raises(ValueError, match="original edge"):
+        sample_nonedges(5, original, count=0, seed=0, exclude=original[:, :1])
+    with pytest.raises(ValueError, match="original connected components"):
+        sample_nonedges(5, original, count=0, seed=0, exclude=torch.tensor([[0], [3]]))
+
+
+def test_cached_components_are_seed_independent_and_wrong_original_plan_is_rejected():
+    original = torch.cat((_path(4), _path(5) + 4), dim=1)
+    first, second = [build_topology(9, original, forest_seed=seed) for seed in (1, 8)]
+    left = sample_nonedges(9, original, count=5, seed=16, original_plan=first)
+    right = sample_nonedges(9, original, count=5, seed=16, original_plan=second)
+    assert torch.equal(left, right)
+    with pytest.raises(ValueError, match="does not match"):
+        sample_nonedges(9, original.flip(1), count=5, seed=16, original_plan=first)
+
+
+def test_zero_corruption_is_explicit_not_an_implicit_fallback():
+    original = torch.triu_indices(4, 4, 1)
+    data = build_corruption(4, original, count=0, seed=0, split="train")
+    assert data.negative_incidence.shape == (2, 0)
+    assert data.provenance.inserted_edge_count == 0
+    assert torch.equal(data.candidate_incidence, original)
+    with pytest.raises(ValueError, match="only 0 eligible"):
+        sample_nonedges(4, original, count=1, seed=0)
+
+
+def test_explicit_zero_request_checks_geometry_without_unnecessary_dfs(monkeypatch):
+    import research.conductance_gat.edge_selection.corruption as corruption
+
+    monkeypatch.setattr(
+        corruption, "build_topology", lambda *a, **k: pytest.fail("unnecessary DFS")
+    )
+    assert sample_nonedges(4, _path(4), count=0, seed=0).shape == (2, 0)
+    with pytest.raises(ValueError, match="self-loops"):
+        sample_nonedges(4, torch.tensor([[0], [0]]), count=0, seed=0)
+
+
+@pytest.mark.parametrize("nodes", [2, 3, 4, 5, 7, 13, 31])
+def test_entire_complement_matches_small_explicit_oracle(nodes):
+    original = _path(nodes)
+    all_pairs = _pairs(torch.triu_indices(nodes, nodes, 1))
+    expected = all_pairs - _pairs(original)
+    result = sample_nonedges(nodes, original, count=len(expected), seed=7)
+    assert _pairs(result) == expected
+````
+
+# tests/test_edge_selection_data.py
+
+````python
+"""CPU data contracts; real PyG/pinned-memory integration explicitly skips if unavailable."""
+
+import dataclasses
+import json
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.edge_selection import data
+from research.conductance_gat.edge_selection.topology import build_topology
+
+
+def _row(nodes=10):
+    edges = torch.stack((torch.arange(nodes - 1), torch.arange(1, nodes)))
+    return {
+        "x": torch.arange(nodes * 3, dtype=torch.float32).reshape(nodes, 3),
+        "y": torch.arange(nodes) % 2,
+        "incidence_edge_index": edges,
+    }
+
+
+def _spec(row=None, *, graph_id=0, split="train", ratio=0.5):
+    return (_row() if row is None else row, graph_id, split, ratio, 29, 17)
+
+
+def _cpu_record(nodes=10, *, graph_id=0, split="train"):
+    row = _row(nodes)
+    corrupted = data.prepare_controlled_corruption(_spec(row, graph_id=graph_id, split=split))
+    graph = SimpleNamespace(
+        x=row["x"], y=row["y"], incidence_edge_index=corrupted.candidate_incidence
+    )
+    plan = build_topology(nodes, graph.incidence_edge_index, forest_seed=17)
+    return graph, plan, corrupted.edge_targets, data.RecordEvidence(graph_id, corrupted)
+
+
+def test_controlled_preparation_uses_frozen_provenance_and_distinct_eval_nonedges():
+    train = data.prepare_controlled_corruption(_spec())
+    validation = data.prepare_controlled_corruption(_spec(split="validation"))
+    assert train.provenance.split == "train" and validation.provenance.split == "validation"
+    assert not (
+        set(map(tuple, train.negative_incidence.T.tolist()))
+        & set(map(tuple, validation.negative_incidence.T.tolist()))
+    )
+    train.verify_unchanged()
+    validation.verify_unchanged()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        train.provenance.seed = 3
+
+
+def test_corruption_preparation_does_not_read_task_labels():
+    row = _row()
+    row["y"] = object()  # Not a tensor: geometry preparation must never inspect y.
+    result = data.prepare_controlled_corruption(_spec(row))
+    assert result.provenance.inserted_edge_count == 4
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("node_type", torch.zeros(10, dtype=torch.long)),
+        ("node_types", ["protein"]),
+        ("node_type_id", torch.zeros(10, dtype=torch.long)),
+        ("edge_relation_id", torch.zeros(9, dtype=torch.long)),
+        ("edge_type", torch.zeros(9, dtype=torch.long)),
+        ("relation_types", ["friend"]),
+        ("num_relations", 1),
+        ("edge_attr", torch.ones(9, 2)),
+    ],
+)
+def test_typed_or_edge_feature_rows_are_rejected_before_pyg_import(field, value):
+    row = _row()
+    row[field] = value
+    with pytest.raises(ValueError, match="cannot discard"):
+        data.prepare_record(_spec(row))
+
+
+@pytest.mark.parametrize("ratio", [-1, float("nan"), float("inf"), True])
+def test_invalid_noise_budget_is_not_silently_changed(ratio):
+    with pytest.raises(ValueError, match="finite and nonnegative"):
+        data.prepare_controlled_corruption(_spec(ratio=ratio))
+
+
+def test_json_provenance_is_a_verified_copy_not_the_mutable_training_source():
+    inputs = object.__new__(data.PreparedInputs)
+    inputs._records = (_cpu_record(),)
+    first = inputs.provenance
+    json.dumps(first, allow_nan=False)
+    first[0]["corruption"]["seed"] = 999
+    assert inputs.provenance[0]["corruption"]["seed"] != 999
+    inputs._records[0][2][0] = 99
+    with pytest.raises(ValueError, match="changed after provenance"):
+        _ = inputs.provenance
+
+
+def test_record_evidence_checks_model_and_forest_alignment_not_only_saved_targets():
+    graph, plan, targets, evidence = _cpu_record()
+    evidence.verify_unchanged(graph, plan, targets)
+    graph.incidence_edge_index = graph.incidence_edge_index.flip(1)
+    with pytest.raises(ValueError, match="model candidate topology"):
+        evidence.verify_unchanged(graph, plan, targets)
+    with pytest.raises(ValueError, match="trainer origin targets"):
+        evidence.verify_unchanged(targets=targets + 1)
+
+
+def test_stress_batch_rejects_non_ppi_and_impossible_physical_batch():
+    inputs = object.__new__(data.PreparedInputs)
+    inputs.indices = {"train": torch.tensor([0])}
+    with pytest.raises(ValueError, match="only for PPI"):
+        inputs.stress_batch(torch.device("cpu"))
+    inputs.indices = None
+    inputs._records = (_cpu_record(),)
+    inputs.args = SimpleNamespace(batch_size=2, pin_memory=False)
+    with pytest.raises(ValueError, match="actual full PPI"):
+        inputs.stress_batch(torch.device("cpu"))
+
+
+def test_prepare_record_pyg_whitelist_has_no_origin_or_relation_features():
+    pytest.importorskip("torch_geometric")
+    row = _row()
+    row["is_original"] = torch.ones(9)  # Deliberately untrusted extra metadata.
+    graph, plan, targets, evidence = data.prepare_record(_spec(row))
+    assert set(graph.keys()) == {"x", "y", "incidence_edge_index", "edge_index"}
+    evidence.verify_unchanged(graph, plan, targets)
+    assert graph.incidence_edge_index.shape[1] == len(targets)
+
+
+def test_pyg_collation_merges_all_graphs_and_preserves_frozen_evidence():
+    pytest.importorskip("torch_geometric")
+    records = [data.prepare_record(_spec(_row(n), graph_id=i)) for i, n in enumerate((6, 8, 10))]
+    batch = data.collate_records(records)
+    assert batch.topology.num_graphs == 3
+    assert batch.graph.x.shape[0] == 24
+    assert torch.equal(batch.graph.incidence_edge_index, batch.topology.incidence_edge_index)
+    assert batch.origin_targets.numel() == sum(record[2].numel() for record in records)
+    moved = batch.to("cpu")
+    assert moved.origin_targets.data_ptr() != batch.origin_targets.data_ptr()
+    assert set(moved.graph.keys()).isdisjoint({"origin_targets", "provenance", "is_original"})
+
+
+def test_pyg_stress_batch_uses_largest_train_graphs_without_changing_training_records():
+    pytest.importorskip("torch_geometric")
+    inputs = object.__new__(data.PreparedInputs)
+    inputs.indices = None
+    inputs.args = SimpleNamespace(batch_size=2, pin_memory=False)
+    records = [data.prepare_record(_spec(_row(n), graph_id=i)) for i, n in enumerate((5, 11, 8))]
+    validation = data.prepare_record(_spec(_row(15), graph_id=7, split="validation"))
+    inputs._records = tuple([*records, validation])
+    before = inputs.provenance
+    stress = inputs.stress_batch(torch.device("cpu"))
+    assert stress.graph.x.shape[0] == 19  # Train 11+8, not validation's larger 15.
+    assert stress.topology.num_graphs == 2
+    assert inputs.provenance == before
+    assert len(inputs._records) == 4
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="real pinned-memory allocator/CUDA unavailable; no fake pinning",
+)
+def test_real_topology_pin_memory_pins_every_tensor_without_changing_cpu_cache():
+    plan = build_topology(5, _row(5)["incidence_edge_index"])
+    before = {
+        name: tensor.clone()
+        for name, tensor in vars(plan).items()
+        if isinstance(tensor, torch.Tensor)
+    }
+    pinned = plan.pin_memory()
+    assert all(
+        tensor.is_pinned() for tensor in vars(pinned).values() if isinstance(tensor, torch.Tensor)
+    )
+    for name, tensor in before.items():
+        assert torch.equal(getattr(plan, name), tensor)
+    moved = pinned.to("cuda:0", non_blocking=True)
+    assert moved.incidence_edge_index.device.type == "cuda"
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="real pinned-memory allocator/CUDA unavailable; no fake pinning",
+)
+def test_real_selection_batch_pins_topology_graph_and_origin_targets():
+    pytest.importorskip("torch_geometric")
+    record = data.prepare_record(_spec())
+    batch = data.collate_records([record])
+    batch.pin_memory()
+    assert batch.graph.x.is_pinned() and batch.origin_targets.is_pinned()
+    assert all(
+        tensor.is_pinned()
+        for tensor in vars(batch.topology).values()
+        if isinstance(tensor, torch.Tensor)
+    )
+````
+
+# tests/test_edge_selection_integrity.py
+
+````python
+"""Synthetic CPU checkpoint metadata tests, never evidence of real model training."""
+
+from __future__ import annotations
+
+import copy
+import json
+import weakref
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.edge_selection import integrity, train
+from research.conductance_gat.v5.learning_budget import plan_learning_budget
+
+
+def publish(case):
+    identity = case.metrics["resume_identity"]
+    identity_hash = train.base._canonical_sha256(identity)
+    case.metrics["resume_identity_sha256"] = identity_hash
+    case.best.update(resume_identity=identity, resume_identity_sha256=identity_hash)
+    case.last.update(resume_identity=identity, resume_identity_sha256=identity_hash)
+    torch.save(case.best, case.folder / "best.pt")
+    best_hash = train.base.sha256_file(case.folder / "best.pt")
+    case.metrics["checkpoint_sha256"] = best_hash
+    case.last["best_checkpoint_sha256"] = best_hash
+    torch.save(case.last, case.folder / "last.pt")
+    (case.folder / "history.json").write_text(json.dumps(case.rows), encoding="utf-8")
+    case.metrics.update(
+        last_checkpoint_sha256=train.base.sha256_file(case.folder / "last.pt"),
+        history_sha256=train.base.sha256_file(case.folder / "history.json"),
+    )
+    (case.folder / "metrics.json").write_text(json.dumps(case.metrics), encoding="utf-8")
+
+
+@pytest.fixture
+def evidence(tmp_path):
+    arguments = train.build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            "shared_dynamic_c",
+            "--selection-mode",
+            "full",
+            "--output-dir",
+            str(tmp_path),
+            "--data-root",
+            str(tmp_path / "debug-data"),
+            "--epochs",
+            "4",
+            "--patience",
+            "1",
+            "--learning-budget-policy",
+            "reference_updates",
+        ]
+    )
+    train.validate_args(arguments)
+    budget = plan_learning_budget(4, 1, 1, 1, "reference_updates")
+    provenance = [{"explicit_synthetic_checkpoint_fixture": True}]
+    protocol = {
+        "data_sha256": "a" * 64,
+        "split_sha256": {"train": "b" * 64, "validation": "c" * 64},
+    }
+    identity = train.build_identity(
+        arguments, protocol, budget, "d" * 64, SimpleNamespace(provenance=provenance)
+    )
+    rows = [
+        {
+            "epoch": epoch,
+            "train_batches": 1,
+            "optimizer_steps": epoch,
+            "processed_units": 3,
+            "phase": {"phase": "joint"},
+            "validation": score,
+        }
+        for epoch, score in enumerate((0.4, 0.5, 0.6, 0.7), 1)
+    ]
+    metrics = {
+        "status": "passed",
+        "research_suite": train.SUITE,
+        "dataset": "cora",
+        "condition": "full",
+        "configuration": train.configuration(arguments),
+        "resume_identity": identity,
+        "source_sha256": identity["source_sha256"],
+        "protocol": protocol,
+        "learning_budget": budget,
+        "initial_state_sha256": "d" * 64,
+        "shared_initial_state_sha256": "e" * 64,
+        "common_backbone_initial_state_sha256": "e" * 64,
+        "topology": {"train_count": 3, "provenance": provenance},
+        "epochs_run": 4,
+        "optimizer_steps": 4,
+        "best_epoch": 4,
+        "best_validation": 0.7,
+        "validation": 0.7,
+        "test_evaluated": False,
+        "debug": False,
+        "subset": False,
+    }
+    last = {
+        "epoch": 4,
+        "optimizer_steps": 4,
+        "history": rows,
+        "best_epoch": 4,
+        "best_validation": 0.7,
+        "shared_initial_state_sha256": "e" * 64,
+        "model_state": {"debug_weight": torch.tensor([1.0])},
+        "optimizer_state": {
+            "state": {0: {"step": torch.tensor(4.0)}},
+            "param_groups": [{"params": [0]}],
+        },
+    }
+    best = {
+        "epoch": 4,
+        "validation": 0.7,
+        "selection_role": "primary",
+        "model_state": {"debug_weight": torch.tensor([0.5])},
+    }
+    case = SimpleNamespace(
+        folder=tmp_path, args=arguments, metrics=metrics, rows=rows, best=best, last=last
+    )
+    publish(case)
+    return case
+
+
+def test_completed_evidence_is_read_only_and_cpu_only(evidence, monkeypatch):
+    before = {path.name: train.base.sha256_file(path) for path in evidence.folder.iterdir()}
+    load = train.base.load_checkpoint_on_cpu
+    last_tensor = []
+    calls = []
+
+    def cpu_load(path):
+        if path.name == "best.pt":
+            assert (
+                last_tensor[0]() is None
+            )  # No simultaneous last+best checkpoint tensor retention.
+        saved = load(path)
+        assert all(value.device.type == "cpu" for value in saved["model_state"].values())
+        calls.append(path.name)
+        if path.name == "last.pt":
+            last_tensor.append(weakref.ref(saved["model_state"]["debug_weight"]))
+        return saved
+
+    monkeypatch.setattr(train.base, "load_checkpoint_on_cpu", cpu_load)
+    assert integrity.inspect_completed(evidence.folder)["best_epoch"] == 4
+    assert calls == ["last.pt", "best.pt"]
+    assert before == {path.name: train.base.sha256_file(path) for path in evidence.folder.iterdir()}
+
+
+@pytest.mark.parametrize(
+    "damage,match",
+    [
+        ("seed", "configuration"),
+        ("budget", "learning budget"),
+        ("gap", "contiguous"),
+        ("partial", "coverage"),
+        ("updates", "coverage"),
+        ("best", "strict maximum"),
+        ("last_history", "last checkpoint"),
+        ("last_steps", "last checkpoint"),
+        ("last_best", "last checkpoint"),
+        ("best_interior", "best checkpoint"),
+        ("optimizer", "optimizer state"),
+        ("protocol", "protocol"),
+        ("source", "source_sha256"),
+        ("shared", "last checkpoint"),
+        ("not_finite", "finite"),
+        ("empty", "positive integer"),
+    ],
+)
+def test_internally_rehashed_but_inconsistent_evidence_is_rejected(evidence, damage, match):
+    case = evidence
+    if damage == "seed":
+        case.metrics["resume_identity"]["training_arguments"]["model_seed"] = 7
+    elif damage == "budget":
+        case.metrics["learning_budget"]["requested_epochs"] = 5
+    elif damage == "gap":
+        case.rows[1]["epoch"] = 3
+    elif damage == "partial":
+        case.rows[1]["processed_units"] = 2
+    elif damage == "updates":
+        case.rows[1]["optimizer_steps"] = 1
+    elif damage == "best":
+        case.metrics.update(best_epoch=3, best_validation=0.6)
+    elif damage == "last_history":
+        case.last["history"] = copy.deepcopy(case.rows[:-1])
+    elif damage == "last_steps":
+        case.last["optimizer_steps"] = 9
+    elif damage == "last_best":
+        case.last["best_epoch"] = 1
+    elif damage == "best_interior":
+        case.best["epoch"] = 3
+    elif damage == "optimizer":
+        case.last["optimizer_state"]["state"] = {}
+    elif damage == "protocol":
+        case.metrics["protocol"] = {"data_sha256": "f" * 64}
+    elif damage == "source":
+        case.metrics["source_sha256"] = {"debug": "f" * 64}
+    elif damage == "shared":
+        case.last["shared_initial_state_sha256"] = "f" * 64
+    elif damage == "not_finite":
+        case.rows[2]["validation"] = float("nan")
+    else:
+        case.rows.clear()
+        case.metrics["epochs_run"] = 0
+    publish(case)
+    with pytest.raises(ValueError, match=match):
+        integrity.inspect_completed(case.folder)
+
+
+def shorten(case, scores, best_epoch):
+    case.rows[:] = case.rows[: len(scores)]
+    for row, value in zip(case.rows, scores, strict=True):
+        row["validation"] = value
+    count, best_value = len(scores), scores[best_epoch - 1]
+    case.metrics.update(
+        epochs_run=count,
+        optimizer_steps=count,
+        best_epoch=best_epoch,
+        best_validation=best_value,
+        validation=best_value,
+    )
+    case.last.update(
+        epoch=count, optimizer_steps=count, best_epoch=best_epoch, best_validation=best_value
+    )
+    case.best.update(epoch=best_epoch, validation=best_value)
+    publish(case)
+
+
+def test_legitimate_patience_stop_is_accepted(evidence):
+    shorten(evidence, (0.7, 0.6), 1)
+    assert integrity.inspect_completed(evidence.folder)["epochs_run"] == 2
+
+
+def test_unjustified_early_completion_is_rejected(evidence):
+    shorten(evidence, (0.4, 0.5, 0.6), 3)
+    with pytest.raises(ValueError, match="budget and patience"):
+        integrity.inspect_completed(evidence.folder)
+
+
+def test_equal_best_scores_select_first_strict_maximum(evidence):
+    shorten(evidence, (0.7, 0.7), 2)
+    with pytest.raises(ValueError, match="first strict maximum"):
+        integrity.inspect_completed(evidence.folder)
+
+
+def test_identity_hash_tampering_is_rejected(evidence):
+    evidence.metrics["resume_identity_sha256"] = "f" * 64
+    (evidence.folder / "metrics.json").write_text(json.dumps(evidence.metrics), encoding="utf-8")
+    with pytest.raises(ValueError, match="identity is corrupt"):
+        integrity.inspect_completed(evidence.folder)
+
+
+def test_resume_boolean_is_not_a_new_scientific_identity(evidence):
+    before = train.serializable_arguments(evidence.args)
+    evidence.args.resume = True
+    assert train.serializable_arguments(evidence.args) == before
+````
+
+# tests/test_edge_selection_model.py
+
+````python
+"""Synthetic CPU/debug checks only; no final-data, GPU or SOTA claims."""
+
+import copy
+import io
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch.nn import functional as F
+
+from research.conductance_gat.edge_selection.model import EdgeSelectionClassifier
+from research.conductance_gat.edge_selection.selection import (
+    CONDITIONS,
+    _ConstrainedLogistic,
+    exact_budget_gate,
+    hard_concrete,
+    selection_configuration,
+)
+from research.conductance_gat.edge_selection.topology import build_topology
+from research.conductance_gat.v5.model import GraphConditionedConductanceNodeClassifier
+
+
+def _graph():
+    generator = torch.Generator().manual_seed(15)
+    incidence = torch.tensor([[0, 0, 0, 1, 1, 2, 4, 4, 5, 5, 6], [1, 2, 3, 2, 3, 3, 5, 7, 6, 7, 7]])
+    batch = torch.tensor([0] * 4 + [1] * 4 + [2])
+    return SimpleNamespace(
+        x=torch.randn(9, 5, generator=generator),
+        y=torch.arange(9) % 3,
+        incidence_edge_index=incidence,
+        batch=batch,
+        _v5_num_graphs=3,
+        edge_selection_topology=build_topology(9, incidence, batch, forest_seed=37),
+    )
+
+
+def _model(condition, *, checkpoint=True, dropout=0.0, **selection):
+    return EdgeSelectionClassifier(
+        5,
+        3,
+        hidden_channels=16,
+        heads=4,
+        layers=2,
+        dropout=dropout,
+        edge_chunk_size=3,
+        activation_checkpoint=checkpoint,
+        selection_config={
+            "condition": condition,
+            "chord_fraction": 0.5,
+            "selection_seed": 76,
+            **selection,
+        },
+    )
+
+
+@pytest.mark.parametrize("condition", CONDITIONS)
+@pytest.mark.parametrize("training", [False, True])
+def test_exact_zeros_positive_r_protected_forest_and_budget(condition, training):
+    torch.manual_seed(88)
+    model, graph = _model(condition), _graph()
+    model.train(training)
+    output = model(graph)
+    assert output.shape == (9, 3) and torch.isfinite(output).all()
+    plan = graph.edge_selection_topology
+    for operator in model.operators:
+        gate, amplitude, effective = operator.last_gate, operator.last_r, operator.last_effective_c
+        assert gate.shape == (11,) and amplitude.shape == (11, 4)
+        assert (amplitude > 0).all() and (effective >= 0).all()
+        torch.testing.assert_close(effective, amplitude * gate[:, None], rtol=0, atol=0)
+        assert (effective[gate == 0] == 0).all()
+        if condition != "hard_concrete":
+            assert ((gate == 0) | (gate == 1)).all()
+            assert (gate[plan.forest_mask] == 1).all()
+            if condition in {"forest_random", "forest_learned", "forest_cycle"}:
+                counts = torch.bincount(plan.edge_graph[~plan.forest_mask], minlength=3)
+                selected = torch.bincount(
+                    plan.edge_graph[(gate > 0) & ~plan.forest_mask], minlength=3
+                )
+                torch.testing.assert_close(selected, (counts.double() * 0.5).floor().long())
+            if condition == "forest_only":
+                torch.testing.assert_close(gate, plan.forest_mask.float())
+
+
+@pytest.mark.parametrize("condition", ["forest_learned", "forest_cycle", "hard_concrete"])
+def test_task_loss_and_auxiliary_update_selector_amplitude_w_and_beta(condition):
+    torch.manual_seed(93)
+    model, graph = _model(condition), _graph()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+    before = {name: p.detach().clone() for name, p in model.named_parameters()}
+    loss = F.cross_entropy(model(graph), graph.y)
+    target = (torch.arange(11) % 3 != 0).float() if condition == "hard_concrete" else None
+    auxiliary = model.auxiliary_loss(target)
+    loss = loss + 0.01 * auxiliary["l0"] + auxiliary["negative"]
+    loss.backward()
+    for name, value in model.named_parameters():
+        assert value.grad is not None, name
+        assert torch.isfinite(value.grad).all(), name
+    optimizer.step()
+    changed = {
+        name for name, value in model.named_parameters() if not torch.equal(before[name], value)
+    }
+    assert any("selector.node_projection" in name for name in changed)
+    assert any("selector.edge_hidden" in name for name in changed)
+    assert any("selector.score" in name for name in changed)
+    assert any("estimator.context_metric" in name for name in changed)
+    assert any("value_weight" in name for name in changed)
+    assert any("beta_estimator" in name for name in changed)
+    if condition == "forest_cycle":
+        assert any("cycle_weight" in name for name in changed)
+    model.clear_auxiliary_cache()
+    assert all(
+        op.selector.live_probability is None and op.selector.live_logits is None
+        for op in model.operators
+    )
+
+
+@pytest.mark.parametrize("condition", ["full", "forest_only", "forest_random"])
+def test_controls_have_no_unused_selector_parameters(condition):
+    model = _model(condition)
+    assert all(list(op.selector.parameters()) == [] for op in model.operators)
+    loss = F.cross_entropy(model(_graph()), _graph().y)
+    loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_all_arms_preserve_common_backbone_and_amplitude_initialization():
+    models = []
+    for condition in CONDITIONS:
+        torch.manual_seed(24)
+        models.append(_model(condition))
+    expected = models[0].state_dict()
+    for model in models[1:]:
+        for name, value in expected.items():
+            torch.testing.assert_close(value, model.state_dict()[name], rtol=0, atol=0)
+    learned = models[CONDITIONS.index("forest_learned")].state_dict()
+    cycle = models[CONDITIONS.index("forest_cycle")].state_dict()
+    for name in learned:
+        torch.testing.assert_close(learned[name], cycle[name], rtol=0, atol=0)
+
+
+def test_full_condition_matches_original_positive_perhead_row_v5_exactly():
+    torch.manual_seed(24)
+    selection = _model("full").eval()
+    torch.manual_seed(24)
+    original = GraphConditionedConductanceNodeClassifier(
+        5,
+        3,
+        hidden_channels=16,
+        heads=4,
+        layers=2,
+        dropout=0.0,
+        edge_chunk_size=3,
+        activation_checkpoint=True,
+        conductance_heads="per_head",
+        propagation_normalization="row",
+        solver_cost_scaling="width_scaled",
+    ).eval()
+    assert selection.state_dict().keys() == original.state_dict().keys()
+    for name, value in original.state_dict().items():
+        torch.testing.assert_close(value, selection.state_dict()[name], rtol=0, atol=0)
+    torch.testing.assert_close(original(_graph()), selection(_graph()), rtol=0, atol=0)
+
+
+def test_fixed_budget_relaxation_has_correct_implicit_gradient_and_group_constraint():
+    logits = torch.tensor([-0.8, 0.1, 1.2, -0.2, 0.5, 2.0], dtype=torch.float64, requires_grad=True)
+    groups = torch.tensor([0, 0, 0, 1, 1, 1])
+    counts, budget = torch.tensor([3, 3]), torch.tensor([1, 2])
+
+    def probability(value):
+        return _ConstrainedLogistic.apply(value, groups, counts, budget, 0.8)
+
+    result = probability(logits)
+    sums = torch.zeros(2, dtype=result.dtype).index_add(0, groups, result)
+    torch.testing.assert_close(sums, budget.double(), rtol=1e-12, atol=1e-12)
+    assert torch.autograd.gradcheck(probability, (logits,), fast_mode=True)
+    gate, _, actual_budget = exact_budget_gate(
+        logits,
+        torch.ones(6, dtype=torch.bool),
+        groups,
+        2,
+        0.5,
+        temperature=0.8,
+        straight_through=True,
+    )
+    assert ((gate == 0) | (gate == 1)).all()
+    assert gate.sum() == 2 and actual_budget.tolist() == [1, 1]
+    (gate * torch.arange(6, dtype=gate.dtype)).sum().backward()
+    assert logits.grad.abs().sum() > 0
+    torch.testing.assert_close(
+        torch.zeros(2, dtype=gate.dtype).index_add(0, groups, logits.grad),
+        torch.zeros(2, dtype=gate.dtype),
+        atol=1e-12,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("fraction", [0.0, 1.0])
+def test_budget_endpoints_have_exact_counts_without_nan(fraction):
+    scores = torch.randn(5, requires_grad=True)
+    eligible, groups = torch.tensor([True, True, False, True, False]), torch.tensor([0, 0, 0, 1, 1])
+    gate, probability, budget = exact_budget_gate(
+        scores, eligible, groups, 2, fraction, temperature=1.0, straight_through=True
+    )
+    torch.testing.assert_close(gate, eligible.float() * fraction)
+    gate.sum().backward()
+    assert torch.isfinite(scores.grad).all() and not scores.grad.any()
+
+
+def test_hard_concrete_exact_zero_l0_probability_and_deterministic_eval():
+    logits = torch.tensor([-100.0, -2.0, 0.0, 2.0, 100.0], requires_grad=True)
+    gate, p = hard_concrete(logits, training=False)
+    assert gate[0] == 0 and gate[-1] == 1
+    expected = (logits - (2 / 3) * torch.tensor(0.1 / 1.1).log()).sigmoid()
+    torch.testing.assert_close(p, expected)
+    torch.testing.assert_close(gate, hard_concrete(logits, training=False)[0], rtol=0, atol=0)
+    (gate.sum() + p.sum()).backward()
+    assert torch.isfinite(logits.grad).all() and logits.grad.abs().sum() > 0
+
+
+def test_checkpoint_replay_preserves_stochastic_gates_outputs_gradients_and_aux_loss():
+    torch.manual_seed(72)
+    plain = _model("hard_concrete", checkpoint=False, dropout=0.2)
+    recompute = copy.deepcopy(plain)
+    recompute.activation_checkpoint = True
+    graph, target = _graph(), (torch.arange(11) % 2).float()
+    results = []
+    for model in (plain, recompute):
+        torch.manual_seed(94)
+        output = model(graph)
+        before = [op.last_gate.clone() for op in model.operators]
+        aux = model.auxiliary_loss(target)
+        loss = F.cross_entropy(output, graph.y) + 0.01 * aux["l0"] + aux["negative"]
+        loss.backward()
+        for gate, op in zip(before, model.operators, strict=True):
+            torch.testing.assert_close(gate, op.last_gate, rtol=0, atol=0)
+        results.append(
+            (output.detach(), {name: p.grad.clone() for name, p in model.named_parameters()})
+        )
+    torch.testing.assert_close(results[0][0], results[1][0], rtol=0, atol=0)
+    for name in results[0][1]:
+        torch.testing.assert_close(results[0][1][name], results[1][1][name], rtol=1e-5, atol=1e-6)
+
+
+def test_auxiliary_source_targets_are_not_used_in_forward_and_cache_clears():
+    model, graph = _model("hard_concrete"), _graph()
+    model.eval()
+    output = model(graph)
+    graph.corruption_origin = torch.arange(11) % 2
+    torch.testing.assert_close(output, model(graph), rtol=0, atol=0)
+    first = model.auxiliary_loss(torch.zeros(11))["negative"]
+    second = model.auxiliary_loss(torch.ones(11))["negative"]
+    assert first != second
+    torch.testing.assert_close(output, model(graph), rtol=0, atol=0)
+    model.clear_auxiliary_cache()
+    with pytest.raises(RuntimeError, match="current forward"):
+        model.auxiliary_loss()
+    with pytest.raises(ValueError, match="separate corruption"):
+        _model("forest_learned").auxiliary_loss(torch.ones(11))
+
+
+def test_cycle_context_changes_gate_scores_and_is_orientation_invariant():
+    model, graph = _model("forest_cycle"), _graph()
+    model.eval()
+    model(graph)
+    before = [op.last_logits.clone() for op in model.operators]
+    with torch.no_grad():
+        for op in model.operators:
+            op.selector.cycle_weight.fill_(0.7)
+    output = model(graph)
+    assert any(
+        not torch.allclose(old, op.last_logits)
+        for old, op in zip(before, model.operators, strict=True)
+    )
+    changed = copy.deepcopy(graph)
+    changed.incidence_edge_index = graph.incidence_edge_index.flip(0)
+    changed.edge_selection_topology = build_topology(
+        9, changed.incidence_edge_index, changed.batch, forest_seed=37
+    )
+    torch.testing.assert_close(output, model(changed), rtol=1e-5, atol=1e-6)
+
+
+def test_no_topology_or_wrong_topology_is_an_explicit_error():
+    graph = _graph()
+    del graph.edge_selection_topology
+    with pytest.raises(ValueError, match="prepare"):
+        _model("full")(graph)
+    graph = _graph()
+    graph.incidence_edge_index = graph.incidence_edge_index.flip(1)
+    with pytest.raises(RuntimeError, match="different physical"):
+        _model("full")(graph)
+
+
+def test_checkpoint_state_roundtrip_and_eval_gate_reproduction():
+    torch.manual_seed(21)
+    model = _model("forest_cycle").eval()
+    graph = _graph()
+    expected = model(graph)
+    buffer = io.BytesIO()
+    torch.save(model.state_dict(), buffer)
+    buffer.seek(0)
+    restored = _model("forest_cycle").eval()
+    restored.load_state_dict(torch.load(buffer, weights_only=True), strict=True)
+    torch.testing.assert_close(restored(graph), expected, rtol=0, atol=0)
+    for first, second in zip(model.operators, restored.operators, strict=True):
+        torch.testing.assert_close(first.last_gate, second.last_gate, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("condition", CONDITIONS)
+def test_edgeless_graph_preserves_finite_full_model(condition):
+    graph = SimpleNamespace(
+        x=torch.randn(3, 5), incidence_edge_index=torch.empty(2, 0, dtype=torch.long)
+    )
+    graph.edge_selection_topology = build_topology(3, graph.incidence_edge_index)
+    model = _model(condition)
+    output = model(graph)
+    assert torch.isfinite(output).all()
+    if condition == "hard_concrete":
+        assert model.auxiliary_loss()["l0"] == 0
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {"condition": "forest_learned"},
+        {"condition": "full", "chord_fraction": True},
+        {"condition": "full", "selection_temperature": 0},
+        {"condition": "hard_concrete", "hard_concrete_lower": 0},
+        {"condition": "full", "l0_weight": 0.1},
+    ],
+)
+def test_configuration_refuses_missing_budget_or_invalid_semantics(config):
+    with pytest.raises(ValueError):
+        selection_configuration(config)
+
+
+@pytest.mark.parametrize("condition", ["forest_learned", "forest_cycle", "hard_concrete"])
+def test_bf16_geometry_and_full_backward_remain_finite(condition):
+    torch.manual_seed(65)
+    model, graph = _model(condition), _graph()
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = model(graph)
+        auxiliary = model.auxiliary_loss(
+            (torch.arange(11) % 2).float() if condition == "hard_concrete" else None
+        )
+        loss = (
+            F.cross_entropy(output.float(), graph.y)
+            + 0.01 * auxiliary["l0"]
+            + auxiliary["negative"]
+        )
+    loss.backward()
+    for operator in model.operators:
+        assert operator.last_gate.dtype == operator.last_r.dtype == torch.float32
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
+
+def test_hard_concrete_negative_loss_is_on_the_actual_active_probability():
+    model, graph = _model("hard_concrete"), _graph()
+    model.eval()
+    model(graph)
+    targets = torch.ones(11)
+    actual = model.auxiliary_loss(targets)["negative"]
+    references = []
+    groups = graph.edge_selection_topology.edge_graph
+    for operator in model.operators:
+        losses = -operator.selector.live_probability.log()
+        sums = torch.zeros(3).index_add(0, groups, losses)
+        counts = torch.bincount(groups, minlength=3)
+        references.append((sums / counts.clamp_min(1)).mean())
+    torch.testing.assert_close(actual, torch.stack(references).mean())
+
+
+def test_nonfinite_selector_scores_fail_in_eval_instead_of_silently_ranking_nan():
+    model, graph = _model("forest_learned"), _graph()
+    model.eval()
+    with torch.no_grad():
+        model.operators[0].selector.score.weight.fill_(torch.nan)
+    with pytest.raises(RuntimeError, match="logits must be finite"):
+        model(graph)
+
+
+def test_read_only_gate_and_frozen_amplitude_interventions_restore_state_and_rng():
+    torch.manual_seed(82)
+    model, graph = _model("forest_cycle").eval(), _graph()
+    with torch.no_grad():
+        baseline = model(graph)
+    gates = [operator.last_gate.clone() for operator in model.operators]
+    before = {
+        (id(module), name): value
+        for module in model.modules()
+        for name, value in vars(module).items()
+        if name.startswith(("last_", "live_"))
+    }
+    parameters = {name: p.detach().clone() for name, p in model.named_parameters()}
+    rng = torch.get_rng_state().clone()
+    with model.gate_intervention("all"):
+        altered = model(graph)
+        assert not altered.requires_grad
+        assert all((operator.last_gate == 1).all() for operator in model.operators)
+        torch.rand(3)
+    assert not torch.equal(baseline, altered)
+    torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+    with model.gate_intervention(gates, amplitude_ones=True):
+        model(graph)
+        for gate, operator in zip(gates, model.operators, strict=True):
+            torch.testing.assert_close(operator.last_gate, gate, rtol=0, atol=0)
+            assert (operator.last_r == 1).all()
+            torch.testing.assert_close(
+                operator.last_effective_c, gate[:, None].expand(-1, 4), rtol=0, atol=0
+            )
+    for module in model.modules():
+        for name, value in vars(module).items():
+            if name.startswith(("last_", "live_")):
+                assert value is before[(id(module), name)]
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(parameter, parameters[name], rtol=0, atol=0)
+        assert parameter.grad is None
+    assert all(operator.amplitude_override is None for operator in model.operators)
+    assert all(operator.selector.gate_override is None for operator in model.operators)
+
+
+def test_random_budget_intervention_matches_control_and_rejects_unconstrained_scope():
+    graph = _graph()
+    model = _model("forest_learned").eval()
+    random = _model("forest_random").eval()
+    with torch.no_grad():
+        random(graph)
+    with model.gate_intervention("random_budget"):
+        model(graph)
+        for original, reference in zip(model.operators, random.operators, strict=True):
+            torch.testing.assert_close(original.last_gate, reference.last_gate, rtol=0, atol=0)
+    corruption = _model("hard_concrete").eval()
+    with pytest.raises(ValueError, match="protected exact-budget"):
+        with corruption.gate_intervention("random_budget"):
+            corruption(graph)
+    assert all(operator.selector.gate_override is None for operator in corruption.operators)
+
+
+def test_gate_intervention_exception_restores_caches_rng_and_rejects_training():
+    model, graph = _model("forest_learned").eval(), _graph()
+    with torch.no_grad():
+        model(graph)
+    before = [operator.last_gate for operator in model.operators]
+    rng = torch.get_rng_state().clone()
+    with pytest.raises(ValueError, match="same-device physical"):
+        with model.gate_intervention([torch.ones(3), torch.ones(3)]):
+            torch.rand(4)
+            model(graph)
+    torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+    for operator, gate in zip(model.operators, before, strict=True):
+        assert operator.last_gate is gate and operator.selector.gate_override is None
+    model.train()
+    with pytest.raises(RuntimeError, match="eval"):
+        with model.gate_intervention("all"):
+            model(graph)
+
+
+@pytest.mark.parametrize("condition", ["forest_random", "forest_learned", "forest_cycle"])
+def test_edge_order_permutation_keeps_physical_gates_even_when_learned_scores_tie(condition):
+    torch.manual_seed(53)
+    graph, model = _graph(), _model(condition).eval()
+    with torch.no_grad():
+        for operator in model.operators:
+            if operator.selector.score is not None:
+                operator.selector.score.weight.zero_()
+        baseline = model(graph)
+    gates = [operator.last_gate.clone() for operator in model.operators]
+    order = torch.tensor([8, 2, 4, 0, 10, 7, 3, 6, 1, 9, 5])
+    shuffled = copy.deepcopy(graph)
+    shuffled.incidence_edge_index = graph.incidence_edge_index[:, order]
+    shuffled.edge_selection_topology = build_topology(
+        9, shuffled.incidence_edge_index, shuffled.batch, forest_seed=37
+    )
+    with torch.no_grad():
+        actual = model(shuffled)
+    torch.testing.assert_close(actual, baseline, rtol=1e-5, atol=1e-6)
+    for gate, operator in zip(gates, model.operators, strict=True):
+        torch.testing.assert_close(operator.last_gate, gate[order], rtol=0, atol=0)
+````
+
+# tests/test_edge_selection_reallocation.py
+
+````python
+"""CPU-only allocation regression fixtures; no GPU or final-training claim."""
+
+from __future__ import annotations
+
+import copy
+import platform
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat import edge_selection
+from research.conductance_gat.edge_selection import calibration, reallocation
+from scripts import run_v5_edge_selection as driver
+
+
+@pytest.fixture
+def allocation_fixture(tmp_path, monkeypatch):
+    args = driver.parser().parse_args(
+        [
+            "--run-id",
+            "debug-reallocation",
+            "--datasets",
+            "ogbn-arxiv",
+            "--profiles",
+            "reference",
+            "--suites",
+            "corruption",
+        ]
+    )
+    jobs = driver.make_jobs(args, tmp_path)
+    parsed = {job["job_id"]: calibration.parse_job(job) for job in jobs}
+    identity = {"synthetic_fixture": True, "data_sha256": "a" * 64}
+    hardware = {
+        "device": "cuda:0",
+        "uuid": "GPU-original",
+        "uuid_unavailable_reason": None,
+        "name": "NVIDIA RTX A6000",
+        "total_memory_bytes": 48 * 1024**3,
+        "compute_capability": [8, 6],
+        "allocated_cpu_count": 8,
+        "cuda_visible_devices": "1",
+    }
+    runtime = {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+    }
+    current = dict(hardware, uuid="GPU-reallocated", cuda_visible_devices="4")
+
+    def configuration(value):
+        return {
+            key: str(item) if isinstance(item, Path) else item for key, item in vars(value).items()
+        }
+
+    fake_train = SimpleNamespace(
+        configuration=configuration,
+        load_calibration_payload=lambda _: (
+            {"synthetic_fixture": True},
+            copy.deepcopy(identity),
+            4096,
+            "sampled_seed_nodes",
+        ),
+    )
+    monkeypatch.setattr(edge_selection, "train", fake_train)
+    monkeypatch.setattr(calibration, "parse_job", lambda job: copy.deepcopy(parsed[job["job_id"]]))
+    monkeypatch.setattr(calibration.resources, "allocated_cpu_count", lambda: 8)
+    calls = []
+
+    def measure(job, loaded, child, batch, workers):
+        assert loaded == {"synthetic_fixture": True}
+        calls.append((job["job_id"], batch, workers))
+        physical = calibration._probe_args(child, "sampled_seed_nodes", batch, workers)
+        auxiliary = child.negative_loss_weight > 0
+        return {
+            "synthetic_fixture": True,
+            "status": "passed",
+            "condition": job["variant_id"],
+            "model_seed": job["model_seed"],
+            "samples_per_second": 4096,
+            "processed_units": 4096 * 5,
+            "elapsed_seconds": 5.0,
+            "optimizer_steps": 5 * ((4096 + batch - 1) // batch),
+            "measurement_steps_requested": 5,
+            "warmup_steps_requested": 2,
+            "minimum_measure_seconds_requested": 3.0,
+            "complete_measurement_epochs": 5,
+            "complete_warmup_epochs": 2,
+            "warmup_optimizer_steps": 4,
+            "optimizer_state_bytes": 1024,
+            "peak_allocated_bytes": (8 if auxiliary else 12) * 1024**3,
+            "peak_reserved_bytes": (10 if auxiliary else 14) * 1024**3,
+            "total_memory_bytes": 48 * 1024**3,
+            "free_bytes_before": 46 * 1024**3,
+            "unit": "synthetic_supervised_seed_nodes",
+            "batch_size": batch,
+            "workers": workers,
+            "configuration": configuration(physical),
+            "validation_completed": True,
+            "validation_seconds": (20.0 if batch == 4096 else 2.0) if auxiliary else 1.0,
+            "topology_preparation_seconds": 1.0,
+            "setup_seconds": 1.0,
+            "auxiliary_path_measured": True,
+            "required_auxiliary_path": auxiliary,
+            "required_cycle_preparation": False,
+            "cycle_preparation_measured": False,
+            "calibration_not_final": True,
+            "parameter_update_verified": True,
+            "model_parameter_count": 100_000,
+            "initial_model_sha256": "b" * 64,
+            "gradient_accumulation_steps": 1,
+            "data_parallel_workers": 1,
+            "effective_batch_size": batch,
+            "hardware": {
+                "device_name": hardware["name"],
+                "total_memory_bytes": hardware["total_memory_bytes"],
+                "compute_capability": hardware["compute_capability"],
+            },
+        }
+
+    monkeypatch.setattr(calibration, "_measure", measure)
+    entry = {}
+    calibration.calibrate_group(jobs, entry, lambda: None)
+    manifest = {
+        "hardware": copy.deepcopy(hardware),
+        "runtime": runtime,
+        "planned_jobs": jobs,
+        "jobs": driver.common._apply_common_resources(jobs, [entry]),
+        "calibration_entries": [entry],
+        "resources_applied": True,
+        "calibration_status": "passed",
+    }
+    calls.clear()
+    monkeypatch.setattr(driver.hardware_tools, "_hardware", lambda _: current)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda _: (46 * 1024**3, 48 * 1024**3))
+    return SimpleNamespace(
+        args=args,
+        jobs=jobs,
+        manifest=manifest,
+        hardware=hardware,
+        current=current,
+        runtime=runtime,
+        calls=calls,
+        measure=measure,
+        identity=identity,
+        train=fake_train,
+        grouped=driver.common._grouped(jobs),
+    )
+
+
+def test_reallocation_preserves_original_recipe_and_reuses_passed_evidence(allocation_fixture):
+    value = allocation_fixture
+    original = copy.deepcopy(value.manifest)
+    snapshots = []
+    driver._ensure_calibration(
+        value.args, value.manifest, lambda: snapshots.append(copy.deepcopy(value.manifest))
+    )
+    for key, content in original.items():
+        assert value.manifest[key] == content
+    assert len(value.calls) == 2
+    assert {(batch, workers) for _, batch, workers in value.calls} == {(2048, 0)}
+    attempt = value.manifest["allocation_history"][0]
+    assert attempt["status"] == "passed" and attempt["scope"] == reallocation.SCOPE
+    assert attempt["hardware"]["cuda_visible_devices"] == "4"
+    assert attempt["original_calibration_sha256"] == reallocation._original_digest(original)
+    assert all("current_allocation" not in item for item in snapshots[:-2])
+    references = attempt["groups"][0]["representatives"]
+    assert {criterion for item in references for criterion in item["selection_criteria"]} == {
+        "maximum_peak_reserved_bytes",
+        "maximum_peak_allocated_bytes",
+        "maximum_projected_full_budget_seconds",
+    }
+    driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert len(value.calls) == 2 and len(value.manifest["allocation_history"]) == 1
+
+
+@pytest.mark.parametrize(
+    "field,new",
+    [
+        ("name", "different GPU"),
+        ("compute_capability", [9, 0]),
+        ("allocated_cpu_count", 4),
+    ],
+)
+def test_hardware_class_and_cpu_changes_fail_before_probe(allocation_fixture, field, new):
+    value = allocation_fixture
+    value.current[field] = new
+    original = copy.deepcopy(value.manifest)
+    with pytest.raises(ValueError, match=rf"hardware\.{field}"):
+        driver._ensure_calibration(
+            value.args, value.manifest, lambda: pytest.fail("persisted mismatch")
+        )
+    assert value.manifest == original and not value.calls
+
+
+def test_runtime_change_reports_exact_field(allocation_fixture):
+    value = allocation_fixture
+    value.manifest["runtime"]["torch"] = "different-version"
+    with pytest.raises(ValueError, match=r"runtime\.torch"):
+        driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert not value.calls
+
+
+@pytest.mark.parametrize("capacity", [47839313920, 52 * 1024**3])
+def test_changed_capacity_remeasures_all_arms_without_changing_recipe(
+    allocation_fixture, monkeypatch, capacity
+):
+    value = allocation_fixture
+    value.manifest["hardware"]["total_memory_bytes"] = 51041271808
+    value.current["total_memory_bytes"] = capacity
+    original = copy.deepcopy(value.manifest)
+
+    def measure(*args):
+        report = value.measure(*args)
+        report["total_memory_bytes"] = capacity
+        report["hardware"]["total_memory_bytes"] = capacity
+        report["free_bytes_before"] = capacity - 1024**3
+        return report
+
+    monkeypatch.setattr(calibration, "_measure", measure)
+    driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    for key, content in original.items():
+        assert value.manifest[key] == content
+    attempt = value.manifest["allocation_history"][0]
+    assert attempt["scope"] == reallocation.CAPACITY_SCOPE
+    assert {job_id for job_id, _, _ in value.calls} == {job["job_id"] for job in value.jobs}
+    assert all(
+        "changed_capacity_all_arms" in item["selection_criteria"]
+        for item in attempt["groups"][0]["representatives"]
+    )
+    calls = list(value.calls)
+    driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert value.calls == calls
+
+
+def test_changed_capacity_selects_non_maximal_arm_too(allocation_fixture):
+    value = allocation_fixture
+    entry = copy.deepcopy(value.manifest["calibration_entries"][0])
+    selected = entry["selected_candidate"]
+    candidate = next(
+        item for item in entry["candidates"] if {key: item[key] for key in selected} == selected
+    )
+    first, second = candidate["measurements"]
+    for key in list(first):
+        if key not in {"condition", "model_seed"}:
+            second[key] = copy.deepcopy(first[key])
+    assert len(reallocation._representatives(entry, value.jobs)) == 1
+    assert len(reallocation._representatives(entry, value.jobs, all_arms=True)) == 2
+
+
+def test_changed_capacity_oom_preserves_original_and_cannot_commit(allocation_fixture, monkeypatch):
+    value = allocation_fixture
+    value.current["total_memory_bytes"] = 47839313920
+    original = copy.deepcopy(value.manifest)
+    monkeypatch.setattr(
+        calibration, "_measure", lambda *_: {"status": "oom", "error": "synthetic CPU fixture OOM"}
+    )
+    with pytest.raises(RuntimeError, match="no batch, worker, model or data downscale"):
+        driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    for key, content in original.items():
+        assert value.manifest[key] == content
+    assert "current_allocation" not in value.manifest
+    assert value.manifest["allocation_history"][0]["status"] == "failed"
+
+
+def test_changed_capacity_below_hardware_profile_rejected(allocation_fixture):
+    value = allocation_fixture
+    value.current["total_memory_bytes"] = 24 * 1024**3
+    with pytest.raises(ValueError, match=">=40 GiB"):
+        driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert not value.calls
+
+
+@pytest.mark.parametrize("capacity", [0, -1, None, True, float("nan")])
+def test_invalid_capacity_rejected(allocation_fixture, capacity):
+    value = allocation_fixture
+    value.current["total_memory_bytes"] = capacity
+    with pytest.raises(ValueError, match="total_memory_bytes"):
+        driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert not value.calls
+
+
+@pytest.mark.parametrize("outcome", ["oom", "insufficient_headroom", "interrupted"])
+def test_failed_probe_is_retained_and_retry_remeasures(allocation_fixture, monkeypatch, outcome):
+    value = allocation_fixture
+    original = copy.deepcopy(value.manifest)
+
+    def failure(*args):
+        if outcome == "interrupted":
+            raise KeyboardInterrupt("synthetic fixture interruption")
+        if outcome == "oom":
+            return {"status": "oom", "error": "synthetic fixture OOM"}
+        report = value.measure(*args)
+        report["free_bytes_before"] = report["peak_reserved_bytes"]
+        return report
+
+    monkeypatch.setattr(calibration, "_measure", failure)
+    expected = KeyboardInterrupt if outcome == "interrupted" else RuntimeError
+    with pytest.raises(expected):
+        driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    for key, content in original.items():
+        assert value.manifest[key] == content
+    assert "current_allocation" not in value.manifest
+    failed = copy.deepcopy(value.manifest["allocation_history"][0])
+    assert failed["status"] == ("interrupted" if outcome == "interrupted" else "failed")
+    monkeypatch.setattr(calibration, "_measure", value.measure)
+    driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert value.manifest["allocation_history"][0] == failed
+    assert value.manifest["current_allocation"]["history_index"] == 1
+
+
+@pytest.mark.parametrize(
+    "field,new",
+    [
+        ("parameter_update_verified", False),
+        ("effective_batch_size", 1),
+        ("gradient_accumulation_steps", 2),
+        ("data_parallel_workers", 2),
+        ("model_parameter_count", 10),
+        ("initial_model_sha256", "c" * 64),
+        ("complete_warmup_epochs", 0),
+        ("validation_completed", False),
+        ("complete_warmup_epochs", float("nan")),
+        ("warmup_optimizer_steps", float("inf")),
+        ("parameter_update_verified", 1),
+        ("complete_measurement_epochs", 1.5),
+        ("auxiliary_path_measured", False),
+        ("configuration", {}),
+    ],
+)
+def test_fresh_probe_must_match_full_unchanged_recipe(allocation_fixture, monkeypatch, field, new):
+    value = allocation_fixture
+
+    def damaged(*args):
+        report = value.measure(*args)
+        report[field] = new
+        return report
+
+    monkeypatch.setattr(calibration, "_measure", damaged)
+    with pytest.raises(ValueError):
+        driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert "current_allocation" not in value.manifest
+
+
+def test_data_change_rejected_before_probe(allocation_fixture):
+    value = allocation_fixture
+    value.identity["data_sha256"] = "changed"
+    with pytest.raises(ValueError, match="data/split/topology"):
+        driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert not value.calls and "current_allocation" not in value.manifest
+
+
+def test_passed_evidence_tampering_rejected(allocation_fixture):
+    value = allocation_fixture
+    driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    value.manifest["allocation_history"][0]["groups"][0]["measurements"][0]["report"][
+        "batch_size"
+    ] = 1
+    with pytest.raises(ValueError, match="evidence"):
+        driver._ensure_calibration(value.args, value.manifest, lambda: None)
+
+
+def test_partial_original_calibration_cannot_mix_allocations(allocation_fixture):
+    value = allocation_fixture
+    value.manifest["calibration_status"] = "running"
+    with pytest.raises(ValueError, match="partial measurements"):
+        driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert not value.calls and "allocation_history" not in value.manifest
+
+
+def test_finished_groups_skip_new_probes_until_audit_command_changes(allocation_fixture):
+    value = allocation_fixture
+    for job in value.manifest["jobs"]:
+        job.update(
+            status="passed",
+            audit={"status": "passed", "command": driver._audit_command(value.args, job)},
+        )
+    driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert not value.calls and "current_allocation" not in value.manifest
+    value.args.repeat_evaluations += 1
+    driver._ensure_calibration(value.args, value.manifest, lambda: None)
+    assert value.calls and value.manifest["allocation_history"][0]["status"] == "passed"
+
+
+def test_failed_final_publish_never_commits_allocation(allocation_fixture):
+    value = allocation_fixture
+
+    def persist():
+        if "current_allocation" in value.manifest:
+            raise OSError("synthetic publication failure")
+
+    with pytest.raises(OSError, match="publication"):
+        driver._ensure_calibration(value.args, value.manifest, persist)
+    assert "current_allocation" not in value.manifest
+    assert value.manifest["allocation_history"][0]["status"] == "failed"
+````
+
+# tests/test_edge_selection_topology.py
+
+````python
+"""Synthetic CPU unit checks only; not a reduced real-data experiment."""
+
+import dataclasses
+import pickle
+
+import pytest
+import torch
+
+from research.conductance_gat.edge_selection.topology import (
+    batch_topologies,
+    build_topology,
+    cycle_context,
+    cycle_to_edge,
+    edge_to_cycle,
+)
+
+
+def _fixture():
+    return 8, torch.tensor([[0, 0, 1, 1, 2, 4, 4, 5], [1, 2, 2, 3, 3, 5, 6, 6]])
+
+
+def _explicit_basis(plan):
+    """Tiny-test oracle only: production code never allocates this matrix."""
+    z = torch.zeros(plan.num_edges, len(plan.chord_indices), dtype=torch.float64)
+    for column, edge in enumerate(plan.chord_indices.tolist()):
+        z[edge, column] = 1
+        node, ancestor = int(plan.chord_descendant[column]), int(plan.chord_ancestor[column])
+        while node != ancestor:
+            z[int(plan.parent_edge[node]), column] = -plan.chord_sign[column] * plan.tree_sign[node]
+            node = int(plan.parent[node])
+    return z
+
+
+def test_dfs_forest_components_and_exact_incidence_kernel_basis():
+    nodes, edges = _fixture()
+    plan = build_topology(nodes, edges, forest_seed=7)
+    assert plan.metadata["num_components"] == 3
+    assert int(plan.forest_mask.sum()) == nodes - 3
+    assert len(plan.chord_indices) == edges.shape[1] - nodes + 3
+    z = _explicit_basis(plan)
+    incidence = torch.zeros(edges.shape[1], nodes, dtype=torch.float64)
+    incidence[torch.arange(edges.shape[1]), edges[0]] = -1
+    incidence[torch.arange(edges.shape[1]), edges[1]] = 1
+    assert torch.equal(incidence.T @ z, torch.zeros(nodes, z.shape[1], dtype=torch.float64))
+    assert torch.linalg.matrix_rank(z) == z.shape[1]
+    assert torch.equal(z.abs().sum(0).long(), plan.cycle_length)
+    assert torch.equal(z.abs().sum(1).long(), plan.cycle_count)
+    assert torch.equal(plan.incidence_edge_index, edges)
+
+
+@pytest.mark.parametrize("signed", [False, True])
+def test_implicit_operators_match_explicit_small_oracle_and_are_adjoints(signed):
+    nodes, edges = _fixture()
+    plan = build_topology(nodes, edges)
+    z = _explicit_basis(plan)
+    if not signed:
+        z = z.abs()
+    values = torch.randn(edges.shape[1], 3, dtype=torch.float64, requires_grad=True)
+    cycles = torch.randn(z.shape[1], 3, dtype=torch.float64, requires_grad=True)
+    forward = edge_to_cycle(values, plan, signed=signed)
+    backward = cycle_to_edge(cycles, plan, signed=signed)
+    torch.testing.assert_close(forward, z.T @ values)
+    torch.testing.assert_close(backward, z @ cycles)
+    torch.testing.assert_close((forward * cycles).sum(), (values * backward).sum())
+    assert torch.autograd.gradcheck(lambda x: edge_to_cycle(x, plan, signed=signed), (values,))
+    assert torch.autograd.gradcheck(lambda x: cycle_to_edge(x, plan, signed=signed), (cycles,))
+
+
+def test_unsigned_normalized_context_matches_dense_cycle_means_and_edge_means():
+    nodes, edges = _fixture()
+    plan = build_topology(nodes, edges)
+    z = _explicit_basis(plan).abs()
+    value = torch.randn(edges.shape[1], 2, dtype=torch.float64, requires_grad=True)
+    reference = (z @ ((z.T @ value) / plan.cycle_length[:, None])) / plan.cycle_count[
+        :, None
+    ].clamp_min(1)
+    torch.testing.assert_close(cycle_context(value, plan), reference)
+    torch.testing.assert_close(cycle_context(value, plan, normalize=False), z @ z.T @ value)
+    assert torch.autograd.gradcheck(lambda x: cycle_context(x, plan), (value,))
+
+
+def test_orientation_and_column_permutation_do_not_change_unsigned_context_or_forest():
+    nodes, edges = _fixture()
+    perm = torch.tensor([7, 1, 4, 5, 0, 3, 2, 6])
+    permuted = edges.flip(0)[:, perm]
+    first, second = (
+        build_topology(nodes, edges, forest_seed=9),
+        build_topology(nodes, permuted, forest_seed=9),
+    )
+    assert torch.equal(second.forest_mask, first.forest_mask[perm])
+    assert torch.equal(second.random_priority, first.random_priority[perm])
+    values = torch.randn(edges.shape[1], dtype=torch.float64)
+    torch.testing.assert_close(
+        cycle_context(values[perm], second), cycle_context(values, first)[perm]
+    )
+
+
+def test_cached_ppi_plans_batch_without_rebuilding_dfs_or_mixing_graphs(monkeypatch):
+    nodes, edges = _fixture()
+    plans = [build_topology(nodes, edges, forest_seed=seed) for seed in (2, 4)]
+    import research.conductance_gat.edge_selection.topology as topology
+
+    monkeypatch.setattr(topology, "build_topology", lambda *a, **k: pytest.fail("DFS reexecuted"))
+    batch = batch_topologies(plans)
+    assert batch.metadata["num_graphs"] == 2 and batch.metadata["dfs_reexecuted"] is False
+    assert batch.num_graphs == 2
+    assert torch.equal(batch.edge_graph, torch.tensor([0] * 8 + [1] * 8))
+    assert torch.equal(batch.incidence_edge_index[:, 8:], edges + nodes)
+    values = [torch.randn(8, dtype=torch.float64) for _ in plans]
+    expected = torch.cat(
+        [cycle_context(value, plan) for value, plan in zip(values, plans, strict=True)]
+    )
+    torch.testing.assert_close(cycle_context(torch.cat(values), batch), expected)
+    assert torch.equal(batch.cycle_count, torch.cat([plan.cycle_count for plan in plans]))
+
+
+def test_bridge_and_isolate_have_no_cycle_not_a_fake_capped_cycle():
+    plan = build_topology(5, torch.tensor([[0, 1], [1, 2]]))
+    assert plan.metadata["cycle_rank"] == 0
+    value = torch.tensor([1.0, 2.0], requires_grad=True)
+    result = cycle_context(value, plan)
+    assert torch.equal(result, torch.zeros(2))
+    result.sum().backward()
+    assert torch.equal(value.grad, torch.zeros(2))
+    empty = build_topology(0, torch.empty((2, 0), dtype=torch.long))
+    assert cycle_context(torch.empty(0), empty).numel() == 0
+
+
+def test_plan_device_copy_and_pickle_keep_cache_independent():
+    nodes, edges = _fixture()
+    plan = build_topology(nodes, edges)
+    copied = plan.to("cpu")
+    assert copied.incidence_edge_index.data_ptr() != plan.incidence_edge_index.data_ptr()
+    copied.forest_mask.logical_not_()
+    assert not torch.equal(copied.forest_mask, plan.forest_mask)
+    restored = pickle.loads(pickle.dumps(plan))
+    assert torch.equal(restored.parent_edge, plan.parent_edge)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        plan.parent = torch.zeros(nodes, dtype=torch.long)
+
+
+@pytest.mark.parametrize(
+    "edges,graphs",
+    [
+        (torch.tensor([[0], [0]]), None),
+        (torch.tensor([[0, 1], [1, 0]]), None),
+        (torch.tensor([[0], [5]]), None),
+        (torch.tensor([[0], [2]]), torch.tensor([0, 0, 1, 1, 1])),
+    ],
+)
+def test_invalid_physical_topology_rejected(edges, graphs):
+    with pytest.raises(ValueError):
+        build_topology(5, edges, graphs)
+
+
+def test_cycle_rank_is_not_capped_and_plan_storage_is_linear():
+    nodes = 200
+    edges = torch.triu_indices(nodes, nodes, 1)
+    plan = build_topology(nodes, edges)
+    assert len(plan.chord_indices) == edges.shape[1] - nodes + 1
+    elements = sum(
+        value.numel() for value in vars(plan).values() if isinstance(value, torch.Tensor)
+    )
+    assert elements < 20 * (nodes + edges.shape[1])
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+def test_low_precision_inputs_use_stable_accumulation_and_keep_output_dtype(dtype):
+    nodes, edges = _fixture()
+    plan = build_topology(nodes, edges)
+    value = torch.tensor(
+        [1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0], dtype=dtype, requires_grad=True
+    )
+    result = cycle_context(value, plan)
+    assert result.dtype == dtype and torch.isfinite(result).all()
+    torch.testing.assert_close(result, cycle_context(value.double(), plan).to(dtype))
+    result.float().square().sum().backward()
+    assert value.grad is not None and torch.isfinite(value.grad).all()
+````
+
+# tests/test_edge_selection_training.py
+
+````python
+"""Synthetic CPU integration tests, not production training or GPU measurements."""
+
+from __future__ import annotations
+
+import copy
+import random
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+import torch
+
+from research.conductance_gat.edge_selection import protocol, train
+from research.conductance_gat.edge_selection.topology import build_topology
+
+
+@pytest.fixture
+def synthetic_path():
+    """A path value only; these tests neither create nor read result files."""
+    return Path(__file__).resolve().parent / "not-created-synthetic-unit-path"
+
+
+def _args(synthetic_path, condition="forest_learned", *, dataset="cora", **changes):
+    argv = [
+        "--dataset",
+        dataset,
+        "--condition",
+        "shared_dynamic_c",
+        "--selection-mode",
+        condition,
+        "--output-dir",
+        str(synthetic_path / "synthetic-output"),
+        "--data-root",
+        str(synthetic_path / "synthetic-cache"),
+        "--device",
+        "cpu",
+        "--hidden-channels",
+        "16",
+        "--layers",
+        "2",
+        "--heads",
+        "4",
+        "--edge-chunk-size",
+        "3",
+        "--dropout",
+        "0.2",
+        "--workers",
+        "0",
+    ]
+    if condition in protocol.BUDGET_MODES:
+        argv += ["--chord-fraction", "0.5"]
+    if condition == "hard_concrete":
+        argv += [
+            "--corruption-ratio",
+            "0.2",
+            "--l0-weight",
+            "0.0001",
+            "--negative-loss-weight",
+            "0.1",
+        ]
+    args = train.build_parser().parse_args(argv)
+    for key, value in changes.items():
+        setattr(args, key, value)
+    train.validate_args(args)
+    return args
+
+
+def _graph(*, multilabel=False):
+    generator = torch.Generator().manual_seed(19)
+    incidence = torch.tensor([[0, 0, 0, 1, 1, 2, 4, 4, 5, 5, 6], [1, 2, 3, 2, 3, 3, 5, 7, 6, 7, 7]])
+    batch = torch.tensor([0] * 4 + [1] * 4 + [2])
+    target = torch.arange(9) % 3
+    if multilabel:
+        target = torch.nn.functional.one_hot(target, 3).float()
+    return SimpleNamespace(
+        x=torch.randn(9, 5, generator=generator),
+        y=target,
+        incidence_edge_index=incidence,
+        batch=batch,
+        _v5_num_graphs=3,
+        edge_selection_topology=build_topology(9, incidence, batch, forest_seed=0),
+    )
+
+
+class SyntheticDebugInputs:
+    """Two complete synthetic graph-batches; never used by a final-data runner."""
+
+    def __init__(self, *, multilabel=False):
+        self.graph = _graph(multilabel=multilabel)
+        self.selected = None if multilabel else torch.arange(9)
+        self.indices = None if multilabel else {"train": self.selected}
+        self.origin_targets = (torch.arange(11) % 2).float()
+
+    def training_batches(self, epoch, device):
+        assert device == torch.device("cpu")
+        for _ in range(2):
+            yield SimpleNamespace(
+                graph=self.graph,
+                selected_indices=self.selected,
+                origin_targets=self.origin_targets,
+            )
+
+
+def _model(args, inputs):
+    return train.make_model(
+        {"graphs": [{"x": inputs.graph.x}], "classes": 3}, args, torch.device("cpu")
+    )
+
+
+@pytest.mark.parametrize("condition", protocol.MODES)
+def test_optimizer_owns_every_actual_parameter_exactly_once(synthetic_path, condition):
+    args, inputs = _args(synthetic_path, condition), SyntheticDebugInputs()
+    model = _model(args, inputs)
+    optimizer = train.make_optimizer(model)
+    mapping = dict(model.named_parameters())
+    actual = []
+    for group in optimizer.param_groups:
+        assert len(group["parameter_names"]) == len(group["params"])
+        for name, value in zip(group["parameter_names"], group["params"], strict=True):
+            assert value is mapping[name]
+            assert train.parameter_group(name) == group["name"]
+            actual.append(id(value))
+    assert len(actual) == len(set(actual)) == len(mapping)
+    assert set(actual) == {id(value) for value in mapping.values()}
+    gate_groups = [group for group in optimizer.param_groups if group["name"] == "gate"]
+    assert bool(gate_groups) == (condition in {"forest_learned", "forest_cycle", "hard_concrete"})
+    if gate_groups:
+        assert (
+            gate_groups[0]["lr"]
+            == train.base.COMMON["lr"] * train.base.COMMON["conductance_lr_multiplier"]
+        )
+
+
+@pytest.mark.parametrize("condition", ["forest_learned", "forest_cycle", "hard_concrete"])
+@pytest.mark.parametrize("multilabel", [False, True])
+def test_real_training_epoch_updates_task_and_auxiliary_parameters_and_clears_live_cache(
+    synthetic_path, condition, multilabel
+):
+    torch.manual_seed(12)
+    args = _args(synthetic_path, condition, dataset="ppi" if multilabel else "cora")
+    inputs = SyntheticDebugInputs(multilabel=multilabel)
+    model = _model(args, inputs)
+    before = {name: value.detach().clone() for name, value in model.named_parameters()}
+    optimizer = train.make_optimizer(model)
+    result = train.run_training_epoch(
+        model, optimizer, inputs, args, torch.device("cpu"), 1, validate=True
+    )
+    assert result["optimizer_steps"] == result["train_batches"] == 2
+    assert result["train_labels"] == (54 if multilabel else 18)
+    assert result["processed_units"] == (6 if multilabel else 18)
+    assert result["largest_measured_graph_batch"] == 3
+    assert result["largest_measured_physical_edges"] == 11
+    assert set(result["first_step_gradient_norms"]) == {
+        "backbone",
+        "spatial_w",
+        "beta",
+        "conductance",
+        "gate",
+    }
+    assert all(value > 0 for value in result["first_step_gradient_norms"].values())
+    changed_groups = {
+        train.parameter_group(name)
+        for name, value in model.named_parameters()
+        if not torch.equal(value.detach(), before[name])
+    }
+    assert changed_groups == {"backbone", "spatial_w", "beta", "conductance", "gate"}
+    if condition == "hard_concrete":
+        assert result["train_l0"] > 0 and result["train_negative_loss"] > 0
+    else:
+        assert result["train_l0"] == result["train_negative_loss"] == 0
+    assert all(
+        operator.selector.live_logits is None and operator.selector.live_probability is None
+        for operator in model.operators
+    )
+
+
+def test_same_rng_epoch_resume_matches_uninterrupted_cpu_training(synthetic_path, monkeypatch):
+    """Only CUDA RNG transport is mocked; model/loss/optimizer and CPU RNG are real."""
+    transported = []
+    monkeypatch.setattr(
+        torch.cuda, "get_rng_state", lambda device: torch.tensor([7, 9], dtype=torch.uint8)
+    )
+    monkeypatch.setattr(
+        torch.cuda, "set_rng_state", lambda value, device: transported.append(value.clone())
+    )
+    args, inputs = _args(synthetic_path, "hard_concrete"), SyntheticDebugInputs()
+    random.seed(55)
+    np.random.seed(55)
+    torch.manual_seed(55)
+    model = _model(args, inputs)
+    optimizer = train.make_optimizer(model)
+    train.run_training_epoch(model, optimizer, inputs, args, torch.device("cpu"), 1)
+    saved = {
+        "model_state": copy.deepcopy(model.state_dict()),
+        "optimizer_state": copy.deepcopy(optimizer.state_dict()),
+        **train._checkpoint_rng(torch.device("cpu")),
+    }
+    expected_random = (random.random(), float(np.random.random()))
+    expected = train.run_training_epoch(model, optimizer, inputs, args, torch.device("cpu"), 2)
+    restored = _model(args, inputs)
+    restored_optimizer = train.make_optimizer(restored)
+    restored.load_state_dict(saved["model_state"], strict=True)
+    restored_optimizer.load_state_dict(saved["optimizer_state"])
+    train._restore_rng(saved, torch.device("cpu"))
+    assert (random.random(), float(np.random.random())) == expected_random
+    actual = train.run_training_epoch(
+        restored, restored_optimizer, inputs, args, torch.device("cpu"), 2
+    )
+    assert actual == expected
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
+    for first, second in zip(
+        optimizer.state.values(), restored_optimizer.state.values(), strict=True
+    ):
+        assert first.keys() == second.keys()
+        for name in first:
+            torch.testing.assert_close(first[name], second[name], rtol=0, atol=0)
+    torch.testing.assert_close(transported[0], saved["cuda_rng_state"], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"chord_fraction": 0.5},
+        {"corruption_ratio": 0.2},
+        {"negative_loss_weight": 0.1},
+        {"l0_weight": 0.001},
+        {"selection_temperature": 0.5},
+        {"gate_temperature": 0.5},
+        {"corruption_seed": 7},
+        {"conductance_heads": "shared"},
+        {"propagation_normalization": "symmetric"},
+        {"conductance_generator": "degree_only"},
+        {"propagation_filter": "polynomial3"},
+        {"condition": "fixed_c"},
+        {"training_schedule": "staged"},
+        {"transition_from_checkpoint": Path("old-v5.pt")},
+    ],
+)
+def test_protocol_rejects_inactive_or_changed_scientific_axes(synthetic_path, changes):
+    args = _args(synthetic_path, "full")
+    for name, value in changes.items():
+        setattr(args, name, value)
+    with pytest.raises(ValueError):
+        protocol.validate(args)
+
+
+def test_restore_arguments_roundtrips_exact_trained_configuration_without_reusing_output(
+    synthetic_path,
+):
+    args = _args(synthetic_path, "forest_cycle")
+    saved = {
+        "resume_identity": {
+            "training_arguments": train.serializable_arguments(args),
+            "configuration": train.configuration(args),
+        }
+    }
+    restored = train.restore_arguments(
+        saved, synthetic_path / "audit-only", synthetic_path / "cache-new-location", "cpu"
+    )
+    assert restored.output_dir == synthetic_path / "audit-only"
+    assert restored.data_root == synthetic_path / "cache-new-location"
+    assert restored.device == "cpu"
+    assert protocol.configuration(restored) == protocol.configuration(args)
+    altered = copy.deepcopy(saved)
+    altered["resume_identity"]["training_arguments"]["chord_fraction"] = 0.25
+    with pytest.raises(ValueError, match="trained configuration"):
+        train.restore_arguments(
+            altered, synthetic_path / "audit-only", synthetic_path / "cache-new-location", "cpu"
+        )
+
+
+@pytest.mark.parametrize("change", ["source_sha256", "configuration", "research_suite"])
+def test_resume_identity_refuses_changed_sources_recipes_and_legacy_evidence(change):
+    identity = {
+        "research_suite": protocol.SUITE,
+        "source_sha256": {"model.py": "a" * 64},
+        "configuration": {"edge_selection": {"condition": "forest_cycle", "chord_fraction": 0.5}},
+    }
+    saved = {
+        "resume_identity": identity,
+        "resume_identity_sha256": train.base._canonical_sha256(identity),
+    }
+    train.validate_identity(saved, copy.deepcopy(identity))
+    expected = copy.deepcopy(identity)
+    expected[change] = "different"
+    with pytest.raises(ValueError, match="identity mismatch"):
+        train.validate_identity(saved, expected)
+    corrupt = copy.deepcopy(saved)
+    corrupt["resume_identity"][change] = "altered without updating hash"
+    with pytest.raises(ValueError, match="corrupt"):
+        train.validate_identity(corrupt, expected)
+
+
+def test_first_launch_and_resume_share_identity_but_recipe_change_still_fails(
+    synthetic_path, monkeypatch
+):
+    """Operational resume permission must not mutate scientific training identity."""
+    monkeypatch.setattr(
+        train, "implementation_source_hashes", lambda: {"synthetic-debug-source": "a" * 64}
+    )
+    monkeypatch.setattr(train.base, "_versions", lambda: {"scope": "synthetic-CPU-unit-test"})
+    initial = _args(synthetic_path, "forest_cycle", resume=False)
+    resumed = copy.deepcopy(initial)
+    resumed.resume = True
+    assert train.serializable_arguments(initial) == train.serializable_arguments(resumed)
+    assert train.serializable_arguments(resumed)["resume"] is False
+    assert initial.resume is False and resumed.resume is True
+    inputs = SimpleNamespace(provenance={"scope": "synthetic fixture; no official cache read"})
+    data_protocol = {"dataset": "synthetic-debug", "split": "synthetic-debug"}
+    budget = {"planned_epochs": 200, "actual_batches_per_epoch": 2}
+    before = train.build_identity(initial, data_protocol, budget, "b" * 64, inputs)
+    after = train.build_identity(resumed, data_protocol, budget, "b" * 64, inputs)
+    assert before == after
+    assert train.base._canonical_sha256(before) == train.base._canonical_sha256(after)
+    saved = {
+        "resume_identity": before,
+        "resume_identity_sha256": train.base._canonical_sha256(before),
+    }
+    train.validate_identity(saved, after)
+    changed = copy.deepcopy(resumed)
+    changed.chord_fraction = 0.25
+    train.validate_args(changed)
+    changed_identity = train.build_identity(changed, data_protocol, budget, "b" * 64, inputs)
+    assert changed_identity["configuration"] != before["configuration"]
+    with pytest.raises(ValueError, match="identity mismatch"):
+        train.validate_identity(saved, changed_identity)
+````
+
 # tests/test_execution_optimization.py
 
 ````python
@@ -99046,6 +116839,779 @@ def test_setup_validates_profile_files_before_any_pip(
     assert result.returncode == 2
     assert not any(call[:2] == ["-m", "pip"] for call in calls)
     assert "GPU environment ready" not in result.stdout
+````
+
+# tests/test_incidence_ablation.py
+
+````python
+"""Synthetic CPU/debug verification; never a full-data or GPU training claim."""
+
+import copy
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch.nn import functional as F
+
+from experiments.incidence_ablation import calibration, engine, provenance, runner
+from experiments.incidence_ablation.audit import Observer
+from experiments.incidence_ablation.diagnostics import (
+    component_mean,
+    components,
+    cross_hop_gram,
+    laplacian,
+    reconstruction_probe,
+    solve_centered,
+)
+from experiments.incidence_ablation.model import ARMS, IncidenceClassifier, cross_hop_score
+from research.conductance_gat.edge_selection.model import EdgeSelectionClassifier
+from research.conductance_gat.edge_selection.topology import build_topology
+
+
+def graph():
+    incidence = torch.tensor([[0, 0, 1, 1, 3, 3, 4], [1, 2, 2, 3, 4, 5, 5]])
+    batch = torch.zeros(7, dtype=torch.long)
+    return SimpleNamespace(
+        x=torch.randn(7, 5, generator=torch.Generator().manual_seed(18)),
+        y=torch.arange(7) % 3,
+        incidence_edge_index=incidence,
+        batch=batch,
+        _v5_num_graphs=1,
+        edge_selection_topology=build_topology(7, incidence, batch, forest_seed=0),
+    )
+
+
+def model(arm, checkpoint=True):
+    return IncidenceClassifier(
+        5,
+        3,
+        arm=arm,
+        hidden_channels=16,
+        heads=4,
+        layers=3,
+        dropout=0,
+        edge_chunk_size=3,
+        activation_checkpoint=checkpoint,
+        selection_config={"condition": "full"},
+    )
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_every_trainable_parameter_has_finite_gradient_and_new_terms_update(arm):
+    torch.manual_seed(13)
+    net, data = model(arm), graph()
+    optimizer = engine.make_optimizer(net)
+    before = {n: p.detach().clone() for n, p in net.named_parameters()}
+    loss = F.cross_entropy(net(data), data.y)
+    loss.backward()
+    for name, parameter in net.named_parameters():
+        assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
+        if "lift_projection" in name or "hop_coefficients" in name:
+            assert parameter.grad.norm() > 0, name
+    optimizer.step()
+    for name, parameter in net.named_parameters():
+        if "lift_projection" in name or "hop_coefficients" in name:
+            assert not torch.equal(parameter, before[name]), name
+    assert torch.isfinite(net(data)).all()
+
+
+def test_all_arms_have_same_seed_paired_backbone_and_neutral_initial_function():
+    outputs, hashes = [], []
+    for arm in ARMS:
+        torch.manual_seed(23)
+        net = model(arm).eval()
+        hashes.append(engine.shared_initial_state_sha256(net))
+        outputs.append(net(graph()))
+    assert len(set(hashes)) == 1
+    for value in outputs[1:]:
+        torch.testing.assert_close(value, outputs[0])
+    torch.manual_seed(23)
+    old = EdgeSelectionClassifier(
+        5,
+        3,
+        hidden_channels=16,
+        heads=4,
+        layers=3,
+        dropout=0,
+        edge_chunk_size=3,
+        selection_config={"condition": "full"},
+    )
+    torch.testing.assert_close(old(graph()), outputs[0])
+
+
+@pytest.mark.parametrize("arm", ARMS)
+def test_checkpoint_forward_gradient_and_state_restore(arm):
+    torch.manual_seed(33)
+    first, data = model(arm, checkpoint=False), graph()
+    for op in first.operators:
+        if op.hop_coefficients is not None:
+            op.hop_coefficients.data.fill_(0.1)
+        if op.lift_projection is not None:
+            op.lift_projection.data[:, op.head_width :] = 0.03
+    second = copy.deepcopy(first)
+    second.activation_checkpoint = True
+    a, b = first(data), second(data)
+    torch.testing.assert_close(a, b)
+    F.cross_entropy(a, data.y).backward()
+    F.cross_entropy(b, data.y).backward()
+    for (name, x), (_, y) in zip(first.named_parameters(), second.named_parameters(), strict=True):
+        torch.testing.assert_close(x.grad, y.grad, msg=name)
+    third = model(arm)
+    third.load_state_dict(second.state_dict(), strict=True)
+    torch.testing.assert_close(third(data), b)
+
+
+def test_bilinear_matches_dense_local_form_and_orientation_invariance():
+    torch.manual_seed(5)
+    history = torch.randn(4, 7, 2, 3, requires_grad=True)
+    edges = graph().incidence_edge_index
+    weight = torch.rand(7, 2) + 0.1
+    coefficients = torch.randn(2, 6, requires_grad=True)
+    actual = cross_hop_score(history, edges, weight, coefficients, 2)
+    expected = torch.zeros(7, 2)
+    degree = torch.zeros(7, 2)
+    pairs = torch.triu_indices(4, 4, 1)
+    for e, (tail, head) in enumerate(edges.T):
+        delta = history[:, head] - history[:, tail]
+        energy = ((delta[pairs[0]] * delta[pairs[1]]).sum(-1).T * coefficients).sum(-1) / 3**0.5
+        expected[tail] += weight[e] * energy
+        expected[head] += weight[e] * energy
+        degree[tail] += weight[e]
+        degree[head] += weight[e]
+    torch.testing.assert_close(actual, expected / degree.clamp_min(1e-30))
+    torch.testing.assert_close(
+        actual, cross_hop_score(history, edges.flip(0), weight, coefficients, 4)
+    )
+    actual.square().sum().backward()
+    assert history.grad.norm() > 0 and coefficients.grad.norm() > 0
+
+
+def test_quadratic_recovery_cg_dense_pseudoinverse_and_unidentifiable_components():
+    torch.manual_seed(13)
+    edges = torch.tensor([[0, 1, 0, 3], [1, 2, 2, 4]])
+    x = torch.randn(6, 4, dtype=torch.float64) + 3
+    x[3:5, 2] = 2
+    weight = torch.arange(1, 5, dtype=torch.float64)
+    count, labels = components(edges, len(x))
+    delta = x[edges[1]] - x[edges[0]]
+    recovered, _ = solve_centered(edges, weight, delta, labels, count)
+    matrix = laplacian(edges, weight, len(x)).to_dense()
+    torch.testing.assert_close(recovered, torch.linalg.pinv(matrix) @ matrix @ x)
+    torch.testing.assert_close(recovered, x - component_mean(x, labels, count)[labels])
+    report = reconstruction_probe(x, edges, weight)
+    assert report["linear_minimum_norm_relative_l2"] > 0.5
+    assert report["pre_quadratic_identifiable_relative_l2"] < 1e-6
+    assert report["linear_with_oracle_means_relative_l2"] < 1e-6
+    assert report["identifiable_component_features"] == 7
+    assert report["total_component_features"] == 12
+    constant = reconstruction_probe(torch.ones_like(x), edges, weight)
+    assert constant["identifiable_component_features"] == 0
+    assert constant["pre_quadratic_identifiable_relative_l2"] is None
+    noisy = reconstruction_probe(x, edges, weight, noise_relative=1e-3)
+    assert (
+        noisy["pre_quadratic_identifiable_relative_l2"]
+        > report["pre_quadratic_identifiable_relative_l2"]
+    )
+
+
+def test_cross_hop_gram_equals_trace_form():
+    torch.manual_seed(20)
+    h = torch.randn(4, 7, 5, dtype=torch.double)
+    edges = graph().incidence_edge_index
+    weight = torch.rand(edges.shape[1], dtype=torch.double) + 1
+    result = cross_hop_gram(h, edges, weight, 3)
+    expected = torch.einsum("knf,nm,lmf->kl", h, laplacian(edges, weight, 7).to_dense(), h)
+    torch.testing.assert_close(torch.tensor(result["energy_gram"], dtype=torch.double), expected)
+
+
+def test_fresh_matrix_retains_full_recipe_and_independent_sources():
+    args = runner.parser().parse_args(
+        ["--run-id", "debug-contract", "--datasets", "ppi", "--profiles", "reference", "large"]
+    )
+    runner.validate_args(args)
+    jobs = runner.make_jobs(args, Path("results/incidence_ablation/debug-contract"))
+    assert len(jobs) == 16
+    for job in jobs:
+        child = calibration.parse_job(job)
+        assert child.layers == (8 if job["profile"] == "reference" else 12)
+        assert child.hidden_channels == (256 if job["profile"] == "reference" else 384)
+        assert child.heads == 8 and child.epochs == 200 and child.sampling == "full"
+        assert child.ablation_arm == job["variant_id"]
+    snapshot = provenance.source_snapshot()
+    assert "experiments/incidence_ablation/model.py" in snapshot
+    assert not any(name.startswith("experiments/") for name in provenance.core_snapshot())
+    assert provenance.require_source_compatibility(snapshot, snapshot, scope="debug") is None
+    with pytest.raises(ValueError, match="source mismatch"):
+        provenance.require_source_compatibility({}, snapshot, scope="debug")
+
+
+def test_pre_post_lift_difference_and_linear_capacity_control():
+    models = []
+    for arm in ("linear_lift", "pre_lift", "post_lift"):
+        torch.manual_seed(51)
+        net = model(arm)
+        for op in net.operators:
+            op.lift_projection.data[:, op.head_width :] = torch.eye(op.head_width) * 0.5
+        models.append(net)
+    assert len({sum(p.numel() for p in net.parameters()) for net in models}) == 1
+    assert not torch.allclose(models[1](graph()), models[2](graph()))
+
+
+def test_mig_portable_recipe_preserves_model_data_and_all_eight_arms():
+    args = runner.parser().parse_args(
+        [
+            "--run-id",
+            "debug-mig-contract",
+            "--datasets",
+            "ppi",
+            "--profiles",
+            "reference",
+            "--hardware-profile",
+            "portable",
+            "--edge-chunk-size",
+            "4096",
+            "--activation-checkpoint",
+            "--min-free-gb",
+            "8",
+        ]
+    )
+    runner.validate_args(args)
+    jobs = runner.make_jobs(args, Path("results/incidence_ablation/debug-mig-contract"))
+    assert len(jobs) == 8
+    for job in jobs:
+        child = calibration.parse_job(job)
+        assert (child.layers, child.hidden_channels, child.heads) == (8, 256, 8)
+        assert child.batch_size == 2 and child.epochs == 200 and child.sampling == "full"
+        assert child.edge_chunk_size == 4096 and child.activation_checkpoint
+        assert child.precision == "fp32" and not child.tf32
+        assert child.hardware_profile == "portable"
+
+
+class SyntheticDebugInputs:
+    def __init__(self, multilabel):
+        self.graph = graph()
+        if multilabel:
+            self.graph.y = F.one_hot(self.graph.y, 3).float()
+        self.indices = None if multilabel else {"train": torch.arange(7)}
+
+    def training_batches(self, epoch, device):
+        for _ in range(2):
+            yield SimpleNamespace(
+                graph=self.graph,
+                selected_indices=None if self.indices is None else torch.arange(7),
+                origin_targets=torch.ones(7),
+                topology=self.graph.edge_selection_topology,
+            )
+
+
+def debug_args(multilabel=False):
+    args = engine.build_parser().parse_args(
+        [
+            "--dataset",
+            "ppi" if multilabel else "cora",
+            "--condition",
+            "shared_dynamic_c",
+            "--selection-mode",
+            "full",
+            "--ablation-arm",
+            "bilinear_pre_lift",
+            "--output-dir",
+            "not-created-debug-path",
+            "--device",
+            "cpu",
+            "--hidden-channels",
+            "16",
+            "--heads",
+            "4",
+            "--layers",
+            "3",
+            "--edge-chunk-size",
+            "3",
+            "--workers",
+            "0",
+            "--dropout",
+            "0.2",
+        ]
+    )
+    engine.validate_args(args)
+    return args
+
+
+@pytest.mark.parametrize("multilabel", [False, True])
+def test_real_engine_epoch_resume_matches_uninterrupted_optimizer_and_rng(multilabel):
+    torch.manual_seed(63)
+    args, inputs = debug_args(multilabel), SyntheticDebugInputs(multilabel)
+    payload = {"graphs": [{"x": inputs.graph.x}], "classes": 3}
+    net = engine.make_model(payload, args, torch.device("cpu"))
+    optimizer = engine.make_optimizer(net)
+    first = engine.run_training_epoch(
+        net, optimizer, inputs, args, torch.device("cpu"), 1, validate=True
+    )
+    assert first["optimizer_steps"] == 2
+    assert set(first["first_step_gradient_norms"]) == {
+        "backbone",
+        "spatial_w",
+        "beta",
+        "conductance",
+    }
+    saved_model, saved_optimizer = (
+        copy.deepcopy(net.state_dict()),
+        copy.deepcopy(optimizer.state_dict()),
+    )
+    saved_rng = torch.get_rng_state().clone()
+    expected = engine.run_training_epoch(net, optimizer, inputs, args, torch.device("cpu"), 2)
+    restored = engine.make_model(payload, args, torch.device("cpu"))
+    restored.load_state_dict(saved_model)
+    restored_optimizer = engine.make_optimizer(restored)
+    restored_optimizer.load_state_dict(saved_optimizer)
+    torch.set_rng_state(saved_rng)
+    actual = engine.run_training_epoch(
+        restored, restored_optimizer, inputs, args, torch.device("cpu"), 2
+    )
+    assert actual == expected
+    for name, value in net.state_dict().items():
+        torch.testing.assert_close(restored.state_dict()[name], value, rtol=0, atol=0)
+
+
+def test_full_observer_consumes_all_layers_and_preserves_model_parameters():
+    torch.manual_seed(82)
+    args, inputs = debug_args(), SyntheticDebugInputs(False)
+    net = model("bilinear_pre_lift").eval()
+    net.capture = True
+    batch = next(inputs.training_batches(0, torch.device("cpu")))
+    before = engine.base.state_sha256(net)
+    observer = Observer(args)
+    with torch.no_grad():
+        observer(net, batch, net(batch.graph), 0)
+    result = observer.report(0.5)
+    assert len(result["layers_and_batches"][0]["layers"]) == 3
+    assert set(result["interventions"]) == {"disable_bilinear", "remove_second_lift_channel"}
+    assert engine.base.state_sha256(net) == before
+    assert net.last_history is None
+    assert all(op.last_probe is None for op in net.operators)
+
+
+def test_disconnected_isolates_and_edge_streaming_do_not_hide_coordinates():
+    torch.manual_seed(35)
+    x = torch.randn(7, 6, dtype=torch.double) + 4
+    edges = graph().incidence_edge_index
+    weight = torch.ones(edges.shape[1], dtype=torch.double)
+    a = reconstruction_probe(x, edges, weight, edge_chunk_size=2)
+    b = reconstruction_probe(x, edges, weight, edge_chunk_size=20)
+    assert a["nodes"] == b["nodes"] == 7
+    assert a["edges"] == b["edges"] == 7
+    assert a["identifiable_component_features"] == b["identifiable_component_features"] == 6
+    assert a["pre_quadratic_identifiable_relative_l2"] < 1e-6
+    assert b["pre_quadratic_identifiable_relative_l2"] < 1e-6
+````
+
+# tests/test_incidence_ablation_integrity.py
+
+````python
+"""Synthetic CPU checkpoint metadata tests, never evidence of real model training."""
+
+from __future__ import annotations
+
+import copy
+import json
+import weakref
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from experiments.incidence_ablation import engine as train
+from experiments.incidence_ablation import integrity
+from research.conductance_gat.v5.learning_budget import plan_learning_budget
+
+
+def publish(case):
+    identity = case.metrics["resume_identity"]
+    identity_hash = train.base._canonical_sha256(identity)
+    case.metrics["resume_identity_sha256"] = identity_hash
+    case.best.update(resume_identity=identity, resume_identity_sha256=identity_hash)
+    case.last.update(resume_identity=identity, resume_identity_sha256=identity_hash)
+    torch.save(case.best, case.folder / "best.pt")
+    best_hash = train.base.sha256_file(case.folder / "best.pt")
+    case.metrics["checkpoint_sha256"] = best_hash
+    case.last["best_checkpoint_sha256"] = best_hash
+    torch.save(case.last, case.folder / "last.pt")
+    (case.folder / "history.json").write_text(json.dumps(case.rows), encoding="utf-8")
+    case.metrics.update(
+        last_checkpoint_sha256=train.base.sha256_file(case.folder / "last.pt"),
+        history_sha256=train.base.sha256_file(case.folder / "history.json"),
+    )
+    (case.folder / "metrics.json").write_text(json.dumps(case.metrics), encoding="utf-8")
+
+
+@pytest.fixture
+def evidence(tmp_path):
+    arguments = train.build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            "shared_dynamic_c",
+            "--selection-mode",
+            "full",
+            "--ablation-arm",
+            "bilinear_pre_lift",
+            "--output-dir",
+            str(tmp_path),
+            "--data-root",
+            str(tmp_path / "debug-data"),
+            "--epochs",
+            "4",
+            "--patience",
+            "1",
+            "--learning-budget-policy",
+            "reference_updates",
+        ]
+    )
+    train.validate_args(arguments)
+    budget = plan_learning_budget(4, 1, 1, 1, "reference_updates")
+    provenance = [{"explicit_synthetic_checkpoint_fixture": True}]
+    protocol = {
+        "data_sha256": "a" * 64,
+        "split_sha256": {"train": "b" * 64, "validation": "c" * 64},
+    }
+    identity = train.build_identity(
+        arguments, protocol, budget, "d" * 64, SimpleNamespace(provenance=provenance)
+    )
+    rows = [
+        {
+            "epoch": epoch,
+            "train_batches": 1,
+            "optimizer_steps": epoch,
+            "processed_units": 3,
+            "phase": {"phase": "joint"},
+            "validation": score,
+        }
+        for epoch, score in enumerate((0.4, 0.5, 0.6, 0.7), 1)
+    ]
+    metrics = {
+        "status": "passed",
+        "research_suite": train.SUITE,
+        "dataset": "cora",
+        "condition": "full",
+        "configuration": train.configuration(arguments),
+        "resume_identity": identity,
+        "source_sha256": identity["source_sha256"],
+        "protocol": protocol,
+        "learning_budget": budget,
+        "initial_state_sha256": "d" * 64,
+        "shared_initial_state_sha256": "e" * 64,
+        "common_backbone_initial_state_sha256": "e" * 64,
+        "topology": {"train_count": 3, "provenance": provenance},
+        "epochs_run": 4,
+        "optimizer_steps": 4,
+        "best_epoch": 4,
+        "best_validation": 0.7,
+        "validation": 0.7,
+        "test_evaluated": False,
+        "debug": False,
+        "subset": False,
+    }
+    last = {
+        "epoch": 4,
+        "optimizer_steps": 4,
+        "history": rows,
+        "best_epoch": 4,
+        "best_validation": 0.7,
+        "shared_initial_state_sha256": "e" * 64,
+        "model_state": {"debug_weight": torch.tensor([1.0])},
+        "optimizer_state": {
+            "state": {0: {"step": torch.tensor(4.0)}},
+            "param_groups": [{"params": [0]}],
+        },
+    }
+    best = {
+        "epoch": 4,
+        "validation": 0.7,
+        "selection_role": "primary",
+        "model_state": {"debug_weight": torch.tensor([0.5])},
+    }
+    case = SimpleNamespace(
+        folder=tmp_path, args=arguments, metrics=metrics, rows=rows, best=best, last=last
+    )
+    publish(case)
+    return case
+
+
+def test_completed_evidence_is_read_only_and_cpu_only(evidence, monkeypatch):
+    before = {path.name: train.base.sha256_file(path) for path in evidence.folder.iterdir()}
+    load = train.base.load_checkpoint_on_cpu
+    last_tensor = []
+    calls = []
+
+    def cpu_load(path):
+        if path.name == "best.pt":
+            assert (
+                last_tensor[0]() is None
+            )  # No simultaneous last+best checkpoint tensor retention.
+        saved = load(path)
+        assert all(value.device.type == "cpu" for value in saved["model_state"].values())
+        calls.append(path.name)
+        if path.name == "last.pt":
+            last_tensor.append(weakref.ref(saved["model_state"]["debug_weight"]))
+        return saved
+
+    monkeypatch.setattr(train.base, "load_checkpoint_on_cpu", cpu_load)
+    assert integrity.inspect_completed(evidence.folder)["best_epoch"] == 4
+    assert calls == ["last.pt", "best.pt"]
+    assert before == {path.name: train.base.sha256_file(path) for path in evidence.folder.iterdir()}
+
+
+@pytest.mark.parametrize(
+    "damage,match",
+    [
+        ("seed", "configuration"),
+        ("budget", "learning budget"),
+        ("gap", "contiguous"),
+        ("partial", "coverage"),
+        ("updates", "coverage"),
+        ("best", "strict maximum"),
+        ("last_history", "last checkpoint"),
+        ("last_steps", "last checkpoint"),
+        ("last_best", "last checkpoint"),
+        ("best_interior", "best checkpoint"),
+        ("optimizer", "optimizer state"),
+        ("protocol", "protocol"),
+        ("source", "source_sha256"),
+        ("shared", "last checkpoint"),
+        ("not_finite", "finite"),
+        ("empty", "positive integer"),
+    ],
+)
+def test_internally_rehashed_but_inconsistent_evidence_is_rejected(evidence, damage, match):
+    case = evidence
+    if damage == "seed":
+        case.metrics["resume_identity"]["training_arguments"]["model_seed"] = 7
+    elif damage == "budget":
+        case.metrics["learning_budget"]["requested_epochs"] = 5
+    elif damage == "gap":
+        case.rows[1]["epoch"] = 3
+    elif damage == "partial":
+        case.rows[1]["processed_units"] = 2
+    elif damage == "updates":
+        case.rows[1]["optimizer_steps"] = 1
+    elif damage == "best":
+        case.metrics.update(best_epoch=3, best_validation=0.6)
+    elif damage == "last_history":
+        case.last["history"] = copy.deepcopy(case.rows[:-1])
+    elif damage == "last_steps":
+        case.last["optimizer_steps"] = 9
+    elif damage == "last_best":
+        case.last["best_epoch"] = 1
+    elif damage == "best_interior":
+        case.best["epoch"] = 3
+    elif damage == "optimizer":
+        case.last["optimizer_state"]["state"] = {}
+    elif damage == "protocol":
+        case.metrics["protocol"] = {"data_sha256": "f" * 64}
+    elif damage == "source":
+        case.metrics["source_sha256"] = {"debug": "f" * 64}
+    elif damage == "shared":
+        case.last["shared_initial_state_sha256"] = "f" * 64
+    elif damage == "not_finite":
+        case.rows[2]["validation"] = float("nan")
+    else:
+        case.rows.clear()
+        case.metrics["epochs_run"] = 0
+    publish(case)
+    with pytest.raises(ValueError, match=match):
+        integrity.inspect_completed(case.folder)
+
+
+def shorten(case, scores, best_epoch):
+    case.rows[:] = case.rows[: len(scores)]
+    for row, value in zip(case.rows, scores, strict=True):
+        row["validation"] = value
+    count, best_value = len(scores), scores[best_epoch - 1]
+    case.metrics.update(
+        epochs_run=count,
+        optimizer_steps=count,
+        best_epoch=best_epoch,
+        best_validation=best_value,
+        validation=best_value,
+    )
+    case.last.update(
+        epoch=count, optimizer_steps=count, best_epoch=best_epoch, best_validation=best_value
+    )
+    case.best.update(epoch=best_epoch, validation=best_value)
+    publish(case)
+
+
+def test_legitimate_patience_stop_is_accepted(evidence):
+    shorten(evidence, (0.7, 0.6), 1)
+    assert integrity.inspect_completed(evidence.folder)["epochs_run"] == 2
+
+
+def test_unjustified_early_completion_is_rejected(evidence):
+    shorten(evidence, (0.4, 0.5, 0.6), 3)
+    with pytest.raises(ValueError, match="budget and patience"):
+        integrity.inspect_completed(evidence.folder)
+
+
+def test_equal_best_scores_select_first_strict_maximum(evidence):
+    shorten(evidence, (0.7, 0.7), 2)
+    with pytest.raises(ValueError, match="first strict maximum"):
+        integrity.inspect_completed(evidence.folder)
+
+
+def test_identity_hash_tampering_is_rejected(evidence):
+    evidence.metrics["resume_identity_sha256"] = "f" * 64
+    (evidence.folder / "metrics.json").write_text(json.dumps(evidence.metrics), encoding="utf-8")
+    with pytest.raises(ValueError, match="identity is corrupt"):
+        integrity.inspect_completed(evidence.folder)
+
+
+def test_resume_boolean_is_not_a_new_scientific_identity(evidence):
+    before = train.serializable_arguments(evidence.args)
+    evidence.args.resume = True
+    assert train.serializable_arguments(evidence.args) == before
+````
+
+# tests/test_incidence_mig_launcher.py
+
+````python
+"""CPU fixtures only: no real NVML/CUDA allocation or server claims."""
+
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from experiments import launch_incidence_mig as launcher
+
+
+def records():
+    return [
+        {
+            "physical_gpu": gpu,
+            "mig_index": index,
+            "gpu_instance": gi,
+            "compute_instance": 0,
+            "uuid": f"MIG-{gpu}-{gi}",
+            "total_bytes": 10 * 2**30,
+            "free_bytes": free * 2**30,
+        }
+        for gpu, index, gi, free in [(3, 0, 7, 10), (4, 0, 7, 9), (4, 1, 8, 10)]
+    ]
+
+
+def test_physical_gpu_automatic_selection_stays_within_requested_parent():
+    selected = launcher.select_device(
+        records(), physical_gpu=4, gpu_instance=None, compute_instance=None, min_free_gb=8
+    )
+    assert selected["uuid"] == "MIG-4-8"
+
+
+def test_explicit_gi_ci_selects_exact_instance_even_when_another_has_more_memory():
+    selected = launcher.select_device(
+        records(), physical_gpu=4, gpu_instance=7, compute_instance=0, min_free_gb=8
+    )
+    assert selected["uuid"] == "MIG-4-7"
+    with pytest.raises(RuntimeError, match="No requested"):
+        launcher.select_device(
+            records(), physical_gpu=4, gpu_instance=7, compute_instance=0, min_free_gb=9.5
+        )
+
+
+def test_launch_scopes_environment_before_fresh_torch_process(monkeypatch):
+    monkeypatch.setattr(launcher, "nvml_devices", lambda _: records())
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0,1,2,3,4,5")
+    monkeypatch.setenv("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
+    calls = []
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *a, **k: calls.append((a, k)) or SimpleNamespace(returncode=0),
+    )
+    assert (
+        launcher.main(
+            [
+                "--physical-gpu",
+                "4",
+                "--gpu-instance",
+                "7",
+                "--compute-instance",
+                "0",
+                "--",
+                "--run-id",
+                "kept",
+            ]
+        )
+        == 0
+    )
+    argv, options = calls[0]
+    assert argv[0][-2:] == ["--run-id", "kept"]
+    assert options["env"]["CUDA_VISIBLE_DEVICES"] == "MIG-4-7"
+    assert "PYTORCH_NVML_BASED_CUDA_CHECK" not in options["env"]
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5"
+
+
+def test_launcher_import_does_not_import_torch():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-c",
+            "import experiments.launch_incidence_mig; import sys; "
+            "assert 'torch' not in sys.modules",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_nvml_mapping_reads_actual_gi_ci_and_uuid_not_mig_index(monkeypatch):
+    calls = []
+
+    class Function:
+        def __init__(self, name):
+            self.name = name
+
+        def __call__(self, *args):
+            calls.append(self.name)
+            if self.name == "nvmlDeviceGetHandleByIndex_v2":
+                assert args[0] == 4
+                args[1]._obj.value = 100
+            elif self.name == "nvmlDeviceGetMaxMigDeviceCount":
+                args[1]._obj.value = 2
+            elif self.name == "nvmlDeviceGetMigDeviceHandleByIndex":
+                if args[1] == 1:
+                    return 6
+                args[2]._obj.value = 200
+            elif self.name == "nvmlDeviceGetGpuInstanceId":
+                args[1]._obj.value = 7
+            elif self.name == "nvmlDeviceGetComputeInstanceId":
+                args[1]._obj.value = 0
+            elif self.name == "nvmlDeviceGetUUID":
+                args[1].value = b"MIG-actual-uuid"
+            elif self.name == "nvmlDeviceGetMemoryInfo":
+                args[1]._obj.total = 10 * 2**30
+                args[1]._obj.free = 9 * 2**30
+                args[1]._obj.used = 2**30
+            return 0
+
+    class Library:
+        def __init__(self):
+            self.functions = {}
+
+        def __getattr__(self, name):
+            return self.functions.setdefault(name, Function(name))
+
+    monkeypatch.setattr(launcher.ct, "CDLL", lambda _: Library())
+    actual = launcher.nvml_devices(4)
+    assert len(actual) == 1
+    assert actual[0]["gpu_instance"] == 7 and actual[0]["mig_index"] == 0
+    assert actual[0]["uuid"] == "MIG-actual-uuid"
+    assert calls[-1] == "nvmlShutdown"
 ````
 
 # tests/test_observability.py
@@ -106343,6 +124909,558 @@ def test_real_pyg_disjoint_container_offsets_and_cpu_model_smoke():
     assert all(parameter.grad is not None for parameter in network.parameters())
 ````
 
+# tests/test_v5_distribution_audit.py
+
+````python
+"""Exact synthetic CPU graph diagnostics; no real-data or hardware performance claim."""
+
+import math
+
+import pytest
+import torch
+
+from research.conductance_gat.v5.distribution_audit import audit_conductance_distribution
+from research.conductance_gat.v5.stage_audit import _json
+
+
+def _audit(c, *, correction=None, normalization="row", batch=None, edges=None, heads=2):
+    if edges is None:
+        edges = torch.tensor([[0, 0, 0], [1, 2, 3]])
+    if batch is None:
+        batch = torch.zeros(5, dtype=torch.long)
+    graphs = int(batch.max()) + 1
+    return _json(
+        audit_conductance_distribution(
+            c,
+            edges,
+            batch,
+            graphs,
+            heads=heads,
+            beta=torch.full((graphs, heads), 0.5),
+            sampling_correction=correction,
+            normalization=normalization,
+        )
+    )
+
+
+def test_raw_c_quantiles_histogram_and_fractions_are_not_cv_or_alpha():
+    row = _audit(torch.tensor([0.2, 0.8, 2.0]))["graphs"][0]
+    raw = row["raw_c"]
+    assert raw["mean"] == pytest.approx([1, 1])
+    assert raw["quantiles"]["0.5"] == pytest.approx([0.8, 0.8])
+    assert raw["fractions"]["c_ge_0_7"] == pytest.approx([2 / 3, 2 / 3])
+    assert raw["fractions"]["abs_c_minus_1_le_0_1"] == [0, 0]
+    assert raw["fractions"]["c_gt_1"] == pytest.approx([1 / 3, 1 / 3])
+    assert all(sum(counts) == 3 for counts in raw["histogram"]["counts_by_head"])
+    assert row["beta_by_head"] == [0.5, 0.5]
+
+
+def test_isolates_and_degree_one_are_explicit_and_concentration_has_correct_values():
+    row = _audit(torch.ones(3))["graphs"][0]
+    assert row["isolates"] == 1 and row["degree_one_nodes"] == 3
+    scope = row["probabilities"]["weighted_c_row_alpha"]["node_scopes"]
+    assert scope["degree_1"]["top1"]["mean"] == [1, 1]
+    assert scope["degree_1"]["normalized_entropy"]["mean"] == [0, 0]
+    assert scope["degree_1"]["effective_neighbors"]["mean"] == [1, 1]
+    center = scope["degree_2_4"]
+    assert center["nodes"] == 1
+    assert center["top1"]["mean"] == pytest.approx([1 / 3, 1 / 3])
+    assert center["normalized_entropy"]["mean"] == pytest.approx([1, 1])
+    assert center["effective_neighbors"]["mean"] == pytest.approx([3, 3])
+    assert scope["all_nonisolates"]["nodes"] == 4
+
+
+def test_symmetric_actual_coefficients_are_not_falsely_called_row_probabilities():
+    report = _audit(torch.ones(3), normalization="symmetric")
+    row = report["graphs"][0]
+    assert "diagnostic only" in report["actual_kernel_row_relative_definition"] or (
+        report["actual_kernel_row_relative_definition"] == "P / row_sum(P); diagnostic only"
+    )
+    assert row["actual_one_hop_row_sum"]["quantiles"]["1.0"] == pytest.approx([math.sqrt(3)] * 2)
+    assert row["actual_one_hop_coefficient"]["mean"] == pytest.approx([1 / math.sqrt(3)] * 2)
+
+
+@pytest.mark.parametrize("normalization", ["row", "symmetric"])
+def test_scale_only_head_differences_vanish_after_neighbor_normalization(normalization):
+    c = torch.tensor([[0.2, 2.0], [0.8, 8.0], [2.0, 20.0]])
+    row = _audit(c, normalization=normalization)["graphs"][0]
+    assert row["raw_c"]["mean"][1] > row["raw_c"]["mean"][0]
+    for family in row["probabilities"].values():
+        diversity = family["head_diversity_nonisolates"]
+        assert diversity["total_variation"]["mean"][0] < 1e-6
+        assert abs(diversity["jensen_shannon_nats"]["mean"][0]) < 1e-6
+
+
+def test_head_preference_changes_have_positive_tv_and_js():
+    row = _audit(torch.tensor([[0.1, 2.0], [0.9, 0.9], [2.0, 0.1]]))["graphs"][0]
+    diversity = row["probabilities"]["weighted_c_row_alpha"]["head_diversity_nonisolates"]
+    assert diversity["total_variation"]["mean"][0] > 0.1
+    assert diversity["jensen_shannon_nats"]["mean"][0] > 0.01
+
+
+def test_c_one_reference_retains_sampling_correction_not_uniform_neighbors():
+    row = _audit(torch.ones(3), correction=torch.tensor([1.0, 2.0, 3.0]))["graphs"][0]
+    center = row["probabilities"]["weighted_c_row_alpha"]["node_scopes"]["degree_2_4"]
+    assert center["top1"]["mean"] == pytest.approx([0.5, 0.5])
+    assert center["c_one_same_correction"]["top1"]["mean"] == pytest.approx([0.5, 0.5])
+    assert center["c_one_total_variation"]["mean"] == [0, 0]
+
+
+def test_graph_scopes_do_not_pool_disjoint_graph_distributions():
+    row = _audit(
+        torch.tensor([0.2, 1.8]),
+        edges=torch.tensor([[0, 2], [1, 3]]),
+        batch=torch.tensor([0, 0, 1, 1, 1]),
+    )["graphs"]
+    assert row[0]["raw_c"]["mean"] == pytest.approx([0.2, 0.2])
+    assert row[1]["raw_c"]["mean"] == pytest.approx([1.8, 1.8])
+    assert row[0]["isolates"] == 0 and row[1]["isolates"] == 1
+
+
+def test_edgeless_scope_is_unavailable_not_fake_concentration():
+    row = _audit(torch.empty(0), edges=torch.empty((2, 0), dtype=torch.long))["graphs"][0]
+    assert row["isolates"] == 5
+    assert row["raw_c"]["mean"] is None
+    assert (
+        row["probabilities"]["weighted_c_row_alpha"]["node_scopes"]["all_nonisolates"]["top1"][
+            "mean"
+        ]
+        is None
+    )
+````
+
+# tests/test_v5_edge_selection_runner.py
+
+````python
+"""CPU-only orchestration tests; mocks are not real GPU calibration or training."""
+
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from research.conductance_gat import edge_selection
+from research.conductance_gat.edge_selection import calibration, protocol
+from research.conductance_gat.edge_selection import train as new_train
+from scripts import run_v5_edge_selection as driver
+
+
+def args(*extra):
+    return driver.parser().parse_args(["--run-id", "debug-edge", *extra])
+
+
+def parse_child(job):
+    parser = new_train.build_parser()
+    child = parser.parse_args(job["command"][5:])
+    new_train.validate_args(child)
+    return child
+
+
+def test_default_matrix_retains_full_scale(tmp_path):
+    selected = args()
+    driver.validate_args(selected)
+    planned = driver.make_jobs(selected, tmp_path / "not-created")
+    assert len(driver.variants(selected)) == 13 and len(planned) == 130
+    assert {job["dataset"] for job in planned} == {
+        "cora",
+        "citeseer",
+        "pubmed",
+        "ppi",
+        "ogbn-arxiv",
+    }
+    assert {job["model_seed"] for job in planned} == {0}
+    assert len({job["output_dir"] for job in planned}) == 130
+    for job in planned:
+        child = parse_child(job)
+        assert job["command"][4] == driver.TRAIN_MODULE
+        assert (child.hidden_channels, child.layers, child.heads) == (
+            (256, 8, 8) if job["profile"] == "reference" else (384, 12, 8)
+        )
+        assert (child.epochs, child.patience) == (200, 50)
+        assert child.learning_budget_policy == "reference_updates"
+        assert child.conductance_heads == "per_head" and child.propagation_normalization == "row"
+        assert child.condition == "shared_dynamic_c" and child.training_schedule == "joint"
+        assert child.activation_checkpoint is True
+        if child.selection_mode in protocol.BUDGET_MODES:
+            assert child.chord_fraction in {0.25, 0.5, 0.75}
+        else:
+            assert "--chord-fraction" not in job["command"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_structure_and_corruption_axes_are_distinct():
+    variants = driver.variants(args())
+    structures = [item for item in variants if item["suite"] == "structure"]
+    corrupted = [item for item in variants if item["suite"] == "corruption"]
+    assert len(structures) == 11 and len(corrupted) == 2
+    for fraction in (0.25, 0.5, 0.75):
+        group = [item for item in structures if item["configuration"]["chord_fraction"] == fraction]
+        assert {item["configuration"]["selection_mode"] for item in group} == protocol.BUDGET_MODES
+    assert all(item["configuration"]["corruption_ratio"] == 0 for item in structures)
+    first, second = [copy.deepcopy(item["configuration"]) for item in corrupted]
+    assert first["selection_mode"] == second["selection_mode"] == "hard_concrete"
+    assert first.pop("negative_loss_weight") == 0 and second.pop("negative_loss_weight") == 1
+    assert first == second and first["l0_weight"] == 1e-4
+
+
+def test_nondefault_parameters_are_scoped_to_their_experiment_axis(tmp_path):
+    selected = args("--forest-seed", "7", "--corruption-seed", "11", "--gate-temperature", "0.8")
+    jobs = driver.make_jobs(selected, tmp_path)
+    assert len(jobs) == 130
+    for job in jobs:
+        child = parse_child(job)
+        if child.selection_mode == "hard_concrete":
+            assert (child.forest_seed, child.corruption_seed, child.gate_temperature) == (
+                0,
+                11,
+                0.8,
+            )
+        else:
+            assert (child.forest_seed, child.corruption_seed, child.gate_temperature) == (
+                7,
+                0,
+                2 / 3,
+            )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_endpoint_controls_are_deduplicated():
+    selected = args("--suites", "structure", "--chord-fractions", "0", "0.5", "1")
+    driver.validate_args(selected)
+    assert len(driver.variants(selected)) == 5
+
+
+def test_fraction_ids_preserve_distinct_float_budgets():
+    selected = args("--suites", "structure", "--chord-fractions", "0.2500001", "0.2500002")
+    variants = driver.variants(selected)
+    assert len(variants) == len({item["variant_id"] for item in variants}) == 8
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--chord-fractions", "-0.1"],
+        ["--chord-fractions", "nan"],
+        ["--negative-loss-weight", "0"],
+        ["--corruption-ratio", "0"],
+        ["--model-seeds", "0", "0"],
+        ["--device", "cpu"],
+    ],
+)
+def test_invalid_recipe_refused(options):
+    with pytest.raises(ValueError):
+        driver.validate_args(args(*options))
+
+
+def test_dry_plan_does_not_write_or_launch(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        driver.standalone,
+        "check_dependencies",
+        lambda: pytest.fail("dry run queried training environment"),
+    )
+    monkeypatch.setattr(
+        driver, "_ensure_calibration", lambda *_: pytest.fail("dry run measured GPU")
+    )
+    assert (
+        driver.main(["--run-id", "debug-plan", "--results-root", str(tmp_path), "--dry-run"]) == 0
+    )
+    text = capsys.readouterr().out
+    assert "13 independent arms; 130 full-size trainings" in text
+    assert "old V5 runs are untouched" in text
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        ["--chord-fractions", "0.5"],
+        ["--epochs", "201"],
+        ["--negative-loss-weight", "2"],
+        ["--corruption-seed", "1"],
+        ["--suites", "structure"],
+    ],
+)
+def test_recipe_change_refuses_resume(tmp_path, override):
+    old = args()
+    jobs = driver.make_jobs(old, tmp_path)
+    manifest = {
+        "schema_version": 1,
+        "suite": driver.SUITE,
+        "run_id": old.run_id,
+        "config": driver._config(old),
+        "source_sha256": {},
+        "dependencies": {},
+        "planned_jobs": jobs,
+    }
+    text = json.dumps(manifest)
+    path = SimpleNamespace(read_text=lambda **_: text)
+    with pytest.raises(ValueError, match="identity changed|matrix"):
+        driver._resume(path, args(*override), driver.make_jobs(args(*override), tmp_path), {}, {})
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_source_map_includes_new_and_old_dependencies():
+    snapshot = driver.resources.source_snapshot()
+    for relative in (
+        "scripts/run_v5_edge_selection.py",
+        "research/conductance_gat/edge_selection/calibration.py",
+        "scripts/run_conductance_v5.py",
+        "scripts/run_v5_mechanism_experiments.py",
+    ):
+        assert snapshot[relative] == driver.common._file_sha(driver.ROOT / relative)
+
+
+def test_actual_audit_cli_contract(tmp_path, monkeypatch, capsys):
+    from research.conductance_gat.edge_selection import audit
+
+    received = []
+
+    def inspect(*values):
+        received.append(values)
+        return {
+            "validation": {"metric": 0.5},
+            "clean_validation": {"metric": 0.5},
+            "diagnostics": {"interventions": {}},
+            "synthetic_fixture": True,
+        }
+
+    monkeypatch.setattr(audit, "audit", inspect)
+    options = [
+        "--root",
+        str(tmp_path),
+        "--data-root",
+        str(tmp_path / "data"),
+        "--device",
+        "cuda:0",
+        "--repeat-evaluations",
+        "5",
+    ]
+    assert audit.main(options) == 0
+    assert received[0][0] == tmp_path and received[0][3:] == (5, 32)
+    assert "no test evaluated" in capsys.readouterr().out
+    assert list(tmp_path.iterdir()) == []
+
+
+def fake_result():
+    return {
+        "validation": 0.5,
+        "best_epoch": 1,
+        "shared_initial_state_sha256": "a" * 64,
+        "data_sha256": "b" * 64,
+        "split_sha256": "c" * 64,
+        "learning_budget": {"explicit_synthetic_fixture": True},
+        "checkpoint_sha256": "d" * 64,
+    }
+
+
+def test_audit_retry_preserves_training(tmp_path, monkeypatch):
+    options = [
+        "--run-id",
+        "debug-a",
+        "--results-root",
+        str(tmp_path),
+        "--datasets",
+        "cora",
+        "--profiles",
+        "reference",
+        "--suites",
+        "corruption",
+    ]
+    monkeypatch.setattr(driver.standalone, "check_dependencies", lambda: {"synthetic": True})
+    monkeypatch.setattr(driver.resources, "source_snapshot", lambda: {"synthetic": "stable"})
+    monkeypatch.setattr(driver, "_ensure_calibration", lambda *_: None)
+    monkeypatch.setattr(driver, "_read_result", lambda _: fake_result())
+    training, audits = [], []
+
+    def dispatch(command, log, *_):
+        if "--root" in command:
+            audits.append(command.copy())
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text("explicit synthetic audit fixture", encoding="utf-8")
+            return 8 if len(audits) == 1 else 0
+        training.append(command.copy())
+        return 0
+
+    monkeypatch.setattr(driver.standalone.shared, "run_logged", dispatch)
+    assert driver.main(options) == 1
+    path = tmp_path / "conductance_gat/edge_selection/debug-a/manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    first = manifest["jobs"][0]
+    assert first["status"] == "passed" and first["audit"]["status"] == "failed"
+    failed_log = Path(first["audit"]["log_path"])
+    failed_bytes = failed_log.read_bytes()
+    assert driver.main(options) == 0
+    assert len(training) == 2 and len(audits) == 3
+    assert failed_log.read_bytes() == failed_bytes
+    assert driver.main(options) == 0 and len(training) == 2 and len(audits) == 3
+
+
+def calibration_fixture(monkeypatch, tmp_path):
+    selected = args("--datasets", "ogbn-arxiv", "--profiles", "reference", "--suites", "corruption")
+    jobs = driver.make_jobs(selected, tmp_path)
+    parsed = {job["variant_id"]: parse_child(job) for job in jobs}
+    fake_train = SimpleNamespace(
+        configuration=lambda value: vars(value).copy(),
+        load_calibration_payload=lambda _: (
+            {"synthetic": True},
+            {"data_sha256": "a" * 64},
+            4096,
+            "sampled_seed_nodes",
+        ),
+    )
+    monkeypatch.setattr(edge_selection, "train", fake_train, raising=False)
+    monkeypatch.setattr(
+        calibration, "parse_job", lambda job: copy.deepcopy(parsed[job["variant_id"]])
+    )
+    monkeypatch.setattr(calibration.resources, "allocated_cpu_count", lambda: 8)
+    calls = []
+
+    def measure(job, loaded, child, batch, workers):
+        calls.append((job["variant_id"], batch, workers))
+        epochs = 5
+        physical = calibration._probe_args(child, "sampled_seed_nodes", batch, workers)
+        count = (4096 + batch - 1) // batch
+        report = {
+            "status": "passed",
+            "condition": job["variant_id"],
+            "model_seed": job["model_seed"],
+            "samples_per_second": 4096 * epochs / 5,
+            "processed_units": 4096 * epochs,
+            "elapsed_seconds": 5.0,
+            "optimizer_steps": epochs * count,
+            "measurement_steps_requested": 5,
+            "warmup_steps_requested": 2,
+            "minimum_measure_seconds_requested": 3.0,
+            "complete_measurement_epochs": epochs,
+            "optimizer_state_bytes": 1024,
+            "peak_allocated_bytes": 8 * 1024**3,
+            "peak_reserved_bytes": 10 * 1024**3,
+            "total_memory_bytes": 48 * 1024**3,
+            "free_bytes_before": 46 * 1024**3,
+            "unit": "synthetic_supervised_seed_nodes",
+            "batch_size": batch,
+            "workers": workers,
+            "configuration": vars(physical).copy(),
+            "validation_completed": True,
+            "validation_seconds": 1.0,
+            "topology_preparation_seconds": 1.0,
+            "setup_seconds": 1.0,
+            "auxiliary_path_measured": True,
+            "required_auxiliary_path": child.negative_loss_weight > 0,
+            "required_cycle_preparation": child.selection_mode == "forest_cycle",
+        }
+        if batch == 4096 and child.negative_loss_weight > 0:
+            report["validation_seconds"] = 20.0
+        return report
+
+    monkeypatch.setattr(calibration, "_measure", measure)
+    return jobs, calls
+
+
+def test_ppi_candidate_preserves_measured_worker_provenance(tmp_path):
+    selected = args("--datasets", "ppi", "--profiles", "reference", "--suites", "corruption")
+    child = parse_child(driver.make_jobs(selected, tmp_path)[0])
+    candidate = calibration._probe_args(child, "graphs", child.batch_size, 2)
+    assert candidate.workers == 2
+    assert candidate.worker_configuration_source == "measured_batch_calibration_candidate"
+    assert new_train.configuration(candidate)["worker_configuration_source"] == (
+        "measured_batch_calibration_candidate"
+    )
+
+
+def test_interrupted_training_resumes_only_incomplete_arm(tmp_path, monkeypatch):
+    options = [
+        "--run-id",
+        "debug-r",
+        "--results-root",
+        str(tmp_path),
+        "--datasets",
+        "cora",
+        "--profiles",
+        "reference",
+        "--suites",
+        "corruption",
+    ]
+    monkeypatch.setattr(driver.standalone, "check_dependencies", lambda: {"synthetic": True})
+    monkeypatch.setattr(driver.resources, "source_snapshot", lambda: {"synthetic": "stable"})
+    monkeypatch.setattr(driver, "_ensure_calibration", lambda *_: None)
+    monkeypatch.setattr(driver, "_read_result", lambda _: fake_result())
+    calls = []
+
+    def dispatch(command, log, *_):
+        if "--root" in command:
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text("explicit synthetic audit fixture", encoding="utf-8")
+            return 0
+        calls.append(command.copy())
+        if len(calls) == 2:
+            output = Path(command[command.index("--output-dir") + 1])
+            output.mkdir(parents=True)
+            (output / "last.pt").write_bytes(b"explicit synthetic resume-control fixture")
+            return 9
+        return 0
+
+    monkeypatch.setattr(driver.standalone.shared, "run_logged", dispatch)
+    assert driver.main(options) == 1
+    assert driver.main(options) == 0 and len(calls) == 3
+    assert "--resume" in calls[-1]
+    assert driver.main(options) == 0 and len(calls) == 3
+
+
+def test_common_calibration_includes_validation_cost(tmp_path, monkeypatch):
+    jobs, calls = calibration_fixture(monkeypatch, tmp_path)
+    entry = {}
+    calibration.calibrate_group(jobs, entry, lambda: None)
+    assert len(calls) == 4
+    assert {batch for _, batch, _ in calls} == {2048, 4096}
+    # Larger batch is faster per optimizer update, but full validation cost makes it worse.
+    assert entry["selected"]["sample_seed_batch_size"] == 2048
+    resolved = driver.common._apply_common_resources(jobs, [entry])
+    assert {job["execution"]["sample_seed_batch_size"] for job in resolved} == {2048}
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_completed_calibration_is_verified_without_new_measurement(tmp_path, monkeypatch):
+    jobs, calls = calibration_fixture(monkeypatch, tmp_path)
+    entry = {}
+    calibration.calibrate_group(jobs, entry, lambda: None)
+    prior, measured = copy.deepcopy(entry), list(calls)
+    calibration.calibrate_group(
+        jobs, entry, lambda: pytest.fail("completed measurement unexpectedly changed")
+    )
+    assert entry == prior and calls == measured
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["missing_arm", "validation", "auxiliary", "config", "selected", "boundary", "workers"],
+)
+def test_calibration_rejects_partial_evidence(tmp_path, monkeypatch, damage):
+    jobs, _ = calibration_fixture(monkeypatch, tmp_path)
+    entry = {}
+    calibration.calibrate_group(jobs, entry, lambda: None)
+    if damage == "missing_arm":
+        entry["candidates"][0]["measurements"].pop()
+    elif damage == "validation":
+        entry["candidates"][0]["measurements"][0]["validation_completed"] = False
+    elif damage == "auxiliary":
+        entry["candidates"][0]["measurements"][1]["auxiliary_path_measured"] = False
+    elif damage == "config":
+        entry["candidates"][0]["measurements"][0]["configuration"]["epochs"] = 10
+    elif damage == "selected":
+        entry["selected"]["sample_seed_batch_size"] = 4096
+    elif damage == "boundary":
+        entry["stop_reason"] = "memory_headroom_boundary"
+    else:
+        entry["worker_candidates"] = [0, 1]
+    with pytest.raises(ValueError):
+        calibration.validate_entry(entry, jobs)
+````
+
 # tests/test_v5_learning_budget.py
 
 ````python
@@ -106948,6 +126066,1242 @@ def test_explicit_corrected_recipe_preserves_full_v5_matrix_and_probe_argv_contr
         _value(probe["command"], "--learning-budget-policy") == "reference_updates"
         for probe in request["jobs"]
     )
+````
+
+# tests/test_v5_mechanism_experiments.py
+
+````python
+"""Explicit CPU/mock driver regressions; no real training or GPU evidence."""
+
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from research.conductance_gat.v5 import train
+from scripts import run_v5_mechanism_experiments as driver
+
+
+def args(*extra):
+    return driver.parser().parse_args(["--run-id", "debug-mechanism-contract", *extra])
+
+
+@pytest.mark.parametrize(
+    "suites,count",
+    [
+        (["core"], 6),
+        (["generators"], 4),
+        (["solvers"], 3),
+        (["filters"], 4),
+        (["core", "generators"], 8),
+        (list(driver.SUITES), 12),
+    ],
+)
+def test_staged_suites_deduplicate_the_same_scientific_control(suites, count):
+    variants = driver.variants(suites)
+    assert len(variants) == count
+    assert len({variant["variant_id"] for variant in variants}) == count
+    signatures = [
+        json.dumps([variant["condition"], variant["configuration"]], sort_keys=True)
+        for variant in variants
+    ]
+    assert len(set(signatures)) == count
+
+
+def test_default_full_dataset_scale_seed_budget_and_explicit_generator_semantics(tmp_path):
+    selected = args()
+    driver.validate_args(selected)
+    jobs = driver.make_jobs(selected, tmp_path / "not-created")
+    assert len(jobs) == 80
+    assert selected.profiles == ["reference", "large"] and selected.model_seeds == [0]
+    assert set(selected.datasets) == {"cora", "citeseer", "pubmed", "ppi", "ogbn-arxiv"}
+    assert selected.epochs == 200 and selected.patience == 50
+    assert selected.learning_budget_policy == "reference_updates"
+    assert selected.sampling == "auto"
+    for job in jobs:
+        child = train.build_parser().parse_args(job["command"][5:])
+        train.validate_args(child)
+        assert (child.hidden_channels, child.layers, child.heads) == (
+            (256, 8, 8) if job["profile"] == "reference" else (384, 12, 8)
+        )
+        assert child.beta_initial == 0.5 and child.training_schedule == "joint"
+        assert child.epochs == 200 and child.patience == 50 and child.model_seed == 0
+        assert child.learning_budget_policy == "reference_updates"
+        assert child.conductance_heads == job["variant"]["configuration"]["conductance_heads"]
+        assert (
+            child.propagation_normalization
+            == job["variant"]["configuration"]["propagation_normalization"]
+        )
+        assert (
+            child.conductance_generator == job["variant"]["configuration"]["conductance_generator"]
+        )
+        if job["variant_id"] == "mlp-shared-symmetric":
+            assert child.conductance_backend == "mlp" and child.solver_cost_scaling == "legacy_unit"
+        if job["variant_id"] == "degree-only-symmetric":
+            assert child.conductance_generator == "degree_only"
+        assert "mechanism" not in str(tmp_path) or Path(job["output_dir"]).is_relative_to(tmp_path)
+    assert len({job["output_dir"] for job in jobs}) == 80
+    assert len({job["job_id"] for job in jobs}) == 80
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_all_feedback_suites_include_train_time_exact_solver_and_polynomial_filter(tmp_path):
+    selected = args("--suites", *driver.SUITES)
+    jobs = driver.make_jobs(selected, tmp_path)
+    assert len(jobs) == 120
+    exact = [job for job in jobs if job["variant_id"] == "entropy-exact-symmetric"]
+    assert len(exact) == 10
+    for job in exact:
+        child = train.build_parser().parse_args(job["command"][5:])
+        train.validate_args(child)
+        assert child.conductance_generator == "entropy_exact" and child.solver_degree_barrier == 0
+    polynomial = [job for job in jobs if "polynomial3" in job["variant_id"]]
+    assert len(polynomial) == 20
+    assert {job["condition"] for job in polynomial} == {"fixed_c", "shared_dynamic_c"}
+    for job in polynomial:
+        child = train.build_parser().parse_args(job["command"][5:])
+        train.validate_args(child)
+        assert child.propagation_filter == "polynomial3"
+
+
+def test_dry_run_does_not_measure_launch_or_create_results(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        driver, "_ensure_calibration", lambda *_: pytest.fail("dry run measured GPU")
+    )
+    monkeypatch.setattr(
+        driver.standalone, "check_dependencies", lambda: pytest.fail("dry run queried environment")
+    )
+    code = driver.main(["--run-id", "debug-dry", "--results-root", str(tmp_path), "--dry-run"])
+    assert code == 0
+    output = capsys.readouterr().out
+    assert "8 unique variants; 80 full-size validation-only trainings" in output
+    assert "common" in output.lower() and "no files" in output
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        ["--epochs", "201"],
+        ["--suites", "core", "generators", "solvers"],
+        ["--sampling", "auto_disjoint", "--sample-context-seed-batch-size", "2048"],
+    ],
+)
+def test_changed_recipe_or_matrix_refuses_silent_resume_without_writes(tmp_path, override):
+    old_args = args()
+    old_jobs = driver.make_jobs(old_args, tmp_path)
+    manifest = {
+        "schema_version": 1,
+        "suite": driver.SUITE,
+        "run_id": old_args.run_id,
+        "config": driver._config(old_args),
+        "source_sha256": {},
+        "dependencies": {},
+        "planned_jobs": old_jobs,
+    }
+    text = json.dumps(manifest)
+    path = SimpleNamespace(read_text=lambda **_: text)
+    new_args = args(*override)
+    with pytest.raises(ValueError, match="new run ID|matrix"):
+        driver._resume_manifest(
+            path,
+            args=new_args,
+            planned=driver.make_jobs(new_args, tmp_path),
+            sources={},
+            dependencies={},
+        )
+    assert path.read_text() == text
+    assert list(tmp_path.iterdir()) == []
+
+
+def debug_probe_report(job, configuration, batch, workers, *, oom):
+    if oom:
+        return {
+            "status": "oom",
+            "condition": job["condition"],
+            "model_seed": job["model_seed"],
+            "error": "synthetic per-head memory boundary, not a real GPU measurement",
+        }
+    rate = batch * 10
+    return {
+        "status": "passed",
+        "condition": job["condition"],
+        "model_seed": job["model_seed"],
+        "batch_size": batch,
+        "workers": workers,
+        "unit": "synthetic_supervised_seed_nodes",
+        "processed_units": rate * 3,
+        "elapsed_seconds": 3.0,
+        "samples_per_second": rate,
+        "optimizer_steps": 5,
+        "optimizer_state_bytes": 1024,
+        "measurement_steps_requested": 5,
+        "warmup_steps_requested": 2,
+        "minimum_measure_seconds_requested": 3.0,
+        "peak_allocated_bytes": 8 * 1024**3,
+        "peak_reserved_bytes": 10 * 1024**3,
+        "total_memory_bytes": 48 * 1024**3,
+        "free_bytes_before": 46 * 1024**3,
+        "configuration": configuration,
+    }
+
+
+def test_all_variants_are_probed_together_and_one_oom_limits_every_arm_equally(
+    tmp_path, monkeypatch
+):
+    selected = args(
+        "--datasets", "ogbn-arxiv", "--profiles", "reference", "--learning-budget-policy", "epochs"
+    )
+    planned = driver.make_jobs(selected, tmp_path)
+    manifest = {"planned_jobs": planned, "jobs": copy.deepcopy(planned), "calibration_entries": []}
+    monkeypatch.setattr(
+        driver.calibration,
+        "_hardware",
+        lambda _: {
+            "total_memory_bytes": 48 * 1024**3,
+            "compute_capability": [8, 6],
+            "allocated_cpu_count": 8,
+            "name": "synthetic CPU-test fixture, not actual hardware",
+        },
+    )
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *_: (46 * 1024**3, 48 * 1024**3))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(driver.calibration, "allocated_cpu_count", lambda: 8)
+    monkeypatch.setattr(
+        driver.calibration,
+        "_load_group",
+        lambda *_: (
+            {"synthetic_payload_only": True},
+            {"data_sha256": "a" * 64, "split_sha256": "b" * 64},
+            4096,
+            "sampled_seed_nodes",
+        ),
+    )
+    calls = []
+
+    def measure(job, _loaded, parsed, *, batch_size, workers):
+        calls.append((job["condition"], batch_size, workers))
+        return debug_probe_report(
+            job,
+            train.configuration(parsed),
+            batch_size,
+            workers,
+            oom=batch_size == 4096 and "per-head" in job["condition"],
+        )
+
+    monkeypatch.setattr(driver.calibration, "_measure", measure)
+    driver._ensure_calibration(selected, manifest, lambda: None)
+    assert len(calls) == 8 * 2
+    assert {condition for condition, _, _ in calls} == {job["variant_id"] for job in planned}
+    assert {(size, count) for _, size, count in calls} == {(2048, 0), (4096, 0)}
+    assert {job["execution"]["sample_seed_batch_size"] for job in manifest["jobs"]} == {2048}
+    assert manifest["calibration_status"] == "passed" and manifest["resources_applied"]
+    assert manifest["calibration_entries"][0]["stop_reason"] == "memory_headroom_boundary"
+    # Removing any generator from one candidate invalidates the common certificate.
+    damaged = copy.deepcopy(manifest["calibration_entries"][0])
+    damaged["candidates"][0]["measurements"].pop()
+    with pytest.raises(ValueError, match="missing paired"):
+        driver._validate_common_entry(damaged, planned, 8)
+    assert list(tmp_path.iterdir()) == []
+
+
+def fake_result():
+    return {
+        "validation": 0.5,
+        "best_epoch": 1,
+        "shared_initial_state_sha256": "a" * 64,
+        "common_backbone_initial_state_sha256": "b" * 64,
+        "learning_budget": {"synthetic": True},
+        "data_sha256": "c" * 64,
+        "split_sha256": "d" * 64,
+        "checkpoint_sha256": "f" * 64,
+    }
+
+
+def test_same_namespace_skips_completed_and_resumes_only_interrupted_checkpoint(
+    tmp_path, monkeypatch
+):
+    options = [
+        "--run-id",
+        "debug-resume",
+        "--results-root",
+        str(tmp_path),
+        "--datasets",
+        "cora",
+        "--profiles",
+        "reference",
+        "--suites",
+        "core",
+    ]
+    monkeypatch.setattr(
+        driver.standalone, "check_dependencies", lambda: {"synthetic_fixture": True}
+    )
+    monkeypatch.setattr(
+        driver.resources, "source_snapshot", lambda: {"synthetic_fixture": "stable"}
+    )
+    monkeypatch.setattr(driver, "_ensure_calibration", lambda *_: None)
+    monkeypatch.setattr(driver, "_read_result", lambda _: fake_result())
+    calls, audits = [], []
+
+    def dispatch(command, log, *_):
+        if "--root" in command:
+            audits.append(command.copy())
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text("Synthetic successful audit control-flow fixture\n", encoding="utf-8")
+            return 0
+        calls.append(command.copy())
+        if len(calls) == 2:
+            output = Path(command[command.index("--output-dir") + 1])
+            output.mkdir(parents=True)
+            (output / "last.pt").write_bytes(
+                b"explicit fake checkpoint for resume-control-flow test"
+            )
+            return 9
+        return 0
+
+    monkeypatch.setattr(driver.standalone.shared, "run_logged", dispatch)
+    assert driver.main(options) == 1
+    assert driver.main(options) == 0
+    assert len(calls) == 7
+    assert "--resume" in calls[2]
+    manifest_path = tmp_path / "conductance_gat/mechanisms/debug-resume/manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "passed" and len(manifest["jobs"]) == 6
+    assert all(job["status"] == "passed" for job in manifest["jobs"])
+    assert len(audits) == 6
+    assert all(job["audit"]["status"] == "passed" for job in manifest["jobs"])
+    assert driver.main(options) == 0 and len(calls) == 7
+    assert len(audits) == 6
+
+
+def test_common_initialization_and_budget_mismatch_are_not_reported_as_paired(tmp_path):
+    selected = args("--datasets", "cora", "--profiles", "reference", "--suites", "generators")
+    jobs = driver.make_jobs(selected, tmp_path)
+    for job in jobs:
+        job.update(status="passed", result=fake_result())
+    driver._check_comparison_contracts(jobs)
+    jobs[-1]["result"]["shared_initial_state_sha256"] = "e" * 64
+    with pytest.raises(ValueError, match="initialization"):
+        driver._check_comparison_contracts(jobs)
+    jobs[-1]["result"] = fake_result()
+    jobs[-1]["result"]["learning_budget"] = {"synthetic": "different"}
+    with pytest.raises(ValueError, match="learning_budget"):
+        driver._check_comparison_contracts(jobs)
+
+
+def test_source_snapshot_pins_new_driver_audit_and_core_implementation():
+    snapshot = driver.resources.source_snapshot()
+    for relative in (
+        "scripts/run_v5_mechanism_experiments.py",
+        "scripts/audit_v5_stages.py",
+        "research/conductance_gat/v5/train.py",
+        "research/conductance_gat/v5/model.py",
+    ):
+        assert snapshot[relative] == driver._file_sha(driver.ROOT / relative)
+
+
+def test_missing_common_backbone_provenance_cannot_certify_paired_comparisons(tmp_path):
+    jobs = driver.make_jobs(args("--datasets", "cora", "--profiles", "reference"), tmp_path)
+    for job in jobs:
+        job.update(status="passed", result=fake_result())
+    jobs[0]["result"]["common_backbone_initial_state_sha256"] = None
+    with pytest.raises(ValueError, match="backbone initialization"):
+        driver._check_comparison_contracts(jobs)
+
+
+def test_audit_retry_retains_training(tmp_path, monkeypatch):
+    options = [
+        "--run-id",
+        "debug-audit",
+        "--results-root",
+        str(tmp_path),
+        "--datasets",
+        "cora",
+        "--profiles",
+        "reference",
+        "--suites",
+        "solvers",
+    ]
+    monkeypatch.setattr(
+        driver.standalone, "check_dependencies", lambda: {"synthetic_fixture": True}
+    )
+    monkeypatch.setattr(
+        driver.resources, "source_snapshot", lambda: {"synthetic_fixture": "stable"}
+    )
+    monkeypatch.setattr(driver, "_ensure_calibration", lambda *_: None)
+    monkeypatch.setattr(driver, "_read_result", lambda _: fake_result())
+    training, audits = [], []
+
+    def dispatch(command, log, *_):
+        if "--root" in command:
+            audits.append(command.copy())
+            log.parent.mkdir(parents=True, exist_ok=True)
+            log.write_text("Explicit synthetic audit control-flow fixture\n", encoding="utf-8")
+            return 8 if len(audits) == 1 else 0
+        training.append(command.copy())
+        return 0
+
+    monkeypatch.setattr(driver.standalone.shared, "run_logged", dispatch)
+    assert driver.main(options) == 1
+    run_dir = tmp_path / "conductance_gat/mechanisms/debug-audit"
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    first = manifest["jobs"][0]
+    assert first["status"] == "passed" and first["audit"]["status"] == "failed"
+    failed_log = Path(first["audit"]["log_path"])
+    failed_bytes = failed_log.read_bytes()
+    assert len(training) == 1
+    assert driver.main(options) == 0
+    assert len(training) == 3 and len(audits) == 4
+    manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    first = manifest["jobs"][0]
+    assert first["audit"]["status"] == "passed" and len(first["audit_attempts"]) == 1
+    assert Path(first["audit"]["log_path"]) != failed_log
+    assert failed_log.read_bytes() == failed_bytes
+    assert ".audit" in (run_dir / "comparison.md").read_text(encoding="utf-8")
+    assert driver.main(options) == 0 and len(training) == 3 and len(audits) == 4
+
+
+def completed_recipe_fixture(tmp_path):
+    """Explicit four-epoch CPU metadata fixture, never a training result."""
+    selected = args(
+        "--datasets",
+        "cora",
+        "--profiles",
+        "reference",
+        "--suites",
+        "solvers",
+        "--epochs",
+        "4",
+        "--patience",
+        "1",
+        "--learning-budget-policy",
+        "epochs",
+    )
+    job = driver.make_jobs(selected, tmp_path)[0]
+    child = train.build_parser().parse_args(job["command"][5:])
+    train.validate_args(child)
+    budget = train.plan_learning_budget(4, 1, 1, 1, policy="epochs")
+    schedule = train.phase_schedule(4, list(child.phase_fractions), "joint")
+    history = [
+        {
+            "epoch": epoch,
+            "train_batches": 1,
+            "optimizer_steps": epoch,
+            "phase": {"phase": "joint"},
+            "validation": 0.5,
+        }
+        for epoch in range(1, 5)
+    ]
+    payload = {
+        "configuration": train.configuration(child),
+        "source_sha256": train.implementation_source_hashes(),
+        "learning_budget": budget,
+        "epochs_run": 4,
+        "schedule": schedule,
+        "resume_identity": {"schedule": schedule},
+        "optimizer_steps": 4,
+        "best_epoch": 3,
+        "joint_best_epoch": 3,
+    }
+    return job, child, payload, history
+
+
+@pytest.mark.parametrize(
+    "damage,match",
+    [
+        ("epochs", "configuration"),
+        ("budget", "learning budget"),
+        ("gap", "contiguous"),
+        ("partial", "incomplete"),
+        ("early", "patience"),
+        ("source", "source"),
+        ("schedule", "schedule"),
+    ],
+)
+def test_exact_result_recipe_refuses_changed_budget_incomplete_history_or_sources(
+    tmp_path, damage, match
+):
+    _, child, payload, history = completed_recipe_fixture(tmp_path)
+    driver._validate_result_recipe(child, payload, history)
+    if damage == "epochs":
+        payload["configuration"]["epochs"] = 5
+    elif damage == "budget":
+        payload["learning_budget"]["requested_patience"] = 7
+    elif damage == "gap":
+        history[2]["epoch"] = 4
+    elif damage == "partial":
+        history[1]["train_batches"] = 0
+    elif damage == "early":
+        history.pop()
+        payload.update(epochs_run=3, optimizer_steps=3)
+    elif damage == "source":
+        payload["source_sha256"] = {}
+    elif damage == "schedule":
+        payload["resume_identity"]["schedule"] = []
+    with pytest.raises(ValueError, match=match):
+        driver._validate_result_recipe(child, payload, history)
+
+
+def test_result_read_checks_real_identity_and_common_backbone_hash(tmp_path, monkeypatch):
+    from scripts import audit_v5_stages as audit
+
+    job, child, payload, history = completed_recipe_fixture(tmp_path)
+    output = Path(job["output_dir"])
+    output.mkdir(parents=True)
+    (output / "best.pt").write_bytes(b"explicit CPU provenance fixture, not trained weights")
+    (output / "last.pt").write_bytes(b"explicit CPU last checkpoint fixture")
+    (output / "history.json").write_text(json.dumps(history), encoding="utf-8")
+    protocol = {"data_sha256": "a" * 64, "split_sha256": "b" * 64}
+    identity = train.build_resume_identity(
+        child, protocol, payload["schedule"], initial_state_sha256="c" * 64
+    )
+    payload.update(
+        research_suite=audit.SUITE,
+        status="passed",
+        dataset=child.dataset,
+        condition=child.condition,
+        protocol=protocol,
+        cache_sha256=protocol["data_sha256"],
+        resume_identity=identity,
+        resume_identity_sha256=audit._canonical(identity),
+        validation=0.5,
+        checkpoint_selection={"primary_epoch": 3, "primary_validation": 0.5, "test_used": False},
+        checkpoint_sha256=audit._sha(output / "best.pt"),
+        last_checkpoint_sha256=audit._sha(output / "last.pt"),
+        history_sha256=audit._sha(output / "history.json"),
+        shared_initial_state_sha256="c" * 64,
+        common_backbone_initial_state_sha256="d" * 64,
+        evaluation_split="validation",
+        test_evaluated=False,
+    )
+    path = Path(job["metrics_path"])
+    monkeypatch.setattr(
+        driver.standalone, "_load_metrics", lambda _: {"validation": 0.5, "best_epoch": 3}
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert driver._read_result(job)["common_backbone_initial_state_sha256"] == "d" * 64
+    payload["common_backbone_initial_state_sha256"] = None
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="initialization provenance"):
+        driver._read_result(job)
+    payload["common_backbone_initial_state_sha256"] = "d" * 64
+    payload["resume_identity_sha256"] = "e" * 64
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(audit.AuditError, match="identity SHA256"):
+        driver._read_result(job)
+````
+
+# tests/test_v5_mechanism_training_contract.py
+
+````python
+"""CPU debug contracts for new mechanisms; no real GPU/benchmark evidence."""
+
+from __future__ import annotations
+
+import copy
+
+import pytest
+import torch
+
+from research.conductance_gat.v5 import train
+from research.conductance_gat.v5.model import GraphConditionedConductanceNodeClassifier
+from research.conductance_gat.v5.protocol import SCALE_PROFILES, conductance_configuration
+from scripts import run_conductance_v5 as standalone
+
+
+def _args(*options):
+    args = train.build_parser().parse_args(
+        [
+            "--dataset",
+            "cora",
+            "--condition",
+            "shared_dynamic_c",
+            "--output-dir",
+            "debug-unused",
+            "--hidden-channels",
+            "16",
+            "--heads",
+            "4",
+            "--layers",
+            "2",
+            "--epochs",
+            "12",
+            "--no-activation-checkpoint",
+            *options,
+        ]
+    )
+    train.validate_args(args)
+    return args
+
+
+def _model(args):
+    return GraphConditionedConductanceNodeClassifier(
+        5,
+        3,
+        **train.architecture_configuration(args),
+        conductance_mode=train.CONDITIONS[args.condition]["conductance_mode"],
+    )
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "conductance_heads",
+        "propagation_normalization",
+        "conductance_generator",
+        "num_relations",
+        "edge_direction",
+        "propagation_filter",
+    ],
+)
+def test_legacy_configuration_omits_new_inactive_fields(name):
+    assert name not in conductance_configuration()
+    assert name not in train.architecture_configuration(_args())
+
+
+@pytest.mark.parametrize(
+    "options,key,value",
+    [
+        (["--conductance-heads", "per_head"], "conductance_heads", "per_head"),
+        (["--propagation-normalization", "row"], "propagation_normalization", "row"),
+        (["--conductance-generator", "degree_only"], "conductance_generator", "degree_only"),
+        (
+            ["--conductance-generator", "entropy_exact", "--solver-degree-barrier", "0"],
+            "conductance_generator",
+            "entropy_exact",
+        ),
+        (["--propagation-filter", "polynomial3"], "propagation_filter", "polynomial3"),
+        (["--num-relations", "3"], "num_relations", 3),
+    ],
+)
+def test_new_configuration_round_trips_to_child_and_model(tmp_path, options, key, value):
+    runner_args = standalone.parser().parse_args(["--datasets", "cora", *options])
+    standalone._validate(runner_args)
+    architecture = standalone._architecture(runner_args)
+    assert architecture[key] == value
+    jobs = standalone.make_jobs(runner_args, tmp_path / "debug-plan", architecture)
+    assert len(jobs) == 2
+    for job in jobs:
+        offset = job["command"].index("research.conductance_gat.v5.train") + 1
+        child_args = train.build_parser().parse_args(job["command"][offset:])
+        train.validate_args(child_args)
+        assert train.architecture_configuration(child_args)[key] == value
+    model = _model(_args(*options))
+    assert getattr(model, key) == value
+
+
+def test_degree_only_is_not_misreported_as_trainable_c():
+    model = _model(_args("--conductance-generator", "degree_only"))
+    phase = train.configure_phase(model, "joint", 0)
+    assert "conductance" not in phase["active_parameter_groups"]
+    optimizer = train.make_optimizer(model)
+    train.validate_optimizer_parameter_ownership(model, optimizer)
+    assert "conductance" not in {group["name"] for group in optimizer.param_groups}
+    assert all(not list(operator.estimator.parameters()) for operator in model.operators)
+
+
+def test_mechanism_ablations_preserve_common_initial_backbone():
+    options = [
+        [],
+        ["--conductance-heads", "per_head"],
+        ["--propagation-normalization", "row"],
+        ["--conductance-generator", "degree_only"],
+        ["--propagation-filter", "polynomial3"],
+        ["--conductance-backend", "mlp"],
+    ]
+    hashes = []
+    with torch.random.fork_rng(devices=[]):
+        for option in options:
+            torch.manual_seed(3847)
+            hashes.append(train.common_backbone_initial_state_sha256(_model(_args(*option))))
+    assert len(set(hashes)) == 1
+
+
+def test_filter_coefficients_are_optimizer_owned_without_scalar_weight_decay():
+    model = _model(_args("--propagation-filter", "polynomial3"))
+    optimizer = train.make_optimizer(model)
+    train.validate_optimizer_parameter_ownership(model, optimizer)
+    groups = [
+        g
+        for g in optimizer.param_groups
+        if any("polynomial_delta" in n for n in g["parameter_names"])
+    ]
+    assert len(groups) == 1
+    assert groups[0]["weight_decay"] == 0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"conductance_heads": "bad"},
+        {"propagation_normalization": "bad"},
+        {"conductance_generator": "bad"},
+        {"num_relations": -1},
+        {"num_relations": True},
+        {"edge_direction": "directed"},
+        {"propagation_filter": "bad"},
+        {"conductance_generator": "entropy_exact"},
+        {"conductance_backend": "mlp", "conductance_heads": "per_head"},
+    ],
+)
+def test_invalid_mechanisms_are_rejected(kwargs):
+    with pytest.raises(ValueError):
+        conductance_configuration(**kwargs)
+
+
+def test_old_resume_identity_cannot_silently_become_multic():
+    args = _args()
+    common = dict(
+        initial_state_sha256="a" * 64,
+        source_sha256={"debug.py": "b" * 64},
+        runtime_versions={"torch": "debug"},
+    )
+    protocol = {"data_sha256": "c" * 64}
+    schedule = train.phase_schedule(args.epochs, list(args.phase_fractions), args.training_schedule)
+    old = train.build_resume_identity(args, protocol, schedule, **common)
+    new_args = copy.deepcopy(args)
+    new_args.conductance_heads = "per_head"
+    new = train.build_resume_identity(new_args, protocol, schedule, **common)
+    assert old != new
+
+
+def test_production_scale_is_not_shrunk():
+    assert (
+        SCALE_PROFILES["reference"]["hidden_channels"],
+        SCALE_PROFILES["reference"]["layers"],
+        SCALE_PROFILES["reference"]["heads"],
+    ) == (256, 8, 8)
+    assert (
+        SCALE_PROFILES["large"]["hidden_channels"],
+        SCALE_PROFILES["large"]["layers"],
+        SCALE_PROFILES["large"]["heads"],
+    ) == (384, 12, 8)
+
+
+def _typed_payload():
+    return {
+        "graphs": [
+            {
+                "incidence_edge_index": torch.tensor([[0, 1, 2], [1, 2, 3]]),
+                "edge_relation_id": torch.tensor([0, 1, 0]),
+            }
+        ]
+    }
+
+
+def test_real_relation_metadata_validated_without_label_derived_types():
+    payload = _typed_payload()
+    train.validate_relation_metadata(payload, 2)
+    with pytest.raises(ValueError, match="cannot be ignored"):
+        train.validate_relation_metadata(payload, 0)
+    with pytest.raises(ValueError, match="vocabulary"):
+        train.validate_relation_metadata(payload, 1)
+    del payload["graphs"][0]["edge_relation_id"]
+    with pytest.raises(ValueError, match="requires"):
+        train.validate_relation_metadata(payload, 2)
+
+
+def test_sampled_relation_ids_follow_original_physical_edges():
+    pyg = pytest.importorskip(
+        "torch_geometric.data", reason="real PyG sampling integration unavailable"
+    )
+    from research.conductance_gat.v5.sampling import TransductiveGraphSampler
+
+    incidence = torch.tensor([[0, 0, 1, 2, 3], [1, 3, 2, 3, 4]])
+    relation = torch.tensor([0, 1, 2, 1, 0])
+    graph = pyg.Data(
+        x=torch.randn(5, 3),
+        y=torch.arange(5) % 2,
+        incidence_edge_index=incidence,
+        edge_index=torch.cat((incidence, incidence.flip(0)), dim=1),
+        edge_relation_id=relation,
+    )
+    sampler = TransductiveGraphSampler(
+        graph, torch.arange(5), mode="cluster", seed_batch_size=32, fanouts=[15, 10], model_seed=0
+    )
+    sample, edge_ids, _, _ = sampler._induced_result(torch.tensor([0, 1, 3]), torch.tensor([0]))
+    assert torch.equal(sample.edge_relation_id, relation[edge_ids])
+````
+
+# tests/test_v5_multi_conductance.py
+
+````python
+"""CPU synthetic/debug-only mathematical and gradient tests, not training results."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+from research.conductance_gat.v5.model import GraphConditionedConductanceNodeClassifier
+from research.conductance_gat.v5.operator import (
+    conductance_propagation_coefficients,
+    graph_sum,
+    shared_head_diffusion,
+)
+from research.conductance_gat.v5.optimization import GraphOptimizedConductance, conductance_energy
+
+
+def _inputs(dtype=torch.float64):
+    generator = torch.Generator().manual_seed(741)
+    x = torch.randn(9, 8, generator=generator, dtype=dtype)
+    incidence = torch.tensor([[0, 0, 0, 1, 2, 4, 5, 5], [1, 2, 3, 2, 3, 5, 6, 7]])
+    batch = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1, 2])
+    degree = torch.bincount(incidence.flatten(), minlength=9).to(dtype)
+    omega = torch.tensor([1.0, 2.5, 0.7, 1.3, 3.0, 1.2, 0.8, 2.1], dtype=dtype)
+    context = torch.randn(3, 24, generator=generator, dtype=dtype)
+    return x, incidence, batch, degree, omega, context
+
+
+def _solve(estimator, inputs, relations=None):
+    x, incidence, batch, degree, omega, context = inputs
+    return estimator(
+        x,
+        incidence,
+        batch,
+        3,
+        graph_context=context,
+        sample_degree=degree,
+        full_degree=degree + 2,
+        edge_normalization_weight=omega,
+        edge_relation_id=relations,
+    )
+
+
+def _dense(message, c, incidence, batch, beta, omega, normalization, polynomial):
+    # Dense adjacency exists ONLY in this explicitly tiny mathematical test.
+    heads, nodes = message.shape[1], message.shape[0]
+    effective = (c[:, None] if c.ndim == 1 else c) * omega[:, None]
+    adjacency = message.new_zeros((nodes, nodes, heads))
+    tail, head = incidence
+    adjacency = adjacency.index_put((tail, head), effective.expand(-1, heads), accumulate=True)
+    adjacency = adjacency.index_put((head, tail), effective.expand(-1, heads), accumulate=True)
+    degree = adjacency.sum(dim=1)
+    active = degree > 0
+    safe = torch.where(active, degree, torch.ones_like(degree))
+    if normalization == "row":
+        p = adjacency / safe[:, None, :]
+    else:
+        p = adjacency * safe.rsqrt()[:, None, :] * safe.rsqrt()[None, :, :]
+    p = p + torch.eye(nodes, dtype=message.dtype)[:, :, None] * (~active)[:, None, :]
+    p1 = torch.einsum("ijh,jhd->ihd", p, message)
+    result = message + beta[batch, :, None] * (p1 - message)
+    if polynomial is not None:
+        p2 = torch.einsum("ijh,jhd->ihd", p, p1)
+        p3 = torch.einsum("ijh,jhd->ihd", p, p2)
+        result = result + polynomial[None, :, 0, None] * (p2 - message)
+        result = result + polynomial[None, :, 1, None] * (p3 - message)
+    return result
+
+
+@pytest.mark.parametrize("normalization", ["symmetric", "row"])
+@pytest.mark.parametrize("per_head", [False, True])
+@pytest.mark.parametrize("polynomial", [False, True])
+def test_dense_forward_and_gradient_equivalence(normalization, per_head, polynomial):
+    torch.manual_seed(63)
+    _, incidence, batch, _, omega, _ = _inputs()
+    message = torch.randn(9, 2, 3, dtype=torch.float64, requires_grad=True)
+    c = torch.rand((8, 2) if per_head else (8,), dtype=torch.float64).add(0.2).requires_grad_()
+    beta = torch.rand(3, 2, dtype=torch.float64, requires_grad=True)
+    omega = omega.requires_grad_()
+    coefficients = (
+        torch.randn(2, 2, dtype=torch.float64, requires_grad=True) if polynomial else None
+    )
+    actual = shared_head_diffusion(
+        message,
+        c,
+        incidence,
+        batch,
+        beta,
+        sampling_correction=omega,
+        propagation_normalization=normalization,
+        polynomial_coefficients=coefficients,
+        edge_chunk_size=3,
+    )
+    expected = _dense(message, c, incidence, batch, beta, omega, normalization, coefficients)
+    torch.testing.assert_close(actual, expected, rtol=1e-11, atol=1e-12)
+    torch.testing.assert_close(actual[8], message[8], rtol=0, atol=0)
+    probe = torch.randn_like(actual)
+    parameters = [message, c, beta, omega] + ([coefficients] if polynomial else [])
+    actual_grad = torch.autograd.grad((actual * probe).sum(), parameters, retain_graph=True)
+    expected_grad = torch.autograd.grad((expected * probe).sum(), parameters)
+    for first, second in zip(actual_grad, expected_grad, strict=True):
+        torch.testing.assert_close(first, second, rtol=1e-10, atol=1e-11)
+
+
+@pytest.mark.parametrize("normalization", ["symmetric", "row"])
+def test_per_head_custom_autograd_gradgradcheck(normalization):
+    incidence = torch.tensor([[0, 0, 1], [1, 2, 2]])
+    batch = torch.zeros(3, dtype=torch.long)
+    message = torch.randn(3, 2, 2, dtype=torch.float64, requires_grad=True)
+    c = torch.rand(3, 2, dtype=torch.float64).add(0.5).requires_grad_()
+    beta = torch.rand(1, 2, dtype=torch.float64, requires_grad=True)
+
+    def fn(m, w, b):
+        return shared_head_diffusion(
+            m, w, incidence, batch, b, propagation_normalization=normalization, edge_chunk_size=2
+        )
+
+    assert torch.autograd.gradcheck(fn, (message, c, beta), fast_mode=True)
+    assert torch.autograd.gradgradcheck(fn, (message, c, beta), fast_mode=True)
+
+
+@pytest.mark.parametrize("generator", ["optimized", "degree_only", "entropy_exact"])
+def test_independent_head_solver_gauge_energy_and_permutations(generator):
+    torch.manual_seed(85)
+    inputs = _inputs()
+    estimator = GraphOptimizedConductance(
+        8,
+        conductance_heads=3,
+        generator=generator,
+        solver_degree_barrier=0.0 if generator == "entropy_exact" else 0.1,
+        solver_cost_scaling="width_scaled",
+        edge_chunk_size=3,
+    ).double()
+    c = _solve(estimator, inputs)
+    assert c.shape == (8, 3)
+    assert torch.isfinite(c).all() and (c > 0).all()
+    edge_graph = inputs[2][inputs[1][0]]
+    mass = graph_sum(inputs[4], edge_graph, 3)
+    means = graph_sum(c * inputs[4][:, None], edge_graph, 3) / mass.clamp_min(1e-30)[:, None]
+    torch.testing.assert_close(means[:2], torch.ones_like(means[:2]))
+    if generator != "degree_only":
+        assert (c[:, 0] - c[:, 1]).abs().max() > 1e-5
+    else:
+        assert list(estimator.parameters()) == []
+        assert (c - 1).abs().max() > 1e-5
+        torch.testing.assert_close(c[:, 0], c[:, 1], rtol=0, atol=0)
+    diagnostics = estimator.last_solver_diagnostics
+    assert diagnostics["executed_steps"] == (0 if generator == "entropy_exact" else 8)
+    assert (diagnostics["objective_final"] <= diagnostics["objective_initial"] + 1e-12).all()
+    energy = conductance_energy(
+        c,
+        estimator.last_scores,
+        inputs[1],
+        inputs[2],
+        3,
+        inputs[4],
+        entropy=1.0,
+        degree_barrier=estimator.solver_degree_barrier,
+    )
+    torch.testing.assert_close(energy, diagnostics["objective_final"])
+    order = torch.tensor([7, 3, 0, 6, 2, 1, 5, 4])
+    permuted = list(inputs)
+    permuted[1] = inputs[1].flip(0)[:, order]
+    permuted[4] = inputs[4][order]
+    torch.testing.assert_close(_solve(estimator, permuted), c[order], rtol=1e-10, atol=1e-11)
+    if generator == "entropy_exact":
+        raw = (-estimator.last_scores).exp()
+        denominator = (
+            graph_sum(raw * permuted[4][:, None], edge_graph[order], 3)
+            / mass.clamp_min(1e-30)[:, None]
+        )
+        torch.testing.assert_close(
+            _solve(estimator, permuted), raw / denominator[edge_graph[order]]
+        )
+        assert diagnostics["projected_gradient_rms_final"].max() < 1e-12
+
+
+def _model_graph():
+    x, incidence, batch, degree, omega, _ = _inputs(torch.float32)
+    return SimpleNamespace(
+        x=x,
+        incidence_edge_index=incidence,
+        batch=batch,
+        _v5_num_graphs=3,
+        full_degree=degree + 2,
+        edge_normalization_weight=omega,
+        sampling_correction=omega,
+    )
+
+
+@pytest.mark.parametrize("generator", ["optimized", "degree_only", "entropy_exact"])
+@pytest.mark.parametrize("normalization", ["symmetric", "row"])
+def test_forward_loss_backward_optimizer_updates_real_components(generator, normalization):
+    torch.manual_seed(76)
+    model = GraphConditionedConductanceNodeClassifier(
+        8,
+        3,
+        hidden_channels=16,
+        layers=2,
+        heads=2,
+        dropout=0.0,
+        activation_checkpoint=True,
+        conductance_heads="per_head",
+        conductance_generator=generator,
+        propagation_normalization=normalization,
+        propagation_filter="polynomial3",
+        solver_degree_barrier=0.0 if generator == "entropy_exact" else 0.1,
+        solver_cost_scaling="width_scaled",
+        edge_chunk_size=3,
+    )
+    graph = _model_graph()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    before = {name: value.detach().clone() for name, value in model.named_parameters()}
+    loss = F.cross_entropy(model(graph), torch.arange(9) % 3)
+    loss.backward()
+    for name, parameter in model.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+    optimizer.step()
+    changed = {
+        name for name, value in model.named_parameters() if not torch.equal(before[name], value)
+    }
+    assert any("value_weight" in name for name in changed)
+    assert any("beta_estimator" in name for name in changed)
+    assert any("polynomial_delta" in name for name in changed)
+    if generator == "degree_only":
+        assert not any("estimator." in name and "beta_estimator" not in name for name in before)
+    else:
+        assert any("context_metric" in name for name in changed)
+        assert any("node_projection" in name for name in changed)
+        assert any("structure_metric" in name for name in changed)
+
+
+def test_raw_c_is_not_attention_and_heads_are_not_averaged():
+    message = torch.arange(12, dtype=torch.float64).reshape(3, 2, 2)
+    c = torch.tensor([[0.2, 1.8], [1.8, 0.2]], dtype=torch.float64)
+    incidence = torch.tensor([[0, 0], [1, 2]])
+    batch = torch.zeros(3, dtype=torch.long)
+    beta = torch.ones(1, 2, dtype=torch.float64)
+    tail, head, degree = conductance_propagation_coefficients(c, incidence, 3, normalization="row")
+    rows = (
+        torch.zeros(3, 2, dtype=torch.float64)
+        .index_add(0, incidence[0], tail)
+        .index_add(0, incidence[1], head)
+    )
+    torch.testing.assert_close(rows[degree > 0], torch.ones_like(rows[degree > 0]))
+    assert c.max() > 1 and tail.min() >= 0 and tail.max() <= 1
+    result = shared_head_diffusion(
+        message, c, incidence, batch, beta, propagation_normalization="row"
+    )
+    averaged = shared_head_diffusion(
+        message, c.mean(1), incidence, batch, beta, propagation_normalization="row"
+    )
+    assert not torch.allclose(result, averaged)
+
+
+@pytest.mark.parametrize("heads", [1, 3])
+def test_relation_metric_uses_explicit_types_and_receives_task_gradient(heads):
+    torch.manual_seed(51)
+    inputs = _inputs()
+    estimator = GraphOptimizedConductance(
+        8, conductance_heads=heads, num_relations=2, solver_cost_scaling="width_scaled"
+    ).double()
+    ids = torch.arange(8) % 2
+    with pytest.raises(ValueError, match="explicit edge_relation_id"):
+        _solve(estimator, inputs)
+    c = _solve(estimator, inputs, ids)
+    coefficient = torch.arange(c.numel(), dtype=c.dtype).reshape_as(c)
+    (c * coefficient).sum().backward()
+    assert estimator.relation_metric.grad is not None
+    assert estimator.relation_metric.grad.abs().sum() > 0
+    flipped = _solve(estimator, inputs, 1 - ids)
+    assert not torch.allclose(c, flipped)
+    permuted = list(inputs)
+    permuted[1] = inputs[1].flip(0)
+    torch.testing.assert_close(_solve(estimator, permuted, ids), c)
+    with pytest.raises(RuntimeError, match="outside"):
+        _solve(estimator, inputs, ids + 2)
+
+
+@pytest.mark.parametrize("normalization", ["symmetric", "row"])
+def test_all_ones_control_perhead_equals_shared(normalization):
+    inputs = _inputs()
+    estimator = GraphOptimizedConductance(8, mode="fixed_one", conductance_heads=2).double()
+    c = _solve(estimator, inputs)
+    assert list(estimator.parameters()) == []
+    torch.testing.assert_close(c, torch.ones_like(c), rtol=0, atol=0)
+    message = torch.randn(9, 2, 4, dtype=torch.float64)
+    beta = torch.rand(3, 2, dtype=torch.float64)
+    common = (inputs[1], inputs[2], beta)
+    actual = shared_head_diffusion(message, c, *common, propagation_normalization=normalization)
+    expected = shared_head_diffusion(
+        message, c[:, 0], *common, propagation_normalization=normalization
+    )
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-13)
+
+
+def test_legacy_defaults_state_dict_configuration_and_seed_pairing_unchanged():
+    args = dict(hidden_channels=16, layers=2, heads=2, dropout=0.0)
+    torch.manual_seed(58)
+    legacy = GraphConditionedConductanceNodeClassifier(8, 3, **args).eval()
+    torch.manual_seed(58)
+    explicit = GraphConditionedConductanceNodeClassifier(
+        8,
+        3,
+        conductance_heads="shared",
+        propagation_normalization="symmetric",
+        conductance_generator="optimized",
+        propagation_filter="linear",
+        num_relations=0,
+        edge_direction="undirected",
+        **args,
+    ).eval()
+    assert legacy.conductance_configuration == explicit.conductance_configuration
+    assert "conductance_heads" not in legacy.conductance_configuration
+    assert legacy.state_dict().keys() == explicit.state_dict().keys()
+    for name, value in legacy.state_dict().items():
+        torch.testing.assert_close(value, explicit.state_dict()[name], rtol=0, atol=0)
+    torch.testing.assert_close(legacy(_model_graph()), explicit(_model_graph()), rtol=0, atol=0)
+    torch.manual_seed(58)
+    larger_c = GraphConditionedConductanceNodeClassifier(8, 3, conductance_heads="per_head", **args)
+    for name, value in legacy.state_dict().items():
+        if ".estimator." not in name:
+            torch.testing.assert_close(value, larger_c.state_dict()[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"edge_direction": "directed"},
+        {"conductance_backend": "mlp", "conductance_heads": "per_head"},
+        {"conductance_generator": "entropy_exact", "solver_degree_barrier": 0.1},
+        {"conductance_generator": "degree_only", "num_relations": 2},
+    ],
+)
+def test_unsupported_semantics_are_rejected_not_silently_faked(kwargs):
+    with pytest.raises(ValueError):
+        GraphConditionedConductanceNodeClassifier(
+            8, 3, hidden_channels=16, layers=2, heads=2, **kwargs
+        )
+
+
+def test_head_solver_matches_independent_scalar_objectives_and_gradients():
+    torch.manual_seed(92)
+    inputs = _inputs()
+    multi = GraphOptimizedConductance(
+        8, conductance_heads=3, solver_cost_scaling="width_scaled"
+    ).double()
+    actual = _solve(multi, inputs)
+    # Independent scalar runs are a debug oracle only, never a production head loop.
+    scalar_results = []
+    for head in range(3):
+        scalar = GraphOptimizedConductance(8, solver_cost_scaling="width_scaled").double()
+        with torch.no_grad():
+            scalar.node_projection.weight.copy_(multi.node_projection.weight)
+            scalar.context_metric.weight.copy_(
+                multi.context_metric.weight[8 * head : 8 * (head + 1)]
+            )
+            scalar.context_metric.bias.copy_(multi.context_metric.bias[8 * head : 8 * (head + 1)])
+            scalar.structure_metric.copy_(multi.structure_metric[head])
+        scalar_results.append(_solve(scalar, inputs))
+    torch.testing.assert_close(actual, torch.stack(scalar_results, dim=1), rtol=1e-11, atol=1e-12)
+    x, incidence, batch, degree, omega, context = inputs
+    x = x.clone().requires_grad_()
+    omega = omega.clone().requires_grad_()
+
+    def fn(state, weight):
+        return _solve(multi, (state, incidence, batch, degree, weight, context))
+
+    assert torch.autograd.gradcheck(fn, (x, omega), fast_mode=True, atol=1e-6, rtol=1e-4)
+
+
+def test_per_head_disjoint_batch_independence_node_permutation_and_weight_scale():
+    torch.manual_seed(34)
+    inputs = _inputs()
+    estimator = GraphOptimizedConductance(
+        8, conductance_heads=3, solver_cost_scaling="width_scaled"
+    ).double()
+    expected = _solve(estimator, inputs)
+    x, incidence, batch, degree, omega, context = inputs
+    single = estimator(
+        x[:4],
+        incidence[:, :5],
+        torch.zeros(4, dtype=torch.long),
+        1,
+        graph_context=context[:1],
+        sample_degree=degree[:4],
+        full_degree=degree[:4] + 2,
+        edge_normalization_weight=omega[:5],
+    )
+    torch.testing.assert_close(single, expected[:5], rtol=1e-10, atol=1e-11)
+    scale = torch.tensor([2.5, 0.3, 10.0], dtype=x.dtype)
+    scaled = (x, incidence, batch, degree, omega * scale[batch[incidence[0]]], context)
+    torch.testing.assert_close(_solve(estimator, scaled), expected, rtol=1e-10, atol=1e-11)
+    order = torch.tensor([8, 4, 1, 6, 0, 3, 7, 2, 5])
+    inverse = order.argsort()
+    permuted = (x[order], inverse[incidence], batch[order], degree[order], omega, context)
+    torch.testing.assert_close(_solve(estimator, permuted), expected, rtol=1e-10, atol=1e-11)
+    estimator.override = "shuffle"
+    shuffled = _solve(estimator, inputs)
+    torch.testing.assert_close(shuffled[:5], expected[:5].flip(0))
+    torch.testing.assert_close(shuffled[5:], expected[5:].flip(0))
+    estimator.override = "mean"
+    torch.testing.assert_close(_solve(estimator, inputs), torch.ones_like(expected))
+
+
+def test_relation_metric_is_used_by_classifier_task_loss_and_optimizer():
+    torch.manual_seed(89)
+    graph = _model_graph()
+    graph.edge_relation_id = torch.arange(8) % 2
+    model = GraphConditionedConductanceNodeClassifier(
+        8,
+        3,
+        hidden_channels=16,
+        layers=2,
+        heads=2,
+        dropout=0.0,
+        conductance_heads="per_head",
+        num_relations=2,
+        propagation_normalization="row",
+        solver_cost_scaling="width_scaled",
+    )
+    parameters = [operator.estimator.relation_metric for operator in model.operators]
+    before = [value.detach().clone() for value in parameters]
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    F.cross_entropy(model(graph), torch.arange(9) % 3).backward()
+    assert all(value.grad is not None and value.grad.abs().sum() > 0 for value in parameters)
+    optimizer.step()
+    assert all(
+        not torch.equal(previous, value) for previous, value in zip(before, parameters, strict=True)
+    )
+
+
+@pytest.mark.parametrize("normalization", ["row", "symmetric"])
+def test_bf16_keeps_geometry_fp32_and_has_finite_backward(normalization):
+    torch.manual_seed(28)
+    model = GraphConditionedConductanceNodeClassifier(
+        8,
+        3,
+        hidden_channels=16,
+        layers=2,
+        heads=2,
+        conductance_heads="per_head",
+        propagation_normalization=normalization,
+        propagation_filter="polynomial3",
+        dropout=0.0,
+    )
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        output = model(_model_graph())
+        loss = F.cross_entropy(output.float(), torch.arange(9) % 3)
+    loss.backward()
+    for operator in model.operators:
+        assert operator.estimator.last_c.dtype == torch.float32
+        assert operator.last_beta.dtype == torch.float32
+    assert all(
+        value.grad is not None and torch.isfinite(value.grad).all() for value in model.parameters()
+    )
+
+
+def test_polynomial_zero_delta_starts_as_identical_linear_filter():
+    torch.manual_seed(94)
+    graph = _model_graph()
+    kwargs = dict(hidden_channels=16, layers=2, heads=2, dropout=0.0, conductance_heads="per_head")
+    linear = GraphConditionedConductanceNodeClassifier(8, 3, **kwargs).eval()
+    torch.manual_seed(94)
+    polynomial = GraphConditionedConductanceNodeClassifier(
+        8, 3, propagation_filter="polynomial3", **kwargs
+    ).eval()
+    for name, value in linear.state_dict().items():
+        torch.testing.assert_close(value, polynomial.state_dict()[name], rtol=0, atol=0)
+    torch.testing.assert_close(linear(graph), polynomial(graph), rtol=0, atol=0)
 ````
 
 # tests/test_v5_optimizer_runner_contract.py
@@ -107797,7 +128151,7 @@ import torch
 
 from research.conductance_gat.v5.diagnostics import PreparedValidationGraph
 from research.conductance_gat.v5.model import GraphConditionedConductanceNodeClassifier
-from research.conductance_gat.v5.stage_audit import audit_stage_roles
+from research.conductance_gat.v5.stage_audit import _json, audit_stage_roles
 
 
 class DebugGraph(SimpleNamespace):
@@ -107814,11 +128168,9 @@ class DebugGraph(SimpleNamespace):
         return vars(self).items()
 
 
-def _fixture(mode="dynamic", batched=False):
+def _fixture(mode="dynamic", batched=False, **overrides):
     torch.manual_seed(421)
-    model = GraphConditionedConductanceNodeClassifier(
-        5,
-        3,
+    configuration = dict(
         hidden_channels=16,
         layers=2,
         heads=4,
@@ -107831,6 +128183,7 @@ def _fixture(mode="dynamic", batched=False):
         beta_initial=0.5,
         activation_checkpoint=False,
     )
+    model = GraphConditionedConductanceNodeClassifier(5, 3, **{**configuration, **overrides})
     edges = torch.tensor([[0, 0, 1, 1, 2, 4, 4, 5], [1, 2, 2, 3, 3, 5, 6, 6]])
     graph = DebugGraph(
         x=torch.randn(8, 5), incidence_edge_index=edges, y=torch.tensor([0, 1, 2, 1, 0, 2, 1, 0])
@@ -107922,7 +128275,7 @@ def test_validation_interventions_and_local_reference_are_read_only_and_json_ser
     assert torch.equal(graph.x, x)
     json.dumps(result, allow_nan=False)
     assert result["execution_status"] == "passed"
-    assert result["contribution_status"] == "observed"
+    assert result["contribution_status"] == "observed_above_repeat_noise"
     assert result["scope"]["test_used"] is False
     assert result["scope"]["parameters_updated"] is False
     assert result["interventions"]["learned"]["label_count"] == 4
@@ -107975,8 +128328,11 @@ def test_ppi_disjoint_batches_are_not_split_and_generator_is_consumed_once():
 def test_fixed_c_reports_no_inner_optimization_or_contribution_evidence():
     model, graph = _fixture(mode="fixed_one")
     result = _audit(model, graph, torch.arange(8))
-    assert result["contribution_status"] == "inconclusive"
-    assert all(value["logit_max_abs"] == 0 for value in result["interventions"].values())
+    assert result["contribution_status"] == "not_applicable"
+    assert all(
+        result["interventions"][name]["logit_max_abs"] == 0
+        for name in ("learned", "c_one", "mean_c", "shuffled_c")
+    )
     for row in result["local_layer_comparisons"]:
         assert row["reference_tolerance_reached_by_graph"] is None
         assert row["baseline_solver"]["enabled"] is False
@@ -108105,6 +128461,156 @@ def test_zero_beta_bypass_is_inconclusive_even_when_solver_c_varies():
         assert row["baseline_c"]["std"] > 0
         assert row["baseline_beta"]["max"] == 0
         assert row["operator_c_one_vs_deployed"]["max_abs"] == 0
+
+
+def test_same_checkpoint_eval_repeats_do_not_become_training_seeds():
+    model, graph = _fixture()
+    result = _audit(model, graph, torch.arange(8), repeat_evaluations=6)
+    noise = result["repeat_noise_control"]
+    assert noise["evaluation_count"] == len(noise["repeats"]) == 6
+    assert noise["different_training_seeds"] is False
+    assert noise["max_logit_difference_l2"] == 0
+    assert "mean_head_beta" in result["interventions"]
+    assert result["scope"]["full_validation_passes"] == 11
+
+
+def test_fixed_c_numerical_jitter_is_never_a_contribution_certificate():
+    model, graph = _fixture(mode="fixed_one")
+    call = []
+
+    def simulated_numerical_jitter(module, args, output):
+        call.append(1)
+        return output + 0.0001 * len(call)
+
+    handle = model.decoder.register_forward_hook(simulated_numerical_jitter)
+    try:
+        result = _audit(model, graph, torch.arange(8))
+    finally:
+        handle.remove()
+    assert result["repeat_noise_control"]["max_logit_difference_l2"] > 0
+    assert result["interventions"]["c_one"]["logit_max_abs"] > 0
+    assert result["contribution_status"] == "not_applicable"
+
+
+@pytest.mark.parametrize("normalization", ["row", "symmetric"])
+def test_per_head_real_audit_has_scoped_distribution_and_headwise_residual(normalization):
+    model, graph = _fixture(
+        batched=True, conductance_heads="per_head", propagation_normalization=normalization
+    )
+    result = _audit(model, [graph])
+    json.dumps(result, allow_nan=False)
+    for local in result["local_layer_comparisons"]:
+        distribution = local["distribution"]
+        assert distribution["conductance_layout"] == "per_head_E_H"
+        assert distribution["propagation_normalization"] == normalization
+        assert len(distribution["graphs"]) == 2
+        assert len(local["reference_tolerance_reached_by_graph"]) == 2
+        for graph_row in distribution["graphs"]:
+            assert len(graph_row["raw_c"]["quantiles"]["0.5"]) == 4
+            assert graph_row["heads"] == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"conductance_backend": "mlp", "solver_cost_scaling": "legacy_unit"},
+        {"conductance_generator": "entropy_exact", "solver_degree_barrier": 0.0},
+        {"conductance_generator": "degree_only"},
+    ],
+)
+def test_noniterative_controls_have_no_fake_higher_k_measurement(options):
+    model, graph = _fixture(**options)
+    result = _audit(model, graph, torch.arange(8))
+    assert result["reference_contract"]["applicable"] is False
+    assert "higher_k_full_model" not in result["interventions"]
+    for local in result["local_layer_comparisons"]:
+        assert local["c_deployed_vs_reference"] is None
+        assert local["reference_tolerance_reached_by_graph"] is None
+        assert local["distribution"]["graphs"]
+
+
+def test_optional_actual_task_head_c_gradients_preserve_grads_weights_rng_and_hooks():
+    model, graph = _fixture(conductance_heads="per_head", propagation_normalization="row")
+    model(graph).square().mean().backward()
+    state = _state(model)
+    result = _audit(model, graph, torch.arange(8), head_gradient_conflict=True)
+    _assert_restored(model, state)
+    audit = result["head_gradient_conflict"]
+    assert audit["measured"] is True
+    assert "not theta-space" in audit["scope"]
+    assert len(audit["layers"]) == 2
+    assert all(row["measured"] for row in audit["layers"])
+    assert all(len(row["graphs"][0]["head_pair_dot_matrix"]) == 4 for row in audit["layers"])
+    assert result["scope"]["autograd_vjp_used"] is True
+    assert all(not op.estimator._forward_hooks for op in model.operators)
+
+
+def test_optional_shared_c_head_expansion_keeps_forward_and_parameters_unchanged():
+    model, graph = _fixture()
+    state = _state(model)
+    result = _audit(model, graph, torch.arange(8), head_gradient_conflict=True)
+    _assert_restored(model, state)
+    for row in result["head_gradient_conflict"]["layers"]:
+        assert row["equal_c_forward_difference"]["relative_l2"] < 1e-5
+        assert row["graphs"][0]["shared_c_sum_gradient_norm"] > 0
+
+
+def test_too_few_same_checkpoint_repeats_are_rejected():
+    model, graph = _fixture()
+    with pytest.raises(ValueError, match="at least 5"):
+        _audit(model, graph, torch.arange(8), repeat_evaluations=4)
+
+
+def test_optional_vjp_failure_removes_hooks_and_restores_model(monkeypatch):
+    model, graph = _fixture()
+    state = _state(model)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("synthetic requested VJP failure")
+
+    monkeypatch.setattr(torch.autograd, "grad", fail)
+    with pytest.raises(RuntimeError, match="requested VJP"):
+        _audit(model, graph, torch.arange(8), head_gradient_conflict=True)
+    _assert_restored(model, state)
+    assert all(not op.estimator._forward_hooks for op in model.operators)
+
+
+def test_summary_json_packs_once_per_dtype_without_losing_nested_shapes_or_int64(monkeypatch):
+    calls = []
+    original = torch.Tensor.cpu
+
+    def count_cpu(tensor, *args, **kwargs):
+        calls.append((tensor.dtype, tensor.numel()))
+        return original(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "cpu", count_cpu)
+    floating = torch.tensor([[0.5, 1.5], [2.5, 3.5]]).T
+    data = {
+        "nested": (floating, {"same_tensor": floating, "empty": torch.empty(2, 0)}),
+        "scalar": torch.tensor(0.25),
+        "integer": torch.tensor(2**62 + 1),
+        "boolean": torch.tensor([True, False]),
+        "none": None,
+    }
+    result = _json(data)
+    assert len(calls) == 3
+    assert sum(count for dtype, count in calls if dtype == torch.float32) == 5
+    assert result["nested"] == [
+        [[0.5, 2.5], [1.5, 3.5]],
+        {"same_tensor": [[0.5, 2.5], [1.5, 3.5]], "empty": [[], []]},
+    ]
+    assert result["integer"] == 2**62 + 1 and type(result["integer"]) is int
+    assert result["boolean"] == [True, False] and type(result["boolean"][0]) is bool
+    assert result["scalar"] == 0.25 and result["none"] is None
+    json.dumps(result, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "bad", [torch.tensor(float("nan")), torch.tensor(float("inf")), float("nan")]
+)
+def test_packed_summary_json_rejects_nonfinite_values(bad):
+    with pytest.raises(FloatingPointError, match="nonfinite stage audit statistic"):
+        _json({"nested": [torch.ones(2), {"bad": bad}]})
 ````
 
 # tests/test_v5_static_graph_runtime.py

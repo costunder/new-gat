@@ -2,6 +2,18 @@
 
 기본 설치·실험 순서는 [시작 안내](GETTING_STARTED.md)를 따른다. 아래 항목은 환경별 조정과 개발 검증용이다.
 
+## 2026-09-26 로컬 Windows GPU 검증 환경
+
+이 PC의 실제 GPU는 RTX 5070 Ti 16GB이며 CPU 전용 장비가 아니다. 기본 `.venv`의
+잘못 설치된 `torch 2.14.0+cpu`를 같은 release의 `2.14.0+cu130`으로 교체했다.
+기본 환경에서 6개 reference 모델의 FP32/BF16 CUDA smoke 15개가 통과했다.
+CUDA가 없으면 이 GPU 검사는 skip이나 CPU 전환 없이 실패한다.
+
+별도 `.venv-gpu`에는 `torch 2.13.0+cu130`과 `requirements-lock.txt` 의존성이 있다.
+기본 `.venv`의 GPU 연산 검증을 전체 benchmark 의존성 설치/공식 데이터 학습 성공으로
+해석하지 않는다. 시스템 드라이버와 아래 Linux production 설치 프로필은 변경하지 않았다.
+검증 범위와 재현 명령은 [AGGREGATION_COMPARISON.md](AGGREGATION_COMPARISON.md)에 있다.
+
 ## Conda
 
 `environment.yml`은 Python 3.11과 pip를 준비한다. 연구 패키지는 `setup_gpu.sh`가

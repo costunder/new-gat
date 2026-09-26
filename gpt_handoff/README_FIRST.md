@@ -1,5 +1,91 @@
 # GPT 전달용 전체 프로젝트 묶음
 
+**최신화 기준: 2026-09-26 / 구현 기준 로컬 커밋 `9103fad`.**
+기존 10개 문서를 유지하며 최신 우선 검수 대상은
+`experiments/aggregation_comparison/`의 독립 비교 실험이다.
+`CODE_SUMMARY.md`는 현재 source/test/config/script 원문으로 다시 생성했다.
+아래 9월 중순 이전 안내는 역사적 기록이며 현재 상태는 이 절을 우선한다.
+
+## 현재 상태
+
+| 항목 | 확인된 상태 |
+| --- | --- |
+| 기존 incidence ablation | `experiments/incidence_ablation/`, 8조건, residual/FFN backbone의 내부 ablation |
+| 새 외부 모델 비교 | `experiments/aggregation_comparison/`, 6조건, 새 모델·결과 폴더·run ID |
+| 우리 모델 | 외부 residual/FFN 제거; 기본, pre-lift, 국소 에너지, 에너지+pre-lift |
+| 외부 비교 대상 | DUALFormer(ICLR 2025) 공식 수식 기반 공통 레시피 구현과 별도 no-skip 변형 |
+| 미포함 비교 | 원래 GAT, GATv2, M3Dphormer는 새 6조건에 없음. 2026 최신 SOTA 비교 완료 주장은 금지 |
+| GPU 검증 | RTX 5070 Ti 16GB, 6개 reference 모델 FP32/BF16 포함 15개 CUDA 검사 통과 |
+| 실제 benchmark | 새 6조건의 전체 데이터 학습·test 평가·다중 seed 비교는 미실행 |
+| A100 MIG 10GB | 실제 적합성·처리량·전체 그래프 calibration 미측정 |
+| 배포 | 로컬 구현/커밋 기준. 원격 서버 동기화·실행 완료로 간주하지 않음 |
+
+GPU 검사에는 실패 이력도 있다. 기본 환경 2.14 CUDA의 최초 비결정적 실행에서
+FP32 에너지 모델 재개 일치 검사 1개가 실패했다(14 passed / 1 failed).
+테스트에만 결정적 CUDA 연산을 적용한 뒤 같은 허용 오차로 15개가 통과했다.
+정식 학습 레시피까지 결정적으로 바꾼 것은 아니다. 근거와 범위는
+[EXPERIMENT_STATUS.md](EXPERIMENT_STATUS.md)의 최신 절에 있다.
+
+## 이번 검수의 읽는 순서
+
+1. `README_FIRST.md`: 이 최신 절과 아래 검수 요청문.
+2. `HANDOFF.md`: 최신 요구사항 반영표, 코드 지도, 미구현 범위와 검수 질문.
+3. `EXPERIMENT_STATUS.md`: CUDA 증거와 실패 이력, 과거 연구 결과의 구분.
+4. `CONDUCTANCE_V5.md`: 최신 local Gram/lift/DUALFormer 설계와 과거 V5 계약.
+5. `CODE_SUMMARY.md`: 현재 전체 원문. `# experiments/aggregation_comparison/model.py`부터
+   engine, runner, calibration, integrity, audit, CUDA tests 및 기존 의존 구현을 확인한다.
+6. `CONDUCTANCE_V2.md`, `CONDUCTANCE_V3.md`, `CONDUCTANCE_V4.md`, `CYCLE_PE_V2.md`,
+   `RICH_SCALING_EXPERIMENTS.md`: 다른 연구 트랙을 각 날짜·계약별로 구분해서 검토한다.
+
+소스 스냅샷은 파일별 원문이며 코드가 생략된 요약문이 아니다. LF 줄바꿈으로 정규화한다.
+검수 ZIP에는 문서 10개, 실제 소스, 실행 문서, 해시 manifest와 CUDA XML/JSON 기록을
+포함한다. `MANIFEST.json`으로 파일 무결성을 확인한다. 데이터 cache·가상환경·대형
+checkpoint는 포함하지 않는다. 한 파일씩 전달할 때는 적어도 문서 10개를 함께 제공한다.
+
+## 이번에 GPT에 그대로 줄 검수 요청문
+
+> 첨부 자료를 읽고 NEW GAT의 현재 코드와 연구 설계를 독립적으로 검수해 줘.
+> 먼저 README_FIRST.md의 2026-09-26 상태와 HANDOFF.md 최신 반영표를 읽어라.
+> ZIP 접근이 가능하면 압축을 풀고 MANIFEST.json 및 실제 소스를 확인해라.
+> 코드 실행 환경이 없다면 정적 검수와 실행으로 확인한 사실을 명확히 구분해라.
+>
+> 우선 `experiments/aggregation_comparison/` 6조건을 검토해라. 기존 8조건 내부
+> ablation 및 역사적 PPI 점수를 새 외부 비교의 결과로 취급하지 마라.
+> 우리 모델의 외부 residual/FFN 제거, 내부 diffusion의 identity 항,
+> diagonal/cross-depth local Gram, live C gradient, pre-lift의 실제 forward/loss/
+> backward/optimizer 연결을 코드로 확인해라. depth state를 exact-distance hop으로,
+> feature rank 증가를 전체 Jacobian의 가역성으로 오해한 주장이 있는지 확인해라.
+>
+> DUALFormer 공식 commit 68fbdaf007af2f7d409cd435c4c48dd0e3155510과 수식을 대조해라.
+> intrinsic residual/LayerNorm을 유지한 행과 제거한 control을 구분하고,
+> 공통 width/head/depth/AdamW가 정말 공정한 비교인지 비판적으로 판단해라.
+> 파라미터 수가 같지 않고 원 논문의 튜닝 레시피 재현도 아니라는 점을 반영해라.
+> 원형 DUALFormer의 graph step 수와 새 reference의 8단계 차이도 검토해라.
+>
+> 공식 split·full graph·validation-only checkpoint 선택·모든 arm의 동일 자원
+> calibration·update budget·source hash·optimizer/RNG 재개 계약을 확인해라.
+> CUDA 15개 통과가 synthetic graph 검증임을 유지하고, 실패한 최초 재개 검사와
+> 테스트에만 적용한 결정적 연산의 의미를 검토해라. MIG 적합성이나 SOTA를 추정하지 마라.
+>
+> 이어 다른 연구 트랙은 각 날짜와 결과 출처를 유지해서 검토해라.
+> 결과는 (1) 심각도순 오류와 파일/함수/근거, (2) 비교 공정성 문제,
+> (3) 구현 누락, (4) 현재 증거로 허용/금지할 주장, (5) 필요한 다음 실험으로 정리해라.
+> 변경 제안에는 원래 규모를 유지하는 수정안과 재검증 방법을 적고,
+> 검증 없이 모델·데이터·학습 예산을 축소하거나 과거 결과를 재해석하지 마라.
+
+## 최신 근거의 경계
+
+- 기본 `.venv`는 CPU 전용 설치를 수정하여 2.14.0+cu130을 사용한다.
+  `.venv-gpu`는 2.13.0+cu130과 고정 의존성을 사용하는 별도 검증 환경이다.
+  Windows CUDA smoke와 Linux production 설치 계약은 다르다.
+- 과거 CPU 49개 통과는 수식·무결성 검사 기록이며 이번 전체 학습 완료가 아니다.
+- 사용자 대화의 PPI validation 약 0.989는 새 6조건의 test/SOTA 점수가 아니다.
+  해당 실행의 원본 manifest/checkpoint를 이 묶음에서 독립 확인하지 못했다.
+- 최신 모델 선택을 모두 해결하지 못했다. 현재 외부 comparator는 2025 DUALFormer 하나다.
+- 서버의 기존 checkpoint와 전체 학습 결과는 별도 원본 자료가 있어야 재검증할 수 있다.
+
+## 이전 전달 안내의 역사적 기록 — 현재 상태로 읽지 않음
+
 최신 보존(2026-09-16): 작은 기존 연구 산출물 13개(338.6 KiB)를 Git에 포함했다.
 초기 합성 conductance/cycle/tree 검증과 보류된 combined prototype의 기록이며,
 최근 서버 GPU 결과가 아니다. 원본 파일을 바꾸지 않고 byte-preserving 속성으로 보존한다.
@@ -29,7 +115,7 @@
 2규모×seed0=120회다. 구형 결과는 보존하며, 새로운 구조의 GPU 학습 결과가 나온 것은 아니다.
 아래 이전 날짜별 결과와 새 실험 계획을 구분한다.
 
-스냅샷 상태: `CODE_SUMMARY.md`는 이번 멀티 C 구현 전의 스냅샷이다. 기존 자동 생성
+당시 스냅샷 상태(2026-09-08, 현재는 재생성 완료): `CODE_SUMMARY.md`는 멀티 C 구현 전의 스냅샷이었다. 기존 자동 생성
 파일 재생성이 별도 덮어쓰기 승인 요구로 차단되어 갱신하지 않았다. 현재 구현 검토에는
 저장소의 `research/conductance_gat/v5/`와 `scripts/run_v5_mechanism_experiments.py`,
 해당 tests의 실제 소스를 사용해야 한다. 아래 과거의 스냅샷 갱신 기록과 구분한다.
@@ -60,7 +146,7 @@ GPT에는 파일을 따로 고르지 말고 이 폴더의 **10개 파일을 전�
 8. `CYCLE_PE_V2.md`: QR-free DFS 기저의 구조 SE 대 SE+cycle 상대 PE 비교 계약
 9. `RICH_SCALING_EXPERIMENTS.md`: Conductance V1–V5, Cycle PE V1/V2, Tree의
    reference/large 전체 scaling 계약(122 child / 126 model trainings)
-10. `CODE_SUMMARY.md`: 멀티 C 확장 이전 Python·test·config·script 원문 스냅샷(위 주의 참고)
+10. `CODE_SUMMARY.md`: 현재 Python·test·config·script 원문 스냅샷(2026-09-26 재생성)
 
 Conductance v2/v3/v4/v5와 Cycle PE v2는 각각의 원문 문서를 직접 제공한다. 이 문서만 보는
 것도 아니며 Conductance v1, Cycle PE v1, Tree Augmentation, 전체 scaling 실험, 데이터·평가

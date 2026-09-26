@@ -1,6 +1,96 @@
 # 실험 결과와 구현 상태
 
-기준일: 2026-09-19 (Asia/Seoul).
+기준일: 2026-09-26 (Asia/Seoul). 아래 과거 날짜의 결과는 해당 실행의 기록이다.
+
+## 2026-09-26: 새 독립 비교 구현 및 실제 CUDA 검증
+
+구현 기준 로컬 커밋 `9103fad`. `2764250`에서 새 6조건 비교를 추가했고,
+`347477c`에서 CUDA 검증, `9103fad`에서 기본 CUDA 환경 수리 안내·GPU 필수 검사·
+결정적 재개 검증을 반영했다. 로컬 커밋은 원격 서버 반영이나 원격 학습 증거가 아니다.
+이번 문서 갱신은 위 모델 구현·실험 예산·원본 결과를 변경하지 않는다.
+
+### 서로 다른 실험과 증거
+
+| 대상 | 현재 근거 | 주장할 수 없는 것 |
+| --- | --- | --- |
+| 기존 V5/edge-selection | 아래 날짜별 보존 기록 | 새 6조건의 성능 |
+| 기존 incidence 내부 ablation | 별도 8조건 코드. 사용자 대화에 PPI validation 약 0.989 언급 | 해당 run의 원본 확인, test/SOTA 또는 새 비교의 결과 |
+| 새 aggregation comparison | 6조건 구현, CLI dry-run, 과거 CPU 검사 49개 통과 기록 | 전체 데이터 학습 완료·일반화 우위 |
+| CUDA 검증 | 아래 실제 RTX 5070 Ti XML/JSON | A100 MIG 10GB 적합성·최적 batch·실제 데이터 처리량 |
+| 배포 | 로컬 코드/문서/커밋 | 서버에 최신 파일이 이미 설치됐다는 주장 |
+
+CPU 49개는 기존 대화의 실행 결과에 근거한 이전 수식/무결성/합성 학습 검사이며,
+이번 문서 작업에서 CPU 모델 학습을 새로 실행하지 않았다. 최신 GPU 검증은 별도다.
+
+### 실제 GPU 검증 이력 — 실패 포함
+
+실제 장비: NVIDIA GeForce RTX 5070 Ti, VRAM 17,094,344,704 bytes(표시 16GB),
+Windows, Python 3.13.2. CPU logical 16, RAM 68,640,653,312 bytes를 확인했다.
+기본 `.venv`는 원래 2.14.0+cpu였으나 현재 2.14.0+cu130으로 수리했다.
+
+| 실행 기록 폴더 (`results/` 아래) | Torch | 결과 | 총 시간 | 범위 |
+| --- | --- | --- | ---: | --- |
+| `debug-aggregation-cuda-20260926-01` | 2.13.0+cu130 | 15 passed / 0 skipped | 52.629초 | 별도 `.venv-gpu`, 최초 CUDA smoke |
+| `debug-default-venv-cuda-20260926-01` | 2.14.0+cu130 | 14 passed / 1 failed | 56.990초 | 기본 환경, 비결정적 CUDA 재개 비교 |
+| `debug-default-venv-cuda-20260926-02` | 2.14.0+cu130 | 15 passed / 0 skipped | 70.483초 | 기본 환경, 테스트만 결정적 CUDA 연산 |
+
+실패는 `fp32-incidence_energy`의 저장 후 재개와 연속 학습 파라미터 비교였다.
+최대 절대 차이 1.3392418622970581e-05, 당시 허용 atol 2e-06,
+12,800개 원소 중 49개(0.4%)가 기준을 넘었다. 이를 성능 실패나 NaN으로 보고하지 않는다.
+GPU 합산의 비결정성을 테스트에서 통제하기 위해 deterministic algorithms와
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`를 사용한 재검사에서 같은 허용 오차로 통과했다.
+이 관측은 테스트의 비결정성 영향을 지지하지만 모든 production 재개가 bitwise 동일하다는
+보증은 아니다. production 모델/학습 레시피는 수정하지 않았으며 실패 원문도 보존했다.
+
+15개 검사는 여섯 reference 모델×FP32/BF16 12개와 streaming attention 수식/gradient
+2개, local energy/bilinear identity 1개다. 모델은 8 graph layers, width 256, 8 heads를
+유지했다. 입력은 명시적 합성 graph 4개를 disjoint batch로 묶은 총 256 nodes,
+512 undirected edges, feature 50, class 7이다. 일부 공식 데이터를 사용한 결과가 아니다.
+forward→task loss→backward→AdamW update→validation→저장한 model/optimizer/RNG 재개를
+실제 CUDA에서 실행했다. 모델·입력·모든 trainable gradient의 CUDA device를 검사한다.
+GPU가 없으면 이 검사는 skip이나 CPU fallback 없이 실패한다.
+
+### parameter 및 메모리 관측의 해석
+
+| Synthetic reference 모델 | parameter 수 | FP32 해당 테스트 peak allocated MiB |
+| --- | ---: | ---: |
+| incidence | 10,674,375 | 268.363 |
+| incidence_pre_lift | 10,805,447 | 270.863 |
+| incidence_energy | 10,705,095 | 278.782 |
+| incidence_energy_pre_lift | 10,836,167 | 281.282 |
+| dualformer | 1,594,887 | 296.685 |
+| dualformer_no_skip_control | 1,594,887 | 296.685 |
+
+값은 마지막 결정적 검사의 JUnit properties에서 읽었다. `max_memory_allocated`는 같은
+pytest process 안 해당 구간의 peak이며, caching·이전 객체 수명·초기화·warmup 조건이
+모델별 독립 benchmark로 통제되지 않았다. first-step CUDA event 시간도 원문에 있지만
+정상상태 graphs/s나 모델 간 속도 우위로 환산하지 않는다. 실제 데이터의 입력·출력 차원과
+graph 크기는 다르므로 위 메모리로 MIG full graph 적합성을 추정하지 않는다.
+
+### 원문 증거의 SHA-256
+
+검수 ZIP에는 아래 경로의 작은 XML/JSON/환경 목록을 원본 바이트 그대로 포함한다.
+checkpoints와 대용량 데이터는 포함하지 않는다.
+
+| 원문 | SHA-256 |
+| --- | --- |
+| `debug-aggregation-cuda-20260926-01/pytest.xml` | `d40850026c2a577203a07f3b1bd2c39c7c741705c0a0648c77b0af6cb75f8627` |
+| `debug-default-venv-cuda-20260926-01/pytest.xml` | `e60c4d3db549c8351ed407f5c5660a505204b82a747ff96f3d5b43f834f97bdc` |
+| `debug-default-venv-cuda-20260926-02/pytest.xml` | `8cdbfabc4c962e46975574363e894d35cb1eff0b40ae655167d011288fbb4c68` |
+| `debug-default-venv-cuda-20260926-02/summary.json` | `13ae433a57c05ab9f91cc234227e6cbb67856b0cecadc81115281c4cf87c888d` |
+| `tests/test_aggregation_comparison_cuda.py` | `677a2b62909ed294986a81ec9e0be34e6007d17e95ceefe0986a7d44ae72544d` |
+
+### 명확한 미실행·미구현
+
+새 비교의 전체 공식 데이터 학습, 전체 test 평가, multi-seed 결과, 동등한 validation
+튜닝 예산의 search, A100 MIG 10GB calibration, parameter-matched 비교는 미실행이다.
+2026 최신 모델군, 추가 heterophily dataset, 전체 Jacobian/역복원 실험,
+정확 거리별 B_r 및 bipartite solver는 구현하지 않았다. 따라서 SOTA·가설 입증·일반화
+우위·full-graph 자원 적합성을 현재 근거로 주장하지 않는다.
+
+---
+
+## 이하 역사적 기록
 
 ### 2026-09-19: 동일 GPU 모델의 노출 VRAM 변경 후 재개 수정
 

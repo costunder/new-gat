@@ -1,5 +1,98 @@
 # NEW GAT 연구 프로젝트 Hand-off
 
+## 2026-09-26 현재 검수 대상과 반영 현황
+
+이 절이 최신 상태다. 아래 2026-09-08 이전 본문은 해당 시점의 역사적 계약이며,
+새 비교 실험이 과거 V5·edge-selection 결과를 대체하거나 승계하지 않는다.
+현재 구현 기준 로컬 커밋은 `9103fad`다. 이번 문서 갱신은 모델·기존 결과를 바꾸지 않는다.
+
+### 논의한 요구와 실제 구현의 대응
+
+| 요구/가설 | 현재 코드 | 상태·한계 |
+| --- | --- | --- |
+| 기존 결과와 섞이지 않는 새 실험 | `experiments/aggregation_comparison/runner.py` | 독립 root/run ID, fresh 모델; 옛 checkpoint 재사용 안 함 |
+| 외부 모델 비교 | `model.py:ARMS`, `DualAttention` | DUALFormer와 명시적 no-skip control 구현. 원래 GAT 미포함 |
+| 우리 모델의 외적 residual/FFN 제거 | `AggregationClassifier.__init__/forward` | 옛 operator만 채택; encoder/decoder는 linear; wrapper skip/FFN/LayerNorm 없음 |
+| 국소 이차형식 및 교차 쌍선형항 | `local_gram`, `energy_readouts` | k≤l 자기·교차항을 별도 채널로 계산하고 task 출력에 연결 |
+| 비선형 pre-lift | 기존 `IncidenceOperator`의 pre 경로 재사용 | `[V,V²]`를 diffusion 전에 만들고 learned projection; 초기 projection은 1차 채널 선택 |
+| C까지 역전파 | estimator hook의 live tensor→local Gram | detached 진단 tensor를 학습값으로 쓰지 않음. 미분은 입력 의존 C를 포함 |
+| 깊이 상태 비교 | `history`, layer별 현재 value projection | 모든 앞선 depth state 사용. 정확한 거리 shell은 아님 |
+| 정보 손실·가역성 검증 | 옛 suite에 frozen-C reconstruction probe | 새 전체 네트워크 Jacobian/역복원 실험은 미구현 |
+| 거리별 B_r / 이분 그래프 경계값 해법 | 없음 | 논의된 별도 설계이며 구현 완료로 보고하면 안 됨 |
+| 최근·어려운 benchmark | 기존 지원 데이터 중 arxiv full을 우선 실행 안내 | 새 heterophily dataset 추가나 2026 최신 모델군 구현은 안 됨 |
+| GPU 실행 | engine의 CUDA 필수 검사, CUDA test 파일 | 실제 5070 Ti 검사 완료; A100 MIG·실제 대규모 데이터는 미측정 |
+
+### 현재 비교의 정확한 범위
+
+새 조건은 `incidence`, `incidence_pre_lift`, `incidence_energy`,
+`incidence_energy_pre_lift`, `dualformer`, `dualformer_no_skip_control`이다.
+기존 8조건 `experiments/incidence_ablation/`은 외부 residual/FFN이 있는 내부 ablation이다.
+두 suite의 결과를 합쳐 하나의 공정 비교표로 쓰면 안 된다.
+
+새 비교는 split, seed 목록, physical batch/worker 공통 교정, update-budget 계약,
+precision, AdamW learning rate/weight decay를 공유한다. 공유 초기값 검사는
+encoder/decoder에 한정된다. 다른 family 전체 backbone 초기값이 같다는 뜻이 아니다.
+동일 learning rate·width·head 수 자체가 모델별 최적화 공정성을 보장하지 않는다.
+
+우리 모델은 8개/12개 incidence operator를 사용한다. DUALFormer는 global SA 1층 뒤
+공통 profile의 SGC 8/12단계를 사용한다. 공식 train.py의 기본 graph step 2를 그대로
+재현한 실험이 아니다. SA 자체의 alpha=0.1 residual 및 LayerNorm은 intrinsic 구조로
+원형 comparator에 남겼고 no-skip 조건만 따로 제거한다. 양쪽 모두 별도 wrapper FFN은 없다.
+이 설계가 사용자 의도의 '순수 operator 비교'를 충족하는지 외부 검수가 필요하다.
+
+실제 CUDA fixture(입력 50차원, 출력 7개)에서 parameter 수는
+incidence 10,674,375 / pre-lift 10,805,447 / energy 10,705,095 /
+energy+pre-lift 10,836,167 / DUALFormer 각 1,594,887이었다.
+이는 **parameter-matched 비교가 아니며** 실제 데이터셋의 입력·출력 차원에 따라 수가 달라진다.
+더 작은 외부 모델을 비교해서 이기는 것만으로 핵심 operator 우위를 입증할 수 없다.
+
+### 검수용 코드 지도
+
+`CODE_SUMMARY.md`에서 아래 정확한 경로 제목을 찾아 원문을 읽는다.
+
+- `experiments/aggregation_comparison/model.py`: 실제 여섯 forward, streaming SA, local Gram.
+- `experiments/aggregation_comparison/engine.py`: 모델/optimizer 생성, loss, gradient 검사,
+  전체 epoch/validation, immutable resume identity 및 artifact 저장.
+- `experiments/aggregation_comparison/runner.py`: 모델별 child 명령, 공통 자원 교정,
+  독립 결과 경로, 같은 split/initial endpoint/budget 대조.
+- `experiments/aggregation_comparison/calibration.py`, `reallocation.py`: 실제 모든 arm 교정,
+  할당 변경 시 보존·재검증; 모델/그래프 축소 fallback 없음.
+- `experiments/aggregation_comparison/integrity.py`, `provenance.py`, `audit.py`:
+  source/epoch/optimizer/artifact 무결성, 읽기 전용 repeated full validation.
+- `experiments/incidence_ablation/model.py`: 재사용하는 lift와 incidence operator의 실제 수식.
+- `research/conductance_gat/edge_selection/model.py`, `data.py`, `topology.py`:
+  후보 지지집합, 물리 incidence, disjoint batching, 정적 CPU 전처리.
+- `research/conductance_gat/v5/model.py`, `operator.py`, `optimization.py`:
+  원래 C solver/β/context와 실제 diffusion·custom backward. 경로의 존재는 코드 목록으로 확인한다.
+- `tests/test_aggregation_comparison.py`, `test_aggregation_comparison_integrity.py`,
+  `test_aggregation_comparison_cuda.py`: 수식·저장 증거·실제 CUDA 경로의 서로 다른 검증 범위.
+
+### 검수에서 우선 답할 질문
+
+1. Gamma의 1/2 endpoint 분배와 전체 합 `tr(H_k^T L H_l)`이 구현과 일치하는가?
+   pre-lift와 Gamma가 사용하는 value 좌표계 차이를 명확히 해석했는가?
+2. C hook·nested checkpoint 재계산에서 잘못된 layer tensor나 stale cache를 참조할 수 있는가?
+3. streaming DUAL attention이 원래 softmax 축·head 평균·N 정규화와 일치하는가?
+   PPI disjoint batch의 서로 다른 graph가 global attention으로 섞이지 않는가?
+4. 학습 가능한 모듈이 실제 task loss와 optimizer에 모두 연결되는가?
+   energy readout zero 초기화로 첫 step의 영향/gradient를 잘못 설명한 곳은 없는가?
+5. 같은 width/head/update budget에도 parameter·intrinsic norm·graph step 차이가 크다.
+   현재 표가 답하는 질문과 추가로 필요한 matched/native 비교는 무엇인가?
+6. validation-only 반복 5회를 multi-seed 또는 test 성능으로 잘못 해석하지 않았는가?
+7. CUDA checkpoint 일치 검증은 테스트의 결정적 연산 하에서만 확인됐다.
+   실제 비결정적 학습 재개의 허용할 수 있는 주장과 추가 검증은 무엇인가?
+8. 큰 그래프의 all-history projection/local Gram/optimizer 메모리와 host/device 준비 비용을
+   실제 측정하기 전에 A100 MIG 10GB 적합성이나 처리량을 주장하지 않았는가?
+
+원형 DUALFormer 근거: [공식 코드](https://github.com/JiamingZhuo/DUALFormer/tree/68fbdaf007af2f7d409cd435c4c48dd0e3155510),
+[ICLR 2025 논문](https://proceedings.iclr.cc/paper_files/paper/2025/hash/128911cc894d57bcae78074a9551c132-Abstract-Conference.html).
+M3Dphormer 검토 이력은 구현 완료가 아니다. 최신 SOTA와 공개 benchmark 전체 결과는
+이번 묶음이 제공하는 증거 범위 밖이다.
+
+---
+
+## 아래는 2026-09-08 기준의 역사적 인계 기록
+
 작성 기준일: 2026-09-08 (Asia/Seoul)
 
 최신 결과·검토(2026-09-08): corrected V5 20조건 학습은 수령 출력상 모두 passed다.
