@@ -69,32 +69,10 @@ def local_gram(history, edges, conductance, edge_chunk_size, *, diagonal_only=Fa
     depth, nodes, heads, _ = history.shape
     if conductance.ndim == 1:
         conductance = conductance[:, None]
-    pairs = (
-        torch.arange(depth, device=history.device).expand(2, -1)
-        if diagonal_only
-        else torch.triu_indices(depth, depth, device=history.device)
-    )
-    result = history.new_zeros(nodes, heads, pairs.shape[1])
+    from .gram import LocalGram
+
     chunk = max(1, (edge_chunk_size or max(edges.shape[1], 1)) // depth)
-
-    def compute(past, ends, weight):
-        delta = past[:, ends[1]] - past[:, ends[0]]
-        values = (delta[pairs[0]] * delta[pairs[1]]).sum(-1)
-        return values.permute(1, 2, 0) * weight[..., None] / 2
-
-    for start in range(0, edges.shape[1], chunk):
-        ends = edges[:, start : start + chunk]
-        weight = conductance[start : start + chunk]
-        values = (
-            checkpoint(compute, history, ends, weight, use_reentrant=False)
-            if torch.is_grad_enabled()
-            else compute(history, ends, weight)
-        )
-        # index_add backward needs indices, not the old destination buffer.
-        # Accumulate without cloning the N x heads x pairs tensor per chunk.
-        result.index_add_(0, ends[0], values)
-        result.index_add_(0, ends[1], values)
-    return result
+    return LocalGram.apply(history, conductance, edges, chunk, diagonal_only)
 
 
 class DualAttention(nn.Module):

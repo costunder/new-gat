@@ -1,5 +1,10 @@
 # Aggregation comparison v3: mechanism controls and evidence
 
+This records the v3 mechanism design and its historical verification. V4 keeps
+these controls and adds the backward allocation correction and separate
+sampled-inductive study described in [SAMPLED_INDUCTIVE.md](SAMPLED_INDUCTIVE.md).
+Use the current review bundle's verification manifest for current test totals.
+
 The second review was based on the old six-condition package. V2 already added
 the 12-cell incidence matrix, GATv2, score reproduction checks and scatter-copy
 fix. V3 implements the additional missing conductance controls, diagnostics,

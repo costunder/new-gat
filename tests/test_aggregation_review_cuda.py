@@ -50,7 +50,16 @@ def test_scatter_output_history_and_conductance_gradient_under_nested_checkpoint
     new_grads = torch.autograd.grad(actual, (new_h, new_c), cotangent)
     torch.testing.assert_close(actual, reference, rtol=0, atol=0)
     for new, old in zip(new_grads, old_grads, strict=True):
-        torch.testing.assert_close(new, old, rtol=0, atol=0)
+        # The fused first-order backward changes reduction order. Production
+        # Gram geometry is FP32 even under BF16 autocast; FP64 dense gradcheck
+        # independently verifies the analytic derivatives in the v4 tests.
+        if dtype == torch.bfloat16:
+            error = torch.linalg.vector_norm((new - old).float())
+            scale = torch.linalg.vector_norm(old.float()).clamp_min(1)
+            assert error <= 4 * torch.finfo(dtype).eps * scale
+        else:
+            tolerance = 1e-12 if dtype == torch.float64 else 1e-5
+            torch.testing.assert_close(new, old, rtol=tolerance, atol=tolerance)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

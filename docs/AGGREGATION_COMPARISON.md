@@ -1,6 +1,13 @@
 # Independent aggregation comparison
 
-## Review correction, 2026-09-26 (v3)
+## Review correction, 2026-09-27 (v4)
+
+V4 preserves the 19-arm design and replaces Gram backward with a single-buffer
+analytic accumulation. Incidence-only transductive runs now allow sampling;
+external comparators retain full context. The original sampled/unseen-graph
+hypothesis has a separate four-cell PPI runner, described in
+[SAMPLED_INDUCTIVE.md](SAMPLED_INDUCTIVE.md). Use fresh run IDs after the v4
+source change; v3 checkpoints/results remain historical evidence.
 
 The v3 runner defaults to **19 conditions**: 12 per-head incidence controls,
 four additional fixed/shared-C controls, GATv2, DUALFormer and its separately
@@ -143,30 +150,33 @@ branch. Historical reconstruction probes remain in the old independent suite.
 
 ## Execution
 
-Full graph support is required. The global attention baseline must not receive
+Full graph support is required for the external comparators. The global attention baseline must not receive
 sampled subgraphs masquerading as its original global context. DUALFormer uses
 exact two-pass node streaming and checkpoint recomputation: no node is omitted.
 PPI disjoint batches compute separate attention statistics per tissue graph.
 All-arm optimizer-inclusive calibration, complete validation, strict artifact
 hashes and epoch-boundary resume are retained from the existing runner.
+Incidence-only runs can select the existing cluster/cluster_disjoint samplers
+on transductive datasets. PPI sampled training uses the separate inductive
+runner; the historical V5 PPI data path is not modified.
 
 Dry-run the comparison on **ogbn-arxiv**, not PPI as the primary benchmark:
 
 ```bash
 cd /home/aicompetition07/new-gat &&
 /home/aicompetition07/.conda/envs/new-gat/bin/python -B -m experiments.aggregation_comparison \
-  --run-id aggregation-arxiv-reference-gpu4-seed0-v3 \
+  --run-id aggregation-arxiv-reference-gpu4-seed0-v4 \
   --datasets ogbn-arxiv --profiles reference --model-seeds 0 \
   --hardware-profile portable --sampling full --edge-chunk-size 4096 --dry-run
 ```
 
-Train only after this code is available on that server (fresh v3 run ID):
+Train only after this code is available on that server (fresh v4 run ID):
 
 ```bash
 cd /home/aicompetition07/new-gat &&
 env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=4 \
 /home/aicompetition07/.conda/envs/new-gat/bin/python -B -m experiments.aggregation_comparison \
-  --run-id aggregation-arxiv-reference-gpu4-seed0-v3 \
+  --run-id aggregation-arxiv-reference-gpu4-seed0-v4 \
   --datasets ogbn-arxiv --profiles reference --model-seeds 0 \
   --device cuda:0 --hardware-profile portable --sampling full \
   --edge-chunk-size 4096 --activation-checkpoint --min-free-gb 8

@@ -37,7 +37,7 @@ from .provenance import require_source_compatibility
 from .validation import POLICY, require_reproduction, require_score
 
 ROOT = Path(__file__).resolve().parents[2]
-SUITE = "aggregation_comparison_v3"
+SUITE = "aggregation_comparison_v4"
 
 
 def build_parser():
@@ -58,7 +58,7 @@ def build_parser():
 
 def validate_args(args):
     base.validate_args(args)
-    if args.sampling != "full":
+    if args.sampling != "full" and not args.ablation_arm.startswith("incidence"):
         raise ValueError(
             "global-attention comparison requires full graph support; no sampled fallback"
         )

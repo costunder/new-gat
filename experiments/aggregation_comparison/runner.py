@@ -41,7 +41,7 @@ from scripts import run_v5_mechanism_experiments as common  # noqa: E402
 from scripts import training_resource_plan as resources  # noqa: E402
 from scripts.calibration_lock import calibration_lock  # noqa: E402
 
-SUITE = "aggregation_comparison_controller_v3"
+SUITE = "aggregation_comparison_controller_v4"
 TRAIN_MODULE = "experiments.aggregation_comparison.engine"
 
 
@@ -89,7 +89,7 @@ def validate_args(args):
         raise ValueError("invalid full training/worker/audit budget")
     if any(seed < 0 for seed in args.model_seeds):
         raise ValueError("model seeds must be nonnegative")
-    if args.sampling != "full":
+    if args.sampling != "full" and any(not arm.startswith("incidence") for arm in args.arms):
         raise ValueError("comparison requires full graph support for global attention")
     if not str(args.device).startswith("cuda"):
         raise ValueError("production training requires CUDA; no CPU fallback")
