@@ -119,16 +119,17 @@ Five repeated evaluations measure numerical repeatability, not five model seeds.
 
 ## Explicit CUDA smoke verification
 
-The local machine has an RTX 5070 Ti with 16 GB VRAM. The original `.venv`
-contains CPU-only PyTorch; its availability result must not be interpreted as
-absence of a physical GPU. Use the separate, ignored `.venv-gpu` for CUDA tests.
-This Windows smoke environment uses Python 3.13.2, torch 2.13.0+cu130 and the
-remaining packages pinned in `requirements-lock.txt`. It does not change the
-Linux production installation profile, GPU driver or existing CPU environment.
+The local machine has an RTX 5070 Ti with 16 GB VRAM. The default `.venv` was
+incorrectly installed with CPU-only PyTorch. It has been repaired from
+2.14.0+cpu to 2.14.0+cu130, preserving its existing PyTorch release. Use this
+default CUDA environment for local model execution. The separate `.venv-gpu`
+also remains available with Python 3.13.2, torch 2.13.0+cu130 and the remaining
+packages pinned in `requirements-lock.txt`. Neither environment changes the
+Linux production installation profile or GPU driver.
 
 ```powershell
-.venv-gpu/Scripts/python.exe -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
-.venv-gpu/Scripts/python.exe -m pytest tests/test_aggregation_comparison_cuda.py -v
+.venv/Scripts/python.exe -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
+.venv/Scripts/python.exe -m pytest tests/test_aggregation_comparison_cuda.py -v
 ```
 
 The CUDA suite covers all six reference-size models (8 graph layers, width 256,
@@ -139,6 +140,15 @@ and continued training with restored RNG states. Separate CUDA checks compare
 streamed attention outputs/gradients with the dense formula and local energy
 with the global bilinear identity. JUnit properties record the GPU, precision,
 parameter count, peak allocation and first-step CUDA event duration.
+Missing CUDA is a test failure, not a skip. Parameters, model inputs and every
+trainable parameter's gradient are explicitly checked to reside on CUDA.
+Production training already rejects CPU execution and has no CPU fallback;
+CPU work is reserved for loading/preprocessing, scheduling and reporting.
+Checkpoint equivalence checks enable deterministic CUDA algorithms and set
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` within the test process. This separates
+restoration errors from GPU atomic-reduction ordering; it does not relax the
+parameter tolerances or change the production training recipe. See the
+[PyTorch deterministic algorithms contract](https://docs.pytorch.org/docs/2.14/generated/torch.use_deterministic_algorithms.html).
 
 These are explicit synthetic smoke tests, not measured real-data throughput,
 benchmark training, or evidence that the complete recipe fits an A100 MIG 10GB.

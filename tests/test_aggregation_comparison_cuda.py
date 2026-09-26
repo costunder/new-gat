@@ -4,6 +4,7 @@ These tests are not a benchmark, a full-data fit measurement, or an A100 MIG tes
 Invoke this file explicitly after a CUDA preflight; CPU execution is never used.
 """
 
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,12 +18,25 @@ from research.conductance_gat.edge_selection.topology import build_topology
 
 @pytest.fixture(scope="module", autouse=True)
 def cuda_required():
+    # Isolate checkpoint restoration from CUDA atomic-reduction ordering.
+    # This applies only to these verification tests, never the training recipe.
+    workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     if not torch.cuda.is_available():
-        pytest.skip("CUDA smoke tests require a CUDA-enabled PyTorch environment")
+        pytest.fail("CUDA smoke tests require a CUDA-enabled PyTorch environment; no CPU fallback")
     previous = torch.backends.cuda.matmul.allow_tf32
+    previous_determinism = torch.are_deterministic_algorithms_enabled()
     torch.backends.cuda.matmul.allow_tf32 = False
-    yield
-    torch.backends.cuda.matmul.allow_tf32 = previous
+    torch.use_deterministic_algorithms(True)
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous
+        torch.use_deterministic_algorithms(previous_determinism)
+        if workspace is None:
+            os.environ.pop("CUBLAS_WORKSPACE_CONFIG", None)
+        else:
+            os.environ["CUBLAS_WORKSPACE_CONFIG"] = workspace
 
 
 def synthetic_disjoint_batch(device):
@@ -95,6 +109,7 @@ def test_cuda_reference_model_training_and_optimizer_resume(
     started, ended = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     started.record()
     report = engine.run_training_epoch(model, optimizer, inputs, args, device, 1, validate=True)
+    assert all(p.grad is not None and p.grad.is_cuda for p in model.parameters())
     ended.record()
     ended.synchronize()
     assert report["processed_units"] == 256 and report["largest_measured_graph_batch"] == 4
@@ -103,6 +118,7 @@ def test_cuda_reference_model_training_and_optimizer_resume(
     peak = torch.cuda.max_memory_allocated(device)
     record_property("gpu", torch.cuda.get_device_name(device))
     record_property("precision", precision)
+    record_property("deterministic_algorithms", torch.are_deterministic_algorithms_enabled())
     record_property("synthetic_batch", "4 graphs / 256 nodes / 512 undirected edges")
     record_property("parameters", sum(p.numel() for p in model.parameters()))
     record_property("peak_allocated_bytes", peak)
