@@ -2,6 +2,13 @@
 
 ## Review correction, 2026-09-27 (v4)
 
+See [the detailed follow-up review](DEEP_IMPLEMENTATION_REVIEW_20260927.md) for
+the requirements matrix, independent CUDA math checks, persisted-best audit
+correction, and remaining main-experiment gaps. The comparison's effective
+optimizer is uniform AdamW with weight decay 0.01 for all parameters, including
+C/beta. Configuration now records that value instead of inherited legacy zero
+decay fields; the optimizer computation itself did not change.
+
 V4 preserves the 19-arm design and replaces Gram backward with a single-buffer
 analytic accumulation. Incidence-only transductive runs now allow sampling;
 external comparators retain full context. **The primary benchmark remains

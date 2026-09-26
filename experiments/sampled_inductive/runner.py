@@ -317,7 +317,7 @@ def main(argv=None):
             "seed": s,
             "support": m,
             "arm": a,
-            "configuration": engine.configuration(child_arguments(options, a, s)),
+            "configuration": train.configuration(child_arguments(options, a, s), m),
         }
         for s, m, a in cells(options)
     ]

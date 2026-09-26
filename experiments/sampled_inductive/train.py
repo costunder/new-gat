@@ -163,15 +163,24 @@ def evaluate(model, inputs, args, device):
     return result
 
 
+def configuration(args, mode):
+    config = engine.configuration(args)
+    config["sampling"] = "inductive_cluster_contexts" if mode == "sampled" else "full"
+    # This runner performs persisted-best count reproduction, not the separate
+    # aggregation runner's layer/head diagnostic and intervention audit.
+    config["comparison_contract"]["mechanism_audit"] = None
+    config["comparison_contract"]["validation_audit"] = (
+        "fresh CUDA model loaded from last.pt/best_state; five full count reproductions"
+    )
+    return config
+
+
 def identity(args, mode, batch, workers, protocol, inputs):
     return {
         "suite": SUITE,
         "training_support": mode,
         "model": args.ablation_arm,
-        "configuration": {
-            **engine.configuration(args),
-            "sampling": "inductive_cluster_contexts" if mode == "sampled" else "full",
-        },
+        "configuration": configuration(args, mode),
         "inputs": inputs.metadata(),
         "protocol": protocol,
         "sources": sources(),
@@ -202,6 +211,18 @@ def completed(folder, expected=None):
         raise ValueError("inductive evidence/source mismatch")
     if metrics["last_sha256"] != engine.base.sha256_file(folder / "last.pt"):
         raise ValueError("inductive checkpoint was changed")
+    from research.conductance_gat.ablation.model import _named_state_sha256
+
+    expected_audit = {
+        "schema_version": 1,
+        "checkpoint_sha256": metrics["last_sha256"],
+        "best_state_sha256": _named_state_sha256(saved["best_state"].items()),
+        "best_epoch": saved["best_epoch"],
+        "origin": "last.pt/best_state loaded into a fresh CUDA model",
+        "repeats": 5,
+    }
+    if metrics.get("persisted_best_audit") != expected_audit:
+        raise ValueError("missing or mismatched persisted-best CUDA audit evidence")
     history = saved["history"]
     budget = saved["identity"]["budget"]
     if len(history) != budget["epochs"] or [r["epoch"] for r in history] != list(
@@ -215,6 +236,8 @@ def completed(folder, expected=None):
         raise ValueError("best epoch differs from validation-only selection")
     for row in history:
         validate_evaluation(row["validation"], label="history")
+        if row["validation"]["graph_ids"] != saved["identity"]["inputs"]["graph_ids"]["validation"]:
+            raise ValueError("history validation graph IDs changed")
         if row["coverage"]["seed_coverage"] != 1.0:
             raise ValueError("incomplete supervised coverage")
         if row["coverage"]["supervised_nodes"] != saved["identity"]["inputs"]["training_nodes"]:
@@ -225,6 +248,8 @@ def completed(folder, expected=None):
     require_reproduction(best["validation"], metrics["validation"], label="selected/reloaded")
     for repeat in metrics["audit"]:
         require_reproduction(best["validation"], repeat, label="repeat audit")
+        if repeat["graph_ids"] != metrics["validation"]["graph_ids"]:
+            raise ValueError("repeat audit used different held-out graphs")
     if len(metrics["audit"]) < 5:
         raise ValueError("missing repeated validation audit")
     return metrics
@@ -315,26 +340,52 @@ def train_cell(payload, protocol, args, mode, batch, workers, device, folder):
                 f"val={row['validation']['metric']:.6f} seconds={row['training_seconds']:.2f}",
                 flush=True,
             )
-        model.load_state_dict(best_state)
         selected = history[best_epoch - 1]["validation"]
+        # Discard the in-memory best and training model. A correct in-memory
+        # prediction cannot attest to the weights actually committed to disk.
+        del optimizer, model, best_state
+        gc.collect()
+        torch.cuda.empty_cache()
+        committed_sha = engine.base.sha256_file(checkpoint)
+        saved = engine.base.load_checkpoint_on_cpu(checkpoint)
+        if (
+            saved["identity"] != contract
+            or saved["history"] != history
+            or saved["best_epoch"] != best_epoch
+        ):
+            raise ValueError("persisted checkpoint identity/history/selection changed")
+        require_reproduction(selected, saved["best_validation"], label="persisted selection")
+        model = engine.make_model(payload, args, device)
+        model.load_state_dict(saved["best_state"], strict=True)
+        del saved
         repetitions = []
         state_hash = engine.base.state_sha256(model)
         for repeat in range(5):
             validation = evaluate(model, inputs, args, device)
-            require_reproduction(selected, validation, label=f"inductive audit {repeat}")
+            require_reproduction(selected, validation, label=f"persisted-best audit {repeat}")
             repetitions.append(validation)
         if state_hash != engine.base.state_sha256(model) or contract["sources"] != sources():
             raise ValueError("read-only validation or source changed")
+        if engine.base.sha256_file(checkpoint) != committed_sha:
+            raise ValueError("persisted checkpoint changed during its CUDA audit")
         result = {
             "status": "passed",
             "identity": contract,
             "model_contract": model.contract(),
             "validation": repetitions[0],
             "audit": repetitions,
+            "persisted_best_audit": {
+                "schema_version": 1,
+                "checkpoint_sha256": committed_sha,
+                "best_state_sha256": state_hash,
+                "best_epoch": best_epoch,
+                "origin": "last.pt/best_state loaded into a fresh CUDA model",
+                "repeats": len(repetitions),
+            },
             "best_epoch": best_epoch,
             "shared_initial_sha256": shared_hash,
             "test_evaluated": False,
-            "last_sha256": engine.base.sha256_file(checkpoint),
+            "last_sha256": committed_sha,
             "history": history,
             "resumed": resumed,
             "cost_comparable": not resumed,

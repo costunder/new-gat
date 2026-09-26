@@ -8,6 +8,13 @@ as already stated in AGGREGATION_COMPARISON.md. Do not use the PPI commands belo
 as the next main experiment or present this package as completion of that request.
 They remain a record of the implemented PPI-specific path.
 
+The follow-up [deep review](DEEP_IMPLEMENTATION_REVIEW_20260927.md) reproduces and
+fixes a persisted-best audit defect. Final validation now loads `last.pt/best_state`
+into a fresh CUDA model, compares selected counts in five full passes, and binds
+the audit to checkpoint/state hashes. `completed()` checks this stored evidence;
+it does not perform CUDA inference on every call. Older source identities are
+preserved and are not silently upgraded to this audit contract.
+
 The main sampling comparison must keep the current backbone and ogbn-arxiv
 protocol, and cross fixed/learned C with full/sampled training. Incidence-only
 sampling is now permitted by the aggregation runner. A unified, verified
@@ -151,7 +158,7 @@ Resume also verifies calibration-record checksums and recomputes the selected
 resource plan from those measurements; missing or inconsistent evidence fails.
 Existing historical experiments and checkpoints are not imported or overwritten.
 
-First inspect the explicit recipe without loading data or starting training:
+Historical PPI command, retained for provenance only (not the next main run):
 
 ```bash
 cd /home/aicompetition07/new-gat &&
@@ -169,8 +176,8 @@ physical context batch. These are explicit hypotheses/resource candidates,
 not locally calibrated PPI or MIG measurements. Runtime coverage reports expose
 saturation/overlap; the code never silently adjusts the context size.
 
-After making this revision available on the server, run the same configuration
-on the user's physical GPU 4, adding the final test evaluation:
+Historical GPU 4 invocation, retained for provenance only. This is not a
+recommendation to launch a new PPI experiment or reuse this old run identity:
 
 ```bash
 cd /home/aicompetition07/new-gat &&

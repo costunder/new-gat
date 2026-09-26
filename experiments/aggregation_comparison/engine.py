@@ -82,6 +82,12 @@ def configuration(args):
     inherited = base.configuration(args)
     inherited.pop("ffn_multiplier")  # The comparison contains no external FFN.
     inherited["lr"] = args.learning_rate
+    # The historical trainer exempts C/beta from decay. This comparison uses
+    # one uniform AdamW group; inherited metadata must describe that optimizer.
+    inherited["conductance_weight_decay"] = base.COMMON["weight_decay"]
+    inherited["scalar_weight_decay"] = base.COMMON["weight_decay"]
+    inherited["conductance_lr_multiplier"] = 1.0
+    inherited["beta_lr_multiplier"] = 1.0
     c_config = conductance_contract(args.ablation_arm)
     if c_config is not None:
         inherited.update({key: value for key, value in c_config.items() if key != "regime"})
