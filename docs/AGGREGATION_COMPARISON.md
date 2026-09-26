@@ -116,3 +116,29 @@ The default learning rate remains 0.0005. `--learning-rate` records an explicit
 common-recipe variation in a new run ID. It does not automatically tune models.
 Use equal validation-only search budgets before drawing competitive conclusions.
 Five repeated evaluations measure numerical repeatability, not five model seeds.
+
+## Explicit CUDA smoke verification
+
+The local machine has an RTX 5070 Ti with 16 GB VRAM. The original `.venv`
+contains CPU-only PyTorch; its availability result must not be interpreted as
+absence of a physical GPU. Use the separate, ignored `.venv-gpu` for CUDA tests.
+This Windows smoke environment uses Python 3.13.2, torch 2.13.0+cu130 and the
+remaining packages pinned in `requirements-lock.txt`. It does not change the
+Linux production installation profile, GPU driver or existing CPU environment.
+
+```powershell
+.venv-gpu/Scripts/python.exe -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
+.venv-gpu/Scripts/python.exe -m pytest tests/test_aggregation_comparison_cuda.py -v
+```
+
+The CUDA suite covers all six reference-size models (8 graph layers, width 256,
+8 heads) in FP32 and BF16. Four synthetic graphs are processed together, with
+256 total nodes and 512 undirected edges. The tests execute the actual training
+loop, backward, optimizer update, validation, checkpoint/optimizer restoration,
+and continued training with restored RNG states. Separate CUDA checks compare
+streamed attention outputs/gradients with the dense formula and local energy
+with the global bilinear identity. JUnit properties record the GPU, precision,
+parameter count, peak allocation and first-step CUDA event duration.
+
+These are explicit synthetic smoke tests, not measured real-data throughput,
+benchmark training, or evidence that the complete recipe fits an A100 MIG 10GB.
