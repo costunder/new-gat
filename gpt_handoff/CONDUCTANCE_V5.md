@@ -1,5 +1,25 @@
 # Conductance GAT V5 — graph-specific C optimization and weighted-Laplacian propagation
 
+## 2026-09-27 현재 비교 및 문서 해석
+
+최신 구현 `4b4df52`의 실행 계약은 `docs/ARXIV_BASELINE_COMPARISON.md`다.
+새 comparison은 arxiv만 허용하며 16개 incidence 조건과 GCN/GraphSAGE/GATv2/
+DUALFormer/no-skip의 총 21조건이다. PPI-only sampled_inductive 공개 진입점은
+중단됐다. 아래 과거의 6조건, validation-only 및 PPI 실행 안내는 현재 명령이 아니다.
+
+C는 입력 그래프 자체가 아니라, 발생행렬 B와 특징 H 및 공유 파라미터로 계산하는
+conductance diag(c)다. 고정 C에서 spectral filter로 해석할 수 있다는 사실과
+입력 의존 C(H)를 포함한 전체 모델의 비선형성은 구분한다. depth history가
+정확한 거리 shell을 의미하지 않으며 비선형 lift의 rank 증가가 역함수를 보장하지 않는다.
+자세한 독립 수식 검증과 유한 반복·1차 미분의 경계는
+`docs/DEEP_IMPLEMENTATION_REVIEW_20260927.md`를 함께 읽는다.
+
+원래 연구 목표는 공유 C 규칙·sampling·미관측 그래프 일반화·총비용 절감이다.
+현재 full-only arxiv 비교와 공식 transductive test는 그 전체 목표의 검증이 아니다.
+4조건 통합 sampler 비교와 별도 independent-graph 평가 규약은 아직 남아 있다.
+
+## 아래는 이전 설계 문서의 보존 기록
+
 ## 2026-09-26: 독립 aggregation comparison의 수학·구현 경계
 
 최신 구현은 `experiments/aggregation_comparison/`이며 기존 V5와 8조건 incidence ablation을

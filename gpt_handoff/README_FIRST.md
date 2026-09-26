@@ -1,5 +1,54 @@
 # GPT 전달용 전체 프로젝트 묶음
 
+## 현재 검수 기준 — 2026-09-27, 구현 커밋 `4b4df52`
+
+**이번 ZIP의 `MANIFEST.json`에 문서까지 포함한 정확한 커밋과 파일별 SHA-256이 있다.**
+이 절이 현재 상태이며 아래 2026-09-26 및 그 이전 내용은 역사적 기록이다.
+당시의 6조건/19조건, GATv2 미포함, validation-only 안내를 현재 계약으로 읽지 않는다.
+이전부터 수정 중이던 세 전달 문서의 내용도 삭제하지 않고 아래에 보존했다.
+
+- 주 벤치마크는 **ogbn-arxiv**다. 새 aggregation CLI와 하위 학습기는 PPI를 거부한다.
+  PPI-only sampled_inductive 공개 실행 진입점도 중단했다. 과거 결과는 보존 자료다.
+- 현재 기본 matrix는 **21조건**: incidence 내부 대조군 16개 + GCN + GraphSAGE +
+  GATv2 + DUALFormer + DUALFormer no-skip control이다.
+- 사전학습 모델/가중치 다운로드 없이 무작위 초기화부터 학습한다. 설치된 PyG의
+  GCNConv, SAGEConv, GATv2Conv를 사용한다. 자기 실험의 저장 checkpoint 복원과 구분한다.
+- 공통 reference 8층/256 hidden, large 12층/384 hidden 및 기존 학습 예산을 유지한다.
+  공통 encoder/decoder·데이터·split·레시피 비교이며 parameter-matched/SOTA 재현은 아니다.
+- validation으로 선택한 전체 matrix의 best checkpoint를 먼저 고정한 뒤
+  `--evaluate-test`로 공식 test mask를 평가한다. 실제 데이터 본학습·test 평가는 미실행이다.
+- RTX 5070 Ti의 합성 debug/무결성 회귀 검사 105개 통과 후 최종 변경 영향 검사 13개를
+  재실행해 통과했다. 중복 실행을 118개로 합산하지 않는다. MIG 10GB 적합성은 미측정이다.
+- **연구 전체 완성은 아니다.** arxiv의 고정/학습 C × full/sampled 4조건 통합 실행·보고,
+  학습 예산 해석, 독립된 미관측 그래프 평가 규약, 실제 데이터 성능·총비용 측정은 남아 있다.
+  arxiv 공식 transductive test를 독립 그래프 inductive 검증으로 취급하지 않는다.
+
+읽는 순서: 이 절 → `HANDOFF.md` 최신 절 → `EXPERIMENT_STATUS.md` 최신 절 →
+`docs/ARXIV_BASELINE_COMPARISON.md` → `docs/DEEP_IMPLEMENTATION_REVIEW_20260927.md`
+(직전 감사의 역사적 근거) → 실제 소스 및 `CODE_SUMMARY.md`.
+ZIP에는 기존 전달 문서 10개, 현재 코드·설정·테스트·실행 문서, 최신 및 이전 감사의
+구분된 증거를 넣는다. 데이터, 가상환경, 모델 가중치 및 대형 학습 산출물은 제외한다.
+
+### GPT에 줄 최신 검수 요청문
+
+> README_FIRST.md의 2026-09-27 절과 MANIFEST.json부터 읽고 현재 코드의 요구사항 충족을
+> 독립 검수해 줘. 아래 과거 문서는 날짜별 역사로 다루고, 현재 21조건 및 arxiv 계약은
+> docs/ARXIV_BASELINE_COMPARISON.md와 실제 소스를 우선 대조해 줘.
+> C는 입력 그래프가 아니라 공유 규칙으로 계산되는 conductance다. C 계산→가중
+> 라플라시안→예측→loss→gradient→optimizer 경로, 에너지·cross-depth Gram·lift와
+> 각 대조군의 식/구현 일치 및 비교 공정성을 확인해 줘. nonlinear rank와 가역성을
+> 동일시하거나 depth history를 정확한 거리별 hop으로 해석하면 안 된다.
+> GCN/GraphSAGE/GATv2의 실제 연산, root/self-loop/정규화/외부 residual의 구분,
+> 공통 backbone과 모델별 parameter 수 차이, baseline 튜닝 한계를 검토해 줘.
+> final_test.py의 전체 matrix 검증·디스크 증거·checkpoint 사전 고정·validation 재현·
+> test mask 및 완료 결과 재사용의 무결성을 확인해 줘. test로 모델을 재선택하지 않는지 봐 줘.
+> PPI 차단이 원래의 샘플링/inductive 연구 목표 완성을 의미하지 않는다는 점을 유지해 줘.
+> 테스트는 합성 debug이며 실제 benchmark 성능·속도·MIG 적합성을 입증하지 않는다.
+> 결과를 심각도순 오류(파일/함수/근거), 요구사항 누락, 비교 공정성, 허용/금지할 주장,
+> 필요한 수정과 재검증으로 정리해 줘. 실행하지 못한 것은 정적 검수로 명시해 줘.
+
+## 아래는 2026-09-26 전달본의 보존 기록
+
 **최신화 기준: 2026-09-26 / 구현 기준 로컬 커밋 `9103fad`.**
 기존 10개 문서를 유지하며 최신 우선 검수 대상은
 `experiments/aggregation_comparison/`의 독립 비교 실험이다.
@@ -10,7 +59,7 @@
 
 | 항목 | 확인된 상태 |
 | --- | --- |
-| 기존 incidence ablation | `experiments/incidence_ablation/`, 8조건, residual/FFN backbone의 내부 ablation |
+| 기존 incidence ablation | 사용자 제공 PPI v2 콘솔에서 학습·감사 8/8 passed. 최고 post_lift 0.989503. residual/FFN backbone의 내부 ablation |
 | 새 외부 모델 비교 | `experiments/aggregation_comparison/`, 6조건, 새 모델·결과 폴더·run ID |
 | 우리 모델 | 외부 residual/FFN 제거; 기본, pre-lift, 국소 에너지, 에너지+pre-lift |
 | 외부 비교 대상 | DUALFormer(ICLR 2025) 공식 수식 기반 공통 레시피 구현과 별도 no-skip 변형 |
@@ -79,8 +128,9 @@ checkpoint는 포함하지 않는다. 한 파일씩 전달할 때는 적어도 �
   `.venv-gpu`는 2.13.0+cu130과 고정 의존성을 사용하는 별도 검증 환경이다.
   Windows CUDA smoke와 Linux production 설치 계약은 다르다.
 - 과거 CPU 49개 통과는 수식·무결성 검사 기록이며 이번 전체 학습 완료가 아니다.
-- 사용자 대화의 PPI validation 약 0.989는 새 6조건의 test/SOTA 점수가 아니다.
-  해당 실행의 원본 manifest/checkpoint를 이 묶음에서 독립 확인하지 못했다.
+- 사용자 제공 PPI v2 콘솔의 8개 점수를 `EXPERIMENT_STATUS.md` 최신 절에 반영했다.
+  최고 post_lift 0.989503은 새 6조건의 test/SOTA 점수가 아니다. 학습·감사 완료 상태는
+  콘솔로 확인했으며 원본 manifest/checkpoint/audit 내용의 독립 검증은 아직이다.
 - 최신 모델 선택을 모두 해결하지 못했다. 현재 외부 comparator는 2025 DUALFormer 하나다.
 - 서버의 기존 checkpoint와 전체 학습 결과는 별도 원본 자료가 있어야 재검증할 수 있다.
 

@@ -1,6 +1,74 @@
 # 실험 결과와 구현 상태
 
+## 현재 상태 — 2026-09-27, 구현 `4b4df52`
+
+현재 arxiv 21조건 비교의 실제 benchmark 학습/평가는 **미실행**이다. 아래 PPI 점수와
+과거 감사 결과는 새 arxiv 결과가 아니다. 최신 계약은
+[ARXIV_BASELINE_COMPARISON.md](../docs/ARXIV_BASELINE_COMPARISON.md)를 따른다.
+
+| 증거 | 결과 | 의미 |
+| --- | --- | --- |
+| results/arxiv-baselines-debug-20260927-01.xml | 105 passed, failure/error/skip 0 | CUDA 모델/무결성 회귀; 합성 debug 및 제어 검사 |
+| results/arxiv-baselines-debug-20260927-02.xml | 13 passed, failure/error/skip 0 | 최종 CLI/metadata/test 재사용 변경 뒤 영향 경로 재검사; 위와 중복 |
+| results/arxiv-baselines-dry-run-20260927.txt | arxiv 21조건 계획 생성 | 다운로드·본학습·실제 자원 교정 아님 |
+| results/deep-audit-verified-20260927-02.xml 및 deep-audit-control-20260927-03.xml | 직전 감사 93개 통과 | 이전 커밋 cc173ed의 감사 근거; 최신 검사와 합산하지 않음 |
+| results/deep-audit-disk-fault-before-20260927.xml | 의도한 회귀 실패 1개 | 수정 전 디스크 best 훼손 주입으로 결함 재현; 사용자 결과 훼손 증거 아님 |
+
+최신 모델 검사는 RTX 5070 Ti 16GB, Torch 2.13.0+cu130, PyG 2.8.0.post1에서 CUDA로
+수행했다. GCN/SAGE의 독립 dense 식 및 gradient, 그래프 cache 교체,
+GCN/SAGE/GATv2/incidence의 reference 구조 학습·저장·validation audit·test mask를
+검사했다. small graph/4epoch 경로는 명시적 debug이며 production 설정을 바꾸지 않았다.
+105+13=118개의 서로 다른 검사로 세지 않는다. Torch/PyG deprecation 경고가 있었다.
+정적 Ruff·whitespace 검사 통과 기록과 본학습 실행 완료는 구분한다.
+
+구현 완료: arxiv 전용 새 CLI, GCN/SAGE 추가, validation 선택 후 공식 test 실행 경로.
+미검증: 실제 arxiv 정확도, 다중 seed 우위, 실제 calibration/처리량/peak VRAM,
+A100 MIG 10GB 적합성. 공식 arxiv transductive test를 독립 그래프 평가로 부르지 않는다.
+모델·가중치·데이터 다운로드는 이번 변경에서 수행하지 않았다.
+
+이 전달본에는 최신 검사와 이전 감사의 원본 XML/JSON을 서로 구분해 넣으며,
+묶음의 VERIFICATION.json에 각각의 출처와 SHA-256을 기록한다.
+
+## 아래는 이전 실험·사용자 제공 콘솔 기록
+
 기준일: 2026-09-26 (Asia/Seoul). 아래 과거 날짜의 결과는 해당 실행의 기록이다.
+
+## 2026-09-26 추가 수령: 이전 PPI 내부 ablation 8조건 완료
+
+사용자가 서버에서 읽기 전용 manifest 확인 명령을 실행한 콘솔 출력을 전달했다.
+출력상 `incidence-ppi-reference-mig10gb-gpu4-seed0-v2`는 전체 `passed`,
+학습 8/8, 감사 8/8 완료다. 이는 이전 `experiments/incidence_ablation/`의
+reference/seed0 내부 실험이며 새 `aggregation_comparison/` 6조건 결과가 아니다.
+기존 backbone의 외부 residual/FFN이 포함된 조건이다.
+
+| 조건 | Training | Audit | Validation micro-F1 | Best epoch | baseline 대비 pp |
+| --- | --- | --- | ---: | ---: | ---: |
+| baseline | passed | passed | 0.988320 | 169 | 0.0000 |
+| linear_lift | passed | passed | 0.988655 | 160 | +0.0335 |
+| pre_lift | passed | passed | 0.988825 | 165 | +0.0505 |
+| post_lift | passed | passed | **0.989503** | 193 | **+0.1183** |
+| bilinear | passed | passed | 0.988370 | 127 | +0.0050 |
+| bilinear_linear_lift | passed | passed | 0.988458 | 200 | +0.0138 |
+| bilinear_pre_lift | passed | passed | 0.988611 | 196 | +0.0291 |
+| bilinear_post_lift | passed | passed | 0.988917 | 184 | +0.0597 |
+
+pp는 `(조건 F1 - baseline F1) × 100`이다. 최고는 post_lift로 baseline보다
+F1 0.001183 높다. bilinear 결합은 대응 lift 단독보다 각각 linear -0.0197pp,
+pre -0.0214pp, post -0.0586pp 낮았다. 이 run은 bilinear의 일관된 추가 이득을
+보여 주지 않는다. 반대로 이것만으로 bilinear 또는 pre-lift 가설을 일반적으로 기각할
+수도 없다. 단일 seed의 validation 선택 결과이며 test·다중 seed 유의성 근거는 없다.
+Best epoch는 선택된 checkpoint의 epoch이지 각 조건의 총 epochs_run이 아니다.
+
+함께 출력된 `incidence-ppi-reference-mig10gb-seed0-v1`은 전체 failed, 학습/감사 0/8,
+모든 조건 pending이었다. 오류는 원래 공통 calibration 완료 전 GPU allocation이
+바뀌어 partial measurements를 섞을 수 없다는 사전 중단이다. 이는 별도 v2의 완료를
+취소하는 오류가 아니며 v1을 완료 결과로 집계하지 않는다.
+
+근거 수준: 사용자 제공 콘솔 출력. 서버의 원본 manifest/history/checkpoint 및 audit log를
+현재 로컬에서 직접 열어 hash·diagnostic 내용·epochs_run을 독립 재검증한 것은 아니다.
+따라서 '서버 실행 기록상 8/8 학습·감사 완료'와 '원본 산출물 독립 검증 완료'를 구분한다.
+run 이름에 MIG10GB가 있지만 이 출력만으로 실제 hardware fingerprint를 재확인하지 않았다.
+특히 새 6조건의 A100 MIG 적합성 미검증 상태는 그대로다.
 
 ## 2026-09-26: 새 독립 비교 구현 및 실제 CUDA 검증
 
@@ -14,7 +82,7 @@
 | 대상 | 현재 근거 | 주장할 수 없는 것 |
 | --- | --- | --- |
 | 기존 V5/edge-selection | 아래 날짜별 보존 기록 | 새 6조건의 성능 |
-| 기존 incidence 내부 ablation | 별도 8조건 코드. 사용자 대화에 PPI validation 약 0.989 언급 | 해당 run의 원본 확인, test/SOTA 또는 새 비교의 결과 |
+| 기존 incidence 내부 ablation | 사용자 제공 v2 콘솔: 학습/감사 8/8 passed, 최고 post_lift 0.989503 | 원본 artifact 독립 확인, test/SOTA 또는 새 6조건의 결과 |
 | 새 aggregation comparison | 6조건 구현, CLI dry-run, 과거 CPU 검사 49개 통과 기록 | 전체 데이터 학습 완료·일반화 우위 |
 | CUDA 검증 | 아래 실제 RTX 5070 Ti XML/JSON | A100 MIG 10GB 적합성·최적 batch·실제 데이터 처리량 |
 | 배포 | 로컬 코드/문서/커밋 | 서버에 최신 파일이 이미 설치됐다는 주장 |

@@ -1,5 +1,45 @@
 # NEW GAT 연구 프로젝트 Hand-off
 
+## 2026-09-27 현재 반영표 — 구현 `4b4df52`
+
+문서까지 포함한 배포 커밋은 ZIP의 MANIFEST.json을 따른다. 아래 9월 26일 설명은
+보존 기록이다. 최신 실행 계약과 명령은 [ARXIV_BASELINE_COMPARISON.md](../docs/ARXIV_BASELINE_COMPARISON.md)에 있다.
+
+| 요구사항 | 현재 구현/근거 | 남은 경계 |
+| --- | --- | --- |
+| PPI 제외, arxiv 비교 | benchmark_policy.py, runner.py, engine.py; sampled_inductive/runner.py 공개 진입점 중단 | 과거 PPI 소스·결과는 역사로만 보존 |
+| GCN·GraphSAGE·GATv2 비교 | aggregation_comparison/model.py의 실제 PyG 연산, 21개 기본 조건 | 공통 레시피; 개별 최적 튜닝/parameter matching 아님 |
+| 사전학습 모델 다운로드 금지 | 각 모델 random initialization, 자기 run의 resume/test checkpoint만 복원 | 데이터 캐시도 검증된 로컬 캐시를 요구 |
+| 원래 깊이/너비 보존 | reference 8/256, large 12/384; attention/incidence 8 heads | GCN/SAGE에는 multi-head 계약을 붙이지 않음 |
+| 외부 wrapper 제거 | incidence/GCN/SAGE/GATv2에 공통 외부 residual/FFN/LayerNorm 없음 | SAGE root transform, diffusion identity, DUALFormer intrinsic 구조는 구분 |
+| 공식 test 평가 | final_test.py; 전체 요청 matrix/디스크 audit 검증 후 best hash 고정, validation 재현 후 test mask | 실제 arxiv 본학습/test 미실행 |
+| C 및 국소 Gram/lift | model.py + 기존 incidence operator; 16개 내부 조건 유지 | C가 입력 그래프라는 해석은 오류; exact-hop/가역성 증명 아님 |
+| 저장 best 감사 | sampled_inductive/train.py 직전 감사 수정, 독립 새 CUDA 모델에 디스크 best 복원 | 과거 PPI 사용자 결과가 손상됐다는 증거는 아님 |
+| GPU 검증 | 최신 105개 회귀 검사 및 최종 영향 13개 재검사 | 합성 debug, RTX 5070 Ti; A100 MIG 및 실제 성능 미측정 |
+| 공유 C + sampling + inductive + 비용 | 기존 V5 경로와 감사 문서에 원래 목표 보존 | 현재 full-only arxiv 비교가 목표 전체를 검증하지 않음 |
+
+### 우선 검토할 실제 파일
+
+- `experiments/aggregation_comparison/model.py`: 21개 조건, GCN 정규화 cache,
+  SAGE mean/root, GATv2 self-loop, C/energy/Gram/lift 및 model contract.
+- `benchmark_policy.py`, `runner.py`, `engine.py`: 데이터셋 제한, 공통 자원 교정,
+  학습/감사 matrix, 최종 test 진입, metadata 및 학습 예산.
+- `final_test.py`: 누락/중복/실패 cell과 데이터·source·checkpoint 변경 거부,
+  validation 재현 및 test 노드 전체 평가, 저장 결과 재사용.
+- `tests/test_arxiv_baselines_cuda.py`: 독립 GCN/SAGE dense 출력·gradient,
+  네 모델의 실제 CUDA 학습→저장→감사→test 파이프라인(명시적 합성 debug).
+- `tests/test_arxiv_benchmark_policy.py`: PPI 차단, 기본 matrix 및 test 전 무결성 제어.
+- `docs/DEEP_IMPLEMENTATION_REVIEW_20260927.md`: 이전 상세 수학·요구사항 감사와 미구현 목록.
+
+### 아직 완료되지 않은 핵심 연구
+
+고정/학습 C × full/sampled의 arxiv 4조건 통합 실험, full/sample update 및 관측
+예산 해석, 독립 그래프 held-out 규약, 실제 데이터의 다중 seed 성능과 sampling·전송·
+C 반복·forward/backward를 포함한 총비용 측정은 미완료다. 이번 baseline 추가를
+이 요구들의 완료로 보고하지 않는다. 원래 규모를 줄이거나 PPI로 대체하지 않는다.
+
+## 아래는 이전 인계 내용의 보존 기록
+
 ## 2026-09-26 현재 검수 대상과 반영 현황
 
 이 절이 최신 상태다. 아래 2026-09-08 이전 본문은 해당 시점의 역사적 계약이며,
@@ -28,6 +68,11 @@
 `incidence_energy_pre_lift`, `dualformer`, `dualformer_no_skip_control`이다.
 기존 8조건 `experiments/incidence_ablation/`은 외부 residual/FFN이 있는 내부 ablation이다.
 두 suite의 결과를 합쳐 하나의 공정 비교표로 쓰면 안 된다.
+
+추가 수령한 서버 콘솔에서 기존 PPI `incidence-ppi-reference-mig10gb-gpu4-seed0-v2`는
+학습/감사 모두 8/8 passed였다. post_lift 0.989503이 최고이며 baseline 0.988320 대비
++0.1183pp다. 세 bilinear+lift 조합은 각각 대응 lift 단독보다 낮다. 정확한 8조건 표와
+출처·단일 seed validation의 한계는 `EXPERIMENT_STATUS.md` 첫 절에 있다.
 
 새 비교는 split, seed 목록, physical batch/worker 공통 교정, update-budget 계약,
 precision, AdamW learning rate/weight decay를 공유한다. 공유 초기값 검사는
