@@ -112,7 +112,7 @@ def test_duplicate_cell_rejected():
         contrast_report([row, copy.deepcopy(row)])
 
 
-def test_actual_cli_recipes_form_complete_19_arm_matrix():
+def test_actual_cli_recipes_form_complete_21_arm_matrix():
     from pathlib import Path
 
     from experiments.aggregation_comparison import engine, runner
@@ -123,7 +123,7 @@ def test_actual_cli_recipes_form_complete_19_arm_matrix():
             "--run-id",
             "debug-control-plan",
             "--datasets",
-            "ppi",
+            "ogbn-arxiv",
             "--profiles",
             "reference",
             "--hardware-profile",
@@ -131,7 +131,7 @@ def test_actual_cli_recipes_form_complete_19_arm_matrix():
         ]
     )
     jobs = runner.make_jobs(args, Path("results/debug-control-plan"))
-    assert len(jobs) == len(ARMS) == 19
+    assert len(jobs) == len(ARMS) == 21
     records = []
     for planned in jobs:
         child = engine.build_parser().parse_args(

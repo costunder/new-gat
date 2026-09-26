@@ -30,6 +30,8 @@ ARMS = {
     "dualformer": None,
     "dualformer_no_skip_control": None,
     "gatv2": None,
+    "gcn": None,
+    "graphsage": None,
 }
 for _energy_suffix, _energy in (("", False), ("_diagonal", "diagonal"), ("_energy", True)):
     for _lift_suffix, _lift in (
@@ -229,6 +231,28 @@ class AggregationClassifier(nn.Module):
                 )
                 for _ in range(layers)
             )
+        elif arm == "gcn":
+            from torch_geometric.nn import GCNConv
+
+            # Cache graph normalization once in forward, shared by all layers.
+            self.layers.extend(
+                GCNConv(hidden_channels, hidden_channels, normalize=False, add_self_loops=False)
+                for _ in range(layers)
+            )
+        elif arm == "graphsage":
+            from torch_geometric.nn import SAGEConv
+
+            self.layers.extend(
+                SAGEConv(
+                    hidden_channels,
+                    hidden_channels,
+                    aggr="mean",
+                    normalize=False,
+                    root_weight=True,
+                    project=False,
+                )
+                for _ in range(layers)
+            )
         elif arm.startswith("dualformer"):
             self.layers.extend(
                 DualAttention(hidden_channels, heads, edge_chunk_size)
@@ -307,7 +331,7 @@ class AggregationClassifier(nn.Module):
             "common_encoder": "linear",
             "common_decoder": "linear",
             "hidden_channels": self.width,
-            "heads": self.heads,
+            "heads": None if self.arm in {"gcn", "graphsage"} else self.heads,
             "graph_propagation_layers": self.depth,
             "dual_sa_layers": len(self.layers) if dual else 0,
             "intrinsic_dual_residual": self.arm == "dualformer",
@@ -339,6 +363,25 @@ class AggregationClassifier(nn.Module):
                 "edge_chunking": False,
             }
             if self.arm == "gatv2"
+            else None,
+            "gcn": {
+                "implementation": "torch_geometric.nn.GCNConv",
+                "normalization": "symmetric D^-1/2 (A+I) D^-1/2 cached per input graph",
+                "self_loops": True,
+                "edge_chunking": False,
+            }
+            if self.arm == "gcn"
+            else None,
+            "graphsage": {
+                "implementation": "torch_geometric.nn.SAGEConv",
+                "aggregation": "mean",
+                "root_weight": True,
+                "neighbor_self_loops": False,
+                "project": False,
+                "normalize": False,
+                "edge_chunking": False,
+            }
+            if self.arm == "graphsage"
             else None,
             "dual_upstream_commit": "68fbdaf007af2f7d409cd435c4c48dd0e3155510" if dual else None,
             "comparison_scope": "common training protocol, not published tuned score reproduction",
@@ -404,25 +447,46 @@ class AggregationClassifier(nn.Module):
         else:
             graphs = graph._v5_num_graphs
         h = self.encoder(x)
-        if self.arm == "gatv2":
+        if self.arm in {"gatv2", "gcn", "graphsage"}:
             # The canonical incidence support contains each undirected edge once.
             # Cache both directions and exactly one self-loop/node. Avoid
             # rebuilding static graph support in every layer/epoch.
-            cached = getattr(graph, "_comparison_gatv2_edges", None)
+            cache_key = (
+                "_comparison_gatv2_edges"
+                if self.arm == "gatv2"
+                else "_comparison_local_" + self.arm
+            )
+            cached = getattr(graph, cache_key, None)
             signature = (edges._version, h.shape[0], h.device)
             if cached is None or cached[0] is not edges or cached[1] != signature:
                 nonloops = edges[:, edges[0] != edges[1]]
                 nodes = torch.arange(h.shape[0], device=h.device)
-                directed = torch.cat(
-                    (nonloops, nonloops.flip(0), torch.stack((nodes, nodes))), dim=1
-                )
-                cached = (edges, signature, directed)
-                graph._comparison_gatv2_edges = cached
+                directed = torch.cat((nonloops, nonloops.flip(0)), dim=1)
+                if self.arm != "graphsage":
+                    directed = torch.cat((directed, torch.stack((nodes, nodes))), dim=1)
+                weights = None
+                if self.arm == "gcn":
+                    from torch_geometric.nn.conv.gcn_conv import gcn_norm
+
+                    directed, weights = gcn_norm(
+                        directed,
+                        num_nodes=h.shape[0],
+                        add_self_loops=False,
+                        dtype=torch.float32,
+                    )
+                cached = (edges, signature, directed, weights)
+                setattr(graph, cache_key, cached)
             directed = cached[2]
+            weights = cached[3]
             for layer in self.layers:
 
                 def step(value, layer=layer):
-                    return F.dropout(F.relu(layer(value, directed)), self.dropout, self.training)
+                    output = (
+                        layer(value, directed, weights)
+                        if self.arm == "gcn"
+                        else layer(value, directed)
+                    )
+                    return F.dropout(F.relu(output), self.dropout, self.training)
 
                 h = (
                     checkpoint(step, h, use_reentrant=False)

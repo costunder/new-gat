@@ -1,5 +1,10 @@
 # 2026-09-27 첨부 검수 통합 재검토
 
+이 문서는 cc173ed까지의 검수 기록이다. 이후 사용자 지시에 따라 PPI 실행을 차단하고
+GCN/GraphSAGE 및 arxiv 공식 test 경로를 추가한 현재 계약은
+[ARXIV_BASELINE_COMPARISON.md](ARXIV_BASELINE_COMPARISON.md)에 있다.
+아래 당시 측정값을 후속 코드에서 새로 실행한 결과로 읽지 않는다.
+
 ## 판정과 범위
 
 **현재 상태를 원래 연구 요구사항의 완료본으로 판정할 수 없다.** 주 데이터셋을

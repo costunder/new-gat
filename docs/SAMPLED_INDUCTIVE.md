@@ -1,5 +1,11 @@
 # Shared C learning, sampled training, and unseen graphs
 
+**Retired production launcher.** The user excludes PPI. The `main` entry point
+now refuses execution before data loading, GPU allocation, or training. Old
+implementation/results remain inspectable. Use the
+[ogbn-arxiv comparison](ARXIV_BASELINE_COMPARISON.md) for the current benchmark.
+The following text is historical design context, not execution guidance.
+
 ## Scope correction after user review (2026-09-27)
 
 The PPI-only implementation below was an agent-selected detour, not the user's
@@ -158,42 +164,8 @@ Resume also verifies calibration-record checksums and recomputes the selected
 resource plan from those measurements; missing or inconsistent evidence fails.
 Existing historical experiments and checkpoints are not imported or overwritten.
 
-Historical PPI command, retained for provenance only (not the next main run):
-
-```bash
-cd /home/aicompetition07/new-gat &&
-/home/aicompetition07/.conda/envs/new-gat/bin/python -B -m experiments.sampled_inductive \
-  --run-id sampled-inductive-ppi-reference-gpu4-seed0-v1 \
-  --profile reference --model-seeds 0 --hardware-profile portable \
-  --context-seeds 32 --context-batches 32 64 128 \
-  --graph-batches 2 4 8 16 20 --worker-candidates 2 4 \
-  --num-neighbors 15 10 --edge-chunk-size 4096 --dry-run
-```
-
-The example declares 32 supervised seeds/context, a maximum cluster expansion
-budget of 832 nodes/context, and 1024/2048/4096 nominal supervised seeds per full
-physical context batch. These are explicit hypotheses/resource candidates,
-not locally calibrated PPI or MIG measurements. Runtime coverage reports expose
-saturation/overlap; the code never silently adjusts the context size.
-
-Historical GPU 4 invocation, retained for provenance only. This is not a
-recommendation to launch a new PPI experiment or reuse this old run identity:
-
-```bash
-cd /home/aicompetition07/new-gat &&
-env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=4 \
-/home/aicompetition07/.conda/envs/new-gat/bin/python -B -m experiments.sampled_inductive \
-  --run-id sampled-inductive-ppi-reference-gpu4-seed0-v1 \
-  --profile reference --model-seeds 0 --hardware-profile portable \
-  --context-seeds 32 --context-batches 32 64 128 \
-  --graph-batches 2 4 8 16 20 --worker-candidates 2 4 \
-  --num-neighbors 15 10 --edge-chunk-size 4096 \
-  --device cuda:0 --min-free-gb 8 --evaluate-test
-```
-
-`--calibration-only` measures resources without final training. Repeat the same
-command to resume; a changed allocation or recipe needs a fresh run ID. There
-is no session termination, GPU reset, CPU fallback or old-results replacement.
+Historical PPI launch commands have been removed. This launcher must not be
+used for a new run or a resume. Existing evidence is preserved in place.
 
 ## Gram backward correction (aggregation v4)
 

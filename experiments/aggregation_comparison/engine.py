@@ -154,6 +154,9 @@ def parameter_group(name):
             "value_weight": "value_projection",
             "output_projection": "output_projection",
             "lift_projection": "lift_projection",
+            "lin": "gcn_projection",
+            "lin_l": "neighbor_projection",
+            "lin_r": "root_projection",
         }.get(parts[2], "attention")
         return f"layer_{parts[1]}.{component}"
     raise ValueError(f"unclassified trainable parameter {name}")
@@ -550,7 +553,7 @@ def train_model(payload, protocol, args, device, output):
             "data": base._v5_data_observability(payload, inputs.data, inputs.indices, args),
             "topology": inputs.metadata(),
             "model_contract": model.contract(),
-            "debug": False,
+            "debug": bool(protocol.get("explicit_synthetic_debug", False)),
             "subset": False,
             "test_evaluated": False,
             "batching": {
@@ -951,6 +954,9 @@ def run_calibration_candidate(
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    from .benchmark_policy import require_benchmark_datasets
+
+    require_benchmark_datasets([args.dataset])
     validate_args(args)
     output, data_root = (
         args.output_dir.expanduser().resolve(),

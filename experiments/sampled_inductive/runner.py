@@ -94,7 +94,7 @@ def validate(options):
 
 
 def child_arguments(options, arm, seed, batch=2, workers=2):
-    parent = comparison_parser().parse_args(
+    parent = comparison_parser(historical_datasets=True).parse_args(
         [
             "--run-id",
             options.run_id,
@@ -304,6 +304,14 @@ def evaluate_test(options, payload, protocol, manifest, folder, device, save):
 
 
 def main(argv=None):
+    raise ValueError(
+        "The PPI-only sampled_inductive launcher is retired by user request. "
+        "Use experiments.aggregation_comparison with ogbn-arxiv; old results are preserved."
+    )
+
+
+def _historical_main(argv=None):
+    """Archived implementation, not an executable production entry point."""
     invocation_started = time.perf_counter()
     invocation_unix = time.time()
     options = parser().parse_args(argv)

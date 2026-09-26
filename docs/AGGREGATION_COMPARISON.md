@@ -1,5 +1,18 @@
 # Independent aggregation comparison
 
+## Current production benchmark
+
+**Use ogbn-arxiv. PPI is excluded.** The production runner and training entry
+point reject other datasets; the PPI-only sampled launcher is retired.
+GCN and mean GraphSAGE have been added beside GATv2. The default matrix now has
+21 models, preserving all 16 incidence controls and both DUALFormer conditions.
+All models start from random initialization, using installed operator classes;
+no pretrained weights are downloaded. `--evaluate-test` freezes all selected
+checkpoints before official test evaluation. The default device recipe is portable.
+See [the current benchmark contract](ARXIV_BASELINE_COMPARISON.md) for graph/split
+preprocessing, model definitions, validation/test separation, and execution.
+The sections below preserve the historical v3/v4 review context.
+
 ## Review correction, 2026-09-27 (v4)
 
 See [the detailed follow-up review](DEEP_IMPLEMENTATION_REVIEW_20260927.md) for

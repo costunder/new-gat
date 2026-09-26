@@ -24,6 +24,10 @@ for directory in (ROOT, ROOT / "src"):
 
 from chartgat.cache import atomic_write_bytes, atomic_write_json  # noqa: E402
 from experiments.aggregation_comparison import calibration, provenance, reallocation  # noqa: E402
+from experiments.aggregation_comparison.benchmark_policy import (  # noqa: E402
+    PRIMARY_DATASET,
+    require_benchmark_datasets,
+)
 from experiments.aggregation_comparison.model import ARMS  # noqa: E402
 from experiments.aggregation_comparison.provenance import (  # noqa: E402
     require_source_compatibility,
@@ -45,24 +49,30 @@ SUITE = "aggregation_comparison_controller_v4"
 TRAIN_MODULE = "experiments.aggregation_comparison.engine"
 
 
-def parser():
+def parser(*, historical_datasets=False):
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--run-id", required=True)
     result.add_argument("--learning-rate", type=float, default=0.0005)
     result.add_argument("--arms", nargs="+", choices=tuple(ARMS), default=list(ARMS))
-    result.add_argument("--datasets", nargs="+", choices=DATASETS, required=True)
+    result.add_argument(
+        "--datasets",
+        nargs="+",
+        choices=DATASETS if historical_datasets else (PRIMARY_DATASET,),
+        default=[PRIMARY_DATASET],
+    )
     result.add_argument("--profiles", nargs="+", choices=("reference", "large"), required=True)
     result.add_argument("--model-seeds", nargs="+", type=int, default=[0])
     result.add_argument("--data-root", type=Path, default=ROOT / "data/paper")
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
     result.add_argument("--device", default="cuda:0")
-    result.add_argument(
-        "--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="a6000-48gb"
-    )
+    result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
     result.add_argument("--epochs", type=int, default=200)
     result.add_argument("--patience", type=int, default=50)
     result.add_argument("--workers", type=int, default=4)
-    result.add_argument("--ppi-batch-size", type=int)
+    if historical_datasets:
+        result.add_argument("--ppi-batch-size", type=int)
+    else:
+        result.set_defaults(ppi_batch_size=None)
     result.add_argument("--sample-seed-batch-size", type=int)
     result.add_argument("--edge-chunk-size", type=int)
     result.add_argument(
@@ -75,6 +85,11 @@ def parser():
     result.add_argument("--repeat-evaluations", type=int, default=5)
     result.add_argument("--dry-run", action="store_true")
     result.add_argument("--calibration-only", action="store_true")
+    result.add_argument(
+        "--evaluate-test",
+        action="store_true",
+        help="freeze all validation-selected checkpoints before official test",
+    )
     return result
 
 
@@ -205,6 +220,7 @@ def _config(args):
             "calibration_only",
             "run_id",
             "repeat_evaluations",
+            "evaluate_test",
         }
     }
 
@@ -486,7 +502,7 @@ def _summary(run_dir, manifest):
     lines = [
         "# Aggregation-comparison experiment progress",
         "",
-        "Validation only; common-recipe operator comparison, "
+        "Common-recipe operator comparison; validation selection, "
         "not parameter matched or paper reproduction.",
         "",
         "Fresh models; paired encoder/decoder initialization, full splits and measured resources.",
@@ -508,6 +524,10 @@ def _summary(run_dir, manifest):
     effects = contrast_report(manifest["jobs"])
     atomic_write_json(run_dir / "effects.json", effects)
     lines.extend(markdown(effects))
+    if manifest.get("official_test"):
+        from .final_test import markdown as test_markdown
+
+        lines.extend(test_markdown(manifest["official_test"]))
     atomic_write_bytes(run_dir / "comparison.md", ("\n".join(lines) + "\n").encode())
 
 
@@ -587,6 +607,10 @@ def _run(args, run_dir, planned, sources, dependencies):
         _compare(manifest["jobs"])
         if provenance.source_snapshot() != sources:
             raise ValueError("aggregation-comparison implementation changed during the final audit")
+        if args.evaluate_test:
+            from .final_test import evaluate_matrix
+
+            evaluate_matrix(args, manifest, persist)
         manifest.update(status="passed", finished_at_utc=dt.datetime.now(dt.UTC).isoformat())
         manifest.pop("error", None)
         persist()
@@ -616,6 +640,7 @@ def _run(args, run_dir, planned, sources, dependencies):
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
+        require_benchmark_datasets(args.datasets)
         validate_args(args)
         data = args.data_root.expanduser().resolve()
         run_dir = args.results_root.expanduser().resolve() / "aggregation_comparison" / args.run_id

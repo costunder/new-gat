@@ -72,7 +72,7 @@ def reference_arguments(arm, precision):
             "--run-id",
             "debug-cuda-smoke",
             "--datasets",
-            "cora",
+            "ogbn-arxiv",
             "--profiles",
             "reference",
             "--arms",
