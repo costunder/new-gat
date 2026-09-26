@@ -1,0 +1,355 @@
+"""Residual-free incidence models and a DUALFormer (ICLR 2025) comparator.
+
+DUALFormer preserves its published SA-residual/normalization mechanism. Those
+are intrinsic to that comparator; no extra wrapper residual or FFN is added.
+Its optional no-skip control is explicitly named, never called a reproduction.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
+
+from experiments.incidence_ablation.model import IncidenceClassifier
+from research.conductance_gat.v5.model import _static_graph_context
+
+ARMS = {
+    "incidence": ("baseline", False),
+    "incidence_pre_lift": ("pre_lift", False),
+    "incidence_energy": ("baseline", True),
+    "incidence_energy_pre_lift": ("pre_lift", True),
+    "dualformer": None,
+    "dualformer_no_skip_control": None,
+}
+
+
+def local_gram(history, edges, conductance, edge_chunk_size):
+    """N x heads x pairs, including diagonal local energies and cross terms.
+
+    Each undirected edge contributes half its weighted inner product to each
+    endpoint, so summing nodes gives tr(H_k.T L H_l), without degree scaling.
+    The identity assumes a common, frozen conductance and feature coordinates.
+    """
+    depth, nodes, heads, _ = history.shape
+    pairs = torch.triu_indices(depth, depth, device=history.device)
+    result = history.new_zeros(nodes, heads, pairs.shape[1])
+    chunk = max(1, (edge_chunk_size or max(edges.shape[1], 1)) // depth)
+
+    def compute(past, ends, weight):
+        delta = past[:, ends[1]] - past[:, ends[0]]
+        values = (delta[pairs[0]] * delta[pairs[1]]).sum(-1)
+        return values.permute(1, 2, 0) * weight[..., None] / 2
+
+    for start in range(0, edges.shape[1], chunk):
+        ends = edges[:, start : start + chunk]
+        weight = conductance[start : start + chunk]
+        values = (
+            checkpoint(compute, history, ends, weight, use_reentrant=False)
+            if torch.is_grad_enabled()
+            else compute(history, ends, weight)
+        )
+        result = result.index_add(0, ends[0], values).index_add(0, ends[1], values)
+    return result
+
+
+class DualAttention(nn.Module):
+    """Official feature-space SA: Q softmax(K.T V / sqrt(N)), mean heads.
+
+    Reference: JiamingZhuo/DUALFormer, commit 68fbdaf, model/sa.py.
+    Heads each have hidden_channels features, as in the original code.
+    """
+
+    def __init__(self, width, heads, chunk_size=None):
+        super().__init__()
+        self.width, self.heads = width, heads
+        self.chunk_size = chunk_size
+        self.query = nn.Linear(width, width * heads)
+        self.key = nn.Linear(width, width * heads)
+        self.value = nn.Linear(width, width * heads)
+
+    def forward(self, x, batch, graphs):
+        if self.chunk_size is not None:
+            return self.streamed(x, batch, graphs)
+        q = self.query(x).reshape(-1, self.width, self.heads)
+        k = self.key(x).reshape_as(q)
+        v = self.value(x).reshape_as(q)
+        # Each graph is independent. Vectorized disjoint batching, no mixing
+        # across the PPI tissues in a physical minibatch.
+        counts = torch.bincount(batch, minlength=graphs)
+        if graphs == 1:
+            attention = torch.einsum("nmh,ndh->mdh", k / math.sqrt(x.shape[0]), v)
+            return torch.einsum("nmh,mdh->ndh", q, attention.softmax(0)).mean(-1)
+        membership = F.one_hot(batch, graphs).to(k.dtype)
+        attention = torch.einsum("ng,nmh,ndh->gmdh", membership, k, v)
+        attention = attention / counts.to(k.dtype).sqrt()[:, None, None, None]
+        queries = torch.einsum("ng,nmh->gnmh", membership, q)
+        return torch.einsum("gnmh,gmdh->ndh", queries, attention.softmax(1)).mean(-1)
+
+    def streamed(self, x, batch, graphs):
+        """Exact two-pass global attention; chunking does not sample nodes."""
+        counts = torch.bincount(batch, minlength=graphs).to(x.dtype)
+        metric = x.new_zeros(graphs, self.width, self.width, self.heads)
+
+        def accumulate(features, groups):
+            k = self.key(features).reshape(-1, self.width, self.heads)
+            v = self.value(features).reshape_as(k)
+            membership = F.one_hot(groups, graphs).to(k.dtype)
+            return torch.einsum("gnmh,ndh->gmdh", membership.T[..., None, None] * k[None], v)
+
+        def apply(features, groups, attention):
+            q = self.query(features).reshape(-1, self.width, self.heads)
+            membership = F.one_hot(groups, graphs).to(q.dtype)
+            queries = torch.einsum("ng,nmh->gnmh", membership, q)
+            return torch.einsum("gnmh,gmdh->ndh", queries, attention).mean(-1)
+
+        for start in range(0, x.shape[0], self.chunk_size):
+            features, groups = (
+                x[start : start + self.chunk_size],
+                batch[start : start + self.chunk_size],
+            )
+            term = (
+                checkpoint(accumulate, features, groups, use_reentrant=False)
+                if torch.is_grad_enabled()
+                else accumulate(features, groups)
+            )
+            metric = metric + term
+        attention = (metric / counts.sqrt()[:, None, None, None]).softmax(1)
+        outputs = []
+        for start in range(0, x.shape[0], self.chunk_size):
+            features, groups = (
+                x[start : start + self.chunk_size],
+                batch[start : start + self.chunk_size],
+            )
+            outputs.append(
+                checkpoint(apply, features, groups, attention, use_reentrant=False)
+                if torch.is_grad_enabled()
+                else apply(features, groups, attention)
+            )
+        return torch.cat(outputs)
+
+
+def graph_normalization(x, edges):
+    """Static symmetric normalization, shared by every propagation layer."""
+    degree = torch.ones(x.shape[0], device=x.device, dtype=torch.float32)
+    ones = degree.new_ones(edges.shape[1])
+    degree.index_add_(0, edges[0], ones)
+    degree.index_add_(0, edges[1], ones)
+    inverse = degree.rsqrt()
+    return degree, inverse[edges[0]] * inverse[edges[1]]
+
+
+def normalized_graph_step(x, edges, chunk, normalization=None):
+    """Symmetric GCN normalization with unit self loops, all physical edges."""
+    degree, weights = graph_normalization(x, edges) if normalization is None else normalization
+    out = x / degree[:, None]
+    for start in range(0, edges.shape[1], chunk or max(edges.shape[1], 1)):
+        ends = edges[:, start : start + (chunk or edges.shape[1])]
+        weight = weights[start : start + ends.shape[1]]
+        out = out.index_add(0, ends[0], x[ends[1]] * weight[:, None])
+        out = out.index_add(0, ends[1], x[ends[0]] * weight[:, None])
+    return out
+
+
+class AggregationClassifier(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        classes,
+        *,
+        arm,
+        selection_config,
+        hidden_channels,
+        layers,
+        heads,
+        dropout=0.2,
+        activation_checkpoint=True,
+        edge_chunk_size=None,
+        dual_sa_layers=1,
+        dual_alpha=0.1,
+        **architecture,
+    ):
+        super().__init__()
+        if arm not in ARMS:
+            raise ValueError(f"unknown comparison model: {arm}")
+        if selection_config.get("condition") != "full":
+            raise ValueError("comparison requires full original edge support")
+        if layers < 1 or dual_sa_layers < 1 or not 0 <= dual_alpha <= 1:
+            raise ValueError("invalid depth or DUALFormer residual coefficient")
+        self.arm, self.width, self.heads = arm, hidden_channels, heads
+        self.depth, self.dropout = layers, dropout
+        self.activation_checkpoint = activation_checkpoint
+        self.edge_chunk_size = edge_chunk_size
+        # Instantiate the common endpoints before any family-specific RNG use.
+        self.encoder = nn.Linear(in_channels, hidden_channels)
+        self.decoder = nn.Linear(hidden_channels, classes)
+        self.layers = nn.ModuleList()
+        self.energy_readouts = nn.ParameterList()
+        self.dual_alpha = dual_alpha
+        if arm.startswith("dualformer"):
+            self.layers.extend(
+                DualAttention(hidden_channels, heads, edge_chunk_size)
+                for _ in range(dual_sa_layers)
+            )
+            self.norms = nn.ModuleList(
+                nn.LayerNorm(hidden_channels) for _ in range(dual_sa_layers + 1)
+            )
+        else:
+            old_arm, energy = ARMS[arm]
+            original = IncidenceClassifier(
+                in_channels,
+                classes,
+                arm=old_arm,
+                selection_config=selection_config,
+                hidden_channels=hidden_channels,
+                layers=layers,
+                heads=heads,
+                dropout=dropout,
+                activation_checkpoint=activation_checkpoint,
+                edge_chunk_size=edge_chunk_size,
+                **architecture,
+            )
+            # Only retain the actual operator modules. The old encoder, norms,
+            # SwiGLU FFNs and both external residual paths are absent.
+            self.layers.extend(original.operators)
+            if energy:
+                for operator in self.layers:
+                    # Full-support selector is identically one, hence r is C.
+                    # Keep its live tensor for the energy path, not the detached
+                    # diagnostics copy. Return None to preserve estimator output.
+                    operator.estimator.register_forward_hook(
+                        lambda module, inputs, output, op=operator: setattr(
+                            op, "live_comparison_c", output
+                        )
+                    )
+                for depth in range(1, layers + 1):
+                    self.energy_readouts.append(
+                        nn.Parameter(
+                            torch.zeros(heads, depth * (depth + 1) // 2, hidden_channels // heads)
+                        )
+                    )
+
+    def contract(self):
+        dual = self.arm.startswith("dualformer")
+        return {
+            "model": self.arm,
+            "external_residual": False,
+            "external_ffn": False,
+            "common_encoder": "linear",
+            "common_decoder": "linear",
+            "hidden_channels": self.width,
+            "heads": self.heads,
+            "graph_propagation_layers": self.depth,
+            "dual_sa_layers": len(self.layers) if dual else 0,
+            "intrinsic_dual_residual": self.arm == "dualformer",
+            "intrinsic_dual_layernorm": dual,
+            "dual_alpha": self.dual_alpha if dual else None,
+            "activation": "ReLU",
+            "dropout": self.dropout,
+            "parameter_matched": False,
+            "total_parameters": sum(p.numel() for p in self.parameters()),
+            "energy": "diagonal and cross-depth local Gram channels"
+            if len(self.energy_readouts)
+            else None,
+            "depth_states_are_distance_shells": False,
+            "dual_upstream_commit": "68fbdaf007af2f7d409cd435c4c48dd0e3155510" if dual else None,
+            "comparison_scope": "common training protocol, not published tuned score reproduction",
+        }
+
+    def clear_auxiliary_cache(self):
+        # Shared trainer interface; this suite has no auxiliary objectives.
+        for layer in self.layers:
+            if hasattr(layer, "live_comparison_c"):
+                layer.live_comparison_c = None
+
+    def auxiliary_loss(self, targets=None):
+        if targets is not None:
+            raise ValueError("comparison has no corruption objective")
+        zero = self.decoder.weight.new_zeros(())
+        return {"l0": zero, "negative": zero}
+
+    def forward(self, graph):
+        x, edges = graph.x, graph.incidence_edge_index
+        batch = getattr(graph, "batch", None)
+        if batch is None:
+            batch = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+            graphs = 1
+        else:
+            graphs = graph._v5_num_graphs
+        h = self.encoder(x)
+        if self.arm.startswith("dualformer"):
+            h = F.dropout(F.relu(self.norms[0](h)), self.dropout, self.training)
+            for index, layer in enumerate(self.layers):
+
+                def step(value, layer=layer, norm=self.norms[index + 1]):
+                    result = layer(value, batch, graphs)
+                    if self.arm == "dualformer":
+                        result = self.dual_alpha * result + (1 - self.dual_alpha) * value
+                    return F.dropout(F.relu(norm(result)), self.dropout, self.training)
+
+                h = (
+                    checkpoint(step, h, use_reentrant=False)
+                    if self.activation_checkpoint and torch.is_grad_enabled()
+                    else step(h)
+                )
+            cached = getattr(graph, "_comparison_sgc_normalization", None)
+            signature = (edges._version, h.shape[0], h.device)
+            if cached is None or cached[0] is not edges or cached[1] != signature:
+                cached = (edges, signature, graph_normalization(h, edges))
+                graph._comparison_sgc_normalization = cached
+            normalization = cached[2]
+            for _ in range(self.depth):
+                h = normalized_graph_step(h, edges, self.edge_chunk_size, normalization)
+            return self.decoder(F.dropout(h, self.dropout, self.training))
+        kwargs = {
+            name: getattr(graph, name, None)
+            for name in (
+                "full_degree",
+                "graph_structure",
+                "edge_normalization_weight",
+                "sampling_correction",
+                "edge_relation_id",
+            )
+        }
+        kwargs["edge_selection_topology"] = graph.edge_selection_topology
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            kwargs["static_context"] = _static_graph_context(
+                x.float(), edges, batch, graphs, kwargs["full_degree"], kwargs["graph_structure"]
+            )
+        history = [h]
+        for index, operator in enumerate(self.layers):
+
+            def step(*past, operator=operator, index=index):
+                current = past[-1]
+                value = operator(current, edges, batch, graphs, **kwargs)
+                if len(self.energy_readouts):
+                    projected = torch.einsum(
+                        "knd,hdw->knhw", torch.stack(past), operator.value_weight
+                    )
+                    # Reuse the live metric so gradients reach conductance;
+                    # last_effective_c is deliberately detached in the legacy op.
+                    metric = operator.live_comparison_c
+                    correction = kwargs["sampling_correction"]
+                    if correction is not None:
+                        metric = metric * correction.reshape(-1, 1)
+                    statistics = local_gram(
+                        projected.float(), edges, metric.float(), self.edge_chunk_size
+                    )
+                    extra = torch.einsum(
+                        "nhp,hpd->nhd", statistics, self.energy_readouts[index].float()
+                    )
+                    value = value + F.linear(
+                        extra.to(value.dtype).flatten(1), operator.output_projection.weight
+                    )
+                return F.dropout(F.relu(value), self.dropout, self.training)
+
+            h = (
+                checkpoint(step, *history, use_reentrant=False)
+                if self.activation_checkpoint and torch.is_grad_enabled()
+                else step(*history)
+            )
+            history.append(h)
+        return self.decoder(h)
