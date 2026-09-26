@@ -6,6 +6,8 @@ import json
 import math
 from pathlib import Path
 
+from .validation import POLICY, require_reproduction, require_score, validate_evaluation
+
 
 def _positive_integer(value, label):
     if type(value) is not int or value < 1:
@@ -91,6 +93,8 @@ def _history(metrics, identity, rows, args):
     for row in rows:
         _positive_integer(row.get("epoch"), "history epoch")
         _score(row.get("validation"), "history validation")
+        evidence = validate_evaluation(row.get("validation_evidence"), label="history validation")
+        require_score(row["validation"], evidence["metric"], label="history score/counts")
         if (
             row.get("train_batches") != budget["actual_batches_per_epoch"]
             or row.get("optimizer_steps") != row["epoch"] * budget["actual_batches_per_epoch"]
@@ -110,6 +114,14 @@ def _history(metrics, identity, rows, args):
     if best != first_maximum + 1 or score != rows[first_maximum]["validation"]:
         raise ValueError("selected checkpoint is not the first strict maximum validation epoch")
     _score(metrics.get("validation"), "selected-checkpoint validation recheck")
+    require_score(score, metrics["validation"], label="completed validation")
+    selected = rows[best - 1]["validation_evidence"]
+    if metrics.get("selected_validation_evidence") != selected:
+        raise ValueError("selected validation evidence differs from history")
+    require_reproduction(selected, metrics.get("validation_evidence"), label="completed validation")
+    require_score(
+        metrics["validation"], metrics["validation_evidence"]["metric"], label="final score/counts"
+    )
     if epochs < budget["planned_epochs"] and not should_stop_learning_budget(
         budget,
         epochs_since_best=epochs - best,
@@ -210,6 +222,8 @@ def inspect_completed(output):
     if "training_arguments" in metrics and metrics["training_arguments"] != saved_args:
         raise ValueError("completed training arguments disagree with the immutable identity")
     args = train.restore_arguments(metrics, output, saved_args["data_root"], saved_args["device"])
+    if metrics["configuration"].get("validation_reproduction_policy") != POLICY:
+        raise ValueError("missing or changed validation reproduction policy; use a fresh run")
     if args.dataset != metrics["dataset"] or args.selection_mode != metrics["condition"]:
         raise ValueError("saved dataset/selection mode disagrees with the actual trained arguments")
     initial = _fingerprint(metrics.get("initial_state_sha256"), "initial model")
@@ -251,6 +265,7 @@ def inspect_completed(output):
         best.get("selection_role") != "primary"
         or best.get("epoch") != metrics["best_epoch"]
         or best.get("validation") != metrics["best_validation"]
+        or best.get("validation_evidence") != metrics["selected_validation_evidence"]
     ):
         raise ValueError("best checkpoint selection metadata disagrees with completed metrics")
     del best

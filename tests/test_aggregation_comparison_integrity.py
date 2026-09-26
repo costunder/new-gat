@@ -15,6 +15,14 @@ from experiments.aggregation_comparison import integrity
 from research.conductance_gat.v5.learning_budget import plan_learning_budget
 
 
+def evaluation(score):
+    return {
+        "metric": score,
+        "metric_kind": "accuracy",
+        "counts": {"correct": round(score * 10), "total": 10},
+    }
+
+
 def publish(case):
     identity = case.metrics["resume_identity"]
     identity_hash = train.base._canonical_sha256(identity)
@@ -76,6 +84,7 @@ def evidence(tmp_path):
             "processed_units": 3,
             "phase": {"phase": "joint"},
             "validation": score,
+            "validation_evidence": evaluation(score),
         }
         for epoch, score in enumerate((0.4, 0.5, 0.6, 0.7), 1)
     ]
@@ -98,6 +107,8 @@ def evidence(tmp_path):
         "best_epoch": 4,
         "best_validation": 0.7,
         "validation": 0.7,
+        "selected_validation_evidence": evaluation(0.7),
+        "validation_evidence": evaluation(0.7),
         "test_evaluated": False,
         "debug": False,
         "subset": False,
@@ -118,6 +129,7 @@ def evidence(tmp_path):
     best = {
         "epoch": 4,
         "validation": 0.7,
+        "validation_evidence": evaluation(0.7),
         "selection_role": "primary",
         "model_state": {"debug_weight": torch.tensor([0.5])},
     }
@@ -217,6 +229,7 @@ def shorten(case, scores, best_epoch):
     case.rows[:] = case.rows[: len(scores)]
     for row, value in zip(case.rows, scores, strict=True):
         row["validation"] = value
+        row["validation_evidence"] = evaluation(value)
     count, best_value = len(scores), scores[best_epoch - 1]
     case.metrics.update(
         epochs_run=count,
@@ -224,11 +237,15 @@ def shorten(case, scores, best_epoch):
         best_epoch=best_epoch,
         best_validation=best_value,
         validation=best_value,
+        selected_validation_evidence=evaluation(best_value),
+        validation_evidence=evaluation(best_value),
     )
     case.last.update(
         epoch=count, optimizer_steps=count, best_epoch=best_epoch, best_validation=best_value
     )
-    case.best.update(epoch=best_epoch, validation=best_value)
+    case.best.update(
+        epoch=best_epoch, validation=best_value, validation_evidence=evaluation(best_value)
+    )
     publish(case)
 
 
@@ -260,3 +277,18 @@ def test_resume_boolean_is_not_a_new_scientific_identity(evidence):
     before = train.serializable_arguments(evidence.args)
     evidence.args.resume = True
     assert train.serializable_arguments(evidence.args) == before
+
+
+def test_review_counterexample_selected_07_rechecked_01_is_rejected(evidence):
+    evidence.metrics["validation"] = 0.1
+    evidence.metrics["validation_evidence"] = evaluation(0.1)
+    publish(evidence)
+    with pytest.raises(ValueError, match="reproduction failed"):
+        integrity.inspect_completed(evidence.folder)
+
+
+def test_equal_ratio_with_different_validation_counts_is_rejected(evidence):
+    evidence.metrics["validation_evidence"]["counts"] = {"correct": 14, "total": 20}
+    publish(evidence)
+    with pytest.raises(ValueError, match="reproduction failed"):
+        integrity.inspect_completed(evidence.folder)

@@ -17,6 +17,7 @@ from research.conductance_gat.v5.batch_calibration import _isolated_execution_st
 
 from . import engine as train
 from .provenance import require_source_compatibility
+from .validation import POLICY, require_reproduction
 
 
 def audit(root, data_root, device, repeats):
@@ -51,7 +52,18 @@ def audit(root, data_root, device, repeats):
             for _ in range(repeats):
                 _synchronize(device)
                 started = time.perf_counter()
-                evaluations.append(train.evaluate(model, inputs, args, device))
+                evaluation = train.evaluate(model, inputs, args, device)
+                require_reproduction(
+                    metrics["selected_validation_evidence"],
+                    evaluation,
+                    label=f"audit repeat {len(evaluations) + 1}",
+                )
+                require_reproduction(
+                    metrics["validation_evidence"],
+                    evaluation,
+                    label=f"final recheck versus audit repeat {len(evaluations) + 1}",
+                )
+                evaluations.append(evaluation)
                 model.clear_auxiliary_cache()
                 _synchronize(device)
                 timings.append(time.perf_counter() - started)
@@ -73,6 +85,8 @@ def audit(root, data_root, device, repeats):
                 "repeated_validation": {
                     "count": repeats,
                     "scores": scores,
+                    "evaluations": evaluations,
+                    "reproduction_policy": POLICY,
                     "range_pp": 100 * (max(scores) - min(scores)),
                     "evaluation_seconds": timings,
                 },

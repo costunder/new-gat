@@ -1,5 +1,60 @@
 # Independent aggregation comparison
 
+## Review correction, 2026-09-26 (v2)
+
+The v2 runner now defaults to **15 conditions**: 12 incidence controls, GATv2,
+DUALFormer and its separately labelled no-skip control. Original six-condition
+v1 evidence must not be resumed or pooled with v2; use a fresh run ID. Historical
+incidence-ablation code and results are untouched.
+
+The incidence controls form a complete 3 x 4 design on the same backbone:
+
+| Energy channels | No lift | Linear lift | Pre-lift | Post-lift |
+| --- | --- | --- | --- | --- |
+| None | `incidence` | `incidence_linear_lift` | `incidence_pre_lift` | `incidence_post_lift` |
+| Diagonal only | `incidence_diagonal` | `incidence_diagonal_linear_lift` | `incidence_diagonal_pre_lift` | `incidence_diagonal_post_lift` |
+| Diagonal + cross | `incidence_energy` | `incidence_energy_linear_lift` | `incidence_energy_pre_lift` | `incidence_energy_post_lift` |
+
+Compare the last two rows to isolate cross-depth terms; compare columns to
+separate nonlinear placement from a linear channel-expansion control. Energy
+always uses the pre-lift projected value coordinates. Readouts start at zero;
+the energy branch's additional gradient to C starts only after readouts learn.
+All preceding depths and all original edges remain included.
+
+`gatv2` uses PyG's actual `GATv2Conv` in the same linear encoder/decoder wrapper,
+8 layers / 256 total channels / 8 heads (32 channels per head) for reference,
+with ReLU and feature dropout after each layer. It has separate source/target
+projections, self-loops, no residual, no FFN and no LayerNorm. Attention dropout
+is zero; feature dropout follows the common recipe. Canonical undirected edges
+are converted to both directions. This is an **operator comparison**, not a
+reproduction of a paper's independently tuned GATv2 result. GATv2 uses full
+PyG edge tensors and layer checkpointing; `edge_chunk_size` does not chunk that
+operator. Calibration must measure its actual memory before training.
+
+Reference implementations:
+[authors' GATv2 repository](https://github.com/tech-srl/how_attentive_are_gats),
+[PyG GATv2Conv](https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.GATv2Conv.html).
+The locked research environment includes torch-geometric 2.8.0.post1.
+
+The review's two blocking bugs are corrected:
+
+- Best-checkpoint reload, read-only integrity inspection and **every** audit
+  repeat require reproduction of the selected validation evidence. Accuracy
+  stores correct/total; PPI micro-F1 stores TP/FP/FN/total binary decisions.
+  Counts must match exactly; score absolute tolerance is fixed at 1e-12,
+  relative tolerance zero. The policy is part of the immutable configuration.
+  This tolerance only allows ratio/serialization arithmetic, not changed
+  predictions. Any mismatch fails before a passing result is published.
+- Local Gram and DUALFormer SGC accumulate into one output buffer with
+  `index_add_`, eliminating per-chunk out-of-place full-node copies. No graph,
+  channel, hop pair, physical batch or training-budget reduction is involved.
+
+GPU regression tests live in `tests/test_aggregation_review_cuda.py` and
+`tests/test_aggregation_comparison_cuda.py`. Metadata and mocked audit negative
+tests live in `tests/test_aggregation_validation.py` and the integrity tests.
+The review's 0.7-selected / 0.1-rechecked counterexample is explicitly rejected.
+See `docs/AGGREGATION_REVIEW_FIXES.md` for measured verification and limitations.
+
 This suite implements the follow-up to the shared research discussion. It never
 modifies `experiments/incidence_ablation` or reuses its checkpoints. Original GAT
 is deliberately not a comparator. The implemented recent external architecture
@@ -14,7 +69,7 @@ M3Dphormer (NeurIPS 2025) was inspected as another candidate but is **not implem
 in this suite**. Its cluster/global token construction and additional global-node
 supervision must be reproduced and accounted for before a valid comparison.
 
-## What is implemented
+## Original six conditions (retained within the v2 matrix above)
 
 | CLI arm | Actual computation |
 | --- | --- |
@@ -90,19 +145,19 @@ cd /home/aicompetition07/new-gat &&
   --hardware-profile portable --sampling full --edge-chunk-size 4096 --dry-run
 ```
 
-Train only after this code is available on that server:
+Train only after this code is available on that server (fresh v2 run ID):
 
 ```bash
 cd /home/aicompetition07/new-gat &&
 env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES=4 \
 /home/aicompetition07/.conda/envs/new-gat/bin/python -B -m experiments.aggregation_comparison \
-  --run-id aggregation-arxiv-reference-gpu4-seed0-v1 \
+  --run-id aggregation-arxiv-reference-gpu4-seed0-v2 \
   --datasets ogbn-arxiv --profiles reference --model-seeds 0 \
   --device cuda:0 --hardware-profile portable --sampling full \
   --edge-chunk-size 4096 --activation-checkpoint --min-free-gb 8
 ```
 
-This performs six fresh trainings, not the old eight-arm run. It uses no existing
+This performs 15 fresh trainings, not the old eight-arm run. It uses no existing
 training evidence. GPU 4 means the user's allocated physical GPU, mapped to
 visible cuda:0 as in the successful earlier initialization.
 
@@ -122,17 +177,18 @@ Five repeated evaluations measure numerical repeatability, not five model seeds.
 The local machine has an RTX 5070 Ti with 16 GB VRAM. The default `.venv` was
 incorrectly installed with CPU-only PyTorch. It has been repaired from
 2.14.0+cpu to 2.14.0+cu130, preserving its existing PyTorch release. Use this
-default CUDA environment for local model execution. The separate `.venv-gpu`
+default CUDA environment for local model execution when all dependencies are
+installed. The v2 GATv2 arm also requires PyG; the complete separate `.venv-gpu`
 also remains available with Python 3.13.2, torch 2.13.0+cu130 and the remaining
 packages pinned in `requirements-lock.txt`. Neither environment changes the
 Linux production installation profile or GPU driver.
 
 ```powershell
-.venv/Scripts/python.exe -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
-.venv/Scripts/python.exe -m pytest tests/test_aggregation_comparison_cuda.py -v
+.venv-gpu/Scripts/python.exe -c "import torch, torch_geometric; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
+.venv-gpu/Scripts/python.exe -m pytest tests/test_aggregation_comparison_cuda.py tests/test_aggregation_review_cuda.py -v
 ```
 
-The CUDA suite covers all six reference-size models (8 graph layers, width 256,
+The CUDA suite covers all 15 reference-size models (8 graph layers, width 256,
 8 heads) in FP32 and BF16. Four synthetic graphs are processed together, with
 256 total nodes and 512 undirected edges. The tests execute the actual training
 loop, backward, optimizer update, validation, checkpoint/optimizer restoration,

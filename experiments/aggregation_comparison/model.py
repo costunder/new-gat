@@ -24,10 +24,19 @@ ARMS = {
     "incidence_energy_pre_lift": ("pre_lift", True),
     "dualformer": None,
     "dualformer_no_skip_control": None,
+    "gatv2": None,
 }
+for _energy_suffix, _energy in (("", False), ("_diagonal", "diagonal"), ("_energy", True)):
+    for _lift_suffix, _lift in (
+        ("", "baseline"),
+        ("_linear_lift", "linear_lift"),
+        ("_pre_lift", "pre_lift"),
+        ("_post_lift", "post_lift"),
+    ):
+        ARMS.setdefault("incidence" + _energy_suffix + _lift_suffix, (_lift, _energy))
 
 
-def local_gram(history, edges, conductance, edge_chunk_size):
+def local_gram(history, edges, conductance, edge_chunk_size, *, diagonal_only=False):
     """N x heads x pairs, including diagonal local energies and cross terms.
 
     Each undirected edge contributes half its weighted inner product to each
@@ -35,7 +44,11 @@ def local_gram(history, edges, conductance, edge_chunk_size):
     The identity assumes a common, frozen conductance and feature coordinates.
     """
     depth, nodes, heads, _ = history.shape
-    pairs = torch.triu_indices(depth, depth, device=history.device)
+    pairs = (
+        torch.arange(depth, device=history.device).expand(2, -1)
+        if diagonal_only
+        else torch.triu_indices(depth, depth, device=history.device)
+    )
     result = history.new_zeros(nodes, heads, pairs.shape[1])
     chunk = max(1, (edge_chunk_size or max(edges.shape[1], 1)) // depth)
 
@@ -52,7 +65,10 @@ def local_gram(history, edges, conductance, edge_chunk_size):
             if torch.is_grad_enabled()
             else compute(history, ends, weight)
         )
-        result = result.index_add(0, ends[0], values).index_add(0, ends[1], values)
+        # index_add backward needs indices, not the old destination buffer.
+        # Accumulate without cloning the N x heads x pairs tensor per chunk.
+        result.index_add_(0, ends[0], values)
+        result.index_add_(0, ends[1], values)
     return result
 
 
@@ -149,8 +165,8 @@ def normalized_graph_step(x, edges, chunk, normalization=None):
     for start in range(0, edges.shape[1], chunk or max(edges.shape[1], 1)):
         ends = edges[:, start : start + (chunk or edges.shape[1])]
         weight = weights[start : start + ends.shape[1]]
-        out = out.index_add(0, ends[0], x[ends[1]] * weight[:, None])
-        out = out.index_add(0, ends[1], x[ends[0]] * weight[:, None])
+        out.index_add_(0, ends[0], x[ends[1]] * weight[:, None])
+        out.index_add_(0, ends[1], x[ends[0]] * weight[:, None])
     return out
 
 
@@ -188,8 +204,27 @@ class AggregationClassifier(nn.Module):
         self.decoder = nn.Linear(hidden_channels, classes)
         self.layers = nn.ModuleList()
         self.energy_readouts = nn.ParameterList()
+        self.diagonal_only = arm.startswith("incidence_diagonal")
         self.dual_alpha = dual_alpha
-        if arm.startswith("dualformer"):
+        if arm == "gatv2":
+            from torch_geometric.nn import GATv2Conv
+
+            if hidden_channels % heads:
+                raise ValueError("GATv2 total width must be divisible by heads")
+            self.layers.extend(
+                GATv2Conv(
+                    hidden_channels,
+                    hidden_channels // heads,
+                    heads=heads,
+                    concat=True,
+                    dropout=0.0,
+                    add_self_loops=False,  # Supplied once in the cached edge support below.
+                    share_weights=False,
+                    residual=False,
+                )
+                for _ in range(layers)
+            )
+        elif arm.startswith("dualformer"):
             self.layers.extend(
                 DualAttention(hidden_channels, heads, edge_chunk_size)
                 for _ in range(dual_sa_layers)
@@ -228,7 +263,11 @@ class AggregationClassifier(nn.Module):
                 for depth in range(1, layers + 1):
                     self.energy_readouts.append(
                         nn.Parameter(
-                            torch.zeros(heads, depth * (depth + 1) // 2, hidden_channels // heads)
+                            torch.zeros(
+                                heads,
+                                depth if self.diagonal_only else depth * (depth + 1) // 2,
+                                hidden_channels // heads,
+                            )
                         )
                     )
 
@@ -251,10 +290,29 @@ class AggregationClassifier(nn.Module):
             "dropout": self.dropout,
             "parameter_matched": False,
             "total_parameters": sum(p.numel() for p in self.parameters()),
-            "energy": "diagonal and cross-depth local Gram channels"
+            "energy": (
+                "diagonal local Gram channels"
+                if self.diagonal_only
+                else "diagonal and cross-depth local Gram channels"
+            )
             if len(self.energy_readouts)
             else None,
             "depth_states_are_distance_shells": False,
+            "lift": ARMS[self.arm][0] if self.arm.startswith("incidence") else None,
+            "energy_coordinates": "pre-lift projected values"
+            if len(self.energy_readouts)
+            else None,
+            "gatv2": {
+                "implementation": "torch_geometric.nn.GATv2Conv",
+                "head_width": self.width // self.heads,
+                "attention_dropout": 0.0,
+                "self_loops": True,
+                "share_weights": False,
+                "residual": False,
+                "edge_chunking": False,
+            }
+            if self.arm == "gatv2"
+            else None,
             "dual_upstream_commit": "68fbdaf007af2f7d409cd435c4c48dd0e3155510" if dual else None,
             "comparison_scope": "common training protocol, not published tuned score reproduction",
         }
@@ -280,6 +338,32 @@ class AggregationClassifier(nn.Module):
         else:
             graphs = graph._v5_num_graphs
         h = self.encoder(x)
+        if self.arm == "gatv2":
+            # The canonical incidence support contains each undirected edge once.
+            # Cache both directions and exactly one self-loop/node. Avoid
+            # rebuilding static graph support in every layer/epoch.
+            cached = getattr(graph, "_comparison_gatv2_edges", None)
+            signature = (edges._version, h.shape[0], h.device)
+            if cached is None or cached[0] is not edges or cached[1] != signature:
+                nonloops = edges[:, edges[0] != edges[1]]
+                nodes = torch.arange(h.shape[0], device=h.device)
+                directed = torch.cat(
+                    (nonloops, nonloops.flip(0), torch.stack((nodes, nodes))), dim=1
+                )
+                cached = (edges, signature, directed)
+                graph._comparison_gatv2_edges = cached
+            directed = cached[2]
+            for layer in self.layers:
+
+                def step(value, layer=layer):
+                    return F.dropout(F.relu(layer(value, directed)), self.dropout, self.training)
+
+                h = (
+                    checkpoint(step, h, use_reentrant=False)
+                    if self.activation_checkpoint and torch.is_grad_enabled()
+                    else step(h)
+                )
+            return self.decoder(h)
         if self.arm.startswith("dualformer"):
             h = F.dropout(F.relu(self.norms[0](h)), self.dropout, self.training)
             for index, layer in enumerate(self.layers):
@@ -336,7 +420,11 @@ class AggregationClassifier(nn.Module):
                     if correction is not None:
                         metric = metric * correction.reshape(-1, 1)
                     statistics = local_gram(
-                        projected.float(), edges, metric.float(), self.edge_chunk_size
+                        projected.float(),
+                        edges,
+                        metric.float(),
+                        self.edge_chunk_size,
+                        diagonal_only=self.diagonal_only,
                     )
                     extra = torch.einsum(
                         "nhp,hpd->nhd", statistics, self.energy_readouts[index].float()

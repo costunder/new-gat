@@ -41,7 +41,7 @@ from scripts import run_v5_mechanism_experiments as common  # noqa: E402
 from scripts import training_resource_plan as resources  # noqa: E402
 from scripts.calibration_lock import calibration_lock  # noqa: E402
 
-SUITE = "aggregation_comparison_controller_v1"
+SUITE = "aggregation_comparison_controller_v2"
 TRAIN_MODULE = "experiments.aggregation_comparison.engine"
 
 
@@ -382,6 +382,9 @@ def _read_result(job):
         raise ValueError("aggregation-comparison final optimizer-step evidence is inconsistent")
     return {
         "validation": value,
+        "validation_evidence": payload["validation_evidence"],
+        "model_contract": payload["model_contract"],
+        "total_parameters": payload["model_contract"]["total_parameters"],
         "best_epoch": best,
         "epochs_run": len(history),
         "shared_initial_state_sha256": initial,
@@ -479,12 +482,13 @@ def _summary(run_dir, manifest):
     lines = [
         "# Aggregation-comparison experiment progress",
         "",
-        "Validation only; no SOTA or multi-seed claim.",
+        "Validation only; common-recipe operator comparison, "
+        "not parameter matched or paper reproduction.",
         "",
         "Fresh models; paired encoder/decoder initialization, full splits and measured resources.",
         "",
-        "| Profile | Dataset | Seed | Arm | Training | Audit | Validation | Epoch |",
-        "| --- | --- | ---: | --- | --- | --- | ---: | ---: |",
+        "| Profile | Dataset | Seed | Arm | Training | Audit | Validation | Epoch | Parameters |",
+        "| --- | --- | ---: | --- | --- | --- | ---: | ---: | ---: |",
     ]
     for job in manifest["jobs"]:
         result, audit = job.get("result", {}), job.get("audit", {})
@@ -495,7 +499,7 @@ def _summary(run_dir, manifest):
         lines.append(
             f"| {job['profile']} | {job['dataset']} | {job['model_seed']} | "
             f"{job['variant_id']} | {job['status']} | {label} | {score} | "
-            f"{result.get('best_epoch', '')} |"
+            f"{result.get('best_epoch', '')} | {result.get('total_parameters', '')} |"
         )
     atomic_write_bytes(run_dir / "comparison.md", ("\n".join(lines) + "\n").encode())
 

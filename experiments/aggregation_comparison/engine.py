@@ -34,9 +34,10 @@ from research.conductance_gat.v5.timing import StageTimer
 
 from .model import ARMS, AggregationClassifier
 from .provenance import require_source_compatibility
+from .validation import POLICY, require_reproduction, require_score
 
 ROOT = Path(__file__).resolve().parents[2]
-SUITE = "aggregation_comparison_v1"
+SUITE = "aggregation_comparison_v2"
 
 
 def build_parser():
@@ -85,6 +86,7 @@ def configuration(args):
         **inherited,
         "edge_selection": selection_protocol.configuration(args),
         "ablation_arm": args.ablation_arm,
+        "validation_reproduction_policy": dict(POLICY),
         "comparison_contract": {
             "external_residual": False,
             "external_ffn": False,
@@ -123,8 +125,15 @@ def parameter_group(name):
 
 
 def make_optimizer(model, learning_rate=None):
+    named = list(model.named_parameters())
     return torch.optim.AdamW(
-        model.parameters(),
+        [
+            {
+                "params": [parameter for _, parameter in named],
+                "name": "backbone",
+                "parameter_names": [name for name, _ in named],
+            }
+        ],
         lr=base.COMMON["lr"] if learning_rate is None else learning_rate,
         weight_decay=base.COMMON["weight_decay"],
     )
@@ -358,6 +367,7 @@ def evaluate(model, inputs, args, device, *, observer=None):
     model.eval()
     totals = torch.zeros(6, dtype=torch.float64, device=device)
     batches = 0
+    decisions = 0
     for batch in inputs.validation_batches(device):
         with autocast(args, device):
             logits = model(batch.graph)
@@ -374,6 +384,7 @@ def evaluate(model, inputs, args, device, *, observer=None):
                 target.new_zeros(()),
                 target.new_zeros(()),
             )
+        decisions += target.numel()
         totals[:3] += torch.stack(numbers)
         totals[3] += count
         totals[4] += task.double() * count
@@ -390,7 +401,19 @@ def evaluate(model, inputs, args, device, *, observer=None):
         if inputs.indices is None
         else first / count
     )
-    return {"metric": metric, "loss": loss / count, "label_count": int(count), "batches": batches}
+    counts = (
+        {"tp": int(first), "fp": int(fp), "fn": int(fn), "total": decisions}
+        if inputs.indices is None
+        else {"correct": int(first), "total": int(count)}
+    )
+    return {
+        "metric": metric,
+        "loss": loss / count,
+        "label_count": int(count),
+        "batches": batches,
+        "metric_kind": "micro_f1" if inputs.indices is None else "accuracy",
+        "counts": counts,
+    }
 
 
 def _checkpoint_rng(device):
@@ -542,6 +565,7 @@ def train_model(payload, protocol, args, device, output):
                 "optimizer_steps": steps,
                 "validation": validation["metric"],
                 "validation_loss": validation["loss"],
+                "validation_evidence": validation,
                 "stage_seconds": timing.report(synchronize=True),
                 "elapsed_wall_seconds": time.perf_counter() - started,
                 "topology_preparation_seconds_cumulative": inputs.plan_preparation_seconds,
@@ -556,6 +580,7 @@ def train_model(payload, protocol, args, device, output):
                         "model_state": model.state_dict(),
                         "epoch": epoch,
                         "validation": best_metric,
+                        "validation_evidence": validation,
                         "selection_role": "primary",
                         "resume_identity": identity,
                         "resume_identity_sha256": identity_hash,
@@ -598,15 +623,23 @@ def train_model(payload, protocol, args, device, output):
         if selected["epoch"] != best_epoch or selected["validation"] != best_metric:
             raise ValueError("best checkpoint selection disagrees with last.pt")
         model.load_state_dict(selected["model_state"], strict=True)
+        selected_validation = selected["validation_evidence"]
+        require_score(best_metric, selected_validation["metric"], label="selected score/counts")
+        require_reproduction(
+            history[best_epoch - 1]["validation_evidence"],
+            selected_validation,
+            label="selected checkpoint versus history",
+        )
         del selected
         final_validation = evaluate(model, inputs, args, device)
+        require_reproduction(selected_validation, final_validation, label="best checkpoint reload")
         resources = monitor.finish(
             peak_allocated_bytes=int(torch.cuda.max_memory_allocated(device)),
             peak_reserved_bytes=int(torch.cuda.max_memory_reserved(device)),
         )
         finished = True
         result = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "passed",
             "research_suite": SUITE,
             "dataset": args.dataset,
@@ -628,6 +661,8 @@ def train_model(payload, protocol, args, device, output):
             "best_validation": best_metric,
             "validation": final_validation["metric"],
             "validation_loss": final_validation["loss"],
+            "selected_validation_evidence": selected_validation,
+            "validation_evidence": final_validation,
             "checkpoint_sha256": base.sha256_file(best_path),
             "last_checkpoint_sha256": base.sha256_file(last_path),
             "history_sha256": base.sha256_file(output / "history.json"),
