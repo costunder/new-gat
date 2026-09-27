@@ -1,5 +1,9 @@
 # 실험 결과와 구현 상태
 
+최신 상태는 [fused 후속 수정 기록](../docs/FUSED_REVIEW_FIXES_20260927.md)과
+ZIP의 `current_affected_regression`을 따른다. 아래 152개는 이전 커밋의 보존 기록이다.
+이번 영향 회귀는 **110 passed / 0 failed / 0 skipped**(CUDA 100, validation 제어 10).
+
 ## 최신 구현 상태: 네 검수 문서 후속 보완
 
 현재 구현 목록과 제한은 [보완 기록](../docs/REVIEW_REMEDIATION_20260927.md)을 따른다.

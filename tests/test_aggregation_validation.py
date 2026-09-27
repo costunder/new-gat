@@ -45,7 +45,12 @@ def test_audit_rejects_review_counterexample_on_any_repeat(monkeypatch, tmp_path
         "selected_validation_evidence": good,
         "validation_evidence": good,
     }
-    args = SimpleNamespace(dataset="cora", data_root=tmp_path, model_seed=0)
+    args = SimpleNamespace(
+        dataset="ogbn-arxiv",
+        data_root=tmp_path,
+        model_seed=0,
+        visibility_protocol="official_transductive",
+    )
     monkeypatch.setattr(audit.train, "inspect_completed", lambda root: metrics)
     monkeypatch.setattr(audit.train, "implementation_source_hashes", lambda: {"x": "y"})
     monkeypatch.setattr(audit.train, "restore_arguments", lambda *a: args)

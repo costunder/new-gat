@@ -1,5 +1,8 @@
 # NEW GAT 연구 프로젝트 Hand-off
 
+최신 추가 보완: [fused 연결·진단 수정](../docs/FUSED_REVIEW_FIXES_20260927.md).
+실제 caller의 shared C shape와 passive observer 검사를 추가했고 validation fixture를 복구했다.
+
 ## 최신 보완 기준
 
 [네 검수 문서 이후 구현 기록](../docs/REVIEW_REMEDIATION_20260927.md)이 아래 보존 기록보다

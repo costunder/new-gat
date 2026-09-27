@@ -16,12 +16,12 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-IMPLEMENTATION_COMMIT = "2602d90"  # Previous review base; current implementation is package HEAD.
+IMPLEMENTATION_COMMIT = "4c2d7f4"  # Previous review base; current implementation is package HEAD.
 TEXT_SUFFIXES = {".py", ".md", ".toml", ".yaml", ".yml", ".sh", ".ps1", ".json", ".txt"}
 EVIDENCE = {
-    "current_regression": ("results/revision-final-debug-20260927-01.xml", None, 0),
-    "intermediate_R0_checks": ("results/revision-r0-debug-20260927-01.xml", 45, 0),
-    "intermediate_new_paths": ("results/revision-paths-debug-20260927-02.xml", 31, 0),
+    "current_affected_regression": ("results/fused-review-after-20260927.xml", None, 0),
+    "previous_4c2d7f4_regression": ("results/revision-final-debug-20260927-01.xml", 152, 0),
+    "deliberate_before_fix_reproduction": ("results/fused-review-before-20260927.xml", 4, 3),
 }
 EXTRA_EVIDENCE = (
     "results/revision-gram-profile-20260927-02.json",
@@ -117,7 +117,9 @@ def main() -> None:
             "research_requirements_complete": False,
             "model_or_weight_downloaded": False,
             "notes": [
-                "Use current_regression count; intermediate runs overlap and must not be added.",
+                "Current affected regressions and the previous 152 checks are separate records.",
+                "CUDA before repair: 3 deliberate failures and 1 passing control.",
+                "Diagnostics and interventions now preserve the declared numerical path.",
                 "Before-fix counterexamples use synthetic evidence, not user result damage.",
                 "Model forward/backward checks used CUDA and explicit synthetic debug inputs.",
                 "CPU metadata/control checks do not constitute CPU model training.",

@@ -3911,45 +3911,28 @@ class AggregationClassifier(nn.Module):
                     )
                     # Exactly the weight used by diffusion, including correction once.
                     metric = output.effective_weight
-                    if (
-                        self.gram_implementation == "fused"
-                        and len(self.energy_readouts)
-                        and self.diagnostic_collector is None
-                        and self.energy_intervention is None
-                    ):
-                        from .gram import GramReadout
-
-                        chunk = max(
-                            1, (self.edge_chunk_size or max(edges.shape[1], 1)) // len(past)
-                        )
-                        with torch.autocast(device_type=x.device.type, enabled=False):
-                            extra = GramReadout.apply(
-                                projected.float(),
-                                metric.float(),
-                                self.energy_readouts[index].float(),
-                                edges,
-                                chunk,
-                                self.diagonal_only,
-                            )
-                        branch = F.linear(
-                            extra.to(value.dtype).flatten(1), operator.output_projection.weight
-                        )
-                        return F.dropout(F.relu(value + branch), self.dropout, self.training)
-                    statistics = local_gram(
-                        projected.float(),
-                        edges,
-                        metric.float(),
-                        self.edge_chunk_size,
-                        diagonal_only=self.diagonal_only,
-                    )
                     pairs = (
                         torch.arange(len(past), device=value.device).expand(2, -1)
                         if self.diagonal_only
                         else torch.triu_indices(len(past), len(past), device=value.device)
                     )
                     diagonal = pairs[0] == pairs[1]
+                    statistics = None
+                    if (
+                        self.gram_implementation == "reference"
+                        or self.diagnostic_collector is not None
+                    ):
+                        # Diagnostics observe a separate Gram tensor. They never choose
+                        # the numerical path used for the declared prediction branch.
+                        statistics = local_gram(
+                            projected.float(),
+                            edges,
+                            metric.float(),
+                            self.edge_chunk_size,
+                            diagonal_only=self.diagonal_only,
+                        )
                     if len(self.energy_readouts):
-                        used = statistics
+                        mask = None
                         if self.energy_intervention is not None:
                             if self.training or torch.is_grad_enabled():
                                 raise RuntimeError("energy interventions are evaluation-only")
@@ -3960,10 +3943,30 @@ class AggregationClassifier(nn.Module):
                                 if self.energy_intervention == "diagonal_off"
                                 else torch.zeros_like(diagonal)
                             )
-                            used = used * mask
-                        extra = torch.einsum(
-                            "nhp,hpd->nhd", used, self.energy_readouts[index].float()
-                        )
+                        readout = self.energy_readouts[index].float()
+                        if self.gram_implementation == "fused":
+                            from .gram import GramReadout
+
+                            # Normalize outside custom autograd so unsqueeze's backward
+                            # restores the real shared/fixed estimator's (E,) gradient.
+                            metric_2d = metric[:, None] if metric.ndim == 1 else metric
+                            if mask is not None:
+                                readout = readout * mask[None, :, None]
+                            chunk = max(
+                                1, (self.edge_chunk_size or max(edges.shape[1], 1)) // len(past)
+                            )
+                            with torch.autocast(device_type=x.device.type, enabled=False):
+                                extra = GramReadout.apply(
+                                    projected.float(),
+                                    metric_2d.float(),
+                                    readout,
+                                    edges,
+                                    chunk,
+                                    self.diagonal_only,
+                                )
+                        else:
+                            used = statistics if mask is None else statistics * mask
+                            extra = torch.einsum("nhp,hpd->nhd", used, readout)
                         branch = F.linear(
                             extra.to(value.dtype).flatten(1), operator.output_projection.weight
                         )
@@ -77109,12 +77112,12 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-IMPLEMENTATION_COMMIT = "2602d90"  # Previous review base; current implementation is package HEAD.
+IMPLEMENTATION_COMMIT = "4c2d7f4"  # Previous review base; current implementation is package HEAD.
 TEXT_SUFFIXES = {".py", ".md", ".toml", ".yaml", ".yml", ".sh", ".ps1", ".json", ".txt"}
 EVIDENCE = {
-    "current_regression": ("results/revision-final-debug-20260927-01.xml", None, 0),
-    "intermediate_R0_checks": ("results/revision-r0-debug-20260927-01.xml", 45, 0),
-    "intermediate_new_paths": ("results/revision-paths-debug-20260927-02.xml", 31, 0),
+    "current_affected_regression": ("results/fused-review-after-20260927.xml", None, 0),
+    "previous_4c2d7f4_regression": ("results/revision-final-debug-20260927-01.xml", 152, 0),
+    "deliberate_before_fix_reproduction": ("results/fused-review-before-20260927.xml", 4, 3),
 }
 EXTRA_EVIDENCE = (
     "results/revision-gram-profile-20260927-02.json",
@@ -77210,7 +77213,9 @@ def main() -> None:
             "research_requirements_complete": False,
             "model_or_weight_downloaded": False,
             "notes": [
-                "Use current_regression count; intermediate runs overlap and must not be added.",
+                "Current affected regressions and the previous 152 checks are separate records.",
+                "CUDA before repair: 3 deliberate failures and 1 passing control.",
+                "Diagnostics and interventions now preserve the declared numerical path.",
                 "Before-fix counterexamples use synthetic evidence, not user result damage.",
                 "Model forward/backward checks used CUDA and explicit synthetic debug inputs.",
                 "CPU metadata/control checks do not constitute CPU model training.",
@@ -101628,7 +101633,12 @@ def test_audit_rejects_review_counterexample_on_any_repeat(monkeypatch, tmp_path
         "selected_validation_evidence": good,
         "validation_evidence": good,
     }
-    args = SimpleNamespace(dataset="cora", data_root=tmp_path, model_seed=0)
+    args = SimpleNamespace(
+        dataset="ogbn-arxiv",
+        data_root=tmp_path,
+        model_seed=0,
+        visibility_protocol="official_transductive",
+    )
     monkeypatch.setattr(audit.train, "inspect_completed", lambda root: metrics)
     monkeypatch.setattr(audit.train, "implementation_source_hashes", lambda: {"x": "y"})
     monkeypatch.setattr(audit.train, "restore_arguments", lambda *a: args)
@@ -121351,6 +121361,131 @@ def test_compiler_errors_are_not_silently_fallback(monkeypatch):
     monkeypatch.setattr(torch, "compile", Mock(side_effect=RuntimeError("compiler missing")))
     with pytest.raises(RuntimeError, match="compiler missing"):
         configure_execution(model, argparse.Namespace(compile=True), "cuda")
+````
+
+# tests/test_fused_integration_cuda.py
+
+````python
+"""Actual model callers and passive diagnostics; explicit CUDA synthetic verification."""
+
+import copy
+
+import pytest
+import torch
+
+from experiments.aggregation_comparison import engine
+from experiments.aggregation_comparison.mechanisms import MechanismCollector
+from experiments.aggregation_comparison.model import ARMS
+from tests.test_aggregation_comparison_cuda import (  # noqa: F401
+    cuda_required,
+    reference_arguments,
+    synthetic_disjoint_batch,
+)
+
+
+def model_and_graph(arm, precision, implementation):
+    engine.base._seed(377)
+    device = torch.device("cuda:0")
+    _, graph, payload = synthetic_disjoint_batch(device)
+    args = reference_arguments(arm, precision)
+    args.edge_chunk_size = 4096
+    args.gram_implementation = implementation
+    net = engine.make_model(payload, args, device)
+    net.dropout = 0
+    with torch.no_grad():
+        for readout in net.energy_readouts:
+            readout.normal_(0, 0.015)
+    return net, graph, args, device
+
+
+@pytest.mark.parametrize("precision", ["fp32", "bf16"])
+@pytest.mark.parametrize("arm", [name for name in ARMS if name.startswith("incidence")])
+def test_all_actual_fused_callers_output_input_and_parameter_gradients(arm, precision):
+    net, graph, args, device = model_and_graph(arm, precision, "fused")
+    reference = copy.deepcopy(net)
+    reference.gram_implementation = "reference"
+    graph.x.requires_grad_()
+    with engine.autocast(args, device):
+        actual, expected = net(graph), reference(graph)
+    direction = torch.randn_like(actual)
+    ga = torch.autograd.grad(actual, (graph.x, *net.parameters()), direction)
+    gb = torch.autograd.grad(expected, (graph.x, *reference.parameters()), direction)
+    tolerance = 0.05 if precision == "bf16" else 2e-4
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+    for left, right in zip(ga, gb, strict=True):
+        assert torch.isfinite(left).all()
+        torch.testing.assert_close(left, right, rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.parametrize("implementation", ["reference", "fused"])
+@pytest.mark.parametrize("precision", ["fp32", "bf16"])
+@pytest.mark.parametrize(
+    "arm",
+    [
+        "incidence_energy_pre_lift",
+        "incidence_diagonal",
+        "incidence_shared_energy",
+        "incidence_fixed_energy",
+    ],
+)
+def test_observer_is_exactly_passive_including_interventions(
+    arm, precision, implementation, monkeypatch
+):
+    from experiments.aggregation_comparison.gram import GramReadout
+
+    calls = []
+    original_apply = GramReadout.apply
+
+    def traced(*args):
+        calls.append(args[2].detach().clone())
+        return original_apply(*args)
+
+    monkeypatch.setattr(GramReadout, "apply", traced)
+    net, graph, args, device = model_and_graph(arm, precision, implementation)
+    net.eval()
+    state = engine.base.state_sha256(net)
+    with torch.no_grad(), engine.autocast(args, device):
+        for intervention in (None, "energy_off", "cross_off", "diagonal_off"):
+            net.energy_intervention = intervention
+            net.diagnostic_collector = None
+            before_rng = torch.cuda.get_rng_state(device)
+            calls.clear()
+            expected = net(graph)
+            if implementation == "fused":
+                assert len(calls) == 8
+                for index, used_readout in enumerate(calls):
+                    pairs = (
+                        torch.arange(index + 1, device=device).expand(2, -1)
+                        if net.diagonal_only
+                        else torch.triu_indices(index + 1, index + 1, device=device)
+                    )
+                    diagonal = pairs[0] == pairs[1]
+                    mask = (
+                        torch.ones_like(diagonal)
+                        if intervention is None
+                        else diagonal
+                        if intervention == "cross_off"
+                        else ~diagonal
+                        if intervention == "diagonal_off"
+                        else torch.zeros_like(diagonal)
+                    )
+                    torch.testing.assert_close(
+                        used_readout,
+                        net.energy_readouts[index] * mask[None, :, None],
+                        rtol=0,
+                        atol=0,
+                    )
+            calls.clear()
+            net.diagnostic_collector = MechanismCollector()
+            actual = net(graph)
+            assert len(calls) == (8 if implementation == "fused" else 0)
+            # Exact logits are stronger than matching counts on this sample.
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            assert torch.equal(torch.cuda.get_rng_state(device), before_rng)
+            assert len(net.diagnostic_collector.layers) == 8
+            assert engine.base.state_sha256(net) == state
+        net.energy_intervention = None
+        net.diagnostic_collector = None
 ````
 
 # tests/test_generate_code_summary.py

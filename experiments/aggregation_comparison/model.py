@@ -540,45 +540,28 @@ class AggregationClassifier(nn.Module):
                     )
                     # Exactly the weight used by diffusion, including correction once.
                     metric = output.effective_weight
-                    if (
-                        self.gram_implementation == "fused"
-                        and len(self.energy_readouts)
-                        and self.diagnostic_collector is None
-                        and self.energy_intervention is None
-                    ):
-                        from .gram import GramReadout
-
-                        chunk = max(
-                            1, (self.edge_chunk_size or max(edges.shape[1], 1)) // len(past)
-                        )
-                        with torch.autocast(device_type=x.device.type, enabled=False):
-                            extra = GramReadout.apply(
-                                projected.float(),
-                                metric.float(),
-                                self.energy_readouts[index].float(),
-                                edges,
-                                chunk,
-                                self.diagonal_only,
-                            )
-                        branch = F.linear(
-                            extra.to(value.dtype).flatten(1), operator.output_projection.weight
-                        )
-                        return F.dropout(F.relu(value + branch), self.dropout, self.training)
-                    statistics = local_gram(
-                        projected.float(),
-                        edges,
-                        metric.float(),
-                        self.edge_chunk_size,
-                        diagonal_only=self.diagonal_only,
-                    )
                     pairs = (
                         torch.arange(len(past), device=value.device).expand(2, -1)
                         if self.diagonal_only
                         else torch.triu_indices(len(past), len(past), device=value.device)
                     )
                     diagonal = pairs[0] == pairs[1]
+                    statistics = None
+                    if (
+                        self.gram_implementation == "reference"
+                        or self.diagnostic_collector is not None
+                    ):
+                        # Diagnostics observe a separate Gram tensor. They never choose
+                        # the numerical path used for the declared prediction branch.
+                        statistics = local_gram(
+                            projected.float(),
+                            edges,
+                            metric.float(),
+                            self.edge_chunk_size,
+                            diagonal_only=self.diagonal_only,
+                        )
                     if len(self.energy_readouts):
-                        used = statistics
+                        mask = None
                         if self.energy_intervention is not None:
                             if self.training or torch.is_grad_enabled():
                                 raise RuntimeError("energy interventions are evaluation-only")
@@ -589,10 +572,30 @@ class AggregationClassifier(nn.Module):
                                 if self.energy_intervention == "diagonal_off"
                                 else torch.zeros_like(diagonal)
                             )
-                            used = used * mask
-                        extra = torch.einsum(
-                            "nhp,hpd->nhd", used, self.energy_readouts[index].float()
-                        )
+                        readout = self.energy_readouts[index].float()
+                        if self.gram_implementation == "fused":
+                            from .gram import GramReadout
+
+                            # Normalize outside custom autograd so unsqueeze's backward
+                            # restores the real shared/fixed estimator's (E,) gradient.
+                            metric_2d = metric[:, None] if metric.ndim == 1 else metric
+                            if mask is not None:
+                                readout = readout * mask[None, :, None]
+                            chunk = max(
+                                1, (self.edge_chunk_size or max(edges.shape[1], 1)) // len(past)
+                            )
+                            with torch.autocast(device_type=x.device.type, enabled=False):
+                                extra = GramReadout.apply(
+                                    projected.float(),
+                                    metric_2d.float(),
+                                    readout,
+                                    edges,
+                                    chunk,
+                                    self.diagonal_only,
+                                )
+                        else:
+                            used = statistics if mask is None else statistics * mask
+                            extra = torch.einsum("nhp,hpd->nhd", used, readout)
                         branch = F.linear(
                             extra.to(value.dtype).flatten(1), operator.output_projection.weight
                         )

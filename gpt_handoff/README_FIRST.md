@@ -1,5 +1,13 @@
 # GPT 전달용 전체 프로젝트 묶음
 
+## 최신: 4c2d7f4 재검수 후 fused 연결·진단 보완
+
+먼저 [최신 수정 기록](../docs/FUSED_REVIEW_FIXES_20260927.md)을 읽는다.
+shared/fixed-C shape, collector의 예측 경로 변경, 누락 validation fixture를 수정했다.
+현재 검사와 이전 152개 기록은 ZIP의 VERIFICATION.json에서 별도로 구분한다.
+현재 영향 회귀 110개 통과(CUDA 100, validation 제어 10). 실패·skip은 없다.
+아래 구현 설명과 과거 검증 개수를 새 소스의 실행 결과로 합산하지 않는다.
+
 ## 최신 보완 — 2026-09-27 네 문서 검수 이후
 
 **현재 기준은 [REVIEW_REMEDIATION_20260927.md](../docs/REVIEW_REMEDIATION_20260927.md)와
