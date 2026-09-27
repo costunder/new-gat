@@ -1,6 +1,8 @@
 # NEW GAT 문서 모음
 
-추가 검수 후 최신 수정: [fused caller·수동적 진단·validation 회귀](FUSED_REVIEW_FIXES_20260927.md).
+최신 수정: [energy 정밀도·실제 BF16 검사·reference 순서 재계산](ENERGY_PRECISION_REVIEW_20260927.md).
+
+이전 수정: [fused caller·수동적 진단·validation 회귀](FUSED_REVIEW_FIXES_20260927.md).
 
 최신 코드 보완과 실행 계약: [네 검수 문서 후속 구현](REVIEW_REMEDIATION_20260927.md).
 

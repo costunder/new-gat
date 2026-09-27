@@ -16,12 +16,18 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-IMPLEMENTATION_COMMIT = "4c2d7f4"  # Previous review base; current implementation is package HEAD.
+IMPLEMENTATION_COMMIT = "3eb0eb6"  # Previous review base; current implementation is package HEAD.
 TEXT_SUFFIXES = {".py", ".md", ".toml", ".yaml", ".yml", ".sh", ".ps1", ".json", ".txt"}
 EVIDENCE = {
-    "current_affected_regression": ("results/fused-review-after-20260927.xml", None, 0),
+    "current_affected_regression": ("results/energy-precision-after-20260927.xml", None, 0),
+    "previous_3eb0eb6_regression": ("results/fused-review-after-20260927.xml", 110, 0),
     "previous_4c2d7f4_regression": ("results/revision-final-debug-20260927-01.xml", 152, 0),
     "deliberate_before_fix_reproduction": ("results/fused-review-before-20260927.xml", 4, 3),
+    "before_precision_fix_cuda_bf16": ("results/energy-precision-before-actual-20260927.xml", 1, 1),
+    "invalid_bf16_fixture_fp32_control": ("results/energy-precision-before-20260927.xml", 1, 0),
+    "dtype_only_repair_ordering_failures": (
+        "results/energy-precision-focused-20260927.xml", 112, 20
+    ),
 }
 EXTRA_EVIDENCE = (
     "results/revision-gram-profile-20260927-02.json",
@@ -117,7 +123,13 @@ def main() -> None:
             "research_requirements_complete": False,
             "model_or_weight_downloaded": False,
             "notes": [
-                "Current affected regressions and the previous 152 checks are separate records.",
+                "Current affected regressions and previous 110/152 checks are separate records.",
+                "Previous model BF16 fixture ran FP32; historical labels are not BF16 evidence.",
+                "Current CUDA fixture asserts actual AMP state after hardware argument resolution.",
+                "Energy readout reference/fused uses explicit FP32 with autocast disabled (v1).",
+                "Fused v2 preserves reference contraction order and recomputes Gram in backward.",
+                "Transient node Gram is allocated; no current speed/peak-memory benefit claimed.",
+                "Precision policy/source identity changed: new run ID; old results preserved.",
                 "CUDA before repair: 3 deliberate failures and 1 passing control.",
                 "Diagnostics and interventions now preserve the declared numerical path.",
                 "Before-fix counterexamples use synthetic evidence, not user result damage.",
@@ -135,7 +147,7 @@ def main() -> None:
     entries["REVIEW_FIRST.md"] = (
         "# Current GPT review package — 2026-09-27\n\n"
         f"Package and implementation commit: `{commit}`.\n\n"
-        "Start with docs/REVIEW_REMEDIATION_20260927.md and gpt_handoff/README_FIRST.md.\n"
+        "Start with docs/ENERGY_PRECISION_REVIEW_20260927.md and gpt_handoff/README_FIRST.md.\n"
         "Then read docs/FOUR_DOCUMENT_REVIEW_20260927.md (before-fix review),\n"
         "VERIFICATION.json, and actual source. Older sections retain historical context only.\n"
         "Current benchmark: ogbn-arxiv, 21 conditions including GCN, GraphSAGE and GATv2.\n"

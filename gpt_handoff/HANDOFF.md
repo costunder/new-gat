@@ -1,6 +1,12 @@
 # NEW GAT 연구 프로젝트 Hand-off
 
-최신 추가 보완: [fused 연결·진단 수정](../docs/FUSED_REVIEW_FIXES_20260927.md).
+현재 기준: [energy 정밀도·BF16 검증 정정](../docs/ENERGY_PRECISION_REVIEW_20260927.md).
+readout FP32 통일과 reference 순서 재계산을 구현하고, 기존 helper가 BF16을 FP32로
+덮어쓰던 검사 오류를 수정했다. 과거 BF16 모델 검사 표시는 정정 대상이다.
+현재 fused는 transient Gram을 생성한다. 최신 증거는 ZIP의 current_affected_regression이다.
+최종 회귀 230개 통과(CUDA 220, 제어 10), 실패·오류·skip 0. 실제 데이터 본실험은 미실행이다.
+
+이전 추가 보완: [fused 연결·진단 수정](../docs/FUSED_REVIEW_FIXES_20260927.md).
 실제 caller의 shared C shape와 passive observer 검사를 추가했고 validation fixture를 복구했다.
 
 ## 최신 보완 기준

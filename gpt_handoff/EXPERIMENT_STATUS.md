@@ -1,6 +1,13 @@
 # 실험 결과와 구현 상태
 
-최신 상태는 [fused 후속 수정 기록](../docs/FUSED_REVIEW_FIXES_20260927.md)과
+현재 상태는 [energy 정밀도 후속 검수](../docs/ENERGY_PRECISION_REVIEW_20260927.md)와
+ZIP의 `current_affected_regression`을 따른다. 실제 BF16을 검증하도록 helper를 고쳤으며,
+과거 helper 기반 BF16 모델 검사는 FP32 실행이었다. 110/152개 XML은 과거 기록이다.
+정밀도만 맞춘 중간 실행의 20개 실패도 보존했다. 현재 fused는 reference 순서를 유지하며
+Gram을 backward에서 재계산한다. 실제 arxiv 본학습·평가와 MIG 측정은 여전히 미실행이다.
+현재 영향 회귀는 **230 passed / 0 failed / 0 errors / 0 skipped**(CUDA 220, 제어 10)이다.
+
+이전 상태는 [fused 후속 수정 기록](../docs/FUSED_REVIEW_FIXES_20260927.md)과
 ZIP의 `current_affected_regression`을 따른다. 아래 152개는 이전 커밋의 보존 기록이다.
 이번 영향 회귀는 **110 passed / 0 failed / 0 skipped**(CUDA 100, validation 제어 10).
 

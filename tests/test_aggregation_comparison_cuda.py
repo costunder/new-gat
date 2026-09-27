@@ -88,8 +88,14 @@ def reference_arguments(arm, precision):
     )
     job = runner.make_jobs(options, Path("results/debug-cuda-smoke"))[0]
     args = engine.build_parser().parse_args(job["command"][job["command"].index("-m") + 2 :])
-    args.precision = precision
     engine.validate_args(args)
+    # Validation resolves portable hardware to FP32. This explicit synthetic
+    # precision matrix overrides it AFTER validation; it is not a production
+    # hardware profile or evidence that the A6000/MIG allocation fits.
+    args.precision = precision
+    with engine.autocast(args, torch.device("cuda:0")):
+        assert torch.is_autocast_enabled("cuda") == (precision == "bf16")
+        assert torch.get_autocast_dtype("cuda") == torch.bfloat16
     assert (args.layers, args.hidden_channels, args.heads) == (8, 256, 8)
     return args
 

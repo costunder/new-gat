@@ -33,7 +33,13 @@ from research.conductance_gat.v5.learning_budget import should_stop_learning_bud
 from research.conductance_gat.v5.timing import StageTimer
 
 from .evidence import origin, require_approval
-from .model import ARMS, AggregationClassifier, conductance_contract
+from .model import (
+    ARMS,
+    ENERGY_READOUT_PRECISION_POLICY,
+    GRAM_READOUT_EXECUTION_POLICIES,
+    AggregationClassifier,
+    conductance_contract,
+)
 from .provenance import require_source_compatibility
 from .validation import POLICY, require_reproduction, require_score
 
@@ -144,6 +150,7 @@ def configuration(args):
         "complete_supervised_passes": args.complete_supervised_passes,
         "learning_budget_policy": args.learning_budget_policy,
         "gram_implementation": args.gram_implementation,
+        "gram_readout_execution_policy": GRAM_READOUT_EXECUTION_POLICIES[args.gram_implementation],
         "visibility_protocol": args.visibility_protocol,
         "sampled_local_baselines": args.sampled_local_baselines,
         "sampled_baseline_semantics": (
@@ -151,6 +158,7 @@ def configuration(args):
         ),
         "validation_reproduction_policy": dict(POLICY),
         "comparison_contract": {
+            "energy_readout_precision_policy": ENERGY_READOUT_PRECISION_POLICY,
             "external_residual": False,
             "external_ffn": False,
             "normalization": "intrinsic DUALFormer LayerNorm only",

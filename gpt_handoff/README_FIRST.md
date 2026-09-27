@@ -1,6 +1,16 @@
 # GPT 전달용 전체 프로젝트 묶음
 
-## 최신: 4c2d7f4 재검수 후 fused 연결·진단 보완
+## 현재 기준: 3eb0eb6 이후 정밀도 및 검증 보완
+
+먼저 [energy 정밀도 후속 검수](../docs/ENERGY_PRECISION_REVIEW_20260927.md)를 읽는다.
+reference/fused readout은 명시적 FP32이고 fused는 reference 순서로 Gram을 재계산한다.
+기존 BF16 모델 테스트 helper가 FP32로 덮어써지던 문제를 수정했다. 아래의 과거 BF16
+표시는 실제 BF16 실행 증거로 인정하지 않는다. 최신 실행 개수는 VERIFICATION.json의
+`current_affected_regression`만 따른다. 이전 110/152개와 중간 실패 기록을 합산하지 않는다.
+새 정밀도/실행 정책 및 소스 identity 때문에 새 run ID가 필요하다. 실제 arxiv/MIG는 미실행이다.
+최종 영향 회귀는 **230 passed, 실패·오류·skip 0**(CUDA 220, 제어 10)이다.
+
+## 이전 기록: 4c2d7f4 재검수 후 fused 연결·진단 보완
 
 먼저 [최신 수정 기록](../docs/FUSED_REVIEW_FIXES_20260927.md)을 읽는다.
 shared/fixed-C shape, collector의 예측 경로 변경, 누락 validation fixture를 수정했다.

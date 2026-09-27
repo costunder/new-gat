@@ -1,5 +1,9 @@
 # 네 검수 문서 이후 실제 보완 사항
 
+**최신 [energy 정밀도 검수](ENERGY_PRECISION_REVIEW_20260927.md)가 우선한다.
+기존 모델 BF16 테스트 helper가 FP32로 덮어쓴 문제를 정정했다. 현재 optional fused는
+노드 Gram을 일시 생성하고 backward에서 재계산하므로 아래 R2의 생성 생략 설명은 과거 구현이다.**
+
 **이 문서의 152개 검증 기록은 `4c2d7f4` 시점이다. 이후 확인된 fused shape/진단 오류와
 최신 수정·검증은 [FUSED_REVIEW_FIXES_20260927.md](FUSED_REVIEW_FIXES_20260927.md)를 따른다.**
 

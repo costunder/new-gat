@@ -1407,7 +1407,13 @@ from research.conductance_gat.v5.learning_budget import should_stop_learning_bud
 from research.conductance_gat.v5.timing import StageTimer
 
 from .evidence import origin, require_approval
-from .model import ARMS, AggregationClassifier, conductance_contract
+from .model import (
+    ARMS,
+    ENERGY_READOUT_PRECISION_POLICY,
+    GRAM_READOUT_EXECUTION_POLICIES,
+    AggregationClassifier,
+    conductance_contract,
+)
 from .provenance import require_source_compatibility
 from .validation import POLICY, require_reproduction, require_score
 
@@ -1518,6 +1524,7 @@ def configuration(args):
         "complete_supervised_passes": args.complete_supervised_passes,
         "learning_budget_policy": args.learning_budget_policy,
         "gram_implementation": args.gram_implementation,
+        "gram_readout_execution_policy": GRAM_READOUT_EXECUTION_POLICIES[args.gram_implementation],
         "visibility_protocol": args.visibility_protocol,
         "sampled_local_baselines": args.sampled_local_baselines,
         "sampled_baseline_semantics": (
@@ -1525,6 +1532,7 @@ def configuration(args):
         ),
         "validation_reproduction_policy": dict(POLICY),
         "comparison_contract": {
+            "energy_readout_precision_policy": ENERGY_READOUT_PRECISION_POLICY,
             "external_residual": False,
             "external_ffn": False,
             "normalization": "intrinsic DUALFormer LayerNorm only",
@@ -2836,61 +2844,47 @@ class LocalGram(torch.autograd.Function):
 
 
 class GramReadout(torch.autograd.Function):
-    """Exact contraction without allocating node x head x pair statistics.
+    """Reference-order readout with Gram recomputation in first-order backward.
 
-    Uses the same already-projected history (including AMP rounding) as LocalGram.
-    Higher derivatives are deliberately unsupported, as in LocalGram.
+    The historical edge-first contraction reordered FP32 sums before downstream
+    BF16 rounding. Matching dtype alone did not match deep-model gradients.
+    Keep the node-Gram-then-readout order exactly. A transient N x H x P Gram
+    is allocated, but not saved across forward/backward; backward recomputes it.
+    This is an explicit memory/recomputation policy, not a speedup claim.
     """
 
     @staticmethod
     def forward(ctx, history, c, readout, edges, chunk, diagonal_only):
-        depth, nodes, heads, _ = history.shape
-        pairs = (
-            torch.arange(depth, device=history.device).expand(2, -1)
-            if diagonal_only
-            else torch.triu_indices(depth, depth, device=history.device)
-        )
-        out = history.new_zeros(nodes, heads, readout.shape[-1])
-        for start in range(0, edges.shape[1], chunk):
-            ends = edges[:, start : start + chunk]
-            delta = history[:, ends[1]] - history[:, ends[0]]
-            product = (delta[pairs[0]] * delta[pairs[1]]).sum(-1).permute(1, 2, 0)
-            value = torch.einsum("ehp,hpd->ehd", product, readout)
-            value = value * c[start : start + chunk, :, None] / 2
-            out.index_add_(0, ends[0], value)
-            out.index_add_(0, ends[1], value)
-        ctx.save_for_backward(history, c, readout, edges, pairs)
-        ctx.chunk = chunk
+        with torch.autocast(device_type=history.device.type, enabled=False):
+            statistics = LocalGram.apply(history, c, edges, chunk, diagonal_only)
+            out = torch.einsum("nhp,hpd->nhd", statistics, readout)
+        ctx.save_for_backward(history, c, readout, edges)
+        ctx.chunk, ctx.diagonal_only = chunk, diagonal_only
         return out
 
     @staticmethod
     @once_differentiable
     def backward(ctx, gradient):
-        history, c, readout, edges, pairs = ctx.saved_tensors
-        dh = torch.zeros_like(history) if ctx.needs_input_grad[0] else None
-        dc = torch.zeros_like(c) if ctx.needs_input_grad[1] else None
-        dr = torch.zeros_like(readout) if ctx.needs_input_grad[2] else None
-        for start in range(0, edges.shape[1], ctx.chunk):
-            ends = edges[:, start : start + ctx.chunk]
-            delta = history[:, ends[1]] - history[:, ends[0]]
-            product = (delta[pairs[0]] * delta[pairs[1]]).sum(-1).permute(1, 2, 0)
-            upstream = (gradient[ends[0]] + gradient[ends[1]]) / 2
-            weight = c[start : start + ends.shape[1], :, None]
-            if dr is not None:
-                dr.add_(torch.einsum("ehp,ehd->hpd", product * weight, upstream))
-            pair_gradient = torch.einsum("ehd,hpd->ehp", upstream, readout)
-            if dc is not None:
-                value = (pair_gradient * product).sum(-1)
-                if c.shape[1] == 1:
-                    value = value.sum(1, keepdim=True)
-                dc[start : start + ends.shape[1]].copy_(value)
-            if dh is not None:
-                pair_gradient = (pair_gradient * weight).permute(2, 0, 1)[..., None]
-                local = torch.zeros_like(delta)
-                local.index_add_(0, pairs[0], pair_gradient * delta[pairs[1]])
-                local.index_add_(0, pairs[1], pair_gradient * delta[pairs[0]])
-                dh.index_add_(1, ends[0], -local)
-                dh.index_add_(1, ends[1], local)
+        history, c, readout, edges = ctx.saved_tensors
+        needs = ctx.needs_input_grad[:3]
+        # Reuse reference autograd order in backward too. LocalGram allocates
+        # each history/C gradient buffer once; no Gram survives from forward.
+        values = [
+            value.detach().requires_grad_(needed)
+            for value, needed in zip((history, c, readout), needs, strict=True)
+        ]
+        with torch.enable_grad(), torch.autocast(device_type=history.device.type, enabled=False):
+            statistics = LocalGram.apply(values[0], values[1], edges, ctx.chunk, ctx.diagonal_only)
+            out = torch.einsum("nhp,hpd->nhd", statistics, values[2])
+            gradients = iter(
+                torch.autograd.grad(
+                    out,
+                    [value for value, needed in zip(values, needs, strict=True) if needed],
+                    gradient,
+                    create_graph=False,
+                )
+            )
+        dh, dc, dr = (next(gradients) if needed else None for needed in needs)
         return dh, dc, dr, None, None, None
 ````
 
@@ -3393,6 +3387,12 @@ from research.conductance_gat.v5.model import (
     _static_graph_context,
 )
 
+ENERGY_READOUT_PRECISION_POLICY = "fp32_autocast_disabled_v1"
+GRAM_READOUT_EXECUTION_POLICIES = {
+    "reference": "materialized_gram_autograd_v1",
+    "fused": "reference_order_gram_recompute_v2",
+}
+
 ARMS = {
     "incidence": ("baseline", False),
     "incidence_pre_lift": ("pre_lift", False),
@@ -3719,6 +3719,14 @@ class AggregationClassifier(nn.Module):
             "energy_coordinates": "pre-lift projected values"
             if len(self.energy_readouts)
             else None,
+            "energy_readout_precision_policy": ENERGY_READOUT_PRECISION_POLICY
+            if len(self.energy_readouts)
+            else None,
+            "gram_readout_execution_policy": GRAM_READOUT_EXECUTION_POLICIES[
+                self.gram_implementation
+            ]
+            if len(self.energy_readouts)
+            else None,
             "gatv2": {
                 "implementation": "torch_geometric.nn.GATv2Conv",
                 "head_width": self.width // self.heads,
@@ -3966,7 +3974,10 @@ class AggregationClassifier(nn.Module):
                                 )
                         else:
                             used = statistics if mask is None else statistics * mask
-                            extra = torch.einsum("nhp,hpd->nhd", used, readout)
+                            # FP32 inputs alone do not prevent AMP from casting
+                            # einsum to BF16. Match the fused readout contract.
+                            with torch.autocast(device_type=x.device.type, enabled=False):
+                                extra = torch.einsum("nhp,hpd->nhd", used.float(), readout.float())
                         branch = F.linear(
                             extra.to(value.dtype).flatten(1), operator.output_projection.weight
                         )
@@ -77112,12 +77123,18 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-IMPLEMENTATION_COMMIT = "4c2d7f4"  # Previous review base; current implementation is package HEAD.
+IMPLEMENTATION_COMMIT = "3eb0eb6"  # Previous review base; current implementation is package HEAD.
 TEXT_SUFFIXES = {".py", ".md", ".toml", ".yaml", ".yml", ".sh", ".ps1", ".json", ".txt"}
 EVIDENCE = {
-    "current_affected_regression": ("results/fused-review-after-20260927.xml", None, 0),
+    "current_affected_regression": ("results/energy-precision-after-20260927.xml", None, 0),
+    "previous_3eb0eb6_regression": ("results/fused-review-after-20260927.xml", 110, 0),
     "previous_4c2d7f4_regression": ("results/revision-final-debug-20260927-01.xml", 152, 0),
     "deliberate_before_fix_reproduction": ("results/fused-review-before-20260927.xml", 4, 3),
+    "before_precision_fix_cuda_bf16": ("results/energy-precision-before-actual-20260927.xml", 1, 1),
+    "invalid_bf16_fixture_fp32_control": ("results/energy-precision-before-20260927.xml", 1, 0),
+    "dtype_only_repair_ordering_failures": (
+        "results/energy-precision-focused-20260927.xml", 112, 20
+    ),
 }
 EXTRA_EVIDENCE = (
     "results/revision-gram-profile-20260927-02.json",
@@ -77213,7 +77230,13 @@ def main() -> None:
             "research_requirements_complete": False,
             "model_or_weight_downloaded": False,
             "notes": [
-                "Current affected regressions and the previous 152 checks are separate records.",
+                "Current affected regressions and previous 110/152 checks are separate records.",
+                "Previous model BF16 fixture ran FP32; historical labels are not BF16 evidence.",
+                "Current CUDA fixture asserts actual AMP state after hardware argument resolution.",
+                "Energy readout reference/fused uses explicit FP32 with autocast disabled (v1).",
+                "Fused v2 preserves reference contraction order and recomputes Gram in backward.",
+                "Transient node Gram is allocated; no current speed/peak-memory benefit claimed.",
+                "Precision policy/source identity changed: new run ID; old results preserved.",
                 "CUDA before repair: 3 deliberate failures and 1 passing control.",
                 "Diagnostics and interventions now preserve the declared numerical path.",
                 "Before-fix counterexamples use synthetic evidence, not user result damage.",
@@ -77231,7 +77254,7 @@ def main() -> None:
     entries["REVIEW_FIRST.md"] = (
         "# Current GPT review package — 2026-09-27\n\n"
         f"Package and implementation commit: `{commit}`.\n\n"
-        "Start with docs/REVIEW_REMEDIATION_20260927.md and gpt_handoff/README_FIRST.md.\n"
+        "Start with docs/ENERGY_PRECISION_REVIEW_20260927.md and gpt_handoff/README_FIRST.md.\n"
         "Then read docs/FOUR_DOCUMENT_REVIEW_20260927.md (before-fix review),\n"
         "VERIFICATION.json, and actual source. Older sections retain historical context only.\n"
         "Current benchmark: ogbn-arxiv, 21 conditions including GCN, GraphSAGE and GATv2.\n"
@@ -100337,8 +100360,14 @@ def reference_arguments(arm, precision):
     )
     job = runner.make_jobs(options, Path("results/debug-cuda-smoke"))[0]
     args = engine.build_parser().parse_args(job["command"][job["command"].index("-m") + 2 :])
-    args.precision = precision
     engine.validate_args(args)
+    # Validation resolves portable hardware to FP32. This explicit synthetic
+    # precision matrix overrides it AFTER validation; it is not a production
+    # hardware profile or evidence that the A6000/MIG allocation fits.
+    args.precision = precision
+    with engine.autocast(args, torch.device("cuda:0")):
+        assert torch.is_autocast_enabled("cuda") == (precision == "bf16")
+        assert torch.get_autocast_dtype("cuda") == torch.bfloat16
     assert (args.layers, args.hidden_channels, args.heads) == (8, 256, 8)
     return args
 
@@ -121077,6 +121106,163 @@ def test_first_launch_and_resume_share_identity_but_recipe_change_still_fails(
         train.validate_identity(saved, changed_identity)
 ````
 
+# tests/test_energy_precision_cuda.py
+
+````python
+"""CUDA-only synthetic checks of the actual energy caller's precision contract."""
+
+import copy
+
+import pytest
+import torch
+
+from experiments.aggregation_comparison import engine
+from experiments.aggregation_comparison.gram import GramReadout
+from tests.test_aggregation_comparison_cuda import cuda_required  # noqa: F401
+from tests.test_fused_integration_cuda import model_and_graph
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+@pytest.mark.parametrize("precision", ["fp32", "bf16"])
+@pytest.mark.parametrize("implementation", ["reference", "fused"])
+@pytest.mark.parametrize(
+    "arm",
+    [
+        "incidence_shared_energy",
+        "incidence_fixed_energy",
+        "incidence_diagonal",
+        "incidence_energy_pre_lift",
+    ],
+)
+def test_actual_energy_readout_stays_fp32_through_backward(
+    arm, implementation, precision, checkpoint, monkeypatch, record_property
+):
+    net, graph, args, device = model_and_graph(arm, precision, implementation)
+    assert net.contract()["energy_readout_precision_policy"] == "fp32_autocast_disabled_v1"
+    assert (
+        engine.configuration(args)["comparison_contract"]["energy_readout_precision_policy"]
+        == "fp32_autocast_disabled_v1"
+    )
+    net.activation_checkpoint = checkpoint
+    calls = []
+    original_einsum, original_apply = torch.einsum, GramReadout.apply
+
+    def check(operation, *operands):
+        assert not torch.is_autocast_enabled("cuda"), "energy readout must disable AMP"
+        assert all(value.dtype == torch.float32 for value in operands[:3])
+        result = operation(*operands)
+        assert result.dtype == torch.float32
+        calls.append(result.dtype)
+        return result
+
+    def traced_einsum(equation, *operands, **kwargs):
+        if equation == "nhp,hpd->nhd" and implementation == "reference":
+            return check(lambda *values: original_einsum(equation, *values, **kwargs), *operands)
+        return original_einsum(equation, *operands, **kwargs)
+
+    monkeypatch.setattr(torch, "einsum", traced_einsum)
+    monkeypatch.setattr(GramReadout, "apply", lambda *values: check(original_apply, *values))
+    graph.x.requires_grad_()
+    with engine.autocast(args, device):
+        output = net(graph)
+        loss = output.float().square().mean()
+    forward_calls = len(calls)
+    assert forward_calls == net.depth == 8
+    loss.backward()
+    assert len(calls) >= forward_calls
+    for name, parameter in net.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+    assert torch.isfinite(graph.x.grad).all()
+    record_property("readout_dtype", "float32")
+    record_property("forward_readout_calls", forward_calls)
+    record_property("checkpoint", checkpoint)
+
+
+@pytest.mark.parametrize("precision", ["fp32", "bf16"])
+@pytest.mark.parametrize("implementation", ["reference", "fused"])
+def test_checkpoint_preserves_near_zero_relu_and_gradients(
+    precision, implementation, monkeypatch, record_property
+):
+    net, graph, args, device = model_and_graph(
+        "incidence_energy_pre_lift", precision, implementation
+    )
+    net.activation_checkpoint = False
+    recomputed = copy.deepcopy(net)
+    recomputed.activation_checkpoint = True
+    original_relu = torch.nn.functional.relu
+    activations = []
+
+    def trace(value, *args, **kwargs):
+        if value.shape == (256, 256):
+            activations.append(value.detach().clone())
+        return original_relu(value, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "relu", trace)
+    graph.x.requires_grad_()
+    with engine.autocast(args, device):
+        expected = net(graph)
+        ordinary_activations = activations[:]
+        activations.clear()
+        actual = recomputed(graph)
+    assert len(ordinary_activations) == len(activations) == 8
+    for left, right in zip(ordinary_activations, activations, strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    values = torch.stack(ordinary_activations).float()
+    # Exercise both ReLU regions and actual states close to its kink, rather
+    # than accepting a checkpoint comparison with an inactive energy/lift.
+    nearby = (values.abs() < 1e-3) & (values != 0)
+    assert nearby.any() and (values[nearby] > 0).any() and (values[nearby] < 0).any()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    direction = torch.randn_like(actual)
+    ga = torch.autograd.grad(actual, (graph.x, *recomputed.parameters()), direction)
+    gb = torch.autograd.grad(expected, (graph.x, *net.parameters()), direction)
+    for left, right in zip(ga, gb, strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    record_property("nonzero_relu_inputs_within_1e-3", nearby.sum().item())
+    record_property("minimum_absolute_relu_input", values.abs().min().item())
+
+
+@pytest.mark.parametrize(
+    "needs",
+    [
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+        (True, True, False),
+        (True, False, True),
+        (False, True, True),
+        (True, True, True),
+    ],
+)
+def test_recomputed_readout_saves_inputs_and_supports_partial_gradients(needs):
+    from experiments.aggregation_comparison.gram import LocalGram
+
+    torch.manual_seed(91)
+    values = [
+        torch.randn(3, 13, 2, 4, device="cuda"),
+        torch.rand(14, 1, device="cuda"),
+        torch.randn(2, 6, 4, device="cuda"),
+    ]
+    for value, needed in zip(values, needs, strict=True):
+        value.requires_grad_(needed)
+    edges = torch.randint(0, 13, (2, 14), device="cuda")
+    actual = GramReadout.apply(*values, edges, 3, False)
+    saved = actual.grad_fn.saved_tensors
+    assert len(saved) == 4
+    assert all(a.data_ptr() == b.data_ptr() for a, b in zip(saved, [*values, edges], strict=True))
+    expected = torch.einsum(
+        "nhp,hpd->nhd", LocalGram.apply(values[0], values[1], edges, 3, False), values[2]
+    )
+    inputs = [v for v, needed in zip(values, needs, strict=True) if needed]
+    direction = torch.randn_like(actual)
+    ga = torch.autograd.grad(actual, inputs, direction)
+    gb = torch.autograd.grad(expected, inputs, direction)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for left, right in zip(ga, gb, strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+````
+
 # tests/test_execution_optimization.py
 
 ````python
@@ -121395,13 +121581,20 @@ def model_and_graph(arm, precision, implementation):
     with torch.no_grad():
         for readout in net.energy_readouts:
             readout.normal_(0, 0.015)
+        for layer in net.layers:
+            if getattr(layer, "lift_projection", None) is not None:
+                layer.lift_projection.add_(torch.randn_like(layer.lift_projection) * 0.01)
     return net, graph, args, device
 
 
 @pytest.mark.parametrize("precision", ["fp32", "bf16"])
+@pytest.mark.parametrize("checkpoint", [False, True])
 @pytest.mark.parametrize("arm", [name for name in ARMS if name.startswith("incidence")])
-def test_all_actual_fused_callers_output_input_and_parameter_gradients(arm, precision):
+def test_all_actual_fused_callers_output_input_and_parameter_gradients(
+    arm, precision, checkpoint, record_property
+):
     net, graph, args, device = model_and_graph(arm, precision, "fused")
+    net.activation_checkpoint = checkpoint
     reference = copy.deepcopy(net)
     reference.gram_implementation = "reference"
     graph.x.requires_grad_()
@@ -121415,6 +121608,17 @@ def test_all_actual_fused_callers_output_input_and_parameter_gradients(arm, prec
     for left, right in zip(ga, gb, strict=True):
         assert torch.isfinite(left).all()
         torch.testing.assert_close(left, right, rtol=tolerance, atol=tolerance)
+    energy_errors = [
+        ((left - right).norm() / right.norm().clamp_min(1e-12)).detach()
+        for (name, _), left, right in zip(net.named_parameters(), ga[1:], gb[1:], strict=True)
+        if name.startswith("energy_readouts.")
+    ]
+    maximum = torch.stack(energy_errors).max().item() if energy_errors else 0.0
+    # Absolute .05 alone can conceal a substantial relative readout-gradient
+    # error. This separately rejects the review's 14% relative-error example.
+    assert maximum < (0.02 if precision == "bf16" else 5e-4), maximum
+    record_property("max_energy_gradient_relative_l2", maximum)
+    record_property("actual_amp_enabled", precision == "bf16")
 
 
 @pytest.mark.parametrize("implementation", ["reference", "fused"])

@@ -22,6 +22,12 @@ from research.conductance_gat.v5.model import (
     _static_graph_context,
 )
 
+ENERGY_READOUT_PRECISION_POLICY = "fp32_autocast_disabled_v1"
+GRAM_READOUT_EXECUTION_POLICIES = {
+    "reference": "materialized_gram_autograd_v1",
+    "fused": "reference_order_gram_recompute_v2",
+}
+
 ARMS = {
     "incidence": ("baseline", False),
     "incidence_pre_lift": ("pre_lift", False),
@@ -348,6 +354,14 @@ class AggregationClassifier(nn.Module):
             "energy_coordinates": "pre-lift projected values"
             if len(self.energy_readouts)
             else None,
+            "energy_readout_precision_policy": ENERGY_READOUT_PRECISION_POLICY
+            if len(self.energy_readouts)
+            else None,
+            "gram_readout_execution_policy": GRAM_READOUT_EXECUTION_POLICIES[
+                self.gram_implementation
+            ]
+            if len(self.energy_readouts)
+            else None,
             "gatv2": {
                 "implementation": "torch_geometric.nn.GATv2Conv",
                 "head_width": self.width // self.heads,
@@ -595,7 +609,10 @@ class AggregationClassifier(nn.Module):
                                 )
                         else:
                             used = statistics if mask is None else statistics * mask
-                            extra = torch.einsum("nhp,hpd->nhd", used, readout)
+                            # FP32 inputs alone do not prevent AMP from casting
+                            # einsum to BF16. Match the fused readout contract.
+                            with torch.autocast(device_type=x.device.type, enabled=False):
+                                extra = torch.einsum("nhp,hpd->nhd", used.float(), readout.float())
                         branch = F.linear(
                             extra.to(value.dtype).flatten(1), operator.output_projection.weight
                         )

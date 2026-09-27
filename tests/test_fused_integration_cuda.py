@@ -27,13 +27,20 @@ def model_and_graph(arm, precision, implementation):
     with torch.no_grad():
         for readout in net.energy_readouts:
             readout.normal_(0, 0.015)
+        for layer in net.layers:
+            if getattr(layer, "lift_projection", None) is not None:
+                layer.lift_projection.add_(torch.randn_like(layer.lift_projection) * 0.01)
     return net, graph, args, device
 
 
 @pytest.mark.parametrize("precision", ["fp32", "bf16"])
+@pytest.mark.parametrize("checkpoint", [False, True])
 @pytest.mark.parametrize("arm", [name for name in ARMS if name.startswith("incidence")])
-def test_all_actual_fused_callers_output_input_and_parameter_gradients(arm, precision):
+def test_all_actual_fused_callers_output_input_and_parameter_gradients(
+    arm, precision, checkpoint, record_property
+):
     net, graph, args, device = model_and_graph(arm, precision, "fused")
+    net.activation_checkpoint = checkpoint
     reference = copy.deepcopy(net)
     reference.gram_implementation = "reference"
     graph.x.requires_grad_()
@@ -47,6 +54,17 @@ def test_all_actual_fused_callers_output_input_and_parameter_gradients(arm, prec
     for left, right in zip(ga, gb, strict=True):
         assert torch.isfinite(left).all()
         torch.testing.assert_close(left, right, rtol=tolerance, atol=tolerance)
+    energy_errors = [
+        ((left - right).norm() / right.norm().clamp_min(1e-12)).detach()
+        for (name, _), left, right in zip(net.named_parameters(), ga[1:], gb[1:], strict=True)
+        if name.startswith("energy_readouts.")
+    ]
+    maximum = torch.stack(energy_errors).max().item() if energy_errors else 0.0
+    # Absolute .05 alone can conceal a substantial relative readout-gradient
+    # error. This separately rejects the review's 14% relative-error example.
+    assert maximum < (0.02 if precision == "bf16" else 5e-4), maximum
+    record_property("max_energy_gradient_relative_l2", maximum)
+    record_property("actual_amp_enabled", precision == "bf16")
 
 
 @pytest.mark.parametrize("implementation", ["reference", "fused"])
