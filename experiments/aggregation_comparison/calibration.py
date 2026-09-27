@@ -141,8 +141,43 @@ def _choose(candidates, policy):
     eligible = [(value, _score(value, policy)) for value in candidates]
     eligible = [(candidate, score) for candidate, score in eligible if score is not None]
     if not eligible:
-        raise RuntimeError("no common safe physical batch fits all arms; no model/data downscale")
+        details = [
+            _memory_summary(report, candidate["batch_size"], candidate["workers"])
+            for candidate in candidates
+            for report in candidate["measurements"]
+        ]
+        raise RuntimeError(
+            "no common safe physical batch fits all arms; no model/data downscale\n"
+            + "\n".join(details)
+        )
     return min(eligible, key=lambda item: (item[1], -item[0]["batch_size"], item[0]["workers"]))[0]
+
+
+def _memory_summary(report, batch, workers):
+    prefix = (
+        f"{report.get('condition', 'unknown')} seed={report.get('model_seed', '?')} "
+        f"physical={batch} workers={workers}"
+    )
+    memory = report if report["status"] == "passed" else report.get("failure_memory", {})
+
+    def gib(key):
+        value = memory.get(key)
+        return "unavailable" if value is None else f"{value / 1024**3:.3f}GiB"
+
+    detail = (
+        f"peak allocated={gib('peak_allocated_bytes')}, "
+        f"peak reserved={gib('peak_reserved_bytes')}, "
+        f"free before={gib('free_bytes_before')}"
+    )
+    if report["status"] == "oom":
+        return f"{prefix}: CUDA OOM; {detail}; {report['error']}"
+    margin = max(2 * 1024**3, math.ceil(report["total_memory_bytes"] * 0.10))
+    deficit = report["peak_reserved_bytes"] + margin - report["free_bytes_before"]
+    state = "headroom rejected" if deficit > 0 else "memory safe"
+    return (
+        f"{prefix}: {state}; {detail}; required margin={margin / 1024**3:.3f}GiB; "
+        f"shortfall={max(0, deficit) / 1024**3:.3f}GiB"
+    )
 
 
 def _measure(job, loaded, args, batch, workers):
@@ -164,7 +199,13 @@ def _measure(job, loaded, args, batch, workers):
             minimum_measure_seconds=3.0,
         )
     except torch.OutOfMemoryError as error:
-        report = {"status": "oom", "error": f"{type(error).__name__}: {error}"}
+        report = {
+            "status": "oom",
+            "error": f"{type(error).__name__}: {error}",
+            "traceback": traceback.format_exc(),
+            "failure_memory": getattr(error, "calibration_memory", {}),
+            "resource_observability": getattr(error, "calibration_resource_observability", None),
+        }
         traceback.clear_frames(error.__traceback__)
     report.update(
         condition=job["variant_id"],
@@ -174,6 +215,7 @@ def _measure(job, loaded, args, batch, workers):
     )
     gc.collect()
     torch.cuda.empty_cache()
+    print("[comparison memory] " + _memory_summary(report, batch, workers), flush=True)
     return report
 
 

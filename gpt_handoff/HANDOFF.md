@@ -1,6 +1,13 @@
 # NEW GAT 연구 프로젝트 Hand-off
 
-현재 기준: [energy 정밀도·BF16 검증 정정](../docs/ENERGY_PRECISION_REVIEW_20260927.md).
+현재 기준: [실제 arxiv CUDA 메모리 검증](../docs/ARXIV_MEMORY_REVIEW_20260927.md).
+전체 공식 데이터를 로컬 GPU에서 calibration했다. 진단 projection의 중간 tensor와
+allocator 예약 메모리 문제를 수정하고 조건별 실패 수치를 보존한다. GPU memory cap은
+MIG 에뮬레이션이 아니며, 최종 본학습/test 완료를 의미하지 않는다.
+회귀 160개와 실제 데이터 네 조건 calibration이 통과했다. 최대 peak reserved는 6.936GiB.
+현재 local physical floor에서는 sampled가 full보다 느렸다는 측정 결과도 명시했다.
+
+이전 기준: [energy 정밀도·BF16 검증 정정](../docs/ENERGY_PRECISION_REVIEW_20260927.md).
 readout FP32 통일과 reference 순서 재계산을 구현하고, 기존 helper가 BF16을 FP32로
 덮어쓰던 검사 오류를 수정했다. 과거 BF16 모델 검사 표시는 정정 대상이다.
 현재 fused는 transient Gram을 생성한다. 최신 증거는 ZIP의 current_affected_regression이다.
@@ -9,7 +16,7 @@ readout FP32 통일과 reference 순서 재계산을 구현하고, 기존 helper
 이전 추가 보완: [fused 연결·진단 수정](../docs/FUSED_REVIEW_FIXES_20260927.md).
 실제 caller의 shared C shape와 passive observer 검사를 추가했고 validation fixture를 복구했다.
 
-## 최신 보완 기준
+## 이전 보완 기록
 
 [네 검수 문서 이후 구현 기록](../docs/REVIEW_REMEDIATION_20260927.md)이 아래 보존 기록보다
 우선한다. R0 세 결함과 별도 4조건 연구 실행기, temporal view, 선택적 fused Gram,

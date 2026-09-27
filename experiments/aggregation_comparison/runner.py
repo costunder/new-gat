@@ -23,7 +23,12 @@ for directory in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(directory))
 
 from chartgat.cache import atomic_write_bytes, atomic_write_json  # noqa: E402
-from experiments.aggregation_comparison import calibration, provenance, reallocation  # noqa: E402
+from experiments.aggregation_comparison import (  # noqa: E402
+    calibration,
+    memory,
+    provenance,
+    reallocation,
+)
 from experiments.aggregation_comparison.benchmark_policy import (  # noqa: E402
     PRIMARY_DATASET,
     require_benchmark_datasets,
@@ -66,6 +71,7 @@ def parser(*, historical_datasets=False):
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
     result.add_argument("--device", default="cuda:0")
     result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
+    memory.add_argument(result)
     result.add_argument("--epochs", type=int, default=200)
     result.add_argument(
         "--learning-budget-policy",
@@ -109,6 +115,7 @@ def parser(*, historical_datasets=False):
 
 
 def validate_args(args):
+    memory.validate(args)
     if not standalone.RUN_ID_PATTERN.fullmatch(args.run_id):
         raise ValueError("run-id must be a safe 1-120 character identifier")
     for name in ("arms", "datasets", "profiles", "model_seeds"):
@@ -221,6 +228,11 @@ def make_jobs(args, run_dir):
                     command = job["command"]
                     command[command.index("-m") + 1] = TRAIN_MODULE
                     command += ["--gram-implementation", args.gram_implementation]
+                    if memory.validate(args) is not None:
+                        command += [
+                            "--cuda-allocator-limit-gib",
+                            str(args.cuda_allocator_limit_gib),
+                        ]
                     command += ["--visibility-protocol", args.visibility_protocol]
                     if args.sampled_local_baselines:
                         command.append("--sampled-local-baselines")

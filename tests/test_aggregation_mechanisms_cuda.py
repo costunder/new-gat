@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from experiments.aggregation_comparison import engine
+from experiments.aggregation_comparison.gram import diagnostic_projection
 from experiments.aggregation_comparison.mechanisms import MechanismCollector, mechanism_audit
 from experiments.aggregation_comparison.model import AggregationClassifier
 from tests.test_aggregation_comparison_cuda import (  # noqa: F401
@@ -11,6 +12,22 @@ from tests.test_aggregation_comparison_cuda import (  # noqa: F401
     reference_arguments,
     synthetic_disjoint_batch,
 )
+
+
+@pytest.mark.parametrize("precision", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("chunk", [17, 64, 263])
+def test_streamed_observation_projection_matches_all_nodes_and_hops(precision, chunk):
+    torch.manual_seed(701)
+    past = [torch.randn(263, 256, device="cuda") for _ in range(8)]
+    weight = torch.randn(8, 256, 32, device="cuda") / 16
+    with (
+        torch.no_grad(),
+        torch.autocast("cuda", dtype=precision, enabled=precision != torch.float32),
+    ):
+        expected = torch.einsum("knd,hdw->knhw", torch.stack(past), weight)
+        actual = diagnostic_projection(past, weight, chunk)
+    assert actual.dtype == expected.dtype and actual.shape == (8, 263, 8, 32)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_observation_weighted_moments_and_histograms():

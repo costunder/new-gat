@@ -27,6 +27,8 @@ def test_four_cells_complete_exposure_pairing_and_global_freeze(monkeypatch, tmp
             "debug-core",
             "--profiles",
             "reference",
+            "--cuda-allocator-limit-gib",
+            "7",
             "--epochs",
             "4",
             "--patience",

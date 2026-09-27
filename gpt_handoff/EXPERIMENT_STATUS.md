@@ -1,6 +1,15 @@
 # 실험 결과와 구현 상태
 
-현재 상태는 [energy 정밀도 후속 검수](../docs/ENERGY_PRECISION_REVIEW_20260927.md)와
+현재 상태는 [실제 arxiv 메모리 검수](../docs/ARXIV_MEMORY_REVIEW_20260927.md) 및 최신
+묶음의 real-data calibration JSON과 회귀 XML을 따른다. 로컬 RTX 5070 Ti에서 전체 공식
+arxiv 학습/validation/진단 calibration을 실행했다. 이는 disposable 자원 측정이며
+최종 200 epoch 학습이나 공식 test, 실제 A100 MIG 10GB 측정으로 간주하지 않는다.
+최종 영향 회귀 **160 passed / 0 failed / 0 errors / 0 skipped**(CUDA 143, 제어 17).
+실제 arxiv의 full/sampled × fixed/learned C **4/4 조건**이 7GiB allocator 상한에서 통과했다.
+전체 진단 포함 peak reserved는 순서대로 6.936 / 6.811 / 6.902 / 6.576GiB다.
+sampled learned의 한 train pass는 현재 로컬 후보에서 450.574초로, full 20.378초보다 느렸다.
+
+이전 상태는 [energy 정밀도 후속 검수](../docs/ENERGY_PRECISION_REVIEW_20260927.md)와
 ZIP의 `current_affected_regression`을 따른다. 실제 BF16을 검증하도록 helper를 고쳤으며,
 과거 helper 기반 BF16 모델 검사는 FP32 실행이었다. 110/152개 XML은 과거 기록이다.
 정밀도만 맞춘 중간 실행의 20개 실패도 보존했다. 현재 fused는 reference 순서를 유지하며
@@ -11,7 +20,7 @@ Gram을 backward에서 재계산한다. 실제 arxiv 본학습·평가와 MIG �
 ZIP의 `current_affected_regression`을 따른다. 아래 152개는 이전 커밋의 보존 기록이다.
 이번 영향 회귀는 **110 passed / 0 failed / 0 skipped**(CUDA 100, validation 제어 10).
 
-## 최신 구현 상태: 네 검수 문서 후속 보완
+## 이전 구현 기록: 네 검수 문서 후속 보완
 
 현재 구현 목록과 제한은 [보완 기록](../docs/REVIEW_REMEDIATION_20260927.md)을 따른다.
 아래의 '4조건 controller 미구현'은 이전 버전의 상태다. 최신 코드에는 F0/F1/S0/S1

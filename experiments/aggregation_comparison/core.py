@@ -75,6 +75,7 @@ def child_argv(args, root, mode):
         "data_root",
         "device",
         "hardware_profile",
+        "cuda_allocator_limit_gib",
         "epochs",
         "patience",
         "workers",

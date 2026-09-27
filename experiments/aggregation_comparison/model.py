@@ -549,9 +549,16 @@ class AggregationClassifier(nn.Module):
                 output = operator.forward_with_state(current, edges, batch, graphs, **kwargs)
                 value = output.message
                 if len(self.energy_readouts) or self.diagnostic_collector is not None:
-                    projected = torch.einsum(
-                        "knd,hdw->knhw", torch.stack(past), operator.value_weight
-                    )
+                    if not len(self.energy_readouts) and self.diagnostic_collector is not None:
+                        from .gram import diagnostic_projection
+
+                        projected = diagnostic_projection(
+                            past, operator.value_weight, self.edge_chunk_size or current.shape[0]
+                        )
+                    else:
+                        projected = torch.einsum(
+                            "knd,hdw->knhw", torch.stack(past), operator.value_weight
+                        )
                     # Exactly the weight used by diffusion, including correction once.
                     metric = output.effective_weight
                     pairs = (
@@ -617,6 +624,9 @@ class AggregationClassifier(nn.Module):
                             extra.to(value.dtype).flatten(1), operator.output_projection.weight
                         )
                     else:
+                        # No prediction branch consumes this projection. Release
+                        # it before the collector's FP64 reductions allocate.
+                        del projected
                         branch = torch.zeros_like(value)
                     if self.diagnostic_collector is not None:
                         self.diagnostic_collector.record(

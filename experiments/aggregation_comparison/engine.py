@@ -32,6 +32,7 @@ from research.conductance_gat.v5.batch_calibration import (
 from research.conductance_gat.v5.learning_budget import should_stop_learning_budget
 from research.conductance_gat.v5.timing import StageTimer
 
+from . import memory
 from .evidence import origin, require_approval
 from .model import (
     ARMS,
@@ -70,6 +71,7 @@ def load_dataset(args):
 
 def build_parser():
     parser = base.build_parser()
+    memory.add_argument(parser)
     parser.description = __doc__
     parser.set_defaults(
         conductance_heads="per_head",
@@ -96,6 +98,7 @@ def build_parser():
 
 def validate_args(args):
     base.validate_args(args)
+    memory.validate(args)
     if args.complete_supervised_passes and args.learning_budget_policy != "epochs":
         raise ValueError("complete supervised passes require the explicit epochs budget")
     if (
@@ -146,6 +149,7 @@ def configuration(args):
     return {
         **inherited,
         "edge_selection": topology,
+        "cuda_allocator_limit_gib": memory.validate(args),
         "ablation_arm": args.ablation_arm,
         "complete_supervised_passes": args.complete_supervised_passes,
         "learning_budget_policy": args.learning_budget_policy,
@@ -184,6 +188,9 @@ def implementation_source_hashes():
 
 
 def make_model(payload, args, device):
+    # All calibration/training/audit/test paths construct models here. The saved
+    # CLI contract therefore reapplies the same cap in every child process.
+    memory.configure(args, device)
     architecture = base.architecture_configuration(args)
     c_config = conductance_contract(args.ablation_arm)
     if c_config is not None:
@@ -858,6 +865,7 @@ def run_calibration_candidate(
     model = optimizer = inputs = None
     monitor = None
     report = None
+    free_before = total = None
     with _isolated_execution_state(device):
         try:
             gc.collect()
@@ -1009,6 +1017,16 @@ def run_calibration_candidate(
                     "calibration failed to verify actual optimizer state and parameter update"
                 )
         except BaseException as error:
+            error.calibration_memory = (
+                {
+                    "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+                    "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+                    "free_bytes_before": int(free_before),
+                    "total_memory_bytes": int(total),
+                }
+                if free_before is not None
+                else {}
+            )
             if monitor is not None:
                 failed_monitor, monitor = monitor, None
                 try:

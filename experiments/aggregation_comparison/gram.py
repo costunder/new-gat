@@ -4,6 +4,29 @@ import torch
 from torch.autograd.function import once_differentiable
 
 
+def diagnostic_projection(history, weight, node_chunk):
+    """Project every node/hop without simultaneously stacking full input history.
+
+    Observation-only path: prediction readouts retain their declared contraction.
+    Chunk over nodes for memory, vectorize all hops/heads/features within a chunk.
+    """
+    if torch.is_grad_enabled():
+        raise RuntimeError("streamed diagnostic projection requires no_grad")
+    if node_chunk < 1:
+        raise ValueError("diagnostic node chunk must be positive")
+    nodes = history[0].shape[0]
+    result = None
+    for start in range(0, max(nodes, 1), node_chunk):
+        stop = min(start + node_chunk, nodes)
+        projected = torch.einsum(
+            "knd,hdw->knhw", torch.stack([value[start:stop] for value in history]), weight
+        )
+        if result is None:
+            result = projected.new_empty(len(history), nodes, *projected.shape[2:])
+        result[:, start:stop].copy_(projected)
+    return result
+
+
 class LocalGram(torch.autograd.Function):
     @staticmethod
     def forward(ctx, history, conductance, edges, chunk, diagonal_only):

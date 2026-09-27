@@ -16,23 +16,30 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-IMPLEMENTATION_COMMIT = "3eb0eb6"  # Previous review base; current implementation is package HEAD.
+IMPLEMENTATION_COMMIT = "4ddead7"  # Previous review base; current implementation is package HEAD.
 TEXT_SUFFIXES = {".py", ".md", ".toml", ".yaml", ".yml", ".sh", ".ps1", ".json", ".txt"}
 EVIDENCE = {
-    "current_affected_regression": ("results/energy-precision-after-20260927.xml", None, 0),
+    "current_affected_regression": ("results/arxiv-memory-regression-20260927.xml", None, 0),
+    "previous_4ddead7_regression": ("results/energy-precision-after-20260927.xml", 230, 0),
     "previous_3eb0eb6_regression": ("results/fused-review-after-20260927.xml", 110, 0),
     "previous_4c2d7f4_regression": ("results/revision-final-debug-20260927-01.xml", 152, 0),
     "deliberate_before_fix_reproduction": ("results/fused-review-before-20260927.xml", 4, 3),
     "before_precision_fix_cuda_bf16": ("results/energy-precision-before-actual-20260927.xml", 1, 1),
     "invalid_bf16_fixture_fp32_control": ("results/energy-precision-before-20260927.xml", 1, 0),
     "dtype_only_repair_ordering_failures": (
-        "results/energy-precision-focused-20260927.xml", 112, 20
+        "results/energy-precision-focused-20260927.xml",
+        112,
+        20,
     ),
 }
 EXTRA_EVIDENCE = (
     "results/revision-gram-profile-20260927-02.json",
     "results/review-four-documents-20260927/reproduced.json",
     "results/review-four-documents-20260927/fusion-sampling.json",
+)
+REAL_DATA_CALIBRATIONS = tuple(
+    f"results/arxiv-mig-memory/{condition}-final-cap7.json"
+    for condition in ("full-fixed", "full-learned", "sampled-fixed", "sampled-learned")
 )
 
 
@@ -106,6 +113,22 @@ def main() -> None:
         reports[category] = {"path": name, "sha256": sha(data), **counts}
     for name in EXTRA_EVIDENCE:
         entries[name] = (ROOT / name).read_bytes()
+    for path in sorted((ROOT / "results/arxiv-mig-memory").glob("*.json")):
+        entries[path.relative_to(ROOT).as_posix()] = path.read_bytes()
+    for path in sorted((ROOT / "results").glob("arxiv-*.log")):
+        entries[path.relative_to(ROOT).as_posix()] = path.read_bytes()
+    real_data = {}
+    for name in REAL_DATA_CALIBRATIONS:
+        measured = json.loads(entries[name])
+        if measured["status"] != "passed" or not measured["source_unchanged_during_measurement"]:
+            raise ValueError(f"Incomplete or modified-source real-data calibration: {name}")
+        real_data[name] = {
+            "sha256": sha(entries[name]),
+            "actual_gpu": measured["actual_gpu"],
+            "allocator_limit_bytes": measured["allocator_limit_bytes"],
+            "peak_allocated_bytes": measured["measurement"]["peak_allocated_bytes"],
+            "peak_reserved_bytes": measured["measurement"]["peak_reserved_bytes"],
+        }
     entries["evidence/before_fix/sampled_inductive_train.py.txt"] = git(
         "show", "cd411cf:experiments/sampled_inductive/train.py"
     )
@@ -117,13 +140,18 @@ def main() -> None:
             "historical_audit_commit": git("rev-parse", "cc173ed").decode().strip(),
             "evidence": reports,
             "source_files_in_code_summary": len(summary_paths),
-            "real_dataset_training": False,
+            "real_dataset_training": "disposable calibration only; no final training",
+            "real_dataset_calibration": real_data,
+            "final_real_dataset_training": False,
             "official_real_dataset_test_evaluation": False,
             "a100_mig_10gb_verified": False,
             "research_requirements_complete": False,
             "model_or_weight_downloaded": False,
             "notes": [
-                "Current affected regressions and previous 110/152 checks are separate records.",
+                "Current regressions and previous 230/110/152 checks are separate records.",
+                "Complete official arxiv calibration ran on local RTX 5070 Ti with a 7GiB cap.",
+                "Allocator cap is not A100 MIG emulation; actual MIG speed/fit remains unverified.",
+                "No-energy diagnostic projection streams nodes; prediction/learning is unchanged.",
                 "Previous model BF16 fixture ran FP32; historical labels are not BF16 evidence.",
                 "Current CUDA fixture asserts actual AMP state after hardware argument resolution.",
                 "Energy readout reference/fused uses explicit FP32 with autocast disabled (v1).",
@@ -135,7 +163,7 @@ def main() -> None:
                 "Before-fix counterexamples use synthetic evidence, not user result damage.",
                 "Model forward/backward checks used CUDA and explicit synthetic debug inputs.",
                 "CPU metadata/control checks do not constitute CPU model training.",
-                "No arxiv result, speedup, multi-seed superiority or MIG fit is established.",
+                "No final arxiv score, speedup, multi-seed superiority or MIG fit is established.",
                 "Core full/sampled x fixed/dynamic C uses complete matched supervised passes.",
                 "Custom arxiv node-year views are not an OGB score or independent-graph test.",
                 "Optional fused Gram/readout keeps projected history; no end-to-end speed claim.",
@@ -147,11 +175,12 @@ def main() -> None:
     entries["REVIEW_FIRST.md"] = (
         "# Current GPT review package — 2026-09-27\n\n"
         f"Package and implementation commit: `{commit}`.\n\n"
-        "Start with docs/ENERGY_PRECISION_REVIEW_20260927.md and gpt_handoff/README_FIRST.md.\n"
+        "Start with docs/ARXIV_MEMORY_REVIEW_20260927.md and gpt_handoff/README_FIRST.md.\n"
         "Then read docs/FOUR_DOCUMENT_REVIEW_20260927.md (before-fix review),\n"
         "VERIFICATION.json, and actual source. Older sections retain historical context only.\n"
         "Current benchmark: ogbn-arxiv, 21 conditions including GCN, GraphSAGE and GATv2.\n"
-        "No pretrained weights; no actual benchmark training/test or MIG fit measurements.\n"
+        "No pretrained weights; real arxiv calibration on local RTX with a 7GiB allocator cap.\n"
+        "No final benchmark training/test or actual MIG fit measurements.\n"
         "Includes core four-cell controller, temporal visibility, and optional fused Gram.\n"
         "Real-data accuracy/cost and independent-graph generalization remain unverified.\n\n"
         "MANIFEST.json hashes every archive member except itself. Evidence XMLs distinguish\n"

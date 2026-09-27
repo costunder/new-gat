@@ -514,8 +514,43 @@ def _choose(candidates, policy):
     eligible = [(value, _score(value, policy)) for value in candidates]
     eligible = [(candidate, score) for candidate, score in eligible if score is not None]
     if not eligible:
-        raise RuntimeError("no common safe physical batch fits all arms; no model/data downscale")
+        details = [
+            _memory_summary(report, candidate["batch_size"], candidate["workers"])
+            for candidate in candidates
+            for report in candidate["measurements"]
+        ]
+        raise RuntimeError(
+            "no common safe physical batch fits all arms; no model/data downscale\n"
+            + "\n".join(details)
+        )
     return min(eligible, key=lambda item: (item[1], -item[0]["batch_size"], item[0]["workers"]))[0]
+
+
+def _memory_summary(report, batch, workers):
+    prefix = (
+        f"{report.get('condition', 'unknown')} seed={report.get('model_seed', '?')} "
+        f"physical={batch} workers={workers}"
+    )
+    memory = report if report["status"] == "passed" else report.get("failure_memory", {})
+
+    def gib(key):
+        value = memory.get(key)
+        return "unavailable" if value is None else f"{value / 1024**3:.3f}GiB"
+
+    detail = (
+        f"peak allocated={gib('peak_allocated_bytes')}, "
+        f"peak reserved={gib('peak_reserved_bytes')}, "
+        f"free before={gib('free_bytes_before')}"
+    )
+    if report["status"] == "oom":
+        return f"{prefix}: CUDA OOM; {detail}; {report['error']}"
+    margin = max(2 * 1024**3, math.ceil(report["total_memory_bytes"] * 0.10))
+    deficit = report["peak_reserved_bytes"] + margin - report["free_bytes_before"]
+    state = "headroom rejected" if deficit > 0 else "memory safe"
+    return (
+        f"{prefix}: {state}; {detail}; required margin={margin / 1024**3:.3f}GiB; "
+        f"shortfall={max(0, deficit) / 1024**3:.3f}GiB"
+    )
 
 
 def _measure(job, loaded, args, batch, workers):
@@ -537,7 +572,13 @@ def _measure(job, loaded, args, batch, workers):
             minimum_measure_seconds=3.0,
         )
     except torch.OutOfMemoryError as error:
-        report = {"status": "oom", "error": f"{type(error).__name__}: {error}"}
+        report = {
+            "status": "oom",
+            "error": f"{type(error).__name__}: {error}",
+            "traceback": traceback.format_exc(),
+            "failure_memory": getattr(error, "calibration_memory", {}),
+            "resource_observability": getattr(error, "calibration_resource_observability", None),
+        }
         traceback.clear_frames(error.__traceback__)
     report.update(
         condition=job["variant_id"],
@@ -547,6 +588,7 @@ def _measure(job, loaded, args, batch, workers):
     )
     gc.collect()
     torch.cuda.empty_cache()
+    print("[comparison memory] " + _memory_summary(report, batch, workers), flush=True)
     return report
 
 
@@ -890,6 +932,7 @@ def child_argv(args, root, mode):
         "data_root",
         "device",
         "hardware_profile",
+        "cuda_allocator_limit_gib",
         "epochs",
         "patience",
         "workers",
@@ -1406,6 +1449,7 @@ from research.conductance_gat.v5.batch_calibration import (
 from research.conductance_gat.v5.learning_budget import should_stop_learning_budget
 from research.conductance_gat.v5.timing import StageTimer
 
+from . import memory
 from .evidence import origin, require_approval
 from .model import (
     ARMS,
@@ -1444,6 +1488,7 @@ def load_dataset(args):
 
 def build_parser():
     parser = base.build_parser()
+    memory.add_argument(parser)
     parser.description = __doc__
     parser.set_defaults(
         conductance_heads="per_head",
@@ -1470,6 +1515,7 @@ def build_parser():
 
 def validate_args(args):
     base.validate_args(args)
+    memory.validate(args)
     if args.complete_supervised_passes and args.learning_budget_policy != "epochs":
         raise ValueError("complete supervised passes require the explicit epochs budget")
     if (
@@ -1520,6 +1566,7 @@ def configuration(args):
     return {
         **inherited,
         "edge_selection": topology,
+        "cuda_allocator_limit_gib": memory.validate(args),
         "ablation_arm": args.ablation_arm,
         "complete_supervised_passes": args.complete_supervised_passes,
         "learning_budget_policy": args.learning_budget_policy,
@@ -1558,6 +1605,9 @@ def implementation_source_hashes():
 
 
 def make_model(payload, args, device):
+    # All calibration/training/audit/test paths construct models here. The saved
+    # CLI contract therefore reapplies the same cap in every child process.
+    memory.configure(args, device)
     architecture = base.architecture_configuration(args)
     c_config = conductance_contract(args.ablation_arm)
     if c_config is not None:
@@ -2232,6 +2282,7 @@ def run_calibration_candidate(
     model = optimizer = inputs = None
     monitor = None
     report = None
+    free_before = total = None
     with _isolated_execution_state(device):
         try:
             gc.collect()
@@ -2383,6 +2434,16 @@ def run_calibration_candidate(
                     "calibration failed to verify actual optimizer state and parameter update"
                 )
         except BaseException as error:
+            error.calibration_memory = (
+                {
+                    "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+                    "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+                    "free_bytes_before": int(free_before),
+                    "total_memory_bytes": int(total),
+                }
+                if free_before is not None
+                else {}
+            )
             if monitor is not None:
                 failed_monitor, monitor = monitor, None
                 try:
@@ -2792,6 +2853,29 @@ def markdown(report, jobs=None):
 
 import torch
 from torch.autograd.function import once_differentiable
+
+
+def diagnostic_projection(history, weight, node_chunk):
+    """Project every node/hop without simultaneously stacking full input history.
+
+    Observation-only path: prediction readouts retain their declared contraction.
+    Chunk over nodes for memory, vectorize all hops/heads/features within a chunk.
+    """
+    if torch.is_grad_enabled():
+        raise RuntimeError("streamed diagnostic projection requires no_grad")
+    if node_chunk < 1:
+        raise ValueError("diagnostic node chunk must be positive")
+    nodes = history[0].shape[0]
+    result = None
+    for start in range(0, max(nodes, 1), node_chunk):
+        stop = min(start + node_chunk, nodes)
+        projected = torch.einsum(
+            "knd,hdw->knhw", torch.stack([value[start:stop] for value in history]), weight
+        )
+        if result is None:
+            result = projected.new_empty(len(history), nodes, *projected.shape[2:])
+        result[:, start:stop].copy_(projected)
+    return result
 
 
 class LocalGram(torch.autograd.Function):
@@ -3360,6 +3444,51 @@ def mechanism_audit(model, inputs, args, device, selected, evaluate):
     }
 ````
 
+# experiments/aggregation_comparison/memory.py
+
+````python
+"""Explicit CUDA allocator budget, independent of scientific model/data sizes."""
+
+import math
+
+import torch
+
+
+def add_argument(parser):
+    parser.add_argument(
+        "--cuda-allocator-limit-gib",
+        type=float,
+        help="cap PyTorch CUDA allocations/reservations; never resize model, graph or batch",
+    )
+
+
+def validate(args):
+    value = getattr(args, "cuda_allocator_limit_gib", None)
+    if value is not None and (not math.isfinite(value) or value <= 0):
+        raise ValueError("cuda-allocator-limit-gib must be finite and positive")
+    return value
+
+
+def configure(args, device):
+    value = validate(args)
+    if value is None:
+        return None
+    if torch.device(device).type != "cuda":
+        raise ValueError("CUDA allocator budget requires CUDA")
+    if torch.cuda.memory.get_allocator_backend() != "native":
+        raise ValueError("the measured CUDA allocator limit requires the native allocator")
+    total = torch.cuda.get_device_properties(device).total_memory
+    limit = int(value * 1024**3)
+    if not 0 < limit <= total:
+        raise ValueError("CUDA allocator limit exceeds actual visible device capacity")
+    if torch.cuda.memory_allocated(device) > limit:
+        raise RuntimeError(
+            "existing live CUDA tensors already exceed the requested allocator limit"
+        )
+    torch.cuda.set_per_process_memory_fraction(limit / total, device)
+    return limit
+````
+
 # experiments/aggregation_comparison/model.py
 
 ````python
@@ -3914,9 +4043,16 @@ class AggregationClassifier(nn.Module):
                 output = operator.forward_with_state(current, edges, batch, graphs, **kwargs)
                 value = output.message
                 if len(self.energy_readouts) or self.diagnostic_collector is not None:
-                    projected = torch.einsum(
-                        "knd,hdw->knhw", torch.stack(past), operator.value_weight
-                    )
+                    if not len(self.energy_readouts) and self.diagnostic_collector is not None:
+                        from .gram import diagnostic_projection
+
+                        projected = diagnostic_projection(
+                            past, operator.value_weight, self.edge_chunk_size or current.shape[0]
+                        )
+                    else:
+                        projected = torch.einsum(
+                            "knd,hdw->knhw", torch.stack(past), operator.value_weight
+                        )
                     # Exactly the weight used by diffusion, including correction once.
                     metric = output.effective_weight
                     pairs = (
@@ -3982,6 +4118,9 @@ class AggregationClassifier(nn.Module):
                             extra.to(value.dtype).flatten(1), operator.output_projection.weight
                         )
                     else:
+                        # No prediction branch consumes this projection. Release
+                        # it before the collector's FP64 reductions allocate.
+                        del projected
                         branch = torch.zeros_like(value)
                     if self.diagnostic_collector is not None:
                         self.diagnostic_collector.record(
@@ -4400,7 +4539,12 @@ for directory in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(directory))
 
 from chartgat.cache import atomic_write_bytes, atomic_write_json  # noqa: E402
-from experiments.aggregation_comparison import calibration, provenance, reallocation  # noqa: E402
+from experiments.aggregation_comparison import (  # noqa: E402
+    calibration,
+    memory,
+    provenance,
+    reallocation,
+)
 from experiments.aggregation_comparison.benchmark_policy import (  # noqa: E402
     PRIMARY_DATASET,
     require_benchmark_datasets,
@@ -4443,6 +4587,7 @@ def parser(*, historical_datasets=False):
     result.add_argument("--results-root", type=Path, default=ROOT / "results")
     result.add_argument("--device", default="cuda:0")
     result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
+    memory.add_argument(result)
     result.add_argument("--epochs", type=int, default=200)
     result.add_argument(
         "--learning-budget-policy",
@@ -4486,6 +4631,7 @@ def parser(*, historical_datasets=False):
 
 
 def validate_args(args):
+    memory.validate(args)
     if not standalone.RUN_ID_PATTERN.fullmatch(args.run_id):
         raise ValueError("run-id must be a safe 1-120 character identifier")
     for name in ("arms", "datasets", "profiles", "model_seeds"):
@@ -4598,6 +4744,11 @@ def make_jobs(args, run_dir):
                     command = job["command"]
                     command[command.index("-m") + 1] = TRAIN_MODULE
                     command += ["--gram-implementation", args.gram_implementation]
+                    if memory.validate(args) is not None:
+                        command += [
+                            "--cuda-allocator-limit-gib",
+                            str(args.cuda_allocator_limit_gib),
+                        ]
                     command += ["--visibility-protocol", args.visibility_protocol]
                     if args.sampled_local_baselines:
                         command.append("--sampled-local-baselines")
@@ -77123,23 +77274,30 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-IMPLEMENTATION_COMMIT = "3eb0eb6"  # Previous review base; current implementation is package HEAD.
+IMPLEMENTATION_COMMIT = "4ddead7"  # Previous review base; current implementation is package HEAD.
 TEXT_SUFFIXES = {".py", ".md", ".toml", ".yaml", ".yml", ".sh", ".ps1", ".json", ".txt"}
 EVIDENCE = {
-    "current_affected_regression": ("results/energy-precision-after-20260927.xml", None, 0),
+    "current_affected_regression": ("results/arxiv-memory-regression-20260927.xml", None, 0),
+    "previous_4ddead7_regression": ("results/energy-precision-after-20260927.xml", 230, 0),
     "previous_3eb0eb6_regression": ("results/fused-review-after-20260927.xml", 110, 0),
     "previous_4c2d7f4_regression": ("results/revision-final-debug-20260927-01.xml", 152, 0),
     "deliberate_before_fix_reproduction": ("results/fused-review-before-20260927.xml", 4, 3),
     "before_precision_fix_cuda_bf16": ("results/energy-precision-before-actual-20260927.xml", 1, 1),
     "invalid_bf16_fixture_fp32_control": ("results/energy-precision-before-20260927.xml", 1, 0),
     "dtype_only_repair_ordering_failures": (
-        "results/energy-precision-focused-20260927.xml", 112, 20
+        "results/energy-precision-focused-20260927.xml",
+        112,
+        20,
     ),
 }
 EXTRA_EVIDENCE = (
     "results/revision-gram-profile-20260927-02.json",
     "results/review-four-documents-20260927/reproduced.json",
     "results/review-four-documents-20260927/fusion-sampling.json",
+)
+REAL_DATA_CALIBRATIONS = tuple(
+    f"results/arxiv-mig-memory/{condition}-final-cap7.json"
+    for condition in ("full-fixed", "full-learned", "sampled-fixed", "sampled-learned")
 )
 
 
@@ -77213,6 +77371,22 @@ def main() -> None:
         reports[category] = {"path": name, "sha256": sha(data), **counts}
     for name in EXTRA_EVIDENCE:
         entries[name] = (ROOT / name).read_bytes()
+    for path in sorted((ROOT / "results/arxiv-mig-memory").glob("*.json")):
+        entries[path.relative_to(ROOT).as_posix()] = path.read_bytes()
+    for path in sorted((ROOT / "results").glob("arxiv-*.log")):
+        entries[path.relative_to(ROOT).as_posix()] = path.read_bytes()
+    real_data = {}
+    for name in REAL_DATA_CALIBRATIONS:
+        measured = json.loads(entries[name])
+        if measured["status"] != "passed" or not measured["source_unchanged_during_measurement"]:
+            raise ValueError(f"Incomplete or modified-source real-data calibration: {name}")
+        real_data[name] = {
+            "sha256": sha(entries[name]),
+            "actual_gpu": measured["actual_gpu"],
+            "allocator_limit_bytes": measured["allocator_limit_bytes"],
+            "peak_allocated_bytes": measured["measurement"]["peak_allocated_bytes"],
+            "peak_reserved_bytes": measured["measurement"]["peak_reserved_bytes"],
+        }
     entries["evidence/before_fix/sampled_inductive_train.py.txt"] = git(
         "show", "cd411cf:experiments/sampled_inductive/train.py"
     )
@@ -77224,13 +77398,18 @@ def main() -> None:
             "historical_audit_commit": git("rev-parse", "cc173ed").decode().strip(),
             "evidence": reports,
             "source_files_in_code_summary": len(summary_paths),
-            "real_dataset_training": False,
+            "real_dataset_training": "disposable calibration only; no final training",
+            "real_dataset_calibration": real_data,
+            "final_real_dataset_training": False,
             "official_real_dataset_test_evaluation": False,
             "a100_mig_10gb_verified": False,
             "research_requirements_complete": False,
             "model_or_weight_downloaded": False,
             "notes": [
-                "Current affected regressions and previous 110/152 checks are separate records.",
+                "Current regressions and previous 230/110/152 checks are separate records.",
+                "Complete official arxiv calibration ran on local RTX 5070 Ti with a 7GiB cap.",
+                "Allocator cap is not A100 MIG emulation; actual MIG speed/fit remains unverified.",
+                "No-energy diagnostic projection streams nodes; prediction/learning is unchanged.",
                 "Previous model BF16 fixture ran FP32; historical labels are not BF16 evidence.",
                 "Current CUDA fixture asserts actual AMP state after hardware argument resolution.",
                 "Energy readout reference/fused uses explicit FP32 with autocast disabled (v1).",
@@ -77242,7 +77421,7 @@ def main() -> None:
                 "Before-fix counterexamples use synthetic evidence, not user result damage.",
                 "Model forward/backward checks used CUDA and explicit synthetic debug inputs.",
                 "CPU metadata/control checks do not constitute CPU model training.",
-                "No arxiv result, speedup, multi-seed superiority or MIG fit is established.",
+                "No final arxiv score, speedup, multi-seed superiority or MIG fit is established.",
                 "Core full/sampled x fixed/dynamic C uses complete matched supervised passes.",
                 "Custom arxiv node-year views are not an OGB score or independent-graph test.",
                 "Optional fused Gram/readout keeps projected history; no end-to-end speed claim.",
@@ -77254,11 +77433,12 @@ def main() -> None:
     entries["REVIEW_FIRST.md"] = (
         "# Current GPT review package — 2026-09-27\n\n"
         f"Package and implementation commit: `{commit}`.\n\n"
-        "Start with docs/ENERGY_PRECISION_REVIEW_20260927.md and gpt_handoff/README_FIRST.md.\n"
+        "Start with docs/ARXIV_MEMORY_REVIEW_20260927.md and gpt_handoff/README_FIRST.md.\n"
         "Then read docs/FOUR_DOCUMENT_REVIEW_20260927.md (before-fix review),\n"
         "VERIFICATION.json, and actual source. Older sections retain historical context only.\n"
         "Current benchmark: ogbn-arxiv, 21 conditions including GCN, GraphSAGE and GATv2.\n"
-        "No pretrained weights; no actual benchmark training/test or MIG fit measurements.\n"
+        "No pretrained weights; real arxiv calibration on local RTX with a 7GiB allocator cap.\n"
+        "No final benchmark training/test or actual MIG fit measurements.\n"
         "Includes core four-cell controller, temporal visibility, and optional fused Gram.\n"
         "Real-data accuracy/cost and independent-graph generalization remain unverified.\n\n"
         "MANIFEST.json hashes every archive member except itself. Evidence XMLs distinguish\n"
@@ -81809,6 +81989,187 @@ __all__ = [
     "terminate_owned_child",
     "terminate_owned_child_after_error",
 ]
+````
+
+# scripts/profile_arxiv_memory.py
+
+````python
+"""Real-data CUDA calibration probe; allocator cap is not A100 MIG emulation.
+
+No final training, test evaluation, model/data downsizing, or checkpoint export.
+Use a new output path for every measurement. Dataset must already be prepared.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import traceback
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+for folder in (ROOT, ROOT / "src"):
+    if str(folder) not in sys.path:
+        sys.path.insert(0, str(folder))
+
+import torch  # noqa: E402
+
+from experiments.aggregation_comparison import core, engine, provenance, runner  # noqa: E402
+from research.conductance_gat.v5.protocol import HARDWARE_PROFILES  # noqa: E402
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--arm", choices=core.ARMS, required=True)
+    parser.add_argument("--hardware-profile", choices=HARDWARE_PROFILES, default="portable")
+    parser.add_argument("--sampling", choices=("full", "cluster_disjoint"), default="full")
+    parser.add_argument("--context-seeds", type=int, default=2048)
+    parser.add_argument("--physical-seeds", type=int, default=2048)
+    parser.add_argument("--edge-chunk-size", type=int, default=4096)
+    parser.add_argument("--allocator-limit-gib", type=float, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    if args.output.exists():
+        raise FileExistsError(f"Preserving previous evidence: {args.output}")
+    device = torch.device("cuda:0")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA required; no CPU model fallback")
+    total = torch.cuda.get_device_properties(device).total_memory
+    cap = int(args.allocator_limit_gib * 1024**3)
+    if not 0 < cap <= total:
+        raise ValueError("allocator cap must be positive and fit the actual visible device")
+    options = [
+        "--run-id",
+        "debug-real-arxiv-memory-probe",
+        "--profiles",
+        "reference",
+        "--arms",
+        args.arm,
+        "--datasets",
+        "ogbn-arxiv",
+        "--model-seeds",
+        "0",
+        "--device",
+        "cuda:0",
+        "--hardware-profile",
+        args.hardware_profile,
+        "--cuda-allocator-limit-gib",
+        str(args.allocator_limit_gib),
+        "--learning-budget-policy",
+        "epochs",
+        "--complete-supervised-passes",
+        "--activation-checkpoint",
+        "--edge-chunk-size",
+        str(args.edge_chunk_size),
+        "--sampling",
+        args.sampling,
+    ]
+    if args.sampling != "full":
+        options += [
+            "--sample-context-seed-batch-size",
+            str(args.context_seeds),
+            "--sample-seed-batch-size",
+            str(args.physical_seeds),
+        ]
+    control = runner.parser().parse_args(options)
+    runner.validate_args(control)
+    command = runner.make_jobs(control, args.output.parent)[0]["command"]
+    training = engine.build_parser().parse_args(command[command.index("-m") + 2 :])
+    engine.validate_args(training)
+    result = {
+        "scope": "real arxiv complete calibration; not final training or MIG speed/fit proof",
+        "actual_gpu": torch.cuda.get_device_name(device),
+        "torch": torch.__version__,
+        "visible_memory_bytes": total,
+        "allocator_limit_bytes": cap,
+        "allocator_environment": {
+            name: os.environ.get(name) for name in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
+        },
+        "allocator_backend": torch.cuda.memory.get_allocator_backend(),
+        "source_sha256": provenance.source_snapshot(),
+        "configuration": engine.configuration(training),
+        "events": [],
+    }
+    started = time.perf_counter()
+
+    def persist():
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+
+    def mark(stage):
+        result["last_stage"] = stage
+        event = {
+            "stage": stage,
+            "seconds": time.perf_counter() - started,
+            "allocated_bytes": torch.cuda.memory_allocated(device),
+            "reserved_bytes": torch.cuda.memory_reserved(device),
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+            "peak_reserved_bytes": torch.cuda.max_memory_reserved(device),
+        }
+        result["events"].append(event)
+        persist()
+        print(json.dumps(event), flush=True)
+
+    original_train, original_evaluate = engine.run_training_epoch, engine.evaluate
+    epoch_count = 0
+
+    def train(*values, **kwargs):
+        nonlocal epoch_count
+        epoch_count += 1
+        mark(f"train_epoch_{epoch_count}_start")
+        report = original_train(*values, **kwargs)
+        mark(f"train_epoch_{epoch_count}_end")
+        return report
+
+    def evaluate(*values, **kwargs):
+        stage = "diagnostic" if values[0].diagnostic_collector is not None else "validation"
+        mark(stage + "_start")
+        report = original_evaluate(*values, **kwargs)
+        mark(stage + "_end")
+        return report
+
+    engine.run_training_epoch, engine.evaluate = train, evaluate
+    try:
+        mark("official_data_load")
+        payload, protocol = engine.load_dataset(training)
+        result["dataset_protocol"] = protocol
+        mark("calibration_start")
+        result["measurement"] = engine.run_calibration_candidate(
+            {"payload": payload, "protocol": protocol},
+            training,
+            device,
+            physical_batch_size=1 if args.sampling == "full" else args.physical_seeds,
+            workers=0 if args.sampling == "full" else training.sample_context_workers,
+        )
+        if result["source_sha256"] != provenance.source_snapshot():
+            raise RuntimeError("source changed during calibration; do not use as final evidence")
+        result["source_unchanged_during_measurement"] = True
+        result["status"] = "passed"
+        peak = result["measurement"]["peak_reserved_bytes"]
+        result["cap_minus_peak_reserved_bytes"] = cap - peak
+        result["minimum_free_bytes_for_two_gib_headroom"] = peak + 2 * 1024**3
+        mark("calibration_complete")
+    except Exception as error:
+        result.update(
+            status="oom" if isinstance(error, torch.OutOfMemoryError) else "error",
+            error=f"{type(error).__name__}: {error}",
+            traceback=traceback.format_exc(),
+        )
+        result["failure_resources"] = getattr(error, "calibration_resource_observability", None)
+        mark("failed_after_" + result["last_stage"])
+        print(result["error"], flush=True)
+        return 1
+    finally:
+        engine.run_training_epoch, engine.evaluate = original_train, original_evaluate
+        persist()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ````
 
 # scripts/reproduce.sh
@@ -100957,6 +101318,7 @@ import pytest
 import torch
 
 from experiments.aggregation_comparison import engine
+from experiments.aggregation_comparison.gram import diagnostic_projection
 from experiments.aggregation_comparison.mechanisms import MechanismCollector, mechanism_audit
 from experiments.aggregation_comparison.model import AggregationClassifier
 from tests.test_aggregation_comparison_cuda import (  # noqa: F401
@@ -100964,6 +101326,22 @@ from tests.test_aggregation_comparison_cuda import (  # noqa: F401
     reference_arguments,
     synthetic_disjoint_batch,
 )
+
+
+@pytest.mark.parametrize("precision", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("chunk", [17, 64, 263])
+def test_streamed_observation_projection_matches_all_nodes_and_hops(precision, chunk):
+    torch.manual_seed(701)
+    past = [torch.randn(263, 256, device="cuda") for _ in range(8)]
+    weight = torch.randn(8, 256, 32, device="cuda") / 16
+    with (
+        torch.no_grad(),
+        torch.autocast("cuda", dtype=precision, enabled=precision != torch.float32),
+    ):
+        expected = torch.einsum("knd,hdw->knhw", torch.stack(past), weight)
+        actual = diagnostic_projection(past, weight, chunk)
+    assert actual.dtype == expected.dtype and actual.shape == (8, 263, 8, 32)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_observation_weighted_moments_and_histograms():
@@ -105893,6 +106271,149 @@ def test_reparse_directory_metadata_is_refused(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="symlink/reparse"):
         with calibration_lock(output):
             raise AssertionError("reparse output must not be followed")
+````
+
+# tests/test_comparison_allocator_cuda.py
+
+````python
+"""Explicit CUDA allocator smoke test; no benchmark/model size reduction."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from experiments.aggregation_comparison import engine, memory
+from tests.test_aggregation_comparison_cuda import cuda_required, reference_arguments  # noqa: F401
+
+
+def test_native_budget_rejects_oversized_allocation_and_keeps_gpu_usable():
+    device = torch.device("cuda:0")
+    torch.cuda.empty_cache()
+    previous = torch.cuda.get_per_process_memory_fraction(device)
+    live = torch.cuda.memory_allocated(device)
+    limit = live + 64 * 1024**2
+    try:
+        actual = memory.configure(SimpleNamespace(cuda_allocator_limit_gib=limit / 1024**3), device)
+        assert actual == limit
+        with pytest.raises(torch.OutOfMemoryError):
+            torch.empty(limit + 64 * 1024**2, dtype=torch.uint8, device=device)
+        small = torch.ones(1024, device=device)
+        assert small.sum().item() == 1024
+        del small
+    finally:
+        torch.cuda.empty_cache()
+        torch.cuda.set_per_process_memory_fraction(previous, device)
+
+
+def test_hardware_preflight_error_is_not_masked_by_memory_reporting(monkeypatch):
+    def fail(*args):
+        raise ValueError("debug rejected hardware before memory snapshot")
+
+    monkeypatch.setattr(engine.base, "validate_hardware_runtime", fail)
+    with pytest.raises(ValueError, match="debug rejected hardware"):
+        engine.run_calibration_candidate(
+            {},
+            reference_arguments("incidence", "fp32"),
+            torch.device("cuda:0"),
+            physical_batch_size=1,
+            workers=0,
+        )
+````
+
+# tests/test_comparison_memory_reporting.py
+
+````python
+"""Control-plane memory rejection diagnostics; no CPU model execution."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from experiments.aggregation_comparison import calibration, core, engine, memory, runner
+
+
+def test_headroom_rejection_is_distinguished_from_cuda_oom(monkeypatch):
+    gib = 1024**3
+    passed = {
+        "status": "passed",
+        "condition": "incidence_fixed",
+        "model_seed": 0,
+        "peak_allocated_bytes": 5 * gib,
+        "peak_reserved_bytes": 9 * gib,
+        "free_bytes_before": 10 * gib,
+        "total_memory_bytes": 10 * gib,
+    }
+    oom = {
+        "status": "oom",
+        "condition": "incidence",
+        "model_seed": 0,
+        "error": "actual CUDA allocation failure",
+        "failure_memory": passed,
+    }
+    monkeypatch.setattr(calibration, "_score", lambda *args: None)
+    with pytest.raises(RuntimeError) as failure:
+        calibration._choose([{"batch_size": 1, "workers": 0, "measurements": [passed, oom]}], {})
+    message = str(failure.value)
+    assert "incidence_fixed seed=0 physical=1 workers=0: headroom rejected" in message
+    assert "shortfall=1.000GiB" in message and "peak allocated=5.000GiB" in message
+    assert "incidence seed=0 physical=1 workers=0: CUDA OOM" in message
+    assert "actual CUDA allocation failure" in message
+
+
+def test_oom_keeps_telemetry_and_traceback(monkeypatch):
+    def fail(*args, **kwargs):
+        error = torch.OutOfMemoryError("debug injected OOM")
+        error.calibration_memory = {"peak_reserved_bytes": 123}
+        error.calibration_resource_observability = {"cpu_seconds": 2.5}
+        raise error
+
+    monkeypatch.setattr(engine, "run_calibration_candidate", fail)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    result = calibration._measure(
+        {"variant_id": "incidence", "model_seed": 0},
+        {},
+        SimpleNamespace(device="cuda:0", negative_loss_weight=0, selection_mode="full"),
+        1,
+        0,
+    )
+    assert result["status"] == "oom"
+    assert result["failure_memory"] == {"peak_reserved_bytes": 123}
+    assert result["resource_observability"] == {"cpu_seconds": 2.5}
+    assert "debug injected OOM" in result["traceback"]
+
+
+@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
+def test_allocator_budget_rejects_invalid_limits(value):
+    with pytest.raises(ValueError, match="finite and positive"):
+        memory.validate(SimpleNamespace(cuda_allocator_limit_gib=value))
+
+
+def test_allocator_budget_reaches_all_four_core_cells(tmp_path):
+    args = core.parser().parse_args(
+        [
+            "--run-id",
+            "debug-memory-forwarding",
+            "--profiles",
+            "reference",
+            "--sample-context-seed-batch-size",
+            "2048",
+            "--sample-seed-batch-size",
+            "2048",
+            "--cuda-allocator-limit-gib",
+            "7",
+        ]
+    )
+    core.validate(args)
+    for mode in core.MODES:
+        child = runner.parser().parse_args(core.child_argv(args, tmp_path, mode))
+        runner.validate_args(child)
+        jobs = runner.make_jobs(child, tmp_path / mode)
+        assert len(jobs) == 2
+        for job in jobs:
+            config = engine.configuration(calibration.parse_job(job))
+            assert config["cuda_allocator_limit_gib"] == 7
 ````
 
 # tests/test_compile_blocks.py
@@ -114820,6 +115341,8 @@ def test_four_cells_complete_exposure_pairing_and_global_freeze(monkeypatch, tmp
             "debug-core",
             "--profiles",
             "reference",
+            "--cuda-allocator-limit-gib",
+            "7",
             "--epochs",
             "4",
             "--patience",

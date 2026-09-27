@@ -1,6 +1,17 @@
 # GPT 전달용 전체 프로젝트 묶음
 
-## 현재 기준: 3eb0eb6 이후 정밀도 및 검증 보완
+## 현재 기준: 실제 arxiv 메모리 재현 및 보완
+
+먼저 [실제 arxiv CUDA 메모리 검수](../docs/ARXIV_MEMORY_REVIEW_20260927.md)를 읽는다.
+공식 전체 arxiv의 fixed/learned C calibration을 로컬 RTX 5070 Ti에서 직접 측정했다.
+진단 중 전체 hop projection 입력 stack이 메모리 병목이었다. 관측 전용 node chunk 처리와
+명시적 CUDA allocator 예산을 추가했다. 모델/그래프/epoch/context/physical batch 축소는 없다.
+이전의 “실제 arxiv 미실행”은 아래 역사적 기록에만 해당한다. 최종 200 epoch 본학습,
+공식 test 및 실제 A100 MIG 검증은 별개이며 미완료다. 최신 JSON/XML 증거를 참조한다.
+최신 결과: **영향 회귀 160개 통과, 실제 arxiv 4조건 모두 7GiB allocator 상한에서 통과**.
+최대 peak reserved는 6.936GiB다. sampled의 속도 우위는 확인되지 않았으며 실제 비용도 기록했다.
+
+## 이전 기준: 3eb0eb6 이후 정밀도 및 검증 보완
 
 먼저 [energy 정밀도 후속 검수](../docs/ENERGY_PRECISION_REVIEW_20260927.md)를 읽는다.
 reference/fused readout은 명시적 FP32이고 fused는 reference 순서로 Gram을 재계산한다.
@@ -18,7 +29,7 @@ shared/fixed-C shape, collector의 예측 경로 변경, 누락 validation fixtu
 현재 영향 회귀 110개 통과(CUDA 100, validation 제어 10). 실패·skip은 없다.
 아래 구현 설명과 과거 검증 개수를 새 소스의 실행 결과로 합산하지 않는다.
 
-## 최신 보완 — 2026-09-27 네 문서 검수 이후
+## 이전 보완 기록 — 2026-09-27 네 문서 검수 이후
 
 **현재 기준은 [REVIEW_REMEDIATION_20260927.md](../docs/REVIEW_REMEDIATION_20260927.md)와
 이번 ZIP의 VERIFICATION.json이다.** 아래 4b4df52 설명은 수정 전 보존 기록이다.
@@ -30,10 +41,10 @@ R0 객체 격리/test 원본 봉인/debug 출처, arxiv 핵심 4조건 controlle
 fused/reference gradient와 AMP 차이, 원본 예측 artifact 재사용을 독립 확인해야 한다.
 
 
-## 현재 검수 기준 — 2026-09-27, 구현 커밋 `4b4df52`
+## 과거 검수 기준 — 2026-09-27, 구현 커밋 `4b4df52`
 
 **이번 ZIP의 `MANIFEST.json`에 문서까지 포함한 정확한 커밋과 파일별 SHA-256이 있다.**
-이 절이 현재 상태이며 아래 2026-09-26 및 그 이전 내용은 역사적 기록이다.
+이 절도 과거 기록이며 현재 상태는 문서 맨 위의 실제 arxiv 메모리 검수 문서를 따른다.
 당시의 6조건/19조건, GATv2 미포함, validation-only 안내를 현재 계약으로 읽지 않는다.
 이전부터 수정 중이던 세 전달 문서의 내용도 삭제하지 않고 아래에 보존했다.
 
