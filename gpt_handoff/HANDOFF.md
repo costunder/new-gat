@@ -1,5 +1,13 @@
 # NEW GAT 연구 프로젝트 Hand-off
 
+## 최신 보완 기준
+
+[네 검수 문서 이후 구현 기록](../docs/REVIEW_REMEDIATION_20260927.md)이 아래 보존 기록보다
+우선한다. R0 세 결함과 별도 4조건 연구 실행기, temporal view, 선택적 fused Gram,
+sampled GCN/SAGE를 실제 코드에 연결했다. 현재 코드·검증 파일은 새 ZIP에 포함한다.
+실제 arxiv 본학습·공식/시간순 test·A100 MIG 측정은 수행하지 않았다.
+
+
 ## 2026-09-27 현재 반영표 — 구현 `4b4df52`
 
 문서까지 포함한 배포 커밋은 ZIP의 MANIFEST.json을 따른다. 아래 9월 26일 설명은

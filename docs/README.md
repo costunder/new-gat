@@ -1,5 +1,7 @@
 # NEW GAT 문서 모음
 
+최신 코드 보완과 실행 계약: [네 검수 문서 후속 구현](REVIEW_REMEDIATION_20260927.md).
+
 프로젝트의 일반 사용자 안내, 연구 설계와 개별 실험 문서는 이 `docs/` 폴더에서 관리한다.
 외부 GPT에 줄 전체 프로젝트 검토 묶음은 별도의 **[`gpt_handoff/`](../gpt_handoff/README_FIRST.md)**
 폴더에 있으며, 루트 `README.md`는 두 위치로 들어오는 짧은 입구만 제공한다.

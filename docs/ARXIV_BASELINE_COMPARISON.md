@@ -1,5 +1,9 @@
 # 주 벤치마크: ogbn-arxiv × GCN / GraphSAGE / GATv2 / incidence
 
+최신 보완: [REVIEW_REMEDIATION_20260927.md](REVIEW_REMEDIATION_20260927.md).
+기존 21조건 비교와 별도로 4조건 core controller, 원본 test 봉인, 시간순 custom protocol,
+선택적 sampled GCN/SAGE가 추가됐다. 아래 공식 transductive 규약과 시간순 규약을 섞지 않는다.
+
 PPI는 새 벤치마크에서 제외한다. 새 aggregation 실행기는 ogbn-arxiv만 허용하며,
 PPI-only sampled_inductive의 실행 진입점은 중단된다. 이전 결과/소스의 재현 자료는
 보존하지만 새 실험의 데이터나 성능 근거로 가져오지 않는다.

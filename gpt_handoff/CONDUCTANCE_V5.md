@@ -1,5 +1,9 @@
 # Conductance GAT V5 — graph-specific C optimization and weighted-Laplacian propagation
 
+최신 연구 실행 보완은 [네 검수 문서 이후 구현 기록](../docs/REVIEW_REMEDIATION_20260927.md)을
+따른다. 기존 V5 재현 경로는 보존했고 arxiv 핵심 4조건은 `aggregation_comparison.core`로
+분리했다. C는 입력 그래프가 아닌 학습 규칙으로 계산되는 conductance다.
+
 ## 2026-09-27 현재 비교 및 문서 해석
 
 최신 구현 `4b4df52`의 실행 계약은 `docs/ARXIV_BASELINE_COMPARISON.md`다.

@@ -22,7 +22,7 @@ import torch
 from chartgat.cache import atomic_write_json
 from chartgat.observability import RuntimeResourceMonitor
 from research.conductance_gat.edge_selection import protocol as selection_protocol
-from research.conductance_gat.edge_selection.data import PreparedInputs
+from research.conductance_gat.edge_selection.data import PreparedInputs as BaseInputs
 from research.conductance_gat.v5 import train as base
 from research.conductance_gat.v5.batch_calibration import (
     _candidate_args,
@@ -32,12 +32,34 @@ from research.conductance_gat.v5.batch_calibration import (
 from research.conductance_gat.v5.learning_budget import should_stop_learning_budget
 from research.conductance_gat.v5.timing import StageTimer
 
+from .evidence import origin, require_approval
 from .model import ARMS, AggregationClassifier, conductance_contract
 from .provenance import require_source_compatibility
 from .validation import POLICY, require_reproduction, require_score
 
 ROOT = Path(__file__).resolve().parents[2]
 SUITE = "aggregation_comparison_v4"
+
+
+def PreparedInputs(payload, args):
+    if getattr(args, "visibility_protocol", "official_transductive") != "official_transductive":
+        from .temporal import TemporalInputs
+
+        return TemporalInputs(payload, args)
+    if getattr(args, "complete_supervised_passes", False):
+        from .study_inputs import StudyInputs
+
+        return StudyInputs(payload, args)
+    return BaseInputs(payload, args)
+
+
+def load_dataset(args):
+    payload, protocol = base.load_dataset(args.dataset, args.data_root, allow_download=False)
+    if args.visibility_protocol != "official_transductive":
+        from .temporal import attach
+
+        return attach(payload, protocol, args.data_root)
+    return payload, protocol
 
 
 def build_parser():
@@ -53,12 +75,32 @@ def build_parser():
     selection_protocol.add_arguments(parser)
     parser.add_argument("--learning-rate", type=float, default=base.COMMON["lr"])
     parser.add_argument("--ablation-arm", choices=tuple(ARMS), required=True)
+    parser.add_argument("--complete-supervised-passes", action="store_true")
+    parser.add_argument(
+        "--gram-implementation", choices=("reference", "fused"), default="reference"
+    )
+    parser.add_argument(
+        "--visibility-protocol",
+        choices=("official_transductive", "arxiv_node_year_views_v1"),
+        default="official_transductive",
+    )
+    parser.add_argument("--sampled-local-baselines", action="store_true")
     return parser
 
 
 def validate_args(args):
     base.validate_args(args)
-    if args.sampling != "full" and not args.ablation_arm.startswith("incidence"):
+    if args.complete_supervised_passes and args.learning_budget_policy != "epochs":
+        raise ValueError("complete supervised passes require the explicit epochs budget")
+    if (
+        args.sampling != "full"
+        and not args.ablation_arm.startswith("incidence")
+        and not (
+            args.sampled_local_baselines
+            and args.sampling == "cluster_disjoint"
+            and args.ablation_arm in {"gcn", "graphsage"}
+        )
+    ):
         raise ValueError(
             "global-attention comparison requires full graph support; no sampled fallback"
         )
@@ -99,6 +141,14 @@ def configuration(args):
         **inherited,
         "edge_selection": topology,
         "ablation_arm": args.ablation_arm,
+        "complete_supervised_passes": args.complete_supervised_passes,
+        "learning_budget_policy": args.learning_budget_policy,
+        "gram_implementation": args.gram_implementation,
+        "visibility_protocol": args.visibility_protocol,
+        "sampled_local_baselines": args.sampled_local_baselines,
+        "sampled_baseline_semantics": (
+            "GCN/SAGE induced-context local normalization; no omega correction; not GraphSAINT"
+        ),
         "validation_reproduction_policy": dict(POLICY),
         "comparison_contract": {
             "external_residual": False,
@@ -134,6 +184,7 @@ def make_model(payload, args, device):
         payload["graphs"][0]["x"].shape[1],
         payload["classes"],
         arm=args.ablation_arm,
+        gram_implementation=args.gram_implementation,
         **architecture,
         max_log_conductance=base.COMMON["max_log_conductance"],
         edge_chunk_size=args.edge_chunk_size,
@@ -187,6 +238,18 @@ def shared_initial_state_sha256(model):
     return digest.hexdigest()
 
 
+def common_incidence_state_sha256(model):
+    """Pair value/output/beta/endpoints, excluding the differing C-generator state."""
+    if model.arm not in {"incidence", "incidence_fixed"}:
+        return None
+    digest = hashlib.sha256()
+    for name, value in model.state_dict().items():
+        if ".estimator." not in name:
+            digest.update(name.encode())
+            digest.update(base.tensor_hash(value).encode())
+    return digest.hexdigest()
+
+
 def resolve_budget(inputs, args):
     if inputs.indices is not None:
         return base.resolve_learning_budget(inputs.data, inputs.indices, inputs.sampler, args)
@@ -202,6 +265,7 @@ def build_identity(args, protocol, budget, initial_hash, inputs):
         "configuration": configuration(args),
         "training_arguments": serializable_arguments(args),
         "dataset_protocol": protocol,
+        "evidence_origin": origin(protocol),
         "dataset_protocol_sha256": base._canonical_sha256(protocol),
         "source_sha256": implementation_source_hashes(),
         "runtime_versions": base._versions(),
@@ -394,6 +458,7 @@ def run_training_epoch(
         "largest_measured_physical_edges": largest_edges,
         "largest_measured_graph_batch": largest_graphs,
         "batch_observations": observations,
+        "supervised_pass_evidence": getattr(inputs, "last_pass_evidence", None),
         "first_step_gradient_norms": {
             name: float(value.cpu()) for name, value in gradient_rows.items()
         },
@@ -476,6 +541,9 @@ def inspect_completed(output):
 
 
 def train_model(payload, protocol, args, device, output):
+    require_approval(protocol)
+    if protocol.get("visibility_protocol", "official_transductive") != args.visibility_protocol:
+        raise ValueError("training visibility protocol differs from immutable data evidence")
     base._require_cuda(device)
     validate_args(args)
     base.validate_cached_graphs_once(payload)
@@ -495,6 +563,7 @@ def train_model(payload, protocol, args, device, output):
         shared_hash = shared_initial_state_sha256(model)
         optimizer = make_optimizer(model, args.learning_rate)
         identity = build_identity(args, protocol, budget, initial_hash, inputs)
+        identity["common_incidence_initial_sha256"] = common_incidence_state_sha256(model)
         identity_hash = base._canonical_sha256(identity)
         execution_sources = copy.deepcopy(identity["source_sha256"])
         source_transitions = []
@@ -553,7 +622,8 @@ def train_model(payload, protocol, args, device, output):
             "data": base._v5_data_observability(payload, inputs.data, inputs.indices, args),
             "topology": inputs.metadata(),
             "model_contract": model.contract(),
-            "debug": bool(protocol.get("explicit_synthetic_debug", False)),
+            "debug": identity["evidence_origin"]["debug"],
+            "evidence_origin": identity["evidence_origin"],
             "subset": False,
             "test_evaluated": False,
             "batching": {
@@ -577,11 +647,15 @@ def train_model(payload, protocol, args, device, output):
         print(json.dumps(pre_run, sort_keys=True), flush=True)
         torch.cuda.reset_peak_memory_stats(device)
         for epoch in range(len(history) + 1, budget["planned_epochs"] + 1):
-            if history and should_stop_learning_budget(
-                budget,
-                epochs_since_best=history[-1]["epoch"] - best_epoch,
-                optimizer_steps_since_best=steps - history[best_epoch - 1]["optimizer_steps"],
-                eligible=True,
+            if (
+                not args.complete_supervised_passes
+                and history
+                and should_stop_learning_budget(
+                    budget,
+                    epochs_since_best=history[-1]["epoch"] - best_epoch,
+                    optimizer_steps_since_best=steps - history[best_epoch - 1]["optimizer_steps"],
+                    eligible=True,
+                )
             ):
                 break
             started = time.perf_counter()
@@ -708,7 +782,8 @@ def train_model(payload, protocol, args, device, output):
             "model_contract": model.contract(),
             "topology": inputs.metadata(),
             "test_evaluated": False,
-            "debug": False,
+            "debug": identity["evidence_origin"]["debug"],
+            "evidence_origin": identity["evidence_origin"],
             "subset": False,
         }
         atomic_write_json(output / "metrics.json", result)
@@ -732,7 +807,7 @@ def train_model(payload, protocol, args, device, output):
 
 
 def load_calibration_payload(args):
-    payload, protocol = base.load_dataset(args.dataset, args.data_root, allow_download=False)
+    payload, protocol = load_dataset(args)
     maximum = (
         len(payload["splits"]["train"])
         if args.dataset == "ppi"
@@ -966,7 +1041,7 @@ def main(argv=None):
         raise ValueError("selection output must not overlap the immutable official data cache")
     if args.output_dir.is_symlink() or any(path.is_symlink() for path in args.output_dir.parents):
         raise ValueError("selection output must not be indirect")
-    payload, protocol = base.load_dataset(args.dataset, data_root, allow_download=False)
+    payload, protocol = load_dataset(args)
     train_model(payload, protocol, args, torch.device(args.device), output)
     print(f"passed: {output}", flush=True)
     return 0

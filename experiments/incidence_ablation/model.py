@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -71,6 +72,14 @@ def cross_hop_score(values, incidence, weight, coefficients, edge_chunk_size):
     return score / degree.clamp_min(torch.finfo(degree.dtype).tiny)
 
 
+@dataclass(frozen=True)
+class OperatorOutput:
+    message: torch.Tensor
+    conductance: torch.Tensor
+    effective_weight: torch.Tensor
+    beta: torch.Tensor
+
+
 class IncidenceOperator(EdgeSelectionOperator):
     def __init__(self, original, selection_config, *, layer, lift, bilinear):
         super().__init__(original, selection_config, layer=layer)
@@ -94,7 +103,10 @@ class IncidenceOperator(EdgeSelectionOperator):
         else:
             self.register_parameter("hop_coefficients", None)
 
-    def forward(
+    def forward(self, *args, **kwargs):
+        return self.forward_with_state(*args, **kwargs).message
+
+    def forward_with_state(
         self,
         state,
         incidence,
@@ -157,13 +169,18 @@ class IncidenceOperator(EdgeSelectionOperator):
             return torch.cat((v, second), dim=-1)
 
         lifted = lift(value) if self.lift in {"linear", "pre"} else value
+        weight = effective
+        if sampling_correction is not None:
+            weight = weight * (
+                sampling_correction if weight.ndim == 1 else sampling_correction[:, None]
+            )
         propagated = shared_head_diffusion(
             lifted,
-            effective,
+            weight,
             incidence,
             node_graph,
             beta,
-            sampling_correction=sampling_correction,
+            sampling_correction=None,
             edge_chunk_size=self.edge_chunk_size,
             propagation_normalization=self.propagation_normalization,
             polynomial_coefficients=self.polynomial_delta,
@@ -201,7 +218,12 @@ class IncidenceOperator(EdgeSelectionOperator):
         self.live_edge_graph, self.live_num_graphs = edge_selection_topology.edge_graph, num_graphs
         if self.capture:
             self.last_probe = value.detach()
-        return self.output_projection(propagated.reshape(state.shape[0], self.channels))
+        return OperatorOutput(
+            self.output_projection(propagated.reshape(state.shape[0], self.channels)),
+            r,
+            weight,
+            beta,
+        )
 
 
 class IncidenceClassifier(EdgeSelectionClassifier):

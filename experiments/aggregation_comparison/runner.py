@@ -67,6 +67,21 @@ def parser(*, historical_datasets=False):
     result.add_argument("--device", default="cuda:0")
     result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
     result.add_argument("--epochs", type=int, default=200)
+    result.add_argument(
+        "--learning-budget-policy",
+        choices=("epochs", "reference_updates"),
+        default="reference_updates",
+    )
+    result.add_argument("--complete-supervised-passes", action="store_true")
+    result.add_argument(
+        "--gram-implementation", choices=("reference", "fused"), default="reference"
+    )
+    result.add_argument(
+        "--visibility-protocol",
+        choices=("official_transductive", "arxiv_node_year_views_v1"),
+        default="official_transductive",
+    )
+    result.add_argument("--sampled-local-baselines", action="store_true")
     result.add_argument("--patience", type=int, default=50)
     result.add_argument("--workers", type=int, default=4)
     if historical_datasets:
@@ -104,7 +119,17 @@ def validate_args(args):
         raise ValueError("invalid full training/worker/audit budget")
     if any(seed < 0 for seed in args.model_seeds):
         raise ValueError("model seeds must be nonnegative")
-    if args.sampling != "full" and any(not arm.startswith("incidence") for arm in args.arms):
+    if args.complete_supervised_passes and args.learning_budget_policy != "epochs":
+        raise ValueError("complete supervised passes require the epochs policy")
+    if args.sampling != "full" and any(
+        not arm.startswith("incidence")
+        and not (
+            args.sampled_local_baselines
+            and args.sampling == "cluster_disjoint"
+            and arm in {"gcn", "graphsage"}
+        )
+        for arm in args.arms
+    ):
         raise ValueError("comparison requires full graph support for global attention")
     if not str(args.device).startswith("cuda"):
         raise ValueError("production training requires CUDA; no CPU fallback")
@@ -156,7 +181,7 @@ def make_jobs(args, run_dir):
                     "--beta-initial",
                     "0.5",
                     "--learning-budget-policy",
-                    "reference_updates",
+                    args.learning_budget_policy,
                 ]
                 for name in (
                     "data_root",
@@ -195,6 +220,12 @@ def make_jobs(args, run_dir):
                         continue
                     command = job["command"]
                     command[command.index("-m") + 1] = TRAIN_MODULE
+                    command += ["--gram-implementation", args.gram_implementation]
+                    command += ["--visibility-protocol", args.visibility_protocol]
+                    if args.sampled_local_baselines:
+                        command.append("--sampled-local-baselines")
+                    if args.complete_supervised_passes:
+                        command.append("--complete-supervised-passes")
                     for name, value in variant["configuration"].items():
                         if value is not None:
                             command += ["--" + name.replace("_", "-"), str(value)]
@@ -527,7 +558,7 @@ def _summary(run_dir, manifest):
     if manifest.get("official_test"):
         from .final_test import markdown as test_markdown
 
-        lines.extend(test_markdown(manifest["official_test"]))
+        lines.extend(test_markdown(manifest["official_test"], manifest["jobs"]))
     atomic_write_bytes(run_dir / "comparison.md", ("\n".join(lines) + "\n").encode())
 
 

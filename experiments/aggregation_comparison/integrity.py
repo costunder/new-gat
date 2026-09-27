@@ -6,6 +6,7 @@ import json
 import math
 from pathlib import Path
 
+from .evidence import require_approval
 from .validation import POLICY, require_reproduction, require_score, validate_evaluation
 
 
@@ -90,7 +91,19 @@ def _history(metrics, identity, rows, args):
         )
     if epochs > budget["planned_epochs"]:
         raise ValueError("completed epochs exceed the declared full learning budget")
+    if args.complete_supervised_passes and epochs != budget["planned_epochs"]:
+        raise ValueError("core study ended before every declared supervised pass")
     for row in rows:
+        if args.complete_supervised_passes:
+            proof = row.get("supervised_pass_evidence", {})
+            if (
+                proof.get("every_train_seed_exactly_once") is not True
+                or proof.get("supervised_nodes") != count
+                or proof.get("physical_batches") != budget["actual_batches_per_epoch"]
+            ):
+                raise ValueError("missing complete supervised pass evidence")
+            for field in ("seed_counts_sha256", "sample_sequence_sha256"):
+                _fingerprint(proof.get(field), field)
         _positive_integer(row.get("epoch"), "history epoch")
         _score(row.get("validation"), "history validation")
         evidence = validate_evaluation(row.get("validation_evidence"), label="history validation")
@@ -187,11 +200,7 @@ def inspect_completed(output):
     ):
         if metrics.get(key) != identity.get(key):
             raise ValueError(f"completed metrics and immutable identity disagree on {key}")
-    if (
-        metrics.get("test_evaluated") is not False
-        or metrics.get("debug") is not False
-        or metrics.get("subset") is not False
-    ):
+    if metrics.get("test_evaluated") is not False or metrics.get("subset") is not False:
         raise ValueError(
             "completed comparison evidence is not full validation-only research training"
         )
@@ -207,6 +216,21 @@ def inspect_completed(output):
         or train.base._canonical_sha256(protocol) != identity.get("dataset_protocol_sha256")
     ):
         raise ValueError("completed data/split protocol identity mismatch")
+    evidence_origin = require_approval(protocol)
+    if (
+        identity.get("evidence_origin") != evidence_origin
+        or metrics.get("debug") is not evidence_origin["debug"]
+        or metrics.get("evidence_origin") != evidence_origin
+    ):
+        raise ValueError("completed evidence debug/origin differs from immutable identity")
+    configuration_path = output / "configuration.json"
+    if configuration_path.exists():
+        observed = json.loads(configuration_path.read_text(encoding="utf-8"))
+        if (
+            observed.get("debug") is not evidence_origin["debug"]
+            or observed.get("evidence_origin") != evidence_origin
+        ):
+            raise ValueError("configuration evidence origin differs from immutable identity")
     _fingerprint(protocol.get("data_sha256"), "official data cache")
     if not isinstance(identity.get("input_provenance"), list) or not identity["input_provenance"]:
         raise ValueError("completed identity has no topology/corruption provenance")

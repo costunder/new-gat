@@ -16,23 +16,17 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-IMPLEMENTATION_COMMIT = "4b4df52"
+IMPLEMENTATION_COMMIT = "2602d90"  # Previous review base; current implementation is package HEAD.
 TEXT_SUFFIXES = {".py", ".md", ".toml", ".yaml", ".yml", ".sh", ".ps1", ".json", ".txt"}
 EVIDENCE = {
-    "current_regression": ("results/arxiv-baselines-debug-20260927-01.xml", 105, 0),
-    "final_affected_repeat": ("results/arxiv-baselines-debug-20260927-02.xml", 13, 0),
-    "historical_cuda_audit": ("results/deep-audit-verified-20260927-02.xml", None, 0),
-    "historical_control_audit": ("results/deep-audit-control-20260927-03.xml", None, 0),
-    "historical_deliberate_before_fix_failure": (
-        "results/deep-audit-disk-fault-before-20260927.xml",
-        None,
-        1,
-    ),
+    "current_regression": ("results/revision-final-debug-20260927-01.xml", None, 0),
+    "intermediate_R0_checks": ("results/revision-r0-debug-20260927-01.xml", 45, 0),
+    "intermediate_new_paths": ("results/revision-paths-debug-20260927-02.xml", 31, 0),
 }
 EXTRA_EVIDENCE = (
-    "results/arxiv-baselines-dry-run-20260927.txt",
-    "results/deep-audit-math-summary-20260927.json",
-    "results/deep-audit-disk-fault-proof-20260927.json",
+    "results/revision-gram-profile-20260927-02.json",
+    "results/review-four-documents-20260927/reproduced.json",
+    "results/review-four-documents-20260927/fusion-sampling.json",
 )
 
 
@@ -104,12 +98,6 @@ def main() -> None:
             raise ValueError(f"Unexpected evidence outcome: {name}: {counts}")
         entries[name] = data
         reports[category] = {"path": name, "sha256": sha(data), **counts}
-    if (
-        reports["historical_cuda_audit"]["testcase"]
-        + reports["historical_control_audit"]["testcase"]
-        != 93
-    ):
-        raise ValueError("Historical audit must remain a separate 93-test record")
     for name in EXTRA_EVIDENCE:
         entries[name] = (ROOT / name).read_bytes()
     entries["evidence/before_fix/sampled_inductive_train.py.txt"] = git(
@@ -118,7 +106,8 @@ def main() -> None:
     entries["VERIFICATION.json"] = json_bytes(
         {
             "package_commit": commit,
-            "implementation_commit": git("rev-parse", IMPLEMENTATION_COMMIT).decode().strip(),
+            "implementation_commit": commit,
+            "previous_review_base": git("rev-parse", IMPLEMENTATION_COMMIT).decode().strip(),
             "historical_audit_commit": git("rev-parse", "cc173ed").decode().strip(),
             "evidence": reports,
             "source_files_in_code_summary": len(summary_paths),
@@ -128,34 +117,36 @@ def main() -> None:
             "research_requirements_complete": False,
             "model_or_weight_downloaded": False,
             "notes": [
-                "105 regression tests; 13 repeated after final changes. Do not add them.",
-                "The prior 93-test audit was not rerun on this package commit.",
-                "The deliberate pre-fix failure is synthetic corruption, not user result damage.",
+                "Use current_regression count; intermediate runs overlap and must not be added.",
+                "Before-fix counterexamples use synthetic evidence, not user result damage.",
                 "Model forward/backward checks used CUDA and explicit synthetic debug inputs.",
                 "CPU metadata/control checks do not constitute CPU model training.",
                 "No arxiv result, speedup, multi-seed superiority or MIG fit is established.",
-                "Arxiv's fixed/learned C x full/sampled controller remains incomplete.",
-                "The independent-graph evaluation protocol remains incomplete.",
+                "Core full/sampled x fixed/dynamic C uses complete matched supervised passes.",
+                "Custom arxiv node-year views are not an OGB score or independent-graph test.",
+                "Optional fused Gram/readout keeps projected history; no end-to-end speed claim.",
+                "Matched-update secondary study and independent-graph testing are not implemented.",
                 "Historical PPI source is preserved; current production comparison rejects PPI.",
             ],
         }
     )
     entries["REVIEW_FIRST.md"] = (
         "# Current GPT review package — 2026-09-27\n\n"
-        f"Package commit: `{commit}`. Implementation: `4b4df52`.\n\n"
-        "Start with gpt_handoff/README_FIRST.md's 2026-09-27 section and review prompt.\n"
-        "Then read HANDOFF.md, EXPERIMENT_STATUS.md, docs/ARXIV_BASELINE_COMPARISON.md,\n"
+        f"Package and implementation commit: `{commit}`.\n\n"
+        "Start with docs/REVIEW_REMEDIATION_20260927.md and gpt_handoff/README_FIRST.md.\n"
+        "Then read docs/FOUR_DOCUMENT_REVIEW_20260927.md (before-fix review),\n"
         "VERIFICATION.json, and actual source. Older sections retain historical context only.\n"
         "Current benchmark: ogbn-arxiv, 21 conditions including GCN, GraphSAGE and GATv2.\n"
         "No pretrained weights; no actual benchmark training/test or MIG fit measurements.\n"
-        "The full original sampled-inductive research goal is not complete.\n\n"
+        "Includes core four-cell controller, temporal visibility, and optional fused Gram.\n"
+        "Real-data accuracy/cost and independent-graph generalization remain unverified.\n\n"
         "MANIFEST.json hashes every archive member except itself. Evidence XMLs distinguish\n"
         "current checks, repeats, historical audits and deliberate pre-fix failures.\n"
         "Review source independently; documentation alone is not proof of successful execution.\n"
     ).encode()
     manifest = {
         "package_commit": commit,
-        "implementation_commit": IMPLEMENTATION_COMMIT,
+        "implementation_commit": commit,
         "files": {name: sha(data) for name, data in sorted(entries.items())},
     }
     entries["MANIFEST.json"] = json_bytes(manifest)

@@ -80,12 +80,53 @@ def _full_budget_seconds(report, policy):
         raise ValueError("cycle preparation was not measured in calibration")
     if not safe:
         return None
+    if policy.get("name") == "complete_supervised_passes":
+        from research.conductance_gat.v5.learning_budget import deterministic_batches_per_epoch
+
+        epochs = report.get("complete_measurement_epochs")
+        if type(epochs) is not int or epochs < 1:
+            raise ValueError("core calibration must measure complete supervised passes")
+        actual = (
+            1
+            if policy["batch_axis"] == "full_graph"
+            else deterministic_batches_per_epoch(
+                policy["training_split_size"], report["batch_size"]
+            )
+        )
+        if report["optimizer_steps"] != epochs * actual:
+            raise ValueError("core calibration update count differs from measured passes")
+        if policy["batch_axis"] != "full_graph" and report["processed_units"] != (
+            epochs * policy["training_split_size"]
+        ):
+            raise ValueError("core calibration must cover the whole supervised split")
+        if not math.isfinite(report["elapsed_seconds"]) or report["elapsed_seconds"] <= 0:
+            raise ValueError("invalid measured core runtime")
+        return (
+            policy["epochs"] * (report["elapsed_seconds"] / epochs + report["validation_seconds"])
+            + report["setup_seconds"]
+            + report["mechanism_audit_seconds"]
+        )
     cost = resources.projected_training_budget_cost(report, policy)
     return (
         cost["projected_training_seconds"]
         + cost["learning_budget"]["planned_epochs"] * report["validation_seconds"]
         + report["setup_seconds"]
         + report["mechanism_audit_seconds"]
+    )
+
+
+def _selection_policy(args, maximum, axis):
+    if args.complete_supervised_passes:
+        return {
+            "name": "complete_supervised_passes",
+            "epochs": args.epochs,
+            "training_split_size": maximum,
+            "batch_axis": axis,
+            "early_stopping": False,
+            "learning_budget_policy": "epochs",
+        }
+    return resources.learning_budget_selection_policy(
+        vars(args), training_split_size=maximum, batch_axis=axis
     )
 
 
@@ -165,11 +206,7 @@ def validate_entry(entry, jobs):
         )
     if context != (entry.get("worker_axis") == "sample_context_workers"):
         raise ValueError("calibration worker axis differs from the declared sampler")
-    policy = resources.learning_budget_selection_policy(
-        vars(parsed[0]),
-        training_split_size=entry["natural_training_split_size"],
-        batch_axis=axis,
-    )
+    policy = _selection_policy(parsed[0], entry["natural_training_split_size"], axis)
     if policy != entry.get("selection_policy"):
         raise ValueError("calibration learning-budget selection recipe changed")
     seen = set()
@@ -291,9 +328,7 @@ def calibrate_group(jobs, entry, persist):
     if entry.get("status") == "passed":
         validate_entry(entry, jobs)
         return
-    policy = resources.learning_budget_selection_policy(
-        vars(parsed[0]), training_split_size=maximum, batch_axis=axis
-    )
+    policy = _selection_policy(parsed[0], maximum, axis)
     if policy is None:
         raise ValueError(
             "aggregation-comparison calibration requires explicit reference_updates budget"

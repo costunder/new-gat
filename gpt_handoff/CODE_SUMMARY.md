@@ -253,7 +253,7 @@ def audit(root, data_root, device, repeats):
     args = train.restore_arguments(metrics, root, data_root, device)
     train.base._require_cuda(device)
     train.base.configure_compute(args)
-    payload, protocol = train.base.load_dataset(args.dataset, args.data_root, allow_download=False)
+    payload, protocol = train.load_dataset(args)
     if protocol != identity["dataset_protocol"]:
         raise ValueError("audit cache/split provenance differs from training")
     monitor = RuntimeResourceMonitor(device)
@@ -304,6 +304,8 @@ def audit(root, data_root, device, repeats):
                 "research_suite": train.SUITE,
                 "ablation_arm": args.ablation_arm,
                 "dataset": args.dataset,
+                "evidence_origin": identity["evidence_origin"],
+                "debug": identity["evidence_origin"]["debug"],
                 "checkpoint_sha256": metrics["checkpoint_sha256"],
                 "source_sha256": sources,
                 "test_evaluated": False,
@@ -451,12 +453,53 @@ def _full_budget_seconds(report, policy):
         raise ValueError("cycle preparation was not measured in calibration")
     if not safe:
         return None
+    if policy.get("name") == "complete_supervised_passes":
+        from research.conductance_gat.v5.learning_budget import deterministic_batches_per_epoch
+
+        epochs = report.get("complete_measurement_epochs")
+        if type(epochs) is not int or epochs < 1:
+            raise ValueError("core calibration must measure complete supervised passes")
+        actual = (
+            1
+            if policy["batch_axis"] == "full_graph"
+            else deterministic_batches_per_epoch(
+                policy["training_split_size"], report["batch_size"]
+            )
+        )
+        if report["optimizer_steps"] != epochs * actual:
+            raise ValueError("core calibration update count differs from measured passes")
+        if policy["batch_axis"] != "full_graph" and report["processed_units"] != (
+            epochs * policy["training_split_size"]
+        ):
+            raise ValueError("core calibration must cover the whole supervised split")
+        if not math.isfinite(report["elapsed_seconds"]) or report["elapsed_seconds"] <= 0:
+            raise ValueError("invalid measured core runtime")
+        return (
+            policy["epochs"] * (report["elapsed_seconds"] / epochs + report["validation_seconds"])
+            + report["setup_seconds"]
+            + report["mechanism_audit_seconds"]
+        )
     cost = resources.projected_training_budget_cost(report, policy)
     return (
         cost["projected_training_seconds"]
         + cost["learning_budget"]["planned_epochs"] * report["validation_seconds"]
         + report["setup_seconds"]
         + report["mechanism_audit_seconds"]
+    )
+
+
+def _selection_policy(args, maximum, axis):
+    if args.complete_supervised_passes:
+        return {
+            "name": "complete_supervised_passes",
+            "epochs": args.epochs,
+            "training_split_size": maximum,
+            "batch_axis": axis,
+            "early_stopping": False,
+            "learning_budget_policy": "epochs",
+        }
+    return resources.learning_budget_selection_policy(
+        vars(args), training_split_size=maximum, batch_axis=axis
     )
 
 
@@ -536,11 +579,7 @@ def validate_entry(entry, jobs):
         )
     if context != (entry.get("worker_axis") == "sample_context_workers"):
         raise ValueError("calibration worker axis differs from the declared sampler")
-    policy = resources.learning_budget_selection_policy(
-        vars(parsed[0]),
-        training_split_size=entry["natural_training_split_size"],
-        batch_axis=axis,
-    )
+    policy = _selection_policy(parsed[0], entry["natural_training_split_size"], axis)
     if policy != entry.get("selection_policy"):
         raise ValueError("calibration learning-budget selection recipe changed")
     seen = set()
@@ -662,9 +701,7 @@ def calibrate_group(jobs, entry, persist):
     if entry.get("status") == "passed":
         validate_entry(entry, jobs)
         return
-    policy = resources.learning_budget_selection_policy(
-        vars(parsed[0]), training_split_size=maximum, batch_axis=axis
-    )
+    policy = _selection_policy(parsed[0], maximum, axis)
     if policy is None:
         raise ValueError(
             "aggregation-comparison calibration requires explicit reference_updates budget"
@@ -771,6 +808,379 @@ def calibrate_group(jobs, entry, persist):
     )
     validate_entry(entry, jobs)
     persist()
+````
+
+# experiments/aggregation_comparison/core.py
+
+````python
+"""Arxiv fixed/learned C x full/sampled study, with a global test barrier."""
+
+from __future__ import annotations
+
+import json
+import sys
+import time
+from pathlib import Path
+
+from chartgat.cache import atomic_write_json
+from scripts.calibration_lock import calibration_lock
+
+from . import engine, final_test, provenance, runner
+
+ARMS = ("incidence_fixed", "incidence")
+MODES = ("full", "sampled")
+
+
+def parser():
+    result = runner.parser()
+    result.description = __doc__
+    result.set_defaults(
+        arms=list(ARMS),
+        learning_budget_policy="epochs",
+        complete_supervised_passes=True,
+        sampling="cluster_disjoint",
+    )
+    result.add_argument("--include-sampled-baselines", action="store_true")
+    return result
+
+
+def validate(args):
+    runner.validate_args(args)
+    if args.sampling != "cluster_disjoint":
+        raise ValueError("core sampled cells require cluster_disjoint contexts")
+    if set(args.arms) != set(ARMS) or args.datasets != ["ogbn-arxiv"]:
+        raise ValueError("core study requires all four arxiv fixed/dynamic C cells")
+    if not args.complete_supervised_passes or args.learning_budget_policy != "epochs":
+        raise ValueError("core study requires complete exposure-matched supervised passes")
+    if args.sample_context_seed_batch_size is None:
+        raise ValueError("declare --sample-context-seed-batch-size; context is a research variable")
+    if len(args.run_id) > 100:
+        raise ValueError("core run ID must leave room for independent child identifiers")
+
+
+def child_argv(args, root, mode):
+    argv = [
+        "--run-id",
+        args.run_id + "-" + mode,
+        "--datasets",
+        "ogbn-arxiv",
+        "--profiles",
+        *args.profiles,
+        "--model-seeds",
+        *map(str, args.model_seeds),
+        "--arms",
+        *(ARMS + (("gcn", "graphsage") if args.include_sampled_baselines else ())),
+        "--results-root",
+        str(root / "children"),
+        "--learning-budget-policy",
+        "epochs",
+        "--complete-supervised-passes",
+        "--sampling",
+        "full" if mode == "full" else "cluster_disjoint",
+    ]
+    argv += [
+        "--visibility-protocol",
+        args.visibility_protocol,
+        "--gram-implementation",
+        args.gram_implementation,
+    ]
+    if args.include_sampled_baselines:
+        argv.append("--sampled-local-baselines")
+    for name in (
+        "data_root",
+        "device",
+        "hardware_profile",
+        "epochs",
+        "patience",
+        "workers",
+        "learning_rate",
+        "edge_chunk_size",
+        "min_free_gb",
+        "repeat_evaluations",
+    ):
+        value = getattr(args, name)
+        if value is not None:
+            argv.extend(("--" + name.replace("_", "-"), str(value)))
+    argv.append(
+        "--activation-checkpoint" if args.activation_checkpoint else "--no-activation-checkpoint"
+    )
+    if mode == "sampled":
+        argv += [
+            "--sample-context-seed-batch-size",
+            str(args.sample_context_seed_batch_size),
+            "--sample-context-workers",
+            str(runner.sampling_context_configuration(args)["sample_context_workers"]),
+            "--num-neighbors",
+            *map(str, args.num_neighbors),
+        ]
+        if args.sample_seed_batch_size is not None:
+            argv += ["--sample-seed-batch-size", str(args.sample_seed_batch_size)]
+    if args.calibration_only:
+        argv.append("--calibration-only")
+    return argv
+
+
+def child_root(args, root, mode):
+    return root / "children" / "aggregation_comparison" / (args.run_id + "-" + mode)
+
+
+def read_groups(args, root):
+    groups = {}
+    for mode in MODES:
+        path = child_root(args, root, mode) / "manifest.json"
+        if path.is_symlink():
+            raise ValueError("indirect core child manifest")
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        if manifest["status"] != "passed":
+            raise ValueError("every core child must finish training and audit before test")
+        child = runner.parser().parse_args(child_argv(args, root, mode))
+        runner._resume(
+            path,
+            child,
+            runner.make_jobs(child, path.parent),
+            provenance.source_snapshot(),
+            manifest["dependencies"],
+        )
+        groups[mode] = {"args": child, "manifest": manifest, "path": path}
+    return groups
+
+
+def verify_and_report(groups):
+    """Reject unequal exposure/sample pairing before reporting any causal contrast."""
+    rows = {}
+    comparators = []
+    for mode, group in groups.items():
+        for job in group["manifest"]["jobs"]:
+            metrics = engine.inspect_completed(job["output_dir"])
+            if job["variant_id"] not in ARMS:
+                comparators.append(
+                    {
+                        "mode": mode,
+                        "arm": job["variant_id"],
+                        "profile": job["profile"],
+                        "seed": job["model_seed"],
+                        "validation_accuracy": metrics["validation"],
+                        "parameters": metrics["model_contract"]["total_parameters"],
+                        "optimizer_steps": metrics["optimizer_steps"],
+                        "resources": metrics["resource_observability"],
+                    }
+                )
+                continue
+            config = metrics["configuration"]
+            if (
+                not config["complete_supervised_passes"]
+                or config["learning_budget_policy"] != "epochs"
+            ):
+                raise ValueError("core results lack the declared complete-pass budget")
+            if config["sampling"] != ("full" if mode == "full" else "cluster_disjoint"):
+                raise ValueError("core cell has the wrong sampling law")
+            history = json.loads(
+                (Path(job["output_dir"]) / "history.json").read_text(encoding="utf-8")
+            )
+            label = ("F" if mode == "full" else "S") + (
+                "0" if job["variant_id"] == ARMS[0] else "1"
+            )
+            key = (job["profile"], job["model_seed"], label)
+            if key in rows:
+                raise ValueError("duplicate core cell")
+            rows[key] = {
+                "profile": key[0],
+                "seed": key[1],
+                "cell": label,
+                "validation_accuracy": metrics["validation"],
+                "checkpoint_sha256": metrics["checkpoint_sha256"],
+                "history_sha256": metrics["history_sha256"],
+                "source_sha256": metrics["source_sha256"],
+                "data_protocol": metrics["protocol"],
+                "common_initialization": metrics["shared_initial_state_sha256"],
+                "common_incidence_initialization": metrics["resume_identity"][
+                    "common_incidence_initial_sha256"
+                ],
+                "epochs": metrics["epochs_run"],
+                "validation_observations": len(history),
+                "optimizer_steps": metrics["optimizer_steps"],
+                "supervised_exposures": sum(r["train_labels"] for r in history),
+                "pass_evidence": [r["supervised_pass_evidence"] for r in history],
+                "history": history,
+                "total_parameters": metrics["model_contract"]["total_parameters"],
+                "resource_observability": metrics["resource_observability"],
+                "training_child_wall_seconds_including_IO": job.get("elapsed_seconds"),
+                "sampling_configuration": {
+                    name: config.get(name)
+                    for name in (
+                        "sampling",
+                        "sample_seed_batch_size",
+                        "sample_context_seed_batch_size",
+                        "sample_context_workers",
+                        "num_neighbors",
+                    )
+                },
+            }
+    contrasts = []
+    if not rows or set(groups) != set(MODES):
+        raise ValueError("core study requires full and sampled result groups")
+    for profile, seed in sorted({(key[0], key[1]) for key in rows}):
+        if any((profile, seed, name) not in rows for name in ("F0", "F1", "S0", "S1")):
+            raise ValueError("core study requires every F0/F1/S0/S1 cell")
+        cells = {name: rows[(profile, seed, name)] for name in ("F0", "F1", "S0", "S1")}
+        for field in (
+            "epochs",
+            "validation_observations",
+            "supervised_exposures",
+            "data_protocol",
+            "common_initialization",
+            "common_incidence_initialization",
+            "source_sha256",
+        ):
+            if any(row[field] != cells["F0"][field] for row in cells.values()):
+                raise ValueError(f"core cells do not share {field}")
+        seeds = [
+            [proof["seed_counts_sha256"] for proof in row["pass_evidence"]]
+            for row in cells.values()
+        ]
+        if any(value != seeds[0] for value in seeds):
+            raise ValueError("core cells supervised different original seed IDs")
+        if cells["S0"]["pass_evidence"] != cells["S1"]["pass_evidence"]:
+            raise ValueError("sampled fixed/learned C saw different context sequences")
+        f0, f1, s0, s1 = (cells[name]["validation_accuracy"] for name in ("F0", "F1", "S0", "S1"))
+        contrasts.append(
+            {
+                "profile": profile,
+                "seed": seed,
+                "selection_split": "validation",
+                "C_full": f1 - f0,
+                "C_sampled": s1 - s0,
+                "sampling_dynamic": s1 - f1,
+                "interaction": s1 - s0 - f1 + f0,
+            }
+        )
+    return {
+        "cells": list(rows.values()),
+        "comparators": comparators,
+        "contrasts": contrasts,
+        "interpretation": "exposure-matched training strategies; optimizer steps differ",
+        "independent_graph_generalization_claimed": False,
+        "parameter_matched": False,
+    }
+
+
+def freeze_and_test(args, groups, master, persist):
+    # Verify EVERY group's actual training and audit evidence before ANY test.
+    for group in groups.values():
+        final_test.freeze_matrix(group["args"], group["manifest"], lambda: None)
+    report = verify_and_report(groups)
+    lock = {
+        mode + "/" + job["job_id"]: job["result"]["checkpoint_sha256"]
+        for mode, group in groups.items()
+        for job in group["manifest"]["jobs"]
+    }
+    if master.get("checkpoint_lock") not in (None, lock):
+        raise ValueError("core study checkpoint matrix changed after freeze")
+    master.update(checkpoint_lock=lock, validation_report=report)
+    persist()  # ALL four cells frozen before ANY official test access.
+    if args.evaluate_test:
+        for group in groups.values():
+            final_test.evaluate_matrix(
+                group["args"],
+                group["manifest"],
+                lambda group=group: atomic_write_json(group["path"], group["manifest"]),
+            )
+            runner._summary(group["path"].parent, group["manifest"])
+        master["official_test"] = {
+            mode: group["manifest"]["official_test"] for mode, group in groups.items()
+        }
+        contrasts = []
+        for row in report["contrasts"]:
+            prefix = f"{row['profile']}/ogbn-arxiv/model-seed-{row['seed']}/"
+            scores = [
+                master["official_test"][mode]["results"][prefix + arm]["evaluation"]["metric"]
+                for mode, arm in (
+                    ("full", ARMS[0]),
+                    ("full", ARMS[1]),
+                    ("sampled", ARMS[0]),
+                    ("sampled", ARMS[1]),
+                )
+            ]
+            f0, f1, s0, s1 = scores
+            contrasts.append(
+                {
+                    "profile": row["profile"],
+                    "seed": row["seed"],
+                    "C_full": f1 - f0,
+                    "C_sampled": s1 - s0,
+                    "sampling_dynamic": s1 - f1,
+                    "interaction": s1 - s0 - f1 + f0,
+                    "selection_split": "validation",
+                    "evaluation_protocol": args.visibility_protocol,
+                }
+            )
+        report["heldout_contrasts"] = contrasts
+    return report
+
+
+def execute(args):
+    validate(args)
+    root = args.results_root.resolve() / "core_conductance" / args.run_id
+    if root.is_relative_to(args.data_root.resolve()) or args.data_root.resolve().is_relative_to(
+        root
+    ):
+        raise ValueError("core outputs must be outside the dataset cache")
+    if args.dry_run:
+        for mode in MODES:
+            child = runner.parser().parse_args(child_argv(args, root, mode))
+            jobs = runner.make_jobs(child, child_root(args, root, mode))
+            print(json.dumps({"mode": mode, "jobs": jobs}, default=str))
+        return 0
+    with calibration_lock(root):
+        path = root / "manifest.json"
+        identity = {"config": runner._config(args), "source_sha256": provenance.source_snapshot()}
+        if path.exists():
+            master = json.loads(path.read_text(encoding="utf-8"))
+            if master["identity"] != identity:
+                raise ValueError("core identity changed; use a fresh run and preserve evidence")
+        else:
+            master = {"schema_version": 1, "identity": identity, "status": "running"}
+        root.mkdir(parents=True, exist_ok=True)
+        started = time.perf_counter()
+
+        def persist():
+            atomic_write_json(path, master)
+
+        persist()
+        try:
+            for mode in MODES:
+                status = runner.main(child_argv(args, root, mode))
+                if status:
+                    raise RuntimeError(f"core {mode} child failed with status {status}")
+            if args.calibration_only:
+                master["status"] = "calibrated"
+            else:
+                groups = read_groups(args, root)
+                report = freeze_and_test(args, groups, master, persist)
+                atomic_write_json(root / "comparison.json", report)
+                master["status"] = "passed"
+            master["last_invocation_wall_seconds_including_calibration_audit_IO"] = (
+                time.perf_counter() - started
+            )
+            persist()
+            print(f"Core study {master['status']}: {root}")
+            return 0
+        except (Exception, KeyboardInterrupt) as error:
+            master.update(status="failed", error=f"{type(error).__name__}: {error}")
+            persist()
+            raise
+
+
+def main(argv=None):
+    try:
+        return execute(parser().parse_args(argv))
+    except (ValueError, RuntimeError, OSError) as error:
+        print(f"Core study stopped safely: {type(error).__name__}: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 ````
 
 # experiments/aggregation_comparison/effects.py
@@ -986,7 +1396,7 @@ import torch
 from chartgat.cache import atomic_write_json
 from chartgat.observability import RuntimeResourceMonitor
 from research.conductance_gat.edge_selection import protocol as selection_protocol
-from research.conductance_gat.edge_selection.data import PreparedInputs
+from research.conductance_gat.edge_selection.data import PreparedInputs as BaseInputs
 from research.conductance_gat.v5 import train as base
 from research.conductance_gat.v5.batch_calibration import (
     _candidate_args,
@@ -996,12 +1406,34 @@ from research.conductance_gat.v5.batch_calibration import (
 from research.conductance_gat.v5.learning_budget import should_stop_learning_budget
 from research.conductance_gat.v5.timing import StageTimer
 
+from .evidence import origin, require_approval
 from .model import ARMS, AggregationClassifier, conductance_contract
 from .provenance import require_source_compatibility
 from .validation import POLICY, require_reproduction, require_score
 
 ROOT = Path(__file__).resolve().parents[2]
 SUITE = "aggregation_comparison_v4"
+
+
+def PreparedInputs(payload, args):
+    if getattr(args, "visibility_protocol", "official_transductive") != "official_transductive":
+        from .temporal import TemporalInputs
+
+        return TemporalInputs(payload, args)
+    if getattr(args, "complete_supervised_passes", False):
+        from .study_inputs import StudyInputs
+
+        return StudyInputs(payload, args)
+    return BaseInputs(payload, args)
+
+
+def load_dataset(args):
+    payload, protocol = base.load_dataset(args.dataset, args.data_root, allow_download=False)
+    if args.visibility_protocol != "official_transductive":
+        from .temporal import attach
+
+        return attach(payload, protocol, args.data_root)
+    return payload, protocol
 
 
 def build_parser():
@@ -1017,12 +1449,32 @@ def build_parser():
     selection_protocol.add_arguments(parser)
     parser.add_argument("--learning-rate", type=float, default=base.COMMON["lr"])
     parser.add_argument("--ablation-arm", choices=tuple(ARMS), required=True)
+    parser.add_argument("--complete-supervised-passes", action="store_true")
+    parser.add_argument(
+        "--gram-implementation", choices=("reference", "fused"), default="reference"
+    )
+    parser.add_argument(
+        "--visibility-protocol",
+        choices=("official_transductive", "arxiv_node_year_views_v1"),
+        default="official_transductive",
+    )
+    parser.add_argument("--sampled-local-baselines", action="store_true")
     return parser
 
 
 def validate_args(args):
     base.validate_args(args)
-    if args.sampling != "full" and not args.ablation_arm.startswith("incidence"):
+    if args.complete_supervised_passes and args.learning_budget_policy != "epochs":
+        raise ValueError("complete supervised passes require the explicit epochs budget")
+    if (
+        args.sampling != "full"
+        and not args.ablation_arm.startswith("incidence")
+        and not (
+            args.sampled_local_baselines
+            and args.sampling == "cluster_disjoint"
+            and args.ablation_arm in {"gcn", "graphsage"}
+        )
+    ):
         raise ValueError(
             "global-attention comparison requires full graph support; no sampled fallback"
         )
@@ -1063,6 +1515,14 @@ def configuration(args):
         **inherited,
         "edge_selection": topology,
         "ablation_arm": args.ablation_arm,
+        "complete_supervised_passes": args.complete_supervised_passes,
+        "learning_budget_policy": args.learning_budget_policy,
+        "gram_implementation": args.gram_implementation,
+        "visibility_protocol": args.visibility_protocol,
+        "sampled_local_baselines": args.sampled_local_baselines,
+        "sampled_baseline_semantics": (
+            "GCN/SAGE induced-context local normalization; no omega correction; not GraphSAINT"
+        ),
         "validation_reproduction_policy": dict(POLICY),
         "comparison_contract": {
             "external_residual": False,
@@ -1098,6 +1558,7 @@ def make_model(payload, args, device):
         payload["graphs"][0]["x"].shape[1],
         payload["classes"],
         arm=args.ablation_arm,
+        gram_implementation=args.gram_implementation,
         **architecture,
         max_log_conductance=base.COMMON["max_log_conductance"],
         edge_chunk_size=args.edge_chunk_size,
@@ -1151,6 +1612,18 @@ def shared_initial_state_sha256(model):
     return digest.hexdigest()
 
 
+def common_incidence_state_sha256(model):
+    """Pair value/output/beta/endpoints, excluding the differing C-generator state."""
+    if model.arm not in {"incidence", "incidence_fixed"}:
+        return None
+    digest = hashlib.sha256()
+    for name, value in model.state_dict().items():
+        if ".estimator." not in name:
+            digest.update(name.encode())
+            digest.update(base.tensor_hash(value).encode())
+    return digest.hexdigest()
+
+
 def resolve_budget(inputs, args):
     if inputs.indices is not None:
         return base.resolve_learning_budget(inputs.data, inputs.indices, inputs.sampler, args)
@@ -1166,6 +1639,7 @@ def build_identity(args, protocol, budget, initial_hash, inputs):
         "configuration": configuration(args),
         "training_arguments": serializable_arguments(args),
         "dataset_protocol": protocol,
+        "evidence_origin": origin(protocol),
         "dataset_protocol_sha256": base._canonical_sha256(protocol),
         "source_sha256": implementation_source_hashes(),
         "runtime_versions": base._versions(),
@@ -1358,6 +1832,7 @@ def run_training_epoch(
         "largest_measured_physical_edges": largest_edges,
         "largest_measured_graph_batch": largest_graphs,
         "batch_observations": observations,
+        "supervised_pass_evidence": getattr(inputs, "last_pass_evidence", None),
         "first_step_gradient_norms": {
             name: float(value.cpu()) for name, value in gradient_rows.items()
         },
@@ -1440,6 +1915,9 @@ def inspect_completed(output):
 
 
 def train_model(payload, protocol, args, device, output):
+    require_approval(protocol)
+    if protocol.get("visibility_protocol", "official_transductive") != args.visibility_protocol:
+        raise ValueError("training visibility protocol differs from immutable data evidence")
     base._require_cuda(device)
     validate_args(args)
     base.validate_cached_graphs_once(payload)
@@ -1459,6 +1937,7 @@ def train_model(payload, protocol, args, device, output):
         shared_hash = shared_initial_state_sha256(model)
         optimizer = make_optimizer(model, args.learning_rate)
         identity = build_identity(args, protocol, budget, initial_hash, inputs)
+        identity["common_incidence_initial_sha256"] = common_incidence_state_sha256(model)
         identity_hash = base._canonical_sha256(identity)
         execution_sources = copy.deepcopy(identity["source_sha256"])
         source_transitions = []
@@ -1517,7 +1996,8 @@ def train_model(payload, protocol, args, device, output):
             "data": base._v5_data_observability(payload, inputs.data, inputs.indices, args),
             "topology": inputs.metadata(),
             "model_contract": model.contract(),
-            "debug": bool(protocol.get("explicit_synthetic_debug", False)),
+            "debug": identity["evidence_origin"]["debug"],
+            "evidence_origin": identity["evidence_origin"],
             "subset": False,
             "test_evaluated": False,
             "batching": {
@@ -1541,11 +2021,15 @@ def train_model(payload, protocol, args, device, output):
         print(json.dumps(pre_run, sort_keys=True), flush=True)
         torch.cuda.reset_peak_memory_stats(device)
         for epoch in range(len(history) + 1, budget["planned_epochs"] + 1):
-            if history and should_stop_learning_budget(
-                budget,
-                epochs_since_best=history[-1]["epoch"] - best_epoch,
-                optimizer_steps_since_best=steps - history[best_epoch - 1]["optimizer_steps"],
-                eligible=True,
+            if (
+                not args.complete_supervised_passes
+                and history
+                and should_stop_learning_budget(
+                    budget,
+                    epochs_since_best=history[-1]["epoch"] - best_epoch,
+                    optimizer_steps_since_best=steps - history[best_epoch - 1]["optimizer_steps"],
+                    eligible=True,
+                )
             ):
                 break
             started = time.perf_counter()
@@ -1672,7 +2156,8 @@ def train_model(payload, protocol, args, device, output):
             "model_contract": model.contract(),
             "topology": inputs.metadata(),
             "test_evaluated": False,
-            "debug": False,
+            "debug": identity["evidence_origin"]["debug"],
+            "evidence_origin": identity["evidence_origin"],
             "subset": False,
         }
         atomic_write_json(output / "metrics.json", result)
@@ -1696,7 +2181,7 @@ def train_model(payload, protocol, args, device, output):
 
 
 def load_calibration_payload(args):
-    payload, protocol = base.load_dataset(args.dataset, args.data_root, allow_download=False)
+    payload, protocol = load_dataset(args)
     maximum = (
         len(payload["splits"]["train"])
         if args.dataset == "ppi"
@@ -1930,7 +2415,7 @@ def main(argv=None):
         raise ValueError("selection output must not overlap the immutable official data cache")
     if args.output_dir.is_symlink() or any(path.is_symlink() for path in args.output_dir.parents):
         raise ValueError("selection output must not be indirect")
-    payload, protocol = base.load_dataset(args.dataset, data_root, allow_download=False)
+    payload, protocol = load_dataset(args)
     train_model(payload, protocol, args, torch.device(args.device), output)
     print(f"passed: {output}", flush=True)
     return 0
@@ -1938,6 +2423,45 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+````
+
+# experiments/aggregation_comparison/evidence.py
+
+````python
+"""Immutable data origin and explicit in-process synthetic verification scope.
+
+Production command lines never expose this scope. Debug artifacts remain marked
+and cannot be approved/exported by an ordinary production invocation.
+"""
+
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+_VERIFY_SYNTHETIC = ContextVar("aggregation_synthetic_verification", default=False)
+
+
+def origin(protocol):
+    debug = protocol.get("explicit_synthetic_debug", False)
+    if type(debug) is not bool:
+        raise ValueError("explicit_synthetic_debug must be a boolean")
+    return {"kind": "synthetic_debug" if debug else "benchmark", "debug": debug}
+
+
+def require_approval(protocol):
+    value = origin(protocol)
+    if value["debug"] and not _VERIFY_SYNTHETIC.get():
+        raise ValueError("synthetic debug evidence cannot be approved as a benchmark result")
+    return value
+
+
+@contextmanager
+def synthetic_verification():
+    """For isolated verification code, not a runtime fallback or CLI option."""
+    token = _VERIFY_SYNTHETIC.set(True)
+    try:
+        yield
+    finally:
+        _VERIFY_SYNTHETIC.reset(token)
 ````
 
 # experiments/aggregation_comparison/final_test.py
@@ -1956,8 +2480,9 @@ from pathlib import Path
 
 import torch
 
-from . import engine, runner
+from . import engine, runner, test_artifacts
 from .benchmark_policy import require_benchmark_datasets
+from .evidence import require_approval
 from .validation import require_reproduction, validate_evaluation
 
 
@@ -2016,11 +2541,24 @@ def freeze_matrix(args, manifest, persist):
 
 def evaluate_matrix(args, manifest, persist):
     lock = freeze_matrix(args, manifest, persist)
+    existing = manifest.get("official_test")
+    if existing is None and manifest.get("test_evaluated") is True:
+        raise ValueError("completed official test report is missing")
+    if existing is not None:
+        if existing.get("status") not in {"running", "passed"}:
+            raise ValueError("unknown official test state")
+        if existing["status"] == "passed" and (
+            set(existing["results"]) != set(lock) or manifest.get("test_evaluated") is not True
+        ):
+            raise ValueError("completed official test requires the exact result matrix")
+        if existing["status"] == "running" and manifest.get("test_evaluated") is True:
+            raise ValueError("running official test cannot be marked complete")
     device = torch.device(args.device)
     engine.base._require_cuda(device)
-    payload, protocol = engine.base.load_dataset(
-        args.datasets[0], args.data_root, allow_download=False
-    )
+    from .calibration import parse_job
+
+    payload, protocol = engine.load_dataset(parse_job(manifest["jobs"][0]))
+    evidence_origin = require_approval(protocol)
     engine.base.validate_cached_graphs_once(payload)
     test_mask = payload["splits"]["test"]
     for split in ("train", "validation"):
@@ -2037,6 +2575,8 @@ def evaluate_matrix(args, manifest, persist):
             "selection": "validation only; all checkpoint hashes frozen before test",
             "expected_cells": len(lock),
             "status": "running",
+            "evidence_origin": evidence_origin,
+            "visibility_protocol": protocol.get("visibility_protocol", "official_transductive"),
             "results": {},
         },
     )
@@ -2045,9 +2585,29 @@ def evaluate_matrix(args, manifest, persist):
         or report["source_sha256"] != sources
         or report["dataset"] != args.datasets[0]
         or report["expected_cells"] != len(lock)
+        or report.get("evidence_origin") != evidence_origin
+        or report.get("visibility_protocol")
+        != protocol.get("visibility_protocol", "official_transductive")
         or not set(report["results"]) <= set(lock)
     ):
         raise ValueError("official test identity or cell set changed")
+    for job in manifest["jobs"]:
+        if (
+            job["result"]["data_sha256"] != protocol["data_sha256"]
+            or job["result"]["split_sha256"] != protocol["split_sha256"]
+        ):
+            raise ValueError("official test current cache differs from the frozen training data")
+    # Check every retained cell before any missing running cell starts inference.
+    for job in manifest["jobs"]:
+        if job["job_id"] in report["results"]:
+            test_artifacts.read(
+                job,
+                test_artifacts.binding(job, protocol, sources, test_hash),
+                payload,
+                test_mask,
+                report["results"][job["job_id"]],
+            )
+    persist()
     prepared = {}
     for job in manifest["jobs"]:
         key, root = job["job_id"], Path(job["output_dir"])
@@ -2057,18 +2617,12 @@ def evaluate_matrix(args, manifest, persist):
         ):
             raise ValueError("official test current cache differs from the frozen training data")
         if key in report["results"]:
-            stored = report["results"][key]
-            validate_evaluation(stored["evaluation"], label="saved official test")
-            if (
-                stored["checkpoint_sha256"] != lock[key]
-                or stored["evaluation"]["metric_kind"] != "accuracy"
-                or stored["evaluation"]["counts"]["total"] != int(test_mask.sum())
-                or stored["arm"] != job["variant_id"]
-                or stored["profile"] != job["profile"]
-                or stored["seed"] != job["model_seed"]
-                or stored["parameters"] != job["result"]["total_parameters"]
-            ):
-                raise ValueError("saved official test count/checkpoint changed")
+            continue
+        expected_binding = test_artifacts.binding(job, protocol, sources, test_hash)
+        if test_artifacts.artifact_path(job).exists():
+            # Interrupted after atomic artifact publish but before manifest commit.
+            report["results"][key] = test_artifacts.read(job, expected_binding, payload, test_mask)
+            persist()
             continue
         metrics = engine.inspect_completed(root)
         if metrics["resume_identity"]["dataset_protocol"] != protocol:
@@ -2100,7 +2654,24 @@ def evaluate_matrix(args, manifest, persist):
         )
         torch.cuda.synchronize(device)
         started = time.perf_counter()
-        evaluation = engine.evaluate(model, HeldoutInputs(inputs, test_mask), child, device)
+        predictions = {"node_ids": [], "class_ids": []}
+
+        def capture(_model, batch, logits, _index, predictions=predictions):
+            ids = batch.selected_indices
+            mapping = getattr(batch.graph, "temporal_original_ids", None)
+            originals = ids if mapping is None else mapping[ids]
+            predictions["node_ids"].extend(originals.detach().cpu().tolist())
+            predictions["class_ids"].extend(logits[ids].argmax(-1).detach().cpu().tolist())
+
+        if child.visibility_protocol == "official_transductive":
+            test_inputs = HeldoutInputs(inputs, test_mask)
+        else:
+            from .temporal import TemporalTestInputs
+
+            test_inputs = TemporalTestInputs(payload, child)
+        evaluation = engine.evaluate(model, test_inputs, child, device, observer=capture)
+        ordered = sorted(zip(predictions["node_ids"], predictions["class_ids"], strict=True))
+        predictions = {"node_ids": [p[0] for p in ordered], "class_ids": [p[1] for p in ordered]}
         torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - started
         validate_evaluation(evaluation, label="official test")
@@ -2114,7 +2685,7 @@ def evaluate_matrix(args, manifest, persist):
             or engine.implementation_source_hashes() != sources
         ):
             raise ValueError("official test modified checkpoint/model/source")
-        report["results"][key] = {
+        record = {
             "arm": job["variant_id"],
             "profile": job["profile"],
             "seed": job["model_seed"],
@@ -2122,7 +2693,12 @@ def evaluate_matrix(args, manifest, persist):
             "evaluation": evaluation,
             "evaluation_seconds": elapsed,
             "parameters": metrics["model_contract"]["total_parameters"],
+            "evidence_origin": evidence_origin,
+            "visibility_views": getattr(test_inputs, "view_evidence", None),
         }
+        report["results"][key] = test_artifacts.publish(
+            job, expected_binding, payload, test_mask, record, predictions
+        )
         persist()
         del model
         gc.collect()
@@ -2131,10 +2707,52 @@ def evaluate_matrix(args, manifest, persist):
     persist()
 
 
-def markdown(report):
+def verify_summary(report, jobs):
+    """Reporting is read-only and must verify original predictions too."""
+    if report.get("status") not in {"running", "passed"}:
+        raise ValueError("unknown official test state")
+    by_id = {job["job_id"]: job for job in jobs}
+    if (
+        len(by_id) != report["expected_cells"]
+        or not set(report["results"]) <= set(by_id)
+        or (report["status"] == "passed" and set(report["results"]) != set(by_id))
+    ):
+        raise ValueError("saved official test summary has the wrong matrix")
+    if not report["results"]:
+        return
+    from .calibration import parse_job
+
+    first = parse_job(jobs[0])
+    payload, protocol = engine.load_dataset(first)
+    evidence_origin = require_approval(protocol)
+    sources = engine.implementation_source_hashes()
+    mask = payload["splits"]["test"]
+    test_hash = engine.base.tensor_hash(mask)
+    if (
+        report["source_sha256"] != sources
+        or report["split_sha256"] != test_hash
+        or report.get("evidence_origin") != evidence_origin
+    ):
+        raise ValueError("saved official test summary identity changed")
+    for key, row in report["results"].items():
+        job = by_id[key]
+        test_artifacts.read(
+            job, test_artifacts.binding(job, protocol, sources, test_hash), payload, mask, row
+        )
+
+
+def markdown(report, jobs=None):
+    if jobs is not None:
+        verify_summary(report, jobs)
     lines = [
         "",
-        "## Official test (validation-selected checkpoints)",
+        "## Synthetic debug test (not a benchmark result)"
+        if report.get("evidence_origin", {}).get("debug")
+        else (
+            "## Custom temporal test (not an official OGB score)"
+            if report.get("visibility_protocol", "official_transductive") != "official_transductive"
+            else "## Official test (validation-selected checkpoints)"
+        ),
         "",
         f"Status: {report['status']}; completed cells: "
         f"{len(report['results'])}/{report['expected_cells']}.",
@@ -2215,6 +2833,65 @@ class LocalGram(torch.autograd.Function):
                 dh.index_add_(1, ends[0], -local)
                 dh.index_add_(1, ends[1], local)
         return dh, dc, None, None, None
+
+
+class GramReadout(torch.autograd.Function):
+    """Exact contraction without allocating node x head x pair statistics.
+
+    Uses the same already-projected history (including AMP rounding) as LocalGram.
+    Higher derivatives are deliberately unsupported, as in LocalGram.
+    """
+
+    @staticmethod
+    def forward(ctx, history, c, readout, edges, chunk, diagonal_only):
+        depth, nodes, heads, _ = history.shape
+        pairs = (
+            torch.arange(depth, device=history.device).expand(2, -1)
+            if diagonal_only
+            else torch.triu_indices(depth, depth, device=history.device)
+        )
+        out = history.new_zeros(nodes, heads, readout.shape[-1])
+        for start in range(0, edges.shape[1], chunk):
+            ends = edges[:, start : start + chunk]
+            delta = history[:, ends[1]] - history[:, ends[0]]
+            product = (delta[pairs[0]] * delta[pairs[1]]).sum(-1).permute(1, 2, 0)
+            value = torch.einsum("ehp,hpd->ehd", product, readout)
+            value = value * c[start : start + chunk, :, None] / 2
+            out.index_add_(0, ends[0], value)
+            out.index_add_(0, ends[1], value)
+        ctx.save_for_backward(history, c, readout, edges, pairs)
+        ctx.chunk = chunk
+        return out
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, gradient):
+        history, c, readout, edges, pairs = ctx.saved_tensors
+        dh = torch.zeros_like(history) if ctx.needs_input_grad[0] else None
+        dc = torch.zeros_like(c) if ctx.needs_input_grad[1] else None
+        dr = torch.zeros_like(readout) if ctx.needs_input_grad[2] else None
+        for start in range(0, edges.shape[1], ctx.chunk):
+            ends = edges[:, start : start + ctx.chunk]
+            delta = history[:, ends[1]] - history[:, ends[0]]
+            product = (delta[pairs[0]] * delta[pairs[1]]).sum(-1).permute(1, 2, 0)
+            upstream = (gradient[ends[0]] + gradient[ends[1]]) / 2
+            weight = c[start : start + ends.shape[1], :, None]
+            if dr is not None:
+                dr.add_(torch.einsum("ehp,ehd->hpd", product * weight, upstream))
+            pair_gradient = torch.einsum("ehd,hpd->ehp", upstream, readout)
+            if dc is not None:
+                value = (pair_gradient * product).sum(-1)
+                if c.shape[1] == 1:
+                    value = value.sum(1, keepdim=True)
+                dc[start : start + ends.shape[1]].copy_(value)
+            if dh is not None:
+                pair_gradient = (pair_gradient * weight).permute(2, 0, 1)[..., None]
+                local = torch.zeros_like(delta)
+                local.index_add_(0, pairs[0], pair_gradient * delta[pairs[1]])
+                local.index_add_(0, pairs[1], pair_gradient * delta[pairs[0]])
+                dh.index_add_(1, ends[0], -local)
+                dh.index_add_(1, ends[1], local)
+        return dh, dc, dr, None, None, None
 ````
 
 # experiments/aggregation_comparison/integrity.py
@@ -2228,6 +2905,7 @@ import json
 import math
 from pathlib import Path
 
+from .evidence import require_approval
 from .validation import POLICY, require_reproduction, require_score, validate_evaluation
 
 
@@ -2312,7 +2990,19 @@ def _history(metrics, identity, rows, args):
         )
     if epochs > budget["planned_epochs"]:
         raise ValueError("completed epochs exceed the declared full learning budget")
+    if args.complete_supervised_passes and epochs != budget["planned_epochs"]:
+        raise ValueError("core study ended before every declared supervised pass")
     for row in rows:
+        if args.complete_supervised_passes:
+            proof = row.get("supervised_pass_evidence", {})
+            if (
+                proof.get("every_train_seed_exactly_once") is not True
+                or proof.get("supervised_nodes") != count
+                or proof.get("physical_batches") != budget["actual_batches_per_epoch"]
+            ):
+                raise ValueError("missing complete supervised pass evidence")
+            for field in ("seed_counts_sha256", "sample_sequence_sha256"):
+                _fingerprint(proof.get(field), field)
         _positive_integer(row.get("epoch"), "history epoch")
         _score(row.get("validation"), "history validation")
         evidence = validate_evaluation(row.get("validation_evidence"), label="history validation")
@@ -2409,11 +3099,7 @@ def inspect_completed(output):
     ):
         if metrics.get(key) != identity.get(key):
             raise ValueError(f"completed metrics and immutable identity disagree on {key}")
-    if (
-        metrics.get("test_evaluated") is not False
-        or metrics.get("debug") is not False
-        or metrics.get("subset") is not False
-    ):
+    if metrics.get("test_evaluated") is not False or metrics.get("subset") is not False:
         raise ValueError(
             "completed comparison evidence is not full validation-only research training"
         )
@@ -2429,6 +3115,21 @@ def inspect_completed(output):
         or train.base._canonical_sha256(protocol) != identity.get("dataset_protocol_sha256")
     ):
         raise ValueError("completed data/split protocol identity mismatch")
+    evidence_origin = require_approval(protocol)
+    if (
+        identity.get("evidence_origin") != evidence_origin
+        or metrics.get("debug") is not evidence_origin["debug"]
+        or metrics.get("evidence_origin") != evidence_origin
+    ):
+        raise ValueError("completed evidence debug/origin differs from immutable identity")
+    configuration_path = output / "configuration.json"
+    if configuration_path.exists():
+        observed = json.loads(configuration_path.read_text(encoding="utf-8"))
+        if (
+            observed.get("debug") is not evidence_origin["debug"]
+            or observed.get("evidence_origin") != evidence_origin
+        ):
+            raise ValueError("configuration evidence origin differs from immutable identity")
     _fingerprint(protocol.get("data_sha256"), "official data cache")
     if not isinstance(identity.get("input_provenance"), list) or not identity["input_provenance"]:
         raise ValueError("completed identity has no topology/corruption provenance")
@@ -2861,6 +3562,7 @@ class AggregationClassifier(nn.Module):
         edge_chunk_size=None,
         dual_sa_layers=1,
         dual_alpha=0.1,
+        gram_implementation="reference",
         **architecture,
     ):
         super().__init__()
@@ -2874,6 +3576,9 @@ class AggregationClassifier(nn.Module):
         self.depth, self.dropout = layers, dropout
         self.activation_checkpoint = activation_checkpoint
         self.edge_chunk_size = edge_chunk_size
+        if gram_implementation not in {"reference", "fused"}:
+            raise ValueError("unknown Gram implementation")
+        self.gram_implementation = gram_implementation
         # Instantiate the common endpoints before any family-specific RNG use.
         self.encoder = nn.Linear(in_channels, hidden_channels)
         self.decoder = nn.Linear(hidden_channels, classes)
@@ -2971,15 +3676,6 @@ class AggregationClassifier(nn.Module):
                 for index, operator in enumerate(original.operators)
             )
             if energy:
-                for operator in self.layers:
-                    # Full-support selector is identically one, hence r is C.
-                    # Keep its live tensor for the energy path, not the detached
-                    # diagnostics copy. Return None to preserve estimator output.
-                    operator.estimator.register_forward_hook(
-                        lambda module, inputs, output, op=operator: setattr(
-                            op, "live_comparison_c", output
-                        )
-                    )
                 for depth in range(1, layers + 1):
                     self.energy_readouts.append(
                         nn.Parameter(
@@ -3059,9 +3755,8 @@ class AggregationClassifier(nn.Module):
 
     def clear_auxiliary_cache(self):
         # Shared trainer interface; this suite has no auxiliary objectives.
-        for layer in self.layers:
-            if hasattr(layer, "live_comparison_c"):
-                layer.live_comparison_c = None
+        # Live C is local to forward_with_state, never stored across forwards.
+        return None
 
     def auxiliary_loss(self, targets=None):
         if targets is not None:
@@ -3208,21 +3903,38 @@ class AggregationClassifier(nn.Module):
 
             def step(*past, operator=operator, index=index):
                 current = past[-1]
-                value = operator(current, edges, batch, graphs, **kwargs)
+                output = operator.forward_with_state(current, edges, batch, graphs, **kwargs)
+                value = output.message
                 if len(self.energy_readouts) or self.diagnostic_collector is not None:
                     projected = torch.einsum(
                         "knd,hdw->knhw", torch.stack(past), operator.value_weight
                     )
-                    # Reuse the live metric so gradients reach conductance;
-                    # last_effective_c is deliberately detached in the legacy op.
-                    metric = (
-                        operator.live_comparison_c
-                        if len(self.energy_readouts)
-                        else operator.last_effective_c
-                    )
-                    correction = kwargs["sampling_correction"]
-                    if correction is not None:
-                        metric = metric * (correction if metric.ndim == 1 else correction[:, None])
+                    # Exactly the weight used by diffusion, including correction once.
+                    metric = output.effective_weight
+                    if (
+                        self.gram_implementation == "fused"
+                        and len(self.energy_readouts)
+                        and self.diagnostic_collector is None
+                        and self.energy_intervention is None
+                    ):
+                        from .gram import GramReadout
+
+                        chunk = max(
+                            1, (self.edge_chunk_size or max(edges.shape[1], 1)) // len(past)
+                        )
+                        with torch.autocast(device_type=x.device.type, enabled=False):
+                            extra = GramReadout.apply(
+                                projected.float(),
+                                metric.float(),
+                                self.energy_readouts[index].float(),
+                                edges,
+                                chunk,
+                                self.diagonal_only,
+                            )
+                        branch = F.linear(
+                            extra.to(value.dtype).flatten(1), operator.output_projection.weight
+                        )
+                        return F.dropout(F.relu(value + branch), self.dropout, self.training)
                     statistics = local_gram(
                         projected.float(),
                         edges,
@@ -3718,6 +4430,21 @@ def parser(*, historical_datasets=False):
     result.add_argument("--device", default="cuda:0")
     result.add_argument("--hardware-profile", choices=tuple(HARDWARE_PROFILES), default="portable")
     result.add_argument("--epochs", type=int, default=200)
+    result.add_argument(
+        "--learning-budget-policy",
+        choices=("epochs", "reference_updates"),
+        default="reference_updates",
+    )
+    result.add_argument("--complete-supervised-passes", action="store_true")
+    result.add_argument(
+        "--gram-implementation", choices=("reference", "fused"), default="reference"
+    )
+    result.add_argument(
+        "--visibility-protocol",
+        choices=("official_transductive", "arxiv_node_year_views_v1"),
+        default="official_transductive",
+    )
+    result.add_argument("--sampled-local-baselines", action="store_true")
     result.add_argument("--patience", type=int, default=50)
     result.add_argument("--workers", type=int, default=4)
     if historical_datasets:
@@ -3755,7 +4482,17 @@ def validate_args(args):
         raise ValueError("invalid full training/worker/audit budget")
     if any(seed < 0 for seed in args.model_seeds):
         raise ValueError("model seeds must be nonnegative")
-    if args.sampling != "full" and any(not arm.startswith("incidence") for arm in args.arms):
+    if args.complete_supervised_passes and args.learning_budget_policy != "epochs":
+        raise ValueError("complete supervised passes require the epochs policy")
+    if args.sampling != "full" and any(
+        not arm.startswith("incidence")
+        and not (
+            args.sampled_local_baselines
+            and args.sampling == "cluster_disjoint"
+            and arm in {"gcn", "graphsage"}
+        )
+        for arm in args.arms
+    ):
         raise ValueError("comparison requires full graph support for global attention")
     if not str(args.device).startswith("cuda"):
         raise ValueError("production training requires CUDA; no CPU fallback")
@@ -3807,7 +4544,7 @@ def make_jobs(args, run_dir):
                     "--beta-initial",
                     "0.5",
                     "--learning-budget-policy",
-                    "reference_updates",
+                    args.learning_budget_policy,
                 ]
                 for name in (
                     "data_root",
@@ -3846,6 +4583,12 @@ def make_jobs(args, run_dir):
                         continue
                     command = job["command"]
                     command[command.index("-m") + 1] = TRAIN_MODULE
+                    command += ["--gram-implementation", args.gram_implementation]
+                    command += ["--visibility-protocol", args.visibility_protocol]
+                    if args.sampled_local_baselines:
+                        command.append("--sampled-local-baselines")
+                    if args.complete_supervised_passes:
+                        command.append("--complete-supervised-passes")
                     for name, value in variant["configuration"].items():
                         if value is not None:
                             command += ["--" + name.replace("_", "-"), str(value)]
@@ -4178,7 +4921,7 @@ def _summary(run_dir, manifest):
     if manifest.get("official_test"):
         from .final_test import markdown as test_markdown
 
-        lines.extend(test_markdown(manifest["official_test"]))
+        lines.extend(test_markdown(manifest["official_test"], manifest["jobs"]))
     atomic_write_bytes(run_dir / "comparison.md", ("\n".join(lines) + "\n").encode())
 
 
@@ -4333,6 +5076,451 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
+````
+
+# experiments/aggregation_comparison/study_inputs.py
+
+````python
+"""CPU provenance for complete supervised passes, before asynchronous GPU transfer."""
+
+import hashlib
+
+import torch
+
+from research.conductance_gat.edge_selection.data import PreparedInputs as BaseInputs
+from research.conductance_gat.v5.train import tensor_hash
+
+
+class StudyInputs(BaseInputs):
+    def _record_study_batch(self, batch):
+        graph = batch.graph
+        original_ids = getattr(graph, "global_node_id", None)
+        if original_ids is None:
+            original_ids = torch.arange(graph.x.shape[0])
+        selected = original_ids[batch.selected_indices]
+        self._seen.index_add_(0, selected, torch.ones_like(selected))
+        identity = {
+            "original_nodes": tensor_hash(original_ids),
+            "local_edges": tensor_hash(graph.incidence_edge_index),
+            "supervised_original_ids": tensor_hash(selected),
+        }
+        digest = hashlib.sha256("|".join(identity.values()).encode()).hexdigest()
+        self._sequence.append(digest)
+        graph.study_batch_identity = identity
+        return batch
+
+    def _cpu_training(self, epoch):
+        for batch in super()._cpu_training(epoch):
+            yield self._record_study_batch(batch)
+
+    def training_batches(self, epoch, device):
+        self._seen = torch.zeros(self.data.x.shape[0], dtype=torch.long)
+        self._sequence = []
+        if self.sampler is None:
+            self._record_study_batch(self.training_record)
+        yield from super().training_batches(epoch, device)
+        expected = torch.zeros_like(self._seen)
+        expected[self.indices["train"]] = 1
+        if not torch.equal(self._seen, expected):
+            raise ValueError("core study must supervise every train ID exactly once per pass")
+        self.last_pass_evidence = {
+            "supervised_nodes": self.train_count,
+            "seed_counts_sha256": tensor_hash(self._seen),
+            "sample_sequence_sha256": hashlib.sha256("|".join(self._sequence).encode()).hexdigest(),
+            "physical_batches": len(self._sequence),
+            "every_train_seed_exactly_once": True,
+        }
+````
+
+# experiments/aggregation_comparison/temporal.py
+
+````python
+"""Separate arxiv node-year visibility protocol; never an official OGB score.
+
+Uses provided features as fixed covariates. Node years do not prove edge-time or
+feature-time causality, and views of one graph are not independent graphs.
+"""
+
+import copy
+import json
+import time
+from pathlib import Path
+
+import torch
+
+from chartgat.cache import atomic_write_json
+from research.conductance_gat.benchmark_data import canonical_edges, sha256_file, tensor_hash
+from research.conductance_gat.edge_selection.data import PreparedInputs as BaseInputs
+
+NAME = "arxiv_node_year_views_v1"
+
+
+def validate_years(payload, years):
+    nodes = payload["graphs"][0]["x"].shape[0]
+    if years.device.type != "cpu" or years.dtype != torch.long or years.shape != (nodes,):
+        raise ValueError("node-year sidecar requires one CPU int64 year per original node")
+    if not ((years >= 1800) & (years <= 2200)).all():
+        raise ValueError("invalid publication year")
+    splits = payload["splits"]
+    if any(not splits[s].any() for s in ("train", "validation", "test")):
+        raise ValueError("temporal protocol requires all three complete splits")
+    if not torch.equal(sum(v.long() for v in splits.values()), torch.ones(nodes, dtype=torch.long)):
+        raise ValueError("temporal protocol requires disjoint exhaustive official splits")
+    if not (
+        years[splits["train"]].max() < years[splits["validation"]].min()
+        and years[splits["validation"]].max() < years[splits["test"]].min()
+    ):
+        raise ValueError("official split/year chronology is inconsistent")
+
+
+def sidecar_path(data_root):
+    return Path(data_root) / "ogbn-arxiv" / "node_year_v1.json"
+
+
+def prepare_years(data_root, raw_dir):
+    """Import existing OGB raw files after exact node/edge/label alignment checks."""
+    import numpy as np
+
+    from . import engine
+
+    payload, protocol = engine.base.load_dataset("ogbn-arxiv", data_root, allow_download=False)
+    path = sidecar_path(data_root)
+    if path.exists():
+        raise ValueError("node-year sidecar already exists; preserving immutable input")
+    names = ("node-feat.csv.gz", "node-label.csv.gz", "edge.csv.gz", "node-year.csv.gz")
+    paths = {name: Path(raw_dir) / name for name in names}
+    if any(p.is_symlink() or not p.is_file() for p in paths.values()):
+        raise ValueError("provide the existing complete OGB raw directory; no download fallback")
+    before = {name: sha256_file(p) for name, p in paths.items()}
+    x = torch.from_numpy(np.loadtxt(paths[names[0]], delimiter=",", dtype=np.float32))
+    y = torch.from_numpy(np.loadtxt(paths[names[1]], delimiter=",", dtype=np.int64)).reshape(-1)
+    edge = torch.from_numpy(
+        np.loadtxt(paths[names[2]], delimiter=",", dtype=np.int64)
+    ).T.contiguous()
+    years = torch.from_numpy(np.loadtxt(paths[names[3]], delimiter=",", dtype=np.int64)).reshape(-1)
+    graph = payload["graphs"][0]
+    if not torch.equal(x, graph["x"]) or not torch.equal(y, graph["y"].reshape(-1)):
+        raise ValueError("raw features/labels do not exactly match cached original node order")
+    if not torch.equal(canonical_edges(edge, x.shape[0])[1], graph["incidence_edge_index"]):
+        raise ValueError("raw edges differ from cached canonical graph")
+    validate_years(payload, years)
+    if before != {name: sha256_file(p) for name, p in paths.items()}:
+        raise ValueError("raw files changed during sidecar verification")
+    atomic_write_json(
+        path,
+        {
+            "schema_version": 1,
+            "dataset_sha256": protocol["data_sha256"],
+            "split_sha256": protocol["split_sha256"],
+            "raw_sha256": before,
+            "alignment": "exact raw features, labels and canonical edges",
+            "years_sha256": tensor_hash(years),
+            "years": years.tolist(),
+        },
+    )
+    return path
+
+
+def attach(payload, protocol, data_root):
+    path = sidecar_path(data_root)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(
+            "temporal protocol needs verified node_year_v1.json; old cache has no years"
+        )
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        document.get("schema_version") != 1
+        or document.get("dataset_sha256") != protocol["data_sha256"]
+        or document.get("split_sha256") != protocol["split_sha256"]
+        or document.get("alignment") != "exact raw features, labels and canonical edges"
+        or set(document.get("raw_sha256", {}))
+        != {"node-feat.csv.gz", "node-label.csv.gz", "edge.csv.gz", "node-year.csv.gz"}
+    ):
+        raise ValueError("node-year sidecar identity/alignment mismatch")
+    if any(type(year) is not int for year in document["years"]):
+        raise ValueError("node years must be integers")
+    years = torch.tensor(document["years"], dtype=torch.long)
+    validate_years(payload, years)
+    if tensor_hash(years) != document["years_sha256"]:
+        raise ValueError("node-year sidecar tensor hash mismatch")
+    return {**payload, "node_year": years}, {
+        **protocol,
+        "visibility_protocol": NAME,
+        "node_year_sidecar_sha256": sha256_file(path),
+        "temporal_contract": {
+            "train": "train-induced graph only",
+            "validation": "train+validation-induced graph",
+            "test": "cumulative node-year views; score each test node in its publication year",
+            "parameters": "frozen after validation selection",
+            "features": "provided fixed covariates; feature-time causality not established",
+            "edge_time": "not observed; induced support uses original edges among visible nodes",
+            "official_ogb_score": False,
+            "independent_graph_generalization": False,
+        },
+    }
+
+
+def view(payload, visible, selected):
+    """Recompute all geometry on an induced graph; never carry full-graph degrees."""
+    graph = payload["graphs"][0]
+    ids = visible.nonzero(as_tuple=False).flatten()
+    inverse = torch.full((visible.numel(),), -1, dtype=torch.long)
+    inverse[ids] = torch.arange(ids.numel())
+    edge = graph["incidence_edge_index"]
+    local_edge = inverse[edge[:, visible[edge[0]] & visible[edge[1]]]]
+    row = {
+        "x": graph["x"][ids],
+        "y": graph["y"][ids],
+        "incidence_edge_index": local_edge,
+        "edge_index": torch.cat((local_edge, local_edge.flip(0)), 1),
+    }
+    masks = {name: mask[ids] for name, mask in payload["splits"].items()}
+    masks["validation"] = selected[ids]
+    result = {
+        "dataset": payload["dataset"],
+        "classes": payload["classes"],
+        "graphs": [row],
+        "splits": masks,
+    }
+    identity = {
+        "original_ids": tensor_hash(ids),
+        "features": tensor_hash(row["x"]),
+        "edges": tensor_hash(local_edge),
+        "selected": tensor_hash(selected[ids]),
+        "nodes": ids.numel(),
+        "edge_count": local_edge.shape[1],
+    }
+    return result, ids, identity
+
+
+class TemporalInputs:
+    def __init__(self, payload, args):
+        from .study_inputs import StudyInputs
+
+        started = time.perf_counter()
+        validate_years(payload, payload["node_year"])
+        train_mask, validation_mask = (payload["splits"][s] for s in ("train", "validation"))
+        train, self.train_ids, train_identity = view(
+            payload, train_mask, torch.zeros_like(train_mask)
+        )
+        validation, self.val_ids, val_identity = view(
+            payload, train_mask | validation_mask, validation_mask
+        )
+        factory = StudyInputs if args.complete_supervised_passes else BaseInputs
+        self.train = factory(train, args)
+        full = copy.deepcopy(args)
+        full.sampling = "full"
+        self.validation = BaseInputs(validation, full)
+        self.view_identity = {"protocol": NAME, "train": train_identity, "validation": val_identity}
+        self.plan_preparation_seconds = time.perf_counter() - started
+
+    def __getattr__(self, name):
+        return getattr(self.train, name)
+
+    @property
+    def validation_count(self):
+        return self.validation.validation_count
+
+    @property
+    def validation_record(self):
+        return self.validation.validation_record
+
+    @property
+    def provenance(self):
+        return [
+            {
+                "views": self.view_identity,
+                "training": self.train.provenance,
+                "validation": self.validation.provenance,
+            }
+        ]
+
+    @property
+    def indices(self):
+        return {
+            "train": self.train.indices["train"],
+            "validation": self.validation.indices["validation"],
+        }
+
+    def metadata(self):
+        return {
+            **self.train.metadata(),
+            "provenance": self.provenance,
+            "validation_count": self.validation_count,
+            "visibility": self.view_identity,
+            "topology_preparation_seconds": self.plan_preparation_seconds,
+        }
+
+    def validation_batches(self, device):
+        yield from self.validation.validation_batches(device)
+
+
+class TemporalTestInputs:
+    """One cumulative graph per year; these views overlap and must not be merged."""
+
+    def __init__(self, payload, args):
+        self.payload, self.args = payload, copy.deepcopy(args)
+        self.args.sampling = "full"
+        self.indices = {"test": payload["splits"]["test"].nonzero().flatten()}
+        self.view_evidence = []
+
+    def validation_batches(self, device):
+        years, test = self.payload["node_year"], self.payload["splits"]["test"]
+        self.view_evidence = []
+        for year in years[test].unique(sorted=True).tolist():
+            selected = test & (years == year)
+            data, ids, identity = view(self.payload, years <= year, selected)
+            inputs = BaseInputs(data, self.args)
+            self.view_evidence.append({"year": year, **identity})
+            for batch in inputs.validation_batches(device):
+                batch.graph.temporal_original_ids = ids.to(device)
+                yield batch
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Verify existing raw arxiv node-year data; no downloads"
+    )
+    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--raw-dir", type=Path, required=True)
+    args = parser.parse_args()
+    print(prepare_years(args.data_root, args.raw_dir))
+
+
+if __name__ == "__main__":
+    main()
+````
+
+# experiments/aggregation_comparison/test_artifacts.py
+
+````python
+"""Bound original test predictions, separate from mutable summary rows."""
+
+import math
+from pathlib import Path
+
+import torch
+
+from . import engine
+from .evidence import origin
+from .validation import validate_evaluation
+
+
+def binding(job, protocol, sources, test_hash):
+    return {
+        "job_id": job["job_id"],
+        "checkpoint_sha256": job["result"]["checkpoint_sha256"],
+        "data_protocol": protocol,
+        "source_sha256": sources,
+        "test_mask_sha256": test_hash,
+        "visibility_protocol": protocol.get("visibility_protocol", "official_transductive"),
+    }
+
+
+def validate_record(record, job, expected_count):
+    validate_evaluation(record["evaluation"], label="saved official test")
+    loss = record["evaluation"].get("loss")
+    if (
+        isinstance(loss, bool)
+        or not isinstance(loss, (int, float))
+        or not math.isfinite(loss)
+        or loss < 0
+    ):
+        raise ValueError("saved test loss must be finite and nonnegative")
+    elapsed = record.get("evaluation_seconds")
+    if (
+        isinstance(elapsed, bool)
+        or not isinstance(elapsed, (int, float))
+        or not math.isfinite(elapsed)
+        or elapsed < 0
+    ):
+        raise ValueError("saved official test runtime must be finite and nonnegative")
+    if (
+        record["checkpoint_sha256"] != job["result"]["checkpoint_sha256"]
+        or record["evaluation"]["metric_kind"] != "accuracy"
+        or record["evaluation"]["counts"]["total"] != expected_count
+        or record["arm"] != job["variant_id"]
+        or record["profile"] != job["profile"]
+        or record["seed"] != job["model_seed"]
+        or record["parameters"] != job["result"]["total_parameters"]
+    ):
+        raise ValueError("saved official test identity/count/checkpoint changed")
+
+
+def artifact_path(job):
+    return Path(job["output_dir"]) / "test_result.json"
+
+
+def verify(artifact, expected_binding, job, payload, test_mask):
+    if artifact.get("schema_version") != 1 or artifact.get("binding") != expected_binding:
+        raise ValueError("saved official test artifact identity differs")
+    selected = test_mask.nonzero(as_tuple=False).flatten().tolist()
+    predictions = artifact["predictions"]
+    if predictions["node_ids"] != selected or any(
+        type(v) is not int for v in predictions["node_ids"]
+    ):
+        raise ValueError("saved test node order/coverage changed")
+    classes = predictions["class_ids"]
+    if len(classes) != len(selected) or any(
+        type(value) is not int or not 0 <= value < payload["classes"] for value in classes
+    ):
+        raise ValueError("saved test predictions have invalid classes/counts")
+    target = payload["graphs"][0]["y"].reshape(-1)[selected].cpu()
+    correct = int((torch.tensor(classes, dtype=torch.long) == target).sum())
+    record = artifact["record"]
+    if record.get("evidence_origin") != origin(expected_binding["data_protocol"]):
+        raise ValueError("saved test evidence origin changed")
+    if expected_binding["visibility_protocol"] != "official_transductive":
+        from .temporal import view
+
+        years = payload["node_year"]
+        expected_views = []
+        for year in years[test_mask].unique(sorted=True).tolist():
+            _, _, identity = view(payload, years <= year, test_mask & (years == year))
+            expected_views.append({"year": year, **identity})
+        if record.get("visibility_views") != expected_views:
+            raise ValueError("saved temporal test views changed")
+    validate_record(record, job, len(selected))
+    if record["evaluation"]["counts"]["correct"] != correct:
+        raise ValueError("saved test count differs from original predictions")
+    return record
+
+
+def read(job, expected_binding, payload, test_mask, stored=None):
+    import json
+
+    path = artifact_path(job)
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("saved official test artifact missing; inference will not be repeated")
+    fingerprint = engine.base.sha256_file(path)
+    if stored is not None and stored.get("artifact_sha256") != fingerprint:
+        raise ValueError("saved official test artifact hash changed")
+    artifact = json.loads(path.read_text(encoding="utf-8"))
+    record = verify(artifact, expected_binding, job, payload, test_mask)
+    row = {**record, "artifact_sha256": fingerprint}
+    if stored is not None and stored != row:
+        raise ValueError("saved official test summary differs from original artifact")
+    return row
+
+
+def publish(job, expected_binding, payload, test_mask, record, predictions):
+    from chartgat.cache import atomic_write_json
+
+    path = artifact_path(job)
+    if path.exists():
+        raise ValueError("original test artifact already exists; refuse to overwrite")
+    artifact = {
+        "schema_version": 1,
+        "binding": expected_binding,
+        "record": record,
+        "predictions": predictions,
+        "loss_evidence": "original sealed evaluation; class IDs only rederive accuracy",
+    }
+    verify(artifact, expected_binding, job, payload, test_mask)
+    atomic_write_json(path, artifact)
+    return read(job, expected_binding, payload, test_mask)
 ````
 
 # experiments/aggregation_comparison/validation.py
@@ -6521,6 +7709,7 @@ def inspect_completed(output):
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 from torch import nn
@@ -6589,6 +7778,14 @@ def cross_hop_score(values, incidence, weight, coefficients, edge_chunk_size):
     return score / degree.clamp_min(torch.finfo(degree.dtype).tiny)
 
 
+@dataclass(frozen=True)
+class OperatorOutput:
+    message: torch.Tensor
+    conductance: torch.Tensor
+    effective_weight: torch.Tensor
+    beta: torch.Tensor
+
+
 class IncidenceOperator(EdgeSelectionOperator):
     def __init__(self, original, selection_config, *, layer, lift, bilinear):
         super().__init__(original, selection_config, layer=layer)
@@ -6612,7 +7809,10 @@ class IncidenceOperator(EdgeSelectionOperator):
         else:
             self.register_parameter("hop_coefficients", None)
 
-    def forward(
+    def forward(self, *args, **kwargs):
+        return self.forward_with_state(*args, **kwargs).message
+
+    def forward_with_state(
         self,
         state,
         incidence,
@@ -6675,13 +7875,18 @@ class IncidenceOperator(EdgeSelectionOperator):
             return torch.cat((v, second), dim=-1)
 
         lifted = lift(value) if self.lift in {"linear", "pre"} else value
+        weight = effective
+        if sampling_correction is not None:
+            weight = weight * (
+                sampling_correction if weight.ndim == 1 else sampling_correction[:, None]
+            )
         propagated = shared_head_diffusion(
             lifted,
-            effective,
+            weight,
             incidence,
             node_graph,
             beta,
-            sampling_correction=sampling_correction,
+            sampling_correction=None,
             edge_chunk_size=self.edge_chunk_size,
             propagation_normalization=self.propagation_normalization,
             polynomial_coefficients=self.polynomial_delta,
@@ -6719,7 +7924,12 @@ class IncidenceOperator(EdgeSelectionOperator):
         self.live_edge_graph, self.live_num_graphs = edge_selection_topology.edge_graph, num_graphs
         if self.capture:
             self.last_probe = value.detach()
-        return self.output_projection(propagated.reshape(state.shape[0], self.channels))
+        return OperatorOutput(
+            self.output_projection(propagated.reshape(state.shape[0], self.channels)),
+            r,
+            weight,
+            beta,
+        )
 
 
 class IncidenceClassifier(EdgeSelectionClassifier):
@@ -75899,23 +77109,17 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-IMPLEMENTATION_COMMIT = "4b4df52"
+IMPLEMENTATION_COMMIT = "2602d90"  # Previous review base; current implementation is package HEAD.
 TEXT_SUFFIXES = {".py", ".md", ".toml", ".yaml", ".yml", ".sh", ".ps1", ".json", ".txt"}
 EVIDENCE = {
-    "current_regression": ("results/arxiv-baselines-debug-20260927-01.xml", 105, 0),
-    "final_affected_repeat": ("results/arxiv-baselines-debug-20260927-02.xml", 13, 0),
-    "historical_cuda_audit": ("results/deep-audit-verified-20260927-02.xml", None, 0),
-    "historical_control_audit": ("results/deep-audit-control-20260927-03.xml", None, 0),
-    "historical_deliberate_before_fix_failure": (
-        "results/deep-audit-disk-fault-before-20260927.xml",
-        None,
-        1,
-    ),
+    "current_regression": ("results/revision-final-debug-20260927-01.xml", None, 0),
+    "intermediate_R0_checks": ("results/revision-r0-debug-20260927-01.xml", 45, 0),
+    "intermediate_new_paths": ("results/revision-paths-debug-20260927-02.xml", 31, 0),
 }
 EXTRA_EVIDENCE = (
-    "results/arxiv-baselines-dry-run-20260927.txt",
-    "results/deep-audit-math-summary-20260927.json",
-    "results/deep-audit-disk-fault-proof-20260927.json",
+    "results/revision-gram-profile-20260927-02.json",
+    "results/review-four-documents-20260927/reproduced.json",
+    "results/review-four-documents-20260927/fusion-sampling.json",
 )
 
 
@@ -75987,12 +77191,6 @@ def main() -> None:
             raise ValueError(f"Unexpected evidence outcome: {name}: {counts}")
         entries[name] = data
         reports[category] = {"path": name, "sha256": sha(data), **counts}
-    if (
-        reports["historical_cuda_audit"]["testcase"]
-        + reports["historical_control_audit"]["testcase"]
-        != 93
-    ):
-        raise ValueError("Historical audit must remain a separate 93-test record")
     for name in EXTRA_EVIDENCE:
         entries[name] = (ROOT / name).read_bytes()
     entries["evidence/before_fix/sampled_inductive_train.py.txt"] = git(
@@ -76001,7 +77199,8 @@ def main() -> None:
     entries["VERIFICATION.json"] = json_bytes(
         {
             "package_commit": commit,
-            "implementation_commit": git("rev-parse", IMPLEMENTATION_COMMIT).decode().strip(),
+            "implementation_commit": commit,
+            "previous_review_base": git("rev-parse", IMPLEMENTATION_COMMIT).decode().strip(),
             "historical_audit_commit": git("rev-parse", "cc173ed").decode().strip(),
             "evidence": reports,
             "source_files_in_code_summary": len(summary_paths),
@@ -76011,34 +77210,36 @@ def main() -> None:
             "research_requirements_complete": False,
             "model_or_weight_downloaded": False,
             "notes": [
-                "105 regression tests; 13 repeated after final changes. Do not add them.",
-                "The prior 93-test audit was not rerun on this package commit.",
-                "The deliberate pre-fix failure is synthetic corruption, not user result damage.",
+                "Use current_regression count; intermediate runs overlap and must not be added.",
+                "Before-fix counterexamples use synthetic evidence, not user result damage.",
                 "Model forward/backward checks used CUDA and explicit synthetic debug inputs.",
                 "CPU metadata/control checks do not constitute CPU model training.",
                 "No arxiv result, speedup, multi-seed superiority or MIG fit is established.",
-                "Arxiv's fixed/learned C x full/sampled controller remains incomplete.",
-                "The independent-graph evaluation protocol remains incomplete.",
+                "Core full/sampled x fixed/dynamic C uses complete matched supervised passes.",
+                "Custom arxiv node-year views are not an OGB score or independent-graph test.",
+                "Optional fused Gram/readout keeps projected history; no end-to-end speed claim.",
+                "Matched-update secondary study and independent-graph testing are not implemented.",
                 "Historical PPI source is preserved; current production comparison rejects PPI.",
             ],
         }
     )
     entries["REVIEW_FIRST.md"] = (
         "# Current GPT review package — 2026-09-27\n\n"
-        f"Package commit: `{commit}`. Implementation: `4b4df52`.\n\n"
-        "Start with gpt_handoff/README_FIRST.md's 2026-09-27 section and review prompt.\n"
-        "Then read HANDOFF.md, EXPERIMENT_STATUS.md, docs/ARXIV_BASELINE_COMPARISON.md,\n"
+        f"Package and implementation commit: `{commit}`.\n\n"
+        "Start with docs/REVIEW_REMEDIATION_20260927.md and gpt_handoff/README_FIRST.md.\n"
+        "Then read docs/FOUR_DOCUMENT_REVIEW_20260927.md (before-fix review),\n"
         "VERIFICATION.json, and actual source. Older sections retain historical context only.\n"
         "Current benchmark: ogbn-arxiv, 21 conditions including GCN, GraphSAGE and GATv2.\n"
         "No pretrained weights; no actual benchmark training/test or MIG fit measurements.\n"
-        "The full original sampled-inductive research goal is not complete.\n\n"
+        "Includes core four-cell controller, temporal visibility, and optional fused Gram.\n"
+        "Real-data accuracy/cost and independent-graph generalization remain unverified.\n\n"
         "MANIFEST.json hashes every archive member except itself. Evidence XMLs distinguish\n"
         "current checks, repeats, historical audits and deliberate pre-fix failures.\n"
         "Review source independently; documentation alone is not proof of successful execution.\n"
     ).encode()
     manifest = {
         "package_commit": commit,
-        "implementation_commit": IMPLEMENTATION_COMMIT,
+        "implementation_commit": commit,
         "files": {name: sha(data) for name, data in sorted(entries.items())},
     }
     entries["MANIFEST.json"] = json_bytes(manifest)
@@ -98150,6 +99351,84 @@ def resolve_seed_axes(
 __all__ = ["SeedAxes", "resolve_seed_axes"]
 ````
 
+# tests/profile_gram_cuda.py
+
+````python
+"""Explicit synthetic CUDA microbenchmark; not arxiv or end-to-end speed evidence."""
+
+import argparse
+import json
+import statistics
+import sys
+from pathlib import Path
+
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
+
+from experiments.aggregation_comparison.gram import GramReadout, LocalGram  # noqa: E402
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    if args.output.exists():
+        raise ValueError("preserve existing profiling evidence")
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA required; no CPU fallback")
+    torch.manual_seed(103)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    # Explicit synthetic workload; reference K/head/feature widths, not training data.
+    history = torch.randn(8, 4096, 8, 32, device="cuda", requires_grad=True)
+    c = torch.rand(16384, 8, device="cuda", requires_grad=True)
+    readout = torch.randn(8, 36, 32, device="cuda", requires_grad=True)
+    edges = torch.randint(0, 4096, (2, 16384), device="cuda")
+    upstream = torch.randn(4096, 8, 32, device="cuda")
+    records = {}
+    for implementation in ("reference", "fused"):
+        durations = []
+        torch.cuda.reset_peak_memory_stats()
+        for repetition in range(7):
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            if implementation == "reference":
+                output = torch.einsum(
+                    "nhp,hpd->nhd", LocalGram.apply(history, c, edges, 512, False), readout
+                )
+            else:
+                output = GramReadout.apply(history, c, readout, edges, 512, False)
+            gradient = torch.autograd.grad(output, (history, c, readout), upstream)
+            end.record()
+            end.synchronize()
+            if repetition >= 2:
+                durations.append(start.elapsed_time(end))
+            del output, gradient
+        records[implementation] = {
+            "forward_backward_milliseconds": durations,
+            "median_milliseconds": statistics.median(durations),
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
+        }
+    record = {
+        "explicit_synthetic_debug": True,
+        "scope": __doc__,
+        "GPU": torch.cuda.get_device_name(),
+        "torch": torch.__version__,
+        "shape": {"history": list(history.shape), "edges": 16384, "chunk": 512},
+        "results": records,
+        "end_to_end_speedup_claimed": False,
+    }
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(record, indent=2))
+
+
+if __name__ == "__main__":
+    main()
+````
+
 # tests/test_aggregate_paper.py
 
 ````python
@@ -98994,7 +100273,10 @@ def cuda_required():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.use_deterministic_algorithms(True)
     try:
-        yield
+        from experiments.aggregation_comparison.evidence import synthetic_verification
+
+        with synthetic_verification():
+            yield
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
         torch.use_deterministic_algorithms(previous_determinism)
@@ -99221,6 +100503,7 @@ def evidence(tmp_path):
     budget = plan_learning_budget(4, 1, 1, 1, "reference_updates")
     provenance = [{"explicit_synthetic_checkpoint_fixture": True}]
     protocol = {
+        "explicit_synthetic_debug": True,
         "data_sha256": "a" * 64,
         "split_sha256": {"train": "b" * 64, "validation": "c" * 64},
     }
@@ -99261,7 +100544,8 @@ def evidence(tmp_path):
         "selected_validation_evidence": evaluation(0.7),
         "validation_evidence": evaluation(0.7),
         "test_evaluated": False,
-        "debug": False,
+        "debug": True,
+        "evidence_origin": identity["evidence_origin"],
         "subset": False,
     }
     last = {
@@ -99288,7 +100572,10 @@ def evidence(tmp_path):
         folder=tmp_path, args=arguments, metrics=metrics, rows=rows, best=best, last=last
     )
     publish(case)
-    return case
+    from experiments.aggregation_comparison.evidence import synthetic_verification
+
+    with synthetic_verification():
+        yield case
 
 
 def test_completed_evidence_is_read_only_and_cpu_only(evidence, monkeypatch):
@@ -101588,6 +102875,14 @@ def test_arxiv_full_training_validation_selection_and_frozen_test_matrix(monkeyp
             },
         )
     manifest = {"jobs": jobs}
+    from contextvars import Context
+
+    for job in jobs:
+        metrics = engine.inspect_completed(job["output_dir"])
+        assert metrics["debug"] is True
+        assert metrics["resume_identity"]["evidence_origin"]["debug"] is True
+        with pytest.raises(ValueError, match="synthetic debug evidence"):
+            Context().run(engine.inspect_completed, job["output_dir"])
     persisted = []
     final_test.evaluate_matrix(options, manifest, lambda: persisted.append(copy.deepcopy(manifest)))
     assert persisted[0]["official_test_checkpoint_lock"]
@@ -101610,6 +102905,32 @@ def test_arxiv_full_training_validation_selection_and_frozen_test_matrix(monkeyp
 
     monkeypatch.setattr(engine, "evaluate", forbidden)
     final_test.evaluate_matrix(options, manifest, lambda: None)
+    for defect in ("score", "negative_time", "nan_time", "deleted", "unknown_state"):
+        changed = copy.deepcopy(manifest)
+        report = changed["official_test"]
+        key = next(iter(report["results"]))
+        row = report["results"][key]
+        if defect == "score":
+            counts = row["evaluation"]["counts"]
+            counts["correct"] = (counts["correct"] + 1) % (counts["total"] + 1)
+            row["evaluation"]["metric"] = counts["correct"] / counts["total"]
+        elif defect == "negative_time":
+            row["evaluation_seconds"] = -100
+        elif defect == "nan_time":
+            row["evaluation_seconds"] = float("nan")
+        elif defect == "deleted":
+            del report["results"][key]
+        else:
+            report["status"] = "unknown"
+        with pytest.raises(ValueError):
+            final_test.evaluate_matrix(options, changed, lambda: None)
+    # Crash between artifact publish and manifest commit: validate and adopt,
+    # never recompute a test prediction that is already on disk.
+    interrupted = copy.deepcopy(manifest)
+    interrupted["official_test"].update(status="running", results={})
+    interrupted["test_evaluated"] = False
+    final_test.evaluate_matrix(options, interrupted, lambda: None)
+    assert interrupted == manifest
     wrong = copy.deepcopy(manifest)
     next(iter(wrong["official_test"]["results"].values()))["arm"] = "other"
     with pytest.raises(ValueError, match="saved official test"):
@@ -113428,6 +114749,127 @@ def test_missing_or_invalid_history_cannot_fabricate_processed_work(history):
         training_throughput(history, 20.0)
 ````
 
+# tests/test_core_conductance_cuda.py
+
+````python
+"""Full-size reference network, explicitly synthetic four-cell integration test."""
+
+import copy
+import json
+
+import pytest
+import torch
+
+from experiments.aggregation_comparison import audit, calibration, core, engine, runner
+from tests.test_aggregation_comparison_cuda import cuda_required  # noqa: F401
+from tests.test_aggregation_sampling_path_cuda import transductive_payload
+
+
+@pytest.mark.parametrize("visibility", ["official_transductive", "arxiv_node_year_views_v1"])
+def test_four_cells_complete_exposure_pairing_and_global_freeze(monkeypatch, tmp_path, visibility):
+    torch.manual_seed(100)
+    payload = transductive_payload()
+    protocol = {
+        "explicit_synthetic_debug": True,
+        "data_sha256": engine.base.tensor_hash(payload["graphs"][0]["x"]),
+        "split_sha256": {k: engine.base.tensor_hash(v) for k, v in payload["splits"].items()},
+    }
+    monkeypatch.setattr(engine.base, "load_dataset", lambda *a, **k: (payload, protocol))
+    options = core.parser().parse_args(
+        [
+            "--run-id",
+            "debug-core",
+            "--profiles",
+            "reference",
+            "--epochs",
+            "4",
+            "--patience",
+            "1",
+            "--sample-seed-batch-size",
+            "32",
+            "--sample-context-seed-batch-size",
+            "8",
+            "--sample-context-workers",
+            "2",
+            "--num-neighbors",
+            "2",
+            "--edge-chunk-size",
+            "128",
+            "--data-root",
+            str(tmp_path / "data"),
+            "--evaluate-test",
+        ]
+    )
+    core.validate(options)
+    options.visibility_protocol = visibility
+    if visibility != "official_transductive":
+        import numpy as np
+
+        from experiments.aggregation_comparison import temporal
+
+        raw = tmp_path / "synthetic-raw"
+        raw.mkdir()
+        graph = payload["graphs"][0]
+        for name, values, fmt in (
+            ("node-feat", graph["x"].numpy(), "%.9g"),
+            ("node-label", graph["y"].numpy(), "%d"),
+            ("edge", graph["incidence_edge_index"].T.numpy(), "%d"),
+            ("node-year", np.array([2017] * 96 + [2018] * 32 + [2019] * 16 + [2020] * 16), "%d"),
+        ):
+            np.savetxt(raw / (name + ".csv.gz"), values, delimiter=",", fmt=fmt)
+        temporal.prepare_years(options.data_root, raw)
+    groups = {}
+    for mode in core.MODES:
+        args = runner.parser().parse_args(core.child_argv(options, tmp_path, mode))
+        root = core.child_root(options, tmp_path, mode)
+        jobs = runner.make_jobs(args, root)
+        for job in jobs:
+            child = calibration.parse_job(job)
+            loaded, identity = engine.load_dataset(child)
+            engine.train_model(loaded, identity, child, torch.device("cuda:0"), child.output_dir)
+            report = audit.audit(child.output_dir, child.data_root, torch.device("cuda:0"), 5)
+            log = child.output_dir / "synthetic-audit.json"
+            log.write_text(json.dumps(report), encoding="utf-8")
+            job.update(
+                status="passed",
+                result=runner._read_result(job),
+                audit={
+                    "status": "passed",
+                    "checkpoint_sha256": report["checkpoint_sha256"],
+                    "evaluator_source_sha256": engine.implementation_source_hashes(),
+                    "log_path": str(log),
+                    "log_sha256": engine.base.sha256_file(log),
+                },
+            )
+        groups[mode] = {"args": args, "manifest": {"jobs": jobs}, "path": root / "manifest.json"}
+    master, saves = {}, []
+    report = core.freeze_and_test(
+        options, groups, master, lambda: saves.append(copy.deepcopy(master))
+    )
+    assert len(saves[0]["checkpoint_lock"]) == 4
+    assert "official_test" not in saves[0]
+    assert len(report["cells"]) == 4
+    assert {r["epochs"] for r in report["cells"]} == {4}
+    assert {r["supervised_exposures"] for r in report["cells"]} == {384}
+    assert {r["optimizer_steps"] for r in report["cells"]} == {4, 12}
+    assert len(master["official_test"]) == 2
+
+    def forbidden(*a, **k):
+        pytest.fail("completed four-cell test must not run inference again")
+
+    monkeypatch.setattr(engine, "evaluate", forbidden)
+    core.freeze_and_test(options, groups, master, lambda: None)
+    partial = {
+        **groups,
+        "sampled": {
+            **groups["sampled"],
+            "manifest": {"jobs": groups["sampled"]["manifest"]["jobs"][:1]},
+        },
+    }
+    with pytest.raises(ValueError, match="every F0/F1/S0/S1"):
+        core.verify_and_report(partial)
+````
+
 # tests/test_cycle_pe_v2_projector.py
 
 ````python
@@ -123579,6 +125021,196 @@ def test_half_applied_release_is_rejected(transition, side):
         previous["research/example/train.py"] = current["research/example/train.py"]
     with pytest.raises(ValueError, match="complete reviewed"):
         compat.require_source_compatibility(previous, current)
+````
+
+# tests/test_revision_integrity_cuda.py
+
+````python
+"""Explicit CUDA debug regressions for the independent review's counterexamples."""
+
+import copy
+
+import pytest
+import torch
+
+from experiments.aggregation_comparison.model import AggregationClassifier
+from tests.test_aggregation_comparison_cuda import (  # noqa: F401
+    cuda_required,
+    synthetic_disjoint_batch,
+)
+
+
+@pytest.mark.parametrize("checkpoint", [False, True])
+def test_energy_clone_local_state_gradients_and_checkpoint(checkpoint):
+    torch.manual_seed(773)
+    _, graph, _ = synthetic_disjoint_batch(torch.device("cuda:0"))
+
+    def make():
+        return (
+            AggregationClassifier(
+                50,
+                7,
+                arm="incidence_energy_pre_lift",
+                selection_config={"condition": "full"},
+                hidden_channels=256,
+                layers=8,
+                heads=8,
+                dropout=0,
+                edge_chunk_size=4096,
+                activation_checkpoint=checkpoint,
+            )
+            .cuda()
+            .eval()
+        )
+
+    original = make()
+    with torch.no_grad():
+        for value in original.energy_readouts:
+            value.normal_(0, 0.001)
+    first_clone = copy.deepcopy(original)
+    with torch.no_grad():
+        torch.testing.assert_close(first_clone(graph), original(graph))
+    clone, fresh = copy.deepcopy(original), make()
+    fresh.load_state_dict(original.state_dict())
+    previous = [op.last_effective_c.clone() for op in original.layers]
+    next_graph = copy.copy(graph)
+    next_graph.x = graph.x + torch.randn_like(graph.x) * 0.2
+    actual, expected = clone(next_graph), fresh(next_graph)
+    direction = torch.randn_like(actual)
+    left = torch.autograd.grad(actual, tuple(clone.parameters()), direction)
+    right = torch.autograd.grad(expected, tuple(fresh.parameters()), direction)
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+    for a, b in zip(left, right, strict=True):
+        torch.testing.assert_close(a, b, rtol=2e-5, atol=2e-6)
+    for before, op in zip(previous, original.layers, strict=True):
+        torch.testing.assert_close(before, op.last_effective_c, rtol=0, atol=0)
+        assert not op.estimator._forward_hooks
+        assert not hasattr(op, "live_comparison_c")
+````
+
+# tests/test_revision_paths_cuda.py
+
+````python
+"""CUDA-only math/visibility verification using explicit synthetic inputs."""
+
+import copy
+
+import pytest
+import torch
+
+from experiments.aggregation_comparison import engine, temporal
+from experiments.aggregation_comparison.gram import GramReadout, LocalGram
+from tests.test_aggregation_comparison_cuda import cuda_required, reference_arguments  # noqa: F401
+from tests.test_aggregation_sampling_path_cuda import transductive_payload
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shared", [False, True])
+@pytest.mark.parametrize("diagonal", [False, True])
+@pytest.mark.parametrize("chunk", [1, 7])
+def test_fused_gram_first_derivatives(dtype, shared, diagonal, chunk):
+    torch.manual_seed(77)
+    history = (
+        torch.randn(4, 13, 3, 5, device="cuda", dtype=dtype)
+        .to(torch.float64 if dtype == torch.float64 else torch.float32)
+        .requires_grad_()
+    )
+    c = torch.rand(14, 1 if shared else 3, device="cuda", dtype=history.dtype).requires_grad_()
+    readout = torch.randn(
+        3, 4 if diagonal else 10, 5, device="cuda", dtype=history.dtype
+    ).requires_grad_()
+    edges = torch.randint(0, 13, (2, 14), device="cuda")
+    expected = torch.einsum(
+        "nhp,hpd->nhd", LocalGram.apply(history, c, edges, chunk, diagonal), readout
+    )
+    actual = GramReadout.apply(history, c, readout, edges, chunk, diagonal)
+    upstream = torch.randn_like(actual)
+    ga = torch.autograd.grad(actual, (history, c, readout), upstream)
+    gb = torch.autograd.grad(expected, (history, c, readout), upstream)
+    tolerance = 1e-11 if dtype == torch.float64 else 3e-5
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+    for left, right in zip(ga, gb, strict=True):
+        torch.testing.assert_close(left, right, rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.parametrize("arm", ["incidence", "gcn", "graphsage"])
+def test_temporal_unseen_future_isolation_and_sampled_backprop(arm):
+    engine.base._seed(123)
+    payload = transductive_payload()
+    payload["node_year"] = torch.tensor([2017] * 96 + [2018] * 32 + [2019] * 16 + [2020] * 16)
+    args = reference_arguments(arm, "fp32")
+    args.visibility_protocol = temporal.NAME
+    args.sampling = "cluster_disjoint"
+    args.sampled_local_baselines = True
+    args.complete_supervised_passes = True
+    args.learning_budget_policy = "epochs"
+    args.sample_seed_batch_size = 32
+    args.sample_context_seed_batch_size = 8
+    args.sample_context_workers = 2
+    args.num_neighbors = [2]
+    engine.validate_args(args)
+    changed = copy.deepcopy(payload)
+    changed["graphs"][0]["x"][128:] += 10000
+    changed["graphs"][0]["y"][128:] = 0
+    # Alter only edges involving future test nodes, keeping past support unchanged.
+    edge = changed["graphs"][0]["incidence_edge_index"]
+    changed["graphs"][0]["incidence_edge_index"] = edge[:, (edge < 128).all(0)]
+    inputs, other = engine.PreparedInputs(payload, args), engine.PreparedInputs(changed, args)
+    assert inputs.provenance == other.provenance
+    assert inputs.training_record.graph.x.shape[0] == 96
+    assert inputs.validation_record.graph.x.shape[0] == 128
+    device = torch.device("cuda:0")
+    model = engine.make_model(payload, args, device)
+    model.eval()
+    with torch.no_grad():
+        a = model(next(inputs.validation_batches(device)).graph)
+        b = model(next(other.validation_batches(device)).graph)
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    optimizer = engine.make_optimizer(model, args.learning_rate)
+    before = engine.base.state_sha256(model)
+    result = engine.run_training_epoch(model, optimizer, inputs, args, device, 1, validate=True)
+    assert result["supervised_pass_evidence"]["supervised_nodes"] == 96
+    assert result["optimizer_steps"] == 3
+    assert before != engine.base.state_sha256(model)
+    assert all(p.grad is not None and p.grad.is_cuda for p in model.parameters())
+    test = temporal.TemporalTestInputs(payload, args)
+    observations = []
+
+    def observe(_model, batch, logits, index):
+        observations.extend(
+            batch.graph.temporal_original_ids[batch.selected_indices].cpu().tolist()
+        )
+
+    before = engine.base.state_sha256(model)
+    result = engine.evaluate(model, test, args, device, observer=observe)
+    assert result["counts"]["total"] == 32
+    assert sorted(observations) == list(range(128, 160))
+    assert [v["nodes"] for v in test.view_evidence] == [144, 160]
+    assert before == engine.base.state_sha256(model)
+
+
+@pytest.mark.parametrize("precision", ["fp32", "bf16"])
+def test_fused_full_reference_energy_model_gradient_and_checkpoint(precision):
+    from tests.test_aggregation_comparison_cuda import synthetic_disjoint_batch
+
+    engine.base._seed(33)
+    device = torch.device("cuda:0")
+    _, graph, payload = synthetic_disjoint_batch(device)
+    args = reference_arguments("incidence_energy_pre_lift", precision)
+    original = engine.make_model(payload, args, device)
+    for p in original.energy_readouts:
+        torch.nn.init.normal_(p, std=0.001)
+    fused = copy.deepcopy(original)
+    fused.gram_implementation = "fused"
+    original.dropout = fused.dropout = 0
+    with engine.autocast(args, device):
+        expected, actual = original(graph), fused(graph)
+    ga = torch.autograd.grad(actual.square().sum(), tuple(fused.parameters()))
+    gb = torch.autograd.grad(expected.square().sum(), tuple(original.parameters()))
+    tolerance = 0.05 if precision == "bf16" else 2e-4
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+    for left, right in zip(ga, gb, strict=True):
+        torch.testing.assert_close(left, right, rtol=tolerance, atol=tolerance)
 ````
 
 # tests/test_rich_resource_calibration.py

@@ -124,6 +124,14 @@ def test_arxiv_full_training_validation_selection_and_frozen_test_matrix(monkeyp
             },
         )
     manifest = {"jobs": jobs}
+    from contextvars import Context
+
+    for job in jobs:
+        metrics = engine.inspect_completed(job["output_dir"])
+        assert metrics["debug"] is True
+        assert metrics["resume_identity"]["evidence_origin"]["debug"] is True
+        with pytest.raises(ValueError, match="synthetic debug evidence"):
+            Context().run(engine.inspect_completed, job["output_dir"])
     persisted = []
     final_test.evaluate_matrix(options, manifest, lambda: persisted.append(copy.deepcopy(manifest)))
     assert persisted[0]["official_test_checkpoint_lock"]
@@ -146,6 +154,32 @@ def test_arxiv_full_training_validation_selection_and_frozen_test_matrix(monkeyp
 
     monkeypatch.setattr(engine, "evaluate", forbidden)
     final_test.evaluate_matrix(options, manifest, lambda: None)
+    for defect in ("score", "negative_time", "nan_time", "deleted", "unknown_state"):
+        changed = copy.deepcopy(manifest)
+        report = changed["official_test"]
+        key = next(iter(report["results"]))
+        row = report["results"][key]
+        if defect == "score":
+            counts = row["evaluation"]["counts"]
+            counts["correct"] = (counts["correct"] + 1) % (counts["total"] + 1)
+            row["evaluation"]["metric"] = counts["correct"] / counts["total"]
+        elif defect == "negative_time":
+            row["evaluation_seconds"] = -100
+        elif defect == "nan_time":
+            row["evaluation_seconds"] = float("nan")
+        elif defect == "deleted":
+            del report["results"][key]
+        else:
+            report["status"] = "unknown"
+        with pytest.raises(ValueError):
+            final_test.evaluate_matrix(options, changed, lambda: None)
+    # Crash between artifact publish and manifest commit: validate and adopt,
+    # never recompute a test prediction that is already on disk.
+    interrupted = copy.deepcopy(manifest)
+    interrupted["official_test"].update(status="running", results={})
+    interrupted["test_evaluated"] = False
+    final_test.evaluate_matrix(options, interrupted, lambda: None)
+    assert interrupted == manifest
     wrong = copy.deepcopy(manifest)
     next(iter(wrong["official_test"]["results"].values()))["arm"] = "other"
     with pytest.raises(ValueError, match="saved official test"):

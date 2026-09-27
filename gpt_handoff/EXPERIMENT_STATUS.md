@@ -1,5 +1,17 @@
 # 실험 결과와 구현 상태
 
+## 최신 구현 상태: 네 검수 문서 후속 보완
+
+현재 구현 목록과 제한은 [보완 기록](../docs/REVIEW_REMEDIATION_20260927.md)을 따른다.
+아래의 '4조건 controller 미구현'은 이전 버전의 상태다. 최신 코드에는 F0/F1/S0/S1
+complete-pass 통제·전체 checkpoint freeze·test 원본 검증이 있다.
+시간순 arxiv 평가는 공식 OGB 성적과 별도인 custom protocol이다.
+새 GPU 합성 검사 결과는 ZIP의 VERIFICATION.json에 구분해서 기록한다.
+최종 회귀는 **152 passed / 0 failed / 0 skipped**: CUDA 118개, metadata/control 34개.
+중간 45개/31개 실행은 중복이므로 합산하지 않는다. Ruff와 diff 검사도 통과했다.
+이 문서의 과거 PPI 성적이나 합성 검사값을 새 arxiv 성능으로 사용하지 않는다.
+
+
 ## 현재 상태 — 2026-09-27, 구현 `4b4df52`
 
 현재 arxiv 21조건 비교의 실제 benchmark 학습/평가는 **미실행**이다. 아래 PPI 점수와

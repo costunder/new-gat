@@ -29,7 +29,10 @@ def cuda_required():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.use_deterministic_algorithms(True)
     try:
-        yield
+        from experiments.aggregation_comparison.evidence import synthetic_verification
+
+        with synthetic_verification():
+            yield
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
         torch.use_deterministic_algorithms(previous_determinism)

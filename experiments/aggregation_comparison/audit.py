@@ -31,7 +31,7 @@ def audit(root, data_root, device, repeats):
     args = train.restore_arguments(metrics, root, data_root, device)
     train.base._require_cuda(device)
     train.base.configure_compute(args)
-    payload, protocol = train.base.load_dataset(args.dataset, args.data_root, allow_download=False)
+    payload, protocol = train.load_dataset(args)
     if protocol != identity["dataset_protocol"]:
         raise ValueError("audit cache/split provenance differs from training")
     monitor = RuntimeResourceMonitor(device)
@@ -82,6 +82,8 @@ def audit(root, data_root, device, repeats):
                 "research_suite": train.SUITE,
                 "ablation_arm": args.ablation_arm,
                 "dataset": args.dataset,
+                "evidence_origin": identity["evidence_origin"],
+                "debug": identity["evidence_origin"]["debug"],
                 "checkpoint_sha256": metrics["checkpoint_sha256"],
                 "source_sha256": sources,
                 "test_evaluated": False,

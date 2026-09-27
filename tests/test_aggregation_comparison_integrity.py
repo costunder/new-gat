@@ -70,6 +70,7 @@ def evidence(tmp_path):
     budget = plan_learning_budget(4, 1, 1, 1, "reference_updates")
     provenance = [{"explicit_synthetic_checkpoint_fixture": True}]
     protocol = {
+        "explicit_synthetic_debug": True,
         "data_sha256": "a" * 64,
         "split_sha256": {"train": "b" * 64, "validation": "c" * 64},
     }
@@ -110,7 +111,8 @@ def evidence(tmp_path):
         "selected_validation_evidence": evaluation(0.7),
         "validation_evidence": evaluation(0.7),
         "test_evaluated": False,
-        "debug": False,
+        "debug": True,
+        "evidence_origin": identity["evidence_origin"],
         "subset": False,
     }
     last = {
@@ -137,7 +139,10 @@ def evidence(tmp_path):
         folder=tmp_path, args=arguments, metrics=metrics, rows=rows, best=best, last=last
     )
     publish(case)
-    return case
+    from experiments.aggregation_comparison.evidence import synthetic_verification
+
+    with synthetic_verification():
+        yield case
 
 
 def test_completed_evidence_is_read_only_and_cpu_only(evidence, monkeypatch):

@@ -1,5 +1,17 @@
 # GPT 전달용 전체 프로젝트 묶음
 
+## 최신 보완 — 2026-09-27 네 문서 검수 이후
+
+**현재 기준은 [REVIEW_REMEDIATION_20260927.md](../docs/REVIEW_REMEDIATION_20260927.md)와
+이번 ZIP의 VERIFICATION.json이다.** 아래 4b4df52 설명은 수정 전 보존 기록이다.
+R0 객체 격리/test 원본 봉인/debug 출처, arxiv 핵심 4조건 controller,
+선택적 Gram/readout 융합, 별도 시간순 view 규약, sampled GCN/SAGE 경로를 보완했다.
+기존 21조건 및 reference/large 규모는 유지한다. 실제 arxiv/MIG 실측은 아직 없다.
+최종 회귀 152개 통과(CUDA 118, metadata/control 34); 중간 실행과 중복 합산하지 않는다.
+검수자는 특히 전체 test barrier, complete-pass 노출량·샘플 시퀀스, 미래 정보 격리,
+fused/reference gradient와 AMP 차이, 원본 예측 artifact 재사용을 독립 확인해야 한다.
+
+
 ## 현재 검수 기준 — 2026-09-27, 구현 커밋 `4b4df52`
 
 **이번 ZIP의 `MANIFEST.json`에 문서까지 포함한 정확한 커밋과 파일별 SHA-256이 있다.**

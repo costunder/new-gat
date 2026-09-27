@@ -11,8 +11,9 @@ from pathlib import Path
 
 import torch
 
-from . import engine, runner
+from . import engine, runner, test_artifacts
 from .benchmark_policy import require_benchmark_datasets
+from .evidence import require_approval
 from .validation import require_reproduction, validate_evaluation
 
 
@@ -71,11 +72,24 @@ def freeze_matrix(args, manifest, persist):
 
 def evaluate_matrix(args, manifest, persist):
     lock = freeze_matrix(args, manifest, persist)
+    existing = manifest.get("official_test")
+    if existing is None and manifest.get("test_evaluated") is True:
+        raise ValueError("completed official test report is missing")
+    if existing is not None:
+        if existing.get("status") not in {"running", "passed"}:
+            raise ValueError("unknown official test state")
+        if existing["status"] == "passed" and (
+            set(existing["results"]) != set(lock) or manifest.get("test_evaluated") is not True
+        ):
+            raise ValueError("completed official test requires the exact result matrix")
+        if existing["status"] == "running" and manifest.get("test_evaluated") is True:
+            raise ValueError("running official test cannot be marked complete")
     device = torch.device(args.device)
     engine.base._require_cuda(device)
-    payload, protocol = engine.base.load_dataset(
-        args.datasets[0], args.data_root, allow_download=False
-    )
+    from .calibration import parse_job
+
+    payload, protocol = engine.load_dataset(parse_job(manifest["jobs"][0]))
+    evidence_origin = require_approval(protocol)
     engine.base.validate_cached_graphs_once(payload)
     test_mask = payload["splits"]["test"]
     for split in ("train", "validation"):
@@ -92,6 +106,8 @@ def evaluate_matrix(args, manifest, persist):
             "selection": "validation only; all checkpoint hashes frozen before test",
             "expected_cells": len(lock),
             "status": "running",
+            "evidence_origin": evidence_origin,
+            "visibility_protocol": protocol.get("visibility_protocol", "official_transductive"),
             "results": {},
         },
     )
@@ -100,9 +116,29 @@ def evaluate_matrix(args, manifest, persist):
         or report["source_sha256"] != sources
         or report["dataset"] != args.datasets[0]
         or report["expected_cells"] != len(lock)
+        or report.get("evidence_origin") != evidence_origin
+        or report.get("visibility_protocol")
+        != protocol.get("visibility_protocol", "official_transductive")
         or not set(report["results"]) <= set(lock)
     ):
         raise ValueError("official test identity or cell set changed")
+    for job in manifest["jobs"]:
+        if (
+            job["result"]["data_sha256"] != protocol["data_sha256"]
+            or job["result"]["split_sha256"] != protocol["split_sha256"]
+        ):
+            raise ValueError("official test current cache differs from the frozen training data")
+    # Check every retained cell before any missing running cell starts inference.
+    for job in manifest["jobs"]:
+        if job["job_id"] in report["results"]:
+            test_artifacts.read(
+                job,
+                test_artifacts.binding(job, protocol, sources, test_hash),
+                payload,
+                test_mask,
+                report["results"][job["job_id"]],
+            )
+    persist()
     prepared = {}
     for job in manifest["jobs"]:
         key, root = job["job_id"], Path(job["output_dir"])
@@ -112,18 +148,12 @@ def evaluate_matrix(args, manifest, persist):
         ):
             raise ValueError("official test current cache differs from the frozen training data")
         if key in report["results"]:
-            stored = report["results"][key]
-            validate_evaluation(stored["evaluation"], label="saved official test")
-            if (
-                stored["checkpoint_sha256"] != lock[key]
-                or stored["evaluation"]["metric_kind"] != "accuracy"
-                or stored["evaluation"]["counts"]["total"] != int(test_mask.sum())
-                or stored["arm"] != job["variant_id"]
-                or stored["profile"] != job["profile"]
-                or stored["seed"] != job["model_seed"]
-                or stored["parameters"] != job["result"]["total_parameters"]
-            ):
-                raise ValueError("saved official test count/checkpoint changed")
+            continue
+        expected_binding = test_artifacts.binding(job, protocol, sources, test_hash)
+        if test_artifacts.artifact_path(job).exists():
+            # Interrupted after atomic artifact publish but before manifest commit.
+            report["results"][key] = test_artifacts.read(job, expected_binding, payload, test_mask)
+            persist()
             continue
         metrics = engine.inspect_completed(root)
         if metrics["resume_identity"]["dataset_protocol"] != protocol:
@@ -155,7 +185,24 @@ def evaluate_matrix(args, manifest, persist):
         )
         torch.cuda.synchronize(device)
         started = time.perf_counter()
-        evaluation = engine.evaluate(model, HeldoutInputs(inputs, test_mask), child, device)
+        predictions = {"node_ids": [], "class_ids": []}
+
+        def capture(_model, batch, logits, _index, predictions=predictions):
+            ids = batch.selected_indices
+            mapping = getattr(batch.graph, "temporal_original_ids", None)
+            originals = ids if mapping is None else mapping[ids]
+            predictions["node_ids"].extend(originals.detach().cpu().tolist())
+            predictions["class_ids"].extend(logits[ids].argmax(-1).detach().cpu().tolist())
+
+        if child.visibility_protocol == "official_transductive":
+            test_inputs = HeldoutInputs(inputs, test_mask)
+        else:
+            from .temporal import TemporalTestInputs
+
+            test_inputs = TemporalTestInputs(payload, child)
+        evaluation = engine.evaluate(model, test_inputs, child, device, observer=capture)
+        ordered = sorted(zip(predictions["node_ids"], predictions["class_ids"], strict=True))
+        predictions = {"node_ids": [p[0] for p in ordered], "class_ids": [p[1] for p in ordered]}
         torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - started
         validate_evaluation(evaluation, label="official test")
@@ -169,7 +216,7 @@ def evaluate_matrix(args, manifest, persist):
             or engine.implementation_source_hashes() != sources
         ):
             raise ValueError("official test modified checkpoint/model/source")
-        report["results"][key] = {
+        record = {
             "arm": job["variant_id"],
             "profile": job["profile"],
             "seed": job["model_seed"],
@@ -177,7 +224,12 @@ def evaluate_matrix(args, manifest, persist):
             "evaluation": evaluation,
             "evaluation_seconds": elapsed,
             "parameters": metrics["model_contract"]["total_parameters"],
+            "evidence_origin": evidence_origin,
+            "visibility_views": getattr(test_inputs, "view_evidence", None),
         }
+        report["results"][key] = test_artifacts.publish(
+            job, expected_binding, payload, test_mask, record, predictions
+        )
         persist()
         del model
         gc.collect()
@@ -186,10 +238,52 @@ def evaluate_matrix(args, manifest, persist):
     persist()
 
 
-def markdown(report):
+def verify_summary(report, jobs):
+    """Reporting is read-only and must verify original predictions too."""
+    if report.get("status") not in {"running", "passed"}:
+        raise ValueError("unknown official test state")
+    by_id = {job["job_id"]: job for job in jobs}
+    if (
+        len(by_id) != report["expected_cells"]
+        or not set(report["results"]) <= set(by_id)
+        or (report["status"] == "passed" and set(report["results"]) != set(by_id))
+    ):
+        raise ValueError("saved official test summary has the wrong matrix")
+    if not report["results"]:
+        return
+    from .calibration import parse_job
+
+    first = parse_job(jobs[0])
+    payload, protocol = engine.load_dataset(first)
+    evidence_origin = require_approval(protocol)
+    sources = engine.implementation_source_hashes()
+    mask = payload["splits"]["test"]
+    test_hash = engine.base.tensor_hash(mask)
+    if (
+        report["source_sha256"] != sources
+        or report["split_sha256"] != test_hash
+        or report.get("evidence_origin") != evidence_origin
+    ):
+        raise ValueError("saved official test summary identity changed")
+    for key, row in report["results"].items():
+        job = by_id[key]
+        test_artifacts.read(
+            job, test_artifacts.binding(job, protocol, sources, test_hash), payload, mask, row
+        )
+
+
+def markdown(report, jobs=None):
+    if jobs is not None:
+        verify_summary(report, jobs)
     lines = [
         "",
-        "## Official test (validation-selected checkpoints)",
+        "## Synthetic debug test (not a benchmark result)"
+        if report.get("evidence_origin", {}).get("debug")
+        else (
+            "## Custom temporal test (not an official OGB score)"
+            if report.get("visibility_protocol", "official_transductive") != "official_transductive"
+            else "## Official test (validation-selected checkpoints)"
+        ),
         "",
         f"Status: {report['status']}; completed cells: "
         f"{len(report['results'])}/{report['expected_cells']}.",

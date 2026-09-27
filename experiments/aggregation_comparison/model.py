@@ -191,6 +191,7 @@ class AggregationClassifier(nn.Module):
         edge_chunk_size=None,
         dual_sa_layers=1,
         dual_alpha=0.1,
+        gram_implementation="reference",
         **architecture,
     ):
         super().__init__()
@@ -204,6 +205,9 @@ class AggregationClassifier(nn.Module):
         self.depth, self.dropout = layers, dropout
         self.activation_checkpoint = activation_checkpoint
         self.edge_chunk_size = edge_chunk_size
+        if gram_implementation not in {"reference", "fused"}:
+            raise ValueError("unknown Gram implementation")
+        self.gram_implementation = gram_implementation
         # Instantiate the common endpoints before any family-specific RNG use.
         self.encoder = nn.Linear(in_channels, hidden_channels)
         self.decoder = nn.Linear(hidden_channels, classes)
@@ -301,15 +305,6 @@ class AggregationClassifier(nn.Module):
                 for index, operator in enumerate(original.operators)
             )
             if energy:
-                for operator in self.layers:
-                    # Full-support selector is identically one, hence r is C.
-                    # Keep its live tensor for the energy path, not the detached
-                    # diagnostics copy. Return None to preserve estimator output.
-                    operator.estimator.register_forward_hook(
-                        lambda module, inputs, output, op=operator: setattr(
-                            op, "live_comparison_c", output
-                        )
-                    )
                 for depth in range(1, layers + 1):
                     self.energy_readouts.append(
                         nn.Parameter(
@@ -389,9 +384,8 @@ class AggregationClassifier(nn.Module):
 
     def clear_auxiliary_cache(self):
         # Shared trainer interface; this suite has no auxiliary objectives.
-        for layer in self.layers:
-            if hasattr(layer, "live_comparison_c"):
-                layer.live_comparison_c = None
+        # Live C is local to forward_with_state, never stored across forwards.
+        return None
 
     def auxiliary_loss(self, targets=None):
         if targets is not None:
@@ -538,21 +532,38 @@ class AggregationClassifier(nn.Module):
 
             def step(*past, operator=operator, index=index):
                 current = past[-1]
-                value = operator(current, edges, batch, graphs, **kwargs)
+                output = operator.forward_with_state(current, edges, batch, graphs, **kwargs)
+                value = output.message
                 if len(self.energy_readouts) or self.diagnostic_collector is not None:
                     projected = torch.einsum(
                         "knd,hdw->knhw", torch.stack(past), operator.value_weight
                     )
-                    # Reuse the live metric so gradients reach conductance;
-                    # last_effective_c is deliberately detached in the legacy op.
-                    metric = (
-                        operator.live_comparison_c
-                        if len(self.energy_readouts)
-                        else operator.last_effective_c
-                    )
-                    correction = kwargs["sampling_correction"]
-                    if correction is not None:
-                        metric = metric * (correction if metric.ndim == 1 else correction[:, None])
+                    # Exactly the weight used by diffusion, including correction once.
+                    metric = output.effective_weight
+                    if (
+                        self.gram_implementation == "fused"
+                        and len(self.energy_readouts)
+                        and self.diagnostic_collector is None
+                        and self.energy_intervention is None
+                    ):
+                        from .gram import GramReadout
+
+                        chunk = max(
+                            1, (self.edge_chunk_size or max(edges.shape[1], 1)) // len(past)
+                        )
+                        with torch.autocast(device_type=x.device.type, enabled=False):
+                            extra = GramReadout.apply(
+                                projected.float(),
+                                metric.float(),
+                                self.energy_readouts[index].float(),
+                                edges,
+                                chunk,
+                                self.diagonal_only,
+                            )
+                        branch = F.linear(
+                            extra.to(value.dtype).flatten(1), operator.output_projection.weight
+                        )
+                        return F.dropout(F.relu(value + branch), self.dropout, self.training)
                     statistics = local_gram(
                         projected.float(),
                         edges,
