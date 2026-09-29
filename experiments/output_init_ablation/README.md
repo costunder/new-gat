@@ -83,6 +83,23 @@ checkpoint와 완료된 결과는 보존되며 중단 시 새 실행 계획을 �
 
 ## 결과 위치
 
+실행 터미널에는 단계 시작/종료, calibration 조합과 측정 순서, 학습 epoch와
+배치 진행, epoch 완료 시 train CE·validation accuracy·소요시간을 표시한다.
+긴 연산 중에는 30초마다 자식 프로세스가 살아 있는지와 경과 시간을 표시한다.
+프로세스 생존 안내만으로 GPU가 정상 계산 중이라고 판정하지 않는다.
+상세 JSON은 기존 로그에 보존하고, 경고와 traceback도 화면에 표시한다.
+
+이미 실행 중인 이전 버전은 별도 터미널에서 `progress.py`의 독립 복사본을 실행하면
+기존 로그의 epoch·성능과 최근 저장 시각을 읽을 수 있다. 이 모니터는 표준 라이브러리만
+사용하며 학습 프로세스나 결과 파일을 변경하지 않는다. 기존 버전에는 배치별 로그가
+없으므로 그 실행의 배치 진행률은 표시할 수 없다. 모니터의 Ctrl+C는 모니터만 종료한다.
+**학습 중인 저장소에서 git pull하지 않는다.** 실행 중 소스 hash 변경은 계약 검사에서
+실패하므로, 현재 실행은 그대로 두고 독립 모니터 파일만 다른 경로에 받아 사용한다.
+
+```bash
+python /path/to/standalone-progress.py --run-dir /path/to/existing-run
+```
+
 - `study_contract.json`, `execution_sources.zip`: 시작 시 소스와 전체 설정.
 - `status.json`, `*-started.json`, `*-completed.json`: 단계·PID·명령·완료 상태.
 - `calibrate-*/`: 각 초기화의 실제 calibration·단계별 관측·문맥 평가.

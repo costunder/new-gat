@@ -14,6 +14,7 @@ from pathlib import Path
 from experiments.aggregation_comparison import engine
 
 from .model import INITIALIZATIONS
+from .progress import announce, wait_with_progress
 from .train import parser as run_parser
 from .train import research_contract, validate, write_json
 
@@ -225,6 +226,7 @@ def main():
         output = root / label
         calibration = root / ("calibrate-" + initialization) / "calibration.json"
         argv = command(initialization, action, output, data_root, calibration)
+        announce(f"START {label} | results: {output}")
         with (root / (label + ".log")).open("x", encoding="utf-8") as log:
             child = subprocess.Popen(argv, cwd=engine.ROOT, stdout=log, stderr=subprocess.STDOUT)
             write_json(
@@ -248,12 +250,15 @@ def main():
                 ),
                 encoding="utf-8",
             )
-            return_code = child.wait()
+            return_code = wait_with_progress(child, root / (label + ".log"), label)
         if return_code:
-            raise RuntimeError(f"{label} failed with code {return_code}; inspect its log")
+            raise RuntimeError(
+                f"{label} failed with code {return_code}; log: {root / (label + '.log')}"
+            )
         verify_sources()
         completed.append(label)
         write_json(root / (label + "-completed.json"), {"completed_at_unix": time.time()})
+        announce(f"DONE {label}")
 
     try:
         # Inspect the candidate first; both arms are calibrated before any full training.
@@ -265,6 +270,7 @@ def main():
         comparison = compare_results(root)
         write_json(root / "signal_trajectory.json", signal_trajectory(root))
         write_json(root / "comparison.json", comparison)
+        announce(f"STUDY COMPLETE | comparison: {root / 'comparison.json'}")
         (root / "status.json").write_text(
             json.dumps(
                 {

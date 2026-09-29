@@ -444,6 +444,8 @@ def calibration_evaluations(model, inputs, payload, args, device):
 
 
 def calibrate(payload, args, protocol, output, device):
+    from .progress import announce
+
     contract = research_contract(args, protocol)
     rows = []
     for physical in args.physical_seed_candidates:
@@ -452,6 +454,7 @@ def calibrate(payload, args, protocol, output, device):
             selected.sample_seed_batch_size, selected.sample_context_workers = physical, workers
             validate_shared_data_recipe(selected)
             for condition in CONDITIONS:
+                announce(f"calibration {condition} batch={physical} workers={workers} | preparing")
                 inputs = StudyInputs(payload, selected)
                 model = make_model(payload, selected, device, condition)
                 optimizer = engine.make_optimizer(model, selected.learning_rate)
@@ -460,6 +463,10 @@ def calibrate(payload, args, protocol, output, device):
                 pairs, sampling_seconds = [], []
                 shape = None
                 for index in range(args.calibration_repeats):
+                    announce(
+                        f"calibration {condition} batch={physical} workers={workers} | "
+                        f"measurement {index + 1}/{args.calibration_repeats}"
+                    )
                     torch.cuda.synchronize(device)
                     start = time.perf_counter()
                     try:
@@ -487,6 +494,7 @@ def calibrate(payload, args, protocol, output, device):
                             )
                     shape = batch_shape(batch)
                 # Full validation/intervention also has to fit; it is never a training subset.
+                announce(f"calibration {condition} | full validation and new-context evaluations")
                 evaluation = calibration_evaluations(model, inputs, payload, selected, device)
                 row = {
                     "condition": condition,
@@ -556,6 +564,9 @@ def validate_calibration(args, protocol, device):
 
 
 def train_one(payload, args, condition, output, device, paired=None):
+    from .progress import announce
+
+    announce(f"TRAIN {condition} | {args.epochs} epochs | preparing model and initial validation")
     debug = bool(payload.get("explicit_synthetic_debug", False))
     inputs = StudyInputs(payload, args)
     model = make_model(payload, args, device, condition)
@@ -591,6 +602,8 @@ def train_one(payload, args, condition, output, device, paired=None):
         # Each condition sees identical epoch-specific dropout and sample streams.
         engine.base._seed(args.model_seed + 1_000_003 * (epoch + 1))
         start = time.perf_counter()
+        last_progress = start
+        announce(f"{condition} epoch {epoch + 1}/{args.epochs} | starting training")
         total_loss = torch.zeros((), device=device)
         total = steps = 0
         torch.cuda.reset_peak_memory_stats(device)
@@ -612,6 +625,14 @@ def train_one(payload, args, condition, output, device, paired=None):
                     },
                 )
             steps += 1
+            now = time.perf_counter()
+            if steps == 1 or steps == len(inputs.sampler) or now - last_progress >= 30:
+                announce(
+                    f"{condition} epoch {epoch + 1}/{args.epochs} | "
+                    f"batch {steps}/{len(inputs.sampler)} | "
+                    f"supervised seeds {total}/{inputs.train_count} | elapsed {now - start:.0f}s"
+                )
+                last_progress = now
         if total != inputs.train_count:
             raise RuntimeError("incomplete supervised epoch")
         evidence = inputs.last_pass_evidence
@@ -619,6 +640,7 @@ def train_one(payload, args, condition, output, device, paired=None):
             raise RuntimeError(
                 "conditions did not receive identical sampled contexts and train seeds"
             )
+        announce(f"{condition} epoch {epoch + 1}/{args.epochs} | validating")
         validation = evaluate(
             model,
             inputs.validation_batches(device),
@@ -729,7 +751,10 @@ def evaluate_selected(payload, args, selected, output, device):
 
 
 def main(argv=None):
+    from .progress import announce
+
     args = parser().parse_args(argv)
+    announce(f"{args.output_initialization} {args.action} | checking CUDA and data")
     validate(args)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA unavailable; no CPU fallback for production")
