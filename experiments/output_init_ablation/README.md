@@ -123,3 +123,7 @@ python /path/to/standalone-progress.py --run-dir /path/to/existing-run
 고립 노드, C=1 개입, checkpoint 켜기/끄기, log C의 실제 CE 미분을 검사한다.
 FP64 전체 모델 검사는 테스트에서만 정적 그래프 문맥의 dtype을 FP64로 맞춘 수학 기준이다.
 production은 기존 FP32 설정을 유지한다. 서버에서의 처리시간과 전체 학습 성공은 미검증이다.
+
+`log_row`의 청크 Q/K 역전파는 전체 노드 gradient를 한 번씩 할당하여 누적한다.
+수식, 미분 검사와 로컬 합성 연산 시간 비교는 [SCORE_BACKWARD.md](SCORE_BACKWARD.md)에
+기록했다. 해당 연산의 개선 비율은 서버 전체 epoch의 개선 비율이 아니다.

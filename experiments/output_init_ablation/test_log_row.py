@@ -11,12 +11,42 @@ from experiments.c_learning_bracket import model as accepted_model
 from experiments.c_learning_bracket.test_debug import cpu_threads, fixture_batch
 from research.conductance_gat.v5.operator import conductance_propagation_coefficients
 
-from .log_row import log_row_coefficients
+from .log_row import ChunkedSymmetricScores, log_row_coefficients
 from .model import make_model
 from .test_debug import arguments
 from .train import step
 
 __all__ = ["cpu_threads"]
+
+
+@pytest.mark.parametrize("chunk", [1, 3, 64])
+def test_chunked_scores_match_all_gradients_and_second_derivatives(chunk):
+    edges = torch.tensor([[0, 0, 1, 3, 4], [1, 2, 2, 4, 5]])
+    query = torch.randn(7, 2, 3, dtype=torch.float64, requires_grad=True)
+    key = torch.randn_like(query, requires_grad=True)
+    expected = 0.5 * (query[edges[0]] * key[edges[1]] + query[edges[1]] * key[edges[0]]).mean(-1)
+    actual = ChunkedSymmetricScores.apply(query, key, edges, chunk)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    probe = torch.randn_like(actual)
+    old_grads = torch.autograd.grad((expected * probe).sum(), (query, key))
+    new_grads = torch.autograd.grad((actual * probe).sum(), (query, key))
+    for a, b in zip(old_grads, new_grads, strict=True):
+        torch.testing.assert_close(a, b, rtol=1e-13, atol=1e-14)
+
+    def function(q, k):
+        return ChunkedSymmetricScores.apply(q, k, edges, chunk)
+
+    assert torch.autograd.gradcheck(function, (query, key))
+    assert torch.autograd.gradgradcheck(function, (query, key))
+
+
+def test_empty_score_gradients_and_single_required_input():
+    query = torch.randn(3, 8, 32, requires_grad=True)
+    key = torch.randn_like(query)
+    edges = torch.empty(2, 0, dtype=torch.long)
+    ChunkedSymmetricScores.apply(query, key, edges, 2).sum().backward()
+    assert torch.equal(query.grad, torch.zeros_like(query))
+    assert key.grad is None
 
 
 def test_coefficients_and_score_correction_gradients_match_raw_exp():

@@ -2,12 +2,45 @@
 
 import torch
 from torch import nn
-from torch.utils.checkpoint import checkpoint
 
 from experiments.c_learning_bracket.conductance import BracketConductance
 from experiments.c_learning_bracket.operator import OperatorOutput
 from research.conductance_gat.v5.model import graph_context_features
 from research.conductance_gat.v5.operator import _ChunkedHeadPropagation, graph_broadcast
+
+
+class ChunkedSymmetricScores(torch.autograd.Function):
+    """Accumulate Q/K gradients once, instead of allocating NHD per edge chunk."""
+
+    @staticmethod
+    def forward(ctx, query, key, edges, chunk_size):
+        ctx.save_for_backward(query, key, edges)
+        ctx.chunk_size = chunk_size
+        ctx.set_materialize_grads(False)
+        chunks = [
+            BracketConductance.edge_score(query, key, edges[:, start : start + chunk_size])
+            for start in range(0, edges.shape[1], chunk_size)
+        ]
+        return torch.cat(chunks) if chunks else query.new_empty((0, query.shape[1]))
+
+    @staticmethod
+    def backward(ctx, gradient):
+        if gradient is None:
+            return None, None, None, None
+        query, key, edges = ctx.saved_tensors
+        grad_query = torch.zeros_like(query) if ctx.needs_input_grad[0] else None
+        grad_key = torch.zeros_like(key) if ctx.needs_input_grad[1] else None
+        for start in range(0, edges.shape[1], ctx.chunk_size):
+            stop = start + ctx.chunk_size
+            tail, head = edges[:, start:stop]
+            scale = (gradient[start:stop] / (2 * query.shape[-1])).unsqueeze(-1)
+            if grad_query is not None:
+                grad_query.index_add_(0, tail, scale * key[head])
+                grad_query.index_add_(0, head, scale * key[tail])
+            if grad_key is not None:
+                grad_key.index_add_(0, tail, scale * query[head])
+                grad_key.index_add_(0, head, scale * query[tail])
+        return grad_query, grad_key, None, None
 
 
 def require_finite(value, label):
@@ -35,23 +68,14 @@ class LogConductance(BracketConductance):
             geometry = state.to(self.query.weight.dtype)
             query = self.query(geometry).reshape(-1, self.heads, self.head_width)
             key = self.key(geometry).reshape_as(query)
-            chunks = []
-            for start in range(0, incidence.shape[1], self.edge_chunk_size):
-                edges = incidence[:, start : start + self.edge_chunk_size]
-                score = (
-                    checkpoint(
-                        self.edge_score,
-                        query,
-                        key,
-                        edges,
-                        use_reentrant=False,
-                        preserve_rng_state=False,
-                    )
-                    if self.checkpoint_edges and torch.is_grad_enabled()
-                    else self.edge_score(query, key, edges)
-                )
-                chunks.append(score)
-            scores = torch.cat(chunks) if chunks else query.sum(-1)[:0]
+            if self.checkpoint_edges and torch.is_grad_enabled():
+                scores = ChunkedSymmetricScores.apply(query, key, incidence, self.edge_chunk_size)
+            else:
+                chunks = [
+                    self.edge_score(query, key, incidence[:, start : start + self.edge_chunk_size])
+                    for start in range(0, incidence.shape[1], self.edge_chunk_size)
+                ]
+                scores = torch.cat(chunks) if chunks else query.sum(-1)[:0]
         self.last_scores = scores.detach()
         return scores
 
