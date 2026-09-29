@@ -4,6 +4,10 @@
 기준 모델 파일은 수정하지 않는다. 새 실험은 같은 모델의 forward를 상속하고
 별도 runner에서 초기화 조건과 소스 hash를 기록한다.
 
+현재 서버 실행은 **`log_row` 수치 계산 경로**를 네 조건 모두에 적용한다.
+이전 raw-exp 실행과 소스·관측 형식이 다르므로 별도 run으로 기록한다.
+이번 변경의 수식과 검사 범위는 [NUMERICAL_STABILITY.md](NUMERICAL_STABILITY.md)에 있다.
+
 ## 네 조건
 
 | 출력 초기화 | C 학습 | C=1 고정 |
@@ -62,7 +66,7 @@ env -u PYTORCH_NVML_BASED_CUDA_CHECK \
   /home/aicompetition07/.conda/envs/new-gat/bin/python -u \
   -m experiments.output_init_ablation.study \
   --data-root /home/aicompetition07/new-gat/data/paper \
-  --output-dir "results/output-init-server-$(date +%Y%m%d-%H%M%S)"
+  --output-dir "results/output-init-log-row-server-$(date +%Y%m%d-%H%M%S)"
 ```
 
 서버에서 calibration부터 새로 측정한다. 로컬 calibration과 소요시간은 서버 학습의
@@ -114,3 +118,8 @@ python /path/to/standalone-progress.py --run-dir /path/to/existing-run
 변경, 난수 상태 일치, 실제 4조건 CUDA 학습·checkpoint·평가·최종 대조를 검사한다.
 작은 합성 그래프와 2epoch는 별도 테스트에만 사용하며 모델은 8/256/8을 유지한다.
 이 테스트 통과는 실제 데이터 200epoch 실험 완료를 뜻하지 않는다.
+
+새 경로는 추가로 raw-exp와의 FP32/FP64 수학 비교, ±1000 점수, sampling 보정 미분,
+고립 노드, C=1 개입, checkpoint 켜기/끄기, log C의 실제 CE 미분을 검사한다.
+FP64 전체 모델 검사는 테스트에서만 정적 그래프 문맥의 dtype을 FP64로 맞춘 수학 기준이다.
+production은 기존 FP32 설정을 유지한다. 서버에서의 처리시간과 전체 학습 성공은 미검증이다.

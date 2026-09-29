@@ -62,6 +62,9 @@ class RecipeParser(argparse.ArgumentParser):
 def parser():
     result = RecipeParser(description=__doc__)
     result.add_argument("--output-initialization", choices=INITIALIZATIONS, required=True)
+    result.add_argument(
+        "--conductance-evaluation", choices=("raw_exp", "log_row"), default="log_row"
+    )
     result.add_argument("--output-dir", type=Path, required=True)
     result.add_argument("--data-root", type=Path, default=Path("data/paper"))
     result.add_argument("--device", default="cuda")
@@ -245,6 +248,7 @@ def research_contract(args, protocol):
     configuration = {name: getattr(args, name) for name in fields}
     configuration.update(
         {
+            "conductance_evaluation": getattr(args, "conductance_evaluation", "raw_exp"),
             "generator": "symmetric_dot_exp",
             "head_aggregation": "none; per-head C",
             "score_scale": "1/head_width",
@@ -260,7 +264,11 @@ def research_contract(args, protocol):
         configuration.pop(name, None)
     return {
         "suite": SUITE,
-        "implementation_revision": "output_init_ablation_1",
+        "implementation_revision": (
+            "output_init_log_row_1"
+            if getattr(args, "conductance_evaluation", "raw_exp") == "log_row"
+            else "output_init_ablation_1"
+        ),
         "input_pipeline": "bracket tensors without forest/cycle plans; verified CPU pinning",
         "dataset_protocol": protocol,
         "configuration": configuration,
@@ -289,10 +297,15 @@ def step(model, batch, optimizer, example_nodes=None, timer=None):
     with phase("zero_grad"):
         optimizer.zero_grad(set_to_none=True)
     with phase("inspection_setup") if example_nodes is not None else nullcontext():
+        inspection_type = UpdateInspection
+        if getattr(model, "conductance_evaluation", "raw_exp") == "log_row":
+            from .log_inspect import LogUpdateInspection
+
+            inspection_type = LogUpdateInspection
         observation = (
             None
             if example_nodes is None
-            else UpdateInspection(
+            else inspection_type(
                 model,
                 example_nodes,
                 optimizer=optimizer,

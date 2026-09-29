@@ -110,12 +110,14 @@ def test_contract_records_the_only_factor_and_production_budget(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA integration smoke")
-def test_debug_four_conditions_train_save_reload_evaluate_and_compare(tmp_path):
+@pytest.mark.parametrize("evaluation", ["raw_exp", "log_row"])
+def test_debug_four_conditions_train_save_reload_evaluate_and_compare(tmp_path, evaluation):
     # Explicit synthetic debug only. Both arms keep full 8/256/8 architecture.
     device = torch.device("cuda")
     payload = debug_payload()
     for initialization in ("baseline", "kaiming_relu"):
         args = arguments(initialization)
+        args.conductance_evaluation = evaluation
         args.epochs = 2
         args.sample_seed_batch_size = 64
         args.sample_context_seed_batch_size = 32

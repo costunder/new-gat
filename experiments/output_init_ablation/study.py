@@ -27,6 +27,8 @@ def command(initialization, action, output, data_root, calibration=None):
         "experiments.output_init_ablation.train",
         "--output-initialization",
         initialization,
+        "--conductance-evaluation",
+        "log_row",
         "--action",
         action,
         "--output-dir",
@@ -81,13 +83,21 @@ def signal_trajectory(root, *, expected_epochs=200):
                                 key: value["rms"]
                                 for key, value in layer["signal_stages_before_update"].items()
                             },
-                            "c_std_by_head": layer["c"]["before"]["std"],
-                            "c_update_max_by_head": layer["c"]["change"]["max_abs"],
+                            "conductance_coordinate": "log_c" if "log_c" in layer else "c",
+                            "conductance_std_by_head": layer.get("log_c", layer.get("c"))["before"][
+                                "std"
+                            ],
+                            "conductance_update_max_by_head": layer.get("log_c", layer.get("c"))[
+                                "change"
+                            ]["max_abs"],
                             "alpha_update_max_by_head": layer["alpha"]["change"]["max_abs"],
                             "alpha_resolved_by_head": layer[
                                 "alpha_change_resolved_above_observed_replay_by_head"
                             ],
-                            "live_c_gradient": layer["live_c_gradient_norm_and_max_by_head"],
+                            "live_conductance_gradient": layer.get(
+                                "live_log_c_gradient_norm_and_max_by_head",
+                                layer.get("live_c_gradient_norm_and_max_by_head"),
+                            ),
                         }
                     )
                 rows.append(
@@ -198,6 +208,7 @@ def main():
             "layers": 8,
             "hidden_channels": 256,
             "heads": 8,
+            "conductance_evaluation": "log_row",
             "calibration_physical_candidates": [2048, 4096],
             "calibration_worker_candidates": [2, 4],
             "data_root": str(data_root),

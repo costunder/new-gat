@@ -14,10 +14,13 @@ INITIALIZATIONS = ("baseline", "kaiming_relu")
 
 
 class OutputInitClassifier(BracketClassifier):
-    def __init__(self, *args, output_initialization, **kwargs):
+    def __init__(self, *args, output_initialization, conductance_evaluation="raw_exp", **kwargs):
         if output_initialization not in INITIALIZATIONS:
             raise ValueError("declare baseline or kaiming_relu initialization")
         super().__init__(*args, **kwargs)
+        if conductance_evaluation not in {"raw_exp", "log_row"}:
+            raise ValueError("unknown conductance evaluation")
+        self.conductance_evaluation = conductance_evaluation
         self.output_initialization = output_initialization
         if output_initialization == "kaiming_relu":
             # Linear default U[-1/sqrt(D),1/sqrt(D)] -> U[-sqrt(6/D),sqrt(6/D)].
@@ -25,6 +28,12 @@ class OutputInitClassifier(BracketClassifier):
             with torch.no_grad():
                 for op in self.layers:
                     op.output_projection.weight.mul_(math.sqrt(6.0))
+        if conductance_evaluation == "log_row":
+            from .log_row import LogRowOperator
+
+            self.layers = torch.nn.ModuleList(
+                LogRowOperator.from_existing(op) for op in self.layers
+            )
 
     def contract(self):
         result = super().contract()
@@ -38,6 +47,14 @@ class OutputInitClassifier(BracketClassifier):
             else 1.0,
             initialization_pairing="same draws; only output weights scaled once before training",
         )
+        result["conductance_evaluation"] = self.conductance_evaluation
+        if self.conductance_evaluation == "log_row":
+            result.update(
+                positive_map="C=exp(score), stored as log C; no score clipping",
+                normalization_evaluation="receiver log-sum-exp; shared symmetric edge scores",
+                conductance_output_representation="log C",
+                implementation_revision="output_init_log_row_1",
+            )
         return result
 
 
@@ -66,5 +83,6 @@ def make_model(payload, args, device, condition="learned"):
         edge_chunk_size=args.edge_chunk_size,
         checkpoint_edges=args.checkpoint_edges,
         output_initialization=args.output_initialization,
+        conductance_evaluation=getattr(args, "conductance_evaluation", "raw_exp"),
     ).to(device)
     return model if condition == "learned" else model.fixed_copy()
