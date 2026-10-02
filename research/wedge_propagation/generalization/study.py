@@ -142,12 +142,34 @@ def validate_source_rows(source, rows, controls, audit):
         raise ValueError("source teacher operator audit does not cover every graph")
 
 
-def original_reproduction(source_rows, repeated, tolerance, relative_tolerance=1e-5):
-    """Verify saved selected states reproduce the actual source messages."""
+def target_rms_scales(cases, dtype):
+    """Use the same stored targets/precision as the source metric serializer."""
+    scales = {}
+    fields = {"L": "lx", "L2": "l2x", "path": "target_path"}
+    for case in cases:
+        for target, field in fields.items():
+            truth = getattr(case, field).to(dtype=dtype).double()
+            scale = float(truth.square().mean().sqrt())
+            if not math.isfinite(scale) or scale < 0:
+                raise ValueError(f"invalid source target RMS: {target}/{case.graph_id}")
+            scales[(target, case.graph_id)] = scale
+    return scales
+
+
+def original_reproduction(
+    source_rows, repeated, tolerance, relative_tolerance=1e-5, *, target_rms, epsilon=1e-8
+):
+    """Compare metric replay; normalize absolute RMSE by the original target RMS.
+
+    A small residual RMSE is not the FP32 arithmetic scale. Target normalization
+    keeps its replay threshold in the same dimensionless units as message error.
+    """
+    if not math.isfinite(epsilon) or epsilon <= 0:
+        raise ValueError("reproduction epsilon must be finite and positive")
     actual = {metric_key(row): row for row in repeated if row["split"] != "train"}
     if len(actual) != len(source_rows):
         raise ValueError("original model reproduction coverage differs from source")
-    maximum = 0.0
+    maximum = maximum_normalized_rmse = 0.0
     for expected in source_rows:
         current = actual[metric_key(expected)]
         for field in ("message_relerr", "message_abs_rmse", "u", "v", "beta"):
@@ -158,17 +180,63 @@ def original_reproduction(source_rows, repeated, tolerance, relative_tolerance=1
                 continue
             error = abs(left - right)
             maximum = max(maximum, error)
-            if not math.isclose(left, right, abs_tol=tolerance, rel_tol=relative_tolerance):
+            if field == "message_abs_rmse":
+                scale = target_rms[(expected["target"], expected["graph_id"])]
+                if not math.isfinite(scale) or scale < 0:
+                    raise ValueError("source target RMS must be finite and nonnegative")
+                denominator = scale + epsilon
+                compared_left, compared_right = left / denominator, right / denominator
+                maximum_normalized_rmse = max(maximum_normalized_rmse, error / denominator)
+            else:
+                compared_left, compared_right = left, right
+            if not math.isclose(
+                compared_left, compared_right, abs_tol=tolerance, rel_tol=relative_tolerance
+            ):
                 raise ArithmeticError(
                     f"saved-model reproduction failed for {metric_key(expected)} {field}: "
-                    f"{left} vs {right}; atol={tolerance}, rtol={relative_tolerance}"
+                    f"{left} vs {right}; compared={compared_left} vs {compared_right}; "
+                    f"atol={tolerance}, rtol={relative_tolerance}"
                 )
     return {
         "graph_seed_rows": len(actual),
         "maximum_absolute_error": maximum,
+        "maximum_target_normalized_rmse_error": maximum_normalized_rmse,
+        "rmse_comparison": "absolute RMSE divided by the original target RMS plus epsilon",
+        "normalization_epsilon": epsilon,
         "absolute_tolerance": tolerance,
         "relative_tolerance": relative_tolerance,
         "verified": True,
+    }
+
+
+def cache_original_batches(source, device, dtype):
+    """Restore source split/order/batch geometry for the metric replay only."""
+    size = source.contract["physical_graph_batch_selected"]
+    if isinstance(size, bool) or not isinstance(size, int) or size < 1:
+        raise ValueError("source physical graph batch must be a positive integer")
+    recorded_sizes = source.contract["physical_graph_batch_actual"]
+    recorded_shapes = source.contract["input_shapes"]
+    cached, layout = [], {}
+    # Experiment 2 evaluated these five splits in this order. Train is an
+    # additional measurement in Experiment 3 and follows the source replay.
+    for split in (*SPLITS[1:], "train"):
+        cases = [case for case in source.cases if case.split == split]
+        group = cache_batches(cases, size, device, dtype)
+        counts = [batch.num_graphs for _, batch in group]
+        shapes = [list(batch.x.shape) for _, batch in group]
+        if counts != recorded_sizes[split] or shapes != recorded_shapes[split]:
+            raise ValueError(f"source replay batch layout mismatch for split={split}")
+        cached.extend(group)
+        layout[split] = {
+            "physical_graph_batches": counts,
+            "input_shapes": shapes,
+            "graph_ids": [case.graph_id for case in cases],
+        }
+    return cached, {
+        "physical_graph_batch_selected": size,
+        "split_order": list(layout),
+        "splits": layout,
+        "source_batch_layout_verified": True,
     }
 
 
@@ -338,6 +406,8 @@ def run(args, output):
         flush=True,
     )
     metrics, scale_rows, scenarios, reproduction = [], [], [], None
+    reproduction_layout = None
+    source_target_rms = target_rms_scales(source.cases, dtype)
     fresh_base = feature_cases(
         source.cases, source.config["teacher"], config["master_seed"], 1.0, workers
     )
@@ -353,7 +423,15 @@ def run(args, output):
             torch.cuda.reset_peak_memory_stats(device)
         if scenario == "original":
             cases = source.cases
-            cached = cache_batches(cases, size, device, dtype)
+            cached, reproduction_layout = cache_original_batches(source, device, dtype)
+            write_json(output / "original_reproduction_layout.json", reproduction_layout)
+            print(
+                f"[reproduction layout] source_batch="
+                f"{reproduction_layout['physical_graph_batch_selected']} "
+                f"split_order={reproduction_layout['split_order']} "
+                "source_layout_verified=True",
+                flush=True,
+            )
         elif amplitude == 1:
             cases, cached = fresh_base, reference_cached
         else:
@@ -413,15 +491,24 @@ def run(args, output):
                 flush=True,
             )
         if scenario == "original":
+            # Keep measured rows even if the strict numerical replay rejects
+            # them, so a failed run remains inspectable without another run.
+            for row in scenario_rows:
+                row["reproduction_target_rms"] = source_target_rms[(row["target"], row["graph_id"])]
+            write_csv(output / "original_reproduction_metrics.csv", scenario_rows)
             reproduction = original_reproduction(
                 old_metrics,
                 scenario_rows,
                 config["original_reproduction_atol"],
                 config["original_reproduction_rtol"],
+                target_rms=source_target_rms,
+                epsilon=config["metric_epsilon"],
             )
             print(
                 f"[reproduction] original selected models "
-                f"maximum_error={reproduction['maximum_absolute_error']:.3g}",
+                f"maximum_raw_difference={reproduction['maximum_absolute_error']:.3g} "
+                f"maximum_target_normalized_rmse_difference="
+                f"{reproduction['maximum_target_normalized_rmse_error']:.3g}",
                 flush=True,
             )
         metrics.extend(scenario_rows)
@@ -517,6 +604,7 @@ def run(args, output):
         "source_code_sha256": code_before,
         "source_code_unchanged": True,
         "original_metric_reproduction": reproduction,
+        "original_reproduction_layout": reproduction_layout,
         "source_graph_count": len(source.cases),
         "source_input_count": len(source.cases) * source.config["features"],
         "feature_realizations": source.config["features"],

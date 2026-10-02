@@ -38,6 +38,16 @@ X.T A.T C2 A X = sum_p c_p(AX)_p²다. C2가 입력에 의존하므로 전체 �
 G의 연결·경로·random pair는 원본 NPZ에서 읽는다. 원본 X로 selected 모델의 출력 지표를
 다시 계산해 원본 CSV의 각 graph/target/condition/seed에 맞춰 검증한다.
 
+수치 재현은 원본 contract의 physical batch와 split별 순서·shape를 그대로 복구한다.
+CUDA의 합산은 같은 입력에서도 작은 반올림 차이가 생길 수 있다.
+이는 [PyTorch 2.7 index_add_ 문서](https://docs.pytorch.org/docs/2.7/generated/torch.Tensor.index_add_.html)에도 명시돼 있다.
+Absolute RMSE의 재현 비교에는 원본 정답의 RMS
+\(R_G=\sqrt{\operatorname{mean}(M_G^{*2})}\)를 사용한다.
+원본과 재평가의 RMSE를 각각 \(R_G+10^{-8}\)로 나눈 뒤 atol=rtol=1e-5로 비교한다.
+정답은 원본 NPZ를 모델 평가 dtype으로 변환한 값이다. 정답이 0일 때도 epsilon을 사용하며
+비교를 생략하지 않는다. RMSE 원 측정값은 그대로 보존한다.
+메시지 상대 오차와 모델 계수 검사, 원본 파일·모델 상태 hash 검사는 유지한다.
+
 새로운 독립 표준정규 입력 \(\tilde X_G\)를 만든 뒤
 
 \[

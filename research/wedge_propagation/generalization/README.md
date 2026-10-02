@@ -66,7 +66,11 @@ env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES="$WEDGE_GPU" \
 
 원본 완료 상태·설정·입력·수식 코드 SHA256·checkpoint 대응을 먼저 검사한다.
 원본 CSV 재현이 허용 오차를 벗어나거나 입력·모델이 실행 중 바뀌면 실패 처리한다.
-FP32 batch/하드웨어 차이를 위해 재현 허용값은 atol=rtol=1e-5다.
+원본 재현은 저장된 split별 배치·순서·입력 shape를 복구해서 수행한다.
+새 특징 평가는 처리량으로 선택한 batch를 사용한다.
+재현 허용값은 atol=rtol=1e-5다. 메시지 상대 오차와 계수는 직접 비교하고,
+absolute RMSE는 원본 정답 RMS+epsilon으로 나눈 뒤 비교한다.
+정답의 크기를 기준으로 FP32 반올림 차이를 판단하며, raw RMSE 값도 그대로 저장한다.
 모델 상태와 원본 파일의 hash는 실행 전후 정확히 같아야 한다.
 
 CPU worker는 전체 새 특징 준비로 측정한다. GPU는 원본 batch, 두 배 batch, 전체 그래프
@@ -80,6 +84,8 @@ disjoint-union batch와 tensor 축에서 병렬 처리한다. 원본은 한 번 
   원본 C2·고정 개입·teacher 진단을 실제 값으로 요약한다.
 - `metrics.csv`: 모든 그래프·target·condition·seed·시나리오별 메시지 오차와 가중치 진단.
 - `scale_checks.csv`: 같은 새 특징의 배율 간 C2 변화와 메시지 비례성 오차.
+- `original_reproduction_layout.json`, `original_reproduction_metrics.csv`:
+  복구한 원본 배치와 정답 RMS를 포함한 재평가. 재현 검사가 실패해도 측정 표를 남긴다.
 - `source_metrics.csv`, `source_interventions.csv`, `source_teacher_operator_audit.csv`:
   원본 진단의 값을 새 출력 폴더에 복사한 표. 원본 파일은 그대로 보존한다.
 - `fresh-a*/dataset.npz`, `fresh-a*/data_manifest.json`: 배율별 실제 전체 입력·teacher·목표·연결·seed·hash.
