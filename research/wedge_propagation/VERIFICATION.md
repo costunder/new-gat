@@ -1,6 +1,8 @@
 # 구현과 검증 상태
 
-2026년 10월 2일. 이 기록은 로컬 개발 검증이며 서버 본실험 결과가 아니다.
+2026년 10월 2일. 아래 표는 Experiment 0/1 구현 당시의 로컬 개발 검증이다.
+이후 서버 full 결과는 [SERVER_FIXED_RESULTS.md](SERVER_FIXED_RESULTS.md),
+Experiment 2의 현재 상태는 [learned/VERIFICATION.md](learned/VERIFICATION.md)에 별도로 기록한다.
 
 | 구분 | 상태 |
 | --- | --- |

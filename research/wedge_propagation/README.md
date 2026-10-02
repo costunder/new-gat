@@ -1,8 +1,11 @@
 # 독립 경로 이차 차분 실험
 
-현재 구현은 **Experiment 0 대수 검사와 Experiment 1 고정 연산 비교**다.
+이 문서와 `study` 실행 명령은 **Experiment 0 대수 검사와 Experiment 1 고정 연산 비교**를 설명한다.
 `C2=I`로 고정하고 같은 입력에 `LX`, `L²X`, `QX`를 적용한다.
 이후 경로 가중치 학습과 분류 실험은 [현재 계획](EXPERIMENT_PLAN_FIXED_FIRST.md)에 정리되어 있다.
+
+**Experiment 2 구현과 A6000 학습 명령은 [learned/README.md](learned/README.md)에 있다.**
+고정 연산의 서버 결과는 [SERVER_FIXED_RESULTS.md](SERVER_FIXED_RESULTS.md)에 기록했다.
 
 ## 무엇을 계산하는가
 

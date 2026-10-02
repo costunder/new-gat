@@ -1,6 +1,6 @@
 # 고정 경로 연산부터 검증하는 독립 실험 계획
 
-2026년 10월 2일. 사용자 첨부의 수정 요청을 반영한 현재 계획이다. 이전 계획은 archive에 보존했으며 그 설정과 실행 수를 계승하지 않는다. Experiment 0/1 코드는 구현했으며, 실행과 검증 상태는 [README](README.md)와 [검증 기록](VERIFICATION.md)에 구분해 적었다. 이 문서의 후속 학습 단계는 설계다.
+2026년 10월 2일. 사용자 첨부의 수정 요청을 반영한 계획이다. 이전 계획은 archive에 보존했으며 그 설정과 실행 수를 계승하지 않는다. Experiment 0/1의 서버 결과는 [SERVER_FIXED_RESULTS.md](SERVER_FIXED_RESULTS.md)에 기록했다. Experiment 2는 최신 첨부로 갱신해 [별도 패키지](learned/README.md)에 구현하고 debug 검증을 완료했다. Experiment 3/4는 후속 설계다.
 
 연구 질문은 **연속된 두 엣지의 특징 변화 관계를 이용한 경로 차분 연산이 무엇을 추가하며, 이후 공유 생성기로 그 경로 가중치를 학습할 수 있는가**이다.
 
@@ -9,7 +9,7 @@
 ## 독립 실험의 범위
 
 - 기존 Conductance 모델, C 생성기, 정규화, checkpoint, optimizer 규약, synthetic generator를 가져오지 않는다.
-- 앞 계획의 degree 입력, graph mean C 정규화, softmax alpha/beta, hidden 256, AdamW, 10seed와 698run은 이번 실험의 기본 설정에서 제거한다.
+- 앞 계획의 degree 입력, softmax alpha/beta, hidden 256, AdamW, 10seed와 698run은 이번 실험의 기본 설정에서 제거한다. Graph mean C 정규화는 최신 Experiment 2 첨부에 따라 새 teacher/student에 명시적으로 채택했다.
 - Adaptive edge, blind gate, repeated first-order, PPI, arxiv는 초기 실험 범위에서 제외한다. GraphSAGE, GAT, GATv2도 이번 비교에 넣지 않는다.
 - 프로젝트 안전 규칙, 전체 경로 보존, 실제 자원 계측, debug와 본학습의 구분은 그대로 적용한다.
 - 새 code/data/results/config를 이 트랙 안에 분리한다. 이전 코드와 실험 결과는 보존한다.
@@ -93,6 +93,11 @@ Regular graph에서는 Q=L²+2(d−2)L, cycle에서는 Q=L²다. 또한 모든 e
 
 ## Experiment 2 새 경로 규칙의 학습
 
+**이 절의 최초 teacher/student 제안은 이후 사용자 첨부 `654482c4-8516-4ff8-a8c3-792dc49ac796`로 갱신됐다.**
+현재 구현은 [learned/MODEL_MATH.md](learned/MODEL_MATH.md)의 exp(tau tanh)/graph mean 정규화,
+다섯 pure operator 비교군, 세 target과 독립 split을 따른다. 실제 full 설정은
+[learned/config_full.json](learned/config_full.json)에 명시했다. 아래 최초 제안은 변경 이력을 위해 남긴다.
+
 Experiment 0/1의 검사 결과를 확인한 뒤 시작한다. 새 생성기의 입력은 두 엣지 차분뿐이다.
 
 \[
@@ -158,6 +163,10 @@ Validation만으로 설정과 checkpoint를 선택하고 모든 조건을 고정
 
 ## 학습 모델의 다섯 가지 개입
 
+이 절은 최초 후속 GNN 계획이다. 현재 Experiment 2의 개입은
+[learned/MODEL_MATH.md](learned/MODEL_MATH.md)에 있는 identity/mean/weight shuffle/
+other graph pattern/correspondence randomization이며, 아래 분기 제거 실험은 현재 다섯 개입에 포함하지 않는다.
+
 1. C2=1.
 2. C2=mean(C2).
 3. Path 사이에서 C2 shuffle.
@@ -178,11 +187,12 @@ Learned 단계에서는 task A/B의 양성 대조가 작동하고, task C에서 
 
 본학습은 서버에서만 진행한다. GPU/MIG, RAM, CPU, 전체 N/E/P를 실측한다. 모든 path를 유지하며 tensor 연산, cache, exact chunking을 사용한다. 독립 graph는 disjoint-union으로 batch 처리한다. Physical batch는 후보들을 측정해 결정하며, 같은 학습 비교에서는 조건 간 batch와 update 수를 맞춘다.
 
-실행한 같은 terminal에 현재 phase, case 또는 epoch, loss, metric, 처리시간을 표시하고 log에도 저장한다. 새 결과 directory에 실제 config/source/data hash와 완전한 재개 checkpoint를 보관한다. Experiment 0/1은 학습 checkpoint를 만들지 않는다. 현재 Experiment 0/1 구현과 별도 debug 검증을 완료했고, 서버의 full 고정 실험과 Experiment 2–4 학습은 아직 실행하지 않았다.
+실행한 같은 terminal에 현재 phase, case 또는 epoch, loss, metric, 처리시간을 표시하고 log에도 저장한다. 새 결과 directory에 실제 config/source/data hash와 재개 checkpoint를 보관한다. Experiment 0/1은 학습 checkpoint를 만들지 않는다. 서버의 full 고정 실험은 완료됐으며 사용자가 제공한 결과를 기록했다. Experiment 2는 코드·테스트·로컬 GPU debug를 완료했고 서버 full 학습은 아직 실행하지 않았다. Experiment 3/4는 아직 구현·실행하지 않았다. Experiment 2의 재개 범위는 한 target/condition job이며 새 결과 폴더에서 나머지 job을 다시 실행한다.
 
 ## 출처
 
 - 이번 방향의 근거: 사용자 첨부 `626327d7-5b90-4965-a6c8-667344d1359b`의 본문.
+- 현재 Experiment 2의 근거: 사용자 첨부 `654482c4-8516-4ff8-a8c3-792dc49ac796`의 본문.
 - [원 GCN 논문](https://arxiv.org/abs/1609.02907).
 - [GCN 저자의 학습 코드](https://github.com/tkipf/gcn/blob/master/gcn/train.py).
 - [표준 GCNConv 정의](https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.GCNConv.html).
