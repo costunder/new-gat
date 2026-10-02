@@ -9,6 +9,10 @@
 학습 수식과 재실행 명령은 [learned/README.md](learned/README.md)에 있다.
 이 완료 모델에 새 특징과 amplitude 변화를 적용하는 **Experiment 3**는
 [generalization/README.md](generalization/README.md)에 구현돼 있다. 재학습과 checkpoint 재선택은 하지 않는다.
+Experiment 3의 서버 전체 평가도 완료했으며 [결과](SERVER_GENERALIZATION_RESULTS.md)를 기록했다.
+다음 **Experiment 3.1**은 C 입력의 엣지 차분 RMS 정규화를
+[scale_normalization/README.md](scale_normalization/README.md)의 별도 모델·실행기로 비교한다.
+전체 source 데이터와 학습 규모를 유지하고 실제 AX 메시지는 원래 크기를 사용한다.
 고정 연산의 서버 결과는 [SERVER_FIXED_RESULTS.md](SERVER_FIXED_RESULTS.md)에 있다.
 
 ## 무엇을 계산하는가

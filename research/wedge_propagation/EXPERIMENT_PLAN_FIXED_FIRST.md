@@ -6,6 +6,8 @@ Experiment 0/1의 서버 결과는 [SERVER_FIXED_RESULTS.md](SERVER_FIXED_RESULT
 Experiment 2는 최신 첨부로 갱신한 [별도 패키지](learned/README.md)의 서버 full 학습·평가를 완료했고,
 제공된 터미널 결과는 [SERVER_LEARNED_RESULTS.md](SERVER_LEARNED_RESULTS.md)에 정리했다.
 Experiment 3는 고정된 모델의 새 특징·amplitude 평가로 [구현](generalization/README.md)했다.
+서버 full 평가를 완료했으며 [결과](SERVER_GENERALIZATION_RESULTS.md)를 기록했다.
+Experiment 3.1은 [C 입력 RMS 정규화](scale_normalization/README.md)를 동일 규모로 비교한다.
 Experiment 4 실제 데이터 분류는 후속 설계다.
 
 연구 질문은 **연속된 두 엣지의 특징 변화 관계를 이용한 경로 차분 연산이 무엇을 추가하며, 이후 공유 생성기로 그 경로 가중치를 학습할 수 있는가**이다.
@@ -195,6 +197,26 @@ Raw scale에서 1과 mean의 차이를 기록한다. 이후 mean 정규화나 op
 Random pair는 signed pair operator T를 만들어 Arand=TB로 정의한다. B의 방향을 S로 바꾸면 T도 TS로 바꾸고, gate에 제공하는 두 차분의 부호도 함께 바꾼다. Pair와 sign을 manifest에 고정한다. Pair를 바꾸면 row norm도 달라지므로 true wedge의 sqrt(6)으로 row norm을 맞춘 대조도 함께 기록한다.
 
 Pair 수, edge 사용 빈도, 공유 중심의 비율, node support, hop 거리, trace, operator norm을 기록한다. Random pair의 악화에는 이러한 변화도 포함되므로 연속성만의 인과 효과라고 단정하지 않는다. True gate를 고정하고 operator만 바꾸는 개입과, random pair에 맞춰 gate 입력도 바꾸는 개입을 구분한다. Random 대조군을 다시 학습한다면 고정 checkpoint 개입과 별도 표로 보고한다.
+
+## Experiment 3.1 C 입력의 크기 정규화
+
+Experiment 3에서 새 특징에 대한 경로 메시지 회수는 유지됐지만 입력을 4배로 키우면
+student C와 메시지가 크게 변했다. 같은 teacher의 배율 변화는 수치 오차 수준이었다.
+이에 따라 기존 모델과 원래 AX 메시지를 보존하면서 C 생성 입력에만
+graph/feature별 physical-edge 차분의 RMS 정규화를 적용한다.
+
+- 기존 Experiment 2 raw 모델과 scalar 대조는 고정한다.
+- 새 normalized learned/random-pair 모델은 세 목표 모두 처음부터 학습한다.
+- source의 531개 graph·16 scalar 실현·hidden 64·500 epoch·5 seed·Adam/loss/validation 선택을 유지한다.
+- source 학습 physical batch와 step 수를 유지한다. 대안 batch 처리량을 계측하고 유지 이유를 기록한다.
+- Experiment 3의 저장된 새 특징과 다섯 배율을 양쪽 모델에 그대로 제공한다.
+- 같은 배율의 예측 오차, C 회수, original/fresh1 고정 개입, C 불변성과 메시지 등변성을 각각 보고한다.
+- 비영 신호의 입력 RMS에 epsilon을 더하지 않는다. Zero-edge signal은 scale 1을 사용한다.
+- 크기 불변성은 설계에 들어간 성질이며, teacher 회수 정확도 개선은 관측 결과로 판단한다.
+- 새 teacher weight loss, scale augmentation, GNN 분류기를 추가하지 않는다.
+
+실행은 [scale_normalization/README.md](scale_normalization/README.md), 수식은
+[MODEL_MATH.md](scale_normalization/MODEL_MATH.md)에 있다. 서버 full 결과는 아직 없다.
 
 ## 판정과 실행 조건
 

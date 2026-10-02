@@ -1,0 +1,13 @@
+{
+  "profile": "debug",
+  "experiment": "3.1",
+  "normalization": "graph_edge_rms",
+  "variants": ["raw", "normalized"],
+  "master_seed": 20261003,
+  "amplitudes": [0.25, 0.5, 1.0, 2.0, 4.0],
+  "training_contract": "inherit_complete_source",
+  "training_batch": "retain_source",
+  "evaluation_batch": "retain_feature_source",
+  "scale_augmentation": false,
+  "teacher_weight_loss": false
+}
