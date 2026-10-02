@@ -82,8 +82,9 @@ disjoint union으로 병렬 계산하고 문맥 준비에 worker 4개를 사용�
 학습 시작 시 현재 소스·설정과 calibration 계약이 일치해야 한다.
 예외가 발생하면 로그와 failure JSON을 남기고 다음 실험으로 넘어가지 않는다.
 수식·정밀도·배치 크기를 조용히 바꾸지 않으며, 다른 GPU 작업을 종료하지 않는다.
-기존 runner처럼 중단된 epoch부터의 resume은 제공하지 않는다.
-checkpoint와 완료된 결과는 보존되며 중단 시 새 실행 계획을 별도로 정한다.
+중단된 epoch부터의 optimizer/RNG resume은 제공하지 않는다.
+200 epoch를 마친 조건은 소스·데이터·checkpoint·CUDA validation을 검증한 뒤
+별도 폴더에서 재사용할 수 있다. [종료 시 계약 오류 복구](RECOVERY.md)를 참고한다.
 
 ## 결과 위치
 
