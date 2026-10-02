@@ -7,8 +7,10 @@ Experiment 2는 최신 첨부로 갱신한 [별도 패키지](learned/README.md)
 제공된 터미널 결과는 [SERVER_LEARNED_RESULTS.md](SERVER_LEARNED_RESULTS.md)에 정리했다.
 Experiment 3는 고정된 모델의 새 특징·amplitude 평가로 [구현](generalization/README.md)했다.
 서버 full 평가를 완료했으며 [결과](SERVER_GENERALIZATION_RESULTS.md)를 기록했다.
-Experiment 3.1은 [C 입력 RMS 정규화](scale_normalization/README.md)를 동일 규모로 비교한다.
-Experiment 4 실제 데이터 분류는 후속 설계다.
+Experiment 3.1은 [C 입력 RMS 정규화](scale_normalization/README.md)를 동일 규모로 비교했다.
+사용자가 제공한 서버 full 완료 결과는 [SERVER_SCALE_NORMALIZATION_RESULTS.md](SERVER_SCALE_NORMALIZATION_RESULTS.md)에 기록했다.
+Experiment 4는 [실제 분류 설계](classification/EXPERIMENT_DESIGN.md)의
+[서버 실행기](classification/README.md)를 구현했다. 로컬 검증과 서버 본학습을 구분한다.
 
 연구 질문은 **연속된 두 엣지의 특징 변화 관계를 이용한 경로 차분 연산이 무엇을 추가하며, 이후 공유 생성기로 그 경로 가중치를 학습할 수 있는가**이다.
 
@@ -158,27 +160,21 @@ Source 완료 상태·config/source/data/checkpoint hash와 전체 평가 covera
 
 ## Experiment 4 공통 backbone과 표준 GCN
 
-Synthetic를 검증한 뒤 Cora, CiteSeer, PubMed의 공식 split에서 평가한다. 독립 loader를 만들며 공식 raw cache는 checksum을 확인한 뒤 사용할 수 있다. 기존 Conductance adapter나 전처리 규약을 import하지 않는다.
+상세 수식·데이터·학습·개입 계약은 [classification/EXPERIMENT_DESIGN.md](classification/EXPERIMENT_DESIGN.md)를 기준으로 한다.
 
-통제된 backbone은 모든 조건에서 Z=HW, H'=sigma(PZ)를 공유하고 P만 바꾼다.
+- Cora/CiteSeer/PubMed public fixed split, 전체 노드·물리 엣지·unordered wedge.
+- 공통 두 층, hidden 64, dropout 0.5, bias 없는 Z=HW, U=(I−αL̄−βT̄)Z.
+- L̄² / 고정 Q̄ / 학습 T̄_C를 바꾸며 raw와 graph RMS gate를 각각 새로 학습한다.
+- Topology의 S_Q를 고정하고 κ(C)로 강도 상한을 맞추는 분류용 정규화다. Synthetic의 원래 AZ 규약과 구분한다.
+- MLP/first/polynomial/fixed/learned raw/learned RMS/fixed+node MLP/standard GCN의 8조건.
+- Gate 입력은 현재 투영 Z다. 경로당 scalar C 하나를 모든 channel에 공유한다.
+- 실제 node MLP를 고정 wedge에 추가해 gate와 파라미터 수를 정확히 맞춘다.
+- 각 run 500 epoch. 3lr×3tuning seed의 216 run에서 validation으로 선택하고 독립 5seed로 120 final run을 수행한다.
+- 합계 336 run·168,000 독립 update. 튜닝 중 test는 평가하지 않는다.
+- 직접 sparse 전파는 두 층에서 최대 4홉이며 graph RMS·κ는 전역 통계 의존을 만든다.
+- 서버 실행기는 구현했으며 전체 336 run 본학습은 서버에서 수행한다.
 
-| 주 모델 | 사용하는 graph operator |
-| --- | --- |
-| MLP | Graph propagation 없음 |
-| First-order | L |
-| Polynomial-2 | L과 L² |
-| Fixed-wedge | L과 Q |
-| Learned-wedge | L과 A.T C2(H) A |
-
-추가 파라미터 수를 맞춘 node MLP와 표준 이층 GCN을 추가한다. 표준 GCN은 자기 연결을 포함한 대칭 정규화 인접행렬을 사용하는 외부 sanity baseline이다. Combinatorial L을 사용하는 통제된 모델을 표준 GCN과 동일하다고 부르지 않는다.
-
-Public task의 P를 raw T로 할지 I−tau T로 할지, 부호·분기 계수·정규화를 사전에 수식으로 확정한다. 첨부의 GCN+L²라는 이름만으로 forward를 결정하지 않는다. 이층 이차 연산은 최대 4hop, 이층 GCN은 최대 2hop이므로 연산의 추가 효과는 polynomial 대 wedge를 주로 비교한다.
-
-Depth는 새 이층 backbone을 기본안으로 둔다. Width/dropout/optimizer 등은 원 GCN의 저자 코드에서 독립적으로 참조할 수 있다. 이를 이전 설정의 계승이나 원논문의 완전 재현으로 설명하지 않는다. 최종 설정과 공통 tuning 예산을 benchmark 시작 전에 독립 계약으로 확정하며, 설정이 없으면 실행하지 않는다.
-
-용량 대조는 dummy parameter 없이 정확히 맞출 수 있다. Gate는 4F→m→1, node MLP는 F→2m→F로 만들고 두 모델 모두 첫 Linear에만 bias를 사용한다. 그러면 추가 파라미터 수가 각각 m(4F+2)로 같다. Node MLP 출력을 실제 특징 업데이트에 연결하고 추가 학습 scalar 수도 맞춘다. 파라미터 수가 같다는 것을 전체 표현력이 동일하다는 증명으로 해석하지 않는다.
-
-Validation만으로 설정과 checkpoint를 선택하고 모든 조건을 고정한 뒤 test를 평가한다. Seed별 값과 paired 차를 보고한다. 반복 수와 학습 기간도 새 계약에서 근거와 함께 결정한다. 이전 698run 예산은 철회한다.
+기존 문서의 미정 항목은 새 계약에 기록했고 이전 698run 예산은 계승하지 않는다.
 
 ## 학습 모델의 다섯 가지 개입
 
@@ -216,7 +212,8 @@ graph/feature별 physical-edge 차분의 RMS 정규화를 적용한다.
 - 새 teacher weight loss, scale augmentation, GNN 분류기를 추가하지 않는다.
 
 실행은 [scale_normalization/README.md](scale_normalization/README.md), 수식은
-[MODEL_MATH.md](scale_normalization/MODEL_MATH.md)에 있다. 서버 full 결과는 아직 없다.
+[MODEL_MATH.md](scale_normalization/MODEL_MATH.md)에 있다. 사용자 첨부의 서버 full 완료 결과는
+[SERVER_SCALE_NORMALIZATION_RESULTS.md](SERVER_SCALE_NORMALIZATION_RESULTS.md)에 기록했다.
 
 ## 판정과 실행 조건
 
@@ -231,7 +228,9 @@ Learned 단계에서는 task A/B의 양성 대조가 작동하고, task C에서 
 Experiment 0/1은 학습 checkpoint를 만들지 않는다. 서버 full 고정 연산과 Experiment 2 full 학습·평가는 완료됐다.
 Experiment 2의 제공된 terminal 결과를 기록했으며, 원본 C₂·개입·teacher 진단 CSV의 검증은 Experiment 3가 서버에서 수행한다.
 Experiment 3는 구현 단계의 검증과 서버 full 평가를 구분해 [검증 문서](generalization/VERIFICATION.md)에 기록한다.
-Experiment 4는 아직 구현·실행하지 않았다. Experiment 2의 재개 범위는 한 target/condition job이며
+Experiment 4는 구현과 DEBUG 실행을 검증했으며 전체 citation 본학습은 서버 실행 대상이다.
+검증 범위는 [classification/VERIFICATION.md](classification/VERIFICATION.md)에 있다.
+Experiment 2의 재개 범위는 한 target/condition job이며
 재개할 때 새 결과 폴더에서 나머지 job을 다시 실행한다.
 
 ## 출처
