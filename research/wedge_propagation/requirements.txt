@@ -1,0 +1,4 @@
+# Use the existing CUDA PyTorch environment; do not replace its torch build.
+numpy>=1.26
+matplotlib>=3.8
+psutil>=5.9
