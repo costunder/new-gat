@@ -1,6 +1,12 @@
 # 고정 경로 연산부터 검증하는 독립 실험 계획
 
-2026년 10월 2일. 사용자 첨부의 수정 요청을 반영한 계획이다. 이전 계획은 archive에 보존했으며 그 설정과 실행 수를 계승하지 않는다. Experiment 0/1의 서버 결과는 [SERVER_FIXED_RESULTS.md](SERVER_FIXED_RESULTS.md)에 기록했다. Experiment 2는 최신 첨부로 갱신해 [별도 패키지](learned/README.md)에 구현하고 debug 검증을 완료했다. Experiment 3/4는 후속 설계다.
+2026년 10월 2일 설계, 10월 3일 상태 갱신. 사용자 첨부의 수정 요청을 반영한 계획이다.
+이전 계획은 archive에 보존했으며 그 설정과 실행 수를 계승하지 않는다.
+Experiment 0/1의 서버 결과는 [SERVER_FIXED_RESULTS.md](SERVER_FIXED_RESULTS.md)에 기록했다.
+Experiment 2는 최신 첨부로 갱신한 [별도 패키지](learned/README.md)의 서버 full 학습·평가를 완료했고,
+제공된 터미널 결과는 [SERVER_LEARNED_RESULTS.md](SERVER_LEARNED_RESULTS.md)에 정리했다.
+Experiment 3는 고정된 모델의 새 특징·amplitude 평가로 [구현](generalization/README.md)했다.
+Experiment 4 실제 데이터 분류는 후속 설계다.
 
 연구 질문은 **연속된 두 엣지의 특징 변화 관계를 이용한 경로 차분 연산이 무엇을 추가하며, 이후 공유 생성기로 그 경로 가중치를 학습할 수 있는가**이다.
 
@@ -96,7 +102,10 @@ Regular graph에서는 Q=L²+2(d−2)L, cycle에서는 Q=L²다. 또한 모든 e
 **이 절의 최초 teacher/student 제안은 이후 사용자 첨부 `654482c4-8516-4ff8-a8c3-792dc49ac796`로 갱신됐다.**
 현재 구현은 [learned/MODEL_MATH.md](learned/MODEL_MATH.md)의 exp(tau tanh)/graph mean 정규화,
 다섯 pure operator 비교군, 세 target과 독립 split을 따른다. 실제 full 설정은
-[learned/config_full.json](learned/config_full.json)에 명시했다. 아래 최초 제안은 변경 이력을 위해 남긴다.
+[learned/config_full.json](learned/config_full.json)에 명시했고 서버 full 실행을 완료했다.
+**아래 softplus/sigmoid teacher와 beta=1 제안은 현재 구현에 적용되지 않는 과거 설계다.**
+현재 student 입력, 자유 scalar beta, bounded exp teacher와 학습 계약은 위 수식 문서를 기준으로 읽는다.
+아래 최초 제안은 변경 이력을 위해 남긴다.
 
 Experiment 0/1의 검사 결과를 확인한 뒤 시작한다. 새 생성기의 입력은 두 엣지 차분뿐이다.
 
@@ -125,17 +134,25 @@ Task C의 첫 teacher는 scalar feature에서 `c*=sigmoid(lambda g1 g2)+epsilon`
 
 Graph 수, train/validation/test 비율, m, lambda, epsilon, loss의 scale, optimizer, epoch, seed 수는 이 단계 시작 전에 독립 config로 확정한다. 이전 계획의 42/9/9, 노드 16〜32, AdamW, 200epoch 등으로 자동 설정하지 않는다. Target이 0일 때의 relative error 처리도 계약에 포함한다.
 
-## Experiment 3 같은 규칙을 새 부분구조에 적용
+## Experiment 3 고정 모델의 새 특징과 크기 변화
 
-Train은 20〜40노드의 sparse random graph다. Checkpoint를 고정하고 다음 차이를 구분한다.
+새 graph ID, 크기, family, family+size OOD는 현재 Experiment 2에 포함돼 있다.
+Train 크기는 20/30/40/50이며 ER/tree/tree+chord를 사용했고, size OOD는 60/80/100이다.
+Cycle/star/grid는 family OOD에 들어 있다.
+Experiment 3는 이미 완료한 모델에 **같은 저장된 graph의 독립적인 새 특징과 amplitude 변화**를 적용한다.
 
-- 같은 graph의 새로운 특징.
-- 같은 생성 규칙의 새로운 graph.
-- 같은 규칙으로 크기를 60〜100노드로 확대.
-- 같은 크기에서 cycle, grid, tree+chord로 구조 변경.
-- 구조와 크기를 모두 변경.
+- 입력 source: 서버의 완료 폴더 `results/wedge-learned-20261002-172132`.
+- source config와 원본 NPZ의 531개 graph·8,496개 scalar 실현, 모든 wedge와 random-pair를 그대로 읽는다.
+- 선택된 checkpoint 6개와 train-only scalar fit 9개를 고정하며, 새 epoch·optimizer update·checkpoint 선택은 0이다.
+- 원본 X에서 평가를 재현한 뒤, 새로운 표준정규 X₀를 생성한다. 난수 stream은 source와 분리한다.
+- amplitude 0.25/0.5/1/2/4 모두 같은 X₀를 공유한다. amplitude마다 teacher C₂와 세 target을 다시 계산한다.
+- train/validation/ID/size OOD/family OOD/family+size OOD를 원래 소속 그대로 구분해 보고한다.
+- teacher의 epsilon을 유지하고, 고정한 학생의 C₂와 출력이 입력 배율에 따라 어떻게 바뀌는지 측정한다.
 
-특징의 scale은 teacher와 train에 맞추고, amplitude 변화는 별도 stress test로 다룬다. 동일 graph의 특징 실현을 unseen graph test에 섞지 않는다. Graph를 먼저 생성·분할하고 seed와 content 중복을 검사한다.
+구현과 실행 명령은 [generalization/README.md](generalization/README.md)에 있다.
+Source 완료 상태·config/source/data/checkpoint hash와 전체 평가 coverage를 확인한 뒤 평가한다.
+원본 개입과 teacher audit CSV는 서버의 source 파일에서 읽는다.
+새 graph를 만들거나 기존 학습을 다시 돌린 결과로 설명하지 않는다.
 
 ## Experiment 4 공통 backbone과 표준 GCN
 
@@ -187,12 +204,19 @@ Learned 단계에서는 task A/B의 양성 대조가 작동하고, task C에서 
 
 본학습은 서버에서만 진행한다. GPU/MIG, RAM, CPU, 전체 N/E/P를 실측한다. 모든 path를 유지하며 tensor 연산, cache, exact chunking을 사용한다. 독립 graph는 disjoint-union으로 batch 처리한다. Physical batch는 후보들을 측정해 결정하며, 같은 학습 비교에서는 조건 간 batch와 update 수를 맞춘다.
 
-실행한 같은 terminal에 현재 phase, case 또는 epoch, loss, metric, 처리시간을 표시하고 log에도 저장한다. 새 결과 directory에 실제 config/source/data hash와 재개 checkpoint를 보관한다. Experiment 0/1은 학습 checkpoint를 만들지 않는다. 서버의 full 고정 실험은 완료됐으며 사용자가 제공한 결과를 기록했다. Experiment 2는 코드·테스트·로컬 GPU debug를 완료했고 서버 full 학습은 아직 실행하지 않았다. Experiment 3/4는 아직 구현·실행하지 않았다. Experiment 2의 재개 범위는 한 target/condition job이며 새 결과 폴더에서 나머지 job을 다시 실행한다.
+실행한 같은 terminal에 현재 phase, case 또는 epoch, loss, metric, 처리시간을 표시하고 log에도 저장한다.
+새 결과 directory에 실제 config/source/data hash와 재개 checkpoint를 보관한다.
+Experiment 0/1은 학습 checkpoint를 만들지 않는다. 서버 full 고정 연산과 Experiment 2 full 학습·평가는 완료됐다.
+Experiment 2의 제공된 terminal 결과를 기록했으며, 원본 C₂·개입·teacher 진단 CSV의 검증은 Experiment 3가 서버에서 수행한다.
+Experiment 3는 구현 단계의 검증과 서버 full 평가를 구분해 [검증 문서](generalization/VERIFICATION.md)에 기록한다.
+Experiment 4는 아직 구현·실행하지 않았다. Experiment 2의 재개 범위는 한 target/condition job이며
+재개할 때 새 결과 폴더에서 나머지 job을 다시 실행한다.
 
 ## 출처
 
 - 이번 방향의 근거: 사용자 첨부 `626327d7-5b90-4965-a6c8-667344d1359b`의 본문.
 - 현재 Experiment 2의 근거: 사용자 첨부 `654482c4-8516-4ff8-a8c3-792dc49ac796`의 본문.
+- Experiment 2 서버 완료 결과: 사용자 첨부 `0412f129-7f5b-4c0f-9212-29dfb745cfe4`의 terminal 로그.
 - [원 GCN 논문](https://arxiv.org/abs/1609.02907).
 - [GCN 저자의 학습 코드](https://github.com/tkipf/gcn/blob/master/gcn/train.py).
 - [표준 GCNConv 정의](https://pytorch-geometric.readthedocs.io/en/latest/generated/torch_geometric.nn.conv.GCNConv.html).

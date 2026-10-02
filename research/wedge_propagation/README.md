@@ -4,8 +4,12 @@
 `C2=I`로 고정하고 같은 입력에 `LX`, `L²X`, `QX`를 적용한다.
 이후 경로 가중치 학습과 분류 실험은 [현재 계획](EXPERIMENT_PLAN_FIXED_FIRST.md)에 정리되어 있다.
 
-**Experiment 2 구현과 A6000 학습 명령은 [learned/README.md](learned/README.md)에 있다.**
-고정 연산의 서버 결과는 [SERVER_FIXED_RESULTS.md](SERVER_FIXED_RESULTS.md)에 기록했다.
+**Experiment 2의 A6000 full 학습과 평가가 완료됐다.**
+출력 오차와 확인 범위는 [SERVER_LEARNED_RESULTS.md](SERVER_LEARNED_RESULTS.md)에 기록했다.
+학습 수식과 재실행 명령은 [learned/README.md](learned/README.md)에 있다.
+이 완료 모델에 새 특징과 amplitude 변화를 적용하는 **Experiment 3**는
+[generalization/README.md](generalization/README.md)에 구현돼 있다. 재학습과 checkpoint 재선택은 하지 않는다.
+고정 연산의 서버 결과는 [SERVER_FIXED_RESULTS.md](SERVER_FIXED_RESULTS.md)에 있다.
 
 ## 무엇을 계산하는가
 
@@ -26,7 +30,8 @@ Q=L^2+B^\top\operatorname{diag}(d_u+d_v-4)B.
 코드는 모든 경로를 사용하는 gather/scatter 구현, 엣지만 사용하는 정확한 항등식 구현,
 독립 행렬 참조의 결과를 비교한다. 실제 측정은 동일 크기의 여러 그래프와 모든 특징을 함께 batch 처리한다.
 행렬 고유값을 직접 계산해 norm과 nullspace 차원을 측정한다.
-Dense 행렬은 이 작은 그래프의 참조·스펙트럼 검사에 사용하며, 큰 그래프용 learned 모델의 구현은 후속 단계다.
+Dense 행렬은 이 작은 그래프의 참조·스펙트럼 검사에 사용한다.
+학습 가능한 경로 생성기는 별도 Experiment 2 패키지에서 구현하고 synthetic 출력 회수를 평가했다.
 
 주요 질문은 **Q가 L과 L²의 조합으로 설명되는 범위와 남는 작용의 차이**다.
 Cycle에서는 Q=L²이고, star도 L과 L²의 조합으로 환원된다.
@@ -105,5 +110,5 @@ python -u -m research.wedge_propagation.study --profile debug --device cuda \
   --output-dir "results/wedge-fixed-debug-$(date +%Y%m%d-%H%M%S)"
 ```
 
-디버그 검사는 본실험과 별도로 기록한다. 전체 fixed 실험과 후속 학습의 완료 여부는
-각 서버 실행의 결과로 판단한다.
+디버그 검사는 본실험과 별도로 기록한다. 서버 full 고정 연산과 Experiment 2 학습은 완료됐다.
+Experiment 3의 서버 full 평가와 실제 데이터 분류의 완료 여부는 각각의 결과로 판단한다.
