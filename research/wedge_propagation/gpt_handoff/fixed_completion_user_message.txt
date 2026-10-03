@@ -1,0 +1,34 @@
+Source: user-provided terminal output in this conversation.
+This is a transcription of the displayed output, not the server terminal.log file.
+
+[start] profile=full device=cuda dtype=float64 trainable_parameters=0 epochs=N/A C2=I
+[hardware] {"platform": "Linux-5.15.0-78-generic-x86_64-with-glibc2.35", "python": "3.11.16 | packaged by conda-forge | (main, Aug 21 2026, 22:44:51) [GCC 14.4.0]", "torch": "2.7.1+cu118", "numpy": "2.4.6", "logical_cpu": 96, "cpu_affinity_count": 96, "cpu_quota": null, "ram_total_bytes": 1081814966272, "ram_available_bytes": 1068890169344, "container_memory_limit_bytes": null, "process_rss_bytes": 351637504, "cuda_visible_devices": "0", "selected_device": "cuda", "gpu_count_visible": 1, "gpu_count_used": 1, "gpu": {"name": "NVIDIA RTX A6000", "total_memory_bytes": 51041271808, "free_memory_bytes": 50760777728, "runtime_total_memory_bytes": 51041271808, "multiprocessors": 84, "uuid": "deecf97d-157f-4f3e-0713-16f63cc9b71f", "capability": [8, 6], "cuda_runtime": "11.8"}, "output_storage_total_bytes": 80653027639296, "output_storage_free_bytes": 3629049184256}
+[algebra] path: n=5 e=4 p=3 passed
+[algebra] cycle: n=5 e=5 p=5 passed
+[algebra] star: n=5 e=4 p=6 passed
+[algebra] clique: n=4 e=6 p=12 passed
+[algebra] irregular: n=6 e=6 p=8 passed
+[algebra] isolates: n=5 e=1 p=0 passed
+[algebra] empty: n=4 e=0 p=0 passed
+[cpu calibration] workers=1 graphs=33 seconds=0.070 graphs/s=468.8
+[cpu calibration] workers=2 graphs=33 seconds=0.042 graphs/s=790.3
+[cpu calibration] workers=4 graphs=33 seconds=0.056 graphs/s=589.9
+[cpu calibration] workers=8 graphs=33 seconds=0.059 graphs/s=556.8
+[prepare] all 198 graphs; workers=2
+[data] graphs=198 inputs=3168 fraction=1.0 prepare_seconds=0.200 no_sampling
+[graph statistics] {"nodes": {"min": 20, "mean": 55.0, "max": 100, "sum": 10890}, "edges": {"min": 19, "mean": 77.3989898989899, "max": 225, "sum": 15325}, "wedges": {"min": 20, "mean": 267.87373737373736, "max": 4851, "sum": 53039}}
+[batch calibration] device=cuda batch=4 graphs/pass=33 graphs/s=83.4 peak_bytes=12583424
+[batch calibration] device=cuda batch=8 graphs/pass=33 graphs/s=87.0 peak_bytes=15511552
+[batch calibration] device=cuda batch=16 graphs/pass=33 graphs/s=88.7 peak_bytes=23309824
+[batch calibration] device=cuda batch=32 graphs/pass=33 graphs/s=89.8 peak_bytes=35944448
+[batch calibration] device=cuda batch=33 graphs/pass=33 graphs/s=89.8 peak_bytes=36800000
+[selected] graph_batch=33; all feature draws run together
+[fixed] graphs=33/198 n=20 batch=33 compute=0.007s elapsed=28.4s max_identity_abs_error=0.00e+00
+[fixed] graphs=66/198 n=30 batch=33 compute=0.011s elapsed=28.4s max_identity_abs_error=0.00e+00
+[fixed] graphs=99/198 n=40 batch=33 compute=0.100s elapsed=28.5s max_identity_abs_error=0.00e+00
+[fixed] graphs=132/198 n=60 batch=33 compute=0.136s elapsed=28.7s max_identity_abs_error=0.00e+00
+[fixed] graphs=165/198 n=80 batch=33 compute=0.316s elapsed=29.0s max_identity_abs_error=0.00e+00
+[fixed] graphs=198/198 n=100 batch=33 compute=0.351s elapsed=29.4s max_identity_abs_error=0.00e+00
+[report] writing summary and scientific figures
+[complete] fixed operator study; graphs=198 inputs=3168 results=/home/aicompetition07/new-gat/results/wedge-fixed-20261002-144119
+[scope] no learned C2 or classifier training was run

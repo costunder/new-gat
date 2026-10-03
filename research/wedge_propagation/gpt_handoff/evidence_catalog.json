@@ -1,0 +1,28 @@
+{
+  "description": "Original user attachment bytes. advisory means a proposal/review, not independent execution evidence.",
+  "attachments": [
+    {"id":"21e80c7f-9b60-454f-8efd-584b5c40a3f8","label":"legacy_v2_initial_scope","kind":"advisory","required":false},
+    {"id":"93f69c5e-f340-498d-9a14-46920cd7bc95","label":"legacy_bracket_design","kind":"advisory","required":false},
+    {"id":"987bb3e9-83b4-4b2e-a614-e99240b86ba1","label":"legacy_bracket_review","kind":"advisory","required":false},
+    {"id":"357c2749-a8eb-470e-ae74-87b4c13566c9","label":"legacy_bracket_review_fixes","kind":"advisory","required":false},
+    {"id":"a0990870-ae0e-4090-994a-727a5d22b493","label":"legacy_signal_audit_review_1","kind":"advisory","required":false},
+    {"id":"e18bca41-e02a-4ce2-91a7-420d0ec38278","label":"legacy_signal_audit_review_2","kind":"advisory","required":false},
+    {"id":"c67dc52b-b46e-477d-b201-3bf928af33d4","label":"legacy_signal_followup_review","kind":"advisory","required":false},
+    {"id":"ef2fa6c7-06cf-425c-8f09-e661f0765c1a","label":"legacy_output_init_progress","kind":"server_excerpt","required":false},
+    {"id":"d159052b-a84f-457f-a992-5ef3c7a5e16b","label":"legacy_output_init_failure","kind":"server_excerpt","required":false},
+    {"id":"026eb20b-4cbe-4283-a247-b23a1a7f2269","label":"wedge_initial_math_proposal","kind":"advisory","required":false},
+    {"id":"626327d7-5b90-4965-a6c8-667344d1359b","label":"wedge_independent_track_proposal","kind":"advisory","required":false},
+    {"id":"e5e7dcf0-1e82-45c8-b7f9-efb9b59e52c5","label":"experiment_01_fixed","kind":"server_excerpt","required":true},
+    {"id":"654482c4-8516-4ff8-a8c3-792dc49ac796","label":"experiment_2_proposal","kind":"advisory","required":false},
+    {"id":"0412f129-7f5b-4c0f-9212-29dfb745cfe4","label":"experiment_2_learned","kind":"server_excerpt","required":true},
+    {"id":"88eb7672-9661-455c-b2de-91f4cc7b35ca","label":"legacy_output_init_200_epoch_contract_error","kind":"server_excerpt","required":false},
+    {"id":"28537dca-db0f-49a6-9c49-afc35f80d2e8","label":"legacy_output_init_recovery_partial","kind":"server_excerpt","required":true},
+    {"id":"43094fe2-6bfc-4a48-9974-f30776c53783","label":"experiment_3_feature_execution","kind":"server_excerpt","required":true},
+    {"id":"e7640614-a320-4e01-88b7-8e88a447d102","label":"experiment_3_feature_summary_same_run","kind":"server_excerpt","required":true},
+    {"id":"da9ba5a2-ee1e-4ea1-9964-09d9c29ceb63","label":"experiment_31_scale","kind":"server_excerpt","required":true},
+    {"id":"a0770e1e-506a-43e1-b656-bbd3b045b108","label":"experiment_4_classification","kind":"server_excerpt","required":true},
+    {"id":"975a1691-1a87-4c34-a672-f9aa8cf682ec","label":"experiment_41_branch_strength","kind":"server_excerpt","required":true},
+    {"id":"76feaf64-c752-4d8b-bb09-8aaf929648b2","label":"experiment_41_saved_csv_analysis","kind":"server_excerpt","required":true},
+    {"id":"5bdcdc63-17da-4c09-90bb-30b3139d7704","label":"experiment_42_node_normalization","kind":"server_excerpt","required":true}
+  ]
+}
