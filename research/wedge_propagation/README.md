@@ -16,7 +16,10 @@ Experiment 3의 서버 전체 평가도 완료했으며 [결과](SERVER_GENERALI
 사용자가 제공한 서버 full 완료 결과는 [SERVER_SCALE_NORMALIZATION_RESULTS.md](SERVER_SCALE_NORMALIZATION_RESULTS.md)에 있다.
 **Experiment 4**는 [분류 실행기](classification/README.md)로 구현했다.
 [설계](classification/EXPERIMENT_DESIGN.md)의 전체 그래프·336 run·500 epoch 계약을 유지한다.
-로컬 검증과 서버 본학습 실행 여부는 [검증 기록](classification/VERIFICATION.md)에서 구분한다.
+서버 전체 336 run 학습·평가 완료 출력은 [결과](SERVER_CLASSIFICATION_RESULTS.md)에 기록했다.
+**Experiment 4.1**은 [branch_strength/README.md](branch_strength/README.md)의 별도 실행기로
+완료 checkpoint에서 C 위치와 실제 분기 메시지 크기를 분리해 관측한다. 새 학습은 없다.
+로컬 검증과 서버 실행 증거는 [검증 기록](classification/VERIFICATION.md)에서 구분한다.
 고정 연산의 서버 결과는 [SERVER_FIXED_RESULTS.md](SERVER_FIXED_RESULTS.md)에 있다.
 
 ## 무엇을 계산하는가

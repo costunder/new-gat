@@ -1,0 +1,77 @@
+{
+  "schema": "wedge-branch-strength-v1",
+  "experiment": "4.1",
+  "profile": "debug",
+  "data": {
+    "datasets": [
+      "DEBUG-Cora",
+      "DEBUG-CiteSeer",
+      "DEBUG-PubMed"
+    ]
+  },
+  "conditions": [
+    "mlp",
+    "first_order",
+    "polynomial_2",
+    "fixed_wedge",
+    "learned_wedge_raw",
+    "learned_wedge_rms",
+    "fixed_wedge_node_mlp",
+    "standard_gcn"
+  ],
+  "final_seeds": [
+    11,
+    23
+  ],
+  "manifests_per_dataset": 2,
+  "treatments": [
+    "baseline",
+    "true_c_unit_denominator",
+    "identity_hold_reference",
+    "identity_unit_denominator",
+    "identity_norm_matched",
+    "branch_off",
+    "shuffle_hold_reference",
+    "shuffle_norm_matched"
+  ],
+  "targets": [
+    "layer_0",
+    "layer_1",
+    "both"
+  ],
+  "optimization_updates": 0,
+  "sampling_ratio": 1.0,
+  "precision": "float32",
+  "tf32": false,
+  "norm_match": "whole_current_transductive_Z_frobenius_branch_norm_no_labels",
+  "selection": "no_checkpoint_lr_or_treatment_selection_posthoc_diagnostics",
+  "source_replay": {
+    "ce_atol": 1e-05,
+    "ce_rtol": 1e-05,
+    "accuracy_atol": 1e-07
+  },
+  "runtime": {
+    "packed_candidates": [
+      1,
+      2
+    ],
+    "path_chunk_candidates": [
+      16,
+      64
+    ],
+    "calibration_warmups": 1,
+    "calibration_repeats": 1,
+    "gpu_memory_safety_fraction": 0.85,
+    "cpu_threads": 1
+  },
+  "expected_counts": {
+    "baseline_rows": 144,
+    "treatment_rows": 972,
+    "diagnostic_rows": 744,
+    "fixed_z_rows": 240,
+    "source_final_models": 48,
+    "learned_final_models": 12,
+    "end_to_end_seed_cases": 372,
+    "optimizer_updates": 0
+  }
+}

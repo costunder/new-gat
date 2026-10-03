@@ -1,7 +1,10 @@
 # Experiment 4 구현 검증
 
 2026년 10월 3일 요청에 대한 구현 기록. 로컬 산출물에는 실행 시각에 따라 `20261004` 이름이 붙었다.
-**서버 실행 코드·수학·연결·DEBUG를 검증했다. 전체 336 run 본학습은 서버에서 실행할 대상이다.**
+**서버 실행 코드·수학·연결·DEBUG를 검증했고, 이후 사용자가 서버 full 완료 결과를 제공했다.**
+336 run·168,000 새 update·모든 고정 모델 평가 완료는
+[서버 결과 기록](../SERVER_CLASSIFICATION_RESULTS.md)에 정리했다.
+원본 서버 checkpoint/CSV의 독립 검증은 Experiment 4.1 실행 시 수행한다.
 
 ## 구현한 경로
 
@@ -80,11 +83,11 @@ GPU FP32 재평가에서 primary CE의 최대 차이는 1.1921e-7이었다. CSV�
 독립적으로 2개 CPU worker에서 DEBUG 전체 96 tuning run·288 update를 실행했다.
 worker 분배·실시간 출력·source/graph 보존을 확인했으며 test 잠금은 유지했다.
 
-## 서버에서 확인할 범위
+## 서버 완료 출력과 남은 확인 범위
 
 - A6000의 전체 run 처리량·peak VRAM 및 할당 GPU 수에 따른 분배.
-- PyTorch 2.7.1/cu118 서버 환경에서 500 epoch 학습 완료.
-- 전체 336 run의 실제 분류 성능과 모든 고정 모델 평가.
+- 사용자가 제공한 full 완료 출력: 500 epoch × 336 run, 전체 분류·고정 모델 평가 완료.
+- 원본 checkpoint/CSV·학습 이력·hash의 독립 검증: Experiment 4.1 source validator가 수행한다.
 
 로컬 CPU subprocess 분배와 한 GPU 계산은 검증했다. 실제 여러 GPU의 동시 실행과 A6000 처리시간은
 서버에서 계측한다. 실행 명령은 [README.md](README.md)에 있다.

@@ -172,7 +172,7 @@ Source 완료 상태·config/source/data/checkpoint hash와 전체 평가 covera
 - 각 run 500 epoch. 3lr×3tuning seed의 216 run에서 validation으로 선택하고 독립 5seed로 120 final run을 수행한다.
 - 합계 336 run·168,000 독립 update. 튜닝 중 test는 평가하지 않는다.
 - 직접 sparse 전파는 두 층에서 최대 4홉이며 graph RMS·κ는 전역 통계 의존을 만든다.
-- 서버 실행기는 구현했으며 전체 336 run 본학습은 서버에서 수행한다.
+- 서버 full 336 run·168,000 update 완료 출력은 [결과](SERVER_CLASSIFICATION_RESULTS.md)에 기록했다.
 
 기존 문서의 미정 항목은 새 계약에 기록했고 이전 698run 예산은 계승하지 않는다.
 
@@ -228,8 +228,12 @@ Learned 단계에서는 task A/B의 양성 대조가 작동하고, task C에서 
 Experiment 0/1은 학습 checkpoint를 만들지 않는다. 서버 full 고정 연산과 Experiment 2 full 학습·평가는 완료됐다.
 Experiment 2의 제공된 terminal 결과를 기록했으며, 원본 C₂·개입·teacher 진단 CSV의 검증은 Experiment 3가 서버에서 수행한다.
 Experiment 3는 구현 단계의 검증과 서버 full 평가를 구분해 [검증 문서](generalization/VERIFICATION.md)에 기록한다.
-Experiment 4는 구현과 DEBUG 실행을 검증했으며 전체 citation 본학습은 서버 실행 대상이다.
+Experiment 4는 서버 full 완료 출력까지 확인했다.
 검증 범위는 [classification/VERIFICATION.md](classification/VERIFICATION.md)에 있다.
+Experiment 4.1은 [branch_strength/README.md](branch_strength/README.md)의 frozen 진단이다.
+모든 120 final checkpoint를 재현한 뒤 learned raw/RMS 30개 모델에서
+같은 메시지 크기의 C 위치 변경과 같은 방향의 강도 변경을 각 층/두 층에서 비교한다.
+새 학습·checkpoint 선택·최고 test 개입 선택은 하지 않는다.
 Experiment 2의 재개 범위는 한 target/condition job이며
 재개할 때 새 결과 폴더에서 나머지 job을 다시 실행한다.
 
