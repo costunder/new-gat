@@ -245,6 +245,9 @@ learned node/raw·RMS의 다섯 조건이다. 전체 Cora·CiteSeer·PubMed,
 두 층·hidden 64·500 epoch·기존 LR와 seed를 유지한다.
 총 135 tuning/75 final run이며 모든 checkpoint를 validation으로 고정한 뒤 test를 읽는다.
 기존 Experiment 4/4.1 코드·checkpoint·결과를 보존한다.
+Experiment 4.2 서버 전체 210-run 학습·평가는 완료됐으며 [결과](SERVER_NODE_NORMALIZATION_RESULTS.md)를 기록했다.
+Node는 global 대비 개선됐지만 학습 C의 고정 C=1 대비 이득은 아직 입증되지 않았다.
+다음 확인은 저장된 층별 norm-matched C 개입과 구간을 읽는 것이다. 새 학습을 실행하지 않는다.
 Experiment 2의 재개 범위는 한 target/condition job이며
 재개할 때 새 결과 폴더에서 나머지 job을 다시 실행한다.
 

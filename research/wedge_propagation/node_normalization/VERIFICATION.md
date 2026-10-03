@@ -65,11 +65,15 @@ forward/backward를 검사했다. Optimizer는 생성하지 않았고 update는 
 
 ## 서버 본학습과 평가
 
-**Experiment 4.2 서버 210-run 학습·전체 평가를 아직 실행하지 않았다.**
+**사용자가 제공한 출력에서 Experiment 4.2 서버 210-run 학습·전체 평가 완료를 확인했다.**
+전체 105,000 updates, primary 225행, 개입 12,420행, 층별 진단 8,430행,
+실제 데이터·전체 coverage·source/graph 보존이 보고됐으며 약 1시간 56분이 걸렸다.
+결과와 해석 범위는 [서버 기록](../SERVER_NODE_NORMALIZATION_RESULTS.md)에 있다.
+원본 서버 CSV·checkpoint를 로컬에서 재평가한 것은 아니다.
 서버 실행 명령은 [README](README.md), 수식은 [MODEL_MATH](MODEL_MATH.md)에 있다.
-완료 후 `completion.json`의 실제 데이터·105,000 update·전체 coverage를 확인하고
-`NODE_NORMALIZATION_SUMMARY.md`에서 정확도·CE·C 변동·실제 분기 크기와 paired 차이를 읽는다.
+`completion.json`과 `NODE_NORMALIZATION_SUMMARY.md`에서 완료 범위·정확도·CE·C 변동·실제 분기 크기와 paired 차이를 확인했다.
 
 고정 C의 PSD/norm 상한은 수학적·수치적으로 확인했다.
-전체 비선형 신경망의 안정성, 학습 성공, C의 분류 이득은 앞으로 서버 결과로 판단한다.
+서버 결과에서 node 정규화는 global 대비 성능을 개선했지만 학습한 C의 고정 C=1 대비 이득은 입증되지 않았다.
+전체 비선형 신경망의 안정성을 증명한 것은 아니다.
 기존 public test 관측 뒤의 후속 비교이며 독립적인 새 그래프 일반화 검증은 아니다.
