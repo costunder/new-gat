@@ -24,6 +24,7 @@
 - [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md): 고정 계약, 비교 범위, 판정과 한계.
 - [RUN.md](RUN.md): 서버 실행과 완료 결과 확인.
 - [구현 검증](../../../docs/RECEIVER_AGGREGATION_VERIFICATION_20261004.md): 실제 검사와 DEBUG 완료 범위.
+- [서버 FULL 결과](../../../docs/RECEIVER_AGGREGATION_SERVER_FINDINGS_20261004.md): 사용자 제공 완료 원문과 실제 citation 재구성 결과.
 
 ## 다음 판단
 

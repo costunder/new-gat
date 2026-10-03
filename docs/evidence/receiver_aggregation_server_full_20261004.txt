@@ -1,0 +1,208 @@
+
+(new-gat) aicompetition07@ece-a6gpu6:~/new-gat$
+(new-gat) aicompetition07@ece-a6gpu6:~/new-gat$ cat "$RECEIVER_RUN/completion.json"
+cat "$RECEIVER_RUN/RECEIVER_AGGREGATION_SUMMARY.md"
+{
+  "status": "complete",
+  "profile": "full",
+  "debug": false,
+  "graphs": 201,
+  "synthetic_graphs": 198,
+  "citation_graphs": 3,
+  "actual_citation_graphs": 3,
+  "synthetic_scalar_inputs": 3168,
+  "sampling_ratio": 1.0,
+  "all_nodes_edges_features": true,
+  "weights": [
+    "unit",
+    "local_degree"
+  ],
+  "states": [
+    "H0",
+    "H1",
+    "H2"
+  ],
+  "conditions": [
+    "tagged",
+    "sum",
+    "sum_within",
+    "sum_between",
+    "sum_both"
+  ],
+  "trainable_parameters": 0,
+  "optimizer_updates": 0,
+  "classifier_training_run": false,
+  "decoder_uses_energy_or_relations": false,
+  "restricted_q_rank_loss": 0,
+  "source_and_inputs_preserved": true,
+  "source_dir": "/home/aicompetition07/new-gat/results/local-energy-20261004-002815",
+  "source_digest": "f2f4b7aa7cedde338b3722165f19540208e37a89289552c0f7849ec7a864887c",
+  "raw_input_metric_rows": 19026,
+  "physical_graph_batch_selected": 198,
+  "macro_rows": {
+    "reconstruction": 1206,
+    "condition": 6030,
+    "relation": 6030
+  },
+  "elapsed_seconds": 3464.8505717380904
+}
+# 수신 측 집계와 복원 진단
+
+Profile: **full**.
+전체 그래프 **201개**, 실제 citation **3개**.
+Trainable parameters **0**, optimizer updates **0**, epoch **해당 없음**.
+검증된 이전 FULL 입력을 모두 사용한 고정 진단이다.
+
+## 이번 관측과 판정 범위
+
+모든 원래 노드·물리 엣지·특징 채널, induced 1홉 로컬, 양방향 인접 중심 전달을 사용했다.
+`tagged`는 송신별 receipt R, `sum`은 수신 로컬·원래 노드별 합 Y다.
+`sum_within`, `sum_between`, `sum_both`는 실제 내부 이차 에너지 E와
+incidence 대응 쌍선형 J를 관측에 붙였다.
+H0/H1/H2는 기존 전체 그래프의 고정 reference states다.
+이번 수신 합으로 업데이트한 학습 층이 아니다.
+
+**receipt 합의 임의 입력 공간과 현재 실제 메시지 제약을 구분한다.**
+합에 직접 보이지 않는 송신별 성분은 `R−Sᵀdiag(receipt_count)†Y`다.
+그러나 실제 R은 알려진 양의 C 아래 한 전역 H에서 생성된다.
+수신 중심 행이 원래 연결의 positive directed Laplacian을 포함한다.
+따라서 실제 rank는 채널당 N−components다. 성분별 상수는 q/E/J에 영향을 주지 않는다.
+실제 q의 추가 kernel 차원과 E/J의 추가 rank는 **0**이다.
+아래 tag contrast 비율을 영구히 잃은 정보량으로 해석하면 안 된다.
+
+## 모든 citation의 차원
+
+| graph_id | num_nodes | num_edges | num_features | components | tagged_coordinates | fused_active_coordinates | ambient_tag_kernel_per_channel | restricted_rank_per_channel |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Cora | 2708 | 5278 | 1433 | 78 | 30892 | 13264 | 17628 | 2630 |
+| CiteSeer | 3327 | 4552 | 3703 | 438 | 25210 | 12383 | 12827 | 2889 |
+| PubMed | 19717 | 44324 | 500 | 1 | 252416 | 108365 | 144051 | 19716 |
+
+tagged/fused 좌표는 채널당 receipt/수신 행 수다. 실제 citation 관측은 전체 채널을 포함한다.
+DEBUG이면 위 표의 입력은 DEBUG vector fixtures다.
+
+## 송신별 상쇄와 실제 복원
+
+| graph_id | weight | state | tag_contrast_fraction_sq | tagged_q_relative_error | fused_q_relative_error | centered_h_relative_error | tagged_reconstruction_relative_error | fused_relative_residual | solver_iterations_max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Cora | unit | H0 | 0.3435029 | 4.402255e-09 | 2.70996e-07 | 2.330361e-06 | 2.373528e-08 | 9.962095e-09 | 4017 |
+| Cora | unit | H1 | 0.2703068 | 3.46942e-09 | 2.068882e-07 | 1.77007e-06 | 2.500295e-08 | 9.962038e-09 | 3987 |
+| Cora | unit | H2 | 0.2219333 | 3.795765e-09 | 1.782799e-07 | 1.498604e-06 | 2.628254e-08 | 9.968088e-09 | 3981 |
+| Cora | local_degree | H0 | 0.1032614 | 1.22448e-09 | 6.796091e-08 | 4.613388e-07 | 2.904314e-08 | 9.917789e-09 | 1379 |
+| Cora | local_degree | H1 | 0.105275 | 1.313305e-09 | 6.269081e-08 | 4.157166e-07 | 2.7287e-08 | 9.909148e-09 | 1376 |
+| Cora | local_degree | H2 | 0.106983 | 1.477195e-09 | 6.000075e-08 | 3.952732e-07 | 2.648039e-08 | 9.902141e-09 | 1376 |
+| CiteSeer | unit | H0 | 0.2815907 | 3.199674e-09 | 3.305544e-07 | 4.015959e-06 | 3.980416e-08 | 9.958628e-09 | 7140 |
+| CiteSeer | unit | H1 | 0.2262187 | 2.509666e-09 | 2.749831e-07 | 3.324356e-06 | 4.484372e-08 | 9.964903e-09 | 7122 |
+| CiteSeer | unit | H2 | 0.1882886 | 2.475566e-09 | 2.472258e-07 | 2.9243e-06 | 4.773164e-08 | 9.963833e-09 | 7117 |
+| CiteSeer | local_degree | H0 | 0.09478817 | 4.465759e-10 | 8.550849e-08 | 1.136633e-06 | 3.791193e-08 | 9.955811e-09 | 2989 |
+| CiteSeer | local_degree | H1 | 0.09607254 | 4.657385e-10 | 7.959141e-08 | 1.045007e-06 | 3.617968e-08 | 9.952882e-09 | 2991 |
+| CiteSeer | local_degree | H2 | 0.09735025 | 5.508049e-10 | 7.631143e-08 | 9.978723e-07 | 3.533383e-08 | 9.952674e-09 | 2994 |
+| PubMed | unit | H0 | 0.2269456 | 5.217788e-09 | 6.815293e-07 | 8.026027e-06 | 4.45736e-08 | 9.992807e-09 | 10470 |
+| PubMed | unit | H1 | 0.2203956 | 4.766024e-09 | 5.845627e-07 | 6.494186e-06 | 4.492922e-08 | 9.992464e-09 | 10496 |
+| PubMed | unit | H2 | 0.214701 | 4.460042e-09 | 5.194766e-07 | 5.499492e-06 | 4.497523e-08 | 9.991572e-09 | 10530 |
+| PubMed | local_degree | H0 | 0.1261083 | 1.11192e-09 | 1.197799e-07 | 1.059268e-06 | 4.059089e-08 | 9.970184e-09 | 3134 |
+| PubMed | local_degree | H1 | 0.1305056 | 1.091376e-09 | 1.116851e-07 | 9.611616e-07 | 3.895254e-08 | 9.970727e-09 | 3138 |
+| PubMed | local_degree | H2 | 0.1346809 | 1.055843e-09 | 1.055882e-07 | 8.90889e-07 | 3.776244e-08 | 9.972306e-09 | 3145 |
+
+tag contrast는 **제곱 norm 비율**이다. 다른 복원 지표는 norm 상대 오차다.
+복원 target H는 연결성분 평균을 뺀 H다.
+R의 복원은 source labels가 있는 전체 실제 receipt와 비교했다.
+normal CG는 실제 Y 상대 잔차를 확인한다.
+잔차와 H/q/R 오차는 conditioning 때문에 같은 수치일 필요가 없다.
+0인 분모의 상대 지표는 `undefined`이며 절대 norm/error는 CSV에 있다.
+
+## E/J 관측의 조건부 재현
+
+| graph_id | weight | state | E_norm_sq | E_relative_error | J_norm_sq | J_relative_error | additional_rank |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Cora | unit | H0 | 6607.072 | 8.063108e-09 | 1599931 | 1.587009e-08 | 0 |
+| Cora | unit | H1 | 5112.439 | 9.95934e-09 | 678299.6 | 1.3971e-08 | 0 |
+| Cora | unit | H2 | 4303.458 | 9.54778e-09 | 431251.8 | 7.434103e-09 | 0 |
+| Cora | local_degree | H0 | 249.0729 | 2.460968e-09 | 992.0149 | 2.285222e-09 | 0 |
+| Cora | local_degree | H1 | 219.0355 | 2.2507e-09 | 823.4369 | 2.113956e-09 | 0 |
+| Cora | local_degree | H2 | 196.8723 | 2.010306e-09 | 714.4556 | 1.889419e-09 | 0 |
+| CiteSeer | unit | H0 | 521.7811 | 4.835651e-09 | 172575.2 | 6.928929e-09 | 0 |
+| CiteSeer | unit | H1 | 367.4148 | 4.297356e-09 | 76272.36 | 3.237545e-09 | 0 |
+| CiteSeer | unit | H2 | 286.6938 | 3.871019e-09 | 48126.38 | 2.092489e-09 | 0 |
+| CiteSeer | local_degree | H0 | 27.36714 | 2.958098e-09 | 107.8198 | 2.216427e-09 | 0 |
+| CiteSeer | local_degree | H1 | 23.04573 | 2.71357e-09 | 85.22627 | 2.029318e-09 | 0 |
+| CiteSeer | local_degree | H2 | 20.01529 | 2.579739e-09 | 71.13073 | 2.005997e-09 | 0 |
+| PubMed | unit | H0 | 17026.32 | 9.961601e-09 | 1.130845e+07 | 8.609724e-09 | 0 |
+| PubMed | unit | H1 | 12126.1 | 9.461832e-09 | 6026564 | 6.029431e-09 | 0 |
+| PubMed | unit | H2 | 9103.121 | 8.641455e-09 | 3607544 | 4.423967e-09 | 0 |
+| PubMed | local_degree | H0 | 351.032 | 5.178708e-09 | 1313.322 | 3.992212e-09 | 0 |
+| PubMed | local_degree | H1 | 277.312 | 5.092328e-09 | 931.8528 | 3.972226e-09 | 0 |
+| PubMed | local_degree | H2 | 226.4084 | 5.045078e-09 | 693.0676 | 3.993233e-09 | 0 |
+
+추가 관측은 실제 forward 출력에 연결됐다. **decoder는 동일한 Y만 사용한다.**
+복원한 H에서 E/J를 다시 계산해 원래 E/J와 비교했다.
+E/J를 inverse 입력에 사용해 개선한 복원 실험이 아니다.
+이는 E/J가 현재 조건에서 독립 정보가 아니라 Y로 결정되는 비선형 좌표임을 검사한다.
+`sum_both`의 E/J 검사는 각각 단독 추가 조건과 같으며, condition CSV에 다섯 조건 전체를 기록했다.
+
+## 같은 단계와 연속 단계의 쌍선형 관계
+
+| graph_id | weight | stage | shared_mean | node_mean | distinct_mean | distinct_negative_percent | shared_relative_error | node_relative_error | distinct_relative_error |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Cora | unit | H0→H0 | 0.3771637 | 3.97496 | 3.220633 | 0 | 1.606572e-08 | 1.556887e-08 | 1.623363e-08 |
+| Cora | unit | H1→H1 | 0.3489632 | 3.041068 | 2.343142 | 0.01894657 | 1.831518e-08 | 1.362521e-08 | 1.438183e-08 |
+| Cora | unit | H2→H2 | 0.3277405 | 2.583783 | 1.928303 | 0.05683971 | 1.680129e-08 | 7.570996e-09 | 6.969571e-09 |
+| Cora | unit | H0→H1 | 0.361763 | 3.409334 | 2.685808 | 0.009473285 | 1.620645e-08 | 1.446242e-08 | 1.529334e-08 |
+| Cora | unit | H1→H2 | 0.3377902 | 2.780879 | 2.105298 | 0.03789314 | 1.718037e-08 | 1.038096e-08 | 1.074678e-08 |
+| Cora | local_degree | H0→H0 | 0.03227819 | 0.1885752 | 0.1240189 | 0 | 3.751554e-09 | 2.314915e-09 | 2.063377e-09 |
+| Cora | local_degree | H1→H1 | 0.03080913 | 0.1725304 | 0.1109122 | 0.01894657 | 4.002568e-09 | 2.092293e-09 | 1.904256e-09 |
+| Cora | local_degree | H2→H2 | 0.02957327 | 0.1608038 | 0.1016573 | 0.03789314 | 2.989702e-09 | 1.822765e-09 | 1.896654e-09 |
+| Cora | local_degree | H0→H1 | 0.03150213 | 0.1797434 | 0.1167392 | 0.009473285 | 3.282251e-09 | 2.085187e-09 | 2.092657e-09 |
+| Cora | local_degree | H1→H2 | 0.03017111 | 0.1663229 | 0.1059807 | 0.01894657 | 3.1093e-09 | 1.925826e-09 | 2.018263e-09 |
+| CiteSeer | unit | H0→H0 | 0.1405846 | 1.311413 | 1.030244 | 0 | 6.284983e-09 | 6.695108e-09 | 7.22499e-09 |
+| CiteSeer | unit | H1→H1 | 0.1253324 | 0.9990635 | 0.7483986 | 0 | 5.322737e-09 | 3.14218e-09 | 3.338436e-09 |
+| CiteSeer | unit | H2→H2 | 0.1139152 | 0.8341337 | 0.6063032 | 0 | 5.058142e-09 | 2.080814e-09 | 2.033544e-09 |
+| CiteSeer | unit | H0→H1 | 0.1322586 | 1.124767 | 0.86025 | 0 | 4.96458e-09 | 4.598303e-09 | 5.095493e-09 |
+| CiteSeer | unit | H1→H2 | 0.1193042 | 0.9067537 | 0.6681452 | 0 | 4.770897e-09 | 2.480835e-09 | 2.619069e-09 |
+| CiteSeer | local_degree | H0→H0 | 0.01754874 | 0.07936347 | 0.04426599 | 0 | 3.895297e-09 | 2.115009e-09 | 2.109234e-09 |
+| CiteSeer | local_degree | H1→H1 | 0.01665026 | 0.0717627 | 0.03846219 | 0 | 3.683351e-09 | 1.974104e-09 | 1.702213e-09 |
+| CiteSeer | local_degree | H2→H2 | 0.01586936 | 0.06605299 | 0.03431428 | 0 | 3.401916e-09 | 1.963516e-09 | 1.667935e-09 |
+| CiteSeer | local_degree | H0→H1 | 0.01707984 | 0.07521232 | 0.04105264 | 0 | 3.669619e-09 | 1.973781e-09 | 1.895837e-09 |
+| CiteSeer | local_degree | H1→H2 | 0.01624877 | 0.06875422 | 0.03625668 | 0 | 3.472384e-09 | 1.947848e-09 | 1.706449e-09 |
+| PubMed | unit | H0→H0 | 0.1762021 | 3.160648 | 2.808244 | 0.02707337 | 1.294971e-08 | 8.500631e-09 | 8.724906e-09 |
+| PubMed | unit | H1→H1 | 0.152598 | 2.454375 | 2.149179 | 0.05189062 | 1.224008e-08 | 5.986075e-09 | 6.052972e-09 |
+| PubMed | unit | H2→H2 | 0.1343866 | 1.979208 | 1.710435 | 0.09475679 | 1.144518e-08 | 4.461289e-09 | 4.328586e-09 |
+| PubMed | unit | H0→H1 | 0.1635583 | 2.768183 | 2.441066 | 0.03835394 | 1.237414e-08 | 6.971325e-09 | 7.120027e-09 |
+| PubMed | unit | H1→H2 | 0.1429478 | 2.195823 | 1.909927 | 0.07332371 | 1.162583e-08 | 5.091579e-09 | 5.080226e-09 |
+| PubMed | local_degree | H0→H0 | 0.006500636 | 0.06852085 | 0.05551958 | 0.02707337 | 1.209644e-08 | 4.043001e-09 | 3.665702e-09 |
+| PubMed | local_degree | H1→H1 | 0.006019773 | 0.05887704 | 0.04683749 | 0.05189062 | 1.147166e-08 | 4.013579e-09 | 3.618156e-09 |
+| PubMed | local_degree | H2→H2 | 0.005617323 | 0.05146784 | 0.04023319 | 0.08798845 | 1.070271e-08 | 4.021792e-09 | 3.64149e-09 |
+| PubMed | local_degree | H0→H1 | 0.006248438 | 0.06334634 | 0.05084947 | 0.03835394 | 1.16564e-08 | 4.03267e-09 | 3.685098e-09 |
+| PubMed | local_degree | H1→H2 | 0.005810263 | 0.0549491 | 0.04332858 | 0.06881148 | 1.097415e-08 | 4.014708e-09 | 3.663343e-09 |
+
+연속 단계의 J는 각 단계에서 복원한 두 H를 사용했다.
+한 단계의 관측만으로 다른 단계를 독립적으로 관측한 것처럼 사용하지 않았다.
+`J_node=2J_shared+J_distinct`이며 세 J는 독립 항 세 개가 아니다.
+부호를 유지하며 전체 합의 PSD를 주장하지 않는다.
+서로 다른 그래프의 raw trace를 분류 점수나 독립 seed 수로 비교하지 않는다.
+
+## 전체 기록과 그림
+
+- [모든 그래프·연결성분·rank](graph_summary.csv)
+- [모든 그래프 × 두 C × 세 상태의 실제 복원](reconstruction_summary.csv)
+- [다섯 관측 조건의 실제 E/J와 오차](condition_summary.csv)
+- [모든 그래프의 같은 단계·연속 단계 관계와 재현 오차](relation_summary.csv)
+- [실제 calibration·execution 자원](resources.json)
+
+Macro rows: graph=201, reconstruction=1206,
+condition=6030, relation=6030.
+그림은 전체 macro rows의 정의된 지표를 사용한다. 임의의 그래프/채널 subset을 만들지 않았다.
+정의되지 않은 비율은 그림에서 제외한 수를 표시하고 0으로 채우지 않았다. PNG와 PDF를 각각 저장했다.
+
+![tag contrast and actual q recovery](figures/tag_contrast_and_recovery.png)
+
+![E/J reproduced from the Y-only inverse](figures/energy_relation_reconstruction.png)
+
+## 다음 연구의 범위
+
+이번 조건에서는 수신 합이 실제 q/E/J를 결정한다. E/J의 예측 효과, 학습된 C/W, source별 독립 상태,
+일부 수신만 관측하는 모델이나 학습된 비선형 압축에는 이 결론을 자동으로 적용하지 않는다.
+에너지·쌍선형 관계가 비선형 표현으로 학습에 도움을 주는지는 별도 실험에서 확인한다.
+그 실험에는 실제 forward·loss·gradient·optimizer 경로와 예측 평가가 있어야 한다.
+이번 완료를 분류 학습 완료나 예측 개선으로 보고하지 않는다.
+(new-gat) aicompetition07@ece-a6gpu6:~/new-gat$

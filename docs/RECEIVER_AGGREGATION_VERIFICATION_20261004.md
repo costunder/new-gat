@@ -70,7 +70,8 @@ DEBUG에서는 각각 1이 선택됐으며, 서버에서는 같은 후보를 전
 ## 완료와 미검증 상태
 
 - 구현·정적 검사·단위 검사·전체 DEBUG 경로: 완료.
-- 서버 FULL 201개와 실제 citation 3개: 이번 로컬 작업에서 실행하지 않음.
+- 초기 로컬 구현 검증에서는 서버 FULL을 실행하지 않았다. 이후 사용자가 전달한 서버 결과는
+  201개와 실제 citation 3개 완료를 기록한다. [서버 결과](RECEIVER_AGGREGATION_SERVER_FINDINGS_20261004.md) 참조.
 - 분류기·C/W·E/J decoder 학습: 이번 고정 진단에는 없음.
 - 예측 개선과 학습 일반화: 이번 진단의 결과로 주장하지 않음.
 
@@ -94,4 +95,5 @@ DEBUG 출력은 `results/receiver-aggregation-DEBUG-20261004-02`이며 이전 �
 새 회귀 검사는 context가 spawn인지 확인하고, 실제 CUDA를 초기화한 부모에서 CPU worker
 두 개로 CSR을 준비했다. 자식의 CUDA 상태는 준비 전후 모두 초기화되지 않았고,
 반환한 operator의 GPU forward는 직렬 준비와 1e−12 허용오차로 일치했다.
-이 검사는 로컬 Windows에서 실행했다. Linux 서버 FULL 재실행 결과는 아직 확인하지 않았다.
+이 회귀 검사는 로컬 Windows에서 실행했다. 후속 Linux 서버 FULL 결과는
+[서버 결과](RECEIVER_AGGREGATION_SERVER_FINDINGS_20261004.md)에 원문과 함께 기록했다.
