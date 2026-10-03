@@ -76,3 +76,22 @@ DEBUG에서는 각각 1이 선택됐으며, 서버에서는 같은 후보를 전
 
 서버 실행과 결과 확인은 [RUN.md](../research/local_energy_relations/receiver_aggregation/RUN.md),
 수학과 판정 범위는 [MODEL_MATH.md](../research/local_energy_relations/receiver_aggregation/MODEL_MATH.md)에 있다.
+
+## 서버 CPU worker 초기화 오류 수정
+
+서버 FULL은 입력 201개를 읽은 뒤 CPU sparse operator calibration의 worker 2개 단계에서
+`CUDA error: initialization error`로 실패했다. GPU 연산과 복원 검사는 시작되지 않았다.
+CUDA hardware discovery 뒤에 Linux 기본 fork로 자식 프로세스를 만든 것이 실패 지점이다.
+
+`ProcessPoolExecutor`에 명시적인 `multiprocessing.get_context("spawn")`을 전달하고,
+준비하는 CSR tensor와 graph index의 device를 CPU로 명시했다. 자식은 새 interpreter에서
+시작하며 부모의 CUDA runtime을 물려받지 않는다. CUDA와 fork에 대한 제한은
+[서버 버전 PyTorch 2.7 문서](https://docs.pytorch.org/docs/2.7/notes/multiprocessing.html#cuda-in-multiprocessing)에도 있다.
+worker 수·그래프·채널·정밀도·solver 계약은 유지했다. CPU 후보 1/2/4/8은 계속 측정한다.
+
+수정 후 관련 core·study 검사 31개와 GPU DEBUG 전체 21개가 통과했다.
+DEBUG 출력은 `results/receiver-aggregation-DEBUG-20261004-02`이며 이전 결과를 보존했다.
+새 회귀 검사는 context가 spawn인지 확인하고, 실제 CUDA를 초기화한 부모에서 CPU worker
+두 개로 CSR을 준비했다. 자식의 CUDA 상태는 준비 전후 모두 초기화되지 않았고,
+반환한 operator의 GPU forward는 직렬 준비와 1e−12 허용오차로 일치했다.
+이 검사는 로컬 Windows에서 실행했다. Linux 서버 FULL 재실행 결과는 아직 확인하지 않았다.

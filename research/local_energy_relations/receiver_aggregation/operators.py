@@ -75,6 +75,7 @@ def _tensor_csr(matrix):
         torch.from_numpy(matrix.data.astype(np.float64)),
         size=matrix.shape,
         dtype=torch.float64,
+        device="cpu",
         check_invariants=True,
     )
 
@@ -167,7 +168,7 @@ def prepare_receiver_operator(topology: LocalTopology, weight_mode: str) -> Rece
     component_index = torch.from_numpy(component)
     sizes = torch.bincount(component_index)
     graph_sizes = top.graph_node_offsets[1:] - top.graph_node_offsets[:-1]
-    node_graph = torch.repeat_interleave(torch.arange(top.num_graphs), graph_sizes)
+    node_graph = torch.repeat_interleave(torch.arange(top.num_graphs, device="cpu"), graph_sizes)
     counts = torch.bincount(top.shared_node_left, minlength=top.num_local_nodes)
     receiver_counts = torch.bincount(top.shared_node_right, minlength=top.num_local_nodes)
     if not bool(((counts > 0) | (top.local_degree == 0)).all()):

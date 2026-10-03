@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import multiprocessing as mp
 import os
 import shutil
 import sys
@@ -52,7 +53,9 @@ def _parallel(arguments, workers):
             return [_prepare(item) for item in arguments]
         finally:
             torch.set_num_threads(previous)
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    # CUDA hardware discovery runs before this CPU preparation. A fresh spawned
+    # interpreter must not inherit the parent's CUDA runtime through Linux fork.
+    with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as pool:
         return list(pool.map(_prepare, arguments))
 
 
@@ -79,6 +82,10 @@ def prepare_operators(cases, topologies, config, hardware, resources):
     )
     if any(k > available_cpus(hardware) for k in candidates):
         raise ValueError("CPU processes exceed actual affinity/quota")
+    print(
+        f"[CPU operator preparation] device=cpu start_method=spawn candidates={candidates}",
+        flush=True,
+    )
     best, cache, selected = float("inf"), None, None
     for workers in candidates:
         start = time.perf_counter()
@@ -91,6 +98,8 @@ def prepare_operators(cases, topologies, config, hardware, resources):
                 "operators": len(indices),
                 "seconds": seconds,
                 "scope": "largest_whole_synthetic_graphs_and_all_whole_citation_graphs",
+                "worker_start_method": "spawn" if workers > 1 else "in_process",
+                "operator_device": "cpu",
             }
         )
         print(
@@ -689,6 +698,7 @@ def run(args, output):
             "trainable_parameters": 0,
             "optimizer_steps": 0,
             "DataLoader": "complete_source_cache_no_resampling",
+            "CPU_operator_worker_start_method": "spawn",
         },
     )
     print(

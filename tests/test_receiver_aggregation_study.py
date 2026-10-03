@@ -16,6 +16,8 @@ from research.local_energy_relations.receiver_aggregation.data import prepare_ca
 from research.local_energy_relations.receiver_aggregation.operators import prepare_receiver_operator
 from research.local_energy_relations.topology import build_topology
 
+_ORIGINAL_PREPARE = study._prepare
+
 
 @pytest.fixture(autouse=True)
 def cpu_threads():
@@ -343,4 +345,73 @@ def test_all_saved_debug_source_graphs_compute_and_collect(tmp_path):
     assert all(
         r["fused_relative_residual"] is None or r["fused_relative_residual"] <= 1e-8
         for r in rows["reconstruction"]
+    )
+
+
+def test_sparse_preparation_explicitly_uses_spawn_context(monkeypatch):
+    """A Linux fork default must never leak into the CUDA-initialized parent."""
+    calls = []
+
+    class InspectPool:
+        def __init__(self, *, max_workers, mp_context):
+            assert max_workers == 2
+            assert mp_context.get_start_method() == "spawn"
+            calls.append(mp_context.get_start_method())
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def map(self, function, arguments):
+            return map(function, arguments)
+
+    monkeypatch.setattr(study, "ProcessPoolExecutor", InspectPool)
+    case = make_case("DEBUG-spawn-context", [(0, 1), (1, 2)], 3)
+    top = build_topology(case.num_nodes, case.edges)
+    prepared = study._parallel([(top, "unit"), (top, "local_degree")], 2)
+    assert calls == ["spawn"]
+    assert len(prepared) == 2
+    assert all(op.matrix.device.type == "cpu" for op in prepared)
+
+
+def _observed_child_prepare(argument):
+    """Importable spawn target records real worker state around actual preparation."""
+    before = torch.cuda.is_initialized()
+    result = _ORIGINAL_PREPARE(argument)
+    result.metadata["DEBUG_worker_cuda_initialized_before"] = before
+    result.metadata["DEBUG_worker_cuda_initialized_after"] = torch.cuda.is_initialized()
+    return result
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="DEBUG CUDA not available")
+def test_spawn_cpu_preparation_after_parent_cuda_init_then_gpu_parity(monkeypatch):
+    """Runs on this host; Windows parity does not claim Linux server execution."""
+    torch.cuda.init()
+    assert torch.cuda.is_initialized()
+    cases = [
+        make_case("DEBUG-spawn-a", [(0, 1), (0, 2), (1, 2), (2, 3)], 5),
+        make_case("DEBUG-spawn-b", [(0, 1), (1, 2), (3, 4)], 6),
+    ]
+    arguments = [(build_topology(case.num_nodes, case.edges), "local_degree") for case in cases]
+    serial = study._parallel(arguments, 1)
+    monkeypatch.setattr(study, "_prepare", _observed_child_prepare)
+    parallel = study._parallel(arguments, 2)
+    for actual, expected in zip(parallel, serial, strict=True):
+        assert actual.metadata["DEBUG_worker_cuda_initialized_before"] is False
+        assert actual.metadata["DEBUG_worker_cuda_initialized_after"] is False
+        assert actual.matrix.device.type == "cpu"
+        assert actual.matrix_transpose.device.type == "cpu"
+        assert actual.weights.device.type == "cpu"
+        torch.testing.assert_close(actual.matrix.to_dense(), expected.matrix.to_dense())
+        torch.testing.assert_close(actual.normal_diagonal, expected.normal_diagonal)
+    batched_parallel = study.batch_receiver_operators(parallel).to("cuda")
+    batched_serial = study.batch_receiver_operators(serial).to("cuda")
+    physical = torch.cat([case.x for case in cases]).to("cuda")
+    torch.testing.assert_close(
+        study.fused_apply(batched_parallel, physical),
+        study.fused_apply(batched_serial, physical),
+        atol=1e-12,
+        rtol=1e-12,
     )
