@@ -89,3 +89,12 @@ GPU 번호를 임의로 바꾸거나 실행 중인 다른 작업을 중단하지
 추가했다. 송신별 메시지 보존, 수신 행별 합, 내부 E·집합 사이 J 추가의 다섯 관측을 비교한다.
 합에서 직접 숨는 송신별 차이와 실제 메시지 복원 가능성을 따로 측정한다.
 서버 명령은 [receiver_aggregation/RUN.md](receiver_aggregation/RUN.md)에 있다.
+
+## 후속 학습: E/J를 실제 노드 업데이트에 사용
+
+[로컬 예측 실험](prediction/README.md)은 같은 두 홉 기본 전파 위에서
+base / 내부 E / 집합 사이 J / E+J를 각각 새로 학습한다.
+두 고정 C 규칙, 전체 citation 3개, validation 튜닝과 독립 최종 seed를 사용한다.
+수식은 [prediction/MODEL_MATH.md](prediction/MODEL_MATH.md),
+서버 명령과 결과 확인은 [prediction/RUN.md](prediction/RUN.md)에 있다.
+고정 수신 역복원 성공과 실제 로컬 분류 기여는 별도의 검증이다.

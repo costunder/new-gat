@@ -63,6 +63,8 @@
 | [수신 측 집계와 복원](../research/local_energy_relations/receiver_aggregation/README.md) | 송신별 보존·수신 합·E/J 추가의 다섯 조건, 전체 201개 입력 재사용과 서버 실행 |
 | [수신 집계 구현 검증](RECEIVER_AGGREGATION_VERIFICATION_20261004.md) | 단위 검사, GPU DEBUG 범위와 실제 수치, 서버 worker 오류 수정 |
 | [수신 집계 서버 FULL 결과](RECEIVER_AGGREGATION_SERVER_FINDINGS_20261004.md) | 201개 완료 원문, 실제 q/E/J 재구성 수치와 다음 국소 예측 질문 |
+| [로컬 E/J 실제 예측 실험](../research/local_energy_relations/prediction/README.md) | 같은 두 홉 기본 전파의 base/E/J/both × 두 고정 C, 전체 citation 3개·336회 학습·서버 실행 |
+| [로컬 E/J 예측 구현 검증](LOCAL_PREDICTION_VERIFICATION_20261004.md) | 독립 수식·미분·학습·이어하기·평가 검사, CUDA DEBUG 실행과 미실행 FULL 범위 |
 
 ## GPT 전체 프로젝트 전달 묶음
 
