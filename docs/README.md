@@ -60,6 +60,8 @@
 | [RESEARCH_OVERVIEW.md](RESEARCH_OVERVIEW.md) | 세 독립 연구 트랙의 경계와 코드 위치 |
 | [COMBINED_LATER.md](COMBINED_LATER.md) | 트랙 결합을 현재 결과와 분리해 둔 후속 아이디어 |
 | [로컬 이차 에너지·집합 사이 쌍선형 관계](../research/local_energy_relations/README.md) | 원래 로컬 E/J 연구의 첫 고정 진단: 전체 induced ego, 집계·복원·전달, 서버 FULL 실행 |
+| [수신 측 집계와 복원](../research/local_energy_relations/receiver_aggregation/README.md) | 송신별 보존·수신 합·E/J 추가의 다섯 조건, 전체 201개 입력 재사용과 서버 실행 |
+| [수신 집계 구현 검증](RECEIVER_AGGREGATION_VERIFICATION_20261004.md) | 단위 검사, GPU DEBUG 범위와 실제 수치, 서버 FULL의 미실행 상태 |
 
 ## GPT 전체 프로젝트 전달 묶음
 

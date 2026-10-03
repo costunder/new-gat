@@ -1,0 +1,63 @@
+{
+  "schema": "local-energy-receiver-aggregation-v1",
+  "experiment": "receiver_aggregation_fixed_audit",
+  "profile": "debug",
+  "purpose": "DEBUG_actual_multi_sender_sum_tag_cancellation_pipeline_only",
+  "precision": "float64",
+  "source": {
+    "required_experiment": "local_energy_relations_initial_audit",
+    "required_status": "complete",
+    "profile": "debug",
+    "graphs": 21,
+    "synthetic_graphs": 18,
+    "synthetic_scalar_inputs": 72,
+    "citation_graphs": 3,
+    "actual_citation_graphs": 0,
+    "no_regeneration_or_download": true,
+    "reuse_complete_input_and_topology_snapshots": true
+  },
+  "data": {
+    "sampling_ratio": 1.0,
+    "all_nodes_edges_features": true,
+    "all_directed_adjacent_senders": true,
+    "all_receiver_local_rows": true,
+    "original_node_ids": "zero_based_original_graph_order",
+    "citation_channels": "one_vector_trace_not_independent_replicates"
+  },
+  "weights": ["unit", "local_degree"],
+  "states": ["H0", "H1", "H2"],
+  "relations": ["shared_edges", "shared_nodes", "distinct_edges"],
+  "conditions": ["tagged", "sum", "sum_within", "sum_between", "sum_both"],
+  "reference": {
+    "update": "H_next=H-tau*L_physical@H",
+    "tau": "1/(2*max_physical_degree); zero_for_edgeless_graph",
+    "reference_steps": 2,
+    "learned": false,
+    "feature_coordinates": "unchanged_original_channels"
+  },
+  "training": {"trainable_parameters": 0, "optimizer_updates": 0, "epochs": "N/A"},
+  "solver": {
+    "tolerance": 1e-8,
+    "maximum_iterations_factor": 10,
+    "maximum_iterations_rule": "10*largest_physical_graph_node_count",
+    "operator": "cached_sparse_A_and_AT_exact_adjoint_normal_equations",
+    "target": "physical_component_centered_H_and_actual_flows_receipts",
+    "unconverged_result": "explicit_error_no_zero_or_random_replacement"
+  },
+  "runtime": {
+    "cpu_workers": "auto",
+    "cpu_threads": "auto",
+    "physical_graph_batch": "auto",
+    "channel_chunk": "auto",
+    "relation_batch": "auto",
+    "gpu_memory_safety_fraction": 0.75,
+    "preprocessing_worker_candidates": [1, 2, 4, 8],
+    "exact_chunking_all_channels": true
+  },
+  "provenance": {
+    "exclusive_new_output": true,
+    "content_sha256": true,
+    "preserve_source_inputs_topology_and_manifests": true,
+    "server_full_only": true
+  }
+}
