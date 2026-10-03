@@ -19,6 +19,9 @@ Experiment 3의 서버 전체 평가도 완료했으며 [결과](SERVER_GENERALI
 서버 전체 336 run 학습·평가 완료 출력은 [결과](SERVER_CLASSIFICATION_RESULTS.md)에 기록했다.
 **Experiment 4.1**은 [branch_strength/README.md](branch_strength/README.md)의 별도 실행기로
 완료 checkpoint에서 C 위치와 실제 분기 메시지 크기를 분리해 관측한다. 새 학습은 없다.
+서버 full 완료 출력은 [결과](SERVER_BRANCH_STRENGTH_RESULTS.md)에 기록했다.
+후속 [저장된 결과 분석](branch_analysis/README.md)은 CSV의 β·κ·실제 메시지 크기를 분해하고
+각 층 개별 개입을 비교한다. 학습·모델 forward를 추가로 실행하지 않는다.
 로컬 검증과 서버 실행 증거는 [검증 기록](classification/VERIFICATION.md)에서 구분한다.
 고정 연산의 서버 결과는 [SERVER_FIXED_RESULTS.md](SERVER_FIXED_RESULTS.md)에 있다.
 

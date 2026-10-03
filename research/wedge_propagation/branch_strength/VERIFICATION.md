@@ -47,7 +47,9 @@ RTX 5070 Ti 16GB, 원래 완료한 classification DEBUG fixture checkpoint를 �
 ## 서버 실행 범위
 
 Experiment 4 서버 full 완료 출력은 [기록](../SERVER_CLASSIFICATION_RESULTS.md)에 있다.
-이번 Experiment 4.1의 **서버 full 평가는 아직 실행하지 않았다.**
+사용자가 서버 full 완료 출력을 제공했다. [기록](../SERVER_BRANCH_STRENGTH_RESULTS.md)에
+전체 범위·처리시간·실제 데이터·원본 보존·관측 결과를 정리했다.
+로컬에서 원본 서버 CSV/checkpoint를 직접 읽은 것으로 표현하지 않는다.
 서버 실행기는 전체 3개 citation graph·120개 원래 모델·30개 learned 모델,
 최종 5seed·원래 10manifest·모든 경로를 검사한다.
 총 2,370개 전체 forward seed 경우와 fixed-Z 관측을 수행한다.

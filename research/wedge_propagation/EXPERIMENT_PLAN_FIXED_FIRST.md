@@ -234,6 +234,10 @@ Experiment 4.1은 [branch_strength/README.md](branch_strength/README.md)의 froz
 모든 120 final checkpoint를 재현한 뒤 learned raw/RMS 30개 모델에서
 같은 메시지 크기의 C 위치 변경과 같은 방향의 강도 변경을 각 층/두 층에서 비교한다.
 새 학습·checkpoint 선택·최고 test 개입 선택은 하지 않는다.
+Experiment 4.1 서버 full 완료 출력은 [결과](SERVER_BRANCH_STRENGTH_RESULTS.md)에 기록했다.
+후속 [CSV 분석 실행기](branch_analysis/README.md)는 원래 source를 보존한 채
+각 seed의 β/κ, 정규화 전 메시지 크기, 일차/이차 메시지 비교와 각 층 개입 결과를 요약한다.
+원래 4.1 평가를 다시 실행하거나 새 학습으로 대체하지 않는다.
 Experiment 2의 재개 범위는 한 target/condition job이며
 재개할 때 새 결과 폴더에서 나머지 job을 다시 실행한다.
 
