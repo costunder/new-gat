@@ -4,6 +4,9 @@
 전체 실험 순서·실제 모델 수식·서버 결과·이전 CGAT 기록·검토 요청문을 모았다.
 패키지 생성기는 `gpt_handoff/build_package.py`다. 기존 소스·결과를 보존하고 새 ZIP만 만든다.
 
+후속 GPT 검토의 [연구 범위 정정](REVIEW_SCOPE_20261003.md)은 원래의 로컬 내부 에너지·
+로컬 사이 쌍선형 관계와 현재 wedge 특수형을 구분한다. 아래는 구현·완료한 wedge 실험의 기록이다.
+
 이 문서와 `study` 실행 명령은 **Experiment 0 대수 검사와 Experiment 1 고정 연산 비교**를 설명한다.
 `C2=I`로 고정하고 같은 입력에 `LX`, `L²X`, `QX`를 적용한다.
 이후 경로 가중치 학습과 분류 실험은 [현재 계획](EXPERIMENT_PLAN_FIXED_FIRST.md)에 정리되어 있다.
