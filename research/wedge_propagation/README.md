@@ -22,6 +22,10 @@ Experiment 3의 서버 전체 평가도 완료했으며 [결과](SERVER_GENERALI
 서버 full 완료 출력은 [결과](SERVER_BRANCH_STRENGTH_RESULTS.md)에 기록했다.
 후속 [저장된 결과 분석](branch_analysis/README.md)은 CSV의 β·κ·실제 메시지 크기를 분해하고
 각 층 개별 개입을 비교한다. 학습·모델 forward를 추가로 실행하지 않는다.
+서버 full 분석 완료와 다음 비교의 근거는 [기록](SERVER_BRANCH_ANALYSIS_RESULTS.md)에 있다.
+**Experiment 4.2**는 [노드별 대각 정규화](node_normalization/README.md)의 재학습 비교다.
+고정 C=1, 전역 raw/RMS, 노드별 raw/RMS 다섯 조건을 전체 citation 그래프에서 각각 학습한다.
+두 층·hidden 64·각 500 epoch·기존 LR/seed 계약을 유지하며 본학습은 서버에서 실행한다.
 로컬 검증과 서버 실행 증거는 [검증 기록](classification/VERIFICATION.md)에서 구분한다.
 고정 연산의 서버 결과는 [SERVER_FIXED_RESULTS.md](SERVER_FIXED_RESULTS.md)에 있다.
 

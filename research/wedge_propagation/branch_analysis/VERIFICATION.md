@@ -45,7 +45,7 @@ Output: `results/wedge-branch-analysis-debug-20261003-01`.
 ## 서버 범위
 
 사용자가 제공한 4.1 서버 full 완료 summary는 [기록](../SERVER_BRANCH_STRENGTH_RESULTS.md)에 있다.
-새 분석기의 서버 full 실행은 아직 수행하지 않았다.
+사용자가 제공한 새 분석기의 서버 full 완료 출력은 [기록](../SERVER_BRANCH_ANALYSIS_RESULTS.md)에 있다.
 서버에서는 기존 360/6,750/4,740/1,560행과 120개 모델 보존 기록을 모두 읽는다.
 분석 결과는 seed/층 인자 60행, 강도 추정 204행, paired 층 변화 756행, fixed-Z 추정 384행이다.
 공식 graph·split을 축소하지 않으며 원래 4.1 평가나 본학습을 다시 시작하지 않는다.

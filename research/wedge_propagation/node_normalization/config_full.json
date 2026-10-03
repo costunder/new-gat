@@ -1,0 +1,279 @@
+{
+  "schema": "wedge-node-normalization-design-v1",
+  "experiment": "4.2",
+  "date": "2026-10-03",
+  "status": "runnable",
+  "data": {
+    "datasets": [
+      "Cora",
+      "CiteSeer",
+      "PubMed"
+    ],
+    "split": "public",
+    "setting": "transductive_full_graph",
+    "features": "row_sum_normalize_preserve_zero_rows",
+    "physical_graph": "simple_undirected_no_self_loops_or_reciprocal_duplicates",
+    "paths": "all_unordered_distinct_neighbors_per_center_including_triangles",
+    "sampling_ratio": 1.0,
+    "raw_and_processed_sha256_required": true,
+    "expected_shapes": {
+      "Cora": {
+        "nodes": 2708,
+        "features": 1433,
+        "classes": 7,
+        "train": 140,
+        "validation": 500,
+        "test": 1000
+      },
+      "CiteSeer": {
+        "nodes": 3327,
+        "features": 3703,
+        "classes": 6,
+        "train": 120,
+        "validation": 500,
+        "test": 1000
+      },
+      "PubMed": {
+        "nodes": 19717,
+        "features": 500,
+        "classes": 3,
+        "train": 60,
+        "validation": 500,
+        "test": 1000
+      }
+    }
+  },
+  "backbone": {
+    "layers": 2,
+    "hidden_dim": 64,
+    "projection_bias": false,
+    "dropout_probability": 0.5,
+    "dropout_placement": "before_each_projection",
+    "activation": "relu_after_first_propagation_only",
+    "output": "second_layer_logits",
+    "initialization": "xavier_uniform_weights_zero_bias",
+    "shared_initialization_and_dropout_streams": true,
+    "first_alpha": "sigmoid(u); initial=0.5",
+    "two_branch_coefficients": "t=sigmoid(u); r=sigmoid(v); alpha=t*(1-r); beta=t*r",
+    "two_branch_initial_alpha": 0.5,
+    "two_branch_initial_beta": 0.25,
+    "extra_projection": false
+  },
+  "operators": {
+    "L_bar": "0.5 * S_degree @ (B.T @ B) @ S_degree",
+    "Q_bar": "S_diagQ @ (A.T @ A) @ S_diagQ / 3",
+    "kappa_C": "max(diag(A.T@diag(c)@A)/diag(Q)) on positive diag(Q); 1 if no paths",
+    "T_C_bar": "S_diagQ @ (A.T@diag(c)@A) @ S_diagQ / (3*kappa_C)",
+    "polynomial": "L_bar @ L_bar",
+    "inverse_sqrt_zero_diagonal": 0.0,
+    "preconditioning": "global_uses_cached_topology_SQ; node_uses_current_C_diagonal_each_layer",
+    "kappa_gradient": "preserved",
+    "kappa_tie_gradient": "torch.amax_over_nodes_after_all_path_diagonal_sums_equal_gradient_on_tied_maxima",
+    "psd_norm_upper_bound": 1.0,
+    "exact_spectral_norm_equality_claim": false,
+    "T_C_node": "S_diagTC @ (A.T@diag(c)@A) @ S_diagTC / 3",
+    "S_diagTC": "inverse_sqrt(diag(A.T@diag(c)@A)); zero diagonal -> zero",
+    "node_diagonal_gradient": "preserved_through_C_and_both_S_diagTC_factors",
+    "condition_normalization": {
+      "fixed_wedge": "fixed",
+      "learned_wedge_raw": "global_kappa",
+      "learned_wedge_rms": "global_kappa",
+      "learned_wedge_local_raw": "node_diagonal",
+      "learned_wedge_local_rms": "node_diagonal"
+    },
+    "conditional_operator_bound": "fixed_C_PSD_norm_at_most_one; no_full_nonlinear_Jacobian_claim"
+  },
+  "gate": {
+    "input": "current_projected_Z_before_propagation",
+    "channels_by_layer": [
+      "64",
+      "num_classes"
+    ],
+    "hidden_dim": 64,
+    "architecture": "4F -> 64 -> 1",
+    "activation": "relu",
+    "first_linear_bias": true,
+    "second_linear_bias": false,
+    "features": [
+      "abs(g1)+abs(g2)",
+      "g1*g2",
+      "abs(g2-g1)",
+      "(abs(g1)-abs(g2))**2"
+    ],
+    "rms": "sqrt(sum((B@Z)**2)/(physical_edges*F)) per graph/layer/seed pooled across channels",
+    "rms_zero_signal_scale": 1.0,
+    "rms_nonzero_epsilon": 0.0,
+    "c": "exp(tanh(score)) / mean_over_all_paths(exp(tanh(score)))",
+    "tau": 1.0,
+    "scalar_c_shared_across_channels": true,
+    "synthetic_checkpoint_transfer": false,
+    "teacher_or_C_target_loss": false
+  },
+  "conditions": [
+    "fixed_wedge",
+    "learned_wedge_raw",
+    "learned_wedge_rms",
+    "learned_wedge_local_raw",
+    "learned_wedge_local_rms"
+  ],
+  "capacity_control": {
+    "total_parameters": {
+      "Cora": {
+        "fixed_and_polynomial": 92164,
+        "learned_and_capacity": 110596
+      },
+      "CiteSeer": {
+        "fixed_and_polynomial": 237380,
+        "learned_and_capacity": 255556
+      },
+      "PubMed": {
+        "fixed_and_polynomial": 32196,
+        "learned_and_capacity": 49604
+      }
+    },
+    "dummy_parameters": 0
+  },
+  "training": {
+    "location": "server_only",
+    "optimizer": "Adam",
+    "learning_rate_candidates": [
+      0.001,
+      0.003,
+      0.01
+    ],
+    "weight_decay": 0.0005,
+    "weight_decay_scope": "projection_and_gate_weight_matrices_only",
+    "optimizer_betas": [
+      0.9,
+      0.999
+    ],
+    "optimizer_epsilon": 1e-08,
+    "epochs_per_run": 500,
+    "updates_per_epoch": 1,
+    "physical_graph_batch_per_run": 1,
+    "gradient_accumulation_steps": 1,
+    "data_parallel_replicas_per_run": 1,
+    "effective_graph_batch_per_run": 1,
+    "early_stopping": false,
+    "scheduler": false,
+    "gradient_clipping": false,
+    "precision": "float32",
+    "tf32": false,
+    "tuning_seeds": [
+      101,
+      202,
+      303
+    ],
+    "final_seeds": [
+      11,
+      23,
+      37,
+      53,
+      71
+    ],
+    "checkpoint_selection": [
+      "minimum_validation_CE_without_L2",
+      "maximum_validation_accuracy",
+      "earliest_epoch"
+    ],
+    "lr_selection": "minimum_mean_selected_validation_CE_then_smaller_lr",
+    "tuning_runs": 135,
+    "final_runs": 75,
+    "total_runs": 210,
+    "total_updates": 105000,
+    "test_evaluation_during_tuning": false
+  },
+  "evaluation": {
+    "primary": "test_accuracy",
+    "secondary": "test_CE",
+    "unit": "initialization_seed_on_fixed_public_split",
+    "summary": [
+      "each_seed",
+      "mean",
+      "sample_std",
+      "paired_differences",
+      "paired_95_percent_t_interval_with_fixed_split_scope"
+    ],
+    "comparisons": [
+      "local_minus_global_raw",
+      "local_minus_global_rms",
+      "local_raw_minus_fixed",
+      "local_rms_minus_fixed",
+      "global_raw_minus_fixed",
+      "global_rms_minus_fixed",
+      "rms_minus_raw_within_normalization"
+    ],
+    "frozen_interventions": [
+      "c_identity",
+      "c_position_shuffle",
+      "c_identity_norm_matched",
+      "c_position_shuffle_norm_matched",
+      "second_branch_remove"
+    ],
+    "intervention_scopes": [
+      "layer_0",
+      "layer_1",
+      "both"
+    ],
+    "shuffle_manifests_per_dataset": 10,
+    "identity_equals_mean": true,
+    "norm_match": "current_original_Z_per_seed_all_nodes_channels_to_current_true_C_branch",
+    "local_intervention_diagonal": "recomputed_from_intervened_C_on_current_Z",
+    "test_evaluation_during_model_selection": false,
+    "teacher_recovery_metrics": false,
+    "test_already_observed_in_previous_experiment": true,
+    "independent_generalization_claim": false
+  },
+  "resources": {
+    "gpu": "assigned_A6000_actual_allocation_measured",
+    "parallel_tuning_run_candidates": [
+      1,
+      2,
+      3
+    ],
+    "parallel_final_run_candidates": [
+      1,
+      2,
+      4,
+      5
+    ],
+    "preprocessing_worker_candidates": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "seeds": "packed_leading_axis_with_independent_parameters_and_adam_state",
+    "packed_loss": "sum_of_per_replica_train_node_mean_CE",
+    "static_cache": true,
+    "epoch_dataloader": "N/A_for_resident_GPU_data",
+    "all_paths": true,
+    "large_paths": "exact_chunking_and_checkpointing_with_graph_wide_reductions",
+    "multi_gpu_if_allocated": "partition_dataset_condition_lr_groups",
+    "calibration": "separate_updates_restore_initial_states_before_training",
+    "ETA": "derived_from_measured_epoch_throughput",
+    "same_terminal_progress_and_logfile": true,
+    "new_output_directory": true
+  },
+  "profile": "full",
+  "data_source": "planetoid_public",
+  "runtime": {
+    "calibration_warmups": 1,
+    "calibration_repeats": 3,
+    "path_chunk_candidates": [
+      4096,
+      16384,
+      65536
+    ],
+    "resume_every_epochs": 50,
+    "gpu_memory_safety_fraction": 0.85,
+    "cpu_threads": "auto"
+  },
+  "provenance": {
+    "previous_experiments_preserved": true,
+    "fresh_training_all_conditions": true,
+    "fixed_global_and_node_equal": true,
+    "previous_global_models_retrained_for_current_source_contract": true,
+    "scope": "new_normalization_comparison_same_public_splits; not_independent_test_replication"
+  }
+}

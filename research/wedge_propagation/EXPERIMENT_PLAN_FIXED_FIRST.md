@@ -238,6 +238,13 @@ Experiment 4.1 서버 full 완료 출력은 [결과](SERVER_BRANCH_STRENGTH_RESU
 후속 [CSV 분석 실행기](branch_analysis/README.md)는 원래 source를 보존한 채
 각 seed의 β/κ, 정규화 전 메시지 크기, 일차/이차 메시지 비교와 각 층 개입 결과를 요약한다.
 원래 4.1 평가를 다시 실행하거나 새 학습으로 대체하지 않는다.
+서버 full 분석 결과는 [기록](SERVER_BRANCH_ANALYSIS_RESULTS.md)에 있다.
+Experiment 4.2는 [노드별 대각 정규화](node_normalization/README.md)로 새로 학습한다.
+C=1에서는 전역/노드별 정규화가 같으므로 fixed 하나와 learned global/raw·RMS,
+learned node/raw·RMS의 다섯 조건이다. 전체 Cora·CiteSeer·PubMed,
+두 층·hidden 64·500 epoch·기존 LR와 seed를 유지한다.
+총 135 tuning/75 final run이며 모든 checkpoint를 validation으로 고정한 뒤 test를 읽는다.
+기존 Experiment 4/4.1 코드·checkpoint·결과를 보존한다.
 Experiment 2의 재개 범위는 한 target/condition job이며
 재개할 때 새 결과 폴더에서 나머지 job을 다시 실행한다.
 
