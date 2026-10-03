@@ -1,0 +1,80 @@
+{
+  "schema": "local-energy-relations-fixed-audit-v1",
+  "experiment": "local_energy_relations_initial_audit",
+  "profile": "debug",
+  "purpose": "DEBUG_local_quadratic_energy_interlocal_bilinear_pipeline_only",
+  "precision": "float64",
+  "synthetic": {
+    "source": "existing_fixed_graph_generator",
+    "master_seed": 20261002,
+    "sizes": [5, 8],
+    "families": ["cycle", "star", "grid", "er", "tree", "tree_chord"],
+    "random_draws_per_size_family": 2,
+    "deterministic_draws_per_size_family": 1,
+    "scalar_realizations": 4,
+    "graphs": 18,
+    "scalar_inputs": 72,
+    "feature_mode": "independent_scalar_columns"
+  },
+  "citation": {
+    "source": "debug_fixture",
+    "datasets": ["DEBUG-Cora", "DEBUG-CiteSeer", "DEBUG-PubMed"],
+    "expected_shapes": {
+      "DEBUG-Cora": {"nodes": 24, "features": 12},
+      "DEBUG-CiteSeer": {"nodes": 30, "features": 12},
+      "DEBUG-PubMed": {"nodes": 36, "features": 12}
+    },
+    "feature_origin": "classification_DEBUG_fixture_row_sum_normalized_float32_promoted_to_float64",
+    "feature_mode": "vector_trace",
+    "use_labels_or_masks": false,
+    "all_input_channels": true,
+    "encoder": null
+  },
+  "data": {
+    "total_graphs": 21,
+    "sampling_ratio": 1.0,
+    "all_nodes": true,
+    "all_physical_edges": true,
+    "all_induced_one_hop_egos": true,
+    "all_directed_adjacent_center_pairs": true,
+    "original_node_ids": "zero_based_original_graph_order",
+    "physical_graph": "canonical_simple_undirected"
+  },
+  "weights": ["unit", "local_degree"],
+  "local_degree_weight": "2/(degree_in_induced_ego[source]+degree_in_induced_ego[target])",
+  "relations": ["shared_edges", "shared_nodes", "distinct_edges"],
+  "states": ["H0", "H1", "H2"],
+  "reference": {
+    "H0": "all_original_loader_features",
+    "update": "H_next=H-tau*L_physical@H",
+    "tau": "1/(2*max_physical_degree); zero_for_edgeless_graph",
+    "learned": false,
+    "meaning": "fixed_reference_diagnostic_not_trained_GNN"
+  },
+  "training": {"trainable_parameters": 0, "optimizer_updates": 0, "epochs": "N/A"},
+  "solver": {
+    "tolerance": 1e-9,
+    "maximum_iterations_factor": 10,
+    "maximum_iterations_rule": "10*largest_induced_ego_node_count",
+    "unconverged_result": "explicit_error_no_zero_or_random_replacement"
+  },
+  "runtime": {
+    "cpu_workers": "auto",
+    "cpu_threads": "auto",
+    "physical_graph_batch": "auto",
+    "channel_chunk": "auto",
+    "relation_batch": "auto",
+    "gpu_memory_safety_fraction": 0.75,
+    "reference_steps": 2,
+    "preprocessing_worker_candidates": [1, 2, 4, 8],
+    "exact_chunking_all_channels": true
+  },
+  "provenance": {
+    "exclusive_new_output": true,
+    "save_all_input_snapshots": true,
+    "content_sha256": true,
+    "preserve_existing_data_and_results": true,
+    "old_wedge_models_not_imported": true,
+    "server_full_only": true
+  }
+}

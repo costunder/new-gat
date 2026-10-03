@@ -1,0 +1,6 @@
+# Keep the server's existing CUDA-enabled PyTorch (>=2.7).
+numpy>=1.26
+scipy>=1.10
+matplotlib>=3.7
+psutil>=5.9
+threadpoolctl>=3.1
