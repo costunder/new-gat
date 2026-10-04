@@ -7,7 +7,8 @@ E/J는 실제 logits와 분류 CE·gradient·optimizer update에 연결한다.
 - [MODEL_MATH.md](MODEL_MATH.md): 무엇을 계산하고 노드 상태에 어떻게 더하는가.
 - [EXPERIMENT_DESIGN.md](EXPERIMENT_DESIGN.md): 8조건·전체 데이터·336 run 계약과 해석 범위.
 - [RUN.md](RUN.md): 서버 실행과 결과 확인.
-- [VERIFICATION.md](VERIFICATION.md): 이번 구현에서 실제 완료한 검사.
+- [구현 검증](../../../docs/LOCAL_PREDICTION_VERIFICATION_20261004.md): 실제 완료한 단위·CUDA DEBUG 검사.
+- [서버 FULL 결과](../../../docs/LOCAL_PREDICTION_SERVER_FINDINGS_20261004.md): 336회 완료 기록과 기본 모델 대비 E/J 기여.
 
 앞선 fixed audit와 수신 역복원 실험은 그대로 보존한다.
 그 역복원 성공은 제한된 깊이에서 E/J가 분류에 도움이 되는지에 답하지 않는다.
