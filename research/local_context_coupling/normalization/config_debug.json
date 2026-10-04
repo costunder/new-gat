@@ -1,0 +1,289 @@
+{
+  "schema": "local-context-coupling-normalization-v1",
+  "experiment": "local_context_coupling_normalization",
+  "status": "runnable",
+  "date": "2026-10-04",
+  "profile": "debug",
+  "data_source": "debug_fixture",
+  "data": {
+    "datasets": [
+      "DEBUG-Cora",
+      "DEBUG-CiteSeer",
+      "DEBUG-PubMed"
+    ],
+    "split": "public",
+    "setting": "transductive_full_graph",
+    "features": "row_sum_normalize_preserve_zero_rows",
+    "physical_graph": "simple_undirected_no_self_loops_or_reciprocal_duplicates",
+    "sampling_ratio": 1,
+    "all_nodes": true,
+    "all_physical_edges": true,
+    "all_induced_one_hop_egos": true,
+    "all_directed_adjacent_center_pairs": true,
+    "raw_and_processed_sha256_required": true,
+    "expected_shapes": {
+      "DEBUG-Cora": {
+        "nodes": 24,
+        "features": 12,
+        "classes": 3,
+        "train": 9,
+        "validation": 6,
+        "test": 9
+      },
+      "DEBUG-CiteSeer": {
+        "nodes": 30,
+        "features": 12,
+        "classes": 3,
+        "train": 9,
+        "validation": 6,
+        "test": 15
+      },
+      "DEBUG-PubMed": {
+        "nodes": 36,
+        "features": 12,
+        "classes": 3,
+        "train": 9,
+        "validation": 6,
+        "test": 21
+      }
+    }
+  },
+  "source": {
+    "required_experiment": "local_energy_relations_initial_audit",
+    "required_status": "complete",
+    "profile": "debug",
+    "graphs": 21,
+    "synthetic_graphs": 18,
+    "synthetic_scalar_inputs": 72,
+    "citation_graphs": 3,
+    "actual_citation_graphs": 0,
+    "whole_prior_audit_preserved": true,
+    "synthetic_graphs_used_for_training": 0,
+    "reuse_exact_citation_features_edges_and_topology": true,
+    "labels_and_public_masks_loaded_from_pinned_raw": true
+  },
+  "backbone": {
+    "layers": 2,
+    "hidden_dim": 8,
+    "projection_bias": false,
+    "dropout_probability": 0.5,
+    "dropout_placement": "before_each_projection",
+    "activation": "relu_after_first_update_only",
+    "output": "second_layer_logits",
+    "initialization": "xavier_uniform_projection_weights; learned_theta=0",
+    "shared_initialization_and_dropout_streams": true,
+    "extra_projection": false
+  },
+  "operators": {
+    "weights": [
+      "unit",
+      "local_degree"
+    ],
+    "intra": "S=graphwise_eta*A or blockdiag(local_eta_v*L_v); identical before and after cross",
+    "cross": "G=graphwise_gamma*K or .5*J.T diag(1/max(unit_K_degree_i,unit_K_degree_j)) J",
+    "replicate": "R exact original-node-ID copies",
+    "merge": "M=diag(copy_counts)^(-1) R.T",
+    "update": "M(I-S)(I-rho G)(I-S)RZ",
+    "off": "same two internal passes, rho=0, no theta",
+    "fixed": "rho=1, no theta",
+    "learned": "one theta per seed shared across both macro layers; rho=sigmoid(theta), initial .5",
+    "eta": "graph: .5/max_intra_degree; local: .5/max_weighted_degree_inside_each_ego",
+    "gamma": "graph: .5/max_unit_K_degree; edge: .5/max(unit_K_endpoint_degrees)",
+    "local_degree_weight": "2/(degree_in_induced_ego[source]+degree_in_induced_ego[target])",
+    "zero_operator_step": 0,
+    "learned_C": false,
+    "learned_cross_edge_weights": false,
+    "scalar_E_J_lift": false,
+    "dense_global_matrix": false,
+    "normalization": "intra graph/local crossed with cross graph/edge, matched off per C/intra",
+    "energy_convention": "one_half_trace_Y_transpose_applied_S_or_G_Y",
+    "channel_interpretation": "feature vector per seed, not independent replicates",
+    "off_cross_diagnostic_reference": "graph G; cross inactive in forward, no theta",
+    "cross_degree_source": "original unit canonical K before any normalization",
+    "maximum_applied_weighted_degree": 0.5,
+    "exact_delta": "-rho M S G S RZ",
+    "normalized_symmetric_cross_laplacian": false
+  },
+  "conditions": [
+    "unit__graph__none__off",
+    "unit__graph__graph__fixed",
+    "unit__graph__graph__learned",
+    "unit__graph__edge__fixed",
+    "unit__graph__edge__learned",
+    "unit__local__none__off",
+    "unit__local__graph__fixed",
+    "unit__local__graph__learned",
+    "unit__local__edge__fixed",
+    "unit__local__edge__learned",
+    "local_degree__graph__none__off",
+    "local_degree__graph__graph__fixed",
+    "local_degree__graph__graph__learned",
+    "local_degree__graph__edge__fixed",
+    "local_degree__graph__edge__learned",
+    "local_degree__local__none__off",
+    "local_degree__local__graph__fixed",
+    "local_degree__local__graph__learned",
+    "local_degree__local__edge__fixed",
+    "local_degree__local__edge__learned"
+  ],
+  "capacity": {
+    "disabled_gate_parameters": 0,
+    "learned_gate_parameters_per_seed": 1,
+    "fixed_gate_parameters_per_seed": 0,
+    "expected_parameters_per_seed": {
+      "DEBUG-Cora": {
+        "off": 120,
+        "fixed": 120,
+        "learned": 121
+      },
+      "DEBUG-CiteSeer": {
+        "off": 120,
+        "fixed": 120,
+        "learned": 121
+      },
+      "DEBUG-PubMed": {
+        "off": 120,
+        "fixed": 120,
+        "learned": 121
+      }
+    }
+  },
+  "training": {
+    "location": "server_only",
+    "optimizer": "Adam",
+    "learning_rate_candidates": [
+      0.003,
+      0.01
+    ],
+    "weight_decay": 0.0005,
+    "weight_decay_scope": "projection_weight_matrices_only",
+    "optimizer_betas": [
+      0.9,
+      0.999
+    ],
+    "optimizer_epsilon": 1e-08,
+    "epochs_per_run": 3,
+    "updates_per_epoch": 1,
+    "physical_graph_batch_per_run": 1,
+    "gradient_accumulation_steps": 1,
+    "data_parallel_replicas_per_run": 1,
+    "effective_graph_batch_per_run": 1,
+    "early_stopping": false,
+    "scheduler": false,
+    "gradient_clipping": false,
+    "precision": "float32",
+    "tf32": false,
+    "tuning_seeds": [
+      101,
+      202
+    ],
+    "final_seeds": [
+      11,
+      23
+    ],
+    "checkpoint_selection": [
+      "minimum_validation_CE_without_L2",
+      "maximum_validation_accuracy",
+      "earliest_epoch"
+    ],
+    "lr_selection": "minimum_mean_selected_validation_CE_then_smaller_lr",
+    "tuning_runs": 240,
+    "final_runs": 120,
+    "total_runs": 360,
+    "total_updates": 1080,
+    "test_evaluation_during_tuning": false,
+    "diagnostic_every_epochs": 1,
+    "gate_weight_decay": 0,
+    "gate_gradient_every_epoch": true,
+    "gate_update_every_epoch": true,
+    "layer_diagnostics_epochs": "epoch1, every diagnostic interval, final epoch; selected frozen checkpoint"
+  },
+  "evaluation": {
+    "primary": "test_accuracy",
+    "secondary": "test_CE",
+    "unit": "initialization_seed_on_fixed_public_split",
+    "summary": [
+      "each_seed",
+      "mean",
+      "sample_std",
+      "paired_differences",
+      "paired_95_percent_t_interval_with_fixed_split_scope"
+    ],
+    "comparisons": [
+      "same_C_intra_cross_on_minus_off",
+      "same_C_intra_cross_learned_minus_fixed",
+      "same_C_intra_variant_edge_minus_graph",
+      "same_C_cross_variant_local_minus_graph",
+      "same_intra_cross_variant_local_degree_minus_unit"
+    ],
+    "frozen_interventions": [
+      "gain0",
+      "gain1"
+    ],
+    "intervention_scopes": [
+      "layer_0",
+      "layer_1",
+      "both"
+    ],
+    "retrained_ablation": "all twenty conditions trained fresh; legacy six included but old metrics never pooled",
+    "scope": "exploratory_same_public_split_after_prior_results_not_independent_graph_generalization",
+    "global_reconstruction_accuracy_claim": false,
+    "interventions_only_for_enabled_cross_conditions": true,
+    "predeclared_direct_contrasts": 52,
+    "predeclared_interaction_contrasts": 12
+  },
+  "resources": {
+    "gpu": "assigned_A6000_actual_allocation_measured",
+    "parallel_tuning_run_candidates": [
+      1,
+      2
+    ],
+    "parallel_final_run_candidates": [
+      1,
+      2
+    ],
+    "preprocessing_worker_candidates": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "seeds": "packed_leading_axis_with_independent_parameters_and_adam_state",
+    "packed_loss": "sum_of_per_replica_train_node_mean_CE",
+    "static_cache": true,
+    "epoch_dataloader": "N/A_for_resident_GPU_data",
+    "relations": "all induced local edges and every canonical shared-copy link; no subset",
+    "large_relations": "exact edge chunking symmetric custom backward; macro activation checkpointing",
+    "multi_gpu_if_allocated": "partition_dataset_condition_lr_groups",
+    "calibration": "separate_updates_restore_initial_states_before_training",
+    "ETA": "derived_from_measured_epoch_throughput",
+    "same_terminal_progress_and_logfile": true,
+    "new_output_directory": true
+  },
+  "runtime": {
+    "calibration_warmups": 1,
+    "calibration_repeats": 1,
+    "relation_chunk_candidates": [
+      16,
+      64
+    ],
+    "resume_every_epochs": 1,
+    "gpu_memory_safety_fraction": 0.85,
+    "cpu_threads": 1,
+    "cpu_workers": "auto",
+    "activation_checkpointing": true
+  },
+  "debug_fixture": {
+    "nodes": [
+      24,
+      30,
+      36
+    ],
+    "features": 12,
+    "classes": 3,
+    "train_per_class": 3,
+    "validation_nodes": 6,
+    "master_seed": 20261003
+  },
+  "selection_question": "Does local intra normalization or degree-aware cross normalization change the additional classification effect of copy coupling?"
+}

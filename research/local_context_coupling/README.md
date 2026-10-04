@@ -56,3 +56,14 @@ Cora·CiteSeer·PubMed 전체 그래프에서 조건별 500 epoch,
 - [실험 계약](classification/EXPERIMENT_DESIGN.md)
 - [서버 본학습 명령과 결과 확인](classification/RUN.md)
 - [분류 코드 검증 기록](classification/VERIFICATION.md)
+
+## 후속: 내부·교차 정규화 분리
+
+[normalization](normalization/README.md)은 기존 여섯 조건을 보존하고 다시 학습하면서,
+로컬별 내부 step과 연결 양끝 degree를 반영한 교차 step을 비교한다.
+20조건 각각에서 같은 내부 연산의 off 대조를 유지한다.
+전체 citation 데이터·2층·hidden64·500 epoch·기존 LR와 seed 범위를 유지하며,
+540회 tuning과 300회 final 학습을 서버에서 실행한다.
+
+- [새 서버 실행·결과 확인](normalization/RUN.md)
+- [새 연산 수식](normalization/MODEL_MATH.md)
