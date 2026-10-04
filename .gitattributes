@@ -3,6 +3,7 @@
 # Preserve the recorded bytes (including CSV line endings) of curated evidence.
 docs/evidence/receiver_aggregation_server_full_20261004.txt -text whitespace=cr-at-eol
 docs/evidence/local_prediction_server_full_20261004.txt -text whitespace=cr-at-eol
+docs/evidence/local_prediction_layer_removal_server_20261004.txt -text
 research/conductance_gat/results/summary.json -text
 research/conductance_gat/results/isotropic_history.csv -text
 research/conductance_gat/results/learned_history.csv -text

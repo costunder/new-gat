@@ -65,7 +65,7 @@
 | [수신 집계 서버 FULL 결과](RECEIVER_AGGREGATION_SERVER_FINDINGS_20261004.md) | 201개 완료 원문, 실제 q/E/J 재구성 수치와 다음 국소 예측 질문 |
 | [로컬 E/J 실제 예측 실험](../research/local_energy_relations/prediction/README.md) | 같은 두 홉 기본 전파의 base/E/J/both × 두 고정 C, 전체 citation 3개·336회 학습·서버 실행 |
 | [로컬 E/J 예측 구현 검증](LOCAL_PREDICTION_VERIFICATION_20261004.md) | 독립 수식·미분·학습·이어하기·평가 검사와 CUDA DEBUG 실행 |
-| [로컬 E/J 예측 서버 FULL 결과](LOCAL_PREDICTION_SERVER_FINDINGS_20261004.md) | 336회 완료 원문, 실제 분기 사용과 기본 대비 정확도 차이, 기존 층별 제거의 후속 확인 |
+| [로컬 E/J 예측 서버 FULL 결과](LOCAL_PREDICTION_SERVER_FINDINGS_20261004.md) | 336회 완료 원문, 기본 대비 정확도와 첫 층·출력층 제거 결과, 주입 위치 대조 제안 |
 
 ## GPT 전체 프로젝트 전달 묶음
 
