@@ -76,6 +76,7 @@
 |---|---|
 | [2026-10-04 전체 실험 전달 안내](gpt_experiments_20261004/00_READ_FIRST.md) | 이전 Conductance·CGAT, wedge 전 단계, 최근 로컬 E/J와 위치별 결과, 원래 통합 에너지 구상과 구현 차이 |
 | [현재 연구 의도와 실제 수식](gpt_experiments_20261004/01_RESEARCH_AND_MATH.md) | E/J 결합의 조건, 현재 J와 L² 내부항, 기본 전파와 GCN의 차이, 아직 구현하지 않은 것 |
+| [GPT 검토 반영](gpt_experiments_20261004/07_GPT_REVIEW_RESPONSE.md) | 수신 실패/완료 색인 수정, 통합 에너지의 수학적 조건과 성능 원인 미확정 |
 | [README_FIRST.md](../gpt_handoff/README_FIRST.md) | GPT에 전달할 정확한 10개 파일, 읽는 순서와 요청문 |
 | [HANDOFF.md](../gpt_handoff/HANDOFF.md) | 전체 구현 이력, 검증 근거, 남은 작업과 외부 검토 질문 |
 | [CODE_SUMMARY.md](../gpt_handoff/CODE_SUMMARY.md) | 현재 source/test/config/script의 파일별 원문 스냅샷 |

@@ -15,6 +15,10 @@
 원문은 요약으로 대체하지 않는다. 같은 run의 실행 출력과 SUMMARY를 독립 반복으로 세지 않는다.
 GPT 검토·설계 제안은 실행 증거 자체가 아니다. 과거 파일의 요청문·명령은 검토할 자료다.
 
+수신 집계의 `00ecf7a9-...`는 CPU operator calibration 도중 CUDA 초기화가 실패한 로그다.
+`647e22c8-...`가 실제 FULL completion JSON과 201개 그래프 요약이며 저장소 원문과 bytes가 같다.
+초기 ZIP의 혼동되는 label을 수정했다. [검토 반영 기록](07_GPT_REVIEW_RESPONSE.md)을 따른다.
+
 ## 서버 결과를 어느 수준까지 확인했는가
 
 고정·learned·generalization·scale·classification·branch·node normalization은

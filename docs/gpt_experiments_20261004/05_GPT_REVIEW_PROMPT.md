@@ -7,6 +7,7 @@
 첨부 ZIP은 지금까지 진행한 실험 코드·수식·설정·검증 기록·서버 결과 원문입니다.
 먼저 00_READ_FIRST.md와 01_RESEARCH_AND_MATH.md를 읽고,
 04_LOCAL_HISTORY.md → 02_WEDGE_HISTORY.md → 03_EARLIER_HISTORY.md → 06_EVIDENCE_AND_LIMITS.md 순서로 확인해 주세요.
+후속 검토와 원문 색인 수정은 07_GPT_REVIEW_RESPONSE.md에 있습니다.
 현재 코드 확인은 repository/research/local_energy_relations/placement/model.py,
 재사용하는 prediction/operators.py, 각 MODEL_MATH.md에서 시작하세요.
 결과 수치는 evidence/attachments/와 repository/docs/evidence/의 원문에 대조하세요.

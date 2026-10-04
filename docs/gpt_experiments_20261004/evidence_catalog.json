@@ -5,9 +5,11 @@
     {"id":"d45c6de6-b684-43fb-ac8e-263d7d1bc542","label":"wedge_gpt_review","kind":"advisory","required":true},
     {"id":"66944be6-db4b-4e4f-9d21-c2c09f4f3cd6","label":"local_energy_research_direction","kind":"advisory","required":true},
     {"id":"af5804c5-a6ba-4cae-88da-7b0d0734be14","label":"local_energy_fixed_full","kind":"server_report","required":true},
-    {"id":"00ecf7a9-5c65-4eb3-8370-ed8ee4b864ad","label":"receiver_aggregation_full","kind":"server_report","required":true},
-    {"id":"647e22c8-116d-4f15-a7ef-c376fca5db99","label":"receiver_terminal_followup","kind":"server_excerpt","required":true},
+    {"id":"00ecf7a9-5c65-4eb3-8370-ed8ee4b864ad","label":"receiver_aggregation_cuda_initialization_failure","kind":"server_failure_log","required":true},
+    {"id":"647e22c8-116d-4f15-a7ef-c376fca5db99","label":"receiver_aggregation_full_completion","kind":"server_report","required":true},
     {"id":"01f0a7cb-cfc0-4f57-a388-28ca06bca17a","label":"local_prediction_full","kind":"server_report","required":true},
-    {"id":"07fd0337-612a-4c97-aa7a-80b1671c6c03","label":"local_placement_full_summary","kind":"server_summary_without_raw_completion","required":true}
+    {"id":"07fd0337-612a-4c97-aa7a-80b1671c6c03","label":"local_placement_full_summary","kind":"server_summary_without_raw_completion","required":true},
+    {"id":"a0d53a07-449c-48b7-9e9e-2907bd9e47f0","label":"all_experiments_gpt_review","kind":"advisory","required":true},
+    {"id":"e48b0e76-f31c-4bd1-a317-0770ce2537e9","label":"integrated_energy_gpt_followup","kind":"advisory","required":true}
   ]
 }

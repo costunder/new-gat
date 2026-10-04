@@ -19,6 +19,7 @@ DOCS = (
     "00_READ_FIRST.md", "01_RESEARCH_AND_MATH.md", "04_LOCAL_HISTORY.md",
     "02_WEDGE_HISTORY.md", "03_EARLIER_HISTORY.md", "06_EVIDENCE_AND_LIMITS.md",
     "05_GPT_REVIEW_PROMPT.md",
+    "07_GPT_REVIEW_RESPONSE.md",
 )
 LEGACY_DIRS = (
     "experiments/information_flow_v2", "gpt_handoff_v2_20260928",
@@ -207,7 +208,7 @@ def main():
 
         content = re.sub(r"\[([^\]\n]+)\]\(([^)\n]+)\)", rewrite, original.decode("utf-8-sig"))
         add(filename, content.encode("utf-8"), "review_document_with_archive_links", source.relative_to(ROOT).as_posix())
-    add("REVIEW_ALL.md", b"\n\n---\n\n".join(entries[name] for name in DOCS), "combined_review", "Seven documents in reading order")
+    add("REVIEW_ALL.md", b"\n\n---\n\n".join(entries[name] for name in DOCS), "combined_review", "Review documents in declared reading order")
     add("GPT_REVIEW_PROMPT.md", entries["05_GPT_REVIEW_PROMPT.md"], "review_prompt", "Same as 05_GPT_REVIEW_PROMPT.md")
     add("EVIDENCE_INDEX.json", encode({"attachments": evidence, "local_history": local_history,
         "recent_server_raw_checkpoints_included": False, "recent_server_seed_csv_included": False,

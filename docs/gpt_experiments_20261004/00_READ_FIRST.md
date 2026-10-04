@@ -30,11 +30,15 @@ GCN과 동일한 조건의 직접 비교도 최근 E/J 실험에는 없다.
 4. [Conductance·C 학습·Cycle PE·Tree 등 이전 이력](03_EARLIER_HISTORY.md)
 5. [원문 출처와 확인 범위](06_EVIDENCE_AND_LIMITS.md)
 6. [GPT에 보낼 요청문](05_GPT_REVIEW_PROMPT.md)
+7. [GPT 검토 반영과 원문 색인 수정](07_GPT_REVIEW_RESPONSE.md)
 
 `REVIEW_ALL.md`는 위 문서를 합쳐 놓은 읽기용 파일이다.
 ZIP의 `repository/`에는 코드·수식·설정·테스트·기존 결과 문서,
 `evidence/attachments/`에는 수령한 첨부 원문이 있다.
 `MANIFEST.json`은 파일별 출처·bytes·SHA-256, `PACKAGE_CHECKS.json`은 묶음 검사 결과다.
+
+후속 검토에서 수신 집계의 실패 첨부와 완료 첨부에 붙인 색인 이름을 바로잡았다.
+수신 집계 완료 원문 자체와 기존 실험 수치는 변경하지 않았다.
 
 ## 확인 수준
 
