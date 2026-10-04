@@ -114,6 +114,10 @@ CE 일부 마지막 표시 자리는 다르며 원시 checkpoint·CSV가 없어 
 분기별 학습 파라미터 64개를 그대로 맞춰 채널 요약 방식의 차이를 비교할 수 있다.
 스칼라 요약이 성능 부진의 원인이라는 결론은 아직 없으며, 이 대조는 설계 제안이다.
 
+후속 논의에서는 E/J를 같은 통합 에너지의 내부항·교차항으로 구성한다는 연구 의도를 다시 확인했다.
+현재 J와 E가 그 결합을 직접 구현하지 않으므로, 채널별 대조에 앞서 에너지 정의와 실제 전파 연결을 정리해야 한다.
+이 차이는 [전체 실험 전달용 수식 정리](gpt_experiments_20261004/01_RESEARCH_AND_MATH.md)에 기록했다.
+
 [전체 원문](evidence/local_placement_server_full_20261004.txt) ·
 [구현 검증](LOCAL_PLACEMENT_VERIFICATION_20261004.md) ·
 [앞선 두 층 분류 결과](LOCAL_PREDICTION_SERVER_FINDINGS_20261004.md).

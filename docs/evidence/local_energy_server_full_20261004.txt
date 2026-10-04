@@ -1,0 +1,148 @@
+
+(new-gat) aicompetition07@ece-a6gpu6:~/new-gat$ LOCAL_ENERGY_RUN=/home/aicompetition07/new-gat/results/local-energy-20261004-002815
+cat "$LOCAL_ENERGY_RUN/completion.json"
+cat "$LOCAL_ENERGY_RUN/LOCAL_ENERGY_RELATIONS_SUMMARY.md"
+{
+  "status": "complete",
+  "profile": "full",
+  "debug": false,
+  "graphs": 201,
+  "synthetic_graphs": 198,
+  "citation_graphs": 3,
+  "actual_citation_graphs": 3,
+  "synthetic_scalar_inputs": 3168,
+  "sampling_ratio": 1.0,
+  "all_nodes_edges_features": true,
+  "states": [
+    "H0",
+    "H1",
+    "H2"
+  ],
+  "weights": [
+    "unit",
+    "local_degree"
+  ],
+  "relations": [
+    "shared_edges",
+    "shared_nodes",
+    "distinct_edges"
+  ],
+  "trainable_parameters": 0,
+  "optimizer_updates": 0,
+  "classifier_training_run": false,
+  "known_C_all_nodes_recovery_only": true,
+  "raw_rows": {
+    "local": 1199952,
+    "relation": 17961240,
+    "transfer": 3592248,
+    "temporal": 799968
+  },
+  "source_digest": "6342eb5da8d8ca2e54557d3058605924db63946290e2b70b8d394f81429b0265",
+  "source_and_inputs_preserved": true,
+  "physical_graph_batch_selected": 198,
+  "elapsed_seconds": 563.8261359580792
+}
+# 로컬 에너지·집합 사이 관계 감사
+
+Profile: **full**. 측정 그래프 201개, 실제 citation 3개.
+Trainable parameters: **0**. Epoch/optimizer updates: **해당 없음**.
+모든 원래 노드·엣지·특징을 사용한 고정 연산 감사다. 분류 성능 결과가 아니다.
+FULL 원래 입력의 측정 결과다. 실행 성공 여부와 CG/coverage 검사는 completion 기록을 함께 확인한다.
+
+## 계산과 해석
+
+각 중심의 1홉 **induced graph**에는 이웃끼리의 원래 엣지도 들어 있다.
+`q=C BH`, `d=Bᵀq`이며 내부 에너지는 `Σc||BH||²`, flow 제곱 norm은 `Σc²||BH||²`다.
+서로 다른 로컬 그래프의 관계는 공통 엣지 내적과 `qvᵀ(Bv_global Bu_globalᵀ)qu`다.
+`Jnode=2Jshared+Jdistinct`이며 distinct 항의 부호를 유지한다.
+H0/H1/H2는 공통 global Laplacian 좌표의 두 고정 확산 단계다. 학습 층이 아니다.
+
+Euclidean cycle 성분은 실제 q에서 계산했다. 알려진 양의 C와 모든 로컬 노드 집계를
+관측한 `q=CBH`의 복원은 별도 검사다.
+cycle 성분이 있는 것을 복구 불가능한 손실과 같게 해석하지 않는다.
+전달 표는 공통 노드로 복사한 d와 남지 않은 d를 기록한다. 부분 관측 역복원을 수행하지 않았다.
+이 복사는 bookkeeping·진단이다. 복사한 d를 H_next에 사용하지 않았으며,
+H1/H2는 전체 물리 라플라시안의 고정 reference 확산에서 얻었다.
+
+## 로컬 에너지와 복원
+
+| graph_id | weight | state | count | energy_sum | flow_norm_sq_sum | cycle_fraction_sq | reconstruction_relative_error_max |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Cora | unit | H0 | 2708 | 1891.0446 | 1891.0446 | 1.4049336e-19 | 2.1088274e-09 |
+| Cora | unit | H1 | 2708 | 1759.4716 | 1759.4716 | 9.019764e-20 | 1.451001e-09 |
+| Cora | unit | H2 | 2708 | 1659.0518 | 1659.0518 | 1.1686287e-19 | 2.043872e-09 |
+| Cora | local_degree | H0 | 2708 | 621.90103 | 276.23821 | 0.012968999 | 1.6749551e-09 |
+| Cora | local_degree | H1 | 2708 | 585.64519 | 261.75061 | 0.012889732 | 1.6489455e-09 |
+| Cora | local_degree | H2 | 2708 | 557.14331 | 250.34145 | 0.012804993 | 1.6485474e-09 |
+| CiteSeer | unit | H0 | 3327 | 640.72285 | 640.72285 | 6.7015462e-20 | 1.6508154e-09 |
+| CiteSeer | unit | H1 | 3327 | 584.52918 | 584.52918 | 5.1685393e-20 | 1.2731489e-09 |
+| CiteSeer | unit | H2 | 3327 | 541.41113 | 541.41113 | 5.563389e-20 | 1.364363e-09 |
+| CiteSeer | local_degree | H0 | 3327 | 259.23156 | 149.94494 | 0.0057060443 | 6.3795076e-10 |
+| CiteSeer | local_degree | H1 | 3327 | 242.75629 | 142.39535 | 0.0054262526 | 6.4479867e-10 |
+| CiteSeer | local_degree | H2 | 3327 | 229.35629 | 136.07361 | 0.005202558 | 6.259384e-10 |
+| PubMed | unit | H0 | 19717 | 7253.1956 | 7253.1956 | 2.5599342e-19 | 4.3914502e-09 |
+| PubMed | unit | H1 | 19717 | 6463.3094 | 6463.3094 | 1.9856412e-19 | 1.765853e-09 |
+| PubMed | unit | H2 | 19717 | 5843.9545 | 5843.9545 | 1.6877301e-19 | 1.5942454e-09 |
+| PubMed | local_degree | H0 | 19717 | 1957.2545 | 1018.0254 | 0.014267517 | 1.0844862e-09 |
+| PubMed | local_degree | H1 | 19717 | 1788.1681 | 942.6956 | 0.01351923 | 1.0616515e-09 |
+| PubMed | local_degree | H2 | 19717 | 1652.6757 | 882.21091 | 0.012881356 | 1.0546926e-09 |
+
+실제 citation은 모든 특징 채널을 합한 vector trace이며 각 채널을 독립 그래프로 세지 않는다.
+합성 데이터의 count는 모든 중심 × 독립 scalar columns다. 서로 다른 입력의 raw 에너지를
+같은 분류 점수로 비교하거나 occurrence 수를 독립 학습 seed 수로 사용하지 않는다.
+
+## 중복 집계
+
+| graph_id | weight | state | energy_raw_local_sum | energy_overlap_corrected_sum | energy_physical_average_sum | energy_physical_unit_sum | identity_abs_error_max |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Cora | unit | H0 | 1891.0446 | 649.61352 | 649.61352 | 649.61352 | 1.2505552e-12 |
+| Cora | unit | H1 | 1759.4716 | 607.5404 | 607.5404 | 607.5404 | 2.2737368e-13 |
+| Cora | unit | H2 | 1659.0518 | 574.78937 | 574.78937 | 574.78937 | 9.094947e-13 |
+| Cora | local_degree | H0 | 621.90103 | 230.05348 | 230.05348 | 649.61352 | 1.1368684e-13 |
+| Cora | local_degree | H1 | 585.64519 | 217.90415 | 217.90415 | 607.5404 | 1.1368684e-13 |
+| Cora | local_degree | H2 | 557.14331 | 208.12058 | 208.12058 | 574.78937 | 3.4106051e-13 |
+| CiteSeer | unit | H0 | 640.72285 | 236.65637 | 236.65637 | 236.65637 | 6.2527761e-13 |
+| CiteSeer | unit | H1 | 584.52918 | 218.90549 | 218.90549 | 218.90549 | 8.5265128e-14 |
+| CiteSeer | unit | H2 | 541.41113 | 204.88483 | 204.88483 | 204.88483 | 5.6843419e-14 |
+| CiteSeer | local_degree | H0 | 259.23156 | 108.08671 | 108.08671 | 236.65637 | 1.4210855e-14 |
+| CiteSeer | local_degree | H1 | 242.75629 | 102.10807 | 102.10807 | 218.90549 | 4.2632564e-14 |
+| CiteSeer | local_degree | H2 | 229.35629 | 97.104642 | 97.104642 | 204.88483 | 4.2632564e-14 |
+| PubMed | unit | H0 | 7253.1956 | 2585.8757 | 2585.8757 | 2585.8757 | 3.5015546e-11 |
+| PubMed | unit | H1 | 6463.3094 | 2345.5339 | 2345.5339 | 2345.5339 | 6.8212103e-12 |
+| PubMed | unit | H2 | 5843.9545 | 2154.2423 | 2154.2423 | 2154.2423 | 1.3187673e-11 |
+| PubMed | local_degree | H0 | 1957.2545 | 792.35083 | 792.35083 | 2585.8757 | 1.3073986e-11 |
+| PubMed | local_degree | H1 | 1788.1681 | 733.23284 | 733.23284 | 2345.5339 | 1.2505552e-12 |
+| PubMed | local_degree | H2 | 1652.6757 | 685.1111 | 685.1111 | 2154.2423 | 1.8189894e-12 |
+
+raw 합은 여러 ego에서 같은 물리 엣지를 반복해서 센다.
+inverse-occurrence 보정은 물리 엣지별 평균 C를 사용한 에너지와 일치한다.
+unit 조건에서만 이 보정 에너지가 원래 unit 물리 에너지와 같다.
+
+## 모든 측정과 자원
+
+- [그래프 입력·feature mode](graph_summary.csv)
+- [모든 로컬 에너지·cycle·known-C 복원](local_summary.csv)
+- [모든 방향·같은 단계/교차 단계 관계와 부호](relation_summary.csv)
+- [노드 전달 및 retained/boundary/omitted 엣지 norm](transfer_summary.csv)
+- [물리 에너지와 중복 보정](assembly_summary.csv)
+- [실제 calibration·execution 자원 기록](resources.json)
+
+과학 그림은 모든 graph macro rows를 사용한다. 큰 점은 실제 citation이다.
+zero-flow에서 정의되지 않는 상대 비율은 0으로 채우지 않고 undefined로 기록한다.
+
+![energy versus flow](figures/energy_vs_flow.png)
+
+![cycle versus restricted recovery](figures/cycle_and_reconstruction.png)
+
+![signed local relations](figures/signed_relations.png)
+
+PNG와 같은 이름의 PDF는 독립적으로 저장했다.
+CSV 수: graph=201, local=1206, relation=6834,
+transfer=1206, assembly=1206.
+
+## 남은 연구 질문
+
+C/W는 학습하지 않았다. encoder·분류기·CE·예측에 연결한 관계 항도 없다.
+항등식 검사를 통과한 것을 학습된 새 메시지 패싱의 성능, GATv2 대체, 전체 cycle 정보 복원의
+성공이나 선행 연구 대비 신규성으로 주장하지 않는다. 다음 학습 범위는 이 감사 결과를 읽은 뒤 정한다.
+(new-gat) aicompetition07@ece-a6gpu6:~/new-gat$
