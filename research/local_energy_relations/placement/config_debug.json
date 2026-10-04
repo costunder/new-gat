@@ -1,0 +1,323 @@
+{
+  "schema": "local-energy-placement-design-v1",
+  "experiment": "local_energy_relation_placement",
+  "status": "runnable",
+  "date": "2026-10-04",
+  "profile": "debug",
+  "data_source": "debug_fixture",
+  "data": {
+    "datasets": [
+      "DEBUG-Cora",
+      "DEBUG-CiteSeer",
+      "DEBUG-PubMed"
+    ],
+    "split": "public",
+    "setting": "transductive_full_graph",
+    "features": "row_sum_normalize_preserve_zero_rows",
+    "physical_graph": "simple_undirected_no_self_loops_or_reciprocal_duplicates",
+    "sampling_ratio": 1,
+    "all_nodes": true,
+    "all_physical_edges": true,
+    "all_induced_one_hop_egos": true,
+    "all_directed_adjacent_center_pairs": true,
+    "raw_and_processed_sha256_required": true,
+    "expected_shapes": {
+      "DEBUG-Cora": {
+        "nodes": 24,
+        "features": 12,
+        "classes": 3,
+        "train": 9,
+        "validation": 6,
+        "test": 9
+      },
+      "DEBUG-CiteSeer": {
+        "nodes": 30,
+        "features": 12,
+        "classes": 3,
+        "train": 9,
+        "validation": 6,
+        "test": 15
+      },
+      "DEBUG-PubMed": {
+        "nodes": 36,
+        "features": 12,
+        "classes": 3,
+        "train": 9,
+        "validation": 6,
+        "test": 21
+      }
+    }
+  },
+  "source": {
+    "required_experiment": "local_energy_relations_initial_audit",
+    "required_status": "complete",
+    "profile": "debug",
+    "graphs": 21,
+    "synthetic_graphs": 18,
+    "synthetic_scalar_inputs": 72,
+    "citation_graphs": 3,
+    "actual_citation_graphs": 0,
+    "whole_prior_audit_preserved": true,
+    "synthetic_graphs_used_for_training": 0,
+    "reuse_exact_citation_features_edges_and_topology": true,
+    "labels_and_public_masks_loaded_from_pinned_raw": true
+  },
+  "backbone": {
+    "layers": 2,
+    "hidden_dim": 8,
+    "projection_bias": false,
+    "dropout_probability": 0.5,
+    "dropout_placement": "before_each_projection",
+    "activation": "relu_after_first_update_only",
+    "output": "second_layer_logits",
+    "initialization": "xavier_uniform_projection_weights_zero_initial_lift_vectors",
+    "shared_initialization_and_dropout_streams": true,
+    "alpha": "sigmoid(u); initial=0.5",
+    "extra_projection": false
+  },
+  "operators": {
+    "local": "q_v=C_v B_v R_v Z; d_v=B_v.T q_v",
+    "weights": [
+      "unit",
+      "local_degree"
+    ],
+    "local_degree_weight": "2/(degree_in_induced_ego[source]+degree_in_induced_ego[target])",
+    "base": "(1-alpha)*Z+alpha*(P_C@P_C@Z)",
+    "P_C": "receiver_center_positive_weighted_neighbor_row_mean; isolate_row_identity",
+    "within_raw": "E_v=sum_e c_v[e]*sum_f (B_v R_v Z)[e,f]**2",
+    "within_feature": "E_v/(2*F*sum_e c_v[e]); zero_if_no_local_edges",
+    "between_primary": "J_node(v,u)=sum_a_in_shared_nodes sum_f d_v[a,f]*d_u[a,f]",
+    "between_pair_feature": "J_node(v,u)/(F*sqrt(trace(L_v**2)*trace(L_u**2))); zero_if_zero_topology_denominator",
+    "between_receiver_feature": "mean_of_all_incoming_adjacent_sender_pair_features; zero_for_isolates",
+    "lift": "one_active_trainable_vector_per_enabled_energy_or_relation_branch_per_layer",
+    "update": "base+within_feature[:,None]*within_vector+between_receiver_feature[:,None]*between_vector",
+    "normalization": "topology_only_no_feature_RMS",
+    "learned_C": false,
+    "global_inverse_in_forward": false,
+    "relation_sign_preserved": true,
+    "correspondence": "original_shared_node_ID",
+    "channel_interpretation": "one_vector_trace_per_seed_not_independent_channel_replicates"
+  },
+  "conditions": [
+    "unit__base",
+    "unit__within__hidden",
+    "unit__within__output",
+    "unit__within__all",
+    "unit__between__hidden",
+    "unit__between__output",
+    "unit__between__all",
+    "unit__both__hidden",
+    "unit__both__output",
+    "unit__both__all",
+    "local_degree__base",
+    "local_degree__within__hidden",
+    "local_degree__within__output",
+    "local_degree__within__all",
+    "local_degree__between__hidden",
+    "local_degree__between__output",
+    "local_degree__between__all",
+    "local_degree__both__hidden",
+    "local_degree__both__output",
+    "local_degree__both__all"
+  ],
+  "capacity": {
+    "added_parameters": "per_enabled_branch: hidden=hidden_dim; output=num_classes; all=hidden_dim+num_classes; both doubles this",
+    "disabled_branch_parameters": 0,
+    "expected_parameters_per_seed": {
+      "DEBUG-Cora": {
+        "base": 122,
+        "within__hidden": 130,
+        "within__output": 125,
+        "within__all": 133,
+        "between__hidden": 130,
+        "between__output": 125,
+        "between__all": 133,
+        "both__hidden": 138,
+        "both__output": 128,
+        "both__all": 144
+      },
+      "DEBUG-CiteSeer": {
+        "base": 122,
+        "within__hidden": 130,
+        "within__output": 125,
+        "within__all": 133,
+        "between__hidden": 130,
+        "between__output": 125,
+        "between__all": 133,
+        "both__hidden": 138,
+        "both__output": 128,
+        "both__all": 144
+      },
+      "DEBUG-PubMed": {
+        "base": 122,
+        "within__hidden": 130,
+        "within__output": 125,
+        "within__all": 133,
+        "between__hidden": 130,
+        "between__output": 125,
+        "between__all": 133,
+        "both__hidden": 138,
+        "both__output": 128,
+        "both__all": 144
+      }
+    },
+    "interpretation": "placement_and_active_parameter_count_change; scalar_features_not_information_reconstruction"
+  },
+  "training": {
+    "location": "server_only",
+    "optimizer": "Adam",
+    "learning_rate_candidates": [
+      0.003,
+      0.01
+    ],
+    "weight_decay": 0.0005,
+    "weight_decay_scope": "projection_weight_matrices_only",
+    "optimizer_betas": [
+      0.9,
+      0.999
+    ],
+    "optimizer_epsilon": 1e-08,
+    "epochs_per_run": 3,
+    "updates_per_epoch": 1,
+    "physical_graph_batch_per_run": 1,
+    "gradient_accumulation_steps": 1,
+    "data_parallel_replicas_per_run": 1,
+    "effective_graph_batch_per_run": 1,
+    "early_stopping": false,
+    "scheduler": false,
+    "gradient_clipping": false,
+    "precision": "float32",
+    "tf32": false,
+    "tuning_seeds": [
+      101,
+      202
+    ],
+    "final_seeds": [
+      11,
+      23
+    ],
+    "checkpoint_selection": [
+      "minimum_validation_CE_without_L2",
+      "maximum_validation_accuracy",
+      "earliest_epoch"
+    ],
+    "lr_selection": "minimum_mean_selected_validation_CE_then_smaller_lr",
+    "tuning_runs": 240,
+    "final_runs": 120,
+    "total_runs": 360,
+    "total_updates": 1080,
+    "test_evaluation_during_tuning": false
+  },
+  "evaluation": {
+    "primary": "test_accuracy",
+    "secondary": "test_CE",
+    "unit": "initialization_seed_on_fixed_public_split",
+    "summary": [
+      "each_seed",
+      "mean",
+      "sample_std",
+      "paired_differences",
+      "paired_95_percent_t_interval_with_fixed_split_scope"
+    ],
+    "comparisons": [
+      "within_minus_base",
+      "between_minus_base",
+      "both_minus_base",
+      "both_minus_within",
+      "both_minus_between",
+      "both_minus_sum_of_single_branch_effects",
+      "hidden_minus_all_same_variant",
+      "output_minus_all_same_variant",
+      "hidden_minus_output_same_variant"
+    ],
+    "frozen_interventions": [
+      "within_remove",
+      "between_remove",
+      "both_remove"
+    ],
+    "intervention_scopes": [
+      "layer_0",
+      "layer_1",
+      "both"
+    ],
+    "interventions_only_for_enabled_branches": true,
+    "retrained_ablation": "base_once_per_C_and_three_branch_variants_at_each_of_three_placements_independently_trained",
+    "scope": "exploratory_fixed_public_split_not_independent_graph_generalization",
+    "global_reconstruction_accuracy_claim": false,
+    "interventions_only_for_enabled_layers": true
+  },
+  "resources": {
+    "gpu": "assigned_A6000_actual_allocation_measured",
+    "parallel_tuning_run_candidates": [
+      1,
+      2
+    ],
+    "parallel_final_run_candidates": [
+      1,
+      2
+    ],
+    "preprocessing_worker_candidates": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "seeds": "packed_leading_axis_with_independent_parameters_and_adam_state",
+    "packed_loss": "sum_of_per_replica_train_node_mean_CE",
+    "static_cache": true,
+    "epoch_dataloader": "N/A_for_resident_GPU_data",
+    "relations": "all_original_shared_nodes_all_directed_adjacent_center_pairs",
+    "large_relations": "exact_chunking_and_checkpointing",
+    "multi_gpu_if_allocated": "partition_dataset_condition_lr_groups",
+    "calibration": "separate_updates_restore_initial_states_before_training",
+    "ETA": "derived_from_measured_epoch_throughput",
+    "same_terminal_progress_and_logfile": true,
+    "new_output_directory": true
+  },
+  "runtime": {
+    "calibration_warmups": 1,
+    "calibration_repeats": 1,
+    "relation_chunk_candidates": [
+      16,
+      64
+    ],
+    "resume_every_epochs": 1,
+    "gpu_memory_safety_fraction": 0.85,
+    "cpu_threads": 1,
+    "cpu_workers": "auto"
+  },
+  "debug_fixture": {
+    "nodes": [
+      24,
+      30,
+      36
+    ],
+    "features": 12,
+    "classes": 3,
+    "train_per_class": 3,
+    "validation_nodes": 6,
+    "master_seed": 20261003
+  },
+  "placement": {
+    "question": "Does injecting the same E/J features at the hidden or output layer change prediction?",
+    "injection_layers": {
+      "hidden": [
+        0
+      ],
+      "output": [
+        1
+      ],
+      "all": [
+        0,
+        1
+      ],
+      "none": []
+    },
+    "base_once_per_C": true,
+    "fresh_base_and_all_controls": true,
+    "disabled_layer_branch_parameters": 0,
+    "placement_changes_only_active_lift_layers": true,
+    "selection": "each_condition_lr_and_checkpoint_use_validation_only; report_all_placements",
+    "motivation": "exploratory_followup_after_inspecting_previous_fixed_split_test_results"
+  }
+}

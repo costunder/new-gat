@@ -98,3 +98,12 @@ base / 내부 E / 집합 사이 J / E+J를 각각 새로 학습한다.
 수식은 [prediction/MODEL_MATH.md](prediction/MODEL_MATH.md),
 서버 명령과 결과 확인은 [prediction/RUN.md](prediction/RUN.md)에 있다.
 고정 수신 역복원 성공과 실제 로컬 분류 기여는 별도의 검증이다.
+
+## 후속 학습: E/J를 넣는 층 비교
+
+[위치별 재학습](placement/README.md)은 E만·J만·E+J를 첫 층만,
+출력층만, 두 층 모두에 넣어 각각 다시 학습한다.
+두 고정 C의 base를 포함한 20조건에서 기존 두 층·hidden 64·500 epoch를 유지한다.
+전체 840회 학습이며 [서버 실행 명령](placement/RUN.md)과
+[모델 수식](placement/MODEL_MATH.md)을 함께 제공한다.
+기존 예측 코드·checkpoint·결과는 보존한다.

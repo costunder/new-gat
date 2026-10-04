@@ -28,3 +28,9 @@ Full 본학습은 서버에서 실행한다. 진행 상황과 로그 파일을 �
 `completion.json`과 `LOCAL_PREDICTION_SUMMARY.md`만 먼저 보내면 된다.
 요약에는 실제 최종 seed 성능·대응 차이·분기 사용·고정 제거·전체 coverage가 들어간다.
 원시 전체 metric/개입/branch/resource CSV와 checkpoint·hash는 결과 폴더에 남는다.
+
+## 다음 실험
+
+[E/J 위치별 재학습](../placement/README.md)은 같은 E/J를 첫 층만·출력층만·두 층 모두에
+넣어 별도로 학습한다. 이 8조건 구현과 기존 결과를 보존하며,
+새 실험에서는 두 C의 base와 E/J/both × 세 위치를 합친 20조건을 비교한다.

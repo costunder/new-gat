@@ -66,6 +66,8 @@
 | [로컬 E/J 실제 예측 실험](../research/local_energy_relations/prediction/README.md) | 같은 두 홉 기본 전파의 base/E/J/both × 두 고정 C, 전체 citation 3개·336회 학습·서버 실행 |
 | [로컬 E/J 예측 구현 검증](LOCAL_PREDICTION_VERIFICATION_20261004.md) | 독립 수식·미분·학습·이어하기·평가 검사와 CUDA DEBUG 실행 |
 | [로컬 E/J 예측 서버 FULL 결과](LOCAL_PREDICTION_SERVER_FINDINGS_20261004.md) | 336회 완료 원문, 기본 대비 정확도와 첫 층·출력층 제거 결과, 주입 위치 대조 제안 |
+| [E/J 위치별 재학습](../research/local_energy_relations/placement/README.md) | 첫 층만·출력층만·두 층 모두 × E/J/both, 두 고정 C와 base의 20조건·840회 서버 학습 |
+| [위치별 실험 구현 검증](LOCAL_PLACEMENT_VERIFICATION_20261004.md) | 이전 대조군과 계산 일치, 활성 파라미터·학습·평가·이어하기 검사와 CUDA DEBUG 범위 |
 
 ## GPT 전체 프로젝트 전달 묶음
 
