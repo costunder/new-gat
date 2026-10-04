@@ -1,0 +1,101 @@
+{
+  "schema": "local-context-coupling-fixed-audit-v1",
+  "experiment": "local_context_coupling_initial_audit",
+  "profile": "debug",
+  "precision": "float64",
+  "source": {
+    "required_experiment": "local_energy_relations_initial_audit",
+    "required_status": "complete",
+    "profile": "debug",
+    "graphs": 21,
+    "synthetic_graphs": 18,
+    "synthetic_scalar_inputs": 72,
+    "citation_graphs": 3,
+    "actual_citation_graphs": 0,
+    "no_regeneration_or_download": true,
+    "reuse_complete_input_and_topology_snapshots": true
+  },
+  "data": {
+    "sampling_ratio": 1.0,
+    "all_nodes_edges_features": true,
+    "all_induced_one_hop_locals": true,
+    "all_original_adjacent_center_pairs": true,
+    "shared_copy_link_once_per_undirected_center_pair": true,
+    "physical_feature_columns": 108,
+    "citation_columns_are_diagnostics_not_independent_replicates": true
+  },
+  "weights": [
+    "unit",
+    "local_degree"
+  ],
+  "states": [
+    "H0",
+    "H1",
+    "H2"
+  ],
+  "operators": {
+    "intra": "A=blockdiag(B_v.T C_v B_v)",
+    "cross": "K=copy_link_incidence.T copy_link_incidence; fixed W=1",
+    "replicate": "R maps one physical H to all existing local copies",
+    "merge": "M=diag(copy_counts)^(-1) R.T",
+    "eta": "0.5/max_intra_weighted_degree_per_physical_graph; zero_for_empty_A",
+    "gamma": "0.5/max_cross_copy_degree_per_physical_graph; zero_for_empty_K",
+    "sandwich": "M(I-eta*A)(I-gamma*K)(I-eta*A)R",
+    "immediate": "M(I-gamma*K)(I-eta*A)R",
+    "persistent_steps": [
+      1,
+      2,
+      3
+    ],
+    "persistent": "M(I-step*(A+K))^steps R",
+    "persistent_step": "0.5/max(intra_degree+cross_degree); same step for on/off",
+    "fixed_coefficients": true,
+    "dense_folded_full_matrix": false
+  },
+  "training": {
+    "trainable_parameters": 0,
+    "optimizer_updates": 0,
+    "classifier_training_run": false,
+    "epochs": "N/A"
+  },
+  "measurement": {
+    "raw_row_unit": "physical_graph_feature_column_weight_reference_state",
+    "dependency": "linear_operator_action_on_every_existing_feature_column_not_full_Jacobian",
+    "graph_reduction": "sum_all_channel_norm_squares_then_form_vector_ratios",
+    "energy_convention": "one_half_Z_transpose_L_Z",
+    "relative_identity_tolerance": 1e-09,
+    "numerically_resolved_relative_threshold": 1e-12,
+    "requires_nonzero_on_all_inputs": false
+  },
+  "runtime": {
+    "cpu_workers": 1,
+    "cpu_threads": "auto",
+    "physical_graph_batch": "auto",
+    "channel_chunk": "auto",
+    "gpu_memory_safety_fraction": 0.75,
+    "preprocessing_worker_candidates": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "cpu_thread_candidates": [
+      1,
+      2,
+      4
+    ],
+    "graph_batch_candidates": [
+      4,
+      8,
+      16
+    ],
+    "channel_chunk_candidates": [
+      4,
+      8,
+      16
+    ],
+    "calibration_warmups": 1,
+    "calibration_repeats": 1,
+    "exclusive_new_output": true
+  }
+}
