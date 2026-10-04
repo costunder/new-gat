@@ -1,0 +1,15 @@
+{
+  "legacy_catalog": "research/wedge_propagation/gpt_handoff/evidence_catalog.json",
+  "previous_catalog": "docs/gpt_experiments_20261004/evidence_catalog.json",
+  "description": "Add the copy-context design discussion and latest server classification to all earlier specifically supplied attachments. Preserve exact original bytes and evidence roles.",
+  "extra_attachments": [
+    {"id":"cf29ca6b-bdd1-48d8-9028-5ee85630f54b","label":"review_corrected_scope","kind":"advisory","required":true},
+    {"id":"0bfc72a3-8ab2-4d09-95a1-16db21d6cc74","label":"shared_nodes_edges_connections_design","kind":"advisory","required":true},
+    {"id":"6c05cc38-25d2-42a9-bc9f-ed4a4de295ef","label":"research_structure_design","kind":"advisory","required":true},
+    {"id":"ac27e75a-ef60-4ebd-9073-9c16e98a33be","label":"overlap_block_problem","kind":"advisory","required":true},
+    {"id":"af71260c-f745-4e04-b454-bda207c0aadf","label":"local_copy_construction_design","kind":"advisory","required":true},
+    {"id":"5c4850bb-bdf6-428d-b6ee-8bac73de44b7","label":"local_copy_revision","kind":"advisory","required":true},
+    {"id":"150fa1d4-6d7b-4742-bbc2-74246de3fd32","label":"copy_nonzero_guarantee_conditions","kind":"advisory","required":true},
+    {"id":"6db6a7aa-e13d-46de-bb58-5259019b90b7","label":"local_context_classification_full","kind":"server_report","required":true}
+  ]
+}

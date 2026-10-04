@@ -76,6 +76,7 @@
 
 | 문서 | 내용 |
 |---|---|
+| [2026-10-04 전체 이론·실험 최신 전달본](gpt_all_research_20261004/00_READ_FIRST.md) | 초기 트랙부터 wedge·로컬 E/J·copy 분류·정규화 DEBUG까지의 전체 이론·실행 근거, GPT 요청문과 원본 자료 지도 |
 | [2026-10-04 전체 실험 전달 안내](gpt_experiments_20261004/00_READ_FIRST.md) | 이전 Conductance·CGAT, wedge 전 단계, 최근 로컬 E/J와 위치별 결과, 원래 통합 에너지 구상과 구현 차이 |
 | [현재 연구 의도와 실제 수식](gpt_experiments_20261004/01_RESEARCH_AND_MATH.md) | E/J 결합의 조건, 현재 J와 L² 내부항, 기본 전파와 GCN의 차이, 아직 구현하지 않은 것 |
 | [GPT 검토 반영](gpt_experiments_20261004/07_GPT_REVIEW_RESPONSE.md) | 수신 실패/완료 색인 수정, 통합 에너지의 수학적 조건과 성능 원인 미확정 |
