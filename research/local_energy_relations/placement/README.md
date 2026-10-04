@@ -13,6 +13,7 @@ dropout, seed, 500 epoch 예산을 유지한다.
 - [모델 수식과 실제 forward](MODEL_MATH.md)
 - [서버 실행·진행·결과 확인·재개](RUN.md)
 - [검증 기록](../../../docs/LOCAL_PLACEMENT_VERIFICATION_20261004.md)
+- [위치별 서버 결과와 해석](../../../docs/LOCAL_PLACEMENT_SERVER_FINDINGS_20261004.md)
 - [앞선 분류 결과와 후속 실험의 근거](../../../docs/LOCAL_PREDICTION_SERVER_FINDINGS_20261004.md)
 
 FULL은 840 runs / 420,000 updates다. 본학습은 서버에서 실행한다.

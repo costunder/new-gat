@@ -77,9 +77,13 @@ CUDA 실행과 재개 때 기록된 source digest는
 CUDA scatter의 수치 변동 범위이며 모델 state 변화와 구분한다.
 개별 run의 원본 파일 byte 보존과 이어하기 거부 조건도 단위 검사했다.
 
-## 아직 실행하지 않은 것
+## 구현 검증 이후 제출된 서버 결과
 
-이 새 840회 FULL 본학습과 실제 citation 성능 평가는 **서버에서 실행해야 한다**.
+이 문서의 앞부분은 본학습 전 수행한 구현·DEBUG 검증 기록이다.
+이후 사용자가 제출한 서버 요약은 tuning 540회·final 300회와 계약 420,000 update를 보고하며,
+60개 조건 요약·18개 상호작용·174개 paired 비교·120개 분기 관측·150개 제거 범위가 포함된다.
+원문과 분석을 [위치별 서버 결과](LOCAL_PLACEMENT_SERVER_FINDINGS_20261004.md)에 기록했다.
+이번 첨부에는 completion.json·원시 CSV·checkpoint가 없어 서버 원시 파일을 독립 검증한 것으로 보고하지 않는다.
 로컬 DEBUG 결과를 최종 분류 성능·새 그래프 일반화·learned C·사이클 정보 복원의 증거로 제출하지 않는다.
 모델의 위치별 lift 폭은 hidden 64 / output K / all 64+K여서 용량도 함께 변한다.
 
