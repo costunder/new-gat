@@ -678,7 +678,7 @@ Local A 이후에는 copy가 문맥별로 달라져 cross가 작용할 수 있�
 \mathcal E(Y)=\tfrac12\operatorname{tr}(Y^\top(A+\lambda K)Y)
 \]
 
-는 결합 copy 에너지다.
+는 λ≥0일 때의 결합 copy 에너지다.
 두 local block에서 K는 음의 off-diagonal과 양의 degree diagonal을 함께 가진다.
 내부·교차의 모든 block이 같은 operator에서 나오므로 PSD인 큰 **copy energy**다.
 이전 scalar E/J readout을 이 식으로 바꿔 읽는 것은 아니다.
