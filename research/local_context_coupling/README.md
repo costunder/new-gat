@@ -42,3 +42,17 @@ Copy를 사용한다고 선형 표현력의 우위나 정보 복원이 자동으
 - [서버 실행·결과 확인](RUN.md)
 - [검증 기록](VERIFICATION.md)
 - [서버 FULL 고정 검증 결과](../../docs/LOCAL_CONTEXT_COUPLING_SERVER_FINDINGS_20261004.md)
+
+## 다음 단계: 실제 노드 분류 학습
+
+[classification](classification/README.md)은 위 고정 감사 다음의 별도 실험이다.
+같은 내부 연산을 유지한 `off / fixed / learned`를 두 C 조건에서 학습한다.
+학습하는 교차 강도 하나의 gradient·실제 update와 두 층의 출력 차이를 기록한다.
+Cora·CiteSeer·PubMed 전체 그래프에서 조건별 500 epoch,
+학습률 선택 162회와 별도 seed의 최종 학습 90회, 총252회·126,000 update다.
+고정 감사와 과거 E/J 실험의 코드·결과를 보존한다.
+
+- [분류 모델 수식](classification/MODEL_MATH.md)
+- [실험 계약](classification/EXPERIMENT_DESIGN.md)
+- [서버 본학습 명령과 결과 확인](classification/RUN.md)
+- [분류 코드 검증 기록](classification/VERIFICATION.md)
