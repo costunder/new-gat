@@ -53,3 +53,4 @@ Off/fixed에는 사용하지 않는 θ 파라미터가 없습니다.
 - [실험 설계와 판단 기준](EXPERIMENT_DESIGN.md)
 - [전체 본학습 설정](config_full.json)
 - [로컬 검증 기록](VERIFICATION.md)
+- [제출된 서버 FULL 결과와 해석](../../../docs/LOCAL_CONTEXT_CLASSIFICATION_SERVER_FINDINGS_20261004.md)

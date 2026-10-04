@@ -1,0 +1,344 @@
+
+(new-gat) aicompetition07@ece-a6gpu6:~/new-gat$ cat "$LOCAL_CONTEXT_CLASS_RUN/completion.json"
+cat "$LOCAL_CONTEXT_CLASS_RUN/LOCAL_CONTEXT_CLASSIFICATION_SUMMARY.md"
+{
+  "completed": true,
+  "profile": "full",
+  "scope": "full_public_split_local_context_coupling_classification",
+  "seconds": 2067.5804731831886,
+  "coverage": {
+    "tuning_runs": 162,
+    "final_runs": 90,
+    "primary_metric_rows": 270,
+    "total_runs": 252,
+    "contract_optimizer_updates": 126000,
+    "all_datasets_conditions_seeds_splits": true,
+    "intervention_rows": 1080,
+    "branch_rows": 900
+  },
+  "new_optimizer_updates": 126000,
+  "actual_data": true,
+  "frozen_model_updates": 0,
+  "code_and_graphs_preserved": true
+}
+# 로컬 문맥 결합: 노드 분류 결과
+
+Profile **FULL**, 실제 citation 데이터 **True**.
+두 macro 층·hidden64·각 500epoch,
+전체 162tuning+90final=252run,
+계약상 독립 optimizer update 126000개다.
+재개 실행의 새 update는 완료 파일의 `new_optimizer_updates`와 구분한다.
+DEBUG이면 별도 fixture의 구현 검사이며 citation 본학습 성능이 아니다.
+
+## 실제 비교
+
+각 층은 투영 특징을 모든 로컬 copy에 복제하고 intra→cross→intra→균등 merge한다.
+두 C조건은 고정 unit/local_degree이며, 학습하는 것은 learned 조건의 seed당 cross 강도 θ 하나다.
+ρ=sigmoid(θ)를 두 macro 층에서 공유한다. Fixed는ρ=1, off는ρ=0이며 θ 파라미터가 없다.
+모든 조건의 내부 전파 두 번·정규화·전체 graph·seed 초기 projection/dropout 규칙을 맞췄다.
+Scalar E/J lift나 learned edge C를 쓰는 모델의 결과로 해석하지 않는다.
+
+## 주 분류 결과
+
+평균±표본 std다. Accuracy는 %, CE는 L2를 제외한 평가 분류 손실이다.
+LR/checkpoint는 validation만으로 선택하고 모든 final 선택을 고정한 뒤 test를 읽었다.
+
+| 데이터 | 조건 | LR | Train acc % | Val acc % | Test acc % | Test CE |
+| --- | --- | --- | --- | --- | --- | --- |
+| Cora | unit__off | 0.01 | 100 ± 0 | 60.52 ± 0.889945 | 58.66 ± 0.606631 | 1.25366 ± 0.00910288 |
+| Cora | unit__fixed | 0.01 | 100 ± 0 | 60.44 ± 0.89889 | 58.72 ± 0.63008 | 1.25366 ± 0.00940333 |
+| Cora | unit__learned | 0.01 | 100 ± 0 | 60.36 ± 0.920871 | 58.6 ± 0.587367 | 1.25368 ± 0.00922062 |
+| Cora | local_degree__off | 0.01 | 100 ± 0 | 76.92 ± 0.109546 | 79.38 ± 0.258845 | 0.747431 ± 0.00597482 |
+| Cora | local_degree__fixed | 0.01 | 100 ± 0 | 76.96 ± 0.167333 | 79.46 ± 0.230217 | 0.747207 ± 0.00605718 |
+| Cora | local_degree__learned | 0.01 | 100 ± 0 | 76.96 ± 0.167333 | 79.38 ± 0.248998 | 0.747322 ± 0.00603421 |
+| CiteSeer | unit__off | 0.01 | 100 ± 0 | 56.48 ± 0.67231 | 57.62 ± 0.408657 | 1.2281 ± 0.00745508 |
+| CiteSeer | unit__fixed | 0.01 | 100 ± 0 | 56.64 ± 0.669327 | 57.46 ± 0.487851 | 1.22796 ± 0.00750436 |
+| CiteSeer | unit__learned | 0.01 | 100 ± 0 | 56.68 ± 0.626099 | 57.32 ± 0.798121 | 1.22967 ± 0.0107594 |
+| CiteSeer | local_degree__off | 0.01 | 100 ± 0 | 69.36 ± 0.477494 | 70.64 ± 0.336155 | 0.991449 ± 0.0028183 |
+| CiteSeer | local_degree__fixed | 0.01 | 100 ± 0 | 69.28 ± 0.460434 | 70.6 ± 0.331664 | 0.991394 ± 0.00275519 |
+| CiteSeer | local_degree__learned | 0.01 | 100 ± 0 | 69.28 ± 0.521537 | 70.6 ± 0.331664 | 0.991432 ± 0.00276039 |
+| PubMed | unit__off | 0.01 | 100 ± 0 | 72.52 ± 0.657268 | 73.16 ± 0.507937 | 0.682603 ± 0.00861878 |
+| PubMed | unit__fixed | 0.01 | 100 ± 0 | 72.56 ± 0.622896 | 73.16 ± 0.507937 | 0.682578 ± 0.00864354 |
+| PubMed | unit__learned | 0.01 | 100 ± 0 | 72.56 ± 0.622896 | 73.16 ± 0.507937 | 0.68259 ± 0.00863647 |
+| PubMed | local_degree__off | 0.01 | 100 ± 0 | 78.28 ± 0.609917 | 77.66 ± 0.915424 | 0.593621 ± 0.00940664 |
+| PubMed | local_degree__fixed | 0.01 | 100 ± 0 | 78.28 ± 0.609917 | 77.66 ± 0.928979 | 0.593551 ± 0.00938057 |
+| PubMed | local_degree__learned | 0.01 | 100 ± 0 | 78.28 ± 0.609917 | 77.66 ± 0.981327 | 0.593638 ± 0.00945717 |
+
+## 재학습한 조건 간 paired 차이
+
+아래 차이는 조건−기준이다. Accuracy pp는 양수, CE는 음수가 개선이다.
+같은 final seed끼리 먼저 차이를 계산한 뒤 평균·표본 std·95% t 구간을 만들었다.
+동일 C의 fixed−off/learned−off/learned−fixed가 핵심 비교이고, C조건 간 비교는 탐색적이다.
+Train/validation/test 전체는 `paired_comparisons.csv`에 있다.
+
+| 데이터 | 조건 | 기준 | 지표 | 차이 [95% 구간] | 범위 |
+| --- | --- | --- | --- | --- | --- |
+| CiteSeer | unit__fixed | unit__off | accuracy pp | -0.159999 [-0.326583, 0.0065846] | within_weight_mode |
+| CiteSeer | unit__fixed | unit__off | CE | -0.000135732 [-0.000265591, -5.87282e-06] | within_weight_mode |
+| CiteSeer | unit__learned | unit__off | accuracy pp | -0.3 [-0.933124, 0.333125] | within_weight_mode |
+| CiteSeer | unit__learned | unit__off | CE | 0.00156698 [-0.00315197, 0.00628593] | within_weight_mode |
+| CiteSeer | unit__learned | unit__fixed | accuracy pp | -0.140001 [-0.671166, 0.391164] | within_weight_mode |
+| CiteSeer | unit__learned | unit__fixed | CE | 0.00170271 [-0.00302677, 0.0064322] | within_weight_mode |
+| CiteSeer | local_degree__fixed | local_degree__off | accuracy pp | -0.0400007 [-0.108011, 0.0280092] | within_weight_mode |
+| CiteSeer | local_degree__fixed | local_degree__off | CE | -5.52416e-05 [-0.000201713, 9.12296e-05] | within_weight_mode |
+| CiteSeer | local_degree__learned | local_degree__off | accuracy pp | -0.0400007 [-0.108011, 0.0280092] | within_weight_mode |
+| CiteSeer | local_degree__learned | local_degree__off | CE | -1.75118e-05 [-0.000233389, 0.000198365] | within_weight_mode |
+| CiteSeer | local_degree__learned | local_degree__fixed | accuracy pp | 0 [0, 0] | within_weight_mode |
+| CiteSeer | local_degree__learned | local_degree__fixed | CE | 3.77297e-05 [-5.15965e-05, 0.000127056] | within_weight_mode |
+| CiteSeer | local_degree__off | unit__off | accuracy pp | 13.02 [12.1144, 13.9257] | between_weight_modes_exploratory |
+| CiteSeer | local_degree__off | unit__off | CE | -0.236651 [-0.248479, -0.224823] | between_weight_modes_exploratory |
+| CiteSeer | local_degree__fixed | unit__fixed | accuracy pp | 13.14 [12.156, 14.124] | between_weight_modes_exploratory |
+| CiteSeer | local_degree__fixed | unit__fixed | CE | -0.236571 [-0.248353, -0.224788] | between_weight_modes_exploratory |
+| CiteSeer | local_degree__learned | unit__learned | accuracy pp | 13.28 [11.9329, 14.6271] | between_weight_modes_exploratory |
+| CiteSeer | local_degree__learned | unit__learned | CE | -0.238236 [-0.253943, -0.222529] | between_weight_modes_exploratory |
+| Cora | unit__fixed | unit__off | accuracy pp | 0.0599992 [-0.182043, 0.302041] | within_weight_mode |
+| Cora | unit__fixed | unit__off | CE | 2.55108e-06 [-0.000414695, 0.000419797] | within_weight_mode |
+| Cora | unit__learned | unit__off | accuracy pp | -0.0600004 [-0.17106, 0.0510589] | within_weight_mode |
+| Cora | unit__learned | unit__off | CE | 1.99318e-05 [-0.000523607, 0.00056347] | within_weight_mode |
+| Cora | unit__learned | unit__fixed | accuracy pp | -0.12 [-0.342113, 0.102114] | within_weight_mode |
+| Cora | unit__learned | unit__fixed | CE | 1.73807e-05 [-0.000621134, 0.000655896] | within_weight_mode |
+| Cora | local_degree__fixed | local_degree__off | accuracy pp | 0.0800002 [-0.0238862, 0.183887] | within_weight_mode |
+| Cora | local_degree__fixed | local_degree__off | CE | -0.0002244 [-0.000384059, -6.47399e-05] | within_weight_mode |
+| Cora | local_degree__learned | local_degree__off | accuracy pp | 1.19209e-06 [-0.0877992, 0.0878016] | within_weight_mode |
+| Cora | local_degree__learned | local_degree__off | CE | -0.000109053 [-0.000246773, 2.86679e-05] | within_weight_mode |
+| Cora | local_degree__learned | local_degree__fixed | accuracy pp | -0.079999 [-0.183883, 0.0238848] | within_weight_mode |
+| Cora | local_degree__learned | local_degree__fixed | CE | 0.000115347 [7.76527e-05, 0.000153041] | within_weight_mode |
+| Cora | local_degree__off | unit__off | accuracy pp | 20.72 [19.7212, 21.7188] | between_weight_modes_exploratory |
+| Cora | local_degree__off | unit__off | CE | -0.506229 [-0.515252, -0.497207] | between_weight_modes_exploratory |
+| Cora | local_degree__fixed | unit__fixed | accuracy pp | 20.74 [19.7252, 21.7548] | between_weight_modes_exploratory |
+| Cora | local_degree__fixed | unit__fixed | CE | -0.506456 [-0.515688, -0.497225] | between_weight_modes_exploratory |
+| Cora | local_degree__learned | unit__learned | accuracy pp | 20.78 [19.8492, 21.7108] | between_weight_modes_exploratory |
+| Cora | local_degree__learned | unit__learned | CE | -0.506358 [-0.515432, -0.497285] | between_weight_modes_exploratory |
+| PubMed | unit__fixed | unit__off | accuracy pp | 0 [0, 0] | within_weight_mode |
+| PubMed | unit__fixed | unit__off | CE | -2.52247e-05 [-8.00183e-05, 2.95689e-05] | within_weight_mode |
+| PubMed | unit__learned | unit__off | accuracy pp | 0 [0, 0] | within_weight_mode |
+| PubMed | unit__learned | unit__off | CE | -1.35183e-05 [-6.67349e-05, 3.96983e-05] | within_weight_mode |
+| PubMed | unit__learned | unit__fixed | accuracy pp | 0 [0, 0] | within_weight_mode |
+| PubMed | unit__learned | unit__fixed | CE | 1.17064e-05 [-1.16691e-05, 3.50819e-05] | within_weight_mode |
+| PubMed | local_degree__fixed | local_degree__off | accuracy pp | 0 [-0.087803, 0.087803] | within_weight_mode |
+| PubMed | local_degree__fixed | local_degree__off | CE | -7.01785e-05 [-0.000110865, -2.94916e-05] | within_weight_mode |
+| PubMed | local_degree__learned | local_degree__off | accuracy pp | 1.19209e-06 [-0.0877992, 0.0878016] | within_weight_mode |
+| PubMed | local_degree__learned | local_degree__off | CE | 1.67847e-05 [-6.08509e-05, 9.44202e-05] | within_weight_mode |
+| PubMed | local_degree__learned | local_degree__fixed | accuracy pp | 1.19209e-06 [-0.0877992, 0.0878016] | within_weight_mode |
+| PubMed | local_degree__learned | local_degree__fixed | CE | 8.69632e-05 [-1.14705e-05, 0.000185397] | within_weight_mode |
+| PubMed | local_degree__off | unit__off | accuracy pp | 4.5 [2.85041, 6.14959] | between_weight_modes_exploratory |
+| PubMed | local_degree__off | unit__off | CE | -0.0889817 [-0.101838, -0.0761251] | between_weight_modes_exploratory |
+| PubMed | local_degree__fixed | unit__fixed | accuracy pp | 4.5 [2.84109, 6.15892] | between_weight_modes_exploratory |
+| PubMed | local_degree__fixed | unit__fixed | CE | -0.0890267 [-0.101886, -0.0761674] | between_weight_modes_exploratory |
+| PubMed | local_degree__learned | unit__learned | accuracy pp | 4.5 [2.77503, 6.22498] | between_weight_modes_exploratory |
+| PubMed | local_degree__learned | unit__learned | CE | -0.0889514 [-0.101878, -0.0760249] | between_weight_modes_exploratory |
+
+## 고정 checkpoint의 gain 개입
+
+차이는 개입 후−동일 checkpoint의 원래 예측이다. Gain0/1을 지정 층에 적용하고 후속 특징을 다시 계산했다.
+원래 학습 파라미터·buffer hash를 보존하며 optimizer update는0이다.
+Fixed/gain1은 예상 no-op control이고 off에서는 별도 개입을 출력하지 않는다.
+새로 off로 학습한 모델과 gain0으로 바꾼 checkpoint의 효과는 다른 질문이다.
+
+| 데이터 | 조건 | 개입 | 층 | 지표 | 차이 [95% 구간] | no-op |
+| --- | --- | --- | --- | --- | --- | --- |
+| CiteSeer | local_degree__fixed | gain0 | both | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | local_degree__fixed | gain0 | both | CE | 3.25084e-05 [2.97104e-05, 3.53064e-05] | False |
+| CiteSeer | local_degree__fixed | gain0 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | local_degree__fixed | gain0 | layer_0 | CE | 1.77026e-05 [1.62896e-05, 1.91155e-05] | False |
+| CiteSeer | local_degree__fixed | gain0 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | local_degree__fixed | gain0 | layer_1 | CE | 1.48058e-05 [1.33932e-05, 1.62184e-05] | False |
+| CiteSeer | local_degree__fixed | gain1 | both | accuracy pp | 0 [0, 0] | True |
+| CiteSeer | local_degree__fixed | gain1 | both | CE | -1.19209e-08 [-4.50187e-08, 2.11769e-08] | True |
+| CiteSeer | local_degree__fixed | gain1 | layer_0 | accuracy pp | 0 [0, 0] | True |
+| CiteSeer | local_degree__fixed | gain1 | layer_0 | CE | -2.38419e-08 [-6.43782e-08, 1.66945e-08] | True |
+| CiteSeer | local_degree__fixed | gain1 | layer_1 | accuracy pp | 0 [0, 0] | True |
+| CiteSeer | local_degree__fixed | gain1 | layer_1 | CE | -2.38419e-08 [-6.43782e-08, 1.66945e-08] | True |
+| CiteSeer | local_degree__learned | gain0 | both | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | local_degree__learned | gain0 | both | CE | 2.18153e-06 [1.74809e-06, 2.61497e-06] | False |
+| CiteSeer | local_degree__learned | gain0 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | local_degree__learned | gain0 | layer_0 | CE | 1.20401e-06 [9.67648e-07, 1.44038e-06] | False |
+| CiteSeer | local_degree__learned | gain0 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | local_degree__learned | gain0 | layer_1 | CE | 9.89437e-07 [8.03676e-07, 1.1752e-06] | False |
+| CiteSeer | local_degree__learned | gain1 | both | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | local_degree__learned | gain1 | both | CE | -3.03984e-05 [-3.2986e-05, -2.78107e-05] | False |
+| CiteSeer | local_degree__learned | gain1 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | local_degree__learned | gain1 | layer_0 | CE | -1.65939e-05 [-1.78786e-05, -1.53093e-05] | False |
+| CiteSeer | local_degree__learned | gain1 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | local_degree__learned | gain1 | layer_1 | CE | -1.38879e-05 [-1.52252e-05, -1.25506e-05] | False |
+| CiteSeer | unit__fixed | gain0 | both | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | unit__fixed | gain0 | both | CE | 1.01328e-05 [9.32885e-06, 1.09367e-05] | False |
+| CiteSeer | unit__fixed | gain0 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | unit__fixed | gain0 | layer_0 | CE | 5.22137e-06 [4.74864e-06, 5.6941e-06] | False |
+| CiteSeer | unit__fixed | gain0 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | unit__fixed | gain0 | layer_1 | CE | 4.91142e-06 [4.57389e-06, 5.24896e-06] | False |
+| CiteSeer | unit__fixed | gain1 | both | accuracy pp | 0 [0, 0] | True |
+| CiteSeer | unit__fixed | gain1 | both | CE | 2.38419e-08 [-4.23538e-08, 9.00375e-08] | True |
+| CiteSeer | unit__fixed | gain1 | layer_0 | accuracy pp | 0 [0, 0] | True |
+| CiteSeer | unit__fixed | gain1 | layer_0 | CE | 0 [-1.04664e-07, 1.04664e-07] | True |
+| CiteSeer | unit__fixed | gain1 | layer_1 | accuracy pp | 0 [0, 0] | True |
+| CiteSeer | unit__fixed | gain1 | layer_1 | CE | 0 [0, 0] | True |
+| CiteSeer | unit__learned | gain0 | both | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | unit__learned | gain0 | both | CE | 9.03606e-06 [8.06319e-06, 1.00089e-05] | False |
+| CiteSeer | unit__learned | gain0 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | unit__learned | gain0 | layer_0 | CE | 4.673e-06 [4.17764e-06, 5.16837e-06] | False |
+| CiteSeer | unit__learned | gain0 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | unit__learned | gain0 | layer_1 | CE | 4.33922e-06 [3.92583e-06, 4.75261e-06] | False |
+| CiteSeer | unit__learned | gain1 | both | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | unit__learned | gain1 | both | CE | -1.04904e-06 [-1.31382e-06, -7.84259e-07] | False |
+| CiteSeer | unit__learned | gain1 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | unit__learned | gain1 | layer_0 | CE | -5.48363e-07 [-6.80754e-07, -4.15972e-07] | False |
+| CiteSeer | unit__learned | gain1 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| CiteSeer | unit__learned | gain1 | layer_1 | CE | -5.00679e-07 [-6.2452e-07, -3.76838e-07] | False |
+| Cora | local_degree__fixed | gain0 | both | accuracy pp | 0 [0, 0] | False |
+| Cora | local_degree__fixed | gain0 | both | CE | 7.72595e-05 [7.61209e-05, 7.83982e-05] | False |
+| Cora | local_degree__fixed | gain0 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| Cora | local_degree__fixed | gain0 | layer_0 | CE | 4.19974e-05 [4.15021e-05, 4.24928e-05] | False |
+| Cora | local_degree__fixed | gain0 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| Cora | local_degree__fixed | gain0 | layer_1 | CE | 3.52502e-05 [3.43459e-05, 3.61545e-05] | False |
+| Cora | local_degree__fixed | gain1 | both | accuracy pp | 0 [0, 0] | True |
+| Cora | local_degree__fixed | gain1 | both | CE | 0 [0, 0] | True |
+| Cora | local_degree__fixed | gain1 | layer_0 | accuracy pp | 0 [0, 0] | True |
+| Cora | local_degree__fixed | gain1 | layer_0 | CE | 0 [0, 0] | True |
+| Cora | local_degree__fixed | gain1 | layer_1 | accuracy pp | 0 [0, 0] | True |
+| Cora | local_degree__fixed | gain1 | layer_1 | CE | 0 [0, 0] | True |
+| Cora | local_degree__learned | gain0 | both | accuracy pp | -0.0200009 [-0.0755324, 0.0355306] | False |
+| Cora | local_degree__learned | gain0 | both | CE | 2.86937e-05 [2.45434e-05, 3.2844e-05] | False |
+| Cora | local_degree__learned | gain0 | layer_0 | accuracy pp | -0.0200009 [-0.0755324, 0.0355306] | False |
+| Cora | local_degree__learned | gain0 | layer_0 | CE | 1.55926e-05 [1.32519e-05, 1.79333e-05] | False |
+| Cora | local_degree__learned | gain0 | layer_1 | accuracy pp | -0.0200009 [-0.0755324, 0.0355306] | False |
+| Cora | local_degree__learned | gain0 | layer_1 | CE | 1.30773e-05 [1.12362e-05, 1.49183e-05] | False |
+| Cora | local_degree__learned | gain1 | both | accuracy pp | 0.0199997 [-0.0355284, 0.0755279] | False |
+| Cora | local_degree__learned | gain1 | both | CE | -4.86016e-05 [-5.3389e-05, -4.38143e-05] | False |
+| Cora | local_degree__learned | gain1 | layer_0 | accuracy pp | 0.0199997 [-0.0355284, 0.0755279] | False |
+| Cora | local_degree__learned | gain1 | layer_0 | CE | -2.64287e-05 [-2.89675e-05, -2.38899e-05] | False |
+| Cora | local_degree__learned | gain1 | layer_1 | accuracy pp | 0.0199997 [-0.0355284, 0.0755279] | False |
+| Cora | local_degree__learned | gain1 | layer_1 | CE | -2.22087e-05 [-2.45099e-05, -1.99075e-05] | False |
+| Cora | unit__fixed | gain0 | both | accuracy pp | 0 [0, 0] | False |
+| Cora | unit__fixed | gain0 | both | CE | 1.30415e-05 [1.15226e-05, 1.45604e-05] | False |
+| Cora | unit__fixed | gain0 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| Cora | unit__fixed | gain0 | layer_0 | CE | 6.50883e-06 [5.6676e-06, 7.35006e-06] | False |
+| Cora | unit__fixed | gain0 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| Cora | unit__fixed | gain0 | layer_1 | CE | 6.38962e-06 [5.69063e-06, 7.0886e-06] | False |
+| Cora | unit__fixed | gain1 | both | accuracy pp | 0 [0, 0] | True |
+| Cora | unit__fixed | gain1 | both | CE | 0 [0, 0] | True |
+| Cora | unit__fixed | gain1 | layer_0 | accuracy pp | 0 [0, 0] | True |
+| Cora | unit__fixed | gain1 | layer_0 | CE | 0 [0, 0] | True |
+| Cora | unit__fixed | gain1 | layer_1 | accuracy pp | 0 [0, 0] | True |
+| Cora | unit__fixed | gain1 | layer_1 | CE | 0 [0, 0] | True |
+| Cora | unit__learned | gain0 | both | accuracy pp | 0 [0, 0] | False |
+| Cora | unit__learned | gain0 | both | CE | 1.1158e-05 [9.26649e-06, 1.30495e-05] | False |
+| Cora | unit__learned | gain0 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| Cora | unit__learned | gain0 | layer_0 | CE | 5.62668e-06 [4.52198e-06, 6.73137e-06] | False |
+| Cora | unit__learned | gain0 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| Cora | unit__learned | gain0 | layer_1 | CE | 5.57899e-06 [4.67621e-06, 6.48178e-06] | False |
+| Cora | unit__learned | gain1 | both | accuracy pp | 0 [0, 0] | False |
+| Cora | unit__learned | gain1 | both | CE | -1.88351e-06 [-2.36769e-06, -1.39933e-06] | False |
+| Cora | unit__learned | gain1 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| Cora | unit__learned | gain1 | layer_0 | CE | -8.82149e-07 [-1.10663e-06, -6.57669e-07] | False |
+| Cora | unit__learned | gain1 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| Cora | unit__learned | gain1 | layer_1 | CE | -8.82149e-07 [-1.12983e-06, -6.34467e-07] | False |
+| PubMed | local_degree__fixed | gain0 | both | accuracy pp | 0 [0, 0] | False |
+| PubMed | local_degree__fixed | gain0 | both | CE | 4.31776e-05 [3.28462e-05, 5.3509e-05] | False |
+| PubMed | local_degree__fixed | gain0 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| PubMed | local_degree__fixed | gain0 | layer_0 | CE | 2.19345e-05 [1.66916e-05, 2.71774e-05] | False |
+| PubMed | local_degree__fixed | gain0 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| PubMed | local_degree__fixed | gain0 | layer_1 | CE | 2.12312e-05 [1.61629e-05, 2.62994e-05] | False |
+| PubMed | local_degree__fixed | gain1 | both | accuracy pp | 0 [0, 0] | True |
+| PubMed | local_degree__fixed | gain1 | both | CE | 0 [0, 0] | True |
+| PubMed | local_degree__fixed | gain1 | layer_0 | accuracy pp | 0 [0, 0] | True |
+| PubMed | local_degree__fixed | gain1 | layer_0 | CE | 0 [0, 0] | True |
+| PubMed | local_degree__fixed | gain1 | layer_1 | accuracy pp | 0 [0, 0] | True |
+| PubMed | local_degree__fixed | gain1 | layer_1 | CE | 1.19209e-08 [-2.11769e-08, 4.50187e-08] | True |
+| PubMed | local_degree__learned | gain0 | both | accuracy pp | 0 [0, 0] | False |
+| PubMed | local_degree__learned | gain0 | both | CE | 1.12295e-05 [1.03405e-05, 1.21185e-05] | False |
+| PubMed | local_degree__learned | gain0 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| PubMed | local_degree__learned | gain0 | layer_0 | CE | 5.6982e-06 [5.2976e-06, 6.09881e-06] | False |
+| PubMed | local_degree__learned | gain0 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| PubMed | local_degree__learned | gain0 | layer_1 | CE | 5.51939e-06 [5.07349e-06, 5.96529e-06] | False |
+| PubMed | local_degree__learned | gain1 | both | accuracy pp | -0.0200009 [-0.0755324, 0.0355306] | False |
+| PubMed | local_degree__learned | gain1 | both | CE | -3.19481e-05 [-4.19908e-05, -2.19053e-05] | False |
+| PubMed | local_degree__learned | gain1 | layer_0 | accuracy pp | -0.0200009 [-0.0755324, 0.0355306] | False |
+| PubMed | local_degree__learned | gain1 | layer_0 | CE | -1.62363e-05 [-2.13575e-05, -1.11151e-05] | False |
+| PubMed | local_degree__learned | gain1 | layer_1 | accuracy pp | -0.0200009 [-0.0755324, 0.0355306] | False |
+| PubMed | local_degree__learned | gain1 | layer_1 | CE | -1.57356e-05 [-2.0654e-05, -1.08172e-05] | False |
+| PubMed | unit__fixed | gain0 | both | accuracy pp | 0 [0, 0] | False |
+| PubMed | unit__fixed | gain0 | both | CE | 1.7643e-06 [1.57854e-06, 1.95006e-06] | False |
+| PubMed | unit__fixed | gain0 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| PubMed | unit__fixed | gain0 | layer_0 | CE | 9.53674e-07 [8.15216e-07, 1.09213e-06] | False |
+| PubMed | unit__fixed | gain0 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| PubMed | unit__fixed | gain0 | layer_1 | CE | 7.98702e-07 [6.64258e-07, 9.33146e-07] | False |
+| PubMed | unit__fixed | gain1 | both | accuracy pp | 0 [0, 0] | True |
+| PubMed | unit__fixed | gain1 | both | CE | 1.19209e-08 [-2.11769e-08, 4.50187e-08] | True |
+| PubMed | unit__fixed | gain1 | layer_0 | accuracy pp | 0 [0, 0] | True |
+| PubMed | unit__fixed | gain1 | layer_0 | CE | 1.19209e-08 [-2.11769e-08, 4.50187e-08] | True |
+| PubMed | unit__fixed | gain1 | layer_1 | accuracy pp | 0 [0, 0] | True |
+| PubMed | unit__fixed | gain1 | layer_1 | CE | 0 [0, 0] | True |
+| PubMed | unit__learned | gain0 | both | accuracy pp | 0 [0, 0] | False |
+| PubMed | unit__learned | gain0 | both | CE | 8.46386e-07 [6.85938e-07, 1.00683e-06] | False |
+| PubMed | unit__learned | gain0 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| PubMed | unit__learned | gain0 | layer_0 | CE | 4.64916e-07 [3.6842e-07, 5.61412e-07] | False |
+| PubMed | unit__learned | gain0 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| PubMed | unit__learned | gain0 | layer_1 | CE | 3.45707e-07 [2.64634e-07, 4.2678e-07] | False |
+| PubMed | unit__learned | gain1 | both | accuracy pp | 0 [0, 0] | False |
+| PubMed | unit__learned | gain1 | both | CE | -9.65595e-07 [-1.16418e-06, -7.67008e-07] | False |
+| PubMed | unit__learned | gain1 | layer_0 | accuracy pp | 0 [0, 0] | False |
+| PubMed | unit__learned | gain1 | layer_0 | CE | -5.36442e-07 [-6.10451e-07, -4.62433e-07] | False |
+| PubMed | unit__learned | gain1 | layer_1 | accuracy pp | 0 [0, 0] | False |
+| PubMed | unit__learned | gain1 | layer_1 | CE | -4.17233e-07 [-4.91241e-07, -3.43224e-07] | False |
+
+## 선택된 모델의 실제 cross 작용
+
+Δ/off는 현재 층의 동일 투영 특징에서 `||Tρ Z−T0 Z||/||T0 Z||`다.
+Θ가 있거나ρ가 양수라는 사실과 실제 context/출력 변화·분류 기여를 구분한다.
+Zero denominator는 undefined로 기록하며0을 대신 넣지 않는다.
+원래/개입 두 층의 전체 norm·energy·gain은 `branch_estimates.csv`와 원시 branch CSV에 있다.
+
+| 데이터 | 조건 | 층 | rho | theta | 실제 Δ/off | context norm | cross E 전 | cross E 후 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| CiteSeer | local_degree__fixed | 0 | 1 ± 0 | undefined | 0.000152588 ± 1.26712e-06 | 17.8299 | 11.8274 | 10.4605 |
+| CiteSeer | local_degree__fixed | 1 | 1 ± 0 | undefined | 0.000158378 ± 8.99154e-07 | 118.481 | 545.214 | 484.589 |
+| CiteSeer | local_degree__learned | 0 | 0.0659821 ± 0.00866752 | -2.6565 ± 0.13372 | 1.00691e-05 ± 1.36278e-06 | 17.8159 | 11.8213 | 11.7161 |
+| CiteSeer | local_degree__learned | 1 | 0.0659821 ± 0.00866752 | -2.6565 ± 0.13372 | 1.04576e-05 ± 1.33269e-06 | 118.548 | 545.874 | 541.222 |
+| CiteSeer | local_degree__off | 0 | 0 ± 0 | undefined | 1.45075e-08 ± 4.50814e-10 | 17.811 | 11.819 | 11.819 |
+| CiteSeer | local_degree__off | 1 | 0 ± 0 | undefined | 1.85598e-08 ± 4.88959e-10 | 118.555 | 545.911 | 545.911 |
+| CiteSeer | unit__fixed | 0 | 1 ± 0 | undefined | 2.76564e-05 ± 1.60205e-06 | 9.85628 | 0.606849 | 0.232999 |
+| CiteSeer | unit__fixed | 1 | 1 ± 0 | undefined | 4.44163e-05 ± 2.47753e-06 | 88.3129 | 48.8925 | 18.8664 |
+| CiteSeer | unit__learned | 0 | 0.902937 ± 0.0120618 | 2.23702 ± 0.146788 | 2.47222e-05 ± 1.96378e-06 | 9.75069 | 0.595789 | 0.254808 |
+| CiteSeer | unit__learned | 1 | 0.902937 ± 0.0120618 | 2.23702 ± 0.146788 | 4.00151e-05 ± 2.62972e-06 | 87.9885 | 48.5393 | 20.7851 |
+| CiteSeer | unit__off | 0 | 0 ± 0 | undefined | 1.42154e-08 ± 1.05267e-10 | 9.81913 | 0.602972 | 0.602972 |
+| CiteSeer | unit__off | 1 | 0 ± 0 | undefined | 1.85569e-08 ± 8.34863e-10 | 88.0581 | 48.6562 | 48.6562 |
+| Cora | local_degree__fixed | 0 | 1 ± 0 | undefined | 0.000143136 ± 1.96119e-06 | 45.6621 | 59.3642 | 53.9499 |
+| Cora | local_degree__fixed | 1 | 1 ± 0 | undefined | 0.000128937 ± 1.35571e-06 | 251.445 | 1989.23 | 1822.91 |
+| Cora | local_degree__learned | 0 | 0.37141 ± 0.0460868 | -0.52948 ± 0.192748 | 5.31462e-05 ± 6.52621e-06 | 45.6566 | 59.352 | 57.1586 |
+| Cora | local_degree__learned | 1 | 0.37141 ± 0.0460868 | -0.52948 ± 0.192748 | 4.78941e-05 ± 5.83226e-06 | 251.526 | 1990.17 | 1923.2 |
+| Cora | local_degree__off | 0 | 0 ± 0 | undefined | 1.93708e-08 ± 2.14663e-10 | 45.6524 | 59.3445 | 59.3445 |
+| Cora | local_degree__off | 1 | 0 ± 0 | undefined | 2.30981e-08 ± 7.54499e-10 | 251.575 | 1990.7 | 1990.7 |
+| Cora | unit__fixed | 0 | 1 ± 0 | undefined | 2.17598e-05 ± 1.41184e-06 | 24.2575 | 2.60111 | 1.22101 |
+| Cora | unit__fixed | 1 | 1 ± 0 | undefined | 2.92751e-05 ± 1.16079e-06 | 188.403 | 154.932 | 71.924 |
+| Cora | unit__learned | 0 | 0.857757 ± 0.0351214 | 1.81946 ± 0.280309 | 1.86722e-05 ± 1.84279e-06 | 24.2311 | 2.59716 | 1.36898 |
+| Cora | unit__learned | 1 | 0.857757 ± 0.0351214 | 1.81946 ± 0.280309 | 2.50985e-05 ± 1.97142e-06 | 188.139 | 154.645 | 80.7647 |
+| Cora | unit__off | 0 | 0 ± 0 | undefined | 1.79937e-08 ± 5.52667e-10 | 24.1592 | 2.58711 | 2.58711 |
+| Cora | unit__off | 1 | 0 ± 0 | undefined | 2.47746e-08 ± 2.18828e-10 | 187.908 | 154.455 | 154.455 |
+| PubMed | local_degree__fixed | 0 | 1 ± 0 | undefined | 0.000129605 ± 4.51907e-06 | 75.5615 | 202.022 | 186.293 |
+| PubMed | local_degree__fixed | 1 | 1 ± 0 | undefined | 0.000130525 ± 2.00939e-06 | 388.975 | 5511.84 | 5094.18 |
+| PubMed | local_degree__learned | 0 | 0.266711 ± 0.0438284 | -1.02177 ± 0.23429 | 3.44013e-05 ± 4.63018e-06 | 75.5551 | 201.972 | 197.53 |
+| PubMed | local_degree__learned | 1 | 0.266711 ± 0.0438284 | -1.02177 ± 0.23429 | 3.48006e-05 ± 5.51592e-06 | 389.19 | 5516.02 | 5401.78 |
+| PubMed | local_degree__off | 0 | 0 ± 0 | undefined | 1.86042e-08 ± 4.58656e-10 | 75.5576 | 201.989 | 201.989 |
+| PubMed | local_degree__off | 1 | 0 ± 0 | undefined | 3.06506e-08 ± 5.45541e-10 | 389.235 | 5517.16 | 5517.16 |
+| PubMed | unit__fixed | 0 | 1 ± 0 | undefined | 1.10441e-05 ± 1.52101e-07 | 32.1387 | 6.73904 | 4.19174 |
+| PubMed | unit__fixed | 1 | 1 ± 0 | undefined | 1.36272e-05 ± 2.11958e-07 | 188.16 | 236.154 | 148.612 |
+| PubMed | unit__learned | 0 | 0.469102 ± 0.0355614 | -0.124168 ± 0.142864 | 5.17876e-06 ± 3.51108e-07 | 32.1387 | 6.73908 | 5.42646 |
+| PubMed | unit__learned | 1 | 0.469102 ± 0.0355614 | -0.124168 ± 0.142864 | 6.39546e-06 ± 5.15472e-07 | 188.191 | 236.197 | 191.058 |
+| PubMed | unit__off | 0 | 0 ± 0 | undefined | 1.21898e-08 ± 8.43137e-11 | 32.139 | 6.73891 | 6.73891 |
+| PubMed | unit__off | 1 | 0 ± 0 | undefined | 2.24437e-08 ± 2.41741e-10 | 188.233 | 236.26 | 236.26 |
+
+## 범위와 자원
+
+- Primary metric 270행, frozen metric 1080행, layer branch 900행을 전부 검증했다.
+- Resource 기록 590행에는 CPU 준비·packed seed/edge chunk 후보·학습 측정·재개 여부를 보존한다.
+  Calibration/실제 학습/재개 기록을 섞어 평균 epoch 시간이나 완료 시간을 만들지 않는다.
+- Source201 graph 중 분류에 사용하는 것은 선언된 세 citation 또는 DEBUG graph다.
+  합성198 graph를 label 학습에 쓰지 않는다.
+- Citation public split의5개 초기화 seed 변동은 독립 split/새 graph 일반화가 아니다.
+- 이전 test를 확인한 후의 후속 연구이고 다중 비교 보정이 없다. 0 포함 구간은 동등성 증명이 아니다.
+- 통합 copy 에너지는 전파의 정의다. Classification CE로 학습하며 에너지/복원 loss를 추가하지 않았다.
+- Cross-on/off 연산 차이만으로 정확도 개선·정보 복원·선행연구 대비 신규성이 입증되지는 않는다.
+
+원시 metric·intervention·branch·frozen provenance, source/data hash, resource, completion과 이 요약을 함께 읽는다.
+(new-gat) aicompetition07@ece-a6gpu6:~/new-gat$

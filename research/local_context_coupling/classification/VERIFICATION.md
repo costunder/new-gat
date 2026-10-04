@@ -7,8 +7,11 @@ CE backward, 독립 seed의 Adam update, validation 선택,
 동결한 checkpoint의 층별 개입, 보고서, 새 폴더로의 재개를 구현했다.
 기존 fixed audit와 E/J 실험의 코드·결과는 수정하지 않았다.
 
-FULL 본학습과 실제 citation 성능 평가는 아직 실행하지 않았다.
-아래 실행은 명시된 DEBUG fixture 검사이며 실제 데이터 성능을 뜻하지 않는다.
+2026-10-04 사용자가 서버 FULL 본학습·평가 완료 기록을 제출했다.
+162회 tuning과90회 final 학습, 새 update126,000개, 실제 데이터 사용을 보고했다.
+[제출 결과와 해석](../../../docs/LOCAL_CONTEXT_CLASSIFICATION_SERVER_FINDINGS_20261004.md)을 기록했다.
+서버 raw CSV·checkpoint를 이 컴퓨터에서 독립 재평가하지는 않았다.
+아래 로컬 실행은 명시된 DEBUG fixture 검사이며 실제 데이터 성능을 뜻하지 않는다.
 
 ## 테스트
 
@@ -68,4 +71,9 @@ CE 축의 겹치는 눈금을 수정하고 보고서 테스트31개를 다시 �
   그래프와 모델 규모를 바꾸지 않는다.
 - 모든 최종 checkpoint를 validation으로 선택한 뒤 test를 연다.
 
-FULL 실행 시간·최종 정확도·교차 연산의 성능 기여는 서버 실행 뒤에 판단한다.
+## 제출된 서버 FULL 결과
+
+완료 기록은 전체2,067.5805초(약34분28초), primary270행,
+동결 개입1,080행, 층 진단900행과 code/graph 보존을 보고했다.
+강도ρ는 초기0.5에서 변했고, 같은 C에서 추가 accuracy 효과의95% 구간은 모두0을 포함했다.
+원문과 주요 수치·검토 한계는 위 결과 문서에 보존했다.
