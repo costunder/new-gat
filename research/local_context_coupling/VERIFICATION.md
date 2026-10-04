@@ -81,7 +81,9 @@ Study 검사32개를 다시 실행해6.74초에 통과했고, 기존 같은 입�
 최종 source digest는 `a069a2e8d8140f359d26dac710640d11e0e8a46230db82eef7bc01a4229849ec`다.
 최대 수식 상대 residual9.870444832880725e−17, channel648행·summary126행·resolved114개를 확인했다.
 실제 다중 GPU 병렬 실행은 아직 수행하지 않았으며, 로컬 검증은 CUDA GPU1개를 사용했다.
-본 후보의 서버 FULL fixed audit와 classifier 본학습 결과는 아직 수령하지 않았다.
+서버 FULL fixed audit의 사용자 제출 요약은 수령했다.
+[서버 결과 정리](../../docs/LOCAL_CONTEXT_COUPLING_SERVER_FINDINGS_20261004.md)에 수치·수식 대조와 확인 범위를 기록했다.
+Classifier 본학습 결과는 아직 없다.
 이번 full fixed audit가 끝나도 분류 본학습 완료나 task 개선을 뜻하지 않는다.
 
 ## 아직 입증하지 않은 것

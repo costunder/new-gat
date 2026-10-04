@@ -41,3 +41,4 @@ Copy를 사용한다고 선형 표현력의 우위나 정보 복원이 자동으
 - [전체 수식과 보장 조건](MODEL_MATH.md)
 - [서버 실행·결과 확인](RUN.md)
 - [검증 기록](VERIFICATION.md)
+- [서버 FULL 고정 검증 결과](../../docs/LOCAL_CONTEXT_COUPLING_SERVER_FINDINGS_20261004.md)

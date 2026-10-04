@@ -1,0 +1,78 @@
+# 로컬 문맥 결합: 첫 고정 메커니즘 감사
+
+Profile **full**, 전체 그래프 **201개**,
+실제 citation **3개**.
+모든 원래 노드·엣지·특징·1홉 induced local·공통 노드 copy 연결을 유지했다.
+**학습 parameter 0, optimizer update 0, epoch 해당 없음**인 고정 연산 감사다.
+시작 시의 독립 DEBUG fixture CE/gradient 검사는 `preflight_debug_checks.json`에 따로 기록한다.
+분류기의 본학습이나 예측 성능은 이번 실행에서 측정하지 않았다.
+
+## 실제 비교
+
+A는 local별 weighted Laplacian, K는 서로 인접한 중심의 공통 원래 노드 copy를 잇는
+W=1의 copy Laplacian이다. 동일 undirected 중심 쌍·공통 노드 링크는 한 번만 센다.
+R은 특징을 모든 copy로 복사하고 M은 같은 원래 노드의 copy 평균으로 합친다.
+η·γ는 각 물리 그래프에서 실제 weighted degree를 써서 안전하게 고정한다.
+
+- Immediate: `M(I−γK)(I−ηA)RH`; cross 뒤 즉시 merge하면 K의 변화가 소거되는 대조다.
+- Sandwich: `M(I−ηA)(I−γK)(I−ηA)RH`; cross 뒤 다시 local A를 적용한다.
+- 같은 η의 off 대조와의 차이는 정확히 `−γη² M A K A R H`다. 전체 행렬을 dense로 만들지 않고 직접 action으로 대조했다.
+- Persistent: 같은 step을 쓰는 `M(I−step(A+K))^s RH`와 K off를 s=1/2/3에서 비교했다.
+  첫 두 단계 merge 차이는 0이며 세 번째 차이는 `−step³ M A K A R H`다.
+
+H0/H1/H2는 이전 물리 그래프의 고정 확산 reference 입력이며 새 모델의 학습 층이 아니다.
+각 상태에서 위 연산을 독립 적용했다. Cross 에너지는 `½ ZᵀKZ`, intra도 `½ ZᵀAZ`다.
+새 에너지를 scalar lift로 더하지 않고 copy 상태의 연산에 직접 사용했다.
+
+## 전체 입력의 메커니즘 검사
+
+| sandwich_formula_relative_error_max | immediate_increment_norm_max | persistent_1_increment_norm_max | persistent_2_increment_norm_max | context_resolved_graph_state_cells | predicted_increment_resolved_graph_state_cells | observed_increment_resolved_graph_state_cells |
+| --- | --- | --- | --- | --- | --- | --- |
+| 6.99393e-17 | 4.37073e-15 | 4.14771e-15 | 4.53098e-15 | 1206 | 1206 | 1206 |
+
+Norm residual과 수치상 구별되는 변화, 수학적 항등식은 다른 지표다.
+모든 입력에서 cross·출력 차이가 양수라고 요구하지 않는다. 상수/영공간 입력에서는 0일 수 있다.
+미세한 신호의 on−off 차이는 float64 상쇄 영향을 받을 수 있으므로 실제 값과 직접 계산한 예측값을 모두 CSV에 남겼다.
+Resolved flag는 입력 copy norm에 대한 상대 threshold 1e-12를 사용한다.
+Residual은 상대 허용오차 1e-09로 검사하며 실패를 숨기지 않는다.
+
+## 전체 citation 벡터의 결과
+
+채널별 norm 제곱을 먼저 모두 합한 뒤 norm·상대 비율을 만들었다.
+Citation의 5636개 특징 채널을 독립 표본이나 학습 seed로 세지 않는다.
+
+| graph | C | state | cross_energy_after_intra | sandwich_delta_norm | sandwich_delta_relative | formula_relative_error | persistent_step3_delta_norm | observed_resolved |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| CiteSeer | local_degree | H0 | 9.39496 | 0.0031821 | 0.000387885 | 4.21556e-17 | 1.16146e-06 | True |
+| CiteSeer | local_degree | H1 | 8.44731 | 0.00302579 | 0.000371307 | 4.35459e-17 | 1.10441e-06 | True |
+| CiteSeer | local_degree | H2 | 7.74779 | 0.00289955 | 0.000358026 | 4.39794e-17 | 1.05833e-06 | True |
+| CiteSeer | unit | H0 | 0.555752 | 0.0005396 | 5.23755e-05 | 5.53131e-17 | 6.745e-05 | True |
+| CiteSeer | unit | H1 | 0.233358 | 0.000283146 | 2.77753e-05 | 5.4743e-17 | 3.53933e-05 | True |
+| CiteSeer | unit | H2 | 0.133061 | 0.000158335 | 1.56885e-05 | 5.50054e-17 | 1.97919e-05 | True |
+| Cora | local_degree | H0 | 28.3375 | 0.00316333 | 0.000293122 | 4.16426e-17 | 4.18474e-07 | True |
+| Cora | local_degree | H1 | 25.8987 | 0.00303113 | 0.000282943 | 4.30946e-17 | 4.00985e-07 | True |
+| Cora | local_degree | H2 | 24.084 | 0.00292551 | 0.000274956 | 4.33139e-17 | 3.87013e-07 | True |
+| Cora | unit | H0 | 1.48431 | 0.000471578 | 3.39371e-05 | 5.36875e-17 | 5.89472e-05 | True |
+| Cora | unit | H1 | 0.6829 | 0.000255989 | 1.86002e-05 | 5.27745e-17 | 3.19987e-05 | True |
+| Cora | unit | H2 | 0.401623 | 0.000151838 | 1.11344e-05 | 5.2318e-17 | 1.89797e-05 | True |
+| PubMed | local_degree | H0 | 165.725 | 0.00778637 | 0.000326407 | 4.49518e-17 | 1.006e-06 | True |
+| PubMed | local_degree | H1 | 147.683 | 0.00739028 | 0.000312484 | 4.55765e-17 | 9.5483e-07 | True |
+| PubMed | local_degree | H2 | 133.655 | 0.00705981 | 0.000300865 | 4.59021e-17 | 9.12133e-07 | True |
+| PubMed | unit | H0 | 6.72992 | 0.000667175 | 2.38411e-05 | 5.41587e-17 | 8.33969e-05 | True |
+| PubMed | unit | H1 | 4.21219 | 0.000453256 | 1.63471e-05 | 5.38051e-17 | 5.6657e-05 | True |
+| PubMed | unit | H2 | 2.92995 | 0.000322413 | 1.17281e-05 | 5.38244e-17 | 4.03016e-05 | True |
+
+이 표는 fixed 연산이 현재 입력에 실제로 작용했는지 보여 준다.
+모든 기존 feature column에서 연산자의 action을 검사했으며 전체 input Jacobian을 dense하게 계산한 검사가 아니다.
+일반적인 성능 개선·learned C·독립 그래프 일반화·새 GNN의 우월성을 입증하지 않는다.
+
+## 전체 기록
+
+- `channel_metrics.csv`: 모든 원래 graph/feature column/C/reference의 raw 진단.
+- `graph_summary.csv`: 모든 graph/C/reference의 전체 채널 제곱 norm 합과 벡터 비율.
+- `resources.json`: 입력 읽기·geometry CPU worker·CPU thread·GPU batch/chunk 후보와 최종 실제 실행 자원.
+- `source_input_manifest.json`, `source_adapter.json`, `source_manifest.json`: 기존 source와 현재 scientific import closure의 hash.
+- `coverage.json`, `completion.json`: 전체 coverage, scope, source 보존, elapsed.
+
+GPU chunking과 graph batching은 계산만 분할했다. 노드·엣지·feature column을 제외하지 않았다.
+DEBUG이면 명시된 fixture 경로이며 실제 데이터 분류 결과로 해석하지 않는다.

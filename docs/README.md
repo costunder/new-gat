@@ -70,6 +70,7 @@
 | [위치별 실험 구현 검증](LOCAL_PLACEMENT_VERIFICATION_20261004.md) | 이전 대조군과 계산 일치, 활성 파라미터·학습·평가·이어하기 검사와 CUDA DEBUG 범위 |
 | [E/J 위치별 서버 결과](LOCAL_PLACEMENT_SERVER_FINDINGS_20261004.md) | 840회 계획의 제출 요약, 54개 base 대비 비교, 층별 재학습·제거 반응과 채널별 특징 대조 제안 |
 | [로컬 문맥 교차 전파](../research/local_context_coupling/README.md) | 로컬별 상태의 내부→교차→내부 갱신, 균등 평균의 소거 조건, 동일 내부 계산의 J-off 대조와 서버 전체 고정 검사 |
+| [로컬 문맥 교차 전파 서버 결과](LOCAL_CONTEXT_COUPLING_SERVER_FINDINGS_20261004.md) | FULL 201개 고정 검증 요약, 교차 효과의 크기, persistent 계수 관계와 다음 분류 비교 |
 
 ## GPT 전체 프로젝트 전달 묶음
 
