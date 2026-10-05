@@ -1,0 +1,451 @@
+{
+  "completed": true,
+  "scope": "component_validation_not_checkpoint_analysis",
+  "actual_citation_data": true,
+  "new_training_runs": 0,
+  "trained_checkpoints_analyzed": 0,
+  "all_nodes_edges_features": true,
+  "rows": [
+    {
+      "dataset": "Cora",
+      "actual_citation_data": true,
+      "nodes": 2708,
+      "physical_edges": 5278,
+      "all_features": 1433,
+      "local_nodes": 13264,
+      "local_edges": 15446,
+      "directed_pairs": 10556,
+      "topology_seconds": 0.34232279995922,
+      "workers": 16,
+      "chosen_chunk": 512,
+      "calibration": [
+        {
+          "feature_chunk": 32,
+          "full_features": 1433,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 1,
+          "seconds": [
+            0.08842220000224188,
+            0.07830799999646842
+          ],
+          "median_seconds": 0.08336509999935515,
+          "peak_allocated_bytes": 46545408,
+          "peak_reserved_bytes": 65011712,
+          "free_bytes": 15631122432,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 32483.617245357433,
+          "stage_pairs_per_second": 126623.7310347094
+        },
+        {
+          "feature_chunk": 128,
+          "full_features": 1433,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 1,
+          "seconds": [
+            0.021372999995946884,
+            0.02499629999510944
+          ],
+          "median_seconds": 0.02318464999552816,
+          "peak_allocated_bytes": 129887744,
+          "peak_reserved_bytes": 262144000,
+          "free_bytes": 15433990144,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 116801.41820222937,
+          "stage_pairs_per_second": 455301.2446612752
+        },
+        {
+          "feature_chunk": 512,
+          "full_features": 1433,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 1,
+          "seconds": [
+            0.017072300019208342,
+            0.015818600018974394
+          ],
+          "median_seconds": 0.016445450019091368,
+          "peak_allocated_bytes": 463851008,
+          "peak_reserved_bytes": 979369984,
+          "free_bytes": 14716764160,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 164665.60640519465,
+          "stage_pairs_per_second": 641879.668099422
+        }
+      ],
+      "packed_input_copies": 15,
+      "packed_chunk": 32,
+      "packed_calibration": [
+        {
+          "feature_chunk": 8,
+          "full_features": 1433,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 15,
+          "seconds": [
+            0.3431372999912128,
+            0.37090510001871735
+          ],
+          "median_seconds": 0.35702120000496507,
+          "peak_allocated_bytes": 129946112,
+          "peak_reserved_bytes": 245366784,
+          "free_bytes": 15448670208,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 113774.75623138095,
+          "stage_pairs_per_second": 443503.0748812619
+        },
+        {
+          "feature_chunk": 32,
+          "full_features": 1433,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 15,
+          "seconds": [
+            0.26070179999805987,
+            0.2613996000145562
+          ],
+          "median_seconds": 0.26105070000630803,
+          "peak_allocated_bytes": 445762560,
+          "peak_reserved_bytes": 933232640,
+          "free_bytes": 14760804352,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 155601.95777685507,
+          "stage_pairs_per_second": 606548.8427963376
+        }
+      ],
+      "chunk_and_packing_parity": true,
+      "global_input_raw_energy": 649.61352277051,
+      "seconds": 3.9428963999962434,
+      "resources": {
+        "platform": "Windows-11-10.0.26200-SP0",
+        "python": "3.13.2 | packaged by Anaconda, Inc. | (main, Feb  6 2025, 18:49:14) [MSC v.1929 64 bit (AMD64)]",
+        "torch": "2.13.0+cu130",
+        "numpy": "2.4.6",
+        "logical_cpu": 16,
+        "cpu_affinity_count": 16,
+        "cpu_quota": null,
+        "ram_total_bytes": 68640653312,
+        "ram_available_bytes": 42470141952,
+        "container_memory_limit_bytes": null,
+        "process_rss_bytes": 1302663168,
+        "cuda_visible_devices": null,
+        "selected_device": "cuda:0",
+        "gpu_count_visible": 1,
+        "gpu_count_used": 1,
+        "gpu": {
+          "name": "NVIDIA GeForce RTX 5070 Ti",
+          "total_memory_bytes": 17094344704,
+          "free_memory_bytes": 14756610048,
+          "runtime_total_memory_bytes": 17094344704,
+          "multiprocessors": 70,
+          "uuid": "4bb87504-d7ff-5f8b-611c-578338dab472",
+          "capability": [
+            12,
+            0
+          ],
+          "cuda_runtime": "13.0"
+        }
+      }
+    },
+    {
+      "dataset": "CiteSeer",
+      "actual_citation_data": true,
+      "nodes": 3327,
+      "physical_edges": 4552,
+      "all_features": 3703,
+      "local_nodes": 12431,
+      "local_edges": 12605,
+      "directed_pairs": 9104,
+      "topology_seconds": 0.3443066000472754,
+      "workers": 16,
+      "chosen_chunk": 512,
+      "calibration": [
+        {
+          "feature_chunk": 32,
+          "full_features": 3703,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 1,
+          "seconds": [
+            0.21194609999656677,
+            0.24104170000646263
+          ],
+          "median_seconds": 0.2264939000015147,
+          "peak_allocated_bytes": 75669504,
+          "peak_reserved_bytes": 104857600,
+          "free_bytes": 15589179392,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 14689.137323246896,
+          "stage_pairs_per_second": 40195.343008968965
+        },
+        {
+          "feature_chunk": 128,
+          "full_features": 3703,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 1,
+          "seconds": [
+            0.0648450999869965,
+            0.06726300000445917
+          ],
+          "median_seconds": 0.06605404999572784,
+          "peak_allocated_bytes": 145585664,
+          "peak_reserved_bytes": 251658240,
+          "free_bytes": 15442378752,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 50367.84270177498,
+          "stage_pairs_per_second": 137826.5223796091
+        },
+        {
+          "feature_chunk": 512,
+          "full_features": 3703,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 1,
+          "seconds": [
+            0.03761060000397265,
+            0.03750420000869781
+          ],
+          "median_seconds": 0.03755740000633523,
+          "peak_allocated_bytes": 426329600,
+          "peak_reserved_bytes": 819986432,
+          "free_bytes": 14874050560,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 88584.40678638025,
+          "stage_pairs_per_second": 242402.29617769938
+        }
+      ],
+      "packed_input_copies": 15,
+      "packed_chunk": 32,
+      "packed_calibration": [
+        {
+          "feature_chunk": 8,
+          "full_features": 3703,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 15,
+          "seconds": [
+            1.0346499999868684,
+            0.9055299999890849
+          ],
+          "median_seconds": 0.9700899999879766,
+          "peak_allocated_bytes": 150183424,
+          "peak_reserved_bytes": 239075328,
+          "free_bytes": 15454961664,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 51443.68048389173,
+          "stage_pairs_per_second": 140770.44398116932
+        },
+        {
+          "feature_chunk": 32,
+          "full_features": 3703,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 15,
+          "seconds": [
+            0.5817179000005126,
+            0.5799924999591894
+          ],
+          "median_seconds": 0.580855199979851,
+          "peak_allocated_bytes": 410338304,
+          "peak_reserved_bytes": 843055104,
+          "free_bytes": 14850981888,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 85916.42116956365,
+          "stage_pairs_per_second": 235101.62258121656
+        }
+      ],
+      "chunk_and_packing_parity": true,
+      "global_input_raw_energy": 236.6563672246618,
+      "seconds": 6.925402600027155,
+      "resources": {
+        "platform": "Windows-11-10.0.26200-SP0",
+        "python": "3.13.2 | packaged by Anaconda, Inc. | (main, Feb  6 2025, 18:49:14) [MSC v.1929 64 bit (AMD64)]",
+        "torch": "2.13.0+cu130",
+        "numpy": "2.4.6",
+        "logical_cpu": 16,
+        "cpu_affinity_count": 16,
+        "cpu_quota": null,
+        "ram_total_bytes": 68640653312,
+        "ram_available_bytes": 42364837888,
+        "container_memory_limit_bytes": null,
+        "process_rss_bytes": 1424146432,
+        "cuda_visible_devices": null,
+        "selected_device": "cuda:0",
+        "gpu_count_visible": 1,
+        "gpu_count_used": 1,
+        "gpu": {
+          "name": "NVIDIA GeForce RTX 5070 Ti",
+          "total_memory_bytes": 17094344704,
+          "free_memory_bytes": 14846787584,
+          "runtime_total_memory_bytes": 17094344704,
+          "multiprocessors": 70,
+          "uuid": "4bb87504-d7ff-5f8b-611c-578338dab472",
+          "capability": [
+            12,
+            0
+          ],
+          "cuda_runtime": "13.0"
+        }
+      }
+    },
+    {
+      "dataset": "PubMed",
+      "actual_citation_data": true,
+      "nodes": 19717,
+      "physical_edges": 44324,
+      "all_features": 500,
+      "local_nodes": 108365,
+      "local_edges": 126208,
+      "directed_pairs": 88648,
+      "topology_seconds": 3.6640596000361256,
+      "workers": 16,
+      "chosen_chunk": 128,
+      "calibration": [
+        {
+          "feature_chunk": 32,
+          "full_features": 500,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 1,
+          "seconds": [
+            0.052322300034575164,
+            0.054279299976769835
+          ],
+          "median_seconds": 0.0533008000056725,
+          "peak_allocated_bytes": 293068288,
+          "peak_reserved_bytes": 572522496,
+          "free_bytes": 15121514496,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 369919.40079514065,
+          "stage_pairs_per_second": 1663164.5301865207
+        },
+        {
+          "feature_chunk": 128,
+          "full_features": 500,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 1,
+          "seconds": [
+            0.046463800012134016,
+            0.04623489995719865
+          ],
+          "median_seconds": 0.04634934998466633,
+          "peak_allocated_bytes": 972786176,
+          "peak_reserved_bytes": 2011168768,
+          "free_bytes": 13682868224,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 425399.7090902664,
+          "stage_pairs_per_second": 1912605.03177126
+        },
+        {
+          "feature_chunk": 500,
+          "full_features": 500,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 1,
+          "seconds": [
+            0.04703850002260879,
+            0.04745849996106699
+          ],
+          "median_seconds": 0.04724849999183789,
+          "peak_allocated_bytes": 3608037888,
+          "peak_reserved_bytes": 7585398784,
+          "free_bytes": 8108638208,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 417304.25311715895,
+          "stage_pairs_per_second": 1876207.7106217935
+        }
+      ],
+      "packed_input_copies": 15,
+      "packed_chunk": 8,
+      "packed_calibration": [
+        {
+          "feature_chunk": 8,
+          "full_features": 500,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 15,
+          "seconds": [
+            0.7717361999675632,
+            0.7717189999530092
+          ],
+          "median_seconds": 0.7717275999602862,
+          "peak_allocated_bytes": 975770624,
+          "peak_reserved_bytes": 1954545664,
+          "free_bytes": 13739491328,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 383237.5568985998,
+          "stage_pairs_per_second": 1723043.2085990298
+        },
+        {
+          "feature_chunk": 32,
+          "full_features": 500,
+          "repeats": 2,
+          "all_nodes_and_edges": true,
+          "packed_states": 15,
+          "seconds": [
+            0.7842267000232823,
+            0.7842059000395238
+          ],
+          "median_seconds": 0.7842163000314031,
+          "peak_allocated_bytes": 3521843200,
+          "peak_reserved_bytes": 7358906368,
+          "free_bytes": 8335130624,
+          "total_bytes": 17094344704,
+          "safe": true,
+          "stage_nodes_per_second": 377134.4716861366,
+          "stage_pairs_per_second": 1695603.6235752213
+        }
+      ],
+      "chunk_and_packing_parity": true,
+      "global_input_raw_energy": 2585.8757396210926,
+      "seconds": 10.163331100018695,
+      "resources": {
+        "platform": "Windows-11-10.0.26200-SP0",
+        "python": "3.13.2 | packaged by Anaconda, Inc. | (main, Feb  6 2025, 18:49:14) [MSC v.1929 64 bit (AMD64)]",
+        "torch": "2.13.0+cu130",
+        "numpy": "2.4.6",
+        "logical_cpu": 16,
+        "cpu_affinity_count": 16,
+        "cpu_quota": null,
+        "ram_total_bytes": 68640653312,
+        "ram_available_bytes": 42329612288,
+        "container_memory_limit_bytes": null,
+        "process_rss_bytes": 1438965760,
+        "cuda_visible_devices": null,
+        "selected_device": "cuda:0",
+        "gpu_count_visible": 1,
+        "gpu_count_used": 1,
+        "gpu": {
+          "name": "NVIDIA GeForce RTX 5070 Ti",
+          "total_memory_bytes": 17094344704,
+          "free_memory_bytes": 8335130624,
+          "runtime_total_memory_bytes": 17094344704,
+          "multiprocessors": 70,
+          "uuid": "4bb87504-d7ff-5f8b-611c-578338dab472",
+          "capability": [
+            12,
+            0
+          ],
+          "cuda_runtime": "13.0"
+        }
+      }
+    }
+  ]
+}

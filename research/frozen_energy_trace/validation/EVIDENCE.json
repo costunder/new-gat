@@ -1,0 +1,25 @@
+{
+  "scope": "curated DEBUG pipeline and full-input COMPONENT evidence; not trained full checkpoint results",
+  "original_debug_output": "D:\\AI project\\new-gat\\.pytest-tmp-frozen-energy-20261005-03\\test_nine_existing_models_one_0\\diagnostic",
+  "original_component_output": "D:\\AI project\\new-gat\\results\\frozen-energy-full-inputs-COMPONENT-20261005-01",
+  "tests": {
+    "all_tests_passed": 23,
+    "latest_pipeline_repeat_passed": 2,
+    "ruff_passed": true
+  },
+  "copied_files_sha256": {
+    "DEBUG-completion.json": "064c65453c2ceb3b22da82de935ab261ed526691ed722aecf0b4720b6a0e0028",
+    "DEBUG-contract.json": "0e1a4acdae18b6d6658d92e8c592e93b7f39ee6e346bfcf0e10ef70949f73c47",
+    "DEBUG-hardware.json": "2b21fa0a930a56475e8b99429515813121e875cb68a6700e445ce61c2a86f695",
+    "DEBUG-source.json": "810d9988537726f27666ba319f9a217bb4af05ef581105c5b8df776b9e176e55",
+    "DEBUG-artifacts.json": "fd53fed0228025e339b4a9054198b3f43f5f85f0aa0829ba8d010f66fee8c650",
+    "DEBUG-calibration.csv": "1c150c2c5a5fd4aebcd7391b4e9f421d9b0b55c2f2a47fbb798bd7fbe7c71706",
+    "DEBUG-stages.csv": "a598452a6a9a35042cf9a7306eecc3b6d963d868019acce6fab82250f7d5e127",
+    "DEBUG-transitions.csv": "85e4d1254dd2fca4a6e6be5ae4ca8992bdf01f94dbb4d2b75c11f1c760b39695",
+    "COMPONENT-full-input-completion.json": "2792f886e538869e4e7edd6598ab1c57e0d011956c4811f0881283dc464996c4",
+    "COMPONENT-full-input-hardware.json": "f614d55f0775a4df2cc60dfcf494b19d0198232c394a2bc2c107587c817b5d12",
+    "COMPONENT-full-input-source.json": "ba3c1dd240978e8ea5c5a736cb3c79505d7619ab6a5d68e0905875af002974bc"
+  },
+  "omitted": "NPZ fields and execution source ZIP remain in original output; artifacts.json hashes them but does not imply all are copied",
+  "text_serialization": "Curated text uses LF for stable Git checkout hashes; original artifact manifest describes original run bytes."
+}

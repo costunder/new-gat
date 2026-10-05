@@ -1,0 +1,47 @@
+{
+  "completed": true,
+  "profile": "debug",
+  "seed": 11,
+  "seed_count": 1,
+  "checkpoint_analyses": 9,
+  "stage_rows": 99,
+  "transition_rows": 99,
+  "new_training_runs": 0,
+  "optimizer_updates": 0,
+  "parameters_preserved": true,
+  "full_graphs": true,
+  "actual_citation_data": false,
+  "scope": "DEBUG_pipeline_only",
+  "artifact_manifest_sha256": "989d09018243611bb40049fb7fed2d5e882381f9868019387dd596212cb5b2b3",
+  "seconds": 4.59707309998339,
+  "final_resources": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.13.2 | packaged by Anaconda, Inc. | (main, Feb  6 2025, 18:49:14) [MSC v.1929 64 bit (AMD64)]",
+    "torch": "2.13.0+cu130",
+    "numpy": "2.4.6",
+    "logical_cpu": 16,
+    "cpu_affinity_count": 16,
+    "cpu_quota": null,
+    "ram_total_bytes": 68640653312,
+    "ram_available_bytes": 42177486848,
+    "container_memory_limit_bytes": null,
+    "process_rss_bytes": 1630146560,
+    "cuda_visible_devices": null,
+    "selected_device": "cuda:0",
+    "gpu_count_visible": 1,
+    "gpu_count_used": 1,
+    "gpu": {
+      "name": "NVIDIA GeForce RTX 5070 Ti",
+      "total_memory_bytes": 17094344704,
+      "free_memory_bytes": 15647899648,
+      "runtime_total_memory_bytes": 17094344704,
+      "multiprocessors": 70,
+      "uuid": "4bb87504-d7ff-5f8b-611c-578338dab472",
+      "capability": [
+        12,
+        0
+      ],
+      "cuda_runtime": "13.0"
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "platform": "Windows-11-10.0.26200-SP0",
+  "python": "3.13.2 | packaged by Anaconda, Inc. | (main, Feb  6 2025, 18:49:14) [MSC v.1929 64 bit (AMD64)]",
+  "torch": "2.13.0+cu130",
+  "numpy": "2.4.6",
+  "logical_cpu": 16,
+  "cpu_affinity_count": 16,
+  "cpu_quota": null,
+  "ram_total_bytes": 68640653312,
+  "ram_available_bytes": 43151667200,
+  "container_memory_limit_bytes": null,
+  "process_rss_bytes": 669315072,
+  "cuda_visible_devices": null,
+  "selected_device": "cuda:0",
+  "gpu_count_visible": 1,
+  "gpu_count_used": 1,
+  "gpu": {
+    "name": "NVIDIA GeForce RTX 5070 Ti",
+    "total_memory_bytes": 17094344704,
+    "free_memory_bytes": 15740174336,
+    "runtime_total_memory_bytes": 17094344704,
+    "multiprocessors": 70,
+    "uuid": "4bb87504-d7ff-5f8b-611c-578338dab472",
+    "capability": [
+      12,
+      0
+    ],
+    "cuda_runtime": "13.0"
+  }
+}

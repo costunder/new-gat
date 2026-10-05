@@ -1,0 +1,485 @@
+{
+  "seed": 11,
+  "seed_count": 1,
+  "seed_choice": "first declared existing final seed; no score selection",
+  "profile": "debug",
+  "classification_source": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01",
+  "models": [
+    "mlp",
+    "standard_gcn",
+    "polynomial_2"
+  ],
+  "datasets": [
+    "DEBUG-CiteSeer",
+    "DEBUG-Cora",
+    "DEBUG-PubMed"
+  ],
+  "sampling_ratio": 1.0,
+  "local": "induced closed 1-hop neighborhood",
+  "C": "identity",
+  "new_training_runs": 0,
+  "new_optimizer_updates": 0,
+  "LR_reselection": false,
+  "checkpoint_reselection": false,
+  "dropout": "disabled by eval",
+  "model_precision": "source FP32",
+  "energy_precision": "FP64",
+  "tf32": false,
+  "epsilon": 1e-12,
+  "unknown_label": "exclude from label separation only",
+  "J_definition": "audited common edges/nodes: J_node=2*J_shared+J_distinct",
+  "degree_normalization": "local Lsym and augmented Lsym; amplitude quotients separate",
+  "operator_replay": "fixed projected Z; common original GCN P for I/P/P2 on all models",
+  "final_layer": "logits without ReLU; matches existing model",
+  "backbone": {
+    "layers": 2,
+    "hidden_dim": 8,
+    "projection_bias": false,
+    "dropout_probability": 0.5,
+    "dropout_placement": "before_each_projection",
+    "activation": "relu_after_first_propagation_only",
+    "output": "second_layer_logits",
+    "initialization": "xavier_uniform_weights_zero_bias",
+    "shared_initialization_and_dropout_streams": true,
+    "first_alpha": "sigmoid(u); initial=0.5",
+    "two_branch_coefficients": "t=sigmoid(u); r=sigmoid(v); alpha=t*(1-r); beta=t*r",
+    "two_branch_initial_alpha": 0.5,
+    "two_branch_initial_beta": 0.25,
+    "extra_projection": false
+  },
+  "workers": 16,
+  "original_training_epochs": 3,
+  "diagnostic_training_epochs": 0,
+  "physical_seed_batch": 1,
+  "physical_stage_batch": "same-width stages of three models packed; sizes calibrated",
+  "gradient_accumulation_steps": 0,
+  "effective_training_batch": null,
+  "dataloader": "resident CUDA graph; no epoch loader; CPU topology cached once",
+  "graph_batching": "all nodes/local edges on GPU; same-width model/stage axis packed",
+  "statistics": "one-seed descriptive case study; no std/CI/significance",
+  "checkpoints": [
+    {
+      "dataset": "DEBUG-Cora",
+      "condition": "mlp",
+      "seed": 11,
+      "checkpoint": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\jobs\\final\\DEBUG-Cora\\mlp\\lr-0.01\\pack-00\\selected.pt",
+      "checkpoint_sha256": "abc3f593565025cd167a1568f7049ca79bb22b76dcaa1f3e8e30a11d13fec531",
+      "graph_path": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\graphs\\DEBUG-Cora.npz",
+      "graph_sha256": "ef722ed006131bf342418f0de9338e9f301a215b49c99265bcb0b728bdc00ac9",
+      "graph_digest": "3a9a831884f6af7c6ea568b1b539006f89c7a203852a452dbec28ab35b4855c4",
+      "path_chunk": 260,
+      "selected_epoch": 1,
+      "selected_validation_ce": 1.1033563613891602,
+      "selected_validation_accuracy": 0.3333333432674408,
+      "original_metrics": [
+        {
+          "dataset": "DEBUG-Cora",
+          "condition": "mlp",
+          "seed": 11,
+          "split": "train",
+          "ce": 1.1035858392715454,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 24,
+          "num_labeled_nodes": 9
+        },
+        {
+          "dataset": "DEBUG-Cora",
+          "condition": "mlp",
+          "seed": 11,
+          "split": "validation",
+          "ce": 1.1033563613891602,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 24,
+          "num_labeled_nodes": 6
+        },
+        {
+          "dataset": "DEBUG-Cora",
+          "condition": "mlp",
+          "seed": 11,
+          "split": "test",
+          "ce": 1.0889476537704468,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 24,
+          "num_labeled_nodes": 9
+        }
+      ],
+      "source_code_digest": "49ce7528d7d45cff1298aa250d5119afb1c66101968aa17a4f33455c9adaa5ba"
+    },
+    {
+      "dataset": "DEBUG-Cora",
+      "condition": "standard_gcn",
+      "seed": 11,
+      "checkpoint": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\jobs\\final\\DEBUG-Cora\\standard_gcn\\lr-0.003\\pack-00\\selected.pt",
+      "checkpoint_sha256": "e3e7f34847dc3663aa7c2e7ed79d7ed2fcb6d145c06ea6b8a942dee3bd517a88",
+      "graph_path": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\graphs\\DEBUG-Cora.npz",
+      "graph_sha256": "ef722ed006131bf342418f0de9338e9f301a215b49c99265bcb0b728bdc00ac9",
+      "graph_digest": "3a9a831884f6af7c6ea568b1b539006f89c7a203852a452dbec28ab35b4855c4",
+      "path_chunk": 260,
+      "selected_epoch": 3,
+      "selected_validation_ce": 1.1004786491394043,
+      "selected_validation_accuracy": 0.3333333432674408,
+      "original_metrics": [
+        {
+          "dataset": "DEBUG-Cora",
+          "condition": "standard_gcn",
+          "seed": 11,
+          "split": "train",
+          "ce": 1.1079864501953125,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 24,
+          "num_labeled_nodes": 9
+        },
+        {
+          "dataset": "DEBUG-Cora",
+          "condition": "standard_gcn",
+          "seed": 11,
+          "split": "validation",
+          "ce": 1.1004786491394043,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 24,
+          "num_labeled_nodes": 6
+        },
+        {
+          "dataset": "DEBUG-Cora",
+          "condition": "standard_gcn",
+          "seed": 11,
+          "split": "test",
+          "ce": 1.11337411403656,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 24,
+          "num_labeled_nodes": 9
+        }
+      ],
+      "source_code_digest": "49ce7528d7d45cff1298aa250d5119afb1c66101968aa17a4f33455c9adaa5ba"
+    },
+    {
+      "dataset": "DEBUG-Cora",
+      "condition": "polynomial_2",
+      "seed": 11,
+      "checkpoint": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\jobs\\final\\DEBUG-Cora\\polynomial_2\\lr-0.003\\pack-00\\selected.pt",
+      "checkpoint_sha256": "ff77a11a4995e63be431295cb3bd35ccfa76fa77942d46db593a9baa08901c42",
+      "graph_path": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\graphs\\DEBUG-Cora.npz",
+      "graph_sha256": "ef722ed006131bf342418f0de9338e9f301a215b49c99265bcb0b728bdc00ac9",
+      "graph_digest": "3a9a831884f6af7c6ea568b1b539006f89c7a203852a452dbec28ab35b4855c4",
+      "path_chunk": 260,
+      "selected_epoch": 3,
+      "selected_validation_ce": 1.1013972759246826,
+      "selected_validation_accuracy": 0.3333333432674408,
+      "original_metrics": [
+        {
+          "dataset": "DEBUG-Cora",
+          "condition": "polynomial_2",
+          "seed": 11,
+          "split": "train",
+          "ce": 1.1081812381744385,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 24,
+          "num_labeled_nodes": 9
+        },
+        {
+          "dataset": "DEBUG-Cora",
+          "condition": "polynomial_2",
+          "seed": 11,
+          "split": "validation",
+          "ce": 1.1013972759246826,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 24,
+          "num_labeled_nodes": 6
+        },
+        {
+          "dataset": "DEBUG-Cora",
+          "condition": "polynomial_2",
+          "seed": 11,
+          "split": "test",
+          "ce": 1.1064261198043823,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 24,
+          "num_labeled_nodes": 9
+        }
+      ],
+      "source_code_digest": "49ce7528d7d45cff1298aa250d5119afb1c66101968aa17a4f33455c9adaa5ba"
+    },
+    {
+      "dataset": "DEBUG-CiteSeer",
+      "condition": "mlp",
+      "seed": 11,
+      "checkpoint": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\jobs\\final\\DEBUG-CiteSeer\\mlp\\lr-0.003\\pack-00\\selected.pt",
+      "checkpoint_sha256": "ab85d5f7e7e625c5cb16153e4a18c14f02ef9448f74b9f55fee21363854f6384",
+      "graph_path": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\graphs\\DEBUG-CiteSeer.npz",
+      "graph_sha256": "ce3569fbf68b4546bdc3538b5497ea8b604824bb005178ea19bbfa926007d5c9",
+      "graph_digest": "516994c1a5ece279f91dc7c380cbc78e45f0ab00075a6a79c7814d1094e420cf",
+      "path_chunk": 336,
+      "selected_epoch": 3,
+      "selected_validation_ce": 1.1062846183776855,
+      "selected_validation_accuracy": 0.1666666716337204,
+      "original_metrics": [
+        {
+          "dataset": "DEBUG-CiteSeer",
+          "condition": "mlp",
+          "seed": 11,
+          "split": "train",
+          "ce": 1.098883867263794,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 30,
+          "num_labeled_nodes": 9
+        },
+        {
+          "dataset": "DEBUG-CiteSeer",
+          "condition": "mlp",
+          "seed": 11,
+          "split": "validation",
+          "ce": 1.1062846183776855,
+          "accuracy": 0.1666666716337204,
+          "num_nodes": 30,
+          "num_labeled_nodes": 6
+        },
+        {
+          "dataset": "DEBUG-CiteSeer",
+          "condition": "mlp",
+          "seed": 11,
+          "split": "test",
+          "ce": 1.1022194623947144,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 30,
+          "num_labeled_nodes": 15
+        }
+      ],
+      "source_code_digest": "49ce7528d7d45cff1298aa250d5119afb1c66101968aa17a4f33455c9adaa5ba"
+    },
+    {
+      "dataset": "DEBUG-CiteSeer",
+      "condition": "standard_gcn",
+      "seed": 11,
+      "checkpoint": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\jobs\\final\\DEBUG-CiteSeer\\standard_gcn\\lr-0.01\\pack-00\\selected.pt",
+      "checkpoint_sha256": "2e4c727a1a95621122975047fe6e99bc9d44605068223371c8aef2b43d927cd3",
+      "graph_path": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\graphs\\DEBUG-CiteSeer.npz",
+      "graph_sha256": "ce3569fbf68b4546bdc3538b5497ea8b604824bb005178ea19bbfa926007d5c9",
+      "graph_digest": "516994c1a5ece279f91dc7c380cbc78e45f0ab00075a6a79c7814d1094e420cf",
+      "path_chunk": 336,
+      "selected_epoch": 3,
+      "selected_validation_ce": 1.1036067008972168,
+      "selected_validation_accuracy": 0.3333333432674408,
+      "original_metrics": [
+        {
+          "dataset": "DEBUG-CiteSeer",
+          "condition": "standard_gcn",
+          "seed": 11,
+          "split": "train",
+          "ce": 1.1009148359298706,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 30,
+          "num_labeled_nodes": 9
+        },
+        {
+          "dataset": "DEBUG-CiteSeer",
+          "condition": "standard_gcn",
+          "seed": 11,
+          "split": "validation",
+          "ce": 1.1036067008972168,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 30,
+          "num_labeled_nodes": 6
+        },
+        {
+          "dataset": "DEBUG-CiteSeer",
+          "condition": "standard_gcn",
+          "seed": 11,
+          "split": "test",
+          "ce": 1.1017110347747803,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 30,
+          "num_labeled_nodes": 15
+        }
+      ],
+      "source_code_digest": "49ce7528d7d45cff1298aa250d5119afb1c66101968aa17a4f33455c9adaa5ba"
+    },
+    {
+      "dataset": "DEBUG-CiteSeer",
+      "condition": "polynomial_2",
+      "seed": 11,
+      "checkpoint": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\jobs\\final\\DEBUG-CiteSeer\\polynomial_2\\lr-0.003\\pack-00\\selected.pt",
+      "checkpoint_sha256": "f04d61f65cf5b2e65cb28e6e484d8976caff04afbd5e71dbe4f6475b9d65b32f",
+      "graph_path": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\graphs\\DEBUG-CiteSeer.npz",
+      "graph_sha256": "ce3569fbf68b4546bdc3538b5497ea8b604824bb005178ea19bbfa926007d5c9",
+      "graph_digest": "516994c1a5ece279f91dc7c380cbc78e45f0ab00075a6a79c7814d1094e420cf",
+      "path_chunk": 336,
+      "selected_epoch": 3,
+      "selected_validation_ce": 1.1039071083068848,
+      "selected_validation_accuracy": 0.3333333432674408,
+      "original_metrics": [
+        {
+          "dataset": "DEBUG-CiteSeer",
+          "condition": "polynomial_2",
+          "seed": 11,
+          "split": "train",
+          "ce": 1.0997790098190308,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 30,
+          "num_labeled_nodes": 9
+        },
+        {
+          "dataset": "DEBUG-CiteSeer",
+          "condition": "polynomial_2",
+          "seed": 11,
+          "split": "validation",
+          "ce": 1.1039071083068848,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 30,
+          "num_labeled_nodes": 6
+        },
+        {
+          "dataset": "DEBUG-CiteSeer",
+          "condition": "polynomial_2",
+          "seed": 11,
+          "split": "test",
+          "ce": 1.1007330417633057,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 30,
+          "num_labeled_nodes": 15
+        }
+      ],
+      "source_code_digest": "49ce7528d7d45cff1298aa250d5119afb1c66101968aa17a4f33455c9adaa5ba"
+    },
+    {
+      "dataset": "DEBUG-PubMed",
+      "condition": "mlp",
+      "seed": 11,
+      "checkpoint": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\jobs\\final\\DEBUG-PubMed\\mlp\\lr-0.01\\pack-00\\selected.pt",
+      "checkpoint_sha256": "02444612f1223bcece7e5b10d4e10512317121cc5cfbc05f71d4c7074a79298c",
+      "graph_path": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\graphs\\DEBUG-PubMed.npz",
+      "graph_sha256": "27eac4665dbe485857bdde8018e6a2e4a212c13393b44644751c89c554aca8cc",
+      "graph_digest": "cff0ce1ca387a98aeadf23eb61403d7c332a987fad05fa9e5de1508e3121d50f",
+      "path_chunk": 338,
+      "selected_epoch": 1,
+      "selected_validation_ce": 1.0703189373016357,
+      "selected_validation_accuracy": 0.5,
+      "original_metrics": [
+        {
+          "dataset": "DEBUG-PubMed",
+          "condition": "mlp",
+          "seed": 11,
+          "split": "train",
+          "ce": 1.0909390449523926,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 36,
+          "num_labeled_nodes": 9
+        },
+        {
+          "dataset": "DEBUG-PubMed",
+          "condition": "mlp",
+          "seed": 11,
+          "split": "validation",
+          "ce": 1.0703189373016357,
+          "accuracy": 0.5,
+          "num_nodes": 36,
+          "num_labeled_nodes": 6
+        },
+        {
+          "dataset": "DEBUG-PubMed",
+          "condition": "mlp",
+          "seed": 11,
+          "split": "test",
+          "ce": 1.095884084701538,
+          "accuracy": 0.4285714328289032,
+          "num_nodes": 36,
+          "num_labeled_nodes": 21
+        }
+      ],
+      "source_code_digest": "49ce7528d7d45cff1298aa250d5119afb1c66101968aa17a4f33455c9adaa5ba"
+    },
+    {
+      "dataset": "DEBUG-PubMed",
+      "condition": "standard_gcn",
+      "seed": 11,
+      "checkpoint": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\jobs\\final\\DEBUG-PubMed\\standard_gcn\\lr-0.01\\pack-00\\selected.pt",
+      "checkpoint_sha256": "c5f7d1ff1d4fd3b57fac728c5545f80dfa7e7dc8151480dff2e97e6ceed97ca3",
+      "graph_path": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\graphs\\DEBUG-PubMed.npz",
+      "graph_sha256": "27eac4665dbe485857bdde8018e6a2e4a212c13393b44644751c89c554aca8cc",
+      "graph_digest": "cff0ce1ca387a98aeadf23eb61403d7c332a987fad05fa9e5de1508e3121d50f",
+      "path_chunk": 338,
+      "selected_epoch": 3,
+      "selected_validation_ce": 1.1021536588668823,
+      "selected_validation_accuracy": 0.3333333432674408,
+      "original_metrics": [
+        {
+          "dataset": "DEBUG-PubMed",
+          "condition": "standard_gcn",
+          "seed": 11,
+          "split": "train",
+          "ce": 1.0990365743637085,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 36,
+          "num_labeled_nodes": 9
+        },
+        {
+          "dataset": "DEBUG-PubMed",
+          "condition": "standard_gcn",
+          "seed": 11,
+          "split": "validation",
+          "ce": 1.1021536588668823,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 36,
+          "num_labeled_nodes": 6
+        },
+        {
+          "dataset": "DEBUG-PubMed",
+          "condition": "standard_gcn",
+          "seed": 11,
+          "split": "test",
+          "ce": 1.103049874305725,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 36,
+          "num_labeled_nodes": 21
+        }
+      ],
+      "source_code_digest": "49ce7528d7d45cff1298aa250d5119afb1c66101968aa17a4f33455c9adaa5ba"
+    },
+    {
+      "dataset": "DEBUG-PubMed",
+      "condition": "polynomial_2",
+      "seed": 11,
+      "checkpoint": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\jobs\\final\\DEBUG-PubMed\\polynomial_2\\lr-0.01\\pack-00\\selected.pt",
+      "checkpoint_sha256": "bc4adfca6087003f9b59197dea3bc028b61f0e3690112b43050e5498b126346e",
+      "graph_path": "D:\\AI project\\new-gat\\results\\wedge-classification-debug-20261004-01\\graphs\\DEBUG-PubMed.npz",
+      "graph_sha256": "27eac4665dbe485857bdde8018e6a2e4a212c13393b44644751c89c554aca8cc",
+      "graph_digest": "cff0ce1ca387a98aeadf23eb61403d7c332a987fad05fa9e5de1508e3121d50f",
+      "path_chunk": 338,
+      "selected_epoch": 1,
+      "selected_validation_ce": 1.0900444984436035,
+      "selected_validation_accuracy": 0.3333333432674408,
+      "original_metrics": [
+        {
+          "dataset": "DEBUG-PubMed",
+          "condition": "polynomial_2",
+          "seed": 11,
+          "split": "train",
+          "ce": 1.0996869802474976,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 36,
+          "num_labeled_nodes": 9
+        },
+        {
+          "dataset": "DEBUG-PubMed",
+          "condition": "polynomial_2",
+          "seed": 11,
+          "split": "validation",
+          "ce": 1.0900444984436035,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 36,
+          "num_labeled_nodes": 6
+        },
+        {
+          "dataset": "DEBUG-PubMed",
+          "condition": "polynomial_2",
+          "seed": 11,
+          "split": "test",
+          "ce": 1.102156162261963,
+          "accuracy": 0.3333333432674408,
+          "num_nodes": 36,
+          "num_labeled_nodes": 21
+        }
+      ],
+      "source_code_digest": "49ce7528d7d45cff1298aa250d5119afb1c66101968aa17a4f33455c9adaa5ba"
+    }
+  ]
+}
