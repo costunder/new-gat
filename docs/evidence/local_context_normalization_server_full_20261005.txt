@@ -1,0 +1,661 @@
+
+(new-gat) aicompetition07@ece-a6gpu6:~/new-gat$ cat "$LOCAL_CONTEXT_NORM_RUN/completion.json"
+cat "$LOCAL_CONTEXT_NORM_RUN/LOCAL_CONTEXT_NORMALIZATION_SUMMARY.md"
+{
+  "completed": true,
+  "profile": "full",
+  "scope": "full_public_split_local_context_coupling_normalization",
+  "seconds": 6820.536256154999,
+  "coverage": {
+    "tuning_runs": 540,
+    "final_runs": 300,
+    "primary_metric_rows": 900,
+    "total_runs": 840,
+    "contract_optimizer_updates": 420000,
+    "all_datasets_conditions_seeds_splits": true,
+    "intervention_rows": 4320,
+    "branch_rows": 3480
+  },
+  "new_optimizer_updates": 420000,
+  "actual_data": true,
+  "frozen_model_updates": 0,
+  "code_and_graphs_preserved": true
+}
+# 로컬 문맥 결합: 정규화 비교 결과
+
+Profile **FULL**, 실제 citation 데이터 **True**.
+2개 macro 층, hidden dimension 64, 학습마다 500 epoch.
+Tuning 540회와 final 300회, 총 840회 학습이며
+계약상 독립 모델 갱신은 420,000회다. 재개 실행의 새 갱신 횟수는 `new_optimizer_updates`로 따로 확인한다.
+DEBUG 결과는 별도 fixture의 구현 검사이며 citation 본학습 성능이 아니다.
+
+## 바꾼 것과 비교 기준
+
+조건 ID는 C__intra__cross__variant다. C는 unit/local_degree,
+intra는 graph/local, 활성 cross는 graph/edge다. Off에는 none__off 한 조건만 둔다.
+각 층은 `M(I−S)(I−ρG)(I−S)RZ`이며 같은 S를 앞뒤에 적용한다.
+Graph intra는 기존 그래프 전체 degree bound, local intra는 각 ego의 degree bound를 쓴다.
+Graph G는 기존 γK, edge G는 고정 unit cross degree에 따른 대칭 엣지 가중치를 쓴다.
+고정 gain은 1, learned gain은 독립 모델마다 θ 하나를 두 층에서 공유하는 sigmoid(θ)다.
+기존 6조건을 이번 계약에서도 처음부터 튜닝·학습했다. 과거 수치를 새 결과에 끼워 넣지 않았다.
+
+## 분류 결과
+
+평균 ± 표본 std다. Accuracy는 %, CE는 L2 항을 제외한 평가 손실이다.
+LR와 checkpoint는 validation으로 선택하고 모든 final 선택을 고정한 뒤 test를 평가했다.
+
+| 데이터 | 조건 | 기존 6조건 | LR | Train acc % | Val acc % | Test acc % | Test CE |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Cora | unit__graph__none__off | True | 0.01 | 100 ± 0 | 60.52 ± 0.889945 | 58.66 ± 0.606631 | 1.25366 ± 0.00910292 |
+| Cora | unit__graph__graph__fixed | True | 0.01 | 100 ± 0 | 60.44 ± 0.89889 | 58.7 ± 0.620484 | 1.25369 ± 0.009361 |
+| Cora | unit__graph__graph__learned | True | 0.01 | 100 ± 0 | 60.36 ± 0.920871 | 58.6 ± 0.587367 | 1.25369 ± 0.00920893 |
+| Cora | unit__graph__edge__fixed | False | 0.01 | 100 ± 0 | 60.48 ± 0.878637 | 58.66 ± 0.482699 | 1.25381 ± 0.00925105 |
+| Cora | unit__graph__edge__learned | False | 0.01 | 100 ± 0 | 60.28 ± 1.04499 | 58.72 ± 0.563029 | 1.25381 ± 0.00925571 |
+| Cora | unit__local__none__off | False | 0.01 | 100 ± 0 | 76.96 ± 0.260768 | 80.12 ± 0.54037 | 0.721503 ± 0.00591311 |
+| Cora | unit__local__graph__fixed | False | 0.01 | 100 ± 0 | 76.96 ± 0.260768 | 80.14 ± 0.522494 | 0.721294 ± 0.005985 |
+| Cora | unit__local__graph__learned | False | 0.01 | 100 ± 0 | 76.96 ± 0.260768 | 80.14 ± 0.517687 | 0.721407 ± 0.00594969 |
+| Cora | unit__local__edge__fixed | False | 0.01 | 100 ± 0 | 77.56 ± 0.296648 | 80.1 ± 0.51478 | 0.713188 ± 0.00556106 |
+| Cora | unit__local__edge__learned | False | 0.01 | 100 ± 0 | 77.48 ± 0.334665 | 80 ± 0.435889 | 0.715888 ± 0.00588628 |
+| Cora | local_degree__graph__none__off | True | 0.01 | 100 ± 0 | 76.92 ± 0.109546 | 79.4 ± 0.291548 | 0.747381 ± 0.00594368 |
+| Cora | local_degree__graph__graph__fixed | True | 0.01 | 100 ± 0 | 76.96 ± 0.167333 | 79.46 ± 0.230217 | 0.747181 ± 0.00604151 |
+| Cora | local_degree__graph__graph__learned | True | 0.01 | 100 ± 0 | 76.96 ± 0.167333 | 79.4 ± 0.234521 | 0.747336 ± 0.00601401 |
+| Cora | local_degree__graph__edge__fixed | False | 0.01 | 100 ± 0 | 76.92 ± 0.303314 | 79.66 ± 0.194935 | 0.742229 ± 0.0058952 |
+| Cora | local_degree__graph__edge__learned | False | 0.01 | 100 ± 0 | 77 ± 0.141422 | 79.5 ± 0.223607 | 0.745467 ± 0.00608194 |
+| Cora | local_degree__local__none__off | False | 0.01 | 100 ± 0 | 77.72 ± 0.334665 | 80.18 ± 0.311449 | 0.706157 ± 0.00531632 |
+| Cora | local_degree__local__graph__fixed | False | 0.01 | 100 ± 0 | 77.72 ± 0.414729 | 80.14 ± 0.336155 | 0.705907 ± 0.00532964 |
+| Cora | local_degree__local__graph__learned | False | 0.01 | 100 ± 0 | 77.76 ± 0.409878 | 80.14 ± 0.336155 | 0.706076 ± 0.00539365 |
+| Cora | local_degree__local__edge__fixed | False | 0.01 | 100 ± 0 | 78.28 ± 0.334665 | 80.34 ± 0.336155 | 0.699306 ± 0.0051207 |
+| Cora | local_degree__local__edge__learned | False | 0.01 | 100 ± 0 | 77.96 ± 0.167332 | 80.22 ± 0.41473 | 0.702071 ± 0.00534867 |
+| CiteSeer | unit__graph__none__off | True | 0.01 | 100 ± 0 | 56.48 ± 0.67231 | 57.62 ± 0.408657 | 1.2281 ± 0.00745504 |
+| CiteSeer | unit__graph__graph__fixed | True | 0.01 | 100 ± 0 | 56.64 ± 0.669327 | 57.48 ± 0.465832 | 1.22797 ± 0.00750903 |
+| CiteSeer | unit__graph__graph__learned | True | 0.01 | 100 ± 0 | 56.68 ± 0.626099 | 57.32 ± 0.798121 | 1.22967 ± 0.0107594 |
+| CiteSeer | unit__graph__edge__fixed | False | 0.01 | 100 ± 0 | 56.8 ± 0.707107 | 57.56 ± 0.384709 | 1.22785 ± 0.00717828 |
+| CiteSeer | unit__graph__edge__learned | False | 0.01 | 100 ± 0 | 56.56 ± 0.804985 | 57.56 ± 0.279286 | 1.22793 ± 0.00746814 |
+| CiteSeer | unit__local__none__off | False | 0.01 | 100 ± 0 | 69.64 ± 0.409878 | 70.36 ± 0.328634 | 0.980626 ± 0.0047024 |
+| CiteSeer | unit__local__graph__fixed | False | 0.01 | 100 ± 0 | 69.68 ± 0.460434 | 70.38 ± 0.327109 | 0.980426 ± 0.00455411 |
+| CiteSeer | unit__local__graph__learned | False | 0.01 | 100 ± 0 | 69.64 ± 0.409878 | 70.38 ± 0.327109 | 0.98065 ± 0.00461761 |
+| CiteSeer | unit__local__edge__fixed | False | 0.01 | 100 ± 0 | 69.72 ± 0.576194 | 70.28 ± 0.319373 | 0.977969 ± 0.00455935 |
+| CiteSeer | unit__local__edge__learned | False | 0.01 | 100 ± 0 | 69.52 ± 0.414728 | 70.4 ± 0.324037 | 0.980331 ± 0.00446197 |
+| CiteSeer | local_degree__graph__none__off | True | 0.01 | 100 ± 0 | 69.36 ± 0.477494 | 70.66 ± 0.320937 | 0.991456 ± 0.00283117 |
+| CiteSeer | local_degree__graph__graph__fixed | True | 0.01 | 100 ± 0 | 69.28 ± 0.460434 | 70.62 ± 0.311449 | 0.991408 ± 0.00278032 |
+| CiteSeer | local_degree__graph__graph__learned | True | 0.01 | 100 ± 0 | 69.28 ± 0.521537 | 70.64 ± 0.336155 | 0.991444 ± 0.00280676 |
+| CiteSeer | local_degree__graph__edge__fixed | False | 0.01 | 100 ± 0 | 69.32 ± 0.303313 | 70.6 ± 0.339116 | 0.989387 ± 0.00291865 |
+| CiteSeer | local_degree__graph__edge__learned | False | 0.01 | 100 ± 0 | 69.24 ± 0.45607 | 70.58 ± 0.277489 | 0.991385 ± 0.00260502 |
+| CiteSeer | local_degree__local__none__off | False | 0.01 | 100 ± 0 | 69.72 ± 0.363317 | 70.48 ± 0.204939 | 0.974338 ± 0.00454368 |
+| CiteSeer | local_degree__local__graph__fixed | False | 0.01 | 100 ± 0 | 69.88 ± 0.228035 | 70.42 ± 0.342051 | 0.974137 ± 0.00465234 |
+| CiteSeer | local_degree__local__graph__learned | False | 0.01 | 100 ± 0 | 69.84 ± 0.219089 | 70.42 ± 0.342051 | 0.97432 ± 0.00477126 |
+| CiteSeer | local_degree__local__edge__fixed | False | 0.01 | 100 ± 0 | 69.4 ± 0.447215 | 70.36 ± 0.328634 | 0.971974 ± 0.00476436 |
+| CiteSeer | local_degree__local__edge__learned | False | 0.01 | 100 ± 0 | 69.76 ± 0.26077 | 70.42 ± 0.303314 | 0.972477 ± 0.00406119 |
+| PubMed | unit__graph__none__off | True | 0.01 | 100 ± 0 | 72.52 ± 0.657268 | 73.16 ± 0.507937 | 0.682603 ± 0.0086188 |
+| PubMed | unit__graph__graph__fixed | True | 0.01 | 100 ± 0 | 72.56 ± 0.622896 | 73.16 ± 0.507937 | 0.682578 ± 0.00864359 |
+| PubMed | unit__graph__graph__learned | True | 0.01 | 100 ± 0 | 72.56 ± 0.622896 | 73.16 ± 0.507937 | 0.68259 ± 0.00863647 |
+| PubMed | unit__graph__edge__fixed | False | 0.01 | 100 ± 0 | 72.6 ± 0.678232 | 73.16 ± 0.507937 | 0.682591 ± 0.008671 |
+| PubMed | unit__graph__edge__learned | False | 0.01 | 100 ± 0 | 72.56 ± 0.622896 | 73.16 ± 0.507937 | 0.682595 ± 0.0086487 |
+| PubMed | unit__local__none__off | False | 0.01 | 100 ± 0 | 78.12 ± 0.414729 | 77.8 ± 0.604152 | 0.592413 ± 0.00730451 |
+| PubMed | unit__local__graph__fixed | False | 0.01 | 100 ± 0 | 78.28 ± 0.460433 | 77.84 ± 0.626897 | 0.592292 ± 0.00719825 |
+| PubMed | unit__local__graph__learned | False | 0.01 | 100 ± 0 | 78.16 ± 0.433589 | 77.82 ± 0.609918 | 0.592385 ± 0.00721056 |
+| PubMed | unit__local__edge__fixed | False | 0.01 | 100 ± 0 | 78.88 ± 0.481663 | 77.76 ± 0.304958 | 0.592094 ± 0.00576758 |
+| PubMed | unit__local__edge__learned | False | 0.01 | 100 ± 0 | 78.24 ± 0.497994 | 77.88 ± 0.622093 | 0.591899 ± 0.00680851 |
+| PubMed | local_degree__graph__none__off | True | 0.01 | 100 ± 0 | 78.28 ± 0.609917 | 77.66 ± 0.915424 | 0.593621 ± 0.00940664 |
+| PubMed | local_degree__graph__graph__fixed | True | 0.01 | 100 ± 0 | 78.28 ± 0.609917 | 77.66 ± 0.928979 | 0.593551 ± 0.00938057 |
+| PubMed | local_degree__graph__graph__learned | True | 0.01 | 100 ± 0 | 78.28 ± 0.609917 | 77.66 ± 0.981327 | 0.593638 ± 0.00945743 |
+| PubMed | local_degree__graph__edge__fixed | False | 0.01 | 100 ± 0 | 78.36 ± 0.384707 | 77.88 ± 0.785494 | 0.591535 ± 0.00874622 |
+| PubMed | local_degree__graph__edge__learned | False | 0.01 | 100 ± 0 | 78.28 ± 0.609917 | 77.64 ± 1.0139 | 0.593107 ± 0.00958333 |
+| PubMed | local_degree__local__none__off | False | 0.01 | 100 ± 0 | 78 ± 0.469041 | 77.9 ± 0.845577 | 0.589513 ± 0.00700727 |
+| PubMed | local_degree__local__graph__fixed | False | 0.01 | 100 ± 0 | 78.08 ± 0.414728 | 77.92 ± 0.825834 | 0.589436 ± 0.00693344 |
+| PubMed | local_degree__local__graph__learned | False | 0.01 | 100 ± 0 | 78.04 ± 0.45607 | 77.88 ± 0.884308 | 0.589513 ± 0.00699358 |
+| PubMed | local_degree__local__edge__fixed | False | 0.01 | 100 ± 0 | 78.68 ± 0.334665 | 77.36 ± 0.357771 | 0.591151 ± 0.00557414 |
+| PubMed | local_degree__local__edge__learned | False | 0.01 | 100 ± 0 | 78.28 ± 0.334662 | 77.9 ± 0.815475 | 0.589047 ± 0.00655397 |
+
+## 직접 비교 52개
+
+24개 cross/gain 비교, 8개 edge−graph cross 정규화 비교, 10개 local−graph 내부 정규화 비교,
+10개 C 비교를 모두 기록한다. C 비교는 탐색적이다. 아래 값은 조건−기준이다.
+Accuracy의 양수와 CE의 음수가 개선이다. 같은 final seed끼리 차이를 먼저 계산한 paired 95% t 구간이다.
+조건별 LR 선택을 포함한 학습 절차의 비교이며, 학습된 파라미터를 고정한 순수 연산 비교와 구분한다.
+
+| 데이터 | 조건 | 기준 | 지표 | 단위 | 차이 [95% 구간] | 비교 |
+| --- | --- | --- | --- | --- | --- | --- |
+| CiteSeer | unit__graph__graph__fixed | unit__graph__none__off | accuracy | percentage_points | -0.139999 [-0.281568, 0.00156962] | cross_fixed_minus_off |
+| CiteSeer | unit__graph__graph__fixed | unit__graph__none__off | ce | loss | -0.000133157 [-0.000262867, -3.44686e-06] | cross_fixed_minus_off |
+| CiteSeer | unit__graph__graph__learned | unit__graph__none__off | accuracy | percentage_points | -0.3 [-0.933124, 0.333125] | cross_learned_minus_off |
+| CiteSeer | unit__graph__graph__learned | unit__graph__none__off | ce | loss | 0.00156701 [-0.00315201, 0.00628602] | cross_learned_minus_off |
+| CiteSeer | unit__graph__graph__learned | unit__graph__graph__fixed | accuracy | percentage_points | -0.16 [-0.746349, 0.426348] | gain_learned_minus_fixed |
+| CiteSeer | unit__graph__graph__learned | unit__graph__graph__fixed | ce | loss | 0.00170016 [-0.00302217, 0.0064225] | gain_learned_minus_fixed |
+| CiteSeer | unit__graph__edge__fixed | unit__graph__none__off | accuracy | percentage_points | -0.059998 [-0.226585, 0.106589] | cross_fixed_minus_off |
+| CiteSeer | unit__graph__edge__fixed | unit__graph__none__off | ce | loss | -0.000249147 [-0.00062119, 0.000122895] | cross_fixed_minus_off |
+| CiteSeer | unit__graph__edge__learned | unit__graph__none__off | accuracy | percentage_points | -0.0599992 [-0.302046, 0.182047] | cross_learned_minus_off |
+| CiteSeer | unit__graph__edge__learned | unit__graph__none__off | ce | loss | -0.000167894 [-0.000289379, -4.641e-05] | cross_learned_minus_off |
+| CiteSeer | unit__graph__edge__learned | unit__graph__edge__fixed | accuracy | percentage_points | -1.19209e-06 [-0.175599, 0.175597] | gain_learned_minus_fixed |
+| CiteSeer | unit__graph__edge__learned | unit__graph__edge__fixed | ce | loss | 8.12531e-05 [-0.000334809, 0.000497315] | gain_learned_minus_fixed |
+| CiteSeer | unit__graph__edge__fixed | unit__graph__graph__fixed | accuracy | percentage_points | 0.0800014 [-0.056015, 0.216018] | cross_edge_minus_graph |
+| CiteSeer | unit__graph__edge__fixed | unit__graph__graph__fixed | ce | loss | -0.000115991 [-0.000565777, 0.000333796] | cross_edge_minus_graph |
+| CiteSeer | unit__graph__edge__learned | unit__graph__graph__learned | accuracy | percentage_points | 0.24 [-0.487193, 0.967194] | cross_edge_minus_graph |
+| CiteSeer | unit__graph__edge__learned | unit__graph__graph__learned | ce | loss | -0.0017349 [-0.00648679, 0.00301699] | cross_edge_minus_graph |
+| CiteSeer | unit__local__graph__fixed | unit__local__none__off | accuracy | percentage_points | 0.0200009 [-0.0355306, 0.0755324] | cross_fixed_minus_off |
+| CiteSeer | unit__local__graph__fixed | unit__local__none__off | ce | loss | -0.000199306 [-0.000438717, 4.01053e-05] | cross_fixed_minus_off |
+| CiteSeer | unit__local__graph__learned | unit__local__none__off | accuracy | percentage_points | 0.0200009 [-0.0355306, 0.0755324] | cross_learned_minus_off |
+| CiteSeer | unit__local__graph__learned | unit__local__none__off | ce | loss | 2.46406e-05 [-0.000170306, 0.000219587] | cross_learned_minus_off |
+| CiteSeer | unit__local__graph__learned | unit__local__graph__fixed | accuracy | percentage_points | 0 [0, 0] | gain_learned_minus_fixed |
+| CiteSeer | unit__local__graph__learned | unit__local__graph__fixed | ce | loss | 0.000223947 [7.21871e-05, 0.000375706] | gain_learned_minus_fixed |
+| CiteSeer | unit__local__edge__fixed | unit__local__none__off | accuracy | percentage_points | -0.079999 [-0.531116, 0.371118] | cross_fixed_minus_off |
+| CiteSeer | unit__local__edge__fixed | unit__local__none__off | ce | loss | -0.00265635 [-0.00405564, -0.00125706] | cross_fixed_minus_off |
+| CiteSeer | unit__local__edge__learned | unit__local__none__off | accuracy | percentage_points | 0.0400019 [-0.02801, 0.108014] | cross_learned_minus_off |
+| CiteSeer | unit__local__edge__learned | unit__local__none__off | ce | loss | -0.000294602 [-0.000823203, 0.000233999] | cross_learned_minus_off |
+| CiteSeer | unit__local__edge__learned | unit__local__edge__fixed | accuracy | percentage_points | 0.120001 [-0.322489, 0.562491] | gain_learned_minus_fixed |
+| CiteSeer | unit__local__edge__learned | unit__local__edge__fixed | ce | loss | 0.00236175 [0.0013682, 0.0033553] | gain_learned_minus_fixed |
+| CiteSeer | unit__local__edge__fixed | unit__local__graph__fixed | accuracy | percentage_points | -0.0999999 [-0.51181, 0.31181] | cross_edge_minus_graph |
+| CiteSeer | unit__local__edge__fixed | unit__local__graph__fixed | ce | loss | -0.00245705 [-0.00371339, -0.00120071] | cross_edge_minus_graph |
+| CiteSeer | unit__local__edge__learned | unit__local__graph__learned | accuracy | percentage_points | 0.0200009 [-0.0355306, 0.0755324] | cross_edge_minus_graph |
+| CiteSeer | unit__local__edge__learned | unit__local__graph__learned | ce | loss | -0.000319242 [-0.00065811, 1.96248e-05] | cross_edge_minus_graph |
+| CiteSeer | unit__local__none__off | unit__graph__none__off | accuracy | percentage_points | 12.74 [12.0343, 13.4457] | intra_local_minus_graph |
+| CiteSeer | unit__local__none__off | unit__graph__none__off | ce | loss | -0.247475 [-0.261524, -0.233426] | intra_local_minus_graph |
+| CiteSeer | unit__local__graph__fixed | unit__graph__graph__fixed | accuracy | percentage_points | 12.9 [12.1654, 13.6346] | intra_local_minus_graph |
+| CiteSeer | unit__local__graph__fixed | unit__graph__graph__fixed | ce | loss | -0.247541 [-0.26153, -0.233552] | intra_local_minus_graph |
+| CiteSeer | unit__local__graph__learned | unit__graph__graph__learned | accuracy | percentage_points | 13.06 [11.7859, 14.3341] | intra_local_minus_graph |
+| CiteSeer | unit__local__graph__learned | unit__graph__graph__learned | ce | loss | -0.249017 [-0.266831, -0.231203] | intra_local_minus_graph |
+| CiteSeer | unit__local__edge__fixed | unit__graph__edge__fixed | accuracy | percentage_points | 12.72 [12.1416, 13.2984] | intra_local_minus_graph |
+| CiteSeer | unit__local__edge__fixed | unit__graph__edge__fixed | ce | loss | -0.249882 [-0.26383, -0.235934] | intra_local_minus_graph |
+| CiteSeer | unit__local__edge__learned | unit__graph__edge__learned | accuracy | percentage_points | 12.84 [12.2737, 13.4063] | intra_local_minus_graph |
+| CiteSeer | unit__local__edge__learned | unit__graph__edge__learned | ce | loss | -0.247601 [-0.261546, -0.233656] | intra_local_minus_graph |
+| CiteSeer | local_degree__graph__graph__fixed | local_degree__graph__none__off | accuracy | percentage_points | -0.0399995 [-0.108007, 0.0280084] | cross_fixed_minus_off |
+| CiteSeer | local_degree__graph__graph__fixed | local_degree__graph__none__off | ce | loss | -4.84109e-05 [-0.000186842, 9.00205e-05] | cross_fixed_minus_off |
+| CiteSeer | local_degree__graph__graph__learned | local_degree__graph__none__off | accuracy | percentage_points | -0.0199997 [-0.123883, 0.083884] | cross_learned_minus_off |
+| CiteSeer | local_degree__graph__graph__learned | local_degree__graph__none__off | ce | loss | -1.18136e-05 [-0.000193071, 0.000169443] | cross_learned_minus_off |
+| CiteSeer | local_degree__graph__graph__learned | local_degree__graph__graph__fixed | accuracy | percentage_points | 0.0199997 [-0.0355284, 0.0755279] | gain_learned_minus_fixed |
+| CiteSeer | local_degree__graph__graph__learned | local_degree__graph__graph__fixed | ce | loss | 3.65973e-05 [-3.79706e-05, 0.000111165] | gain_learned_minus_fixed |
+| CiteSeer | local_degree__graph__edge__fixed | local_degree__graph__none__off | accuracy | percentage_points | -0.0600004 [-0.201572, 0.0815715] | cross_fixed_minus_off |
+| CiteSeer | local_degree__graph__edge__fixed | local_degree__graph__none__off | ce | loss | -0.00206926 [-0.00251441, -0.00162411] | cross_fixed_minus_off |
+| CiteSeer | local_degree__graph__edge__learned | local_degree__graph__none__off | accuracy | percentage_points | -0.0800002 [-0.241894, 0.0818941] | cross_learned_minus_off |
+| CiteSeer | local_degree__graph__edge__learned | local_degree__graph__none__off | ce | loss | -7.16448e-05 [-0.000480815, 0.000337525] | cross_learned_minus_off |
+| CiteSeer | local_degree__graph__edge__learned | local_degree__graph__edge__fixed | accuracy | percentage_points | -0.0199997 [-0.156015, 0.116016] | gain_learned_minus_fixed |
+| CiteSeer | local_degree__graph__edge__learned | local_degree__graph__edge__fixed | ce | loss | 0.00199761 [0.0014301, 0.00256513] | gain_learned_minus_fixed |
+| CiteSeer | local_degree__graph__edge__fixed | local_degree__graph__graph__fixed | accuracy | percentage_points | -0.0200009 [-0.156018, 0.116016] | cross_edge_minus_graph |
+| CiteSeer | local_degree__graph__edge__fixed | local_degree__graph__graph__fixed | ce | loss | -0.00202085 [-0.0023993, -0.0016424] | cross_edge_minus_graph |
+| CiteSeer | local_degree__graph__edge__learned | local_degree__graph__graph__learned | accuracy | percentage_points | -0.0600004 [-0.17106, 0.0510589] | cross_edge_minus_graph |
+| CiteSeer | local_degree__graph__edge__learned | local_degree__graph__graph__learned | ce | loss | -5.98311e-05 [-0.000384148, 0.000264486] | cross_edge_minus_graph |
+| CiteSeer | local_degree__local__graph__fixed | local_degree__local__none__off | accuracy | percentage_points | -0.0599992 [-0.302041, 0.182043] | cross_fixed_minus_off |
+| CiteSeer | local_degree__local__graph__fixed | local_degree__local__none__off | ce | loss | -0.000201666 [-0.000454651, 5.13182e-05] | cross_fixed_minus_off |
+| CiteSeer | local_degree__local__graph__learned | local_degree__local__none__off | accuracy | percentage_points | -0.0599992 [-0.302041, 0.182043] | cross_learned_minus_off |
+| CiteSeer | local_degree__local__graph__learned | local_degree__local__none__off | ce | loss | -1.86682e-05 [-0.000303199, 0.000265862] | cross_learned_minus_off |
+| CiteSeer | local_degree__local__graph__learned | local_degree__local__graph__fixed | accuracy | percentage_points | 0 [0, 0] | gain_learned_minus_fixed |
+| CiteSeer | local_degree__local__graph__learned | local_degree__local__graph__fixed | ce | loss | 0.000182998 [-6.60453e-05, 0.000432042] | gain_learned_minus_fixed |
+| CiteSeer | local_degree__local__edge__fixed | local_degree__local__none__off | accuracy | percentage_points | -0.119998 [-0.389188, 0.149191] | cross_fixed_minus_off |
+| CiteSeer | local_degree__local__edge__fixed | local_degree__local__none__off | ce | loss | -0.00236418 [-0.00352083, -0.00120754] | cross_fixed_minus_off |
+| CiteSeer | local_degree__local__edge__learned | local_degree__local__none__off | accuracy | percentage_points | -0.0599992 [-0.248304, 0.128306] | cross_learned_minus_off |
+| CiteSeer | local_degree__local__edge__learned | local_degree__local__none__off | ce | loss | -0.0018617 [-0.00544708, 0.00172368] | cross_learned_minus_off |
+| CiteSeer | local_degree__local__edge__learned | local_degree__local__edge__fixed | accuracy | percentage_points | 0.0599992 [-0.263789, 0.383787] | gain_learned_minus_fixed |
+| CiteSeer | local_degree__local__edge__learned | local_degree__local__edge__fixed | ce | loss | 0.000502479 [-0.00415172, 0.00515668] | gain_learned_minus_fixed |
+| CiteSeer | local_degree__local__edge__fixed | local_degree__local__graph__fixed | accuracy | percentage_points | -0.0599992 [-0.39548, 0.275482] | cross_edge_minus_graph |
+| CiteSeer | local_degree__local__edge__fixed | local_degree__local__graph__fixed | ce | loss | -0.00216252 [-0.00324561, -0.00107942] | cross_edge_minus_graph |
+| CiteSeer | local_degree__local__edge__learned | local_degree__local__graph__learned | accuracy | percentage_points | 0 [-0.15207, 0.15207] | cross_edge_minus_graph |
+| CiteSeer | local_degree__local__edge__learned | local_degree__local__graph__learned | ce | loss | -0.00184304 [-0.00559897, 0.0019129] | cross_edge_minus_graph |
+| CiteSeer | local_degree__local__none__off | local_degree__graph__none__off | accuracy | percentage_points | -0.180001 [-0.501397, 0.141395] | intra_local_minus_graph |
+| CiteSeer | local_degree__local__none__off | local_degree__graph__none__off | ce | loss | -0.0171181 [-0.0194962, -0.0147399] | intra_local_minus_graph |
+| CiteSeer | local_degree__local__graph__fixed | local_degree__graph__graph__fixed | accuracy | percentage_points | -0.200001 [-0.516563, 0.116561] | intra_local_minus_graph |
+| CiteSeer | local_degree__local__graph__fixed | local_degree__graph__graph__fixed | ce | loss | -0.0172713 [-0.0198202, -0.0147225] | intra_local_minus_graph |
+| CiteSeer | local_degree__local__graph__learned | local_degree__graph__graph__learned | accuracy | percentage_points | -0.220001 [-0.529171, 0.0891696] | intra_local_minus_graph |
+| CiteSeer | local_degree__local__graph__learned | local_degree__graph__graph__learned | ce | loss | -0.0171249 [-0.0197623, -0.0144876] | intra_local_minus_graph |
+| CiteSeer | local_degree__local__edge__fixed | local_degree__graph__edge__fixed | accuracy | percentage_points | -0.239999 [-0.575477, 0.0954784] | intra_local_minus_graph |
+| CiteSeer | local_degree__local__edge__fixed | local_degree__graph__edge__fixed | ce | loss | -0.017413 [-0.0202048, -0.0146212] | intra_local_minus_graph |
+| CiteSeer | local_degree__local__edge__learned | local_degree__graph__edge__learned | accuracy | percentage_points | -0.16 [-0.348308, 0.0283071] | intra_local_minus_graph |
+| CiteSeer | local_degree__local__edge__learned | local_degree__graph__edge__learned | ce | loss | -0.0189081 [-0.0214706, -0.0163457] | intra_local_minus_graph |
+| CiteSeer | local_degree__graph__none__off | unit__graph__none__off | accuracy | percentage_points | 13.04 [12.155, 13.925] | between_C_exploratory |
+| CiteSeer | local_degree__graph__none__off | unit__graph__none__off | ce | loss | -0.236644 [-0.248479, -0.224809] | between_C_exploratory |
+| CiteSeer | local_degree__graph__graph__fixed | unit__graph__graph__fixed | accuracy | percentage_points | 13.14 [12.2083, 14.0717] | between_C_exploratory |
+| CiteSeer | local_degree__graph__graph__fixed | unit__graph__graph__fixed | ce | loss | -0.236559 [-0.248361, -0.224758] | between_C_exploratory |
+| CiteSeer | local_degree__graph__graph__learned | unit__graph__graph__learned | accuracy | percentage_points | 13.32 [11.9502, 14.6898] | between_C_exploratory |
+| CiteSeer | local_degree__graph__graph__learned | unit__graph__graph__learned | ce | loss | -0.238223 [-0.253959, -0.222486] | between_C_exploratory |
+| CiteSeer | local_degree__graph__edge__fixed | unit__graph__edge__fixed | accuracy | percentage_points | 13.04 [12.2089, 13.8711] | between_C_exploratory |
+| CiteSeer | local_degree__graph__edge__fixed | unit__graph__edge__fixed | ce | loss | -0.238464 [-0.250031, -0.226897] | between_C_exploratory |
+| CiteSeer | local_degree__graph__edge__learned | unit__graph__edge__learned | accuracy | percentage_points | 13.02 [12.349, 13.691] | between_C_exploratory |
+| CiteSeer | local_degree__graph__edge__learned | unit__graph__edge__learned | ce | loss | -0.236548 [-0.248001, -0.225095] | between_C_exploratory |
+| CiteSeer | local_degree__local__none__off | unit__local__none__off | accuracy | percentage_points | 0.12 [-0.0840282, 0.324028] | between_C_exploratory |
+| CiteSeer | local_degree__local__none__off | unit__local__none__off | ce | loss | -0.00628752 [-0.00730953, -0.0052655] | between_C_exploratory |
+| CiteSeer | local_degree__local__graph__fixed | unit__local__graph__fixed | accuracy | percentage_points | 0.0399995 [-0.317718, 0.397717] | between_C_exploratory |
+| CiteSeer | local_degree__local__graph__fixed | unit__local__graph__fixed | ce | loss | -0.00628988 [-0.00730067, -0.00527908] | between_C_exploratory |
+| CiteSeer | local_degree__local__graph__learned | unit__local__graph__learned | accuracy | percentage_points | 0.0399995 [-0.317718, 0.397717] | between_C_exploratory |
+| CiteSeer | local_degree__local__graph__learned | unit__local__graph__learned | ce | loss | -0.00633082 [-0.0073389, -0.00532275] | between_C_exploratory |
+| CiteSeer | local_degree__local__edge__fixed | unit__local__edge__fixed | accuracy | percentage_points | 0.0800002 [-0.296616, 0.456616] | between_C_exploratory |
+| CiteSeer | local_degree__local__edge__fixed | unit__local__edge__fixed | ce | loss | -0.00599535 [-0.00672083, -0.00526986] | between_C_exploratory |
+| CiteSeer | local_degree__local__edge__learned | unit__local__edge__learned | accuracy | percentage_points | 0.0199986 [-0.276442, 0.316439] | between_C_exploratory |
+| CiteSeer | local_degree__local__edge__learned | unit__local__edge__learned | ce | loss | -0.00785462 [-0.0112275, -0.00448178] | between_C_exploratory |
+| Cora | unit__graph__graph__fixed | unit__graph__none__off | accuracy | percentage_points | 0.0399995 [-0.217474, 0.297473] | cross_fixed_minus_off |
+| Cora | unit__graph__graph__fixed | unit__graph__none__off | ce | loss | 3.34024e-05 [-0.000365845, 0.00043265] | cross_fixed_minus_off |
+| Cora | unit__graph__graph__learned | unit__graph__none__off | accuracy | percentage_points | -0.0600004 [-0.17106, 0.0510589] | cross_learned_minus_off |
+| Cora | unit__graph__graph__learned | unit__graph__none__off | ce | loss | 2.79903e-05 [-0.000500224, 0.000556204] | cross_learned_minus_off |
+| Cora | unit__graph__graph__learned | unit__graph__graph__fixed | accuracy | percentage_points | -0.0999999 [-0.34833, 0.148331] | gain_learned_minus_fixed |
+| Cora | unit__graph__graph__learned | unit__graph__graph__fixed | ce | loss | -5.4121e-06 [-0.000671457, 0.000660633] | gain_learned_minus_fixed |
+| Cora | unit__graph__edge__fixed | unit__graph__none__off | accuracy | percentage_points | 0 [-0.196325, 0.196325] | cross_fixed_minus_off |
+| Cora | unit__graph__edge__fixed | unit__graph__none__off | ce | loss | 0.000146055 [-0.000153671, 0.000445781] | cross_fixed_minus_off |
+| Cora | unit__graph__edge__learned | unit__graph__none__off | accuracy | percentage_points | 0.0599992 [-0.128306, 0.248304] | cross_learned_minus_off |
+| Cora | unit__graph__edge__learned | unit__graph__none__off | ce | loss | 0.000152826 [-0.000359533, 0.000665186] | cross_learned_minus_off |
+| Cora | unit__graph__edge__learned | unit__graph__edge__fixed | accuracy | percentage_points | 0.0599992 [-0.0510613, 0.17106] | gain_learned_minus_fixed |
+| Cora | unit__graph__edge__learned | unit__graph__edge__fixed | ce | loss | 6.77109e-06 [-0.000237424, 0.000250966] | gain_learned_minus_fixed |
+| Cora | unit__graph__edge__fixed | unit__graph__graph__fixed | accuracy | percentage_points | -0.0399995 [-0.247771, 0.167772] | cross_edge_minus_graph |
+| Cora | unit__graph__edge__fixed | unit__graph__graph__fixed | ce | loss | 0.000112653 [-0.000372288, 0.000597593] | cross_edge_minus_graph |
+| Cora | unit__graph__edge__learned | unit__graph__graph__learned | accuracy | percentage_points | 0.12 [-0.0160157, 0.256015] | cross_edge_minus_graph |
+| Cora | unit__graph__edge__learned | unit__graph__graph__learned | ce | loss | 0.000124836 [-0.00032826, 0.000577932] | cross_edge_minus_graph |
+| Cora | unit__local__graph__fixed | unit__local__none__off | accuracy | percentage_points | 0.0199997 [-0.0355284, 0.0755279] | cross_fixed_minus_off |
+| Cora | unit__local__graph__fixed | unit__local__none__off | ce | loss | -0.000209236 [-0.000316017, -0.000102456] | cross_fixed_minus_off |
+| Cora | unit__local__graph__learned | unit__local__none__off | accuracy | percentage_points | 0.0199997 [-0.0355284, 0.0755279] | cross_learned_minus_off |
+| Cora | unit__local__graph__learned | unit__local__none__off | ce | loss | -9.69172e-05 [-0.00018753, -6.30417e-06] | cross_learned_minus_off |
+| Cora | unit__local__graph__learned | unit__local__graph__fixed | accuracy | percentage_points | 0 [-0.0877978, 0.0877978] | gain_learned_minus_fixed |
+| Cora | unit__local__graph__learned | unit__local__graph__fixed | ce | loss | 0.000112319 [-1.4109e-05, 0.000238747] | gain_learned_minus_fixed |
+| Cora | unit__local__edge__fixed | unit__local__none__off | accuracy | percentage_points | -0.0199997 [-0.375558, 0.335559] | cross_fixed_minus_off |
+| Cora | unit__local__edge__fixed | unit__local__none__off | ce | loss | -0.0083155 [-0.00935171, -0.0072793] | cross_fixed_minus_off |
+| Cora | unit__local__edge__learned | unit__local__none__off | accuracy | percentage_points | -0.12 [-0.464546, 0.224547] | cross_learned_minus_off |
+| Cora | unit__local__edge__learned | unit__local__none__off | ce | loss | -0.00561581 [-0.00684044, -0.00439117] | cross_learned_minus_off |
+| Cora | unit__local__edge__learned | unit__local__edge__fixed | accuracy | percentage_points | -0.0999999 [-0.252072, 0.0520718] | gain_learned_minus_fixed |
+| Cora | unit__local__edge__learned | unit__local__edge__fixed | ce | loss | 0.0026997 [0.0019335, 0.00346589] | gain_learned_minus_fixed |
+| Cora | unit__local__edge__fixed | unit__local__graph__fixed | accuracy | percentage_points | -0.0399995 [-0.397719, 0.31772] | cross_edge_minus_graph |
+| Cora | unit__local__edge__fixed | unit__local__graph__fixed | ce | loss | -0.00810627 [-0.0091679, -0.00704463] | cross_edge_minus_graph |
+| Cora | unit__local__edge__learned | unit__local__graph__learned | accuracy | percentage_points | -0.139999 [-0.463785, 0.183786] | cross_edge_minus_graph |
+| Cora | unit__local__edge__learned | unit__local__graph__learned | ce | loss | -0.00551889 [-0.00668245, -0.00435533] | cross_edge_minus_graph |
+| Cora | unit__local__none__off | unit__graph__none__off | accuracy | percentage_points | 21.46 [20.3861, 22.5339] | intra_local_minus_graph |
+| Cora | unit__local__none__off | unit__graph__none__off | ce | loss | -0.532157 [-0.544121, -0.520193] | intra_local_minus_graph |
+| Cora | unit__local__graph__fixed | unit__graph__graph__fixed | accuracy | percentage_points | 21.44 [20.3378, 22.5422] | intra_local_minus_graph |
+| Cora | unit__local__graph__fixed | unit__graph__graph__fixed | ce | loss | -0.5324 [-0.544509, -0.52029] | intra_local_minus_graph |
+| Cora | unit__local__graph__learned | unit__graph__graph__learned | accuracy | percentage_points | 21.54 [20.4413, 22.6387] | intra_local_minus_graph |
+| Cora | unit__local__graph__learned | unit__graph__graph__learned | ce | loss | -0.532282 [-0.544448, -0.520116] | intra_local_minus_graph |
+| Cora | unit__local__edge__fixed | unit__graph__edge__fixed | accuracy | percentage_points | 21.44 [20.3068, 22.5733] | intra_local_minus_graph |
+| Cora | unit__local__edge__fixed | unit__graph__edge__fixed | ce | loss | -0.540619 [-0.553187, -0.52805] | intra_local_minus_graph |
+| Cora | unit__local__edge__learned | unit__graph__edge__learned | accuracy | percentage_points | 21.28 [20.1239, 22.4362] | intra_local_minus_graph |
+| Cora | unit__local__edge__learned | unit__graph__edge__learned | ce | loss | -0.537926 [-0.550951, -0.5249] | intra_local_minus_graph |
+| Cora | local_degree__graph__graph__fixed | local_degree__graph__none__off | accuracy | percentage_points | 0.0600004 [-0.0815715, 0.201572] | cross_fixed_minus_off |
+| Cora | local_degree__graph__graph__fixed | local_degree__graph__none__off | ce | loss | -0.000200188 [-0.000353051, -4.73249e-05] | cross_fixed_minus_off |
+| Cora | local_degree__graph__graph__learned | local_degree__graph__none__off | accuracy | percentage_points | 1.19209e-06 [-0.0877992, 0.0878016] | cross_learned_minus_off |
+| Cora | local_degree__graph__graph__learned | local_degree__graph__none__off | ce | loss | -4.54903e-05 [-0.000190475, 9.94946e-05] | cross_learned_minus_off |
+| Cora | local_degree__graph__graph__learned | local_degree__graph__graph__fixed | accuracy | percentage_points | -0.0599992 [-0.128007, 0.00800863] | gain_learned_minus_fixed |
+| Cora | local_degree__graph__graph__learned | local_degree__graph__graph__fixed | ce | loss | 0.000154698 [6.10974e-05, 0.000248298] | gain_learned_minus_fixed |
+| Cora | local_degree__graph__edge__fixed | local_degree__graph__none__off | accuracy | percentage_points | 0.26 [-0.108335, 0.628336] | cross_fixed_minus_off |
+| Cora | local_degree__graph__edge__fixed | local_degree__graph__none__off | ce | loss | -0.00515175 [-0.00576939, -0.00453411] | cross_fixed_minus_off |
+| Cora | local_degree__graph__edge__learned | local_degree__graph__none__off | accuracy | percentage_points | 0.0999999 [-0.0241649, 0.224165] | cross_learned_minus_off |
+| Cora | local_degree__graph__edge__learned | local_degree__graph__none__off | ce | loss | -0.00191414 [-0.00235371, -0.00147458] | cross_learned_minus_off |
+| Cora | local_degree__graph__edge__learned | local_degree__graph__edge__fixed | accuracy | percentage_points | -0.16 [-0.432034, 0.112033] | gain_learned_minus_fixed |
+| Cora | local_degree__graph__edge__learned | local_degree__graph__edge__fixed | ce | loss | 0.00323761 [0.00279348, 0.00368173] | gain_learned_minus_fixed |
+| Cora | local_degree__graph__edge__fixed | local_degree__graph__graph__fixed | accuracy | percentage_points | 0.2 [-0.104144, 0.504144] | cross_edge_minus_graph |
+| Cora | local_degree__graph__edge__fixed | local_degree__graph__graph__fixed | ce | loss | -0.00495156 [-0.00558596, -0.00431716] | cross_edge_minus_graph |
+| Cora | local_degree__graph__edge__learned | local_degree__graph__graph__learned | accuracy | percentage_points | 0.0999987 [-0.0241661, 0.224164] | cross_edge_minus_graph |
+| Cora | local_degree__graph__edge__learned | local_degree__graph__graph__learned | ce | loss | -0.00186865 [-0.00223227, -0.00150504] | cross_edge_minus_graph |
+| Cora | local_degree__local__graph__fixed | local_degree__local__none__off | accuracy | percentage_points | -0.0399995 [-0.108007, 0.0280084] | cross_fixed_minus_off |
+| Cora | local_degree__local__graph__fixed | local_degree__local__none__off | ce | loss | -0.000250006 [-0.000392677, -0.000107334] | cross_fixed_minus_off |
+| Cora | local_degree__local__graph__learned | local_degree__local__none__off | accuracy | percentage_points | -0.0399995 [-0.108007, 0.0280084] | cross_learned_minus_off |
+| Cora | local_degree__local__graph__learned | local_degree__local__none__off | ce | loss | -8.14438e-05 [-0.000194923, 3.20351e-05] | cross_learned_minus_off |
+| Cora | local_degree__local__graph__learned | local_degree__local__graph__fixed | accuracy | percentage_points | 0 [0, 0] | gain_learned_minus_fixed |
+| Cora | local_degree__local__graph__learned | local_degree__local__graph__fixed | ce | loss | 0.000168562 [1.47015e-05, 0.000322422] | gain_learned_minus_fixed |
+| Cora | local_degree__local__edge__fixed | local_degree__local__none__off | accuracy | percentage_points | 0.16 [-0.0477702, 0.367771] | cross_fixed_minus_off |
+| Cora | local_degree__local__edge__fixed | local_degree__local__none__off | ce | loss | -0.00685143 [-0.0075519, -0.00615097] | cross_fixed_minus_off |
+| Cora | local_degree__local__edge__learned | local_degree__local__none__off | accuracy | percentage_points | 0.0399995 [-0.271657, 0.351656] | cross_learned_minus_off |
+| Cora | local_degree__local__edge__learned | local_degree__local__none__off | ce | loss | -0.00408608 [-0.0049804, -0.00319176] | cross_learned_minus_off |
+| Cora | local_degree__local__edge__learned | local_degree__local__edge__fixed | accuracy | percentage_points | -0.120001 [-0.324027, 0.0840257] | gain_learned_minus_fixed |
+| Cora | local_degree__local__edge__learned | local_degree__local__edge__fixed | ce | loss | 0.00276536 [0.00223634, 0.00329437] | gain_learned_minus_fixed |
+| Cora | local_degree__local__edge__fixed | local_degree__local__graph__fixed | accuracy | percentage_points | 0.2 [0.00367451, 0.396325] | cross_edge_minus_graph |
+| Cora | local_degree__local__edge__fixed | local_degree__local__graph__fixed | ce | loss | -0.00660143 [-0.00727491, -0.00592795] | cross_edge_minus_graph |
+| Cora | local_degree__local__edge__learned | local_degree__local__graph__learned | accuracy | percentage_points | 0.079999 [-0.189189, 0.349187] | cross_edge_minus_graph |
+| Cora | local_degree__local__edge__learned | local_degree__local__graph__learned | ce | loss | -0.00400463 [-0.00495299, -0.00305628] | cross_edge_minus_graph |
+| Cora | local_degree__local__none__off | local_degree__graph__none__off | accuracy | percentage_points | 0.779999 [0.150534, 1.40947] | intra_local_minus_graph |
+| Cora | local_degree__local__none__off | local_degree__graph__none__off | ce | loss | -0.0412238 [-0.0428606, -0.039587] | intra_local_minus_graph |
+| Cora | local_degree__local__graph__fixed | local_degree__graph__graph__fixed | accuracy | percentage_points | 0.68 [0.14306, 1.21694] | intra_local_minus_graph |
+| Cora | local_degree__local__graph__fixed | local_degree__graph__graph__fixed | ce | loss | -0.0412736 [-0.0430301, -0.0395171] | intra_local_minus_graph |
+| Cora | local_degree__local__graph__learned | local_degree__graph__graph__learned | accuracy | percentage_points | 0.739999 [0.187492, 1.29251] | intra_local_minus_graph |
+| Cora | local_degree__local__graph__learned | local_degree__graph__graph__learned | ce | loss | -0.0412598 [-0.0428237, -0.0396958] | intra_local_minus_graph |
+| Cora | local_degree__local__edge__fixed | local_degree__graph__edge__fixed | accuracy | percentage_points | 0.68 [0.14306, 1.21694] | intra_local_minus_graph |
+| Cora | local_degree__local__edge__fixed | local_degree__graph__edge__fixed | ce | loss | -0.0429235 [-0.0448634, -0.0409836] | intra_local_minus_graph |
+| Cora | local_degree__local__edge__learned | local_degree__graph__edge__learned | accuracy | percentage_points | 0.719999 [0.0905357, 1.34946] | intra_local_minus_graph |
+| Cora | local_degree__local__edge__learned | local_degree__graph__edge__learned | ce | loss | -0.0433957 [-0.0454472, -0.0413443] | intra_local_minus_graph |
+| Cora | local_degree__graph__none__off | unit__graph__none__off | accuracy | percentage_points | 20.74 [19.729, 21.751] | between_C_exploratory |
+| Cora | local_degree__graph__none__off | unit__graph__none__off | ce | loss | -0.506279 [-0.5154, -0.497159] | between_C_exploratory |
+| Cora | local_degree__graph__graph__fixed | unit__graph__graph__fixed | accuracy | percentage_points | 20.76 [19.7643, 21.7557] | between_C_exploratory |
+| Cora | local_degree__graph__graph__fixed | unit__graph__graph__fixed | ce | loss | -0.506513 [-0.515737, -0.497289] | between_C_exploratory |
+| Cora | local_degree__graph__graph__learned | unit__graph__graph__learned | accuracy | percentage_points | 20.8 [19.8667, 21.7333] | between_C_exploratory |
+| Cora | local_degree__graph__graph__learned | unit__graph__graph__learned | ce | loss | -0.506353 [-0.515404, -0.497302] | between_C_exploratory |
+| Cora | local_degree__graph__edge__fixed | unit__graph__edge__fixed | accuracy | percentage_points | 21 [20.205, 21.7951] | between_C_exploratory |
+| Cora | local_degree__graph__edge__fixed | unit__graph__edge__fixed | ce | loss | -0.511577 [-0.520771, -0.502384] | between_C_exploratory |
+| Cora | local_degree__graph__edge__learned | unit__graph__edge__learned | accuracy | percentage_points | 20.78 [19.9003, 21.6597] | between_C_exploratory |
+| Cora | local_degree__graph__edge__learned | unit__graph__edge__learned | ce | loss | -0.508346 [-0.517766, -0.498927] | between_C_exploratory |
+| Cora | local_degree__local__none__off | unit__local__none__off | accuracy | percentage_points | 0.0599992 [-0.409539, 0.529537] | between_C_exploratory |
+| Cora | local_degree__local__none__off | unit__local__none__off | ce | loss | -0.0153463 [-0.0191876, -0.0115049] | between_C_exploratory |
+| Cora | local_degree__local__graph__fixed | unit__local__graph__fixed | accuracy | percentage_points | 0 [-0.402344, 0.402344] | between_C_exploratory |
+| Cora | local_degree__local__graph__fixed | unit__local__graph__fixed | ce | loss | -0.015387 [-0.0193361, -0.0114379] | between_C_exploratory |
+| Cora | local_degree__local__graph__learned | unit__local__graph__learned | accuracy | percentage_points | 0 [-0.421068, 0.421068] | between_C_exploratory |
+| Cora | local_degree__local__graph__learned | unit__local__graph__learned | ce | loss | -0.0153308 [-0.0192719, -0.0113897] | between_C_exploratory |
+| Cora | local_degree__local__edge__fixed | unit__local__edge__fixed | accuracy | percentage_points | 0.239999 [-0.158493, 0.638492] | between_C_exploratory |
+| Cora | local_degree__local__edge__fixed | unit__local__edge__fixed | ce | loss | -0.0138822 [-0.0181041, -0.00966023] | between_C_exploratory |
+| Cora | local_degree__local__edge__learned | unit__local__edge__learned | accuracy | percentage_points | 0.219998 [-0.0491861, 0.489183] | between_C_exploratory |
+| Cora | local_degree__local__edge__learned | unit__local__edge__learned | ce | loss | -0.0138165 [-0.0178641, -0.00976894] | between_C_exploratory |
+| PubMed | unit__graph__graph__fixed | unit__graph__none__off | accuracy | percentage_points | 0 [0, 0] | cross_fixed_minus_off |
+| PubMed | unit__graph__graph__fixed | unit__graph__none__off | ce | loss | -2.5177e-05 [-8.00172e-05, 2.96632e-05] | cross_fixed_minus_off |
+| PubMed | unit__graph__graph__learned | unit__graph__none__off | accuracy | percentage_points | 0 [0, 0] | cross_learned_minus_off |
+| PubMed | unit__graph__graph__learned | unit__graph__none__off | ce | loss | -1.35183e-05 [-6.67361e-05, 3.96994e-05] | cross_learned_minus_off |
+| PubMed | unit__graph__graph__learned | unit__graph__graph__fixed | accuracy | percentage_points | 0 [0, 0] | gain_learned_minus_fixed |
+| PubMed | unit__graph__graph__learned | unit__graph__graph__fixed | ce | loss | 1.16587e-05 [-1.17613e-05, 3.50786e-05] | gain_learned_minus_fixed |
+| PubMed | unit__graph__edge__fixed | unit__graph__none__off | accuracy | percentage_points | 0 [0, 0] | cross_fixed_minus_off |
+| PubMed | unit__graph__edge__fixed | unit__graph__none__off | ce | loss | -1.22666e-05 [-8.47822e-05, 6.0249e-05] | cross_fixed_minus_off |
+| PubMed | unit__graph__edge__learned | unit__graph__none__off | accuracy | percentage_points | 0 [0, 0] | cross_learned_minus_off |
+| PubMed | unit__graph__edge__learned | unit__graph__none__off | ce | loss | -8.54731e-06 [-6.52928e-05, 4.81982e-05] | cross_learned_minus_off |
+| PubMed | unit__graph__edge__learned | unit__graph__edge__fixed | accuracy | percentage_points | 0 [0, 0] | gain_learned_minus_fixed |
+| PubMed | unit__graph__edge__learned | unit__graph__edge__fixed | ce | loss | 3.71933e-06 [-4.18873e-05, 4.93259e-05] | gain_learned_minus_fixed |
+| PubMed | unit__graph__edge__fixed | unit__graph__graph__fixed | accuracy | percentage_points | 0 [0, 0] | cross_edge_minus_graph |
+| PubMed | unit__graph__edge__fixed | unit__graph__graph__fixed | ce | loss | 1.29104e-05 [-5.12089e-05, 7.70297e-05] | cross_edge_minus_graph |
+| PubMed | unit__graph__edge__learned | unit__graph__graph__learned | accuracy | percentage_points | 0 [0, 0] | cross_edge_minus_graph |
+| PubMed | unit__graph__edge__learned | unit__graph__graph__learned | ce | loss | 4.97103e-06 [-1.50191e-05, 2.49612e-05] | cross_edge_minus_graph |
+| PubMed | unit__local__graph__fixed | unit__local__none__off | accuracy | percentage_points | 0.0399995 [-0.0280084, 0.108007] | cross_fixed_minus_off |
+| PubMed | unit__local__graph__fixed | unit__local__none__off | ce | loss | -0.000121307 [-0.000273796, 3.11814e-05] | cross_fixed_minus_off |
+| PubMed | unit__local__graph__learned | unit__local__none__off | accuracy | percentage_points | 0.0199997 [-0.0355284, 0.0755279] | cross_learned_minus_off |
+| PubMed | unit__local__graph__learned | unit__local__none__off | ce | loss | -2.88606e-05 [-0.000163302, 0.000105581] | cross_learned_minus_off |
+| PubMed | unit__local__graph__learned | unit__local__graph__fixed | accuracy | percentage_points | -0.0199997 [-0.0755279, 0.0355284] | gain_learned_minus_fixed |
+| PubMed | unit__local__graph__learned | unit__local__graph__fixed | ce | loss | 9.24468e-05 [7.85136e-06, 0.000177042] | gain_learned_minus_fixed |
+| PubMed | unit__local__edge__fixed | unit__local__none__off | accuracy | percentage_points | -0.0400007 [-0.639353, 0.559351] | cross_fixed_minus_off |
+| PubMed | unit__local__edge__fixed | unit__local__none__off | ce | loss | -0.000319874 [-0.00264637, 0.00200662] | cross_fixed_minus_off |
+| PubMed | unit__local__edge__learned | unit__local__none__off | accuracy | percentage_points | 0.079999 [-0.142114, 0.302112] | cross_learned_minus_off |
+| PubMed | unit__local__edge__learned | unit__local__none__off | ce | loss | -0.000514042 [-0.00116398, 0.000135897] | cross_learned_minus_off |
+| PubMed | unit__local__edge__learned | unit__local__edge__fixed | accuracy | percentage_points | 0.12 [-0.41694, 0.65694] | gain_learned_minus_fixed |
+| PubMed | unit__local__edge__learned | unit__local__edge__fixed | ce | loss | -0.000194168 [-0.00211755, 0.00172922] | gain_learned_minus_fixed |
+| PubMed | unit__local__edge__fixed | unit__local__graph__fixed | accuracy | percentage_points | -0.0800002 [-0.709463, 0.549463] | cross_edge_minus_graph |
+| PubMed | unit__local__edge__fixed | unit__local__graph__fixed | ce | loss | -0.000198567 [-0.00242686, 0.00202972] | cross_edge_minus_graph |
+| PubMed | unit__local__edge__learned | unit__local__graph__learned | accuracy | percentage_points | 0.0599992 [-0.165557, 0.285556] | cross_edge_minus_graph |
+| PubMed | unit__local__edge__learned | unit__local__graph__learned | ce | loss | -0.000485182 [-0.00100943, 3.90678e-05] | cross_edge_minus_graph |
+| PubMed | unit__local__none__off | unit__graph__none__off | accuracy | percentage_points | 4.64 [3.37802, 5.90199] | intra_local_minus_graph |
+| PubMed | unit__local__none__off | unit__graph__none__off | ce | loss | -0.0901897 [-0.101644, -0.0787354] | intra_local_minus_graph |
+| PubMed | unit__local__graph__fixed | unit__graph__graph__fixed | accuracy | percentage_points | 4.68 [3.38545, 5.97455] | intra_local_minus_graph |
+| PubMed | unit__local__graph__fixed | unit__graph__graph__fixed | ce | loss | -0.0902858 [-0.10174, -0.0788312] | intra_local_minus_graph |
+| PubMed | unit__local__graph__learned | unit__graph__graph__learned | accuracy | percentage_points | 4.66 [3.39802, 5.92199] | intra_local_minus_graph |
+| PubMed | unit__local__graph__learned | unit__graph__graph__learned | ce | loss | -0.0902051 [-0.101597, -0.0788136] | intra_local_minus_graph |
+| PubMed | unit__local__edge__fixed | unit__graph__edge__fixed | accuracy | percentage_points | 4.6 [3.61056, 5.58944] | intra_local_minus_graph |
+| PubMed | unit__local__edge__fixed | unit__graph__edge__fixed | ce | loss | -0.0904973 [-0.101315, -0.0796795] | intra_local_minus_graph |
+| PubMed | unit__local__edge__learned | unit__graph__edge__learned | accuracy | percentage_points | 4.72 [3.37579, 6.06421] | intra_local_minus_graph |
+| PubMed | unit__local__edge__learned | unit__graph__edge__learned | ce | loss | -0.0906952 [-0.101868, -0.0795225] | intra_local_minus_graph |
+| PubMed | local_degree__graph__graph__fixed | local_degree__graph__none__off | accuracy | percentage_points | 0 [-0.087803, 0.087803] | cross_fixed_minus_off |
+| PubMed | local_degree__graph__graph__fixed | local_degree__graph__none__off | ce | loss | -7.01785e-05 [-0.000110846, -2.95108e-05] | cross_fixed_minus_off |
+| PubMed | local_degree__graph__graph__learned | local_degree__graph__none__off | accuracy | percentage_points | 1.19209e-06 [-0.0877992, 0.0878016] | cross_learned_minus_off |
+| PubMed | local_degree__graph__graph__learned | local_degree__graph__none__off | ce | loss | 1.63555e-05 [-6.20483e-05, 9.47594e-05] | cross_learned_minus_off |
+| PubMed | local_degree__graph__graph__learned | local_degree__graph__graph__fixed | accuracy | percentage_points | 1.19209e-06 [-0.0877992, 0.0878016] | gain_learned_minus_fixed |
+| PubMed | local_degree__graph__graph__learned | local_degree__graph__graph__fixed | ce | loss | 8.6534e-05 [-1.2347e-05, 0.000185415] | gain_learned_minus_fixed |
+| PubMed | local_degree__graph__edge__fixed | local_degree__graph__none__off | accuracy | percentage_points | 0.22 [-0.101399, 0.541398] | cross_fixed_minus_off |
+| PubMed | local_degree__graph__edge__fixed | local_degree__graph__none__off | ce | loss | -0.00208654 [-0.00291192, -0.00126116] | cross_fixed_minus_off |
+| PubMed | local_degree__graph__edge__learned | local_degree__graph__none__off | accuracy | percentage_points | -0.0200009 [-0.258842, 0.21884] | cross_learned_minus_off |
+| PubMed | local_degree__graph__edge__learned | local_degree__graph__none__off | ce | loss | -0.000514853 [-0.00077667, -0.000253036] | cross_learned_minus_off |
+| PubMed | local_degree__graph__edge__learned | local_degree__graph__edge__fixed | accuracy | percentage_points | -0.24 [-0.551655, 0.0716542] | gain_learned_minus_fixed |
+| PubMed | local_degree__graph__edge__learned | local_degree__graph__edge__fixed | ce | loss | 0.00157169 [0.000521184, 0.0026222] | gain_learned_minus_fixed |
+| PubMed | local_degree__graph__edge__fixed | local_degree__graph__graph__fixed | accuracy | percentage_points | 0.22 [-0.0491864, 0.489185] | cross_edge_minus_graph |
+| PubMed | local_degree__graph__edge__fixed | local_degree__graph__graph__fixed | ce | loss | -0.00201637 [-0.00280874, -0.00122399] | cross_edge_minus_graph |
+| PubMed | local_degree__graph__edge__learned | local_degree__graph__graph__learned | accuracy | percentage_points | -0.0200021 [-0.204172, 0.164167] | cross_edge_minus_graph |
+| PubMed | local_degree__graph__edge__learned | local_degree__graph__graph__learned | ce | loss | -0.000531209 [-0.000767294, -0.000295123] | cross_edge_minus_graph |
+| PubMed | local_degree__local__graph__fixed | local_degree__local__none__off | accuracy | percentage_points | 0.0199997 [-0.083884, 0.123883] | cross_fixed_minus_off |
+| PubMed | local_degree__local__graph__fixed | local_degree__local__none__off | ce | loss | -7.63655e-05 [-0.000213801, 6.10699e-05] | cross_fixed_minus_off |
+| PubMed | local_degree__local__graph__learned | local_degree__local__none__off | accuracy | percentage_points | -0.0199997 [-0.0755279, 0.0355284] | cross_learned_minus_off |
+| PubMed | local_degree__local__graph__learned | local_degree__local__none__off | ce | loss | 1.3113e-07 [-6.63886e-05, 6.66509e-05] | cross_learned_minus_off |
+| PubMed | local_degree__local__graph__learned | local_degree__local__graph__fixed | accuracy | percentage_points | -0.0399995 [-0.181569, 0.10157] | gain_learned_minus_fixed |
+| PubMed | local_degree__local__graph__learned | local_degree__local__graph__fixed | ce | loss | 7.64966e-05 [-1.83636e-05, 0.000171357] | gain_learned_minus_fixed |
+| PubMed | local_degree__local__edge__fixed | local_degree__local__none__off | accuracy | percentage_points | -0.539999 [-1.55102, 0.471025] | cross_fixed_minus_off |
+| PubMed | local_degree__local__edge__fixed | local_degree__local__none__off | ce | loss | 0.00163821 [-0.0048079, 0.00808432] | cross_fixed_minus_off |
+| PubMed | local_degree__local__edge__learned | local_degree__local__none__off | accuracy | percentage_points | 0 [-0.304147, 0.304147] | cross_learned_minus_off |
+| PubMed | local_degree__local__edge__learned | local_degree__local__none__off | ce | loss | -0.000465667 [-0.00112941, 0.00019808] | cross_learned_minus_off |
+| PubMed | local_degree__local__edge__learned | local_degree__local__edge__fixed | accuracy | percentage_points | 0.539999 [-0.331821, 1.41182] | gain_learned_minus_fixed |
+| PubMed | local_degree__local__edge__learned | local_degree__local__edge__fixed | ce | loss | -0.00210388 [-0.00793625, 0.00372849] | gain_learned_minus_fixed |
+| PubMed | local_degree__local__edge__fixed | local_degree__local__graph__fixed | accuracy | percentage_points | -0.559999 [-1.58991, 0.46991] | cross_edge_minus_graph |
+| PubMed | local_degree__local__edge__fixed | local_degree__local__graph__fixed | ce | loss | 0.00171458 [-0.00466781, 0.00809696] | cross_edge_minus_graph |
+| PubMed | local_degree__local__edge__learned | local_degree__local__graph__learned | accuracy | percentage_points | 0.0199997 [-0.276447, 0.316446] | cross_edge_minus_graph |
+| PubMed | local_degree__local__edge__learned | local_degree__local__graph__learned | ce | loss | -0.000465798 [-0.00113153, 0.000199935] | cross_edge_minus_graph |
+| PubMed | local_degree__local__none__off | local_degree__graph__none__off | accuracy | percentage_points | 0.239999 [-0.291169, 0.771167] | intra_local_minus_graph |
+| PubMed | local_degree__local__none__off | local_degree__graph__none__off | ce | loss | -0.00410881 [-0.007413, -0.000804617] | intra_local_minus_graph |
+| PubMed | local_degree__local__graph__fixed | local_degree__graph__graph__fixed | accuracy | percentage_points | 0.259999 [-0.299438, 0.819437] | intra_local_minus_graph |
+| PubMed | local_degree__local__graph__fixed | local_degree__graph__graph__fixed | ce | loss | -0.004115 [-0.00742886, -0.000801133] | intra_local_minus_graph |
+| PubMed | local_degree__local__graph__learned | local_degree__graph__graph__learned | accuracy | percentage_points | 0.219998 [-0.309716, 0.749713] | intra_local_minus_graph |
+| PubMed | local_degree__local__graph__learned | local_degree__graph__graph__learned | ce | loss | -0.00412503 [-0.00747629, -0.000773775] | intra_local_minus_graph |
+| PubMed | local_degree__local__edge__fixed | local_degree__graph__edge__fixed | accuracy | percentage_points | -0.519999 [-1.41279, 0.372791] | intra_local_minus_graph |
+| PubMed | local_degree__local__edge__fixed | local_degree__graph__edge__fixed | ce | loss | -0.000384057 [-0.00875221, 0.00798409] | intra_local_minus_graph |
+| PubMed | local_degree__local__edge__learned | local_degree__graph__edge__learned | accuracy | percentage_points | 0.26 [-0.26386, 0.783861] | intra_local_minus_graph |
+| PubMed | local_degree__local__edge__learned | local_degree__graph__edge__learned | ce | loss | -0.00405962 [-0.00817333, 5.40781e-05] | intra_local_minus_graph |
+| PubMed | local_degree__graph__none__off | unit__graph__none__off | accuracy | percentage_points | 4.5 [2.85041, 6.14959] | between_C_exploratory |
+| PubMed | local_degree__graph__none__off | unit__graph__none__off | ce | loss | -0.0889817 [-0.101838, -0.0761251] | between_C_exploratory |
+| PubMed | local_degree__graph__graph__fixed | unit__graph__graph__fixed | accuracy | percentage_points | 4.5 [2.84109, 6.15892] | between_C_exploratory |
+| PubMed | local_degree__graph__graph__fixed | unit__graph__graph__fixed | ce | loss | -0.0890267 [-0.101886, -0.0761675] | between_C_exploratory |
+| PubMed | local_degree__graph__graph__learned | unit__graph__graph__learned | accuracy | percentage_points | 4.5 [2.77503, 6.22498] | between_C_exploratory |
+| PubMed | local_degree__graph__graph__learned | unit__graph__graph__learned | ce | loss | -0.0889519 [-0.101879, -0.0760243] | between_C_exploratory |
+| PubMed | local_degree__graph__edge__fixed | unit__graph__edge__fixed | accuracy | percentage_points | 4.72 [3.25242, 6.18758] | between_C_exploratory |
+| PubMed | local_degree__graph__edge__fixed | unit__graph__edge__fixed | ce | loss | -0.091056 [-0.103515, -0.0785966] | between_C_exploratory |
+| PubMed | local_degree__graph__edge__learned | unit__graph__edge__learned | accuracy | percentage_points | 4.48 [2.74522, 6.21478] | between_C_exploratory |
+| PubMed | local_degree__graph__edge__learned | unit__graph__edge__learned | ce | loss | -0.089488 [-0.102467, -0.0765096] | between_C_exploratory |
+| PubMed | local_degree__local__none__off | unit__local__none__off | accuracy | percentage_points | 0.0999987 [-0.29265, 0.492647] | between_C_exploratory |
+| PubMed | local_degree__local__none__off | unit__local__none__off | ce | loss | -0.00290083 [-0.00462322, -0.00117844] | between_C_exploratory |
+| PubMed | local_degree__local__graph__fixed | unit__local__graph__fixed | accuracy | percentage_points | 0.079999 [-0.241399, 0.401397] | between_C_exploratory |
+| PubMed | local_degree__local__graph__fixed | unit__local__graph__fixed | ce | loss | -0.00285589 [-0.00451565, -0.00119612] | between_C_exploratory |
+| PubMed | local_degree__local__graph__learned | unit__local__graph__learned | accuracy | percentage_points | 0.0599992 [-0.375468, 0.495467] | between_C_exploratory |
+| PubMed | local_degree__local__graph__learned | unit__local__graph__learned | ce | loss | -0.00287184 [-0.00453269, -0.00121098] | between_C_exploratory |
+| PubMed | local_degree__local__edge__fixed | unit__local__edge__fixed | accuracy | percentage_points | -0.4 [-0.872811, 0.0728117] | between_C_exploratory |
+| PubMed | local_degree__local__edge__fixed | unit__local__edge__fixed | ce | loss | -0.000942743 [-0.00685925, 0.00497377] | between_C_exploratory |
+| PubMed | local_degree__local__edge__learned | unit__local__edge__learned | accuracy | percentage_points | 0.0199997 [-0.404716, 0.444716] | between_C_exploratory |
+| PubMed | local_degree__local__edge__learned | unit__local__edge__learned | ce | loss | -0.00285245 [-0.00477256, -0.000932341] | between_C_exploratory |
+
+## 정규화 상호작용 12개
+
+8개는 `(local cross−local off)−(graph cross−graph off)`이며,
+4개는 `(local edge−local graph)−(graph edge−graph graph)`다.
+각 seed에서 네 조건의 contrast를 계산한 뒤 통계를 낸다. 이미 집계한 오차막대를 빼서 구간을 만들지 않는다.
+수식의 cross 경로는 `−ρ M S G S R`지만, 분류 지표의 이 차이를 경로별 분류 기여율로 해석하지 않는다.
+
+| 데이터 | 상호작용 | 지표 | 단위 | 차이 [95% 구간] |
+| --- | --- | --- | --- | --- |
+| CiteSeer | unit__graph__fixed__intra_cross_contribution | accuracy | percentage_points | 0.16 [0.0184294, 0.301571] |
+| CiteSeer | unit__graph__fixed__intra_cross_contribution | ce | loss | -6.61492e-05 [-0.000355969, 0.00022367] |
+| CiteSeer | unit__graph__learned__intra_cross_contribution | accuracy | percentage_points | 0.320001 [-0.303307, 0.943309] |
+| CiteSeer | unit__graph__learned__intra_cross_contribution | ce | loss | -0.00154237 [-0.00626175, 0.00317702] |
+| CiteSeer | unit__edge__fixed__intra_cross_contribution | accuracy | percentage_points | -0.0200009 [-0.549712, 0.50971] |
+| CiteSeer | unit__edge__fixed__intra_cross_contribution | ce | loss | -0.00240721 [-0.0037469, -0.00106751] |
+| CiteSeer | unit__edge__learned__intra_cross_contribution | accuracy | percentage_points | 0.100001 [-0.115062, 0.315064] |
+| CiteSeer | unit__edge__learned__intra_cross_contribution | ce | loss | -0.000126708 [-0.000740087, 0.000486672] |
+| CiteSeer | unit__fixed__intra_cross_normalization_interaction | accuracy | percentage_points | -0.180001 [-0.62249, 0.262487] |
+| CiteSeer | unit__fixed__intra_cross_normalization_interaction | ce | loss | -0.00234106 [-0.00340424, -0.00127787] |
+| CiteSeer | unit__learned__intra_cross_normalization_interaction | accuracy | percentage_points | -0.22 [-0.956672, 0.516673] |
+| CiteSeer | unit__learned__intra_cross_normalization_interaction | ce | loss | 0.00141566 [-0.00341616, 0.00624748] |
+| CiteSeer | local_degree__graph__fixed__intra_cross_contribution | accuracy | percentage_points | -0.0199997 [-0.303139, 0.26314] |
+| CiteSeer | local_degree__graph__fixed__intra_cross_contribution | ce | loss | -0.000153255 [-0.000510671, 0.00020416] |
+| CiteSeer | local_degree__graph__learned__intra_cross_contribution | accuracy | percentage_points | -0.0399995 [-0.325848, 0.245849] |
+| CiteSeer | local_degree__graph__learned__intra_cross_contribution | ce | loss | -6.85453e-06 [-0.000350823, 0.000337114] |
+| CiteSeer | local_degree__edge__fixed__intra_cross_contribution | accuracy | percentage_points | -0.059998 [-0.267771, 0.147775] |
+| CiteSeer | local_degree__edge__fixed__intra_cross_contribution | ce | loss | -0.000294924 [-0.00122595, 0.000636098] |
+| CiteSeer | local_degree__edge__learned__intra_cross_contribution | accuracy | percentage_points | 0.0200009 [-0.28917, 0.329172] |
+| CiteSeer | local_degree__edge__learned__intra_cross_contribution | ce | loss | -0.00179006 [-0.00525155, 0.00167143] |
+| CiteSeer | local_degree__fixed__intra_cross_normalization_interaction | accuracy | percentage_points | -0.0399983 [-0.418654, 0.338657] |
+| CiteSeer | local_degree__fixed__intra_cross_normalization_interaction | ce | loss | -0.000141668 [-0.00102786, 0.000744526] |
+| CiteSeer | local_degree__learned__intra_cross_normalization_interaction | accuracy | percentage_points | 0.0600004 [-0.165559, 0.285559] |
+| CiteSeer | local_degree__learned__intra_cross_normalization_interaction | ce | loss | -0.0017832 [-0.00534368, 0.00177728] |
+| Cora | unit__graph__fixed__intra_cross_contribution | accuracy | percentage_points | -0.0199997 [-0.303139, 0.26314] |
+| Cora | unit__graph__fixed__intra_cross_contribution | ce | loss | -0.000242639 [-0.000569245, 8.39676e-05] |
+| Cora | unit__graph__learned__intra_cross_contribution | accuracy | percentage_points | 0.0800002 [-0.0238862, 0.183887] |
+| Cora | unit__graph__learned__intra_cross_contribution | ce | loss | -0.000124907 [-0.000688334, 0.000438519] |
+| Cora | unit__edge__fixed__intra_cross_contribution | accuracy | percentage_points | -0.0199997 [-0.224022, 0.184023] |
+| Cora | unit__edge__fixed__intra_cross_contribution | ce | loss | -0.00846156 [-0.00966205, -0.00726107] |
+| Cora | unit__edge__learned__intra_cross_contribution | accuracy | percentage_points | -0.179999 [-0.449184, 0.0891867] |
+| Cora | unit__edge__learned__intra_cross_contribution | ce | loss | -0.00576863 [-0.0072017, -0.00433557] |
+| Cora | unit__fixed__intra_cross_normalization_interaction | accuracy | percentage_points | 0 [-0.316562, 0.316562] |
+| Cora | unit__fixed__intra_cross_normalization_interaction | ce | loss | -0.00821892 [-0.00922273, -0.00721511] |
+| Cora | unit__learned__intra_cross_normalization_interaction | accuracy | percentage_points | -0.259999 [-0.583787, 0.0637894] |
+| Cora | unit__learned__intra_cross_normalization_interaction | ce | loss | -0.00564373 [-0.00667341, -0.00461404] |
+| Cora | local_degree__graph__fixed__intra_cross_contribution | accuracy | percentage_points | -0.0999999 [-0.252072, 0.0520718] |
+| Cora | local_degree__graph__fixed__intra_cross_contribution | ce | loss | -4.98176e-05 [-0.000227811, 0.000128176] |
+| Cora | local_degree__graph__learned__intra_cross_contribution | accuracy | percentage_points | -0.0400007 [-0.151058, 0.0710569] |
+| Cora | local_degree__graph__learned__intra_cross_contribution | ce | loss | -3.59535e-05 [-0.000124659, 5.27524e-05] |
+| Cora | local_degree__edge__fixed__intra_cross_contribution | accuracy | percentage_points | -0.0999999 [-0.492647, 0.292647] |
+| Cora | local_degree__edge__fixed__intra_cross_contribution | ce | loss | -0.00169969 [-0.00248124, -0.000918133] |
+| Cora | local_degree__edge__learned__intra_cross_contribution | accuracy | percentage_points | -0.0600004 [-0.477391, 0.357391] |
+| Cora | local_degree__edge__learned__intra_cross_contribution | ce | loss | -0.00217193 [-0.0028072, -0.00153666] |
+| Cora | local_degree__fixed__intra_cross_normalization_interaction | accuracy | percentage_points | 0 [-0.316564, 0.316564] |
+| Cora | local_degree__fixed__intra_cross_normalization_interaction | ce | loss | -0.00164987 [-0.00249676, -0.000802974] |
+| Cora | local_degree__learned__intra_cross_normalization_interaction | accuracy | percentage_points | -0.0199997 [-0.375559, 0.335559] |
+| Cora | local_degree__learned__intra_cross_normalization_interaction | ce | loss | -0.00213598 [-0.0028049, -0.00146707] |
+| PubMed | unit__graph__fixed__intra_cross_contribution | accuracy | percentage_points | 0.0399995 [-0.0280084, 0.108007] |
+| PubMed | unit__graph__fixed__intra_cross_contribution | ce | loss | -9.61304e-05 [-0.000278783, 8.65223e-05] |
+| PubMed | unit__graph__learned__intra_cross_contribution | accuracy | percentage_points | 0.0199997 [-0.0355284, 0.0755279] |
+| PubMed | unit__graph__learned__intra_cross_contribution | ce | loss | -1.53422e-05 [-0.000177281, 0.000146596] |
+| PubMed | unit__edge__fixed__intra_cross_contribution | accuracy | percentage_points | -0.0400007 [-0.639353, 0.559351] |
+| PubMed | unit__edge__fixed__intra_cross_contribution | ce | loss | -0.000307608 [-0.0026504, 0.00203519] |
+| PubMed | unit__edge__learned__intra_cross_contribution | accuracy | percentage_points | 0.079999 [-0.142114, 0.302112] |
+| PubMed | unit__edge__learned__intra_cross_contribution | ce | loss | -0.000505495 [-0.00116327, 0.000152279] |
+| PubMed | unit__fixed__intra_cross_normalization_interaction | accuracy | percentage_points | -0.0800002 [-0.709463, 0.549463] |
+| PubMed | unit__fixed__intra_cross_normalization_interaction | ce | loss | -0.000211477 [-0.00240901, 0.00198605] |
+| PubMed | unit__learned__intra_cross_normalization_interaction | accuracy | percentage_points | 0.0599992 [-0.165557, 0.285556] |
+| PubMed | unit__learned__intra_cross_normalization_interaction | ce | loss | -0.000490153 [-0.00100826, 2.79584e-05] |
+| PubMed | local_degree__graph__fixed__intra_cross_contribution | accuracy | percentage_points | 0.0199997 [-0.0838862, 0.123886] |
+| PubMed | local_degree__graph__fixed__intra_cross_contribution | ce | loss | -6.18696e-06 [-0.00013886, 0.000126486] |
+| PubMed | local_degree__graph__learned__intra_cross_contribution | accuracy | percentage_points | -0.0200009 [-0.0755324, 0.0355306] |
+| PubMed | local_degree__graph__learned__intra_cross_contribution | ce | loss | -1.62244e-05 [-0.000133086, 0.000100637] |
+| PubMed | local_degree__edge__fixed__intra_cross_contribution | accuracy | percentage_points | -0.759999 [-1.84459, 0.324597] |
+| PubMed | local_degree__edge__fixed__intra_cross_contribution | ce | loss | 0.00372475 [-0.00228516, 0.00973467] |
+| PubMed | local_degree__edge__learned__intra_cross_contribution | accuracy | percentage_points | 0.0200009 [-0.479764, 0.519766] |
+| PubMed | local_degree__edge__learned__intra_cross_contribution | ce | loss | 4.91858e-05 [-0.000803171, 0.000901542] |
+| PubMed | local_degree__fixed__intra_cross_normalization_interaction | accuracy | percentage_points | -0.779998 [-1.83139, 0.271391] |
+| PubMed | local_degree__fixed__intra_cross_normalization_interaction | ce | loss | 0.00373094 [-0.0022221, 0.00968398] |
+| PubMed | local_degree__learned__intra_cross_normalization_interaction | accuracy | percentage_points | 0.0400019 [-0.412825, 0.492829] |
+| PubMed | local_degree__learned__intra_cross_normalization_interaction | ce | loss | 6.54101e-05 [-0.000732884, 0.000863705] |
+
+## 같은 checkpoint의 frozen 개입과 실제 작용
+
+활성 cross 조건의 gain0/gain1 × layer_0/layer_1/both를 모두 평가한다.
+Fixed gain1은 예상 no-op 대조다. Off에는 별도 개입을 만들지 않는다.
+모델·buffer hash를 보존하고 optimizer 갱신은 0회다. 첫 층 개입이면 후속 특징을 다시 계산한다.
+원시 값과 같은 checkpoint 대비 차이는 `interventions.csv`와 `intervention_changes.csv`에 있다.
+
+Branch 에너지는 **applied S/G**의 ½trace다. 원시 A/K 에너지와 같은 값으로 읽지 않는다.
+Off의 G 에너지와 context norm은 graph G에 대한 참고 진단이며 gain 0으로 실제 교차 경로는 꺼져 있다.
+실제 Δ/off는 현재 층의 동일 Z에 대한 `||TρZ−T0Z||/||T0Z||`다. 분모 0은 undefined다.
+Gain 학습, 실제 출력 변화, 분류 개선을 각각 판단한다.
+
+| 데이터 | 조건 | 층 | gain | 실제 Δ/off | ||G Y1|| | G 에너지 전 | G 에너지 후 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| CiteSeer | local_degree__graph__edge__fixed | 0 | 1 ± 0 | 0.00486717 ± 4.27009e-05 | 1.39789 | 1.48824 | 0.274922 |
+| CiteSeer | local_degree__graph__edge__fixed | 1 | 1 ± 0 | 0.0045998 ± 2.93575e-05 | 8.64179 | 60.627 | 13.3009 |
+| CiteSeer | local_degree__graph__edge__learned | 0 | 0.0668231 ± 0.00887499 | 0.000324918 ± 4.37807e-05 | 1.39357 | 1.47951 | 1.35289 |
+| CiteSeer | local_degree__graph__edge__learned | 1 | 0.0668231 ± 0.00887499 | 0.000316375 ± 4.01674e-05 | 8.80486 | 62.6314 | 57.5799 |
+| CiteSeer | local_degree__graph__graph__fixed | 0 | 1 ± 0 | 0.000152577 ± 1.24753e-06 | 0.0900451 | 0.059732 | 0.0528287 |
+| CiteSeer | local_degree__graph__graph__fixed | 1 | 1 ± 0 | 0.00015838 ± 8.99781e-07 | 0.59839 | 2.75359 | 2.4474 |
+| CiteSeer | local_degree__graph__graph__learned | 0 | 0.0659807 ± 0.00866744 | 1.0069e-05 ± 1.36286e-06 | 0.0899983 | 0.0597111 | 0.0591795 |
+| CiteSeer | local_degree__graph__graph__learned | 1 | 0.0659807 ± 0.00866744 | 1.04574e-05 ± 1.33232e-06 | 0.598784 | 2.75715 | 2.73366 |
+| CiteSeer | local_degree__graph__none__off | 0 | 0 ± 0 | 1.412e-08 ± 3.65776e-10 | 0.0899556 | 0.0596927 | 0.0596927 |
+| CiteSeer | local_degree__graph__none__off | 1 | 0 ± 0 | 1.94614e-08 ± 1.17478e-09 | 0.598754 | 2.75714 | 2.75714 |
+| CiteSeer | local_degree__local__edge__fixed | 0 | 1 ± 0 | 0.016537 ± 0.000174645 | 2.50879 | 4.3257 | 0.686568 |
+| CiteSeer | local_degree__local__edge__fixed | 1 | 1 ± 0 | 0.0114451 ± 8.23671e-05 | 11.9889 | 110.938 | 23.6164 |
+| CiteSeer | local_degree__local__edge__learned | 0 | 0.062231 ± 0.00952153 | 0.00102415 ± 0.000158129 | 2.48963 | 4.26373 | 3.88761 |
+| CiteSeer | local_degree__local__edge__learned | 1 | 0.062231 ± 0.00952153 | 0.0007975 ± 0.00011466 | 12.9413 | 125.934 | 115.778 |
+| CiteSeer | local_degree__local__graph__fixed | 0 | 1 ± 0 | 0.00033382 ± 3.14124e-06 | 0.0894112 | 0.118944 | 0.111766 |
+| CiteSeer | local_degree__local__graph__fixed | 1 | 1 ± 0 | 0.000293677 ± 1.92089e-06 | 0.540731 | 4.26572 | 4.00149 |
+| CiteSeer | local_degree__local__graph__learned | 0 | 0.0618136 ± 0.00939021 | 2.06335e-05 ± 3.17136e-06 | 0.0893763 | 0.118892 | 0.118399 |
+| CiteSeer | local_degree__local__graph__learned | 1 | 0.0618136 ± 0.00939021 | 1.81764e-05 ± 2.63011e-06 | 0.5412 | 4.27495 | 4.2569 |
+| CiteSeer | local_degree__local__none__off | 0 | 0 ± 0 | 1.44934e-08 ± 3.51187e-10 | 0.0896477 | 0.119104 | 0.119104 |
+| CiteSeer | local_degree__local__none__off | 1 | 0 ± 0 | 1.81927e-08 ± 8.82845e-10 | 0.541633 | 4.26867 | 4.26867 |
+| CiteSeer | unit__graph__edge__fixed | 0 | 1 ± 0 | 3.46492e-05 ± 1.22844e-06 | 0.0917384 | 0.00800665 | 0.00187801 |
+| CiteSeer | unit__graph__edge__fixed | 1 | 1 ± 0 | 5.57433e-05 ± 1.81072e-06 | 0.835334 | 0.663012 | 0.15531 |
+| CiteSeer | unit__graph__edge__learned | 0 | 0.130155 ± 0.015445 | 4.50399e-06 ± 5.6416e-07 | 0.0916784 | 0.00799543 | 0.00693909 |
+| CiteSeer | unit__graph__edge__learned | 1 | 0.130155 ± 0.015445 | 7.25027e-06 ± 8.76185e-07 | 0.834964 | 0.662382 | 0.57489 |
+| CiteSeer | unit__graph__graph__fixed | 0 | 1 ± 0 | 2.76531e-05 ± 1.60457e-06 | 0.0497788 | 0.00306491 | 0.00117682 |
+| CiteSeer | unit__graph__graph__fixed | 1 | 1 ± 0 | 4.44184e-05 ± 2.47781e-06 | 0.446044 | 0.246958 | 0.0952981 |
+| CiteSeer | unit__graph__graph__learned | 0 | 0.902937 ± 0.0120618 | 2.47222e-05 ± 1.96352e-06 | 0.0492459 | 0.00300903 | 0.00128691 |
+| CiteSeer | unit__graph__graph__learned | 1 | 0.902937 ± 0.0120618 | 4.00146e-05 ± 2.62807e-06 | 0.444387 | 0.245148 | 0.104975 |
+| CiteSeer | unit__graph__none__off | 0 | 0 ± 0 | 1.36508e-08 ± 4.2117e-10 | 0.0495916 | 0.00304531 | 0.0030453 |
+| CiteSeer | unit__graph__none__off | 1 | 0 ± 0 | 1.77433e-08 ± 1.09872e-09 | 0.444738 | 0.245738 | 0.245738 |
+| CiteSeer | unit__local__edge__fixed | 0 | 1 ± 0 | 0.0169182 ± 0.000168511 | 2.54726 | 4.45565 | 0.690018 |
+| CiteSeer | unit__local__edge__fixed | 1 | 1 ± 0 | 0.0119142 ± 8.12458e-05 | 12.417 | 118.052 | 23.9224 |
+| CiteSeer | unit__local__edge__learned | 0 | 0.0637914 ± 0.00981241 | 0.00107381 ± 0.000165412 | 2.52873 | 4.39519 | 3.9977 |
+| CiteSeer | unit__local__edge__learned | 1 | 0.0637914 ± 0.00981241 | 0.000851054 ± 0.000124062 | 13.3743 | 133.648 | 122.534 |
+| CiteSeer | unit__local__graph__fixed | 0 | 1 ± 0 | 0.000345046 ± 3.62858e-06 | 0.0965915 | 0.124613 | 0.116315 |
+| CiteSeer | unit__local__graph__fixed | 1 | 1 ± 0 | 0.000309984 ± 1.81206e-06 | 0.612602 | 4.65144 | 4.31709 |
+| CiteSeer | unit__local__graph__learned | 0 | 0.0646867 ± 0.00926331 | 2.23206e-05 ± 3.22318e-06 | 0.096534 | 0.124563 | 0.123962 |
+| CiteSeer | unit__local__graph__learned | 1 | 0.0646867 ± 0.00926331 | 2.00814e-05 ± 2.75453e-06 | 0.613125 | 4.66227 | 4.63804 |
+| CiteSeer | unit__local__none__off | 0 | 0 ± 0 | 1.48693e-08 ± 2.57451e-10 | 0.0965237 | 0.124549 | 0.124549 |
+| CiteSeer | unit__local__none__off | 1 | 0 ± 0 | 1.78997e-08 ± 6.04072e-10 | 0.613189 | 4.66295 | 4.66295 |
+| Cora | local_degree__graph__edge__fixed | 0 | 1 ± 0 | 0.00654014 ± 6.62073e-05 | 2.75067 | 6.10317 | 1.17668 |
+| Cora | local_degree__graph__edge__fixed | 1 | 1 ± 0 | 0.00556973 ± 5.63623e-05 | 15.0249 | 189.16 | 40.8027 |
+| Cora | local_degree__graph__edge__learned | 0 | 0.358988 ± 0.0486645 | 0.00234677 ± 0.000319841 | 2.74529 | 6.07941 | 3.71745 |
+| Cora | local_degree__graph__edge__learned | 1 | 0.358988 ± 0.0486645 | 0.00203633 ± 0.000273009 | 15.2001 | 193.09 | 120.44 |
+| Cora | local_degree__graph__graph__fixed | 0 | 1 ± 0 | 0.000143134 ± 1.95866e-06 | 0.135899 | 0.176681 | 0.160567 |
+| Cora | local_degree__graph__graph__fixed | 1 | 1 ± 0 | 0.000128938 ± 1.35672e-06 | 0.748359 | 5.92048 | 5.42548 |
+| Cora | local_degree__graph__graph__learned | 0 | 0.371257 ± 0.0457492 | 5.31273e-05 ± 6.48529e-06 | 0.13596 | 0.176697 | 0.170163 |
+| Cora | local_degree__graph__graph__learned | 1 | 0.371257 ± 0.0457492 | 4.78721e-05 ± 5.78291e-06 | 0.748891 | 5.92376 | 5.72435 |
+| Cora | local_degree__graph__none__off | 0 | 0 ± 0 | 1.97092e-08 ± 2.1503e-10 | 0.135872 | 0.176621 | 0.176621 |
+| Cora | local_degree__graph__none__off | 1 | 0 ± 0 | 2.38053e-08 ± 5.53731e-10 | 0.748722 | 5.92459 | 5.92459 |
+| Cora | local_degree__local__edge__fixed | 0 | 1 ± 0 | 0.0192699 ± 0.000195771 | 4.63453 | 16.2418 | 2.8876 |
+| Cora | local_degree__local__edge__fixed | 1 | 1 ± 0 | 0.0127554 ± 0.000112979 | 20.6144 | 343.495 | 72.5162 |
+| Cora | local_degree__local__edge__learned | 0 | 0.565243 ± 0.071527 | 0.010894 ± 0.00146061 | 4.62211 | 16.1553 | 6.70015 |
+| Cora | local_degree__local__edge__learned | 1 | 0.565243 ± 0.071527 | 0.00751014 ± 0.0009313 | 21.1318 | 357.964 | 158.201 |
+| Cora | local_degree__local__graph__fixed | 0 | 1 ± 0 | 0.000287987 ± 2.87877e-06 | 0.126787 | 0.343719 | 0.328868 |
+| Cora | local_degree__local__graph__fixed | 1 | 1 ± 0 | 0.000224232 ± 1.96962e-06 | 0.635969 | 9.00734 | 8.63126 |
+| Cora | local_degree__local__graph__learned | 0 | 0.364525 ± 0.048157 | 0.000105001 ± 1.42195e-05 | 0.126766 | 0.343659 | 0.337965 |
+| Cora | local_degree__local__graph__learned | 1 | 0.364525 ± 0.048157 | 8.17999e-05 ± 1.08838e-05 | 0.636274 | 9.01544 | 8.87149 |
+| Cora | local_degree__local__none__off | 0 | 0 ± 0 | 1.95572e-08 ± 3.9137e-10 | 0.126756 | 0.343647 | 0.343647 |
+| Cora | local_degree__local__none__off | 1 | 0 ± 0 | 2.30414e-08 ± 1.11143e-09 | 0.636498 | 9.02069 | 9.02069 |
+| Cora | unit__graph__edge__fixed | 0 | 1 ± 0 | 3.14386e-05 ± 1.41734e-06 | 0.149717 | 0.021755 | 0.00522978 |
+| Cora | unit__graph__edge__fixed | 1 | 1 ± 0 | 4.17207e-05 ± 1.21193e-06 | 1.15349 | 1.29136 | 0.310703 |
+| Cora | unit__graph__edge__learned | 0 | 0.553137 ± 0.0752313 | 1.74361e-05 ± 2.89445e-06 | 0.149685 | 0.0217452 | 0.0111832 |
+| Cora | unit__graph__edge__learned | 1 | 0.553137 ± 0.0752313 | 2.31234e-05 ± 3.6762e-06 | 1.15322 | 1.29075 | 0.661961 |
+| Cora | unit__graph__graph__fixed | 0 | 1 ± 0 | 2.17591e-05 ± 1.41186e-06 | 0.0721932 | 0.00774094 | 0.00363372 |
+| Cora | unit__graph__graph__fixed | 1 | 1 ± 0 | 2.92743e-05 ± 1.16034e-06 | 0.560715 | 0.461083 | 0.214046 |
+| Cora | unit__graph__graph__learned | 0 | 0.857761 ± 0.0351238 | 1.86711e-05 ± 1.84278e-06 | 0.0721146 | 0.00772944 | 0.00407433 |
+| Cora | unit__graph__graph__learned | 1 | 0.857761 ± 0.0351238 | 2.50934e-05 ± 1.96977e-06 | 0.559866 | 0.460207 | 0.240377 |
+| Cora | unit__graph__none__off | 0 | 0 ± 0 | 1.79367e-08 ± 4.65052e-10 | 0.0719023 | 0.00769969 | 0.00769969 |
+| Cora | unit__graph__none__off | 1 | 0 ± 0 | 2.36074e-08 ± 9.38404e-10 | 0.559249 | 0.459684 | 0.459684 |
+| Cora | unit__local__edge__fixed | 0 | 1 ± 0 | 0.0203626 ± 0.0001676 | 4.83331 | 17.6224 | 3.00244 |
+| Cora | unit__local__edge__fixed | 1 | 1 ± 0 | 0.0136644 ± 9.63436e-05 | 21.9052 | 384.219 | 76.0351 |
+| Cora | unit__local__edge__learned | 0 | 0.650015 ± 0.0918686 | 0.013248 ± 0.00195259 | 4.81858 | 17.5147 | 6.17345 |
+| Cora | unit__local__edge__learned | 1 | 0.650015 ± 0.0918686 | 0.00917432 ± 0.00124711 | 22.3369 | 397.156 | 149.927 |
+| Cora | unit__local__graph__fixed | 0 | 1 ± 0 | 0.000311971 ± 2.77599e-06 | 0.138335 | 0.37636 | 0.358787 |
+| Cora | unit__local__graph__fixed | 1 | 1 ± 0 | 0.000246614 ± 1.52459e-06 | 0.71705 | 10.1731 | 9.69858 |
+| Cora | unit__local__graph__learned | 0 | 0.501461 ± 0.069925 | 0.000156524 ± 2.26283e-05 | 0.138307 | 0.376254 | 0.367076 |
+| Cora | unit__local__graph__learned | 1 | 0.501461 ± 0.069925 | 0.000123759 ± 1.73839e-05 | 0.717327 | 10.18 | 9.93187 |
+| Cora | unit__local__none__off | 0 | 0 ± 0 | 1.86778e-08 ± 3.58509e-10 | 0.138317 | 0.376254 | 0.376254 |
+| Cora | unit__local__none__off | 1 | 0 ± 0 | 2.24641e-08 ± 6.27727e-10 | 0.717694 | 10.188 | 10.188 |
+| PubMed | local_degree__graph__edge__fixed | 0 | 1 ± 0 | 0.00696064 ± 0.00024453 | 5.6919 | 21.662 | 2.75097 |
+| PubMed | local_degree__graph__edge__fixed | 1 | 1 ± 0 | 0.0067471 ± 8.83336e-05 | 28.0713 | 543.785 | 76.494 |
+| PubMed | local_degree__graph__edge__learned | 0 | 0.257543 ± 0.0468706 | 0.00178187 ± 0.000273648 | 5.68148 | 21.5835 | 14.0776 |
+| PubMed | local_degree__graph__edge__learned | 1 | 0.257543 ± 0.0468706 | 0.00176786 ± 0.000311586 | 28.4677 | 557.94 | 374.892 |
+| PubMed | local_degree__graph__graph__fixed | 0 | 1 ± 0 | 0.000129605 ± 4.51906e-06 | 0.22094 | 0.590686 | 0.544696 |
+| PubMed | local_degree__graph__graph__fixed | 1 | 1 ± 0 | 0.000130525 ± 2.00942e-06 | 1.13735 | 16.1158 | 14.8947 |
+| PubMed | local_degree__graph__graph__learned | 0 | 0.266711 ± 0.0438284 | 3.44013e-05 ± 4.63014e-06 | 0.220921 | 0.59054 | 0.577552 |
+| PubMed | local_degree__graph__graph__learned | 1 | 0.266711 ± 0.0438284 | 3.48004e-05 ± 5.51599e-06 | 1.13798 | 16.1281 | 15.7941 |
+| PubMed | local_degree__graph__none__off | 0 | 0 ± 0 | 1.85711e-08 ± 3.46942e-10 | 0.220929 | 0.59059 | 0.59059 |
+| PubMed | local_degree__graph__none__off | 1 | 0 ± 0 | 3.02073e-08 ± 3.17186e-10 | 1.13811 | 16.1314 | 16.1314 |
+| PubMed | local_degree__local__edge__fixed | 0 | 1 ± 0 | 0.0259057 ± 0.000804994 | 10.2404 | 63.007 | 5.73435 |
+| PubMed | local_degree__local__edge__fixed | 1 | 1 ± 0 | 0.0202551 ± 0.00030441 | 43.8319 | 1226.64 | 142.167 |
+| PubMed | local_degree__local__edge__learned | 0 | 0.250792 ± 0.0509719 | 0.0063774 ± 0.00112713 | 10.3992 | 64.9239 | 40.5929 |
+| PubMed | local_degree__local__edge__learned | 1 | 0.250792 ± 0.0509719 | 0.0054603 ± 0.00105622 | 45.5544 | 1304.68 | 852.816 |
+| PubMed | local_degree__local__graph__fixed | 0 | 1 ± 0 | 0.000300021 ± 1.07714e-05 | 0.225308 | 1.10325 | 1.05475 |
+| PubMed | local_degree__local__graph__fixed | 1 | 1 ± 0 | 0.000283831 ± 3.88792e-06 | 1.14613 | 26.6082 | 25.3536 |
+| PubMed | local_degree__local__graph__learned | 0 | 0.253062 ± 0.0457741 | 7.55555e-05 ± 1.1429e-05 | 0.225285 | 1.10304 | 1.09016 |
+| PubMed | local_degree__local__graph__learned | 1 | 0.253062 ± 0.0457741 | 7.18087e-05 ± 1.25796e-05 | 1.14673 | 26.6344 | 26.3122 |
+| PubMed | local_degree__local__none__off | 0 | 0 ± 0 | 1.87853e-08 ± 4.57034e-10 | 0.22527 | 1.10296 | 1.10296 |
+| PubMed | local_degree__local__none__off | 1 | 0 ± 0 | 3.02855e-08 ± 6.16552e-10 | 1.1467 | 26.6376 | 26.6376 |
+| PubMed | unit__graph__edge__fixed | 0 | 1 ± 0 | 2.30833e-05 ± 3.27205e-07 | 0.287774 | 0.0808839 | 0.0196546 |
+| PubMed | unit__graph__edge__fixed | 1 | 1 ± 0 | 3.00981e-05 ± 5.7186e-07 | 1.72719 | 2.91289 | 0.707082 |
+| PubMed | unit__graph__edge__learned | 0 | 0.346359 ± 0.0165403 | 7.99271e-06 ± 3.10364e-07 | 0.28778 | 0.0808877 | 0.0547712 |
+| PubMed | unit__graph__edge__learned | 1 | 0.346359 ± 0.0165403 | 1.04233e-05 ± 4.61885e-07 | 1.72724 | 2.91306 | 1.97354 |
+| PubMed | unit__graph__graph__fixed | 0 | 1 ± 0 | 1.10441e-05 ± 1.52084e-07 | 0.093973 | 0.0197031 | 0.0122556 |
+| PubMed | unit__graph__graph__fixed | 1 | 1 ± 0 | 1.36271e-05 ± 2.11608e-07 | 0.550175 | 0.690449 | 0.434507 |
+| PubMed | unit__graph__graph__learned | 0 | 0.469102 ± 0.0355615 | 5.17878e-06 ± 3.51106e-07 | 0.0939728 | 0.0197032 | 0.0158656 |
+| PubMed | unit__graph__graph__learned | 1 | 0.469102 ± 0.0355615 | 6.39543e-06 ± 5.15689e-07 | 0.550267 | 0.690577 | 0.558602 |
+| PubMed | unit__graph__none__off | 0 | 0 ± 0 | 1.65152e-08 ± 1.00249e-10 | 0.0939736 | 0.0197027 | 0.0197027 |
+| PubMed | unit__graph__none__off | 1 | 0 ± 0 | 2.32292e-08 ± 4.3269e-10 | 0.550389 | 0.690759 | 0.69076 |
+| PubMed | unit__local__edge__fixed | 0 | 1 ± 0 | 0.0257782 ± 0.000912747 | 10.4766 | 65.8477 | 5.86007 |
+| PubMed | unit__local__edge__fixed | 1 | 1 ± 0 | 0.0203637 ± 0.000291591 | 43.1989 | 1191.86 | 134.491 |
+| PubMed | unit__local__edge__learned | 0 | 0.253232 ± 0.0503905 | 0.0064693 ± 0.00110766 | 10.4166 | 65.0976 | 40.4818 |
+| PubMed | unit__local__edge__learned | 1 | 0.253232 ± 0.0503905 | 0.00556013 ± 0.00104564 | 46.0716 | 1336.61 | 869.945 |
+| PubMed | unit__local__graph__fixed | 0 | 1 ± 0 | 0.000304056 ± 1.12595e-05 | 0.242697 | 1.1282 | 1.07215 |
+| PubMed | unit__local__graph__fixed | 1 | 1 ± 0 | 0.000289699 ± 4.11557e-06 | 1.30395 | 28.4752 | 26.8607 |
+| PubMed | unit__local__graph__learned | 0 | 0.258216 ± 0.0441808 | 7.81328e-05 ± 1.09454e-05 | 0.242659 | 1.12796 | 1.11274 |
+| PubMed | unit__local__graph__learned | 1 | 0.258216 ± 0.0441808 | 7.4775e-05 ± 1.22447e-05 | 1.30461 | 28.5069 | 28.0817 |
+| PubMed | unit__local__none__off | 0 | 0 ± 0 | 1.87264e-08 ± 3.11584e-10 | 0.24267 | 1.12797 | 1.12797 |
+| PubMed | unit__local__none__off | 1 | 0 ± 0 | 3.07197e-08 ± 6.95202e-10 | 1.30486 | 28.5169 | 28.5169 |
+
+## 범위와 한계
+
+- 원시 metric 900행, frozen 4,320행,
+  branch 3,480행의 전체 범위와 hash를 검증했다.
+- Source 그래프 201개를 보존한다. 선언된 citation 또는 DEBUG 그래프만 분류에 사용하며 합성 그래프는 label 학습에 쓰지 않는다.
+- 자원 기록 1976행에서 calibration·본학습·완료된 학습의 재사용을 구분한다.
+- Degree bound는 copy 공간 및 물리 D metric의 contraction을 보장한다. 일반 Euclidean node norm이나 모든 종류의 그래프 에너지 감소를 보장하는 주장이 아니다.
+- Star처럼 local C 변화가 ego step과 정확히 상쇄되는 구조가 있다. C 조건이 다르다는 사실만으로 적용된 S가 다르다고 판단하지 않는다.
+- Public split의 seed 5개에 따른 변동이며 독립 split/새 그래프 일반화가 아니다.
+- 이전 test를 확인한 후 설계한 탐색 연구다. 다중 비교 보정을 적용하지 않았고 0 포함 구간은 동등성 증명이 아니다.
+- 에너지는 전파를 정의한다. 학습 loss는 분류 CE이며 정보 복원이나 신규성은 이 실험만으로 입증하지 않는다.
+
+전체 split의 요약은 CSV, 원시 증거는 metric·intervention·branch·frozen provenance·source/data hash·resource·completion에서 확인한다.
