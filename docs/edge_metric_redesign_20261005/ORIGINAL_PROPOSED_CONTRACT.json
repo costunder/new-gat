@@ -1,0 +1,80 @@
+{
+  "status": "proposed_not_implemented",
+  "name": "edge_metric_relations",
+  "basis_archive": "GPT_ALL_RESEARCH_20261005.zip",
+  "archive_sha256": "676ca54813ed1897ae9fe393a9392be6d22f914ea9556a42a80a27ea0f3e0705",
+  "scientific_training_executed": false,
+  "local_algebra_checks": "math_reference_results.json",
+  "classification": {
+    "datasets": [
+      "Cora",
+      "CiteSeer",
+      "PubMed"
+    ],
+    "physical_graph_fraction": 1.0,
+    "local_graph": "all_induced_one_hop",
+    "center_pairs": "all_original_adjacent_pairs",
+    "edge_pairs": "all_distinct_physical_edges_with_common_endpoint_between_the_two_locals",
+    "hidden": 64,
+    "layers": 2,
+    "epochs": 500,
+    "optimizer": "Adam",
+    "lr_candidates": [
+      0.001,
+      0.003,
+      0.01
+    ],
+    "tuning_seeds": [
+      101,
+      202,
+      303
+    ],
+    "final_seeds": [
+      11,
+      23,
+      37,
+      53,
+      71
+    ],
+    "recipes": [
+      "unit",
+      "local_degree"
+    ],
+    "per_recipe_conditions": [
+      "D0",
+      "D1",
+      "F0",
+      "F1",
+      "F2",
+      "DA"
+    ],
+    "external_conditions": [
+      "G1",
+      "G2",
+      "P2"
+    ],
+    "total_conditions": 15,
+    "tuning_runs": 405,
+    "final_runs": 225,
+    "total_runs": 630,
+    "optimizer_updates": 315000,
+    "primary": "accuracy",
+    "secondary": "CE",
+    "primary_accuracy_contrasts": 18,
+    "multiplicity": "Holm across the 18 predeclared primary accuracy comparisons",
+    "inference_scope": "exploratory_fixed_public_split",
+    "gate_hidden": 64,
+    "pair_input_features": 8,
+    "diagonal_input_features": 4,
+    "pair_mlp_activation": "SiLU",
+    "rho_fixed": 0.5,
+    "diagonal_multiplier_bounds": [
+      0.5,
+      2.0
+    ],
+    "message_step": 0.3333333333333333,
+    "normalizer": "fixed_topology_reference_degree_plus_one",
+    "unapproved_data_or_budget_fallback": false
+  },
+  "math_note": "B.T C B equals L0 squared only for appropriate C, e.g. C=B B.T; not for arbitrary positive diagonal C."
+}

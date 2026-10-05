@@ -1,0 +1,261 @@
+{
+  "schema": "edge-metric-classification-v1",
+  "experiment": "edge_metric_relations_classification",
+  "status": "runnable",
+  "date": "2026-10-05",
+  "profile": "debug",
+  "data_source": "debug_fixture",
+  "data": {
+    "datasets": [
+      "DEBUG-Cora",
+      "DEBUG-CiteSeer",
+      "DEBUG-PubMed"
+    ],
+    "split": "public",
+    "setting": "transductive_full_graph",
+    "features": "row_sum_normalize_preserve_zero_rows",
+    "physical_graph": "simple_undirected_no_self_loops_or_reciprocal_duplicates",
+    "sampling_ratio": 1,
+    "all_nodes": true,
+    "all_physical_edges": true,
+    "all_induced_one_hop_egos": true,
+    "all_directed_adjacent_center_pairs": true,
+    "raw_and_processed_sha256_required": true,
+    "expected_shapes": {
+      "DEBUG-Cora": {
+        "nodes": 24,
+        "features": 12,
+        "classes": 3,
+        "train": 9,
+        "validation": 6,
+        "test": 9
+      },
+      "DEBUG-CiteSeer": {
+        "nodes": 30,
+        "features": 12,
+        "classes": 3,
+        "train": 9,
+        "validation": 6,
+        "test": 15
+      },
+      "DEBUG-PubMed": {
+        "nodes": 36,
+        "features": 12,
+        "classes": 3,
+        "train": 9,
+        "validation": 6,
+        "test": 21
+      }
+    }
+  },
+  "source": {
+    "required_experiment": "local_energy_relations_initial_audit",
+    "required_status": "complete",
+    "profile": "debug",
+    "graphs": 21,
+    "synthetic_graphs": 18,
+    "synthetic_scalar_inputs": 72,
+    "citation_graphs": 3,
+    "actual_citation_graphs": 0,
+    "whole_prior_audit_preserved": true,
+    "synthetic_graphs_used_for_training": 0,
+    "reuse_exact_citation_features_edges_and_topology": true,
+    "labels_and_public_masks_loaded_from_pinned_raw": true
+  },
+  "backbone": {
+    "layers": 2,
+    "hidden_dim": 8,
+    "projection_bias": false,
+    "dropout_probability": 0.5,
+    "dropout_placement": "before_each_projection",
+    "activation": "relu_after_first_update_only",
+    "output": "second_layer_logits",
+    "initialization": "xavier_uniform_projection_weights; Xavier_gate_hidden; zero_gate_output_weight_and_bias",
+    "shared_initialization_and_dropout_streams": true,
+    "extra_projection": false
+  },
+  "operators": {
+    "occurrence_correction": "1/sqrt(r_e)",
+    "pairs": "all_distinct_physical_edges_common_endpoint_across_adjacent_centers",
+    "edge_metric": "sqrt(D)(I+.5K)sqrt(D)",
+    "rho_fixed": 0.5,
+    "diagonal_bounds": [
+      0.5,
+      2.0
+    ],
+    "epsilon": 0.0001,
+    "rms": "sqrt(mean_square+epsilon_squared)",
+    "N0": "diag(1+degree(Q0))^(-1/2)",
+    "tau": 0.3333333333333333,
+    "generation_input": "Z",
+    "action_input": "N0Z",
+    "adaptive_energy_gradient": false,
+    "gate_hidden": 64,
+    "gate_bias": true,
+    "gate_activation": "SiLU",
+    "gate_initialization": "Xavier hidden; zero output weight and bias",
+    "layer_gate_sharing": false,
+    "DA": "sum_normalized_sign_removed_pairs_per_occurrence_then_mean_occurrences_per_physical_edge",
+    "G1": "self_loop_symmetric_GCN",
+    "G2": "P_GCN_squared_per_layer",
+    "P2": "degree2_Ltilde_normalized_by_exact_interval_sup",
+    "parameter_or_input_equality_is_not_function_class_equality": true
+  },
+  "conditions": [
+    "unit__D0",
+    "unit__D1",
+    "unit__F0",
+    "unit__F1",
+    "unit__F2",
+    "unit__DA",
+    "local_degree__D0",
+    "local_degree__D1",
+    "local_degree__F0",
+    "local_degree__F1",
+    "local_degree__F2",
+    "local_degree__DA",
+    "G1",
+    "G2",
+    "P2"
+  ],
+  "capacity": {
+    "per_layer_diagonal_gate": 385,
+    "per_layer_pair_gate": 641,
+    "gate_layers": 2,
+    "pair_input": 8,
+    "diagonal_input": 4,
+    "polynomial_scalars": 6
+  },
+  "training": {
+    "location": "server_only",
+    "optimizer": "Adam",
+    "learning_rate_candidates": [
+      0.003,
+      0.01
+    ],
+    "weight_decay": 0.0005,
+    "weight_decay_scope": "projection_weight_matrices_only",
+    "optimizer_betas": [
+      0.9,
+      0.999
+    ],
+    "optimizer_epsilon": 1e-08,
+    "epochs_per_run": 3,
+    "updates_per_epoch": 1,
+    "physical_graph_batch_per_run": 1,
+    "gradient_accumulation_steps": 1,
+    "data_parallel_replicas_per_run": 1,
+    "effective_graph_batch_per_run": 1,
+    "early_stopping": false,
+    "scheduler": false,
+    "gradient_clipping": false,
+    "precision": "float32",
+    "tf32": false,
+    "tuning_seeds": [
+      101,
+      202
+    ],
+    "final_seeds": [
+      11,
+      23
+    ],
+    "checkpoint_selection": [
+      "minimum_validation_CE_without_L2",
+      "maximum_validation_accuracy",
+      "earliest_epoch"
+    ],
+    "lr_selection": "minimum_mean_selected_validation_CE_then_smaller_lr",
+    "tuning_runs": 180,
+    "final_runs": 90,
+    "total_runs": 270,
+    "total_updates": 810,
+    "test_evaluation_during_tuning": false,
+    "diagnostic_every_epochs": 1,
+    "gate_weight_decay": 0,
+    "layer_diagnostics_epochs": "epoch1, every diagnostic interval, final epoch; selected frozen checkpoint",
+    "parameter_group_gradient_every_epoch": true,
+    "parameter_group_update_every_epoch": true
+  },
+  "evaluation": {
+    "primary": "test_accuracy",
+    "secondary": "test_CE",
+    "unit": "initialization_seed_on_fixed_public_split",
+    "checkpoint_lock_before_all_test": true,
+    "primary_contrasts": [
+      "F2-D1",
+      "F2-DA",
+      "F2-P2"
+    ],
+    "primary_accuracy_contrasts": 18,
+    "test": "two_sided_paired_t",
+    "alpha": 0.05,
+    "multiplicity": "Holm_18_primary_accuracy",
+    "unadjusted_95_percent_CI": true,
+    "secondary_comparisons": "exploratory_unadjusted_labelled",
+    "intervention_scopes": [
+      "layer_0",
+      "layer_1",
+      "both"
+    ],
+    "interventions": "condition_applicable_offdiag_zero_diagonal_one_pair_zero_plus_no_op",
+    "intervention_coefficients": "recomputed_from_current_hidden; matched_Z_removal_separately_in_branch_diagnostics",
+    "practical_threshold_pp": null,
+    "practical_threshold_status": "not_approved_not_used_for_success_or_failure",
+    "scope": "exploratory_public_test_seen_in_prior_research",
+    "no_equivalence_claim_from_zero_in_CI": true
+  },
+  "resources": {
+    "gpu": "assigned_A6000_actual_allocation_measured",
+    "parallel_tuning_run_candidates": [
+      1,
+      2
+    ],
+    "parallel_final_run_candidates": [
+      1,
+      2
+    ],
+    "preprocessing_worker_candidates": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "seeds": "packed_leading_axis_with_independent_parameters_and_adam_state",
+    "packed_loss": "sum_of_per_replica_train_node_mean_CE",
+    "static_cache": true,
+    "epoch_dataloader": "N/A_for_resident_GPU_data",
+    "relations": "all induced edge occurrences and every declared eligible pair; no cap, sampling or top-k",
+    "large_relations": "exact edge chunking symmetric custom backward; macro activation checkpointing",
+    "multi_gpu_if_allocated": "partition_dataset_condition_lr_groups",
+    "calibration": "separate_updates_restore_initial_states_before_training",
+    "ETA": "derived_from_measured_epoch_throughput",
+    "same_terminal_progress_and_logfile": true,
+    "new_output_directory": true
+  },
+  "runtime": {
+    "calibration_warmups": 1,
+    "calibration_repeats": 1,
+    "relation_chunk_candidates": [
+      16,
+      64
+    ],
+    "resume_every_epochs": 1,
+    "gpu_memory_safety_fraction": 0.85,
+    "cpu_threads": 1,
+    "cpu_workers": "auto",
+    "activation_checkpointing": true
+  },
+  "debug_fixture": {
+    "nodes": [
+      24,
+      30,
+      36
+    ],
+    "features": 12,
+    "classes": 3,
+    "train_per_class": 3,
+    "validation_nodes": 6,
+    "master_seed": 20261003
+  },
+  "selection_question": "Does a learned non-diagonal edge metric improve accuracy beyond pair-informed diagonal and polynomial controls?"
+}

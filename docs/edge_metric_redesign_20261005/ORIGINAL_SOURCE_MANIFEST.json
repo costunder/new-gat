@@ -1,0 +1,14 @@
+{
+  "status": "original proposal and its DEBUG algebra only; not current implementation/results",
+  "archive_path": "C:\\Users\\user\\Downloads\\EDGE_METRIC_REDESIGN.zip",
+  "archive_sha256": "1b2ea7981d8273e06cabafbce4f848b54b27ba722327008e12279041756f9087",
+  "pasted_source_path": "C:\\Users\\user\\.codex\\attachments\\c08dde10-e923-4b68-9c76-caa1baa3fa2d\\붙여넣은 텍스트.txt",
+  "files_sha256": {
+    "ORIGINAL_EXPERIMENT_DESIGN.md": "1b8040eb135904fa4f95cbae4fbbd34da5e1253e851f583e1d17db62d11acc9c",
+    "ORIGINAL_PROPOSED_CONTRACT.json": "f8bf03f458bbbb891edbec3db2bbe78c5cb0cb72c36c264324450eb2ec7feb5e",
+    "ORIGINAL_math_reference_checks.py": "acf4601ba3591aa5803b3d0f56f1386e1b0cdd4f992fb83cedad12f1f03868ab",
+    "ORIGINAL_math_reference_log.txt": "c2c15be41e935c46838938183095e52982f2e05d722ae16d5e5e6c571af6a61a",
+    "ORIGINAL_math_reference_results.json": "b5b24ea89a2ec2263fe1515a7959638ec91c0ea159df98744c985f3a7400add1",
+    "ORIGINAL_GPT_DESIGN.txt": "c8fafb2225697076d842dc58d7315befc5dc2f9938a0e8bdee7341e8db76ea2e"
+  }
+}

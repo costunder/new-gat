@@ -1,0 +1,4 @@
+* text eol=lf
+*.py -text whitespace=cr-at-eol
+*.json -text whitespace=cr-at-eol
+classification/training.py whitespace=cr-at-eol,-blank-at-eof
