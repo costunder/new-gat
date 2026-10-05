@@ -29,6 +29,7 @@ B의 고정 조건과 선형 fit 기준선은 optimizer 학습 횟수에 포함�
 - [수식](MODEL_MATH.md): 발생행렬, 이차/쌍선형 에너지, 전파식, 실제 보장과 한계.
 - [실험 계약](EXPERIMENT_DESIGN.md): 수정한 네 항목, 조건, 비교, 데이터와 학습 규모.
 - [서버 실행](RUN.md): A→B→C 실행, 결과 확인, 재개.
+- [A100 MIG 10GB](MIG_10GB.md): FULL 규모를 유지하는 메모리 정책과 실행 옵션.
 - [검증 기록](VERIFICATION.md): DEBUG와 FULL의 구분 및 검증 항목.
 - `geometry.py`: 모든 local·eligible pair를 보존한 정적 구조.
 - `gates.py`, `operators.py`: 실제 생성기와 희소 전파.

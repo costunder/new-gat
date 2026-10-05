@@ -13,12 +13,14 @@ import torch
 
 from .common import assert_source_unchanged,read_json,source_manifest,write_json
 from .predecessors import check_predecessors
+from .hardware import HARDWARE_PROFILES, get_policy, memory_window
 
 
 def command(phase,args,output):
     module={"A":"audit","B":"synthetic","C":"classification"}[phase]
     cmd=[sys.executable,"-u","-B","-m",f"research.edge_metric_relations.{module}.study",
-         "--profile",args.profile,"--device",args.device,"--output-dir",str(output)]
+         "--profile",args.profile,"--device",args.device,"--output-dir",str(output),
+         "--hardware-profile",getattr(args,"hardware_profile","auto")]
     if phase in ("A","C"):
         cmd += ["--source-dir",str(Path(args.source_dir).resolve()),"--data-root",args.data_root]
     if phase=="C":
@@ -28,6 +30,7 @@ def command(phase,args,output):
 
 
 def run(args):
+    policy=get_policy(getattr(args,"hardware_profile","auto"))
     if args.profile=="full" and (sys.platform!="linux" or torch.device(args.device).type!="cuda" or not os.environ.get("CUDA_VISIBLE_DEVICES")):
         raise ValueError("FULL requires a Linux server and explicitly allocated CUDA_VISIBLE_DEVICES")
     if torch.device(args.device).type=="cuda" and not torch.cuda.is_available():
@@ -38,8 +41,9 @@ def run(args):
     source=source_manifest()
     output.mkdir(parents=True,exist_ok=False)
     write_json(output/"source_manifest.json",source)
+    write_json(output/"hardware_policy.json",{"policy":policy,"memory":memory_window(args.device,policy)})
     write_json(output/"plan.json",{"profile":args.profile,"source_dir":str(Path(args.source_dir).resolve()),
-                                  "phases":["A","B","C"],"device":args.device,
+                                  "phases":["A","B","C"],"device":args.device,"hardware_profile":policy["name"],
                                   "original_results_preserved":True,"full_training_location":"Linux server only"})
     start=time.perf_counter();records={}
     try:
@@ -78,6 +82,8 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile",choices=("full","debug"),default="full")
     parser.add_argument("--device",default="cuda",help="cuda dispatches all explicitly allocated visible GPUs")
+    parser.add_argument("--hardware-profile",choices=HARDWARE_PROFILES,default="auto",
+                        help="allocation policy only; full scientific scale is unchanged")
     parser.add_argument("--source-dir",required=True,help="original completed local-energy audit")
     parser.add_argument("--data-root",default="data/wedge-citation")
     parser.add_argument("--output-dir",required=True,type=Path)

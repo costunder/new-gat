@@ -104,12 +104,22 @@ when the subsequent null-space or recovery probe changes its input.
     return result
 
 
-def build_actions(topology, recipe, reference, *, pair_chunk=None, channel_chunk=None):
+def build_actions(topology, recipe, reference, *, pair_chunk=None, channel_chunk=None,
+                  prepared_geometry=None, prepared_copy=None):
     if reference.ndim != 3:
         raise ValueError("reference must be [scalar_draw_or_vector=1,N,F]")
-    cpu = prepare_geometry(topology.to("cpu"), recipe)
-    g = cpu.to(reference.device, reference.dtype)
-    copy = copy_geometry(topology.to("cpu"), recipe).to(reference.device, reference.dtype)
+    if (prepared_geometry is None) != (prepared_copy is None):
+        raise ValueError("prepared edge and copy geometry must be supplied together")
+    if prepared_geometry is None:
+        cpu = prepare_geometry(topology.to("cpu"), recipe)
+        g = cpu.to(reference.device, reference.dtype)
+        copy = copy_geometry(topology.to("cpu"), recipe).to(reference.device, reference.dtype)
+    else:
+        g, copy = prepared_geometry, prepared_copy
+        if (g.recipe != recipe or copy.mode != recipe or g.n != topology.n or
+            g.edges.device != reference.device or copy.intra_weights.device != reference.device or
+            g.c0.dtype != reference.dtype or copy.intra_weights.dtype != reference.dtype):
+            raise ValueError("prepared geometry must match recipe, nodes, reference device and dtype")
     fixed = (g.pair_sign*g.pair_norm).unsqueeze(0)
     analytic = reference_coefficient(g, reference, pair_chunk=pair_chunk, channel_chunk=channel_chunk)
     unit_degree = g.d0.new_zeros(g.n).index_add(0, g.edges[0], g.d0.new_ones(g.num_edges))

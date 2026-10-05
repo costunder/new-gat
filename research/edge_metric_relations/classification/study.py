@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import itertools
 import math
 import os
@@ -42,6 +43,10 @@ from .data import (
 )
 from .evaluation import frozen_evaluate, intervention_scopes, intervention_variants
 from .model import parse_condition
+from ..hardware import (
+    HARDWARE_PROFILES, configure_classification_runtime, get_policy,
+    memory_window, unique_tensor_bytes,
+)
 from .training import (
     _resume_payload,
     choose_packing,
@@ -273,6 +278,8 @@ def _worker(plan_path):
     plan = read_json(plan_path)
     output = Path(plan["output_dir"])
     config = read_config(output / "config.json", plan["profile"])
+    hardware_profile = plan.get("hardware_profile", "auto")
+    policy = get_policy(hardware_profile)
     current_source = source_manifest()
     if current_source["code_digest"] != plan["source"]["code_digest"]:
         raise ValueError("worker source changed after dispatch")
@@ -296,8 +303,10 @@ def _worker(plan_path):
     torch.set_num_threads(int(threads))
     worker_dir = output / "workers" / f"{plan['stage']}-{plan['worker_index']}"
     worker_dir.mkdir(parents=True, exist_ok=False)
-    write_json(worker_dir / "resources.json", {**resources, "torch_cpu_threads": threads})
+    write_json(worker_dir / "resources.json", {**resources, "torch_cpu_threads": threads,
+               "hardware_policy": policy, "memory_window": memory_window(device, policy)})
     graphs, calibrations = {}, {}
+    host_graphs, resident_name, residency_rows = {}, None, []
     resource_rows, selection_rows = [], []
     result = {
         "metric_rows": [],
@@ -312,11 +321,33 @@ def _worker(plan_path):
     for job_index, job in enumerate(plan["jobs"]):
         name, condition = job["dataset"], job["condition"]
         if name not in graphs:
-            record = plan["graphs"][name]
-            host = load_graph(record["path"], record["sha256"])
-            if _graph_digest(host) != record["content_digest"]:
-                raise ValueError("worker graph tensors changed")
+            if name not in host_graphs:
+                record = plan["graphs"][name]
+                host = load_graph(record["path"], record["sha256"])
+                if _graph_digest(host) != record["content_digest"]:
+                    raise ValueError("worker graph tensors changed")
+                host_graphs[name] = host
+            host = host_graphs[name]
+            if hardware_profile == "a100-mig-10gb" and resident_name is not None:
+                # Cache every complete graph on CPU; only the active dataset is
+                # GPU resident. No scientific input or relation is removed.
+                del graph
+                graphs.clear()
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+            window = memory_window(device, policy)
+            static_upper_bound = unique_tensor_bytes(host)
+            if device.type == "cuda" and static_upper_bound > window["allocation_budget_bytes"]:
+                raise MemoryError(f"Complete {name} graph storage upper bound {static_upper_bound} "
+                                  f"exceeds remaining GPU budget {window['allocation_budget_bytes']}; "
+                                  "all nodes/features/pairs preserved; inspect assigned MIG free memory")
             graphs[name] = host.to(device, torch.float32)
+            resident_name = name
+            residency_rows.append({"kind": "dataset_residency", "dataset": name,
+                                  "hardware_profile": hardware_profile,
+                                  "static_storage_upper_bound_bytes": static_upper_bound,
+                                  **memory_window(device, policy)})
         graph = graphs[name]
         calibration_path = output / "calibration" / f"{job['phase']}-{name}-{condition}.json"
         key = job["phase"], name, condition
@@ -338,10 +369,13 @@ def _worker(plan_path):
                     job["phase"],
                     name,
                     condition,
+                    graph=graph,
+                    hardware_profile=hardware_profile,
                 )
             else:
                 calibration = choose_packing(
-                    graph, condition, job["seeds"], job["lr"], config, job["phase"]
+                    graph, condition, job["seeds"], job["lr"], config, job["phase"],
+                    hardware_profile=hardware_profile,
                 )
                 write_json(
                     calibration_path,
@@ -422,6 +456,7 @@ def _worker(plan_path):
                 del model, payload, evaluated
         if device.type == "cuda":
             torch.cuda.empty_cache()
+    write_json(worker_dir / "dataset_residency.json", residency_rows)
     write_json(
         worker_dir / "results.json",
         {
@@ -443,7 +478,8 @@ def _worker(plan_path):
 
 
 def _dispatch(
-    output, config, source, graphs, jobs, devices, stage, resume_from=None, test_unlock_digest=None
+    output, config, source, graphs, jobs, devices, stage, resume_from=None, test_unlock_digest=None,
+    hardware_profile="auto",
 ):
     # Keep all LRs for a dataset/condition on one worker: one calibration and cache.
     groups = {}
@@ -468,6 +504,7 @@ def _dispatch(
             {
                 "output_dir": str(output),
                 "profile": config["profile"],
+                "hardware_profile": hardware_profile,
                 "stage": stage,
                 "worker_index": index,
                 "num_workers": len(devices),
@@ -542,6 +579,8 @@ def run(args):
     config = read_config(
         args.config or Path(__file__).with_name(f"config_{args.profile}.json"), args.profile
     )
+    hardware_profile = getattr(args, "hardware_profile", "auto")
+    config = configure_classification_runtime(config, hardware_profile)
     if args.workers != "auto":
         config["runtime"]["cpu_workers"] = args.workers
     output = Path(args.output_dir).resolve()
@@ -589,6 +628,8 @@ def run(args):
                 if predecessors is not None:
                     write_json(output / "predecessors.json", predecessors)
                 hardware = runtime_resources(requested)
+                hardware["allocation_policy"] = get_policy(hardware_profile)
+                hardware["memory_window"] = memory_window(requested, get_policy(hardware_profile))
                 hardware["gpu_count_used"] = len(devices) if requested.type == "cuda" else 0
                 hardware["worker_devices"] = devices
                 hardware["worker_gpus"] = []
@@ -649,6 +690,7 @@ def run(args):
                     devices,
                     "tuning",
                     resume,
+                    hardware_profile=hardware_profile,
                 )
                 selections = select_learning_rates(config, tuning["selection_rows"])
                 write_json(output / "learning_rate_selection.json", selections)
@@ -660,7 +702,8 @@ def run(args):
                 )
                 final_jobs = build_jobs(config, "final", selections)
                 final = _dispatch(
-                    output, config, source, graph_records, final_jobs, devices, "final", resume
+                    output, config, source, graph_records, final_jobs, devices, "final", resume,
+                    hardware_profile=hardware_profile,
                 )
                 _validate_final_training(config, final["selection_rows"], final_jobs)
                 write_csv(output / "final_validation_selection.csv", final["selection_rows"])
@@ -685,6 +728,7 @@ def run(args):
                     devices,
                     "evaluation",
                     test_unlock_digest=digest(unlock),
+                    hardware_profile=hardware_profile,
                 )
                 coverage = verify_coverage(
                     config, tuning["selection_rows"], evaluated["metric_rows"]
@@ -711,6 +755,7 @@ def run(args):
                 write_json(output / "coverage.json", coverage)
                 contract = {
                     "profile": args.profile,
+                    "hardware_profile": hardware_profile,
                     "parameter_counts": parameter_counts,
                     "config_digest": digest(config),
                     "source": source,
@@ -786,6 +831,8 @@ def _workers(value):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=("full", "debug"), default="full")
+    parser.add_argument("--hardware-profile", choices=HARDWARE_PROFILES, default="auto",
+                        help="memory allocations only; scientific contract unchanged")
     parser.add_argument(
         "--device", default="cuda", help="cuda uses all explicitly allocated visible GPUs"
     )

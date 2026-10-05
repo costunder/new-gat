@@ -366,3 +366,58 @@ def test_complete_case_engine_exports_exact_expected_targets(tmp_path, feature_m
     assert records["rows"] == coverage["target_rows"]
     assert coverage["channels"] == (1 if feature_mode.startswith("independent") else 2)
     assert files and summary and all(row["bytes"] > 0 for row in files)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_mig_complete_static_actions_share_topology_and_match_existing(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    from types import SimpleNamespace
+    from research.edge_metric_relations.audit.study import _prepare_sparse_actions
+    topology = top()
+    features = torch.sin(torch.arange(35, dtype=torch.float64).reshape(5, 7)*.17)
+    case = SimpleNamespace(features=features, feature_mode="vector_trace")
+    source, actions, transferred, record = _prepare_sparse_actions(
+        case, topology, "local_degree", torch.device(device), "a100-mig-10gb")
+    expected = build_actions(topology, "local_degree", features.to(device)[None],
+                             pair_chunk=3, channel_chunk=2)
+    assert actions["copy_on"].copy.topology is transferred
+    assert all(action.geometry.topology is transferred for action in actions.values())
+    assert actions["Q_reference"].coefficient is actions["P_reference"].coefficient
+    assert record["all_nodes_edges_pairs_channels_retained"]
+    assert record["channel_chunk_during_coefficient_preparation"] == 7
+    for name in actions:
+        for repeats in OPERATOR_PLAN[name]:
+            torch.testing.assert_close(actions[name](source, repeats), expected[name](source, repeats),
+                                       atol=1e-10, rtol=1e-10)
+
+
+def test_mig_dense_chunk_budget_counts_all_basis_columns():
+    from research.edge_metric_relations.audit.study import _initial_pair_chunk
+    topology = top()
+    scalar = torch.ones(4, 5, 1, dtype=torch.float64)
+    budget = 8*4*5*12*3
+    assert _initial_pair_chunk(topology, scalar, budget, work_channels=5) == 3
+    assert _initial_pair_chunk(topology, scalar, budget) == 15
+
+
+def test_mig_sparse_calibration_retains_smaller_exact_candidates():
+    from research.edge_metric_relations.audit.study import _sparse_calibration
+    topology = top()
+    source = torch.sin(torch.arange(20, dtype=torch.float64).reshape(1, 5, 4))
+    actions = build_actions(topology, "unit", source, pair_chunk=2, channel_chunk=4)
+    pairs = actions["Q_reference"].geometry.num_pairs
+    record = _sparse_calibration(topology, source, actions, "unit", torch.device("cpu"), "a100-mig-10gb")
+    measured = [row for row in record["measurements"] if row["type"] == "target_channel_chunk"]
+    assert {1, 2, 4} <= {row["channel_chunk"] for row in measured}
+    assert actions["Q_reference"].geometry.num_pairs == pairs
+    assert record["hardware_profile"] == "a100-mig-10gb"
+
+
+def test_audit_rejects_measured_reserved_peak_beyond_headroom(monkeypatch):
+    import research.edge_metric_relations.audit.study as module
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device: 91)
+    row = {"status": "measured", "peak_vram_bytes": 50}
+    module._record_headroom(row, torch.device("cuda"),
+                            {"allocated_ceiling_bytes": 80, "reserved_ceiling_bytes": 90})
+    assert row["status"] == "measured_headroom_exceeded"

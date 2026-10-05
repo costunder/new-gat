@@ -22,6 +22,7 @@ import time
 import traceback
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +34,7 @@ from threadpoolctl import threadpool_limits
 from ...wedge_propagation.study import Tee, available_cpus, runtime_resources, synchronize
 from ..common import assert_source_unchanged, cpu_state, digest, save_checkpoint, source_manifest, write_csv, write_json
 from ..geometry import prepare_geometry, prepare_geometries
+from ..hardware import HARDWARE_PROFILES, get_policy, memory_window, headroom_safe, unique_tensor_bytes
 from .data import SPLITS, SyntheticBatch, data_manifest, pack_cases, prepare_cases, save_dataset
 from .model import (BASELINES, CONDITIONS, TARGETS, TRAINABLE, RawStudent, baseline_predict,
                     fit_baseline, graph_draw_errors, normalized_mse, parameter_vector_stats, target_message)
@@ -42,6 +44,10 @@ RECIPES = ("unit", "local_degree")
 CONTRASTS = (("F2", "D1"), ("F2", "F1"), ("F2", "DA"),
              ("F2", "F0"), ("F1", "D1"), ("D1", "D0"))
 FOLDER = Path(__file__).resolve().parent
+
+
+class StaticCacheMemoryError(MemoryError):
+    """An exact packing candidate exceeds the observed device budget."""
 
 
 def require_full_server(profile, device):
@@ -100,6 +106,44 @@ class ResultTable:
 def cache_batches(cases, recipe, size, device, dtype):
     return [pack_cases(cases[start:start + size], recipe, device, dtype)
             for start in range(0, len(cases), size)]
+
+
+def _resident_batches(cases, recipe, size, device, dtype, hardware_profile="auto"):
+    """Budget the entire static all-split cache before a MIG device transfer."""
+    resident = {split: cache_batches([case for case in cases if case.split == split],
+                                    recipe, size, "cpu" if hardware_profile != "auto" else device, dtype)
+                for split in SPLITS}
+    if hardware_profile == "auto" or device.type != "cuda":
+        return resident
+    # The native geometry transfer copies each tensor field. Count those fields,
+    # rather than optimistic CPU aliases, so the preflight is an upper bound.
+    from dataclasses import fields
+    required = 0
+    for batches in resident.values():
+        for batch in batches:
+            required += batch.x.numel()*batch.x.element_size()
+            for field in fields(batch.geometry):
+                value = getattr(batch.geometry, field.name)
+                if isinstance(value, torch.Tensor):
+                    required += value.numel()*value.element_size()
+                elif field.name == "topology":
+                    required += unique_tensor_bytes(value)
+    before = memory_window(device, get_policy(hardware_profile))
+    if required > before["allocation_budget_bytes"]:
+        raise StaticCacheMemoryError(f"all-split synthetic static cache requires at most {required} bytes; "
+                           f"MIG budget is {before['allocation_budget_bytes']} bytes; "
+                           "all graphs/draws retained; inspect actual GPU allocation")
+    return {split: [replace(batch, geometry=batch.geometry.to(device, dtype), x=batch.x.to(device))
+                    for batch in batches] for split, batches in resident.items()}
+
+
+def _calibration_window(device, hardware_profile):
+    if device.type != "cuda":
+        return None
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    return memory_window(device, get_policy(hardware_profile))
 
 
 def choose_workers(config, hardware, requested):
@@ -195,63 +239,101 @@ def train_epoch(model, batches, targets, optimizer, total_graphs, epsilon, pair_
     return torch.stack((loss_total, gradients, parameters, updates), -1).cpu().tolist()
 
 
-def _measure_packing(cases, refs, config, recipe, size, pair_chunk, device, dtype, resident_cases=None):
+def _measure_packing(cases, refs, config, recipe, size, pair_chunk, device, dtype, resident_cases=None,
+                     hardware_profile="auto", prepared_resident=None):
     # Keep a trial's CUDA references in its own frame: a genuine OOM unwinds
     # them before the caller releases allocator cache and tries exact chunks.
-    if resident_cases is None:
+    before = _calibration_window(device, hardware_profile)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    if prepared_resident is not None:
+        resident = prepared_resident
+    elif resident_cases is None:
         resident = {"train": cache_batches(cases, recipe, size, device, dtype)}
     else:
         # Match the static all-split geometry cache of the real job, not just
         # an artificially cheap train-only allocation.
-        resident = {split: cache_batches([case for case in resident_cases if case.split == split],
-                                        recipe, size, device, dtype) for split in SPLITS}
+        resident = _resident_batches(resident_cases, recipe, size, device, dtype, hardware_profile)
     batches = resident["train"]
-    targets = batch_targets(batches, refs, "local_degree", "analytic_pair")
+    # Real jobs retain the six teacher/target caches while iterating conditions.
+    # Measure that complete steady-state footprint, including validation/test.
+    target_cache = {(teacher, target): {split: batch_targets(group, refs, teacher, target)
+                                      for split, group in resident.items()}
+                    for teacher in RECIPES for target in TARGETS}
+    targets = target_cache["local_degree", "analytic_pair"]["train"]
     model = RawStudent("F2", config["model_seeds"], config["hidden"], config["epsilon"]).to(device=device, dtype=dtype)
     optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"])
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
     synchronize(device)
     start = time.perf_counter()
     train_epoch(model, batches, targets, optimizer, len(cases), config["loss_epsilon"], pair_chunk)
+    for split, group in resident.items():
+        if group:
+            validation_scores(model, group, target_cache["local_degree", "analytic_pair"][split],
+                              config["loss_epsilon"], pair_chunk)
     synchronize(device)
     seconds = time.perf_counter() - start
     peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None
+    reserved = torch.cuda.max_memory_reserved(device) if device.type == "cuda" else None
+    safe = before is None or headroom_safe(peak, reserved, before)
     return {"physical_graph_batch": size, "pair_chunk": pair_chunk, "recipe": recipe,
             "graphs": len(cases), "realizations": config["features"],
             "static_graphs_resident": sum(batch.num_graphs for group in resident.values() for batch in group),
             "parallel_seed_models": len(config["model_seeds"]),
             "seconds_per_epoch": seconds, "graphs_per_second": len(cases) / seconds,
-            "peak_vram_bytes": peak, "status": "measured",
+            "peak_vram_bytes": peak, "peak_reserved_vram_bytes": reserved, "memory_window": before,
+            "target_cache_recipe_target_pairs": 6, "hardware_profile": hardware_profile,
+            "all_split_forward_probe": True,
+            "status": "measured" if safe else "measured_headroom_exceeded",
             "scope": "temporary calibration only; every train graph; no scientific checkpoint"}
 
 
-def choose_packing(cases, refs, config, device, dtype, requested, requested_chunk, resident_cases=None):
-    candidates = sorted({min(n, len(cases)) for n in (8, 32, 64, 128, len(cases))})
+def choose_packing(cases, refs, config, device, dtype, requested, requested_chunk, resident_cases=None,
+                   hardware_profile="auto"):
+    policy = get_policy(hardware_profile)
+    candidates = sorted({min(n, len(cases)) for n in
+                         (*policy["extra_graph_batches"], 8, 32, 64, 128, len(cases))})
     if requested != "auto":
         candidates = [int(requested)]
         if candidates[0] < 1:
             raise ValueError("physical batch must be positive")
-    chunks = (1024, 4096, 16384, 65536, 262144, 1 << 30) if requested_chunk == "auto" else (int(requested_chunk),)
+    chunks = (*policy["extra_pair_chunks"], 1024, 4096, 16384, 65536, 262144, 1 << 30) if requested_chunk == "auto" else (int(requested_chunk),)
     if min(chunks) < 1:
         raise ValueError("pair chunk must be positive")
     trials = []
     for size in candidates:
-        for pair_chunk in chunks:
-            for recipe in RECIPES:
+        for recipe in RECIPES:
+            prepared = None
+            if hardware_profile != "auto" and resident_cases is not None:
+                # Cache a packing's exact topology once across its pair-chunk
+                # measurements. It is released before the next packing.
+                _calibration_window(device, hardware_profile)
                 try:
-                    row = _measure_packing(cases, refs, config, recipe, size, pair_chunk, device, dtype, resident_cases)
+                    prepared = _resident_batches(resident_cases, recipe, size, device, dtype, hardware_profile)
+                except (torch.cuda.OutOfMemoryError, StaticCacheMemoryError) as error:
+                    if device.type != "cuda":
+                        raise
+                    for pair_chunk in chunks:
+                        trials.append({"physical_graph_batch": size, "pair_chunk": pair_chunk,
+                                       "recipe": recipe, "status": "static_budget_exceeded",
+                                       "error": str(error), "scope": "complete static cache; every graph retained"})
+                    continue
+            for pair_chunk in chunks:
+                try:
+                    row = _measure_packing(cases, refs, config, recipe, size, pair_chunk, device, dtype,
+                                           resident_cases, hardware_profile, prepared)
                     trials.append(row)
-                    print(f"[GPU calibration] recipe={recipe} batch={size} pair_chunk={pair_chunk} epoch={row['seconds_per_epoch']:.3f}s peak={row['peak_vram_bytes']}", flush=True)
-                except torch.cuda.OutOfMemoryError:
+                    print(f"[GPU calibration] recipe={recipe} batch={size} pair_chunk={pair_chunk} epoch={row['seconds_per_epoch']:.3f}s peak={row['peak_vram_bytes']} status={row['status']}", flush=True)
+                except (torch.cuda.OutOfMemoryError, StaticCacheMemoryError) as error:
                     if device.type != "cuda":
                         raise
                     trials.append({"physical_graph_batch": size, "pair_chunk": pair_chunk, "recipe": recipe,
-                                   "status": "OOM", "scope": "temporary calibration; graph/model scale preserved"})
+                                   "status": "static_budget_exceeded" if isinstance(error, StaticCacheMemoryError) else "OOM",
+                                   "error": str(error), "scope": "temporary calibration; graph/model scale preserved"})
                     print(f"[GPU calibration OOM] recipe={recipe} batch={size} pair_chunk={pair_chunk}; every graph retained", flush=True)
                     # Only allocator cache belonging to this process is released.
                     import gc
                     gc.collect(); torch.cuda.empty_cache()
+            del prepared
     scores = []
     for size in candidates:
         for chunk in chunks:
@@ -433,14 +515,15 @@ def _load_shared(folder, config, source):
 
 
 def run_student_jobs(assignments, cases, refs, config, source, manifest_digest, output,
-                     device, dtype, batch_size, pair_chunk, resume_from, graph_table, draw_table):
+                     device, dtype, batch_size, pair_chunk, resume_from, graph_table, draw_table,
+                     hardware_profile="auto"):
     splits = {split: [case for case in cases if case.split == split] for split in SPLITS}
     rows, history, jobs, new_updates, resources = [], [], [], 0, []
     for recipe in RECIPES:
         current = [job for job in assignments if job[0] == recipe]
         if not current:
             continue
-        batches = {split: cache_batches(splits[split], recipe, batch_size, device, dtype) for split in SPLITS}
+        batches = _resident_batches(cases, recipe, batch_size, device, dtype, hardware_profile)
         cached_targets = {}
         for _, teacher, target, condition in current:
             key = (teacher, target)
@@ -475,7 +558,7 @@ def run_student_jobs(assignments, cases, refs, config, source, manifest_digest, 
                               "seconds_this_execution": seconds, "new_seed_optimizer_updates": updates,
                               "peak_vram_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None})
             del model
-        del cached_targets, batches
+        del cached_targets, batches, targets
     return rows, history, jobs, new_updates, resources
 
 
@@ -538,7 +621,8 @@ def dispatch_gpu_workers(args, output, cases, refs, config, source, manifest_dig
                    "--profile", args.profile, "--device", "cuda", "--output-dir", str(workers_folder / f"gpu-{ordinal:02d}"),
                    "--shared-prepared-dir", str(output), "--worker-plan", str(plan),
                    "--workers", str(max(1, workers // gpu_count)), "--batch-size", args.batch_size,
-                   "--pair-chunk", args.pair_chunk]
+                   "--pair-chunk", args.pair_chunk,
+                   "--hardware-profile", getattr(args, "hardware_profile", "auto")]
         prior_worker = args.resume_from / "workers" / f"gpu-{ordinal:02d}" if args.resume_from else None
         if prior_worker is not None and prior_worker.is_dir():
             command += ["--resume-from", str(prior_worker)]
@@ -579,6 +663,7 @@ def worker_run(args, output):
     if len(assignments) != len(set(assignments)):
         raise ValueError("duplicate worker scientific jobs")
     device = torch.device(args.device); hardware = runtime_resources(device)
+    hardware_profile = getattr(args, "hardware_profile", "auto")
     if device.type != "cuda" or hardware["gpu_count_visible"] != 1:
         raise ValueError("worker must receive exactly one assigned GPU")
     torch.set_num_threads(1); torch.backends.cuda.matmul.allow_tf32 = False
@@ -588,21 +673,24 @@ def worker_run(args, output):
     checks = run_math_checks(device)
     write_json(output / "source_manifest.json", source); write_json(output / "math_checks.json", checks)
     write_json(output / "hardware.json", hardware)
+    write_json(output / "hardware_policy.json", get_policy(hardware_profile))
     train_cases = [case for case in cases if case.split == "train"]
     requested_batch, requested_chunk = args.batch_size, args.pair_chunk
     if args.resume_from is not None and (args.resume_from / "runtime_packing.json").is_file():
         prior = json.loads((args.resume_from / "runtime_packing.json").read_text(encoding="utf-8"))
         requested_batch = str(prior["physical_graph_batch"]) if requested_batch == "auto" else requested_batch
         requested_chunk = str(prior["pair_chunk"]) if requested_chunk == "auto" else requested_chunk
-    batch_size, pair_chunk, trials = choose_packing(train_cases, refs, config, device, dtype, requested_batch, requested_chunk, cases)
+    batch_size, pair_chunk, trials = choose_packing(train_cases, refs, config, device, dtype,
+                                                 requested_batch, requested_chunk, cases, hardware_profile)
     write_json(output / "runtime_packing.json", {"physical_graph_batch": batch_size, "pair_chunk": pair_chunk,
         "packing_trials": trials, "worker_ordinal": plan["ordinal"], "gpu_count_used": 1,
-        "source_digest": source["code_digest"], "config_digest": digest(config), "data_manifest_digest": manifest_digest})
+        "source_digest": source["code_digest"], "config_digest": digest(config), "data_manifest_digest": manifest_digest,
+        "hardware_profile": hardware_profile, "hardware_policy": get_policy(hardware_profile)})
     graph_table, draw_table = ResultTable(output / "per_graph.csv", GRAPH_COLUMNS), ResultTable(output / "per_realization.csv", DRAW_COLUMNS)
     try:
         rows, history, records, updates, resources = run_student_jobs(
             assignments, cases, refs, config, source, manifest_digest, output, device, dtype,
-            batch_size, pair_chunk, args.resume_from, graph_table, draw_table)
+            batch_size, pair_chunk, args.resume_from, graph_table, draw_table, hardware_profile)
     finally:
         graph_table.close(); draw_table.close()
     expected_runs = sum(len(config["model_seeds"]) if job[3] in TRAINABLE else 1 for job in assignments)
@@ -756,6 +844,8 @@ def run(args, output):
         raise ValueError("only an explicit CPU or CUDA device is supported")
     require_full_server(args.profile, device)
     hardware = runtime_resources(device)
+    hardware_profile = getattr(args, "hardware_profile", "auto")
+    policy = get_policy(hardware_profile)
     gpu_count = hardware["gpu_count_visible"] if device.type == "cuda" else 0
     hardware["gpu_count_used"] = gpu_count
     torch.set_num_threads(1)
@@ -767,7 +857,8 @@ def run(args, output):
     write_json(output / "source_manifest.json", source)
     write_json(output / "config.json", config)
     write_json(output / "hardware.json", hardware)
-    print(f"[start] experiment=B profile={args.profile} device={device} dtype={dtype} raw Q(X)X hidden={config['hidden']} epochs={config['epochs']}", flush=True)
+    write_json(output / "hardware_policy.json", policy)
+    print(f"[start] experiment=B profile={args.profile} hardware_profile={hardware_profile} device={device} dtype={dtype} raw Q(X)X hidden={config['hidden']} epochs={config['epochs']}", flush=True)
     print(f"[hardware] {json.dumps(hardware, ensure_ascii=False)}", flush=True)
     math_checks = run_math_checks(device)
     write_json(output / "math_checks.json", math_checks)
@@ -793,13 +884,14 @@ def run(args, output):
             requested_batch = str(old_resources["physical_graph_batch"]) if requested_batch == "auto" else requested_batch
             requested_chunk = str(old_resources["pair_chunk"]) if requested_chunk == "auto" else requested_chunk
         batch_size, pair_chunk, packing_trials = choose_packing(splits["train"], refs, config, device, dtype,
-                                                              requested_batch, requested_chunk, cases)
+                                                              requested_batch, requested_chunk, cases, hardware_profile)
         print(f"[selected] physical_graph_batch={batch_size} pair_chunk={pair_chunk} effective_train_graphs={len(splits['train'])} all_draws={config['features']} parallel_seeds={len(config['model_seeds'])}", flush=True)
         write_json(output / "runtime_packing.json", {"physical_graph_batch": batch_size, "pair_chunk": pair_chunk,
                                                     "workers": workers, "packing_trials": packing_trials,
                                                     "effective_train_graphs": len(splits["train"]),
                                                     "config_digest": digest(config), "source_digest": source["code_digest"],
-                                                    "data_manifest_digest": manifest_digest})
+                                                    "data_manifest_digest": manifest_digest,
+                                                    "hardware_profile": hardware_profile, "hardware_policy": policy})
     else:
         batch_size, pair_chunk, packing_trials = None, None, []
     resources = {"cpu_trials": cpu_trials, "packing_trials": packing_trials, "workers": workers,
@@ -808,7 +900,7 @@ def run(args, output):
                  "physical_graph_batch": batch_size, "pair_chunk": pair_chunk,
                  "effective_graph_batch_per_seed": len(splits["train"]), "realizations": config["features"],
                  "gradient_accumulation_batches_per_epoch": math.ceil(len(splits["train"]) / batch_size) if batch_size else None,
-                 "gpu_count_used": gpu_count,
+                 "gpu_count_used": gpu_count, "hardware_profile": hardware_profile, "hardware_policy": policy,
                  "seed_axis": "independent models, not data-parallel workers", "jobs": []}
     graph_table = ResultTable(output / "per_graph.csv", GRAPH_COLUMNS)
     draw_table = ResultTable(output / "per_realization.csv", DRAW_COLUMNS)
@@ -817,7 +909,7 @@ def run(args, output):
         if gpu_count <= 1:
             rows, history, jobs, new_updates, resource_jobs = run_student_jobs(
                 all_student_jobs(), cases, refs, config, source, manifest_digest, output,
-                device, dtype, batch_size, pair_chunk, args.resume_from, graph_table, draw_table)
+                device, dtype, batch_size, pair_chunk, args.resume_from, graph_table, draw_table, hardware_profile)
             resources["jobs"].extend(resource_jobs)
         else:
             rows, history, jobs, new_updates, resource_jobs, worker_packing = dispatch_gpu_workers(
@@ -832,7 +924,7 @@ def run(args, output):
         # Oracles use the teacher's own Ld, independent of every student recipe.
         for teacher in RECIPES:
             cpu_batches = cache_batches(splits["train"], teacher, batch_size, "cpu", torch.float64)
-            eval_batches = {split: cache_batches(splits[split], teacher, batch_size, device, dtype) for split in SPLITS}
+            eval_batches = _resident_batches(cases, teacher, batch_size, device, dtype, hardware_profile)
             for target in TARGETS:
                 fit_targets = batch_targets(cpu_batches, refs, teacher, target)
                 eval_targets = {split: batch_targets(eval_batches[split], refs, teacher, target) for split in SPLITS}
@@ -846,7 +938,9 @@ def run(args, output):
                     jobs.append(dict(meta, seeds=[-1], parameters_per_seed=0, selected_epochs=None,
                                      optimizer_updates_per_seed=0, optimizer=None))
                     print(f"[oracle] teacher={teacher} target={target} condition={condition} coefficients={fit['coefficients']} fit=train_only", flush=True)
-            del cpu_batches, eval_batches
+            # Do not retain the previous teacher's GPU targets during the next
+            # full static transfer. All exported rows/checkpoints are preserved.
+            del cpu_batches, eval_batches, eval_targets, fit_targets
     finally:
         graph_table.close(); draw_table.close()
     assert_source_unchanged(source)
@@ -914,6 +1008,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=("full", "debug"), default="full")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--hardware-profile", choices=HARDWARE_PROFILES, default="auto")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--workers", default="auto")

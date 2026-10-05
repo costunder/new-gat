@@ -1,5 +1,42 @@
 # 서버 실행
 
+## A100 MIG 10GB
+
+`--hardware-profile a100-mig-10gb`를 A/B/C 전체에 전달한다. FULL 모델·데이터·정밀도·
+epoch·seed·조건 수를 유지하며 실제 할당 메모리로 batch/chunk 후보를 측정한다.
+GPU 이름에 적힌 부모 A100 용량을 메모리 예산으로 사용하지 않는다.
+
+아래 명령을 한 터미널에 붙여 넣고 **할당받은 MIG UUID**를 입력한다.
+관리자나 스케줄러가 지정한 `MIG-…` 값을 사용한다.
+
+```bash
+cd /home/aicompetition07/new-gat &&
+git pull --ff-only &&
+read -r -p "할당받은 MIG UUID: " EDGE_MIG &&
+test -n "$EDGE_MIG" &&
+env -u PYTORCH_NVML_BASED_CUDA_CHECK CUDA_VISIBLE_DEVICES="$EDGE_MIG" \
+  /home/aicompetition07/.conda/envs/new-gat/bin/python -u -B \
+  -m research.edge_metric_relations.study \
+  --profile full --device cuda --hardware-profile a100-mig-10gb \
+  --source-dir /home/aicompetition07/new-gat/results/local-energy-20261004-002815 \
+  --data-root /home/aicompetition07/new-gat/data/wedge-citation \
+  --output-dir "results/edge-metric-mig10-$(date +%Y%m%d-%H%M%S)"
+```
+
+진행 상황과 오류는 이 터미널에 출력한다. 초기 calibration은 측정용 별도 상태이며
+본학습 업데이트 수에 포함하지 않는다. A가 끝나면 B, B가 끝나면 C를 실행한다.
+실제 MIG에서의 전체 실행은 아직 검증하지 않았으며, 처리시간은 서버 측정값으로 판단한다.
+
+위 MIG 명령으로 실행한 결과 확인:
+
+```bash
+EDGE_RUN=$(ls -dt /home/aicompetition07/new-gat/results/edge-metric-mig10-*/ | head -n 1)
+cat "${EDGE_RUN}completion.json"
+cat "${EDGE_RUN}C/EDGE_METRIC_CLASSIFICATION_SUMMARY.md"
+```
+
+MIG 정책의 메모리 계산·로그·재개 조건은 [MIG_10GB.md](MIG_10GB.md)에 정리했다.
+
 ## 준비
 
 FULL은 본학습을 서버에서 실행한다. Python 환경은 기존 `/home/aicompetition07/.conda/envs/new-gat/bin/python`을 사용한다. 할당된 GPU만 CUDA_VISIBLE_DEVICES에 적는다. 여러 GPU를 실제 할당받았다면 `0,1`처럼 지정하면 독립 job을 분배한다.

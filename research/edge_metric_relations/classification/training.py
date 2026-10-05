@@ -25,6 +25,7 @@ import torch
 
 from ...wedge_propagation.classification.evaluation import classification_metrics, split_indices
 from ...wedge_propagation.study import Tee, synchronize
+from ..hardware import get_policy, headroom_safe, memory_window
 from .common import condition_metadata, cpu_state, digest, file_sha256, parse_condition, read_json, save_checkpoint, write_json
 from .model import PackedClassifier
 
@@ -66,6 +67,54 @@ def make_optimizer(model, config, lr):
         model.weight_decay_groups(train["weight_decay"]), lr=lr,
         betas=tuple(train["optimizer_betas"]), eps=train["optimizer_epsilon"], foreach=False,
     )
+
+
+def _estimated_trial_increment_bytes(graph, condition, packed, config, path_chunk):
+    """Conservative allocation screen, followed by a required measured trial.
+
+    This estimate is not a claim that CUDA allocation will succeed. It prevents
+    an obviously oversized all-pairs calibration candidate from allocating its
+    feature/MLP intermediates before the exact smaller chunks can be measured.
+    Resident graph/geometry tensors are already included in the device baseline.
+    """
+    mode, family, cross, variant = parse_condition(condition)
+    geometry = graph.geometry_for(mode)
+    width, hidden, classes = graph.x.shape[-1], config["backbone"]["hidden_dim"], graph.num_classes
+    scalar = graph.x.element_size()
+    nodes, edges = graph.num_nodes, geometry.num_edges
+    active_chunk = min(path_chunk, max(1, geometry.num_pairs, edges))
+    # Deterministic dropout uses int64 counter/hash intermediates in addition to
+    # the floating mask and input. Those allocations depend on the full input.
+    input_bytes = nodes*width*(8 + packed*(3*8 + 3*scalar))
+    node_bytes = packed*nodes*(12*hidden + 8*classes)*scalar
+    edge_bytes = packed*edges*(12*hidden + 12)*scalar if family == "edge_metric" else 0
+    occurrence_bytes = packed*geometry.num_occurrences*4*scalar if variant == "DA" else 0
+    # Both pair feature construction and its checkpoint recomputation participate
+    # in the memory probe. Gate hidden dimension remains the contracted 64.
+    if variant in ("F1", "F2", "DA"):
+        pair_bytes = packed*active_chunk*(12*hidden + 5*64 + 48)*scalar
+    elif variant == "F0":
+        # A constant pair gate still materializes both feature-width cross-flow
+        # tensors. It must not try a huge full-pair candidate without a screen.
+        pair_bytes = packed*active_chunk*(8*hidden + 32)*scalar
+    elif family == "edge_metric":
+        # D0/D1 diagnostics retain scalar pair statistics, without pair messages.
+        pair_bytes = packed*active_chunk*8*scalar
+    else:
+        pair_bytes = 0
+    gcn_chunk = min(path_chunk, max(1, graph.gcn_edges.shape[1]))
+    baseline_bytes = packed*gcn_chunk*4*hidden*scalar if family == "baseline" else 0
+    gate_parameters = 2*(385*int(variant in ("D1", "F2", "DA"))
+                         + 641*int(variant in ("F1", "F2", "DA")))
+    parameters = width*hidden + hidden*classes + gate_parameters + 6*int(variant == "P2")
+    # Parameters, gradients, Adam moments, telemetry clone and selected state.
+    parameter_bytes = packed*parameters*8*scalar
+    pieces = {"full_input_dropout": input_bytes, "node_states": node_bytes,
+              "physical_edge_states": edge_bytes, "DA_occurrence_rows": occurrence_bytes,
+              "pair_chunk_intermediates": pair_bytes, "baseline_chunk_intermediates": baseline_bytes,
+              "model_Adam_telemetry_and_selected_state": parameter_bytes}
+    return {"increment_bytes": int(sum(pieces.values())), "components_bytes": pieces,
+            "scope": "conservative_screen_not_an_allocation_guarantee; actual_trial_required"}
 
 
 def _seed_rows(value, seeds):
@@ -138,15 +187,16 @@ def _epoch(model, graph, optimizer, epoch, telemetry=True, diagnostics=False):
 
 def benchmark_trial(graph, condition, seeds, lr, config, path_chunk):
     """Disposable updates plus a validation diagnostic memory probe; no run reuse."""
-    model = make_model(graph, condition, seeds, config, path_chunk)
-    optimizer = make_optimizer(model, config, lr)
+    model = optimizer = None
     runtime = config["runtime"]
     try:
+        if graph.x.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(graph.x.device)
+        model = make_model(graph, condition, seeds, config, path_chunk)
+        optimizer = make_optimizer(model, config, lr)
         for epoch in range(runtime["calibration_warmups"]):
             _epoch(model, graph, optimizer, epoch, telemetry=False)
         synchronize(graph.x.device)
-        if graph.x.device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(graph.x.device)
         start = time.perf_counter()
         for epoch in range(runtime["calibration_repeats"]):
             _epoch(model, graph, optimizer, epoch, telemetry=True,diagnostics=True)
@@ -162,13 +212,17 @@ def benchmark_trial(graph, condition, seeds, lr, config, path_chunk):
             if not bool(torch.isfinite(probe).all()):
                 raise FloatingPointError("nonfinite diagnostic calibration logits")
         synchronize(graph.x.device)
-        peak = torch.cuda.max_memory_allocated(graph.x.device) if graph.x.device.type == "cuda" else None
-        return seconds, peak, model.parameters_per_seed
+        cuda = graph.x.device.type == "cuda"
+        memory = {
+            "peak_allocated_bytes": torch.cuda.max_memory_allocated(graph.x.device) if cuda else None,
+            "peak_reserved_bytes": torch.cuda.max_memory_reserved(graph.x.device) if cuda else None,
+        }
+        return seconds, memory, model.parameters_per_seed
     finally:
         del model, optimizer
 
 
-def choose_packing(graph, condition, seeds, lr, config, phase):
+def choose_packing(graph, condition, seeds, lr, config, phase, *, hardware_profile="auto"):
     mode, intra, cross, variant = parse_condition(condition)
     candidates = sorted({min(value, len(seeds)) for value in config["resources"][f"parallel_{phase}_run_candidates"]})
     if not candidates or min(candidates) < 1:
@@ -177,32 +231,51 @@ def choose_packing(graph, condition, seeds, lr, config, phase):
     paths = max(graph.topology.num_local_edges, geometry.num_cross_edges)
     chunks = sorted({max(1, min(paths, value)) for value in [*config["runtime"]["relation_chunk_candidates"], max(1, paths)]})
     trials, device = [], graph.x.device
+    policy = dict(get_policy(hardware_profile))
+    policy["memory_safety_fraction"] = (config["runtime"]["gpu_memory_safety_fraction"] if hardware_profile == "auto"
+                                        else min(policy["memory_safety_fraction"], config["runtime"]["gpu_memory_safety_fraction"]))
     for packed in candidates:
         for chunk in chunks:
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-                free, _ = torch.cuda.mem_get_info(device)
-                baseline = torch.cuda.memory_allocated(device)
+                before = memory_window(device, policy)
             else:
-                free = baseline = None
+                before = None
+            estimate = _estimated_trial_increment_bytes(graph, condition, packed, config, chunk)
             row = {
                 "dataset": graph.name, "condition": condition, **_condition_fields(condition), "phase": phase, "scope": "calibration", "device": str(device),
                 "packed_runs": packed, "path_chunk": chunk, "all_intra_edges": graph.topology.num_local_edges,
                 "all_cross_edges": geometry.num_cross_edges, "measured": False,
                 "includes_diagnostic_memory_probe": True,
+                "hardware_profile": hardware_profile, "memory_window_before": before,
+                "estimated_increment_bytes": estimate["increment_bytes"],
+                "estimate_components_bytes": estimate["components_bytes"],
+                "estimate_scope": estimate["scope"],
                 "calibration_state": "disposable_fresh_model_and_Adam; identical_named_initialization_restored_for_training",
             }
+            if before is not None and estimate["increment_bytes"] > before["allocation_budget_bytes"]:
+                row.update(status="memory_safety_rejected", rejection_reason="estimated_before_allocation", seconds_per_epoch=None,
+                           peak_vram_bytes=None, peak_reserved_vram_bytes=None, model_updates_per_second=None)
+                trials.append(row)
+                print(f"[calibration estimate] {phase} {graph.name}/{condition} packed={packed} chunk={chunk} "
+                      f"estimated={estimate['increment_bytes']} available_budget={before['allocation_budget_bytes']}; "
+                      "candidate rejected before allocation; all relations retained by other exact chunks", flush=True)
+                continue
             try:
-                seconds, peak, parameters = benchmark_trial(graph, condition, seeds[:packed], lr, config, chunk)
-                safe = device.type != "cuda" or peak-baseline < free*config["runtime"]["gpu_memory_safety_fraction"]
+                seconds, memory, parameters = benchmark_trial(graph, condition, seeds[:packed], lr, config, chunk)
+                peak, reserved = memory["peak_allocated_bytes"], memory["peak_reserved_bytes"]
+                safe = device.type != "cuda" or headroom_safe(peak, reserved, before)
                 row.update(
-                    seconds_per_epoch=seconds, peak_vram_bytes=peak, parameters_per_seed=parameters,
+                    seconds_per_epoch=seconds, peak_vram_bytes=peak, peak_reserved_vram_bytes=reserved,
+                    parameters_per_seed=parameters,
                     model_updates_per_second=packed/seconds, measured=True,
                     status="measured" if safe else "memory_safety_rejected",
                 )
-                print(f"[calibration] {phase} {graph.name}/{condition} packed={packed} chunk={chunk} seconds/epoch={seconds:.4f} peak={peak} status={row['status']}", flush=True)
+                print(f"[calibration] {phase} {graph.name}/{condition} packed={packed} chunk={chunk} "
+                      f"seconds/epoch={seconds:.4f} allocated_peak={peak} reserved_peak={reserved} status={row['status']}", flush=True)
             except torch.cuda.OutOfMemoryError as error:
-                row.update(status="OOM", error=str(error), seconds_per_epoch=None, peak_vram_bytes=None, model_updates_per_second=None)
+                row.update(status="OOM", error=str(error), seconds_per_epoch=None, peak_vram_bytes=None,
+                           peak_reserved_vram_bytes=None, model_updates_per_second=None)
                 print(f"[calibration OOM] {graph.name}/{condition} packed={packed} chunk={chunk}; exact alternative allocation", flush=True)
             trials.append(row)
             gc.collect()
@@ -215,11 +288,60 @@ def choose_packing(graph, condition, seeds, lr, config, phase):
     return {
         "packed_runs": chosen["packed_runs"], "path_chunk": chosen["path_chunk"],
         "seconds_per_epoch": chosen["seconds_per_epoch"], "trials": trials,
+        "hardware_profile": hardware_profile,
+        "memory_policy": policy,
+        "selected_memory_window_before": chosen["memory_window_before"],
+        "selected_peak_allocated_bytes": chosen["peak_vram_bytes"],
+        "selected_peak_reserved_bytes": chosen["peak_reserved_vram_bytes"],
         "temporary_calibration_updates_not_training_budget": sum(
             row["packed_runs"]*(config["runtime"]["calibration_warmups"]+config["runtime"]["calibration_repeats"])
             for row in trials if row["measured"]
         ),
     }
+
+
+def _validate_calibration_memory(graph, condition, calibration, config, *, hardware_profile=None):
+    """Screen a checked packing against the currently assigned CUDA allocation.
+
+    A checkpoint's seed blocks and Adam history cannot be silently repacked when
+    moving from a whole GPU to a smaller MIG allocation. An incompatible choice
+    raises before creating its model, leaving the original result intact.
+    """
+    if graph.x.device.type != "cuda":
+        return {"device": str(graph.x.device), "status": "CPU_no_CUDA_allocation_guard"}
+    name = hardware_profile or calibration.get("hardware_profile", "auto")
+    policy = dict(get_policy(name))
+    policy["memory_safety_fraction"] = (config["runtime"]["gpu_memory_safety_fraction"] if name == "auto"
+                                        else min(policy["memory_safety_fraction"], config["runtime"]["gpu_memory_safety_fraction"]))
+    torch.cuda.empty_cache()
+    before = memory_window(graph.x.device, policy)
+    estimate = _estimated_trial_increment_bytes(graph, condition, calibration["packed_runs"], config, calibration["path_chunk"])
+    prior = 0
+    for row in calibration.get("trials", []):
+        if (row.get("packed_runs"), row.get("path_chunk"), row.get("status")) != (
+            calibration["packed_runs"], calibration["path_chunk"], "measured"
+        ):
+            continue
+        original = row.get("memory_window_before") or {}
+        for peak_key, baseline_key in (("peak_vram_bytes", "allocated_bytes"),
+                                       ("peak_reserved_vram_bytes", "reserved_bytes")):
+            if row.get(peak_key) is not None:
+                prior = max(prior, int(row[peak_key])-int(original.get(baseline_key, 0)))
+    required = max(estimate["increment_bytes"], prior)
+    record = {"device": str(graph.x.device), "hardware_profile": name,
+              "memory_policy": policy, "memory_window_before": before,
+              "estimated_increment_bytes": estimate["increment_bytes"],
+              "previous_measured_increment_bytes": prior, "required_screen_bytes": required,
+              "packed_runs": calibration["packed_runs"], "path_chunk": calibration["path_chunk"],
+              "status": "allocation_screen_passed_actual_measurement_required"}
+    if required > before["allocation_budget_bytes"]:
+        raise RuntimeError(
+            f"checked classification packing does not fit current allocation: {graph.name}/{condition} "
+            f"packed={calibration['packed_runs']} chunk={calibration['path_chunk']} "
+            f"screen_bytes={required} available_budget_bytes={before['allocation_budget_bytes']}; "
+            "checkpoint and Adam packing preserved; start a NEW calibrated run on this allocation"
+        )
+    return record
 
 
 def _resume_payload(folder, metadata):
@@ -312,6 +434,8 @@ def _train_pack(graph, condition, seeds, lr, config, folder, source, graph_diges
 
     device = graph.x.device
     mode, intra, cross, variant = parse_condition(condition)
+    allocation_screen = _validate_calibration_memory(graph, condition, calibration, config)
+    write_json(folder/"allocation_screen.json", allocation_screen)
     model = make_model(graph, condition, seeds, config, calibration["path_chunk"])
     optimizer = make_optimizer(model, config, lr)
     metadata = {
@@ -430,6 +554,9 @@ def _train_pack(graph, condition, seeds, lr, config, folder, source, graph_diges
         "path_chunk": calibration["path_chunk"], "seconds_per_epoch": float(np.mean(durations)) if durations else None,
         "seconds_this_execution": time.perf_counter()-begin,
         "peak_vram_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None,
+        "peak_reserved_vram_bytes": torch.cuda.max_memory_reserved(device) if device.type == "cuda" else None,
+        "hardware_profile": calibration.get("hardware_profile", "auto"),
+        "allocation_screen": allocation_screen,
         "parameters_per_seed": model.parameters_per_seed, "status": "measured" if durations else "reused_complete",
         "measured": bool(durations), "resumed_from": str(restored) if restored else None,
     }
@@ -442,8 +569,9 @@ def _train_pack(graph, condition, seeds, lr, config, folder, source, graph_diges
     return {"model": model, "rows": rows, "resource": resource, "selected_path": folder/"selected.pt"}
 
 
-def preserve_resume_calibration(source_path, output_path, config, phase, dataset, condition):
-    """Copy checked allocation choices; resumed Adam states keep their seed packing."""
+def preserve_resume_calibration(source_path, output_path, config, phase, dataset, condition,
+                                *, graph=None, hardware_profile="auto"):
+    """Preserve Adam packing and remeasure it on the current allocation before use."""
     source_path, output_path = Path(source_path), Path(output_path)
     record = read_json(source_path)
     fields = _condition_fields(condition)
@@ -455,8 +583,27 @@ def preserve_resume_calibration(source_path, output_path, config, phase, dataset
         raise ValueError("resume calibration identity mismatch")
     if output_path.exists():
         raise FileExistsError("calibration output already exists; preserved")
+    selection = record["selection"]
+    revalidation = None
+    if graph is not None:
+        revalidation = _validate_calibration_memory(graph, condition, selection, config,
+                                                   hardware_profile=hardware_profile)
+        before = revalidation.get("memory_window_before")
+        _, memory, parameters = benchmark_trial(
+            graph, condition, config["training"][f"{phase}_seeds"][:selection["packed_runs"]],
+            config["training"]["learning_rate_candidates"][0], config, selection["path_chunk"],
+        )
+        if before is not None and not headroom_safe(memory["peak_allocated_bytes"], memory["peak_reserved_bytes"], before):
+            raise RuntimeError("resume classification packing measured outside current GPU headroom; original results preserved")
+        revalidation.update(status="same_packing_remeasured_safe", measured=True,
+                            **memory, parameters_per_seed=parameters,
+                            temporary_calibration_updates_not_training_budget=(selection["packed_runs"]*(
+                                config["runtime"]["calibration_warmups"]+config["runtime"]["calibration_repeats"])))
     with output_path.open("xb") as destination, source_path.open("rb") as original:
         shutil.copyfileobj(original, destination)
-    return record["selection"]
+    if revalidation is not None:
+        write_json(output_path.with_name(output_path.stem+"_device_revalidation.json"), revalidation)
+        selection = {**selection, "hardware_profile": hardware_profile, "device_revalidation": revalidation}
+    return selection
 
 

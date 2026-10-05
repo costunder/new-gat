@@ -211,6 +211,9 @@ def test_resume_one_job_identical_no_new_updates(config, cases, tmp_path):
         torch.testing.assert_close(value, other.state_dict()[name], atol=0, rtol=0)
     with pytest.raises(ValueError, match="data_manifest_digest"):
         load_resume(first, job, config, source, "wrong-data", "cpu")
+    with pytest.raises(ValueError, match="resume packing differs"):
+        train_job(other, train, tr, validation, va, config, source, "fixture-data",
+                  job, second, 2, 5, resume)
 
 
 def test_preflight_math_and_real_debug_update():
@@ -276,10 +279,10 @@ def test_actual_single_cuda_worker_declared_debug_job(config, cases, tmp_path, m
     refs = {}
     for case in cases:
         refs[case.graph_id] = {}
-        batch = pack_cases([case], "unit", "cpu", torch.float64)
-        refs[case.graph_id]["unit", "analytic_pair"] = target_message(batch.geometry, batch.x, "analytic_pair", 128)
-        batch = pack_cases([case], "local_degree", "cpu", torch.float64)
-        refs[case.graph_id]["local_degree", "analytic_pair"] = target_message(batch.geometry, batch.x, "analytic_pair", 128)
+        for recipe in ("unit", "local_degree"):
+            batch = pack_cases([case], recipe, "cpu", torch.float64)
+            for target in ("diagonal", "diagonal_squared", "analytic_pair"):
+                refs[case.graph_id][recipe, target] = target_message(batch.geometry, batch.x, target, 128)
     cache = shared / "worker_inputs.pt"; save_checkpoint(cache, _shared_payload(cases, refs))
     manifest = {"source_digest": source["code_digest"], "config_digest": digest(config),
         "data_manifest_digest": digest(data_manifest(cases, config)),
@@ -297,3 +300,59 @@ def test_actual_single_cuda_worker_declared_debug_job(config, cases, tmp_path, m
     assert completion["completed"] and completion["jobs"] == jobs
     assert completion["graph_rows"] == 60 and completion["draw_rows"] == 240
     assert results["new_updates"] == 6 and len(results["history"]) == 6
+
+
+def test_mig_packing_measures_small_candidates_and_excludes_headroom(config, cases, monkeypatch):
+    import research.edge_metric_relations.synthetic.study as module
+    seen = []
+    monkeypatch.setattr(module, "_calibration_window", lambda *args: None)
+    monkeypatch.setattr(module, "_resident_batches", lambda *args: {})
+    def measured(cases, refs, config, recipe, size, pair_chunk, device, dtype, resident_cases,
+                 hardware_profile, prepared):
+        seen.append((size, pair_chunk, recipe))
+        return {"physical_graph_batch": size, "pair_chunk": pair_chunk, "recipe": recipe,
+                "seconds_per_epoch": 1/size, "peak_vram_bytes": 10,
+                "status": "measured" if size <= 4 else "measured_headroom_exceeded"}
+    monkeypatch.setattr(module, "_measure_packing", measured)
+    size, chunk, trials = module.choose_packing(cases[:6], {}, config, torch.device("cpu"), torch.float64,
+                                               "auto", "auto", cases, "a100-mig-10gb")
+    assert size == 4
+    assert {2, 4, 6} <= {row[0] for row in seen}
+    assert {128, 512, 1024, 4096} <= {row[1] for row in seen}
+    assert any(row["status"] == "measured_headroom_exceeded" for row in trials)
+
+
+def test_mig_actual_measurement_includes_all_static_graphs_and_six_targets(config, cases):
+    import research.edge_metric_relations.synthetic.study as module
+    refs = {}
+    for case in cases:
+        refs[case.graph_id] = {}
+        for recipe in ("unit", "local_degree"):
+            batch = pack_cases([case], recipe, "cpu", torch.float64)
+            for target in ("diagonal", "diagonal_squared", "analytic_pair"):
+                refs[case.graph_id][recipe, target] = target_message(batch.geometry, batch.x, target, 128)
+    train = [case for case in cases if case.split == "train"]
+    row = module._measure_packing(train, refs, config, "unit", 4, 128, torch.device("cpu"),
+                                  torch.float64, cases, "a100-mig-10gb")
+    assert row["status"] == "measured"
+    assert row["static_graphs_resident"] == len(cases)
+    assert row["target_cache_recipe_target_pairs"] == 6
+    assert row["graphs"] == len(train) and row["realizations"] == config["features"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+def test_mig_static_device_cache_retains_every_graph_draw_and_recipe(config, cases):
+    import research.edge_metric_relations.synthetic.study as module
+    for recipe in ("unit", "local_degree"):
+        resident = module._resident_batches(cases, recipe, 4, torch.device("cuda"), torch.float64,
+                                            "a100-mig-10gb")
+        assert sum(batch.num_graphs for batches in resident.values() for batch in batches) == len(cases)
+        for split, batches in resident.items():
+            expected = module.cache_batches([case for case in cases if case.split == split], recipe, 4,
+                                              torch.device("cpu"), torch.float64)
+            for actual, cpu in zip(batches, expected, strict=True):
+                assert actual.x.shape[1] == config["features"]
+                torch.testing.assert_close(actual.x.cpu(), cpu.x, atol=0, rtol=0)
+                torch.testing.assert_close(actual.geometry.c0.cpu(), cpu.geometry.c0, atol=0, rtol=0)
+                assert actual.geometry.num_pairs == cpu.geometry.num_pairs
+        del resident

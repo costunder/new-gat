@@ -13,16 +13,18 @@ from pathlib import Path
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import fields, replace
 
 import torch
 
 from ..common import file_sha256, write_json, source_manifest, assert_source_unchanged
+from ..hardware import HARDWARE_PROFILES, get_policy, memory_window, headroom_safe, unique_tensor_bytes
 from ..verify import run_checks
 from ...local_energy_relations.receiver_aggregation.contract import read_config as input_contract
 from ...local_energy_relations.receiver_aggregation.data import prepare_cases, assert_inputs_unchanged
 from ...local_energy_relations.topology import batch_topologies
 from ...wedge_propagation.study import Tee, available_cpus, runtime_resources, synchronize
-from .actions import build_actions, feature_fields
+from .actions import build_actions, feature_fields, prepare_geometry, copy_geometry
 from .contract import OPERATOR_PLAN, read_config, expected_target_rows, validate_completion
 from .dense import observability_rows
 from .numerics import relative
@@ -87,12 +89,39 @@ class Results:
         return files, summaries
 
 
-def _memory_budget(device):
+def _memory_budget(device, hardware_profile="auto"):
     if device.type == "cuda":
-        free, _ = torch.cuda.mem_get_info(device)
-        return int(.75*free)
+        return memory_window(device, get_policy(hardware_profile))["allocation_budget_bytes"]
     import psutil
     return int(.75*psutil.virtual_memory().available)
+
+
+def _transfer_geometry(geometry_cpu, copy_cpu, device):
+    """Keep one shared topology for edge/copy operators and audit targets."""
+    geometry = geometry_cpu.to(device, torch.float64)
+    values = {}
+    for field in fields(copy_cpu):
+        value = getattr(copy_cpu, field.name)
+        values[field.name] = (geometry.topology if field.name == "topology" else
+                             value.to(device) if isinstance(value, torch.Tensor) else value)
+    return geometry, type(copy_cpu)(**values)
+
+
+def _trial_window(device, hardware_profile):
+    if device.type != "cuda":
+        return None
+    gc.collect()
+    torch.cuda.empty_cache()
+    return memory_window(device, get_policy(hardware_profile))
+
+
+def _record_headroom(row, device, before):
+    if before is not None:
+        reserved = torch.cuda.max_memory_reserved(device)
+        safe = headroom_safe(row["peak_vram_bytes"], reserved, before)
+        row.update(peak_reserved_vram_bytes=reserved, memory_window=before,
+                   status="measured" if safe else "measured_headroom_exceeded")
+    return row
 
 
 def _measured(device, function):
@@ -107,10 +136,11 @@ def _measured(device, function):
     return result, elapsed, peak
 
 
-def _initial_pair_chunk(topology, reference, budget):
+def _initial_pair_chunk(topology, reference, budget, work_channels=None):
     # Measured resources determine the safe first calibration allocation. This
     # is exact work chunking; eligible pairs and reference features are retained.
-    bytes_per_pair = 8*reference.shape[0]*max(1, reference.shape[-1])*12
+    width = reference.shape[-1] if work_channels is None else work_channels
+    bytes_per_pair = 8*reference.shape[0]*max(1, width)*12
     return max(1, min(max(1, topology.num_local_edges*topology.num_local_edges), budget//max(1, bytes_per_pair)))
 
 
@@ -129,12 +159,14 @@ def _dense_group(items, recipe, device, pair_chunk, channel_chunk):
     return matrices
 
 
-def _dense_calibration(items, recipe, device):
-    budget = _memory_budget(device)
+def _dense_calibration(items, recipe, device, hardware_profile="auto"):
+    budget = _memory_budget(device, hardware_profile)
     rows, accepted = [], []
     top = items[0][1].to(device)
     reference = feature_fields(items[0][0], device)
-    pair_chunk = _initial_pair_chunk(items[0][1], reference, budget)
+    # Dense matrix actions carry n basis columns, even when input draws are scalar.
+    pair_chunk = _initial_pair_chunk(items[0][1], reference, budget,
+                                     top.n if hardware_profile != "auto" else None)
     matrix = _dense_group(items[:1], recipe, device, pair_chunk, reference.shape[-1])["Q_reference", 1][0]
     for size in sorted(set([1, 2, 4, 8, 16, top.n])):
         if size > top.n:
@@ -145,6 +177,7 @@ def _dense_calibration(items, recipe, device):
                          "estimated_bytes": estimated, "memory_budget_bytes": budget})
             continue
         try:
+            before = _trial_window(device, hardware_profile)
             print(f"[calibration] {device} dense target_chunk={size} nodes={top.n} scalar_draws={reference.shape[0]}", flush=True)
             def probe():
                 # Include direct SVD and actual collision targets in measurement.
@@ -153,8 +186,10 @@ def _dense_calibration(items, recipe, device):
             del result
             row = {"type": "target_chunk", "target_chunk": size, "status": "measured",
                    "seconds": seconds, "target_graphs_per_second": top.n/seconds, "peak_vram_bytes": peak}
+            _record_headroom(row, device, before)
             rows.append(row)
-            accepted.append(row)
+            if row["status"] == "measured":
+                accepted.append(row)
         except torch.cuda.OutOfMemoryError:
             rows.append({"type": "target_chunk", "target_chunk": size, "status": "calibration_OOM_only"})
             gc.collect()
@@ -167,13 +202,16 @@ def _dense_calibration(items, recipe, device):
         if size > len(items):
             continue
         try:
+            before = _trial_window(device, hardware_profile)
             print(f"[calibration] {device} physical_graph_batch={size}", flush=True)
             result, seconds, peak = _measured(device, lambda: _dense_group(items[:size], recipe, device, pair_chunk, 1))
             del result
             row = {"type": "physical_graph_batch", "physical_graph_batch": size, "status": "measured",
                    "seconds": seconds, "graphs_per_second": size/seconds, "peak_vram_bytes": peak}
+            _record_headroom(row, device, before)
             rows.append(row)
-            accepted.append(row)
+            if row["status"] == "measured":
+                accepted.append(row)
         except torch.cuda.OutOfMemoryError:
             rows.append({"type": "physical_graph_batch", "physical_graph_batch": size, "status": "calibration_OOM_only"})
             gc.collect()
@@ -182,13 +220,15 @@ def _dense_calibration(items, recipe, device):
         raise RuntimeError("complete physical graph does not fit; no data scale fallback")
     count = max(accepted, key=lambda row: row["graphs_per_second"])["physical_graph_batch"]
     return {"physical_graph_batch": count, "target_chunk": target, "channel_chunk": 1,
-            "pair_chunk": pair_chunk, "memory_budget_bytes": budget, "measurements": rows}
+            "pair_chunk": pair_chunk, "memory_budget_bytes": budget, "measurements": rows,
+            "hardware_profile": hardware_profile}
 
 
-def _sparse_calibration(top, source, actions, recipe, device):
-    budget, rows, accepted = _memory_budget(device), [], []
+def _sparse_calibration(top, source, actions, recipe, device, hardware_profile="auto"):
+    budget, rows, accepted = _memory_budget(device, hardware_profile), [], []
+    policy = get_policy(hardware_profile)
     width = source.shape[-1]
-    candidates = sorted(set([8, 32, 128, 512, width]))
+    candidates = sorted(set([*policy["extra_channel_chunks"], 8, 32, 128, 512, width]))
     for size in (1, 2, 4, 8, 16, 32, 64):
         if size > top.n:
             continue
@@ -203,6 +243,7 @@ def _sparse_calibration(top, source, actions, recipe, device):
                              "status": "estimated_memory_exceeds_budget", "estimated_bytes": footprint})
                 continue
             try:
+                before = _trial_window(device, hardware_profile)
                 print(f"[calibration] {device} observer_batch={size} channel_chunk={channels}", flush=True)
                 def probe():
                     mask = observation_masks(top, "one_hop", 0, size)
@@ -217,8 +258,10 @@ def _sparse_calibration(top, source, actions, recipe, device):
                 row = {"type": "target_channel_chunk", "target_chunk": size, "channel_chunk": channels,
                        "status": "measured", "seconds": seconds, "target_channels_per_second": size*channels/seconds,
                        "peak_vram_bytes": peak}
+                _record_headroom(row, device, before)
                 rows.append(row)
-                accepted.append(row)
+                if row["status"] == "measured":
+                    accepted.append(row)
             except torch.cuda.OutOfMemoryError:
                 rows.append({"type": "target_channel_chunk", "target_chunk": size, "channel_chunk": channels,
                              "status": "calibration_OOM_only"})
@@ -231,20 +274,24 @@ def _sparse_calibration(top, source, actions, recipe, device):
     pairs = actions["Q_reference"].geometry.num_pairs
     safe_pair = actions["Q_reference"].pair_chunk
     pair_accepted = []
-    for size in sorted(set([min(max(1, pairs), value) for value in (1024, 16384, 65536, safe_pair, max(1, pairs))])):
+    for size in sorted(set([min(max(1, pairs), value) for value in
+                           (*policy["extra_pair_chunks"], 1024, 16384, 65536, safe_pair, max(1, pairs))])):
         if 8*best["target_chunk"]*best["channel_chunk"]*size*8 > budget:
             rows.append({"type": "pair_chunk", "pair_chunk": size, "status": "estimated_memory_exceeds_budget"})
             continue
         previous = actions["Q_reference"].pair_chunk
         actions["Q_reference"].pair_chunk = size
         try:
+            before = _trial_window(device, hardware_profile)
             result, seconds, peak = _measured(device, lambda: actions["Q_reference"](
                 source[..., :best["channel_chunk"]].expand(best["target_chunk"], *source.shape[1:-1], best["channel_chunk"])))
             del result
             row = {"type": "pair_chunk", "pair_chunk": size, "status": "measured", "seconds": seconds,
                    "pairs_per_second": pairs/seconds, "peak_vram_bytes": peak}
+            _record_headroom(row, device, before)
             rows.append(row)
-            pair_accepted.append(row)
+            if row["status"] == "measured":
+                pair_accepted.append(row)
         except torch.cuda.OutOfMemoryError:
             rows.append({"type": "pair_chunk", "pair_chunk": size, "status": "calibration_OOM_only"})
             gc.collect()
@@ -258,7 +305,7 @@ def _sparse_calibration(top, source, actions, recipe, device):
         action.pair_chunk = pair
     return {"physical_graph_batch": 1, "physical_graph_batch_reason": "one_complete_citation_graph_per_independent_GPU_job",
             "target_chunk": best["target_chunk"], "channel_chunk": best["channel_chunk"], "pair_chunk": pair,
-            "memory_budget_bytes": budget, "measurements": rows}
+            "memory_budget_bytes": budget, "measurements": rows, "hardware_profile": hardware_profile}
 
 
 def _ranges(n, kind, size):
@@ -334,8 +381,9 @@ def _solver_rows(record, kind, first, observed_counts, scale, method):
                    "numerical_operator_scale": scale, "method": method, "exact_rank_claim": False}
 
 
-def _case_views(case, top, recipe, device, config, calibration, output, matrices=None, actions=None):
-    source = feature_fields(case, device)
+def _case_views(case, top, recipe, device, config, calibration, output, matrices=None, actions=None,
+                reference=None):
+    source = feature_fields(case, device) if reference is None else reference
     realizations = source.shape[0]
     covered, failures, observation_residuals, unresolved_targets, solver_rows = 0, 0, 0, 0, 0
     for name, repeats in OPERATOR_PLAN.items():
@@ -447,7 +495,51 @@ def _case_views(case, top, recipe, device, config, calibration, output, matrices
             "scalar_realizations": realizations, "channels": source.shape[-1]}
 
 
-def _worker(worker, device_name, jobs, root, config):
+def _prepare_sparse_actions(case, topology, recipe, device, hardware_profile):
+    """Budget complete static indices, then compute coefficients on the device."""
+    started = time.perf_counter()
+    if hardware_profile == "auto":
+        source = feature_fields(case, device)
+        chunk = _initial_pair_chunk(topology, source, _memory_budget(device, hardware_profile))
+        actions = build_actions(topology, recipe, source, pair_chunk=chunk,
+                                channel_chunk=min(source.shape[-1], 128))
+        return source, actions, topology.to(device), {"mode": "existing_auto_device_preparation"}
+    source_cpu = feature_fields(case, "cpu")
+    geometry_cpu = prepare_geometry(topology.to("cpu"), recipe)
+    copy_cpu = copy_geometry(topology.to("cpu"), recipe)
+    before = _trial_window(device, hardware_profile)
+    needed = unique_tensor_bytes([geometry_cpu, copy_cpu, source_cpu])
+    # Fixed and analytic snapshots are computed on the selected GPU after
+    # the complete CPU-prepared index geometry has passed the static budget.
+    needed += (1+source_cpu.shape[0])*geometry_cpu.num_pairs*8
+    if before is not None and needed > before["allocation_budget_bytes"]:
+        raise RuntimeError(f"complete audit static tensors require {needed} bytes; MIG available budget "
+                           f"is {before['allocation_budget_bytes']} bytes; all graph/features retained; "
+                           "inspect actual allocation or use a larger allocated instance")
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    source = source_cpu.to(device)
+    geometry, copy = _transfer_geometry(geometry_cpu, copy_cpu, device)
+    remaining = _memory_budget(device, hardware_profile)
+    channel_chunk = min(source.shape[-1], 128)
+    chunk = _initial_pair_chunk(topology, source, remaining, work_channels=channel_chunk)
+    actions = build_actions(topology, recipe, source, pair_chunk=chunk, channel_chunk=channel_chunk,
+                            prepared_geometry=geometry, prepared_copy=copy)
+    synchronize(device)
+    peak = torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None
+    reserved = torch.cuda.max_memory_reserved(device) if device.type == "cuda" else None
+    if before is not None and not headroom_safe(peak, reserved, before):
+        raise RuntimeError("complete audit static transfer exceeded reserved MIG headroom; "
+                           "graph/features preserved; inspect hardware allocation")
+    return source, actions, actions["Q_reference"].geometry.topology, {
+        "mode": "CPU_static_indices_then_shared_transfer_and_device_coefficients", "static_tensor_bytes": needed,
+        "memory_window": before, "peak_vram_bytes": peak, "peak_reserved_vram_bytes": reserved,
+        "channel_chunk_during_coefficient_preparation": channel_chunk, "pair_chunk": chunk,
+        "coefficient_device": str(source.device),
+        "seconds": time.perf_counter()-started, "all_nodes_edges_pairs_channels_retained": True}
+
+
+def _worker(worker, device_name, jobs, root, config, hardware_profile="auto"):
     device = torch.device(device_name)
     if device.type == "cuda":
         torch.cuda.set_device(device)
@@ -458,7 +550,7 @@ def _worker(worker, device_name, jobs, root, config):
         for kind, recipe, items in jobs:
             print(f"[job start] {device} {kind} C={recipe} graphs={[case.graph_id for case, _ in items]}", flush=True)
             if kind == "dense":
-                calibration = _dense_calibration(items, recipe, device)
+                calibration = _dense_calibration(items, recipe, device, hardware_profile)
                 calibration_records.append({"worker": worker, "device": str(device), "recipe": recipe,
                                             "graphs": [item[0].graph_id for item in items], **calibration})
                 size = calibration["physical_graph_batch"]
@@ -468,17 +560,17 @@ def _worker(worker, device_name, jobs, root, config):
                     for graph, (case, top) in enumerate(packed):
                         isolated = {key: value[graph] for key, value in matrices.items()}
                         coverage.append(_case_views(case, top.to(device), recipe, device, config, calibration, output, isolated))
+                    del matrices, isolated
             else:
                 case, topology = items[0]
-                source = feature_fields(case, device)
-                chunk = _initial_pair_chunk(topology, source, _memory_budget(device))
-                actions = build_actions(topology, recipe, source, pair_chunk=chunk,
-                                        channel_chunk=min(source.shape[-1], 128))
-                top = topology.to(device)
-                calibration = _sparse_calibration(top, source, actions, recipe, device)
+                source, actions, top, static = _prepare_sparse_actions(
+                    case, topology, recipe, device, hardware_profile)
+                calibration = _sparse_calibration(top, source, actions, recipe, device, hardware_profile)
                 calibration_records.append({"worker": worker, "device": str(device), "recipe": recipe,
-                                            "graphs": [case.graph_id], **calibration})
-                coverage.append(_case_views(case, top, recipe, device, config, calibration, output, actions=actions))
+                                            "graphs": [case.graph_id], "static_preparation": static, **calibration})
+                coverage.append(_case_views(case, top, recipe, device, config, calibration, output,
+                                            actions=actions, reference=source))
+                del actions, source, top
         files, summaries = output.close()
         return {"worker": worker, "device": str(device), "coverage": coverage, "calibration": calibration_records,
                 "files": files, "summaries": summaries}
@@ -525,6 +617,8 @@ def _jobs(cases, topologies, recipes, devices):
 def run(args):
     args._phase = "configuration"
     config = read_config(args.profile, args.config)
+    hardware_profile = getattr(args, "hardware_profile", "auto")
+    policy = get_policy(hardware_profile)
     if args.trained_source_dir is not None:
         raise ValueError("trained-model audit requires selected checkpoints and exact frozen-state manifests; these are unavailable. Fixed audit never substitutes fake trained states")
     if args.profile == "full" and (sys.platform != "linux" or args.device != "cuda" or not os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()):
@@ -551,10 +645,11 @@ def run(args):
         manifest = source_manifest()
         write_json(root/"config.json", config)
         write_json(root/"source_manifest.json", manifest)
+        write_json(root/"hardware_policy.json", policy)
         write_json(root/"hardware.json", {"devices": hardware, "gpu_count_used": len(devices) if args.device == "cuda" else 0,
                                         "cpu_threads": torch.get_num_threads(), "data_root": args.data_root,
                                         "input_policy": "entire_hash_verified_original_snapshots_no_redownload"})
-        print(f"[start] Stage A profile={args.profile} float64 allocated_devices={devices} operators=21 C=2 sampling=1.0 trainable=0 epochs=N/A", flush=True)
+        print(f"[start] Stage A profile={args.profile} hardware_profile={hardware_profile} float64 allocated_devices={devices} operators=21 C=2 sampling=1.0 trainable=0 epochs=N/A", flush=True)
         args._phase = "independent_DEBUG_algebra_gate"
         checks = run_checks(devices[0])
         write_json(root/"math_checks.json", checks)
@@ -570,7 +665,7 @@ def run(args):
         print(f"[data] graphs={len(cases)} all original nodes/edges/channels; GPU workers={len(devices)}", flush=True)
         args._phase = "all_allocated_GPU_operator_audit"
         with ThreadPoolExecutor(max_workers=len(devices)) as pool:
-            futures = [pool.submit(_worker, index, device, queue, root, config)
+            futures = [pool.submit(_worker, index, device, queue, root, config, hardware_profile)
                        for index, (device, queue) in enumerate(zip(devices, queues, strict=True))]
             results = [future.result() for future in futures]
         args._phase = "coverage_and_provenance_validation"
@@ -612,6 +707,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=("full", "debug"), default="full")
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument("--hardware-profile", choices=HARDWARE_PROFILES, default="auto")
     parser.add_argument("--source-dir", required=True)
     parser.add_argument("--data-root", default=None, help="compatibility metadata; data read only from hash-verified source snapshots")
     parser.add_argument("--output-dir", required=True)

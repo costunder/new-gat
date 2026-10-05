@@ -6,6 +6,56 @@
 
 **로컬에서 수행한 것은 DEBUG 검증이다. 서버 FULL 본학습과 실제 citation 성능 평가는 아직 실행하지 않았다.** DEBUG 결과로 분류 우월성이나 독립 그래프 일반화를 주장하지 않는다.
 
+## A100 MIG 10GB 실행 정책 검증
+
+2026-10-05에 `--hardware-profile a100-mig-10gb`를 추가했다.
+원래 FULL 모델·모든 노드/엣지/feature/pair·정밀도·조건·seed·epoch 계약을 유지한다.
+수정은 메모리 여유분, 측정하는 allocation 후보, 공유 정적 자료 전달과 GPU residency에 한정한다.
+
+현재 **서로 다른 회귀 테스트 258개가 통과**했다. 다음 세 XML의 testcase identity를 합쳐
+중복을 제외한 수다. C의 최종 33개에는 F0 flow 메모리와 baseline의 실제 엣지 수 검사가 포함된다.
+
+- `results/edge-metric-mig-tests-DEBUG-20261005-05/junit.xml`: core/C/evaluation/hardware/pipeline 150개.
+- `results/mig-ab-tests-DEBUG-20261005-03.xml`: A/B 107개.
+- `results/edge-metric-mig-C-tests-DEBUG-20261005-03/junit.xml`: 최종 C 33개, 앞의 C 32개와 중복.
+
+MIG 정책의 10GB/free/reserved 경계는 모의 메모리 상태로 검사했다.
+실제 CUDA에서는 A의 모든 21 view가 기존 연산과 같은지 확인했고,
+B의 전체 static cache·6개 target cache·OOD를 포함한 forward probe를 검사했다.
+C의 작은 relation chunk와 전체 chunk의 logits·모든 CE gradient·두 Adam update를 비교했다.
+
+`results/edge-metric-mig-C-CUDA-DEBUG-20261005-02/`에서는 F2/DA 각각 2 seed × 3 epoch,
+총 12 optimizer update를 실제 CUDA로 실행했다. Pair gradient와 parameter update가 비영이고
+모든 CE/gradient/update가 유한했다. 측정한 후보 중 2 seed를 동시에 실행하도록 선택됐다.
+이 fixture의 결과를 FULL 학습 성능으로 사용하지 않는다.
+
+### MIG 정책으로 전체 CUDA DEBUG 실행
+
+`results/edge-metric-mig-pipeline-CUDA-DEBUG-20261005-01/`의 A→B→C가
+**1295.987초**에 완료됐다. 실행 source digest는
+`0a1f93c520d9968bd971e7a7b5b57423518aa5a0f3b87cd72d9a4eb312663b98`다.
+세 단계 모두 같은 source identity를 확인했다.
+
+| 단계 | 실제 DEBUG 실행 |
+| --- | --- |
+| A | 21그래프, 전체 42 graph/recipe 조합·21 view, 516.3초, optimizer 0 |
+| B | 30그래프, 96 learned run, 288 seed update, 21.613초 |
+| C | 270 run, 810 seed update, 748.523초; metric 270·intervention 1,566·branch 1,224행 |
+
+C의 tuning/final/evaluation worker마다 세 전체 DEBUG dataset을 CPU에서 읽고
+현재 dataset만 GPU에 유지했다. `dataset_residency.json`의 전환 순서와 실제 allocated byte를 확인했다.
+모든 final checkpoint를 잠근 뒤 test와 frozen 개입을 평가했고 source·입력 변경 검사가 통과했다.
+45개 frozen pack의 90개 seed state hash가 보존됐다. CUDA float32 no-op 810행의
+logit 변화 norm 최대는 `3.60730e-8`, 최대 원소 오차는 `1.86265e-8`이며 기존 roundoff 허용오차를 통과했다.
+예측 변경 비율은 모두 0이다. 이 작은 원문 잔차를 0으로 덮어쓰지 않았다.
+이 실행의 C backbone은 명시된 DEBUG hidden 8·3epoch이고, FULL hidden 64·500epoch와 구분한다.
+A의 직접 SVD stationarity 미충족 71건과 관측 잔차 기준 밖 5,745건은 raw 진단에 보존했다.
+수치상 미해결 진단을 모든 복원이 성공한 결과로 해석하지 않는다.
+
+**실제 장치는 로컬 RTX 5070 Ti이며 실제 A100 MIG에서의 전체 실행은 아직 검증하지 않았다.**
+서버의 MIG UUID·실제 메모리·SM·peak·처리량은 새 실행 로그에서 확인한다.
+실행 정책과 명령은 [MIG_10GB.md](MIG_10GB.md), [RUN.md](RUN.md)에 있다.
+
 ## 단위 테스트와 독립 CPU/CUDA 검사
 
 `results/edge-metric-tests-DEBUG-20261005-02/unit-tests.xml`과 `unit-tests.txt`에 전체 **232개 테스트 통과, 46.55초**를 기록했다.
